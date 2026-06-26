@@ -1,0 +1,12 @@
+{
+  "id": "case-001",
+  "title": "Investigate suspicious outbound traffic",
+  "description": "Multiple ET MALWARE alerts from workstation-01",
+  "status": "in progress",
+  "severity": "high",
+  "priority": "2",
+  "assigneeId": "user-bob",
+  "tags": ["malware", "investigation", "outbound"],
+  "createTime": "2026-05-07T11:00:00Z",
+  "updateTime": "2026-05-07T11:30:00Z"
+}

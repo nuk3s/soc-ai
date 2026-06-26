@@ -1,0 +1,35 @@
+# soc-ai automated-install settings.
+#
+#   cp setup.conf.example setup.conf
+#   $EDITOR setup.conf          # fill in the REQUIRED values below
+#   ./setup.sh --auto           # installs with no prompts
+#
+# Format is KEY=value, one per line (no quotes needed). Lines starting with #
+# are ignored. Anything you leave blank falls back to the default shown.
+# setup.conf holds secrets — it is chmod 600 and gitignored; keep it private.
+
+# ── REQUIRED ──────────────────────────────────────────────────────────────────
+SO_HOST=https://your-so-grid           # Security Onion URL
+SO_USERNAME=analyst@example.com        # SO analyst login (also used for Elasticsearch)
+SO_PASSWORD=                           # SO analyst password
+LITELLM_BASE_URL=http://localhost:4000 # your LiteLLM gateway
+ANALYST_MODEL=                           # a model your gateway serves (GET /v1/models) — REQUIRED for hunts to work
+
+# ── Connection details (sensible defaults) ────────────────────────────────────
+SO_VERIFY_SSL=false                    # false for a self-signed Security Onion
+ES_HOSTS=                              # Elasticsearch URL; blank = <SO_HOST>:9200
+ES_VERIFY_SSL=false
+LITELLM_API_KEY=                       # gateway API key, if it requires one
+LITELLM_VERIFY_SSL=true                # false if the gateway uses a self-signed cert
+
+# ── Grid-specific tuning (defaults fit most single-node grids) ────────────────
+WEBUI_ALERTS_QUERY=tags:alert          # Elastic-Agent grids often: event.dataset:suricata.alert
+EVENTS_INDEX_PATTERN=*:so-*            # single-node grids often: logs-*
+API_AUTH_REQUIRED=true                 # require login/token for the API (recommended)
+
+# ── Secrets (leave blank to auto-generate; fill in to pin a value) ────────────
+CONFIG_SECRET_KEY=                     # Fernet key for encrypted secret overrides; auto-generated if blank
+BOOTSTRAP_ADMIN_PASSWORD=              # first admin password; auto-generated + printed if blank
+
+# ── TLS cert ──────────────────────────────────────────────────────────────────
+CERT_HOST=                             # IP/DNS put in the self-signed cert SAN; blank = this host's primary IP

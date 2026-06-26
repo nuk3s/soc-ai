@@ -1,0 +1,16 @@
+[Unit]
+Description=soc-ai - daily blocklist + cloud-prefix refresh
+Documentation=https://github.com/nuk3s/soc-ai
+
+[Timer]
+# Run daily. OnCalendar fires at the next 03:30 local time; if the machine was
+# off at that time, Persistent=true runs it on the next boot so a powered-down
+# host doesn't drift past blocklist_stale_threshold_days unnoticed.
+OnCalendar=*-*-* 03:30:00
+# Spread load / avoid hammering upstream feeds at the same second as everyone
+# else's cron — jitter the start by up to 15 minutes.
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

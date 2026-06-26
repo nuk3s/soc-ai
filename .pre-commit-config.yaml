@@ -1,0 +1,38 @@
+---
+# Run with `uv run pre-commit install` after cloning to activate the hooks.
+# To run manually against everything: `uv run pre-commit run --all-files`.
+#
+# Hooks are intentionally fast — under 5s on a typical change — so they
+# don't slow `git commit`. The full pytest suite is NOT part of pre-commit
+# (it's run in CI); only the formatters + linter that catch the ~80% of
+# regressions immediately surfaceable from a diff.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.5
+    hooks:
+      - id: ruff-format
+      - id: ruff
+        args: ["--fix"]
+
+# Note: mypy is intentionally NOT in pre-commit. It needs the full
+# project venv to resolve dependencies (pydantic-ai's profiles, lark
+# without stubs, etc.) and runs slow enough to feel intrusive on every
+# commit. Run it manually before pushing:
+#
+#     uv run mypy soc_ai
+#
+# CI runs the same check on PRs.

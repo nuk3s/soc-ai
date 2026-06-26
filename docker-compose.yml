@@ -1,0 +1,107 @@
+# soc-ai compose stack.
+#
+# Usage:
+#   docker compose up -d        # build + start soc-ai
+#
+# soc-ai talks to a LiteLLM gateway you run separately (most setups put it on a
+# GPU host). The RAG/reranker engine and its vector store arrive with the v1.1
+# "heavy" deployment; they are not part of this stack.
+#
+# Before starting:
+#   1. Copy .env.example → .env and populate all required values.
+#   2. Generate a self-signed (or CA-signed) cert pair:
+#        mkdir -p ./certs
+#        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#          -subj "/CN=soc-ai" -keyout ./certs/key.pem -out ./certs/cert.pem
+#   3. (Optional) Run `soc-ai blocklists refresh` once to seed enrichment data.
+
+services:
+
+  soc-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: soc-ai:latest
+    container_name: soc-ai
+
+    # ── Port ─────────────────────────────────────────────────────────────────
+    # uvicorn terminates TLS directly on 8443; no reverse-proxy needed.
+    ports:
+      - "${SOC_AI_PORT:-8443}:8443"
+
+    # ── Environment & secrets ─────────────────────────────────────────────────
+    # .env is bind-mounted read-only so secrets never bake into an image layer.
+    # pydantic-settings reads it from the working directory (/opt/soc-ai).
+    env_file:
+      - path: .env
+        required: true   # fail fast if the operator forgot to create it
+
+    # ── Mounts ───────────────────────────────────────────────────────────────
+    # NOTE: mounted files must be READABLE BY UID 1000 (the in-container soc-ai
+    # user). `openssl` writes the key 0600 owned by you — `chmod 644 ./certs/*`.
+    # The `,Z` suffix relabels each bind mount for the container on SELinux hosts
+    # (Fedora/RHEL/Rocky/podman); without it the container gets EACCES even at
+    # mode 644. On non-SELinux hosts (Ubuntu/Debian) `,Z` is a harmless no-op, so
+    # it ships on by default.
+    volumes:
+      # TLS certificate — read-only; generate once, mount permanently.
+      # Generate with: openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+      #   -subj "/CN=soc-ai" -keyout ./certs/key.pem -out ./certs/cert.pem
+      - ./certs/cert.pem:/etc/soc-ai/cert.pem:ro,Z
+
+      # TLS private key — read-only; readable by uid 1000 (see note above).
+      - ./certs/key.pem:/etc/soc-ai/key.pem:ro,Z
+
+      # PCAP fetch SSH key (OPTIONAL — only for t_get_pcap). Uncomment + provide
+      # the de-privileged sensor key, then set SO_SSH_KEY=/etc/soc-ai/so_pcap in
+      # .env. Read-only; readable by uid 1000.
+      # - ./certs/so_pcap:/etc/soc-ai/so_pcap:ro,Z
+
+      # SQLite database + session store.  Named volume so data survives
+      # container replacement (image updates, `docker compose down`).
+      # Maps to SOC_AI_DATA_DIR=/var/lib/soc-ai/data (set in .env or default).
+      - soc_ai_data:/var/lib/soc-ai/data
+
+      # Blocklist cache (URLhaus, Feodo, Tor, etc.) — optional but recommended.
+      # Seed with: docker compose run --rm soc-ai soc-ai blocklists refresh
+      - soc_ai_blocklists:/var/lib/soc-ai/blocklists
+
+      # MaxMind GeoLite2 .mmdb files — optional; requires MAXMIND_LICENSE_KEY.
+      # Seed with: docker compose run --rm soc-ai soc-ai blocklists refresh
+      - soc_ai_maxmind:/var/lib/soc-ai/maxmind
+
+      # Cloud-provider prefix JSON (AWS/GCP/Azure/Cloudflare) — optional.
+      # Seed with: docker compose run --rm soc-ai soc-ai blocklists refresh
+      - soc_ai_cloud_prefixes:/var/lib/soc-ai/cloud_prefixes
+
+    # ── Health check ─────────────────────────────────────────────────────────
+    # Mirrors the HEALTHCHECK in the Dockerfile; compose uses it to gate
+    # dependent services (e.g. a future nginx reverse-proxy).
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://127.0.0.1:8443/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    restart: unless-stopped
+
+    # ── Resource hints (adjust to your hardware) ──────────────────────────────
+    # The app is primarily I/O-bound (ES queries + LLM calls); these are soft
+    # limits that prevent a runaway investigation loop from starving the host.
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  # Persistent application data (SQLite DB + session store).
+  soc_ai_data:
+
+  # Enrichment caches — safe to recreate; re-seed with `soc-ai blocklists refresh`.
+  soc_ai_blocklists:
+  soc_ai_maxmind:
+  soc_ai_cloud_prefixes:

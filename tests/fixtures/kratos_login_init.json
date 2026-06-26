@@ -1,0 +1,11 @@
+{
+  "id": "flow-abc-123",
+  "type": "api",
+  "expires_at": "2026-05-07T11:00:00Z",
+  "issued_at": "2026-05-07T10:30:00Z",
+  "ui": {
+    "action": "https://so.example.com/auth/self-service/login?flow=flow-abc-123",
+    "method": "POST",
+    "nodes": []
+  }
+}

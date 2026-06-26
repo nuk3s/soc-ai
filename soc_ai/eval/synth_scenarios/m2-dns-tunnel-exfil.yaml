@@ -1,0 +1,134 @@
+id: m2-dns-tunnel-exfil
+name: "DNS tunnel exfil (dnscat2-style)"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.88 issues thousands of long TXT queries under
+  *.update-cdn.click over 30 minutes (~6000 queries, mean qname length 78
+  chars, Shannon entropy on subdomain labels >4.0, predominantly TXT/NULL
+  records). Suricata fires ET POLICY DNS Query for .click TLD (Informational
+  severity) — alone, pure noise. The host has zero non-DNS egress in the
+  window. The real signal is in Zeek dns.log aggregations: volume + entropy
+  + qtype distribution + absence of corroborating egress.
+attack:
+  - T1048.003  # Exfiltration Over Alternative Protocol: Unencrypted/Obfuscated Non-C2 Protocol
+  - T1071.004  # Application Layer Protocol: DNS
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # DNS volume / entropy
+    - typed_path
+    - prefetch_pivot         # conn.log absence of non-DNS egress
+  expected_actions:
+    - kind: escalate
+    - kind: block_indicator
+      target_field: zeek.dns.query
+    - kind: isolate
+      target_field: source.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.88"
+      source.port: 56234
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      network.protocol: dns
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'udp') }}"
+      rule.name: "ET POLICY DNS Query for .click TLD"
+      rule.category: "Potential Corporate Privacy Violation"
+      rule.signature: "2027866"
+      classtype: policy-violation
+      signature_severity: Informational
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: m2-dns-tunnel-exfil
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-dns-summary
+    time_offset_seconds: -1800
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1800) }}"
+      event.dataset: zeek.dns_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      synth.dns_profile:
+        parent_domain: "update-cdn.click"
+        query_count: 6018
+        window_seconds: 1800
+        unique_subdomains: 5912
+        qname_length_mean: 78.4
+        qname_length_p95: 132
+        qname_label_entropy_mean: 4.21
+        qtype_distribution:
+          TXT: 4892
+          NULL: 1014
+          A: 112
+        rcode_distribution:
+          NOERROR: 6010
+          NXDOMAIN: 8
+      synth.scenario_id: m2-dns-tunnel-exfil
+
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      source.port: 56234
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dns.query: "j7HkLp9mNqRsT3vXyB2cDfGhJkLmNpQrStUvWxYz.update-cdn.click"
+      zeek.dns.qtype_name: "TXT"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["RGVjb2RlZF9waXBlbGluZV9zZXNzaW9uX2lkPTkyNDA="]
+      synth.scenario_id: m2-dns-tunnel-exfil
+
+  - index: logs-synth-zeek-conn-summary
+    time_offset_seconds: -1800
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1800) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      synth.host_egress_profile:
+        window_seconds: 1800
+        total_connections: 6044
+        dns_connections: 6018
+        non_dns_connections: 26
+        non_dns_bytes_total: 412
+        http_connections: 0
+        ssl_connections: 4
+        ssl_destinations_unique: 1  # corporate update server only
+      synth.scenario_id: m2-dns-tunnel-exfil
+
+rubric_notes: |
+  Medium TP. The Suricata alert is Informational — taken alone, classic noise.
+  Verdict requires the system to use the DNS summary (volume + entropy +
+  qtype mix favoring TXT/NULL) AND the conn-summary showing the host has no
+  other meaningful egress. A signature-only triage will misclassify this.
+  This scenario tests the system's ability to reason about volume aggregates,
+  not single events. It also tests the absence-of-other-egress signal (a
+  positive observation, not a "no MISP hit" negative).

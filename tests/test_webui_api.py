@@ -1,0 +1,2859 @@
+"""Tests for the React-facing JSON API (/api/v1) — mapping, coercion, auth."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+from soc_ai.config import Settings
+from soc_ai.main import create_app
+from soc_ai.webui.alerts_query import AlertEvent, AlertGroup
+
+
+def _client(settings: Settings) -> Iterator[TestClient]:
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            yield client
+
+
+@pytest.fixture
+def client(settings_kratos: Settings) -> Iterator[TestClient]:
+    yield from _client(settings_kratos)
+
+
+def test_alerts_maps_and_coerces(client: TestClient) -> None:
+    groups = [
+        AlertGroup(
+            rule_name="ET MALWARE X",
+            count=12,
+            severity="HIGH",
+            latest_ts="2026-06-17T14:46:22Z",
+            latest_id="es-1",
+            kind="suricata",
+        ),
+        AlertGroup(
+            rule_name="weird",
+            count=2,
+            severity="unknown",
+            latest_ts="",
+            latest_id="",
+            kind="alert",
+        ),
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 14))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body[0]["name"] == "ET MALWARE X"
+    assert body[0]["sev"] == "high"
+    assert body[0]["id"] == "es-1"
+    assert body[0]["verdict"] == "untriaged"
+    assert body[0]["conf"] is None
+    assert body[0]["events"] == []
+    # coercion into the frontend's narrower unions
+    assert body[1]["sev"] == "low"  # unknown -> low
+    assert body[1]["kind"] == "suricata"  # alert -> suricata
+    assert body[1]["id"] == "weird"  # no latest_id -> falls back to rule name
+
+
+def test_alerts_verdict_badge_inherited(client: TestClient) -> None:
+    groups = [
+        AlertGroup(
+            rule_name="ET X",
+            count=3,
+            severity="medium",
+            latest_ts="2026-06-17T10:00:00Z",
+            latest_id="cur",
+            kind="suricata",
+        )
+    ]
+    inv = SimpleNamespace(
+        id="INV-9",
+        verdict="true_positive",
+        confidence=0.91,
+        status="complete",
+        alert_es_id="OTHER",
+        src_ip="10.0.0.5",
+        dest_ip="1.2.3.4",
+    )
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 3))),
+        patch(
+            "soc_ai.api.webui_api.inv_svc.latest_for_rules",
+            AsyncMock(return_value={"ET X": inv}),
+        ),
+    ):
+        body = client.get("/api/v1/alerts").json()
+    assert body[0]["verdict"] == "true_positive"
+    assert body[0]["conf"] == 0.91
+    assert body[0]["inherited"] is True  # verdict came from a different alert id
+    assert body[0]["invId"] == "INV-9"  # drawer opens this exact investigation
+    assert "10.0.0.5 → 1.2.3.4" in body[0]["inheritedReason"]  # why it's inherited
+
+
+def test_alerts_coverage_note(client: TestClient) -> None:
+    # A directly-investigated multi-event group: the verdict covers all N events
+    # though only one was investigated — surfaced as a coverage note.
+    groups = [
+        AlertGroup(
+            rule_name="ET X",
+            count=264,
+            severity="medium",
+            latest_ts="2026-06-17T10:00:00Z",
+            latest_id="cur",
+            kind="suricata",
+        )
+    ]
+    inv = SimpleNamespace(
+        id="INV-5",
+        verdict="true_positive",
+        confidence=0.88,
+        status="complete",
+        alert_es_id="cur",  # representative WAS the investigated alert -> not "inherited"
+        src_ip="10.0.0.1",
+        dest_ip="2.2.2.2",
+    )
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 264))),
+        patch(
+            "soc_ai.api.webui_api.inv_svc.latest_for_rules",
+            AsyncMock(return_value={"ET X": inv}),
+        ),
+    ):
+        body = client.get("/api/v1/alerts").json()
+    assert body[0]["inherited"] is False
+    assert "1 of 264 events" in body[0]["inheritedReason"]
+
+
+def test_investigations_list(client: TestClient) -> None:
+    invs = [
+        SimpleNamespace(
+            id="INV-1",
+            rule_name="ET X",
+            verdict="false_positive",
+            confidence=0.85,
+            status="complete",
+            src_ip="10.0.0.5",
+            created_at=datetime(2026, 6, 17, 12, 0, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id="INV-2",
+            rule_name=None,
+            verdict=None,
+            confidence=None,
+            status="running",
+            src_ip=None,
+            created_at=datetime(2026, 6, 17, 12, 5, tzinfo=UTC),
+        ),
+    ]
+    with patch("soc_ai.api.webui_api.inv_svc.list_recent", AsyncMock(return_value=invs)):
+        body = client.get("/api/v1/investigations").json()
+    assert body[0]["id"] == "INV-1"
+    assert body[0]["verdict"] == "false_positive"
+    assert body[0]["host"] == "10.0.0.5"
+    assert body[0]["status"] == "complete"
+    assert body[1]["name"] == "Investigation"  # None rule_name -> fallback
+    assert body[1]["verdict"] == "untriaged"  # None verdict -> untriaged
+    assert body[1]["status"] == "running"
+
+
+def test_group_events(client: TestClient) -> None:
+    events = [
+        AlertEvent(
+            es_id="abc123",
+            timestamp="2026-06-22T10:00:00Z",
+            src="1.1.1.1:5",
+            dst="2.2.2.2:443",
+            severity="high",
+            host="wks-1",
+            dst_port=443,
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        resp = client.get("/api/v1/alerts/events", params={"rule_name": "ET X", "kind": "suricata"})
+    assert resp.status_code == 200
+    ev = resp.json()[0]
+    assert ev["src"] == "1.1.1.1:5"
+    assert ev["dst"] == "2.2.2.2:443"
+    assert ev["host"] == "wks-1"
+    assert ev["proto"] == ""
+    # enriched fields
+    assert ev["id"] == "abc123"
+    assert ev["sev"] == "high"
+    assert ev["port"] == 443
+    assert ev["ts"] == "2026-06-22T10:00:00Z"
+    assert ev["ago"] != ""  # non-empty relative label
+
+
+def test_group_events_provenance_direct_and_inherited(client: TestClient) -> None:
+    """GET /alerts/events annotates events with investigated/inherited provenance.
+
+    Three tiers verified in one request:
+    - ev-direct: es_id directly investigated → investigated=True, invId set, inheritedReason=None
+    - ev-rule:   no direct or pair match → rule-level fallback, investigated=False, reason present
+    - ev-direct also asserts the direct inv id matches (not the rule-level one)
+
+    A separate request against a rule with NO investigations verifies the
+    no-match case → investigated=False, invId=None, inheritedReason=None.
+    """
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    RULE = "ET PROV TEST"
+    EMPTY_RULE = "ET PROV EMPTY"
+
+    async def _seed() -> tuple[str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            # Direct investigation whose alert_es_id matches ev-direct exactly.
+            direct_inv = await inv_svc.create(db, alert_es_id="ev-direct", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                direct_inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.9,
+                rationale="Benign.",
+            )
+            direct_inv.rule_name = RULE
+            direct_inv.src_ip = "10.0.0.1"
+            direct_inv.dest_ip = "1.2.3.4"
+            await db.commit()
+
+            # Rule-level investigation on a different alert (ev-other) — will be the
+            # rule fallback for events without a direct or pair match.
+            rule_inv = await inv_svc.create(db, alert_es_id="ev-other", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                rule_inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.85,
+                rationale="Same rule.",
+            )
+            rule_inv.rule_name = RULE
+            rule_inv.src_ip = "10.0.0.9"
+            rule_inv.dest_ip = "9.9.9.9"
+            await db.commit()
+
+            return direct_inv.id, rule_inv.id
+
+    direct_inv_id, rule_inv_id = asyncio.run(_seed())
+
+    # Determine which is "latest" for the rule — it's the most recently created one.
+    # Both are complete; latest_for_rules returns the most recent by created_at/id.
+    # rule_inv was created after direct_inv so it will be latest_for_rules result.
+
+    fake_events = [
+        AlertEvent(
+            es_id="ev-direct",
+            timestamp="2026-06-22T10:00:00Z",
+            src="10.0.0.1:5001",
+            dst="1.2.3.4:443",
+            severity="high",
+            host="wks-1",
+            src_ip="10.0.0.1",
+            dst_ip="1.2.3.4",
+            dst_port=443,
+        ),
+        AlertEvent(
+            es_id="ev-rule",
+            timestamp="2026-06-22T10:01:00Z",
+            src="10.0.0.2:5002",
+            dst="5.5.5.5:80",
+            severity="medium",
+            host="wks-2",
+            src_ip="10.0.0.2",
+            dst_ip="5.5.5.5",
+            dst_port=80,
+        ),
+    ]
+
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=fake_events),
+    ):
+        resp = client.get(
+            "/api/v1/alerts/events",
+            params={"rule_name": RULE, "kind": "suricata"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    ev_map = {ev["id"]: ev for ev in body}
+
+    # ev-direct: exact es_id investigated → tier-1 direct hit
+    d = ev_map["ev-direct"]
+    assert d["investigated"] is True
+    assert d["invId"] == direct_inv_id
+    assert d["inheritedReason"] is None
+
+    # ev-rule: no direct or pair hit → tier-3 rule-level fallback
+    r = ev_map["ev-rule"]
+    assert r["investigated"] is False
+    assert r["invId"] == rule_inv_id
+    assert r["inheritedReason"] is not None
+    assert "Inherited" in r["inheritedReason"]
+    assert "10.0.0.9" in r["inheritedReason"]
+
+    # Separate request for a rule that has NEVER been investigated → no badge
+    empty_events = [
+        AlertEvent(
+            es_id="ev-noninv",
+            timestamp="2026-06-22T10:03:00Z",
+            src="10.0.0.4:9999",
+            dst="7.7.7.7:22",
+            severity="low",
+            host="wks-4",
+            src_ip="10.0.0.4",
+            dst_ip="7.7.7.7",
+            dst_port=22,
+        ),
+    ]
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=empty_events),
+    ):
+        resp2 = client.get(
+            "/api/v1/alerts/events",
+            params={"rule_name": EMPTY_RULE, "kind": "suricata"},
+        )
+    assert resp2.status_code == 200
+    n = resp2.json()[0]
+    assert n["investigated"] is False
+    assert n["invId"] is None
+    assert n["inheritedReason"] is None
+
+
+def test_alerts_acked_escalated_counts(client: TestClient) -> None:
+    """Per-group acked/escalated counts are forwarded from ES aggs to the response."""
+    groups = [
+        AlertGroup(
+            rule_name="ET TEST",
+            count=10,
+            severity="high",
+            latest_ts="2026-06-22T10:00:00Z",
+            latest_id="es-abc",
+            kind="suricata",
+            acked_count=3,
+            escalated_count=1,
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 10))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body[0]["ackedCount"] == 3
+    assert body[0]["escalatedCount"] == 1
+
+
+def test_alerts_hide_acked_param_forwarded(client: TestClient) -> None:
+    """GET /alerts?hide_acked=true passes hide_acked=True into fetch_groups."""
+    groups: list[AlertGroup] = []
+    mock_fetch = AsyncMock(return_value=(groups, 0))
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", mock_fetch),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts", params={"hide_acked": "true"})
+    assert resp.status_code == 200
+    _args, kwargs = mock_fetch.call_args
+    assert kwargs.get("hide_acked") is True
+
+
+def test_alerts_triaging_from_pending_rules(settings_kratos: Settings) -> None:
+    """A group whose rule_name is in auto-triage pending_rules shows triaging=True,
+    even when its investigation is not the currently-running one (is_running=False)."""
+    from soc_ai.webui.autotriage import AutoTriageStatus
+
+    groups = [
+        AlertGroup(
+            rule_name="ET RULE X",
+            count=5,
+            severity="high",
+            latest_ts="2026-06-22T10:00:00Z",
+            latest_id="es-pending",
+            kind="suricata",
+        )
+    ]
+    # Simulate an active auto-triage run with "ET RULE X" queued (not yet running).
+    fake_status = AutoTriageStatus(active=True, total=2, pending_rules={"ET RULE X"})
+
+    for c in _client(settings_kratos):
+        with (
+            patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 5))),
+            patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+            patch("soc_ai.api.webui_api.at.get_status", return_value=fake_status),
+        ):
+            resp = c.get("/api/v1/alerts")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body[0]["triaging"] is True, (
+            f"expected triaging=True for rule in pending_rules, got {body[0]['triaging']!r}"
+        )
+
+
+def test_alerts_triaging_from_pending_alert_ids(settings_kratos: Settings) -> None:
+    """Multi-select auto-triage (explicit alert ids) flips EVERY queued group's
+    pill to triaging, not just the one currently running.
+
+    The selected path (`plan_targets_for_ids`) leaves target rule_name="" so
+    pending_rules holds the selected alert ES ids (each group's ``latest_id``),
+    not rule names. The /alerts group must match on that key too — otherwise only
+    the sequentially-running target shows "Triaging…" and the rest look idle."""
+    from soc_ai.webui.autotriage import AutoTriageStatus
+
+    groups = [
+        AlertGroup(
+            rule_name="ET RULE A",
+            count=3,
+            severity="high",
+            latest_ts="2026-06-22T10:00:00Z",
+            latest_id="es-sel-1",
+            kind="suricata",
+        ),
+        AlertGroup(
+            rule_name="ET RULE B",
+            count=2,
+            severity="high",
+            latest_ts="2026-06-22T09:00:00Z",
+            latest_id="es-sel-2",
+            kind="suricata",
+        ),
+    ]
+    # Selected-path run: pending_rules holds the selected alert ES ids (= the
+    # groups' latest_id), NOT rule names. Neither group is the running one.
+    fake_status = AutoTriageStatus(active=True, total=2, pending_rules={"es-sel-1", "es-sel-2"})
+
+    for c in _client(settings_kratos):
+        with (
+            patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 5))),
+            patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+            patch("soc_ai.api.webui_api.at.get_status", return_value=fake_status),
+        ):
+            resp = c.get("/api/v1/alerts")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body[0]["triaging"] is True and body[1]["triaging"] is True, (
+            "expected BOTH selected groups triaging=True (matched by latest_id), got "
+            f"{body[0]['triaging']!r}, {body[1]['triaging']!r}"
+        )
+
+
+def test_config_set_setting_real_path(client: TestClient) -> None:
+    # A real whitelisted, hot, non-danger bool key — exercises coerce + set_override.
+    resp = client.post("/api/v1/config/setting", json={"key": "oracle_enabled", "value": "false"})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "restart_required": False}
+
+
+def test_config_set_setting_rejects_danger(client: TestClient) -> None:
+    resp = client.post("/api/v1/config/setting", json={"key": "so_host", "value": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "danger_zone"
+
+
+def test_config_set_setting_rejects_unknown(client: TestClient) -> None:
+    resp = client.post("/api/v1/config/setting", json={"key": "not_a_key", "value": "1"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "unknown_setting"
+
+
+def test_config_surfaces_events_index_pattern(client: TestClient) -> None:
+    """GET /config exposes the newly-surfaced events_index_pattern (inc 1) with
+    source=env (no override yet), hot apply, and its env value."""
+    resp = client.get("/api/v1/config")
+    assert resp.status_code == 200
+    items = {item["key"]: item for group in resp.json()["groups"] for item in group["items"]}
+    assert "events_index_pattern" in items, "events_index_pattern not surfaced in /config"
+    spec = items["events_index_pattern"]
+    assert spec["source"] == "env"
+    assert spec["apply"] == "hot-apply"
+    assert spec["type"] == "text"
+    assert spec["value"]  # the env/default value is rendered, not blank
+
+
+def test_config_save_events_index_pattern_roundtrips(client: TestClient) -> None:
+    """Saving the inc-1 events_index_pattern persists an override; GET reflects
+    source=db and the new value, proving it's coercible + saveable."""
+    save = client.post(
+        "/api/v1/config/setting",
+        json={"key": "events_index_pattern", "value": "logs-*"},
+    )
+    assert save.status_code == 200
+    assert save.json() == {"ok": True, "restart_required": False}
+
+    items = {
+        item["key"]: item
+        for group in client.get("/api/v1/config").json()["groups"]
+        for item in group["items"]
+    }
+    assert items["events_index_pattern"]["source"] == "db"
+    assert items["events_index_pattern"]["value"] == "logs-*"
+
+
+def test_approve_unknown_token_404(client: TestClient) -> None:
+    resp = client.post("/api/v1/approve", json={"token": "nope", "approved": True})
+    assert resp.status_code == 404
+
+
+def test_health_shape(client: TestClient) -> None:
+    with (
+        patch(
+            "soc_ai.api.webui_api.probes.probe_es",
+            AsyncMock(return_value={"ok": True, "detail": "cluster — ES 8"}),
+        ),
+        patch(
+            "soc_ai.api.webui_api.probes.probe_llm",
+            AsyncMock(return_value={"ok": False, "detail": "gateway down"}),
+        ),
+    ):
+        body = client.get("/api/v1/health").json()
+    assert body["es"]["ok"] is True
+    assert body["llm"] == {"ok": False, "detail": "gateway down"}
+    assert body["pcap"] is None  # pcap_enabled is False by default
+
+
+def test_probe_pcap_disabled(settings_kratos: Settings) -> None:
+    import asyncio
+
+    from soc_ai.webui import probes
+
+    r = asyncio.run(probes.probe_pcap(settings_kratos))
+    assert r["ok"] is True
+    assert "disabled" in r["detail"]
+
+
+def test_security_response_headers_present(client: TestClient) -> None:
+    """Every response carries the conservative security headers."""
+    resp = client.get("/healthz")
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    # TestClient uses http:// by default → HSTS is NOT sent on plain HTTP.
+    assert "Strict-Transport-Security" not in resp.headers
+
+
+def test_security_headers_hsts_only_on_https(client: TestClient) -> None:
+    """HSTS is emitted only when the request scheme is https."""
+    resp = client.get("/healthz", headers={"X-Forwarded-Proto": "https"}, follow_redirects=False)
+    # Whether HSTS appears depends on request.url.scheme; the nosniff header is
+    # unconditional, so assert that as the load-bearing guarantee.
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_auto_triage_status(client: TestClient) -> None:
+    s = client.get("/api/v1/auto-triage").json()
+    assert s["active"] is False
+    assert {"total", "hunted", "skipped", "failed", "severities"} <= set(s)
+
+
+def test_auto_triage_nothing_to_hunt(client: TestClient) -> None:
+    with patch("soc_ai.api.webui_api.at.plan_targets", AsyncMock(return_value=([], 0))):
+        s = client.post("/api/v1/auto-triage", json={}).json()
+    assert s["active"] is False
+    assert s["note"] == "nothing to hunt"
+
+
+def test_auto_triage_selected_routes_to_ids(client: TestClient) -> None:
+    """alert_ids selects the explicit-selection planner and surfaces a note."""
+    captured: dict[str, list[str]] = {}
+
+    async def fake_plan_ids(state: object, *, alert_ids: list[str]) -> tuple[list, int]:
+        captured["ids"] = alert_ids
+        return [], 2  # both selected ids already triaged
+
+    with patch("soc_ai.api.webui_api.at.plan_targets_for_ids", fake_plan_ids):
+        s = client.post("/api/v1/auto-triage", json={"alert_ids": ["a", "b"]}).json()
+
+    assert captured["ids"] == ["a", "b"]
+    assert s["active"] is False
+    assert s["note"] == "all 2 selected already triaged"
+
+
+def test_auto_triage_selected_spawns_for_targets(client: TestClient) -> None:
+    """alert_ids with un-triaged picks spawns a run and reports the counts."""
+    from soc_ai.webui.autotriage import Target
+
+    async def fake_plan_ids(state: object, *, alert_ids: list[str]) -> tuple[list, int]:
+        return [Target(alert_es_id="a", rule_name="", src_ip="", dst_ip="")], 1
+
+    async def noop_run(state: object, *, targets: list, started_by: str) -> None:
+        return None
+
+    with (
+        patch("soc_ai.api.webui_api.at.plan_targets_for_ids", fake_plan_ids),
+        patch("soc_ai.api.webui_api.at.run_auto_triage", noop_run),
+    ):
+        s = client.post("/api/v1/auto-triage", json={"alert_ids": ["a", "b"]}).json()
+
+    assert s["active"] is True
+    assert s["total"] == 1
+    assert s["note"] == "triaging 1 selected (1 already triaged)"
+
+
+def test_auto_triage_sweep_uses_config_floor_medium(settings_kratos: Settings) -> None:
+    """Sweep with auto_triage_min_severity=medium plans critical+high+medium."""
+    settings = settings_kratos.model_copy(update={"auto_triage_min_severity": "medium"})
+    captured: dict[str, tuple[str, ...]] = {}
+
+    async def capturing_plan(state: object, *, time_range: str, oql, severities):
+        captured["severities"] = severities
+        return [], 0
+
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+        patch("soc_ai.api.webui_api.at.plan_targets", capturing_plan),
+    ):
+        app = create_app()
+        with TestClient(app) as c:
+            s = c.post("/api/v1/auto-triage", json={}).json()
+
+    assert s["active"] is False
+    assert set(captured["severities"]) == {"critical", "high", "medium"}
+
+
+def test_auto_triage_sweep_uses_config_floor_critical(settings_kratos: Settings) -> None:
+    """Sweep with auto_triage_min_severity=critical plans only critical."""
+    settings = settings_kratos.model_copy(update={"auto_triage_min_severity": "critical"})
+    captured: dict[str, tuple[str, ...]] = {}
+
+    async def capturing_plan(state: object, *, time_range: str, oql, severities):
+        captured["severities"] = severities
+        return [], 0
+
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+        patch("soc_ai.api.webui_api.at.plan_targets", capturing_plan),
+    ):
+        app = create_app()
+        with TestClient(app) as c:
+            c.post("/api/v1/auto-triage", json={})
+
+    assert captured["severities"] == ("critical",)
+
+
+def test_auto_triage_explicit_severities_override_config_floor(settings_kratos: Settings) -> None:
+    """Explicit body.severities takes precedence over the config floor."""
+    # Config floor is critical-only; caller explicitly requests critical+high+medium.
+    settings = settings_kratos.model_copy(update={"auto_triage_min_severity": "critical"})
+    captured: dict[str, tuple[str, ...]] = {}
+
+    async def capturing_plan(state: object, *, time_range: str, oql, severities):
+        captured["severities"] = severities
+        return [], 0
+
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+        patch("soc_ai.api.webui_api.at.plan_targets", capturing_plan),
+    ):
+        app = create_app()
+        with TestClient(app) as c:
+            c.post(
+                "/api/v1/auto-triage",
+                json={"severities": ["critical", "high", "medium"]},
+            )
+
+    assert set(captured["severities"]) == {"critical", "high", "medium"}
+
+
+async def _seed_inv(client: TestClient, *, alert_es_id: str, actions: list[dict]) -> str:
+    """Persist a completed investigation carrying report.recommended_actions."""
+    from soc_ai.store import investigations as inv_svc
+
+    maker = client.app.state.db_sessionmaker
+    async with maker() as db:
+        inv = await inv_svc.create(db, alert_es_id=alert_es_id, started_by="tester")
+        inv.report = {"recommended_actions": actions}
+        await db.commit()
+        return inv.id
+
+
+def _fake_write_tool(calls: list[dict], result: dict):
+    """Patch target for approvals.get_tool — records the call, returns ``result``."""
+    from soc_ai.tools._registry import ToolSpec
+
+    async def fn(alert_id: str, comment: str | None = None, *, auth, settings=None) -> dict:
+        calls.append({"alert_id": alert_id, "comment": comment, "auth": auth})
+        return result
+
+    return ToolSpec(name="ack_alert", read_only=False, description="", func=fn)
+
+
+def test_execute_action_acks_and_defaults_alert_id(client: TestClient) -> None:
+    import asyncio
+
+    # alert_id deliberately omitted from tool_args -> endpoint defaults it from
+    # the investigation's own alert es-id.
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="bgCT1Z4B9CEm8iACKAkT",
+            actions=[{"tool_name": "ack_alert", "tool_args": {}}],
+        )
+    )
+    calls: list[dict] = []
+    with patch(
+        "soc_ai.api.approvals.get_tool",
+        return_value=_fake_write_tool(calls, {"acknowledged": True}),
+    ):
+        resp = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "executed"
+    assert body["title"] == "Acknowledge alert"
+    assert body["detail"] == "Alert acknowledged in Security Onion."
+    # defaulted alert_id reached the tool; auth was injected (signature declares it)
+    assert calls[0]["alert_id"] == "bgCT1Z4B9CEm8iACKAkT"
+    assert calls[0]["auth"] is not None
+
+
+def test_execute_action_surfaces_tool_error(client: TestClient) -> None:
+    import asyncio
+
+    from soc_ai.errors import SoApiError
+    from soc_ai.tools._registry import ToolSpec
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-77",
+            actions=[{"tool_name": "ack_alert", "tool_args": {"alert_id": "es-77"}}],
+        )
+    )
+
+    async def boom(alert_id: str, *, auth, settings=None) -> dict:
+        raise SoApiError("ack_alert returned 503: upstream down", status_code=503)
+
+    spec = ToolSpec(name="ack_alert", read_only=False, description="", func=boom)
+    with patch("soc_ai.api.approvals.get_tool", return_value=spec):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+    assert body["status"] == "error"
+    assert "503" in body["error"]
+
+
+def test_execute_action_rejects_non_write_tool(client: TestClient) -> None:
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-9",
+            actions=[{"tool_name": "search_events", "tool_args": {}}],
+        )
+    )
+    resp = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute")
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "not_executable"
+
+
+def test_execute_action_index_out_of_range(client: TestClient) -> None:
+    import asyncio
+
+    inv_id = asyncio.run(_seed_inv(client, alert_es_id="es-1", actions=[]))
+    resp = client.post(f"/api/v1/investigations/{inv_id}/actions/3/execute")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["reason"] == "no_such_action"
+
+
+def test_execute_action_unknown_investigation_404(client: TestClient) -> None:
+    resp = client.post("/api/v1/investigations/NOPE/actions/0/execute")
+    assert resp.status_code == 404
+
+
+def test_execute_write_tool_refuses_non_write_tool() -> None:
+    import asyncio
+
+    from soc_ai.api.approvals import execute_write_tool
+
+    result, error = asyncio.run(
+        execute_write_tool("search_events", {}, auth=AsyncMock(), settings=AsyncMock())
+    )
+    assert result is None
+    assert "not an executable write tool" in error
+
+
+def test_alerts_auth_gated(settings_kratos: Settings) -> None:
+    auth = settings_kratos.model_copy(
+        update={"api_auth_required": True, "bootstrap_admin_password": SecretStr("pw")}
+    )
+    for client in _client(auth):
+        resp = client.get("/api/v1/alerts")
+        assert resp.status_code == 401
+        assert resp.json()["detail"]["reason"] == "no_session"
+
+
+def test_investigation_surfaces_open_questions(client: TestClient) -> None:
+    """report.open_questions is exposed as Investigation.openQuestions."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-nmi", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.4,
+                rationale="Need PCAP to decide.",
+                report={"open_questions": ["Was the payload executed?", "Is 1.2.3.4 known-bad?"]},
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body["verdict"] == "needs_more_info"
+    assert body["openQuestions"] == ["Was the payload executed?", "Is 1.2.3.4 known-bad?"]
+
+
+def test_investigation_alert_id_surfaces_es_id(client: TestClient) -> None:
+    """alert.id in GET /investigations/{id} equals the seeded alert_es_id (GUID)."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    ES_ID = "ZrXB7J4B9CEm8iACssIW"
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id=ES_ID, started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.85,
+                rationale="Benign internal scan.",
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+
+    # Inject a minimal enriched_alert_context event so _alert_meta is populated.
+    from soc_ai.store.models import InvestigationEvent
+
+    async def _add_event(inv_id: str) -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            db.add(
+                InvestigationEvent(
+                    investigation_id=inv_id,
+                    sequence=1,
+                    kind="enriched_alert_context",
+                    payload={
+                        "alert": {
+                            "rule_name": "ET SCAN Test",
+                            "source_ip": "10.0.0.1",
+                            "destination_ip": "10.0.0.2",
+                        },
+                        "host_alert_profile": {},
+                        "enrichments": {},
+                    },
+                )
+            )
+            await db.commit()
+
+    asyncio.run(_add_event(inv_id))
+
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body["alert"] is not None, "alert block should be present"
+    assert body["alert"]["id"] == ES_ID
+
+
+def test_get_investigation_non_dict_host_alert_profile_returns_200(client: TestClient) -> None:
+    """BUG #8: GET /investigations/{id} must return 200 (not 500) when
+    host_alert_profile is a non-dict (e.g. a string) from a partial enrichment."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+    from soc_ai.store.models import InvestigationEvent
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="es-nondict-hp", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="error",
+                verdict=None,
+                confidence=None,
+                rationale=None,
+            )
+            # rule_name intentionally left unset → shows as "Investigation" in list
+            db.add(
+                InvestigationEvent(
+                    investigation_id=inv.id,
+                    sequence=1,
+                    kind="enriched_alert_context",
+                    payload={
+                        "alert": {
+                            "rule_name": "ET TEST Non-dict",
+                            "source_ip": "10.1.2.3",
+                            "destination_ip": "10.4.5.6",
+                        },
+                        # Truthy non-dict — the pre-fix code would pass `or {}` and
+                        # then call .items() / .get() on a string → AttributeError.
+                        "host_alert_profile": "partial_string_from_failed_enrichment",
+                        "enrichments": ["unexpected", "list"],
+                    },
+                )
+            )
+            await db.commit()
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    resp = client.get(f"/api/v1/investigations/{inv_id}")
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    # Graceful degradation: non-dict fields silently become empty
+    assert body["hostContext"] == []
+
+
+def test_get_investigation_null_rule_name_partial_enrichment_200(client: TestClient) -> None:
+    """BUG #8: investigation with null rule_name + minimal/missing enrichment payload
+    must return 200 with sane defaults (matches 'Investigation' list item)."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            # No rule_name set — this is the "errored before set_rule_name" case
+            inv = await inv_svc.create(db, alert_es_id="es-no-rule", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="error",
+                verdict=None,
+                confidence=None,
+                rationale=None,
+            )
+            # No enriched_alert_context event at all — enr_p stays {}
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    resp = client.get(f"/api/v1/investigations/{inv_id}")
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["name"] == "Investigation"  # fallback for null rule_name
+    assert body["hostContext"] == []
+
+
+def test_get_investigation_validator_note_surfaces_in_response(client: TestClient) -> None:
+    """GET /investigations/{id} must expose validator_note from the report as validatorNote."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    VALIDATOR_NOTE = (
+        "Verdict auto-corrected from false_positive to true_positive by SyntheticTPValidator"
+    )
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="es-validator-note", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="true_positive",
+                confidence=0.9,
+                rationale="TP confirmed",
+                report={"validator_note": VALIDATOR_NOTE},
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    resp = client.get(f"/api/v1/investigations/{inv_id}")
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["validatorNote"] == VALIDATOR_NOTE
+
+
+def test_resolve_applies_proposal_and_is_idempotent(client: TestClient) -> None:
+    """A valid (message_id, token) resolves the verdict and unlocks actions; re-apply 409s."""
+    import asyncio
+
+    from soc_ai.store import chat as chat_svc
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, int]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-res", started_by="t")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.4,
+                rationale="need more",
+            )
+            msg = await chat_svc.create_pending_assistant(db, inv.id)
+            await chat_svc.finish_assistant(
+                db,
+                msg.id,
+                content="I propose true_positive.",
+                status="done",
+                meta={
+                    "kind": "verdict_proposal",
+                    "validation": "pass",
+                    "token": "tok-abc",
+                    "proposal": {
+                        "verdict": "true_positive",
+                        "confidence": 0.8,
+                        "rationale": "PCAP shows C2.",
+                        "citations": ["(id ev-res)"],
+                        "recommended_actions": [
+                            {"tool_name": "escalate_to_case", "tool_args": {}, "rationale": "C2."}
+                        ],
+                    },
+                },
+            )
+            return inv.id, msg.id
+
+    inv_id, msg_id = asyncio.run(_seed())
+
+    ok = client.post(
+        f"/api/v1/investigations/{inv_id}/resolve", json={"message_id": msg_id, "token": "tok-abc"}
+    )
+    assert ok.status_code == 200
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body["verdict"] == "true_positive"
+    assert any(a["title"] for a in body["actions"])
+
+    again = client.post(
+        f"/api/v1/investigations/{inv_id}/resolve", json={"message_id": msg_id, "token": "tok-abc"}
+    )
+    assert again.status_code == 409
+
+    inv2_id, msg2_id = asyncio.run(_seed())
+    bad = client.post(
+        f"/api/v1/investigations/{inv2_id}/resolve", json={"message_id": msg2_id, "token": "wrong"}
+    )
+    assert bad.status_code == 403
+
+
+def test_resolve_rejects_cross_investigation_message(client: TestClient) -> None:
+    """A proposal message from inv A can't be applied via inv B's path (404)."""
+    import asyncio
+
+    from soc_ai.store import chat as chat_svc
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, str, int]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            a = await inv_svc.create(db, alert_es_id="ev-a", started_by="t")
+            b = await inv_svc.create(db, alert_es_id="ev-b", started_by="t")
+            msg = await chat_svc.create_pending_assistant(db, a.id)
+            await chat_svc.finish_assistant(
+                db,
+                msg.id,
+                content="propose",
+                status="done",
+                meta={
+                    "kind": "verdict_proposal",
+                    "validation": "pass",
+                    "token": "tk",
+                    "proposal": {
+                        "verdict": "false_positive",
+                        "confidence": 0.7,
+                        "rationale": "benign",
+                        "citations": ["x"],
+                        "recommended_actions": [],
+                    },
+                },
+            )
+            return a.id, b.id, msg.id
+
+    _a_id, b_id, msg_id = asyncio.run(_seed())
+    resp = client.post(
+        f"/api/v1/investigations/{b_id}/resolve", json={"message_id": msg_id, "token": "tk"}
+    )
+    assert resp.status_code == 404
+
+
+def test_chat_thread_surfaces_verdict_proposal(client: TestClient) -> None:
+    import asyncio
+
+    from soc_ai.store import chat as chat_svc
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, int]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-th", started_by="t")
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="needs_more_info", confidence=0.4
+            )
+            m = await chat_svc.create_pending_assistant(db, inv.id)
+            await chat_svc.finish_assistant(
+                db,
+                m.id,
+                content="proposing TP",
+                status="done",
+                meta={
+                    "kind": "verdict_proposal",
+                    "validation": "pass",
+                    "token": "tk",
+                    "proposal": {
+                        "verdict": "true_positive",
+                        "confidence": 0.8,
+                        "rationale": "C2",
+                        "citations": ["enrich_indicator"],
+                        "recommended_actions": [],
+                    },
+                },
+            )
+            return inv.id, m.id
+
+    inv_id, msg_id = asyncio.run(_seed())
+    thread = client.get(f"/api/v1/investigations/{inv_id}/chat").json()
+    prop = [m for m in thread["messages"] if m.get("kind") == "verdict_proposal"]
+    assert prop and prop[0]["validation"] == "pass"
+    assert prop[0]["messageId"] == msg_id
+    assert prop[0]["proposal"]["verdict"] == "true_positive"
+    assert prop[0]["token"] == "tk"
+
+
+def test_seedchat_surfaces_verdict_proposal(client: TestClient) -> None:
+    """A verdict proposal must render as a card on reload (seedChat path), not plain text."""
+    import asyncio
+
+    from soc_ai.store import chat as chat_svc
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, int]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-seed", started_by="t")
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="needs_more_info", confidence=0.4
+            )
+            m = await chat_svc.create_pending_assistant(db, inv.id)
+            await chat_svc.finish_assistant(
+                db,
+                m.id,
+                content="proposing TP",
+                status="done",
+                meta={
+                    "kind": "verdict_proposal",
+                    "validation": "pass",
+                    "token": "tk",
+                    "proposal": {
+                        "verdict": "true_positive",
+                        "confidence": 0.8,
+                        "rationale": "C2",
+                        "citations": ["enrich_indicator"],
+                        "recommended_actions": [],
+                    },
+                },
+            )
+            return inv.id, m.id
+
+    inv_id, msg_id = asyncio.run(_seed())
+    inv = client.get(f"/api/v1/investigations/{inv_id}").json()
+    prop = [m for m in inv["seedChat"] if m.get("kind") == "verdict_proposal"]
+    assert prop and prop[0]["messageId"] == msg_id and prop[0]["token"] == "tk"
+    assert prop[0]["proposal"]["verdict"] == "true_positive"
+
+
+def test_override_verdict_manual_provenance(client: TestClient) -> None:
+    """POST /override flips verdict and records manual provenance.
+
+    Invalid verdict → 400; running investigation → 409.
+    """
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed_complete() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-override", started_by="t")
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="needs_more_info", confidence=0.4
+            )
+            return inv.id
+
+    async def _seed_running() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-override-run", started_by="t")
+            # leave as running (finalize not called)
+            return inv.id
+
+    inv_id = asyncio.run(_seed_complete())
+
+    # Valid override
+    ok = client.post(
+        f"/api/v1/investigations/{inv_id}/override",
+        json={"verdict": "false_positive", "rationale": "Analyst confirmed benign."},
+    )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["ok"] is True
+    assert body["verdict"] == "false_positive"
+    # No confidence in request → defaults to 1.0
+    assert body["confidence"] == pytest.approx(1.0)
+
+    # Verify provenance in the investigation detail
+    detail = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert detail["verdict"] == "false_positive"
+    assert detail["conf"] == pytest.approx(1.0)
+    res = detail.get("resolution")
+    assert res is not None
+    assert res["resolved_via"] == "manual"
+    assert res["original_verdict"] == "needs_more_info"
+
+    # Invalid verdict → 400
+    bad = client.post(
+        f"/api/v1/investigations/{inv_id}/override",
+        json={"verdict": "banana"},
+    )
+    assert bad.status_code == 400
+
+    # Non-existent investigation → 404
+    not_found = client.post(
+        "/api/v1/investigations/DOES_NOT_EXIST/override",
+        json={"verdict": "true_positive"},
+    )
+    assert not_found.status_code == 404
+
+    # Running investigation → 409
+    run_id = asyncio.run(_seed_running())
+    running = client.post(
+        f"/api/v1/investigations/{run_id}/override",
+        json={"verdict": "true_positive"},
+    )
+    assert running.status_code == 409
+
+
+def test_ack_group_calls_write_tool_per_event(client: TestClient) -> None:
+    """POST /alerts/ack-group fetches events and calls execute_write_tool for each."""
+    from soc_ai.webui.alerts_query import AlertEvent
+
+    fake_events = [
+        AlertEvent(
+            es_id="ev-ack-1",
+            timestamp="t",
+            src="1.1.1.1:5",
+            dst="2.2.2.2:443",
+            severity="high",
+            host="wks-1",
+        ),
+        AlertEvent(
+            es_id="ev-ack-2",
+            timestamp="t",
+            src="1.1.1.1:6",
+            dst="2.2.2.2:443",
+            severity="high",
+            host="wks-1",
+        ),
+    ]
+    write_tool_calls: list[dict] = []
+
+    async def fake_execute_write_tool(
+        tool_name: str,
+        tool_args: dict,
+        *,
+        auth,
+        settings,
+        **_kwargs,
+    ):
+        write_tool_calls.append({"tool_name": tool_name, "tool_args": tool_args})
+        return {"acknowledged": True}, None
+
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_group_events",
+            AsyncMock(return_value=fake_events),
+        ),
+        patch(
+            "soc_ai.api.webui_api.execute_write_tool",
+            fake_execute_write_tool,
+        ),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/ack-group",
+            json={"rule_name": "ET MALWARE X", "range": "24h"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["acked"] == 2
+    assert body["failed"] == 0
+    assert body["total"] == 2
+    assert body["capped"] is False
+    # one call per event, each with the right alert_id. The fan-out is now
+    # concurrent (asyncio.gather under a bounded semaphore) so call ORDER is not
+    # guaranteed — assert on the SET of alert_ids acked, not the sequence.
+    assert len(write_tool_calls) == 2
+    assert {c["tool_name"] for c in write_tool_calls} == {"ack_alert"}
+    assert {c["tool_args"]["alert_id"] for c in write_tool_calls} == {"ev-ack-1", "ev-ack-2"}
+
+
+def test_ack_group_empty_returns_zeros(client: TestClient) -> None:
+    """When there are no events in the window the endpoint returns acked=0 gracefully."""
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=[]),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/ack-group",
+            json={"rule_name": "ET NOTHING", "range": "24h"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["acked"] == 0
+    assert body["total"] == 0
+
+
+def test_ack_group_notice_kind_threads_kind_to_fetch(client: TestClient) -> None:
+    """Regression: kind='notice' must be forwarded to fetch_group_events so
+    zeek.notice groups are fetched by notice.note rather than rule.name."""
+    mock_fetch = AsyncMock(return_value=[])
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_group_events", mock_fetch),
+        patch("soc_ai.api.webui_api.execute_write_tool", AsyncMock(return_value=(None, None))),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/ack-group",
+            json={"rule_name": "ATTACK::Discovery", "kind": "notice", "range": "24h"},
+        )
+    assert resp.status_code == 200
+    _, kwargs = mock_fetch.call_args
+    assert kwargs["kind"] == "notice", "kind must be threaded to fetch_group_events"
+
+
+def test_ack_group_passes_hide_acked_true(client: TestClient) -> None:
+    """ack_group must call fetch_group_events with hide_acked=True so already-acked
+    events are excluded and re-running a capped group makes progress."""
+    mock_fetch = AsyncMock(return_value=[])
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_group_events", mock_fetch),
+        patch("soc_ai.api.webui_api.execute_write_tool", AsyncMock(return_value=(None, None))),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/ack-group",
+            json={"rule_name": "ET MALWARE X", "range": "24h"},
+        )
+    assert resp.status_code == 200
+    _, kwargs = mock_fetch.call_args
+    assert kwargs.get("hide_acked") is True, (
+        "ack_group must pass hide_acked=True to fetch_group_events"
+    )
+
+
+def test_ack_events_success(client: TestClient) -> None:
+    """POST /alerts/ack-events dedupes ids and calls execute_write_tool for each unique id."""
+
+    async def fake_write(
+        tool_name: str,
+        tool_args: dict,
+        *,
+        auth,
+        settings,
+        **_kwargs,
+    ):
+        return (None, None)  # success
+
+    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+        resp = client.post(
+            "/api/v1/alerts/ack-events",
+            json={"es_ids": ["a", "b", "b", "c"]},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["acked"] == 3  # dedupe: a, b, c
+    assert data["failed"] == 0
+    assert data["total"] == 3
+
+
+def test_ack_events_partial_failure(client: TestClient) -> None:
+    """POST /alerts/ack-events reports failures per-id without short-circuiting."""
+
+    async def fake_write(
+        tool_name: str,
+        tool_args: dict,
+        *,
+        auth,
+        settings,
+        **_kwargs,
+    ):
+        if tool_args["alert_id"] == "b":
+            return (None, "boom")
+        return (None, None)
+
+    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+        resp = client.post(
+            "/api/v1/alerts/ack-events",
+            json={"es_ids": ["a", "b", "c"]},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["acked"] == 2
+    assert data["failed"] == 1
+    assert data["total"] == 3
+
+
+def test_ack_events_fans_out_concurrently_under_semaphore_bound(client: TestClient) -> None:
+    """Bulk ack runs writes concurrently but never exceeds the semaphore bound.
+
+    Each write blocks on an event until released; we record the peak number of
+    in-flight writes. With a serial loop the peak would be 1; with the bounded
+    fan-out it climbs to _ACK_CONCURRENCY (8) and is capped there even though
+    more events are queued.
+    """
+    import asyncio as _asyncio
+
+    from soc_ai.api.webui_api import _ACK_CONCURRENCY
+
+    n_events = _ACK_CONCURRENCY + 5  # more than the bound so the cap is exercised
+    in_flight = 0
+    peak = 0
+    gate = _asyncio.Event()
+
+    async def fake_write(tool_name, tool_args, *, auth, settings, **_kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        # Once the bound's worth of writes are in flight, release everyone so the
+        # test can't deadlock; the cap has been observed by then.
+        if in_flight >= _ACK_CONCURRENCY:
+            gate.set()
+        await gate.wait()
+        in_flight -= 1
+        return (None, None)
+
+    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+        resp = client.post(
+            "/api/v1/alerts/ack-events",
+            json={"es_ids": [f"e{i}" for i in range(n_events)]},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["acked"] == n_events
+    assert data["failed"] == 0
+    # Concurrency happened (peak > 1) AND was bounded (peak never exceeds the cap).
+    assert peak == _ACK_CONCURRENCY, f"expected peak in-flight == bound, got {peak}"
+
+
+def test_ack_events_swallows_raised_exceptions_as_failures(client: TestClient) -> None:
+    """A write that RAISES (not just returns an error tuple) counts as a failure
+    and never escapes — the other events still complete (return_exceptions=True)."""
+
+    async def fake_write(tool_name, tool_args, *, auth, settings, **_kwargs):
+        if tool_args["alert_id"] == "boom":
+            raise RuntimeError("upstream blew up")
+        return (None, None)
+
+    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+        resp = client.post(
+            "/api/v1/alerts/ack-events",
+            json={"es_ids": ["a", "boom", "c"]},
+        )
+    assert resp.status_code == 200  # endpoint did not 500
+    data = resp.json()
+    assert data["acked"] == 2
+    assert data["failed"] == 1
+    assert data["total"] == 3
+
+
+def test_ack_group_fans_out_and_counts_mixed_results(client: TestClient) -> None:
+    """ack-group aggregates successes/failures across the concurrent fan-out."""
+    from soc_ai.webui.alerts_query import AlertEvent
+
+    events = [
+        AlertEvent(
+            es_id=f"g{i}",
+            timestamp="t",
+            src="1.1.1.1:5",
+            dst="2.2.2.2:443",
+            severity="high",
+            host="wks-1",
+        )
+        for i in range(6)
+    ]
+
+    async def fake_write(tool_name, tool_args, *, auth, settings, **_kwargs):
+        # Two of the six fail (one via error tuple, one via raise).
+        if tool_args["alert_id"] == "g2":
+            return (None, "es rejected")
+        if tool_args["alert_id"] == "g4":
+            raise RuntimeError("network reset")
+        return (None, None)
+
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)),
+        patch("soc_ai.api.webui_api.execute_write_tool", fake_write),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/ack-group",
+            json={"rule_name": "ET MALWARE X", "range": "24h"},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["acked"] == 4
+    assert data["failed"] == 2
+    assert data["total"] == 6
+
+
+def test_assign_persists_and_surfaces_in_list(client: TestClient) -> None:
+    """POST /alerts/assign persists an owner; GET /alerts returns that owner on the group."""
+    # Assign "ET X" to the anonymous caller (API auth is off in test settings)
+    resp = client.post("/api/v1/alerts/assign", json={"rule_name": "ET X"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rule_name"] == "ET X"
+    assert body["owner"] == "anonymous"  # identify_caller returns this with no session
+
+    # Now list alerts: patch aq.fetch_groups to return a group with rule_name "ET X"
+    groups = [
+        AlertGroup(
+            rule_name="ET X",
+            count=1,
+            severity="high",
+            latest_ts="2026-06-22T10:00:00Z",
+            latest_id="es-x1",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        alerts = client.get("/api/v1/alerts").json()
+
+    assert len(alerts) == 1
+    assert alerts[0]["name"] == "ET X"
+    assert alerts[0]["owner"] == "anonymous"
+
+
+def test_assign_unassign_clears_owner(client: TestClient) -> None:
+    """Unassign removes the owner; a subsequent list returns owner=null."""
+    # Assign first
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET Y"})
+
+    # Then unassign
+    resp = client.post("/api/v1/alerts/assign", json={"rule_name": "ET Y", "unassign": True})
+    assert resp.status_code == 200
+    assert resp.json()["owner"] is None
+
+    groups = [
+        AlertGroup(
+            rule_name="ET Y",
+            count=1,
+            severity="low",
+            latest_ts="2026-06-22T10:00:00Z",
+            latest_id="es-y1",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        alerts = client.get("/api/v1/alerts").json()
+
+    assert alerts[0]["owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# /alerts/representative
+# ---------------------------------------------------------------------------
+
+
+def test_representative_picks_modal_tuple(client: TestClient) -> None:
+    """GET /alerts/representative returns the newest event from the most-common flow.
+
+    Cluster: 3 events on (A→B:443) + 1 on (A→C:53).
+    Expected: alert_id of the newest (A→B:443) event; matched=3; total=4.
+    """
+    from soc_ai.webui.alerts_query import AlertEvent
+
+    # Three events on the modal tuple; timestamps are different so we can
+    # verify the *newest* is chosen as the representative.
+    ev_b1 = AlertEvent(
+        es_id="ev-b-oldest",
+        timestamp="2026-06-20T10:00:00Z",
+        src="10.0.0.1:1234",
+        dst="10.0.0.2:443",
+        severity="high",
+        host="wks-1",
+        src_ip="10.0.0.1",
+        dst_ip="10.0.0.2",
+        dst_port=443,
+    )
+    ev_b2 = AlertEvent(
+        es_id="ev-b-mid",
+        timestamp="2026-06-21T10:00:00Z",
+        src="10.0.0.1:1235",
+        dst="10.0.0.2:443",
+        severity="high",
+        host="wks-1",
+        src_ip="10.0.0.1",
+        dst_ip="10.0.0.2",
+        dst_port=443,
+    )
+    ev_b3 = AlertEvent(
+        es_id="ev-b-newest",
+        timestamp="2026-06-22T10:00:00Z",
+        src="10.0.0.1:1236",
+        dst="10.0.0.2:443",
+        severity="high",
+        host="wks-1",
+        src_ip="10.0.0.1",
+        dst_ip="10.0.0.2",
+        dst_port=443,
+    )
+    ev_c1 = AlertEvent(
+        es_id="ev-c-only",
+        timestamp="2026-06-22T12:00:00Z",  # newest overall, but minority tuple
+        src="10.0.0.1:9999",
+        dst="10.0.0.3:53",
+        severity="high",
+        host="wks-1",
+        src_ip="10.0.0.1",
+        dst_ip="10.0.0.3",
+        dst_port=53,
+    )
+
+    fake_events = [ev_b1, ev_b2, ev_b3, ev_c1]
+
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=fake_events),
+    ):
+        resp = client.get(
+            "/api/v1/alerts/representative",
+            params={"rule_name": "ET MODAL TEST", "range": "24h"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Must pick the newest of the (A→B:443) tuple, NOT the globally newest event.
+    assert body["alert_id"] == "ev-b-newest"
+    assert body["matched"] == 3
+    assert body["total"] == 4
+    assert "10.0.0.1" in body["reason"]
+    assert "10.0.0.2" in body["reason"]
+    assert "443" in body["reason"]
+    assert body["dst_port"] == 443
+
+
+def test_representative_no_events_returns_404(client: TestClient) -> None:
+    """GET /alerts/representative with no events in window returns 404."""
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=[]),
+    ):
+        resp = client.get(
+            "/api/v1/alerts/representative",
+            params={"rule_name": "ET EMPTY", "range": "24h"},
+        )
+    assert resp.status_code == 404
+
+
+def test_representative_no_ip_falls_back_to_newest(client: TestClient) -> None:
+    """When no events have IPs, the fallback is the globally newest event."""
+    from soc_ai.webui.alerts_query import AlertEvent
+
+    ev1 = AlertEvent(
+        es_id="ev-no-ip-old",
+        timestamp="2026-06-21T08:00:00Z",
+        src="—",
+        dst="—",
+        severity="low",
+        host="wks-x",
+    )
+    ev2 = AlertEvent(
+        es_id="ev-no-ip-new",
+        timestamp="2026-06-22T08:00:00Z",
+        src="—",
+        dst="—",
+        severity="low",
+        host="wks-x",
+    )
+
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=[ev1, ev2]),
+    ):
+        resp = client.get(
+            "/api/v1/alerts/representative",
+            params={"rule_name": "ET NO IP", "range": "24h"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["alert_id"] == "ev-no-ip-new"
+    assert "newest overall" in body["reason"]
+
+
+# ---------------------------------------------------------------------------
+# chatCount on the investigations list
+# ---------------------------------------------------------------------------
+
+
+def test_investigations_list_chat_count(client: TestClient) -> None:
+    """GET /investigations includes chatCount reflecting done chat messages."""
+    import asyncio
+
+    from soc_ai.store import chat as chat_svc
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-chat-count", started_by="tester")
+            # user message (done)
+            await chat_svc.add_user_message(db, inv.id, "Is this benign?")
+            # assistant message: create pending then finish (done)
+            msg = await chat_svc.create_pending_assistant(db, inv.id)
+            await chat_svc.finish_assistant(db, msg.id, content="Looks benign.", status="done")
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    body = client.get("/api/v1/investigations").json()
+    row = next((r for r in body if r["id"] == inv_id), None)
+    assert row is not None, "seeded investigation not found in list"
+    # 1 user + 1 assistant = 2 done messages
+    assert row["chatCount"] == 2
+
+
+def test_investigation_oracle_adjudication_surface(client: TestClient) -> None:
+    """GET /investigations/{id} exposes structured OracleOut when oracle events are present."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+    from soc_ai.store.models import InvestigationEvent
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-oracle-adj", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="true_positive",
+                confidence=0.82,
+                rationale="Oracle overrode local call.",
+            )
+            db.add(
+                InvestigationEvent(
+                    investigation_id=inv.id,
+                    sequence=1,
+                    kind="oracle_escalation",
+                    payload={
+                        "reason": "below_confidence",
+                        "local_verdict": "false_positive",
+                        "local_confidence": 0.6,
+                    },
+                )
+            )
+            db.add(
+                InvestigationEvent(
+                    investigation_id=inv.id,
+                    sequence=2,
+                    kind="oracle_adjudication",
+                    payload={
+                        "oracle_verdict": "true_positive",
+                        "oracle_confidence": 0.82,
+                        "oracle_model": "claude-opus-4-8",
+                        "redaction": "2 credentials redacted",
+                    },
+                )
+            )
+            await db.commit()
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+
+    oracle = body.get("oracle")
+    assert oracle is not None, "oracle block should be present"
+    assert oracle["escalated"] is True
+    assert oracle["localVerdict"] == "false_positive"
+    assert oracle["oracleVerdict"] == "true_positive"
+    assert oracle["changed"] is True
+    assert oracle["model"] == "claude-opus-4-8"
+    assert oracle["redacted"] is True
+    assert oracle["redactionNote"] == "2 credentials redacted"
+
+
+def test_investigation_no_oracle_yields_null(client: TestClient) -> None:
+    """GET /investigations/{id} yields oracle=null when no oracle events are present."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-no-oracle", started_by="tester")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.9,
+                rationale="Clean traffic.",
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body.get("oracle") is None
+
+
+# ---------------------------------------------------------------------------
+# User management JSON API — /api/v1/config/users
+# ---------------------------------------------------------------------------
+
+
+def test_create_user_appears_in_list(client: TestClient) -> None:
+    """POST /config/users creates a user; GET /config/users surfaces it."""
+    resp = client.post(
+        "/api/v1/config/users",
+        json={"username": "alice", "password": "longpassword1", "role": "analyst"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    resp2 = client.get("/api/v1/config/users")
+    assert resp2.status_code == 200
+    usernames = [u["username"] for u in resp2.json()["users"]]
+    assert "alice" in usernames
+
+
+def test_create_user_bad_role(client: TestClient) -> None:
+    """POST /config/users with an unrecognised role returns 400 invalid_role."""
+    resp = client.post(
+        "/api/v1/config/users",
+        json={"username": "bob", "password": "longpassword1", "role": "superuser"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "invalid_role"
+
+
+def test_create_user_short_password(client: TestClient) -> None:
+    """POST /config/users with a password shorter than 8 chars returns 400 password_too_short."""
+    resp = client.post(
+        "/api/v1/config/users",
+        json={"username": "bob", "password": "short", "role": "analyst"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "password_too_short"
+
+
+def test_set_user_role(client: TestClient) -> None:
+    """POST /config/users/{id}/set-role promotes/demotes a user; GET reflects the change."""
+    client.post(
+        "/api/v1/config/users",
+        json={"username": "charlie", "password": "longpassword1", "role": "analyst"},
+    )
+    users = client.get("/api/v1/config/users").json()["users"]
+    uid = next(u["id"] for u in users if u["username"] == "charlie")
+
+    resp = client.post(f"/api/v1/config/users/{uid}/set-role", json={"role": "admin"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    users2 = client.get("/api/v1/config/users").json()["users"]
+    charlie = next(u for u in users2 if u["username"] == "charlie")
+    assert charlie["role"] == "admin"
+
+
+def test_toggle_user_disabled(client: TestClient) -> None:
+    """POST /config/users/{id}/toggle-disabled flips the disabled flag to True on first call."""
+    client.post(
+        "/api/v1/config/users",
+        json={"username": "dana", "password": "longpassword1", "role": "analyst"},
+    )
+    users = client.get("/api/v1/config/users").json()["users"]
+    uid = next(u["id"] for u in users if u["username"] == "dana")
+
+    resp = client.post(f"/api/v1/config/users/{uid}/toggle-disabled")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["disabled"] is True  # was enabled, now disabled
+
+
+def test_last_admin_cannot_be_demoted(client: TestClient) -> None:
+    """set-role to non-admin is blocked when the target is the only enabled admin."""
+    users = client.get("/api/v1/config/users").json()["users"]
+    admin_users = [u for u in users if u["role"] == "admin" and not u["disabled"]]
+    # The bootstrap admin is the only admin in a fresh test DB.
+    # If (somehow) there are multiple enabled admins, disable all but one first.
+    if len(admin_users) > 1:
+        for u in admin_users[1:]:
+            client.post(f"/api/v1/config/users/{u['id']}/toggle-disabled")
+    uid = admin_users[0]["id"]
+    resp = client.post(f"/api/v1/config/users/{uid}/set-role", json={"role": "analyst"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "last_admin"
+
+
+def test_last_admin_cannot_be_disabled(client: TestClient) -> None:
+    """toggle-disabled is blocked when the target is the only enabled admin."""
+    users = client.get("/api/v1/config/users").json()["users"]
+    admin_users = [u for u in users if u["role"] == "admin" and not u["disabled"]]
+    # Disable all but one enabled admin to guarantee the last-admin scenario.
+    if len(admin_users) > 1:
+        for u in admin_users[1:]:
+            client.post(f"/api/v1/config/users/{u['id']}/toggle-disabled")
+    uid = admin_users[0]["id"]
+    resp = client.post(f"/api/v1/config/users/{uid}/toggle-disabled")
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "last_admin"
+
+
+def test_reset_password_returns_password(client: TestClient) -> None:
+    """POST /config/users/{id}/reset-password returns ok=True and a non-empty new password."""
+    client.post(
+        "/api/v1/config/users",
+        json={"username": "eve", "password": "longpassword1", "role": "analyst"},
+    )
+    users = client.get("/api/v1/config/users").json()["users"]
+    uid = next(u["id"] for u in users if u["username"] == "eve")
+
+    resp = client.post(f"/api/v1/config/users/{uid}/reset-password")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert isinstance(data["password"], str)
+
+
+# ---------------------------------------------------------------------------
+# /me + /me/status — current-user endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_get_me_dev_fallback(client: TestClient) -> None:
+    """GET /me returns the dev-fallback when api_auth_required is False and no session."""
+    resp = client.get("/api/v1/me")
+    assert resp.status_code == 200
+    data = resp.json()
+    # Dev fallback shape: must have username, role, status
+    assert "username" in data
+    assert "role" in data
+    assert "status" in data
+
+
+def test_status_defaults_empty_on_create(client: TestClient) -> None:
+    """Newly-created users have status == '' in the users list."""
+    client.post(
+        "/api/v1/config/users",
+        json={"username": "frank", "password": "longpassword1", "role": "analyst"},
+    )
+    users = client.get("/api/v1/config/users").json()["users"]
+    frank = next(u for u in users if u["username"] == "frank")
+    assert frank["status"] == ""
+
+
+def test_set_my_status_dev_echo(client: TestClient) -> None:
+    """POST /me/status echoes back the trimmed status (dev no-session path)."""
+    resp = client.post("/api/v1/me/status", json={"status": "  investigating  "})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    # The API trims whitespace server-side
+    assert data["status"] == "investigating"
+
+
+def test_set_my_status_cap_64(client: TestClient) -> None:
+    """POST /me/status truncates status to 64 characters."""
+    long_status = "x" * 100
+    resp = client.post("/api/v1/me/status", json={"status": long_status})
+    assert resp.status_code == 200
+    assert len(resp.json()["status"]) <= 64
+
+
+def test_status_visible_in_users_list(client: TestClient) -> None:
+    """status field is present in every row returned by GET /config/users."""
+    resp = client.get("/api/v1/config/users")
+    assert resp.status_code == 200
+    for user in resp.json()["users"]:
+        assert "status" in user
+
+
+# ── Danger-zone endpoint tests ────────────────────────────────────────────────
+
+
+class TestDangerZoneGet:
+    """GET /api/v1/config/danger — list danger rows, never leak secret values."""
+
+    def test_get_danger_returns_known_keys(self, settings_kratos: Settings) -> None:
+        """At minimum so_password and es_password appear in the list."""
+        for c in _client(settings_kratos):
+            r = c.get("/api/v1/config/danger")
+            assert r.status_code == 200
+            data = r.json()
+            keys = {row["key"] for row in data}
+            assert "so_password" in keys
+            assert "es_password" in keys
+            assert "litellm_api_key" in keys
+
+    def test_get_danger_secret_rows_have_no_value(self, settings_kratos: Settings) -> None:
+        """Secret-typed rows must NOT have a 'value' field."""
+        for c in _client(settings_kratos):
+            r = c.get("/api/v1/config/danger")
+            assert r.status_code == 200
+            # The fixture sets so_password=SecretStr("password123"); confirm it never appears.
+            assert "password123" not in r.text, "Raw secret value leaked into response body"
+            for row in r.json():
+                if row.get("type") == "secret":
+                    # Structural guarantee: DangerSettingOut has no value field.
+                    assert "value" not in row, f"Secret value leaked for {row['key']}"
+
+    def test_get_danger_row_shape(self, settings_kratos: Settings) -> None:
+        """Every row has key, label, type, isSet, source, hot fields."""
+        for c in _client(settings_kratos):
+            r = c.get("/api/v1/config/danger")
+            assert r.status_code == 200
+            for row in r.json():
+                assert "key" in row
+                assert "label" in row
+                assert "type" in row
+                assert "isSet" in row
+                assert "source" in row
+                assert "hot" in row
+
+
+class TestDangerZoneSave:
+    """POST /api/v1/config/danger/setting — typed-confirm, encryption, restart flag."""
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        """Settings with a config_secret_key so Fernet encryption works in tests."""
+        from pydantic import SecretStr
+
+        return Settings(
+            so_host="https://so.example.com",
+            so_username="analyst",
+            so_password=SecretStr("password123"),
+            so_verify_ssl=False,
+            es_hosts=["https://so.example.com:9200"],
+            litellm_base_url="http://localhost:4000",
+            synth_first_pipeline=False,
+            config_secret_key=SecretStr("0Y5eLjMDakyujfxGcb5ijyW_GL4pkxv3gHqWkfanOz0="),
+        )
+
+    def test_wrong_confirm_rejected(self, settings: Settings) -> None:
+        """confirm != key must return 400."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "es_password", "value": "hunter2", "confirm": "WRONG"},
+            )
+            assert r.status_code == 400
+            detail_str = str(r.json()).lower()
+            assert "confirm" in detail_str
+
+    def test_unknown_key_rejected(self, settings: Settings) -> None:
+        """Unknown/non-danger key must return 400."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "not_a_real_key", "value": "x", "confirm": "not_a_real_key"},
+            )
+            assert r.status_code == 400
+
+    def test_non_danger_key_rejected(self, settings: Settings) -> None:
+        """A non-danger key (e.g. analyst_model) must be rejected even with correct confirm."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "analyst_model", "value": "x", "confirm": "analyst_model"},
+            )
+            assert r.status_code == 400
+
+    def test_secret_saved_encrypted_and_not_plaintext(self, settings: Settings) -> None:
+        """Saving a secret key stores encrypted (not plaintext) value, returns restart_required."""
+        import asyncio
+        import json as _json
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "es_password", "value": "s3cr3tP@ssw0rd!", "confirm": "es_password"},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["ok"] is True
+            assert body["restart_required"] is True  # es_password has hot=False
+            # The response must not contain the plaintext secret
+            assert "s3cr3tP@ssw0rd!" not in r.text
+
+            # Verify the DB stores an encrypted value, not the plaintext secret
+            async def _read_raw(app=c.app) -> str | None:
+                maker = app.state.db_sessionmaker
+                async with maker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "es_password")
+                    )
+
+            raw_stored = asyncio.run(_read_raw())
+            assert raw_stored is not None, "No DB row found for es_password"
+            stored_value = _json.loads(raw_stored)  # DB value is JSON-encoded
+            assert stored_value != "s3cr3tP@ssw0rd!", "Secret stored as plaintext in DB!"
+            assert stored_value.startswith("gAAAA"), (
+                f"Expected Fernet token (gAAAA...), got: {stored_value[:20]}"
+            )
+
+    def test_non_secret_danger_saved(self, settings: Settings) -> None:
+        """Non-secret danger setting (e.g. es_hosts) can be saved."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "es_hosts", "value": "https://es.local:9200", "confirm": "es_hosts"},
+            )
+            assert r.status_code == 200
+            assert r.json()["ok"] is True
+
+    def test_returns_restart_required_true_for_non_hot(self, settings: Settings) -> None:
+        """All danger specs have hot=False → restart_required=True."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "so_host", "value": "https://so.local", "confirm": "so_host"},
+            )
+            assert r.status_code == 200
+            assert r.json()["restart_required"] is True
+
+    def test_secret_save_without_config_secret_key_returns_400_not_500(self) -> None:
+        """Saving a SECRET danger setting with no CONFIG_SECRET_KEY → 400 (not 500),
+        and no plaintext value is written to the DB."""
+        import asyncio
+
+        from pydantic import SecretStr
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        # Settings WITHOUT config_secret_key → secret_box is None.
+        no_key = Settings(
+            so_host="https://so.example.com",
+            so_username="analyst",
+            so_password=SecretStr("password123"),
+            so_verify_ssl=False,
+            es_hosts=["https://so.example.com:9200"],
+            litellm_base_url="http://localhost:4000",
+            synth_first_pipeline=False,
+        )
+        for c in _client(no_key):
+            assert c.app.state.secret_box is None  # precondition: no key
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "es_password", "value": "s3cr3t!", "confirm": "es_password"},
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"]["reason"] == "no_config_secret_key"
+            # The plaintext secret must never appear in the response…
+            assert "s3cr3t!" not in r.text
+
+            # …and no row (plaintext or otherwise) must be written for the key.
+            async def _read_raw(app=c.app) -> str | None:
+                maker = app.state.db_sessionmaker
+                async with maker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "es_password")
+                    )
+
+            assert asyncio.run(_read_raw()) is None
+
+
+class TestDangerZoneTest:
+    """POST /api/v1/config/danger/test/{target} — probe passthrough, secret-free detail."""
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        from pydantic import SecretStr
+
+        return Settings(
+            so_host="https://so.example.com",
+            so_username="analyst",
+            so_password=SecretStr("password123"),
+            so_verify_ssl=False,
+            es_hosts=["https://so.example.com:9200"],
+            litellm_base_url="http://localhost:4000",
+            synth_first_pipeline=False,
+        )
+
+    def test_es_probe_passthrough(self, settings: Settings) -> None:
+        """ES probe result flows through correctly."""
+        from unittest.mock import AsyncMock, patch
+
+        fake_result = {"ok": True, "detail": "cluster-uuid — ES 8.12"}
+        with patch("soc_ai.api.webui_api.probes.probe_es", AsyncMock(return_value=fake_result)):
+            for c in _client(settings):
+                r = c.post("/api/v1/config/danger/test/es")
+                assert r.status_code == 200
+                body = r.json()
+                assert body["ok"] is True
+                assert body["detail"] == "cluster-uuid — ES 8.12"
+                assert set(body.keys()) == {"ok", "detail"}
+
+    def test_llm_probe_passthrough(self, settings: Settings) -> None:
+        """LLM probe result flows through correctly."""
+        from unittest.mock import AsyncMock, patch
+
+        fake_result = {"ok": False, "detail": "connection refused"}
+        with patch("soc_ai.api.webui_api.probes.probe_llm", AsyncMock(return_value=fake_result)):
+            for c in _client(settings):
+                r = c.post("/api/v1/config/danger/test/llm")
+                assert r.status_code == 200
+                body = r.json()
+                assert body["ok"] is False
+                assert body["detail"] == "connection refused"
+
+    def test_unknown_target_rejected(self, settings: Settings) -> None:
+        """Unknown probe target must return 400."""
+        for c in _client(settings):
+            r = c.post("/api/v1/config/danger/test/pcap")
+            assert r.status_code == 400
+            body = r.json()
+            assert body["detail"]["reason"] == "unknown_target"
+
+    def test_response_has_only_ok_and_detail(self, settings: Settings) -> None:
+        """Response contains exactly {ok, detail} — no extra fields that could leak secrets."""
+        from unittest.mock import AsyncMock, patch
+
+        fake_result = {"ok": False, "detail": "auth failed"}
+        with patch("soc_ai.api.webui_api.probes.probe_es", AsyncMock(return_value=fake_result)):
+            for c in _client(settings):
+                r = c.post("/api/v1/config/danger/test/es")
+                assert r.status_code == 200
+                body = r.json()
+                assert set(body.keys()) == {"ok", "detail"}
+                assert "password" not in body["detail"].lower()
+                assert "api_key" not in body["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# POST /investigations/rehunt — bulk re-hunt
+# ---------------------------------------------------------------------------
+
+
+def test_rehunt_starts_fresh_hunts_for_valid_ids(client: TestClient) -> None:
+    """POST /investigations/rehunt with 2 valid ids starts 2 fresh hunts."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            a = await inv_svc.create(db, alert_es_id="ev-rh-a", started_by="tester")
+            b = await inv_svc.create(db, alert_es_id="ev-rh-b", started_by="tester")
+            await inv_svc.finalize(
+                db, a.id, status="complete", verdict="false_positive", confidence=0.9
+            )
+            await inv_svc.finalize(
+                db, b.id, status="complete", verdict="true_positive", confidence=0.8
+            )
+            return a.id, b.id
+
+    a_id, b_id = asyncio.run(_seed())
+
+    call_counter = {"n": 0}
+
+    async def fake_start(_state, *, alert_id: str, started_by: str) -> str:
+        call_counter["n"] += 1
+        return f"NEW-{call_counter['n']}"
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = fake_start
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post("/api/v1/investigations/rehunt", json={"inv_ids": [a_id, b_id]})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["skipped"] == []
+    started = body["started"]
+    assert len(started) == 2
+    by_inv = {s["invId"]: s for s in started}
+    assert by_inv[a_id]["alertEsId"] == "ev-rh-a"
+    assert by_inv[b_id]["alertEsId"] == "ev-rh-b"
+    assert by_inv[a_id]["newInvId"].startswith("NEW-")
+    assert by_inv[b_id]["newInvId"].startswith("NEW-")
+    # Both new ids must be distinct
+    assert by_inv[a_id]["newInvId"] != by_inv[b_id]["newInvId"]
+
+
+def test_rehunt_skips_unknown_id(client: TestClient) -> None:
+    """An id that doesn't exist in the DB is skipped with reason='not_found'."""
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="NEW-X")
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post(
+            "/api/v1/investigations/rehunt",
+            json={"inv_ids": ["does-not-exist"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["started"] == []
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["invId"] == "does-not-exist"
+    assert body["skipped"][0]["reason"] == "not_found"
+    fake_mgr.start.assert_not_called()
+
+
+def test_rehunt_skips_investigation_with_no_alert_es_id(client: TestClient) -> None:
+    """An investigation row with no alert_es_id is skipped with reason='no_alert'."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-rh-nullcheck", started_by="tester")
+            # Blank out the alert_es_id to simulate the no_alert path.
+            inv.alert_es_id = ""
+            await db.commit()
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="NEW-Y")
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post("/api/v1/investigations/rehunt", json={"inv_ids": [inv_id]})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["started"] == []
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["invId"] == inv_id
+    assert body["skipped"][0]["reason"] == "no_alert"
+    fake_mgr.start.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/hunt — alert-id resolution guard (no synthetic 0.0 investigations)
+# ---------------------------------------------------------------------------
+
+
+def test_hunt_404_when_alert_id_does_not_resolve(client: TestClient) -> None:
+    """A bogus alert_id (e.g. a group's rule NAME leaking through as the id) must
+    404 with a clear hint and NOT spin up a (synthetic 0.0) background hunt."""
+    fake_mgr = AsyncMock()
+    with (
+        patch("soc_ai.api.webui_api._alert_doc_exists", AsyncMock(return_value=False)),
+        patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
+    ):
+        resp = client.post("/api/v1/hunt", json={"alert_id": "ET MALWARE Some Rule Name"})
+
+    assert resp.status_code == 404
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "alert_not_found"
+    assert "aged out" in detail["hint"]
+    # Critically: no investigation was started for the unresolved id.
+    fake_mgr.start.assert_not_called()
+
+
+def test_hunt_starts_when_alert_id_resolves(client: TestClient) -> None:
+    """When the alert id resolves to a real ES document the hunt starts normally."""
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="INV-OK")
+    with (
+        patch("soc_ai.api.webui_api._alert_doc_exists", AsyncMock(return_value=True)),
+        patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
+    ):
+        resp = client.post("/api/v1/hunt", json={"alert_id": "real-es-doc-1"})
+
+    assert resp.status_code == 200
+    assert resp.json()["investigation_id"] == "INV-OK"
+    fake_mgr.start.assert_called_once()
+
+
+def test_alert_doc_exists_uses_ids_lookup() -> None:
+    """_alert_doc_exists resolves via an ES ``ids`` query and reflects hit presence."""
+    import asyncio
+
+    from soc_ai.api.webui_api import _alert_doc_exists
+
+    elastic = AsyncMock()
+    settings = SimpleNamespace(events_index_pattern="logs-*")
+
+    elastic.search = AsyncMock(return_value=SimpleNamespace(hits=[{"_id": "x"}]))
+    assert asyncio.run(_alert_doc_exists(elastic, settings, "x")) is True
+
+    elastic.search = AsyncMock(return_value=SimpleNamespace(hits=[]))
+    assert asyncio.run(_alert_doc_exists(elastic, settings, "missing")) is False
+    # the query is an ids lookup against the events index pattern
+    _args, _kwargs = elastic.search.call_args
+    assert _args[0] == "logs-*"
+    assert _args[1] == {"ids": {"values": ["missing"]}}
+
+
+# ---------------------------------------------------------------------------
+# /api/v1/login and /api/v1/logout
+# ---------------------------------------------------------------------------
+
+ADMIN_PW_API = "test-api-login-pw"
+
+
+def _auth_client(settings_kratos: Settings) -> Iterator[TestClient]:
+    """Client with api_auth_required=True and a bootstrapped admin account."""
+    auth_settings = settings_kratos.model_copy(
+        update={"api_auth_required": True, "bootstrap_admin_password": SecretStr(ADMIN_PW_API)}
+    )
+    yield from _client(auth_settings)
+
+
+def test_api_login_success_sets_cookie(settings_kratos: Settings) -> None:
+    """POST /api/v1/login returns 200, the session cookie, and user info."""
+    for client in _auth_client(settings_kratos):
+        resp = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["username"] == "admin"
+        assert body["role"] == "admin"
+        # Session cookie must be present
+        assert "soc_ai_session" in client.cookies
+
+
+def test_api_login_bad_credentials(settings_kratos: Settings) -> None:
+    """Wrong password → 401 with reason=invalid_credentials."""
+    from soc_ai.store import auth as auth_svc
+
+    auth_svc.login_throttle.reset()
+    for client in _auth_client(settings_kratos):
+        resp = client.post("/api/v1/login", json={"username": "admin", "password": "WRONG"})
+        assert resp.status_code == 401
+        assert resp.json()["detail"]["reason"] == "invalid_credentials"
+    auth_svc.login_throttle.reset()
+
+
+def test_api_login_brute_force_locks_out_after_n_failures(settings_kratos: Settings) -> None:
+    """5 bad logins → the 6th returns 429 (too_many_attempts), not another 401."""
+    from soc_ai.store import auth as auth_svc
+
+    auth_svc.login_throttle.reset()
+    try:
+        for client in _auth_client(settings_kratos):
+            # 5 failures within the window are each a 401.
+            for _ in range(5):
+                r = client.post("/api/v1/login", json={"username": "admin", "password": "WRONG"})
+                assert r.status_code == 401
+            # The 6th attempt is locked out → 429.
+            r = client.post("/api/v1/login", json={"username": "admin", "password": "WRONG"})
+            assert r.status_code == 429
+            assert r.json()["detail"]["reason"] == "too_many_attempts"
+            # Even the CORRECT password is refused while locked out.
+            r = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API})
+            assert r.status_code == 429
+    finally:
+        auth_svc.login_throttle.reset()
+
+
+def test_api_login_success_resets_failure_counter(settings_kratos: Settings) -> None:
+    """A successful login clears the failure counter so later failures start fresh."""
+    from soc_ai.store import auth as auth_svc
+
+    auth_svc.login_throttle.reset()
+    try:
+        for client in _auth_client(settings_kratos):
+            # 4 failures (below the limit of 5).
+            for _ in range(4):
+                assert (
+                    client.post(
+                        "/api/v1/login", json={"username": "admin", "password": "WRONG"}
+                    ).status_code
+                    == 401
+                )
+            # A good login succeeds and resets the counter.
+            ok = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API})
+            assert ok.status_code == 200
+            # After reset, a single failure is a 401 again (not a 429), proving the
+            # counter did not carry the prior 4 forward.
+            again = client.post("/api/v1/login", json={"username": "admin", "password": "WRONG"})
+            assert again.status_code == 401
+    finally:
+        auth_svc.login_throttle.reset()
+
+
+def test_api_login_reachable_without_prior_auth_when_auth_required(
+    settings_kratos: Settings,
+) -> None:
+    """Key test: /api/v1/login must be reachable even when api_auth_required=True.
+
+    The ordinary /api/v1/alerts endpoint returns 401; the login endpoint
+    must return 200 because it is on the open (pre-auth) router.
+    """
+    for client in _auth_client(settings_kratos):
+        # Verify the auth gate IS active on normal endpoints
+        gate_resp = client.get("/api/v1/alerts")
+        assert gate_resp.status_code == 401
+
+        # Login itself must succeed without any prior authentication
+        login_resp = client.post(
+            "/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API}
+        )
+        assert login_resp.status_code == 200
+        assert login_resp.json()["ok"] is True
+
+
+def test_api_logout_clears_session(settings_kratos: Settings) -> None:
+    """POST /api/v1/logout invalidates the session so subsequent requests are rejected."""
+    for client in _auth_client(settings_kratos):
+        # Log in first
+        client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API})
+        assert "soc_ai_session" in client.cookies
+
+        # Logout must succeed
+        logout_resp = client.post("/api/v1/logout")
+        assert logout_resp.status_code == 200
+        assert logout_resp.json()["ok"] is True
+
+        # The cookie should be cleared (deleted by the response)
+        assert client.cookies.get("soc_ai_session", "") == ""
+
+
+def test_api_logout_without_session_is_harmless(settings_kratos: Settings) -> None:
+    """POST /api/v1/logout with no session cookie returns 200 (idempotent)."""
+    for client in _auth_client(settings_kratos):
+        resp = client.post("/api/v1/logout")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Internal-identifier managed-list API — /api/v1/internal-identifiers
+# ---------------------------------------------------------------------------
+
+
+async def _seed_identifier(
+    client: TestClient, *, kind: str, value: str, source: str, state: str, evidence=None
+) -> int:
+    """Insert one internal_identifier row directly; return its id."""
+    from soc_ai.store import internal_identifiers as ids_store
+
+    maker = client.app.state.db_sessionmaker
+    async with maker() as db:
+        if source == "detected":
+            row = await ids_store.upsert_detected(
+                db, kind, value, evidence or {}, initial_state=state
+            )
+        else:
+            row = await ids_store.add_manual(db, kind, value)
+            if state == "muted":
+                await ids_store.set_state(db, row.id, "muted")
+        return row.id
+
+
+def test_internal_identifiers_get_shape_with_always_on(client: TestClient) -> None:
+    """GET groups DB rows (mutable) + always-on reserved/env entries (read-only),
+    and carries last_scan metadata. The reserved .lan suffix appears as an
+    always-on row with no id and source=reserved."""
+    import asyncio
+
+    det_id = asyncio.run(
+        _seed_identifier(
+            client,
+            kind="suffix",
+            value=".corp.acme.com",
+            source="detected",
+            state="active",
+            evidence={"host_count": 31, "event_count": 9200, "last_seen": "2026-06-20"},
+        )
+    )
+
+    resp = client.get("/api/v1/internal-identifiers")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # last_scan metadata is present (reuses the discovery status object).
+    assert "last_scan" in body
+    assert body["last_scan"]["running"] is False
+
+    groups = {g["kind"]: g["rows"] for g in body["groups"]}
+    assert set(groups) == {"suffix", "host", "cidr"}
+
+    suffix_rows = {r["value"]: r for r in groups["suffix"]}
+    # The detected row is mutable, carries its id + evidence.
+    assert suffix_rows[".corp.acme.com"]["id"] == det_id
+    assert suffix_rows[".corp.acme.com"]["mutable"] is True
+    assert suffix_rows[".corp.acme.com"]["source"] == "detected"
+    assert suffix_rows[".corp.acme.com"]["evidence"]["host_count"] == 31
+    # The reserved floor suffix is always-on: no id, not mutable, source=reserved.
+    assert ".lan" in suffix_rows
+    assert suffix_rows[".lan"]["id"] is None
+    assert suffix_rows[".lan"]["mutable"] is False
+    assert suffix_rows[".lan"]["source"] == "reserved"
+    assert suffix_rows[".lan"]["state"] == "active"
+
+
+def test_internal_identifiers_add_manual_happy(client: TestClient) -> None:
+    """POST adds a manual identifier, returns the created mutable row."""
+    resp = client.post(
+        "/api/v1/internal-identifiers",
+        json={"kind": "host", "value": "WIN11-01"},
+    )
+    assert resp.status_code == 200
+    row = resp.json()
+    assert row["value"] == "WIN11-01"
+    assert row["source"] == "manual"
+    assert row["state"] == "active"
+    assert row["mutable"] is True
+    assert isinstance(row["id"], int)
+
+
+def test_internal_identifiers_add_invalid_400(client: TestClient) -> None:
+    """A bad kind (repo ValueError) maps to HTTP 400 with the message."""
+    resp = client.post(
+        "/api/v1/internal-identifiers",
+        json={"kind": "bogus", "value": "x"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "invalid_identifier"
+
+
+def test_internal_identifiers_activate_deactivate(client: TestClient) -> None:
+    """POST .../{id}/deactivate then /activate flips state; 404 for an unknown id."""
+    import asyncio
+
+    ident_id = asyncio.run(
+        _seed_identifier(
+            client, kind="suffix", value=".lab.example", source="manual", state="active"
+        )
+    )
+
+    muted = client.post(f"/api/v1/internal-identifiers/{ident_id}/deactivate")
+    assert muted.status_code == 200
+    assert muted.json()["state"] == "muted"
+
+    unmuted = client.post(f"/api/v1/internal-identifiers/{ident_id}/activate")
+    assert unmuted.status_code == 200
+    assert unmuted.json()["state"] == "active"
+
+    missing = client.post("/api/v1/internal-identifiers/999999/deactivate")
+    assert missing.status_code == 404
+
+
+def test_internal_identifiers_delete_manual_ok(client: TestClient) -> None:
+    """DELETE removes a manual row."""
+    import asyncio
+
+    ident_id = asyncio.run(
+        _seed_identifier(
+            client, kind="host", value="kept-then-gone", source="manual", state="active"
+        )
+    )
+    resp = client.delete(f"/api/v1/internal-identifiers/{ident_id}")
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    # It no longer appears in the GET (not as a mutable row).
+    body = client.get("/api/v1/internal-identifiers").json()
+    groups = {g["kind"]: g["rows"] for g in body["groups"]}
+    assert all(r["value"] != "kept-then-gone" for r in groups["host"])
+
+
+def test_internal_identifiers_delete_detected_409(client: TestClient) -> None:
+    """DELETE on a detected row is refused with 409 (mute it instead)."""
+    import asyncio
+
+    ident_id = asyncio.run(
+        _seed_identifier(
+            client,
+            kind="suffix",
+            value=".detected.example",
+            source="detected",
+            state="active",
+            evidence={"host_count": 5},
+        )
+    )
+    resp = client.delete(f"/api/v1/internal-identifiers/{ident_id}")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_deletable"
+
+
+async def _seed_user_session(client: TestClient, *, username: str, role: str) -> str:
+    """Seed a user + session row directly; return the raw session token."""
+    from soc_ai.store import auth as auth_svc
+
+    maker = client.app.state.db_sessionmaker
+    async with maker() as db:
+        user = await auth_svc.create_user(db, username, "longpassword1", role=role)
+        return await auth_svc.create_session(db, user, ttl_hours=24)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/config/tokens — API token creator-id guard
+# ---------------------------------------------------------------------------
+
+
+def test_create_token_uses_real_admin_id_as_creator(settings_kratos: Settings) -> None:
+    """An authenticated admin mints a token whose created_by is that admin's id
+    (never a null/0 placeholder)."""
+    import asyncio
+
+    from soc_ai.store import auth as auth_svc
+    from soc_ai.store.auth import SESSION_COOKIE
+    from soc_ai.store.models import ApiToken
+    from sqlalchemy import select as _select
+
+    async def _seed_admin(c: TestClient) -> tuple[str, int]:
+        async with c.app.state.db_sessionmaker() as db:
+            user = await auth_svc.create_user(db, "admin2", "longpassword1", role="admin")
+            raw = await auth_svc.create_session(db, user, ttl_hours=24)
+            return raw, user.id
+
+    async def _fetch_created_by(c: TestClient) -> int:
+        async with c.app.state.db_sessionmaker() as db:
+            row = (await db.scalars(_select(ApiToken).where(ApiToken.name == "ci-token"))).one()
+            return row.created_by
+
+    for client in _auth_client(settings_kratos):
+        token, admin_id = asyncio.run(_seed_admin(client))
+        client.cookies.set(SESSION_COOKIE, token)
+
+        # Same-origin Origin header to satisfy the cookie-auth CSRF guard.
+        resp = client.post(
+            "/api/v1/config/tokens",
+            json={"name": "ci-token"},
+            headers={"Origin": "http://testserver"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["token"].startswith("scai_")
+        assert asyncio.run(_fetch_created_by(client)) == admin_id
+
+
+def test_create_token_refused_without_session_user(client: TestClient) -> None:
+    """In dev (api_auth_required=False) the admin gate is a no-op, so a caller with
+    no session user could previously mint a token attributed to user 0. The endpoint
+    must now REFUSE (403) rather than persist a null/0 created_by."""
+    # The default `client` fixture has api_auth_required=False and no session cookie,
+    # so current_user(request) resolves to None.
+    resp = client.post("/api/v1/config/tokens", json={"name": "orphan"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "no_session_user"
+
+
+# ---------------------------------------------------------------------------
+# Session cookie hardening — HttpOnly always, SameSite=Lax, Secure gated on scheme
+# ---------------------------------------------------------------------------
+
+
+def test_login_cookie_has_httponly_samesite_and_no_secure_on_plain_http(
+    settings_kratos: Settings,
+) -> None:
+    """Over plain HTTP (dev), the session cookie is HttpOnly + SameSite=Lax but NOT
+    Secure (a Secure cookie wouldn't be sent over http and would break local login)."""
+    for client in _auth_client(settings_kratos):
+        resp = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API})
+        assert resp.status_code == 200
+        set_cookie = resp.headers["set-cookie"].lower()
+        assert "httponly" in set_cookie
+        assert "samesite=lax" in set_cookie
+        assert "secure" not in set_cookie  # plain-http dev → no Secure
+
+
+def test_login_cookie_is_secure_behind_https_forwarded_proto(
+    settings_kratos: Settings,
+) -> None:
+    """When a TLS-terminating proxy forwards X-Forwarded-Proto: https, the Secure
+    flag IS set even though the upstream hop to uvicorn is plain HTTP."""
+    for client in _auth_client(settings_kratos):
+        resp = client.post(
+            "/api/v1/login",
+            json={"username": "admin", "password": ADMIN_PW_API},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        assert resp.status_code == 200
+        set_cookie = resp.headers["set-cookie"].lower()
+        assert "secure" in set_cookie
+        assert "httponly" in set_cookie
+        assert "samesite=lax" in set_cookie
+
+
+def test_request_is_https_helper_matrix() -> None:
+    """_request_is_https: true for https scheme OR https forwarded-proto; false otherwise."""
+    from soc_ai.api.webui_api import _request_is_https
+
+    def _req(scheme: str, xfp: str | None) -> SimpleNamespace:
+        headers = {} if xfp is None else {"x-forwarded-proto": xfp}
+        return SimpleNamespace(
+            url=SimpleNamespace(scheme=scheme),
+            headers=headers,
+        )
+
+    assert _request_is_https(_req("https", None)) is True
+    assert _request_is_https(_req("http", "https")) is True
+    assert _request_is_https(_req("http", "https, http")) is True  # left-most wins
+    assert _request_is_https(_req("http", None)) is False
+    assert _request_is_https(_req("http", "http")) is False
+
+
+def test_internal_identifiers_admin_gate(settings_kratos: Settings) -> None:
+    """When api_auth_required=True, an unauthenticated GET is rejected (401),
+    and an authenticated non-admin (analyst) is forbidden (403)."""
+    import asyncio
+
+    from soc_ai.store.auth import SESSION_COOKIE
+
+    for client in _auth_client(settings_kratos):
+        # Unauthenticated → router-level auth gate → 401.
+        assert client.get("/api/v1/internal-identifiers").status_code == 401
+
+        # An authenticated analyst (non-admin) → per-route admin gate → 403.
+        token = asyncio.run(_seed_user_session(client, username="analyst1", role="analyst"))
+        client.cookies.set(SESSION_COOKIE, token)
+        resp = client.get("/api/v1/internal-identifiers")
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["reason"] == "admin_required"

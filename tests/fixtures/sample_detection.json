@@ -1,0 +1,10 @@
+{
+  "id": "det-001",
+  "title": "ET MALWARE Suspicious User-Agent",
+  "publicId": "ET-MALWARE-001",
+  "severity": "high",
+  "engine": "suricata",
+  "isEnabled": true,
+  "author": "Emerging Threats",
+  "tags": ["malware", "user-agent", "suricata"]
+}

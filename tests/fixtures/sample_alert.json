@@ -1,0 +1,45 @@
+{
+  "_id": "alert-001",
+  "_index": "so-events-2026.05.07",
+  "_source": {
+    "@timestamp": "2026-05-07T10:30:00.123Z",
+    "rule": {
+      "name": "ET MALWARE Suspicious User-Agent",
+      "uuid": "rule-abc-123",
+      "severity": "high"
+    },
+    "event": {
+      "severity": 75,
+      "severity_label": "high",
+      "kind": "alert"
+    },
+    "network": {
+      "community_id": "1:abc123def456=="
+    },
+    "source": {
+      "ip": "192.168.1.50",
+      "port": 49152
+    },
+    "destination": {
+      "ip": "203.0.113.10",
+      "port": 443
+    },
+    "host": {
+      "name": "workstation-01",
+      "ip": ["192.168.1.50", "fe80::1"]
+    },
+    "user": {
+      "name": "alice"
+    },
+    "process": {
+      "entity_id": "proc-abc-123"
+    },
+    "file": {
+      "hash": {
+        "sha256": "deadbeefcafe0000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "message": "Suspicious traffic from 192.168.1.50 to 203.0.113.10",
+    "tags": ["alert", "suricata", "malware"]
+  }
+}

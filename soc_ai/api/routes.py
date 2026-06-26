@@ -1,0 +1,297 @@
+"""HTTP routes for soc-ai - SSE investigate, approval gate, health."""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import PlainTextResponse
+from sse_starlette.sse import EventSourceResponse
+
+from soc_ai import __version__, metrics
+from soc_ai.agent.orchestrator import (
+    InvestigationContext,
+    build_investigator,
+    build_investigator_model,
+    build_synthesizer,
+    build_synthesizer_model,
+    investigate,
+)
+from soc_ai.api.approvals import apply_approval
+from soc_ai.api.deps import (
+    get_audit,
+    get_auth,
+    get_elastic,
+    get_gate,
+    get_investigation_ctx,
+    get_settings_dep,
+)
+from soc_ai.api.runner import recorded_run, sse_encode
+from soc_ai.api.schemas import (
+    ApproveRequest,
+    ApproveResponse,
+    FindAlertRequest,
+    FindAlertResponse,
+    HealthResponse,
+    InvestigateRequest,
+    SessionInfoResponse,
+)
+from soc_ai.api.security import identify_caller, require_api_auth
+from soc_ai.audit.logger import AuditLogger
+from soc_ai.config import Settings
+from soc_ai.so_client.auth import SoAuthClient
+from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.tools._registry import ApprovalGate
+
+_LOGGER = logging.getLogger(__name__)
+
+# SO's UI prints timestamps as "2026-05-08 17:04:21.855 -04:00" (space before
+# the timezone offset), which Python's datetime.fromisoformat does NOT accept.
+# Strip that space so the standard parser works.
+_SO_TS_TZ_GAP = re.compile(r"\s+([+-]\d{2}:?\d{2})$")
+
+
+def _parse_so_timestamp(s: str) -> datetime:
+    """Parse SO-formatted or ISO-8601 timestamps tolerantly."""
+    norm = s.strip()
+    norm = _SO_TS_TZ_GAP.sub(r"\1", norm)
+    norm = norm.replace("Z", "+00:00")
+    return datetime.fromisoformat(norm)
+
+
+router = APIRouter()
+
+
+@router.get("/healthz", response_model=HealthResponse)
+async def healthz(
+    settings: Settings = Depends(get_settings_dep),
+    gate: ApprovalGate = Depends(get_gate),
+) -> HealthResponse:
+    """Liveness + minimal config-snapshot endpoint."""
+    pending = await gate.pending()
+    return HealthResponse(
+        status="ok",
+        version=__version__,
+        so_auth="connect" if settings.use_connect_api else "kratos",
+        misp_configured=settings.misp_url is not None,
+        pending_approvals=len(pending),
+    )
+
+
+@router.get("/metrics", response_class=PlainTextResponse)
+async def metrics_endpoint(
+    gate: ApprovalGate = Depends(get_gate),
+) -> str:
+    """Prometheus 0.0.4 plain-text exposition.
+
+    Counters are in-process — Prometheus's pull model handles per-scrape
+    rates without any persistence on our side. See ``soc_ai/metrics.py``
+    for the metric set + rationale.
+    """
+    pending = await gate.pending()
+    return metrics.render(version=__version__, pending_approvals=len(pending))
+
+
+@router.post("/investigate", dependencies=[Depends(require_api_auth)])
+async def investigate_endpoint(
+    req: InvestigateRequest,
+    request: Request,
+    ctx: InvestigationContext = Depends(get_investigation_ctx),
+) -> EventSourceResponse:
+    """Stream a triage investigation as Server-Sent Events.
+
+    Each SSE message has ``event: {kind}`` and ``data: {json}`` where the
+    JSON body is the :class:`StepEvent` payload.
+
+    The stream is teed into the investigations store so every run is
+    persisted regardless of caller (web UI, userscript, automation).
+    The leading ``investigation_created`` event carries the new row's id.
+    """
+    started_by = await identify_caller(request)
+    # Build investigator/synthesizer here so tests can patch the routes-module
+    # bindings for investigate, build_investigator_model, build_synthesizer_model.
+    investigator = build_investigator(build_investigator_model(ctx.settings), ctx)
+    synthesizer = build_synthesizer(build_synthesizer_model(ctx.settings))
+
+    async def stream() -> Any:
+        event_gen = investigate(
+            req.alert_id,
+            ctx=ctx,
+            investigator=investigator,
+            synthesizer=synthesizer,
+            session_id=req.session_id,
+        )
+        async for name, data in recorded_run(
+            request.app.state,
+            alert_id=req.alert_id,
+            started_by=started_by,
+            event_stream=event_gen,
+        ):
+            yield sse_encode(name, data)
+
+    return EventSourceResponse(stream())
+
+
+@router.post("/approve", response_model=ApproveResponse, dependencies=[Depends(require_api_auth)])
+async def approve_endpoint(
+    req: ApproveRequest,
+    request: Request,
+    gate: ApprovalGate = Depends(get_gate),
+    auth: SoAuthClient = Depends(get_auth),
+    settings: Settings = Depends(get_settings_dep),
+    audit: AuditLogger = Depends(get_audit),
+) -> ApproveResponse:
+    """Apply the user's decision to a pending write-tool approval.
+
+    On approval, the underlying tool function is executed exactly once
+    (idempotent on duplicate POSTs via :meth:`ApprovalGate.consume`). The
+    execution is audited fail-closed (see :func:`execute_write_tool`).
+    """
+    return await apply_approval(
+        gate=gate,
+        auth=auth,
+        settings=settings,
+        token=req.token,
+        approved=req.approved,
+        reason=req.reason,
+        audit=audit,
+        user=await identify_caller(request),
+    )
+
+
+@router.post(
+    "/find-alert",
+    response_model=FindAlertResponse,
+    dependencies=[Depends(require_api_auth)],
+)
+async def find_alert_endpoint(
+    req: FindAlertRequest,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> FindAlertResponse:
+    """Resolve an alert ES `_id` from row-level context.
+
+    The SO 3.0.0 frontend doesn't embed alert `_id`s in the DOM, only the
+    field values shown in each cell (rule.uuid, source.ip, dest.ip,
+    timestamp, etc.). The userscript reads the row, posts whatever it
+    found here, and we run an ES search to resolve back to a concrete
+    alert.
+    """
+    must: list[dict[str, Any]] = []
+    if req.rule_uuid:
+        must.append({"term": {"rule.uuid": req.rule_uuid}})
+    if req.source_ip:
+        must.append({"term": {"source.ip": req.source_ip}})
+    if req.destination_ip:
+        must.append({"term": {"destination.ip": req.destination_ip}})
+    if req.source_port:
+        must.append({"term": {"source.port": req.source_port}})
+    if req.destination_port:
+        must.append({"term": {"destination.port": req.destination_port}})
+    if req.event_module:
+        must.append({"term": {"event.module": req.event_module}})
+    if req.event_dataset:
+        must.append({"term": {"event.dataset": req.event_dataset}})
+    if req.rule_name:
+        must.append({"match_phrase": {"rule.name": req.rule_name}})
+
+    if not must:
+        raise HTTPException(
+            status_code=400,
+            detail="must provide at least one of: rule_uuid, source_ip, destination_ip, rule_name",
+        )
+
+    # Two-stage matching: try a tight ~2s window around the row's timestamp
+    # first; if that misses (timestamp couldn't be parsed, clock skew, or
+    # the row is older than the default lookback), widen to max_age_minutes.
+    parsed_ts: datetime | None = None
+    if req.timestamp:
+        try:
+            parsed_ts = _parse_so_timestamp(req.timestamp)
+        except ValueError as e:
+            _LOGGER.info("find_alert: could not parse timestamp %r: %s", req.timestamp, e)
+
+    async def _search_with_filter(time_filter: dict[str, Any]) -> tuple[Any, int]:
+        q: dict[str, Any] = {"bool": {"must": must, "filter": [time_filter]}}
+        result = await elastic.search(
+            settings.events_index_pattern,
+            q,
+            size=1,
+            sort=[{"@timestamp": {"order": "desc"}}],
+        )
+        return (result.hits[0] if result.hits else None, result.total)
+
+    hit = None
+    total = 0
+    found_via_stage = "no_match"
+
+    if parsed_ts is not None:
+        window = timedelta(seconds=2)
+        tight_filter = {
+            "range": {
+                "@timestamp": {
+                    "gte": (parsed_ts - window).isoformat(),
+                    "lte": (parsed_ts + window).isoformat(),
+                }
+            }
+        }
+        hit, total = await _search_with_filter(tight_filter)
+        if hit is not None:
+            found_via_stage = "timestamp"
+
+    if hit is None:
+        # Fall back to max_age_minutes window. SO analyst views often span
+        # 10-24h; the default for this endpoint is set wide enough to cover
+        # those without requiring the userscript to override.
+        wide_filter = {"range": {"@timestamp": {"gte": f"now-{req.max_age_minutes}m"}}}
+        hit, total = await _search_with_filter(wide_filter)
+        if hit is not None:
+            found_via_stage = "lookback"
+
+    if hit is None:
+        return FindAlertResponse(
+            alert_id=None,
+            alert_index=None,
+            found_via="no_match",
+            candidates_seen=total,
+        )
+
+    found_via = ("rule_uuid" if req.rule_uuid else "context") + "+" + found_via_stage
+    return FindAlertResponse(
+        alert_id=hit["_id"],
+        alert_index=hit["_index"],
+        found_via=found_via,
+        candidates_seen=total,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}",
+    response_model=SessionInfoResponse,
+    dependencies=[Depends(require_api_auth)],
+)
+async def session_info(
+    session_id: str,
+    gate: ApprovalGate = Depends(get_gate),
+) -> SessionInfoResponse:
+    """Return the pending approvals known to the gate.
+
+    v1 has a single global gate; ``session_id`` is informational only and is
+    echoed back for the client's bookkeeping.
+    """
+    pending = await gate.pending()
+    return SessionInfoResponse(
+        session_id=session_id,
+        pending_approvals=[
+            {
+                "token": p.token,
+                "tool_name": p.tool_name,
+                "tool_args": p.tool_args,
+                "state": p.state,
+            }
+            for p in pending
+        ],
+    )

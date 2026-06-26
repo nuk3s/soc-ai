@@ -1,0 +1,63 @@
+/* Self-hosted fonts (air-gapped friendly) */
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-sans/700.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  html,
+  body,
+  #root {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+  }
+  body {
+    background: #080a0e;
+    color: #e6e9ef;
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #262e3a;
+    border-radius: 6px;
+    border: 2px solid #080a0e;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::selection {
+    background: rgba(75, 139, 245, 0.32);
+  }
+  /* Accessible focus ring for keyboard users */
+  :focus-visible {
+    outline: 2px solid #4b8bf5;
+    outline-offset: 1px;
+  }
+}
+
+@layer components {
+  /* Inputs share a consistent dark-fill treatment */
+  .input-base {
+    @apply w-full bg-bg border border-border-input rounded-control px-3 py-2.5 text-text text-[13.5px] outline-none;
+  }
+  .input-base:focus {
+    @apply border-accent;
+  }
+}

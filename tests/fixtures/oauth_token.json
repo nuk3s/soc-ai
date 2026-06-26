@@ -1,0 +1,6 @@
+{
+  "access_token": "eyJhbGciOiJIUzI1NiJ9.test-token-payload.test-signature",
+  "token_type": "Bearer",
+  "expires_in": 7200,
+  "scope": "soc:read soc:write"
+}

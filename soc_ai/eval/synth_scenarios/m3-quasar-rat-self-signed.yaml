@@ -1,0 +1,130 @@
+id: m3-quasar-rat-self-signed
+name: "Quasar RAT self-signed TLS on non-standard port"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.49 makes outbound TLS to 185.45.43.21:4782 (Quasar
+  default port). The certificate Subject CN is "Quasar Server CA" (Quasar's
+  hardcoded default) and the issuer is identical (self-signed). 30-second
+  keepalive beacon pattern in conn.log. The ET MALWARE Quasar CnC Checkin
+  rule fires, but the verdict-deciding evidence is the cert subject string,
+  the non-standard port, and the beacon cadence — all in Zeek ssl/x509 logs.
+attack:
+  - T1573.002  # Encrypted Channel: Asymmetric Cryptography
+  - T1571      # Non-Standard Port
+  - T1219      # Remote Access Software (Quasar)
+sigma_refs:
+  - dfd2c20e-9fe7-42a7-9ac0-1d014cb2c1de  # Quasar RAT default certificate (sigmahq)
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # ssl/x509 subject CN
+    - typed_path             # rule.name OR destination.port
+    - prefetch_pivot         # conn beacon
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: block_indicator
+      target_field: destination.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 1
+      source.ip: "10.0.0.49"
+      source.port: 49872
+      destination.ip: "185.45.43.21"
+      destination.port: 4782
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET MALWARE Quasar RAT CnC Checkin"
+      rule.category: "A Network Trojan was detected"
+      rule.signature: "2029583"
+      classtype: trojan-activity
+      signature_severity: Major
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: m3-quasar-rat-self-signed
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.49"
+      source.port: 49872
+      destination.ip: "185.45.43.21"
+      destination.port: 4782
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv12"
+      zeek.ssl.server_name: ""
+      zeek.ssl.subject: "CN=Quasar Server CA,OU=Quasar,O=Quasar"
+      zeek.ssl.issuer: "CN=Quasar Server CA,OU=Quasar,O=Quasar"
+      zeek.ssl.established: true
+      zeek.ssl.validation_status: "self signed certificate"
+      synth.scenario_id: m3-quasar-rat-self-signed
+
+  - index: logs-synth-zeek-x509
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.x509
+      event.module: zeek
+      event.kind: event
+      zeek.x509.certificate.subject: "CN=Quasar Server CA,OU=Quasar,O=Quasar"
+      zeek.x509.certificate.issuer: "CN=Quasar Server CA,OU=Quasar,O=Quasar"
+      zeek.x509.certificate.serial: "00b9c5d8e7f6a4b3c2"
+      zeek.x509.certificate.not_valid_before: "{{ run_time | offset_seconds(-86400) }}"
+      zeek.x509.certificate.not_valid_after: "{{ run_time | offset_seconds(31536000) }}"
+      zeek.x509.certificate.key_alg: "rsaEncryption"
+      zeek.x509.certificate.key_length: 2048
+      synth.scenario_id: m3-quasar-rat-self-signed
+
+  - index: logs-synth-zeek-conn-beacon-summary
+    time_offset_seconds: -3600
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3600) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.49"
+      destination.ip: "185.45.43.21"
+      destination.port: 4782
+      network.community_id_pattern: "{{ same_as_triage }}"
+      synth.beacon_profile:
+        connection_count: 120
+        window_seconds: 3600
+        mean_interval_seconds: 30.05
+        interval_stddev_seconds: 0.42
+        interval_similarity: 0.99
+        mean_orig_bytes: 184
+        mean_resp_bytes: 88
+      synth.scenario_id: m3-quasar-rat-self-signed
+
+rubric_notes: |
+  Medium TP. The ET MALWARE rule is medium-fidelity — Quasar operators can
+  customize the cert CN. The decisive triangulation is: (1) cert subject =
+  cert issuer = the literal string "Quasar Server CA" (the default; few
+  operators bother to change it), (2) destination port 4782 (Quasar default),
+  (3) 30-second keepalive beacon with very low interval stddev. System MUST
+  cite the cert subject string and the port. Citing only rule.name is
+  insufficient — that's what got us 'partial' agreements in v8/v9.

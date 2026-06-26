@@ -1,0 +1,110 @@
+id: e3-tor-exit-ssh
+name: "Tor exit node successful SSH to internal jump box"
+version: 1
+tier: easy
+story: |
+  A public Tor exit node (185.220.101.182, matched against the Tor Project
+  exit list) successfully SSHs to internal jump box 10.0.0.10 with successful
+  authentication. The session is sustained (>10 minutes, substantial bytes in
+  both directions — interactive shell). Three independent signals: Tor list
+  match on source, ssh.log auth_success=true, and asset criticality (the
+  jump box).
+attack:
+  - T1133   # External Remote Services
+  - T1078   # Valid Accounts (likely follow-on)
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - blocklist_hit          # Tor exit list
+    - prefetch_pivot         # ssh.log auth_success
+    - typed_path
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: destination.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 2
+      source.ip: "185.220.101.182"
+      source.port: 41209
+      destination.ip: "10.0.0.10"
+      destination.port: 22
+      network.transport: tcp
+      network.protocol: ssh
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET TOR Known Tor Exit Node Traffic group 1"
+      rule.category: "Misc activity"
+      rule.signature: "2520000"
+      classtype: misc-activity
+      signature_severity: Minor
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: e3-tor-exit-ssh
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-ssh
+    time_offset_seconds: 1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(1) }}"
+      event.dataset: zeek.ssh
+      event.module: zeek
+      event.kind: event
+      source.ip: "185.220.101.182"
+      source.port: 41209
+      destination.ip: "10.0.0.10"
+      destination.port: 22
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssh.auth_success: true
+      zeek.ssh.client: "SSH-2.0-OpenSSH_8.9p1"
+      zeek.ssh.server: "SSH-2.0-OpenSSH_8.0"
+      zeek.ssh.auth_attempts: 1
+      zeek.ssh.version: 2
+      synth.scenario_id: e3-tor-exit-ssh
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(1) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "185.220.101.182"
+      source.port: 41209
+      destination.ip: "10.0.0.10"
+      destination.port: 22
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDafF"
+      zeek.conn.duration: 1820.7
+      zeek.conn.orig_bytes: 18432
+      zeek.conn.resp_bytes: 412300
+      zeek.conn.local_orig: false
+      zeek.conn.local_resp: true
+      zeek.conn.service: "ssh"
+      synth.scenario_id: e3-tor-exit-ssh
+
+rubric_notes: |
+  Severity is Minor — the ET TOR rule fires Minor by default. The verdict-
+  defining evidence is in ssh.log (auth_success=true) and the conn.log
+  duration/byte profile (interactive shell). A system that only reads
+  signature_severity would misclassify this. Includes a deliberate direction
+  test: local_resp=true / local_orig=false means the Tor exit is INITIATING.
+  The reconciliation field can remain null (no contradiction), but the
+  field_reconciliation validator (#47) should not falsely flag this.

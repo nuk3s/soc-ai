@@ -1,0 +1,138 @@
+id: m1-cobalt-strike-beacon
+name: "Cobalt Strike Malleable C2 with JA3 pair + beacon jitter"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.115 beacons to a CDN-fronted HTTPS host. A single ET
+  HUNTING rule fires (no commodity blocklist match — the destination is
+  fronted). The decisive evidence is in Zeek SSL: JA3
+  a0e9f5d64349fb13191bc781f81f42e1 (Cobalt Strike Win10 client default) +
+  JA3S b742b407517bac9536a77a7b0fee28e9 (CS team server default). Conn-log
+  shows regular ~60s ± 6s jitter intervals over 4 hours with nearly constant
+  packet sizes — RITA-style beacon profile.
+attack:
+  - T1071.001  # Application Layer Protocol: Web Protocols
+  - T1102.002  # Web Service: Bidirectional Communication
+  - T1571      # Non-Standard Port (sometimes)
+sigma_refs:
+  - 7090adee-82e2-4269-bd59-80691e7c6338  # Cobalt Strike JA3 (sigmahq)
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # Zeek SSL JA3 pair
+    - typed_path             # rule.name (ET HUNTING)
+    - prefetch_pivot         # conn.log beacon profile
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 2
+      source.ip: "10.0.0.115"
+      source.port: 51844
+      destination.ip: "104.18.42.69"  # Cloudflare-fronted
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET HUNTING Possible Cobalt Strike Extra Whitespace HTTP Response"
+      rule.category: "Potentially Bad Traffic"
+      rule.signature: "2029425"
+      classtype: bad-unknown
+      signature_severity: Minor
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: m1-cobalt-strike-beacon
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.115"
+      source.port: 51844
+      destination.ip: "104.18.42.69"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv12"
+      zeek.ssl.ja3: "a0e9f5d64349fb13191bc781f81f42e1"
+      zeek.ssl.ja3s: "b742b407517bac9536a77a7b0fee28e9"
+      zeek.ssl.server_name: "static.example-cdn.com"
+      zeek.ssl.established: true
+      synth.scenario_id: m1-cobalt-strike-beacon
+
+  - index: logs-synth-zeek-conn-beacon-summary
+    time_offset_seconds: -300
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-300) }}"
+      event.dataset: zeek.conn_summary  # aggregated/derived
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.115"
+      destination.ip: "104.18.42.69"
+      destination.port: 443
+      network.community_id_pattern: "{{ same_as_triage }}"
+      synth.beacon_profile:
+        connection_count: 240
+        window_seconds: 14400
+        mean_interval_seconds: 60.1
+        interval_stddev_seconds: 5.8
+        interval_similarity: 0.95  # RITA-style score
+        mean_orig_bytes: 442
+        mean_resp_bytes: 1188
+        orig_bytes_cv: 0.04
+        resp_bytes_cv: 0.06
+      synth.scenario_id: m1-cobalt-strike-beacon
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.115"
+      source.port: 51844
+      destination.ip: "104.18.42.69"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdfFa"
+      zeek.conn.duration: 60.2
+      zeek.conn.orig_bytes: 442
+      zeek.conn.resp_bytes: 1188
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: m1-cobalt-strike-beacon
+
+rubric_notes: |
+  Medium TP. Suricata fires only an ET HUNTING (Minor severity) rule — no
+  blocklist match, no commodity TROJAN signature. The verdict requires
+  correlating: (1) the JA3/JA3S fingerprint pair against known Cobalt Strike
+  defaults (in this scenario, the loader is expected to wire the published
+  CS defaults — see Salesforce JA3 origin post), and (2) the conn-log beacon
+  profile (95% interval similarity, near-constant byte counts). System that
+  takes only the alert at face value and emits FP because severity=Minor =
+  failure. System that ignores Zeek correlation = failure.

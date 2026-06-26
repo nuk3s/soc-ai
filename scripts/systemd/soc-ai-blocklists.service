@@ -1,0 +1,49 @@
+[Unit]
+Description=soc-ai - refresh local IOC blocklists + cloud-prefix data files
+Documentation=https://github.com/nuk3s/soc-ai
+# This is the ONE soc-ai job that talks to the public internet (abuse.ch,
+# the Tor exit list, cloud-provider prefix feeds). It runs on a schedule
+# (soc-ai-blocklists.timer), never during triage.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=soc-ai
+Group=soc-ai
+WorkingDirectory=/opt/soc-ai
+# .env carries ABUSE_CH_AUTH_KEY (free key from https://auth.abuse.ch/) plus
+# the data-dir paths. Without the key the abuse.ch feeds are skipped (the Tor
+# exit list still refreshes) and the job still exits 0.
+EnvironmentFile=/opt/soc-ai/.env
+ExecStart=/opt/soc-ai/.venv/bin/soc-ai blocklists refresh
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening ---------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ProtectSystem=full makes /etc /usr /boot read-only; the refresh only writes
+# its data dirs, so grant those explicitly. Match these to BLOCKLIST_DATA_DIR /
+# CLOUD_PREFIX_DATA_DIR in .env if you override the defaults.
+ReadWritePaths=/var/lib/soc-ai
+StateDirectory=soc-ai
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+[Unit]
+Description=soc-ai - LLM-powered triage assistant for Security Onion
+Documentation=https://github.com/nuk3s/soc-ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=soc-ai
+Group=soc-ai
+WorkingDirectory=/opt/soc-ai
+EnvironmentFile=/opt/soc-ai/.env
+ExecStart=/opt/soc-ai/.venv/bin/uvicorn soc_ai.main:app --host 0.0.0.0 --port 8443 --ssl-certfile /etc/soc-ai/cert.pem --ssl-keyfile /etc/soc-ai/key.pem
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening (safe set; venv at /opt/soc-ai/.venv stays read-write) ---
+# Process-isolation primitives.
+PrivateTmp=true
+NoNewPrivileges=true
+# /usr, /boot, /etc become read-only. /opt is untouched (the venv lives
+# there); /var is also untouched (audit + temp use journald/tmpfs).
+ProtectSystem=full
+# Read-only access to /home — the service runs as user soc-ai whose home
+# is /home/soc-ai but we never write there at runtime.
+ProtectHome=read-only
+# Kernel/cgroup write paths blocked.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Restrict syscall surface area.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Prevent execution of memory-mapped pages with both write+exec.
+MemoryDenyWriteExecute=true
+# Capability removal — uvicorn doesn't need any capabilities.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

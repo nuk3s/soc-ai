@@ -1,0 +1,145 @@
+id: h1-kerberoasting
+name: "Kerberoasting from compromised workstation"
+version: 1
+tier: hard
+story: |
+  Workstation 10.0.0.55 (a domain user laptop) suddenly requests TGS service
+  tickets for 14 distinct SPNs in 90 seconds, all with cipher=rc4-hmac
+  (modern domains use AES). The corresponding ntlm.log shows the same host
+  authenticating to 8 different servers in the same window. No Suricata
+  signature fires — the alert comes from a Sigma rule mapped over Zeek's
+  kerberos.log. The verdict depends on understanding the Kerberos protocol
+  (RC4 is a downgrade marker), baseline (this user does not Kerberoast
+  routinely), and the SPN fan-out pattern.
+attack:
+  - T1558.003  # Steal or Forge Kerberos Tickets: Kerberoasting
+  - T1078.002  # Valid Accounts: Domain Accounts
+sigma_refs:
+  - 31b8ee37-bbed-44f5-aa9a-83e2cffae2bd  # Kerberos network traffic RC4 ticket encryption (sigmahq)
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # kerberos.log RC4 + SPN fan-out
+    - prefetch_pivot         # ntlm.log lateral pattern
+    - typed_path
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: disable_account
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.55"
+      source.port: 50012
+      destination.ip: "10.0.0.250"   # DC
+      destination.port: 88
+      network.transport: tcp
+      network.protocol: kerberos
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SIGMA Kerberos Network Traffic RC4 Ticket Encryption"
+      rule.category: "Suspicious Activity"
+      rule.signature: "9900001"  # synthetic SID — Sigma-on-Zeek
+      classtype: attempted-recon
+      signature_severity: Informational
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      user.name: "jdoe"
+      synth.scenario_id: h1-kerberoasting
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-kerberos-summary
+    time_offset_seconds: -90
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-90) }}"
+      event.dataset: zeek.kerberos_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      destination.ip: "10.0.0.250"
+      user.name: "jdoe"
+      synth.kerberos_profile:
+        window_seconds: 90
+        request_type: TGS
+        success_count: 14
+        fail_count: 0
+        unique_spns: 14
+        ciphers_observed:
+          rc4-hmac: 14
+          aes256-cts-hmac-sha1-96: 0
+        sample_spns:
+          - "MSSQLSvc/sql01.corp.lan:1433"
+          - "MSSQLSvc/sql02.corp.lan:1433"
+          - "HTTP/owa.corp.lan"
+          - "HTTP/intranet.corp.lan"
+          - "cifs/fileserver01.corp.lan"
+          - "ldap/dc01.corp.lan"
+          - "exchange/exch01.corp.lan"
+      synth.scenario_id: h1-kerberoasting
+
+  - index: logs-synth-zeek-kerberos
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.kerberos
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      destination.ip: "10.0.0.250"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.kerberos.request_type: "TGS"
+      zeek.kerberos.success: true
+      zeek.kerberos.client: "jdoe/CORP.LAN"
+      zeek.kerberos.service: "MSSQLSvc/sql01.corp.lan:1433"
+      zeek.kerberos.cipher: "rc4-hmac"
+      synth.scenario_id: h1-kerberoasting
+
+  - index: logs-synth-zeek-ntlm-summary
+    time_offset_seconds: -90
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-90) }}"
+      event.dataset: zeek.ntlm_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      user.name: "jdoe"
+      synth.ntlm_profile:
+        window_seconds: 90
+        servers_authenticated: 8
+        unique_destination_ips:
+          - "10.0.0.131"
+          - "10.0.0.132"
+          - "10.0.0.140"
+          - "10.0.0.141"
+          - "10.0.0.150"
+          - "10.0.0.151"
+          - "10.0.0.160"
+          - "10.0.0.161"
+      synth.scenario_id: h1-kerberoasting
+
+rubric_notes: |
+  Hard TP. NO Emerging Threats signature, NO commodity blocklist match, NO
+  IOC. The Suricata alert is just a Sigma-on-Zeek detection wrapped as an
+  alert event — Informational severity. The verdict requires the system to:
+  (1) understand that RC4-HMAC TGS requests in 2026 are anomalous (AES is
+  standard) — this is *protocol-level* reasoning; (2) recognize SPN fan-out
+  (14 distinct services in 90s) as a Kerberoasting signature; (3) correlate
+  with the NTLM lateral-auth pattern on the same host. A system that scores
+  this on signature_severity alone misses it entirely. This is the strongest
+  test of the system's Zeek + protocol reasoning capability.

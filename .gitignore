@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# uv / venv
+.venv/
+.python-version
+
+# Environment
+.env
+.env.local
+.env.*.local
+.env.bak*
+
+# setup.sh automated-install settings (holds secrets) + generated TLS cert
+setup.conf
+certs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VCR cassettes - store these explicitly when we want them
+tests/cassettes/
+
+# Qdrant local data (when running compose locally)
+qdrant_storage/
+
+# local agent / editor scratch dirs (per-session scratch)
+.superpowers/
+
+# Eval harness artifact bundles (never commit; they contain real triage trails).
+# `docs/dev/evals/` is the curated archive of meta-analyses + aggregates and IS tracked.
+/evals/
+
+# Git worktrees
+.worktrees/
+
+# Local SQLite store created by the web UI (dev runs land here by default)
+data/
+# ...but vendored package-data dirs under soc_ai/ MUST ship in the wheel.
+!soc_ai/**/data/
+!soc_ai/**/data/**
+
+# Local deploy target (host stays out of the public repo)
+.deploy-target

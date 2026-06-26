@@ -1,0 +1,181 @@
+[project]
+name = "soc-ai"
+version = "1.0.0"
+description = "Self-hosted, privacy-respecting LLM-powered triage assistant for Security Onion"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "soc-ai contributors" }]
+keywords = ["security-onion", "soc", "llm", "siem", "mcp", "triage"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Framework :: FastAPI",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    # web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sse-starlette>=2.1.0",
+    "python-multipart>=0.0.18",
+    # data validation / config
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    # agent + MCP
+    # pydantic-ai went 1.0 well before this floor mattered; the resolved
+    # client is 1.91.x. Pin the major so a fresh resolve can't silently
+    # cross into a future breaking 2.x.
+    "pydantic-ai>=1.0,<2",
+    "mcp>=1.1.0",
+    # HTTP / search clients
+    "httpx>=0.27.0",
+    "geoip2>=4.8.0",
+    # MUST track the SO grid's ES major. SO ships Elasticsearch 8.x; a 9.x
+    # client refuses to talk to an 8.x cluster (compatible-with header
+    # rejection) and 9.x also drops the `body=` search/index kwarg this
+    # client still uses. Cap below 9 until the grid itself moves to ES 9.
+    "elasticsearch[async]>=8.16.0,<9",
+    # OQL grammar
+    "lark>=1.2.0",
+    # YAML parsing
+    "pyyaml>=6.0.2",
+    # logging
+    "structlog>=24.4.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20",
+    "alembic>=1.14",
+    "bcrypt>=4.2",
+    "jinja2>=3.1",
+    "python-ulid>=2.7",
+    "dpkt>=1.9.8",
+    # Fernet encryption for secret config overrides at rest (Danger Zone).
+    "cryptography>=43",
+]
+
+[project.urls]
+Homepage = "https://github.com/nuk3s/soc-ai"
+Repository = "https://github.com/nuk3s/soc-ai"
+Issues = "https://github.com/nuk3s/soc-ai/issues"
+Changelog = "https://github.com/nuk3s/soc-ai/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-vcr>=1.0.2",
+    "respx>=0.21.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "playwright>=1.59.0",
+    "pytest-playwright>=0.7.2",
+    "pre-commit>=3.8.0",
+]
+
+[project.scripts]
+soc-ai = "soc_ai.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["soc_ai"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["soc_ai", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",  # pycodestyle / pyflakes
+    "I",            # isort
+    "B",            # bugbear
+    "UP",           # pyupgrade
+    "S",            # bandit (security)
+    "ASYNC",        # async-correctness
+    "RUF",          # ruff-specific
+    "PL",           # pylint
+    "PT",           # pytest-style
+    "SIM",          # simplify
+    "TCH",          # type-checking imports
+]
+ignore = [
+    "PLR0913",      # too many arguments - security tools have wide signatures
+    "PLR0911",      # too many return statements
+    "S101",         # asserts ok in tests (per-file rule below covers tests)
+    "TC001",        # type-checking blocks for app imports - causes runtime gaps
+    "TC002",        # type-checking blocks for third-party imports - same
+    "TC003",        # type-checking blocks for stdlib imports - same
+    "PLR2004",      # magic-value-comparison - status codes etc are self-documenting
+    "B008",         # Depends() in defaults is FastAPI's documented idiom
+    "BLE001",       # bare except is sometimes the right call (top-level SSE wrapper)
+]
+
+[tool.ruff.lint.pylint]
+max-branches = 20
+
+[tool.ruff.lint.per-file-ignores]
+# Tests favour readability over strict style: broad pytest.raises, compound
+# asserts, and en-dashes in comments/strings are fine in test code.
+"tests/**" = ["S", "PLR2004", "ASYNC230", "PLR0915", "PLC0415", "RUF001", "RUF003", "PT011", "PT018"]
+"scripts/**" = ["S", "PLR2004", "PLC0415", "E501"]
+# `×` is intentional in the report headings (cross-tab tables) and
+# in meta_analysis size estimates (".. × 5K tokens").
+"soc_ai/eval/report.py" = ["RUF001", "RUF003"]
+"soc_ai/eval/meta_analysis.py" = ["RUF002", "RUF003"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+files = ["soc_ai"]
+
+# Third-party packages without bundled type stubs. PyYAML ships no inline
+# types and we don't vendor types-PyYAML; the YAML we load (blocklists,
+# synth loader) is validated downstream, so treating it as untyped here is
+# safe and keeps strict mode on everywhere else.
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true
+
+# dpkt ships no py.typed and no stub package; it is a pure-Python decode
+# library with no C surface — treating it as untyped is safe.
+[[tool.mypy.overrides]]
+module = ["dpkt"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config --cov=soc_ai --cov-report=term-missing --cov-fail-under=80"
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow",
+    "integration: requires a live SO grid (skipped in CI)",
+]
+
+[tool.coverage.run]
+source = ["soc_ai"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

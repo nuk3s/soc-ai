@@ -1,0 +1,131 @@
+id: e1-emotet-feodo-c2
+name: "Emotet/Feodo C2 callback"
+version: 2
+tier: easy
+story: |
+  Finance workstation 10.0.0.42 resolves and connects to a Feodo Tracker-listed
+  Emotet C2 (162.243.103.246, in the real abuse.ch Feodo blocklist loaded under
+  /var/lib/soc-ai/blocklists/feodo.csv) over port 443 ten minutes after the
+  user opened a phishing document. Three independent signals corroborate:
+  (1) a Feodo IP blocklist hit on the destination, (2) the ET TROJAN signature,
+  and (3) a JA3 hash matching the published Emotet/IcedID fingerprint.
+
+  Version 2: replaced the illustrative dest IP 185.220.101.7 (which was
+  actually a Tor exit, not in Feodo) with a real Feodo Tracker entry so the
+  blocklist enrichment fires correctly — earlier runs missed this scenario
+  because the IOC wasn't actually loaded.
+attack:
+  - T1071.001  # Application Layer Protocol: Web Protocols
+  - T1573.002  # Encrypted Channel: Asymmetric Cryptography
+  - T1566.001  # Phishing: Spearphishing Attachment (lead-in)
+sigma_refs:
+  - 9b15893a-d5f4-4e94-b08b-e58dabec3501  # Emotet C2 traffic (sigmahq)
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.75
+  required_citation_kinds:
+    - blocklist_hit          # Feodo IP match
+    - typed_path             # rule.name / ja3
+    - prefetch_pivot         # Zeek SSL event by community_id
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+  expected_field_reconciliation: false  # no protocol/direction conflict
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 1
+      source.ip: "10.0.0.42"
+      source.port: 49321
+      destination.ip: "162.243.103.246"
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ETPRO TROJAN Win32/Emotet CnC Activity (POST)"
+      rule.category: "A Network Trojan was detected"
+      rule.signature: "2840001"
+      classtype: trojan-activity
+      signature_severity: Major
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: e1-emotet-feodo-c2
+      synth.scenario_version: 2
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: -1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.42"
+      source.port: 49321
+      destination.ip: "162.243.103.246"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv12"
+      zeek.ssl.ja3: "4d7a28d6f2263ed61de88ca66eb011e3"
+      zeek.ssl.ja3s: "80b3a14bccc8598a1f3bbe83e71f735f"
+      zeek.ssl.server_name: "cdn-fronted-host.example.com"
+      zeek.ssl.established: true
+      synth.scenario_id: e1-emotet-feodo-c2
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.42"
+      source.port: 49321
+      destination.ip: "162.243.103.246"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdfFa"
+      zeek.conn.duration: 320.4
+      zeek.conn.orig_bytes: 12480
+      zeek.conn.resp_bytes: 8240
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      synth.scenario_id: e1-emotet-feodo-c2
+
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -3
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.42"
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      zeek.dns.query: "cdn-fronted-host.example.com"
+      zeek.dns.qtype_name: "A"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["162.243.103.246"]
+      synth.scenario_id: e1-emotet-feodo-c2
+
+rubric_notes: |
+  This is a textbook Easy TP: the destination IP is on the Feodo blocklist,
+  the Suricata rule explicitly names Emotet, and the Zeek SSL log carries a
+  JA3 fingerprint matching the documented Emotet/IcedID client signature.
+  The system MUST cite at least the blocklist hit and one typed alert field
+  (rule.name or signature_severity). Failure to escalate = system broken.

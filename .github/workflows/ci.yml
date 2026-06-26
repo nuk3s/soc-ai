@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    name: lint + typecheck + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: ruff check
+        run: uv run ruff check soc_ai/ tests/
+
+      - name: ruff format check
+        run: uv run ruff format --check soc_ai/ tests/
+
+      - name: mypy
+        run: uv run mypy soc_ai/
+
+      - name: pytest
+        run: uv run pytest -v
+
+  # The React SPA (frontend/) — typecheck + production build so a broken UI can't
+  # land silently. No eslint config is committed yet, so `lint` is omitted.
+  frontend:
+    name: frontend typecheck + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: install
+        run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: build
+        run: npm run build

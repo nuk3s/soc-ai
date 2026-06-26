@@ -1,0 +1,162 @@
+id: h3-low-slow-exfil-r2
+name: "Low-and-slow HTTPS exfil to first-seen cloud bucket"
+version: 1
+tier: hard
+story: |
+  Engineering workstation 10.0.0.118 uploads 4.2 GB to *.r2.cloudflarestorage.com
+  over 9 hours in 1 MB chunks at ~30s intervals. No Suricata rules fire. The
+  JA3 is the standard Windows-Chrome fingerprint (boring). The SNI looks
+  legitimate (Cloudflare R2 is a legitimate service used by many orgs). The
+  alert here is a custom Zeek analytic — Long Connection + Asymmetric Bytes
+  + First-Seen FQDN. The verdict requires reasoning about bytes-out/duration
+  ratios, baseline-first-seen FQDNs, and a DNS resolver-bypass detail (the
+  host used 1.1.1.1 over TCP/853 DoT, not the corporate resolver).
+attack:
+  - T1041      # Exfiltration Over C2 Channel
+  - T1567.002  # Exfiltration to Cloud Storage
+  - T1071.001  # Application Layer Protocol: Web Protocols
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # conn ratio
+    - prefetch_pivot         # first-seen SNI
+    - prefetch_pivot         # DoT resolver bypass
+  expected_actions:
+    - kind: escalate
+    - kind: block_indicator
+      target_field: zeek.ssl.server_name
+    - kind: isolate
+      target_field: source.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.118"
+      source.port: 52199
+      destination.ip: "162.159.140.42"  # Cloudflare R2 edge
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC Long Connection Asymmetric Bytes First-Seen FQDN"
+      rule.category: "Anomalous Traffic"
+      rule.signature: "9700003"  # synthetic SID — analytic-as-alert
+      classtype: anomalous-egress
+      signature_severity: Informational
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: h3-low-slow-exfil-r2
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.118"
+      source.port: 52199
+      destination.ip: "162.159.140.42"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdfFa"
+      zeek.conn.duration: 32400.0     # 9 hours
+      zeek.conn.orig_bytes: 4200000000  # 4.2 GB
+      zeek.conn.resp_bytes: 4100000     # 4.1 MB
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: h3-low-slow-exfil-r2
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.118"
+      destination.ip: "162.159.140.42"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.server_name: "abc12345-bucket.r2.cloudflarestorage.com"
+      zeek.ssl.ja3: "cd08e31494f9531f560d64c695473da9"   # boring win-chrome
+      zeek.ssl.ja3s: "f4febc55ea12b31ae17cfb7e614afda8"
+      zeek.ssl.established: true
+      synth.first_seen_for_org: true
+      synth.scenario_id: h3-low-slow-exfil-r2
+
+  - index: logs-synth-zeek-dns-anomaly
+    time_offset_seconds: -120
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-120) }}"
+      event.dataset: zeek.dns_anomaly
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.118"
+      destination.ip: "1.1.1.1"
+      destination.port: 853
+      network.transport: tcp
+      synth.dns_resolver_bypass:
+        corporate_resolver_ip: "10.0.0.1"
+        observed_resolver_ip: "1.1.1.1"
+        observed_protocol: "DoT"
+        baseline_dns_via_corporate_resolver_percent: 99.4
+      synth.scenario_id: h3-low-slow-exfil-r2
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -120
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-120) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.118"
+      source.port: 52050
+      destination.ip: "1.1.1.1"
+      destination.port: 853
+      network.transport: tcp
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdFaf"
+      zeek.conn.duration: 0.4
+      zeek.conn.orig_bytes: 412
+      zeek.conn.resp_bytes: 824
+      zeek.conn.service: "ssl"
+      synth.scenario_id: h3-low-slow-exfil-r2
+
+rubric_notes: |
+  Hard TP. Nothing about this looks malicious to a signature engine. The
+  JA3 is a Chrome default, the SNI is real (Cloudflare R2 is a legitimate
+  storage service), and TLS 1.3 obscures the content. The verdict requires
+  three behavioral observations that the system must extract from Zeek:
+  (1) bytes-out/duration ratio is 1000:1 outbound (exfil-shaped); (2) the
+  SNI is first-seen for the organization (baseline pivot); (3) the host
+  bypassed the corporate resolver via DoT to 1.1.1.1 just before the upload
+  (intent signal). System should cite all three. Confidence_min is 0.65
+  (slightly lower than other tiers) because reasonable analyst disagreement
+  is possible — TLS 1.3 prevents content inspection and Cloudflare R2 is a
+  legitimate service. The right action is escalate + block + isolate, not
+  ack — but a "needs_more_info with pivot questions" would also be acceptable
+  if confidence is in the 0.5-0.65 band. (Loader can mark this verdict-band
+  acceptance in a future schema version.)

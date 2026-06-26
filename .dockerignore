@@ -1,0 +1,64 @@
+# ── Secrets — MUST NOT bake into any image layer ─────────────────────────────
+.env
+.env.*
+# (cert and key are mounted at runtime; exclude any local copies under etc/)
+etc/
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+
+# ── Frontend — the Node build stage installs deps + builds dist fresh, so the
+# host's copies only bloat the build context (and must never leak into the image).
+frontend/node_modules/
+frontend/dist/
+
+# ── Runtime data (mounted as volumes at runtime) ───────────────────────────────
+data/
+var/
+
+# ── Git + VCS ─────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── Eval artefacts (large, irrelevant to the container) ───────────────────────
+evals/
+
+# ── Dev / CI caches ───────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.pyc
+__pycache__/
+*.pyo
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── local agent / editor scratch dirs ───────────────────────────────────────────
+.claude/
+.superpowers/
+.worktrees/
+
+# ── Internal docs (all internal material lives under docs/dev/) ───────────────
+docs/dev/
+HANDOVER.md
+FUTURE_IDEAS.md
+ROADMAP.md
+TODO.md
+
+# ── Scripts not needed inside the image ───────────────────────────────────────
+scripts/
+
+# ── Userscript (browser extension; not part of the server) ────────────────────
+userscript/
+
+# ── Test suite ────────────────────────────────────────────────────────────────
+tests/

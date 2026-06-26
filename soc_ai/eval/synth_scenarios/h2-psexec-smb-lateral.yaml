@@ -1,0 +1,159 @@
+id: h2-psexec-smb-lateral
+name: "PsExec / SMB-pipe lateral movement (no signature)"
+version: 1
+tier: hard
+story: |
+  Workstation 10.0.0.55 (the same compromised laptop as h1) reaches
+  10.0.0.140 over SMB. Activity sequence on the same community_id flow:
+  (1) ADMIN$ tree mount; (2) SMB file write of psexesvc.exe; (3) DCE-RPC
+  svcctl::CreateServiceWOW64W; (4) StartServiceW within 200ms. BZAR's
+  notice.log fires; no ET signature does. Verdict depends entirely on the
+  Zeek SMB + DCE-RPC sequence.
+attack:
+  - T1021.002  # Remote Services: SMB/Windows Admin Shares
+  - T1543.003  # Create or Modify System Process: Windows Service
+  - T1570      # Lateral Tool Transfer
+sigma_refs:
+  - df7e0eb6-d7c6-4ee0-8f5b-32acd2dabd2f  # PsExec service installation (BZAR)
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # smb_files file write
+    - prefetch_pivot         # dce_rpc svcctl operations
+    - typed_path
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: isolate
+      target_field: destination.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.55"
+      source.port: 50321
+      destination.ip: "10.0.0.140"
+      destination.port: 445
+      network.transport: tcp
+      network.protocol: smb
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "BZAR ATTACK::Execution_Service_Creation"
+      rule.category: "Misc Attack"
+      rule.signature: "9800002"  # synthetic SID — BZAR notice as alert
+      classtype: attempted-admin
+      signature_severity: Informational
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: h2-psexec-smb-lateral
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-smb-mapping
+    time_offset_seconds: -5
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      event.dataset: zeek.smb_mapping
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      destination.ip: "10.0.0.140"
+      destination.port: 445
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_mapping.path: "\\\\10.0.0.140\\ADMIN$"
+      zeek.smb_mapping.service: "ADMIN$"
+      zeek.smb_mapping.share_type: "DISK"
+      synth.scenario_id: h2-psexec-smb-lateral
+
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: -3
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      destination.ip: "10.0.0.140"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_WRITE"
+      zeek.smb_files.name: "PSEXESVC.exe"
+      zeek.smb_files.path: "\\\\10.0.0.140\\ADMIN$\\PSEXESVC.exe"
+      zeek.smb_files.size: 191552
+      synth.scenario_id: h2-psexec-smb-lateral
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      destination.ip: "10.0.0.140"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "svcctl"
+      zeek.dce_rpc.operation: "CreateServiceWOW64W"
+      synth.scenario_id: h2-psexec-smb-lateral
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      destination.ip: "10.0.0.140"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "svcctl"
+      zeek.dce_rpc.operation: "StartServiceW"
+      synth.scenario_id: h2-psexec-smb-lateral
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -5
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.55"
+      source.port: 50321
+      destination.ip: "10.0.0.140"
+      destination.port: 445
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "S1"
+      zeek.conn.history: "ShAdDa"
+      zeek.conn.duration: 12.3
+      zeek.conn.orig_bytes: 200400
+      zeek.conn.resp_bytes: 4800
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "smb"
+      synth.scenario_id: h2-psexec-smb-lateral
+
+rubric_notes: |
+  Hard TP. Zero ET signatures. Zero IOCs. Both source and destination are
+  internal (RFC1918). The verdict comes from the *sequence* of Zeek events:
+  ADMIN$ mount → file write of PSEXESVC.exe → CreateServiceWOW64W →
+  StartServiceW, all within ~5 seconds, all on the same community_id. This
+  is the canonical PsExec lateral-movement chain. System must cite the
+  smb_files write AND at least one of the dce_rpc operations. Source host
+  10.0.0.55 deliberately overlaps with h1 (Kerberoasting) — a system that
+  hunts will spot the multi-stage compromise pattern across both alerts.

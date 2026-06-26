@@ -1,0 +1,25 @@
+{
+  "id": "pb-001",
+  "title": "Suspicious Outbound Traffic Triage",
+  "description": "Steps for investigating outbound malware alerts",
+  "questions": [
+    {
+      "id": "q-1",
+      "question": "Is the destination IP on a known threat list?",
+      "answer": null,
+      "isRequired": true
+    },
+    {
+      "id": "q-2",
+      "question": "What process initiated the connection?",
+      "answer": null,
+      "isRequired": true
+    },
+    {
+      "id": "q-3",
+      "question": "Are other hosts contacting the same destination?",
+      "answer": null,
+      "isRequired": false
+    }
+  ]
+}
