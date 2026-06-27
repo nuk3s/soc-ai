@@ -17,8 +17,10 @@ export function Login() {
     try {
       await login(username, password);
       navigate('/alerts');
-    } catch {
-      setError('Invalid username or password');
+    } catch (e) {
+      // login() already returns a generic message on a real 401 and surfaces
+      // the server's hint (e.g. rate-limit) or a network/cert error otherwise.
+      setError(e instanceof Error ? e.message : 'Invalid username or password');
     } finally {
       setPending(false);
     }

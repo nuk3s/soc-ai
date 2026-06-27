@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -549,6 +550,9 @@ def test_security_response_headers_present(client: TestClient) -> None:
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert resp.headers["X-Frame-Options"] == "DENY"
     assert resp.headers["Referrer-Policy"] == "no-referrer"
+    assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
+    assert resp.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+    assert "Permissions-Policy" in resp.headers
     # TestClient uses http:// by default → HSTS is NOT sent on plain HTTP.
     assert "Strict-Transport-Security" not in resp.headers
 
@@ -559,6 +563,55 @@ def test_security_headers_hsts_only_on_https(client: TestClient) -> None:
     # Whether HSTS appears depends on request.url.scheme; the nosniff header is
     # unconditional, so assert that as the load-bearing guarantee.
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_api_docs_disabled_by_default(client: TestClient) -> None:
+    """Interactive docs + raw schema are gated off by default (expose_api_docs)."""
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+
+
+def test_hunt_rejects_blank_alert_id(client: TestClient) -> None:
+    """Empty alert_id is a 422, not a 500 (would reach ES as ids:[""])."""
+    assert client.post("/api/v1/hunt", json={"alert_id": ""}).status_code == 422
+
+
+def test_override_rejects_out_of_range_confidence(client: TestClient) -> None:
+    """Confidence outside [0,1] is rejected at the schema boundary."""
+    r = client.post(
+        "/api/v1/investigations/nope/override",
+        json={"verdict": "false_positive", "confidence": 5.0},
+    )
+    assert r.status_code == 422
+
+
+def test_alerts_grid_unavailable_fails_fast_503(client: TestClient, monkeypatch: Any) -> None:
+    """When ES is unreachable the alerts console returns a clean 503, not a hang
+    or 500 (perf finding: the ES client otherwise retries for up to ~90s)."""
+    from elastic_transport import TransportError
+
+    async def _boom(*_a: Any, **_k: Any) -> None:
+        raise TransportError("connection refused")
+
+    monkeypatch.setattr("soc_ai.api.webui_api.aq.fetch_groups", _boom)
+    r = client.get("/api/v1/alerts?range=24h")
+    assert r.status_code == 503
+    assert r.json()["detail"]["reason"] == "grid_unavailable"
+
+
+def test_alerts_grid_slow_times_out_503(settings_kratos: Settings, monkeypatch: Any) -> None:
+    """A grid query that exceeds webui_grid_timeout_s is bounded → 503, not a hang."""
+
+    async def _slow(*_a: Any, **_k: Any) -> None:
+        await asyncio.sleep(3)
+
+    monkeypatch.setattr("soc_ai.api.webui_api.aq.fetch_groups", _slow)
+    s = settings_kratos.model_copy(update={"webui_grid_timeout_s": 1})
+    for c in _client(s):
+        r = c.get("/api/v1/alerts?range=24h")
+        assert r.status_code == 503
+        assert r.json()["detail"]["reason"] == "grid_unavailable"
 
 
 def test_auto_triage_status(client: TestClient) -> None:
@@ -2082,6 +2135,7 @@ class TestDangerZoneSave:
             litellm_base_url="http://localhost:4000",
             synth_first_pipeline=False,
             config_secret_key=SecretStr("0Y5eLjMDakyujfxGcb5ijyW_GL4pkxv3gHqWkfanOz0="),
+            api_auth_required=False,  # dev-open; secure default is True
         )
 
     def test_wrong_confirm_rejected(self, settings: Settings) -> None:
@@ -2187,6 +2241,7 @@ class TestDangerZoneSave:
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
             synth_first_pipeline=False,
+            api_auth_required=False,  # dev-open; secure default is True
         )
         for c in _client(no_key):
             assert c.app.state.secret_box is None  # precondition: no key
@@ -2225,6 +2280,7 @@ class TestDangerZoneTest:
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
             synth_first_pipeline=False,
+            api_auth_required=False,  # dev-open; secure default is True
         )
 
     def test_es_probe_passthrough(self, settings: Settings) -> None:

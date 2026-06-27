@@ -172,6 +172,19 @@ def test_parse_garbage_rejected() -> None:
         parse_oql("this is not valid syntax")
 
 
+def test_parse_recursion_error_becomes_oql_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A RecursionError from the parser (deeply-nested input) must surface as a
+    clean OqlValidationError (400), never an unhandled RecursionError (500)."""
+    from soc_ai.so_client import oql
+
+    def _boom(_text: str) -> None:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(oql._PARSER, "parse", _boom)
+    with pytest.raises(OqlValidationError):
+        parse_oql("a:b")
+
+
 def test_parse_unknown_pipe_stage_rejected() -> None:
     with pytest.raises(OqlValidationError, match="unknown pipe stage"):
         parse_oql("* | take 10")

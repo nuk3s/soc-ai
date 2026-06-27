@@ -55,6 +55,8 @@ class AutoTriageStatus:
     current: str | None = None
     # cumulative tool calls fired across the run so far
     tool_calls: int = 0
+    # set by the stop endpoint; the worker checks it between targets and aborts.
+    cancelled: bool = False
     # internal: keep a reference to the running task to prevent GC
     _task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
     # all rule names (or alert ids) still queued in this run (current + remaining)
@@ -77,7 +79,22 @@ class AutoTriageStatus:
         self.severities = severities
         self.current = None
         self.tool_calls = 0
+        self.cancelled = False
         self.pending_rules = set()
+
+
+def request_stop(state: Any) -> bool:
+    """Signal an in-flight auto-triage run to stop after the current target.
+
+    Returns True if a run was active (so the caller can report it). The worker
+    loop checks ``status.cancelled`` between targets; the task reference is left
+    to finish its current investigation cleanly rather than hard-cancelled.
+    """
+    status = get_status(state)
+    if not status.active:
+        return False
+    status.cancelled = True
+    return True
 
 
 def get_status(state: Any) -> AutoTriageStatus:
@@ -267,6 +284,9 @@ async def run_auto_triage(
         ctx = ctx_from_state(state)
 
         for i, target in enumerate(targets):
+            if status.cancelled:  # stop requested — abort before the next target
+                _LOGGER.info("auto-triage: stop requested, aborting after %d targets", i)
+                break
             label = target.rule_name if target.rule_name else target.alert_es_id
             status.current = label
             status.pending_rules = {

@@ -68,11 +68,18 @@ class Settings(BaseSettings):
     # simultaneous ES queries on a contended cluster). 60s gives a typical
     # grid headroom; lower for fast production clusters, raise for
     # shared/contended ones.
-    es_request_timeout_s: int = 60
+    es_request_timeout_s: int = 30
     # Transport-layer retries for transient ConnectionTimeout / 5xx from
     # ES under heavy concurrency. The elasticsearch-py client retries
-    # internally, so we don't need to wrap call sites by hand.
-    es_max_retries: int = 3
+    # internally, so we don't need to wrap call sites by hand. Bounded so a
+    # fully-unreachable grid can't stall a call for request_timeout × (1+retries):
+    # 30s × 3 = 90s worst case (was 60 × 4 = 240s).
+    es_max_retries: int = 2
+    # Hard wall-clock bound for INTERACTIVE console grid queries (alerts list +
+    # group events). Below the worst-case ES retry budget so the UI fails fast
+    # with a clean "grid unavailable" error instead of hanging while the client
+    # retries a down/slow Elasticsearch. Background hunts are not bounded by this.
+    webui_grid_timeout_s: int = 12
 
     # --- LiteLLM gateway -----------------------------------------------
     litellm_base_url: AnyHttpUrl
@@ -149,13 +156,24 @@ class Settings(BaseSettings):
     ]
 
     # --- Index patterns ------------------------------------------------
-    # Wildcard pattern that matches the SO events indices/aliases. The default
-    # `*:so-*` covers cross-cluster setups; tighten on single-node grids if you
-    # have many unrelated indices.
-    events_index_pattern: str = "*:so-*"
-    cases_index_pattern: str = "*:so-case-*"
-    detections_index_pattern: str = "*:so-detection-*"
-    playbooks_index_pattern: str = "*:so-playbook-*"
+    # Patterns that match the SO indices. On Security Onion 3.0 the Suricata/Zeek
+    # event + alert data lives in Elasticsearch DATA STREAMS named `logs-*` (e.g.
+    # `.ds-logs-suricata.alerts-so-*`), while cases/detections/playbooks use the
+    # older `so-*` indices. The defaults below target a SINGLE-NODE grid.
+    #
+    # MULTI-NODE / distributed grids reach the data through cross-cluster search,
+    # so prefix every pattern with the remote-cluster wildcard, e.g.
+    # `*:logs-*`, `*:so-case*`. `setup.sh` AUTO-DETECTS the right prefix (it
+    # probes the grid during the ES check) and writes the concrete values to
+    # `.env`, so the guided install gets this right on either shape.
+    #
+    # NOTE: the legacy `*:so-*` default matched the old `so-*` indices, NOT the
+    # `logs-*` data streams where alerts live — it left the console empty on a
+    # healthy grid. Do not reintroduce it.
+    events_index_pattern: str = "logs-*"
+    cases_index_pattern: str = "so-case*"
+    detections_index_pattern: str = "so-detection*"
+    playbooks_index_pattern: str = "so-playbook*"
 
     # --- Internal-identifier discovery ---------------------------------
     # Auto-discovery of internal domain suffixes + bare internal hostnames from
@@ -201,7 +219,10 @@ class Settings(BaseSettings):
 
     # --- Web UI / local store -------------------------------------------
     soc_ai_data_dir: Path = Path("data")
-    api_auth_required: bool = False
+    # Secure default: require a login/token for the API. The admin console and
+    # the userscript both authenticate; only flip this off for an isolated,
+    # trusted-network demo where you understand the exposure.
+    api_auth_required: bool = True
     # Cross-origin origins allowed to call the API (the Tampermonkey userscript
     # runs in the SO web UI's origin). CSV; empty = scope to so_host; "*" = allow
     # all (NOT recommended for a public deployment). The React /app is
@@ -214,6 +235,23 @@ class Settings(BaseSettings):
     # a reverse-proxy hostname or an extra UI host. (Distinct from CORS: CORS
     # governs cross-origin *browser fetches*; this governs CSRF Origin checks.)
     csrf_trusted_origins: str = ""
+    # Expose the interactive API docs (/docs, /redoc) and the raw schema
+    # (/openapi.json). Off by default — a security product shouldn't publish its
+    # full admin API surface unauthenticated. Turn on for local development.
+    expose_api_docs: bool = False
+    # Content-Security-Policy sent on every response. The default is safe for the
+    # bundled Vite SPA (self-hosted scripts; Tailwind needs inline styles). Set to
+    # an empty string to disable, or override for a custom deployment.
+    content_security_policy: str = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    )
+    # Coarse per-client-IP request ceiling (fixed 60s window) as flood/DoS
+    # backpressure. Generous by default so normal UI polling never trips it; set
+    # 0 to disable (e.g. when a reverse proxy already rate-limits). /healthz is
+    # always exempt so container health checks keep working under load.
+    api_rate_limit_per_min: int = 1200
     session_ttl_hours: int = 12
     bootstrap_admin_password: SecretStr | None = None
     config_secret_key: SecretStr | None = None
@@ -334,6 +372,12 @@ class Settings(BaseSettings):
     fast_path_enrichment_timeout_s: float = 30.0
 
     # --- Synth-first pipeline ------------------------------------------
+    fast_triage_enabled: bool = True
+    """Allow the fast path: finalize a confident first-pass verdict without the
+    full tool-driven investigation loop. Saves time but can yield shallower
+    results (a verdict may land with few or no tool calls). Turn OFF to always
+    investigate with tools. Exposed in the admin config console."""
+
     synth_first_pipeline: bool = True
     """Route alerts through the synth-first A→B→C→D pipeline (default).
 

@@ -2,6 +2,7 @@ import { ChevronsLeft, Crosshair, Search, Settings, Triangle, Zap } from 'lucide
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { signOut } from '../lib/api';
 import { useShell } from './ShellContext';
 
 interface Command {
@@ -51,7 +52,17 @@ export function CommandPalette() {
       { group: 'View', label: 'My queue', icon: <Triangle size={15} />, run: go('/alerts?view=myqueue') },
       { group: 'View', label: 'Critical alerts', icon: <Triangle size={15} />, run: go('/alerts?view=critical') },
       { group: 'View', label: 'Needs decision', icon: <Triangle size={15} />, run: go('/alerts?view=decision') },
-      { group: 'Account', label: 'Sign out', icon: <Triangle size={15} />, run: go('/login') },
+      {
+        group: 'Account',
+        label: 'Sign out',
+        icon: <Triangle size={15} />,
+        // Destroy the server session — not just a client-side route change
+        // (which would leave the session cookie alive). Shared with the sidebar.
+        run: () => {
+          closePalette();
+          void signOut(navigate);
+        },
+      },
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collapsed, navigate, closePalette, toggleNav, requestTriage]);

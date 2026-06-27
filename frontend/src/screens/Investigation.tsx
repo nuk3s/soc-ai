@@ -391,6 +391,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         {inv.oracle?.escalated && (
           <OracleBadge oracle={inv.oracle} />
         )}
+        {inv.status === 'complete' && inv.meta?.toolCalls === 0 && <HeuristicBadge />}
         <div className="flex-1" />
         <div className="flex items-center gap-[9px]">
           <ConfidenceRing conf={inv.conf} color={v.color} />
@@ -1035,6 +1036,20 @@ function HostContextPanel({ host, signals }: { host: string; signals: HostSignal
 // ── Oracle adjudication components ───────────────────────────────────────────
 
 /** Compact pill shown in the verdict header row when Oracle was consulted. */
+/** Muted chip flagging a verdict reached from prefetched context, no tool calls. */
+function HeuristicBadge() {
+  return (
+    <span
+      title="This verdict was reached from prefetched context without running investigation tools — it may be shallower. Disable 'Fast triage' in Config to always investigate."
+      className="flex cursor-help items-center gap-1.5 rounded-badge border border-border-input px-2 py-[3px] text-[11.5px] font-semibold text-faint"
+      style={{ background: 'rgba(148,163,184,.07)' }}
+    >
+      <Wrench size={11} />
+      heuristic · no tools
+    </span>
+  );
+}
+
 function OracleBadge({ oracle }: { oracle: OracleAdjudication }) {
   const overrode = oracle.changed;
   const hasVerdict = !!oracle.oracleVerdict;

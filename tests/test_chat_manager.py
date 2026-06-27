@@ -427,3 +427,61 @@ def test_run_turn_timeout_error_passthrough() -> None:
     content = finish_mock.call_args.kwargs.get("content", "")
     assert "ran out of time" in content
     assert "42" in content
+
+
+def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
+    """F1: a zero-tool answer that cites tools it never ran ("verified by the
+    tools", t_enrich_ip(...)) is force-caveated and marked ungrounded, never
+    presented to the analyst as verified evidence."""
+    from soc_ai.agent.narrative_grounding import UNVERIFIED_CAVEAT
+
+    captured: dict[str, Any] = {}
+
+    async def _finish(_db: Any, _msg_id: int, *, content: str, status: str, meta: Any) -> None:
+        captured["content"] = content
+        captured["meta"] = meta
+
+    inv = MagicMock()
+    inv.id = "inv-fab"
+    inv.alert_es_id = "es-fab"
+    inv.rule_name = "ET TEST"
+    inv.src_ip = "10.0.0.1"
+    inv.dest_ip = "10.0.0.2"
+    inv.verdict = "false_positive"
+    inv.confidence = 0.9
+    inv.rationale = "benign"
+    inv.summary = ""
+
+    db = AsyncMock()
+    db_cm = MagicMock()
+    db_cm.__aenter__ = AsyncMock(return_value=db)
+    db_cm.__aexit__ = AsyncMock(return_value=False)
+    settings = MagicMock()
+    settings.analyst_model = "test-model"
+    settings.chat_turn_timeout_s = 180
+    state = MagicMock()
+    state.settings = settings
+    state.db_sessionmaker = MagicMock(return_value=db_cm)
+
+    result = MagicMock()
+    result.output = "This is benign. Verified by the tools listed, t_enrich_ip(10.0.0.1) found nothing."
+
+    with (
+        patch("soc_ai.webui.chat_manager.inv_svc.get_with_events", AsyncMock(return_value=(inv, []))),
+        patch("soc_ai.webui.chat_manager.chat_svc.history_for_agent", AsyncMock(return_value=[("user", "why fp?")])),
+        patch("soc_ai.webui.chat_manager.get_alert_context", AsyncMock(return_value=MagicMock())),
+        patch("soc_ai.webui.chat_manager.check_narrative_grounding", return_value=MagicMock(grounded=True)),
+        patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
+        patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock(side_effect=_finish)),
+        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_manager._extract_tools", return_value=[]),
+        patch("soc_ai.webui.chat_manager._extract_tool_evidence", return_value=[]),
+    ):
+        agent_mock = MagicMock()
+        agent_mock.run = AsyncMock(return_value=result)
+        mock_build.return_value = agent_mock
+        asyncio.run(_run_turn(state, "inv-fab", 7))
+
+    assert captured["meta"]["tools"] == []
+    assert captured["meta"]["narrative_grounding"]["grounded"] is False
+    assert UNVERIFIED_CAVEAT in captured["content"]

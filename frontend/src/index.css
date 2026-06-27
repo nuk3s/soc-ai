@@ -50,6 +50,17 @@
     outline: 2px solid #4b8bf5;
     outline-offset: 1px;
   }
+  /* Honor reduced-motion: neutralize the app's looping/infinite animations */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }
 
 @layer components {

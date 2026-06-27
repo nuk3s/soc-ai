@@ -51,7 +51,16 @@ More detail in [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md).
 
 ## Quickstart
 
-You'll need a Linux host with `git` and `curl`, network reach to your SO grid, and a LiteLLM gateway serving at least one model. `setup.sh` handles Docker for you. **First-time installers: skim [the Security Onion account + firewall prerequisites](docs/SECURITY-ONION-SETUP.md) first** — pinholing soc-ai's IP through SO's firewall and the audit-log role grant are the two things that reliably bite.
+You'll need a Linux host with `git` and `curl`, network reach to your SO grid, and a LiteLLM gateway serving at least one model. `setup.sh` handles Docker for you — including the automatic install on RHEL / Rocky / Alma 10. **First-time installers: skim [the Security Onion account + firewall prerequisites](docs/SECURITY-ONION-SETUP.md) first** — pinholing soc-ai's IP through SO's firewall and the audit-log role grant are the two things that reliably bite.
+
+`git` and `curl` aren't preinstalled on minimal images, so add them first:
+
+```bash
+# RHEL / Rocky / Alma / Fedora
+sudo dnf install -y git curl
+# Debian / Ubuntu
+sudo apt install -y git curl
+```
 
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai

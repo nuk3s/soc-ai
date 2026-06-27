@@ -81,6 +81,7 @@ def _settings() -> Settings:
         internal_cidrs=["10.0.0.0/8", "192.168.0.0/16"],
         discovery_min_hosts=3,
         discovery_lookback_days=7,
+        api_auth_required=False,  # dev-open; secure default is True
     )
 
 

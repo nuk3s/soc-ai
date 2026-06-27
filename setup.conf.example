@@ -24,7 +24,10 @@ LITELLM_VERIFY_SSL=true                # false if the gateway uses a self-signed
 
 # ── Grid-specific tuning (defaults fit most single-node grids) ────────────────
 WEBUI_ALERTS_QUERY=tags:alert          # Elastic-Agent grids often: event.dataset:suricata.alert
-EVENTS_INDEX_PATTERN=*:so-*            # single-node grids often: logs-*
+# Events live in SO 3.0 `logs-*` data streams. setup.sh auto-detects the cluster
+# prefix during its ES check and writes the concrete value; leave blank to accept
+# that. Single-node = logs-* ; multi-node / distributed = *:logs-* .
+EVENTS_INDEX_PATTERN=logs-*            # multi-node / distributed grids: *:logs-*
 API_AUTH_REQUIRED=true                 # require login/token for the API (recommended)
 
 # ── Secrets (leave blank to auto-generate; fill in to pin a value) ────────────

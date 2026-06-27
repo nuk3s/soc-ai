@@ -34,6 +34,9 @@ type SortDir = 'asc' | 'desc';
 // checkbox  count  DETECTION      sev   verdict  conf  owner  latest  actions
 const GRID = '28px 48px minmax(180px,1fr) 110px 132px 56px 40px 76px 88px';
 
+// Page size for an expanded group's events ("Load more" pulls one page at a time).
+const EVENTS_PAGE_SIZE = 50;
+
 const SEV_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 const VERDICT_RANK: Record<string, number> = { true_positive: 4, false_positive: 3, needs_more_info: 2, untriaged: 1 };
 
@@ -118,6 +121,10 @@ export function Alerts() {
   // Events live behind a lazy fetch — pulled the first time a group is expanded.
   const [groupEvents, setGroupEvents] = useState<Record<string, AlertEvent[]>>({});
   const [eventsLoading, setEventsLoading] = useState<Record<string, boolean>>({});
+  // Per-group "Load more" state: whether another page likely exists, and whether
+  // a follow-up page is currently fetching.
+  const [eventsMore, setEventsMore] = useState<Record<string, boolean>>({});
+  const [eventsLoadingMore, setEventsLoadingMore] = useState<Record<string, boolean>>({});
   const [starting, setStarting] = useState<AlertGroup | null>(null);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [selEvents, setSelEvents] = useState<Record<string, boolean>>({});
@@ -236,6 +243,8 @@ export function Alerts() {
     setExpanded({});
     setGroupEvents({});
     setEventsLoading({});
+    setEventsMore({});
+    setEventsLoadingMore({});
   }, [filterTime, customRange?.from, customRange?.to]);
 
   const setView = (v: ViewId) => {
@@ -288,14 +297,33 @@ export function Alerts() {
   const toggleExpand = (g: AlertGroup) => {
     const opening = !expanded[g.id];
     setExpanded((s) => ({ ...s, [g.id]: !s[g.id] }));
-    // Fetch this group's events the first time it's opened.
+    // Fetch this group's first page of events the first time it's opened.
     if (opening && groupEvents[g.id] === undefined && !eventsLoading[g.id]) {
       setEventsLoading((s) => ({ ...s, [g.id]: true }));
-      getAlertGroupEvents(g, alertQuery)
-        .then((evs) => setGroupEvents((s) => ({ ...s, [g.id]: evs })))
+      getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset: 0 })
+        .then((evs) => {
+          setGroupEvents((s) => ({ ...s, [g.id]: evs }));
+          // A full page implies there may be more — show "Load more".
+          setEventsMore((s) => ({ ...s, [g.id]: evs.length >= EVENTS_PAGE_SIZE }));
+        })
         .catch(() => setGroupEvents((s) => ({ ...s, [g.id]: [] })))
         .finally(() => setEventsLoading((s) => ({ ...s, [g.id]: false })));
     }
+  };
+
+  // Fetch the next page of a group's events and append it. Hides "Load more"
+  // once a returned page is short (no further pages).
+  const loadMoreEvents = (g: AlertGroup) => {
+    if (eventsLoadingMore[g.id]) return;
+    const offset = groupEvents[g.id]?.length ?? 0;
+    setEventsLoadingMore((s) => ({ ...s, [g.id]: true }));
+    getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset })
+      .then((evs) => {
+        setGroupEvents((s) => ({ ...s, [g.id]: [...(s[g.id] ?? []), ...evs] }));
+        setEventsMore((s) => ({ ...s, [g.id]: evs.length >= EVENTS_PAGE_SIZE }));
+      })
+      .catch(() => setEventsMore((s) => ({ ...s, [g.id]: false })))
+      .finally(() => setEventsLoadingMore((s) => ({ ...s, [g.id]: false })));
   };
 
   const ownerOf = (g: AlertGroup) => g.owner ?? '';
@@ -957,6 +985,22 @@ export function Alerts() {
                       </div>
                     </div>
                   ))}
+                  {!eventsLoading[g.id] && eventsMore[g.id] && (
+                    <div className="py-1.5 pl-[36px] pr-3.5">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          loadMoreEvents(g);
+                        }}
+                        disabled={eventsLoadingMore[g.id]}
+                        className="inline-flex items-center gap-1.5 rounded-badge border border-border-input px-[9px] py-[3px] font-mono text-[11px] font-semibold text-dim hover:text-text disabled:opacity-60"
+                        style={{ background: 'rgba(148,163,184,.06)' }}
+                      >
+                        {eventsLoadingMore[g.id] ? <Spinner size={11} /> : <ChevronRight size={12} className="rotate-90" />}
+                        {eventsLoadingMore[g.id] ? 'Loading…' : 'Load more'}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

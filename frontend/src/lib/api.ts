@@ -15,9 +15,6 @@ import type {
   Config,
   ConnTestResult,
   DangerSetting,
-  HuntDetail,
-  HuntRow,
-  HuntStat,
   Investigation,
   InvestigationRow,
   Me,
@@ -107,12 +104,20 @@ export function getAlerts(query: AlertQuery = {}): Promise<AlertGroup[]> {
   return request<AlertGroup[]>('/alerts' + (qs ? `?${qs}` : ''));
 }
 
-/** Lazy-load the events inside one detection group (fetched on row expand). */
+/**
+ * Lazy-load the events inside one detection group (fetched on row expand).
+ * `page` carries `size`/`offset` for "Load more" pagination; omit it for the
+ * first page (the backend applies its default page size).
+ */
 export function getAlertGroupEvents(
   group: Pick<AlertGroup, 'name' | 'kind'>,
   query: AlertQuery = {},
+  page?: { size?: number; offset?: number },
 ): Promise<AlertEvent[]> {
-  const qs = alertQueryParams(query, { rule_name: group.name, kind: group.kind });
+  const base: Record<string, string> = { rule_name: group.name, kind: group.kind };
+  if (page?.size != null) base.size = String(page.size);
+  if (page?.offset != null) base.offset = String(page.offset);
+  const qs = alertQueryParams(query, base);
   return request<AlertEvent[]>(`/alerts/events?${qs}`);
 }
 
@@ -142,423 +147,13 @@ export function getInvestigation(idOrGroupId: string): Promise<Investigation> {
   return request<Investigation>(`/investigations/${encodeURIComponent(idOrGroupId)}`);
 }
 
-export function getHunts(): Promise<HuntRow[]> {
-  return request<HuntRow[]>('/hunts');
-}
-
-export function getHuntStats(): Promise<HuntStat[]> {
-  return request<HuntStat[]>('/hunts/stats');
-}
-
 // ---------------------------------------------------------------------------
-// Mock HuntDetail rows — one entry per MOCK_HUNTS id from Hunts.tsx.
-// The hunting-agent backend doesn't exist yet; this lets HuntDetail render
-// its preview content behind an in-development banner instead of erroring.
+// Hunting agent — no backend yet. The Hunts list and HuntDetail screens render
+// an honest "coming soon" empty state, so there are no hunt data-access
+// functions here (the prior versions resolved fabricated mock data). When the
+// hunting agent ships, add getHunts()/getHuntStats()/getHuntDetail() that call
+// the real /hunts endpoints.
 // ---------------------------------------------------------------------------
-const MOCK_HUNT_DETAILS: Record<string, HuntDetail> = {
-  'h-zerologon': {
-    hunt: {
-      id: 'h-zerologon',
-      name: 'Zerologon DCE/RPC pattern',
-      type: 'scheduled',
-      query:
-        'event.dataset:zeek.dce_rpc AND zeek.dce_rpc.operation:(NetrServerAuthenticate3 OR NetrServerReqChallenge) | groupby source.ip | sortby count',
-      schedule: 'every 4h',
-      last: '2h ago',
-      findings: 2,
-      maxSev: 'critical',
-      status: 'active',
-      host: '192.0.2.1',
-    },
-    nodes: [
-      { id: 'n1', x: 20, y: 50, kind: 'host', label: '192.0.2.1' },
-      { id: 'n2', x: 70, y: 50, kind: 'dc', label: 'DC-01' },
-    ],
-    edges: [{ from: 'n1', to: 'n2', kind: 'lateral', label: 'NetrServerAuthenticate3' }],
-    riskScore: 88,
-    riskLabel: 'Critical Risk',
-    riskDesc: 'Zerologon exploit attempt pattern detected against domain controller.',
-    hostSignals: [
-      { time: '02:14', label: 'NetrServerAuthenticate3 burst', tone: 'critical', w: 95, sev: 'CRIT' },
-      { time: '02:12', label: 'NetrServerReqChallenge × 31', tone: 'high', w: 78, sev: 'HIGH' },
-    ],
-    patterns: [
-      { tone: '#f04438', label: 'Auth brute', detail: '31 ops / 2 min' },
-    ],
-    sequence: [
-      { tone: '#f04438', name: 'ReqChallenge', time: '02:12' },
-      { tone: '#f04438', name: 'Authenticate3 burst', time: '02:14' },
-    ],
-    findings: [
-      { tone: 'critical', title: 'Zerologon exploit pattern — NetrServerAuthenticate3 × 31 in 2 min', host: '192.0.2.1', when: '2h ago' },
-      { tone: 'high', title: 'DC-01 auth error spike co-incident with DCE/RPC burst', host: '192.0.2.1', when: '2h ago' },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // DCSync / DRSCrackNames — T1003.006: OS Credential Dumping via Directory Replication
-  // A non-DC host issuing drsuapi RPC calls is a near-certain credential harvest.
-  // ---------------------------------------------------------------------------
-  'h-dcsync': {
-    hunt: {
-      id: 'h-dcsync',
-      name: 'DCSync / DRSCrackNames activity',
-      type: 'scheduled',
-      query:
-        'event.dataset:zeek.dce_rpc AND zeek.dce_rpc.endpoint:drsuapi AND zeek.dce_rpc.operation:(DRSCrackNames OR DRSGetNCChanges) | groupby source.ip',
-      schedule: 'every 4h',
-      last: '2h ago',
-      findings: 1,
-      maxSev: 'high',
-      status: 'active',
-      host: '192.0.2.10',
-    },
-    nodes: [
-      { id: 'n1', x: 15, y: 50, kind: 'compromised', label: '192.0.2.10' },
-      { id: 'n2', x: 60, y: 50, kind: 'dc', label: 'DC-01' },
-      { id: 'n3', x: 85, y: 28, kind: 'dc', label: 'DC-02' },
-    ],
-    edges: [
-      { from: 'n1', to: 'n2', kind: 'lateral', label: 'DRSGetNCChanges' },
-      { from: 'n1', to: 'n3', kind: 'lateral', label: 'DRSCrackNames' },
-    ],
-    riskScore: 82,
-    riskLabel: 'High Risk',
-    riskDesc: 'Non-DC workstation issuing drsuapi replication calls — consistent with DCSync credential dumping (T1003.006).',
-    hostSignals: [
-      { time: '14:07', label: 'DRSGetNCChanges from workstation', tone: 'high', w: 88, sev: 'HIGH' },
-      { time: '14:06', label: 'DRSCrackNames — username resolution', tone: 'high', w: 74, sev: 'HIGH' },
-      { time: '14:05', label: 'drsuapi bind from non-DC source', tone: 'medium', w: 55, sev: 'MED' },
-    ],
-    patterns: [
-      { tone: '#f5a623', label: 'Replication abuse', detail: 'DRSGetNCChanges × 4' },
-      { tone: '#f04438', label: 'Cred harvest', detail: 'NTDS dump likely' },
-    ],
-    sequence: [
-      { tone: '#f5a623', name: 'drsuapi bind', time: '14:05' },
-      { tone: '#f5a623', name: 'DRSCrackNames', time: '14:06' },
-      { tone: '#f04438', name: 'DRSGetNCChanges', time: '14:07' },
-    ],
-    findings: [
-      { tone: 'high', title: 'DCSync pattern — DRSGetNCChanges from non-DC host 192.0.2.10 to DC-01 and DC-02', host: '192.0.2.10', when: '2h ago' },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // AD Enumeration — SAMR/LSAR  (T1087.002: Account Discovery – Domain Account)
-  // High volume of SamrEnumerateUsersInDomain / LsarEnumerateAccounts signals
-  // automated recon tooling (BloodHound, SharpHound, Net-based enum).
-  // ---------------------------------------------------------------------------
-  'h-ad-enum': {
-    hunt: {
-      id: 'h-ad-enum',
-      name: 'AD enumeration — SAMR/LSAR',
-      type: 'scheduled',
-      query:
-        'event.dataset:zeek.dce_rpc AND zeek.dce_rpc.endpoint:(samr OR lsarpc) AND zeek.dce_rpc.operation:(SamrEnumerateUsersInDomain OR LsarEnumerateAccounts) | groupby source.ip',
-      schedule: 'every 6h',
-      last: '4h ago',
-      findings: 7,
-      maxSev: 'high',
-      status: 'active',
-      host: '192.0.2.88',
-    },
-    nodes: [
-      { id: 'n1', x: 12, y: 50, kind: 'compromised', label: '192.0.2.88' },
-      { id: 'n2', x: 48, y: 30, kind: 'dc', label: 'DC-01' },
-      { id: 'n3', x: 48, y: 70, kind: 'host', label: 'FS-01' },
-      { id: 'n4', x: 80, y: 50, kind: 'host', label: 'WKS-14' },
-    ],
-    edges: [
-      { from: 'n1', to: 'n2', kind: 'lateral', label: 'SamrEnumerateUsersInDomain' },
-      { from: 'n1', to: 'n3', kind: 'flow', label: 'LsarEnumerateAccounts' },
-      { from: 'n1', to: 'n4', kind: 'flow', label: 'samr bind' },
-    ],
-    riskScore: 71,
-    riskLabel: 'High Risk',
-    riskDesc: 'Automated SAMR/LSAR enumeration from a single source to 3 hosts — characteristic of BloodHound / SharpHound collector run.',
-    hostSignals: [
-      { time: '09:32', label: 'SamrEnumerateUsersInDomain × 148', tone: 'high', w: 92, sev: 'HIGH' },
-      { time: '09:31', label: 'LsarEnumerateAccounts × 67', tone: 'high', w: 76, sev: 'HIGH' },
-      { time: '09:30', label: 'samr / lsarpc bind burst', tone: 'medium', w: 58, sev: 'MED' },
-      { time: '09:29', label: 'Reverse DNS lookups × 200+', tone: 'medium', w: 44, sev: 'MED' },
-    ],
-    patterns: [
-      { tone: '#f5a623', label: 'Domain recon', detail: '148 SAMR ops' },
-      { tone: '#f5a623', label: 'ACL crawl', detail: 'LSAR × 67' },
-      { tone: '#4b8bf5', label: 'Multi-host sweep', detail: '3 targets · 3 min' },
-    ],
-    sequence: [
-      { tone: '#4b8bf5', name: 'RPC bind burst', time: '09:29' },
-      { tone: '#f5a623', name: 'LSAR enum', time: '09:31' },
-      { tone: '#f5a623', name: 'SAMR user enum', time: '09:32' },
-    ],
-    findings: [
-      { tone: 'high', title: 'BloodHound-like SAMR sweep — 148 SamrEnumerateUsersInDomain calls from 192.0.2.88 in 3 min', host: '192.0.2.88', when: '4h ago' },
-      { tone: 'high', title: 'LsarEnumerateAccounts × 67 — privilege and group reconnaissance against DC-01', host: '192.0.2.88', when: '4h ago' },
-      { tone: 'medium', title: 'SAMR bind to file-server FS-01 from non-admin workstation', host: '192.0.2.88', when: '4h ago' },
-      { tone: 'medium', title: 'SAMR bind to WKS-14 — lateral recon target', host: '192.0.2.88', when: '4h ago' },
-      { tone: 'medium', title: 'Bulk reverse-DNS lookups co-timed with SAMR sweep (T1018)', host: '192.0.2.88', when: '4h ago' },
-      { tone: 'medium', title: 'samr / lsarpc RPC bind volume anomaly — 3× daily baseline', host: '192.0.2.88', when: '4h ago' },
-      { tone: 'low', title: 'RPC endpoint mapper query spike from single host prior to enumeration', host: '192.0.2.88', when: '4h ago' },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // Beaconing over zeek.conn — T1071.001: Application Layer Protocol / C2 beacon
-  // Coefficient-of-variation analysis on zeek.conn flows catches periodic C2
-  // sleep+jitter patterns invisible to signature detections.
-  // ---------------------------------------------------------------------------
-  'h-beacon': {
-    hunt: {
-      id: 'h-beacon',
-      name: 'Beaconing over zeek.conn (CV)',
-      type: 'scheduled',
-      query:
-        'event.dataset:zeek.conn | groupby source.ip,destination.ip | sortby count desc | head 500',
-      schedule: 'every 1h',
-      last: 'running',
-      findings: 5,
-      maxSev: 'medium',
-      status: 'running',
-      host: '192.0.2.15',
-    },
-    nodes: [
-      { id: 'n1', x: 18, y: 50, kind: 'compromised', label: '192.0.2.15' },
-      { id: 'n2', x: 75, y: 50, kind: 'c2', label: '198.51.100.42' },
-    ],
-    edges: [{ from: 'n1', to: 'n2', kind: 'beacon', label: 'HTTP/S · 60 s jitter' }],
-    riskScore: 65,
-    riskLabel: 'Medium Risk',
-    riskDesc: 'Low-CV periodic outbound HTTPS to external IP — consistent with a C2 beacon (Cobalt Strike / Sliver sleep jitter pattern).',
-    hostSignals: [
-      { time: '11:00', label: 'HTTPS beacon to 198.51.100.42 (JA3 match)', tone: 'medium', w: 82, sev: 'MED' },
-      { time: '10:59', label: 'Periodic conn interval CV < 0.05', tone: 'medium', w: 68, sev: 'MED' },
-      { time: '10:45', label: 'Staged HTTP GET — small payload pull', tone: 'medium', w: 52, sev: 'MED' },
-      { time: '10:30', label: 'DNS query for stage domain (NX→A transition)', tone: 'low', w: 35, sev: 'LOW' },
-    ],
-    patterns: [
-      { tone: '#f5a623', label: 'Periodic beacon', detail: 'CV 0.032 · 58 s avg' },
-      { tone: '#a472f0', label: 'JA3 fingerprint', detail: '72a589da586844d7f' },
-      { tone: '#4b8bf5', label: 'Small payload', detail: '280 B avg resp' },
-    ],
-    sequence: [
-      { tone: '#4b8bf5', name: 'DNS stage lookup', time: '10:30' },
-      { tone: '#4b8bf5', name: 'HTTP staged pull', time: '10:45' },
-      { tone: '#f5a623', name: 'Periodic HTTPS beacon', time: '11:00' },
-    ],
-    findings: [
-      { tone: 'medium', title: 'Low-CV beacon to 198.51.100.42 — 58 s interval, CV 0.032, JA3 fingerprint match (T1071.001)', host: '192.0.2.15', when: 'running' },
-      { tone: 'medium', title: 'JA3 fingerprint 72a589da586844d7f matches known Cobalt Strike default TLS profile', host: '192.0.2.15', when: 'running' },
-      { tone: 'medium', title: 'HTTP staged payload pull before beacon start — two-stage loader pattern', host: '192.0.2.15', when: 'running' },
-      { tone: 'medium', title: 'External IP 198.51.100.42 not in allow-list — no business justification', host: '192.0.2.15', when: 'running' },
-      { tone: 'low', title: 'DNS NX→A resolution transition for stage domain 30 min before beacon', host: '192.0.2.15', when: 'running' },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // DNS tunneling / DGA entropy — T1071.004: Application Layer Protocol / DNS
-  // High-entropy subdomains, NXDOMAIN bursts, and anomalous query volumes are
-  // hallmarks of DNS data exfiltration (iodine, dnscat2) or DGA malware.
-  // ---------------------------------------------------------------------------
-  'h-dns-dga': {
-    hunt: {
-      id: 'h-dns-dga',
-      name: 'DNS tunneling / DGA entropy',
-      type: 'scheduled',
-      query:
-        'event.dataset:zeek.dns AND dns.query.type_name:A | groupby dns.question.registered_domain | sortby count desc',
-      schedule: 'every 2h',
-      last: '1h ago',
-      findings: 4,
-      maxSev: 'medium',
-      status: 'active',
-      host: '192.0.2.22',
-    },
-    nodes: [
-      { id: 'n1', x: 15, y: 50, kind: 'compromised', label: '192.0.2.22' },
-      { id: 'n2', x: 55, y: 50, kind: 'host', label: 'DNS-Resolver' },
-      { id: 'n3', x: 85, y: 50, kind: 'c2', label: 'tunnel.exfil-ns.net' },
-    ],
-    edges: [
-      { from: 'n1', to: 'n2', kind: 'flow', label: 'high-entropy A queries' },
-      { from: 'n2', to: 'n3', kind: 'beacon', label: 'recursed upstream' },
-    ],
-    riskScore: 60,
-    riskLabel: 'Medium Risk',
-    riskDesc: 'High-entropy subdomain labels and anomalous NXDOMAIN rate from single host — consistent with DNS tunnel or DGA beacon (T1071.004).',
-    hostSignals: [
-      { time: '07:18', label: 'High-entropy labels — avg 22 char per subdomain', tone: 'medium', w: 80, sev: 'MED' },
-      { time: '07:16', label: 'NXDOMAIN rate 43 % — 3× resolver baseline', tone: 'medium', w: 68, sev: 'MED' },
-      { time: '07:15', label: 'DNS query volume 1 200 req / 5 min spike', tone: 'medium', w: 55, sev: 'MED' },
-      { time: '07:10', label: 'Long label detected: 63-char subdomain', tone: 'low', w: 38, sev: 'LOW' },
-    ],
-    patterns: [
-      { tone: '#f5a623', label: 'High entropy', detail: 'H > 3.8 bits / char' },
-      { tone: '#f5a623', label: 'NXDOMAIN burst', detail: '43 % rate' },
-      { tone: '#4b8bf5', label: 'Query volume', detail: '1 200 req / 5 min' },
-    ],
-    sequence: [
-      { tone: '#4b8bf5', name: 'Volume spike', time: '07:15' },
-      { tone: '#f5a623', name: 'NXDOMAIN burst', time: '07:16' },
-      { tone: '#f5a623', name: 'High-entropy labels', time: '07:18' },
-    ],
-    findings: [
-      { tone: 'medium', title: 'DNS tunnel pattern — 1 200 queries in 5 min with avg 22-char entropy-rich subdomains (T1071.004)', host: '192.0.2.22', when: '1h ago' },
-      { tone: 'medium', title: 'NXDOMAIN rate 43 % for domain tunnel.exfil-ns.net — consistent with DGA polling', host: '192.0.2.22', when: '1h ago' },
-      { tone: 'medium', title: '63-character subdomain label detected — exceeds RFC 1035 typical limit, suggests encoding', host: '192.0.2.22', when: '1h ago' },
-      { tone: 'low', title: 'DNS resolver 192.0.2.53 recursed all anomalous queries upstream — not cached', host: '192.0.2.22', when: '1h ago' },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // ATTACK::Discovery notices sweep — T1046/T1018/T1082 (Zeek ATTACK notice layer)
-  // Ad-hoc sweep of Zeek ATTACK::* notices to surface reconnaissance bursts.
-  // High finding count reflects a broad sweep over a 3-day window.
-  // ---------------------------------------------------------------------------
-  'h-adhoc-notice': {
-    hunt: {
-      id: 'h-adhoc-notice',
-      name: 'ATTACK::Discovery notices sweep',
-      type: 'ad-hoc',
-      query:
-        'event.dataset:zeek.notice AND zeek.notice.note:ATTACK::* | groupby zeek.notice.note,source.ip | sortby count',
-      schedule: 'on demand',
-      last: '3d ago',
-      findings: 11,
-      maxSev: 'high',
-      status: 'complete',
-      host: '192.0.2.88',
-    },
-    nodes: [
-      { id: 'n1', x: 12, y: 50, kind: 'compromised', label: '192.0.2.88' },
-      { id: 'n2', x: 40, y: 28, kind: 'dc', label: 'DC-01' },
-      { id: 'n3', x: 40, y: 72, kind: 'host', label: 'SRV-03' },
-      { id: 'n4', x: 68, y: 50, kind: 'host', label: 'WKS-07' },
-      { id: 'n5', x: 88, y: 36, kind: 'host', label: 'WKS-11' },
-    ],
-    edges: [
-      { from: 'n1', to: 'n2', kind: 'lateral', label: 'ATTACK::Discovery' },
-      { from: 'n1', to: 'n3', kind: 'flow', label: 'ATTACK::Lateral' },
-      { from: 'n1', to: 'n4', kind: 'flow', label: 'PortScan' },
-      { from: 'n4', to: 'n5', kind: 'lateral', label: 'ATTACK::Execution' },
-    ],
-    riskScore: 76,
-    riskLabel: 'High Risk',
-    riskDesc: '11 Zeek ATTACK::* notice types from a single source across 4 hosts over 72 h — multi-stage reconnaissance and lateral movement campaign indicators.',
-    hostSignals: [
-      { time: '3d ago', label: 'ATTACK::Discovery × 342 notices', tone: 'high', w: 90, sev: 'HIGH' },
-      { time: '3d ago', label: 'ATTACK::LateralMovement × 18', tone: 'high', w: 74, sev: 'HIGH' },
-      { time: '3d ago', label: 'ATTACK::Execution × 7', tone: 'high', w: 62, sev: 'HIGH' },
-      { time: '3d ago', label: 'PortScan against WKS-07 / SRV-03', tone: 'medium', w: 48, sev: 'MED' },
-    ],
-    patterns: [
-      { tone: '#f04438', label: 'Multi-tactic', detail: '11 ATTACK notice types' },
-      { tone: '#f5a623', label: 'Lateral spread', detail: '4 hosts · 72 h' },
-      { tone: '#4b8bf5', label: 'Recon volume', detail: '342 Discovery notices' },
-    ],
-    sequence: [
-      { tone: '#4b8bf5', name: 'Discovery sweep', time: '3d ago' },
-      { tone: '#f5a623', name: 'Port scan', time: '3d ago' },
-      { tone: '#f04438', name: 'Lateral + Execution', time: '3d ago' },
-    ],
-    findings: [
-      { tone: 'high', title: 'ATTACK::Discovery — 342 notices from 192.0.2.88, 4 distinct destination hosts (T1046 / T1018)', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'high', title: 'ATTACK::LateralMovement × 18 — source host reached DC-01 and SRV-03', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'high', title: 'ATTACK::Execution × 7 on WKS-11 — preceded by lateral movement from WKS-07', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'high', title: 'PortScan notice to WKS-07 (T1046) — 1 022 ports in 45 s', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'medium', title: 'ATTACK::Collection notices × 5 after Execution phase — possible staging', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'medium', title: 'ATTACK::Persistence × 3 against DC-01 — scheduled task or service creation', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'medium', title: 'ATTACK::CredentialAccess × 2 on SRV-03 — co-timed with SAMR enum', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'medium', title: 'ATTACK::DefenseEvasion notice on WKS-07 — LOLBin invocation pattern', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'medium', title: 'ATTACK::CommandAndControl × 4 — periodic small flows to 203.0.113.77', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'low', title: 'ATTACK::Exfiltration notice × 1 — 22 MB upload spike at end of campaign window', host: '192.0.2.88', when: '3d ago' },
-      { tone: 'low', title: 'ATTACK::Impact × 1 — suspect shadow copy query on DC-01', host: '192.0.2.88', when: '3d ago' },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // Sigma rule candidate — Zerologon
-  // Ad-hoc hunt that produced a focused Sigma candidate rule. Complete status
-  // with 3 critical findings used to draft the detection logic.
-  // ---------------------------------------------------------------------------
-  'h-adhoc-sigma-draft': {
-    hunt: {
-      id: 'h-adhoc-sigma-draft',
-      name: 'Sigma rule candidate — Zerologon',
-      type: 'ad-hoc',
-      query: 'event.dataset:zeek.dce_rpc AND zeek.dce_rpc.operation:NetrServerAuthenticate3',
-      schedule: 'on demand',
-      last: '5d ago',
-      findings: 3,
-      maxSev: 'critical',
-      status: 'complete',
-      host: '192.0.2.1',
-    },
-    nodes: [
-      { id: 'n1', x: 20, y: 50, kind: 'host', label: '192.0.2.1' },
-      { id: 'n2', x: 65, y: 50, kind: 'dc', label: 'DC-01' },
-    ],
-    edges: [{ from: 'n1', to: 'n2', kind: 'lateral', label: 'NetrServerAuthenticate3' }],
-    riskScore: 91,
-    riskLabel: 'Critical Risk',
-    riskDesc: 'Three independent events matching the focused Sigma candidate — all originating from the same source, confirming the rule logic fires accurately on real data.',
-    hostSignals: [
-      { time: '5d ago', label: 'NetrServerAuthenticate3 (event 1 of 3)', tone: 'critical', w: 97, sev: 'CRIT' },
-      { time: '5d ago', label: 'NetrServerAuthenticate3 (event 2 of 3)', tone: 'critical', w: 94, sev: 'CRIT' },
-      { time: '5d ago', label: 'NetrServerAuthenticate3 (event 3 of 3)', tone: 'critical', w: 89, sev: 'CRIT' },
-    ],
-    patterns: [
-      { tone: '#f04438', label: 'Rule candidate fires', detail: '3 / 3 TP confirmed' },
-      { tone: '#a472f0', label: 'Sigma draft', detail: 'condition: all of them' },
-    ],
-    sequence: [
-      { tone: '#f04438', name: 'Event 1 — Auth3', time: '5d ago' },
-      { tone: '#f04438', name: 'Event 2 — Auth3', time: '5d ago' },
-      { tone: '#f04438', name: 'Event 3 — Auth3', time: '5d ago' },
-    ],
-    findings: [
-      { tone: 'critical', title: 'Sigma candidate confirmed TP #1 — NetrServerAuthenticate3 at null-byte machine-password (CVE-2020-1472)', host: '192.0.2.1', when: '5d ago' },
-      { tone: 'critical', title: 'Sigma candidate confirmed TP #2 — repeat pattern 4 min later, same source, different session ID', host: '192.0.2.1', when: '5d ago' },
-      { tone: 'critical', title: 'Sigma candidate confirmed TP #3 — DC auth error (STATUS_ACCESS_DENIED) follows each attempt', host: '192.0.2.1', when: '5d ago' },
-    ],
-  },
-};
-
-// Fall back to a generic mock for any id not explicitly listed above.
-function _genericHuntDetail(id: string): HuntDetail {
-  return {
-    hunt: {
-      id,
-      name: id,
-      type: 'scheduled',
-      query: 'event.dataset:zeek.conn | groupby source.ip | sortby count desc',
-      schedule: 'on demand',
-      last: '—',
-      findings: 0,
-      maxSev: 'low',
-      status: 'complete',
-      host: '—',
-    },
-    nodes: [],
-    edges: [],
-    riskScore: 0,
-    riskLabel: 'No data',
-    riskDesc: 'Mock preview — hunting agent not yet available.',
-    hostSignals: [],
-    patterns: [],
-    sequence: [],
-    findings: [],
-  };
-}
-
-export function getHuntDetail(id: string): Promise<HuntDetail> {
-  // No saved-hunt backend yet — hunting agent ships in a future increment.
-  // Resolve illustrative mock data so HuntDetail renders its preview behind
-  // an in-development banner instead of showing an error page.
-  const detail = MOCK_HUNT_DETAILS[id] ?? _genericHuntDetail(id);
-  return Promise.resolve(detail);
-}
 
 export function getConfig(): Promise<Config> {
   return request<Config>('/config');
@@ -900,10 +495,21 @@ export async function login(username: string, password: string): Promise<LoginRe
     throw new Error('Network error — is the soc-ai API reachable?');
   }
   if (res.status === 401) {
+    // Keep generic — don't leak whether the username exists.
     throw new Error('Invalid username or password');
   }
   if (!res.ok) {
-    throw new Error(`Login failed: ${res.status} ${res.statusText}`);
+    // Surface the server's helpful detail/hint (e.g. a 429 rate-limit message)
+    // rather than collapsing every non-401 failure into a credentials error.
+    let detail = `Login failed: ${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      const hint = body?.detail?.hint ?? (typeof body?.detail === 'string' ? body.detail : null);
+      if (hint) detail = hint;
+    } catch {
+      /* non-JSON error body — keep the status line */
+    }
+    throw new Error(detail);
   }
   return (await res.json()) as LoginResult;
 }
@@ -919,4 +525,13 @@ export async function logout(): Promise<void> {
   } catch {
     // Best-effort — if the request fails we still navigate to login.
   }
+}
+
+/**
+ * Sign out: destroy the server session, then route to /login.
+ * Shared by the sidebar and command palette so they can't drift — a bare
+ * client-side navigate would leave the session cookie alive (security bug).
+ */
+export function signOut(navigate: (to: string) => void): Promise<void> {
+  return logout().finally(() => navigate('/login'));
 }

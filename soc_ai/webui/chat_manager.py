@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from typing import Any
 
@@ -30,6 +31,14 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.get_alert_context import get_alert_context
 
 _LOGGER = logging.getLogger(__name__)
+
+# Tool-call-shaped citations the model sometimes fabricates on a zero-tool turn
+# ("verified by the tools", `t_enrich_ip(...)`). If meta.tools is empty and the
+# prose contains these, the answer is claiming evidence it never produced.
+_FABRICATED_TOOL_CITATION_RE = re.compile(
+    r"\bt_[a-z][a-z0-9_]*\s*\(|verified by the tool|evidence citations?\b",
+    re.IGNORECASE,
+)
 _STATE_ATTR = "_chat_manager"
 _MAX_HISTORY = 12  # prior turns embedded into the prompt
 
@@ -212,6 +221,20 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:
             }
         else:
             meta["narrative_grounding"] = {"grounded": True}
+
+        # F1: a zero-tool turn must never present tool-call citations it never
+        # made ("verified by the tools", `t_enrich_ip(...)`) — that is fabricated
+        # evidence to the analyst. Force the unverified caveat + ungrounded meta.
+        if not meta["tools"] and _FABRICATED_TOOL_CITATION_RE.search(answer):
+            _LOGGER.warning(
+                "chat: fabricated tool citations on a zero-tool turn for inv=%s", inv_id
+            )
+            if meta.get("narrative_grounding", {}).get("grounded", True):
+                answer = answer + UNVERIFIED_CAVEAT
+            meta["narrative_grounding"] = {
+                "grounded": False,
+                "reason": "fabricated tool citations on a zero-tool turn",
+            }
 
         if proposal_sink:
             # If the agent proposed more than once this turn, the last proposal

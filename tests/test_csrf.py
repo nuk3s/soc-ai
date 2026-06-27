@@ -182,3 +182,30 @@ def test_dev_mode_with_cookie_still_enforced(open_client: TestClient) -> None:
     )
     assert resp.status_code == 403
     assert resp.json()["detail"]["reason"] == "bad_origin"
+
+
+# ── legacy router gets the same CSRF guard ──────────────────────────────────
+
+
+def test_legacy_router_enforces_csrf(auth_client: TestClient) -> None:
+    """The prefix-less /approve route (routes.py) now enforces the CSRF Origin
+    guard too — a cookie-authenticated cross-origin POST is rejected 403."""
+    _login(auth_client)
+    resp = auth_client.post("/approve", json={}, headers={"Origin": CROSS_ORIGIN})
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "bad_origin"
+
+
+# ── per-IP login spray lockout ──────────────────────────────────────────────
+
+
+def test_login_per_ip_spray_lockout(auth_client: TestClient) -> None:
+    """20 failed logins across DISTINCT usernames from one IP trip the per-IP
+    throttle, even though no single (IP, username) reached the per-user limit —
+    then even a valid credential is refused with 429."""
+    for i in range(20):
+        r = auth_client.post("/api/v1/login", json={"username": f"u{i}", "password": "wrong"})
+        assert r.status_code == 401
+    r = auth_client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW})
+    assert r.status_code == 429
+    assert r.json()["detail"]["reason"] == "too_many_attempts"

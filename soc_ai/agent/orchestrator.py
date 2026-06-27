@@ -4271,19 +4271,27 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # investigate_when_unsure flag.
     ran_investigation_loop = False
     loop_messages: list[Any] | None = None
-    if ctx.settings.investigate_when_unsure and (
-        definitely_investigate
-        or (round1_ok and _should_investigate(triage_round1, enriched, candidate))
+    # fast_triage_enabled=False forces the tool-driven loop regardless of how
+    # confident round-1 was ("agent does agent things"): deeper but slower.
+    force_investigate = not ctx.settings.fast_triage_enabled
+    if force_investigate or (
+        ctx.settings.investigate_when_unsure
+        and (
+            definitely_investigate
+            or (round1_ok and _should_investigate(triage_round1, enriched, candidate))
+        )
     ):
         ran_investigation_loop = True
+        if definitely_investigate:
+            loop_reason = "definitely_investigate"
+        elif force_investigate:
+            loop_reason = "fast_triage_disabled"
+        else:
+            loop_reason = "verdict_not_evidence_backed"
         loop_ev = _ev(
             "investigation_loop_entered",
             {
-                "reason": (
-                    "definitely_investigate"
-                    if definitely_investigate
-                    else "verdict_not_evidence_backed"
-                ),
+                "reason": loop_reason,
                 "round1_verdict": None if definitely_investigate else triage_round1.verdict,
                 "round1_confidence": None if definitely_investigate else triage_round1.confidence,
             },

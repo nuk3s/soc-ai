@@ -288,6 +288,7 @@ async def fetch_group_events(
     severity: str | None = None,
     oql: str | None = None,
     size: int = EVENTS_PER_GROUP,
+    offset: int = 0,
     abs_from: str | None = None,
     abs_to: str | None = None,
     time_zone: str | None = None,
@@ -297,9 +298,13 @@ async def fetch_group_events(
     scope + the name field: notices filter ``notice.note`` within zeek.notice;
     everything else filters ``rule.name`` within the Suricata/Sigma sources.
 
+    ``offset`` pages past the first ``offset`` events (for the "load more" view);
+    ``size`` is the page size (capped at MAX_EVENTS).
+
     Pass ``hide_acked=True`` to exclude already-acknowledged/escalated events
     (used by the bulk-ack path so re-running a capped group makes progress)."""
     size = min(max(size, 1), MAX_EVENTS)
+    offset = max(offset, 0)
     if kind == "notice":
         dataset_oqls = [NOTICE_SOURCE_OQL]
         name_field = "notice.note"
@@ -324,6 +329,7 @@ async def fetch_group_events(
         settings.events_index_pattern,
         query,
         size=size,
+        from_=offset,
         sort=[{"@timestamp": {"order": "desc"}}],
     )
     events: list[AlertEvent] = []

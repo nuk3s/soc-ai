@@ -77,9 +77,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -addext "subjectAltName=DNS:soc-ai.local,IP:<your-host-ip>" \
   -keyout ./certs/key.pem \
   -out    ./certs/cert.pem
-# The container runs as uid 1000 and must be able to READ these (openssl writes
-# the key 0600 owned by you):
-chmod 644 ./certs/cert.pem ./certs/key.pem
+# The container runs as uid 1000 and must be able to READ these. Keep the cert
+# world-readable (0644) but the private key group-readable only (0640) so it
+# isn't world-readable:
+chmod 644 ./certs/cert.pem
+chmod 640 ./certs/key.pem
 ```
 
 The compose file bind-mounts `./certs/cert.pem` → `/etc/soc-ai/cert.pem` and
@@ -92,6 +94,24 @@ mount them elsewhere.
 > without it the container gets `Permission denied` even at mode 644. If you add
 > your own bind mounts on an SELinux host, append `,Z` to them too. On non-SELinux
 > hosts the suffix is a harmless no-op.
+
+#### Replacing the TLS cert
+
+To swap the self-signed pair for a cert from your internal CA / Let's Encrypt,
+drop the new files at the same mounted paths and restart the container — the cert
+and key are read **once at startup**, so a swap is invisible until you restart:
+
+```bash
+cp your-ca-cert.pem  ./certs/cert.pem   # the full chain (leaf + intermediates)
+cp your-ca-key.pem   ./certs/key.pem
+chmod 644 ./certs/cert.pem
+chmod 640 ./certs/key.pem
+docker compose restart soc-ai
+```
+
+Keep the filenames `cert.pem` / `key.pem` (the compose mounts and the
+`SOC_AI_TLS_CERT` / `SOC_AI_TLS_KEY` env vars point at those), or update both to
+match. On SELinux hosts the `,Z` relabel applies automatically on the next start.
 
 ---
 
@@ -119,8 +139,15 @@ curl -k https://localhost:8443/healthz
 ### 4. Open the web UI
 
 Browse to **`https://<host>:8443/app`** and log in with the bootstrap admin
-(username `admin`, the `BOOTSTRAP_ADMIN_PASSWORD` from your `.env`). First visit
-will prompt you to accept the self-signed cert.
+(username `admin`). If you set `BOOTSTRAP_ADMIN_PASSWORD` in `.env`, use that;
+otherwise it was auto-generated and printed once to the container log — recover
+it with:
+
+```bash
+docker compose logs soc-ai | grep -i password
+```
+
+First visit will prompt you to accept the self-signed cert.
 
 The image serves two surfaces on the same port (bare `/` redirects to `/app`):
 
@@ -288,6 +315,28 @@ Then open the new port on hosts with a firewall / SELinux:
 ```bash
 sudo firewall-cmd --add-port=9443/tcp --permanent && sudo firewall-cmd --reload
 ```
+
+### Docker publishes the port *past* firewalld
+
+Docker inserts its own iptables/nftables rules ahead of firewalld, so a published
+port (the default `"${SOC_AI_PORT}:8443"` mapping binds `0.0.0.0`) is reachable
+from any host that can route to this box **even if firewalld shows the port
+closed** — `firewall-cmd --list-ports` won't list it, and adding/removing a
+firewalld rule won't change reachability. To actually restrict who can hit the
+admin console, do it at the Docker layer:
+
+- **Bind a specific host IP** in `.env` so the port isn't published on every
+  interface — e.g. localhost-only behind a reverse proxy, or just your mgmt LAN:
+
+  ```ini
+  SOC_AI_PORT=127.0.0.1:8443    # host side; container still listens on :8443
+  ```
+
+  (Any `IP:PORT` form Docker's port mapping accepts works here.)
+- **Or** add a rule to the `DOCKER-USER` iptables chain (which Docker evaluates
+  before its own publish rules) to filter source addresses.
+
+Auditing only the host firewall will wrongly suggest the console is closed.
 
 ### Hostname upstreams don't resolve inside the bridge network
 

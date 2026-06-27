@@ -39,7 +39,7 @@ from soc_ai.api.schemas import (
     InvestigateRequest,
     SessionInfoResponse,
 )
-from soc_ai.api.security import identify_caller, require_api_auth
+from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
 from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
 from soc_ai.so_client.auth import SoAuthClient
@@ -62,7 +62,10 @@ def _parse_so_timestamp(s: str) -> datetime:
     return datetime.fromisoformat(norm)
 
 
-router = APIRouter()
+# require_csrf_safe is enforced router-wide so the legacy mutating routes
+# (/investigate, /approve, /find-alert) get the same cross-origin cookie-write
+# protection as /api/v1. GET routes (/healthz, /metrics) are exempt by method.
+router = APIRouter(dependencies=[Depends(require_csrf_safe)])
 
 
 @router.get("/healthz", response_model=HealthResponse)
@@ -81,7 +84,11 @@ async def healthz(
     )
 
 
-@router.get("/metrics", response_class=PlainTextResponse)
+@router.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    dependencies=[Depends(require_api_auth)],
+)
 async def metrics_endpoint(
     gate: ApprovalGate = Depends(get_gate),
 ) -> str:

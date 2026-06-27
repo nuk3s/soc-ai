@@ -26,8 +26,13 @@ services:
 
     # ── Port ─────────────────────────────────────────────────────────────────
     # uvicorn terminates TLS directly on 8443; no reverse-proxy needed.
+    # Published on all interfaces by default. Set SOC_AI_BIND=127.0.0.1 to bind
+    # loopback only (e.g. behind a reverse proxy on the same host). NOTE: Docker's
+    # publish rules bypass firewalld — `firewall-cmd --list-ports` won't show this
+    # port; restrict it here (SOC_AI_BIND) or via the DOCKER-USER chain, not the
+    # host firewall zones.
     ports:
-      - "${SOC_AI_PORT:-8443}:8443"
+      - "${SOC_AI_BIND:-0.0.0.0}:${SOC_AI_PORT:-8443}:8443"
 
     # ── Environment & secrets ─────────────────────────────────────────────────
     # .env is bind-mounted read-only so secrets never bake into an image layer.
@@ -85,6 +90,14 @@ services:
       retries: 3
 
     restart: unless-stopped
+
+    # ── Hardening ─────────────────────────────────────────────────────────────
+    # The app runs as non-root (UID 1000) and binds 8443 (>1024), so it needs no
+    # Linux capabilities: drop them all and block privilege escalation (setuid).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
     # ── Resource hints (adjust to your hardware) ──────────────────────────────
     # The app is primarily I/O-bound (ES queries + LLM calls); these are soft

@@ -117,6 +117,19 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=1.0,
     ),
     SettingSpec(
+        key="fast_triage_enabled",
+        attr="fast_triage_enabled",
+        type="bool",
+        label="Fast triage (skip tools when confident)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Saves time but can yield shallower results — the agent may finalize "
+            "a confident first-pass verdict with few or no tool calls. Turn off to "
+            "always investigate with the full tool-driven loop."
+        ),
+    ),
+    SettingSpec(
         key="investigate_when_unsure",
         attr="investigate_when_unsure",
         type="bool",
@@ -722,6 +735,29 @@ def _check_bounds(spec: SettingSpec, value: float) -> None:
         raise ValueError(f"{spec.key} must be <= {spec.max_value}")
 
 
+# URL-valued settings. An admin may legitimately point these at an internal
+# service (self-hosted SearXNG/crawl4ai, the SO/ES/gateway hosts), so the HOST is
+# intentional and NOT restricted — only the scheme is, to block file://, gopher://
+# and similar SSRF vectors. Empty (unset) is always allowed.
+_URL_SETTING_KEYS = frozenset(
+    {"searxng_url", "crawl4ai_url", "so_host", "es_hosts", "litellm_base_url"}
+)
+
+
+def _require_http_scheme(key: str, value: str) -> None:
+    from urllib.parse import urlparse
+
+    for part in value.split(","):  # es_hosts may be a CSV of URLs
+        v = part.strip()
+        if not v:
+            continue
+        scheme = urlparse(v).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                f"{key} must be an http(s) URL (got scheme {scheme or 'none'!r})"
+            )
+
+
 def coerce(key: str, raw_str: str) -> Any:
     """Coerce a raw form string to the declared type for *key*.
 
@@ -744,7 +780,10 @@ def coerce(key: str, raw_str: str) -> Any:
     if spec.type == "csv":
         # Comma-separated list → list[str]; whitespace trimmed, empties dropped.
         return [part.strip() for part in raw_str.split(",") if part.strip()]
-    return str(raw_str)
+    result = str(raw_str)
+    if key in _URL_SETTING_KEYS:
+        _require_http_scheme(key, result)
+    return result
 
 
 def _validate_typed(spec: SettingSpec, value: Any) -> Any:
@@ -775,6 +814,8 @@ def _validate_typed(spec: SettingSpec, value: Any) -> Any:
         return [x.strip() for x in value if x.strip()]
     if not isinstance(value, str):
         raise ValueError(f"{spec.key} expects a string")
+    if spec.key in _URL_SETTING_KEYS:
+        _require_http_scheme(spec.key, value)
     return value
 
 

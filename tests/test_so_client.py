@@ -369,6 +369,10 @@ async def test_elastic_search_passes_size_and_sort(settings_kratos: Settings) ->
 
     call_kwargs = fake_es.search.call_args.kwargs
     assert call_kwargs["index"] == "idx"
+    # Tolerate patterns that only partly resolve (no remote cluster / missing
+    # index) so a both-shapes pattern returns empty instead of 500ing.
+    assert call_kwargs["ignore_unavailable"] is True
+    assert call_kwargs["allow_no_indices"] is True
     body = call_kwargs["body"]
     assert body["size"] == 50
     assert body["sort"] == [{"@timestamp": "desc"}]

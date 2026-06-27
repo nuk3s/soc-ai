@@ -51,6 +51,13 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]
     # repo's runtime .env doesn't bleed into tests.
     monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
+    # Reset the in-process login throttles so failed-login tests don't leak
+    # lockout state into later tests (the per-IP spray throttle aggregates all
+    # failures from the shared "testclient" IP).
+    from soc_ai.store import auth as _auth
+
+    _auth.login_throttle.reset()
+    _auth.login_ip_throttle.reset()
     yield
     get_settings.cache_clear()
 
@@ -120,6 +127,9 @@ def _base_settings_kwargs() -> dict[str, Any]:
         "es_hosts": ["https://so.example.com:9200"],
         "litellm_base_url": "http://localhost:4000",
         "synth_first_pipeline": False,
+        # Tests opt into dev-open mode explicitly; the production default
+        # (soc_ai.config.Settings) is True (secure-by-default).
+        "api_auth_required": False,
     }
 
 

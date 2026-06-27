@@ -240,6 +240,8 @@ def _serve(_args: argparse.Namespace) -> int:
         log_level=settings.log_level.lower(),
         ssl_certfile=str(settings.soc_ai_tls_cert) if settings.soc_ai_tls_cert else None,
         ssl_keyfile=str(settings.soc_ai_tls_key) if settings.soc_ai_tls_key else None,
+        # AEAD ciphers only — no CBC/SHA-1. OpenSSL 3.x already floors at TLS 1.2.
+        ssl_ciphers="ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM",
     )
     return 0
 

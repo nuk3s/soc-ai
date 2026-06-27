@@ -112,9 +112,11 @@ adjust it if you point the data dirs elsewhere.
 `blocklist_stale_threshold_days` (default 7) controls when a stale feed file
 produces a warning; the daily timer keeps you well inside that window.
 
-### Cron alternative
+### Cron alternative (systemd / host-venv deploy only)
 
-If you don't run systemd, a daily cron entry works just as well:
+If you run the host-venv (rsync + systemd) deploy without the timer, a daily cron
+entry works just as well. This block sources the host venv at
+`/opt/soc-ai/.venv` and is **not** valid on the Docker deploy:
 
 ```cron
 # /etc/cron.d/soc-ai-blocklists — runs daily at 03:30 as the soc-ai user.
@@ -124,6 +126,10 @@ If you don't run systemd, a daily cron entry works just as well:
 
 Sourcing `.env` first makes `ABUSE_CH_AUTH_KEY` and the data-dir paths available
 to the process (cron does not read `.env` on its own).
+
+**Docker deploy:** there's no host venv to source — run the refresh inside the
+container with `python -m soc_ai blocklists refresh`. See the
+[`docker compose exec` cron example in DOCKER.md](DOCKER.md#blocklist-refresh-has-no-scheduler-in-the-docker-path).
 
 ## Synth-eval reproducibility (snapshot pinning)
 

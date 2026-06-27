@@ -119,6 +119,15 @@ class LoginThrottle:
 # app, so a per-process throttle is sufficient; reset() in tests.
 login_throttle = LoginThrottle()
 
+# Second throttle keyed per-IP across ALL usernames (uses the "" username bucket),
+# so a password-spray that rotates usernames to stay under the per-(IP,username)
+# limit still trips a coarser per-IP lockout. Higher threshold for shared/NAT IPs.
+login_ip_throttle = LoginThrottle(max_failures=20, window_s=15 * 60, cooldown_s=15 * 60)
+
+# Precomputed bcrypt hash for authenticate()'s constant-time path: verified
+# against when the account is missing/disabled so login timing is uniform.
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"soc-ai-constant-time", bcrypt.gensalt()).decode()
+
 
 def utcnow() -> datetime:
     """Naive UTC now — the single producer for store timestamp comparisons."""
@@ -163,6 +172,10 @@ async def authenticate(db: AsyncSession, username: str, password: str) -> User |
         return None
     user = await db.scalar(select(User).where(User.username == username))
     if user is None or user.disabled:
+        # Constant-time: run a bcrypt comparison against a fixed dummy hash so the
+        # response time doesn't reveal whether the account exists / is enabled
+        # (closes the login user-enumeration timing oracle).
+        await verify_password(password, _DUMMY_PASSWORD_HASH)
         return None
     if not await verify_password(password, user.password_hash):
         return None

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -20,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.types import Scope
 
 from soc_ai import __version__
@@ -303,6 +304,12 @@ def _resolve_cors_origins(cors_setting: str, so_host: str) -> list[str]:
 
 def create_app() -> FastAPI:
     """Application factory."""
+    # Gate the interactive docs + raw schema behind a setting (off in prod) so a
+    # security product doesn't publish its full admin API surface unauthenticated.
+    try:
+        _expose_docs = get_settings().expose_api_docs
+    except Exception:
+        _expose_docs = False
     app = FastAPI(
         title="soc-ai",
         description="Open, self-hosted LLM-powered triage assistant for Security Onion.",
@@ -311,6 +318,9 @@ def create_app() -> FastAPI:
         # /healthz and /metrics routes already report.
         version=__version__,
         lifespan=lifespan,
+        docs_url="/docs" if _expose_docs else None,
+        redoc_url="/redoc" if _expose_docs else None,
+        openapi_url="/openapi.json" if _expose_docs else None,
     )
     # The Tampermonkey userscript runs in the SO web UI's origin and fetches
     # soc-ai cross-origin (the React /app is same-origin and needs no CORS).
@@ -342,24 +352,66 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
     )
 
+    try:
+        _csp = get_settings().content_security_policy.strip()
+    except Exception:
+        _csp = ""
+
     @app.middleware("http")
     async def _security_headers(request: Any, call_next: Any) -> Response:
         """Set conservative security response headers on every response.
 
-        No CSP — the SPA loads inline/bundled assets and a strict policy would
-        break it; ``X-Frame-Options: DENY`` already blocks clickjacking. HSTS is
-        only sent over HTTPS (the app serves TLS in prod) so a plain-HTTP dev run
-        is unaffected.
+        CSP (``content_security_policy``, default tuned for the bundled Vite SPA)
+        plus ``frame-ancestors 'none'`` / ``X-Frame-Options: DENY`` block
+        clickjacking; ``Cross-Origin-Opener-Policy`` isolates the browsing
+        context. HSTS is only sent over HTTPS so a plain-HTTP dev run is
+        unaffected.
         """
         response: Response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+        )
+        response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        if _csp:
+            response.headers.setdefault("Content-Security-Policy", _csp)
         if request.url.scheme == "https":
             response.headers.setdefault(
                 "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
             )
         return response
+
+    try:
+        _rl_limit = get_settings().api_rate_limit_per_min
+    except Exception:
+        _rl_limit = 0
+    if _rl_limit > 0:
+        # ip -> [window (monotonic minute), count]. Per-app-instance, bounded.
+        app.state.rate_buckets = {}
+
+        @app.middleware("http")
+        async def _rate_limit(request: Any, call_next: Any) -> Response:
+            if request.url.path == "/healthz":  # never throttle health checks
+                return await call_next(request)
+            ip = request.client.host if request.client else "?"
+            window = int(time.monotonic()) // 60
+            buckets: dict[str, list[int]] = app.state.rate_buckets
+            entry = buckets.get(ip)
+            if entry is None or entry[0] != window:
+                if len(buckets) > 8192:  # crude bound against unique-IP floods
+                    buckets.clear()
+                buckets[ip] = [window, 1]
+            else:
+                entry[1] += 1
+                if entry[1] > _rl_limit:
+                    return JSONResponse(
+                        status_code=429,
+                        content={"detail": {"reason": "rate_limited",
+                                            "hint": "Too many requests; slow down."}},
+                    )
+            return await call_next(request)
 
     app.include_router(router)
     # Open (pre-auth) endpoints first so FastAPI resolves /api/v1/login before

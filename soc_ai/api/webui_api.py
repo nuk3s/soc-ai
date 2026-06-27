@@ -24,7 +24,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, SecretStr
+from elastic_transport import TransportError
+from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -89,7 +90,8 @@ async def api_login(body: LoginIn, request: Request) -> JSONResponse:
     settings = request.app.state.settings
     client_ip = request.client.host if request.client else "?"
     throttle = auth_svc.login_throttle
-    if throttle.is_locked(client_ip, body.username):
+    ip_throttle = auth_svc.login_ip_throttle  # per-IP across all usernames (spray)
+    if throttle.is_locked(client_ip, body.username) or ip_throttle.is_locked(client_ip, ""):
         _LOGGER.warning(
             "login locked out for user=%r from ip=%s (too many failed attempts)",
             body.username,
@@ -106,6 +108,7 @@ async def api_login(body: LoginIn, request: Request) -> JSONResponse:
         user = await auth_svc.authenticate(db, body.username, body.password)
         if user is None:
             locked = throttle.record_failure(client_ip, body.username)
+            ip_throttle.record_failure(client_ip, "")  # count toward the per-IP spray limit
             if locked:
                 _LOGGER.warning(
                     "login throttle engaged for user=%r from ip=%s after repeated failures",
@@ -253,21 +256,32 @@ async def list_alerts(
 ) -> list[AlertGroupOut]:
     """Grouped-by-detection rows for the Alerts console (events loaded lazily)."""
     try:
-        groups, _total = await aq.fetch_groups(
-            elastic,
-            settings,
-            time_range=range_,
-            severity=severity,
-            oql=q,
-            sort=sort,
-            abs_from=from_,
-            abs_to=to,
-            time_zone=settings.so_timezone,
-            hide_acked=hide_acked,
-        )
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            groups, _total = await aq.fetch_groups(
+                elastic,
+                settings,
+                time_range=range_,
+                severity=severity,
+                oql=q,
+                sort=sort,
+                abs_from=from_,
+                abs_to=to,
+                time_zone=settings.so_timezone,
+                hide_acked=hide_acked,
+            )
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
+        ) from exc
+    except (TimeoutError, TransportError) as exc:
+        # Fail fast with a clean error instead of hanging the console while the
+        # ES client retries a slow/unreachable Security Onion grid.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "grid_unavailable",
+                "hint": "The Security Onion grid (Elasticsearch) is slow or unreachable — retry shortly.",
+            },
         ) from exc
 
     # verdict badge per rule: the rule's most-recent investigation. "inherited"
@@ -356,28 +370,43 @@ async def list_group_events(
     range_: str = Query("24h", alias="range"),
     severity: str | None = None,
     q: str | None = None,
+    size: int = Query(aq.EVENTS_PER_GROUP, ge=1, le=aq.MAX_EVENTS),
+    offset: int = Query(0, ge=0),
     from_: str | None = Query(None, alias="from"),
     to: str | None = None,
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> list[AlertEventOut]:
-    """Flat events for one detection group, newest first (the row-expand view)."""
+    """Flat events for one detection group, newest first (the row-expand view).
+
+    Paginate large groups with ``size`` + ``offset`` ("load more")."""
     try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=rule_name,
-            kind=kind,
-            time_range=range_,
-            severity=severity,
-            oql=q,
-            abs_from=from_,
-            abs_to=to,
-            time_zone=settings.so_timezone,
-        )
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            events = await aq.fetch_group_events(
+                elastic,
+                settings,
+                rule_name=rule_name,
+                kind=kind,
+                time_range=range_,
+                severity=severity,
+                oql=q,
+                size=size,
+                offset=offset,
+                abs_from=from_,
+                abs_to=to,
+                time_zone=settings.so_timezone,
+            )
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
+        ) from exc
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "grid_unavailable",
+                "hint": "The Security Onion grid (Elasticsearch) is slow or unreachable — retry shortly.",
+            },
         ) from exc
 
     # Three batched DB lookups — no per-event queries (no N+1).
@@ -1594,7 +1623,8 @@ async def hunt_stats(request: Request) -> list[HuntStatOut]:
 
 
 class HuntStartIn(BaseModel):
-    alert_id: str
+    # Non-blank: an empty id reaches ES as `ids:[""]` and 500s ("Ids can't be empty").
+    alert_id: str = Field(min_length=1)
 
 
 async def _alert_doc_exists(elastic: ElasticClient, settings: Settings, alert_id: str) -> bool:
@@ -1937,7 +1967,7 @@ _VALID_VERDICTS = {"true_positive", "false_positive", "needs_more_info"}
 class OverrideVerdictIn(BaseModel):
     verdict: str
     rationale: str | None = None
-    confidence: float | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 @router.post("/investigations/{inv_id}/override")
@@ -2021,7 +2051,9 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
 
 
 class TokenCreateIn(BaseModel):
-    name: str
+    # Charset-restricted: the token name surfaces in the alerts-grid owner field
+    # (owner = "token:<name>"), so keep it to a safe, non-injectable set.
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[\w .\-]+$")
 
 
 @router.post("/config/tokens", dependencies=[Depends(require_admin_api)])
@@ -2244,7 +2276,7 @@ class MeOut(BaseModel):
 
 
 class SetStatusIn(BaseModel):
-    status: str
+    status: str = Field(default="", max_length=120)
 
 
 _DEV_ME = MeOut(username="analyst", role="admin", status="")
@@ -2300,8 +2332,8 @@ class UsersListOut(BaseModel):
 
 
 class CreateUserIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64, pattern=r"^[\w.\-@]+$")
+    password: str = Field(min_length=1, max_length=1024)
     role: str
 
 
@@ -2571,6 +2603,18 @@ async def auto_triage_status(request: Request) -> AutoTriageStatusOut:
     return _at_status(at.get_status(request.app.state))
 
 
+@router.post("/auto-triage/stop", response_model=AutoTriageStatusOut)
+async def stop_auto_triage(request: Request) -> AutoTriageStatusOut:
+    """Request an in-flight auto-triage run to stop after its current target.
+
+    The current investigation is allowed to finish cleanly; no further targets
+    are started. Returns the (now winding-down) status; a no-op if idle.
+    """
+    state = request.app.state
+    at.request_stop(state)
+    return _at_status(at.get_status(state))
+
+
 # ── Internal-identifier discovery: scan-now (single-flight) ────────────────────
 #
 # Learns internal domain suffixes + bare hostnames from ES and upserts them as
@@ -2704,7 +2748,9 @@ class InternalIdentifiersOut(BaseModel):
 
 class InternalIdentifierIn(BaseModel):
     kind: str
-    value: str
+    # Domains / hostnames / IPs / CIDRs only — blocks injection payloads while
+    # allowing every legitimate identifier shape (the cidr path validates further).
+    value: str = Field(min_length=1, max_length=253, pattern=r"^[\w.\-:/]+$")
 
 
 _IDENTIFIER_KINDS = ("suffix", "host", "cidr")

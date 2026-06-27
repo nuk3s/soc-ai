@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -116,6 +117,71 @@ def cloud_prefix_staleness_days(data_dir: Path, source: str = "azure") -> float 
     return delta.total_seconds() / 86400.0
 
 
+async def _fetch_validated(
+    client: httpx.AsyncClient, url: str, *, as_json: bool = False, retries: int = 3
+) -> bytes:
+    """GET ``url`` with retries + integrity checks; return the body bytes.
+
+    Guards against the silent truncation that left a partial AWS
+    ``ip-ranges.json`` on disk (received 720283, expected 2517145): a short
+    read versus ``Content-Length`` and — for JSON feeds — a body that doesn't
+    parse both fail the attempt and retry. A 4xx is permanent (no retry);
+    transient transport/5xx/truncation errors back off and retry.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await client.get(url, follow_redirects=True)
+            resp.raise_for_status()
+            content = resp.content
+            clen = resp.headers.get("content-length")
+            # Content-Length is the WIRE size; when the body was transfer-compressed
+            # (gzip/br) httpx returns the larger decompressed bytes, so the header
+            # only matches len(content) for an un-encoded response. Skip the check
+            # when encoded — the JSON-parse guard below still catches truncation.
+            encoded = bool(resp.headers.get("content-encoding"))
+            if clen is not None and clen.isdigit() and not encoded and len(content) != int(clen):
+                raise ValueError(f"truncated download: got {len(content)} bytes, expected {clen}")
+            if as_json:
+                json.loads(content)  # raises on a truncated/garbage body
+            return content
+        except httpx.HTTPStatusError as e:
+            if 400 <= e.response.status_code < 500:
+                raise  # permanent (e.g. 404) — don't burn retries
+            last_err = e
+        except (httpx.HTTPError, ValueError) as e:
+            last_err = e
+        if attempt < retries:
+            await asyncio.sleep(min(2**attempt, 8))  # 2s, 4s, 8s backoff
+    assert last_err is not None
+    raise last_err
+
+
+_AZURE_DOWNLOAD_PAGE = "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
+_AZURE_FILE_RE = re.compile(
+    r"https://download\.microsoft\.com/download/[^\"'\s]+?/ServiceTags_Public_\d{8}\.json"
+)
+
+
+async def _resolve_azure_service_tags_url(client: httpx.AsyncClient) -> str | None:
+    """Resolve the CURRENT Azure Service Tags JSON URL from Microsoft's download
+    page. MS rotates both the dated filename AND the GUID path ~weekly, so a
+    hardcoded URL eventually 404s. Returns ``None`` if the page can't be scraped
+    (the caller then falls back to the configured/override URL).
+    """
+    try:
+        resp = await client.get(_AZURE_DOWNLOAD_PAGE, follow_redirects=True)
+        resp.raise_for_status()
+    except Exception as e:  # best-effort: resolution must never break the refresh
+        _LOGGER.warning("azure service-tags URL resolution failed: %s", e)
+        return None
+    m = _AZURE_FILE_RE.search(resp.text)
+    if m:
+        _LOGGER.info("resolved current azure service-tags URL: %s", m.group(0))
+        return m.group(0)
+    return None
+
+
 async def refresh_blocklists(data_dir: Path, *, sources: list[str]) -> list[RefreshResult]:
     """Fetch each blocklist source and write to ``data_dir``."""
     data_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 — httpx uses asyncio, not trio/anyio
@@ -128,16 +194,13 @@ async def refresh_blocklists(data_dir: Path, *, sources: list[str]) -> list[Refr
                 results.append(RefreshResult(source=source, success=False, error="unknown source"))
                 continue
             try:
-                resp = await client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-            except httpx.HTTPError as e:
+                content = await _fetch_validated(client, url)
+            except (httpx.HTTPError, ValueError) as e:
                 _LOGGER.warning("refresh %s failed: %s", source, e)
                 results.append(RefreshResult(source=source, success=False, error=str(e)))
                 continue
-            (data_dir / fname).write_bytes(resp.content)
-            results.append(
-                RefreshResult(source=source, success=True, bytes_written=len(resp.content))
-            )
+            (data_dir / fname).write_bytes(content)
+            results.append(RefreshResult(source=source, success=True, bytes_written=len(content)))
     return results
 
 
@@ -190,23 +253,34 @@ async def refresh_cloud_prefixes(
             entry: dict[str, str] = status.get(source, {})
             entry["last_attempt"] = now_iso
 
+            content: bytes | None = None
             try:
-                resp = await client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-            except httpx.HTTPError as e:
-                _LOGGER.warning("refresh cloud %s failed: %s", source, e)
-                entry["last_error"] = str(e)
-                status[source] = entry
-                _save_cloud_status(data_dir, status)
-                results.append(RefreshResult(source=source, success=False, error=str(e)))
-                continue
+                content = await _fetch_validated(client, url, as_json=(source != "cloudflare"))
+            except (httpx.HTTPError, ValueError) as e:
+                # Azure rotates its dated filename + GUID path weekly, so the
+                # configured URL eventually 404s. On failure, resolve the current
+                # URL from MS's download page and retry once (honors an explicit
+                # operator override by trying it FIRST, above).
+                if source == "azure":
+                    resolved = await _resolve_azure_service_tags_url(client)
+                    if resolved and resolved != url:
+                        try:
+                            content = await _fetch_validated(client, resolved, as_json=True)
+                        except (httpx.HTTPError, ValueError) as e2:
+                            e = e2
+                if content is None:
+                    _LOGGER.warning("refresh cloud %s failed: %s", source, e)
+                    entry["last_error"] = str(e)
+                    status[source] = entry
+                    _save_cloud_status(data_dir, status)
+                    results.append(RefreshResult(source=source, success=False, error=str(e)))
+                    continue
 
-            content = resp.content
             if source == "cloudflare":
                 # Convert TXT prefix list → JSON envelope.
                 lines = [
                     line.strip()
-                    for line in resp.text.splitlines()
+                    for line in content.decode("utf-8", "replace").splitlines()
                     if line.strip() and not line.startswith("#")
                 ]
                 content = json.dumps({"prefixes": lines}).encode("utf-8")

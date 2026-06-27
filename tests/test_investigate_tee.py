@@ -142,6 +142,9 @@ def tee_client(tee_settings: Settings) -> Iterator[TestClient]:
                 "/api/v1/login",
                 json={"username": "admin", "password": ADMIN_PW},
             )
+            # Cookie-authenticated writes now pass the CSRF Origin guard on the
+            # legacy router too; send the app's own origin like the real SPA.
+            client.headers["Origin"] = "http://testserver"
             yield client
 
 

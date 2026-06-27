@@ -1,5 +1,11 @@
 # Deployment
 
+> **This is the non-Docker (systemd) path.** Most users want the guided
+> `./setup.sh` installer or the container path in
+> [DOCKER.md](DOCKER.md) — start there unless you specifically need a bare
+> rsync + systemd + uv deploy. This guide installs under a system user with a
+> hardened systemd unit and a uv-managed venv.
+
 End-to-end deployment guide for soc-ai against a real Security Onion 3.0.0
 grid. The procedure should produce a working install in ≤30 minutes against
 a fresh VM.
@@ -136,10 +142,19 @@ ANALYST_MODEL=soc-ai-analyst
 # off by default; enable it with ORACLE_ENABLED=true.
 
 # --- Index patterns ----------------------------------------------------
-# SO 3.0.0 uses Elastic-native data streams (.ds-logs-...-so-*), NOT the
-# older `*:so-*` cross-cluster pattern. Don't change unless you know the
-# grid uses something custom.
-EVENTS_INDEX_PATTERN=.ds-logs-*-so-*
+# SO 3.0 stores Suricata/Zeek events + alerts in Elastic data streams named
+# `logs-*` (e.g. `.ds-logs-suricata.alerts-so-...`). The events pattern is:
+#   - single-node grid:           logs-*
+#   - multi-node / distributed:   *:logs-*   (cross-cluster search)
+# `setup.sh` auto-detects the cluster prefix during its ES validation step and
+# writes the concrete pattern for you. The old `*:so-*` default is WRONG for
+# both shapes — it matches the old-style `so-*` admin indices (so-case,
+# so-detection), not the `logs-*` data streams where alerts live, so the alerts
+# console comes up empty on a healthy grid.
+EVENTS_INDEX_PATTERN=logs-*
+# Cases / detections / playbooks live in the old-style `so-*` admin indices.
+# Single-node: so-case* / so-detection* / so-playbook*. Multi-node: prefix each
+# with `*:` (e.g. *:so-case*).
 CASES_INDEX_PATTERN=so-case*
 DETECTIONS_INDEX_PATTERN=so-detection*
 PLAYBOOKS_INDEX_PATTERN=so-playbook*
@@ -234,16 +249,19 @@ bootstraps today's audit index.
 
 ---
 
-## 8. Reasoning trace (LiteLLM/vLLM config, optional, v1.1)
+## 8. Reasoning trace (LiteLLM/vLLM config, optional, model-specific)
 
-soc-ai is plumbed to surface Nemotron 3's `<think>` traces into the
-SSE stream as `model_response.reasoning_trace` payloads. To light
-this up, the LiteLLM/vLLM gateway needs to be configured to split
-`<think>` into the `reasoning_content` field on the response.
-Specifically:
+**Optional — only relevant if your gateway serves a `<think>`-emitting
+reasoning model.** soc-ai is plumbed to surface a model's `<think>` traces
+into the SSE stream as `model_response.reasoning_trace` payloads. If your
+`ANALYST_MODEL` doesn't emit reasoning, skip this section — nothing breaks.
 
-- vLLM serving args: `--enable-reasoning --reasoning-parser nemotron`
-  (or whatever parser flag the deployed vLLM build supports).
+To light it up, the LiteLLM/vLLM gateway needs to be configured to split
+`<think>` into the `reasoning_content` field on the response. Specifically:
+
+- vLLM serving args: `--enable-reasoning --reasoning-parser <parser>`, where
+  `<parser>` matches the reasoning model you serve (each model family has its
+  own parser; check your vLLM build's `--reasoning-parser` choices).
 - LiteLLM config: `merge_reasoning_content_in_choices: false`.
 
 Verify by direct curl:

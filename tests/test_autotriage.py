@@ -1268,3 +1268,19 @@ class TestAutoTriageConfigFloor:
             )
 
         assert set(captured["severities"]) == {"critical", "high", "medium"}
+
+
+def test_request_stop_signals_cancel_only_when_active() -> None:
+    """F6: request_stop is a no-op when idle, and sets cancelled on an active run
+    so the worker loop aborts before the next target."""
+    import types
+
+    from soc_ai.webui import autotriage as at
+
+    state = types.SimpleNamespace()
+    assert at.request_stop(state) is False  # idle → nothing to stop
+    status = at.get_status(state)
+    assert status.cancelled is False
+    status.active = True
+    assert at.request_stop(state) is True
+    assert status.cancelled is True

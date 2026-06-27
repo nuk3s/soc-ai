@@ -357,6 +357,13 @@ def _parse_filter_with_fallback(filter_text: str) -> FilterNode:
             f"failed to parse filter: {primary_err}",
             fragment=filter_text,
         ) from primary_err
+    except RecursionError as rec_err:
+        # Deeply-nested input blows the parser's recursion limit; surface it as a
+        # clean 400 bad_oql rather than an unhandled 500.
+        raise OqlValidationError(
+            "filter too deeply nested to parse",
+            fragment=filter_text,
+        ) from rec_err
 
 
 def _split_pipe(query: str) -> list[str]:

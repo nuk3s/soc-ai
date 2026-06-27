@@ -306,3 +306,21 @@ async def test_fetch_group_events_hide_acked_default_off(settings_kratos: Settin
             assert c != {"term": {"event.acknowledged": True}}, (
                 "hide_acked=False (default) must NOT inject the acknowledged exclusion filter"
             )
+
+
+@pytest.mark.asyncio
+async def test_fetch_group_events_passes_offset_and_size(settings_kratos: Settings) -> None:
+    """F5: size + offset flow through to the ES query (size + from_) so large
+    groups can be paged ("load more") instead of silently truncated."""
+    from soc_ai.webui import alerts_query as aq
+
+    elastic = AsyncMock()
+    elastic.search.return_value = EsSearchResult(
+        total=0, took_ms=0, hits=[], aggregations=None, total_is_lower_bound=False
+    )
+    await aq.fetch_group_events(
+        elastic, settings_kratos, rule_name="ET TEST", size=25, offset=50
+    )
+    kw = elastic.search.call_args.kwargs
+    assert kw["size"] == 25
+    assert kw["from_"] == 50

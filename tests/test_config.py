@@ -225,9 +225,28 @@ def test_cloud_prefix_stale_threshold_days_default(monkeypatch: pytest.MonkeyPat
 def test_webui_settings_defaults(settings_kratos: Settings) -> None:
     """Phase-1 web UI settings exist with safe defaults."""
     assert settings_kratos.soc_ai_data_dir == Path("data")
+    # The fixture opts into dev-open mode; the production default is asserted in
+    # test_api_auth_required_secure_default below.
     assert settings_kratos.api_auth_required is False
     assert settings_kratos.session_ttl_hours == 12
     assert settings_kratos.bootstrap_admin_password is None
+
+
+def test_api_auth_required_secure_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production default requires API auth (secure-by-default)."""
+    _setenv_required(monkeypatch)
+    assert Settings().api_auth_required is True
+
+
+def test_events_index_pattern_single_node_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default index patterns target single-node SO 3.0 (logs-* data streams),
+    not the legacy ``*:so-*`` form that matched the wrong index family."""
+    _setenv_required(monkeypatch)
+    s = Settings()
+    assert s.events_index_pattern == "logs-*"
+    assert s.cases_index_pattern == "so-case*"
+    assert s.detections_index_pattern == "so-detection*"
+    assert s.playbooks_index_pattern == "so-playbook*"
 
 
 def test_webui_alerts_query_default(settings_kratos: Settings) -> None:
@@ -403,3 +422,30 @@ def test_inc1_settings_coerce_from_form_strings() -> None:
     }
     for key, (raw, expected) in samples.items():
         assert cfg.coerce(key, raw) == expected
+
+
+def test_url_setting_rejects_non_http_scheme() -> None:
+    """S11: URL settings allow any host (admin intent) but reject non-http(s)
+    schemes (file://, gopher:// — SSRF vectors)."""
+    from soc_ai.store.config_overrides import coerce
+
+    with pytest.raises(ValueError):
+        coerce("searxng_url", "file:///etc/passwd")
+    with pytest.raises(ValueError):
+        coerce("crawl4ai_url", "gopher://attacker/x")
+    # Any host is allowed — an admin may legitimately use an internal service.
+    assert coerce("searxng_url", "http://127.0.0.1:8888") == "http://127.0.0.1:8888"
+    assert coerce("crawl4ai_url", "https://crawl.internal.example") == "https://crawl.internal.example"
+    assert coerce("searxng_url", "") == ""  # unset is fine
+
+
+def test_fast_triage_toggle_default_and_whitelisted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2: the fast-triage toggle defaults on (current behavior) and is exposed
+    in the admin config console with the speed/depth tradeoff note."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    _setenv_required(monkeypatch)
+    assert Settings().fast_triage_enabled is True
+    spec = WHITELIST_BY_KEY["fast_triage_enabled"]
+    assert spec.type == "bool"
+    assert "shallower" in spec.help.lower()

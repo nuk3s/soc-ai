@@ -77,6 +77,7 @@ class ElasticClient:
         query: dict[str, Any],
         *,
         size: int = 100,
+        from_: int = 0,
         sort: list[dict[str, Any]] | None = None,
         source: list[str] | bool | None = None,
         aggs: dict[str, Any] | None = None,
@@ -88,6 +89,8 @@ class ElasticClient:
         ``{"bool": {...}}`` directly, not the wrapping ``query`` key).
         """
         body: dict[str, Any] = {"query": query, "size": size}
+        if from_:
+            body["from"] = from_
         if sort is not None:
             body["sort"] = sort
         if source is not None:
@@ -97,7 +100,16 @@ class ElasticClient:
         if track_total_hits is not None:
             body["track_total_hits"] = track_total_hits
 
-        response = await self._client.search(index=index, body=body)
+        # Be tolerant of index patterns that only partly resolve: a single-node
+        # grid has no remote clusters (so the `*:logs-*` half of a both-shapes
+        # pattern matches nothing) and a fresh grid may lack an index entirely.
+        # Without these, such a pattern 500s instead of returning empty results.
+        response = await self._client.search(
+            index=index,
+            body=body,
+            ignore_unavailable=True,
+            allow_no_indices=True,
+        )
 
         hits_data: dict[str, Any] = response.get("hits", {})
         total_raw = hits_data.get("total", 0)

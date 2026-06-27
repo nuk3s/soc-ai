@@ -79,6 +79,24 @@ yesno(){ local __v=$1 __p=$2 __d=${3:-y} ans
 
 httpcode(){ curl -k -s -o /dev/null -w '%{http_code}' -m "${2:-8}" "$1" 2>/dev/null || echo 000; }
 
+# Detect the events index pattern that actually matches THIS grid, so it's right
+# on a single-node grid (local `logs-*` data streams) AND a multi-node one
+# (reached cross-cluster as `*:logs-*`). Counts Suricata alerts under each
+# prefix and picks the one with hits — querying both and unioning would
+# double-count on a grid that registers a self-remote cluster.
+detect_events_pattern(){
+  local pfx cnt
+  for pfx in '' '*:'; do
+    cnt=$(curl -k -s -m 8 -u "${SO_USERNAME}:${SO_PASSWORD}" \
+      "${ES_HOSTS%/}/${pfx}logs-*/_search?ignore_unavailable=true&allow_no_indices=true" \
+      -H 'Content-Type: application/json' \
+      -d '{"size":0,"track_total_hits":1,"query":{"term":{"event.dataset":"suricata.alert"}}}' 2>/dev/null \
+      | grep -oE '"value"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    [[ -n ${cnt:-} && $cnt -gt 0 ]] && { printf '%slogs-*' "$pfx"; return 0; }
+  done
+  printf 'logs-*'   # fallback: the single-node form
+}
+
 echo
 printf '%s\n' "${B}soc-ai setup${N} — guided Docker install"
 # Resolve the config file: explicit --config, else setup.conf if it exists.
@@ -88,6 +106,11 @@ if [[ -n $CONF ]]; then
   load_conf "$CONF" && ok "Loaded settings from ${B}${CONF}${N}"
 fi
 [[ $AUTO -eq 1 ]] && info "Automated mode (no prompts)." || info "Interactive mode — press Enter to accept [defaults]."
+# --auto with nothing to go on would silently fall through to placeholder
+# defaults and fail later — stop with a clear instruction instead.
+if [[ $AUTO -eq 1 && -z $CONF && ! -f .env && -z ${SO_HOST:-} ]]; then
+  die "--auto needs settings but found none. Run:  cp setup.conf.example setup.conf  → edit it → ./setup.sh --auto"
+fi
 hr
 
 # ── 1. prerequisites ──────────────────────────────────────────────────────────
@@ -108,8 +131,30 @@ if [[ $need_docker -eq 1 ]]; then
   info "Installing Docker (Docker's installer detects your distro)…"
   curl -fsSL https://get.docker.com -o /tmp/get-docker.sh \
     || die "couldn't download get.docker.com — check the network, or install Docker yourself"
-  sudo sh /tmp/get-docker.sh || die "Docker install failed (see above) — install Docker yourself, then re-run"
-  rm -f /tmp/get-docker.sh
+  if ! sudo sh /tmp/get-docker.sh 2>/tmp/get-docker.err; then
+    # get.docker.com has no packages for some fresh EL10 distros — it points the
+    # repo at e.g. download.docker.com/linux/rocky/$releasever (rocky/10), which
+    # doesn't exist yet. Docker's centos/<ver> packages are EL-compatible; write a
+    # CLEAN repo for them and retry. (Note: the gpgkey is .../linux/centos/gpg —
+    # a fixed key path, NOT a version dir — so we can't just sed the broken repo.)
+    ver=$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID%%.*}")
+    if [[ -n ${ver:-} ]] && command -v dnf >/dev/null 2>&1; then
+      warn "get.docker.com has no packages for this EL${ver} distro; retrying with Docker's centos/${ver} packages…"
+      sudo tee /etc/yum.repos.d/docker-ce.repo >/dev/null <<EOF
+[docker-ce-stable]
+name=Docker CE Stable - centos ${ver}
+baseurl=https://download.docker.com/linux/centos/${ver}/\$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://download.docker.com/linux/centos/gpg
+EOF
+      sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        || die "Docker install failed even via the centos/${ver} repo (see /tmp/get-docker.err) — install Docker yourself, then re-run"
+    else
+      die "Docker install failed (see /tmp/get-docker.err) — install Docker yourself, then re-run"
+    fi
+  fi
+  rm -f /tmp/get-docker.sh /tmp/get-docker.err
   sudo systemctl enable --now docker 2>/dev/null || true
   # Let this user run docker without sudo from next login on.
   sudo usermod -aG docker "$USER" 2>/dev/null || true
@@ -117,7 +162,7 @@ if [[ $need_docker -eq 1 ]]; then
     || die "Docker installed but 'docker compose' isn't working — check the install output above"
 fi
 if docker info >/dev/null 2>&1; then DC="docker compose"
-else DC="sudo docker compose"; warn "Using sudo for docker (add yourself to the 'docker' group to drop it)."; fi
+else DC="sudo docker compose"; warn "Using sudo for docker this run — log out/in (or run 'newgrp docker') to use docker without sudo."; fi
 ok "Docker ready — $(docker --version 2>/dev/null | cut -d, -f1)"
 
 # ── 2. configuration (.env) ───────────────────────────────────────────────────
@@ -189,9 +234,25 @@ if [[ $RECFG == y ]]; then
   fi
 
   echo
-  info "Grid-specific tuning (defaults are fine for most single-node grids):"
+  info "Grid-specific tuning:"
   ask WEBUI_ALERTS_QUERY "  Alerts OQL filter" "${WEBUI_ALERTS_QUERY:-tags:alert}"
-  ask EVENTS_INDEX_PATTERN "  Events index pattern" "${EVENTS_INDEX_PATTERN:-*:so-*}"
+  # Auto-detect the events index pattern unless the operator pinned one. `logs-*`
+  # for a single-node grid; `*:logs-*` when the data is only reachable
+  # cross-cluster (multi-node). Either way the alerts console + agent searches
+  # find the data — the old `*:so-*` default matched the wrong index family and
+  # left the console empty.
+  if [[ -z ${EVENTS_INDEX_PATTERN:-} && -n ${SO_USERNAME:-} && -n ${SO_PASSWORD:-} && -n ${ES_HOSTS:-} ]]; then
+    info "  Detecting the events index pattern from the grid…"
+    EVENTS_INDEX_PATTERN=$(detect_events_pattern)
+    if [[ ${EVENTS_INDEX_PATTERN} == \*:* ]]; then
+      ok "  Multi-node / cross-cluster grid → ${B}${EVENTS_INDEX_PATTERN}${N}"
+    else
+      ok "  Single-node grid → ${B}${EVENTS_INDEX_PATTERN}${N}"
+    fi
+  fi
+  ask EVENTS_INDEX_PATTERN "  Events index pattern (single-node: logs-*  ·  multi-node: *:logs-*)" "${EVENTS_INDEX_PATTERN:-logs-*}"
+  # Carry the same cross-cluster prefix to the cases/detections/playbooks indices.
+  EIDX_PFX=""; [[ ${EVENTS_INDEX_PATTERN} == \*:* ]] && EIDX_PFX="*:"
   yesno APIAUTH "  Require login/token for the API? (recommended)" "$(b2yn "${API_AUTH_REQUIRED:-true}")"
 
   CONFIG_SECRET_KEY=${CONFIG_SECRET_KEY:-$(genfernet)}
@@ -215,6 +276,9 @@ if [[ $RECFG == y ]]; then
     echo "ANALYST_MODEL=${ANALYST_MODEL}"
     echo "WEBUI_ALERTS_QUERY=${WEBUI_ALERTS_QUERY}"
     echo "EVENTS_INDEX_PATTERN=${EVENTS_INDEX_PATTERN}"
+    echo "CASES_INDEX_PATTERN=${EIDX_PFX}so-case*"
+    echo "DETECTIONS_INDEX_PATTERN=${EIDX_PFX}so-detection*"
+    echo "PLAYBOOKS_INDEX_PATTERN=${EIDX_PFX}so-playbook*"
     echo "API_AUTH_REQUIRED=$([[ $APIAUTH == y ]] && echo true || echo false)"
     echo "CONFIG_SECRET_KEY=${CONFIG_SECRET_KEY}"
     echo "BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD}"
@@ -266,7 +330,7 @@ else
     -keyout certs/key.pem -out certs/cert.pem 2>/dev/null \
     || openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=soc-ai" \
          -keyout certs/key.pem -out certs/cert.pem 2>/dev/null
-  chmod 644 certs/cert.pem certs/key.pem
+  chmod 644 certs/cert.pem; chmod 640 certs/key.pem   # cert is public; key not world-readable
   ok "Generated self-signed certs/ (your browser warns once — accept it)."
 fi
 

@@ -23,8 +23,16 @@ This guide is a practical reference for the analyst/operator surfaces.
 - **admin** — everything an analyst can do **plus** the config console (`/app/config`).
 
 The first admin (`admin`) is bootstrapped on first start; its generated password
-is printed once to the service log (`journalctl -u soc-ai`). Change it after
-first login (Config → Users → reset password).
+is printed once to the service log. Recover it from the log for your deploy path:
+
+```bash
+# systemd / host-venv deploy
+journalctl -u soc-ai | grep -i password
+# Docker deploy
+docker compose logs soc-ai | grep -i password
+```
+
+Change it after first login (Config → Users → reset password).
 
 ## Triage console — `/app/alerts`
 

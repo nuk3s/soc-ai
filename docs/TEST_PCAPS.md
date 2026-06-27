@@ -3,9 +3,10 @@
 Catalog of safe, downloadable, labeled-**malicious** packet captures for validating
 the Security Onion (Suricata + Zeek) detection pipeline end-to-end. These are inert
 **network captures** (no live malware execution) — the standard material SOC analysts
-use. Import with `sudo so-import-pcap <file.pcap>` on the sensor; alerts land in
-`.ds-logs-*-so-*` (what soc-ai queries) with the PCAP's original timestamps + an
-`import.id` tag.
+use. Import with `sudo so-import-pcap <file.pcap>` on the sensor; alerts land in the
+SO 3.0 `logs-*` data streams (what soc-ai queries via `EVENTS_INDEX_PATTERN`,
+e.g. the `.ds-logs-suricata.alerts-so-...` backing indices) with the PCAP's
+original timestamps + an `import.id` tag.
 
 > Compiled 2026-06-16 (subagent research; URLs HEAD-verified live then).
 

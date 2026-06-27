@@ -31,22 +31,31 @@ Add soc-ai's source IP to SO's firewall so it can reach:
 - **The web API — TCP 443** (ack / escalate-to-case / comment).
 - **A sensor over SSH — TCP 22**, only if you enable PCAP fetch.
 
-Do it from the SO manager — either in the SOC web UI (**Administration → Configuration →
-Firewall**, add the IP to a host group permitted to reach Elasticsearch + the web
-interface) or on the CLI:
+**Allow-list the *host* IP, not the container's (Docker).** With the default Docker bridge
+network the container's traffic is NAT'd out the Docker host's address, so SO sees the
+**Docker host's IP** — pinhole *that*, not an internal `172.x` container address.
+(Host-networked deployments use the host IP anyway.) This applies whichever method below
+you use.
+
+**Recommended — do it in the SOC web UI.** On the SO manager, go to
+**Administration → Configuration → Firewall**. Pick (or add) a host group that's
+permitted to reach Elasticsearch REST **and** the analyst/web ports — on a stock
+SO 3.0 grid the `analyst` host group covers the web UI; Elasticsearch on `:9200`
+is the access soc-ai specifically needs that a normal analyst workstation lacks,
+so confirm the group you choose opens `9200`. Add soc-ai's source IP to that
+group and apply. This is the supported path and survives upgrades.
+
+The equivalent CLI exists but the host-group semantics changed across SO
+versions, so the exact group name is grid-specific — prefer the UI above unless
+you already know your grid's host groups:
 
 ```bash
+# <hostgroup> is grid-specific — list yours first, then add the IP to one that
+# opens Elasticsearch REST (9200) and the analyst/web ports:
+sudo so-firewall list-hostgroups       # inspect the available groups
 sudo so-firewall includehost <hostgroup> <soc-ai-host-ip>
 sudo so-firewall apply
 ```
-
-(The exact host group is SO-version-specific — pick or create one that opens
-Elasticsearch REST and the analyst/web ports; see Security Onion's firewall docs.)
-
-**Docker nuance — pinhole the *host* IP, not the container's.** With the default Docker
-bridge network the container's traffic is NAT'd out the Docker host's address, so SO sees
-the **Docker host's IP** — allow-list *that*, not an internal `172.x` container address.
-(Host-networked deployments use the host IP anyway.)
 
 **Symptom if you skip it:** the first hunt — or the startup ES health check — hangs and
 then fails with a connection *timeout* / "connection refused" to `…:9200`, even though the
@@ -61,11 +70,16 @@ soc-ai reads alerts and enrichment context straight from Elasticsearch using the
 `ES_USERNAME` / `ES_PASSWORD` basic-auth credentials in `.env` (these are normally the
 same as your SO analyst login). The account needs:
 
-- `read` + `view_index_metadata` on the **events pattern** — `logs-*` on a single-node
-  SO 3.0 grid, or `*:so-*` for a cross-cluster (distributed) deployment. Set this with
-  `EVENTS_INDEX_PATTERN` in `.env`.
-- `read` + `view_index_metadata` on `so-case*`, `so-detection*`, and `so-playbook*`
-  (cases, detections, and playbooks).
+- `read` + `view_index_metadata` on the **events pattern**. SO 3.0 stores Suricata/Zeek
+  events + alerts in `logs-*` data streams, so the pattern is `logs-*` on a single-node
+  grid, or `*:logs-*` (cross-cluster search) on a multi-node / distributed deployment. Set
+  this with `EVENTS_INDEX_PATTERN` in `.env` — `setup.sh` auto-detects the cluster prefix
+  and writes the concrete value. (The old `*:so-*` form is wrong: it matches the
+  old-style `so-*` admin indices, not the `logs-*` data streams, so the alerts console
+  comes up empty.)
+- `read` + `view_index_metadata` on the cases/detections/playbooks patterns —
+  `so-case*` / `so-detection*` / `so-playbook*` on a single-node grid (prefix each with
+  `*:` on a multi-node grid, e.g. `*:so-case*`).
 
 **The stock SO `analyst` role already grants all of these reads.** A normal analyst
 account works out of the box for triage with no extra grants.
@@ -136,11 +150,14 @@ node. It adds the `soc-ai-audit-*` index privileges (`auto_configure`, `create_i
 today's audit index:
 
 ```bash
-# From your dev box, piping the script over SSH to the SO manager:
+# From the soc-ai repo root (so the relative script path resolves), piping the
+# script over SSH to the SO manager:
 ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh
 
-# Or interactively on the SO box itself:
-sudo bash scripts/setup-audit-index.sh
+# Or interactively on the SO box itself (copy the script over first — e.g.
+# `scp scripts/setup-audit-index.sh <admin>@<so-manager>:` , or on a Docker
+# deploy `docker compose cp soc-ai:/opt/soc-ai/scripts/setup-audit-index.sh .`):
+sudo bash setup-audit-index.sh
 ```
 
 It uses `so-elasticsearch-query` (which authenticates against the local ES via the

@@ -1,7 +1,7 @@
 import { ChevronsLeft, ChevronsRight, Crosshair, LogOut, Search, Settings, Triangle } from 'lucide-react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
-import { getMe, logout, setMyStatus } from '../lib/api';
+import { getMe, setMyStatus, signOut } from '../lib/api';
 import type { Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { useShell } from './ShellContext';
@@ -177,7 +177,7 @@ export function Sidebar() {
               )}
             </div>
             <button
-              onClick={() => logout().finally(() => navigate('/login'))}
+              onClick={() => signOut(navigate)}
               title="Sign out"
               className="flex text-faint hover:text-text"
             >

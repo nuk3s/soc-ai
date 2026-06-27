@@ -194,3 +194,73 @@ async def test_refresh_cloud_prefixes_cloudflare_wraps_txt_in_json_envelope(tmp_
     assert "104.16.0.0/13" in written["prefixes"]
     # Comment lines are stripped from the JSON envelope.
     assert "# comment" not in written["prefixes"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_cloud_azure_resolves_rotated_url_on_404(tmp_path: Path) -> None:
+    """A4: when the configured Azure URL 404s, the refresh scrapes MS's download
+    page for the CURRENT ServiceTags URL and retries."""
+    from soc_ai.enrichment.refresh import _AZURE_DOWNLOAD_PAGE
+
+    current = "https://download.microsoft.com/download/a/b/c/ServiceTags_Public_20260601.json"
+    page_html = f'<html><body><a href="{current}">download</a></body></html>'
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(REFRESH_URLS["azure_prefixes"]).mock(return_value=httpx.Response(404))
+        mock.get(_AZURE_DOWNLOAD_PAGE).mock(return_value=httpx.Response(200, text=page_html))
+        mock.get(current).mock(return_value=httpx.Response(200, text='{"values":[]}'))
+        results = await refresh_cloud_prefixes(tmp_path, sources=["azure"])
+    assert all(r.success for r in results)
+    assert (tmp_path / "azure.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_fetch_validated_rejects_truncated_body() -> None:
+    """A5: a body shorter than Content-Length is a truncated transfer → reject."""
+    from soc_ai.enrichment.refresh import _fetch_validated
+
+    url = "https://example.com/big.json"
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(url).mock(
+            return_value=httpx.Response(
+                200, content=b'{"x":1}', headers={"content-length": "99999"}
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(ValueError, match="truncated"):
+                await _fetch_validated(client, url, as_json=True, retries=1)
+
+
+@pytest.mark.asyncio
+async def test_fetch_validated_rejects_unparseable_json() -> None:
+    """A5: a JSON feed whose body doesn't parse (truncated) → reject, not write."""
+    from soc_ai.enrichment.refresh import _fetch_validated
+
+    url = "https://example.com/x.json"
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(url).mock(return_value=httpx.Response(200, content=b'{"truncated'))
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(ValueError):
+                await _fetch_validated(client, url, as_json=True, retries=1)
+
+
+@pytest.mark.asyncio
+async def test_fetch_validated_allows_compressed_body() -> None:
+    """A5 regression: a gzip-encoded body is LARGER than Content-Length (which is
+    the compressed wire size). Don't mis-flag it as truncated (the GCP feed)."""
+    import gzip
+
+    from soc_ai.enrichment.refresh import _fetch_validated
+
+    raw = b'{"prefixes":[{"ipv4Prefix":"8.8.8.0/24"}]}'
+    body = gzip.compress(raw)
+    url = "https://example.com/gcp.json"
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(url).mock(
+            return_value=httpx.Response(
+                200, content=body,
+                headers={"content-length": str(len(body)), "content-encoding": "gzip"},
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            out = await _fetch_validated(client, url, as_json=True, retries=1)
+    assert out == raw  # decompressed body returned, no false truncation error

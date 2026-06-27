@@ -141,4 +141,5 @@ CMD ["sh", "-c", \
         --host 0.0.0.0 \
         --port 8443 \
         --ssl-certfile \"${SOC_AI_TLS_CERT}\" \
-        --ssl-keyfile \"${SOC_AI_TLS_KEY}\""]
+        --ssl-keyfile \"${SOC_AI_TLS_KEY}\" \
+        --ssl-ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM'"]
