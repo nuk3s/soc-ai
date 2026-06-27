@@ -464,15 +464,27 @@ def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
     state.db_sessionmaker = MagicMock(return_value=db_cm)
 
     result = MagicMock()
-    result.output = "This is benign. Verified by the tools listed, t_enrich_ip(10.0.0.1) found nothing."
+    result.output = (
+        "This is benign. Verified by the tools listed, t_enrich_ip(10.0.0.1) found nothing."
+    )
 
     with (
-        patch("soc_ai.webui.chat_manager.inv_svc.get_with_events", AsyncMock(return_value=(inv, []))),
-        patch("soc_ai.webui.chat_manager.chat_svc.history_for_agent", AsyncMock(return_value=[("user", "why fp?")])),
+        patch(
+            "soc_ai.webui.chat_manager.inv_svc.get_with_events", AsyncMock(return_value=(inv, []))
+        ),
+        patch(
+            "soc_ai.webui.chat_manager.chat_svc.history_for_agent",
+            AsyncMock(return_value=[("user", "why fp?")]),
+        ),
         patch("soc_ai.webui.chat_manager.get_alert_context", AsyncMock(return_value=MagicMock())),
-        patch("soc_ai.webui.chat_manager.check_narrative_grounding", return_value=MagicMock(grounded=True)),
+        patch(
+            "soc_ai.webui.chat_manager.check_narrative_grounding",
+            return_value=MagicMock(grounded=True),
+        ),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
-        patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock(side_effect=_finish)),
+        patch(
+            "soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock(side_effect=_finish)
+        ),
         patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
         patch("soc_ai.webui.chat_manager._extract_tools", return_value=[]),
         patch("soc_ai.webui.chat_manager._extract_tool_evidence", return_value=[]),

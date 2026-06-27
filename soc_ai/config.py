@@ -72,8 +72,8 @@ class Settings(BaseSettings):
     # Transport-layer retries for transient ConnectionTimeout / 5xx from
     # ES under heavy concurrency. The elasticsearch-py client retries
     # internally, so we don't need to wrap call sites by hand. Bounded so a
-    # fully-unreachable grid can't stall a call for request_timeout × (1+retries):
-    # 30s × 3 = 90s worst case (was 60 × 4 = 240s).
+    # fully-unreachable grid can't stall a call for request_timeout x (1+retries):
+    # 30s x 3 = 90s worst case (was 60 x 4 = 240s).
     es_max_retries: int = 2
     # Hard wall-clock bound for INTERACTIVE console grid queries (alerts list +
     # group events). Below the worst-case ES retry budget so the UI fails fast

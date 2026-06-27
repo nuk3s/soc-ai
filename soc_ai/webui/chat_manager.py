@@ -139,7 +139,7 @@ def _build_prompt(prior: list[tuple[str, str]], question: str) -> str:
     return f"Conversation so far:\n{convo}\n\nAnalyst's new question: {question}"
 
 
-async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:
+async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # noqa: PLR0915
     try:
         settings = state.settings
         ctx = ctx_from_state(state)

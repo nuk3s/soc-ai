@@ -257,7 +257,8 @@ async def test_fetch_validated_allows_compressed_body() -> None:
     with respx.mock(assert_all_called=False) as mock:
         mock.get(url).mock(
             return_value=httpx.Response(
-                200, content=body,
+                200,
+                content=body,
                 headers={"content-length": str(len(body)), "content-encoding": "gzip"},
             )
         )

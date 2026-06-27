@@ -435,7 +435,9 @@ def test_url_setting_rejects_non_http_scheme() -> None:
         coerce("crawl4ai_url", "gopher://attacker/x")
     # Any host is allowed — an admin may legitimately use an internal service.
     assert coerce("searxng_url", "http://127.0.0.1:8888") == "http://127.0.0.1:8888"
-    assert coerce("crawl4ai_url", "https://crawl.internal.example") == "https://crawl.internal.example"
+    assert (
+        coerce("crawl4ai_url", "https://crawl.internal.example") == "https://crawl.internal.example"
+    )
     assert coerce("searxng_url", "") == ""  # unset is fine
 
 

@@ -302,7 +302,7 @@ def _resolve_cors_origins(cors_setting: str, so_host: str) -> list[str]:
     return []
 
 
-def create_app() -> FastAPI:
+def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewares + routers
     """Application factory."""
     # Gate the interactive docs + raw schema behind a setting (off in prod) so a
     # security product doesn't publish its full admin API surface unauthenticated.
@@ -394,7 +394,8 @@ def create_app() -> FastAPI:
         @app.middleware("http")
         async def _rate_limit(request: Any, call_next: Any) -> Response:
             if request.url.path == "/healthz":  # never throttle health checks
-                return await call_next(request)
+                exempt: Response = await call_next(request)
+                return exempt
             ip = request.client.host if request.client else "?"
             window = int(time.monotonic()) // 60
             buckets: dict[str, list[int]] = app.state.rate_buckets
@@ -408,10 +409,15 @@ def create_app() -> FastAPI:
                 if entry[1] > _rl_limit:
                     return JSONResponse(
                         status_code=429,
-                        content={"detail": {"reason": "rate_limited",
-                                            "hint": "Too many requests; slow down."}},
+                        content={
+                            "detail": {
+                                "reason": "rate_limited",
+                                "hint": "Too many requests; slow down.",
+                            }
+                        },
                     )
-            return await call_next(request)
+            response: Response = await call_next(request)
+            return response
 
     app.include_router(router)
     # Open (pre-auth) endpoints first so FastAPI resolves /api/v1/login before

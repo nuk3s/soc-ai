@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest

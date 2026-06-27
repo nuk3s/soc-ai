@@ -17,6 +17,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
@@ -745,17 +746,13 @@ _URL_SETTING_KEYS = frozenset(
 
 
 def _require_http_scheme(key: str, value: str) -> None:
-    from urllib.parse import urlparse
-
     for part in value.split(","):  # es_hosts may be a CSV of URLs
         v = part.strip()
         if not v:
             continue
         scheme = urlparse(v).scheme.lower()
         if scheme not in ("http", "https"):
-            raise ValueError(
-                f"{key} must be an http(s) URL (got scheme {scheme or 'none'!r})"
-            )
+            raise ValueError(f"{key} must be an http(s) URL (got scheme {scheme or 'none'!r})")
 
 
 def coerce(key: str, raw_str: str) -> Any:

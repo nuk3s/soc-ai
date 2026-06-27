@@ -318,9 +318,7 @@ async def test_fetch_group_events_passes_offset_and_size(settings_kratos: Settin
     elastic.search.return_value = EsSearchResult(
         total=0, took_ms=0, hits=[], aggregations=None, total_is_lower_bound=False
     )
-    await aq.fetch_group_events(
-        elastic, settings_kratos, rule_name="ET TEST", size=25, offset=50
-    )
+    await aq.fetch_group_events(elastic, settings_kratos, rule_name="ET TEST", size=25, offset=50)
     kw = elastic.search.call_args.kwargs
     assert kw["size"] == 25
     assert kw["from_"] == 50

@@ -22,9 +22,9 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
+from elastic_transport import TransportError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from elastic_transport import TransportError
 from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -280,7 +280,10 @@ async def list_alerts(
             status_code=503,
             detail={
                 "reason": "grid_unavailable",
-                "hint": "The Security Onion grid (Elasticsearch) is slow or unreachable — retry shortly.",
+                "hint": (
+                    "The Security Onion grid (Elasticsearch) is slow or unreachable "
+                    "— retry shortly."
+                ),
             },
         ) from exc
 
@@ -405,7 +408,10 @@ async def list_group_events(
             status_code=503,
             detail={
                 "reason": "grid_unavailable",
-                "hint": "The Security Onion grid (Elasticsearch) is slow or unreachable — retry shortly.",
+                "hint": (
+                    "The Security Onion grid (Elasticsearch) is slow or unreachable "
+                    "— retry shortly."
+                ),
             },
         ) from exc
 

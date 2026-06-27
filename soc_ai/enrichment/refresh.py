@@ -256,24 +256,25 @@ async def refresh_cloud_prefixes(
             content: bytes | None = None
             try:
                 content = await _fetch_validated(client, url, as_json=(source != "cloudflare"))
-            except (httpx.HTTPError, ValueError) as e:
+            except (httpx.HTTPError, ValueError) as err:
                 # Azure rotates its dated filename + GUID path weekly, so the
                 # configured URL eventually 404s. On failure, resolve the current
                 # URL from MS's download page and retry once (honors an explicit
                 # operator override by trying it FIRST, above).
+                fail_err: Exception = err
                 if source == "azure":
                     resolved = await _resolve_azure_service_tags_url(client)
                     if resolved and resolved != url:
                         try:
                             content = await _fetch_validated(client, resolved, as_json=True)
-                        except (httpx.HTTPError, ValueError) as e2:
-                            e = e2
+                        except (httpx.HTTPError, ValueError) as err2:
+                            fail_err = err2
                 if content is None:
-                    _LOGGER.warning("refresh cloud %s failed: %s", source, e)
-                    entry["last_error"] = str(e)
+                    _LOGGER.warning("refresh cloud %s failed: %s", source, fail_err)
+                    entry["last_error"] = str(fail_err)
                     status[source] = entry
                     _save_cloud_status(data_dir, status)
-                    results.append(RefreshResult(source=source, success=False, error=str(e)))
+                    results.append(RefreshResult(source=source, success=False, error=str(fail_err)))
                     continue
 
             if source == "cloudflare":
