@@ -5,6 +5,9 @@ import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
+import { AgentToolsPanel } from './AgentToolsPanel';
+import { ApiKeysPanel } from './ApiKeysPanel';
+import { DataSourcesPanel } from './DataSourcesPanel';
 import { addInternalIdentifier, createUser, getConfig, getDiscoveryScan, getInternalIdentifiers, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -95,6 +98,9 @@ export function Config() {
     }
     return [
       ...groupEntries,
+      { id: 'data-sources', label: 'Data sources' },
+      { id: 'api-keys', label: 'API keys' },
+      { id: 'agent-tools', label: 'Agent tools' },
       { id: 'users', label: 'Users' },
       { id: 'api-tokens', label: 'API tokens' },
       { id: 'diagnostics', label: 'Diagnostics' },
@@ -125,6 +131,19 @@ export function Config() {
     els.forEach((el) => obs.observe(el));
     return () => obs.disconnect();
   }, [SECTIONS, nonce, identNonce]);
+
+  // Deep-link support: when arriving at /config#<section> (e.g. the dashboard's
+  // "Manage data sources" link → #data-sources), scroll that section into view
+  // once its DOM has mounted. Runs after the settings + standalone panels render.
+  useEffect(() => {
+    if (loading || !data) return;
+    const id = window.location.hash.replace('#', '');
+    if (!id) return;
+    const t = setTimeout(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 60);
+    return () => clearTimeout(t);
+  }, [loading, data]);
 
   // Wrap a mutation so any error surfaces inline and the list refetches on success.
   const identMutation = (p: Promise<unknown>) => {
@@ -374,6 +393,10 @@ export function Config() {
         </Fragment>
       ))}
 
+      <DataSourcesPanel />
+      <ApiKeysPanel />
+      <AgentToolsPanel />
+
       {/* Users */}
       <div id="users" className="mb-[22px] scroll-mt-6">
         <SectionTitle right={<span className="text-faint"><Users size={14} /></span>}>
@@ -620,7 +643,7 @@ export function Config() {
         >
           <ShieldAlert size={15} className="text-[#f04438]" />
           <span className="text-[13px] font-semibold text-[#f04438]">Danger Zone</span>
-          <span className="ml-auto text-[11px] text-text-muted">All changes require restart</span>
+          <span className="ml-auto text-[11px] text-text-muted">Connection changes may need a restart</span>
         </div>
 
         {/* Settings rows */}

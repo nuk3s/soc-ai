@@ -73,6 +73,20 @@ class HuntManager:
         task.add_done_callback(lambda t: self._tasks.pop(inv_id, None))
         return inv_id
 
+    def cancel(self, inv_id: str) -> bool:
+        """Cancel an in-flight hunt's background task.
+
+        Returns True if a live task was found and cancelled — ``recorded_run``
+        catches the resulting ``CancelledError`` and lands the run as
+        ``cancelled``. Returns False if no live task is tracked (already
+        finished, or never started here).
+        """
+        task = self._tasks.get(inv_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
 
 async def _drain(
     gen: Any,

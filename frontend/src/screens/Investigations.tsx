@@ -1,21 +1,22 @@
-import { MessageSquare, RefreshCw } from 'lucide-react';
-import { useState } from 'react';
+import { Check, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
+import { Fragment, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, VerdictPill } from '../components/Badges';
 import { MultiSelect } from '../components/MultiSelect';
 import { Checkbox } from '../components/Controls';
 import { ErrorState, LoadingState } from '../components/States';
-import { getInvestigations, rehuntInvestigations } from '../lib/api';
+import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import type { InvestigationRow, Verdict } from '../lib/types';
 
-const GRID = '28px 1fr 150px 90px 120px 110px 120px';
+const GRID = '28px 1fr 150px 90px 120px 110px 120px 44px';
 
 const STATUS: Record<InvestigationRow['status'], { color: string; label: string; pulse: boolean }> = {
   complete: { color: '#3fb950', label: 'Complete', pulse: false },
   running: { color: '#4b8bf5', label: 'Investigating', pulse: true },
   awaiting: { color: '#f5a623', label: 'Awaiting decision', pulse: true },
   error: { color: '#f04438', label: 'Error', pulse: false },
+  cancelled: { color: '#8b949e', label: 'Cancelled', pulse: false },
 };
 
 type SortKey = 'name' | 'verdict' | 'conf' | 'host' | 'status' | 'when';
@@ -32,7 +33,8 @@ const STATUS_ORDER: Record<InvestigationRow['status'], number> = {
   running: 0,
   awaiting: 1,
   error: 2,
-  complete: 3,
+  cancelled: 3,
+  complete: 4,
 };
 
 function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: SortDir): number {
@@ -65,15 +67,21 @@ function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: So
 export function Investigations() {
   const navigate = useNavigate();
   const [reloadKey, setReloadKey] = useState(0);
-  const { data, loading, error } = useAsync(getInvestigations, [reloadKey]);
+  const { data, loading, error } = useAsync(getInvestigations, [reloadKey], {
+    refetchInterval: 10000, // live status (running → complete) without a reload
+  });
 
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]);
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: 'when', dir: 'desc' });
+  const [groupBy, setGroupBy] = useState<'none' | 'detection'>('none');
 
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [rehunting, setRehunting] = useState(false);
   const [rehuntMsg, setRehuntMsg] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   const rows = data ?? [];
   const running = rows.filter((r) => r.status === 'running').length;
@@ -84,6 +92,23 @@ export function Investigations() {
     .filter((r) => !filterVerdicts.length || filterVerdicts.includes(r.verdict))
     .filter((r) => !filterStatuses.length || filterStatuses.includes(r.status))
     .sort((a, b) => cmpRows(a, b, sort.key, sort.dir));
+
+  // When grouping, cluster rows by detection name (keeping the user's sort within
+  // each group) and precompute per-group counts for the headers.
+  const displayRows =
+    groupBy === 'detection'
+      ? [...visible].sort(
+          (a, b) =>
+            (a.name || '').localeCompare(b.name || '') || cmpRows(a, b, sort.key, sort.dir),
+        )
+      : visible;
+  const groupCounts = new Map<string, number>();
+  if (groupBy === 'detection') {
+    for (const r of displayRows) {
+      const k = r.name || '(unnamed detection)';
+      groupCounts.set(k, (groupCounts.get(k) ?? 0) + 1);
+    }
+  }
 
   const toggleSort = (key: SortKey) => {
     setSort((prev) =>
@@ -147,6 +172,45 @@ export function Investigations() {
     }
   };
 
+  // Per-row delete (the discoverable path): a hover trash icon arms an inline
+  // confirm in the row, then deletes just that investigation.
+  const deleteOne = async (id: string) => {
+    setRehuntMsg(null);
+    try {
+      await deleteInvestigation(id);
+      setRehuntMsg('Investigation deleted');
+    } catch {
+      setRehuntMsg('Delete failed — cancel a running investigation first, or admin only');
+    }
+    setPendingDelete(null);
+    setReloadKey((k) => k + 1);
+  };
+
+  const handleDelete = async () => {
+    const ids = Object.keys(selected).filter((k) => selected[k]);
+    if (!ids.length) return;
+    setDeleting(true);
+    setRehuntMsg(null);
+    let ok = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        await deleteInvestigation(id);
+        ok += 1;
+      } catch {
+        failed += 1; // running (cancel first) or not admin
+      }
+    }
+    setRehuntMsg(
+      `Deleted ${ok} investigation${ok !== 1 ? 's' : ''}` +
+        (failed ? ` · ${failed} failed (cancel a running one first, or admin only)` : '')
+    );
+    setSelected({});
+    setConfirmDelete(false);
+    setDeleting(false);
+    setReloadKey((k) => k + 1);
+  };
+
   return (
     <div className="px-[22px] pb-[60px] pt-5">
       <div className="text-[20px] font-semibold tracking-[-.015em]">Investigations</div>
@@ -178,6 +242,18 @@ export function Investigations() {
           value={filterStatuses}
           onChange={setFilterStatuses}
         />
+        <button
+          onClick={() => setGroupBy((g) => (g === 'detection' ? 'none' : 'detection'))}
+          title="Group investigations by detection rule"
+          className={
+            'rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold ' +
+            (groupBy === 'detection'
+              ? 'border-accent text-accent'
+              : 'border-border-strong text-dim hover:text-text')
+          }
+        >
+          Group by detection{groupBy === 'detection' ? ' ✓' : ''}
+        </button>
 
         {selCount > 0 && (
           <>
@@ -194,6 +270,32 @@ export function Investigations() {
               <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
               {rehunting ? 'Starting…' : `Re-investigate (${selCount})`}
             </button>
+            {confirmDelete ? (
+              <>
+                <button
+                  disabled={deleting}
+                  onClick={() => { void handleDelete(); }}
+                  className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
+                >
+                  <Trash2 size={12} />
+                  {deleting ? 'Deleting…' : `Confirm delete (${selCount})`}
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                title="Delete the selected investigations (admin)"
+                className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+              >
+                <Trash2 size={12} /> Delete
+              </button>
+            )}
             <button
               onClick={() => setSelected({})}
               className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
@@ -239,6 +341,7 @@ export function Investigations() {
           <div className={headerCls('when')} onClick={() => toggleSort('when')}>
             When{caret('when')}
           </div>
+          <div />
         </div>
 
         {loading && <LoadingState />}
@@ -249,13 +352,23 @@ export function Investigations() {
         {!loading && !error && rows.length > 0 && visible.length === 0 && (
           <div className="px-4 py-10 text-center text-[13px] text-faint">No investigations match the selected filters.</div>
         )}
-        {visible.map((r) => {
-          const st = STATUS[r.status] ?? STATUS.complete;
+        {displayRows.map((r, i) => {
+          const st = STATUS[r.status] ?? STATUS.error;
+          const groupName = r.name || '(unnamed detection)';
+          const showHeader =
+            groupBy === 'detection' &&
+            (i === 0 || (displayRows[i - 1].name || '(unnamed detection)') !== groupName);
           return (
-            <div
-              key={r.id}
-              onClick={() => navigate(`/investigation/${r.id}`, { state: { from: '/investigations' } })}
-              className="grid cursor-pointer items-center gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-surface-hover"
+            <Fragment key={r.id}>
+              {showHeader && (
+                <div className="flex items-center gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[12px] font-semibold text-text-2">
+                  <span className="min-w-0 truncate">{groupName}</span>
+                  <span className="font-mono text-[11px] text-faint">{groupCounts.get(groupName)}</span>
+                </div>
+              )}
+              <div
+                onClick={() => navigate(`/investigation/${r.id}`, { state: { from: '/investigations' } })}
+              className="group grid cursor-pointer items-center gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-surface-hover"
               style={{ gridTemplateColumns: GRID }}
             >
               <div
@@ -293,7 +406,28 @@ export function Investigations() {
                 </span>
               </div>
               <div className="font-mono text-[12px] text-dim">{r.when}</div>
-            </div>
+              <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
+                {pendingDelete === r.id ? (
+                  <div className="flex items-center gap-1.5">
+                    <button onClick={() => { void deleteOne(r.id); }} title="Confirm delete" className="flex text-danger hover:opacity-80">
+                      <Check size={14} />
+                    </button>
+                    <button onClick={() => setPendingDelete(null)} title="Cancel" className="flex text-faint hover:text-text">
+                      <X size={14} />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setPendingDelete(r.id)}
+                    title="Delete investigation"
+                    className="flex text-faint opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                )}
+              </div>
+              </div>
+            </Fragment>
           );
         })}
       </div>

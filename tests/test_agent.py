@@ -4423,6 +4423,45 @@ async def test_synth_first_phase_d_validators_run_on_round2(
     assert "done" in kinds
 
 
+def test_round2_failure_fallback_keeps_settled_round1_verdict() -> None:
+    """A round-2 crash should land the round-1 verdict (annotated), not error."""
+    from soc_ai.agent.orchestrator import _round2_failure_fallback
+    from soc_ai.agent.triage import TriageReport
+
+    r1 = TriageReport(
+        verdict="false_positive",
+        confidence=0.95,
+        summary="legitimate WebMD CDN",
+        citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    out = _round2_failure_fallback("alert-1", r1, TimeoutError("gateway timeout"))
+    assert out.verdict == "false_positive"
+    assert out.confidence == 0.95
+    assert "did not complete" in out.summary  # annotated so the operator knows
+
+
+def test_round2_failure_fallback_nmi_when_round1_inconclusive() -> None:
+    """A round-2 crash with no settled round-1 verdict falls back to needs_more_info."""
+    from soc_ai.agent.orchestrator import _round2_failure_fallback
+    from soc_ai.agent.triage import TriageReport
+
+    inconclusive = TriageReport(
+        verdict="needs_more_info",
+        confidence=0.0,
+        summary="round-1 was inconclusive",
+        citations=[],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    # needs_more_info is not a settled verdict, so it falls through to the
+    # synth-failure NMI report rather than being "kept".
+    from_inconclusive = _round2_failure_fallback("a", inconclusive, TimeoutError("x"))
+    assert from_inconclusive.verdict == "needs_more_info"
+    assert _round2_failure_fallback("a", None, TimeoutError("x")).verdict == "needs_more_info"
+
+
 @pytest.mark.asyncio
 async def test_synth_first_round1_failure_emits_fallback_nmi_triage_report(
     settings_kratos: Settings,
@@ -5133,6 +5172,49 @@ def test_is_evidence_backed_pivot_citation_not_counted_at_round1() -> None:
     assert _is_evidence_backed(report_path_cite, enriched, messages=None) is False
 
 
+class _FakeIterNode:
+    """A pydantic-ai-style node whose ``model_response`` the orchestrator projects."""
+
+    def __init__(self, message: Any) -> None:
+        self.model_response = message
+
+
+class _FakeAgentRun:
+    """Async-iterable run that yields one node per message, then exposes ``result``."""
+
+    def __init__(self, messages: list[Any], result: Any) -> None:
+        self._nodes = [_FakeIterNode(m) for m in messages]
+        self.result = result
+
+    def __aiter__(self) -> Any:
+        return self._agen()
+
+    async def _agen(self) -> Any:
+        for node in self._nodes:
+            yield node
+
+
+class _FakeIterCM:
+    def __init__(self, run: _FakeAgentRun) -> None:
+        self._run = run
+
+    async def __aenter__(self) -> _FakeAgentRun:
+        return self._run
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+def _install_fake_iter(fake_agent: Any, messages: list[Any], result: Any) -> None:
+    """Make ``fake_agent.iter(...)`` stream *messages* as nodes and expose
+    *result* after iteration — mirrors how the orchestrator now drives the
+    investigator via ``agent.iter()`` (live streaming) instead of one blocking
+    ``run()``."""
+    from unittest.mock import MagicMock
+
+    fake_agent.iter = MagicMock(return_value=_FakeIterCM(_FakeAgentRun(messages, result)))
+
+
 @pytest.mark.asyncio
 async def test_investigation_loop_runs_and_flips_verdict(
     settings_kratos: Settings,
@@ -5199,6 +5281,7 @@ async def test_investigation_loop_runs_and_flips_verdict(
     )
     fake_investigator = MagicMock()
     fake_investigator.run = AsyncMock(return_value=inv_result)
+    _install_fake_iter(fake_investigator, [loop_msg], inv_result)
 
     # Loop synthesizer: concludes true_positive from the gathered transcript.
     flipped_report = TriageReport(
@@ -5255,8 +5338,8 @@ async def test_investigation_loop_runs_and_flips_verdict(
     assert "synth_round1_skipped" in kinds
     assert loop_ev.payload["round1_verdict"] is None
     assert loop_ev.payload["reason"] == "definitely_investigate"
-    # The investigator was actually invoked.
-    fake_investigator.run.assert_awaited_once()
+    # The investigator was actually invoked (streamed via iter()).
+    fake_investigator.iter.assert_called_once()
     fake_loop_synth.run.assert_awaited_once()
     # The final verdict changed FP -> TP.
     report_ev = next(e for e in events if e.kind == "triage_report")
@@ -5284,7 +5367,7 @@ async def test_investigation_loop_investigator_failure_errors_not_nmi(
         return _malware_signal_enriched(alert_id)  # malware → definitely_investigate
 
     fake_investigator = MagicMock()
-    fake_investigator.run = AsyncMock(side_effect=ConnectionError("Connection error."))
+    fake_investigator.iter = MagicMock(side_effect=ConnectionError("Connection error."))
 
     with (
         patch(
@@ -5366,6 +5449,7 @@ async def test_investigation_loop_streams_tool_events(
     )
     fake_investigator = MagicMock()
     fake_investigator.run = AsyncMock(return_value=inv_result)
+    _install_fake_iter(fake_investigator, [fake_msg], inv_result)
 
     flipped_report = TriageReport(
         verdict="true_positive",

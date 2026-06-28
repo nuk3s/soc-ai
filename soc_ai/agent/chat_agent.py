@@ -20,12 +20,19 @@ from pydantic_ai.models import Model
 
 from soc_ai.agent.orchestrator import InvestigationContext
 from soc_ai.tools.crawl_page import crawl_page
+from soc_ai.tools.cvedb import cve_lookup
 from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip
 from soc_ai.tools.get_event_raw import get_event_raw
 from soc_ai.tools.get_pcap import get_pcap_facts
+from soc_ai.tools.greynoise import greynoise
+from soc_ai.tools.host_summary import host_summary
+from soc_ai.tools.prevalence import prevalence
 from soc_ai.tools.query_cases import query_cases
 from soc_ai.tools.query_events import query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
+from soc_ai.tools.rule_prevalence import rule_prevalence
+from soc_ai.tools.shodan_host import shodan_host
+from soc_ai.tools.shodan_internetdb import shodan_internetdb
 from soc_ai.tools.web_search import web_search
 
 _LOGGER = logging.getLogger(__name__)
@@ -268,6 +275,128 @@ def build_chat_agent(  # noqa: PLR0915
         """
         try:
             return await get_event_raw(event_id, elastic=ctx.elastic, settings=s)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_host_summary(ip: str, lookback_hours: int = 24) -> dict[str, Any]:
+        """Identify an internal host by IP: hostname, device/OS, role, peers, DNS.
+
+        Use this FIRST whenever the question is about *what a host is* (its
+        device type, OS, or hostname) — it parses the host's HTTP User-Agents so
+        an iPhone is reported as an iPhone, not a Mac. Returns the evidence
+        string behind each guess. Prefer it over inferring identity from a label
+        or a partial UA you saw in passing.
+        """
+        try:
+            return await host_summary(
+                ip,
+                elastic=ctx.elastic,
+                settings=s,
+                lookback_hours=lookback_hours,
+                time_anchor=ctx.default_time_anchor,
+            )
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_prevalence(
+        ip: str,
+        peer_ip: str | None = None,
+        domain: str | None = None,
+        lookback_days: int = 90,
+    ) -> dict[str, Any]:
+        """Has THIS host talked to THIS dest/domain before, and how rare is it?
+
+        Learned from the events index only (no external calls). Pass `peer_ip`
+        to scope to a host pair, `domain` to scope to a domain (DNS/SNI/HTTP),
+        or neither to summarize the host's overall activity. Returns first/last
+        seen, distinct-day count, an `is_novel` flag and a `rarity` label
+        ('first-seen' | 'rare' | 'common')."""
+        try:
+            return await prevalence(
+                ip,
+                elastic=ctx.elastic,
+                settings=s,
+                peer_ip=peer_ip,
+                domain=domain,
+                lookback_days=lookback_days,
+                time_anchor=ctx.default_time_anchor,
+            )
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_rule_prevalence(rule_name: str, lookback_days: int = 30) -> dict[str, Any]:
+        """Base-rate / noisiness of a Suricata detection rule across the estate.
+
+        Answers "is this rule NOISY (fires constantly across many hosts -> a
+        firing is likely benign HERE and weak evidence) or RARE / FIRST-SEEN (a
+        firing is notable)?". Call this whenever the question leans on a rule
+        label — before trusting the signature name, check whether that signature
+        is a constant-firing nuisance on this grid. Returns total_fires, distinct
+        src/dest hosts, first/last seen, fires_per_day, and a noisiness bucket.
+        """
+        try:
+            return await rule_prevalence(
+                rule_name,
+                elastic=ctx.elastic,
+                settings=s,
+                lookback_days=lookback_days,
+            )
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
+        """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key).
+
+        Returns the open ports, software CPEs, reverse-DNS hostnames, tags
+        (cdn/cloud/self-signed) and known CVEs Shodan last observed on that
+        address — use it to corroborate "what is this external host?" for an
+        alert against an unknown public IP. Opt-in ONLINE tool: when online
+        enrichment is disabled it returns a clean 'disabled' dict with no
+        network I/O, and private/reserved IPs are skipped (never sent off-box).
+        """
+        try:
+            return await shodan_internetdb(ip, settings=s)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_greynoise(ip: str) -> dict[str, Any]:
+        """GreyNoise lookup for an EXTERNAL IP — is it indiscriminately scanning
+        the internet (noise), a known-benign service (riot), and its
+        classification. EXTERNAL IPs only; internal IPs are skipped. Opt-in
+        ONLINE tool: returns a clean disabled/not-configured dict (no network
+        I/O) when online enrichment is off or the API key is unset."""
+        try:
+            return await greynoise(ip, settings=s)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_shodan_host(ip: str) -> dict[str, Any]:
+        """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API
+        key): network owner (org/isp/asn), geo, guessed OS, open ports, the
+        per-service banners (product/version), and known CVEs — deeper than
+        t_shodan_internetdb. Opt-in ONLINE tool: returns a clean disabled/
+        not-configured dict (no network I/O) when online enrichment is off or
+        SHODAN_API_KEY is unset; private/internal IPs are skipped."""
+        try:
+            return await shodan_host(ip, settings=s)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
+        """Score a named CVE via Shodan CVEDB (free, no key): CVSS base score,
+        EPSS exploit-probability + ranking, CISA KEV (actively-exploited) flag,
+        summary and references — use to judge HOW SEVERE / HOW LIKELY-EXPLOITED
+        a CVE is. Opt-in ONLINE tool: returns a clean 'disabled' dict (no network
+        I/O) when online enrichment is off."""
+        try:
+            return await cve_lookup(cve_id, settings=s)
         except Exception as e:
             return {"error": str(e)}
 

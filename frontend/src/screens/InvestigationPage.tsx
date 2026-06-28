@@ -1,7 +1,7 @@
-import { ChevronLeft } from 'lucide-react';
+import { ChevronLeft, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { getInvestigation } from '../lib/api';
+import { deleteInvestigation, getInvestigation } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { ErrorState, LoadingState } from '../components/States';
 import { Investigation } from './Investigation';
@@ -16,6 +16,19 @@ export function InvestigationPage() {
   const backLabel = from === '/investigations' ? 'Investigations' : 'Alerts';
   const [tick, setTick] = useState(0);
   const { data: inv, loading, error } = useAsync(() => getInvestigation(id), [id, tick]);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [delErr, setDelErr] = useState('');
+
+  const doDelete = async () => {
+    setDelErr('');
+    try {
+      await deleteInvestigation(inv?.id ?? id);
+      navigate(backTo);
+    } catch (e) {
+      setDelErr(e instanceof Error ? e.message : 'Delete failed (admin only)');
+      setConfirmDel(false);
+    }
+  };
 
   // Poll a running investigation until it lands a verdict.
   useEffect(() => {
@@ -64,7 +77,36 @@ export function InvestigationPage() {
               complete · {inv.elapsedLabel}
             </div>
           ))}
+        {inv && inv.status !== 'investigating' && (
+          confirmDel ? (
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => { void doDelete(); }}
+                className="flex items-center gap-1.5 rounded-badge border border-danger px-2.5 py-[3px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
+              >
+                <Trash2 size={12} /> Confirm delete
+              </button>
+              <button
+                onClick={() => setConfirmDel(false)}
+                className="rounded-badge border border-border-strong px-2.5 py-[3px] text-[11.5px] font-semibold text-dim hover:text-text"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmDel(true)}
+              title="Delete this investigation (admin)"
+              className="flex items-center gap-1.5 rounded-badge border border-border-strong px-2.5 py-[3px] text-[11.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+            >
+              <Trash2 size={12} /> Delete
+            </button>
+          )
+        )}
       </div>
+      {delErr && (
+        <div className="mx-auto mb-3 max-w-workstation text-[12px] text-danger">{delErr}</div>
+      )}
 
       {/* Only on the first load — never on a poll refresh (it would remount the
           page subtree, causing the flicker + scanline reset). */}

@@ -55,9 +55,12 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 
 # ── OS-level deps ─────────────────────────────────────────────────────────────
-# curl: HEALTHCHECK; ca-certificates: trust chain for outbound HTTPS.
+# curl: HEALTHCHECK; ca-certificates: trust chain for outbound HTTPS;
+# openssh-client: the PCAP tool (soc_ai/tools/get_pcap.py) shells out to `ssh` to
+# run tcpdump on the Security Onion sensor — without it, t_get_pcap fails with
+# "ssh: not found" (the host having ssh masked this on non-container installs).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Non-root user ─────────────────────────────────────────────────────────────

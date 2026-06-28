@@ -166,7 +166,7 @@ export interface Investigation {
   summary: SummarySegment[];
   // 'error' arrives when the backend reaper marks a stuck/interrupted run as
   // failed — the drawer renders a terminal error state for it.
-  status: 'complete' | 'investigating' | 'error';
+  status: 'complete' | 'investigating' | 'error' | 'cancelled';
   elapsedLabel: string;
   /** real elapsed seconds at fetch time — seeds the ticker so it survives nav. */
   elapsedSec?: number;
@@ -245,7 +245,7 @@ export interface InvestigationRow {
   verdict: Verdict;
   conf: number | null;
   host: string;
-  status: 'complete' | 'running' | 'awaiting' | 'error';
+  status: 'complete' | 'running' | 'awaiting' | 'error' | 'cancelled';
   when: string;
   ts?: string;
   chatCount?: number;
@@ -404,7 +404,9 @@ export interface Workspace {
 }
 
 export interface Notification {
+  id: string;
   tone: 'danger' | 'warn' | 'accent';
   title: string;
   when: string;
+  href?: string | null;
 }

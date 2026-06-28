@@ -480,6 +480,37 @@ def test_config_set_setting_rejects_unknown(client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "unknown_setting"
 
 
+def test_config_set_setting_rejects_secret(client: TestClient) -> None:
+    """A secret (api-key) spec must be refused here with 400, not 500 — it routes
+    to the dedicated /config/api-keys endpoint."""
+    resp = client.post("/api/v1/config/setting", json={"key": "shodan_api_key", "value": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "secret_setting"
+
+
+def test_row_status_is_honest() -> None:
+    """An investigation row's status never silently claims 'complete'."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui_api import _row_status
+
+    def inv(**k: object) -> object:
+        return SimpleNamespace(**k)
+
+    assert _row_status(inv(status="running", verdict=None)) == "running"
+    assert _row_status(inv(status="complete", verdict="true_positive")) == "complete"
+    # needs_more_info IS a verdict — keep complete
+    assert _row_status(inv(status="complete", verdict="needs_more_info")) == "complete"
+    # finished with NO verdict → not a real completion
+    assert _row_status(inv(status="complete", verdict=None)) == "error"
+    assert _row_status(inv(status="complete", verdict="")) == "error"
+    # cancelled must NOT collapse to 'complete'
+    assert _row_status(inv(status="cancelled", verdict=None)) == "cancelled"
+    assert _row_status(inv(status="awaiting", verdict=None)) == "awaiting"
+    # an unknown stored status falls back to 'error', never 'complete'
+    assert _row_status(inv(status="weird", verdict=None)) == "error"
+
+
 def test_config_surfaces_events_index_pattern(client: TestClient) -> None:
     """GET /config exposes the newly-surfaced events_index_pattern (inc 1) with
     source=env (no override yet), hot apply, and its env value."""
@@ -2215,7 +2246,7 @@ class TestDangerZoneSave:
             assert r.json()["ok"] is True
 
     def test_returns_restart_required_true_for_non_hot(self, settings: Settings) -> None:
-        """All danger specs have hot=False → restart_required=True."""
+        """A connection setting (so_host, hot=False) → restart_required=True."""
         for c in _client(settings):
             r = c.post(
                 "/api/v1/config/danger/setting",
@@ -2223,6 +2254,33 @@ class TestDangerZoneSave:
             )
             assert r.status_code == 200
             assert r.json()["restart_required"] is True
+
+    def test_hot_internal_cidrs_applies_live(self, settings: Settings) -> None:
+        """internal_cidrs is hot — saved value applies live, no restart."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={
+                    "key": "internal_cidrs",
+                    "value": "10.50.0.0/16",
+                    "confirm": "internal_cidrs",
+                },
+            )
+            assert r.status_code == 200
+            assert r.json()["restart_required"] is False
+            nets = [str(n) for n in c.app.state.settings.internal_cidrs]
+            assert "10.50.0.0/16" in nets
+
+    def test_hot_ssh_host_applies_live(self, settings: Settings) -> None:
+        """so_ssh_host is hot (read per PCAP fetch) — applies live."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "so_ssh_host", "value": "sensor.local", "confirm": "so_ssh_host"},
+            )
+            assert r.status_code == 200
+            assert r.json()["restart_required"] is False
+            assert c.app.state.settings.so_ssh_host == "sensor.local"
 
     def test_secret_save_without_config_secret_key_returns_400_not_500(self) -> None:
         """Saving a SECRET danger setting with no CONFIG_SECRET_KEY → 400 (not 500),
@@ -2264,6 +2322,126 @@ class TestDangerZoneSave:
                     )
 
             assert asyncio.run(_read_raw()) is None
+
+
+class TestApiKeys:
+    """GET/POST/DELETE /api/v1/config/api-keys — hot, write-only enrichment keys."""
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        from pydantic import SecretStr
+
+        return Settings(
+            so_host="https://so.example.com",
+            so_username="analyst",
+            so_password=SecretStr("password123"),
+            so_verify_ssl=False,
+            es_hosts=["https://so.example.com:9200"],
+            litellm_base_url="http://localhost:4000",
+            synth_first_pipeline=False,
+            config_secret_key=SecretStr("0Y5eLjMDakyujfxGcb5ijyW_GL4pkxv3gHqWkfanOz0="),
+            api_auth_required=False,
+        )
+
+    def test_list_never_returns_values(self, settings: Settings) -> None:
+        for c in _client(settings):
+            r = c.get("/api/v1/config/api-keys")
+            assert r.status_code == 200
+            rows = r.json()
+            keys = {row["key"] for row in rows}
+            assert {"shodan_api_key", "greynoise_api_key", "misp_api_key"} <= keys
+            for row in rows:
+                assert set(row) == {"key", "label", "help", "isSet", "source"}
+
+    def test_save_hot_applies_and_encrypts(self, settings: Settings) -> None:
+        import asyncio
+        import json as _json
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/api-keys",
+                json={"key": "shodan_api_key", "value": "SHODANKEY123"},
+            )
+            assert r.status_code == 200
+            assert r.json() == {"ok": True, "isSet": True}
+            assert "SHODANKEY123" not in r.text
+            # Hot-applied onto the live Settings singleton (no restart).
+            live = c.app.state.settings.shodan_api_key
+            assert live is not None and live.get_secret_value() == "SHODANKEY123"
+
+            # Stored Fernet-encrypted, never plaintext.
+            async def _read(app: Any = c.app) -> str | None:
+                async with app.state.db_sessionmaker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "shodan_api_key")
+                    )
+
+            stored = _json.loads(asyncio.run(_read()))
+            assert stored != "SHODANKEY123"
+            assert stored.startswith("gAAAA")
+
+            # GET now reports it set + sourced from the DB (still no value).
+            rows = c.get("/api/v1/config/api-keys").json()
+            row = next(x for x in rows if x["key"] == "shodan_api_key")
+            assert row["isSet"] is True
+            assert row["source"] == "db"
+
+    def test_empty_value_rejected(self, settings: Settings) -> None:
+        for c in _client(settings):
+            r = c.post("/api/v1/config/api-keys", json={"key": "shodan_api_key", "value": "   "})
+            assert r.status_code == 400
+
+    def test_non_api_key_rejected(self, settings: Settings) -> None:
+        for c in _client(settings):
+            # A danger secret is NOT an api-key spec.
+            assert (
+                c.post(
+                    "/api/v1/config/api-keys", json={"key": "es_password", "value": "x"}
+                ).status_code
+                == 400
+            )
+            # A non-secret setting is rejected too.
+            assert (
+                c.post(
+                    "/api/v1/config/api-keys", json={"key": "analyst_model", "value": "x"}
+                ).status_code
+                == 400
+            )
+
+    def test_clear_unsets_live_value(self, settings: Settings) -> None:
+        for c in _client(settings):
+            c.post("/api/v1/config/api-keys", json={"key": "greynoise_api_key", "value": "GNKEY"})
+            assert c.app.state.settings.greynoise_api_key is not None
+            r = c.delete("/api/v1/config/api-keys/greynoise_api_key")
+            assert r.status_code == 200
+            assert r.json()["isSet"] is False
+            assert c.app.state.settings.greynoise_api_key is None
+
+    def test_save_without_config_secret_key_returns_400(self) -> None:
+        from pydantic import SecretStr
+
+        no_key = Settings(
+            so_host="https://so.example.com",
+            so_username="analyst",
+            so_password=SecretStr("password123"),
+            so_verify_ssl=False,
+            es_hosts=["https://so.example.com:9200"],
+            litellm_base_url="http://localhost:4000",
+            synth_first_pipeline=False,
+            api_auth_required=False,
+        )
+        for c in _client(no_key):
+            assert c.app.state.secret_box is None
+            r = c.post(
+                "/api/v1/config/api-keys",
+                json={"key": "shodan_api_key", "value": "supersecret"},
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"]["reason"] == "no_config_secret_key"
+            assert "supersecret" not in r.text
 
 
 class TestDangerZoneTest:

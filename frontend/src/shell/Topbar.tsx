@@ -1,8 +1,9 @@
-import { Bell, Check, ChevronDown, HelpCircle, Search, Settings } from 'lucide-react';
+import { Bell, Check, ChevronDown, HelpCircle, Search, Settings, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { useLocation, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { DevBadge } from '../components/Badges';
 import { type Health, getHealth, getNotifications, getWorkspaces } from '../lib/api';
+import { dismissNotification, getDismissed } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
 import { useShell } from './ShellContext';
 
@@ -15,6 +16,7 @@ const TONE: Record<Notification['tone'], string> = {
 function useBreadcrumb(): { crumb: string; crumb2?: string } {
   const { pathname } = useLocation();
   const params = useParams();
+  if (pathname.startsWith('/dashboard')) return { crumb: 'Dashboard' };
   if (pathname.startsWith('/alerts')) return { crumb: 'Alerts' };
   if (pathname.startsWith('/investigations')) return { crumb: 'Investigations' };
   if (pathname.startsWith('/investigation')) return { crumb: 'Investigation', crumb2: params.id };
@@ -27,6 +29,7 @@ function useBreadcrumb(): { crumb: string; crumb2?: string } {
 export function Topbar() {
   const { openPalette, ws, setWs } = useShell();
   const { crumb, crumb2 } = useBreadcrumb();
+  const navigate = useNavigate();
   const [wsOpen, setWsOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [healthOpen, setHealthOpen] = useState(false);
@@ -40,8 +43,33 @@ export function Topbar() {
       setWorkspaces(list);
       if (list.length > 0) setWs(list[0].name);
     });
-    getNotifications().then(setNotifs);
+    let alive = true;
+    const load = () =>
+      getNotifications()
+        .then((list) => {
+          if (!alive) return;
+          const dismissed = getDismissed();
+          setNotifs(list.filter((n) => !dismissed.has(n.id)));
+        })
+        .catch(() => {});
+    load();
+    const t = setInterval(load, 15000); // keep the bell live without a reload
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, []);
+
+  const handleDismiss = (id: string) => {
+    dismissNotification(id);
+    setNotifs((ns) => ns.filter((n) => n.id !== id));
+  };
+  const openNotif = (n: Notification) => {
+    if (n.href) {
+      navigate(n.href);
+      setNotifOpen(false);
+    }
+  };
 
   // Poll upstream health (ES / LLM / PCAP) for the status indicator.
   useEffect(() => {
@@ -245,8 +273,15 @@ export function Topbar() {
           {notifs.length === 0 && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint">No notifications.</div>
           )}
-          {notifs.map((nt, i) => (
-            <div key={i} className="flex cursor-pointer gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-[#141b25]">
+          {notifs.map((nt) => (
+            <div
+              key={nt.id}
+              onClick={() => openNotif(nt)}
+              className={
+                'flex gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-[#141b25] ' +
+                (nt.href ? 'cursor-pointer' : '')
+              }
+            >
               <span
                 className="mt-[5px] h-[7px] w-[7px] flex-none rounded-full"
                 style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
@@ -255,8 +290,27 @@ export function Topbar() {
                 <div className="text-[12.5px] leading-[1.45]">{nt.title}</div>
                 {nt.when && <div className="mt-[3px] font-mono text-[10.5px] text-faint">{nt.when} ago</div>}
               </div>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDismiss(nt.id);
+                }}
+                aria-label="Dismiss"
+                className="flex flex-none self-start p-0.5 text-faint hover:text-text"
+              >
+                <X size={13} />
+              </button>
             </div>
           ))}
+          <button
+            onClick={() => {
+              navigate('/notifications');
+              setNotifOpen(false);
+            }}
+            className="w-full border-t border-border-2 px-3.5 py-2.5 text-left text-[12px] font-semibold text-accent hover:bg-[#141b25]"
+          >
+            View all notifications
+          </button>
         </div>
       )}
 

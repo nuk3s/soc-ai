@@ -384,17 +384,31 @@ def test_whitelist_attrs_all_exist_on_settings() -> None:
         assert spec.attr in fields, f"{spec.attr} is not a Settings field"
 
 
-def test_no_reserved_or_secret_in_nondanger_pane() -> None:
-    """The non-Danger pane never exposes a reserved internal-id or secret field."""
-    from soc_ai.store.config_overrides import WHITELIST
+def test_no_reserved_or_secret_in_rendered_groups() -> None:
+    """The rendered settings groups never expose a reserved internal-id or a secret.
+
+    Secrets live either in the Danger Zone (connection identity) or the dedicated
+    write-only "API keys" section. Neither section is in SECTION_ORDER, so the
+    GET /config groups endpoint can't render — let alone leak — a secret value.
+    """
+    from soc_ai.store.config_overrides import SECTION_ORDER, WHITELIST
 
     for spec in WHITELIST:
         if spec.danger:
-            continue  # Danger Zone is the only place secrets/connection live
+            continue  # Danger Zone handles connection identity + secrets
+        if spec.secret:
+            # The only non-danger home for a secret is the API-keys panel, and
+            # that section must NOT be one the groups endpoint renders.
+            assert spec.section == "API keys", (
+                f"{spec.key} is a secret in section {spec.section!r}; a secret belongs in "
+                "the Danger Zone or the dedicated 'API keys' section"
+            )
+            assert spec.section not in SECTION_ORDER, (
+                f"section {spec.section!r} is rendered by GET /config — it must not hold secrets"
+            )
         assert spec.key not in _RESERVED_INTERNAL_IDENTIFIER_KEYS, (
             f"{spec.key} is reserved for the inc 2/3 managed-list UI"
         )
-        assert not spec.secret, f"{spec.key} is a secret but not in the Danger Zone"
 
 
 def test_inc1_sections_are_in_display_order() -> None:

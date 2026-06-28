@@ -1,4 +1,4 @@
-import { ChevronsLeft, ChevronsRight, Crosshair, LogOut, Search, Settings, Triangle } from 'lucide-react';
+import { Bell, ChevronsLeft, ChevronsRight, Crosshair, LayoutDashboard, LogOut, Search, Settings, Triangle } from 'lucide-react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { getMe, setMyStatus, signOut } from '../lib/api';
@@ -17,8 +17,10 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
+  { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
   { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
   { to: '/investigations', label: 'Investigations', icon: <Search size={16} /> },
+  { to: '/notifications', label: 'Notifications', icon: <Bell size={16} /> },
   { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, dev: true, match: ['/hunts'] },
   { to: '/config', label: 'Config', icon: <Settings size={16} /> },
 ];

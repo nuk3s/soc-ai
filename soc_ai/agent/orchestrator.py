@@ -62,6 +62,7 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools._registry import ApprovalGate
 from soc_ai.tools.crawl_page import crawl_page
+from soc_ai.tools.cvedb import cve_lookup
 from soc_ai.tools.enrichment import (
     MispClient,
     build_local_enrichment_context,
@@ -72,11 +73,17 @@ from soc_ai.tools.enrichment import (
 from soc_ai.tools.get_alert_context import get_alert_context
 from soc_ai.tools.get_pcap import get_pcap_facts
 from soc_ai.tools.get_playbooks import get_playbooks
+from soc_ai.tools.greynoise import greynoise
+from soc_ai.tools.host_summary import host_summary
 from soc_ai.tools.lookup_runbook import lookup_runbook
+from soc_ai.tools.prevalence import prevalence
 from soc_ai.tools.query_cases import query_cases
 from soc_ai.tools.query_detections import query_detections
 from soc_ai.tools.query_events import query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
+from soc_ai.tools.rule_prevalence import rule_prevalence
+from soc_ai.tools.shodan_host import shodan_host
+from soc_ai.tools.shodan_internetdb import shodan_internetdb
 from soc_ai.tools.web_search import web_search
 
 if TYPE_CHECKING:
@@ -1883,6 +1890,194 @@ def build_investigator(  # noqa: PLR0915 - tool registrations are inherently lon
         return _clamp_tool_result(zeek_rows)
 
     @agent.tool_plain
+    async def t_host_summary(ip: str, lookback_hours: int = 24) -> dict[str, Any]:
+        """Identify an internal host by IP from Security Onion data.
+
+        Returns its hostname, a device/OS guess PARSED from the host's HTTP
+        User-Agents (so an iPhone reads as an iPhone, not a Mac), a
+        server-vs-workstation role guess, first/last seen, and its top
+        peers/ports/DNS — each with the raw evidence string behind it.
+
+        Call this whenever the verdict depends on WHAT a host is (device type,
+        OS, role) rather than inferring identity from a rule label or a UA seen
+        in passing. The window is centered on the alert's `@timestamp`.
+        """
+        if dup := _dedup_result(
+            ctx, "t_host_summary", {"ip": ip, "lookback_hours": lookback_hours}
+        ):
+            return dup
+        try:
+            result = await host_summary(
+                ip,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                lookback_hours=lookback_hours,
+                time_anchor=ctx.default_time_anchor,
+            )
+        except Exception as e:
+            _LOGGER.warning("t_host_summary failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_prevalence(
+        ip: str,
+        peer_ip: str | None = None,
+        domain: str | None = None,
+        lookback_days: int = 90,
+    ) -> dict[str, Any]:
+        """Has THIS host talked to THIS dest/domain before, and how rare is it?
+
+        Local first-seen / novelty oracle, learned from the events index only
+        (no external calls). Pass `peer_ip` to scope to a host pair, `domain`
+        to scope to a domain (DNS/SNI/HTTP), or neither to summarize the host's
+        overall activity. Returns first/last seen, distinct-day count, an
+        `is_novel` flag and a `rarity` label ('first-seen' | 'rare' | 'common').
+        """
+        if dup := _dedup_result(
+            ctx,
+            "t_prevalence",
+            {
+                "ip": ip,
+                "peer_ip": peer_ip,
+                "domain": domain,
+                "lookback_days": lookback_days,
+            },
+        ):
+            return dup
+        try:
+            result = await prevalence(
+                ip,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                peer_ip=peer_ip,
+                domain=domain,
+                lookback_days=lookback_days,
+                time_anchor=ctx.default_time_anchor,
+            )
+        except Exception as e:
+            _LOGGER.warning("t_prevalence failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_rule_prevalence(rule_name: str, lookback_days: int = 30) -> dict[str, Any]:
+        """Base-rate / noisiness of a Suricata detection rule across the estate.
+
+        Answers whether this rule is NOISY (fires constantly across many hosts —
+        so its next firing is likely benign HERE and is weak evidence) or RARE /
+        FIRST-SEEN (a firing is notable). Call this whenever the verdict leans on
+        a rule label: before trusting the signature name, check whether that
+        signature is a constant-firing nuisance on this grid. Returns
+        total_fires, distinct src/dest hosts, first/last seen, fires_per_day, and
+        a noisiness bucket. READ-ONLY and zero-egress.
+        """
+        if dup := _dedup_result(
+            ctx, "t_rule_prevalence", {"rule_name": rule_name, "lookback_days": lookback_days}
+        ):
+            return dup
+        try:
+            result = await rule_prevalence(
+                rule_name,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                lookback_days=lookback_days,
+            )
+        except Exception as e:
+            _LOGGER.warning("t_rule_prevalence failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
+        """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key).
+
+        Returns the open ports, software CPEs, reverse-DNS hostnames, tags
+        (cdn/cloud/self-signed) and known CVEs Shodan last observed on that
+        address. Call it to corroborate WHAT an unknown EXTERNAL IP is — exposed
+        service, hosting class, known vulns — when the verdict turns on the
+        nature of the public peer.
+
+        Opt-in ONLINE tool: when online enrichment is disabled it returns a clean
+        'disabled' dict with no network I/O, and private/reserved IPs are skipped
+        (never sent off-box). Pass a PUBLIC IP only.
+        """
+        if dup := _dedup_result(ctx, "t_shodan_internetdb", {"ip": ip}):
+            return dup
+        try:
+            result = await shodan_internetdb(ip, settings=ctx.settings)
+        except Exception as e:
+            _LOGGER.warning("t_shodan_internetdb failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_greynoise(ip: str) -> dict[str, Any]:
+        """Look up an EXTERNAL IP in GreyNoise (Community API): is it scanning the
+        internet indiscriminately (noise), a known-benign service (riot), and its
+        classification.
+
+        Strong fit when the alert involves an unfamiliar external IP and you need
+        to know whether it is a mass-scanner / benign crawler (de-escalate) vs. a
+        targeted actor. EXTERNAL IPs only — internal/non-routable IPs are skipped.
+        Opt-in ONLINE tool: returns a clean disabled/not_configured dict (no I/O)
+        when online enrichment is off or the API key is unset.
+        """
+        if dup := _dedup_result(ctx, "t_greynoise", {"ip": ip}):
+            return dup
+        try:
+            result = await greynoise(ip, settings=ctx.settings)
+        except Exception as e:
+            _LOGGER.warning("t_greynoise failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_shodan_host(ip: str) -> dict[str, Any]:
+        """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API key).
+
+        Deeper than t_shodan_internetdb: adds the network owner (org/isp/asn),
+        geolocation, guessed OS, and the per-service BANNERS Shodan collected
+        (product + version + module per open port), plus the union of known
+        CVEs. Reach for it when the verdict turns on WHAT an unknown external
+        host is actually running and WHO owns it.
+
+        Opt-in ONLINE tool: returns a clean disabled/not_configured dict (no I/O)
+        when online enrichment is off or SHODAN_API_KEY is unset; private/
+        internal IPs are skipped (never sent off-box). PUBLIC IPs only.
+        """
+        if dup := _dedup_result(ctx, "t_shodan_host", {"ip": ip}):
+            return dup
+        try:
+            result = await shodan_host(ip, settings=ctx.settings)
+        except Exception as e:
+            _LOGGER.warning("t_shodan_host failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
+        """Score a named CVE via Shodan CVEDB (free, no key): CVSS base score,
+        EPSS exploit-probability + ranking, CISA KEV (actively-exploited) flag,
+        a short summary and references.
+
+        Call it whenever an alert, rule, or a Shodan host result names a CVE and
+        the verdict depends on HOW SEVERE / HOW LIKELY-EXPLOITED it is — KEV or a
+        high EPSS argues for escalation; an old, low-EPSS, non-KEV CVE does not.
+
+        Opt-in ONLINE tool (no API key): returns a clean 'disabled' dict (no
+        network I/O) when online enrichment is off.
+        """
+        if dup := _dedup_result(ctx, "t_cve_lookup", {"cve_id": cve_id}):
+            return dup
+        try:
+            result = await cve_lookup(cve_id, settings=ctx.settings)
+        except Exception as e:
+            _LOGGER.warning("t_cve_lookup failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
     async def t_get_pcap(
         src_ip: str | None = None,
         dst_ip: str | None = None,
@@ -2171,6 +2366,32 @@ def _synth_failure_fallback_report(alert_id: str, phase: str, exc: BaseException
         recommended_actions=[],
         gap_for_investigator=None,
     )
+
+
+def _round2_failure_fallback(alert_id: str, round1: Any, exc: BaseException) -> Any:
+    """Fallback verdict when the round-2 investigation loop / synth crashes.
+
+    The agent already reached a round-1 verdict before the (expensive, flakier)
+    round-2 path ran — don't discard it on a round-2 crash. If round-1 settled on
+    a confident verdict, land THAT (annotated in the summary so the operator sees
+    round-2 didn't finish) rather than erroring the whole run with no verdict. If
+    round-1 was itself inconclusive (skipped / untriaged), fall back to the
+    needs_more_info synth-failure report.
+    """
+    settled = {"true_positive", "false_positive"}
+    verdict = getattr(round1, "verdict", None)
+    if round1 is not None and verdict in settled:
+        note = (
+            f" (Round-2 deep investigation did not complete: {type(exc).__name__}; "
+            "showing the round-1 verdict.)"
+        )
+        try:
+            return round1.model_copy(
+                update={"summary": (getattr(round1, "summary", "") or "") + note}
+            )
+        except Exception:
+            return round1
+    return _synth_failure_fallback_report(alert_id, "investigation_loop_synth", exc)
 
 
 # Backwards-compat shim — pre-split callers used `build_agent(model, ctx)`
@@ -4331,8 +4552,32 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         inv_user_msg = _format_investigator_prompt(alert_id, enriched_json)
         inv_result: Any = None
         try:
-            inv_result = await investigator.run(inv_user_msg, usage_limits=loop_usage_limits)
-        except Exception as e:
+            # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
+            # tool_result / model_response lands in the timeline THE MOMENT it
+            # happens (the recorder persists every event immediately, FLUSH_EVERY=1)
+            # instead of replaying the whole investigation in one burst at the end.
+            # CallToolsNode carries the model's response (text + tool requests);
+            # the following ModelRequestNode carries that step's tool results.
+            node_msg: Any = None
+            async with investigator.iter(inv_user_msg, usage_limits=loop_usage_limits) as inv_run:
+                async for node in inv_run:
+                    # CallToolsNode carries the model's response (text + tool
+                    # requests); the following ModelRequestNode carries that
+                    # step's tool results. Detect by attribute so the message is
+                    # projected the moment its node arrives.
+                    node_msg = getattr(node, "model_response", None)
+                    if node_msg is None:
+                        node_msg = getattr(node, "request", None)
+                    if node_msg is not None:
+                        async for ev in _walk_message(
+                            node_msg, _ev, phase="investigation_loop", round_num=1
+                        ):
+                            await _audit(ev)
+                            yield ev
+            inv_result = inv_run.result
+        except asyncio.CancelledError:
+            raise  # cooperative cancel — propagate, never swallow
+        except BaseException as e:
             # The investigator could not gather evidence — most often a transient
             # LLM-gateway connection drop (the openai client has already retried
             # litellm_max_retries times). Do NOT fabricate a needs_more_info
@@ -4345,15 +4590,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             yield err_ev
             return
 
-        # Stream the investigator's tool_call / tool_result / model messages so
-        # the UI shows real activity (identical projection to the legacy path).
+        # Events already streamed live above; land the transcript + usage, and
+        # keep the full message history for the downstream citation/evidence check
+        # (loop_messages feeds _is_evidence_backed / the targeted-cite validation).
         if inv_result is not None:
             loop_transcript = inv_result.output
             loop_messages = inv_result.all_messages()
-            for msg in loop_messages:
-                async for ev in _walk_message(msg, _ev, phase="investigation_loop", round_num=1):
-                    await _audit(ev)
-                    yield ev
             inv_usage_ev = _usage_ev(1, inv_result)
             if inv_usage_ev is not None:
                 await _audit(inv_usage_ev)
@@ -4379,11 +4621,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 ),
                 usage_limits=loop_usage_limits,
             )
-        except Exception as e:
+        except asyncio.CancelledError:
+            raise  # cooperative cancel — propagate, never swallow
+        except BaseException as e:
+            # A BaseException here (e.g. a gateway timeout/cancel that escaped the
+            # client retries) previously propagated past the recorder, landing
+            # status=error with NO verdict + no recorded error event. Catch it,
+            # record the error, and DON'T discard the round-1 verdict.
             err_ev = _ev("error", _error_payload(e, phase="investigation_loop_synth", round_num=2))
             await _audit(err_ev)
             yield err_ev
-            triage_final = _synth_failure_fallback_report(alert_id, "investigation_loop_synth", e)
+            triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
         else:
             triage_final = loop_synth_result.output
             loop_synth_usage_ev = _usage_ev(2, loop_synth_result)
@@ -4450,13 +4698,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         )
         try:
             synth_result_round2 = await synth_agent.run(user_msg_round2)
-        except Exception as e:
-            # Same fallback as round 1 — emit error,
-            # fall through with a synthetic NMI so the row is scoreable.
+        except asyncio.CancelledError:
+            raise  # cooperative cancel — propagate, never swallow
+        except BaseException as e:
+            # Emit a recorded error, then fall back to the round-1 verdict (or a
+            # scoreable NMI) so the row is never a silent status=error.
             err_ev = _ev("error", _error_payload(e, phase="synth_first_round2", round_num=2))
             await _audit(err_ev)
             yield err_ev
-            triage_final = _synth_failure_fallback_report(alert_id, "synth_first_round2", e)
+            triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
         else:
             triage_final = synth_result_round2.output
             usage2_ev = _usage_ev(2, synth_result_round2)

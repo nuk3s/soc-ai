@@ -64,3 +64,6 @@ data/
 
 # Local deploy target (host stays out of the public repo)
 .deploy-target
+
+# Claude Code local state (worktrees, settings.local, remember)
+.claude/

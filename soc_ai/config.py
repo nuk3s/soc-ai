@@ -558,6 +558,34 @@ class Settings(BaseSettings):
     web_search_max_results: int = 5
     """How many SearXNG results to return to the agent per query."""
 
+    # --- Online enrichment (opt-in, runtime egress) -------------------
+    # Everything else in this app is zero-egress (local-mirror feeds). These
+    # tools reach OUT to third-party reputation/asset APIs, so they are OFF by
+    # default and gated by this master flag. Per-provider keys live below (set in
+    # .env; never stored in the DB). The master flag is hot-editable in the
+    # config console; keys are display-only there.
+    allow_online_enrichment: bool = False
+    """Master switch for the opt-in online-enrichment tools (GreyNoise, Shodan
+    InternetDB, …). OFF by default to preserve the zero-egress posture. When off,
+    each online tool returns a clean 'disabled' result with no network I/O."""
+
+    online_enrichment_timeout_s: int = 8
+    """Per-request timeout (seconds) for an online-enrichment lookup."""
+
+    online_enrichment_verify_ssl: bool = True
+    """Verify TLS for online-enrichment HTTP calls (these reach the public
+    internet, so leave True; only a transparent-proxy setup would need False)."""
+
+    greynoise_api_key: SecretStr | None = None
+    """GreyNoise API key (free Community tier available). Set in .env. Without it,
+    t_greynoise reports 'not configured' and performs no network I/O."""
+
+    shodan_api_key: SecretStr | None = None
+    """Shodan API key (paid). Set in .env. Powers t_shodan_host (the full,
+    authenticated /shodan/host lookup — banners, services, vulns). Without it
+    that tool reports 'not configured' and makes no request; the free,
+    keyless t_shodan_internetdb and t_cve_lookup still work (master flag on)."""
+
     # --- crawl4ai (deep page read) ------------------------------------
     crawl4ai_enabled: bool = False
     """Enable the ``crawl_page`` investigator tool (crawl4ai). When False the

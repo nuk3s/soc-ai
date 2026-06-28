@@ -197,8 +197,10 @@ async def plan_targets(
 
     targets: list[Target] = []
     for (rule_name, src_ip, dst_ip), ev in clusters.items():
-        # Skip if this specific event has a direct verdict
-        if ev.es_id in direct_hits:
+        # Skip only if this event's investigation is in-flight or settled; an
+        # errored/cancelled run stays re-huntable (see blocks_rehunt).
+        direct = direct_hits.get(ev.es_id)
+        if direct is not None and inv_svc.blocks_rehunt(direct):
             skipped += 1
             continue
         # Skip if (rule, src, dst) pair has a verdict in the window
@@ -252,13 +254,14 @@ async def plan_targets_for_ids(
         return [], 0
 
     async with state.db_sessionmaker() as db:
-        # status-agnostic: any verdict (including a running investigation)
         direct_hits = await inv_svc.latest_for_alerts(db, ids)
 
     targets: list[Target] = []
     skipped = 0
     for aid in ids:
-        if aid in direct_hits:
+        # Skip only settled/in-flight runs; errored/cancelled stay re-huntable.
+        direct = direct_hits.get(aid)
+        if direct is not None and inv_svc.blocks_rehunt(direct):
             skipped += 1
             continue
         # rule/src/dst are only used by plan_targets() clustering; the worker

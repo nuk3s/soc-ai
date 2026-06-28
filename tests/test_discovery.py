@@ -326,12 +326,16 @@ def test_classify_internal_suffix_below_threshold_muted() -> None:
 
 
 def test_classify_public_domain_never_active_even_huge_count() -> None:
-    """THE safety test: a query-only public registrable domain is ALWAYS muted."""
+    """THE safety test: a query-only public registrable domain is never active —
+    and now dropped entirely (not even suggested), to kill FP noise."""
     cand = _Candidate(value="evil.com", host_count=10_000, associated=False)
-    assert classify_suffix(cand, min_hosts=3) == "muted"
+    assert classify_suffix(cand, min_hosts=3) is None
     # multi-label public form too
     cand2 = _Candidate(value="cdn.cloudflare.com", host_count=99_999, associated=False)
-    assert classify_suffix(cand2, min_hosts=3) == "muted"
+    assert classify_suffix(cand2, min_hosts=3) is None
+    # the real-world FP the operator reported: a common external domain looked up
+    # by internal hosts must NOT be surfaced as an internal identifier.
+    assert classify_suffix(_Candidate(value="apple.com", associated=False), min_hosts=3) is None
 
 
 def test_classify_reserved_default_suffix_dropped() -> None:
@@ -352,10 +356,11 @@ def test_classify_associated_public_domain_active() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_classify_query_only_public_domain_muted() -> None:
-    # update-cdn.click seen ONLY as an outbound DNS query → muted, never active.
+def test_classify_query_only_public_domain_dropped() -> None:
+    # update-cdn.click seen ONLY as an outbound DNS query → dropped (public,
+    # lookup-only). New gTLDs are recognised as public via the IANA snapshot.
     cand = _Candidate(value="update-cdn.click", host_count=50, associated=False)
-    assert classify_suffix(cand, min_hosts=3) == "muted"
+    assert classify_suffix(cand, min_hosts=3) is None
 
 
 def test_classify_query_only_internal_suffix_demoted_to_muted() -> None:
@@ -408,7 +413,7 @@ async def test_run_discovery_extracts_and_classifies() -> None:
             _bucket("lonely-box", 2, 1),  # bare host, 1 → muted
         ],
         dns_buckets=[
-            _bucket("www.evil.com", 5000, 8),  # PUBLIC domain → muted (safety)
+            _bucket("www.evil.com", 5000, 8),  # PUBLIC, lookup-only → dropped (FP noise)
             _bucket("printer.corp.acme.local", 12, 1),  # same suffix, +1 host
         ],
     )
@@ -430,16 +435,16 @@ async def test_run_discovery_extracts_and_classifies() -> None:
     assert corp.evidence["host_count"] == 6
     assert "dc01.corp.acme.local" in corp.evidence["sample"]
 
-    # public domain → muted, NEVER active despite 8 hosts
-    evil = rows[("suffix", ".evil.com")]
-    assert evil.state == "muted"
+    # public domain seen ONLY as a lookup → dropped entirely (not even a muted
+    # suggestion), despite 8 hosts — it's an external service, not our domain.
+    assert ("suffix", ".evil.com") not in rows
 
     # bare hosts
     assert rows[("host", "WIN11-01")].state == "active"
     assert rows[("host", "lonely-box")].state == "muted"
 
     assert summary.suffixes_active == 1  # corp.acme.local only
-    assert summary.suffixes_muted >= 1  # evil.com
+    assert summary.suffixes_muted == 0  # evil.com (public, lookup-only) dropped, not muted
 
 
 async def test_run_discovery_query_only_public_domain_never_active() -> None:
@@ -447,13 +452,14 @@ async def test_run_discovery_query_only_public_domain_never_active() -> None:
     maker = await _sessionmaker(settings)
     fake = FakeES(
         host_buckets=[_bucket("dc01.corp.acme.local", 200, 5)],  # associated internal → active
-        dns_buckets=[_bucket("cdn-12.update-cdn.click", 9000, 40)],  # query-only public → muted
+        dns_buckets=[_bucket("cdn-12.update-cdn.click", 9000, 40)],  # query-only public → dropped
     )
     await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
     async with maker() as db:
         rows = {(r.kind, r.value): r for r in await ids.list_identifiers(db)}
     assert rows[("suffix", ".corp.acme.local")].state == "active"
-    assert rows[("suffix", ".update-cdn.click")].state == "muted"  # the bug, fixed
+    # query-only public domain is dropped entirely — never an internal identifier
+    assert ("suffix", ".update-cdn.click") not in rows
 
 
 async def test_run_discovery_hostname_corp_public_domain_active() -> None:
@@ -618,8 +624,8 @@ async def test_run_discovery_domain_resolving_to_internal_ip_is_active() -> None
 async def test_run_discovery_domain_resolving_external_not_associated() -> None:
     """A domain resolving only to EXTERNAL IPs is NOT marked associated here.
 
-    It is still picked up by the weak query-only aggregation, so a public domain
-    stays muted (the safety contract).
+    It is still picked up by the weak query-only aggregation, but a public domain
+    seen only as a lookup is now dropped entirely (the tightened safety contract).
     """
     settings = _settings()
     maker = await _sessionmaker(settings)
@@ -633,8 +639,8 @@ async def test_run_discovery_domain_resolving_external_not_associated() -> None:
     async with maker() as db:
         rows = {(r.kind, r.value): r for r in await ids.list_identifiers(db)}
     # Resolved external → not associated; only the query-only signal applies →
-    # public domain stays muted regardless of count.
-    assert rows[("suffix", ".evil.com")].state == "muted"
+    # public domain is dropped, not surfaced at all.
+    assert ("suffix", ".evil.com") not in rows
 
 
 async def test_run_discovery_prefers_highest_registered_domain() -> None:

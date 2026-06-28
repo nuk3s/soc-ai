@@ -16,7 +16,7 @@ export function Login() {
     setPending(true);
     try {
       await login(username, password);
-      navigate('/alerts');
+      navigate('/dashboard');
     } catch (e) {
       // login() already returns a generic message on a real 401 and surfaces
       // the server's hint (e.g. rate-limit) or a network/cert error otherwise.

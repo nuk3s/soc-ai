@@ -25,11 +25,13 @@ from typing import Any
 from elastic_transport import TransportError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from soc_ai.api import agent_tools as agent_tools_svc
 from soc_ai.api.approvals import WRITE_TOOLS, apply_approval, execute_write_tool
+from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
 from soc_ai.config import Settings
@@ -791,8 +793,29 @@ async def get_representative(
 
 # ── Investigations ─────────────────────────────────────────────────────────
 
-# Frontend status union is complete | running | awaiting | error.
-_STATUS = {"running": "running", "complete": "complete", "error": "error"}
+# Frontend status union: running | complete | awaiting | error | cancelled.
+_STATUS = {
+    "running": "running",
+    "complete": "complete",
+    "error": "error",
+    "cancelled": "cancelled",
+    "awaiting": "awaiting",
+}
+
+
+def _row_status(inv: Investigation) -> str:
+    """Effective display status for an investigation row.
+
+    An unknown stored status falls back to 'error' (never silently 'complete'),
+    and a finished run that produced NO verdict is reported as 'error' — it never
+    reached a triage decision, so labelling it 'complete' would be a lie (the
+    verdict shows 'untriaged'). A real verdict — including needs_more_info — keeps
+    the stored status.
+    """
+    status = _STATUS.get(inv.status, "error")
+    if status == "complete" and not (inv.verdict or "").strip():
+        return "error"
+    return status
 
 
 class InvestigationRowOut(BaseModel):
@@ -831,7 +854,7 @@ def _row(inv: Investigation, chat_count: int = 0) -> InvestigationRowOut:
         verdict=_verdict(inv.verdict),
         conf=inv.confidence,
         host=inv.src_ip or "—",
-        status=_STATUS.get(inv.status, "complete"),
+        status=_row_status(inv),
         when=_ago(inv.created_at.isoformat()),
         ts=inv.created_at.isoformat(),
         chatCount=chat_count,
@@ -844,7 +867,7 @@ async def list_investigations(
     status: str | None = None,
     limit: int = 100,
 ) -> list[InvestigationRowOut]:
-    if status not in (None, "running", "complete", "error"):
+    if status not in (None, "running", "complete", "error", "cancelled", "awaiting"):
         status = None
     async with request.app.state.db_sessionmaker() as db:
         rows = await inv_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
@@ -1400,6 +1423,9 @@ async def get_investigation(
             # instead of an empty "complete" verdict.
             else "error"
             if inv.status == "error"
+            # Operator-cancelled runs: a distinct terminal state, not a crash.
+            else "cancelled"
+            if inv.status == "cancelled"
             else "complete"
         ),
         elapsedLabel=_elapsed(inv),
@@ -1529,7 +1555,7 @@ async def get_config(
                 bounds=_bounds(spec),
             )
             for spec in cfg_svc.WHITELIST
-            if spec.section == section and not spec.danger
+            if spec.section == section and not spec.danger and not spec.secret
         ]
         if items:
             groups.append(SettingGroupOut(title=section, items=items))
@@ -1550,6 +1576,23 @@ async def get_config(
     )
 
 
+class DataSourcesOut(BaseModel):
+    sources: list[DataSourceOut]
+
+
+@router.get(
+    "/config/data-sources",
+    response_model=DataSourcesOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_data_sources(
+    settings: Settings = Depends(get_settings_dep),
+) -> DataSourcesOut:
+    """Every enrichment data source — local feeds + opt-in online lookups — with
+    freshness and key/enable status, for the config console's Data Sources panel."""
+    return DataSourcesOut(sources=collect_data_sources(settings))
+
+
 # ── Shell chrome: workspaces + notifications ───────────────────────────────
 
 
@@ -1559,9 +1602,11 @@ class WorkspaceOut(BaseModel):
 
 
 class NotificationOut(BaseModel):
+    id: str
     tone: str
     title: str
     when: str
+    href: str | None = None
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -1575,17 +1620,26 @@ async def list_workspaces(settings: Settings = Depends(get_settings_dep)) -> lis
 async def list_notifications(request: Request) -> list[NotificationOut]:
     out: list[NotificationOut] = []
     for p in await request.app.state.gate.pending():
+        inv_id = p.metadata.get("investigation_id") if p.metadata else None
         out.append(
-            NotificationOut(tone="warn", title=f"Action awaiting approval: {p.tool_name}", when="")
+            NotificationOut(
+                id=f"approval:{p.token}",
+                tone="warn",
+                title=f"Action awaiting approval: {p.tool_name}",
+                when="",
+                href=f"/investigation/{inv_id}" if inv_id else None,
+            )
         )
     async with request.app.state.db_sessionmaker() as db:
         running = await inv_svc.list_recent(db, status="running", limit=20)
     for inv in running:
         out.append(
             NotificationOut(
+                id=f"inv:{inv.id}",
                 tone="accent",
                 title=f"Investigating: {inv.rule_name or inv.id}",
                 when=_ago(inv.created_at.isoformat()),
+                href=f"/investigation/{inv.id}",
             )
         )
     return out[:12]
@@ -1674,12 +1728,74 @@ async def start_hunt(
                 "hint": ("alert not found — it may have aged out; re-open from the alerts list"),
             },
         )
+    # Block a duplicate hunt: if one is already running for this alert, send the
+    # caller to it instead of spawning a second investigation for the same alert.
+    async with request.app.state.db_sessionmaker() as db:
+        existing = (await inv_svc.latest_for_alerts(db, [body.alert_id])).get(body.alert_id)
+    if existing is not None and existing.status == "running":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "hunt_in_progress",
+                "running_inv_id": existing.id,
+                "hint": (
+                    "a hunt is already running for this alert — open it or cancel "
+                    "it before starting a new one"
+                ),
+            },
+        )
     inv_id = await hunt_manager.get_manager(request.app.state).start(
         request.app.state, alert_id=body.alert_id, started_by=started_by
     )
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
     return {"investigation_id": inv_id}
+
+
+@router.post("/investigations/{inv_id}/cancel")
+async def cancel_hunt(inv_id: str, request: Request) -> dict[str, bool]:
+    """Cancel an in-flight hunt for an investigation.
+
+    200 ``{"cancelled": true}`` if a running background task was stopped (the
+    run lands as ``cancelled``); 404 if there is no in-flight hunt to cancel
+    (it already finished, errored, or completed).
+    """
+    cancelled = hunt_manager.get_manager(request.app.state).cancel(inv_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "not_running",
+                "hint": "no in-flight hunt to cancel — it already finished",
+            },
+        )
+    return {"cancelled": True}
+
+
+@router.delete("/investigations/{inv_id}", dependencies=[Depends(require_admin_api)])
+async def delete_investigation(inv_id: str, request: Request) -> dict[str, bool]:
+    """Delete an investigation and its events + chat messages (admin only).
+
+    For clearing broken/orphaned runs. Refuses to delete a still-``running``
+    investigation (409) — cancel it first — so its background worker can't write
+    rows back after the delete.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        inv = await db.get(Investigation, inv_id)
+        if inv is None:
+            raise HTTPException(
+                status_code=404, detail={"reason": "not_found", "hint": "investigation not found"}
+            )
+        if inv.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "still_running",
+                    "hint": "cancel the running hunt before deleting it",
+                },
+            )
+        await inv_svc.delete(db, inv_id)
+    return {"deleted": True}
 
 
 _REHUNT_CAP = 50
@@ -2039,6 +2155,14 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
             status_code=400,
             detail={"reason": "danger_zone", "hint": "use POST /api/v1/config/danger/setting"},
         )
+    if spec.secret:
+        # Secrets never go through the plaintext (secret_box=None) path — that
+        # would raise deep in set_override (500). Route them to the dedicated
+        # write-only endpoint instead.
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "secret_setting", "hint": "use POST /api/v1/config/api-keys"},
+        )
     try:
         typed = cfg_svc.coerce(body.key, body.value)
     except ValueError as exc:
@@ -2181,11 +2305,15 @@ async def api_get_danger_settings(
 async def api_save_danger_setting(
     body: SaveDangerIn,
     request: Request,
+    settings: Settings = Depends(get_settings_dep),
 ) -> dict[str, object]:
     """Save a danger-zone setting. Requires typed confirmation (confirm must equal key).
 
     Secret-typed settings are Fernet-encrypted before DB storage.
-    Never returns the plaintext value.
+    Never returns the plaintext value. A hot=True danger spec (PCAP SSH, the
+    crawl4ai token, internal_cidrs — all read fresh per tool-call) is applied
+    live; the SO/ES/LiteLLM connection settings feed startup clients and still
+    need a restart.
     """
     # 1. Typed confirmation guard
     if body.confirm.strip() != body.key:
@@ -2237,7 +2365,164 @@ async def api_save_danger_setting(
             },
         ) from exc
 
-    return {"ok": True, "restart_required": not spec.hot}
+    # Hot specs are read fresh per tool-call → apply live via setattr on the
+    # Settings singleton (validate_assignment coerces str→SecretStr, csv→typed).
+    # restart_required reflects whether it actually applied (a non-hot spec, or a
+    # value that fails live validation, still persists and applies on restart).
+    applied_live = False
+    if spec.hot:
+        try:
+            setattr(settings, spec.attr, typed)
+            applied_live = True
+        except (ValueError, TypeError, ValidationError):
+            applied_live = False
+
+    return {"ok": True, "restart_required": not applied_live}
+
+
+# ── API keys (hot, write-only enrichment provider secrets) ────────────────────
+# Distinct from the Danger-Zone secrets (SO/ES/LiteLLM, restart-required): these
+# enrichment keys are read per tool-call, so a save hot-applies live (no restart)
+# and no typed confirm is required. Values are Fernet-encrypted at rest and never
+# returned to the client.
+
+
+class ApiKeyOut(BaseModel):
+    key: str
+    label: str
+    help: str
+    isSet: bool
+    source: str  # "db" | "env" | "unset"
+
+
+class SaveApiKeyIn(BaseModel):
+    key: str
+    value: str
+
+
+@router.get(
+    "/config/api-keys",
+    response_model=list[ApiKeyOut],
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_get_api_keys(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> list[ApiKeyOut]:
+    """List the enrichment API-key fields. Values are NEVER returned — only isSet."""
+    specs = cfg_svc.api_key_specs()
+    async with request.app.state.db_sessionmaker() as db:
+        db_keys: set[str] = set(
+            (
+                await db.scalars(
+                    select(ConfigOverride.key).where(ConfigOverride.key.in_([s.key for s in specs]))
+                )
+            ).all()
+        )
+    out: list[ApiKeyOut] = []
+    for spec in specs:
+        if spec.key in db_keys:
+            source, is_set = "db", True
+        else:
+            attr_val = getattr(settings, spec.attr, None)
+            raw = (
+                attr_val.get_secret_value()
+                if isinstance(attr_val, SecretStr)
+                else ("" if attr_val is None else str(attr_val))
+            )
+            source, is_set = ("env", True) if raw.strip() else ("unset", False)
+        out.append(
+            ApiKeyOut(key=spec.key, label=spec.label, help=spec.help, isSet=is_set, source=source)
+        )
+    return out
+
+
+@router.post(
+    "/config/api-keys",
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_save_api_key(
+    body: SaveApiKeyIn,
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, object]:
+    """Save an enrichment API key (Fernet-encrypted, write-only) and hot-apply it."""
+    spec = cfg_svc.WHITELIST_BY_KEY.get(body.key)
+    if spec is None or not spec.secret or spec.danger:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "unknown_api_key", "hint": "key is not a known API-key setting"},
+        )
+    value = body.value.strip()
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "empty_value", "hint": "send a non-empty value, or DELETE to clear"},
+        )
+    user = await current_user(request)
+    updated_by: int | None = user.id if user else None
+    secret_box = request.app.state.secret_box
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            await cfg_svc.set_override(
+                db, body.key, value, updated_by=updated_by, secret_box=secret_box
+            )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "no_config_secret_key",
+                "hint": "Set CONFIG_SECRET_KEY to store API keys via the UI.",
+            },
+        ) from exc
+    # Hot-apply: enrichment keys are read fresh per tool-call. setattr the
+    # plaintext onto the live Settings singleton (validate_assignment coerces
+    # str → SecretStr). NOT apply_to_settings — that decrypts a stored token.
+    setattr(settings, spec.attr, value)
+    return {"ok": True, "isSet": True}
+
+
+@router.delete(
+    "/config/api-keys/{key}",
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_clear_api_key(
+    key: str,
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, object]:
+    """Clear an enrichment API key: drop the DB override and unset the live value."""
+    spec = cfg_svc.WHITELIST_BY_KEY.get(key)
+    if spec is None or not spec.secret or spec.danger:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "unknown_api_key", "hint": "key is not a known API-key setting"},
+        )
+    async with request.app.state.db_sessionmaker() as db:
+        await cfg_svc.delete_override(db, key)
+    # Hot-clear the live value (reverts to None until a restart re-applies env).
+    setattr(settings, spec.attr, None)
+    return {"ok": True, "isSet": False}
+
+
+class AgentToolsOut(BaseModel):
+    tools: list[agent_tools_svc.AgentToolOut]
+
+
+@router.get(
+    "/config/agent-tools",
+    response_model=AgentToolsOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_get_agent_tools(
+    settings: Settings = Depends(get_settings_dep),
+) -> AgentToolsOut:
+    """List every tool available to the agent, with its description + dependencies."""
+    return AgentToolsOut(tools=agent_tools_svc.collect_agent_tools(settings))
 
 
 _DANGER_TEST_TARGETS: frozenset[str] = frozenset({"es", "llm"})

@@ -159,6 +159,59 @@ export function getConfig(): Promise<Config> {
   return request<Config>('/config');
 }
 
+export interface DataSource {
+  id: string;
+  name: string;
+  category: string;
+  egress: string;
+  enabled: boolean;
+  present: boolean;
+  last_refreshed: string | null;
+  needs_key: boolean;
+  key_configured: boolean;
+  note: string;
+}
+
+export function getDataSources(): Promise<{ sources: DataSource[] }> {
+  return request<{ sources: DataSource[] }>('/config/data-sources');
+}
+
+// ── API keys (write-only enrichment provider secrets) ──────────────────────
+export interface ApiKeyField {
+  key: string;
+  label: string;
+  help: string;
+  isSet: boolean;
+  source: string; // "db" | "env" | "unset"
+}
+
+export function getApiKeys(): Promise<ApiKeyField[]> {
+  return request<ApiKeyField[]>('/config/api-keys');
+}
+
+export function saveApiKey(key: string, value: string): Promise<{ ok: boolean; isSet: boolean }> {
+  return post<{ ok: boolean; isSet: boolean }>('/config/api-keys', { key, value });
+}
+
+export function clearApiKey(key: string): Promise<{ ok: boolean; isSet: boolean }> {
+  return del<{ ok: boolean; isSet: boolean }>(`/config/api-keys/${encodeURIComponent(key)}`);
+}
+
+// ── Agent tools (capabilities + dependency availability) ───────────────────
+export interface AgentTool {
+  name: string;
+  category: string;
+  read_only: boolean;
+  description: string;
+  requires: string[];
+  missing: string[];
+  available: boolean;
+}
+
+export function getAgentTools(): Promise<{ tools: AgentTool[] }> {
+  return request<{ tools: AgentTool[] }>('/config/agent-tools');
+}
+
 export function getWorkspaces(): Promise<Workspace[]> {
   return request<Workspace[]>('/workspaces');
 }
@@ -189,6 +242,16 @@ export function startHunt(alertId: string): Promise<string> {
   return post<{ investigation_id: string }>('/hunt', { alert_id: alertId }).then(
     (r) => r.investigation_id,
   );
+}
+
+/** Cancel an in-flight hunt (lands the run as `cancelled`). 404 if not running. */
+export function cancelHunt(invId: string): Promise<{ cancelled: boolean }> {
+  return post<{ cancelled: boolean }>(`/investigations/${invId}/cancel`);
+}
+
+/** Delete an investigation and its events + chat (admin only). */
+export function deleteInvestigation(invId: string): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/investigations/${invId}`);
 }
 
 /** Re-launch fresh investigations for a set of existing investigation ids. */
@@ -352,6 +415,11 @@ export function startAutoTriage(opts?: { alertIds?: string[]; minSeverity?: stri
 
 export function getAutoTriageStatus(): Promise<AutoTriageStatus> {
   return request<AutoTriageStatus>('/auto-triage');
+}
+
+/** Request the running auto-triage batch to stop after the current target. */
+export function stopAutoTriage(): Promise<AutoTriageStatus> {
+  return post<AutoTriageStatus>('/auto-triage/stop');
 }
 
 export interface AckGroupResult {

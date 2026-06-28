@@ -12,6 +12,7 @@ auto-triage worker calls this module's ``investigate`` directly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -67,6 +68,12 @@ async def recorded_run(
                 },
             )
         await recorder.finish("complete")
+    except asyncio.CancelledError:
+        # Operator cancelled the hunt: land a clean terminal 'cancelled' state
+        # (distinct from a crash) and let the cancellation propagate so the task
+        # actually stops. finish() is idempotent, so the finally below is a no-op.
+        await recorder.finish("cancelled")
+        raise
     except Exception as exc:
         _LOGGER.exception("investigation stream crashed")
         await recorder.finish("error")

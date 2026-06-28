@@ -834,12 +834,12 @@ function ChatPanel({
           return m.role === 'user' ? (
             <div
               key={i}
-              className="max-w-[82%] self-end rounded-[12px_12px_3px_12px] border border-accent-deep bg-[#1d3a6b] px-[13px] py-[9px] text-[13px] leading-[1.5]"
+              className="max-w-[82%] min-w-0 self-end break-words rounded-[12px_12px_3px_12px] border border-accent-deep bg-[#1d3a6b] px-[13px] py-[9px] text-[13px] leading-[1.5]"
             >
               {m.text}
             </div>
           ) : m.kind === 'verdict_proposal' && m.proposal ? (
-            <div key={i} className="max-w-[88%] self-start rounded-card border px-3 py-2.5"
+            <div key={i} className="max-w-[88%] min-w-0 self-start break-words rounded-card border px-3 py-2.5"
                  style={{ borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}>
               <div className="mb-1 flex items-center gap-2 text-[12px] font-semibold text-text-2">
                 Proposed verdict
@@ -868,8 +868,8 @@ function ChatPanel({
               )}
             </div>
           ) : (
-            <div key={i} className={`max-w-[88%] self-start${isNew ? ' animate-fadeUp' : ''}`}>
-              <div className="rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2" style={{ textWrap: 'pretty' }}>
+            <div key={i} className={`max-w-[88%] min-w-0 self-start${isNew ? ' animate-fadeUp' : ''}`}>
+              <div className="overflow-hidden break-words rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2 [&_pre]:max-w-full [&_pre]:overflow-x-auto" style={{ textWrap: 'pretty' }}>
                 <Markdown>{m.text ?? ''}</Markdown>
               </div>
               {m.tools && (

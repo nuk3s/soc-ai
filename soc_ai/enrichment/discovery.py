@@ -47,13 +47,17 @@ What it does, per scan (Increment 3 — suffixes + hosts + CIDRs):
 
 THE DISCRIMINATOR is **internal association**, not the TLD. A candidate seen ONLY
 as an outbound ``zeek.dns.query`` (what internal hosts look up — e.g. the malware
-CDN ``update-cdn.click`` resolved by many infected hosts) is a weak signal and is
-**NEVER** auto-activated; it lands ``muted`` (a suggestion) at most, and if it is
-also a public registrable domain it stays muted regardless of count. This
-guarantees a benign — or malicious — external lookup never becomes a silent
-redaction rule. The "public TLD" test uses a **vendored IANA TLD snapshot**
-(``data/iana_tlds.txt``) so new gTLDs (``click``/``top``/``xyz``/…) are
-recognised as public, not mistaken for internal.
+CDN ``update-cdn.click`` or ``apple.com`` resolved by many hosts) is a weak signal
+and is **NEVER** auto-activated. If it is a PUBLIC registrable domain it is now
+**dropped entirely** (not even suggested) — a lookup-only public name is an
+external service, not the deployment's own domain, and surfacing it is just
+false-positive noise; the deployment's own domain is found via the associated
+signals instead. A lookup-only *clearly-internal* name (reserved TLD / no public
+form) still lands ``muted`` (a suggestion). This guarantees a benign — or
+malicious — external lookup never becomes a silent redaction rule. The "public
+TLD" test uses a **vendored IANA TLD snapshot** (``data/iana_tlds.txt``) so new
+gTLDs (``click``/``top``/``xyz``/…) are recognised as public, not mistaken for
+internal.
 
 An ASSOCIATED candidate — seen as ``host.name`` or the PTR answer of an internal
 IP (what an internal host IS) — activates when seen on ≥ ``discovery_min_hosts``
@@ -316,9 +320,16 @@ def classify_suffix(candidate: _Candidate, min_hosts: int) -> str | None:
 
     * reserved-default suffix (.lan/.local/.internal/.corp) → drop (``None``) —
       already covered by the sanitizer floor.
-    * NOT associated (query-only) → ALWAYS ``"muted"``. A domain an internal host
-      merely resolved (``update-cdn.click``, ``www.evil.com``) is a weak,
-      low-confidence suggestion at most — never an auto-active redaction rule.
+    * NOT associated (query-only) + PUBLIC registrable → DROP (``None``). A public
+      domain an internal host merely looked up (``apple.com``, ``google.com``,
+      ``update-cdn.click``) is almost certainly an EXTERNAL service, not the
+      deployment's own domain — surfacing it (even as a muted suggestion) is just
+      false-positive noise. The deployment's own domain is detected via the
+      associated signals (host.name / PTR / forward-internal), so dropping the
+      lookup-only public case costs no real detection.
+    * NOT associated (query-only) + clearly-internal (reserved TLD / no public
+      form, e.g. ``printers.lan``) → ``"muted"``. A lookup-only internal-looking
+      name is a weak suggestion worth surfacing, never auto-active.
     * associated + public registrable (e.g. the org's own AD domain
       ``corp.acme.com``, seen as host.name of internal hosts) → ``"active"`` at/
       above *min_hosts*, else ``"muted"``. It is provably the deployment's own
@@ -327,20 +338,22 @@ def classify_suffix(candidate: _Candidate, min_hosts: int) -> str | None:
       ``"muted"`` (unchanged behaviour).
 
     THE SAFETY CONTRACT (a benign external lookup never becomes a silent
-    redaction rule) is preserved: a non-associated public domain is always muted.
-    The contract's "never active" rule is scoped to the case it was written to
-    protect (the benign-lookup case); an associated public domain is the
-    deployment's own name and is allowed to activate from real host.name/PTR
-    signal.
+    redaction rule) is preserved and tightened: a non-associated public domain is
+    now dropped outright, not even suggested. An associated public domain is the
+    deployment's own name and may activate from real host.name/PTR signal.
     """
     s = candidate.value.strip(".").lower()
     if not s:
         return None
     if s in RESERVED_DEFAULT_SUFFIXES:
         return None  # already a reserved default — no point re-detecting
-    # Query-only signal: what internal hosts LOOK UP, not what they ARE. Weak —
-    # never auto-active (public-or-not, drop to a muted suggestion).
+    # Query-only signal: what internal hosts LOOK UP, not what they ARE.
     if not candidate.associated:
+        # A public registrable domain seen only as a lookup is an external
+        # service (apple.com, google.com) — drop it, don't even suggest it.
+        if is_public_registrable(s):
+            return None
+        # A clearly-internal lookup-only name is a weak suggestion (never active).
         return "muted"
     # Associated (host.name / PTR-internal): both a public registrable parent
     # (the org's own AD domain) and a clearly-internal suffix are eligible to

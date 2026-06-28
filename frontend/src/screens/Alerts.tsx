@@ -13,6 +13,7 @@ import {
   ackEvents,
   ackGroup,
   assignAlert,
+  cancelHunt,
   getAlertGroupEvents,
   getAlerts,
   getAutoTriageStatus,
@@ -20,6 +21,7 @@ import {
   getRepresentative,
   startAutoTriage,
   startHunt,
+  stopAutoTriage,
 } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import type { AlertEvent, AlertGroup, Investigation as Inv, Severity } from '../lib/types';
@@ -111,7 +113,8 @@ export function Alerts() {
   };
   const { data: groups, loading, error } = useAsync(
     () => getAlerts(alertQuery),
-    [filterTime, customRange?.from, customRange?.to, hideAcked, reloadKey]
+    [filterTime, customRange?.from, customRange?.to, hideAcked, reloadKey],
+    { refetchInterval: 10000 } // keep the grid + verdict/status badges live without a reload
   );
 
   const view = (searchParams.get('view') as ViewId) || 'all';
@@ -211,6 +214,9 @@ export function Alerts() {
           finish(s.note || (s.total ? triageSummary(s) : 'Nothing to triage'));
           return;
         }
+        // Surface the backend's start note up-front (e.g. "triaging 6 selected
+        // (2 already triaged)") so a partial selection isn't a mystery.
+        if (s.note) showTriageMsg(s.note);
         // Refresh the list ~1.5 s after start so rows flip to "Triaging…"
         // before investigations have completed (the finish() bump handles verdicts).
         setTimeout(() => setReloadKey((k) => k + 1), 1500);
@@ -274,7 +280,12 @@ export function Alerts() {
     setStarting(g);
     startHunt(g.id)
       .then((invId) => openDrawer(invId))
-      .catch(() => setStarting(null));
+      .catch((err: unknown) => {
+        setStarting(null);
+        // e.g. 409 hunt_in_progress — tell the operator a hunt is already
+        // running for this alert instead of silently doing nothing.
+        showTriageMsg(err instanceof Error ? err.message : 'Could not start the hunt');
+      });
   };
 
   // Hunt the most-representative event in a collapsed group (most-common-flow
@@ -437,6 +448,15 @@ export function Alerts() {
             })()}
           </div>
           <div className="flex-1" />
+          <button
+            onClick={() => {
+              void stopAutoTriage().catch(() => {});
+            }}
+            title="Stop after the current investigation finishes"
+            className="flex items-center gap-1 rounded-[6px] border border-border-strong px-2 py-1 text-[11.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+          >
+            <X size={12} /> Stop
+          </button>
           <div className="font-mono text-[12px] font-semibold text-accent">{pct}%</div>
         </div>
       )}
@@ -1041,6 +1061,7 @@ function AlertDrawer({
   onComplete: () => void;
 }) {
   const [tick, setTick] = useState(0);
+  const [cancelling, setCancelling] = useState(false);
   const { data: inv, loading, error } = useAsync<Inv | null>(
     () => (drawerId ? getInvestigation(drawerId) : Promise.resolve(null)),
     [drawerId, tick]
@@ -1058,7 +1079,10 @@ function AlertDrawer({
     // Terminal: a verdict landed ('complete') OR the run was reaped/interrupted
     // ('error'). Either way, stop polling and refresh the list so the row badge
     // reflects the final state instead of a stale "investigating".
-    if ((inv?.status === 'complete' || inv?.status === 'error') && wasRunning.current) {
+    if (
+      (inv?.status === 'complete' || inv?.status === 'error' || inv?.status === 'cancelled') &&
+      wasRunning.current
+    ) {
       wasRunning.current = false;
       onComplete();
     }
@@ -1076,6 +1100,21 @@ function AlertDrawer({
             {inv?.kind ?? starting?.kind ?? 'suricata'}
           </span>
           <div className="flex-1 truncate text-[14px] font-semibold">{inv?.name ?? starting?.name ?? 'Investigation'}</div>
+          {inv?.status === 'investigating' && (
+            <button
+              disabled={cancelling}
+              onClick={() => {
+                setCancelling(true);
+                void cancelHunt(inv.id)
+                  .then(() => setTick((x) => x + 1))
+                  .catch(() => {})
+                  .finally(() => setCancelling(false));
+              }}
+              className="flex items-center gap-1.5 text-[12px] text-dim hover:text-danger disabled:opacity-50"
+            >
+              <X size={13} /> {cancelling ? 'Cancelling…' : 'Cancel hunt'}
+            </button>
+          )}
           {inv && (
             <button
               onClick={() => navigateToPermalink(inv.id)}

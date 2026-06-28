@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
@@ -243,6 +244,33 @@ async def latest_for_rules(db: AsyncSession, rule_names: list[str]) -> dict[str,
 async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str, Investigation]:
     """Most recent investigation per alert _id (badge on event rows)."""
     return await _latest_by(db, Investigation.alert_es_id, alert_ids)
+
+
+def blocks_rehunt(inv: Investigation) -> bool:
+    """Whether a prior investigation should suppress starting a NEW hunt for its
+    alert. Only an in-flight (``running``) or genuinely finished (``complete``)
+    run blocks; an ``error`` or ``cancelled`` run produced no usable verdict and
+    must stay re-huntable — otherwise an errored investigation silently locks the
+    alert out of triage forever (the cause of the "selected 2, only 1 ran" bug)."""
+    return inv.status in ("running", "complete")
+
+
+async def delete(db: AsyncSession, inv_id: str) -> bool:
+    """Delete an investigation and its events + chat messages in one transaction.
+
+    Returns True if the investigation existed (and was removed), False otherwise.
+    Used by the admin "delete investigation" action to clear broken/orphaned runs.
+    """
+    inv = await db.get(Investigation, inv_id)
+    if inv is None:
+        return False
+    await db.execute(
+        sa_delete(InvestigationEvent).where(InvestigationEvent.investigation_id == inv_id)
+    )
+    await db.execute(sa_delete(ChatMessage).where(ChatMessage.investigation_id == inv_id))
+    await db.delete(inv)
+    await db.commit()
+    return True
 
 
 async def list_recent(

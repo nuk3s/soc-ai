@@ -441,6 +441,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
     ),
     SettingSpec(
+        key="allow_online_enrichment",
+        attr="allow_online_enrichment",
+        type="bool",
+        label="Online enrichment enabled (GreyNoise, Shodan, …)",
+        section="Online enrichment",
+        hot=True,
+        help=(
+            "Off by default — the rest of soc-ai is zero-egress (local feeds). "
+            "Turning this on lets the agent reach third-party reputation/asset "
+            "APIs over the internet. Provider keys (e.g. GREYNOISE_API_KEY) are "
+            "set in .env; Shodan InternetDB needs no key."
+        ),
+    ),
+    SettingSpec(
         key="searxng_url",
         attr="searxng_url",
         type="str",
@@ -541,10 +555,71 @@ WHITELIST: tuple[SettingSpec, ...] = (
         min_value=1,
         max_value=168,
     ),
-    # ---- DANGER ZONE: connection identity + secrets (restart-required) -------
-    # All hot=False: these feed clients built at startup, so a change takes
-    # effect on the next restart (the lifespan applies overrides BEFORE building
-    # the SO/ES/LiteLLM clients). Each requires a typed confirm at the route.
+    # ---- API KEYS: enrichment provider secrets (hot, write-only) -------------
+    # Distinct from the Danger-Zone secrets: these feed per-call enrichment
+    # clients (read fresh from settings on each tool call / refresh), so they are
+    # hot=True — a saved key applies live, no restart. secret=True ⇒ Fernet-
+    # encrypted at rest, never rendered back (write-only). NOT danger (no typed
+    # confirm). Section "API keys" is intentionally NOT in SECTION_ORDER: these
+    # render in the dedicated API-keys panel next to Data sources, never in the
+    # normal settings groups. Requires CONFIG_SECRET_KEY to persist.
+    SettingSpec(
+        key="shodan_api_key",
+        attr="shodan_api_key",
+        type="str",
+        section="API keys",
+        hot=True,
+        secret=True,
+        label="Shodan API key",
+        help="Paid. Enables the full Shodan host lookup. Needs online enrichment on.",
+    ),
+    SettingSpec(
+        key="greynoise_api_key",
+        attr="greynoise_api_key",
+        type="str",
+        section="API keys",
+        hot=True,
+        secret=True,
+        label="GreyNoise API key",
+        help="Free Community tier. Enables scanner-noise lookups. Needs online enrichment on.",
+    ),
+    SettingSpec(
+        key="misp_api_key",
+        attr="misp_api_key",
+        type="str",
+        section="API keys",
+        hot=True,
+        secret=True,
+        label="MISP API key",
+        help="Threat-intel matches. Also set the MISP URL (Danger Zone) to enable MISP enrichment.",
+    ),
+    SettingSpec(
+        key="maxmind_license_key",
+        attr="maxmind_license_key",
+        type="str",
+        section="API keys",
+        hot=True,
+        secret=True,
+        label="MaxMind license key",
+        help="Refreshes the local GeoLite2 GeoIP/ASN databases (next `blocklists refresh`).",
+    ),
+    SettingSpec(
+        key="abuse_ch_auth_key",
+        attr="abuse_ch_auth_key",
+        type="str",
+        section="API keys",
+        hot=True,
+        secret=True,
+        label="abuse.ch auth key",
+        help="Refreshes the URLhaus / Feodo blocklists (used by the next `blocklists refresh`).",
+    ),
+    # ---- DANGER ZONE: connection identity + secrets (typed-confirm) ----------
+    # The SO/ES/LiteLLM connection settings are hot=False: they feed clients
+    # built at startup, so a change needs a restart (the lifespan applies
+    # overrides BEFORE building those clients). The PCAP-SSH settings, the
+    # crawl4ai token and internal_cidrs are hot=True — they're read fresh per
+    # tool-call, so a save applies live. Every danger setting still requires a
+    # typed confirm at the route.
     SettingSpec(
         key="so_host",
         attr="so_host",
@@ -589,7 +664,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="so_ssh_host",
         type="str",
         section="Danger Zone",
-        hot=False,
+        hot=True,  # read per PCAP fetch (subprocess), not baked into a startup client
         danger=True,
         label="PCAP sensor SSH host",
         help="Hostname/IP of the SO sensor for live PCAP retrieval. Only used when "
@@ -660,26 +735,17 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="internal_cidrs",
         type="csv",
         section="Danger Zone",
-        hot=False,
+        hot=True,  # read per-call by IP classification / is_internal_ip(settings)
         danger=True,
         label="Internal CIDRs (comma-separated)",
         help="RFC1918 + your internal ranges; used to classify internal vs external.",
-    ),
-    SettingSpec(
-        key="so_ssh_host",
-        attr="so_ssh_host",
-        type="str",
-        section="Danger Zone",
-        hot=False,
-        danger=True,
-        label="PCAP sensor SSH host",
     ),
     SettingSpec(
         key="so_ssh_user",
         attr="so_ssh_user",
         type="str",
         section="Danger Zone",
-        hot=False,
+        hot=True,  # read per PCAP fetch
         danger=True,
         label="PCAP sensor SSH user",
     ),
@@ -688,7 +754,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="so_ssh_key",
         type="str",
         section="Danger Zone",
-        hot=False,
+        hot=True,  # read per PCAP fetch
         danger=True,
         label="PCAP sensor SSH key path",
         help="Path on the soc-ai host to the private key used for PCAP fetch.",
@@ -698,7 +764,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="crawl4ai_token",
         type="str",
         section="Danger Zone",
-        hot=False,
+        hot=True,  # read per crawl_page call
         danger=True,
         secret=True,
         label="crawl4ai API token",
@@ -715,6 +781,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "Queries",
     "PCAP",
     "Web research",
+    "Online enrichment",
     "Discovery",
 )
 
@@ -722,6 +789,15 @@ SECTION_ORDER: tuple[str, ...] = (
 def is_editable(key: str) -> bool:
     """True iff *key* is in the admin-editable whitelist."""
     return key in WHITELIST_BY_KEY
+
+
+def api_key_specs() -> tuple[SettingSpec, ...]:
+    """The hot, write-only API-key specs surfaced by the dedicated API-keys panel.
+
+    These are the secret, non-danger provider keys (enrichment) — distinct from
+    the restart-required Danger-Zone connection secrets (SO/ES/LiteLLM).
+    """
+    return tuple(s for s in WHITELIST if s.secret and not s.danger)
 
 
 def _coerce_bool(raw: str) -> bool:
