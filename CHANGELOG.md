@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-02
+
+Trust + reliability release: make the pipeline resilient and the trust story
+provable (from an autonomous review + direction-brainstorm session).
+
+### Added
+
+- **Model reasoning visible on every investigation.** A collapsible "Model
+  reasoning" panel surfaces the agent's per-turn `<think>` traces (previously
+  captured but dropped by the timeline) — the "show your work" explainability an
+  analyst needs to defend a verdict.
+- **Signed decision-record exports.** The audit export now carries a real Ed25519
+  detached signature + public key (verifiable by an external auditor with the
+  public key alone), alongside the existing sha256 checksum. New
+  `GET /decision-record/public-key`.
+- **Benign synthetic eval scenarios + escalation precision.** The synth catalogue
+  gained a benign (false-positive) class, so the eval now reports precision and a
+  true-negative rate — answering the "does it call obvious FPs malicious?" test,
+  not just recall.
+
+### Changed / Fixed
+
+- **Resilient LLM gateway transport.** The primary model path (investigator /
+  synthesizer / hunt / chat) now retries transient gateway failures (429/502/503/
+  504 + connection/read/timeout) with jittered exponential backoff, honoring
+  Retry-After — parity with the Oracle path. Bursty gateway 502s previously
+  errored investigations, hunts, and eval batches outright.
+
 ## [1.0.1] - 2026-07-01
 
 Highlights: the **Hunt Console** and a **backtest harness** land, and a full

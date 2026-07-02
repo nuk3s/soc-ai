@@ -1,0 +1,141 @@
+id: b1-cdn-update-beacon
+name: "Benign software-update poller mistaken for C2 beacon"
+version: 1
+tier: easy
+story: |
+  Workstation 10.0.0.61 polls a vendor update endpoint on a regular ~300s
+  interval over HTTPS to a major CDN (151.101.65.67, Fastly). The regular
+  cadence trips an ET HUNTING beacon-heuristic rule, and taken alone the
+  periodicity looks like C2. But the corroborating evidence disposes it as
+  benign: the JA3 is a stock Microsoft BITS / WinHTTP client fingerprint (not
+  a malware profile), the SNI is the vendor's real update host
+  (ctldl.windowsupdate.com), the destination IP is on the Fastly CDN and NOT
+  on any loaded blocklist, and the conn-log shows the classic tiny-request /
+  larger-response shape of a version check that mostly returns "no update"
+  (304-style small responses). A good analyst dispositions this as a benign
+  false positive: periodic ≠ malicious when the endpoint, client fingerprint,
+  and payload shape all match a legitimate updater.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # Zeek SSL SNI = real update host
+    - typed_path             # rule.name (ET HUNTING, not a TROJAN/blocklist)
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.61"
+      source.port: 52210
+      destination.ip: "151.101.65.67"  # Fastly CDN
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET HUNTING Periodic Outbound HTTPS Connection Possible Beacon"
+      rule.category: "Potentially Bad Traffic"
+      rule.signature: "2029500"
+      classtype: bad-unknown
+      signature_severity: Minor
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: b1-cdn-update-beacon
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.61"
+      source.port: 52210
+      destination.ip: "151.101.65.67"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.ja3: "e7d705a3286e19ea42f587b344ee6865"  # WinHTTP/BITS default
+      zeek.ssl.ja3s: "ae4edc6faf64d08308082ad26be60767"
+      zeek.ssl.server_name: "ctldl.windowsupdate.com"
+      zeek.ssl.established: true
+      synth.scenario_id: b1-cdn-update-beacon
+
+  - index: logs-synth-zeek-conn-beacon-summary
+    time_offset_seconds: -1800
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1800) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.61"
+      destination.ip: "151.101.65.67"
+      destination.port: 443
+      network.community_id_pattern: "{{ same_as_triage }}"
+      synth.beacon_profile:
+        connection_count: 6
+        window_seconds: 1800
+        mean_interval_seconds: 300.2
+        interval_stddev_seconds: 1.1
+        interval_similarity: 0.99  # perfectly regular — but that's an updater
+        mean_orig_bytes: 480
+        mean_resp_bytes: 220        # mostly "no update" small responses
+        orig_bytes_cv: 0.02
+        resp_bytes_cv: 0.05
+      synth.scenario_id: b1-cdn-update-beacon
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.61"
+      source.port: 52210
+      destination.ip: "151.101.65.67"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdfFa"
+      zeek.conn.duration: 0.4
+      zeek.conn.orig_bytes: 480
+      zeek.conn.resp_bytes: 220
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: b1-cdn-update-beacon
+
+rubric_notes: |
+  Benign FP that LOOKS like a beacon. This is the counterweight to
+  m1-cobalt-strike-beacon: identical "periodic HTTPS" alarm, opposite verdict.
+  The disposing evidence is (1) the JA3 matches a stock Microsoft updater
+  client, not a Cobalt Strike / Emotet fingerprint; (2) the SNI is the real
+  Windows Update content-download host; (3) the destination is a Fastly CDN
+  IP with NO blocklist hit; (4) the byte profile is tiny-request / tiny-
+  response — a "check for updates, none found" poll, not a C2 tasking channel.
+  A system that escalates purely on interval regularity (interval_similarity
+  0.99) without checking client fingerprint + endpoint reputation produces a
+  FALSE POSITIVE — the exact "348 obvious FPs called malicious" failure this
+  benign stratum exists to catch. Correct disposition: false_positive, close
+  as benign. Emitting true_positive here is scored as an escalation FP and
+  drops precision.

@@ -17,6 +17,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from soc_ai.agent._gateway_retry import RetryingAsyncTransport
 from soc_ai.config import Settings
 
 
@@ -31,15 +32,25 @@ def _build_provider(settings: Settings) -> OpenAIProvider:
     (``BatchConfig.per_run_timeout_s``) is what catches genuine hangs.
     """
     api_key = settings.litellm_api_key.get_secret_value() if settings.litellm_api_key else "dummy"
+    # Resilient transport: retries transient gateway failures (429/502/503/504 +
+    # connection/read/timeout errors) with jittered exponential backoff. This is
+    # the single retry authority for the primary model path — matching the Oracle
+    # client's backoff — so the OpenAI SDK's own retry is disabled (max_retries=0)
+    # to avoid compounding. Bursty 502s from the LiteLLM gateway repeatedly
+    # confounded investigations, hunts, and eval batches before this.
     http_client = httpx.AsyncClient(
         verify=settings.litellm_verify_ssl,
         timeout=settings.litellm_request_timeout_s,
+        transport=RetryingAsyncTransport(
+            max_retries=settings.litellm_max_retries,
+            verify=settings.litellm_verify_ssl,
+        ),
     )
     openai_client = AsyncOpenAI(
         base_url=str(settings.litellm_base_url).rstrip("/") + "/v1",
         api_key=api_key,
         http_client=http_client,
-        max_retries=settings.litellm_max_retries,
+        max_retries=0,
     )
     return OpenAIProvider(openai_client=openai_client)
 

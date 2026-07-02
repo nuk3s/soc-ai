@@ -230,9 +230,12 @@ def aggregate(rows: list[dict[str, Any]]) -> Aggregates:  # noqa: PLR0915 - sing
     denom = total_input + total_cache
     cache_hit_rate: float | None = total_cache / denom if denom > 0 else None
 
-    # Cross-tabs: verdict × agreement, retask × agreement.
+    # Cross-tabs: verdict × agreement, retask × agreement. Built over the REAL
+    # stratum (synth excluded), consistent with agreement_rate — otherwise the
+    # cross-tab `yes` column overstates the headline by the synth-row count and
+    # the report's own tables don't reconcile with its headline number.
     verdict_x_agreement: dict[str, dict[str, int]] = {}
-    for r in ok_rows:
+    for r in real_ok_rows:
         # Note: distinct name from the walrus-bound `v` (int | None) above so
         # the verdict key stays typed as a str.
         verdict_key = r.get("verdict") or "unknown"
@@ -245,7 +248,7 @@ def aggregate(rows: list[dict[str, Any]]) -> Aggregates:  # noqa: PLR0915 - sing
         "with_retask": dict.fromkeys(_AGREEMENT_KEYS, 0),
         "no_retask": dict.fromkeys(_AGREEMENT_KEYS, 0),
     }
-    for r in ok_rows:
+    for r in real_ok_rows:
         rc = _safe_int(r.get("retask_count"))
         if rc is None:
             continue
@@ -497,6 +500,77 @@ def _render_disagreement_appendix(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_synth_stratum(synth_stratum: dict[str, Any] | None) -> str:
+    """Render the synthetic-scenario stratum: escalation precision + recall.
+
+    The synth stratum has known ground truth, so it reports the objective
+    metrics the real stratum can't — escalation **precision** (did the system
+    escalate benign traffic it shouldn't have?) alongside **recall** (did it
+    catch the seeded true positives?). Precision is only meaningful once the
+    catalogue carries benign (expected≠TP) scenarios; with a TP-only catalogue
+    ``false_positive_count`` / ``true_negative_count`` stay 0 and precision
+    pins to 1.0 or is undefined. Absent (real-only batch) → a short note.
+    """
+    if synth_stratum is None:
+        return (
+            "## Synthetic-scenario stratum\n\n"
+            "_(no synth-tagged rows in this batch)_\n"
+        )
+
+    tp = synth_stratum.get("true_positive_count", 0)
+    fp = synth_stratum.get("false_positive_count", 0)
+    fn = synth_stratum.get("false_negative_count", 0)
+    tn = synth_stratum.get("true_negative_count", 0)
+    precision = synth_stratum.get("escalation_precision")
+    recall = synth_stratum.get("escalation_recall")
+    p_ci = synth_stratum.get("escalation_precision_ci") or [None, None]
+    r_ci = synth_stratum.get("escalation_recall_ci") or [None, None]
+
+    def _ci(ci: list[Any]) -> str:
+        lo, hi = [*ci, None, None][:2]
+        if lo is None or hi is None:
+            return "—"
+        return f"[{_fmt_pct(lo)}, {_fmt_pct(hi)}]"
+
+    lines = [
+        "## Synthetic-scenario stratum\n",
+        "Objective escalation metrics against seeded ground truth. "
+        "Precision answers the skeptic test — did the system escalate benign "
+        "traffic it should have closed? (Needs benign scenarios in the "
+        "catalogue to be meaningful.)\n",
+        "| metric | value | 95% CI |",
+        "|---|---:|:---:|",
+        f"| **Escalation precision** (TP / (TP+FP)) | {_fmt_pct(precision)} | {_ci(p_ci)} |",
+        f"| **Escalation recall** (TP / (TP+FN)) | {_fmt_pct(recall)} | {_ci(r_ci)} |",
+        "",
+        "| TP | FP | FN | TN |",
+        "|---:|---:|---:|---:|",
+        f"| {tp} | {fp} | {fn} | {tn} |",
+    ]
+
+    per_tier = synth_stratum.get("per_tier") or {}
+    if per_tier:
+        lines.append("\n**Recall by tier**\n")
+        lines.append("| tier | TP | FN | recall |")
+        lines.append("|---|---:|---:|---:|")
+        for tier in ("easy", "medium", "hard"):
+            t = per_tier.get(tier)
+            if not t:
+                continue
+            lines.append(
+                f"| {tier} | {t.get('true_positive_count', 0)} | "
+                f"{t.get('false_negative_count', 0)} | {_fmt_pct(t.get('recall'))} |"
+            )
+
+    unmatched = synth_stratum.get("unmatched_scenario_ids") or []
+    if unmatched:
+        lines.append(
+            f"\n_Unmatched synth rows (no catalogue scenario): "
+            f"{', '.join(str(u) for u in unmatched)}_"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _render_meta_pointer(batch_dir: Path) -> str:
     """Pointer to meta_analysis.md if it exists; placeholder otherwise.
 
@@ -520,12 +594,20 @@ def render_markdown(
     batch_dir: Path,
     rows: list[dict[str, Any]],
     agg: Aggregates,
+    synth_stratum: dict[str, Any] | None = None,
 ) -> str:
-    """Render the full ``report.md`` body."""
+    """Render the full ``report.md`` body.
+
+    ``synth_stratum`` (when present) is rendered as its own section so the
+    objective escalation precision/recall the synth stratum measures is
+    visible in the human-readable report — not just buried in
+    ``aggregates.json``.
+    """
     sections = [
         _render_header(batch_dir, rows, agg),
         _render_verdict_table(agg),
         _render_retask(agg),
+        _render_synth_stratum(synth_stratum),
         _render_histograms(agg),
         _render_top_errors(agg),
         _render_meta_pointer(batch_dir),
@@ -538,9 +620,12 @@ def write_report_markdown(
     batch_dir: Path,
     rows: list[dict[str, Any]],
     agg: Aggregates,
+    synth_stratum: dict[str, Any] | None = None,
 ) -> Path:
     path = batch_dir / "report.md"
-    path.write_text(render_markdown(batch_dir, rows, agg), encoding="utf-8")
+    path.write_text(
+        render_markdown(batch_dir, rows, agg, synth_stratum), encoding="utf-8"
+    )
     return path
 
 
@@ -621,5 +706,5 @@ def build_report(
     agg = aggregate(rows)
     synth_stratum = _compute_synth_stratum(rows, scenarios_dir)
     json_path = write_aggregates_json(batch_dir, agg, synth_stratum)
-    md_path = write_report_markdown(batch_dir, rows, agg)
+    md_path = write_report_markdown(batch_dir, rows, agg, synth_stratum)
     return json_path, md_path, agg

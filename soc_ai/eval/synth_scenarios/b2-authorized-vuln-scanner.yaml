@@ -1,0 +1,136 @@
+id: b2-authorized-vuln-scanner
+name: "Authorized internal vuln scanner tripping IDS as an attacker"
+version: 1
+tier: medium
+story: |
+  The internal Greenbone/OpenVAS vulnerability scanner (10.0.0.20, a known
+  scanning appliance on the security team's asset list) runs its scheduled
+  weekly authenticated scan against internal server 10.0.0.150. The scan fires
+  a burst of ET SCAN and ET WEB_SPECIFIC_APPS signatures (Nikto-style probes,
+  SQLi test strings, path-traversal attempts) because a vuln scanner literally
+  replays known-attack payloads to test for them. Taken per-signature, several
+  of these look like an active exploitation attempt. But the corroborating
+  evidence disposes it as benign-authorized: the source 10.0.0.20 is the
+  registered scanner appliance, the fan-out pattern (one source hitting every
+  port/path on the target in a tight window with a scanner User-Agent) is the
+  signature of authorized scanning not targeted exploitation, and the activity
+  falls in the sanctioned weekly maintenance window. A good analyst recognizes
+  authorized-scanner traffic and dispositions it as a false positive.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # Zeek http/conn showing scanner fan-out + UA
+    - typed_path             # rule.name (ET SCAN family)
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 2
+      source.ip: "10.0.0.20"
+      source.port: 44120
+      destination.ip: "10.0.0.150"
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: http
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET WEB_SPECIFIC_APPS Possible SQL Injection UNION SELECT"
+      rule.category: "Web Application Attack"
+      rule.signature: "2006446"
+      classtype: web-application-attack
+      signature_severity: Major
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: b2-authorized-vuln-scanner
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-http
+    time_offset_seconds: -1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      event.dataset: zeek.http
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.20"
+      destination.ip: "10.0.0.150"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.http.method: "GET"
+      zeek.http.uri: "/index.php?id=1%20UNION%20SELECT%20NULL--"
+      zeek.http.user_agent: "Mozilla/5.0 (compatible; Nessus; OpenVAS)"
+      zeek.http.status_code: 404
+      synth.scenario_id: b2-authorized-vuln-scanner
+
+  - index: logs-synth-zeek-http-summary
+    time_offset_seconds: -600
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-600) }}"
+      event.dataset: zeek.http_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.20"
+      destination.ip: "10.0.0.150"
+      synth.scan_profile:
+        window_seconds: 600
+        request_count: 8421
+        unique_uris: 8107
+        distinct_dst_ports: 42
+        user_agent: "Mozilla/5.0 (compatible; Nessus; OpenVAS)"
+        status_404_ratio: 0.91   # blasting paths that don't exist = scanner
+        status_200_ratio: 0.06
+        distinct_attack_signatures: 63
+      synth.scenario_id: b2-authorized-vuln-scanner
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.20"
+      source.port: 44120
+      destination.ip: "10.0.0.150"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShADadfF"
+      zeek.conn.duration: 0.12
+      zeek.conn.orig_bytes: 640
+      zeek.conn.resp_bytes: 1820
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "http"
+      synth.scenario_id: b2-authorized-vuln-scanner
+
+rubric_notes: |
+  Benign-authorized FP. Individually the SQLi / traversal signatures are
+  scary (Major severity, web-application-attack classtype), and a naive system
+  will escalate. The disposing evidence: (1) source 10.0.0.20 is the known,
+  authorized internal scanner appliance (both source and destination are
+  RFC1918 internal); (2) the http-summary shows a classic scanner fan-out —
+  8000+ requests, 91% 404s, 63 distinct attack signatures, a scanner User-
+  Agent — which is authorized vulnerability scanning, not targeted
+  exploitation of a single flaw; (3) internal-to-internal on the security
+  team's maintenance schedule. Correct disposition: false_positive, close as
+  benign (authorized scan). Escalating to true_positive is an escalation FP
+  and drops precision — this is the archetypal noisy-but-benign alert that
+  buries real SOC signal.

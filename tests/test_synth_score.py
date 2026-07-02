@@ -255,7 +255,13 @@ def test_score_counts_attempted_scenario_with_no_row_as_fn() -> None:
     denominator reflects all attempted scenarios — not just successful runs."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)  # all expected-TP
+    # Scope to expected-TP scenarios only — the errored-as-FN backfill is a
+    # positive-class (recall) concern; benign scenarios must not be dragged in.
+    scenarios = [
+        s
+        for s in load_all_scenarios(SCENARIOS_DIR)
+        if s.ground_truth.verdict == "true_positive"
+    ]
     # Only the first scenario produced a (correct) result row; the rest errored.
     first = scenarios[0]
     rows = [
@@ -399,6 +405,145 @@ def test_empty_expected_actions_does_not_add_unscoreable_miss_reason() -> None:
     assert not any("expected_actions" in r for r in detail.miss_reasons), (
         f"expected no 'expected_actions' entry in miss_reasons, got: {detail.miss_reasons}"
     )
+
+
+def test_benign_scenarios_load_and_are_false_positive() -> None:
+    """The b* benign scenarios parse via the real loader and carry
+    ground_truth.verdict == 'false_positive' (the negative class that makes
+    escalation precision meaningful)."""
+    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    benign = [s for s in scenarios if s.ground_truth.verdict == "false_positive"]
+    benign_ids = sorted(s.id for s in benign)
+    assert benign_ids == [
+        "b1-cdn-update-beacon",
+        "b2-authorized-vuln-scanner",
+        "b3-rmm-admin-lateral",
+    ]
+    # Each spans a distinct difficulty tier.
+    assert sorted(s.tier for s in benign) == ["easy", "hard", "medium"]
+
+
+def test_benign_not_escalated_scores_as_true_negative() -> None:
+    """A benign scenario the system correctly does NOT escalate is a true
+    negative: it neither adds a false positive (precision unaffected) nor a
+    false negative (recall unaffected)."""
+    from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
+
+    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    e1 = next(s for s in scenarios if s.id == "e1-emotet-feodo-c2")
+    b1 = next(s for s in scenarios if s.id == "b1-cdn-update-beacon")
+
+    rows = [
+        # Seeded TP escalated correctly.
+        SynthRow(
+            scenario_id=e1.id,
+            verdict="true_positive",
+            confidence=max(e1.ground_truth.confidence_min, 0.9),
+            citations=["blocklist_hit", "typed_path", "prefetch_pivot"],
+        ),
+        # Benign correctly dispositioned as false_positive → true negative.
+        SynthRow(
+            scenario_id=b1.id,
+            verdict="false_positive",
+            confidence=0.8,
+            citations=["prefetch_pivot", "typed_path"],
+        ),
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[e1, b1])
+
+    assert score.true_positive_count == 1
+    assert score.true_negative_count == 1
+    assert score.false_positive_count == 0
+    assert score.false_negative_count == 0
+    # Precision and recall both perfect: no benign was escalated, the TP caught.
+    assert score.escalation_precision == 1.0
+    assert score.escalation_recall == 1.0
+
+
+def test_benign_wrongly_escalated_scores_as_false_positive_and_drops_precision() -> None:
+    """A benign scenario the system WRONGLY escalates to true_positive is a
+    false positive: precision drops, recall is unaffected."""
+    from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
+
+    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    e1 = next(s for s in scenarios if s.id == "e1-emotet-feodo-c2")
+    b1 = next(s for s in scenarios if s.id == "b1-cdn-update-beacon")
+
+    rows = [
+        # Seeded TP caught → true positive.
+        SynthRow(
+            scenario_id=e1.id,
+            verdict="true_positive",
+            confidence=max(e1.ground_truth.confidence_min, 0.9),
+            citations=["blocklist_hit", "typed_path", "prefetch_pivot"],
+        ),
+        # Benign WRONGLY escalated → false positive.
+        SynthRow(
+            scenario_id=b1.id,
+            verdict="true_positive",
+            confidence=0.85,
+            citations=["typed_path"],
+        ),
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[e1, b1])
+
+    assert score.true_positive_count == 1
+    assert score.false_positive_count == 1
+    assert score.true_negative_count == 0
+    # 1 TP + 1 FP → precision 0.5.
+    assert score.escalation_precision == pytest.approx(0.5)
+    # No seeded TP was missed → recall stays perfect (precision/recall decouple).
+    assert score.false_negative_count == 0
+    assert score.escalation_recall == 1.0
+
+
+def test_benign_escalation_at_low_confidence_still_counts_as_false_positive() -> None:
+    """Escalating benign traffic is a false positive regardless of the emitted
+    confidence — the FP classification keys off the true_positive verdict, not
+    whether the confidence cleared the benign scenario's floor."""
+    from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
+
+    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    b2 = next(s for s in scenarios if s.id == "b2-authorized-vuln-scanner")
+
+    rows = [
+        SynthRow(
+            scenario_id=b2.id,
+            verdict="true_positive",
+            confidence=0.30,  # low confidence, but still an escalation of benign
+            citations=[],
+        )
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[b2])
+
+    assert score.false_positive_count == 1
+    assert score.true_negative_count == 0
+    assert score.true_positive_count == 0
+    # 0 TP + 1 FP → precision 0.0.
+    assert score.escalation_precision == 0.0
+
+
+def test_benign_scenario_with_no_row_is_not_counted_as_fn() -> None:
+    """The errored-scenario-as-FN backfill only fires for expected-TP
+    scenarios. An attempted benign scenario that produced no row must NOT be
+    silently turned into a false negative (it isn't a positive-class miss)."""
+    from soc_ai.eval.synth_score import score_synth_stratum
+
+    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    b3 = next(s for s in scenarios if s.id == "b3-rmm-admin-lateral")
+
+    # No rows at all — b3 attempted but produced nothing.
+    score = score_synth_stratum([], scenarios=[b3])
+
+    assert score.false_negative_count == 0
+    assert score.false_positive_count == 0
+    assert score.true_negative_count == 0
+    assert score.true_positive_count == 0
+    # b3 is not backfilled as an error row (that path is TP-only).
+    assert b3.id not in score.per_scenario
 
 
 def test_score_per_tier_breakdown() -> None:

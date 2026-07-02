@@ -169,14 +169,19 @@ async def sample_diverse_alerts(
         yield alert_id
 
     # Second pass: fill remaining slots from cap-overflow candidates so the
-    # cap is soft (no under-fill). Diversity deduplication still applies.
+    # cap is soft (no under-fill). Diversity deduplication still applies AND a
+    # SOFT ceiling of 2x per_rule_cap is enforced per rule — without it one noisy
+    # rule with many distinct diversity tuples could fill every remaining slot and
+    # dominate the batch, defeating max_rule_share and biasing agreement_rate.
+    second_pass_cap = 2 * per_rule_cap
     if yielded < n and cap_overflow_hits:
         _LOGGER.warning(
             "sampler: per-rule cap (%d) reached; filling remaining %d "
-            "slot(s) from %d overflow candidates",
+            "slot(s) from %d overflow candidates (soft ceiling %d/rule)",
             per_rule_cap,
             n - yielded,
             len(cap_overflow_hits),
+            second_pass_cap,
         )
         for hit in cap_overflow_hits:
             if yielded >= n:
@@ -188,7 +193,11 @@ async def sample_diverse_alerts(
             key = _diversity_tuple(source, diversity_keys)
             if key in seen:
                 continue
+            rule_name = _read_dotted(source, "rule.name") or ""
+            if per_rule_counts.get(rule_name, 0) >= second_pass_cap:
+                continue  # soft ceiling: don't let one rule dominate the fill
             seen.add(key)
+            per_rule_counts[rule_name] = per_rule_counts.get(rule_name, 0) + 1
             yielded += 1
             yield alert_id
 

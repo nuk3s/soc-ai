@@ -1,0 +1,169 @@
+id: b3-rmm-admin-lateral
+name: "Legitimate RMM tool flagged as lateral movement"
+version: 1
+tier: hard
+story: |
+  The IT helpdesk uses a sanctioned RMM agent (ConnectWise ScreenConnect) to
+  push a scheduled patch to workstation 10.0.0.132 from the management server
+  10.0.0.25. The push mounts ADMIN$, writes the ScreenConnect client MSI, and
+  creates+starts a Windows service — the same SMB + DCE-RPC svcctl sequence
+  that PsExec-style lateral movement produces. BZAR's notice.log fires and no
+  ET signature does, exactly like h2-psexec-smb-lateral. But the corroborating
+  evidence disposes it as benign: the source 10.0.0.25 is the registered RMM
+  management server, the written binary is the signed ScreenConnect client
+  (not a hollowed PSEXESVC), the service name is the vendor's product service,
+  and the push runs from the sanctioned patch-management host during the
+  maintenance window. A good analyst who checks the binary identity and source
+  asset recognizes authorized RMM administration and dispositions it benign —
+  the behavioral shape alone (ADMIN$ + service create) does NOT make it an
+  incident.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.60
+  required_citation_kinds:
+    - prefetch_pivot         # smb_files: signed vendor MSI, not a dropped exe
+    - prefetch_pivot         # dce_rpc svcctl create of the vendor service
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.25"
+      source.port: 51022
+      destination.ip: "10.0.0.132"
+      destination.port: 445
+      network.transport: tcp
+      network.protocol: smb
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "BZAR ATTACK::Execution_Service_Creation"
+      rule.category: "Misc Attack"
+      rule.signature: "9800002"  # synthetic SID — BZAR notice as alert
+      classtype: attempted-admin
+      signature_severity: Informational
+      host.name: "so-sensor-1"
+      agent.name: "so-sensor-1"
+      synth.scenario_id: b3-rmm-admin-lateral
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-smb-mapping
+    time_offset_seconds: -5
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      event.dataset: zeek.smb_mapping
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.132"
+      destination.port: 445
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_mapping.path: "\\\\10.0.0.132\\ADMIN$"
+      zeek.smb_mapping.service: "ADMIN$"
+      zeek.smb_mapping.share_type: "DISK"
+      synth.scenario_id: b3-rmm-admin-lateral
+
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: -3
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.132"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_WRITE"
+      zeek.smb_files.name: "ScreenConnect.ClientSetup.msi"
+      zeek.smb_files.path: "\\\\10.0.0.132\\ADMIN$\\Temp\\ScreenConnect.ClientSetup.msi"
+      zeek.smb_files.size: 4194304
+      synth.smb_files_signer: "ConnectWise, LLC"   # signed vendor binary
+      synth.scenario_id: b3-rmm-admin-lateral
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -1
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.132"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "svcctl"
+      zeek.dce_rpc.operation: "CreateServiceW"
+      synth.dce_rpc_service_name: "ScreenConnect Client (RMM)"
+      synth.scenario_id: b3-rmm-admin-lateral
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.132"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "svcctl"
+      zeek.dce_rpc.operation: "StartServiceW"
+      synth.dce_rpc_service_name: "ScreenConnect Client (RMM)"
+      synth.scenario_id: b3-rmm-admin-lateral
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -5
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      source.port: 51022
+      destination.ip: "10.0.0.132"
+      destination.port: 445
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDafF"
+      zeek.conn.duration: 8.7
+      zeek.conn.orig_bytes: 4210000
+      zeek.conn.resp_bytes: 5200
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "smb"
+      synth.scenario_id: b3-rmm-admin-lateral
+
+rubric_notes: |
+  Benign-authorized FP, Hard tier — the behavioral twin of h2-psexec-smb-
+  lateral (identical ADMIN$ mount → file write → CreateService → StartService
+  chain, same BZAR notice, zero ET signatures), opposite verdict. This is the
+  hardest kind of FP: the technique-shape is genuinely lateral-movement-like.
+  The disposing evidence is identity, not behavior: (1) the written binary is
+  a SIGNED ConnectWise ScreenConnect MSI (synth.smb_files_signer), not a
+  hollowed PSEXESVC.exe; (2) the created service is the named vendor product
+  service, not a random service name; (3) the source 10.0.0.25 is the
+  registered RMM management server; (4) both hosts internal. A system that
+  pattern-matches on "ADMIN$ + service create = PsExec" without checking the
+  binary identity / source-asset role produces a FALSE POSITIVE and would
+  page the on-call for a routine patch push. Correct disposition:
+  false_positive, close as benign (authorized RMM). Lower confidence floor
+  (0.60) because a defensible analyst may legitimately want to confirm the
+  change ticket before fully clearing it — but the verdict is still benign,
+  and escalating to true_positive is an escalation FP that drops precision.

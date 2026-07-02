@@ -1,7 +1,10 @@
-# Synthetic-TP scenario catalogue
+# Synthetic-scenario catalogue
 
 Hand-authored YAML scenarios that fabricate ECS-shaped Security Onion alerts
 (plus supporting Zeek correlation events) for injection into the eval pipeline.
+The catalogue carries both **true-positive** (`e*`/`m*`/`h*`) and **benign**
+(`b*`, `verdict: false_positive`) scenarios so the synth stratum can report
+escalation **precision** and **recall**, not recall alone.
 
 This directory contains the **data**. The loader, OpenSearch ingestion, and
 escalation precision/recall scoring live in `soc_ai/eval/`.
@@ -23,6 +26,16 @@ provide that signal.
   across Suricata + Zeek logs.
 - **Hard (`h*`)** — pure behavioral, no IOC, requires Zeek-only reasoning.
   Floor for what counts as the system "having real signal-detection."
+- **Benign (`b*`)** — realistic but *alarming* benign traffic
+  (`ground_truth.verdict: false_positive`). These are the negative class:
+  a good analyst dispositions them as NOT an incident. They exist so the
+  synth stratum can report **escalation precision** — the skeptic test
+  ("did the system call an obvious FP malicious?"). Escalating a `b*`
+  scenario to `true_positive` is scored as a false positive and drops
+  precision; correctly closing it as benign is a true negative. `b*`
+  scenarios span all three difficulty tiers (see `tier:`) and are
+  deliberately paired with their TP twins (e.g. `b1`↔`m1` beacon,
+  `b3`↔`h2` SMB lateral) so the disposition turns on evidence, not shape.
 
 ## File naming
 
@@ -129,3 +142,6 @@ After a batch run, scores aggregate per `synth.scenario_id`:
 | `h1-kerberoasting.yaml` | hard | true_positive | T1558.003 | RC4 + SPN fan-out |
 | `h2-psexec-smb-lateral.yaml` | hard | true_positive | T1021.002, T1543.003 | ADMIN$ + svcctl DCE-RPC |
 | `h3-low-slow-exfil-r2.yaml` | hard | true_positive | T1041, T1567.002 | Conn-ratio + first-seen FQDN |
+| `b1-cdn-update-beacon.yaml` | easy | false_positive | — | Benign updater poll — periodic HTTPS, stock JA3, no blocklist (beacon twin of m1) |
+| `b2-authorized-vuln-scanner.yaml` | medium | false_positive | — | Authorized OpenVAS scan — SQLi/traversal probes, scanner fan-out + UA |
+| `b3-rmm-admin-lateral.yaml` | hard | false_positive | — | Sanctioned RMM patch push — signed ScreenConnect MSI + service create (lateral twin of h2) |

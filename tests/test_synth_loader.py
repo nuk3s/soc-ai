@@ -16,12 +16,13 @@ from pydantic import ValidationError
 SCENARIOS_DIR = Path(__file__).parent.parent / "soc_ai" / "eval" / "synth_scenarios"
 
 
-def test_load_all_scenarios_returns_nine_validated_objects() -> None:
+def test_load_all_scenarios_returns_twelve_validated_objects() -> None:
     from soc_ai.eval.synth_loader import load_all_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
 
-    assert len(scenarios) == 9
+    # 9 malicious (e/m/h) + 3 benign (b) for the precision stratum.
+    assert len(scenarios) == 12
     ids = {s.id for s in scenarios}
     expected_ids = {
         "e1-emotet-feodo-c2",
@@ -33,20 +34,27 @@ def test_load_all_scenarios_returns_nine_validated_objects() -> None:
         "h1-kerberoasting",
         "h2-psexec-smb-lateral",
         "h3-low-slow-exfil-r2",
+        "b1-cdn-update-beacon",
+        "b2-authorized-vuln-scanner",
+        "b3-rmm-admin-lateral",
     }
     assert ids == expected_ids
+    # The benign class is expected to be false_positive ground truth.
+    benign = {s.id for s in scenarios if s.ground_truth.verdict == "false_positive"}
+    assert benign == {"b1-cdn-update-beacon", "b2-authorized-vuln-scanner", "b3-rmm-admin-lateral"}
 
 
-def test_easy_tier_filter_returns_three_scenarios() -> None:
+def test_easy_tier_filter_returns_four_scenarios() -> None:
     from soc_ai.eval.synth_loader import load_all_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
     easy = [s for s in scenarios if s.tier == "easy"]
-    assert len(easy) == 3
+    assert len(easy) == 4
     assert {s.id for s in easy} == {
         "e1-emotet-feodo-c2",
         "e2-urlhaus-pe-delivery",
         "e3-tor-exit-ssh",
+        "b1-cdn-update-beacon",
     }
 
 
@@ -223,17 +231,18 @@ def test_select_scenarios_by_tier() -> None:
         "e1-emotet-feodo-c2",
         "e2-urlhaus-pe-delivery",
         "e3-tor-exit-ssh",
+        "b1-cdn-update-beacon",
     }
     medium = select_scenarios(scenarios, selector="medium")
     assert {s.tier for s in medium} == {"medium"}
-    assert len(medium) == 3
+    assert len(medium) == 4  # m1/m2/m3 + benign b2
 
 
 def test_select_scenarios_all_returns_all() -> None:
     from soc_ai.eval.synth_loader import load_all_scenarios, select_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
-    assert len(select_scenarios(scenarios, selector="all")) == 9
+    assert len(select_scenarios(scenarios, selector="all")) == 12
 
 
 def test_select_scenarios_by_explicit_ids() -> None:

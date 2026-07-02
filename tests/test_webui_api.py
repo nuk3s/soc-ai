@@ -3284,6 +3284,25 @@ def test_request_is_https_helper_matrix() -> None:
     assert _request_is_https(_req("http", "http")) is False
 
 
+def test_collect_reasoning_gathers_traces_in_order() -> None:
+    """Reasoning traces from model_response events are collected in order;
+    events without a trace (or other kinds) are ignored."""
+    from soc_ai.api.webui_api import _collect_reasoning
+
+    def _ev(kind: str, payload: dict[str, Any]) -> Any:
+        return SimpleNamespace(kind=kind, payload=payload)
+
+    events = [
+        _ev("model_response", {"content": "checking the IP", "reasoning_trace": "first thought"}),
+        _ev("tool_call", {"tool_name": "t_enrich_ip"}),
+        _ev("model_response", {"content": "no trace here"}),  # no reasoning_trace
+        _ev("model_response", {"reasoning_trace": "  second thought  "}),
+        _ev("done", {}),
+    ]
+    assert _collect_reasoning(events) == ["first thought", "second thought"]
+    assert _collect_reasoning([]) == []
+
+
 def test_client_ip_proxy_awareness() -> None:
     """client_ip: peer IP by default; trust X-Forwarded-For ONLY from an
     allowlisted proxy peer (never from an untrusted client)."""

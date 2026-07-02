@@ -263,10 +263,110 @@ def test_render_markdown_contains_all_required_sections(tmp_path: Path) -> None:
     assert "# Eval batch report" in md
     assert "## Verdict × agreement" in md
     assert "## Retask × agreement" in md
+    assert "## Synthetic-scenario stratum" in md
     assert "## Performance histograms" in md
     assert "## Top errors" in md
     assert "## Meta-analysis" in md
     assert "## Disagreements" in md
+
+
+def test_render_markdown_synth_stratum_note_when_absent(tmp_path: Path) -> None:
+    """Real-only batch (no synth_stratum) still renders the section header
+    with a 'no synth-tagged rows' note."""
+    agg = aggregate([_row("a1")])
+    md = render_markdown(tmp_path, [_row("a1")], agg, None)
+    assert "## Synthetic-scenario stratum" in md
+    assert "no synth-tagged rows" in md
+
+
+def test_render_markdown_surfaces_precision_recall_and_counts(tmp_path: Path) -> None:
+    """When a synth_stratum is present, the report surfaces escalation
+    precision + recall + TP/FP/FN/TN counts — the objective metrics that
+    answer the skeptic test but were previously JSON-only."""
+    agg = aggregate([_row("a1")])
+    synth_stratum = {
+        "true_positive_count": 3,
+        "false_positive_count": 1,
+        "false_negative_count": 2,
+        "true_negative_count": 4,
+        "escalation_precision": 0.75,
+        "escalation_recall": 0.60,
+        "escalation_precision_ci": [0.30, 0.95],
+        "escalation_recall_ci": [0.23, 0.88],
+        "per_scenario": {},
+        "per_tier": {
+            "easy": {
+                "tier": "easy",
+                "true_positive_count": 2,
+                "false_negative_count": 0,
+                "recall": 1.0,
+            },
+            "medium": {
+                "tier": "medium",
+                "true_positive_count": 1,
+                "false_negative_count": 1,
+                "recall": 0.5,
+            },
+            "hard": {
+                "tier": "hard",
+                "true_positive_count": 0,
+                "false_negative_count": 1,
+                "recall": 0.0,
+            },
+        },
+        "unmatched_scenario_ids": [],
+    }
+    md = render_markdown(tmp_path, [_row("a1")], agg, synth_stratum)
+
+    assert "## Synthetic-scenario stratum" in md
+    assert "Escalation precision" in md
+    assert "Escalation recall" in md
+    assert "75.0%" in md  # precision
+    assert "60.0%" in md  # recall
+    # TP/FP/FN/TN counts row present.
+    assert "| 3 | 1 | 2 | 4 |" in md
+    # Per-tier recall table present.
+    assert "Recall by tier" in md
+
+
+def test_build_report_synth_stratum_rendered_in_markdown(tmp_path: Path) -> None:
+    """End-to-end: a batch with benign + TP synth rows produces a report.md
+    that surfaces escalation precision (benign correctly closed → precision
+    stays 1.0; TP caught → recall 1.0)."""
+    real = _row("real-1")
+    synth_tp = _row("synth-e1", verdict="true_positive", confidence=0.92)
+    synth_tp["is_synth"] = True
+    synth_tp["synth_scenario_id"] = "e1-emotet-feodo-c2"
+    synth_tp["citations"] = ["blocklist_hit", "typed_path", "prefetch_pivot"]
+
+    synth_benign_closed = _row(
+        "synth-b1", verdict="false_positive", confidence=0.8
+    )
+    synth_benign_closed["is_synth"] = True
+    synth_benign_closed["synth_scenario_id"] = "b1-cdn-update-beacon"
+    synth_benign_closed["citations"] = ["prefetch_pivot", "typed_path"]
+
+    (tmp_path / "index.jsonl").write_text(
+        "\n".join(
+            json.dumps(r) for r in (real, synth_tp, synth_benign_closed)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    json_path, md_path, _ = build_report(tmp_path)
+    saved = json.loads(json_path.read_text())
+    md = md_path.read_text()
+
+    # Benign correctly closed → true negative; TP caught → precision + recall 1.0.
+    synth = saved["synth_stratum"]
+    assert synth["true_negative_count"] == 1
+    assert synth["false_positive_count"] == 0
+    assert synth["escalation_precision"] == 1.0
+    assert synth["escalation_recall"] == 1.0
+    # And the human-readable report surfaces the precision line.
+    assert "## Synthetic-scenario stratum" in md
+    assert "Escalation precision" in md
 
 
 def test_render_markdown_handles_empty_batch(tmp_path: Path) -> None:

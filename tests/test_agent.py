@@ -6547,6 +6547,24 @@ def test_count_successful_tool_calls_ignores_text_thinking_retry_parts() -> None
     assert count_successful_tool_calls([mixed]) == 1
 
 
+def test_targeted_result_has_data() -> None:
+    """The Phase-D evidence check requires DISCRIMINATING data — an empty-but-
+    non-error result (zero OQL hits, internal IP with no hits) is not evidence."""
+    from soc_ai.agent.orchestrator import _targeted_result_has_data
+
+    # No data → does not exempt the gate.
+    assert _targeted_result_has_data({"total": 0, "hits": []}) is False
+    assert _targeted_result_has_data({"internal": True, "blocklist_hits": [], "asn": None}) is False
+    assert _targeted_result_has_data({"error": "boom"}) is False
+    assert _targeted_result_has_data("targeted dispatch error: x") is False
+    assert _targeted_result_has_data({}) is False
+    # Real data → counts as evidence.
+    assert _targeted_result_has_data({"total": 3, "hits": [{"_id": "a"}]}) is True
+    assert _targeted_result_has_data({"blocklist_hits": [{"src": "feodo"}]}) is True
+    assert _targeted_result_has_data({"asn": {"number": 15169}}) is True
+    assert _targeted_result_has_data({"is_novel": True, "rarity": "rare"}) is True
+
+
 def test_evidence_gate_downgrades_zero_tool_true_positive() -> None:
     from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
 

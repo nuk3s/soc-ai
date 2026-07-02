@@ -316,6 +316,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     gate = ApprovalGate()
     audit = AuditLogger(settings, elastic)
     enrichment = build_local_enrichment_context(settings)
+    # Ed25519 signer for decision-record exports (load-or-generate the key).
+    # Best-effort: a signing failure must not block startup — exports then carry
+    # the sha256 checksum only.
+    from soc_ai.store.signing import DecisionSigner  # noqa: PLC0415
+
+    try:
+        decision_signer: Any = DecisionSigner.load_or_create(settings.soc_ai_data_dir)
+    except Exception:
+        _LOGGER.warning("decision-record signer unavailable; exports use checksum only")
+        decision_signer = None
 
     app.state.settings = settings
     app.state.secret_box = secret_box
@@ -325,6 +335,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     app.state.gate = gate
     app.state.audit = audit
     app.state.enrichment = enrichment
+    app.state.decision_signer = decision_signer
     app.state.db_engine = db_engine
     app.state.db_sessionmaker = db_sessionmaker
 

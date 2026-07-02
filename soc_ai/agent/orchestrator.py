@@ -1576,6 +1576,39 @@ def _has_ioc_hit(enriched_ctx: Any) -> bool:
     return False
 
 
+# Keys on a tool result that are bookkeeping / classification flags, NOT gathered
+# evidence — a result carrying only these did not discriminate anything.
+_NON_EVIDENCE_RESULT_KEYS = frozenset(
+    {
+        "error", "ok", "available", "reason", "hint", "internal", "indicator",
+        "indicator_type", "query", "ip", "domain", "hash", "algo", "note",
+    }
+)
+
+
+def _targeted_result_has_data(result: Any) -> bool:
+    """True iff a Phase-D targeted-tool result carries DISCRIMINATING evidence.
+
+    Mirrors :func:`count_successful_tool_calls`' "non-error DATA" semantics: an
+    empty-but-non-error dict — an OQL/zeek query with zero hits, ``enrich_ip`` on
+    an internal IP with no blocklist/MISP hit — gathered nothing and must NOT
+    exempt the hard evidence gate.
+
+    Rather than enumerate every data-bearing field (fragile — tools return many
+    shapes: hits, sni_servers, dns_queries, asn, prevalence flags…), a result has
+    data iff it carries ANY truthy value under a key that is not a bookkeeping /
+    classification flag. Search-shaped results (``total``/``hits``) are judged on
+    hit count so a zero-hit query is correctly empty.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    # Search-shaped result (OQL / zeek / cases): data iff there are hits.
+    if "total" in result or "hits" in result:
+        return bool(result.get("total")) or bool(result.get("hits"))
+    # Otherwise: any non-bookkeeping key with a truthy value is gathered evidence.
+    return any(v for k, v in result.items() if k not in _NON_EVIDENCE_RESULT_KEYS)
+
+
 def _downgrade_unevidenced_verdict(
     report: Any,  # TriageReport
     enriched_ctx: Any,  # EnrichedAlertContext
@@ -4041,6 +4074,26 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
         await _audit(dg_ev)
         yield dg_ev
 
+    # I2: hard evidence gate — legacy-path parity with the synth-first pipeline.
+    # The primary path runs this inside _synth_first_post_validate; the legacy
+    # fallback never did, so a prefetch-only TP/FP on the non-fast-path could
+    # settle with no tool evidence behind it (the QVOD/zero-tool defect). Gate it
+    # too. The fast path is intentionally exempt — it settles FP verdicts from
+    # materialized prefetch and carries its own TP ceiling + evidence guard.
+    if not fast_path_taken:
+        report = _downgrade_unevidenced_verdict(
+            report,
+            alert_ctx,
+            None,  # no CandidateVerdict on the legacy path → template exemption off
+            downgrade_audit,
+            targeted_messages=inv_messages_for_cite or None,
+            targeted_tool_called=None,
+        )
+        if "evidence_gate_downgrade" in downgrade_audit:
+            eg_ev = _ev("evidence_gate_downgrade", downgrade_audit["evidence_gate_downgrade"])
+            await _audit(eg_ev)
+            yield eg_ev
+
     # ----- Final report + approvals -----
     report_ev = _ev(
         "triage_report",
@@ -4996,11 +5049,11 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         targeted_tool = "investigation_loop"
     elif (
         triage_round1.gap_for_investigator is not None
-        # Only a SUCCESSFUL Phase-D dispatch counts as evidence — an errored
-        # dispatch (string "targeted dispatch error: …" or a tool error dict)
-        # must NOT exempt the hard evidence gate.
-        and isinstance(targeted_result, dict)
-        and not targeted_result.get("error")
+        # Only a SUCCESSFUL Phase-D dispatch that returned DISCRIMINATING DATA
+        # counts as evidence. An errored dispatch (error string / tool error dict)
+        # OR an empty-but-non-error result (zero OQL hits, internal IP with no
+        # blocklist/MISP hit) must NOT exempt the hard evidence gate.
+        and _targeted_result_has_data(targeted_result)
     ):
         targeted_tool = triage_round1.gap_for_investigator.tool_name
     triage_final, validation_audit = _synth_first_post_validate(

@@ -178,6 +178,8 @@ export interface Investigation {
   elapsedSec?: number;
   actions: RecommendedAction[];
   timeline: TimelineStep[];
+  /** Ordered model reasoning traces (the <think> blocks) — the "show your work". */
+  reasoning?: string[];
   nodes: GraphNode[];
   edges: GraphEdge[];
   seedChat: ChatMessage[];

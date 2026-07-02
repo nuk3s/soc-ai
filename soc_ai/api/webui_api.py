@@ -1344,6 +1344,28 @@ class InvestigationOut(BaseModel):
     openQuestions: list[str] = []
     resolution: dict[str, Any] | None = None
     validatorNote: str | None = None
+    # Ordered model reasoning traces (the <think> blocks) captured per model turn.
+    # Surfaced so an analyst can see WHY a verdict was reached — the "show your
+    # work" explainability the timeline (which skips model_response) drops.
+    reasoning: list[str] = []
+
+
+def _collect_reasoning(events: list[Any]) -> list[str]:
+    """Ordered reasoning traces from model_response events.
+
+    ``_walk_message`` attaches the model's ``<think>`` trace to each
+    model_response event as ``reasoning_trace``; the analyst timeline skips
+    model_response, so those traces are otherwise invisible. Collect the
+    non-empty ones in order for the "Model reasoning" panel.
+    """
+    out: list[str] = []
+    for e in events:
+        if e.kind != "model_response":
+            continue
+        trace = (e.payload or {}).get("reasoning_trace")
+        if isinstance(trace, str) and trace.strip():
+            out.append(trace.strip())
+    return out
 
 
 def _build_actions(
@@ -1554,6 +1576,7 @@ async def get_investigation(
         elapsedSec=_elapsed_sec(inv),
         actions=actions,
         timeline=timeline,
+        reasoning=_collect_reasoning(events),
         nodes=nodes,
         edges=edges,
         seedChat=[_chat_msg_out(m) for m in chat],
@@ -3937,15 +3960,17 @@ async def oracle_redaction_preview(
 # ── Audit-grade decision record ("show your work") export ──────────────────────
 
 
-def _decision_record(inv: Investigation, events: list[Any]) -> dict[str, Any]:
+def _decision_record(
+    inv: Investigation, events: list[Any], *, signer: Any | None = None
+) -> dict[str, Any]:
     """A self-contained record of how a verdict was reached.
 
     Bundles the verdict + rationale + the full agent trace (every tool call, every
-    cited event) + provenance, plus a sha256 checksum over the canonical JSON so a
-    recipient can detect accidental corruption/truncation in transit or storage.
-    This is an INTEGRITY CHECKSUM, not a cryptographic signature — it does not
-    prevent deliberate alteration (an editor can recompute a matching hash). The
-    "show your work" artifact for audit, compliance, and hand-off.
+    cited event) + provenance. Integrity: a sha256 checksum over the canonical JSON
+    (accidental-corruption detection) AND — when a signing key is available — an
+    Ed25519 detached SIGNATURE over the same bytes with the public key embedded, so
+    an external auditor can prove the record was not altered using the public key
+    alone. The "show your work" artifact for audit, compliance, and hand-off.
     """
     body: dict[str, Any] = {
         "schema": "soc-ai.decision-record/v1",
@@ -3974,15 +3999,33 @@ def _decision_record(inv: Investigation, events: list[Any]) -> dict[str, Any]:
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    body["integrity"] = {
+    integrity: dict[str, Any] = {
         "algo": "sha256",
         "hash": digest,
         "note": (
             "sha256 checksum over the canonical JSON of this record with the "
-            "'integrity' field removed, for detecting accidental corruption in "
-            "transit/storage. This is a self-consistency checksum, not a signature."
+            "'integrity' field removed — detects accidental corruption in "
+            "transit/storage."
         ),
     }
+    if signer is not None:
+        # Detached Ed25519 signature over the SAME canonical bytes the checksum
+        # covers. Verify: recompute the canonical JSON (integrity field removed),
+        # then ed25519-verify(signature, canonical) against public_key. Tamper-
+        # evident — a post-export edit cannot be re-signed without the private key.
+        try:
+            integrity["signature"] = {
+                "algo": "ed25519",
+                "value": signer.sign_hex(canonical.encode("utf-8")),
+                "public_key": signer.public_key_hex(),
+                "note": (
+                    "detached Ed25519 signature over the canonical JSON (integrity "
+                    "field removed); verify with the public_key — no server secret needed."
+                ),
+            }
+        except Exception:  # pragma: no cover - signing must never break the export
+            _LOGGER.warning("decision-record signing failed; exporting with checksum only")
+    body["integrity"] = integrity
     return body
 
 
@@ -3990,19 +4033,37 @@ def _decision_record(inv: Investigation, events: list[Any]) -> dict[str, Any]:
 async def export_investigation(inv_id: str, request: Request) -> JSONResponse:
     """Download the audit-grade decision record for one investigation.
 
-    JSON with a sha256 integrity checksum (detects accidental corruption; not a
-    cryptographic signature).
+    JSON with a sha256 integrity checksum AND (when a signing key is present) an
+    Ed25519 detached signature + public key — verifiable by an external auditor
+    with the public key alone (see GET /decision-record/public-key).
     """
     async with request.app.state.db_sessionmaker() as db:
         got = await inv_svc.get_with_events(db, inv_id)
     if got is None:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
     inv, events = got
-    record = _decision_record(inv, events)
+    signer = getattr(request.app.state, "decision_signer", None)
+    record = _decision_record(inv, events, signer=signer)
     return JSONResponse(
         content=record,
         headers={"Content-Disposition": f'attachment; filename="soc-ai-{inv.id}.json"'},
     )
+
+
+@router.get("/decision-record/public-key")
+async def decision_record_public_key(request: Request) -> dict[str, Any]:
+    """The Ed25519 public key that verifies decision-record export signatures.
+
+    A verification key is meant to be published; it's also embedded in every
+    export's integrity block, so an external auditor can verify from the exported
+    file alone. Returns ``{"algo": "ed25519", "public_key": null}`` when signing is
+    unavailable (exports then carry the checksum only).
+    """
+    signer = getattr(request.app.state, "decision_signer", None)
+    return {
+        "algo": "ed25519",
+        "public_key": signer.public_key_hex() if signer is not None else None,
+    }
 
 
 # ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────

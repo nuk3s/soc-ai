@@ -116,6 +116,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const [openSteps, setOpenSteps] = useState<Record<string, boolean>>({});
   const [flashStep, setFlashStep] = useState<string | null>(null);
   const [timelineOpen, setTimelineOpen] = useState(true);
+  const [reasoningOpen, setReasoningOpen] = useState(false);
   const [chat, setChat] = useState<ChatMessage[]>(inv.seedChat);
   const [pending, setPending] = useState(false);
   // Restore any draft saved before the drawer last unmounted (close + reopen).
@@ -602,6 +603,32 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </CollapsibleSection>
   );
 
+  const reasoning = inv.reasoning ?? [];
+  const reasoningEl =
+    reasoning.length > 0 ? (
+      <CollapsibleSection
+        title="Model reasoning"
+        meta={`${reasoning.length} step${reasoning.length === 1 ? '' : 's'} · why it decided`}
+        open={reasoningOpen}
+        onToggle={() => setReasoningOpen((o) => !o)}
+      >
+        <Panel>
+          <div className="flex flex-col gap-3 p-1">
+            {reasoning.map((r, i) => (
+              <div key={i} className="rounded-control border border-border-2 bg-bg p-2.5">
+                <div className="mb-1 font-mono text-[10.5px] uppercase tracking-[.06em] text-faint">
+                  turn {i + 1}
+                </div>
+                <div className="whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-dim">
+                  {r}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </CollapsibleSection>
+    ) : null;
+
   const onResolved = () =>
     getChatThread(inv.id).then(applyThread).catch(() => {}).finally(() => onVerdictApplied?.());
   const chatProps = { messages: chat, pending, draft, onDraft: setDraft, onSend: send, invId: inv.id, onResolved };
@@ -722,6 +749,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 {inv.nodes.length > 0 && entityEl}
                 {actionsEl}
                 {timelineEl}
+                {reasoningEl}
               </div>
               <div className="flex flex-col gap-[18px]">
                 {alertEl}
@@ -754,6 +782,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {inv.nodes.length > 0 && <div className="mt-[18px]">{entityEl}</div>}
           <div className="mt-[18px]">{actionsEl}</div>
           <div className="mt-5">{timelineEl}</div>
+          {reasoningEl && <div className="mt-5">{reasoningEl}</div>}
           <div className="mt-5">
             <ChatPanel {...chatProps} />
           </div>
