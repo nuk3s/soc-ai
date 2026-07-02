@@ -31,17 +31,23 @@ export function useAsync<T>(
 
   useEffect(() => {
     let alive = true;
+    // Monotonic request id: a slow earlier response must not overwrite a newer
+    // one, and no setState may fire after unmount / dep change. Every invocation
+    // captures its id and bails unless it's still the latest (and still alive).
+    let seq = 0;
 
     const run = (foreground: boolean) => {
+      const id = ++seq;
+      const fresh = () => alive && id === seq;
       // Foreground (initial / dep change): show loading but keep prior data so
       // the screen doesn't flash. Background (poll): silent.
       if (foreground) setState((s) => ({ data: s.data, loading: true, error: null }));
       loader()
         .then((data) => {
-          if (alive) setState({ data, loading: false, error: null });
+          if (fresh()) setState({ data, loading: false, error: null });
         })
         .catch((error: unknown) => {
-          if (!alive) return;
+          if (!fresh()) return;
           if (!foreground) {
             // A background poll failed — keep the last good data, don't flap.
             setState((s) => ({ ...s, loading: false }));

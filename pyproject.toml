@@ -1,6 +1,6 @@
 [project]
 name = "soc-ai"
-version = "1.0.0"
+version = "1.0.1"
 description = "Self-hosted, privacy-respecting LLM-powered triage assistant for Security Onion"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -129,6 +129,10 @@ max-branches = 20
 # in meta_analysis size estimates (".. × 5K tokens").
 "soc_ai/eval/report.py" = ["RUF001", "RUF003"]
 "soc_ai/eval/meta_analysis.py" = ["RUF002", "RUF003"]
+# `×` is the intentional "fired N× times" count multiplier in the
+# detection-tuning reason/summary strings + docs (same as the webui count badge).
+"soc_ai/webui/detection_tuning.py" = ["RUF001", "RUF002", "RUF003"]
+"soc_ai/tools/rule_tuning.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.format]
 quote-style = "double"

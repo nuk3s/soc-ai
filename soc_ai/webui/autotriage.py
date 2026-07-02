@@ -18,6 +18,7 @@ from typing import Any
 
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
+from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import alerts_query as aq
 
@@ -59,8 +60,6 @@ class AutoTriageStatus:
     cancelled: bool = False
     # internal: keep a reference to the running task to prevent GC
     _task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
-    # all rule names (or alert ids) still queued in this run (current + remaining)
-    pending_rules: set[str] = field(default_factory=set, compare=False, repr=False)
 
     def reset(
         self,
@@ -80,7 +79,6 @@ class AutoTriageStatus:
         self.current = None
         self.tool_calls = 0
         self.cancelled = False
-        self.pending_rules = set()
 
 
 def request_stop(state: Any) -> bool:
@@ -189,10 +187,19 @@ async def plan_targets(
     # Gather all pairs for windowed-pair check
     all_pairs = list(clusters.keys())
 
+    # Inheritance: skip a (rule, src, dst) cluster that already has a verdict in
+    # the window — it inherits that sibling's verdict instead of being re-triaged.
+    # This is what keeps a continuous sweep tenable. Toggleable: with inheritance
+    # off, every cluster is investigated (no pair-skip).
+    inherit_on = getattr(settings, "auto_triage_inheritance_enabled", True)
     async with state.db_sessionmaker() as db:
         direct_hits = await inv_svc.latest_for_alerts(db, all_event_ids)
-        pair_hits = await inv_svc.latest_for_pairs(
-            db, all_pairs, window_days=settings.webui_inherit_window_days
+        pair_hits = (
+            await inv_svc.latest_for_pairs(
+                db, all_pairs, window_days=settings.webui_inherit_window_days
+            )
+            if inherit_on
+            else {}
         )
 
     targets: list[Target] = []
@@ -256,6 +263,13 @@ async def plan_targets_for_ids(
     async with state.db_sessionmaker() as db:
         direct_hits = await inv_svc.latest_for_alerts(db, ids)
 
+    # Resolve rule names for the whole selection in ONE ES lookup so each row is
+    # named at creation — a selected-id run that dies before its first
+    # alert_context event must not leave a nameless "Alert <id>…" row. Best-effort:
+    # an ES failure here just leaves names blank and the recorder backfills from
+    # the stream (the prior behaviour).
+    id_to_rule = await _resolve_rule_names(state, ids)
+
     targets: list[Target] = []
     skipped = 0
     for aid in ids:
@@ -264,10 +278,44 @@ async def plan_targets_for_ids(
         if direct is not None and inv_svc.blocks_rehunt(direct):
             skipped += 1
             continue
-        # rule/src/dst are only used by plan_targets() clustering; the worker
-        # resolves everything it needs from alert_es_id alone.
-        targets.append(Target(alert_es_id=aid, rule_name="", src_ip="", dst_ip=""))
+        # src/dst are only used by plan_targets() clustering; the worker resolves
+        # those from alert_es_id. rule_name is seeded so the row is named at birth.
+        targets.append(
+            Target(alert_es_id=aid, rule_name=id_to_rule.get(aid, ""), src_ip="", dst_ip="")
+        )
     return targets, skipped
+
+
+async def _resolve_rule_names(state: Any, ids: list[str]) -> dict[str, str]:
+    """Batch-resolve ``alert_es_id -> rule.name`` for a selection in one ES query.
+
+    Falls back to ``event.dataset`` / ``event.category`` for non-Suricata
+    detections (no ``rule.name``). Never raises — on any ES error returns an empty
+    map so callers degrade to stream-backfill rather than failing the sweep.
+    """
+    if not ids:
+        return {}
+    try:
+        lookup = await state.elastic.search(
+            state.settings.events_index_pattern,
+            {"ids": {"values": ids}},
+            size=len(ids),
+        )
+    except Exception:
+        _LOGGER.exception("auto-triage: rule-name resolution lookup failed")
+        return {}
+    resolved: dict[str, str] = {}
+    for hit in lookup.hits:
+        aid = hit.get("_id", "")
+        source = hit.get("_source", {})
+        name = (
+            get_dotted(source, "rule.name")
+            or get_dotted(source, "event.dataset")
+            or get_dotted(source, "event.category")
+        )
+        if aid and name:
+            resolved[aid] = str(name)
+    return resolved
 
 
 async def run_auto_triage(
@@ -292,9 +340,6 @@ async def run_auto_triage(
                 break
             label = target.rule_name if target.rule_name else target.alert_es_id
             status.current = label
-            status.pending_rules = {
-                (t.rule_name if t.rule_name else t.alert_es_id) for t in targets[i:]
-            }
             try:
                 stream_errored = False
                 async for name, _data in run_recorded(
@@ -302,6 +347,9 @@ async def run_auto_triage(
                     ctx=ctx,
                     alert_id=target.alert_es_id,
                     started_by=started_by,
+                    # Group sweeps know the rule name up front; selected-id runs
+                    # carry "" and fall back to stream-extraction.
+                    rule_name=target.rule_name or None,
                 ):
                     if name == "error":
                         stream_errored = True
@@ -321,5 +369,46 @@ async def run_auto_triage(
                 status.current = None
     finally:
         status.active = False
-        status.pending_rules = set()
         status.finished_at = datetime.now(UTC).isoformat()
+
+
+def config_severity_band(settings: Any) -> tuple[str, ...]:
+    """The severity band at/above ``settings.auto_triage_min_severity`` (critical
+    first) — the SCOPE of a config-floor sweep. Falls back to high if unset."""
+    ladder = list(aq.SEVERITIES)  # ("critical", "high", "medium", "low")
+    floor = getattr(settings, "auto_triage_min_severity", "high")
+    idx = ladder.index(floor) if floor in ladder else ladder.index("high")
+    return tuple(ladder[: idx + 1])
+
+
+async def start_config_sweep(state: Any, *, started_by: str) -> int:
+    """Plan + launch a config-floor auto-triage sweep (single-flight). Never raises.
+
+    Sweeps every untriaged detection at/above ``auto_triage_min_severity`` and
+    launches a background :func:`run_auto_triage`. Returns the number of targets
+    launched, or 0 if a sweep is already running / there is nothing to triage.
+    Used by the continuous scheduler loop; mirrors the ⚡ endpoint's config-band
+    path.
+    """
+    status = get_status(state)
+    if status.active:
+        return 0
+    band = config_severity_band(state.settings)
+    status.active = True  # claim the single-flight slot before any await
+    try:
+        targets, skipped = await plan_targets(
+            state, time_range=aq.DEFAULT_RANGE, oql=None, severities=band
+        )
+    except Exception:
+        status.active = False
+        _LOGGER.exception("auto-triage: scheduled planning failed")
+        return 0
+    if not targets:
+        status.reset(active=False, total=0, skipped=skipped, severities=band)
+        status.finished_at = datetime.now(UTC).isoformat()
+        return 0
+    status.reset(active=True, total=len(targets), skipped=skipped, severities=band)
+    status._task = asyncio.create_task(
+        run_auto_triage(state, targets=targets, started_by=started_by)
+    )
+    return len(targets)

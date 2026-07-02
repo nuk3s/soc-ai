@@ -452,6 +452,27 @@ class TestAutoTriageSeveritySelector:
         sevs = _severities_from_groups_calls(es)
         assert sevs == ["medium"]  # only medium queried, not critical/high
 
+    def test_inheritance_toggle_gates_the_pair_query(self, at_settings: Settings) -> None:
+        """#3: with inheritance ON the sweep consults latest_for_pairs (to skip
+        already-covered clusters); with it OFF that query is never run, so every
+        cluster is investigated independently."""
+        from soc_ai.webui import autotriage as at
+
+        def _await_count(flag: bool) -> int:
+            es = AsyncMock()
+            es.search.side_effect = _make_es_side_effect()
+            settings = at_settings.model_copy(update={"auto_triage_inheritance_enabled": flag})
+            state = _FakeState(settings, es)
+            with patch(
+                "soc_ai.webui.autotriage.inv_svc.latest_for_pairs",
+                AsyncMock(return_value={}),
+            ) as m:
+                asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+            return int(m.await_count)
+
+        assert _await_count(True) == 1  # inheritance on → pair query runs
+        assert _await_count(False) == 0  # inheritance off → pair query skipped
+
     def test_plan_targets_defaults_to_critical_high(self, at_settings: Settings) -> None:
         """The default severities are critical + high (no caller choice)."""
         from soc_ai.webui import autotriage as at
@@ -1118,18 +1139,20 @@ class TestMaybeAutoAckFp:
 # ---------------------------------------------------------------------------
 
 
-class TestAutoTriagePendingRules:
-    """pending_rules tracks all not-yet-processed targets during a run."""
+class TestAutoTriageProgress:
+    """status.current tracks the single in-flight target (the sequential worker
+    investigates one at a time); it clears when the run finishes."""
 
-    def test_pending_rules_contains_all_remaining_targets(
+    def test_current_tracks_the_in_flight_target(
         self, at_settings: Settings, fake_es: AsyncMock
     ) -> None:
-        """While iterating, pending_rules includes the current + remaining rule names;
-        it is empty after the run finishes.  Uses a gated investigate so we can
-        snapshot mid-flight without a race."""
+        """While the first target is gated mid-investigation, status.current is that
+        target; after the run finishes it is None. (The old pending_rules set that
+        marked the whole queue as 'triaging' was removed — the live "Triaging…"
+        badge now keys off the DB run status, not a scheduler set.)"""
         gate = asyncio.Event()
-        # Snapshots of pending_rules taken while the first target is gated.
-        observed_pending: list[set[str]] = []
+        # Snapshots of status.current taken while the first target is gated.
+        observed_current: list[str | None] = []
 
         async def _gated_investigate(
             alert_id: str,
@@ -1181,21 +1204,19 @@ class TestAutoTriagePendingRules:
                     )
                     # Let the first iteration start and hit the gate.
                     await asyncio.sleep(0.05)
-                    observed_pending.append(set(status.pending_rules))
+                    observed_current.append(status.current)
                     # Release so the run can finish.
                     gate.set()
                     await run_task
 
                 asyncio.run(_drive())
 
-        # While first target was running, pending_rules contained both rule names.
-        assert observed_pending[0] == {"ET RULE A", "ET RULE B"}, (
-            f"expected both rules in pending_rules mid-run, got {observed_pending[0]!r}"
+        # While the first target was running, current pointed at it (only it).
+        assert observed_current[0] == "ET RULE A", (
+            f"expected current=ET RULE A mid-run, got {observed_current[0]!r}"
         )
-        # After the run finishes, pending_rules is empty and active is False.
-        assert status.pending_rules == set(), (
-            f"pending_rules not cleared after run: {status.pending_rules!r}"
-        )
+        # After the run finishes, current is cleared and active is False.
+        assert status.current is None
         assert status.active is False
 
 
@@ -1284,3 +1305,163 @@ def test_request_stop_signals_cancel_only_when_active() -> None:
     status.active = True
     assert at.request_stop(state) is True
     assert status.cancelled is True
+
+
+class TestConfigSeverityBand:
+    """``config_severity_band`` maps the configured floor to the sweep scope —
+    everything at/above it, critical-first. This is what the continuous scheduler
+    triages, so a 'low' floor must drain ALL four severities, not just crit/high."""
+
+    @pytest.mark.parametrize(
+        ("floor", "expected"),
+        [
+            ("low", ("critical", "high", "medium", "low")),
+            ("medium", ("critical", "high", "medium")),
+            ("high", ("critical", "high")),
+            ("critical", ("critical",)),
+        ],
+    )
+    def test_floor_expands_to_band(self, floor: str, expected: tuple[str, ...]) -> None:
+        import types
+
+        from soc_ai.webui import autotriage as at
+
+        s = types.SimpleNamespace(auto_triage_min_severity=floor)
+        assert at.config_severity_band(s) == expected
+
+    def test_unset_floor_defaults_to_high(self) -> None:
+        import types
+
+        from soc_ai.webui import autotriage as at
+
+        assert at.config_severity_band(types.SimpleNamespace()) == ("critical", "high")
+
+    def test_bogus_floor_defaults_to_high(self) -> None:
+        import types
+
+        from soc_ai.webui import autotriage as at
+
+        s = types.SimpleNamespace(auto_triage_min_severity="not-a-severity")
+        assert at.config_severity_band(s) == ("critical", "high")
+
+
+class TestStartConfigSweep:
+    """``start_config_sweep`` is the scheduler's entry point: plan the config band,
+    claim the single-flight slot, launch ``run_auto_triage``. Never raises."""
+
+    def _state(self, floor: str = "low") -> Any:
+        import types
+
+        return types.SimpleNamespace(settings=types.SimpleNamespace(auto_triage_min_severity=floor))
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_a_sweep_is_already_running(self) -> None:
+        from soc_ai.webui import autotriage as at
+
+        state = self._state()
+        at.get_status(state).active = True  # a manual ⚡ press already owns the slot
+
+        async def _boom(*a: Any, **k: Any) -> Any:  # planning must never be reached
+            raise AssertionError("plan_targets called while a sweep was active")
+
+        with patch("soc_ai.webui.autotriage.plan_targets", _boom):
+            assert await at.start_config_sweep(state, started_by="scheduler") == 0
+        assert at.get_status(state).active is True  # slot untouched
+
+    @pytest.mark.asyncio
+    async def test_empty_plan_resets_to_idle(self) -> None:
+        from soc_ai.webui import autotriage as at
+
+        state = self._state(floor="high")
+
+        async def _empty(_s: Any, *, time_range: str, oql: Any, severities: Any) -> Any:
+            assert severities == ("critical", "high")  # planned the config band
+            return [], 4
+
+        with patch("soc_ai.webui.autotriage.plan_targets", _empty):
+            assert await at.start_config_sweep(state, started_by="scheduler") == 0
+        st = at.get_status(state)
+        assert st.active is False  # released the slot — backlog was already clear
+        assert st.finished_at is not None
+        assert st.skipped == 4
+
+    @pytest.mark.asyncio
+    async def test_launches_targets_and_claims_slot(self) -> None:
+        from soc_ai.webui import autotriage as at
+
+        state = self._state(floor="low")
+        targets = [object(), object(), object()]
+        ran: dict[str, Any] = {}
+
+        async def _plan(_s: Any, *, time_range: str, oql: Any, severities: Any) -> Any:
+            assert severities == ("critical", "high", "medium", "low")
+            return targets, 2
+
+        async def _run(_s: Any, *, targets: Any, started_by: str) -> None:
+            ran["targets"] = targets
+            ran["started_by"] = started_by
+
+        with (
+            patch("soc_ai.webui.autotriage.plan_targets", _plan),
+            patch("soc_ai.webui.autotriage.run_auto_triage", _run),
+        ):
+            n = await at.start_config_sweep(state, started_by="auto-triage:scheduler")
+            st = at.get_status(state)
+            assert n == 3
+            assert st.active is True
+            assert st.total == 3
+            assert st.skipped == 2
+            assert st._task is not None
+            await st._task  # let the launched worker run to completion
+
+        assert ran["targets"] == targets
+        assert ran["started_by"] == "auto-triage:scheduler"
+
+
+class TestResolveRuleNames:
+    """plan_targets_for_ids batch-resolves rule names so selected-id runs are named
+    at creation even if they die before their first alert_context event."""
+
+    def _state(self, es: Any) -> Any:
+        import types
+
+        return types.SimpleNamespace(
+            elastic=es, settings=types.SimpleNamespace(events_index_pattern="logs-*")
+        )
+
+    def test_batch_resolves_rule_then_dataset(self) -> None:
+        import types
+
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        es.search = AsyncMock(
+            return_value=types.SimpleNamespace(
+                hits=[
+                    {"_id": "a1", "_source": {"rule": {"name": "ET SCAN x"}}},
+                    {"_id": "a2", "_source": {"event": {"dataset": "zeek.notice"}}},
+                    {"_id": "a3", "_source": {}},  # no name → omitted
+                ]
+            )
+        )
+        out = asyncio.run(at._resolve_rule_names(self._state(es), ["a1", "a2", "a3"]))
+        assert out == {"a1": "ET SCAN x", "a2": "zeek.notice"}
+        # one batched ES call against the events index, sized to the whole selection
+        _args, _kwargs = es.search.call_args
+        assert _args[0] == "logs-*"
+        assert _args[1] == {"ids": {"values": ["a1", "a2", "a3"]}}
+
+    def test_es_failure_returns_empty_map(self) -> None:
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        es.search = AsyncMock(side_effect=RuntimeError("es down"))
+        # Best-effort: a lookup failure must not raise — names just stay blank.
+        assert asyncio.run(at._resolve_rule_names(self._state(es), ["a1"])) == {}
+
+    def test_empty_ids_makes_no_es_call(self) -> None:
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        assert asyncio.run(at._resolve_rule_names(self._state(es), [])) == {}
+        es.search.assert_not_called()

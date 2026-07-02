@@ -62,12 +62,11 @@ class Settings(BaseSettings):
     es_username: str | None = None
     es_password: SecretStr | None = None
     es_verify_ssl: bool = True
-    # Per-request timeout in seconds. Bumped from the original 30s after
-    # batch runs saw prefetches time out with `ConnectionTimeout` under
-    # concurrency (several runs * ~6 pivot queries each = dozens of
-    # simultaneous ES queries on a contended cluster). 60s gives a typical
-    # grid headroom; lower for fast production clusters, raise for
-    # shared/contended ones.
+    # Per-request timeout in seconds. 30s balances a typical grid under moderate
+    # concurrency (several runs * ~6 pivot queries each = dozens of simultaneous
+    # ES queries) against failing fast on a wedged cluster. Lower for fast
+    # production clusters; raise for shared/contended ones that see
+    # `ConnectionTimeout` under batch load.
     es_request_timeout_s: int = 30
     # Transport-layer retries for transient ConnectionTimeout / 5xx from
     # ES under heavy concurrency. The elasticsearch-py client retries
@@ -252,6 +251,12 @@ class Settings(BaseSettings):
     # 0 to disable (e.g. when a reverse proxy already rate-limits). /healthz is
     # always exempt so container health checks keep working under load.
     api_rate_limit_per_min: int = 1200
+    # Reverse-proxy IPs whose ``X-Forwarded-For`` may be trusted for client
+    # attribution (login throttle + rate limiter). EMPTY by default: the socket
+    # peer IP is used. Set to your proxy's IP(s) when fronting soc-ai with a
+    # reverse proxy, else per-IP throttling buckets ALL clients under the proxy
+    # IP. XFF is never trusted from a peer not in this list (it can be forged).
+    proxy_trusted_ips: list[str] = []
     session_ttl_hours: int = 12
     bootstrap_admin_password: SecretStr | None = None
     config_secret_key: SecretStr | None = None
@@ -278,6 +283,34 @@ class Settings(BaseSettings):
     hunts. Overflow targets are simply not queued this run (they have no verdict
     yet, so the next run picks them up). Set 0 to disable the cap."""
 
+    auto_triage_inheritance_enabled: bool = True
+    """Inherit verdicts across similar alerts. When ON (default), an auto-investigate
+    sweep skips any (rule, source, destination) cluster that already has a verdict
+    within ``webui_inherit_window_days`` — it inherits that sibling's verdict instead
+    of opening a fresh investigation, so triaging every incoming alert stays tenable.
+    Turn OFF to investigate every cluster independently. Editable live."""
+
+    auto_triage_schedule_enabled: bool = False
+    """Continuously auto-triage the backlog. When on, a background scheduler
+    periodically sweeps every untriaged detection at/above ``auto_triage_min_
+    severity`` (the same scope the ⚡ button uses) so the queue drains itself with
+    no operator action — the alerts feed lands verdicts on its own. OFF by default
+    (continuous LLM calls); editable live in the config console. Note: the floor
+    setting is the SCOPE of a sweep; THIS flag is what makes sweeps run on their
+    own."""
+
+    auto_triage_schedule_interval_minutes: int = 5
+    """Minimum minutes between scheduled auto-triage sweeps (each sweep drains up
+    to ``auto_triage_max_targets``). Lower = the backlog drains faster but more
+    LLM calls; 5 is a calm default. Only used when the schedule is enabled."""
+
+    backtest_max_sample: int = 50
+    """Hard ceiling on how many already-dispositioned alerts a single Backtest
+    run will replay through the agent. Each sampled alert is a FULL LLM
+    investigation, so a backtest is expensive: the request-level default is 20
+    and this is the absolute cap the endpoint clamps to (and logs when it does).
+    Raise only if you know you can afford the LLM cost of the larger replay."""
+
     # --- Agent execution limits ----------------------------------------
     # Caps the number of tool calls + LLM requests per investigation so a
     # runaway loop can't burn the budget (or the operator's patience). Tuned
@@ -287,6 +320,12 @@ class Settings(BaseSettings):
     # deployment legitimately needs deeper loops.
     agent_tool_calls_limit: int = 25
     agent_request_limit: int = 18
+
+    # Hunts explore FAR more broadly than a single-alert investigation (many hosts,
+    # many queries, cross-time correlation), so they get a bigger budget — otherwise
+    # the agent runs out of requests before it can synthesize its findings report.
+    hunt_tool_calls_limit: int = 60
+    hunt_request_limit: int = 45
 
     synthesizer_temperature: float = 0.2
     """Sampling temperature for the SYNTHESIZER (the verdict decision). Low for
@@ -784,6 +823,9 @@ class Settings(BaseSettings):
         "bootstrap_admin_password",
         "config_secret_key",
         "so_ssh_key",
+        # A blank SO_SSH_KNOWN_HOSTS must mean "unset" (derive the default path),
+        # not Path("") == Path(".") which would point SSH at the CWD.
+        "so_ssh_known_hosts",
         mode="before",
     )
     @classmethod

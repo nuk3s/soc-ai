@@ -40,6 +40,7 @@ from soc_ai.api.schemas import (
     SessionInfoResponse,
 )
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
+from soc_ai.api.webui_api import resolve_alert_for_hunt
 from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
 from soc_ai.so_client.auth import SoAuthClient
@@ -107,6 +108,7 @@ async def investigate_endpoint(
     req: InvestigateRequest,
     request: Request,
     ctx: InvestigationContext = Depends(get_investigation_ctx),
+    elastic: ElasticClient = Depends(get_elastic),
 ) -> EventSourceResponse:
     """Stream a triage investigation as Server-Sent Events.
 
@@ -118,6 +120,15 @@ async def investigate_endpoint(
     The leading ``investigation_created`` event carries the new row's id.
     """
     started_by = await identify_caller(request)
+    # Resolve the rule name up front so the investigation row is named at creation
+    # — a run that dies before its first alert_context event (e.g. an ES prefetch
+    # error) must not leave a nameless "Alert <id>…" row. Best-effort: a resolution
+    # failure must never block the actual investigation, so fall back to None and
+    # let the recorder backfill from the stream.
+    try:
+        _, seed_rule_name = await resolve_alert_for_hunt(elastic, ctx.settings, req.alert_id)
+    except Exception:
+        seed_rule_name = None
     # Build investigator/synthesizer here so tests can patch the routes-module
     # bindings for investigate, build_investigator_model, build_synthesizer_model.
     investigator = build_investigator(build_investigator_model(ctx.settings), ctx)
@@ -136,6 +147,7 @@ async def investigate_endpoint(
             alert_id=req.alert_id,
             started_by=started_by,
             event_stream=event_gen,
+            rule_name=seed_rule_name,
         ):
             yield sse_encode(name, data)
 

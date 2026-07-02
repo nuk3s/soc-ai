@@ -235,6 +235,53 @@ async def test_few_days_is_rare(settings_kratos: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_heavy_volume_few_days_is_concentrated_not_rare(
+    settings_kratos: Settings,
+) -> None:
+    """A heavy burst over only a few days is 'concentrated', never 'rare' — fixes
+    the contradictory "rare — 2421 events across 3 days" wording."""
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        _agg_response(
+            total=2421,
+            first_seen="2026-04-28T00:00:00.000Z",
+            last_seen="2026-04-30T00:00:00.000Z",
+            day_keys=[
+                "2026-04-28T00:00:00.000Z",
+                "2026-04-29T00:00:00.000Z",
+                "2026-04-30T00:00:00.000Z",
+            ],
+        ),
+    )
+    out = await prevalence(
+        "10.0.0.5", elastic=elastic, settings=settings_kratos, domain="cdn.example.com"
+    )
+    assert out["distinct_days"] == 3
+    assert out["is_novel"] is False
+    assert out["rarity"] == "concentrated"
+    assert "rare" not in out["summary"]
+    assert "concentrated" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_heavy_single_day_is_concentrated_not_novel(settings_kratos: Settings) -> None:
+    """A heavy SINGLE-day burst is not 'novel/no baseline' — it's a concentrated burst."""
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        _agg_response(
+            total=900,
+            first_seen="2026-04-28T00:00:00.000Z",
+            last_seen="2026-04-28T23:00:00.000Z",
+            day_keys=["2026-04-28T00:00:00.000Z"],
+        ),
+    )
+    out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
+    assert out["distinct_days"] == 1
+    assert out["is_novel"] is False  # heavy volume overrides single-day novelty
+    assert out["rarity"] == "concentrated"
+
+
+@pytest.mark.asyncio
 async def test_many_days_is_common(settings_kratos: Settings) -> None:
     """Seen across many distinct days -> established baseline, 'common'."""
     days = [f"2026-04-{d:02d}T00:00:00.000Z" for d in range(1, 21)]

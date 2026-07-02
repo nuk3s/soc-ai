@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -82,6 +83,7 @@ from soc_ai.tools.query_detections import query_detections
 from soc_ai.tools.query_events import query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
 from soc_ai.tools.rule_prevalence import rule_prevalence
+from soc_ai.tools.rule_tuning import suggest_rule_tuning
 from soc_ai.tools.shodan_host import shodan_host
 from soc_ai.tools.shodan_internetdb import shodan_internetdb
 from soc_ai.tools.web_search import web_search
@@ -347,6 +349,44 @@ def _tool_was_invoked(
             if tool_name in item:
                 return True
     return False
+
+
+def count_successful_tool_calls(messages: list[Any] | None) -> int:
+    """Count tool calls that returned NON-error DATA in a PydanticAI history.
+
+    A ``ToolReturnPart`` (duck-typed: has ``content``, lacks ``args``) is counted
+    only when its content is usable — an error result (``{"error": True}``), a
+    dedup short-circuit (``{"duplicate_call": True}``) or a prefetch short-circuit
+    (``{"prefetch_already_has_this": True}``) does NOT count, because none of them
+    gathered new evidence. Counting returns (not call parts) sidesteps the
+    fragile call/return pairing by ``tool_call_id``. Returns 0 for None/empty.
+    This is the signal behind the hard evidence gate: did the agent actually
+    investigate, or just reason over prefetch?
+    """
+    if not messages:
+        return 0
+    n = 0
+    for msg in messages:
+        for part in getattr(msg, "parts", []) or []:
+            # Discriminate on ``part_kind`` — NOT on the presence of ``content`` /
+            # absence of ``args``. TextPart ('text'), ThinkingPart ('thinking') and
+            # RetryPromptPart ('retry-prompt') all carry ``.content`` and lack
+            # ``.args`` too, so the old duck-type test miscounted the model's final
+            # text, its <think> trace, and even a FAILED tool-arg retry as tool
+            # evidence — silently defeating the hard evidence gate (a zero-tool
+            # verdict would score >=1 and skip the downgrade). Only an actual tool
+            # RESULT is evidence.
+            if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
+                continue
+            c = part.content
+            if c is None:
+                continue  # a tool that returned nothing is not evidence
+            if isinstance(c, dict) and (
+                c.get("error") or c.get("duplicate_call") or c.get("prefetch_already_has_this")
+            ):
+                continue
+            n += 1
+    return n
 
 
 _RUBRIC_FIELD_TO_TOOLS: dict[str, tuple[str, ...]] = {
@@ -1218,6 +1258,21 @@ def _synth_first_post_validate(
     # and the external IP has no reputation — with zero per-alert evidence.
     report = _downgrade_ungrounded_host_anchored_tp(report, enriched_ctx, audit)
 
+    # ----- Hard evidence gate (zero-tool-verdict defense) -----
+    # FINAL backstop: a settled TP/FP that rests on prefetched fields with no
+    # successful tool call and no strong rule-grounded template is a
+    # rationalization, not a finding — coerce it to needs_more_info. Runs LAST so
+    # the deterministic, prefetch-grounded downgrades above (the solicited-ICMP
+    # FP) are already applied and exempt.
+    report = _downgrade_unevidenced_verdict(
+        report,
+        enriched_ctx,
+        candidate,
+        audit,
+        targeted_messages=targeted_messages,
+        targeted_tool_called=targeted_tool_called,
+    )
+
     return report, audit
 
 
@@ -1468,6 +1523,137 @@ def _apply_targeted_downgrades(
         )
 
     return report
+
+
+def _is_strong_grounded_template(candidate: Any, enriched_ctx: Any) -> bool:
+    """True iff *candidate* is a STRONG, rule-grounded BENIGN template match that
+    is safe to settle WITHOUT an investigation.
+
+    A strong benign template (clean-internal / STUN-QUIC / NTP / DNSSEC / benign-
+    cloud, confidence ≥ 0.8) is a deterministic verdict grounded in the rule +
+    locality — not the model's reading of prefetch — so it is an acceptable
+    evidence-substitute for the hard evidence gate. Explicitly excluded:
+    EXTERNAL-reputation templates (which force investigation), and any
+    malware/attack-class rule (a dangerous rule is never fast-settled benign).
+    The 0.8 floor keeps the weaker TP templates (e.g. C2-classtype @ 0.65) out —
+    those rules also signal malware/attack and are force-investigated anyway.
+
+    NOTE: ``informational_external_clean_benign_cloud`` is confidence exactly 0.8
+    and PASSES this threshold — its exclusion relies entirely on the
+    ``EXTERNAL_REPUTATION_TEMPLATES`` guard below. Do not remove that guard
+    without also tightening this threshold to ``> 0.8``.
+    """
+    if candidate is None:
+        return False
+    if getattr(candidate, "confidence", 0.0) < 0.8:
+        return False
+    from soc_ai.agent.decision_templates import (  # noqa: PLC0415 — avoid circular import
+        EXTERNAL_REPUTATION_TEMPLATES,
+        _rule_signals_attack,
+        _rule_signals_malware,
+    )
+
+    if getattr(candidate, "template_id", None) in EXTERNAL_REPUTATION_TEMPLATES:
+        return False
+    return not (_rule_signals_malware(enriched_ctx) or _rule_signals_attack(enriched_ctx))
+
+
+def _has_ioc_hit(enriched_ctx: Any) -> bool:
+    """True iff any enrichment indicator carries a blocklist or MISP hit.
+
+    A concrete IOC match is real evidence that GROUNDS a verdict — the
+    enrichment layer matched a known-bad indicator, not the model reading alert
+    metadata. So it exempts the hard evidence gate (same signal the
+    ungrounded-host-anchored-TP downgrade uses to leave a TP alone).
+    """
+    try:
+        d = enriched_ctx.model_dump(mode="json")
+    except Exception:
+        return False
+    for e in (d.get("enrichments") or {}).values():
+        if isinstance(e, dict) and (e.get("blocklist_hits") or e.get("misp_hits")):
+            return True
+    return False
+
+
+def _downgrade_unevidenced_verdict(
+    report: Any,  # TriageReport
+    enriched_ctx: Any,  # EnrichedAlertContext
+    candidate: Any,  # CandidateVerdict | None
+    audit: dict[str, Any],
+    *,
+    targeted_messages: list[Any] | None,
+    targeted_tool_called: str | None,
+) -> Any:
+    """HARD evidence gate — the zero-tool-verdict defense.
+
+    A settled verdict (``true_positive`` / ``false_positive``) must rest on REAL
+    evidence:
+
+    * at least one SUCCESSFUL tool call from the investigation loop
+      (``count_successful_tool_calls(targeted_messages) >= 1``), OR
+    * a Phase-D targeted-tool dispatch (``targeted_tool_called is not None``), OR
+    * a strong, rule-grounded benign template (:func:`_is_strong_grounded_template`).
+
+    Otherwise the verdict is a rationalization of prefetched alert fields with no
+    investigation behind it (the QVOD / zero-tool-TP defect) and is coerced to
+    ``needs_more_info`` — the honest "not yet investigated" state — with
+    confidence capped and recommended actions cleared. Records ``audit
+    ['evidence_gate_downgrade']`` when it fires.
+
+    Runs LAST in the validator chain so the deterministic, prefetch-grounded
+    downgrades that PRODUCE a settled verdict (the solicited-ICMP-echo TP→FP) are
+    already applied and exempt — that FP is grounded in typed Zeek, not a guess.
+    """
+    if report.verdict not in ("true_positive", "false_positive"):
+        return report
+    # Exempt a verdict that a deterministic, prefetch-grounded validator produced
+    # (the solicited-ICMP-echo FP). The audit key is code-set, so it can't be
+    # spoofed by the model populating a report field.
+    if "icmp_solicited_downgrade" in audit:
+        return report
+    tool_calls = count_successful_tool_calls(targeted_messages)
+    has_tool_evidence = tool_calls >= 1 or targeted_tool_called is not None
+    # A strong template only grounds a verdict that AGREES with it — a synth that
+    # OVERRODE a strong benign template (e.g. escalated a clean-internal alert to
+    # TP) is not grounded by that template and must still be gated.
+    strong_template = _is_strong_grounded_template(candidate, enriched_ctx) and (
+        getattr(candidate, "verdict", None) == report.verdict
+    )
+    if (
+        has_tool_evidence
+        or strong_template
+        or _has_ioc_hit(enriched_ctx)  # grounded in a concrete blocklist/MISP IOC
+    ):
+        return report
+
+    capped_conf = min(report.confidence, 0.4)
+    audit["evidence_gate_downgrade"] = {
+        "original_verdict": report.verdict,
+        "capped_verdict": "needs_more_info",
+        "original_confidence": report.confidence,
+        "capped_confidence": capped_conf,
+        "successful_tool_calls": tool_calls,
+        "targeted_tool_called": targeted_tool_called,
+        "reason": (
+            "settled verdict with no investigation evidence — no successful tool "
+            "call and no strong rule-grounded template; a prefetch-only "
+            "rationalization, coerced to needs_more_info"
+        ),
+    }
+    note = (
+        " (Downgraded to needs_more_info by the evidence gate: this verdict rested "
+        "on prefetched alert fields with no investigation — no tool was run to "
+        "confirm it. Re-run to investigate.)"
+    )
+    return report.model_copy(
+        update={
+            "verdict": "needs_more_info",
+            "confidence": capped_conf,
+            "recommended_actions": [],
+            "summary": (getattr(report, "summary", "") or "") + note,
+        }
+    )
 
 
 def _is_solicited_internal_icmp_echo(
@@ -1985,6 +2171,34 @@ def build_investigator(  # noqa: PLR0915 - tool registrations are inherently lon
             )
         except Exception as e:
             _LOGGER.warning("t_rule_prevalence failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @agent.tool_plain
+    async def t_suggest_rule_tuning(rule_name: str, lookback_days: int = 7) -> dict[str, Any]:
+        """Detection tuning: is this Suricata rule a noisy FP nuisance to mute?
+
+        Answers the operator's tuning question — is this rule mostly-benign noise
+        that should be muted / re-tuned, or is it pulling its weight? Returns the
+        rule's alert volume, its acknowledged-vs-escalated disposition trend (the
+        ES proxy for false-positive vs true-positive), and a mute/monitor/none
+        recommendation with a one-line reason. Cite it when a verdict leans on a
+        rule label and you want to know whether that signature keeps coming back
+        benign here. READ-ONLY — it nominates, it does not change Security Onion.
+        """
+        if dup := _dedup_result(
+            ctx, "t_suggest_rule_tuning", {"rule_name": rule_name, "lookback_days": lookback_days}
+        ):
+            return dup
+        try:
+            result = await suggest_rule_tuning(
+                rule_name,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                lookback_days=lookback_days,
+            )
+        except Exception as e:
+            _LOGGER.warning("t_suggest_rule_tuning failed: %s", e)
             return _tool_error(e)
         return _clamp_tool_result(result)
 
@@ -4551,6 +4765,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         )
         inv_user_msg = _format_investigator_prompt(alert_id, enriched_json)
         inv_result: Any = None
+        budget_exc: BaseException | None = None
         try:
             # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
             # tool_result / model_response lands in the timeline THE MOMENT it
@@ -4577,6 +4792,20 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             inv_result = inv_run.result
         except asyncio.CancelledError:
             raise  # cooperative cancel — propagate, never swallow
+        except UsageLimitExceeded as e:
+            # Budget exhaustion is an EXPECTED outcome of a thorough investigation,
+            # NOT an infrastructure failure. The tool calls + model responses
+            # already streamed live above, so don't discard them with status=error
+            # and no verdict: land the round-1 verdict via the same fallback used
+            # when the loop-synth crashes. (This is the "conclude gracefully at the
+            # budget boundary" behaviour, vs. the old "error out" one.)
+            _LOGGER.warning("investigation loop hit budget limit: %s", e)
+            err_ev = _ev(
+                "error", _error_payload(e, phase="investigation_loop_budget", round_num=1)
+            )
+            await _audit(err_ev)
+            yield err_ev
+            budget_exc = e
         except BaseException as e:
             # The investigator could not gather evidence — most often a transient
             # LLM-gateway connection drop (the openai client has already retried
@@ -4590,10 +4819,30 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             yield err_ev
             return
 
-        # Events already streamed live above; land the transcript + usage, and
-        # keep the full message history for the downstream citation/evidence check
-        # (loop_messages feeds _is_evidence_backed / the targeted-cite validation).
-        if inv_result is not None:
+        if budget_exc is not None:
+            # Round-1 verdict stands (evidence gathered pre-budget is preserved in
+            # the streamed timeline). loop_messages stays None — the downstream
+            # evidence/citation checks already handle that.
+            triage_final = _round2_failure_fallback(alert_id, triage_round1, budget_exc)
+        elif inv_result is None:
+            # The agent run ended without a final result (no End node reached, and
+            # no exception raised). Emit an honest error instead of crashing with an
+            # UnboundLocalError on loop_transcript below.
+            err_ev = _ev(
+                "error",
+                _error_payload(
+                    RuntimeError("investigation loop returned no result"),
+                    phase="investigation_loop",
+                    round_num=1,
+                ),
+            )
+            await _audit(err_ev)
+            yield err_ev
+            return
+        else:
+            # Events already streamed live above; land the transcript + usage, and
+            # keep the full message history for the downstream citation/evidence
+            # check (loop_messages feeds _is_evidence_backed / targeted-cite check).
             loop_transcript = inv_result.output
             loop_messages = inv_result.all_messages()
             inv_usage_ev = _usage_ev(1, inv_result)
@@ -4601,52 +4850,61 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 await _audit(inv_usage_ev)
                 yield inv_usage_ev
 
-        transcript_ev = _ev(
-            "investigation_transcript",
-            {"round": 1, "phase": "investigation_loop", **loop_transcript.model_dump(mode="json")},
-        )
-        await _audit(transcript_ev)
-        yield transcript_ev
-
-        # Synthesize over the gathered evidence — REUSE the legacy
-        # synthesizer-over-transcript (build_synthesizer + the transcript
-        # user-message formatter). HEAVY model, no tools.
-        loop_synth = build_synthesizer(
-            build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature)
-        )
-        try:
-            loop_synth_result = await loop_synth.run(
-                _format_transcript_for_synthesizer(
-                    alert_id, [loop_transcript], candidate=candidate
-                ),
-                usage_limits=loop_usage_limits,
+            transcript_ev = _ev(
+                "investigation_transcript",
+                {
+                    "round": 1,
+                    "phase": "investigation_loop",
+                    **loop_transcript.model_dump(mode="json"),
+                },
             )
-        except asyncio.CancelledError:
-            raise  # cooperative cancel — propagate, never swallow
-        except BaseException as e:
-            # A BaseException here (e.g. a gateway timeout/cancel that escaped the
-            # client retries) previously propagated past the recorder, landing
-            # status=error with NO verdict + no recorded error event. Catch it,
-            # record the error, and DON'T discard the round-1 verdict.
-            err_ev = _ev("error", _error_payload(e, phase="investigation_loop_synth", round_num=2))
-            await _audit(err_ev)
-            yield err_ev
-            triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
-        else:
-            triage_final = loop_synth_result.output
-            loop_synth_usage_ev = _usage_ev(2, loop_synth_result)
-            if loop_synth_usage_ev is not None:
-                await _audit(loop_synth_usage_ev)
-                yield loop_synth_usage_ev
-            # The loop replaces Phase D — strip any gap so we don't also
-            # dispatch a single-tool targeted round on top of it.
-            if triage_final.gap_for_investigator is not None:
-                triage_final = triage_final.model_copy(update={"gap_for_investigator": None})
+            await _audit(transcript_ev)
+            yield transcript_ev
+
+            # Synthesize over the gathered evidence — REUSE the legacy
+            # synthesizer-over-transcript (build_synthesizer + the transcript
+            # user-message formatter). HEAVY model, no tools.
+            loop_synth = build_synthesizer(
+                build_synthesizer_model(
+                    ctx.settings, temperature=ctx.settings.synthesizer_temperature
+                )
+            )
+            try:
+                loop_synth_result = await loop_synth.run(
+                    _format_transcript_for_synthesizer(
+                        alert_id, [loop_transcript], candidate=candidate
+                    ),
+                    usage_limits=loop_usage_limits,
+                )
+            except asyncio.CancelledError:
+                raise  # cooperative cancel — propagate, never swallow
+            except BaseException as e:
+                # A BaseException here (e.g. a gateway timeout/cancel that escaped
+                # the client retries) previously propagated past the recorder,
+                # landing status=error with NO verdict + no recorded error event.
+                # Catch it, record the error, and DON'T discard the round-1 verdict.
+                err_ev = _ev(
+                    "error", _error_payload(e, phase="investigation_loop_synth", round_num=2)
+                )
+                await _audit(err_ev)
+                yield err_ev
+                triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+            else:
+                triage_final = loop_synth_result.output
+                loop_synth_usage_ev = _usage_ev(2, loop_synth_result)
+                if loop_synth_usage_ev is not None:
+                    await _audit(loop_synth_usage_ev)
+                    yield loop_synth_usage_ev
+                # The loop replaces Phase D — strip any gap so we don't also
+                # dispatch a single-tool targeted round on top of it.
+                if triage_final.gap_for_investigator is not None:
+                    triage_final = triage_final.model_copy(update={"gap_for_investigator": None})
 
     # ----- Phase D (optional): targeted investigator -----
     # Skipped when the investigation loop ran — the loop already gathered
     # evidence agentically (it supersedes the deterministic single-tool
     # dispatch).
+    targeted_result: dict[str, Any] | str | None = None
     if not ran_investigation_loop and triage_round1.gap_for_investigator is not None:
         gap = triage_round1.gap_for_investigator
         # Co-emit `retask` so eval/batch.py:read_retask_count
@@ -4736,7 +4994,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # synthetic-transcript path in post-validate is a no-op here because
         # real messages are threaded for tool-citation resolution.
         targeted_tool = "investigation_loop"
-    elif triage_round1.gap_for_investigator is not None:
+    elif (
+        triage_round1.gap_for_investigator is not None
+        # Only a SUCCESSFUL Phase-D dispatch counts as evidence — an errored
+        # dispatch (string "targeted dispatch error: …" or a tool error dict)
+        # must NOT exempt the hard evidence gate.
+        and isinstance(targeted_result, dict)
+        and not targeted_result.get("error")
+    ):
         targeted_tool = triage_round1.gap_for_investigator.tool_name
     triage_final, validation_audit = _synth_first_post_validate(
         triage_final,
@@ -4768,6 +5033,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         yield ev
     if "icmp_solicited_downgrade" in validation_audit:
         ev = _ev("icmp_solicited_downgrade", validation_audit["icmp_solicited_downgrade"])
+        await _audit(ev)
+        yield ev
+    if "ungrounded_host_anchored_tp_downgrade" in validation_audit:
+        ev = _ev(
+            "ungrounded_host_anchored_tp_downgrade",
+            validation_audit["ungrounded_host_anchored_tp_downgrade"],
+        )
+        await _audit(ev)
+        yield ev
+
+    if "evidence_gate_downgrade" in validation_audit:
+        ev = _ev("evidence_gate_downgrade", validation_audit["evidence_gate_downgrade"])
         await _audit(ev)
         yield ev
 

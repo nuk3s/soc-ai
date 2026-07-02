@@ -32,7 +32,7 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Config', icon: <Settings size={15} />, run: go('/config') },
       {
         group: 'Action',
-        label: 'Auto-triage all untriaged',
+        label: 'Bulk investigate all untriaged',
         icon: <Zap size={15} />,
         run: () => {
           closePalette();

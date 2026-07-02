@@ -121,7 +121,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="fast_triage_enabled",
         attr="fast_triage_enabled",
         type="bool",
-        label="Fast triage (skip tools when confident)",
+        label="Fast verdict (skip tools when confident)",
         section="Agent",
         hot=True,
         help=(
@@ -155,7 +155,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Analyst model",
         section="Agent",
         hot=True,
-        help="LiteLLM model the analyst agent uses for every triage. A bad value fails hunts.",
+        help=(
+            "LiteLLM model the analyst agent uses for every investigation. "
+            "A bad value fails investigations."
+        ),
     ),
     SettingSpec(
         key="host_risk_window_hours",
@@ -219,10 +222,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="auto_triage_max_targets",
         attr="auto_triage_max_targets",
         type="int",
-        label="Auto-triage max alerts per run",
+        label="Investigate sweep: max alerts per run",
         section="Agent",
         hot=True,
-        help="Cap on how many alerts a single ⚡ auto-triage run will hunt.",
+        help="Cap on how many alerts a single Bulk/Auto-Investigate run will investigate.",
         min_value=1,
         max_value=500,
     ),
@@ -265,14 +268,53 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="auto_triage_min_severity",
         attr="auto_triage_min_severity",
         type="str",
-        label="Auto-triage minimum severity",
+        label="Auto-Investigate minimum severity",
         section="Agent",
         hot=True,
         help=(
             "Sweeps triage this severity and above (critical, high, medium, low). "
             "Default: high — triages critical and high detections. "
-            "Set to medium to also include medium-severity detections."
+            "Set to medium to also include medium-severity detections. This is the "
+            "SCOPE of a sweep; turn on the schedule below to make sweeps run by themselves."
         ),
+    ),
+    SettingSpec(
+        key="auto_triage_inheritance_enabled",
+        attr="auto_triage_inheritance_enabled",
+        type="bool",
+        label="Inherit verdicts for similar alerts",
+        section="Agent",
+        hot=True,
+        help=(
+            "Auto-Investigate skips an alert when a similar one (same rule, source "
+            "and destination) was already triaged in the inherit window — it inherits "
+            "that verdict instead of re-investigating. Keeps continuous triage tenable. "
+            "Turn off to investigate every alert independently. Applies live."
+        ),
+    ),
+    SettingSpec(
+        key="auto_triage_schedule_enabled",
+        attr="auto_triage_schedule_enabled",
+        type="bool",
+        label="Continuous auto-investigate (drain the backlog automatically)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Run Auto-Investigate on a schedule so the untriaged backlog drains itself — "
+            "no ⚡ click needed. Sweeps every detection at/above the minimum severity "
+            "above. Off by default (continuous LLM calls); applies live."
+        ),
+    ),
+    SettingSpec(
+        key="auto_triage_schedule_interval_minutes",
+        attr="auto_triage_schedule_interval_minutes",
+        type="int",
+        label="Continuous auto-investigate interval (minutes)",
+        section="Agent",
+        hot=True,
+        help="Minimum minutes between scheduled sweeps. Lower drains faster but costs more LLM.",
+        min_value=1,
+        max_value=1440,
     ),
     SettingSpec(
         key="synth_first_pipeline",

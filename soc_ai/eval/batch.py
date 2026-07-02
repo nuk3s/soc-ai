@@ -176,7 +176,11 @@ def extract_agreement(response_md: str) -> str:
         return "partial"
     if (
         re.match(r"no\b", lead)
-        or re.search(r"\b(?:disagree(?:s|d)?|incorrect|wrong)\b", first_para)
+        # `disagree(s|d)` is the decisive disagreement signal. `incorrect`/`wrong`
+        # were dropped: they misfire on "not incorrect" / "conclusion isn't wrong"
+        # (a double negation that actually means agreement). _NEGATED_AGREE_RE
+        # still catches the negated-agreement forms.
+        or re.search(r"\b(?:disagree(?:s|d)?)\b", first_para)
         or _NEGATED_AGREE_RE.search(first_para)
     ):
         return "no"

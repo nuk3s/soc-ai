@@ -1,4 +1,4 @@
-import { Bell, ChevronsLeft, ChevronsRight, Crosshair, LayoutDashboard, LogOut, Search, Settings, Triangle } from 'lucide-react';
+import { Bell, ChevronsLeft, ChevronsRight, Crosshair, History, LayoutDashboard, LogOut, Search, Settings, Triangle } from 'lucide-react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { getMe, setMyStatus, signOut } from '../lib/api';
@@ -21,7 +21,8 @@ const NAV: NavItem[] = [
   { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
   { to: '/investigations', label: 'Investigations', icon: <Search size={16} /> },
   { to: '/notifications', label: 'Notifications', icon: <Bell size={16} /> },
-  { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, dev: true, match: ['/hunts'] },
+  { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, match: ['/hunts'] },
+  { to: '/backtest', label: 'Backtest', icon: <History size={16} /> },
   { to: '/config', label: 'Config', icon: <Settings size={16} /> },
 ];
 
@@ -81,7 +82,7 @@ export function Sidebar() {
 
       {!collapsed ? (
         <div className="px-2 pb-1.5 pt-2 text-[10.5px] font-semibold uppercase tracking-[.07em] text-faint">
-          Triage
+          Investigate
         </div>
       ) : (
         <div className="h-3.5" />

@@ -23,6 +23,7 @@ from soc_ai.tools import (  # noqa: F401
     query_events,
     query_zeek,
     rule_prevalence,
+    rule_tuning,
     shodan_host,
     shodan_internetdb,
 )

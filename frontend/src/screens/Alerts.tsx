@@ -1,7 +1,8 @@
 import { ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, SeverityTag, VerdictPill } from '../components/Badges';
+import { FlowBadge } from '../components/FlowBadge';
 import { Checkbox } from '../components/Controls';
 import { Drawer } from '../components/Drawer';
 import { MultiSelect } from '../components/MultiSelect';
@@ -40,7 +41,12 @@ const GRID = '28px 48px minmax(180px,1fr) 110px 132px 56px 40px 76px 88px';
 const EVENTS_PAGE_SIZE = 50;
 
 const SEV_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-const VERDICT_RANK: Record<string, number> = { true_positive: 4, false_positive: 3, needs_more_info: 2, untriaged: 1 };
+const VERDICT_RANK: Record<string, number> = { true_positive: 5, false_positive: 4, needs_more_info: 3, untriaged: 1 };
+// A row that is actively being investigated has no verdict yet (still "untriaged"
+// in the DB) but should not interleave with genuinely-untriaged rows when sorting
+// by verdict — rank it just above untriaged so triaging rows cluster together.
+const TRIAGING_RANK = 2;
+const verdictRank = (g: AlertGroup): number => (g.triaging ? TRIAGING_RANK : VERDICT_RANK[g.verdict] ?? 0);
 
 /** Derive 1-2 char avatar initials from a username or token:<name> string. */
 function toInitials(owner: string): string {
@@ -64,7 +70,7 @@ function cmpGroups(a: AlertGroup, b: AlertGroup, key: SortKey, dir: SortDir): nu
       result = (SEV_RANK[a.sev] ?? 0) - (SEV_RANK[b.sev] ?? 0);
       break;
     case 'verdict':
-      result = (VERDICT_RANK[a.verdict] ?? 0) - (VERDICT_RANK[b.verdict] ?? 0);
+      result = verdictRank(a) - verdictRank(b);
       break;
     case 'conf':
       // null sorts last in either direction
@@ -176,7 +182,7 @@ export function Alerts() {
 
   // A one-line summary of how a batch landed — never let it finish silently.
   const triageSummary = (s: AutoTriageStatus): string => {
-    const parts = [`${s.hunted} triaged`];
+    const parts = [`${s.hunted} investigated`];
     if (s.skipped) parts.push(`${s.skipped} skipped`);
     if (s.failed) parts.push(`${s.failed} failed`);
     return parts.join(' · ');
@@ -205,13 +211,13 @@ export function Alerts() {
           setTriageStatus(s);
           if (!s.active) finish(triageSummary(s));
         })
-        .catch(() => finish('Auto-triage status check failed'));
+        .catch(() => finish('Bulk Investigate status check failed'));
     };
     startAutoTriage(alertIds?.length ? { alertIds } : { minSeverity })
       .then((s) => {
         if (!s.active) {
           // nothing to hunt, or the batch already wrapped up — show why
-          finish(s.note || (s.total ? triageSummary(s) : 'Nothing to triage'));
+          finish(s.note || (s.total ? triageSummary(s) : 'Nothing to investigate'));
           return;
         }
         // Surface the backend's start note up-front (e.g. "triaging 6 selected
@@ -224,7 +230,7 @@ export function Alerts() {
       })
       .catch(() => {
         setTriaging(false);
-        showTriageMsg('Auto-triage failed to start');
+        showTriageMsg('Bulk Investigate failed to start');
       });
   };
 
@@ -262,6 +268,9 @@ export function Alerts() {
     searchParams.set('drawer', id);
     setSearchParams(searchParams);
   };
+  // Stable so AlertDrawer's poll-timer effect (dep: onComplete) doesn't reset
+  // every parent re-render.
+  const onDrawerComplete = useCallback(() => setReloadKey((k) => k + 1), []);
   const closeDrawer = () => {
     setStarting(null);
     searchParams.delete('drawer');
@@ -284,7 +293,7 @@ export function Alerts() {
         setStarting(null);
         // e.g. 409 hunt_in_progress — tell the operator a hunt is already
         // running for this alert instead of silently doing nothing.
-        showTriageMsg(err instanceof Error ? err.message : 'Could not start the hunt');
+        showTriageMsg(err instanceof Error ? err.message : 'Could not start the investigation');
       });
   };
 
@@ -296,7 +305,7 @@ export function Alerts() {
     setHuntGroupPending((s) => ({ ...s, [g.id]: true }));
     getRepresentative(g, alertQuery)
       .then((rep) => {
-        showHuntReason(`Hunting representative: ${rep.reason}`);
+        showHuntReason(`Investigating representative: ${rep.reason}`);
         setStarting(g);
         return startHunt(rep.alert_id);
       })
@@ -338,11 +347,15 @@ export function Alerts() {
   };
 
   const ownerOf = (g: AlertGroup) => g.owner ?? '';
-  const visible = (groups ?? [])
-    .filter((g) => matchView(g, view))
-    .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
-    .filter((g) => !filterVerdicts.length || filterVerdicts.includes(g.verdict))
-    .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir));
+  const visible = useMemo(
+    () =>
+      (groups ?? [])
+        .filter((g) => matchView(g, view))
+        .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
+        .filter((g) => !filterVerdicts.length || filterVerdicts.includes(g.verdict))
+        .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir)),
+    [groups, view, filterSevs, filterVerdicts, sort],
+  );
 
   const toggleSort = (key: SortKey) => {
     setSort((s) => ({ key, dir: s.key === key && s.dir === 'desc' ? 'asc' : 'desc' }));
@@ -371,14 +384,19 @@ export function Alerts() {
     });
   };
 
-  const counts = {
-    myqueue: (groups ?? []).filter((g) => !!g.owner && g.owner !== '').length,
-    critical: (groups ?? []).filter((g) => g.sev === 'critical').length,
-    decision: (groups ?? []).filter((g) => g.verdict === 'needs_more_info' || g.verdict === 'untriaged').length,
-    all: (groups ?? []).length,
-  };
-  const untriaged = (groups ?? []).filter((g) => g.verdict === 'untriaged').length;
-  const totalEvents = (groups ?? []).reduce((a, g) => a + g.count, 0);
+  const { counts, untriaged, totalEvents } = useMemo(() => {
+    const gs = groups ?? [];
+    return {
+      counts: {
+        myqueue: gs.filter((g) => !!g.owner && g.owner !== '').length,
+        critical: gs.filter((g) => g.sev === 'critical').length,
+        decision: gs.filter((g) => g.verdict === 'needs_more_info' || g.verdict === 'untriaged').length,
+        all: gs.length,
+      },
+      untriaged: gs.filter((g) => g.verdict === 'untriaged').length,
+      totalEvents: gs.reduce((a, g) => a + g.count, 0),
+    };
+  }, [groups]);
 
   const TABS: Array<{ id: ViewId; label: string; count: number }> = [
     { id: 'myqueue', label: 'My queue', count: counts.myqueue },
@@ -404,7 +422,7 @@ export function Alerts() {
             onChange={(e) => setTriageFloor(e.target.value)}
             disabled={triaging}
             className="rounded-l-control border border-r-0 border-border-strong bg-surface-3 px-2.5 py-2 text-[12.5px] text-dim focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
-            title="Auto-triage severity floor"
+            title="Bulk investigate severity floor"
           >
             <option value="critical">Critical only</option>
             <option value="high">High and up</option>
@@ -416,7 +434,7 @@ export function Alerts() {
             disabled={triaging}
             className="flex items-center gap-1.5 rounded-r-control border border-border-strong bg-surface-3 px-[13px] py-2 text-[13px] font-semibold text-text hover:border-accent hover:bg-[#141b25] disabled:opacity-50"
           >
-            <span className="flex" style={{ color: '#facc15' }}><Zap size={14} /></span> Auto-triage
+            <span className="flex" style={{ color: '#facc15' }}><Zap size={14} /></span> Bulk Investigate
           </button>
         </div>
       </div>
@@ -430,7 +448,7 @@ export function Alerts() {
           <div className="absolute left-0 top-0 h-0.5 w-[40%] animate-scanline" style={{ background: 'linear-gradient(90deg,transparent,#4b8bf5,transparent)' }} />
           <Spinner size={15} />
           <div className="text-[13px] font-semibold">
-            Auto-triaging
+            Bulk investigating
             {triageStatus?.severities?.length ? ` ${triageStatus.severities.join(', ')}` : ''}
             …
           </div>
@@ -439,7 +457,7 @@ export function Alerts() {
               const s = triageStatus;
               const done = s ? s.hunted + s.skipped + s.failed : 0;
               const total = s ? s.total : 0;
-              const parts: string[] = [`${done}/${total} hunted`];
+              const parts: string[] = [`${done}/${total} investigated`];
               if (s && s.skipped) parts.push(`${s.skipped} skipped`);
               if (s && s.failed) parts.push(`${s.failed} failed`);
               if (s && s.tool_calls) parts.push(`${s.tool_calls} tool calls`);
@@ -644,7 +662,7 @@ export function Alerts() {
             className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
             style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
           >
-            <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Auto-triage
+            <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Bulk Investigate
           </button>
           <button
             onClick={() => {
@@ -842,7 +860,10 @@ export function Alerts() {
                     <ChevronRight size={13} />
                   </span>
                   <KindBadge kind={g.kind} />
-                  <span className="min-w-0 flex-1 truncate text-[13.5px] font-medium">{g.name}</span>
+                  <div className="flex min-w-0 flex-1 flex-col gap-px">
+                    <span className="truncate text-[13.5px] font-medium">{g.name}</span>
+                    {(g.src || g.dst) && <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />}
+                  </div>
                   {(g.ackedCount ?? 0) > 0 && (
                     <span
                       title={`${g.ackedCount} acknowledged`}
@@ -867,10 +888,21 @@ export function Alerts() {
                 <div><SeverityTag sev={g.sev} /></div>
                 <div className="min-w-0 overflow-hidden" title={g.inheritedReason ?? undefined}>
                   {g.triaging ? (
-                    <span className="inline-flex items-center gap-1.5 rounded-chip border border-[rgba(251,191,36,.35)] bg-[rgba(251,191,36,.10)] px-2 py-[3px] text-[11px] font-semibold text-[#fbbf24]">
+                    // Clickable so the analyst can open the LIVE investigation
+                    // straight from the grid (invId now points at the running run).
+                    <button
+                      type="button"
+                      disabled={!g.invId}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (g.invId) openDrawer(g.invId);
+                      }}
+                      title={g.invId ? 'Open the in-progress investigation' : undefined}
+                      className="inline-flex items-center gap-1.5 rounded-chip border border-[rgba(251,191,36,.35)] bg-[rgba(251,191,36,.10)] px-2 py-[3px] text-[11px] font-semibold text-[#fbbf24] enabled:hover:bg-[rgba(251,191,36,.18)] disabled:cursor-default"
+                    >
                       <Spinner size={10} color="#fbbf24" />
-                      Triaging…
-                    </span>
+                      Investigating…
+                    </button>
                   ) : (
                     <VerdictPill verdict={g.verdict} conf={g.conf} inherited={g.inherited} showConf={false} showInherited={false} />
                   )}
@@ -911,13 +943,13 @@ export function Alerts() {
                       huntGroup(g);
                     }}
                     disabled={!!huntGroupPending[g.id]}
-                    title="Hunt the most-representative event in this group"
-                    aria-label="Hunt with AI"
+                    title="Investigate the most-representative event in this group"
+                    aria-label="Investigate"
                     className="inline-flex items-center gap-1 rounded-badge border px-[7px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                     style={{ borderColor: 'rgba(139,92,246,.35)', background: 'rgba(139,92,246,.07)', color: '#a78bfa' }}
                   >
                     <Sparkles size={11} />
-                    {huntGroupPending[g.id] ? '…' : 'Hunt'}
+                    {huntGroupPending[g.id] ? '…' : 'Investigate'}
                   </button>
                   <button
                     onClick={(e) => {
@@ -1000,7 +1032,7 @@ export function Alerts() {
                           style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
                         >
                           <Sparkles size={12} />
-                          {g.invId ? 'Open report' : 'Hunt with AI'}
+                          {g.invId ? 'Open report' : 'Investigate'}
                         </button>
                       </div>
                     </div>
@@ -1039,7 +1071,7 @@ export function Alerts() {
         onClose={closeDrawer}
         navigateToPermalink={(id) => navigate(`/investigation/${id}`, { state: { from: '/alerts' } })}
         onReHunt={openDrawer}
-        onComplete={() => setReloadKey((k) => k + 1)}
+        onComplete={onDrawerComplete}
       />
     </div>
   );
@@ -1112,7 +1144,7 @@ function AlertDrawer({
               }}
               className="flex items-center gap-1.5 text-[12px] text-dim hover:text-danger disabled:opacity-50"
             >
-              <X size={13} /> {cancelling ? 'Cancelling…' : 'Cancel hunt'}
+              <X size={13} /> {cancelling ? 'Cancelling…' : 'Cancel'}
             </button>
           )}
           {inv && (

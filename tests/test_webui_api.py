@@ -96,9 +96,10 @@ def test_alerts_verdict_badge_inherited(client: TestClient) -> None:
     with (
         patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 3))),
         patch(
-            "soc_ai.api.webui_api.inv_svc.latest_for_rules",
+            "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={"ET X": inv}),
         ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
         body = client.get("/api/v1/alerts").json()
     assert body[0]["verdict"] == "true_positive"
@@ -133,13 +134,83 @@ def test_alerts_coverage_note(client: TestClient) -> None:
     with (
         patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 264))),
         patch(
-            "soc_ai.api.webui_api.inv_svc.latest_for_rules",
+            "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={"ET X": inv}),
         ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
         body = client.get("/api/v1/alerts").json()
     assert body[0]["inherited"] is False
     assert "1 of 264 events" in body[0]["inheritedReason"]
+
+
+def test_alerts_badge_survives_later_interrupted_run(client: TestClient) -> None:
+    """A rule with a COMPLETE verdict, then a LATER cancelled/errored run, must
+    still show that verdict — not 'untriaged'. This is the group-says-untriaged-
+    but-its-events-are-investigated mismatch the operator reported.
+    """
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    rule = "ET HUNTING curl User-Agent to Dotted Quad"
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            good = await inv_svc.create(db, alert_es_id="ev-good", started_by="t")
+            await inv_svc.finalize(
+                db, good.id, status="complete", verdict="false_positive",
+                confidence=0.8, rationale="benign curl probe",
+            )
+            good.rule_name = rule
+            good.src_ip = "10.0.0.1"
+            good.dest_ip = "1.2.3.4"
+            await db.commit()
+            # A LATER run that was cancelled (no verdict) — must NOT poison the badge.
+            bad = await inv_svc.create(db, alert_es_id="ev-cur", started_by="t")
+            await inv_svc.finalize(db, bad.id, status="cancelled")
+            bad.rule_name = rule
+            await db.commit()
+            return good.id
+
+    good_id = asyncio.run(_seed())
+
+    groups = [
+        AlertGroup(
+            rule_name=rule,
+            count=9,
+            severity="low",
+            latest_ts="2026-06-28T10:00:00Z",
+            latest_id="ev-cur",
+            kind="suricata",
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 9))):
+        body = client.get("/api/v1/alerts").json()
+
+    g = body[0]
+    assert g["verdict"] == "false_positive"  # the standing verdict, NOT untriaged
+    assert g["invId"] == good_id  # drawer opens the run that produced the verdict
+    assert g["triaging"] is False  # the cancelled run is not "running"
+
+
+def test_primary_run_ids_prefers_latest_complete() -> None:
+    """#2: the canonical run per alert is the latest COMPLETE one (else the latest
+    of any status) so a working verdict is never buried under later failed retries."""
+    from soc_ai.api.webui_api import _primary_run_ids
+
+    # Newest-first (list_recent order): a later error retry of alert A, then the
+    # complete run, then an older error. Alert B has only error runs.
+    rows = [
+        SimpleNamespace(id="A-err2", alert_es_id="alertA", status="error"),
+        SimpleNamespace(id="A-done", alert_es_id="alertA", status="complete"),
+        SimpleNamespace(id="A-err1", alert_es_id="alertA", status="error"),
+        SimpleNamespace(id="B-err2", alert_es_id="alertB", status="error"),
+        SimpleNamespace(id="B-err1", alert_es_id="alertB", status="error"),
+    ]
+    primary = _primary_run_ids(rows)
+    assert primary == {"A-done", "B-err2"}  # A's complete run; B's latest error
 
 
 def test_investigations_list(client: TestClient) -> None:
@@ -169,7 +240,8 @@ def test_investigations_list(client: TestClient) -> None:
     assert body[0]["verdict"] == "false_positive"
     assert body[0]["host"] == "10.0.0.5"
     assert body[0]["status"] == "complete"
-    assert body[1]["name"] == "Investigation"  # None rule_name -> fallback
+    # None rule_name -> identify by alert id (here the inv id, no alert_es_id on the mock)
+    assert body[1]["name"] == "Alert INV-2…"
     assert body[1]["verdict"] == "untriaged"  # None verdict -> untriaged
     assert body[1]["status"] == "running"
 
@@ -382,83 +454,46 @@ def test_alerts_hide_acked_param_forwarded(client: TestClient) -> None:
     assert kwargs.get("hide_acked") is True
 
 
-def test_alerts_triaging_from_pending_rules(settings_kratos: Settings) -> None:
-    """A group whose rule_name is in auto-triage pending_rules shows triaging=True,
-    even when its investigation is not the currently-running one (is_running=False)."""
-    from soc_ai.webui.autotriage import AutoTriageStatus
-
+def test_alerts_triaging_when_investigation_running(settings_kratos: Settings) -> None:
+    """A group shows triaging=True iff its LATEST run is live (DB status=running),
+    and invId points at that running run so the pill opens its drawer. A group with
+    no running run is NOT triaging — queued-but-not-started groups stay untriaged."""
     groups = [
         AlertGroup(
-            rule_name="ET RULE X",
+            rule_name="ET RULE RUNNING",
             count=5,
             severity="high",
             latest_ts="2026-06-22T10:00:00Z",
-            latest_id="es-pending",
-            kind="suricata",
-        )
-    ]
-    # Simulate an active auto-triage run with "ET RULE X" queued (not yet running).
-    fake_status = AutoTriageStatus(active=True, total=2, pending_rules={"ET RULE X"})
-
-    for c in _client(settings_kratos):
-        with (
-            patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 5))),
-            patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
-            patch("soc_ai.api.webui_api.at.get_status", return_value=fake_status),
-        ):
-            resp = c.get("/api/v1/alerts")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body[0]["triaging"] is True, (
-            f"expected triaging=True for rule in pending_rules, got {body[0]['triaging']!r}"
-        )
-
-
-def test_alerts_triaging_from_pending_alert_ids(settings_kratos: Settings) -> None:
-    """Multi-select auto-triage (explicit alert ids) flips EVERY queued group's
-    pill to triaging, not just the one currently running.
-
-    The selected path (`plan_targets_for_ids`) leaves target rule_name="" so
-    pending_rules holds the selected alert ES ids (each group's ``latest_id``),
-    not rule names. The /alerts group must match on that key too — otherwise only
-    the sequentially-running target shows "Triaging…" and the rest look idle."""
-    from soc_ai.webui.autotriage import AutoTriageStatus
-
-    groups = [
-        AlertGroup(
-            rule_name="ET RULE A",
-            count=3,
-            severity="high",
-            latest_ts="2026-06-22T10:00:00Z",
-            latest_id="es-sel-1",
+            latest_id="es-run",
             kind="suricata",
         ),
         AlertGroup(
-            rule_name="ET RULE B",
+            rule_name="ET RULE IDLE",
             count=2,
             severity="high",
             latest_ts="2026-06-22T09:00:00Z",
-            latest_id="es-sel-2",
+            latest_id="es-idle",
             kind="suricata",
         ),
     ]
-    # Selected-path run: pending_rules holds the selected alert ES ids (= the
-    # groups' latest_id), NOT rule names. Neither group is the running one.
-    fake_status = AutoTriageStatus(active=True, total=2, pending_rules={"es-sel-1", "es-sel-2"})
+    running_inv = SimpleNamespace(status="running", id="INV-RUN")
 
     for c in _client(settings_kratos):
         with (
-            patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 5))),
-            patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
-            patch("soc_ai.api.webui_api.at.get_status", return_value=fake_status),
+            patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 7))),
+            patch(
+                "soc_ai.api.webui_api.inv_svc.latest_for_rules",
+                AsyncMock(return_value={"ET RULE RUNNING": running_inv}),
+            ),
         ):
             resp = c.get("/api/v1/alerts")
         assert resp.status_code == 200
-        body = resp.json()
-        assert body[0]["triaging"] is True and body[1]["triaging"] is True, (
-            "expected BOTH selected groups triaging=True (matched by latest_id), got "
-            f"{body[0]['triaging']!r}, {body[1]['triaging']!r}"
-        )
+        body = {g["name"]: g for g in resp.json()}
+        # Running group: triaging + links to the live run.
+        assert body["ET RULE RUNNING"]["triaging"] is True
+        assert body["ET RULE RUNNING"]["invId"] == "INV-RUN"
+        # No running run → not triaging (it just awaits its turn).
+        assert body["ET RULE IDLE"]["triaging"] is False
 
 
 def test_config_set_setting_real_path(client: TestClient) -> None:
@@ -466,6 +501,68 @@ def test_config_set_setting_real_path(client: TestClient) -> None:
     resp = client.post("/api/v1/config/setting", json={"key": "oracle_enabled", "value": "false"})
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "restart_required": False}
+
+
+def test_investigation_export_signed_record(client: TestClient) -> None:
+    """#2: the export bundles verdict + the full agent trace and signs it with a
+    sha256 that recomputes — a tamper-evident 'show your work' record."""
+    import asyncio
+    import hashlib
+    import json
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-export", started_by="tester", rule_name="ET X"
+            )
+            await inv_svc.append_events(
+                db,
+                inv.id,
+                [{"sequence": 1, "kind": "tool_call", "payload": {"tool": "prevalence"}}],
+            )
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="false_positive", confidence=0.9,
+                rationale="benign", report={"citations": ["ev1"]},
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    resp = client.get(f"/api/v1/investigations/{inv_id}/export")
+    assert resp.status_code == 200
+    rec = resp.json()
+    assert rec["schema"] == "soc-ai.decision-record/v1"
+    assert rec["investigation_id"] == inv_id
+    assert rec["verdict"] == "false_positive"
+    assert rec["report"] == {"citations": ["ev1"]}
+    assert any(s["kind"] == "tool_call" for s in rec["trace"])  # the trace is included
+    # the signature recomputes → tamper-evident
+    body = {k: v for k, v in rec.items() if k != "integrity"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    assert hashlib.sha256(canonical.encode()).hexdigest() == rec["integrity"]["hash"]
+    assert client.get("/api/v1/investigations/does-not-exist/export").status_code == 404
+
+
+def test_oracle_redaction_preview(client: TestClient) -> None:
+    """#5: the preview redacts internal identifiers and preserves public addresses,
+    so an operator can see exactly what would leave before enabling the Oracle."""
+    import json
+
+    resp = client.get("/api/v1/oracle/redaction-preview")
+    assert resp.status_code == 200
+    body = resp.json()
+    orig = json.dumps(body["original"])
+    san = json.dumps(body["sanitized"])
+    # internal identifiers present in the original are gone from the sanitized output
+    assert "10.0.0.15" in orig and "10.0.0.15" not in san
+    assert "dc01" in orig and "dc01" not in san
+    # a public destination passes through so the Oracle can reason about real infra
+    assert "8.8.8.8" in san
+    # opaque labels + a per-category summary are produced
+    assert "IP_01" in san
+    assert body["summary"].get("IP", 0) >= 2
 
 
 def test_config_set_setting_rejects_danger(client: TestClient) -> None:
@@ -796,6 +893,45 @@ def _fake_write_tool(calls: list[dict], result: dict):
     return ToolSpec(name="ack_alert", read_only=False, description="", func=fn)
 
 
+def test_build_actions_marks_ack_applied_after_auto_ack() -> None:
+    """#8: once auto-ack has acked the alert, the ack action is rendered done
+    (applied=True, no live token) — never offered as an actionable button."""
+    from soc_ai.api.webui_api import _build_actions
+
+    ack_ev = SimpleNamespace(kind="auto_ack", payload={"success": True, "es_id": "es1"})
+    report = {
+        "recommended_actions": [
+            {"tool_name": "ack_alert", "rationale": "benign"},
+            {"tool_name": "add_case_comment", "rationale": "note"},
+        ]
+    }
+    by_tag = {a.tag: a for a in _build_actions([ack_ev], report, set())}
+    assert by_tag["ack"].applied is True
+    assert by_tag["ack"].token is None
+    assert by_tag["comment"].applied is False  # non-ack actions untouched
+
+
+def test_build_actions_ack_not_applied_without_successful_auto_ack() -> None:
+    """No auto_ack event (or a failed one) leaves the ack action actionable."""
+    from soc_ai.api.webui_api import _build_actions
+
+    report = {"recommended_actions": [{"tool_name": "ack_alert", "rationale": "benign"}]}
+    assert _build_actions([], report, set())[0].applied is False
+    failed = SimpleNamespace(kind="auto_ack", payload={"success": False})
+    assert _build_actions([failed], report, set())[0].applied is False
+
+
+def test_tool_step_expands_full_result_not_just_args() -> None:
+    """#10: the expanded tool-call row carries the FULL result headline (generously
+    capped) plus the query — not the arguments alone."""
+    from soc_ai.api.webui_api import _tool_step
+
+    result = {"summary": "prevalence: " + "x" * 300}
+    _title, detail = _tool_step("prevalence", {"ip": "1.2.3.4"}, result)
+    assert "result:" in detail and "query:" in detail
+    assert "x" * 250 in detail  # full result (600-cap), not the old 90-char clip
+
+
 def test_execute_action_acks_and_defaults_alert_id(client: TestClient) -> None:
     import asyncio
 
@@ -1058,7 +1194,9 @@ def test_get_investigation_null_rule_name_partial_enrichment_200(client: TestCli
     resp = client.get(f"/api/v1/investigations/{inv_id}")
     assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
     body = resp.json()
-    assert body["name"] == "Investigation"  # fallback for null rule_name
+    # Null rule_name no longer falls back to the bare "Investigation" literal —
+    # it now identifies the alert by id so the row/detail is never anonymous.
+    assert body["name"] == "Alert es-no-rule…"
     assert body["hostContext"] == []
 
 
@@ -2526,8 +2664,12 @@ def test_rehunt_starts_fresh_hunts_for_valid_ids(client: TestClient) -> None:
     async def _seed() -> tuple[str, str]:
         maker = client.app.state.db_sessionmaker
         async with maker() as db:
-            a = await inv_svc.create(db, alert_es_id="ev-rh-a", started_by="tester")
-            b = await inv_svc.create(db, alert_es_id="ev-rh-b", started_by="tester")
+            a = await inv_svc.create(
+                db, alert_es_id="ev-rh-a", started_by="tester", rule_name="ET A"
+            )
+            b = await inv_svc.create(
+                db, alert_es_id="ev-rh-b", started_by="tester", rule_name="ET B"
+            )
             await inv_svc.finalize(
                 db, a.id, status="complete", verdict="false_positive", confidence=0.9
             )
@@ -2540,7 +2682,9 @@ def test_rehunt_starts_fresh_hunts_for_valid_ids(client: TestClient) -> None:
 
     call_counter = {"n": 0}
 
-    async def fake_start(_state, *, alert_id: str, started_by: str) -> str:
+    async def fake_start(
+        _state, *, alert_id: str, started_by: str, rule_name: str | None = None
+    ) -> str:
         call_counter["n"] += 1
         return f"NEW-{call_counter['n']}"
 
@@ -2562,6 +2706,49 @@ def test_rehunt_starts_fresh_hunts_for_valid_ids(client: TestClient) -> None:
     assert by_inv[b_id]["newInvId"].startswith("NEW-")
     # Both new ids must be distinct
     assert by_inv[a_id]["newInvId"] != by_inv[b_id]["newInvId"]
+    # A named source row seeds the new hunt directly (no ES re-resolution).
+    assert call_counter["n"] == 2
+
+
+def test_rehunt_reresolves_rule_name_when_stored_row_is_nameless(client: TestClient) -> None:
+    """Re-hunting a NAMELESS row (a pre-fix row, or a selected-id run that died
+    early) re-resolves the rule name from ES so the NEW row is named, not NULL."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            # rule_name stays None — the exact nameless row the fix targets.
+            inv = await inv_svc.create(db, alert_es_id="ev-rh-null", started_by="tester")
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    captured: dict[str, Any] = {}
+
+    async def fake_start(
+        _state, *, alert_id: str, started_by: str, rule_name: str | None = None
+    ) -> str:
+        captured["rule_name"] = rule_name
+        return "NEW-RR"
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = fake_start
+
+    with (
+        patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
+        patch(
+            "soc_ai.api.webui_api.resolve_alert_for_hunt",
+            AsyncMock(return_value=(True, "ET RE-RESOLVED Rule")),
+        ),
+    ):
+        resp = client.post("/api/v1/investigations/rehunt", json={"inv_ids": [inv_id]})
+
+    assert resp.status_code == 200
+    assert resp.json()["started"][0]["newInvId"] == "NEW-RR"
+    # the nameless row triggered an ES re-resolve; the new hunt is seeded with it
+    assert captured["rule_name"] == "ET RE-RESOLVED Rule"
 
 
 def test_rehunt_skips_unknown_id(client: TestClient) -> None:
@@ -2626,7 +2813,10 @@ def test_hunt_404_when_alert_id_does_not_resolve(client: TestClient) -> None:
     404 with a clear hint and NOT spin up a (synthetic 0.0) background hunt."""
     fake_mgr = AsyncMock()
     with (
-        patch("soc_ai.api.webui_api._alert_doc_exists", AsyncMock(return_value=False)),
+        patch(
+            "soc_ai.api.webui_api.resolve_alert_for_hunt",
+            AsyncMock(return_value=(False, None)),
+        ),
         patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
     ):
         resp = client.post("/api/v1/hunt", json={"alert_id": "ET MALWARE Some Rule Name"})
@@ -2644,7 +2834,10 @@ def test_hunt_starts_when_alert_id_resolves(client: TestClient) -> None:
     fake_mgr = AsyncMock()
     fake_mgr.start = AsyncMock(return_value="INV-OK")
     with (
-        patch("soc_ai.api.webui_api._alert_doc_exists", AsyncMock(return_value=True)),
+        patch(
+            "soc_ai.api.webui_api.resolve_alert_for_hunt",
+            AsyncMock(return_value=(True, "ET MALWARE Some Rule Name")),
+        ),
         patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
     ):
         resp = client.post("/api/v1/hunt", json={"alert_id": "real-es-doc-1"})
@@ -2652,26 +2845,42 @@ def test_hunt_starts_when_alert_id_resolves(client: TestClient) -> None:
     assert resp.status_code == 200
     assert resp.json()["investigation_id"] == "INV-OK"
     fake_mgr.start.assert_called_once()
+    # the resolved rule name is seeded into the hunt so the row is named at birth
+    assert fake_mgr.start.call_args.kwargs["rule_name"] == "ET MALWARE Some Rule Name"
 
 
-def test_alert_doc_exists_uses_ids_lookup() -> None:
-    """_alert_doc_exists resolves via an ES ``ids`` query and reflects hit presence."""
+def testresolve_alert_for_hunt_returns_existence_and_rule_name() -> None:
+    """resolve_alert_for_hunt does one ES ``ids`` lookup and returns
+    (exists, rule_name), falling back to event.dataset for non-Suricata docs."""
     import asyncio
 
-    from soc_ai.api.webui_api import _alert_doc_exists
+    from soc_ai.api.webui_api import resolve_alert_for_hunt
 
     elastic = AsyncMock()
     settings = SimpleNamespace(events_index_pattern="logs-*")
 
-    elastic.search = AsyncMock(return_value=SimpleNamespace(hits=[{"_id": "x"}]))
-    assert asyncio.run(_alert_doc_exists(elastic, settings, "x")) is True
-
-    elastic.search = AsyncMock(return_value=SimpleNamespace(hits=[]))
-    assert asyncio.run(_alert_doc_exists(elastic, settings, "missing")) is False
+    # Suricata doc → rule.name
+    elastic.search = AsyncMock(
+        return_value=SimpleNamespace(
+            hits=[{"_id": "x", "_source": {"rule": {"name": "ET SCAN thing"}}}]
+        )
+    )
+    assert asyncio.run(resolve_alert_for_hunt(elastic, settings, "x")) == (True, "ET SCAN thing")
     # the query is an ids lookup against the events index pattern
     _args, _kwargs = elastic.search.call_args
     assert _args[0] == "logs-*"
-    assert _args[1] == {"ids": {"values": ["missing"]}}
+
+    # Non-Suricata doc (no rule.name) → event.dataset fallback
+    elastic.search = AsyncMock(
+        return_value=SimpleNamespace(
+            hits=[{"_id": "z", "_source": {"event": {"dataset": "zeek.notice"}}}]
+        )
+    )
+    assert asyncio.run(resolve_alert_for_hunt(elastic, settings, "z")) == (True, "zeek.notice")
+
+    # Missing doc → (False, None)
+    elastic.search = AsyncMock(return_value=SimpleNamespace(hits=[]))
+    assert asyncio.run(resolve_alert_for_hunt(elastic, settings, "missing")) == (False, None)
 
 
 # ---------------------------------------------------------------------------
@@ -3073,6 +3282,28 @@ def test_request_is_https_helper_matrix() -> None:
     assert _request_is_https(_req("http", "https, http")) is True  # left-most wins
     assert _request_is_https(_req("http", None)) is False
     assert _request_is_https(_req("http", "http")) is False
+
+
+def test_client_ip_proxy_awareness() -> None:
+    """client_ip: peer IP by default; trust X-Forwarded-For ONLY from an
+    allowlisted proxy peer (never from an untrusted client)."""
+    from soc_ai.api.webui_api import client_ip
+
+    def _req(peer: str, xff: str | None) -> SimpleNamespace:
+        headers = {} if xff is None else {"x-forwarded-for": xff}
+        return SimpleNamespace(client=SimpleNamespace(host=peer), headers=headers)
+
+    no_proxy = SimpleNamespace(proxy_trusted_ips=[])
+    with_proxy = SimpleNamespace(proxy_trusted_ips=["10.0.0.9"])
+
+    # No proxy configured → always the socket peer, XFF ignored.
+    assert client_ip(_req("203.0.113.5", "1.2.3.4"), no_proxy) == "203.0.113.5"
+    # Trusted proxy peer → left-most XFF is the real client.
+    assert client_ip(_req("10.0.0.9", "198.51.100.7, 10.0.0.9"), with_proxy) == "198.51.100.7"
+    # Untrusted peer forging XFF → NOT trusted, use the peer IP.
+    assert client_ip(_req("203.0.113.5", "198.51.100.7"), with_proxy) == "203.0.113.5"
+    # Trusted proxy but no XFF → fall back to the peer.
+    assert client_ip(_req("10.0.0.9", None), with_proxy) == "10.0.0.9"
 
 
 def test_internal_identifiers_admin_gate(settings_kratos: Settings) -> None:

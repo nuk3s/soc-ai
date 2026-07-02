@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 from soc_ai.agent.orchestrator import (
@@ -32,12 +33,29 @@ from soc_ai.api.recorder import InvestigationRecorder
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass
+class CancelToken:
+    """Marks an EXPLICIT operator cancel so a recorded run can tell it apart from
+    an infrastructural cancellation.
+
+    A bare ``asyncio.CancelledError`` reaches :func:`recorded_run` for several
+    reasons that are NOT an operator cancel — the SSE client disconnects, or the
+    app/container is shutting down (every deploy). Only when the operator hits
+    Cancel does the hunt manager set ``requested = True`` before cancelling the
+    task; everything else is an interrupted run (→ ``error``), never ``cancelled``.
+    """
+
+    requested: bool = False
+
+
 async def recorded_run(
     state: Any,
     *,
     alert_id: str,
     started_by: str,
     event_stream: AsyncIterator[StepEvent],
+    cancel_token: CancelToken | None = None,
+    rule_name: str | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap *event_stream* with the investigation recorder tee.
 
@@ -51,6 +69,7 @@ async def recorded_run(
         state.db_sessionmaker,
         alert_id=alert_id,
         started_by=started_by,
+        rule_name=rule_name,
     )
     inv_id = await recorder.start()
 
@@ -69,10 +88,14 @@ async def recorded_run(
             )
         await recorder.finish("complete")
     except asyncio.CancelledError:
-        # Operator cancelled the hunt: land a clean terminal 'cancelled' state
-        # (distinct from a crash) and let the cancellation propagate so the task
-        # actually stops. finish() is idempotent, so the finally below is a no-op.
-        await recorder.finish("cancelled")
+        # Land a clean terminal state, then let the cancellation propagate so the
+        # task actually stops. Only an EXPLICIT operator cancel is 'cancelled';
+        # any other cancellation (SSE client disconnect, app/container shutdown)
+        # is an interrupted run that never reached a verdict → 'error'. finish()
+        # is idempotent, so the finally below is a no-op.
+        await recorder.finish(
+            "cancelled" if (cancel_token is not None and cancel_token.requested) else "error"
+        )
         raise
     except Exception as exc:
         _LOGGER.exception("investigation stream crashed")
@@ -90,6 +113,8 @@ async def run_recorded(
     alert_id: str,
     started_by: str,
     session_id: str | None = None,
+    cancel_token: CancelToken | None = None,
+    rule_name: str | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Build investigator/synthesizer, call investigate(), and tee through the recorder.
 
@@ -113,6 +138,8 @@ async def run_recorded(
         alert_id=alert_id,
         started_by=started_by,
         event_stream=event_gen,
+        cancel_token=cancel_token,
+        rule_name=rule_name,
     ):
         yield name, data
 

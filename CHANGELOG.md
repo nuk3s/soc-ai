@@ -6,8 +6,55 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-01
+
+Highlights: the **Hunt Console** and a **backtest harness** land, and a full
+correctness / security / performance review hardened the engine.
+
+### Security
+
+- **`web_search` refuses all internal identifiers, not just RFC1918 IPv4.** A
+  shared internal-identifier guard (also used by `crawl_page` and online
+  enrichment) now blocks internal FQDNs, known internal hostnames, IPv6, and every
+  non-globally-routable IP class (CGNAT, benchmark, loopback, link-local) from
+  reaching public search engines.
+- **API tokens are bound to their creator's account** — disabling the operator who
+  minted a token now rejects that token, matching session auth.
+- HSTS is emitted behind a TLS-terminating reverse proxy (honors
+  `X-Forwarded-Proto`); the login throttle and rate limiter are proxy-aware via an
+  opt-in `PROXY_TRUSTED_IPS`; chat input is length-capped; the Oracle
+  redaction-preview endpoint is admin-gated; the decision-record export is
+  described honestly as an integrity checksum (not a signature).
+
+### Fixed
+
+- **Hard evidence gate restored.** The zero-tool-verdict gate was silently
+  defeated by a part-type miscount (the model's own text/reasoning counted as
+  "tool evidence"); it now counts only real tool results, so an ungrounded
+  true/false-positive correctly falls back to `needs_more_info`.
+- **Investigations and hunts conclude gracefully at their budget** instead of
+  erroring with no result — a hunt that reaches its exploration budget now
+  synthesizes a grounded partial report.
+- Background worker tasks are cancelled on shutdown (no use-after-close on the ES
+  or DB clients); several unbounded per-rule queries are now bounded; MaxMind
+  lookups no longer block the event loop; the web console stops polling once a
+  hunt/backtest is idle and no longer races stale responses.
+
 ### Added
 
+- **Hunt Console — estate-wide, objective-driven hunting.** Give it a hunting
+  objective in plain English and it turns the same read-only agent loose across
+  many hosts and a time window, then reports **findings + a narrative** mapped to
+  MITRE ATT&CK — rather than a single-alert verdict. Read-only (no acks, no case
+  edits), runs on a bounded budget, and lands a grounded partial report if cut
+  short.
+- **Backtest harness — "prove it on my last N days."** Samples your already-
+  dispositioned Security Onion alerts, replays soc-ai's triage against them, and
+  scores agreement, false-positive-toil cleared, and a prominent **missed true
+  positives** count — so you can measure the assistant before you trust it.
+- **In-UI admin config console** — Oracle toggle, data sources, agent tools, API
+  tokens, detection tuning, and the Oracle **redaction preview**, applied without
+  a restart where possible.
 - **Internal-identifier discovery + management.** soc-ai now learns a
   deployment's internal identifiers from its own Security Onion data instead of
   assuming them. A new admin **Internal identifiers** config section manages

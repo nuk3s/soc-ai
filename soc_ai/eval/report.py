@@ -200,7 +200,9 @@ def aggregate(rows: list[dict[str, Any]]) -> Aggregates:  # noqa: PLR0915 - sing
     classified = sum(agreement_counts[k] for k in ("yes", "no", "partial"))
     agreement_rate: float | None = agreement_counts["yes"] / classified if classified > 0 else None
 
-    retasks = [r["retask_count"] for r in ok_rows if isinstance(r.get("retask_count"), int)]
+    # retask_rate over the REAL stratum only, consistent with agreement_rate —
+    # synth rows would otherwise skew the rate without disclosure.
+    retasks = [r["retask_count"] for r in real_ok_rows if isinstance(r.get("retask_count"), int)]
     retask_rate: float | None = None
     mean_retasks_when_retasked: float | None = None
     if retasks:
@@ -560,18 +562,33 @@ def _compute_synth_stratum(
     Errors loading the catalogue surface as a logged warning and a
     None return — meta-analysis should still run on the real stratum.
     """
-    synth_rows_raw = [r for r in rows if r.get("is_synth") and not r.get("error")]
-    if not synth_rows_raw:
+    # ALL synth rows, including errored/timed-out runs (which carry is_synth=True
+    # + an error and no verdict). The attempted set is derived from these so an
+    # errored expected-TP run counts as a miss (FN), not a silently-dropped row
+    # that shrinks the recall denominator.
+    synth_rows_all = [r for r in rows if r.get("is_synth")]
+    if not synth_rows_all:
         return None
+    attempted_ids = {
+        r.get("synth_scenario_id") for r in synth_rows_all if r.get("synth_scenario_id")
+    }
     try:
         from soc_ai.eval.synth_loader import load_all_scenarios  # noqa: PLC0415
         from soc_ai.eval.synth_score import SynthRow, score_synth_stratum  # noqa: PLC0415
 
-        scenarios = load_all_scenarios(scenarios_dir)
+        # Score only against scenarios actually attempted this batch — a subset
+        # --synth-set must not be penalised for catalogue scenarios it never ran.
+        scenarios = [s for s in load_all_scenarios(scenarios_dir) if s.id in attempted_ids]
     except Exception as e:
         _LOGGER.warning("synth stratum scoring skipped — catalogue load failed: %s", e)
         return None
 
+    if not scenarios:
+        return None
+
+    # Only successfully-scored runs contribute a verdict row; errored runs are
+    # folded in as false negatives by the catalogue-level pass in the scorer.
+    synth_rows_raw = [r for r in synth_rows_all if not r.get("error")]
     synth_rows = [
         SynthRow(
             scenario_id=r.get("synth_scenario_id") or "",

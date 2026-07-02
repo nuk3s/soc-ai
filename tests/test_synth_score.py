@@ -225,10 +225,12 @@ def test_score_returns_per_scenario_detail() -> None:
 
 
 def test_score_skips_rows_without_matching_scenario() -> None:
-    """A row tagged with an unknown scenario_id is reported, not scored."""
+    """A row tagged with an unknown scenario_id is reported, not scored.
+
+    ``scenarios`` is the ATTEMPTED set — here it's empty, isolating the
+    unmatched-row path (no attempted scenario ⇒ no expected FN)."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
     rows = [
         SynthRow(
             scenario_id="unknown-scenario-id",
@@ -238,13 +240,45 @@ def test_score_skips_rows_without_matching_scenario() -> None:
         )
     ]
 
-    score = score_synth_stratum(rows, scenarios=scenarios)
+    score = score_synth_stratum(rows, scenarios=[])
 
     # Unknown rows don't count toward TP/FN.
     assert score.true_positive_count == 0
     assert score.false_negative_count == 0
     # But they are surfaced as a separate stratum so the operator can find them.
     assert "unknown-scenario-id" in score.unmatched_scenario_ids
+
+
+def test_score_counts_attempted_scenario_with_no_row_as_fn() -> None:
+    """An expected-TP scenario that was attempted but produced no result row
+    (run errored / timed out) counts as a false negative, so recall's
+    denominator reflects all attempted scenarios — not just successful runs."""
+    from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
+
+    scenarios = load_all_scenarios(SCENARIOS_DIR)  # all expected-TP
+    # Only the first scenario produced a (correct) result row; the rest errored.
+    first = scenarios[0]
+    rows = [
+        SynthRow(
+            scenario_id=first.id,
+            verdict="true_positive",
+            confidence=max(first.ground_truth.confidence_min, 0.9),
+            citations=[],
+        )
+    ]
+
+    score = score_synth_stratum(rows, scenarios=scenarios)
+
+    assert score.true_positive_count == 1
+    # every other attempted scenario is a miss
+    assert score.false_negative_count == len(scenarios) - 1
+    # recall denominator = all attempted scenarios (not just the 1 that ran)
+    expected_recall = 1 / len(scenarios)
+    assert abs(score.escalation_recall - expected_recall) < 1e-9
+    # the errored scenarios are recorded with an explicit reason
+    missed = [d for d in score.per_scenario.values() if d.actual_verdict == "error"]
+    assert len(missed) == len(scenarios) - 1
+    assert all("errored or timed out" in " ".join(d.miss_reasons) for d in missed)
 
 
 def test_score_to_dict_round_trips_with_floats() -> None:

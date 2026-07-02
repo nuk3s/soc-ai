@@ -29,7 +29,12 @@ import pytest
 from soc_ai import main as main_mod
 from soc_ai.api.webui_api import _DiscoveryStatus, _get_discovery_status
 from soc_ai.config import Settings
-from soc_ai.main import _discovery_due, _discovery_scheduler_loop, _init_store
+from soc_ai.main import (
+    _auto_triage_scheduler_loop,
+    _discovery_due,
+    _discovery_scheduler_loop,
+    _init_store,
+)
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
@@ -393,4 +398,184 @@ async def test_init_store_reaps_pending_chat_turns(settings_kratos: Settings) ->
         # the completed turn is untouched
         kept = await db.get(ChatMessage, done.id)
         assert kept is not None and kept.status == "done" and kept.content == "kept"
+
+
+@pytest.mark.asyncio
+async def test_init_store_reaps_orphaned_investigation_to_interrupted(
+    settings_kratos: Settings,
+) -> None:
+    """An investigation still 'running' after a restart is resolved to
+    'interrupted' (NOT 'error') by _init_store — a clean restart cut it off; it
+    didn't fail. The benign state is what keeps a healthy single-node env free of
+    spurious 'error'/'cancelled' investigations, and it stays re-huntable."""
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    async with maker() as db:
+        inv = await inv_svc.create(db, alert_es_id="ev-orphan", started_by="t")
+    await engine.dispose()
+
+    # Restart on the same on-disk DB → startup reap runs.
+    engine2 = make_engine(settings_kratos)
+    maker2 = await _init_store(engine2, settings_kratos)
+    async with maker2() as db:
+        from soc_ai.store.models import Investigation
+
+        row = await db.get(Investigation, inv.id)
+        assert row is not None
+        assert row.status == "interrupted"
+        assert inv_svc.blocks_rehunt(row) is False
     await engine2.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Auto-triage scheduler loop — continuously drains the untriaged backlog.
+# Mirrors the discovery-loop harness: deterministic sleep-bounded iterations,
+# the lazily-imported autotriage module patched at its source.
+# --------------------------------------------------------------------------- #
+
+
+def _at_app() -> SimpleNamespace:
+    """A minimal stub app; the auto-triage loop only touches ``app.state``."""
+    return SimpleNamespace(state=SimpleNamespace())
+
+
+def _at_settings(*, enabled: bool = True, interval_minutes: int = 5) -> SimpleNamespace:
+    return SimpleNamespace(
+        auto_triage_schedule_enabled=enabled,
+        auto_triage_schedule_interval_minutes=interval_minutes,
+    )
+
+
+async def _run_at_iterations(
+    monkeypatch: pytest.MonkeyPatch,
+    app: SimpleNamespace,
+    settings: Any,
+    n: int = 1,
+) -> None:
+    """Run ``_auto_triage_scheduler_loop`` for exactly ``n`` body iterations.
+
+    Same bounding trick as the discovery harness: patch ``main.asyncio.sleep`` so
+    the first ``n`` wakes return and the next raises ``CancelledError``."""
+    real_sleep = asyncio.sleep
+    calls = {"n": 0}
+
+    async def _sleep(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] <= n:
+            return None
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await _auto_triage_scheduler_loop(app, settings)
+    finally:
+        monkeypatch.setattr(main_mod.asyncio, "sleep", real_sleep)
+
+
+@pytest.mark.asyncio
+async def test_at_loop_launches_sweep_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When scheduled auto-triage is on and idle, a body iteration kicks a sweep."""
+    app = _at_app()
+    launched: list[str] = []
+
+    async def _stub_sweep(_state: Any, *, started_by: str) -> int:
+        launched.append(started_by)
+        return 3  # pretend it found 3 targets
+
+    monkeypatch.setattr("soc_ai.webui.autotriage.start_config_sweep", _stub_sweep)
+    # idle: no in-flight sweep
+    monkeypatch.setattr(
+        "soc_ai.webui.autotriage.get_status",
+        lambda _s: SimpleNamespace(active=False),
+    )
+
+    await _run_at_iterations(monkeypatch, app, _at_settings(enabled=True))
+    assert launched == ["auto-triage:scheduler"]
+
+
+@pytest.mark.asyncio
+async def test_at_loop_noop_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Master switch off → the loop wakes but never plans or launches a sweep."""
+    app = _at_app()
+    launched: list[str] = []
+
+    async def _stub_sweep(_state: Any, *, started_by: str) -> int:
+        launched.append(started_by)
+        return 0
+
+    monkeypatch.setattr("soc_ai.webui.autotriage.start_config_sweep", _stub_sweep)
+    monkeypatch.setattr(
+        "soc_ai.webui.autotriage.get_status",
+        lambda _s: SimpleNamespace(active=False),
+    )
+
+    await _run_at_iterations(monkeypatch, app, _at_settings(enabled=False))
+    assert launched == []
+
+
+@pytest.mark.asyncio
+async def test_at_loop_respects_single_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sweep already in flight (manual ⚡ or a prior tick) blocks a new launch."""
+    app = _at_app()
+    launched: list[str] = []
+
+    async def _stub_sweep(_state: Any, *, started_by: str) -> int:
+        launched.append(started_by)
+        return 0
+
+    monkeypatch.setattr("soc_ai.webui.autotriage.start_config_sweep", _stub_sweep)
+    monkeypatch.setattr(
+        "soc_ai.webui.autotriage.get_status",
+        lambda _s: SimpleNamespace(active=True),  # a sweep owns the slot
+    )
+
+    await _run_at_iterations(monkeypatch, app, _at_settings(enabled=True))
+    assert launched == []
+
+
+@pytest.mark.asyncio
+async def test_at_loop_survives_iteration_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sweep that raises is logged and swallowed; the loop reaches the next tick."""
+    app = _at_app()
+    calls = {"n": 0}
+
+    async def _stub_sweep(_state: Any, *, started_by: str) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("planning boom")
+        return 1
+
+    monkeypatch.setattr("soc_ai.webui.autotriage.start_config_sweep", _stub_sweep)
+    monkeypatch.setattr(
+        "soc_ai.webui.autotriage.get_status",
+        lambda _s: SimpleNamespace(active=False),
+    )
+
+    # iteration #1 raises (swallowed), #2 runs → proves broad-except resilience.
+    await _run_at_iterations(monkeypatch, app, _at_settings(enabled=True), n=2)
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_at_loop_cancels_cleanly_on_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation at shutdown unwinds the loop without error (lifespan teardown)."""
+    app = _at_app()
+    settings = _at_settings()
+
+    started = asyncio.Event()
+    park = asyncio.Event()  # never set → parks until cancelled
+
+    async def _sleep(_seconds: float) -> None:
+        started.set()
+        await park.wait()
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
+
+    task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled() or task.done()

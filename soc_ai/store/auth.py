@@ -229,8 +229,20 @@ async def check_api_token(db: AsyncSession, raw_token: str) -> ApiToken | None:
     token = await db.scalar(select(ApiToken).where(ApiToken.token_hash == _sha256(raw_token)))
     if token is None or token.revoked:
         return None
-    token.last_used_at = utcnow()
-    await db.commit()
+    # A token is only as valid as the account that minted it: disabling/offboarding
+    # an operator must cut off the tokens they created, matching session auth (which
+    # already rejects a disabled user). created_by is a non-nullable FK, so every
+    # token has a resolvable creator.
+    creator = await db.get(User, token.created_by)
+    if creator is None or creator.disabled:
+        return None
+    # Throttle the last_used_at write: updating + committing on EVERY authenticated
+    # request is a needless DB write per call. Only persist when the timestamp has
+    # advanced by more than a minute (last_used_at is a coarse "recently used" signal).
+    now = utcnow()
+    if token.last_used_at is None or (now - token.last_used_at) > timedelta(seconds=60):
+        token.last_used_at = now
+        await db.commit()
     return token
 
 

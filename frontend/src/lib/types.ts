@@ -52,6 +52,9 @@ export interface AlertGroup {
   invId?: string;
   /** when the verdict is inherited, a short reason (same detection, other alert). */
   inheritedReason?: string;
+  /** representative flow from the group's latest event — both hosts (src → dst). */
+  src?: string | null;
+  dst?: string | null;
   /** true while the rule's latest investigation is still running — show "Triaging…" pill. */
   triaging?: boolean;
   /** number of acknowledged events in this group (from ES aggs). */
@@ -101,6 +104,8 @@ export interface RecommendedAction {
   /** live approval-gate token — present only while the action is actionable. */
   token?: string;
   pending?: boolean;
+  /** already carried out by the system (e.g. auto-ack) — render done, not actionable. */
+  applied?: boolean;
 }
 
 export interface ResolutionProvenance {
@@ -164,9 +169,10 @@ export interface Investigation {
   rationale: string;
   /** structured summary so citations can be rendered as accent superscripts. */
   summary: SummarySegment[];
-  // 'error' arrives when the backend reaper marks a stuck/interrupted run as
-  // failed — the drawer renders a terminal error state for it.
-  status: 'complete' | 'investigating' | 'error' | 'cancelled';
+  // 'error' arrives when the backend reaper marks a stuck run as failed;
+  // 'interrupted' when a restart cut a run off (benign, re-huntable) — the
+  // drawer renders a terminal state for both.
+  status: 'complete' | 'investigating' | 'error' | 'cancelled' | 'interrupted';
   elapsedLabel: string;
   /** real elapsed seconds at fetch time — seeds the ticker so it survives nav. */
   elapsedSec?: number;
@@ -245,29 +251,38 @@ export interface InvestigationRow {
   verdict: Verdict;
   conf: number | null;
   host: string;
-  status: 'complete' | 'running' | 'awaiting' | 'error' | 'cancelled';
+  /** destination IP — paired with `host` (source) for the full flow. */
+  dst?: string | null;
+  status: 'complete' | 'running' | 'awaiting' | 'error' | 'cancelled' | 'interrupted';
   when: string;
   ts?: string;
   chatCount?: number;
+  /** the alert this run investigated — retries of the same alert share it. */
+  alertId?: string;
+  /** the canonical run for its alert (latest complete, else latest); others nest under it. */
+  isPrimary?: boolean;
 }
 
 // ---- Hunts -----------------------------------------------------------------
+// A Hunt is broader than an Investigation: it correlates across hosts/time or a
+// free-form objective and lands findings + a narrative (a HuntReport), not a
+// single-alert verdict. These mirror the /api/v1/hunts* JSON shapes.
 
-export type HuntType = 'scheduled' | 'ad-hoc';
-export type HuntStatus = 'active' | 'running' | 'complete';
+export type HuntStatus = 'running' | 'complete' | 'error' | 'cancelled' | 'interrupted';
+export type HuntKind = 'chat' | 'scheduled' | 'triggered';
 
+/** One row in the Hunts list. */
 export interface HuntRow {
   id: string;
-  name: string;
-  type: HuntType;
-  query: string;
-  schedule: string;
-  last: string;
-  findings: number;
-  /** max severity among findings — drives the findings dot color. */
-  maxSev: Severity;
+  objective: string;
+  kind: HuntKind;
   status: HuntStatus;
-  host: string;
+  findingCount: number;
+  affectedHosts: number;
+  confidence: number | null;
+  startedBy: string;
+  when: string;
+  ts: string;
 }
 
 export interface HuntStat {
@@ -275,6 +290,39 @@ export interface HuntStat {
   value: string;
   sub: string;
   tone: 'accent' | 'sigma' | 'warn' | 'danger';
+}
+
+/** One finding a hunt turned up, backed by evidence. */
+export interface HuntFinding {
+  title: string;
+  detail: string;
+  severity: string;
+  hosts: string[];
+  citations: string[];
+}
+
+export interface HuntAction {
+  title: string;
+  rationale: string;
+}
+
+/** A hunt's full detail: objective, status, narrative, findings, trace timeline. */
+export interface HuntDetailData {
+  id: string;
+  objective: string;
+  kind: HuntKind;
+  status: HuntStatus;
+  narrative: string;
+  findings: HuntFinding[];
+  affectedHosts: string[];
+  mitreTechniques: string[];
+  recommendedActions: HuntAction[];
+  confidence: number;
+  startedBy: string;
+  elapsedLabel: string;
+  elapsedSec: number;
+  ts: string;
+  timeline: TimelineStep[];
 }
 
 export interface HostSignal {
@@ -286,38 +334,6 @@ export interface HostSignal {
   sev: string;
 }
 
-export interface Finding {
-  tone: Severity;
-  title: string;
-  host: string;
-  when: string;
-}
-
-export interface TimelinePattern {
-  tone: string;
-  label: string;
-  detail: string;
-}
-
-export interface TimelinePhase {
-  tone: string;
-  name: string;
-  time: string;
-}
-
-export interface HuntDetail {
-  hunt: HuntRow;
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  riskScore: number;
-  riskLabel: string;
-  riskDesc: string;
-  hostSignals: HostSignal[];
-  patterns: TimelinePattern[];
-  sequence: TimelinePhase[];
-  findings: Finding[];
-}
-
 // ---- Config ----------------------------------------------------------------
 
 export type SettingSource = 'db' | 'env';
@@ -326,6 +342,8 @@ export type SettingType = 'toggle' | 'number' | 'select' | 'text';
 
 export interface Setting {
   key: string;
+  /** human label shown as the field title (the raw key is a secondary hint). */
+  label: string;
   help: string;
   source: SettingSource;
   apply: SettingApply;
@@ -409,4 +427,83 @@ export interface Notification {
   title: string;
   when: string;
   href?: string | null;
+}
+
+// ── Backtest ("prove it on my last N days") ─────────────────────────────────
+// Replay soc-ai's triage over a sample of already-dispositioned alerts and
+// compare its verdicts to the analyst's REAL Security Onion disposition.
+
+export type BacktestRunStatus = 'running' | 'complete' | 'error';
+
+/** The two ground-truth disposition labels + the two settled soc-ai verdicts,
+ * plus the hedge and the "no verdict produced" bucket. */
+export type HumanDisposition = 'true_positive' | 'false_positive';
+export type SocVerdict =
+  | 'true_positive'
+  | 'false_positive'
+  | 'needs_more_info'
+  | 'no_verdict';
+
+/** One replayed alert: what the analyst said vs. what soc-ai said. */
+export interface BacktestRow {
+  alert_id: string;
+  rule_name: string;
+  human_disposition: HumanDisposition;
+  soc_ai_verdict: SocVerdict | null;
+  match: boolean;
+}
+
+/** human_disposition → { soc verdict → count }. */
+export type BacktestConfusion = Record<HumanDisposition, Record<SocVerdict, number>>;
+
+export interface BacktestMetrics {
+  agreement_rate: number;
+  fp_reduction: number;
+  missed_tp: number;
+  n_needs_more_info: number;
+  counts: {
+    total: number;
+    human_tp: number;
+    human_fp: number;
+    agreements: number;
+    fp_cleared: number;
+  };
+}
+
+export interface BacktestResults {
+  metrics: BacktestMetrics;
+  confusion: BacktestConfusion;
+  missed_tp_rows: BacktestRow[];
+  rows: BacktestRow[];
+  caveat: string;
+}
+
+export interface BacktestParams {
+  window_days: number;
+  sample_size: number;
+  requested_sample_size?: number;
+  min_severity: string | null;
+}
+
+/** The current/last backtest: live progress while running, stored results when
+ * complete. Mirrors the backend BacktestStatusOut. */
+export interface Backtest {
+  active: boolean;
+  backtest_id: string | null;
+  total: number;
+  replayed: number;
+  failed: number;
+  finished_at: string | null;
+  current: string | null;
+  note: string | null;
+  params: BacktestParams | null;
+  results: BacktestResults | null;
+  status: BacktestRunStatus | null;
+  sampled: number | null;
+}
+
+export interface StartBacktestOpts {
+  windowDays: number;
+  sampleSize: number;
+  minSeverity?: string;
 }

@@ -150,6 +150,13 @@ def test_extract_agreement_partial_phrasing() -> None:
     assert extract_agreement(md) == "partial"
 
 
+def test_extract_agreement_double_negation_is_not_no() -> None:
+    """A double negation ('not incorrect' / 'isn't wrong') means AGREEMENT — the
+    prose parser must not misfire on the bare words 'incorrect'/'wrong'."""
+    assert extract_agreement("## 1. Verdict\n\nThe agent's conclusion is not incorrect.\n") != "no"
+    assert extract_agreement("## 1. Verdict\n\nYes — the verdict isn't wrong here.\n") == "yes"
+
+
 def test_extract_agreement_partial_beats_agree() -> None:
     """`partial` is more specific than `yes`/`agree` — must win when
     both phrases appear in the verdict paragraph."""

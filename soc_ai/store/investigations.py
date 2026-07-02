@@ -11,7 +11,7 @@ from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
@@ -20,19 +20,32 @@ from soc_ai.store.models import ChatMessage, Investigation, InvestigationEvent
 
 VERDICTS_RUNNING = "running"
 
+# The verdict strings the detection-tuning FP-trend tally buckets. Any other
+# verdict value a row carries is ignored, so the three buckets always sum to
+# their "total".
+_COUNTED_VERDICTS = ("true_positive", "false_positive", "needs_more_info")
+
 
 async def create(
     db: AsyncSession,
     *,
     alert_es_id: str,
     started_by: str,
+    rule_name: str | None = None,
     src_ip: str | None = None,
     dest_ip: str | None = None,
 ) -> Investigation:
+    # Seed the display name at birth when the caller already knows it (the alert
+    # grid / re-hunt / group sweep all do). Otherwise it stays NULL and the
+    # recorder backfills it from the first alert_context event — but a run that
+    # dies before that event (e.g. a prefetch ES error) would then leave the row
+    # permanently nameless. Seeding closes that window.
+    seed_name = rule_name[:512] if rule_name else None
     inv = Investigation(
         id=str(ULID()),
         alert_es_id=alert_es_id,
         started_by=started_by,
+        rule_name=seed_name,
         src_ip=src_ip,
         dest_ip=dest_ip,
     )
@@ -176,8 +189,10 @@ async def resolve(
     return inv
 
 
-async def reap_stale_running(db: AsyncSession, *, older_than_minutes: int | None) -> int:
-    """Mark orphaned ``running`` investigations as ``error``. Returns the count.
+async def reap_stale_running(
+    db: AsyncSession, *, older_than_minutes: int | None, status: str = "error"
+) -> int:
+    """Mark orphaned ``running`` investigations terminal. Returns the count.
 
     ``older_than_minutes=None`` reaps EVERY running row — used at startup, where
     any row still ``running`` was orphaned by the restart (its background task is
@@ -185,6 +200,11 @@ async def reap_stale_running(db: AsyncSession, *, older_than_minutes: int | None
     many minutes — used by the periodic sweep so a legitimately in-flight hunt is
     never killed. ``created_at`` and ``utcnow()`` are both naive UTC, so the
     comparison is consistent.
+
+    ``status`` is the terminal status to write: the periodic sweep uses ``error``
+    (a hunt that ran too long is a genuine failure), while the startup reap uses
+    ``interrupted`` — a clean restart cut the run off; it didn't fail, and the
+    state stays re-huntable (see :func:`blocks_rehunt`).
     """
     q = select(Investigation).where(Investigation.status == VERDICTS_RUNNING)
     if older_than_minutes is not None:
@@ -192,11 +212,16 @@ async def reap_stale_running(db: AsyncSession, *, older_than_minutes: int | None
         q = q.where(Investigation.created_at < cutoff)
     rows = list((await db.scalars(q)).all())
     now = utcnow()
+    interrupted = status == "interrupted"
     for inv in rows:
-        inv.status = "error"
+        inv.status = status
         inv.finished_at = now
         if not inv.rationale:
-            inv.rationale = "Investigation did not finish (interrupted by a restart or timed out)."
+            inv.rationale = (
+                "Investigation was interrupted by a service restart before it finished — re-run it."
+                if interrupted
+                else "Investigation did not finish (interrupted by a restart or timed out)."
+            )
     if rows:
         await db.commit()
     return len(rows)
@@ -226,6 +251,10 @@ async def _latest_by(db: AsyncSession, column: Any, keys: list[str]) -> dict[str
             select(Investigation)
             .where(column.in_(keys))
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+            # Bound the scan: we only keep the newest row per key, so at most a
+            # small multiple of len(keys) is ever needed. Without this the query
+            # returns every historical re-investigation for the keys.
+            .limit(len(keys) * 10)
         )
     ).all()
     out: dict[str, Investigation] = {}
@@ -237,8 +266,84 @@ async def _latest_by(db: AsyncSession, column: Any, keys: list[str]) -> dict[str
 
 
 async def latest_for_rules(db: AsyncSession, rule_names: list[str]) -> dict[str, Investigation]:
-    """Most recent investigation per rule name (badge on group rows)."""
+    """Most recent investigation per rule name, ANY status (used to detect an
+    in-flight re-hunt for the Triaging… flag — NOT for the verdict badge)."""
     return await _latest_by(db, Investigation.rule_name, rule_names)
+
+
+async def latest_complete_for_rules(
+    db: AsyncSession, rule_names: list[str]
+) -> dict[str, Investigation]:
+    """Most recent COMPLETE, verdict-bearing investigation per rule name.
+
+    This is the rule's STANDING VERDICT for the alerts feed. Unlike
+    :func:`latest_for_rules`, it skips running/error/cancelled and verdictless
+    rows, so a later interrupted run (a re-hunt cancelled by a deploy, an errored
+    run) never erases the verdict the rule already earned — the source of the
+    "group says untriaged but its events are investigated/inherited" mismatch.
+    """
+    if not rule_names:
+        return {}
+    rows = (
+        await db.scalars(
+            select(Investigation)
+            .where(
+                Investigation.rule_name.in_(rule_names),
+                Investigation.status == "complete",
+                Investigation.verdict.is_not(None),
+            )
+            .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+            # Bounded like _latest_by: only the newest complete row per rule is
+            # kept, so a small multiple of len(rule_names) suffices.
+            .limit(len(rule_names) * 10)
+        )
+    ).all()
+    out: dict[str, Investigation] = {}
+    for inv in rows:
+        if inv.rule_name and inv.rule_name not in out:
+            out[inv.rule_name] = inv
+    return out
+
+
+async def verdict_counts_by_rule(
+    db: AsyncSession, rule_names: list[str]
+) -> dict[str, dict[str, int]]:
+    """Per-rule verdict tallies over COMPLETE investigations (detection tuning).
+
+    For each name in ``rule_names``, count how many of its ``complete``,
+    verdict-bearing investigations landed each verdict. The shape is::
+
+        {rule_name: {"true_positive": int, "false_positive": int,
+                     "needs_more_info": int, "total": int}}
+
+    Only rules with ≥1 complete investigation appear in the result. ``total`` is
+    the sum of the three buckets (any other verdict string is ignored, so the
+    buckets always sum to ``total``). This is the FP-trend signal the noisy-rule
+    nominator joins against the alert volume — a rule fired a lot and investigated
+    mostly false-positive with zero true-positive is a mute candidate.
+    """
+    out: dict[str, dict[str, int]] = {}
+    if not rule_names:
+        return out
+    rows = await db.execute(
+        select(Investigation.rule_name, Investigation.verdict, func.count())
+        .where(
+            Investigation.rule_name.in_(rule_names),
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+        )
+        .group_by(Investigation.rule_name, Investigation.verdict)
+    )
+    for rule_name, verdict, count in rows.all():
+        if rule_name is None or verdict not in _COUNTED_VERDICTS:
+            continue
+        bucket = out.setdefault(
+            rule_name,
+            {"true_positive": 0, "false_positive": 0, "needs_more_info": 0, "total": 0},
+        )
+        bucket[verdict] = count
+        bucket["total"] += count
+    return out
 
 
 async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str, Investigation]:

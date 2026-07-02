@@ -21,6 +21,7 @@ without churning the agent's tool surface.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress as _ipaddress
 import logging
 from collections.abc import Sequence
@@ -245,8 +246,10 @@ async def enrich_ip(
 
     if maxmind is not None and not enrichment.internal:
         try:
-            enrichment.asn = maxmind.lookup_asn(ip)
-            enrichment.geoip = maxmind.lookup_geoip(ip)
+            # mmdb Reader.asn/.city are synchronous file reads — offload to a
+            # thread so they don't block the single-worker event loop.
+            enrichment.asn = await asyncio.to_thread(maxmind.lookup_asn, ip)
+            enrichment.geoip = await asyncio.to_thread(maxmind.lookup_geoip, ip)
         except Exception as e:  # fail-open
             enrichment.errors.append(f"maxmind lookup failed: {e}")
 

@@ -11,16 +11,21 @@ import type {
   AdminUser,
   AlertEvent,
   AlertGroup,
+  Backtest,
   ChatMessage,
   Config,
   ConnTestResult,
   DangerSetting,
+  HuntDetailData,
+  HuntRow,
+  HuntStat,
   Investigation,
   InvestigationRow,
   Me,
   Notification,
   RehuntResult,
   RepresentativeOut,
+  StartBacktestOpts,
   Workspace,
 } from './types';
 
@@ -147,13 +152,62 @@ export function getInvestigation(idOrGroupId: string): Promise<Investigation> {
   return request<Investigation>(`/investigations/${encodeURIComponent(idOrGroupId)}`);
 }
 
+/** Download the audit-grade decision record (JSON with a sha256 integrity checksum). */
+export async function downloadInvestigationExport(invId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/investigations/${encodeURIComponent(invId)}/export`, {
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw new Error(`Export failed (${res.status})`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `soc-ai-${invId}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 // ---------------------------------------------------------------------------
-// Hunting agent — no backend yet. The Hunts list and HuntDetail screens render
-// an honest "coming soon" empty state, so there are no hunt data-access
-// functions here (the prior versions resolved fabricated mock data). When the
-// hunting agent ships, add getHunts()/getHuntStats()/getHuntDetail() that call
-// the real /hunts endpoints.
+// Hunts (Hunt Console). A Hunt correlates across hosts/time or a free-form
+// objective and lands findings + a narrative (read-only in this phase). The
+// chat-driven hunt runs on the backend hunt agent; the UI starts it, then polls
+// the detail live (mirrors the investigation-hunt flow).
 // ---------------------------------------------------------------------------
+
+export function getHunts(): Promise<HuntRow[]> {
+  return request<HuntRow[]>('/hunts');
+}
+
+export function getHuntStats(): Promise<HuntStat[]> {
+  return request<HuntStat[]>('/hunts/stats');
+}
+
+export function getHunt(id: string): Promise<HuntDetailData> {
+  return request<HuntDetailData>(`/hunts/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Start a chat-driven Hunt Console hunt; resolves with the new hunt's id (poll
+ * it live). Distinct from ``startHunt``, which starts a single-alert
+ * INVESTIGATION — a Hunt Console hunt is broad (findings + narrative).
+ */
+export function startHuntConsole(
+  objective: string,
+  priorHuntId?: string,
+): Promise<{ hunt_id: string }> {
+  return post<{ hunt_id: string }>('/hunts/chat', {
+    objective,
+    prior_hunt_id: priorHuntId ?? null,
+  });
+}
+
+/** Cancel an in-flight Hunt Console hunt (marks it cancelled). */
+export function cancelHuntConsole(id: string): Promise<{ cancelled: boolean }> {
+  return post(`/hunts/${encodeURIComponent(id)}/cancel`);
+}
 
 export function getConfig(): Promise<Config> {
   return request<Config>('/config');
@@ -174,6 +228,68 @@ export interface DataSource {
 
 export function getDataSources(): Promise<{ sources: DataSource[] }> {
   return request<{ sources: DataSource[] }>('/config/data-sources');
+}
+
+// ── Detection tuning (noisy-rule nomination + soft mutes) ──────────────────
+
+/** A nominated noisy rule from the detection-tuning analysis. */
+export interface DetectionNomination {
+  rule_name: string;
+  alert_count: number;
+  investigations: number;
+  fp: number;
+  tp: number;
+  nmi: number;
+  recommendation: 'mute' | 'monitor' | 'none';
+  reason: string;
+  already_muted: boolean;
+}
+
+/** An active operator override (a soft, reversible mute). */
+export interface DetectionOverride {
+  id: number;
+  rule_name: string;
+  action: string;
+  reason: string | null;
+  created_by: string;
+  created_at: string;
+  active: boolean;
+}
+
+export interface DetectionTuning {
+  nominations: DetectionNomination[];
+  overrides: DetectionOverride[];
+}
+
+/** Nominated noisy rules + the active soft-mute overrides. */
+export function getDetectionTuning(): Promise<DetectionTuning> {
+  return request<DetectionTuning>('/detection-tuning');
+}
+
+export interface RedactionPreview {
+  original: Record<string, unknown>;
+  sanitized: Record<string, unknown>;
+  summary: Record<string, number>;
+  note: string;
+}
+
+/** Show exactly what the Oracle pre-egress sanitizer would send (before → after). */
+export function getRedactionPreview(): Promise<RedactionPreview> {
+  return request<RedactionPreview>('/oracle/redaction-preview');
+}
+
+/** Mute a noisy rule (soft, reversible suppression — Security Onion is untouched). */
+export function muteRule(rule_name: string, reason?: string): Promise<DetectionOverride> {
+  return post<DetectionOverride>('/detection-tuning/override', {
+    rule_name,
+    action: 'mute',
+    reason: reason ?? null,
+  });
+}
+
+/** Un-mute a rule by deactivating its override. */
+export function unmuteRule(id: number): Promise<{ removed: boolean }> {
+  return post<{ removed: boolean }>(`/detection-tuning/override/${id}/remove`);
 }
 
 // ── API keys (write-only enrichment provider secrets) ──────────────────────
@@ -420,6 +536,31 @@ export function getAutoTriageStatus(): Promise<AutoTriageStatus> {
 /** Request the running auto-triage batch to stop after the current target. */
 export function stopAutoTriage(): Promise<AutoTriageStatus> {
   return post<AutoTriageStatus>('/auto-triage/stop');
+}
+
+// ── Backtest ("prove it on my last N days") ─────────────────────────────────
+
+/** Launch a background backtest: replay soc-ai's triage over a sample of
+ *  already-dispositioned alerts and score its verdicts against the analyst's
+ *  real Security Onion disposition. Admin-gated + expensive (each sample is a
+ *  full investigation); the backend clamps sampleSize to its hard cap. */
+export function startBacktest(opts: StartBacktestOpts): Promise<Backtest> {
+  const body: Record<string, unknown> = {
+    window_days: opts.windowDays,
+    sample_size: opts.sampleSize,
+  };
+  if (opts.minSeverity) body.min_severity = opts.minSeverity;
+  return post<Backtest>('/backtest', body);
+}
+
+/** The current/last backtest — live progress while running, results when done. */
+export function getBacktest(): Promise<Backtest> {
+  return request<Backtest>('/backtest');
+}
+
+/** A specific backtest run by id. */
+export function getBacktestById(id: string): Promise<Backtest> {
+  return request<Backtest>(`/backtest/${encodeURIComponent(id)}`);
 }
 
 export interface AckGroupResult {

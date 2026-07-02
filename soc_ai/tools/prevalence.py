@@ -20,10 +20,12 @@ The return shape is stable across modes::
 
 ``rarity`` is a coarse human label:
 
-- ``"first-seen"`` — the pairing/domain/host first appears inside the lookback
+- ``"first-seen"``   — the pairing/domain/host first appears inside the lookback
   window (``is_novel`` is True): no prior baseline, treat as new.
-- ``"rare"``       — seen on only a handful of distinct days.
-- ``"common"``     — seen on many distinct days (an established baseline).
+- ``"rare"``         — a genuine handful of events over only a few distinct days.
+- ``"concentrated"`` — many events packed into only a few distinct days: a recent
+  burst / heavy short-span talker (NOT sparse — do not read as "rare").
+- ``"common"``       — seen on many distinct days (an established baseline).
 
 Field resolution is ECS-first (``soc_ai.so_client.fields``) so the same logical
 question resolves on a modern Elastic-Agent 9.x grid and on the legacy ``zeek.*``
@@ -50,6 +52,12 @@ _LOGGER = logging.getLogger(__name__)
 # days has an established baseline and is "common". These are deliberately
 # coarse — the label is a triage hint, not a statistic.
 _RARE_MAX_DISTINCT_DAYS = 3
+
+# Event volume above which a short-span pairing is an established/heavy talker,
+# not a sparse novelty. "rare" must mean a genuine handful of events — tens or
+# thousands crammed into a few days is "concentrated" activity (a recent burst /
+# heavy baseline), and labelling that "rare" misleads the model.
+_HEAVY_VOLUME_EVENTS = 50
 
 # Cap on the number of distinct-day buckets we materialize. A 90-day window can
 # only ever have 90 day-buckets, but pin a hard ceiling so a misconfigured
@@ -153,12 +161,18 @@ def _lookback_filter(lookback_days: int, anchor: datetime | None) -> dict[str, A
     return {"range": {"@timestamp": {"gte": f"now-{lookback_days}d", "lte": "now"}}}
 
 
-def _classify_rarity(distinct_days: int, is_novel: bool) -> str:
-    """Coarse human rarity label from distinct-day count + novelty flag."""
+def _classify_rarity(distinct_days: int, total_events: int, is_novel: bool) -> str:
+    """Coarse human rarity label from day-spread + volume + novelty.
+
+    Two axes kept from contradicting each other: day-SPREAD and event-VOLUME. A
+    handful of events over a few days is "rare"; a heavy burst over the SAME few
+    days is "concentrated" (recent/heavy, not sparse) — never "rare". Many distinct
+    days is "common" (an established baseline) regardless of volume.
+    """
     if is_novel:
         return "first-seen"
     if distinct_days <= _RARE_MAX_DISTINCT_DAYS:
-        return "rare"
+        return "concentrated" if total_events >= _HEAVY_VOLUME_EVENTS else "rare"
     return "common"
 
 
@@ -324,9 +338,12 @@ async def prevalence(
     # history has no established baseline. We treat "seen on a single distinct
     # day" as novel (it only happened the once, around the alert) and otherwise
     # rely on the distinct-day spread for rarity.
-    is_novel = distinct_days <= 1
+    # A single distinct day of LOW volume around the alert has no baseline (novel).
+    # A single day of HEAVY volume is a burst, not a novelty — let it fall through
+    # to "concentrated" so the model isn't told "no baseline" about thousands of events.
+    is_novel = distinct_days <= 1 and total < _HEAVY_VOLUME_EVENTS
 
-    rarity = _classify_rarity(distinct_days, is_novel)
+    rarity = _classify_rarity(distinct_days, total, is_novel)
     evidence["total_events"] = total
     evidence["total_is_lower_bound"] = result.total_is_lower_bound
 
@@ -335,6 +352,13 @@ async def prevalence(
         summary = (
             f"{subject}: seen on a single day only "
             f"({count_str} event(s), first/last {first_seen}) — novel, no baseline."
+        )
+    elif rarity == "concentrated":
+        summary = (
+            f"{subject}: concentrated — {count_str} event(s) packed into just "
+            f"{distinct_days} distinct day(s) (first {first_seen}, last {last_seen}) "
+            f"in the last {lookback_days}d. Heavy short-span activity, not a "
+            f"long-running baseline."
         )
     else:
         summary = (

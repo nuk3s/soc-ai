@@ -3014,6 +3014,9 @@ class _FakeToolReturnPart:
     def __init__(self, tool_name: str, content: Any):
         self.tool_name = tool_name
         self.content = content
+        # count_successful_tool_calls now discriminates on part_kind, so the
+        # stub must carry the real ToolReturnPart discriminator.
+        self.part_kind = "tool-return"
 
 
 def test_derive_rubric_coverage_payload_inspected_from_alert_payload() -> None:
@@ -3673,6 +3676,17 @@ async def test_synth_first_pipeline_template_match_path(
         gap_for_investigator=None,
     )
     synth_model = TestModel(call_tools=[], custom_output_args=fake_report)
+    from soc_ai.agent.decision_templates import CandidateVerdict
+
+    # A strong benign template (clean_internal_traffic @ 0.85) — a real
+    # template-match path that also exempts the hard evidence gate.
+    strong_candidate = CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.85,
+        cited_evidence=["alert.severity_label"],
+        template_id="clean_internal_traffic",
+        rationale="internal scanner",
+    )
 
     async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
         return _stub_enriched_alert_context(alert_id)
@@ -3685,6 +3699,10 @@ async def test_synth_first_pipeline_template_match_path(
         patch(
             "soc_ai.agent.orchestrator.build_synthesizer_model",
             return_value=synth_model,
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=strong_candidate,
         ),
     ):
         events = [ev async for ev in investigate("alert-001", ctx=ctx)]
@@ -4112,19 +4130,20 @@ async def test_synth_first_no_template_ceiling_keeps_real_confidence(
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
-    # Candidate says 0.7 confident; synth over-claims 0.85.
+    # Candidate is the real clean_internal_traffic template (0.85); synth
+    # over-claims 0.9. (A strong benign template also exempts the evidence gate.)
     candidate = CandidateVerdict(
         verdict="false_positive",
-        confidence=0.7,
+        confidence=0.85,
         cited_evidence=["alert.severity_label"],
         template_id="clean_internal_traffic",
         rationale="Internal ICMP scanner.",
     )
 
-    # Synth emits confidence=0.85 with a valid path citation.
+    # Synth emits confidence=0.9 (> the template constant) with a valid citation.
     fake_report = TriageReport(
         verdict="false_positive",
-        confidence=0.85,
+        confidence=0.9,
         summary="Benign internal scanner.",
         citations=["alert.severity_label"],
         recommended_actions=[],
@@ -4165,8 +4184,9 @@ async def test_synth_first_no_template_ceiling_keeps_real_confidence(
     assert "template_ceiling" not in kinds  # ceiling dropped
 
     report_ev = next(e for e in events if e.kind == "triage_report")
-    # The model's own 0.85 stands (citations fully validate, so no citation cap).
-    assert report_ev.payload["confidence"] == pytest.approx(0.85)
+    # The model's own 0.9 stands (> template 0.85; citations validate, no cap;
+    # strong benign template exempts the evidence gate).
+    assert report_ev.payload["confidence"] == pytest.approx(0.9)
     assert report_ev.payload["verdict"] == "false_positive"
 
 
@@ -4179,10 +4199,21 @@ async def test_synth_first_post_validate_invalid_citation_caps_confidence(
     from unittest.mock import MagicMock
 
     from pydantic_ai import Agent
+    from soc_ai.agent.decision_templates import CandidateVerdict
 
     settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
+
+    # A strong benign template so the verdict survives the hard evidence gate —
+    # this test isolates the citation-cap behaviour, not the gate.
+    strong_candidate = CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.85,
+        cited_evidence=["alert.severity_label"],
+        template_id="clean_internal_traffic",
+        rationale="internal scanner",
+    )
 
     # citation "alert.nonexistent_field" will fail path validation.
     # "alert.severity_label" is valid (present in SoAlert).
@@ -4220,7 +4251,7 @@ async def test_synth_first_post_validate_invalid_citation_caps_confidence(
         ),
         patch(
             "soc_ai.agent.decision_templates.match_decision_template",
-            return_value=None,
+            return_value=strong_candidate,
         ),
     ):
         events = [ev async for ev in investigate("alert-001", ctx=ctx)]
@@ -5513,12 +5544,14 @@ async def test_investigation_loop_skipped_for_trivially_benign(
     settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
 
-    # Decision template clears a non-malware internal informational alert FP.
+    # Decision template clears a non-malware internal alert FP. A real strong
+    # benign template (clean_internal_traffic @ 0.85) both skips the loop AND
+    # exempts the evidence gate — the production shape for this case.
     candidate = CandidateVerdict(
         verdict="false_positive",
-        confidence=0.7,
+        confidence=0.85,
         cited_evidence=["alert.severity_label"],
-        template_id="internal_informational",
+        template_id="clean_internal_traffic",
         rationale="internal east-west informational",
     )
     round1_report = TriageReport(
@@ -5846,8 +5879,10 @@ async def test_oracle_wiring_escalated_fp_overridden_to_tp(
     assert report_ev.payload["verdict"] == "true_positive"
     # Summary gets the [Oracle adjudicated] prefix.
     assert "[Oracle adjudicated]" in report_ev.payload["summary"]
-    # Local verdict preserved.
-    assert report_ev.payload["local_verdict"] == "false_positive"
+    # Local verdict preserved. The local zero-tool FP on a MALWARE rule is itself
+    # caught by the hard evidence gate (→ needs_more_info) before escalation —
+    # defense in depth — and the Oracle then overrides it to TP.
+    assert report_ev.payload["local_verdict"] == "needs_more_info"
 
     # oracle_adjudication payload must carry oracle_verdict + redaction.
     adj_ev = next(e for e in events if e.kind == "oracle_adjudication")
@@ -5903,8 +5938,9 @@ async def test_oracle_wiring_adjudicate_returns_none_local_verdict_stands(
     assert "oracle_adjudication" not in kinds
 
     report_ev = next(e for e in events if e.kind == "triage_report")
-    # Local verdict stands.
-    assert report_ev.payload["verdict"] == "false_positive"
+    # Local verdict stands (Oracle refused). The zero-tool FP on a malware rule
+    # was caught by the hard evidence gate → needs_more_info before escalation.
+    assert report_ev.payload["verdict"] == "needs_more_info"
     assert "[Oracle adjudicated]" not in (report_ev.payload["summary"] or "")
     # local_verdict field is None when Oracle didn't override.
     assert report_ev.payload["local_verdict"] is None
@@ -6429,3 +6465,309 @@ def test_downgrade_ungrounded_host_anchored_tp_skipped_when_focus_alert_is_malwa
     assert "ungrounded_host_anchored_tp_downgrade" not in audit, (
         "audit must NOT record a downgrade when the focus alert is malware-class"
     )
+
+
+# ---------------------------------------------------------------------------
+# Hard evidence gate — count_successful_tool_calls / _is_strong_grounded_template
+# / _downgrade_unevidenced_verdict (the zero-tool-verdict defense)
+# ---------------------------------------------------------------------------
+
+
+def _ret(*contents: Any) -> _FakeMessage:
+    """A message carrying one or more ToolReturnParts (tool RESULTS) — reuses the
+    existing _FakeToolReturnPart(tool_name, content) stand-in defined above."""
+    return _FakeMessage([_FakeToolReturnPart("t_tool", c) for c in contents])
+
+
+def test_count_successful_tool_calls_counts_only_real_data() -> None:
+    from soc_ai.agent.orchestrator import count_successful_tool_calls
+
+    assert count_successful_tool_calls(None) == 0
+    assert count_successful_tool_calls([]) == 0
+    # a CALL part (has .args) is not a return → not counted
+    assert count_successful_tool_calls([_msg(("t_enrich_ip", {"ip": "1.2.3.4"}))]) == 0
+    # one good return
+    assert count_successful_tool_calls([_ret({"reputation": "clean"})]) == 1
+    # error / dedup / prefetch-short-circuit returns don't count; only the real one does
+    msgs = [
+        _ret(
+            {"error": True, "type": "X", "message": "boom"},
+            {"duplicate_call": True},
+            {"prefetch_already_has_this": True},
+            {"ports": [80, 443]},
+        )
+    ]
+    assert count_successful_tool_calls(msgs) == 1
+
+
+def test_count_successful_tool_calls_ignores_text_thinking_retry_parts() -> None:
+    """Regression: real ModelResponse parts other than tool returns must NOT
+    count as tool evidence. TextPart/ThinkingPart/RetryPromptPart all carry
+    .content and lack .args — the old duck-type check miscounted them, silently
+    defeating the hard evidence gate for zero-tool verdicts."""
+    from pydantic_ai.messages import (
+        ModelResponse,
+        RetryPromptPart,
+        TextPart,
+        ThinkingPart,
+        ToolReturnPart,
+    )
+    from soc_ai.agent.orchestrator import count_successful_tool_calls
+
+    # A response that only reasoned + emitted text (zero real tool calls).
+    text_only = ModelResponse(
+        parts=[
+            ThinkingPart(content="the alert looks benign because..."),
+            TextPart(content="Verdict: false_positive"),
+        ]
+    )
+    assert count_successful_tool_calls([text_only]) == 0
+
+    # A failed tool-arg validation retry is NOT evidence (both content shapes).
+    retry_str = ModelResponse(parts=[RetryPromptPart(content="bad tool args")])
+    retry_list = ModelResponse(
+        parts=[
+            RetryPromptPart(content=[{"type": "missing", "loc": ("ip",), "msg": "field required"}])
+        ]
+    )
+    assert count_successful_tool_calls([retry_str]) == 0
+    assert count_successful_tool_calls([retry_list]) == 0
+
+    # A real tool return mixed with text counts exactly once.
+    mixed = ModelResponse(
+        parts=[
+            TextPart(content="let me check the IP"),
+            ToolReturnPart(
+                tool_name="t_enrich_ip",
+                content={"reputation": "malicious"},
+                tool_call_id="1",
+            ),
+        ]
+    )
+    assert count_successful_tool_calls([mixed]) == 1
+
+
+def test_evidence_gate_downgrades_zero_tool_true_positive() -> None:
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.9,
+        summary="C2 confirmed (from prefetch alone).",
+        citations=["alert.rule_name"],
+        recommended_actions=[
+            RecommendedAction(tool_name="escalate_to_case", tool_args={}, rationale="x")
+        ],
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "needs_more_info"
+    assert out.confidence <= 0.4
+    assert out.recommended_actions == []
+    assert audit["evidence_gate_downgrade"]["original_verdict"] == "true_positive"
+
+
+def test_evidence_gate_downgrades_zero_tool_false_positive() -> None:
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="false_positive", confidence=0.7, summary="benign per prefetch", citations=[]
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "needs_more_info"
+
+
+def test_evidence_gate_keeps_verdict_with_successful_tool_call() -> None:
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="true_positive", confidence=0.8, summary="C2 confirmed by zeek conn bytes",
+        citations=["t_query_zeek_logs"],
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=[_ret({"conn": {"orig_bytes": 999}})], targeted_tool_called=None,
+    )
+    assert out.verdict == "true_positive"
+    assert "evidence_gate_downgrade" not in audit
+
+
+def test_evidence_gate_keeps_verdict_with_phase_d_dispatch() -> None:
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="false_positive", confidence=0.7, summary="clean per enrich",
+        citations=["t_enrich_ip"],
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=None, targeted_tool_called="t_enrich_ip",
+    )
+    assert out.verdict == "false_positive"
+
+
+def test_evidence_gate_downgrades_loop_that_made_zero_successful_tool_calls() -> None:
+    """QVOD shape: the loop ran but every tool errored → still ungrounded → NMI."""
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="true_positive", confidence=0.85, summary="TP from prefetch",
+        citations=["alert.payload_printable"],
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=[_ret({"error": True, "message": "tool failed"})],
+        targeted_tool_called=None,
+    )
+    assert out.verdict == "needs_more_info"
+
+
+def test_evidence_gate_exempts_strong_benign_template() -> None:
+    from soc_ai.agent.decision_templates import CandidateVerdict
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="false_positive", confidence=0.85, summary="clean internal traffic", citations=[]
+    )
+    candidate = CandidateVerdict(
+        verdict="false_positive", confidence=0.85, cited_evidence=[],
+        template_id="clean_internal_traffic", rationale="both endpoints internal, no IOC",
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), candidate, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "false_positive"
+    assert "evidence_gate_downgrade" not in audit
+
+
+def test_evidence_gate_does_not_exempt_weak_template() -> None:
+    from soc_ai.agent.decision_templates import CandidateVerdict
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(verdict="false_positive", confidence=0.7, summary="x", citations=[])
+    candidate = CandidateVerdict(
+        verdict="false_positive", confidence=0.6, cited_evidence=[],
+        template_id="informational_external_unknown_asn", rationale="y",
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), candidate, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "needs_more_info"
+
+
+def test_evidence_gate_leaves_needs_more_info_untouched() -> None:
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(verdict="needs_more_info", confidence=0.3, summary="x", citations=[])
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "needs_more_info"
+    assert "evidence_gate_downgrade" not in audit
+
+
+def test_evidence_gate_exempts_deterministic_icmp_downgrade() -> None:
+    """An FP produced by the solicited-ICMP-echo validator is prefetch-GROUNDED
+    (typed Zeek), so the gate must not re-downgrade it to needs_more_info."""
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="false_positive", confidence=0.8,
+        summary="solicited internal ICMP echo", citations=[],
+    )
+    audit: dict[str, Any] = {"icmp_solicited_downgrade": {"original_verdict": "true_positive"}}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), None, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "false_positive"
+    assert "evidence_gate_downgrade" not in audit
+
+
+def test_evidence_gate_exempts_blocklist_ioc_hit() -> None:
+    """A verdict grounded in a concrete blocklist/MISP IOC is real evidence — exempt."""
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="true_positive", confidence=0.85, summary="C2 to a known-bad IP",
+        citations=["alert.rule_name"],
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(blocklist_hit=True), None, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "true_positive"
+    assert "evidence_gate_downgrade" not in audit
+
+
+def test_count_successful_tool_calls_excludes_none_content() -> None:
+    from soc_ai.agent.orchestrator import count_successful_tool_calls
+
+    assert count_successful_tool_calls([_ret(None)]) == 0
+    assert count_successful_tool_calls([_ret(None, {"data": 1})]) == 1
+
+
+def test_evidence_gate_strong_template_must_agree_with_verdict() -> None:
+    """A synth TP that OVERRODE a strong benign (FP) template is NOT grounded by
+    it → still gated."""
+    from soc_ai.agent.decision_templates import CandidateVerdict
+    from soc_ai.agent.orchestrator import _downgrade_unevidenced_verdict
+
+    report = TriageReport(
+        verdict="true_positive", confidence=0.85,
+        summary="escalated despite a clean-internal template", citations=[],
+    )
+    candidate = CandidateVerdict(
+        verdict="false_positive", confidence=0.85, cited_evidence=[],
+        template_id="clean_internal_traffic", rationale="x",
+    )
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, _make_vpn_icmp_enriched(), candidate, audit,
+        targeted_messages=None, targeted_tool_called=None,
+    )
+    assert out.verdict == "needs_more_info"
+
+
+def test_is_strong_grounded_template_logic() -> None:
+    from soc_ai.agent.decision_templates import CandidateVerdict
+    from soc_ai.agent.orchestrator import _is_strong_grounded_template
+
+    strong = CandidateVerdict(
+        verdict="false_positive", confidence=0.85, cited_evidence=[],
+        template_id="clean_internal_traffic", rationale="x",
+    )
+    # non-malware focus alert + strong benign template → exempt
+    assert _is_strong_grounded_template(strong, _make_vpn_icmp_enriched()) is True
+    # a malware/attack-class rule is never fast-settled benign
+    assert _is_strong_grounded_template(strong, _malware_signal_enriched()) is False
+    # None / sub-0.8 confidence → not strong
+    assert _is_strong_grounded_template(None, _make_vpn_icmp_enriched()) is False
+    weak = CandidateVerdict(
+        verdict="false_positive", confidence=0.7, cited_evidence=[],
+        template_id="clean_internal_traffic", rationale="x",
+    )
+    assert _is_strong_grounded_template(weak, _make_vpn_icmp_enriched()) is False
+    # external-reputation template is excluded even at high confidence
+    ext = CandidateVerdict(
+        verdict="false_positive", confidence=0.85, cited_evidence=[],
+        template_id="informational_external_unknown_asn", rationale="x",
+    )
+    assert _is_strong_grounded_template(ext, _make_vpn_icmp_enriched()) is False

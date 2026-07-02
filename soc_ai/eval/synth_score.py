@@ -230,6 +230,28 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
         else:
             tn += 1
 
+    # Scenarios that were attempted this batch but produced no scored row (the
+    # harness run errored or timed out before a verdict) still count as false
+    # negatives for an expected-TP scenario. Without this, recall's denominator
+    # silently shrinks to successful runs only and inflates escalation_recall.
+    # ``scenarios`` is scoped by the caller to the ATTEMPTED set, so this never
+    # penalises a subset --synth-set for scenarios it did not inject.
+    for scenario in scenarios:
+        if scenario.id in per_scenario:
+            continue
+        if scenario.ground_truth.verdict == "true_positive":
+            fn += 1
+            per_tier_fn[scenario.tier] += 1
+            per_scenario[scenario.id] = ScenarioDetail(
+                scenario_id=scenario.id,
+                expected_verdict=scenario.ground_truth.verdict,
+                expected_confidence_min=scenario.ground_truth.confidence_min,
+                actual_verdict="error",
+                actual_confidence=0.0,
+                correct=False,
+                miss_reasons=["run errored or timed out — no result row"],
+            )
+
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     precision_ci = wilson_ci(tp, tp + fp)

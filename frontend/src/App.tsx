@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { AppShell } from './shell/AppShell';
 import { Alerts } from './screens/Alerts';
+import { Backtest } from './screens/Backtest';
 import { Config } from './screens/Config';
 import { Dashboard } from './screens/Dashboard';
 import { HuntDetail } from './screens/HuntDetail';
@@ -22,6 +23,7 @@ export function App() {
         <Route path="/notifications" element={<Notifications />} />
         <Route path="/hunts" element={<Hunts />} />
         <Route path="/hunts/:id" element={<HuntDetail />} />
+        <Route path="/backtest" element={<Backtest />} />
         <Route path="/config" element={<Config />} />
       </Route>
       <Route path="/" element={<Navigate to="/login" replace />} />

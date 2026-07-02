@@ -14,6 +14,7 @@ flows through one code path.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
@@ -28,25 +29,40 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sse_starlette.sse import EventSourceResponse
 
+from soc_ai import __version__
 from soc_ai.api import agent_tools as agent_tools_svc
 from soc_ai.api.approvals import WRITE_TOOLS, apply_approval, execute_write_tool
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
-from soc_ai.api.deps import get_elastic, get_settings_dep
+from soc_ai.api.deps import ctx_from_state, get_elastic, get_settings_dep
+from soc_ai.api.hunt_runner import hunt_recorded_run
+from soc_ai.api.hunt_runner import sse_encode as hunt_sse_encode
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import assignments as assign_svc
 from soc_ai.store import auth as auth_svc
+from soc_ai.store import backtests as bt_svc
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import config_overrides as cfg_svc
+from soc_ai.store import detection_overrides as override_svc
+from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import internal_identifiers as ids_store
 from soc_ai.store import investigations as inv_svc
-from soc_ai.store.models import ApiToken, ConfigOverride, Investigation
+from soc_ai.store.models import ApiToken, Backtest, ConfigOverride, Hunt, HuntEvent, Investigation
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui import autotriage as at
-from soc_ai.webui import chat_manager, hunt_manager, probes, timeline_labels
+from soc_ai.webui import backtest as backtest_svc
+from soc_ai.webui import (
+    chat_manager,
+    hunt_console_manager,
+    hunt_manager,
+    probes,
+    timeline_labels,
+)
 from soc_ai.webui.deps import current_user
 
 _LOGGER = logging.getLogger(__name__)
@@ -82,6 +98,24 @@ def _request_is_https(request: Request) -> bool:
     return forwarded.split(",")[0].strip().lower() == "https"
 
 
+def client_ip(request: Request, settings: Any) -> str:
+    """The caller's IP for per-IP throttling / rate-limiting.
+
+    Normally the socket peer. When the app runs behind a reverse proxy whose IP is
+    listed in ``proxy_trusted_ips``, trust the left-most ``X-Forwarded-For`` entry
+    so per-IP controls attribute to the real client, not the shared proxy IP.
+    ``X-Forwarded-For`` is NEVER trusted from a peer that is not allowlisted — any
+    client could otherwise forge it and evade (or poison) the throttles.
+    """
+    peer = request.client.host if request.client else "?"
+    trusted = getattr(settings, "proxy_trusted_ips", None) or ()
+    if peer in set(trusted):
+        first = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if first:
+            return first
+    return peer
+
+
 @open_router.post("/login")
 async def api_login(body: LoginIn, request: Request) -> JSONResponse:
     """Authenticate and set the session cookie.  No auth gate — this IS the gate.
@@ -90,14 +124,14 @@ async def api_login(body: LoginIn, request: Request) -> JSONResponse:
     attempts after repeated failures to blunt online password brute-forcing.
     """
     settings = request.app.state.settings
-    client_ip = request.client.host if request.client else "?"
+    caller_ip = client_ip(request, settings)
     throttle = auth_svc.login_throttle
     ip_throttle = auth_svc.login_ip_throttle  # per-IP across all usernames (spray)
-    if throttle.is_locked(client_ip, body.username) or ip_throttle.is_locked(client_ip, ""):
+    if throttle.is_locked(caller_ip, body.username) or ip_throttle.is_locked(caller_ip, ""):
         _LOGGER.warning(
             "login locked out for user=%r from ip=%s (too many failed attempts)",
             body.username,
-            client_ip,
+            caller_ip,
         )
         raise HTTPException(
             status_code=429,
@@ -109,19 +143,19 @@ async def api_login(body: LoginIn, request: Request) -> JSONResponse:
     async with request.app.state.db_sessionmaker() as db:
         user = await auth_svc.authenticate(db, body.username, body.password)
         if user is None:
-            locked = throttle.record_failure(client_ip, body.username)
-            ip_throttle.record_failure(client_ip, "")  # count toward the per-IP spray limit
+            locked = throttle.record_failure(caller_ip, body.username)
+            ip_throttle.record_failure(caller_ip, "")  # count toward the per-IP spray limit
             if locked:
                 _LOGGER.warning(
                     "login throttle engaged for user=%r from ip=%s after repeated failures",
                     body.username,
-                    client_ip,
+                    caller_ip,
                 )
             raise HTTPException(
                 status_code=401,
                 detail={"reason": "invalid_credentials", "hint": "Invalid username or password"},
             )
-        throttle.clear(client_ip, body.username)
+        throttle.clear(caller_ip, body.username)
         raw = await auth_svc.create_session(db, user, settings.session_ttl_hours)
     resp = JSONResponse({"ok": True, "username": user.username, "role": user.role})
     resp.set_cookie(
@@ -225,6 +259,10 @@ class AlertGroupOut(BaseModel):
     latestTs: str = ""
     inherited: bool = False
     owner: str | None = None
+    # Representative flow (source → destination) from the group's latest event, so
+    # the collapsed row shows BOTH hosts at a glance instead of hiding them.
+    src: str | None = None
+    dst: str | None = None
     events: list[AlertEventOut] = []
     # The investigation whose verdict this badge shows — the drawer opens it
     # directly (None when the rule has never been investigated).
@@ -237,6 +275,10 @@ class AlertGroupOut(BaseModel):
     # Count of acknowledged / escalated events in this group (from ES aggs).
     ackedCount: int = 0
     escalatedCount: int = 0
+    # True when an operator has muted this rule (detection tuning). Muted groups
+    # are EXCLUDED from the default feed; they appear (flagged) only with
+    # ?include_muted=true.
+    muted: bool = False
 
 
 def _inherited_reason(inv: Investigation) -> str:
@@ -253,10 +295,15 @@ async def list_alerts(
     from_: str | None = Query(None, alias="from"),
     to: str | None = None,
     hide_acked: bool = Query(False),
+    include_muted: bool = Query(False),
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> list[AlertGroupOut]:
-    """Grouped-by-detection rows for the Alerts console (events loaded lazily)."""
+    """Grouped-by-detection rows for the Alerts console (events loaded lazily).
+
+    Rules an operator has muted (detection tuning) are EXCLUDED from the default
+    feed; pass ``include_muted=true`` to show them (each flagged ``muted: true``).
+    """
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             groups, _total = await aq.fetch_groups(
@@ -289,44 +336,54 @@ async def list_alerts(
             },
         ) from exc
 
-    # verdict badge per rule: the rule's most-recent investigation. "inherited"
-    # when that verdict came from a different alert than this group's latest one
-    # (mirrors the HTMX _alerts_context derivation).
-    # badge per rule: (verdict, conf, cross_alert_inherited, inv_id, investigated_pair, is_running)
-    badges: dict[str, tuple[str, float | None, bool, str, str, bool]] = {}
+    # Verdict badge per rule = the rule's STANDING verdict (its latest COMPLETE,
+    # verdict-bearing investigation). A later interrupted run (error/cancelled/
+    # still-running) must NOT erase that verdict — it only drives the separate
+    # "Triaging…" flag. This keeps the group badge consistent with the per-event
+    # labels (which already match on complete investigations). "inherited" = the
+    # verdict came from a different alert than this group's latest event.
+    # badge per rule: (verdict, conf, cross_alert_inherited, inv_id, investigated_pair)
+    badges: dict[str, tuple[str, float | None, bool, str, str]] = {}
     owners: dict[str, str] = {}
-    latest: dict[str, Investigation] = {}
+    verdicts: dict[str, Investigation] = {}
+    running_rules: set[str] = set()
+    muted_rules: set[str] = set()
     if groups:
         rule_names = [g.rule_name for g in groups]
         async with request.app.state.db_sessionmaker() as db:
-            latest = await inv_svc.latest_for_rules(db, rule_names)
+            verdicts = await inv_svc.latest_complete_for_rules(db, rule_names)
+            latest_any = await inv_svc.latest_for_rules(db, rule_names)
             owners = await assign_svc.owners_for_rules(db, rule_names)
+            muted_rules = await override_svc.muted_rule_names(db)
+        # The id of the in-flight run per rule, so a "Triaging…" row links straight
+        # to its live investigation (a running row has no completed verdict, so its
+        # id never lands in `badges`/`verdicts`) — fixes the "only a Hunt link" gap.
+        running_inv_ids = {r: inv.id for r, inv in latest_any.items() if inv.status == "running"}
+        running_rules = set(running_inv_ids)
         latest_ids = {g.rule_name: g.latest_id for g in groups}
-        for rule, inv in latest.items():
-            is_running = inv.status == "running"
-            inherited = inv.status == "complete" and inv.alert_es_id != latest_ids.get(rule)
+        for rule, inv in verdicts.items():
+            inherited = inv.alert_es_id != latest_ids.get(rule)
             pair = f"{inv.src_ip or '?'} → {inv.dest_ip or '?'}"
-            badges[rule] = (
-                _verdict(inv.verdict),
-                inv.confidence,
-                inherited,
-                inv.id,
-                pair,
-                is_running,
-            )
+            badges[rule] = (_verdict(inv.verdict), inv.confidence, inherited, inv.id, pair)
 
-    auto = at.get_status(request.app.state)
     out: list[AlertGroupOut] = []
     for g in groups:
-        verdict, conf, inherited, inv_id, pair, is_running = badges.get(
-            g.rule_name, ("untriaged", None, False, "", "", False)
+        is_muted = g.rule_name in muted_rules
+        # Detection tuning: a muted rule is hidden from the default feed (a soft,
+        # soc-ai-side suppression — SO is untouched). It only surfaces, flagged,
+        # when the caller explicitly asks to include muted rules.
+        if is_muted and not include_muted:
+            continue
+        verdict, conf, inherited, inv_id, pair = badges.get(
+            g.rule_name, ("untriaged", None, False, "", "")
         )
+        is_running = g.rule_name in running_rules
         # A verdict is reached by investigating ONE representative alert and then
         # applied to the whole group — so the other events inherit it. Surface
         # that coverage (the analyst should know it's a sampled verdict), and
         # flag the stronger case where even the representative differs.
         reason: str | None = None
-        _inv = latest.get(g.rule_name)
+        _inv = verdicts.get(g.rule_name)
         if inv_id and inherited and _inv is not None:
             reason = _inherited_reason(_inv)
         elif inv_id and g.count > 1:
@@ -344,24 +401,23 @@ async def list_alerts(
                 latestTs=g.latest_ts or "",
                 inherited=inherited,
                 owner=owners.get(g.rule_name),
+                src=g.src_ip,
+                dst=g.dst_ip,
                 events=[],
-                invId=inv_id or None,
+                # Completed verdict's investigation if there is one, else the
+                # in-flight run's id so a "Triaging…" row opens its live drawer.
+                invId=inv_id or running_inv_ids.get(g.rule_name) or None,
                 inheritedReason=reason,
-                # pending_rules is dual-keyed: the global sweep stores rule names,
-                # but the multi-select path stores alert ES ids (each group's
-                # latest_id — plan_targets_for_ids leaves rule_name blank). Match
-                # on either so EVERY queued group in the batch shows "Triaging…",
-                # not just the one the sequential worker is running right now.
-                triaging=is_running
-                or (
-                    auto.active
-                    and (
-                        g.rule_name in auto.pending_rules
-                        or (g.latest_id is not None and g.latest_id in auto.pending_rules)
-                    )
-                ),
+                # "Triaging…" means this group has a LIVE investigation right now —
+                # keyed off the DB (latest run status == "running"), not the sweep's
+                # queue. The worker is sequential, so exactly the in-flight group
+                # shows it; the pill clears the instant that run finishes, and the
+                # triaging count matches the running-investigations count. Queued
+                # groups stay "untriaged" (their true state) until their turn.
+                triaging=is_running,
                 ackedCount=g.acked_count,
                 escalatedCount=g.escalated_count,
+                muted=is_muted,
             )
         )
     return out
@@ -431,7 +487,12 @@ async def list_group_events(
         pair_map = await inv_svc.latest_for_pairs(
             db, pairs, window_days=settings.webui_inherit_window_days
         )
-        rule_map = await inv_svc.latest_for_rules(db, [rule_name])
+        # Rule-level fallback uses the rule's STANDING verdict (latest complete,
+        # verdict-bearing) — same source as the group badge — so every event in a
+        # triaged group inherits consistently. (Using the most-recent run of ANY
+        # status would skip the fallback whenever a later run errored/was
+        # cancelled, leaving some events mislabelled "untriaged".)
+        rule_map = await inv_svc.latest_complete_for_rules(db, [rule_name])
     rule_inv = rule_map.get(rule_name)
 
     out: list[AlertEventOut] = []
@@ -447,21 +508,18 @@ async def list_group_events(
             ago=_ago(e.timestamp),
         )
         direct_inv = direct.get(e.es_id)
+        pair_inv = (
+            pair_map.get((rule_name, e.src_ip, e.dst_ip)) if e.src_ip and e.dst_ip else None
+        )
         if direct_inv is not None:
             base.investigated = True
             base.invId = direct_inv.id
             base.inheritedReason = None
-        elif e.src_ip and e.dst_ip:
-            pair_inv = pair_map.get((rule_name, e.src_ip, e.dst_ip))
-            if pair_inv is not None:
-                base.investigated = False
-                base.invId = pair_inv.id
-                base.inheritedReason = _inherited_reason(pair_inv)
-            elif rule_inv is not None and rule_inv.status == "complete":
-                base.investigated = False
-                base.invId = rule_inv.id
-                base.inheritedReason = _inherited_reason(rule_inv)
-        elif rule_inv is not None and rule_inv.status == "complete":
+        elif pair_inv is not None:
+            base.investigated = False
+            base.invId = pair_inv.id
+            base.inheritedReason = _inherited_reason(pair_inv)
+        elif rule_inv is not None:  # already complete + verdict-bearing
             base.investigated = False
             base.invId = rule_inv.id
             base.inheritedReason = _inherited_reason(rule_inv)
@@ -793,13 +851,14 @@ async def get_representative(
 
 # ── Investigations ─────────────────────────────────────────────────────────
 
-# Frontend status union: running | complete | awaiting | error | cancelled.
+# Frontend status union: running | complete | awaiting | error | cancelled | interrupted.
 _STATUS = {
     "running": "running",
     "complete": "complete",
     "error": "error",
     "cancelled": "cancelled",
     "awaiting": "awaiting",
+    "interrupted": "interrupted",
 }
 
 
@@ -825,10 +884,19 @@ class InvestigationRowOut(BaseModel):
     verdict: str
     conf: float | None = None
     host: str
+    # Destination IP — paired with ``host`` (the source) so the list shows the
+    # full source → destination flow, not just one end.
+    dst: str | None = None
     status: str
     when: str
     ts: str = ""
     chatCount: int = 0
+    # The alert this run investigated — lets the UI cluster retries of the SAME
+    # alert so errored/cancelled re-runs nest under the one that produced a verdict.
+    alertId: str = ""
+    # The canonical run for its alert: the latest COMPLETE run, else the latest of
+    # any status. The UI surfaces this row and tucks the rest away as "earlier runs".
+    isPrimary: bool = True
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -846,19 +914,37 @@ def _elapsed(inv: Investigation) -> str:
     return f"{s}s" if s < 60 else f"{s // 60}m {s % 60}s"
 
 
-def _row(inv: Investigation, chat_count: int = 0) -> InvestigationRowOut:
+def _row(
+    inv: Investigation, chat_count: int = 0, *, is_primary: bool = True
+) -> InvestigationRowOut:
     return InvestigationRowOut(
         id=inv.id,
-        name=inv.rule_name or "Investigation",
+        name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
         kind="suricata",
         verdict=_verdict(inv.verdict),
         conf=inv.confidence,
         host=inv.src_ip or "—",
+        dst=getattr(inv, "dest_ip", None),
         status=_row_status(inv),
         when=_ago(inv.created_at.isoformat()),
         ts=inv.created_at.isoformat(),
         chatCount=chat_count,
+        alertId=getattr(inv, "alert_es_id", None) or inv.id,
+        isPrimary=is_primary,
     )
+
+
+def _primary_run_ids(rows: list[Investigation]) -> set[str]:
+    """The canonical run id per alert: the most recent COMPLETE run, else the most
+    recent run of any status. ``rows`` are newest-first (``list_recent`` order)."""
+    best_complete: dict[str, str] = {}
+    best_any: dict[str, str] = {}
+    for inv in rows:  # newest-first, so first-seen per key is the most recent
+        key = getattr(inv, "alert_es_id", None) or inv.id
+        best_any.setdefault(key, inv.id)
+        if inv.status == "complete":
+            best_complete.setdefault(key, inv.id)
+    return {best_complete.get(key, run_id) for key, run_id in best_any.items()}
 
 
 @router.get("/investigations", response_model=list[InvestigationRowOut])
@@ -867,12 +953,13 @@ async def list_investigations(
     status: str | None = None,
     limit: int = 100,
 ) -> list[InvestigationRowOut]:
-    if status not in (None, "running", "complete", "error", "cancelled", "awaiting"):
+    if status not in (None, "running", "complete", "error", "cancelled", "awaiting", "interrupted"):
         status = None
     async with request.app.state.db_sessionmaker() as db:
         rows = await inv_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
         chat_counts = await chat_svc.counts_for(db, [inv.id for inv in rows])
-    return [_row(inv, chat_counts.get(inv.id, 0)) for inv in rows]
+    primary = _primary_run_ids(rows)
+    return [_row(inv, chat_counts.get(inv.id, 0), is_primary=inv.id in primary) for inv in rows]
 
 
 # ── Investigation detail ───────────────────────────────────────────────────
@@ -1087,16 +1174,30 @@ def _tool_outcome(result: Any) -> str:
         return "no results" if n == 0 else f"{n} result" if n == 1 else f"{n} results"
     for k in ("summary", "verdict", "status", "note", "hint"):
         if result.get(k):
-            return _compact(result[k], 90)
+            return _compact(result[k], 120)
     return _compact({k: result[k] for k in list(result)[:3]}, 110)
 
 
 def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, str]:
-    """Title carries the point (tool + outcome); detail carries the useful query."""
+    """Title carries the point (tool + a short outcome); detail (shown on expand)
+    carries the FULL headline result first, then the query and any enrichment chips.
+
+    The collapsed title is necessarily clipped, so the expanded row is where the
+    analyst reads the whole answer — never just the arguments (the old behaviour).
+    """
     noun = _TOOL_NOUN.get(tool_name, _humanize_id(tool_name).capitalize())
-    outcome = _tool_outcome(result)
-    title = f"{noun}: {outcome}"
-    detail = f"query: {_compact(args, 200)}" if args else "no arguments"
+    title = f"{noun}: {_tool_outcome(result)}"
+
+    lines: list[str] = []
+    headline_key: str | None = None
+    if isinstance(result, dict):
+        # The full answer first — generously capped (the title was the clipped one).
+        for k in ("summary", "verdict", "status", "note", "hint"):
+            if result.get(k):
+                headline_key = k
+                lines.append(f"result: {_compact(result[k], 600)}")
+                break
+    lines.append(f"query: {_compact(args, 200)}" if args else "no arguments")
     if isinstance(result, dict):
         extra = []
         geo = result.get("geoip") if isinstance(result.get("geoip"), dict) else None
@@ -1107,11 +1208,12 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
             extra.append(str(asn["asn_org"]))
         if result.get("cloud_provider"):
             extra.append(str(result["cloud_provider"]))
-        if result.get("hint"):
+        # Don't repeat the hint if it was already the headline line.
+        if headline_key != "hint" and result.get("hint"):
             extra.append(_compact(result["hint"], 120))
         if extra:
-            detail += "\n" + " · ".join(extra)
-    return title, detail
+            lines.append(" · ".join(extra))
+    return title, "\n".join(lines)
 
 
 def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
@@ -1164,6 +1266,11 @@ class RecommendedActionOut(BaseModel):
     rationale: str
     token: str | None = None
     pending: bool = False
+    # True when this action was already carried out by the system (e.g. auto-ack
+    # fired on a high-confidence FP). The UI renders it as done, NOT actionable —
+    # the analyst must not be offered an "Acknowledge" button for an already-acked
+    # alert. Durable: derived from the persisted event stream, not client state.
+    applied: bool = False
 
 
 class TimelineStepOut(BaseModel):
@@ -1242,21 +1349,32 @@ class InvestigationOut(BaseModel):
 def _build_actions(
     events: list[Any], report: dict[str, Any], pending_tokens: set[Any]
 ) -> list[RecommendedActionOut]:
-    """Recommended actions: prefer live approval tokens, else report recommendations."""
+    """Recommended actions: prefer live approval tokens, else report recommendations.
+
+    An ack action already carried out by auto-ack is flagged ``applied`` so the UI
+    never offers an "Acknowledge" button for an alert the system already acked.
+    """
+    # Auto-ack fired successfully? Then any ack action is already done.
+    auto_acked = any(
+        e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events
+    )
     approval_events = [e for e in events if e.kind in ("approval_request", "approval_required")]
     out: list[RecommendedActionOut] = []
     if approval_events:
         for i, ev in enumerate(approval_events):
             tok = ev.payload.get("token")
             tn = ev.payload.get("tool_name", "")
+            applied = auto_acked and tn == "ack_alert"
             out.append(
                 RecommendedActionOut(
                     id=tok or f"a{i}",
                     title=_ACTION_TITLE.get(tn, tn or "Action"),
                     tag=_ACTION_TAG.get(tn, "comment"),
                     rationale=ev.payload.get("rationale", ""),
-                    token=tok,
-                    pending=tok in pending_tokens if tok else False,
+                    # An already-applied action exposes no live token to act on.
+                    token=None if applied else tok,
+                    pending=False if applied else (tok in pending_tokens if tok else False),
+                    applied=applied,
                 )
             )
         return out
@@ -1268,6 +1386,7 @@ def _build_actions(
                 title=_ACTION_TITLE.get(tn, tn or "Action"),
                 tag=_ACTION_TAG.get(tn, "comment"),
                 rationale=a.get("rationale", ""),
+                applied=auto_acked and tn == "ack_alert",
             )
         )
     return out
@@ -1407,7 +1526,7 @@ async def get_investigation(
     return InvestigationOut(
         id=inv.id,
         groupId=inv.alert_es_id or inv.id,
-        name=inv.rule_name or "Investigation",
+        name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
         kind="suricata",
         host=alert_obj.get("host_name") or inv.src_ip or "—",
         ip=inv.dest_ip or inv.src_ip or "—",
@@ -1426,6 +1545,9 @@ async def get_investigation(
             # Operator-cancelled runs: a distinct terminal state, not a crash.
             else "cancelled"
             if inv.status == "cancelled"
+            # Restart-interrupted runs: benign, re-huntable, not a failure.
+            else "interrupted"
+            if inv.status == "interrupted"
             else "complete"
         ),
         elapsedLabel=_elapsed(inv),
@@ -1454,6 +1576,9 @@ _SETTING_TYPE = {"bool": "toggle", "int": "number", "float": "number", "str": "t
 
 class SettingOut(BaseModel):
     key: str
+    # Human label (what the console shows as the field title); the raw key is kept
+    # as a secondary mono hint. Without this the UI fell back to the snake_case key.
+    label: str
     help: str
     source: str
     apply: str
@@ -1547,6 +1672,7 @@ async def get_config(
         items = [
             SettingOut(
                 key=spec.key,
+                label=spec.label,
                 help=spec.help,
                 source="db" if spec.key in overrides else "env",
                 apply="hot-apply" if spec.hot else "restart",
@@ -1645,9 +1771,11 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
     return out[:12]
 
 
-# ── Hunts ──────────────────────────────────────────────────────────────────
-# No saved-hunt backend yet — that arrives with the hunting agent (planned). The
-# list is honestly empty; the stat cards reflect real investigation counts.
+# ── Hunts (Hunt Console) ─────────────────────────────────────────────────────
+# A Hunt is broader than an Investigation: it correlates across hosts/time or a
+# free-form objective and lands findings + a narrative (HuntReport), rather than
+# a single-alert verdict. Read-only in this phase. The chat-driven hunt runs on
+# the hunt agent (soc_ai.agent.hunt) via the HuntConsoleManager background task.
 
 
 class HuntStatOut(BaseModel):
@@ -1657,23 +1785,293 @@ class HuntStatOut(BaseModel):
     tone: str
 
 
-@router.get("/hunts", response_model=list[dict[str, Any]])
-async def list_hunts() -> list[dict[str, Any]]:
-    return []
+class HuntRowOut(BaseModel):
+    id: str
+    objective: str
+    kind: str
+    status: str
+    findingCount: int = 0
+    affectedHosts: int = 0
+    confidence: float | None = None
+    startedBy: str = ""
+    when: str = ""
+    ts: str = ""
+
+
+# Hunt-timeline grouping. The hunt agent emits the same generic tool_call /
+# tool_result / model_response kinds as the investigator, so the shared
+# _tool_step / _compact formatters apply; only the group buckets differ.
+_HUNT_TL_GROUP = {
+    "hunt_started": "Objective",
+    "tool_call": "Tool calls",
+    "hunt_report": "Findings",
+    "error": "Findings",
+}
+_HUNT_TL_SKIP = {"tool_result", "model_response", "done"}
+
+
+class HuntFindingOut(BaseModel):
+    title: str
+    detail: str
+    severity: str = "info"
+    hosts: list[str] = []
+    citations: list[str] = []
+
+
+class HuntActionOut(BaseModel):
+    title: str
+    rationale: str
+
+
+class HuntOut(BaseModel):
+    id: str
+    objective: str
+    kind: str
+    status: str
+    narrative: str
+    findings: list[HuntFindingOut] = []
+    affectedHosts: list[str] = []
+    mitreTechniques: list[str] = []
+    recommendedActions: list[HuntActionOut] = []
+    confidence: float = 0.0
+    startedBy: str = ""
+    elapsedLabel: str = ""
+    elapsedSec: int = 0
+    ts: str = ""
+    timeline: list[TimelineStepOut] = []
+
+
+_HUNT_STATUS = {
+    "running": "running",
+    "complete": "complete",
+    "error": "error",
+    "cancelled": "cancelled",
+    "interrupted": "interrupted",
+}
+
+
+def _hunt_elapsed_sec(hunt: Hunt) -> int:
+    created = hunt.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    end = hunt.finished_at or datetime.now(UTC)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    return max(0, int((end - created).total_seconds()))
+
+
+def _hunt_report(hunt: Hunt) -> dict[str, Any]:
+    return hunt.report if isinstance(hunt.report, dict) else {}
+
+
+def _hunt_row(hunt: Hunt) -> HuntRowOut:
+    report = _hunt_report(hunt)
+    findings = report.get("findings") or []
+    return HuntRowOut(
+        id=hunt.id,
+        objective=hunt.objective,
+        kind=hunt.kind,
+        status=_HUNT_STATUS.get(hunt.status, "error"),
+        findingCount=len(findings) if isinstance(findings, list) else 0,
+        affectedHosts=len(report.get("affected_hosts") or []),
+        confidence=report.get("confidence"),
+        startedBy=hunt.started_by or "—",
+        when=_ago(hunt.created_at.isoformat()),
+        ts=hunt.created_at.isoformat(),
+    )
+
+
+def _build_hunt_timeline(events: list[HuntEvent]) -> list[TimelineStepOut]:
+    """Reuse the shared tool-step formatter; bucket by the hunt group map."""
+    result_by_call = {
+        (e.payload or {}).get("tool_call_id"): (e.payload or {}).get("result")
+        for e in events
+        if e.kind == "tool_result"
+    }
+    timeline: list[TimelineStepOut] = []
+    for e in events:
+        if e.kind in _HUNT_TL_SKIP:
+            continue
+        p = e.payload or {}
+        if e.kind == "tool_call":
+            tn = str(p.get("tool_name", ""))
+            result = result_by_call.get(p.get("tool_call_id"))
+            title, detail = _tool_step(tn, p.get("args") or {}, result)
+        elif e.kind == "hunt_started":
+            title = "Objective"
+            detail = _compact(p.get("objective") or "", 400)
+        elif e.kind == "hunt_report":
+            findings = p.get("findings") or []
+            n = len(findings) if isinstance(findings, list) else 0
+            title = f"Hunt report: {n} finding" + ("" if n == 1 else "s")
+            detail = _compact(p.get("narrative") or "", 400)
+        elif e.kind == "error":
+            title = "Hunt failed"
+            detail = _compact(p.get("message") or p.get("error") or "", 240)
+        else:
+            title = timeline_labels.title_for(e.kind, p)
+            detail = _compact(p, 220)
+        timeline.append(
+            TimelineStepOut(
+                id=f"h{e.sequence}",
+                group=_HUNT_TL_GROUP.get(e.kind, "Tool calls"),
+                title=title,
+                detail=detail,
+            )
+        )
+    return timeline
+
+
+@router.get("/hunts", response_model=list[HuntRowOut])
+async def list_hunts(
+    request: Request, status: str | None = None, limit: int = 100
+) -> list[HuntRowOut]:
+    if status not in (None, "running", "complete", "error", "cancelled", "interrupted"):
+        status = None
+    async with request.app.state.db_sessionmaker() as db:
+        rows = await hunt_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
+    return [_hunt_row(h) for h in rows]
 
 
 @router.get("/hunts/stats", response_model=list[HuntStatOut])
 async def hunt_stats(request: Request) -> list[HuntStatOut]:
     async with request.app.state.db_sessionmaker() as db:
-        recent = await inv_svc.list_recent(db, status=None, limit=500)
+        recent = await hunt_svc.list_recent(db, status=None, limit=500)
     total = len(recent)
-    tp = sum(1 for i in recent if i.verdict == "true_positive")
-    running = sum(1 for i in recent if i.status == "running")
+    running = sum(1 for h in recent if h.status == "running")
+    findings = sum(
+        len(_hunt_report(h).get("findings") or []) for h in recent if h.status == "complete"
+    )
     return [
-        HuntStatOut(label="Investigations", value=str(total), sub="recent", tone="accent"),
-        HuntStatOut(label="True positives", value=str(tp), sub="confirmed", tone="danger"),
-        HuntStatOut(label="In progress", value=str(running), sub="running now", tone="warn"),
+        HuntStatOut(label="Hunts", value=str(total), sub="recent", tone="accent"),
+        HuntStatOut(label="Findings", value=str(findings), sub="surfaced", tone="warn"),
+        HuntStatOut(label="In progress", value=str(running), sub="running now", tone="sigma"),
     ]
+
+
+@router.get("/hunts/{hunt_id}", response_model=HuntOut)
+async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
+    async with request.app.state.db_sessionmaker() as db:
+        got = await hunt_svc.get_with_events(db, hunt_id)
+    if got is None:
+        raise HTTPException(status_code=404, detail={"reason": "not_found"})
+    hunt, events = got
+    report = _hunt_report(hunt)
+    findings = report.get("findings") or []
+    actions = report.get("recommended_actions") or []
+    elapsed = _hunt_elapsed_sec(hunt)  # compute once, not four times inline below
+    return HuntOut(
+        id=hunt.id,
+        objective=hunt.objective,
+        kind=hunt.kind,
+        status=_HUNT_STATUS.get(hunt.status, "error"),
+        narrative=hunt.narrative or report.get("narrative") or "",
+        findings=[
+            HuntFindingOut(
+                title=str(f.get("title") or ""),
+                detail=str(f.get("detail") or ""),
+                severity=str(f.get("severity") or "info"),
+                hosts=[str(h) for h in (f.get("hosts") or [])],
+                citations=[str(c) for c in (f.get("citations") or [])],
+            )
+            for f in findings
+            if isinstance(f, dict)
+        ],
+        affectedHosts=[str(h) for h in (report.get("affected_hosts") or [])],
+        mitreTechniques=[str(m) for m in (report.get("mitre_techniques") or [])],
+        recommendedActions=[
+            HuntActionOut(
+                title=str(a.get("title") or ""), rationale=str(a.get("rationale") or "")
+            )
+            for a in actions
+            if isinstance(a, dict)
+        ],
+        confidence=float(report.get("confidence") or 0.0),
+        startedBy=hunt.started_by or "—",
+        elapsedLabel=(f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m {elapsed % 60}s"),
+        elapsedSec=elapsed,
+        ts=hunt.created_at.isoformat(),
+        timeline=_build_hunt_timeline(events),
+    )
+
+
+class HuntChatIn(BaseModel):
+    # Non-blank objective — an empty hunt objective is a no-op that would burn a
+    # model call for nothing.
+    objective: str = Field(min_length=1, max_length=2000)
+    # Optional prior hunt id for a follow-up turn: its narrative seeds the new
+    # hunt so the agent can pivot within the thread.
+    prior_hunt_id: str | None = None
+
+
+@router.post("/hunts/chat")
+async def start_hunt_chat(request: Request, body: HuntChatIn) -> dict[str, str]:
+    """Start a background chat-driven hunt; returns its id immediately.
+
+    The Hunt Console UI opens the new hunt's detail and polls it live (mirrors
+    the investigation-hunt POST /hunt flow). A dedicated SSE endpoint isn't used
+    by the SPA because a POST can't drive an EventSource; the background drainer
+    persists every event and the detail view polls the timeline.
+    """
+    started_by = await identify_caller(request)
+    prior: str | None = None
+    if body.prior_hunt_id:
+        async with request.app.state.db_sessionmaker() as db:
+            got = await hunt_svc.get_with_events(db, body.prior_hunt_id)
+        if got is not None:
+            prior_hunt, _ = got
+            prior = prior_hunt.narrative or _hunt_report(prior_hunt).get("narrative")
+    hunt_id = await hunt_console_manager.get_manager(request.app.state).start(
+        request.app.state, objective=body.objective, started_by=started_by, prior=prior
+    )
+    if hunt_id is None:
+        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
+    return {"hunt_id": hunt_id}
+
+
+@router.post("/hunts/chat/stream")
+async def stream_hunt_chat(request: Request, body: HuntChatIn) -> EventSourceResponse:
+    """Stream a chat-driven hunt as Server-Sent Events (mirror of /investigate).
+
+    Each SSE message is ``event: {kind}`` / ``data: {json}``. The stream is teed
+    into the hunts store so the run is persisted regardless of caller; the leading
+    ``hunt_created`` event carries the new row's id. The SPA uses the poll-based
+    ``POST /hunts/chat`` above (a POST can't drive an ``EventSource``); this route
+    is the streaming interface for API/CLI callers that read the trace live.
+    """
+    started_by = await identify_caller(request)
+    ctx = ctx_from_state(request.app.state)
+    prior: str | None = None
+    if body.prior_hunt_id:
+        async with request.app.state.db_sessionmaker() as db:
+            got = await hunt_svc.get_with_events(db, body.prior_hunt_id)
+        if got is not None:
+            prior_hunt, _ = got
+            prior = prior_hunt.narrative or _hunt_report(prior_hunt).get("narrative")
+
+    async def stream() -> Any:
+        async for name, data in hunt_recorded_run(
+            request.app.state,
+            ctx=ctx,
+            objective=body.objective,
+            started_by=started_by,
+            prior=prior,
+        ):
+            yield hunt_sse_encode(name, data)
+
+    return EventSourceResponse(stream())
+
+
+@router.post("/hunts/{hunt_id}/cancel")
+async def cancel_hunt_chat(hunt_id: str, request: Request) -> dict[str, bool]:
+    """Cancel an in-flight hunt (marks it ``cancelled``); 404 if none is live."""
+    cancelled = hunt_console_manager.get_manager(request.app.state).cancel(hunt_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "no_live_hunt", "hint": "no in-flight hunt to cancel"},
+        )
+    return {"cancelled": True}
 
 
 # ── Mutations ──────────────────────────────────────────────────────────────
@@ -1687,21 +2085,36 @@ class HuntStartIn(BaseModel):
     alert_id: str = Field(min_length=1)
 
 
-async def _alert_doc_exists(elastic: ElasticClient, settings: Settings, alert_id: str) -> bool:
-    """True iff ``alert_id`` resolves to a real ES document.
+async def resolve_alert_for_hunt(
+    elastic: ElasticClient, settings: Settings, alert_id: str
+) -> tuple[bool, str | None]:
+    """Resolve ``alert_id`` to ``(exists, rule_name)`` in one ES lookup.
 
     Mirrors the ``ids`` lookup ``get_alert_context`` does before fanning out
     pivots. Used to guard ``/hunt`` so a bad id (e.g. an AlertGroup whose
     ``latest_id`` was empty and fell back to the rule NAME, see alerts_query.py
     ``_group_from_bucket`` + the ``id=g.latest_id or g.rule_name`` mapping)
     fails VISIBLY with a 4xx instead of recording a synthetic 0.0 investigation.
+
+    Returns the doc's ``rule.name`` (falling back to ``event.dataset`` /
+    ``event.category`` for non-Suricata detections) so the caller can seed the
+    investigation's display name at creation — the row is then never anonymous,
+    even if the run dies before its first alert_context event.
     """
     lookup = await elastic.search(
         settings.events_index_pattern,
         {"ids": {"values": [alert_id]}},
         size=1,
     )
-    return bool(lookup.hits)
+    if not lookup.hits:
+        return False, None
+    source = lookup.hits[0].get("_source", {})
+    name = (
+        get_dotted(source, "rule.name")
+        or get_dotted(source, "event.dataset")
+        or get_dotted(source, "event.category")
+    )
+    return True, str(name) if name else None
 
 
 @router.post("/hunt")
@@ -1720,7 +2133,8 @@ async def start_hunt(
     investigation. We resolve up front and 404 instead.
     """
     started_by = await identify_caller(request)
-    if not await _alert_doc_exists(elastic, settings, body.alert_id):
+    exists, rule_name = await resolve_alert_for_hunt(elastic, settings, body.alert_id)
+    if not exists:
         raise HTTPException(
             status_code=404,
             detail={
@@ -1745,7 +2159,7 @@ async def start_hunt(
             },
         )
     inv_id = await hunt_manager.get_manager(request.app.state).start(
-        request.app.state, alert_id=body.alert_id, started_by=started_by
+        request.app.state, alert_id=body.alert_id, started_by=started_by, rule_name=rule_name
     )
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
@@ -1802,7 +2216,9 @@ _REHUNT_CAP = 50
 
 
 class RehuntIn(BaseModel):
-    inv_ids: list[str]
+    # Cap at the input boundary so an oversized payload is rejected before the
+    # dedup loop deserializes/iterates it.
+    inv_ids: list[str] = Field(max_length=_REHUNT_CAP)
 
 
 class RehuntResultOut(BaseModel):
@@ -1811,7 +2227,12 @@ class RehuntResultOut(BaseModel):
 
 
 @router.post("/investigations/rehunt", response_model=RehuntResultOut)
-async def bulk_rehunt(request: Request, body: RehuntIn) -> RehuntResultOut:
+async def bulk_rehunt(
+    request: Request,
+    body: RehuntIn,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> RehuntResultOut:
     """Re-launch a fresh investigation for each of the supplied investigation ids.
 
     Deduplicates the input list and caps at ``_REHUNT_CAP`` entries.  Entries
@@ -1848,8 +2269,17 @@ async def bulk_rehunt(request: Request, body: RehuntIn) -> RehuntResultOut:
             skipped.append({"invId": inv_id, "reason": "no_alert"})
             continue
 
+        # Prefer the stored name; if this row was itself created nameless (a pre-fix
+        # row, or a selected-id run that died early), re-resolve from ES so the new
+        # row is named rather than inheriting the NULL.
+        rehunt_name = inv.rule_name
+        if not rehunt_name:
+            _, rehunt_name = await resolve_alert_for_hunt(elastic, settings, inv.alert_es_id)
         new_inv_id = await hunt_manager.get_manager(request.app.state).start(
-            request.app.state, alert_id=inv.alert_es_id, started_by=started_by
+            request.app.state,
+            alert_id=inv.alert_es_id,
+            started_by=started_by,
+            rule_name=rehunt_name,
         )
         if new_inv_id is None:
             skipped.append({"invId": inv_id, "reason": "could_not_start"})
@@ -1899,7 +2329,10 @@ async def get_chat(request: Request, inv_id: str) -> ChatThreadOut:
 
 
 class ChatIn(BaseModel):
-    message: str
+    # Bound the analyst's follow-up turn: the value is stored in SQLite and
+    # forwarded verbatim to the LLM, so an unbounded body burns tokens / can blow
+    # the context window. Mirrors HuntChatIn.objective's cap.
+    message: str = Field(min_length=1, max_length=4000)
 
 
 @router.post("/investigations/{inv_id}/chat", response_model=ChatThreadOut)
@@ -2906,6 +3339,127 @@ async def stop_auto_triage(request: Request) -> AutoTriageStatusOut:
     return _at_status(at.get_status(state))
 
 
+# ── Backtest ("prove it on my last N days") ────────────────────────────────────
+#
+# Replays the agent over a diverse sample of ALREADY-DISPOSITIONED alerts and
+# reports how soc-ai's verdicts compare to the analyst's real Security Onion
+# disposition. Single-flight background job (BacktestStatus on app.state), the
+# same shape as auto-triage. Each sample is a FULL LLM investigation — expensive
+# — so the endpoint clamps sample_size to ``settings.backtest_max_sample``.
+
+
+class BacktestStatusOut(BaseModel):
+    active: bool
+    backtest_id: str | None = None
+    total: int
+    replayed: int
+    failed: int
+    finished_at: str | None = None
+    current: str | None = None
+    note: str | None = None
+    # The finished run's params + scored results (present once complete).
+    params: dict[str, Any] | None = None
+    results: dict[str, Any] | None = None
+    status: str | None = None
+    sampled: int | None = None
+
+
+class BacktestIn(BaseModel):
+    window_days: int = Field(default=30, ge=1, le=365)
+    sample_size: int = Field(default=backtest_svc.DEFAULT_SAMPLE_SIZE, ge=1)
+    min_severity: str | None = None
+
+
+def _bt_status_out(status: Any) -> BacktestStatusOut:
+    """Serialize the in-memory BacktestStatus (live progress, no stored results)."""
+    return BacktestStatusOut(
+        active=status.active,
+        backtest_id=status.backtest_id,
+        total=status.total,
+        replayed=status.replayed,
+        failed=status.failed,
+        finished_at=status.finished_at,
+        current=status.current,
+        note=status.note,
+    )
+
+
+def _bt_row_out(bt: Backtest, *, live: Any = None) -> BacktestStatusOut:
+    """Serialize a persisted Backtest row, overlaying live progress when it's the
+    active run (so a poll of GET /backtest shows both stored results AND the
+    in-flight replayed/failed counters)."""
+    active = bool(live and live.active and live.backtest_id == bt.id)
+    return BacktestStatusOut(
+        active=active,
+        backtest_id=bt.id,
+        total=(live.total if active else bt.sampled),
+        replayed=(live.replayed if active else bt.sampled),
+        failed=(live.failed if active else 0),
+        finished_at=(bt.finished_at.isoformat() if bt.finished_at else None),
+        current=(live.current if active else None),
+        note=(live.note if active else None),
+        params=bt.params,
+        results=bt.results,
+        status=bt.status,
+        sampled=bt.sampled,
+    )
+
+
+@router.post(
+    "/backtest",
+    response_model=BacktestStatusOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def start_backtest(request: Request, body: BacktestIn) -> BacktestStatusOut:
+    """Plan + launch a background backtest (single-flight). Poll GET /backtest.
+
+    Samples already-dispositioned alerts from the last ``window_days`` (analyst
+    escalated ⇒ expected true-positive; acknowledged-not-escalated ⇒ expected
+    false-positive), replays each through the agent, and scores soc-ai's verdicts
+    against the human disposition. ``sample_size`` is clamped to
+    ``settings.backtest_max_sample`` — each sample is a full LLM investigation.
+    Admin-gated (expensive + operator-facing).
+    """
+    state = request.app.state
+    started_by = f"backtest:{await identify_caller(request)}"
+    min_sev = (body.min_severity or "").strip().lower() or None
+    if min_sev is not None and min_sev not in aq.SEVERITIES:
+        min_sev = None
+    status = await backtest_svc.start_backtest(
+        state,
+        window_days=body.window_days,
+        sample_size=body.sample_size,
+        min_severity=min_sev,
+        started_by=started_by,
+    )
+    return _bt_status_out(status)
+
+
+@router.get("/backtest", response_model=BacktestStatusOut)
+async def backtest_status(request: Request) -> BacktestStatusOut:
+    """The current/last backtest: live progress if running, else the stored results."""
+    state = request.app.state
+    live = backtest_svc.get_status(state)
+    async with state.db_sessionmaker() as db:
+        bt = await bt_svc.latest(db)
+    if bt is None:
+        # Never run — return the idle in-memory status.
+        return _bt_status_out(live)
+    return _bt_row_out(bt, live=live)
+
+
+@router.get("/backtest/{backtest_id}", response_model=BacktestStatusOut)
+async def backtest_by_id(request: Request, backtest_id: str) -> BacktestStatusOut:
+    """A specific backtest run by id."""
+    state = request.app.state
+    live = backtest_svc.get_status(state)
+    async with state.db_sessionmaker() as db:
+        bt = await bt_svc.get(db, backtest_id)
+    if bt is None:
+        raise HTTPException(status_code=404, detail={"reason": "backtest_not_found"})
+    return _bt_row_out(bt, live=live)
+
+
 # ── Internal-identifier discovery: scan-now (single-flight) ────────────────────
 #
 # Learns internal domain suffixes + bare hostnames from ES and upserts them as
@@ -3204,6 +3758,251 @@ async def delete_internal_identifier(request: Request, ident_id: int) -> dict[st
                 },
             )
     return {"ok": True}
+
+
+# ── Detection tuning (noisy-rule nomination + soft mutes) ──────────────────────
+
+
+class DetectionNominationOut(BaseModel):
+    """One nominated noisy rule from the detection-tuning analysis."""
+
+    rule_name: str
+    alert_count: int
+    investigations: int
+    fp: int
+    tp: int
+    nmi: int
+    recommendation: str  # 'mute' | 'monitor' | 'none'
+    reason: str
+    already_muted: bool
+
+
+class DetectionOverrideOut(BaseModel):
+    """One active operator override (a soft mute)."""
+
+    id: int
+    rule_name: str
+    action: str  # 'mute'
+    reason: str | None = None
+    created_by: str
+    created_at: str
+    active: bool
+
+
+class DetectionTuningOut(BaseModel):
+    nominations: list[DetectionNominationOut]
+    overrides: list[DetectionOverrideOut]
+
+
+class DetectionOverrideIn(BaseModel):
+    # Detection-rule / signature name. The value is whatever rule.name carries —
+    # bounded length, no pattern restriction (rule names contain spaces/punct).
+    rule_name: str = Field(min_length=1, max_length=512)
+    action: str = "mute"
+    reason: str | None = Field(default=None, max_length=512)
+
+
+def _override_out(row: Any) -> DetectionOverrideOut:
+    return DetectionOverrideOut(
+        id=row.id,
+        rule_name=row.rule_name,
+        action=row.action,
+        reason=row.reason,
+        created_by=row.created_by,
+        created_at=row.created_at.isoformat() if row.created_at else "",
+        active=row.active,
+    )
+
+
+@router.get(
+    "/detection-tuning",
+    response_model=DetectionTuningOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_detection_tuning(request: Request) -> DetectionTuningOut:
+    """Nominated noisy rules + the active soft-mute overrides (detection tuning).
+
+    Nominations join the live alert volume with each rule's completed-investigation
+    verdict trend (see :mod:`soc_ai.webui.detection_tuning`); the overrides are the
+    operator's active soft mutes. A mute hides a rule from the default alerts feed
+    — it never touches Security Onion.
+    """
+    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
+
+    nominations = await dt.nominate(request.app.state)
+    async with request.app.state.db_sessionmaker() as db:
+        overrides = await override_svc.list_active(db)
+    return DetectionTuningOut(
+        nominations=[DetectionNominationOut(**n) for n in nominations],
+        overrides=[_override_out(o) for o in overrides],
+    )
+
+
+@router.post(
+    "/detection-tuning/override",
+    response_model=DetectionOverrideOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def create_detection_override(
+    request: Request, body: DetectionOverrideIn
+) -> DetectionOverrideOut:
+    """Mute a noisy rule — create a soft, reversible suppression. SO is untouched."""
+    if body.action != "mute":
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "invalid_action", "hint": "only 'mute' is supported"},
+        )
+    created_by = await identify_caller(request)
+    async with request.app.state.db_sessionmaker() as db:
+        row = await override_svc.create(
+            db,
+            rule_name=body.rule_name,
+            action=body.action,
+            reason=body.reason,
+            created_by=created_by,
+        )
+    return _override_out(row)
+
+
+@router.post(
+    "/detection-tuning/override/{override_id}/remove",
+    dependencies=[Depends(require_admin_api)],
+)
+async def remove_detection_override(request: Request, override_id: int) -> dict[str, bool]:
+    """Un-mute: deactivate an override (kept for audit). 404 if not active."""
+    async with request.app.state.db_sessionmaker() as db:
+        ok = await override_svc.deactivate(db, override_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "not_found", "hint": "no active override with that id"},
+        )
+    return {"removed": True}
+
+
+# ── Oracle pre-egress redaction preview ────────────────────────────────────────
+
+
+class RedactionPreviewOut(BaseModel):
+    original: dict[str, Any]
+    sanitized: dict[str, Any]
+    summary: dict[str, int]
+    note: str
+
+
+@router.get(
+    "/oracle/redaction-preview",
+    response_model=RedactionPreviewOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def oracle_redaction_preview(
+    settings: Settings = Depends(get_settings_dep),
+) -> RedactionPreviewOut:
+    """Show EXACTLY what leaves the network before an Oracle call.
+
+    Runs THIS deployment's own internal identifiers (derived from
+    ``oracle_internal_suffixes``) through the real pre-egress sanitizer and returns
+    the before → after, plus a per-category count. Lets an operator inspect and
+    trust the redaction before enabling the Oracle — and confirm that public
+    addresses pass through while every internal identifier is pseudonymized.
+    """
+    from soc_ai.oracle.sanitize import Mapping, redaction_summary, sanitize  # noqa: PLC0415
+
+    suffix = (settings.oracle_internal_suffixes or (".local",))[0]
+    # A representative sample: internal host/IP/MAC/user/email (all must redact) +
+    # one PUBLIC destination (must pass through so the Oracle sees real infra).
+    sample: dict[str, Any] = {
+        "host": {"name": f"dc01{suffix}", "ip": "10.0.0.15"},
+        "source": {"ip": "192.168.1.42", "mac": "00:1a:2b:3c:4d:5e"},
+        "user": {"name": "jsmith", "email": f"jsmith@corp{suffix}"},
+        "destination": {"ip": "8.8.8.8"},  # external — preserved
+        "note": f"beacon from dc01{suffix} (10.0.0.15) to 8.8.8.8 every 60s",
+    }
+    mapping = Mapping()
+    sanitized = sanitize(sample, mapping, extra_suffixes=settings.oracle_internal_suffixes)
+    return RedactionPreviewOut(
+        original=sample,
+        sanitized=sanitized,
+        summary=redaction_summary(mapping),
+        note=(
+            "Internal identifiers are replaced with stable opaque labels (IP_01, "
+            "HOST_01, …) before any Oracle call — the same real value always maps to "
+            "the same label so the model's reasoning stays coherent. Public/external "
+            "addresses pass through so the Oracle can reason about real infrastructure. "
+            "Nothing is sent at all unless you enable the Oracle."
+        ),
+    )
+
+
+# ── Audit-grade decision record ("show your work") export ──────────────────────
+
+
+def _decision_record(inv: Investigation, events: list[Any]) -> dict[str, Any]:
+    """A self-contained record of how a verdict was reached.
+
+    Bundles the verdict + rationale + the full agent trace (every tool call, every
+    cited event) + provenance, plus a sha256 checksum over the canonical JSON so a
+    recipient can detect accidental corruption/truncation in transit or storage.
+    This is an INTEGRITY CHECKSUM, not a cryptographic signature — it does not
+    prevent deliberate alteration (an editor can recompute a matching hash). The
+    "show your work" artifact for audit, compliance, and hand-off.
+    """
+    body: dict[str, Any] = {
+        "schema": "soc-ai.decision-record/v1",
+        "soc_ai_version": __version__,
+        "investigation_id": inv.id,
+        "alert_es_id": inv.alert_es_id,
+        "rule_name": inv.rule_name,
+        "verdict": inv.verdict,
+        "confidence": inv.confidence,
+        "rationale": inv.rationale,
+        "summary": inv.summary,
+        "flow": {"src": inv.src_ip, "dst": inv.dest_ip},
+        "status": inv.status,
+        "provenance": {
+            "started_by": inv.started_by,
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+            "finished_at": inv.finished_at.isoformat() if inv.finished_at else None,
+        },
+        # The full triage report: citations, recommended_actions, model metadata,
+        # any validator notes and resolution/override provenance.
+        "report": inv.report,
+        # The agent trace, in order — the actual evidence the verdict rests on.
+        "trace": [
+            {"sequence": e.sequence, "kind": e.kind, "payload": e.payload} for e in events
+        ],
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    body["integrity"] = {
+        "algo": "sha256",
+        "hash": digest,
+        "note": (
+            "sha256 checksum over the canonical JSON of this record with the "
+            "'integrity' field removed, for detecting accidental corruption in "
+            "transit/storage. This is a self-consistency checksum, not a signature."
+        ),
+    }
+    return body
+
+
+@router.get("/investigations/{inv_id}/export")
+async def export_investigation(inv_id: str, request: Request) -> JSONResponse:
+    """Download the audit-grade decision record for one investigation.
+
+    JSON with a sha256 integrity checksum (detects accidental corruption; not a
+    cryptographic signature).
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+    if got is None:
+        raise HTTPException(status_code=404, detail={"reason": "not_found"})
+    inv, events = got
+    record = _decision_record(inv, events)
+    return JSONResponse(
+        content=record,
+        headers={"Content-Disposition": f'attachment; filename="soc-ai-{inv.id}.json"'},
+    )
 
 
 # ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────

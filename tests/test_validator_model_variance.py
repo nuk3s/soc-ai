@@ -18,6 +18,27 @@ from unittest.mock import MagicMock
 import pytest
 
 
+class _RetPart:
+    """ToolReturnPart-like stand-in: content + the real part_kind discriminator."""
+
+    def __init__(self, content: Any) -> None:
+        self.content = content
+        self.part_kind = "tool-return"
+
+
+class _Msg:
+    def __init__(self, parts: list[Any]) -> None:
+        self.parts = parts
+
+
+def _tool_evidence() -> list[Any]:
+    """A message history with one successful tool return — exempts the hard
+    evidence gate so a downstream validator (citation cap / floor / ICMP scope)
+    can be unit-tested in isolation. These tests pre-date the gate and assert
+    verdict-PRESERVATION given that an investigation already gathered evidence."""
+    return [_Msg([_RetPart({"result": "ok"})])]
+
+
 def _benign_internal_bundle() -> Any:
     """A representative `EnrichedAlertContext`-shaped dump for benign
     internal traffic. Used by all voice variants so we can verify that
@@ -288,7 +309,7 @@ class TestEvidenceConditionalFloor:
             report,
             ctx,
             candidate=None,
-            targeted_messages=None,
+            targeted_messages=_tool_evidence(),
             targeted_tool_called=None,
             synthesis_confidence_floor=0.6,
         )
@@ -334,7 +355,7 @@ class TestEvidenceConditionalFloor:
             report,
             ctx,
             candidate=None,
-            targeted_messages=None,
+            targeted_messages=_tool_evidence(),
             targeted_tool_called=None,
             synthesis_confidence_floor=0.6,
         )
@@ -366,7 +387,7 @@ class TestModelVoiceVariance:
             report,
             ctx,
             candidate=None,
-            targeted_messages=None,
+            targeted_messages=_tool_evidence(),
             targeted_tool_called=None,
             synthesis_confidence_floor=0.6,
         )
@@ -605,7 +626,7 @@ class TestSolicitedIcmpEchoDowngrade:
             report,
             ctx,
             candidate=None,
-            targeted_messages=None,
+            targeted_messages=_tool_evidence(),
             targeted_tool_called=None,
             synthesis_confidence_floor=0.6,
         )

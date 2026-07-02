@@ -125,6 +125,23 @@ async def test_api_token_roundtrip(settings_kratos: Settings) -> None:
     await engine.dispose()
 
 
+async def test_api_token_rejected_when_creator_disabled(settings_kratos: Settings) -> None:
+    """A token's validity is tied to its creator's account: disabling the operator
+    who minted it must reject the token, matching session auth."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        user = await auth_svc.create_user(db, "grace", "pw")
+        raw = await auth_svc.create_api_token(db, "userscript", user.id)
+        assert await auth_svc.check_api_token(db, raw) is not None
+        # Disable the creator → the token they minted stops authenticating.
+        await auth_svc.set_user_disabled(db, user.id, True)
+        assert await auth_svc.check_api_token(db, raw) is None
+        # Re-enabling restores it (token itself was never revoked).
+        await auth_svc.set_user_disabled(db, user.id, False)
+        assert await auth_svc.check_api_token(db, raw) is not None
+    await engine.dispose()
+
+
 async def test_bootstrap_admin(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:

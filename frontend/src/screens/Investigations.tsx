@@ -1,8 +1,13 @@
-import { Check, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
 import { Fragment, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, VerdictPill } from '../components/Badges';
+import { FlowBadge } from '../components/FlowBadge';
 import { MultiSelect } from '../components/MultiSelect';
+import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
+import { inRange } from '../lib/timeRange';
+// Shared with the Dashboard — single source of truth for status colour/label/pulse.
+import { INV_STATUS as STATUS } from '../lib/statusMeta';
 import { Checkbox } from '../components/Controls';
 import { ErrorState, LoadingState } from '../components/States';
 import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
@@ -11,13 +16,6 @@ import type { InvestigationRow, Verdict } from '../lib/types';
 
 const GRID = '28px 1fr 150px 90px 120px 110px 120px 44px';
 
-const STATUS: Record<InvestigationRow['status'], { color: string; label: string; pulse: boolean }> = {
-  complete: { color: '#3fb950', label: 'Complete', pulse: false },
-  running: { color: '#4b8bf5', label: 'Investigating', pulse: true },
-  awaiting: { color: '#f5a623', label: 'Awaiting decision', pulse: true },
-  error: { color: '#f04438', label: 'Error', pulse: false },
-  cancelled: { color: '#8b949e', label: 'Cancelled', pulse: false },
-};
 
 type SortKey = 'name' | 'verdict' | 'conf' | 'host' | 'status' | 'when';
 type SortDir = 'asc' | 'desc';
@@ -33,8 +31,9 @@ const STATUS_ORDER: Record<InvestigationRow['status'], number> = {
   running: 0,
   awaiting: 1,
   error: 2,
-  cancelled: 3,
-  complete: 4,
+  interrupted: 3,
+  cancelled: 4,
+  complete: 5,
 };
 
 function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: SortDir): number {
@@ -73,8 +72,12 @@ export function Investigations() {
 
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]);
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
+  const [range, setRange] = useState('24h');
+  const [custom, setCustom] = useState<CustomRange | null>(null);
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: 'when', dir: 'desc' });
   const [groupBy, setGroupBy] = useState<'none' | 'detection'>('none');
+  // Alert ids whose earlier (non-primary) runs are expanded inline.
+  const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>({});
 
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [rehunting, setRehunting] = useState(false);
@@ -89,19 +92,33 @@ export function Investigations() {
 
   // Apply filters then sort
   const visible = rows
+    .filter((r) => inRange(r.ts, range, custom))
     .filter((r) => !filterVerdicts.length || filterVerdicts.includes(r.verdict))
     .filter((r) => !filterStatuses.length || filterStatuses.includes(r.status))
     .sort((a, b) => cmpRows(a, b, sort.key, sort.dir));
+
+  // Cluster retries of the SAME alert: surface the canonical (primary) run and
+  // tuck earlier/errored/cancelled re-runs under it, so the one that WORKED is
+  // never buried under a pile of failed attempts. Retries reveal inline on demand.
+  const retriesByAlert = new Map<string, InvestigationRow[]>();
+  for (const r of visible) {
+    if (r.isPrimary === false && r.alertId) {
+      const arr = retriesByAlert.get(r.alertId) ?? [];
+      arr.push(r);
+      retriesByAlert.set(r.alertId, arr);
+    }
+  }
+  const primaries = visible.filter((r) => r.isPrimary !== false);
 
   // When grouping, cluster rows by detection name (keeping the user's sort within
   // each group) and precompute per-group counts for the headers.
   const displayRows =
     groupBy === 'detection'
-      ? [...visible].sort(
+      ? [...primaries].sort(
           (a, b) =>
             (a.name || '').localeCompare(b.name || '') || cmpRows(a, b, sort.key, sort.dir),
         )
-      : visible;
+      : primaries;
   const groupCounts = new Map<string, number>();
   if (groupBy === 'detection') {
     for (const r of displayRows) {
@@ -220,6 +237,14 @@ export function Investigations() {
 
       {/* filter bar + bulk action */}
       <div className="mb-3.5 flex flex-wrap items-center gap-2">
+        <TimeRangeFilter
+          value={range}
+          custom={custom}
+          onChange={(v, r) => {
+            setRange(v);
+            if (r) setCustom(r);
+          }}
+        />
         <MultiSelect
           label="Verdict"
           options={[
@@ -238,6 +263,8 @@ export function Investigations() {
             { value: 'running', label: 'Investigating' },
             { value: 'awaiting', label: 'Awaiting decision' },
             { value: 'error', label: 'Error' },
+            { value: 'interrupted', label: 'Interrupted' },
+            { value: 'cancelled', label: 'Cancelled' },
           ]}
           value={filterStatuses}
           onChange={setFilterStatuses}
@@ -333,7 +360,7 @@ export function Investigations() {
             Conf{caret('conf')}
           </div>
           <div className={headerCls('host')} onClick={() => toggleSort('host')}>
-            Host{caret('host')}
+            Source → Dest{caret('host')}
           </div>
           <div className={headerCls('status')} onClick={() => toggleSort('status')}>
             Status{caret('status')}
@@ -354,6 +381,8 @@ export function Investigations() {
         )}
         {displayRows.map((r, i) => {
           const st = STATUS[r.status] ?? STATUS.error;
+          const retries = retriesByAlert.get(r.alertId ?? '') ?? [];
+          const expanded = !!expandedAlerts[r.alertId ?? ''];
           const groupName = r.name || '(unnamed detection)';
           const showHeader =
             groupBy === 'detection' &&
@@ -386,6 +415,19 @@ export function Investigations() {
               <div className="flex min-w-0 items-center gap-[9px]">
                 <KindBadge kind={r.kind} />
                 <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{r.name}</span>
+                {retries.length > 0 && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedAlerts((prev) => ({ ...prev, [r.alertId ?? '']: !prev[r.alertId ?? ''] }));
+                    }}
+                    title={`${retries.length} earlier run${retries.length === 1 ? '' : 's'} of this alert`}
+                    className="flex flex-none items-center gap-[3px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint hover:text-text-2"
+                  >
+                    {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                    {retries.length} earlier
+                  </button>
+                )}
                 {(r.chatCount ?? 0) > 0 && (
                   <span
                     className="flex flex-none items-center gap-[4px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-accent"
@@ -396,9 +438,12 @@ export function Investigations() {
                   </span>
                 )}
               </div>
-              <div><VerdictPill verdict={r.verdict} /></div>
+              {/* Only a finished run has a verdict. For running/awaiting/error/
+                  cancelled/interrupted rows the Status column carries the state —
+                  an "untriaged" pill there reads as a contradiction. */}
+              <div>{r.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={r.verdict} />}</div>
               <div className="font-mono text-[12.5px] text-text-2">{r.conf != null ? r.conf.toFixed(2) : '—'}</div>
-              <div className="font-mono text-[12px] text-mono-amber">{r.host}</div>
+              <div className="min-w-0 overflow-hidden"><FlowBadge src={r.host === '—' ? null : r.host} dst={r.dst} /></div>
               <div>
                 <span className="inline-flex items-center gap-1.5 text-[11.5px]" style={{ color: st.color }}>
                   <span className={'h-1.5 w-1.5 rounded-full ' + (st.pulse ? 'animate-pulseDot' : '')} style={{ background: st.color }} />
@@ -427,6 +472,54 @@ export function Investigations() {
                 )}
               </div>
               </div>
+              {expanded &&
+                retries.map((rt) => {
+                  const rtSt = STATUS[rt.status] ?? STATUS.error;
+                  return (
+                    <div
+                      key={rt.id}
+                      onClick={() => navigate(`/investigation/${rt.id}`, { state: { from: '/investigations' } })}
+                      className="group grid cursor-pointer items-center gap-2.5 border-b border-border-faint bg-surface-2/30 px-3.5 py-[8px] hover:bg-surface-hover"
+                      style={{ gridTemplateColumns: GRID }}
+                    >
+                      <div />
+                      <div className="flex min-w-0 items-center gap-[7px] pl-3 text-faint">
+                        <CornerDownRight size={12} className="flex-none" />
+                        <span className="truncate text-[12px]">earlier run</span>
+                      </div>
+                      <div>{rt.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={rt.verdict} />}</div>
+                      <div className="font-mono text-[12px] text-faint">{rt.conf != null ? rt.conf.toFixed(2) : '—'}</div>
+                      <div className="min-w-0 overflow-hidden opacity-70"><FlowBadge src={rt.host === '—' ? null : rt.host} dst={rt.dst} /></div>
+                      <div>
+                        <span className="inline-flex items-center gap-1.5 text-[11px]" style={{ color: rtSt.color }}>
+                          <span className="h-1.5 w-1.5 rounded-full" style={{ background: rtSt.color }} />
+                          {rtSt.label}
+                        </span>
+                      </div>
+                      <div className="font-mono text-[12px] text-faint">{rt.when}</div>
+                      <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
+                        {pendingDelete === rt.id ? (
+                          <div className="flex items-center gap-1.5">
+                            <button onClick={() => { void deleteOne(rt.id); }} title="Confirm delete" className="flex text-danger hover:opacity-80">
+                              <Check size={14} />
+                            </button>
+                            <button onClick={() => setPendingDelete(null)} title="Cancel" className="flex text-faint hover:text-text">
+                              <X size={14} />
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setPendingDelete(rt.id)}
+                            title="Delete this run"
+                            className="flex text-faint opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
             </Fragment>
           );
         })}

@@ -1,4 +1,4 @@
-import { Key, ShieldAlert, Users } from 'lucide-react';
+import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { ApplyBadge, SourceBadge } from '../components/Badges';
 import { NumberField, Select, Toggle } from '../components/Controls';
@@ -8,6 +8,8 @@ import { ErrorState, LoadingState, Spinner } from '../components/States';
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
+import { RedactionPreviewPanel } from './RedactionPreviewPanel';
+import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { addInternalIdentifier, createUser, getConfig, getDiscoveryScan, getInternalIdentifiers, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -21,6 +23,11 @@ function slug(s: string): string {
 
 export function Config() {
   const [nonce, setNonce] = useState(0);
+  // Collapsed config sections (the panel is long — let the operator fold away
+  // the groups they aren't tuning). Session-scoped; deep-link auto-expands.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const toggleSection = (title: string) =>
+    setCollapsed((c) => ({ ...c, [title]: !c[title] }));
   const { data, loading, error } = useAsync(getConfig, [nonce]);
 
   // Fetch users in sync with nonce
@@ -92,6 +99,9 @@ export function Config() {
     const groupEntries: { id: string; label: string }[] = [];
     for (const g of data?.groups ?? []) {
       groupEntries.push({ id: slug(g.title), label: g.title });
+      if (g.title === 'Oracle') {
+        groupEntries.push({ id: 'redaction-preview', label: 'Redaction preview' });
+      }
       if (g.title === 'Discovery') {
         groupEntries.push({ id: 'internal-identifiers', label: 'Internal identifiers' });
       }
@@ -99,6 +109,7 @@ export function Config() {
     return [
       ...groupEntries,
       { id: 'data-sources', label: 'Data sources' },
+      { id: 'detection-tuning', label: 'Detection tuning' },
       { id: 'api-keys', label: 'API keys' },
       { id: 'agent-tools', label: 'Agent tools' },
       { id: 'users', label: 'Users' },
@@ -139,6 +150,10 @@ export function Config() {
     if (loading || !data) return;
     const id = window.location.hash.replace('#', '');
     if (!id) return;
+    // Force-expand a deep-linked section so the target is never hidden behind a
+    // collapsed header.
+    const target = data.groups.find((g) => slug(g.title) === id);
+    if (target) setCollapsed((c) => ({ ...c, [target.title]: false }));
     const t = setTimeout(() => {
       document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 60);
@@ -372,13 +387,34 @@ export function Config() {
       {data.groups.map((g) => (
         <Fragment key={g.title}>
           <div id={slug(g.title)} className="mb-[22px] scroll-mt-6">
-            <SectionTitle>{g.title}</SectionTitle>
+            <button
+              type="button"
+              onClick={() => toggleSection(g.title)}
+              className="group w-full text-left"
+            >
+              <SectionTitle
+                right={
+                  <span className="flex items-center gap-2 text-faint">
+                    <span className="font-mono text-[11px]">{g.items.length}</span>
+                    <ChevronRight
+                      size={15}
+                      className="transition-transform group-hover:text-text-2"
+                      style={{ transform: collapsed[g.title] ? 'none' : 'rotate(90deg)' }}
+                    />
+                  </span>
+                }
+              >
+                {g.title}
+              </SectionTitle>
+            </button>
+            {!collapsed[g.title] && (
             <div className="overflow-hidden rounded-card border border-border bg-surface-1">
               {g.items.map((s) => (
                 <div key={s.key} className="flex items-center gap-3.5 border-b border-border-faint px-[15px] py-[13px]">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-mono text-[12.5px] font-semibold text-text-2">{s.key}</span>
+                      <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
+                      <span className="font-mono text-[11px] text-faint">{s.key}</span>
                       <SourceBadge source={s.source} />
                       <ApplyBadge apply={s.apply} />
                     </div>
@@ -388,12 +424,15 @@ export function Config() {
                 </div>
               ))}
             </div>
+            )}
           </div>
           {g.title === 'Discovery' && internalIdentifiersSection}
+          {g.title === 'Oracle' && <RedactionPreviewPanel />}
         </Fragment>
       ))}
 
       <DataSourcesPanel />
+      <DetectionTuningPanel />
       <ApiKeysPanel />
       <AgentToolsPanel />
 

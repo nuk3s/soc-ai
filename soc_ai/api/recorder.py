@@ -58,13 +58,17 @@ class InvestigationRecorder:
         *,
         alert_id: str,
         started_by: str,
+        rule_name: str | None = None,
     ) -> None:
         self._maker = maker
         self._alert_id = alert_id
         self._started_by = started_by
         self._buffer: list[dict[str, Any]] = []
         self._report: dict[str, Any] | None = None
-        self._rule_name: str | None = None
+        # Seed from the caller when known (alert grid / re-hunt / group sweep), so
+        # the row is named at creation and survives a run that dies before the
+        # first alert_context event. Falls back to stream-extraction when unseeded.
+        self._rule_name: str | None = rule_name or None
         self._src_ip: str | None = None
         self._dest_ip: str | None = None
         self._finished = False
@@ -74,7 +78,10 @@ class InvestigationRecorder:
         try:
             async with self._maker() as db:
                 inv = await inv_svc.create(
-                    db, alert_es_id=self._alert_id, started_by=self._started_by
+                    db,
+                    alert_es_id=self._alert_id,
+                    started_by=self._started_by,
+                    rule_name=self._rule_name,
                 )
         except Exception:
             _LOGGER.exception(
@@ -91,13 +98,18 @@ class InvestigationRecorder:
         if kind in ("alert_context", "enriched_alert_context"):
             if self._rule_name is None:
                 # AlertContext.model_dump() shape: {"alert": {"rule_name": ...}, ...}
-                # Also handle nested rule.name variants for forward-compat.
+                # Also handle nested rule.name variants for forward-compat. When a
+                # detection has no rule.name (Zeek notices, Sysmon, eval synth docs
+                # — `rule.name` is Suricata-specific), fall back to the dataset /
+                # category so the row still gets a meaningful label instead of NULL.
                 rule = _dig(
                     payload,
                     "alert.rule_name",
                     "rule.name",
                     "alert.rule.name",
                     "alert_rule_name",
+                    "alert.event_dataset",
+                    "alert.event_category",
                 )
                 if rule:
                     self._rule_name = str(rule)

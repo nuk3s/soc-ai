@@ -33,7 +33,9 @@ from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import get_settings
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.store import backtests as bt_svc
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import bootstrap_admin
 from soc_ai.store.config_overrides import apply_to_settings, load_overrides
@@ -88,6 +90,14 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
                 n = await inv_svc.reap_stale_running(db, older_than_minutes=age_min)
             if n:
                 _LOGGER.info("reaper: marked %d stale 'running' investigation(s) as error", n)
+            async with db_sessionmaker() as db:
+                nh = await hunt_svc.reap_stale_running(db, older_than_minutes=age_min)
+            if nh:
+                _LOGGER.info("reaper: marked %d stale 'running' hunt(s) as error", nh)
+            async with db_sessionmaker() as db:
+                nb = await bt_svc.reap_stale_running(db, older_than_minutes=age_min)
+            if nb:
+                _LOGGER.info("reaper: marked %d stale 'running' backtest(s) as error", nb)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -159,6 +169,46 @@ async def _discovery_scheduler_loop(app: FastAPI, settings: Any) -> None:
             _LOGGER.exception("discovery scheduler iteration failed; continuing")
 
 
+async def _auto_triage_scheduler_loop(app: FastAPI, settings: Any) -> None:
+    """Continuously drain the untriaged backlog when scheduled auto-triage is on.
+
+    Mirrors :func:`_discovery_scheduler_loop`: a fixed wake cadence (derived from
+    ``auto_triage_schedule_interval_minutes``), live settings read each wake (so a
+    config-console toggle applies without a restart), and a no-op unless
+    ``auto_triage_schedule_enabled``. Single-flight via the shared
+    ``AutoTriageStatus.active`` slot, so a scheduled sweep and a manual ⚡ press
+    can never overlap. A failed iteration is logged and the loop continues — the
+    scheduler must never take the app down.
+    """
+    from soc_ai.webui import autotriage as at  # noqa: PLC0415
+
+    # Fixed short wake cadence + an internal "is due" check (mirrors the discovery
+    # scheduler). Sleeping the whole interval up front meant toggling the schedule
+    # ON only took effect up to interval-length later; a 60s wake makes a fresh
+    # enable fire on the next wake. _last_sweep starts at 0 so the first enabled
+    # wake sweeps immediately.
+    _last_sweep = 0.0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not settings.auto_triage_schedule_enabled:
+                continue
+            interval_min = int(getattr(settings, "auto_triage_schedule_interval_minutes", 5))
+            now = time.monotonic()
+            if now - _last_sweep < max(60, interval_min * 60):
+                continue
+            if at.get_status(app.state).active:
+                continue  # a sweep (manual or scheduled) is already in flight
+            n = await at.start_config_sweep(app.state, started_by="auto-triage:scheduler")
+            if n:
+                _last_sweep = time.monotonic()
+                _LOGGER.info("auto-triage scheduler: launched a sweep of %d target(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("auto-triage scheduler iteration failed; continuing")
+
+
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
     """Migrate the store, bootstrap the admin, apply config overrides, reap orphans.
 
@@ -179,8 +229,12 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
     async with db_sessionmaker() as db:
         created_pw = await bootstrap_admin(db, settings.bootstrap_admin_password)
     if created_pw is not None:
+        # One-shot bootstrap credential. It lands in journald/container logs, so
+        # mark it unmistakably for the operator to change + scrub. setup.sh
+        # pre-generates BOOTSTRAP_ADMIN_PASSWORD so this path is off the happy path.
         _LOGGER.warning(
-            "created initial admin user 'admin' password=%s — change it after first login",
+            "BOOTSTRAP CREDENTIAL (change at first login, then scrub this log line): "
+            "initial admin user 'admin' password=%s",
             created_pw,
         )
 
@@ -193,11 +247,34 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
         _LOGGER.info("applied %d persisted config override(s)", len(overrides))
 
     # Reap investigations orphaned by the previous process: any row still
-    # 'running' at startup can never finish (its background task is gone).
+    # 'running' at startup can never finish (its background task is gone). Mark
+    # them 'interrupted' (NOT 'error') — a clean restart cut them off; they
+    # didn't fail. 'interrupted' is re-huntable, so continuous auto-triage (or a
+    # manual re-hunt) picks them back up, and the UI shows a benign state instead
+    # of a scary "error" in a healthy environment.
     async with db_sessionmaker() as db:
-        orphaned = await inv_svc.reap_stale_running(db, older_than_minutes=None)
+        orphaned = await inv_svc.reap_stale_running(
+            db, older_than_minutes=None, status="interrupted"
+        )
     if orphaned:
         _LOGGER.info("reaped %d orphaned 'running' investigation(s) at startup", orphaned)
+
+    # Same for hunts orphaned by the previous process (mirror the investigation
+    # reaper): a row still 'running' at startup can't finish — mark 'interrupted'.
+    async with db_sessionmaker() as db:
+        orphaned_hunts = await hunt_svc.reap_stale_running(
+            db, older_than_minutes=None, status="interrupted"
+        )
+    if orphaned_hunts:
+        _LOGGER.info("reaped %d orphaned 'running' hunt(s) at startup", orphaned_hunts)
+
+    # Same for backtests orphaned by the previous process: a row still 'running'
+    # at startup can't finish (its background replay task died). Mark 'error' —
+    # a backtest is a one-shot measurement, not a re-huntable target.
+    async with db_sessionmaker() as db:
+        orphaned_bt = await bt_svc.reap_stale_running(db, older_than_minutes=None, status="error")
+    if orphaned_bt:
+        _LOGGER.info("reaped %d orphaned 'running' backtest(s) at startup", orphaned_bt)
 
     # Same for chat turns: any 'pending' assistant chat row at startup was
     # orphaned by the restart (its background chat task died with the previous
@@ -211,7 +288,7 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — linear app setup
     """Wire up app-scoped clients, tear them down on shutdown."""
     settings = get_settings()
     logging.basicConfig(
@@ -253,6 +330,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     reaper_task = asyncio.create_task(_reaper_loop(db_sessionmaker, settings))
     discovery_task = asyncio.create_task(_discovery_scheduler_loop(app, settings))
+    autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
 
     try:
         yield
@@ -264,6 +342,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         discovery_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await discovery_task
+        autotriage_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await autotriage_task
         # A scheduled (or manual "Scan now") discovery worker may be mid-scan,
         # tracked on the shared single-flight status object (the same one the
         # scan-now endpoint uses). Cancel + drain it BEFORE the ES/DB clients it
@@ -276,6 +357,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             _st._task.cancel()
             with contextlib.suppress(BaseException):
                 await _st._task
+        # The scheduler LOOPS are cancelled above, but the WORKER tasks they
+        # spawn (auto-triage drain, backtest replay) and manually-started hunt
+        # console drains hold references to the ES + DB clients. Cancel + drain
+        # them here too, before those clients are torn down, so an in-flight
+        # worker can't do a use-after-close ES search / DB write on shutdown.
+        from soc_ai.webui import autotriage as _at  # noqa: PLC0415
+        from soc_ai.webui import backtest as _bac  # noqa: PLC0415
+        from soc_ai.webui import hunt_console_manager as _hcm  # noqa: PLC0415
+
+        _worker_tasks: list[asyncio.Task[Any]] = []
+        _at_task = _at.get_status(app.state)._task
+        if _at_task is not None:
+            _worker_tasks.append(_at_task)
+        _bac_task = _bac.get_status(app.state)._task
+        if _bac_task is not None:
+            _worker_tasks.append(_bac_task)
+        _worker_tasks.extend(_hcm.get_manager(app.state)._tasks.values())
+        for _t in _worker_tasks:
+            if not _t.done():
+                _t.cancel()
+        for _t in _worker_tasks:
+            with contextlib.suppress(BaseException):
+                await _t
         await auth.aclose()
         await elastic.aclose()
         if misp is not None:
@@ -377,7 +481,12 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
         if _csp:
             response.headers.setdefault("Content-Security-Policy", _csp)
-        if request.url.scheme == "https":
+        # Emit HSTS when the browser reached us over HTTPS — directly, or via a
+        # TLS-terminating reverse proxy that forwards plain HTTP with
+        # X-Forwarded-Proto: https. Mirrors _request_is_https (webui_api) so a
+        # proxy-fronted HTTPS deployment doesn't silently lose HSTS.
+        _fwd_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if request.url.scheme == "https" or _fwd_proto == "https":
             response.headers.setdefault(
                 "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
             )
@@ -391,12 +500,18 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         # ip -> [window (monotonic minute), count]. Per-app-instance, bounded.
         app.state.rate_buckets = {}
 
+        from soc_ai.api.webui_api import client_ip as _client_ip  # noqa: PLC0415
+
         @app.middleware("http")
         async def _rate_limit(request: Any, call_next: Any) -> Response:
             if request.url.path == "/healthz":  # never throttle health checks
                 exempt: Response = await call_next(request)
                 return exempt
-            ip = request.client.host if request.client else "?"
+            # Proxy-aware: attribute to the real client, not a shared proxy IP,
+            # when proxy_trusted_ips is configured (else the socket peer). Read the
+            # resolved settings off app.state (set at startup) rather than a
+            # per-request get_settings(); client_ip tolerates a missing state.
+            ip = _client_ip(request, getattr(request.app.state, "settings", None))
             window = int(time.monotonic()) // 60
             buckets: dict[str, list[int]] = app.state.rate_buckets
             entry = buckets.get(ip)

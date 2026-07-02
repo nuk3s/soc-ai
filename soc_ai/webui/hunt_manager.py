@@ -15,7 +15,7 @@ import logging
 from typing import Any
 
 from soc_ai.api.deps import ctx_from_state
-from soc_ai.api.runner import run_recorded
+from soc_ai.api.runner import CancelToken, run_recorded
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +27,9 @@ class HuntManager:
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        # Per-hunt cancel tokens — set requested=True on an EXPLICIT cancel so the
+        # recorded run lands 'cancelled' (vs 'error' for a shutdown/disconnect).
+        self._tokens: dict[str, CancelToken] = {}
 
     async def start(
         self,
@@ -34,6 +37,7 @@ class HuntManager:
         *,
         alert_id: str,
         started_by: str,
+        rule_name: str | None = None,
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -41,11 +45,22 @@ class HuntManager:
         event to capture the investigation id, then hands the remaining
         generator to a background task that runs it to completion.
 
+        ``rule_name`` seeds the row's display name at creation so it is never
+        anonymous even if the run dies before the first alert_context event.
+
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
         """
         ctx = ctx_from_state(state)
-        gen = run_recorded(state, ctx=ctx, alert_id=alert_id, started_by=started_by)
+        token = CancelToken()
+        gen = run_recorded(
+            state,
+            ctx=ctx,
+            alert_id=alert_id,
+            started_by=started_by,
+            cancel_token=token,
+            rule_name=rule_name,
+        )
 
         # Consume until the first event — must be "investigation_created".
         inv_id: str | None = None
@@ -70,20 +85,30 @@ class HuntManager:
             _drain(gen, alert_id=alert_id, inv_id=inv_id)
         )
         self._tasks[inv_id] = task
-        task.add_done_callback(lambda t: self._tasks.pop(inv_id, None))
+        self._tokens[inv_id] = token
+
+        def _cleanup(_t: asyncio.Task[None]) -> None:
+            self._tasks.pop(inv_id, None)
+            self._tokens.pop(inv_id, None)
+
+        task.add_done_callback(_cleanup)
         return inv_id
 
     def cancel(self, inv_id: str) -> bool:
-        """Cancel an in-flight hunt's background task.
+        """Cancel an in-flight hunt's background task — an EXPLICIT operator cancel.
 
-        Returns True if a live task was found and cancelled — ``recorded_run``
-        catches the resulting ``CancelledError`` and lands the run as
-        ``cancelled``. Returns False if no live task is tracked (already
-        finished, or never started here).
+        Marks the cancel token requested FIRST so ``recorded_run`` records the
+        run as ``cancelled`` (an unmarked cancellation — shutdown / client
+        disconnect — lands as ``error`` instead). Returns True if a live task was
+        found and cancelled; False if no live task is tracked (already finished,
+        or never started here).
         """
         task = self._tasks.get(inv_id)
         if task is None or task.done():
             return False
+        token = self._tokens.get(inv_id)
+        if token is not None:
+            token.requested = True
         task.cancel()
         return True
 

@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Copy,
+  Download,
   Cpu,
   Crosshair,
   GitBranch,
@@ -35,6 +36,7 @@ import {
   approveAction,
   executeAction,
   getChatThread,
+  downloadInvestigationExport,
   overrideVerdict as submitOverride,
   postChat,
   resolveInvestigation,
@@ -137,9 +139,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // keyed on inv.id so polling the same investigation doesn't jitter the pane or
   // restart the elapsed timer.
   const investigating = inv.status === 'investigating';
-  // A reaped/interrupted run, OR one the client-side guard gave up on, is a
-  // terminal failure — render the error state, not the spinner.
-  const failed = inv.status === 'error' || (investigating && stuck);
+  // A terminal run that reached NO verdict — a reaped/errored run, an operator-
+  // cancelled run, or one the client-side guard gave up on — renders the terminal
+  // state, never an empty verdict pane (the "blank investigation" bug).
+  const cancelled = inv.status === 'cancelled';
+  const interrupted = inv.status === 'interrupted';
+  const failed = inv.status === 'error' || cancelled || interrupted || (investigating && stuck);
   // Only spin while genuinely in-flight (not once we've decided it's stuck).
   const running = investigating && !stuck;
 
@@ -300,6 +305,14 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
         {reHunting ? 'Re-running…' : 'Re-run investigation'}
       </button>
+      <button
+        onClick={() => { void downloadInvestigationExport(inv.id); }}
+        title="Download the decision record (tools, cited events, verdict — JSON with a sha256 integrity checksum)"
+        className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
+      >
+        <Download size={13} />
+        Export
+      </button>
     </div>
   );
 
@@ -350,13 +363,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <div className="text-[15px] font-semibold">
           {stuck && inv.status === 'investigating'
             ? 'This investigation seems stuck'
-            : 'This investigation failed or was interrupted'}
+            : interrupted
+              ? 'This investigation was interrupted by a restart'
+              : cancelled
+                ? 'This investigation was cancelled before it finished'
+                : 'This investigation failed or was interrupted'}
         </div>
         <div className="flex-1" />
         <div className="font-mono text-[12.5px] text-faint">elapsed {fmt(elapsed)}</div>
       </div>
       <div className="mt-2 text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
-        No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-run it to try again.
+        {interrupted
+          ? 'No verdict yet — the service restarted while this was running. It will be re-investigated automatically if Auto-Investigate is on, or re-run it now.'
+          : cancelled
+            ? 'No verdict was reached — the run was stopped (an operator cancel, or the service restarting) before it finished. Re-run it to get a verdict.'
+            : 'No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-run it to try again.'}
       </div>
       <div className="mt-[14px]">
         <button
@@ -384,8 +405,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
         <VerdictPill verdict={inv.verdict} large />
         {inv.sev && <SeverityTag sev={inv.sev} />}
-        <span className="rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim">
-          host <span className="text-mono-amber">{inv.host}</span> ·{' '}
+        <span
+          className="rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
+          title={`source ${inv.host} → destination ${inv.ip}`}
+        >
+          <span className="text-mono-amber">{inv.host}</span>
+          <span className="text-faint"> → </span>
           <span className="text-mono-green">{inv.ip}</span>
         </span>
         {inv.oracle?.escalated && (
@@ -1040,7 +1065,7 @@ function HostContextPanel({ host, signals }: { host: string; signals: HostSignal
 function HeuristicBadge() {
   return (
     <span
-      title="This verdict was reached from prefetched context without running investigation tools — it may be shallower. Disable 'Fast triage' in Config to always investigate."
+      title="This verdict was reached from prefetched context without running investigation tools — it may be shallower. Disable 'Fast verdict' in Config to always investigate."
       className="flex cursor-help items-center gap-1.5 rounded-badge border border-border-input px-2 py-[3px] text-[11.5px] font-semibold text-faint"
       style={{ background: 'rgba(148,163,184,.07)' }}
     >
@@ -1329,18 +1354,22 @@ function ActionCard({
 }) {
   const Icon = ACTION_ICON[action.tag];
   const tagStyle = ACTION_TAG_COLOR[action.tag];
+  // The system already carried this out (e.g. auto-ack). Render it done — never
+  // offer the analyst an Approve/Execute button for an already-applied action.
+  const applied = action.applied === true && !decision;
+  const eff = applied ? 'approved' : decision;
   const base =
-    decision === 'rejected'
+    eff === 'rejected'
       ? { border: '#2a3645', bg: '#0c0f15' }
-      : decision === 'failed'
+      : eff === 'failed'
         ? { border: 'rgba(240,68,56,.35)', bg: 'rgba(240,68,56,.05)' }
-        : decision === 'approved'
+        : eff === 'approved'
           ? { border: 'rgba(63,185,80,.32)', bg: 'rgba(63,185,80,.05)' }
           : { border: '#1c232e', bg: '#0b0e13' };
-  const opacity = decision === 'rejected' ? 0.6 : 1;
+  const opacity = eff === 'rejected' ? 0.6 : 1;
   // 'failed' returns to the button row so the analyst can retry; 'executing'
-  // shows an in-flight state; only a clean approve/reject is terminal.
-  const showButtons = !decision || decision === 'failed';
+  // shows an in-flight state; an applied/approved/rejected action is terminal.
+  const showButtons = !applied && (!decision || decision === 'failed');
 
   return (
     <div
@@ -1399,14 +1428,14 @@ function ActionCard({
         <div className="mt-[11px] pl-[31px]">
           <div
             className="flex items-center gap-2 text-[12.5px] font-semibold"
-            style={{ color: decision === 'approved' ? '#3fb950' : '#f04438' }}
+            style={{ color: eff === 'approved' ? '#3fb950' : '#f04438' }}
           >
-            {decision === 'approved' ? '✓ Executed' : '✕ Rejected'}{' '}
+            {applied ? '✓ Auto-acknowledged' : eff === 'approved' ? '✓ Executed' : '✕ Rejected'}{' '}
             <span className="font-mono text-[11px] font-normal text-faint">
-              · analyst · just now
+              {applied ? '· system · automatic' : '· analyst · just now'}
             </span>
           </div>
-          {decision === 'approved' && message && (
+          {eff === 'approved' && message && (
             <div className="mt-1 text-[12px] leading-[1.5] text-dim">{message}</div>
           )}
         </div>

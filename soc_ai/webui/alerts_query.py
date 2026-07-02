@@ -63,6 +63,10 @@ class AlertGroup:
     kind: str = "suricata"
     acked_count: int = 0
     escalated_count: int = 0
+    # Representative flow from the group's most-recent event — so the collapsed
+    # row can show BOTH hosts (source → destination) without expanding.
+    src_ip: str | None = None
+    dst_ip: str | None = None
 
 
 @dataclass
@@ -171,7 +175,13 @@ def _group_aggs(sort: str, field: str = "rule.name") -> dict[str, Any]:
                     "top_hits": {
                         "size": 1,
                         "sort": [{"@timestamp": {"order": "desc"}}],
-                        "_source": ["@timestamp", "event.severity_label", "event.dataset"],
+                        "_source": [
+                            "@timestamp",
+                            "event.severity_label",
+                            "event.dataset",
+                            "source.ip",
+                            "destination.ip",
+                        ],
                     }
                 },
                 "acked": {"filter": {"term": {"event.acknowledged": True}}},
@@ -179,6 +189,13 @@ def _group_aggs(sort: str, field: str = "rule.name") -> dict[str, Any]:
             },
         }
     }
+
+
+def _first_ip(v: Any) -> str | None:
+    """ES ``source.ip`` / ``destination.ip`` may be a scalar or a list — take the first."""
+    if isinstance(v, list):
+        return str(v[0]) if v else None
+    return str(v) if v is not None else None
 
 
 def _group_from_bucket(bucket: dict[str, Any], *, kind: str | None = None) -> AlertGroup:
@@ -193,6 +210,8 @@ def _group_from_bucket(bucket: dict[str, Any], *, kind: str | None = None) -> Al
         kind=kind or _kind_for(_dig(src, "event.dataset")),
         acked_count=int((bucket.get("acked") or {}).get("doc_count", 0)),
         escalated_count=int((bucket.get("escalated") or {}).get("doc_count", 0)),
+        src_ip=_first_ip(_dig(src, "source.ip")),
+        dst_ip=_first_ip(_dig(src, "destination.ip")),
     )
 
 

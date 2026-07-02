@@ -1,7 +1,9 @@
 import { Activity, ArrowUpRight, Crosshair, Database, ShieldAlert, ShieldCheck } from 'lucide-react';
-import { type ReactNode, useMemo, useState } from 'react';
+import { type ReactNode, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, StatusTag, VerdictPill } from '../components/Badges';
+import { FlowBadge } from '../components/FlowBadge';
+import { INV_STATUS } from '../lib/statusMeta';
 import { Panel, PanelHeader } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
@@ -15,18 +17,10 @@ import {
   getInvestigations,
 } from '../lib/api';
 import { VERDICT } from '../lib/tokens';
-import type { AlertGroup, InvestigationRow, Severity, Verdict } from '../lib/types';
+import type { AlertGroup, Severity, Verdict } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 
 // Status presentation mirrors the Investigations screen so a verdict reads the
-// same wherever it appears.
-const INV_STATUS: Record<InvestigationRow['status'], { color: string; label: string; pulse: boolean }> = {
-  complete: { color: '#3fb950', label: 'Complete', pulse: false },
-  running: { color: '#4b8bf5', label: 'Investigating', pulse: true },
-  awaiting: { color: '#f5a623', label: 'Awaiting decision', pulse: true },
-  error: { color: '#f04438', label: 'Error', pulse: false },
-  cancelled: { color: '#8b949e', label: 'Cancelled', pulse: false },
-};
 
 const SEV_META: Record<Severity, { label: string; color: string }> = {
   critical: { label: 'Critical', color: '#f04438' },
@@ -58,9 +52,15 @@ function computeMetrics(groups: AlertGroup[]): Metrics {
   let triaging = 0;
   for (const g of groups) {
     events += g.count || 0;
-    verdict[g.verdict] = (verdict[g.verdict] ?? 0) + 1;
     sev[g.sev] = (sev[g.sev] ?? 0) + 1;
-    if (g.triaging) triaging += 1;
+    // A group with a live investigation is "in flight", not "awaiting triage".
+    // It still reads verdict=untriaged in the DB until the run lands, so counting
+    // it as untriaged is what inflated "Awaiting triage" above the running count.
+    if (g.triaging) {
+      triaging += 1;
+      continue;
+    }
+    verdict[g.verdict] = (verdict[g.verdict] ?? 0) + 1;
   }
   return { events, groups: groups.length, verdict, sev, triaging };
 }
@@ -167,7 +167,7 @@ function SeverityBreakdown({ sev, total }: { sev: Record<Severity, number>; tota
 }
 
 function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: boolean }) {
-  if (!s) return loading ? <LoadingState label="Checking…" /> : <EmptyState>No triage activity.</EmptyState>;
+  if (!s) return loading ? <LoadingState label="Checking…" /> : <EmptyState>No investigation activity.</EmptyState>;
   const done = s.hunted + s.skipped + s.failed;
   const pct = s.total ? Math.round((done / s.total) * 100) : 0;
   if (s.active) {
@@ -191,12 +191,12 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
       {s.finished_at ? (
         <>
           Last batch ·{' '}
-          <span className="font-semibold text-text">{s.hunted}</span> hunted
+          <span className="font-semibold text-text">{s.hunted}</span> investigated
           {s.skipped ? `, ${s.skipped} skipped` : ''}
           {s.failed ? `, ${s.failed} failed` : ''}.
         </>
       ) : (
-        'Idle — no auto-triage batch has run yet.'
+        'Idle — no auto-investigate batch has run yet.'
       )}
     </div>
   );
@@ -269,18 +269,33 @@ export function Dashboard() {
   const rangeLabel = range === 'custom' ? 'custom range' : `last ${range}`;
   const alertQuery: AlertQuery =
     range === 'custom' && custom ? { range: 'custom', from: custom.from, to: custom.to } : { range };
+  // Poll at 10s (matching the live Alerts grid) so KPI cards reflect a landed
+  // verdict within ~10s instead of feeling frozen for half a minute.
   const alerts = useAsync(() => getAlerts(alertQuery), [range, custom?.from, custom?.to], {
-    refetchInterval: 30_000,
+    refetchInterval: 10_000,
   });
-  const invs = useAsync(getInvestigations, [], { refetchInterval: 30_000 });
-  const triage = useAsync(getAutoTriageStatus, [], { refetchInterval: 5_000 });
+  const invs = useAsync(getInvestigations, [], { refetchInterval: 10_000 });
+  // Only poll auto-triage status while a batch is actually running — idle it
+  // otherwise (pauseWhen consults a ref since useAsync captures config at setup).
+  const triageActiveRef = useRef(false);
+  const triage = useAsync(getAutoTriageStatus, [], {
+    refetchInterval: 5_000,
+    pauseWhen: () => !triageActiveRef.current,
+  });
+  triageActiveRef.current = !!triage.data?.active;
   const sources = useAsync(getDataSources, [], { refetchInterval: 60_000 });
 
   const groups = useMemo(() => alerts.data ?? [], [alerts.data]);
   const rows = useMemo(() => invs.data ?? [], [invs.data]);
   const m = useMemo(() => computeMetrics(groups), [groups]);
+  // Recent = real triage activity. Cancelled/interrupted runs are noise (a stop
+  // press or a restart cut them off, no verdict) — keep them off the overview.
   const recent = useMemo(
-    () => [...rows].sort((a, b) => (b.ts ?? '').localeCompare(a.ts ?? '')).slice(0, 7),
+    () =>
+      [...rows]
+        .filter((r) => r.status !== 'cancelled' && r.status !== 'interrupted')
+        .sort((a, b) => (b.ts ?? '').localeCompare(a.ts ?? ''))
+        .slice(0, 7),
     [rows],
   );
   const running = rows.filter((r) => r.status === 'running').length;
@@ -293,22 +308,24 @@ export function Dashboard() {
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div>
           <div className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</div>
-          <div className="mb-4 mt-0.5 text-[13px] text-dim">Live triage overview · {rangeLabel}</div>
+          <div className="mt-0.5 text-[13px] text-dim">Live investigation overview · {rangeLabel}</div>
         </div>
-        <div className="mb-4 flex items-center gap-2.5">
-          <TimeRangeFilter
-            value={range}
-            custom={custom}
-            onChange={(v, r) => {
-              setRange(v);
-              if (r) setCustom(r);
-            }}
-          />
-          <span className="flex items-center gap-1.5 text-[11.5px] text-faint">
-            <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-success" />
-            live
-          </span>
-        </div>
+        <span className="mb-1 flex items-center gap-1.5 text-[11.5px] text-faint">
+          <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-success" />
+          live
+        </span>
+      </div>
+
+      {/* filter bar — TimeRangeFilter sits first, matching Alerts & Investigations */}
+      <div className="mb-4 mt-3 flex flex-wrap items-center gap-2">
+        <TimeRangeFilter
+          value={range}
+          custom={custom}
+          onChange={(v, r) => {
+            setRange(v);
+            if (r) setCustom(r);
+          }}
+        />
       </div>
 
       {/* KPI row */}
@@ -321,9 +338,15 @@ export function Dashboard() {
           icon={<Activity size={16} />}
         />
         <StatCard
-          label="Awaiting triage"
+          label="Awaiting investigation"
           value={a(m.verdict.untriaged)}
-          sub={m.triaging ? `${m.triaging} triaging now` : 'no active triage'}
+          sub={
+            triage.data?.active
+              ? `auto-investigate running · ${triage.data.hunted}/${triage.data.total}`
+              : m.verdict.untriaged > 0
+                ? 'auto-investigate idle'
+                : 'queue clear'
+          }
           color="#f5a623"
           icon={<ShieldAlert size={16} />}
         />
@@ -337,7 +360,7 @@ export function Dashboard() {
         <StatCard
           label="Investigations running"
           value={i(running)}
-          sub={triage.data?.active ? 'auto-triage active' : `${i(rows.length)} total`}
+          sub={triage.data?.active ? 'auto-investigate active' : `${i(rows.length)} total`}
           color="#2dd4bf"
           icon={<Crosshair size={16} />}
         />
@@ -350,7 +373,7 @@ export function Dashboard() {
           <Panel>
             <PanelHeader
               icon={<Activity size={15} />}
-              title="Triage outcomes"
+              title="Investigation outcomes"
               right={<span className="text-[11.5px] text-faint">{a(m.groups)} groups</span>}
             />
             {alerts.loading && !alerts.data ? (
@@ -390,7 +413,7 @@ export function Dashboard() {
                 <ErrorState error={invs.error} />
               </div>
             ) : recent.length === 0 ? (
-              <EmptyState>No investigations yet — hunt an alert to start one.</EmptyState>
+              <EmptyState>No investigations yet — investigate an alert to start one.</EmptyState>
             ) : (
               <div>
                 {recent.map((r) => {
@@ -403,11 +426,14 @@ export function Dashboard() {
                     >
                       <KindBadge kind={r.kind} />
                       <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{r.name}</span>
-                      <span className="hidden w-[120px] flex-none truncate font-mono text-[11px] text-faint sm:block">
-                        {r.host}
+                      <span className="hidden w-[150px] flex-none overflow-hidden sm:block">
+                        <FlowBadge src={r.host === '—' ? null : r.host} dst={r.dst} className="text-[11px]" />
                       </span>
                       <span className="flex-none">
-                        <VerdictPill verdict={r.verdict} conf={r.conf} />
+                        {/* A running/awaiting/errored row has no verdict yet — the
+                            status tag carries that. Showing an "untriaged" pill
+                            beside "Investigating" reads as a contradiction. */}
+                        {r.verdict !== 'untriaged' && <VerdictPill verdict={r.verdict} conf={r.conf} />}
                       </span>
                       <span className="hidden w-[120px] flex-none md:block">
                         <StatusTag color={st.color} label={st.label} pulse={st.pulse} />
@@ -426,7 +452,7 @@ export function Dashboard() {
         {/* right: live activity + enrichment posture */}
         <div className="flex flex-col gap-4">
           <Panel>
-            <PanelHeader icon={<Activity size={15} />} title="Auto-triage" />
+            <PanelHeader icon={<Activity size={15} />} title="Auto-Investigate" />
             <AutoTriagePanel s={triage.data} loading={triage.loading && !triage.data} />
           </Panel>
 

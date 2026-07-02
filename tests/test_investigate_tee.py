@@ -225,6 +225,26 @@ def test_tee_marks_error_on_stream_crash(crash_client: TestClient, tee_settings:
     assert stored["status"] == "error"
 
 
+def test_tee_route_seeds_rule_name_when_stream_crashes_before_context(
+    crash_client: TestClient, tee_settings: Settings
+) -> None:
+    """The /investigate route resolves the rule name up front and seeds the row, so
+    a stream that crashes BEFORE emitting any alert_context event is still named —
+    the userscript path no longer produces a nameless 'Alert <id>…' row."""
+    with patch(
+        "soc_ai.api.routes.resolve_alert_for_hunt",
+        AsyncMock(return_value=(True, "ET SCAN Seeded By Route")),
+    ), crash_client.stream(
+        "POST", "/investigate", json={"alert_id": "es-crash-named"}
+    ) as resp:
+        body = "".join(chunk for chunk in resp.iter_text())
+
+    inv_id = body.split('"investigation_id": "')[1].split('"')[0]
+    stored = _read_investigation(tee_settings, inv_id)
+    assert stored["status"] == "error"  # crashed before a verdict
+    assert stored["rule_name"] == "ET SCAN Seeded By Route"  # …but still named
+
+
 def test_tee_started_by_session_user(tee_client: TestClient, tee_settings: Settings) -> None:
     """When the caller is logged in via session cookie, started_by must be their username."""
     with tee_client.stream("POST", "/investigate", json={"alert_id": "es-auth"}) as resp:
@@ -315,6 +335,70 @@ def test_broken_store_does_not_break_stream(tee_client: TestClient) -> None:
         body = "".join(resp.iter_text())
     assert '"investigation_id": null' in body
     assert "triage_report" in body  # stream still delivered the goods
+
+
+@pytest.mark.asyncio
+async def test_seeded_rule_name_survives_run_with_no_alert_context(
+    settings_kratos: Settings,
+) -> None:
+    """THE FIX: a recorder seeded with a rule_name names the row at creation, so a
+    run that reaches a terminal state BEFORE emitting any alert_context event
+    (e.g. an ES prefetch failure) is still named — never the 'Alert <id>…'
+    fallback. This is the exact regression the user reported."""
+    from soc_ai.api.recorder import InvestigationRecorder
+
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+
+    recorder = InvestigationRecorder(
+        maker, alert_id="es-seed", started_by="t", rule_name="ET SCAN Seeded Rule"
+    )
+    inv_id = await recorder.start()
+    assert inv_id is not None
+
+    # No alert_context is ever recorded — the run dies straight to a terminal error.
+    await recorder.finish("error")
+
+    async with maker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+    await engine.dispose()
+
+    assert got is not None
+    inv, _events = got
+    assert inv.rule_name == "ET SCAN Seeded Rule"  # named at birth, not NULL
+    assert inv.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_unseeded_run_falls_back_to_event_dataset(settings_kratos: Settings) -> None:
+    """An unseeded run (selected-id auto-triage) backfills from the stream. When the
+    detection has no rule.name (Zeek notice etc.) the recorder falls back to
+    event.dataset so the row still gets a meaningful label instead of NULL."""
+    from soc_ai.api.recorder import InvestigationRecorder
+
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+
+    recorder = InvestigationRecorder(maker, alert_id="es-notice", started_by="t", rule_name="")
+    inv_id = await recorder.start()
+    assert inv_id is not None
+
+    # alert_context with NO rule.name but an event_dataset present.
+    await recorder.record(
+        "alert_context", 1, {"alert": {"rule_name": None, "event_dataset": "zeek.notice"}}
+    )
+    await recorder.record("triage_report", 2, REPORT)
+    await recorder.finish("complete")
+
+    async with maker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+    await engine.dispose()
+
+    assert got is not None
+    inv, _events = got
+    assert inv.rule_name == "zeek.notice"  # dataset fallback, not NULL
 
 
 @pytest.mark.asyncio

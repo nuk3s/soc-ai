@@ -509,8 +509,12 @@ def t_policy_violation_internal(ctx: EnrichedAlertContext) -> CandidateVerdict |
     if _rule_signals_malware(ctx):
         return None
     return CandidateVerdict(
+        # 0.80: a deterministic internal-only policy verdict, as rule-grounded as
+        # the DNSSEC/NTP housekeeping templates — and at/above the hard evidence
+        # gate's strong-template exemption floor (0.8), so it auto-clears as FP
+        # instead of flooding needs_more_info.
         verdict="false_positive",
-        confidence=0.75,
+        confidence=0.80,
         cited_evidence=[
             "alert.classtype=policy-violation",
             "both endpoints internal",

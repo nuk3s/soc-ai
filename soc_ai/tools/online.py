@@ -12,11 +12,17 @@ read tools).
 from __future__ import annotations
 
 import ipaddress
+import re
 from typing import Any
 
 import httpx
 
 from soc_ai.config import Settings
+
+# Host/IP-ish tokens in a free-text query (FQDNs, bare hostnames, IPv4, IPv6).
+# Leading ':' is allowed so IPv6 literals written with a leading '::' (e.g. ``::1``)
+# are captured, not just those starting with a hextet.
+_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9:][A-Za-z0-9_.:-]*")
 
 
 def online_unavailable(
@@ -76,6 +82,52 @@ def is_internal_ip(ip: str, settings: Any) -> bool:
         except TypeError:
             continue
     return False
+
+
+def first_internal_identifier(text: str, settings: Any) -> str | None:
+    """Return the first token in *text* that is an INTERNAL identifier (and so must
+    NOT be sent to a third party), else ``None``.
+
+    Catches three leak classes that an IPv4-only, ``internal_cidrs``-membership
+    guard misses:
+
+    * internal IPs — via :func:`is_internal_ip`, which treats anything not
+      globally routable as internal (RFC1918, loopback, link-local, CGNAT,
+      benchmarking) and understands IPv6, plus operator ``internal_cidrs``;
+    * FQDNs on a configured internal DNS suffix (``oracle_internal_suffixes``,
+      e.g. ``dc01.corp.local``);
+    * a bare/known internal hostname configured in ``oracle_extra_hosts``.
+
+    Bare single-label tokens are refused ONLY when they exactly match a configured
+    internal host, so ordinary English/query words are never over-refused.
+    """
+    suffixes = tuple(s.lower() for s in (getattr(settings, "oracle_internal_suffixes", ()) or ()))
+    extra_hosts = {str(h).lower() for h in (getattr(settings, "oracle_extra_hosts", ()) or ())}
+    for raw in _IDENTIFIER_TOKEN_RE.findall(text or ""):
+        # Strip only dot/hyphen punctuation from the ends — NOT colons, which are
+        # part of an IPv6 literal (``::1``) or an IPv4 ``host:port``.
+        tok = str(raw).strip(".-")
+        if not tok:
+            continue
+        # IP candidates: the token itself, plus the host part of an IPv4 host:port.
+        candidates = [tok]
+        if tok.count(":") == 1:
+            candidates.append(tok.rsplit(":", 1)[0])
+        is_ip = False
+        for cand in candidates:
+            try:
+                ipaddress.ip_address(cand)
+            except ValueError:
+                continue
+            is_ip = True
+            if is_internal_ip(cand, settings):  # not globally routable / in internal_cidrs
+                return tok
+        if is_ip:
+            continue  # an external IP literal — not a leak
+        low = tok.lower()
+        if any(low.endswith(sfx) for sfx in suffixes) or low in extra_hosts:
+            return tok
+    return None
 
 
 def online_client(settings: Settings) -> httpx.AsyncClient:

@@ -31,6 +31,7 @@ from soc_ai.tools.query_cases import query_cases
 from soc_ai.tools.query_events import query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
 from soc_ai.tools.rule_prevalence import rule_prevalence
+from soc_ai.tools.rule_tuning import suggest_rule_tuning
 from soc_ai.tools.shodan_host import shodan_host
 from soc_ai.tools.shodan_internetdb import shodan_internetdb
 from soc_ai.tools.web_search import web_search
@@ -339,6 +340,26 @@ def build_chat_agent(  # noqa: PLR0915
         """
         try:
             return await rule_prevalence(
+                rule_name,
+                elastic=ctx.elastic,
+                settings=s,
+                lookback_days=lookback_days,
+            )
+        except Exception as e:
+            return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_suggest_rule_tuning(rule_name: str, lookback_days: int = 7) -> dict[str, Any]:
+        """Detection tuning: is this Suricata rule a noisy FP nuisance to mute?
+
+        Answers "is this rule mostly-benign noise that should be muted/re-tuned,
+        or is it pulling its weight?". Returns the rule's alert volume, its
+        acknowledged-vs-escalated disposition trend (the ES proxy for FP vs TP),
+        and a mute/monitor/none recommendation with a one-line reason. READ-ONLY —
+        it nominates, it does not change Security Onion.
+        """
+        try:
+            return await suggest_rule_tuning(
                 rule_name,
                 elastic=ctx.elastic,
                 settings=s,

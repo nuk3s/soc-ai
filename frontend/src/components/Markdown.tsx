@@ -37,7 +37,7 @@ export function Markdown({ children }: { children: string }) {
           <div className="mb-1 mt-2 text-[12.5px] font-semibold text-text-2 first:mt-0">{children}</div>
         ),
         a: ({ children, href }) => (
-          <a href={href} target="_blank" rel="noreferrer" className="text-accent underline">
+          <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent underline">
             {children}
           </a>
         ),

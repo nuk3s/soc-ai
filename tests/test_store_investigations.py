@@ -33,6 +33,32 @@ REPORT = {
 }
 
 
+async def test_create_seeds_rule_name_at_birth(settings_kratos: Settings) -> None:
+    """create(rule_name=...) names the row immediately so it is never anonymous,
+    even if the run dies before the first alert_context event. Empty/None seeds
+    leave it NULL for the recorder's stream-backfill."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        named = await inv_svc.create(
+            db, alert_es_id="a1", started_by="admin", rule_name="ET SCAN seeded"
+        )
+        assert named.rule_name == "ET SCAN seeded"
+
+        # Empty string must NOT persist as "" — it stays NULL so backfill can fire.
+        blank = await inv_svc.create(db, alert_es_id="a2", started_by="admin", rule_name="")
+        assert blank.rule_name is None
+
+        none = await inv_svc.create(db, alert_es_id="a3", started_by="admin")
+        assert none.rule_name is None
+
+        # Over-long names are truncated to the column bound (512).
+        long = await inv_svc.create(
+            db, alert_es_id="a4", started_by="admin", rule_name="x" * 600
+        )
+        assert long.rule_name is not None and len(long.rule_name) == 512
+    await engine.dispose()
+
+
 async def test_lifecycle_create_append_finalize(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
@@ -213,6 +239,41 @@ async def test_reap_returns_zero_when_nothing_running(settings_kratos: Settings)
         await inv_svc.finalize(db, done.id, status="complete", verdict="true_positive")
         assert await inv_svc.reap_stale_running(db, older_than_minutes=None) == 0
         assert await inv_svc.reap_stale_running(db, older_than_minutes=30) == 0
+    await engine.dispose()
+
+
+async def test_reap_interrupted_status_marks_benign_state(settings_kratos: Settings) -> None:
+    """The startup reap writes 'interrupted' (not 'error') so a clean restart never
+    surfaces a scary failure in a healthy env — and the row stays re-huntable."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        inv = await inv_svc.create(db, alert_es_id="cut-off", started_by="x")
+
+        n = await inv_svc.reap_stale_running(db, older_than_minutes=None, status="interrupted")
+        assert n == 1
+        row = await db.get(Investigation, inv.id)
+        assert row.status == "interrupted"
+        assert row.finished_at is not None
+        # interrupted-specific note (distinct from the 'error' timeout note)
+        assert "interrupted by a service restart" in row.rationale
+        # re-huntable: continuous auto-triage / manual re-hunt must pick it back up
+        assert inv_svc.blocks_rehunt(row) is False
+    await engine.dispose()
+
+
+async def test_reap_default_status_is_error(settings_kratos: Settings) -> None:
+    """The periodic over-age sweep keeps the 'error' status — a hunt that ran too
+    long is a genuine failure, not a benign restart."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        stale = await inv_svc.create(db, alert_es_id="ran-too-long", started_by="x")
+        await _age(db, stale.id, minutes=60)
+
+        n = await inv_svc.reap_stale_running(db, older_than_minutes=30)
+        assert n == 1
+        row = await db.get(Investigation, stale.id)
+        assert row.status == "error"
+        assert "interrupted by a service restart" not in (row.rationale or "")
     await engine.dispose()
 
 

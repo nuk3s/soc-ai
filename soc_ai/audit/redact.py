@@ -1,7 +1,9 @@
 """Regex-based redactor for audit event payloads.
 
-OPT-IN via ``AUDIT_REDACT=true``. Off by default because redacting security
-data can hide actual indicators - the operator must turn it on explicitly.
+ON by default (``AUDIT_REDACT=true``). soc-ai's audit log lands in a *shared* ES
+cluster, so secret-shaped strings are redacted before the write. Set
+``AUDIT_REDACT=false`` only if you need verbatim audit bodies and accept that
+secret-shaped values will be written to the shared cluster.
 """
 
 from __future__ import annotations

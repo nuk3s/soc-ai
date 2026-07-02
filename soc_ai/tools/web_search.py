@@ -6,9 +6,11 @@ abuse. Bounded by a timeout; never raises (returns a graceful ``{"ok": False,
 "error": ...}`` dict).
 
 PRIVACY: SearXNG fans the query out to public search engines, so a query MUST
-contain only EXTERNAL indicators. A query referencing an INTERNAL IP (inside
-``INTERNAL_CIDRS``) is refused — internal IPs/hostnames/usernames must never leak
-to public search engines.
+contain only EXTERNAL indicators. A query referencing an INTERNAL identifier —
+an internal IP (anything not globally routable, incl. RFC1918/CGNAT/benchmark/
+loopback/link-local and IPv6), an internal FQDN on a configured suffix, or a
+known internal hostname — is refused, so internal IPs/hostnames never leak to
+public search engines.
 
 Note: requires the SearXNG instance to expose the JSON API
 (``search.formats: [json]`` in its settings.yml). If it doesn't, the probe
@@ -17,35 +19,14 @@ returns a graceful ``HTTP 403`` error.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
-import re
 from typing import Any
 
 import httpx
 
+from soc_ai.tools.online import first_internal_identifier
+
 _LOGGER = logging.getLogger(__name__)
-
-_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
-
-
-def _first_internal_ip(query: str, settings: Any) -> str | None:
-    """Return the first IP in *query* that falls inside INTERNAL_CIDRS, else None."""
-    nets = list(getattr(settings, "internal_cidrs", []) or [])
-    if not nets:
-        return None
-    for token in _IPV4_RE.findall(query):
-        try:
-            ip = ipaddress.ip_address(token)
-        except ValueError:
-            continue
-        for net in nets:
-            try:
-                if ip in net:
-                    return str(token)
-            except TypeError:
-                continue
-    return None
 
 
 async def web_search(query: str, *, settings: Any) -> dict[str, Any]:
@@ -63,13 +44,17 @@ async def web_search(query: str, *, settings: Any) -> dict[str, Any]:
     base = str(getattr(settings, "searxng_url", "") or "").rstrip("/")
     if not base:
         return {"ok": False, "error": "searxng_url not configured"}
-    # PRIVACY GUARD: never send an internal IP to public search engines.
-    leaked = _first_internal_ip(query, settings)
+    # PRIVACY GUARD: never leak an internal identifier to public search engines.
+    # Covers internal IPs (RFC1918/CGNAT/benchmark/loopback/link-local + IPv6),
+    # internal FQDNs on a configured suffix, and known internal hostnames — the
+    # same predicate the crawl_page + online-enrichment egress paths use, so the
+    # three can't drift.
+    leaked = first_internal_identifier(query, settings)
     if leaked is not None:
         return {
             "ok": False,
             "error": (
-                f"refused: query contains internal IP {leaked}; "
+                f"refused: query contains internal identifier {leaked!r}; "
                 "web_search is for EXTERNAL indicators only"
             ),
         }

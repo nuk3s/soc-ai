@@ -123,6 +123,13 @@ _CATALOG: tuple[_ToolDef, ...] = (
         (_ES,),
     ),
     _ToolDef(
+        "suggest_rule_tuning",
+        "Query",
+        True,
+        "Detection tuning: is a rule a noisy FP nuisance to mute? Volume + ack/escalate trend.",
+        (_ES,),
+    ),
+    _ToolDef(
         "host_summary",
         "Query",
         True,

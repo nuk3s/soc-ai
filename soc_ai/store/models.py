@@ -97,6 +97,71 @@ class InvestigationEvent(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class Hunt(Base):
+    """A broad, multi-alert / multi-host threat hunt.
+
+    Unlike an :class:`Investigation` (which dispositions ONE alert into a
+    verdict), a hunt investigates across hosts/time or a free-form objective and
+    lands **findings + a narrative** (the :class:`~soc_ai.agent.hunt.HuntReport`
+    stored in ``report``). Shares the investigation lifecycle statuses
+    (running/complete/error/cancelled/interrupted). Read-only in this phase —
+    hunts never ack/escalate/open a case. ``hunt_events`` holds the agent trace,
+    exactly like ``investigation_events``.
+    """
+
+    __tablename__ = "hunts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
+    objective: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(16), default="chat")  # chat | scheduled | triggered
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    narrative: Mapped[str | None] = mapped_column(Text, default=None)
+    report: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)  # HuntReport
+    started_by: Mapped[str] = mapped_column(String(64), default="anonymous")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+
+class HuntEvent(Base):
+    __tablename__ = "hunt_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hunt_id: Mapped[str] = mapped_column(ForeignKey("hunts.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(40))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class Backtest(Base):
+    """A "prove it on my last N days" replay of the agent over already-dispositioned alerts.
+
+    Points soc-ai at a historical window of alerts an analyst already dispositioned
+    in Security Onion (``event.escalated`` ⇒ a real true-positive; acknowledged-and-
+    not-escalated ⇒ a proxy false-positive), replays the agent's triage over a
+    sampled subset, and compares soc-ai's verdicts to the human disposition. The
+    ``results`` JSON holds the aggregated metrics (agreement_rate, fp_reduction,
+    the confusion matrix, and the CRITICAL ``missed_tp`` list) plus the per-alert
+    rows. Shares the running/complete/error lifecycle; a single-flight background
+    job on ``app.state`` drives it (see :mod:`soc_ai.webui.backtest`). Read-only:
+    a backtest never acks/escalates/opens a case — it only measures.
+    """
+
+    __tablename__ = "backtests"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
+    # The run's inputs: {"window_days": int, "sample_size": int, "min_severity": str|None}.
+    params: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    # How many alerts were actually sampled + replayed (may be < requested if the
+    # window held fewer dispositioned alerts).
+    sampled: Mapped[int] = mapped_column(Integer, default=0)
+    # The metrics + per-alert comparison rows (the BacktestResults shape).
+    results: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    started_by: Mapped[str] = mapped_column(String(64), default="anonymous")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+
 class ChatMessage(Base):
     """One message in an investigation's follow-up chat thread.
 
@@ -179,3 +244,28 @@ class InternalIdentifier(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(), server_default=func.now(), onupdate=func.now()
     )
+
+
+class DetectionOverride(Base):
+    """An operator's soft, reversible suppression of a noisy detection rule.
+
+    Detection tuning: when a Suricata rule fires constantly and triage keeps
+    coming back false-positive, the operator can *mute* it — a soc-ai-side
+    suppression that hides the rule's alerts from the default feed. This NEVER
+    touches Security Onion / Elasticsearch: nothing is written upstream, no rule
+    is disabled in SO. The mute is reversible (``active`` flips to False on
+    un-mute, the row is kept for audit), and global (no per-host scope in this
+    MVP). The default alerts feed subtracts ``muted_rule_names`` (see
+    ``soc_ai.store.detection_overrides``); ``?include_muted=true`` shows them
+    again.
+    """
+
+    __tablename__ = "detection_override"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_name: Mapped[str] = mapped_column(String(512), index=True)
+    action: Mapped[str] = mapped_column(String(16), default="mute")  # 'mute'
+    reason: Mapped[str | None] = mapped_column(String(512), default=None)
+    created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
