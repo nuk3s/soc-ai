@@ -177,7 +177,12 @@ def build_mcp(
 
     @mcp.tool()
     async def runbook(query: str, k: int = 5) -> list[dict[str, Any]]:
-        """Semantic search over indexed runbooks (v1 stub returns [])."""
+        """Search the operator's runbooks (keyword/tag/rule-linked).
+
+        The MCP server has no local-store session, so this surface returns ``[]``
+        here; runbook search is served by the in-app ``lookup_runbook`` tool
+        (which is handed the store ``db_sessionmaker``).
+        """
         return await lookup_runbook(query, k=k)
 
     return mcp

@@ -333,6 +333,7 @@ async def run_auto_triage(
     status = get_status(state)
     try:
         ctx = ctx_from_state(state)
+        per_target_timeout = getattr(state.settings, "auto_triage_per_target_timeout_s", 600)
 
         for i, target in enumerate(targets):
             if status.cancelled:  # stop requested — abort before the next target
@@ -342,7 +343,10 @@ async def run_auto_triage(
             status.current = label
             try:
                 stream_errored = False
-                async for name, _data in run_recorded(
+                # Hold the generator so we can guarantee it is closed if the
+                # wall-clock backstop fires mid-stream — a hung LLM read would
+                # otherwise leak the coroutine and stall the whole sweep.
+                stream = run_recorded(
                     state,
                     ctx=ctx,
                     alert_id=target.alert_es_id,
@@ -350,16 +354,34 @@ async def run_auto_triage(
                     # Group sweeps know the rule name up front; selected-id runs
                     # carry "" and fall back to stream-extraction.
                     rule_name=target.rule_name or None,
-                ):
-                    if name == "error":
-                        stream_errored = True
-                    elif name == "tool_call":
-                        status.tool_calls += 1
+                )
+                try:
+                    async with asyncio.timeout(per_target_timeout):
+                        async for name, _data in stream:
+                            if name == "error":
+                                stream_errored = True
+                            elif name == "tool_call":
+                                status.tool_calls += 1
+                finally:
+                    # run_recorded is an async generator at runtime; aclose()
+                    # cancels a mid-stream read cleanly on timeout. It is typed
+                    # as AsyncIterator (no aclose in that protocol), so reach the
+                    # method defensively.
+                    aclose = getattr(stream, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
                 if stream_errored:
                     _LOGGER.warning("auto-triage: stream error for alert_id=%s", target.alert_es_id)
                     status.failed += 1
                 else:
                     status.hunted += 1
+            except TimeoutError:
+                _LOGGER.warning(
+                    "auto-triage: target timed out after %ss, alert_id=%s — moving to next target",
+                    per_target_timeout,
+                    target.alert_es_id,
+                )
+                status.failed += 1
             except Exception:
                 _LOGGER.exception(
                     "auto-triage: investigation failed for alert_id=%s", target.alert_es_id

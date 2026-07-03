@@ -269,12 +269,18 @@ export function Dashboard() {
   const rangeLabel = range === 'custom' ? 'custom range' : `last ${range}`;
   const alertQuery: AlertQuery =
     range === 'custom' && custom ? { range: 'custom', from: custom.from, to: custom.to } : { range };
-  // Poll at 10s (matching the live Alerts grid) so KPI cards reflect a landed
-  // verdict within ~10s instead of feeling frozen for half a minute.
+  // KPI cards aren't a live console — a 30s cadence keeps the counts fresh
+  // without hammering ES aggregation on every idle dashboard.
   const alerts = useAsync(() => getAlerts(alertQuery), [range, custom?.from, custom?.to], {
-    refetchInterval: 10_000,
+    refetchInterval: 30_000,
   });
-  const invs = useAsync(getInvestigations, [], { refetchInterval: 10_000 });
+  // Idle the investigations poll once every run is terminal (pauseWhen consults
+  // a ref since useAsync captures config at setup), mirroring triageActiveRef.
+  const invsActiveRef = useRef(false);
+  const invs = useAsync(getInvestigations, [], {
+    refetchInterval: 10_000,
+    pauseWhen: () => !invsActiveRef.current,
+  });
   // Only poll auto-triage status while a batch is actually running — idle it
   // otherwise (pauseWhen consults a ref since useAsync captures config at setup).
   const triageActiveRef = useRef(false);
@@ -287,6 +293,7 @@ export function Dashboard() {
 
   const groups = useMemo(() => alerts.data ?? [], [alerts.data]);
   const rows = useMemo(() => invs.data ?? [], [invs.data]);
+  invsActiveRef.current = rows.some((r) => r.status === 'running' || r.status === 'awaiting');
   const m = useMemo(() => computeMetrics(groups), [groups]);
   // Recent = real triage activity. Cancelled/interrupted runs are noise (a stop
   // press or a restart cut them off, no verdict) — keep them off the overview.

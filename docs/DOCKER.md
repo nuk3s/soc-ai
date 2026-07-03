@@ -245,7 +245,7 @@ to your `.env`. New settings ship with safe defaults, renamed settings keep thei
 old name as an alias (e.g. `HEAVY_MODEL` still works after the rename to
 `ANALYST_MODEL`), and migrations are additive. Anything that genuinely can't keep
 that promise waits for the next major version and gets called out in
-[CHANGELOG.md](../CHANGELOG.md).
+[CHANGELOG.md](https://github.com/nuk3s/soc-ai/blob/main/CHANGELOG.md).
 
 ---
 

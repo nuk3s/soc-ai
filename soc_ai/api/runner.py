@@ -115,12 +115,17 @@ async def run_recorded(
     session_id: str | None = None,
     cancel_token: CancelToken | None = None,
     rule_name: str | None = None,
+    focus_hint: str | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Build investigator/synthesizer, call investigate(), and tee through the recorder.
 
     Used by the auto-triage worker.  The SSE route has its own ``stream()``
     that calls ``recorded_run`` directly so that unittest patches on
     ``soc_ai.api.routes.investigate`` continue to work.
+
+    ``focus_hint`` (optional): prior open questions from a re-launched
+    ``needs_more_info`` investigation ("request more info") — threaded into
+    ``investigate()`` so the fresh run targets those gaps.
     """
     investigator = build_investigator(build_investigator_model(ctx.settings), ctx)
     synthesizer = build_synthesizer(build_synthesizer_model(ctx.settings))
@@ -131,6 +136,7 @@ async def run_recorded(
         investigator=investigator,
         synthesizer=synthesizer,
         session_id=session_id,
+        focus_hint=focus_hint,
     )
 
     async for name, data in recorded_run(

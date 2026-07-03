@@ -1,9 +1,9 @@
-import { ChevronRight, Crosshair, Loader2, Plus, Sparkles } from 'lucide-react';
-import { useState } from 'react';
+import { Check, Crosshair, Loader2, Plus, Sparkles, Trash2, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
-import { getHunts, getHuntStats, startHuntConsole } from '../lib/api';
+import { deleteHunt, getHunts, getHuntStats, startHuntConsole } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import type { HuntRow, HuntStatus } from '../lib/types';
 
@@ -31,6 +31,42 @@ const TONE: Record<string, string> = {
   danger: '#f85149',
 };
 
+// Canned hunts — high-payoff, routine SOC hunts one click away. A chip fills the
+// objective box (so the analyst can tweak the scope, then launch) rather than
+// firing blind; label is the short name, `objective` is the full prompt.
+const PRESETS: { label: string; objective: string }[] = [
+  {
+    label: 'Beaconing to rare IPs',
+    objective:
+      'Hunt for internal hosts beaconing to rare external IPs in the last 24h — regular cadence, low data volume, novel destinations.',
+  },
+  {
+    label: 'Credential abuse / lockouts',
+    objective:
+      'Hunt for credential-abuse signals: account lockouts, failed-auth spikes, and Kerberoasting on the domain controllers.',
+  },
+  {
+    label: 'Lateral movement',
+    objective:
+      'Hunt for lateral movement: SMB/admin-share access, PsExec-style service creation, and RDP between internal hosts.',
+  },
+  {
+    label: 'DNS / C2 exfiltration',
+    objective:
+      'Hunt for DNS tunneling and C2 exfiltration: high-entropy or high-volume DNS, long TXT records, and beaconing over DNS.',
+  },
+  {
+    label: 'New external services',
+    objective:
+      'Hunt for internal hosts newly exposing or reaching new external services this week that they never used before.',
+  },
+  {
+    label: 'Suspicious PowerShell / LOLBins',
+    objective:
+      'Hunt for suspicious PowerShell and living-off-the-land binary use across endpoints.',
+  },
+];
+
 function StatusDot({ status }: { status: HuntStatus }) {
   const m = STATUS_META[status] ?? STATUS_META.error;
   return (
@@ -50,11 +86,53 @@ export function Hunts() {
   const [objective, setObjective] = useState('');
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  // Per-row delete: a trash icon arms an inline confirm in the row, then deletes
+  // just that hunt. A running hunt returns 409 (cancel it first).
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [deleteMsg, setDeleteMsg] = useState<string | null>(null);
 
+  // useAsync captures pauseWhen at setup and can't see `data` there, so track
+  // whether any hunt is still running in a ref and let pauseWhen (on both polls)
+  // consult it: stop polling once every hunt has reached a terminal state.
+  const activeRef = useRef(false);
   const { data, loading, error } = useAsync<HuntRow[]>(getHunts, [reloadKey], {
     refetchInterval: 8000, // live status (running → complete) without a reload
+    pauseWhen: () => !activeRef.current,
   });
-  const stats = useAsync(getHuntStats, [reloadKey], { refetchInterval: 8000 });
+  const stats = useAsync(getHuntStats, [reloadKey], {
+    refetchInterval: 8000,
+    pauseWhen: () => !activeRef.current,
+  });
+  activeRef.current = (data ?? []).some((h) => h.status === 'running');
+
+  // A hunt started elsewhere won't appear while this list is idle — force one
+  // refetch when the tab regains focus.
+  useEffect(() => {
+    const onFocus = () => setReloadKey((k) => k + 1);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') setReloadKey((k) => k + 1);
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
+
+  const deleteOne = async (id: string) => {
+    setDeleteMsg(null);
+    try {
+      await deleteHunt(id);
+    } catch (e: unknown) {
+      // 409 = the hunt is still running; the API hint surfaces as the message.
+      setDeleteMsg(
+        e instanceof Error ? e.message : 'Delete failed — cancel the running hunt first.',
+      );
+    }
+    setPendingDelete(null);
+    setReloadKey((k) => k + 1);
+  };
 
   const launch = () => {
     const obj = objective.trim();
@@ -110,6 +188,24 @@ export function Hunts() {
         <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold">
           <Sparkles size={15} className="text-accent" /> New hunt
         </div>
+        {/* Canned hunts — click a chip to load a high-payoff objective, then
+            tweak the scope and launch. */}
+        <div className="mb-2.5 flex flex-wrap gap-1.5">
+          {PRESETS.map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              onClick={() => {
+                setObjective(p.objective);
+                setStartError(null);
+              }}
+              title={p.objective}
+              className="rounded-badge border border-border-strong bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-dim transition-colors hover:border-accent hover:text-accent"
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
         <div className="flex items-center gap-2">
           <input
             value={objective}
@@ -130,6 +226,7 @@ export function Hunts() {
           </button>
         </div>
         {startError && <div className="mt-2 text-[12px] text-danger">{startError}</div>}
+        {deleteMsg && <div className="mt-2 text-[12px] text-danger">{deleteMsg}</div>}
       </Panel>
 
       {/* hunts list */}
@@ -157,10 +254,10 @@ export function Hunts() {
           </EmptyState>
         ) : (
           data.map((h) => (
-            <button
+            <div
               key={h.id}
               onClick={() => navigate(`/hunts/${h.id}`)}
-              className="grid w-full items-center gap-3 border-b border-border px-4 py-3 text-left last:border-0 hover:bg-surface-2"
+              className="group grid w-full cursor-pointer items-center gap-3 border-b border-border px-4 py-3 text-left last:border-0 hover:bg-surface-2"
               style={{ gridTemplateColumns: GRID }}
             >
               <div className="flex items-center gap-2 truncate">
@@ -173,8 +270,35 @@ export function Hunts() {
                 <StatusDot status={h.status} />
               </div>
               <div className="text-[12px] text-dim">{h.when}</div>
-              <ChevronRight size={15} className="text-faint" />
-            </button>
+              <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
+                {pendingDelete === h.id ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => { void deleteOne(h.id); }}
+                      title="Confirm delete"
+                      className="flex text-danger hover:opacity-80"
+                    >
+                      <Check size={14} />
+                    </button>
+                    <button
+                      onClick={() => setPendingDelete(null)}
+                      title="Cancel"
+                      className="flex text-faint hover:text-text"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => { setPendingDelete(h.id); setDeleteMsg(null); }}
+                    title="Delete hunt"
+                    className="flex text-faint opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                )}
+              </div>
+            </div>
           ))
         )}
       </Panel>

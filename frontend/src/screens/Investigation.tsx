@@ -39,6 +39,7 @@ import {
   downloadInvestigationExport,
   overrideVerdict as submitOverride,
   postChat,
+  requestMoreInfo,
   resolveInvestigation,
   startHunt,
 } from '../lib/api';
@@ -226,6 +227,19 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       .then((newId) => onReHunt?.(newId))
       .catch(() => {})
       .finally(() => setReHunting(false));
+  };
+
+  // "Request more info": launch a FOCUSED re-investigation that targets the
+  // open questions behind this needs_more_info verdict. Same navigate/poll
+  // handoff as reRun — the container switches to the new investigation id.
+  const [requestingInfo, setRequestingInfo] = useState(false);
+  const requestInfo = () => {
+    if (requestingInfo) return;
+    setRequestingInfo(true);
+    requestMoreInfo(inv.id)
+      .then((newId) => onReHunt?.(newId))
+      .catch(() => {})
+      .finally(() => setRequestingInfo(false));
   };
 
   const NET_ERR_TEXT = 'Could not reach the server — please try again.';
@@ -441,24 +455,36 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     {inv.oracle?.escalated && (
       <OracleCard oracle={inv.oracle} />
     )}
-    {inv.verdict === 'needs_more_info' && (inv.openQuestions?.length ?? 0) > 0 && (
+    {(inv.openQuestions?.length ?? 0) > 0 && (
       <div
         className="mb-3 rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
       >
         <div className="mb-1.5 text-[12px] font-semibold uppercase tracking-[.05em]" style={{ color: '#f5a623' }}>
-          Open questions
+          {inv.verdict === 'needs_more_info' ? 'Open questions' : 'Residual open questions'}
         </div>
         <ul className="mb-2.5 list-disc pl-5 text-[13px] text-text-2">
           {inv.openQuestions!.map((q, i) => <li key={i} className="mb-0.5">{q}</li>)}
         </ul>
-        <button
-          onClick={() => document.querySelector('[data-chat-panel]')?.scrollIntoView({ behavior: 'smooth' })}
-          className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
-          style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
-        >
-          <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Resolve in chat
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={requestInfo}
+            disabled={requestingInfo}
+            title="Launch a fresh investigation focused on the open questions above"
+            className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#0b0f16] disabled:opacity-60"
+            style={{ background: '#f5a623', borderColor: '#f5a623' }}
+          >
+            {requestingInfo ? <Spinner size={13} /> : <Crosshair size={13} />}
+            {requestingInfo ? 'Requesting…' : 'Request more info'}
+          </button>
+          <button
+            onClick={() => document.querySelector('[data-chat-panel]')?.scrollIntoView({ behavior: 'smooth' })}
+            className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
+            style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+          >
+            <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Resolve in chat
+          </button>
+        </div>
       </div>
     )}
     {inv.resolution?.resolved_via === 'manual' && (

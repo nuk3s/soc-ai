@@ -191,6 +191,7 @@ async def _fake_investigate_success(
     investigator: Any = None,
     synthesizer: Any = None,
     session_id: str | None = None,
+    focus_hint: str | None = None,
 ) -> AsyncIterator[StepEvent]:
     sid = session_id or "fake-at-sid"
     yield StepEvent(
@@ -320,6 +321,7 @@ class TestAutoTriageSingleFlight:
             investigator: Any = None,
             synthesizer: Any = None,
             session_id: str | None = None,
+            focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
             sid = session_id or "slow-sid"
             yield StepEvent(
@@ -376,6 +378,7 @@ class TestAutoTriageFailedCountsStreamErrors:
             investigator: Any = None,
             synthesizer: Any = None,
             session_id: str | None = None,
+            focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
             sid = session_id or "err-sid"
             yield StepEvent(
@@ -404,6 +407,64 @@ class TestAutoTriageFailedCountsStreamErrors:
                 # 1 failed, 0 hunted
                 assert data["failed"] == 1
                 assert data["hunted"] == 0
+
+    def test_autotriage_bounds_a_hung_target_and_moves_on(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        """A target whose stream hangs (no wall-clock bound on the LLM read) is
+        bounded by ``auto_triage_per_target_timeout_s``, counted as failed, and
+        the sweep proceeds — it does not stall the whole run."""
+
+        async def _hanging_investigate(
+            alert_id: str,
+            *,
+            ctx: Any,
+            agent: Any = None,
+            investigator: Any = None,
+            synthesizer: Any = None,
+            session_id: str | None = None,
+            focus_hint: str | None = None,
+        ) -> AsyncIterator[StepEvent]:
+            sid = session_id or "hang-sid"
+            yield StepEvent(
+                kind="session_start", session_id=sid, sequence=1, payload={"alert_id": alert_id}
+            )
+            await asyncio.sleep(3600)  # never completes within the test's timeout
+            yield StepEvent(kind="done", session_id=sid, sequence=2, payload={})
+
+        # Tiny per-target backstop (model_copy skips int-field revalidation).
+        tight = at_settings.model_copy(update={"auto_triage_per_target_timeout_s": 0.1})
+
+        from soc_ai.webui import autotriage as at
+        from soc_ai.webui.autotriage import Target
+
+        targets = [
+            Target(alert_es_id="a1", rule_name="ET RULE A", src_ip="10.0.0.1", dst_ip="10.0.0.2"),
+        ]
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=tight),
+            patch("soc_ai.api.runner.investigate", _hanging_investigate),
+        ):
+            app = create_app()
+            with TestClient(app):
+                app.state.settings = tight
+                status = at.get_status(app.state)
+                status.reset(active=True, total=1, skipped=0)
+
+                async def _drive() -> None:
+                    await asyncio.wait_for(
+                        at.run_auto_triage(app.state, targets=targets, started_by="test"),
+                        timeout=10,  # the sweep itself must finish well under this
+                    )
+
+                asyncio.run(_drive())
+
+                assert status.failed == 1
+                assert status.hunted == 0
+                assert status.active is False
 
 
 class _FakeState:
@@ -698,6 +759,7 @@ class TestAutoTriageLiveProgress:
             investigator: Any = None,
             synthesizer: Any = None,
             session_id: str | None = None,
+            focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
             sid = session_id or "tc-sid"
             yield StepEvent(
@@ -773,6 +835,7 @@ class TestAutoTriageLiveProgress:
             investigator: Any = None,
             synthesizer: Any = None,
             session_id: str | None = None,
+            focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
             sid = session_id or "gate-sid"
             yield StepEvent(
@@ -1133,6 +1196,76 @@ class TestMaybeAutoAckFp:
         assert result.kind == "auto_ack"
         assert result.payload["success"] is False
 
+    def test_auto_ack_executes_directly_never_creates_approval_token(self) -> None:
+        """Auto-ack WRITES via execute_write_tool — it does NOT queue an approval.
+
+        This is the "auto isn't automatic" regression guard: a confident,
+        low-stakes FP with the toggle on must go straight to the SO write, never
+        park a token on ctx.gate for a human to approve. If auto-ack ever routed
+        through the approval gate, the operator's opt-in would silently do
+        nothing until manually approved — exactly the reported dogfood bug.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+        report = self._make_report(verdict="false_positive", confidence=0.9)
+        alert = self._make_alert()  # benign low-severity info-class FP
+        _ev, _audit, _ = self._make_emit_audit()
+
+        # Spy on the real approval gate: it must never be asked for a token.
+        gate_spy = AsyncMock()
+        ctx.gate.request = gate_spy  # type: ignore[method-assign]
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+            result = asyncio.run(
+                maybe_auto_ack_fp(
+                    report, "ev-direct", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                )
+            )
+
+        # The write happened directly...
+        mock_write.assert_awaited_once()
+        assert mock_write.call_args.args[0] == "ack_alert"
+        # ...and NO approval token was ever requested.
+        gate_spy.assert_not_awaited()
+        assert result is not None
+        assert result.payload["success"] is True
+
+    def test_auto_ack_routes_audit_logger_for_unattended_write(self) -> None:
+        """The unattended ack write carries ctx.audit so it lands in the audit trail.
+
+        An analyst-review-free write must always be auditable — execute_write_tool
+        writes a fail-closed *intent* record before touching SO when an audit
+        logger is provided, so maybe_auto_ack_fp must forward ctx.audit.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+        audit_logger = AsyncMock()
+        ctx.audit = audit_logger  # type: ignore[assignment]
+        report = self._make_report(verdict="false_positive", confidence=0.9)
+        alert = self._make_alert()
+        _ev, _audit, _ = self._make_emit_audit()
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+            result = asyncio.run(
+                maybe_auto_ack_fp(
+                    report, "ev-audit", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                )
+            )
+
+        mock_write.assert_awaited_once()
+        # The audit logger from ctx is forwarded to the write executor.
+        assert mock_write.call_args.kwargs.get("audit") is audit_logger
+        assert result is not None
+        assert result.payload["success"] is True
+
 
 # ---------------------------------------------------------------------------
 # Config floor: auto_triage_min_severity drives the sweep band
@@ -1162,6 +1295,7 @@ class TestAutoTriageProgress:
             investigator: Any = None,
             synthesizer: Any = None,
             session_id: str | None = None,
+            focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
             sid = session_id or "pend-sid"
             yield StepEvent(

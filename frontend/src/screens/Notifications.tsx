@@ -51,8 +51,8 @@ export function Notifications() {
               if (nt.href) navigate(nt.href);
             }}
             className={
-              'flex items-center gap-3 border-b border-border-faint px-4 py-3 hover:bg-surface-hover ' +
-              (nt.href ? 'cursor-pointer' : '')
+              'flex items-center gap-3 border-b border-border-faint px-4 py-3 ' +
+              (nt.href ? 'cursor-pointer hover:bg-surface-hover' : '')
             }
           >
             <span

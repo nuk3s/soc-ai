@@ -178,6 +178,40 @@ def _extract_zeek_typed(source: dict[str, Any], parse_errors: list[str]) -> dict
         "http.status_code", first_present(source, fields.HTTP_STATUS), int
     )
     out["zeek_http_user_agent"] = first_present(source, fields.HTTP_USER_AGENT)
+    # dns qtype / ssl established / conn service — candidate tables existed but
+    # were never surfaced. qtype (e.g. TXT-heavy) is the DNS-tunnel corroborator;
+    # ssl established distinguishes a completed TLS session from a scan.
+    out["zeek_dns_qtype"] = first_present(source, fields.DNS_QTYPE)
+    established = first_present(source, fields.SSL_ESTABLISHED)
+    out["zeek_ssl_established"] = bool(established) if established is not None else None
+    out["zeek_conn_service"] = first_present(source, fields.CONN_SERVICE)
+    # kerberos (Kerberoasting): cipher carries the ticket encryption — RC4-HMAC is
+    # the decisive roast signature; service is the requested SPN.
+    out["zeek_kerberos_cipher"] = first_present(source, fields.KERBEROS_CIPHER)
+    out["zeek_kerberos_service"] = first_present(source, fields.KERBEROS_SERVICE)
+    out["zeek_kerberos_request_type"] = first_present(source, fields.KERBEROS_REQUEST_TYPE)
+    # smb / dce-rpc (PsExec-style lateral): a file write of a service binary to
+    # ADMIN$, then an svcctl CreateServiceW — the classic remote-exec chain.
+    out["zeek_smb_action"] = first_present(source, fields.SMB_FILE_ACTION)
+    out["zeek_smb_name"] = first_present(source, fields.SMB_FILE_NAME)
+    out["zeek_smb_mapping_service"] = first_present(source, fields.SMB_MAPPING_SERVICE)
+    out["zeek_dce_rpc_endpoint"] = first_present(source, fields.DCE_RPC_ENDPOINT)
+    out["zeek_dce_rpc_operation"] = first_present(source, fields.DCE_RPC_OPERATION)
+    # ssh — a COMPLETED authentication (auth_success) is the decisive lateral /
+    # intrusion signal; combined with a bad-reputation source it's a confirmed login.
+    ssh_auth = first_present(source, fields.SSH_AUTH_SUCCESS)
+    out["zeek_ssh_auth_success"] = bool(ssh_auth) if ssh_auth is not None else None
+    out["zeek_ssh_auth_attempts"] = _coerce(
+        "ssh.auth_attempts", first_present(source, fields.SSH_AUTH_ATTEMPTS), int
+    )
+    out["zeek_ssh_client"] = first_present(source, fields.SSH_CLIENT)
+    out["zeek_ssh_server"] = first_present(source, fields.SSH_SERVER)
+    # behavioral-summary pivots — read the whole profile object (a nested dict)
+    # when a derived beacon/DNS-tunnel summary doc is present; None otherwise.
+    beacon = first_present(source, fields.BEACON_PROFILE)
+    out["zeek_beacon_profile"] = beacon if isinstance(beacon, dict) else None
+    dns_profile = first_present(source, fields.DNS_TUNNEL_PROFILE)
+    out["zeek_dns_profile"] = dns_profile if isinstance(dns_profile, dict) else None
     return out
 
 
@@ -336,6 +370,38 @@ class SoAlert(BaseModel):
     zeek_http_uri: str | None = None
     zeek_http_status: int | None = None
     zeek_http_user_agent: str | None = None
+    # DNS query type (TXT-heavy = tunnel corroborator), TLS established flag,
+    # and the conn service label. Tables existed; now surfaced.
+    zeek_dns_qtype: str | None = None
+    zeek_ssl_established: bool | None = None
+    zeek_conn_service: str | None = None
+    # Kerberos (Kerberoasting): ticket cipher (RC4-HMAC = decisive), requested
+    # service principal (SPN), and request type (TGS vs AS).
+    zeek_kerberos_cipher: str | None = None
+    zeek_kerberos_service: str | None = None
+    zeek_kerberos_request_type: str | None = None
+    # SMB / DCE-RPC (PsExec-style lateral movement): the file-write action + name
+    # (e.g. PSEXESVC.exe), the target share service (ADMIN$), and the RPC
+    # endpoint/operation (svcctl / CreateServiceW).
+    zeek_smb_action: str | None = None
+    zeek_smb_name: str | None = None
+    zeek_smb_mapping_service: str | None = None
+    zeek_dce_rpc_endpoint: str | None = None
+    zeek_dce_rpc_operation: str | None = None
+    # SSH — a completed auth (auth_success=true) is the decisive interactive-login
+    # signal; combined with a bad-reputation source it is a confirmed intrusion.
+    zeek_ssh_auth_success: bool | None = None
+    zeek_ssh_auth_attempts: int | None = None
+    zeek_ssh_client: str | None = None
+    zeek_ssh_server: str | None = None
+    # Behavioral-summary pivots (derived/aggregated docs, when the deployment
+    # surfaces them): a RITA-style beacon profile (interval + payload-size
+    # consistency over a window) and a DNS-tunnel aggregate (query volume +
+    # subdomain entropy + qtype mix). Each is the whole profile object; the
+    # decisive-evidence surfacer reads the scoring keys off it. None on
+    # ordinary per-connection docs.
+    zeek_beacon_profile: dict[str, Any] | None = None
+    zeek_dns_profile: dict[str, Any] | None = None
     # Best-effort parsing surface: when typed extraction fails on a
     # field (schema drift, missing block, type mismatch), append a
     # short note here so the investigator knows to fall back to `raw`.

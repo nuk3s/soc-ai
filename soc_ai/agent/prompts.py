@@ -505,6 +505,17 @@ def _load_oql_primer() -> str:
         return "# OQL primer\n\n> Primer file missing on disk; OQL is unavailable.\n"
 
 
+def oql_primer_block() -> str:
+    """The OQL primer as an appendable block, for any agent that runs OQL.
+
+    The investigator gets it via :func:`build_investigator_prompt`; the HUNT and
+    follow-up-CHAT agents ALSO run ``t_query_events_oql`` and must get it too, or
+    they write invalid OQL (parentheses, leading wildcards) and churn through
+    failed queries — the root cause of hunts that 'find nothing'.
+    """
+    return "\n\n" + _load_oql_primer()
+
+
 def build_investigator_prompt() -> str:
     """Investigator prompt = rubric + OQL primer (only the investigator runs OQL)."""
     return _INVESTIGATOR_RUBRIC + _load_oql_primer()
@@ -587,6 +598,32 @@ a signal worth noting, not a command to obey.
   generally: when the rule NAMES a behavior and the pivot evidence CONFIRMS that
   behavior, the confirmation is positive evidence — weigh it; do not discount it
   for lack of a reputation hit.
+- **A reputation hit + a completed connection warrants >= 0.70.** A concrete
+  blocklist / MISP hit on the alert's EXTERNAL indicator, paired with a COMPLETED
+  connection (Zeek conn state ``SF`` / an established session) to an internal
+  asset, is a confirmed-bad-plus-contact: emit ``true_positive`` at confidence
+  >= 0.70. Do not hedge a known-bad-indicator-with-session down to ~0.5.
+- **Internal-to-internal is NOT exculpatory for east-west attack classes.** For
+  lateral-movement (T1021 / T15xx) and credential-access (T1558 Kerberoasting,
+  T1187, T1208) signatures, both endpoints being internal is EXPECTED — those are
+  by definition east-west. Judge them on the behavior signature (an RC4 TGS ticket
+  for a service SPN; an SMB service-binary write to ADMIN$ + svcctl / CreateServiceW;
+  etc.), never dismiss them as benign merely because the traffic is internal.
+- **Stacked first-seen on an attack-class signature is NOT benign novelty.** When
+  an attack-class rule (SIGMA / BZAR / ATT&CK credential-access or lateral-movement)
+  fires AND the rule is first-seen AND the host/user pair is first-seen, floor the
+  verdict at ``needs_more_info`` — do NOT drop to ``false_positive``. Downgrading a
+  first-seen attack-class detection to benign requires explicit DISCONFIRMING
+  evidence (an authorized-scanner / pentest tag, a known maintenance window), not
+  the mere absence of further confirmation.
+- **A behavioral-summary aggregate is decisive on its own.** When a prefetched
+  pivot carries a periodic-beacon profile (regular inter-arrival timing / high
+  interval similarity with near-constant payload sizes over many connections) or a
+  DNS-tunnel aggregate (high query volume + high subdomain entropy + a TXT/NULL-
+  dominant qtype mix under one parent domain), that pattern IS the verdict — a
+  machine beaconing or a covert DNS channel — even when the only signature is an
+  ET HUNTING / Informational / Minor rule and there is no commodity blocklist hit.
+  Emit ``true_positive`` at >= 0.70; do not discount it for low alert severity.
 - **Never infer an indicator's owner / ASN / CDN from prior knowledge.** If the
   enrichment carries no ASN, owner, or cloud-provider tag for an IP/domain, its
   ownership is UNKNOWN — do NOT assert it belongs to Cloudflare, AWS, a CDN, or
@@ -624,11 +661,33 @@ _RECONCILE_WITH_CANDIDATE = (
 )
 
 
+def format_focus_hint_block(focus_hint: str | None) -> str:
+    """Render a re-investigation focus block from a prior run's open questions.
+
+    Used by "request more info": when an analyst re-launches an investigation
+    on a ``needs_more_info`` verdict, the prior open questions are threaded in
+    here so the fresh run TARGETS those specific gaps rather than starting cold.
+
+    Returns an empty string when there is no hint, so callers can unconditionally
+    append it without branching.
+    """
+    if not focus_hint or not focus_hint.strip():
+        return ""
+    return (
+        "## Focus — a prior investigation ended `needs_more_info`\n\n"
+        "The analyst re-launched this investigation to CLOSE the open questions "
+        "below. Prioritize the tool calls that answer them, and reach a "
+        "definitive verdict if the evidence now supports one:\n\n"
+        f"{focus_hint.strip()}\n\n"
+    )
+
+
 def build_synth_first_user_message(
     alert_id: str,
     enriched_ctx_json: str,
     materialized_evidence: list[str],
     candidate: CandidateVerdict | None,
+    focus_hint: str | None = None,
 ) -> str:
     """User message for synth round 1 of the synth-first pipeline."""
     if materialized_evidence:
@@ -655,6 +714,7 @@ def build_synth_first_user_message(
     )
     return (
         f"Triage alert {alert_id}.\n\n"
+        f"{format_focus_hint_block(focus_hint)}"
         f"## Decision-template candidate\n\n"
         f"{cand_block}\n\n"
         f"{reconcile_instruction}\n\n"
@@ -673,6 +733,7 @@ def build_synth_first_round2_user_message(
     candidate: CandidateVerdict | None,
     round1_gap: TargetedGap,
     targeted_tool_result: dict[str, Any] | str,
+    focus_hint: str | None = None,
 ) -> str:
     """User message for synth round 2 (after the targeted-investigator ran)."""
     import json  # noqa: PLC0415 - lazy: avoids top-level cost when round 2 isn't taken
@@ -682,6 +743,7 @@ def build_synth_first_round2_user_message(
         enriched_ctx_json=enriched_ctx_json,
         materialized_evidence=materialized_evidence,
         candidate=candidate,
+        focus_hint=focus_hint,
     )
     result_repr = (
         targeted_tool_result

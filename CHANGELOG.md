@@ -6,6 +6,94 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-07-03
+
+Dogfood + detection + resilience release: 11 dogfood fixes from live use, a docs
+site, operator runbooks, and one-click "request more info", plus dataset-agnostic
+grid discovery, behavioral-summary detections (beaconing + DNS tunneling), and a
+sweep of resilience / effectiveness / performance / flow hardening (from
+autonomous sessions).
+
+### Added
+
+- **The agent discovers what's in your Elastic.** Dataset-agnostic grid
+  inventory (ambient, TTL-cached) plus on-demand `describe_dataset` /
+  `field_values` tools, so hunts and chat reason over whatever datasets a
+  deployment actually ships — not a hardcoded Zeek list. Network-only today,
+  host-log ready.
+- **Behavioral-summary detections.** When the deployment surfaces a derived
+  connection/DNS summary (e.g. RITA-style beacon scoring or a DNS-tunnel
+  aggregate), the agent reads it as decisive evidence: a periodic beacon profile
+  (regular timing + constant payloads) or a high-entropy, TXT/NULL-dominant DNS
+  channel is now a `true_positive` on its own, even behind an ET HUNTING /
+  Informational alert. These per-host rollups carry only `source.ip` (not a
+  `community_id` or `host.name`), so a dedicated IP-keyed prefetch pivot fetches
+  them alongside the five typed pivots — otherwise the decisive signal never
+  reaches the agent. Verified on the synth eval: a Cobalt Strike beacon that read
+  as a false positive on the alert alone now escalates once the beacon profile is
+  in context.
+
+- **Operator runbooks.** A local runbook store (Config → Runbooks) the triage
+  agent can cite: the `lookup_runbook` tool searches your own guidance
+  (rule-link > tag > keyword) and grounds verdicts in it. Purely local — never
+  written to Security Onion.
+- **One-click "request more info."** A `needs_more_info` investigation can be
+  re-launched with its open questions threaded in as a focus hint, so the fresh
+  run targets the gaps instead of re-deriving from scratch.
+- **Chat about a hunt.** Hunts now have the same follow-up chat thread as
+  investigations (read-only — a hunt chat never acks or escalates).
+- **Canned hunts.** Six one-to-three-click preset hunts for routine, high-payoff
+  sweeps (beaconing, new-external-service, rare-process, etc.).
+- **Documentation site.** A Material for MkDocs site (quickstart, config, hunts,
+  backtest, security posture) published via GitHub Pages.
+- **Delete hunts** from the Hunt Console.
+
+### Changed / Fixed
+
+- **Internal-identifier discovery no longer over-claims.** A single-label suffix
+  is treated as internal only if it is not a public TLD (fixes "the entire `.com`
+  is internal"), and per-device Windows mDNS `<guid>.local` names are dropped
+  instead of flooding the identifier list.
+- **Auto-ack of false positives now leaves an audit trail** and its coupling to
+  investigation completion is documented (a benign FP is acked when the
+  investigation that judged it completes, not on a separate schedule).
+- **Timezone-correct "when."** Investigation/hunt/runbook timestamps serialize
+  with an explicit UTC offset, fixing the "a 1-hour-old run shows 8h ago" skew
+  (the browser was parsing naive UTC as local time).
+- **Inheritance is legible.** An inherited verdict shows which investigation it
+  came from and when; re-running an investigation now correctly clears the
+  "inherited" pill on that alert.
+- **Alerts grid** uses the space between IPs and verdict for timestamps, a
+  copyable short alert-id, and a "fired N×" count.
+- **Config apply is explicit.** A sticky "Apply changes (N)" bar with dirty-state
+  tracking replaces the ambiguous auto-apply.
+- **Hunt UI** brought to parity with investigations (collapsible sections,
+  confidence ring, consistent panels).
+- **Hardening (self-review):** runbook content + list fields are size-bounded and
+  the runbook search working-set is capped; a second hunt-chat turn is rejected
+  while one is still pending (no orphaned pending rows).
+- **Auto-triage can't be stalled by a hung run.** Each investigation in a sweep
+  is bounded by a wall-clock backstop (`auto_triage_per_target_timeout_s`); a
+  hung LLM stream is now counted as a failure and the sweep moves on instead of
+  wedging behind it.
+- **Oracle retries use full jitter.** The second-opinion path's backoff is now a
+  randomized draw (matching the primary transport), so many concurrent
+  investigations don't retry in lockstep and re-hammer the gateway as it recovers.
+- **Confidence floor is stricter.** The "grounded catch" confidence floor now
+  fires only on a cited decisive pivot *value* (a JA3/hash/SPN/…), not the mere
+  presence of a correlated pivot id — a raise has to be earned by real signal.
+- **Recall: decisive Zeek evidence surfaces.** SSH logins, low-and-slow exfil
+  duration, Kerberos/SMB/DCE-RPC lateral chains, and the beacon/DNS aggregates
+  above are extracted and cited rather than silently dropped before the agent
+  sees them.
+- **Follow-ups on any verdict.** Residual open questions (and the focused
+  "request more info" action) now show on `true_positive` / `false_positive`
+  investigations too, not only `needs_more_info`.
+- **Faster bulk re-investigate.** The re-hunt endpoint fetches all target
+  investigations in one query instead of one round-trip per id (was an N+1).
+- **Quieter UI.** The Investigations re-investigate/delete status line
+  auto-dismisses; idle screens stop polling at terminal state.
+
 ## [1.0.2] - 2026-07-02
 
 Trust + reliability release: make the pipeline resilient and the trust story

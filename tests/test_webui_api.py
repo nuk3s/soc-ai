@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -92,6 +92,8 @@ def test_alerts_verdict_badge_inherited(client: TestClient) -> None:
         alert_es_id="OTHER",
         src_ip="10.0.0.5",
         dest_ip="1.2.3.4",
+        # real Investigation rows always carry created_at; _inherited_reason reads it
+        created_at=datetime(2026, 6, 17, 9, 0, 0),
     )
     with (
         patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 3))),
@@ -160,8 +162,12 @@ def test_alerts_badge_survives_later_interrupted_run(client: TestClient) -> None
         async with maker() as db:
             good = await inv_svc.create(db, alert_es_id="ev-good", started_by="t")
             await inv_svc.finalize(
-                db, good.id, status="complete", verdict="false_positive",
-                confidence=0.8, rationale="benign curl probe",
+                db,
+                good.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.8,
+                rationale="benign curl probe",
             )
             good.rule_name = rule
             good.src_ip = "10.0.0.1"
@@ -415,6 +421,209 @@ def test_group_events_provenance_direct_and_inherited(client: TestClient) -> Non
     assert n["inheritedReason"] is None
 
 
+def test_group_events_rerun_clears_inherited_pill(client: TestClient) -> None:
+    """FIX #3: after re-running ON a specific alert, that alert's event must show
+    investigated=True (NOT inherited) even when the group's STANDING verdict came
+    from a DIFFERENT alert. A different event in the same group still inherits.
+
+    Reproduces the operator's report: opened a specific alert, re-ran the
+    investigation, but the pill for THAT alert still said 'inherited'.
+    """
+    from soc_ai.store import investigations as inv_svc
+
+    RULE = "ET RERUN CLEARS INHERITED"
+
+    async def _seed() -> tuple[str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            # The group's STANDING verdict was investigated on a DIFFERENT alert
+            # ("ev-other") — this is the rule-level fallback source.
+            other = await inv_svc.create(db, alert_es_id="ev-other", started_by="t")
+            await inv_svc.finalize(
+                db,
+                other.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.8,
+                rationale="benign on the other flow",
+            )
+            other.rule_name = RULE
+            other.src_ip = "10.0.0.9"
+            other.dest_ip = "9.9.9.9"
+            await db.commit()
+
+            # The operator then RE-RAN on THIS specific alert ("ev-target"): a fresh
+            # complete investigation whose alert_es_id == this event's es_id.
+            target = await inv_svc.create(db, alert_es_id="ev-target", started_by="t")
+            await inv_svc.finalize(
+                db,
+                target.id,
+                status="complete",
+                verdict="true_positive",
+                confidence=0.9,
+                rationale="re-run says TP",
+            )
+            target.rule_name = RULE
+            target.src_ip = "10.0.0.1"
+            target.dest_ip = "1.2.3.4"
+            await db.commit()
+            return other.id, target.id
+
+    _other_id, target_id = asyncio.run(_seed())
+
+    events = [
+        AlertEvent(
+            es_id="ev-target",  # the re-run alert
+            timestamp="2026-06-22T10:00:00Z",
+            src="10.0.0.1:5001",
+            dst="1.2.3.4:443",
+            severity="high",
+            host="wks-1",
+            src_ip="10.0.0.1",
+            dst_ip="1.2.3.4",
+            dst_port=443,
+        ),
+        AlertEvent(
+            es_id="ev-sibling",  # a different event in the same group
+            timestamp="2026-06-22T10:01:00Z",
+            src="10.0.0.2:5002",
+            dst="5.5.5.5:80",
+            severity="medium",
+            host="wks-2",
+            src_ip="10.0.0.2",
+            dst_ip="5.5.5.5",
+            dst_port=80,
+        ),
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        body = client.get(
+            "/api/v1/alerts/events", params={"rule_name": RULE, "kind": "suricata"}
+        ).json()
+    ev = {e["id"]: e for e in body}
+
+    # ev-target: the re-run alert → investigated, NOT inherited
+    assert ev["ev-target"]["investigated"] is True
+    assert ev["ev-target"]["invId"] == target_id
+    assert ev["ev-target"]["inheritedReason"] is None
+
+    # ev-sibling: a DIFFERENT event → inherits the rule's standing verdict
+    assert ev["ev-sibling"]["investigated"] is False
+    assert ev["ev-sibling"]["inheritedReason"] is not None
+    assert "Inherited" in ev["ev-sibling"]["inheritedReason"]
+
+
+def test_group_events_errored_direct_run_falls_through_to_inherited(
+    client: TestClient,
+) -> None:
+    """A DIRECT run that ended error/cancelled produced no verdict, so it must NOT
+    claim the alert as investigated — the event falls through to the inherited
+    rule-level verdict (consistent with blocks_rehunt)."""
+    from soc_ai.store import investigations as inv_svc
+
+    RULE = "ET ERRORED DIRECT FALLS THROUGH"
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            # Rule-level standing verdict on a different alert.
+            good = await inv_svc.create(db, alert_es_id="ev-good", started_by="t")
+            await inv_svc.finalize(
+                db,
+                good.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.8,
+                rationale="benign",
+            )
+            good.rule_name = RULE
+            good.src_ip = "10.0.0.9"
+            good.dest_ip = "9.9.9.9"
+            await db.commit()
+            # A DIRECT run on ev-x that ERRORED (no verdict).
+            bad = await inv_svc.create(db, alert_es_id="ev-x", started_by="t")
+            await inv_svc.finalize(db, bad.id, status="error")
+            bad.rule_name = RULE
+            await db.commit()
+
+    asyncio.run(_seed())
+    events = [
+        AlertEvent(
+            es_id="ev-x",
+            timestamp="2026-06-22T10:00:00Z",
+            src="10.0.0.1:5001",
+            dst="1.2.3.4:443",
+            severity="high",
+            host="wks-1",
+            src_ip="10.0.0.1",
+            dst_ip="1.2.3.4",
+            dst_port=443,
+        ),
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        body = client.get(
+            "/api/v1/alerts/events", params={"rule_name": RULE, "kind": "suricata"}
+        ).json()
+    e = body[0]
+    # errored direct run → NOT investigated; inherits the standing verdict
+    assert e["investigated"] is False
+    assert e["inheritedReason"] is not None
+    assert "Inherited" in e["inheritedReason"]
+
+
+def test_ago_treats_naive_created_at_as_utc() -> None:
+    """FIX #10: _ago must treat a naive stored timestamp as UTC (store timestamps
+    are naive UTC). A run from ~1h ago reads '1h', not an offset-shifted value."""
+    from soc_ai.api.webui_api import _ago, _iso_utc
+
+    one_hour_ago_naive = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+    # via the tz-aware serializer the API now uses
+    assert _ago(_iso_utc(one_hour_ago_naive)) == "1h"
+    # and directly on the naive isoformat (no offset marker) — still UTC
+    assert _ago(one_hour_ago_naive.isoformat()) == "1h"
+
+
+def test_iso_utc_stamps_naive_as_offset_aware() -> None:
+    """FIX #10: a naive stored datetime is serialized WITH a +00:00 offset so the
+    browser localizes it (a naive string would be parsed as browser-local)."""
+    from soc_ai.api.webui_api import _iso_utc
+
+    naive = datetime(2026, 7, 2, 11, 23, 49)
+    out = _iso_utc(naive)
+    assert out.endswith("+00:00")
+    assert out == "2026-07-02T11:23:49+00:00"
+    # already-aware passes through unchanged; None → ""
+    aware = datetime(2026, 7, 2, 11, 23, 49, tzinfo=UTC)
+    assert _iso_utc(aware) == "2026-07-02T11:23:49+00:00"
+    assert _iso_utc(None) == ""
+
+
+def test_investigations_list_ts_is_offset_aware(client: TestClient) -> None:
+    """FIX #10: the investigations LIST row's `ts` carries a timezone offset so the
+    frontend's `new Date(ts)` interprets it as UTC, not browser-local."""
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-ts", started_by="t")
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.8,
+                rationale="x",
+            )
+            inv.rule_name = "ET TS TEST"
+            await db.commit()
+
+    asyncio.run(_seed())
+    rows = client.get("/api/v1/investigations").json()
+    assert rows, "expected at least one investigation row"
+    row = next(r for r in rows if r["name"] == "ET TS TEST")
+    assert row["ts"].endswith("+00:00") or row["ts"].endswith("Z")
+
+
 def test_alerts_acked_escalated_counts(client: TestClient) -> None:
     """Per-group acked/escalated counts are forwarded from ES aggs to the response."""
     groups = [
@@ -524,8 +733,13 @@ def test_investigation_export_signed_record(client: TestClient) -> None:
                 [{"sequence": 1, "kind": "tool_call", "payload": {"tool": "prevalence"}}],
             )
             await inv_svc.finalize(
-                db, inv.id, status="complete", verdict="false_positive", confidence=0.9,
-                rationale="benign", report={"citations": ["ev1"]},
+                db,
+                inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.9,
+                rationale="benign",
+                report={"citations": ["ev1"]},
             )
             return inv.id
 
@@ -2801,6 +3015,151 @@ def test_rehunt_skips_investigation_with_no_alert_es_id(client: TestClient) -> N
     assert body["skipped"][0]["invId"] == inv_id
     assert body["skipped"][0]["reason"] == "no_alert"
     fake_mgr.start.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# POST /investigations/{id}/request-more-info — focused re-investigation
+# ---------------------------------------------------------------------------
+
+
+def test_request_more_info_launches_focused_reinvestigation(client: TestClient) -> None:
+    """A needs_more_info source launches a fresh hunt on the SAME alert, seeded
+    with the prior open questions as a focus_hint."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-rmi-a", started_by="tester", rule_name="ET NMI"
+            )
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.3,
+                report={"open_questions": ["Was the download executed?", "Is the C2 reachable?"]},
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    captured: dict[str, Any] = {}
+
+    async def fake_start(
+        _state,
+        *,
+        alert_id: str,
+        started_by: str,
+        rule_name: str | None = None,
+        focus_hint: str | None = None,
+    ) -> str:
+        captured["alert_id"] = alert_id
+        captured["rule_name"] = rule_name
+        captured["focus_hint"] = focus_hint
+        return "NEW-RMI"
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = fake_start
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post(f"/api/v1/investigations/{inv_id}/request-more-info")
+
+    assert resp.status_code == 200
+    assert resp.json()["investigation_id"] == "NEW-RMI"
+    # Same alert, prior name reused, open questions threaded as the focus hint.
+    assert captured["alert_id"] == "ev-rmi-a"
+    assert captured["rule_name"] == "ET NMI"
+    assert "Was the download executed?" in captured["focus_hint"]
+    assert "Is the C2 reachable?" in captured["focus_hint"]
+
+
+def test_request_more_info_rejects_non_needs_more_info(client: TestClient) -> None:
+    """A source verdict that isn't needs_more_info is a 409 and starts no hunt."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-rmi-tp", started_by="tester", rule_name="ET TP"
+            )
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="true_positive", confidence=0.9
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="SHOULD-NOT-START")
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post(f"/api/v1/investigations/{inv_id}/request-more-info")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_needs_more_info"
+    fake_mgr.start.assert_not_called()
+
+
+def test_request_more_info_404_for_unknown_id(client: TestClient) -> None:
+    """An unknown investigation id is a 404 and starts no hunt."""
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="SHOULD-NOT-START")
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post("/api/v1/investigations/does-not-exist/request-more-info")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["reason"] == "not_found"
+    fake_mgr.start.assert_not_called()
+
+
+def test_request_more_info_starts_without_open_questions(client: TestClient) -> None:
+    """A needs_more_info source with NO open questions still re-runs (focus_hint
+    is None — the run just re-investigates the alert)."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-rmi-noq", started_by="tester", rule_name="ET NMI2"
+            )
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="needs_more_info", confidence=0.2
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    captured: dict[str, Any] = {}
+
+    async def fake_start(
+        _state,
+        *,
+        alert_id: str,
+        started_by: str,
+        rule_name: str | None = None,
+        focus_hint: str | None = None,
+    ) -> str:
+        captured["focus_hint"] = focus_hint
+        return "NEW-NOQ"
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = fake_start
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post(f"/api/v1/investigations/{inv_id}/request-more-info")
+
+    assert resp.status_code == 200
+    assert resp.json()["investigation_id"] == "NEW-NOQ"
+    assert captured["focus_hint"] is None
 
 
 # ---------------------------------------------------------------------------

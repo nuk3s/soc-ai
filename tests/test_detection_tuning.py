@@ -87,9 +87,7 @@ def test_assess_all_fp_under_high_volume_bar_monitors() -> None:
 
 def test_assess_threshold_boundary_mute() -> None:
     # Exactly at MUTE_MIN_ALERTS with enough FP and zero TP -> mute.
-    is_noisy, rec, _ = dt.assess(
-        alert_count=dt.MUTE_MIN_ALERTS, fp=dt.MIN_FP, tp=0, nmi=0
-    )
+    is_noisy, rec, _ = dt.assess(alert_count=dt.MUTE_MIN_ALERTS, fp=dt.MIN_FP, tp=0, nmi=0)
     assert is_noisy is True
     assert rec == "mute"
 
@@ -150,9 +148,7 @@ async def test_override_reason_optional(settings_kratos: Settings) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _complete(
-    db: AsyncSession, *, rule_name: str, verdict: str, alert_es_id: str
-) -> None:
+async def _complete(db: AsyncSession, *, rule_name: str, verdict: str, alert_es_id: str) -> None:
     inv = await inv_svc.create(db, alert_es_id=alert_es_id, started_by="t", rule_name=rule_name)
     await inv_svc.finalize(db, inv.id, status="complete", verdict=verdict, confidence=0.9)
 
@@ -197,9 +193,7 @@ async def test_nominate_joins_volume_and_verdicts(settings_kratos: Settings) -> 
     async with maker() as db:
         # ET NOISE: high volume, all FP -> mute candidate
         for i in range(8):
-            await _complete(
-                db, rule_name="ET NOISE", verdict="false_positive", alert_es_id=f"n{i}"
-            )
+            await _complete(db, rule_name="ET NOISE", verdict="false_positive", alert_es_id=f"n{i}")
         # ET REAL: caught a TP -> never nominated
         await _complete(db, rule_name="ET REAL", verdict="true_positive", alert_es_id="r1")
         # ET NOISE is already muted by an operator
@@ -211,9 +205,7 @@ async def test_nominate_joins_volume_and_verdicts(settings_kratos: Settings) -> 
         AlertGroup(rule_name="ET QUIET", count=2, severity="low", latest_ts="", latest_id="z"),
         AlertGroup(rule_name="ET MUTED", count=50, severity="low", latest_ts="", latest_id="m"),
     ]
-    state = SimpleNamespace(
-        settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker
-    )
+    state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
     with patch(
         "soc_ai.webui.detection_tuning.aq.fetch_groups",
         AsyncMock(return_value=(groups, 1463)),
@@ -240,12 +232,8 @@ async def test_nominate_joins_volume_and_verdicts(settings_kratos: Settings) -> 
 
 async def test_nominate_empty_feed(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
-    state = SimpleNamespace(
-        settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker
-    )
-    with patch(
-        "soc_ai.webui.detection_tuning.aq.fetch_groups", AsyncMock(return_value=([], 0))
-    ):
+    state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
+    with patch("soc_ai.webui.detection_tuning.aq.fetch_groups", AsyncMock(return_value=([], 0))):
         assert await dt.nominate(state) == []
     await engine.dispose()
 
@@ -287,9 +275,7 @@ def test_get_detection_tuning_returns_nominations_and_overrides(client: TestClie
             "already_muted": False,
         }
     ]
-    with patch(
-        "soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)
-    ):
+    with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)):
         resp = client.get("/api/v1/detection-tuning")
     assert resp.status_code == 200
     body = resp.json()
@@ -313,9 +299,7 @@ def test_post_override_then_remove_roundtrip(client: TestClient) -> None:
     override_id = created["id"]
 
     # It now shows up in the overrides list.
-    with patch(
-        "soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=[])
-    ):
+    with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=[])):
         listing = client.get("/api/v1/detection-tuning").json()
     assert [o["rule_name"] for o in listing["overrides"]] == ["ET NOISE"]
 
@@ -349,9 +333,7 @@ def test_muted_rule_excluded_from_alerts_feed(client: TestClient) -> None:
         AlertGroup(rule_name="ET REAL", count=3, severity="high", latest_ts="", latest_id="y"),
     ]
     with (
-        patch(
-            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 415))
-        ),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 415))),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={}),

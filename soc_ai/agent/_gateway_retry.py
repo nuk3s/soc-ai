@@ -91,8 +91,10 @@ class RetryingAsyncTransport(httpx.AsyncBaseTransport):
                 # Must release the connection before retrying the request.
                 retry_after = _parse_retry_after(response.headers.get("retry-after"))
                 await response.aclose()
-                delay = retry_after if retry_after is not None else _backoff_s(
-                    attempt, base=self._base, cap=self._cap
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else _backoff_s(attempt, base=self._base, cap=self._cap)
                 )
                 _LOGGER.warning(
                     "gateway returned %d — retry %d/%d in %.1fs",

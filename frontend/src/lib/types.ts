@@ -29,6 +29,9 @@ export interface AlertEvent {
   invId?: string | null;
   /** Human-readable reason when the verdict is inherited rather than direct. */
   inheritedReason?: string | null;
+  /** Relative time of the investigation that gave this event its verdict
+   * ("8m" → "investigated 8m ago"), for both direct and inherited cases. */
+  investigatedAt?: string | null;
 }
 
 /** A grouped-by-detection row in the Alerts console. */

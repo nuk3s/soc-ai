@@ -32,8 +32,10 @@ from soc_ai.agent.hunt import (
 )
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.orchestrator import InvestigationContext, StepEvent, _walk_message
+from soc_ai.agent.prompts import oql_primer_block
 from soc_ai.api.hunt_recorder import HuntRecorder
 from soc_ai.api.runner import CancelToken
+from soc_ai.so_client.inventory import inventory_prompt_block
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,7 +84,16 @@ async def run_hunt(
 
     yield _ev("hunt_started", {"objective": objective})
 
-    system_prompt = HUNT_SYSTEM_PROMPT.format(objective=objective)
+    # The hunt agent runs OQL — append the primer so it writes VALID queries
+    # (no parentheses, no leading wildcards) instead of churning through parse
+    # errors. And append the auto-discovered dataset inventory so the hunt knows
+    # what data ACTUALLY exists on this grid (network today, host logs later)
+    # instead of guessing from a hardcoded list.
+    system_prompt = (
+        HUNT_SYSTEM_PROMPT.format(objective=objective)
+        + oql_primer_block()
+        + await inventory_prompt_block(ctx.elastic, ctx.settings)
+    )
     agent = build_hunt_agent(
         build_investigator_model(ctx.settings), ctx, system_prompt=system_prompt
     )

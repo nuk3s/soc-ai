@@ -34,8 +34,19 @@ type Density = 'comfortable' | 'compact';
 type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 type SortDir = 'asc' | 'desc';
 
-// checkbox  count  DETECTION      sev   verdict  conf  owner  latest  actions
-const GRID = '28px 48px minmax(180px,1fr) 110px 132px 56px 40px 76px 88px';
+// checkbox  DETECTION (name + flow, subtle count)  sev  verdict  conf  owner  last-seen  actions
+// The GROUP row is intentionally LEAN — the per-alert detail (each event's own
+// timestamp + the time of the investigation it ran/inherited from) lives on the
+// expanded event rows, where an analyst actually needs it. The old dedicated
+// "Fired" column and the copyable short-id chip were removed as noise; the fire
+// count is now a subtle inline chip and `actions` is wide enough that the primary
+// button never overlaps the "Last seen" column.
+const GRID = '28px minmax(240px,1fr) 104px 136px 48px 40px 100px 128px';
+
+// Per-alert (expanded) event row: checkbox | alert time (abs+rel) | sev |
+// src→dst:port | host | verdict provenance (+ when) | investigate. Each row now
+// carries the alert's OWN timestamp AND the investigation's timestamp.
+const EVENT_GRID = '16px 132px 56px minmax(150px,1fr) 116px 172px 92px';
 
 // Page size for an expanded group's events ("Load more" pulls one page at a time).
 const EVENTS_PAGE_SIZE = 50;
@@ -55,6 +66,77 @@ function toInitials(owner: string): string {
   const parts = name.split(/[._\-\s]+/).filter(Boolean);
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
   return name.slice(0, 2).toUpperCase();
+}
+
+/** A compact, glanceable clock time for an event row ("14:23:05"). The full
+ * date-time is exposed via the cell's title. */
+function clockTime(iso?: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+/** The verdict-provenance chip for a single event row: whether this exact event
+ * was investigated (green) or inherited a verdict (grey), AND WHEN that
+ * investigation ran. Clickable when it has an investigation to open. Renders a
+ * faint dash when the event has no verdict yet. `investigated` takes strict
+ * priority over `inheritedReason` so a re-run's fresh direct verdict never shows
+ * the stale "inherited" chip (dogfood #3). */
+function ProvenanceBadge({ ev, onOpen }: { ev: AlertEvent; onOpen: (id: string) => void }) {
+  const when = ev.investigatedAt
+    ? `${ev.investigatedAt} ago`
+    : inheritedWhen(ev.inheritedReason) ?? null;
+  const kind = ev.investigated ? 'investigated' : ev.inheritedReason ? 'inherited' : null;
+  if (!kind) return <span className="text-faint">—</span>;
+  const green = kind === 'investigated';
+  const label = when ? `${kind} ${when}` : kind;
+  const tone = green
+    ? { borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }
+    : { borderColor: 'rgba(148,163,184,.25)', background: 'rgba(148,163,184,.07)', color: '#94a3b8' };
+  const title = ev.inheritedReason ?? 'This exact event was investigated — open the report';
+  const cls =
+    'inline-flex min-w-0 max-w-full items-center gap-0.5 truncate rounded-chip border px-[6px] py-[2px] font-mono text-[9.5px] font-semibold';
+  if (ev.invId) {
+    return (
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onOpen(ev.invId!); }}
+        title={title}
+        className={`${cls} hover:brightness-125`}
+        style={tone}
+      >
+        <span className="truncate">{label}</span>
+        <ArrowUpRight size={9} strokeWidth={2.5} className="flex-shrink-0" />
+      </button>
+    );
+  }
+  return (
+    <span title={title} className={`${cls} cursor-help`} style={tone}>
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+/** Format an ISO timestamp as a human-readable absolute time for a tooltip.
+ * Falls back to the raw string if it isn't parseable. */
+function absTime(iso?: string): string | undefined {
+  if (!iso) return undefined;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+
+/** Pull a compact "12m ago" fragment out of the enriched inheritedReason
+ * ("Inherited — investigated 12m ago on X→Y (investigation …)") for the inline
+ * hint. Returns null when no relative-time fragment is present. */
+function inheritedWhen(reason?: string | null): string | null {
+  if (!reason) return null;
+  const m = reason.match(/(\d+\s*[smhdw](?:in|ec|our|ay)?s?)\s+ago/i);
+  return m ? `${m[1]} ago` : null;
 }
 
 function cmpGroups(a: AlertGroup, b: AlertGroup, key: SortKey, dir: SortDir): number {
@@ -117,14 +199,18 @@ export function Alerts() {
       : { range: filterTime }),
     hideAcked: hideAcked || undefined,
   };
+  const view = (searchParams.get('view') as ViewId) || 'all';
+  const drawerId = searchParams.get('drawer');
   const { data: groups, loading, error } = useAsync(
     () => getAlerts(alertQuery),
     [filterTime, customRange?.from, customRange?.to, hideAcked, reloadKey],
-    { refetchInterval: 10000 } // keep the grid + verdict/status badges live without a reload
+    {
+      refetchInterval: 10000, // keep the grid + verdict/status badges live without a reload
+      // Pause the 10s ES aggregation while an investigation drawer is open, so
+      // the grid doesn't churn under the analyst; resumes on close.
+      pauseWhen: () => !!drawerId,
+    }
   );
-
-  const view = (searchParams.get('view') as ViewId) || 'all';
-  const drawerId = searchParams.get('drawer');
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Events live behind a lazy fetch — pulled the first time a group is expanded.
@@ -782,9 +868,6 @@ export function Alerts() {
           <div className="flex items-center">
             <Checkbox checked={allSelected} onClick={toggleSelectAll} title="Select all" />
           </div>
-          <div className={`text-right ${hdrCls('count')}`} onClick={() => toggleSort('count')}>
-            Count{caret('count')}
-          </div>
           <div className={hdrCls('detection')} onClick={() => toggleSort('detection')}>
             Detection{caret('detection')}
           </div>
@@ -798,8 +881,8 @@ export function Alerts() {
             Conf{caret('conf')}
           </div>
           <div>Owner</div>
-          <div className={hdrCls('latest')} onClick={() => toggleSort('latest')}>
-            Latest{caret('latest')}
+          <div className={`text-right ${hdrCls('latest')}`} onClick={() => toggleSort('latest')}>
+            Last seen{caret('latest')}
           </div>
           <div />
         </div>
@@ -854,15 +937,28 @@ export function Alerts() {
                     </div>
                   );
                 })()}
-                <div className="text-right font-mono text-[13px] font-semibold text-text-2">{g.count}</div>
                 <div className="flex min-w-0 items-center gap-[9px]">
                   <span className="flex text-faint transition-transform" style={{ transform: isExp ? 'rotate(90deg)' : 'rotate(0deg)' }}>
                     <ChevronRight size={13} />
                   </span>
                   <KindBadge kind={g.kind} />
                   <div className="flex min-w-0 flex-1 flex-col gap-px">
-                    <span className="truncate text-[13.5px] font-medium">{g.name}</span>
-                    {(g.src || g.dst) && <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />}
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate text-[13.5px] font-medium">{g.name}</span>
+                      {g.count > 1 && (
+                        <span
+                          className="flex-shrink-0 font-mono text-[10.5px] text-faint"
+                          title={`Fired ${g.count.toLocaleString()} times in window — expand to see each event`}
+                        >
+                          ×{g.count.toLocaleString()}
+                        </span>
+                      )}
+                    </div>
+                    {(g.src || g.dst) && (
+                      <div className="flex min-w-0 items-center">
+                        <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />
+                      </div>
+                    )}
                   </div>
                   {(g.ackedCount ?? 0) > 0 && (
                     <span
@@ -886,7 +982,7 @@ export function Alerts() {
                   )}
                 </div>
                 <div><SeverityTag sev={g.sev} /></div>
-                <div className="min-w-0 overflow-hidden" title={g.inheritedReason ?? undefined}>
+                <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
                   {g.triaging ? (
                     // Clickable so the analyst can open the LIVE investigation
                     // straight from the grid (invId now points at the running run).
@@ -903,8 +999,30 @@ export function Alerts() {
                       <Spinner size={10} color="#fbbf24" />
                       Investigating…
                     </button>
+                  ) : g.inherited ? (
+                    // Inherited verdict: make the whole thing a link to the source
+                    // investigation (when + which is in the enriched reason), so the
+                    // analyst can see WHERE this verdict came from and jump to it.
+                    <button
+                      type="button"
+                      disabled={!g.invId}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (g.invId) openDrawer(g.invId);
+                      }}
+                      title={g.inheritedReason ?? 'Verdict inherited from a prior investigation of this detection'}
+                      className="group/inh flex min-w-0 items-center gap-1.5 rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
+                    >
+                      <VerdictPill verdict={g.verdict} conf={g.conf} inherited showConf={false} showInherited={false} />
+                      <span className="flex min-w-0 items-center gap-0.5 truncate font-mono text-[10.5px] text-faint group-enabled/inh:group-hover/inh:text-accent">
+                        <span className="truncate">
+                          · inherited{inheritedWhen(g.inheritedReason) ? ` ${inheritedWhen(g.inheritedReason)}` : ''}
+                        </span>
+                        {g.invId && <ArrowUpRight size={10} className="flex-shrink-0" />}
+                      </span>
+                    </button>
                   ) : (
-                    <VerdictPill verdict={g.verdict} conf={g.conf} inherited={g.inherited} showConf={false} showInherited={false} />
+                    <VerdictPill verdict={g.verdict} conf={g.conf} inherited={false} showConf={false} showInherited={false} />
                   )}
                 </div>
                 <div className="text-right font-mono text-[12px] text-dim">
@@ -935,32 +1053,44 @@ export function Alerts() {
                     </button>
                   )}
                 </div>
-                <div className="font-mono text-[12px] text-dim">{g.latest}</div>
-                <div className="flex items-center justify-end gap-1">
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      huntGroup(g);
-                    }}
-                    disabled={!!huntGroupPending[g.id]}
-                    title="Investigate the most-representative event in this group"
-                    aria-label="Investigate"
-                    className="inline-flex items-center gap-1 rounded-badge border px-[7px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
-                    style={{ borderColor: 'rgba(139,92,246,.35)', background: 'rgba(139,92,246,.07)', color: '#a78bfa' }}
-                  >
-                    <Sparkles size={11} />
-                    {huntGroupPending[g.id] ? '…' : 'Investigate'}
-                  </button>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openDrawer(g.invId ?? g.id);
-                    }}
-                    aria-label="Open investigation"
-                    className="flex rounded-chip p-[3px] text-faint hover:bg-[#141b25] hover:text-accent"
-                  >
-                    <ArrowUpRight size={13} />
-                  </button>
+                <div
+                  className="text-right font-mono text-[12.5px] font-medium text-text-2"
+                  title={absTime(g.latestTs) ?? g.latest}
+                >
+                  {g.latest || '—'}
+                </div>
+                <div className="flex items-center justify-end">
+                  {g.invId || g.triaging ? (
+                    // A report exists (or one is in flight) — one clean "Open" action.
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openDrawer(g.invId ?? g.id);
+                      }}
+                      aria-label="Open investigation"
+                      title="Open the investigation report"
+                      className="inline-flex items-center gap-1 rounded-badge border border-border-input px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent hover:border-accent hover:bg-[#141b25]"
+                    >
+                      Open report
+                      <ArrowUpRight size={12} />
+                    </button>
+                  ) : (
+                    // No report yet — investigate the group's representative event.
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        huntGroup(g);
+                      }}
+                      disabled={!!huntGroupPending[g.id]}
+                      title="Investigate the most-representative event in this group"
+                      aria-label="Investigate"
+                      className="inline-flex items-center gap-1 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
+                      style={{ borderColor: 'rgba(139,92,246,.35)', background: 'rgba(139,92,246,.07)', color: '#a78bfa' }}
+                    >
+                      {huntGroupPending[g.id] ? <Spinner size={11} color="#a78bfa" /> : <Sparkles size={11} />}
+                      Investigate
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -977,7 +1107,7 @@ export function Alerts() {
                     <div
                       key={ev.id ?? i}
                       className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
-                      style={{ gridTemplateColumns: '16px 52px 70px 1fr 140px 132px' }}
+                      style={{ gridTemplateColumns: EVENT_GRID }}
                     >
                       {/* per-event checkbox */}
                       <div onClick={(e) => e.stopPropagation()}>
@@ -990,8 +1120,11 @@ export function Alerts() {
                           onClick={(e) => e.stopPropagation()}
                         />
                       </div>
-                      {/* time */}
-                      <div className="text-faint" title={ev.ts ?? ''}>{ev.ago ?? ''}</div>
+                      {/* this alert's OWN timestamp: clock time + relative age */}
+                      <div className="flex min-w-0 flex-col leading-tight" title={absTime(ev.ts) ?? ev.ts ?? ''}>
+                        <span className="truncate text-text-2">{clockTime(ev.ts) || '—'}</span>
+                        {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
+                      </div>
                       {/* severity */}
                       <div><SeverityTag sev={(ev.sev ?? 'low') as Severity} /></div>
                       {/* src → dst:port */}
@@ -1003,28 +1136,13 @@ export function Alerts() {
                           <span className="text-faint">:{ev.port}</span>
                         )}
                       </div>
-                      {/* host + provenance badge */}
-                      <div className="flex min-w-0 items-center gap-1.5 truncate">
-                        <span className="truncate text-dim">{ev.host}</span>
-                        {ev.investigated ? (
-                          <span
-                            title="This exact event was investigated"
-                            className="inline-flex flex-shrink-0 items-center rounded-chip border px-[5px] py-[2px] font-mono text-[9.5px] font-semibold"
-                            style={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
-                          >
-                            investigated
-                          </span>
-                        ) : ev.inheritedReason ? (
-                          <span
-                            title={ev.inheritedReason}
-                            className="inline-flex flex-shrink-0 cursor-help items-center rounded-chip border px-[5px] py-[2px] font-mono text-[9.5px] font-semibold"
-                            style={{ borderColor: 'rgba(148,163,184,.25)', background: 'rgba(148,163,184,.07)', color: '#94a3b8' }}
-                          >
-                            inherited ↑
-                          </span>
-                        ) : null}
+                      {/* host */}
+                      <div className="truncate text-dim" title={ev.host}>{ev.host}</div>
+                      {/* verdict provenance + WHEN the investigation ran/inherited */}
+                      <div className="flex min-w-0 items-center">
+                        <ProvenanceBadge ev={ev} onOpen={openDrawer} />
                       </div>
-                      {/* hunt button */}
+                      {/* investigate this exact event */}
                       <div className="flex justify-end">
                         <button
                           onClick={() => hunt(g)}
@@ -1032,7 +1150,7 @@ export function Alerts() {
                           style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
                         >
                           <Sparkles size={12} />
-                          {g.invId ? 'Open report' : 'Investigate'}
+                          {g.invId ? 'Open' : 'Investigate'}
                         </button>
                       </div>
                     </div>

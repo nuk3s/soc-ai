@@ -38,6 +38,15 @@ function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+/** JSON-body PUT helper. */
+function put<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
 /** DELETE helper. */
 function del<T>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' });
@@ -209,6 +218,33 @@ export function cancelHuntConsole(id: string): Promise<{ cancelled: boolean }> {
   return post(`/hunts/${encodeURIComponent(id)}/cancel`);
 }
 
+/** Delete a hunt and its events (admin only). 409 if the hunt is still running. */
+export function deleteHunt(id: string): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/hunts/${encodeURIComponent(id)}`);
+}
+
+/** One message in a hunt's read-only follow-up chat thread. */
+export interface HuntChatMessage {
+  role: 'user' | 'assistant';
+  text: string;
+  tools?: string | null;
+}
+
+export interface HuntChatThread {
+  messages: HuntChatMessage[];
+  pending: boolean;
+}
+
+/** The hunt's follow-up "Chat about this" thread (poll while pending). */
+export function getHuntChat(id: string): Promise<HuntChatThread> {
+  return request<HuntChatThread>(`/hunts/${encodeURIComponent(id)}/chat`);
+}
+
+/** Ask a read-only follow-up about a completed hunt; returns the updated thread. */
+export function postHuntChat(id: string, message: string): Promise<HuntChatThread> {
+  return post<HuntChatThread>(`/hunts/${encodeURIComponent(id)}/chat`, { message });
+}
+
 export function getConfig(): Promise<Config> {
   return request<Config>('/config');
 }
@@ -292,6 +328,46 @@ export function unmuteRule(id: number): Promise<{ removed: boolean }> {
   return post<{ removed: boolean }>(`/detection-tuning/override/${id}/remove`);
 }
 
+// ── Operator runbooks (the agent's lookup_runbook tool searches these) ─────
+export interface Runbook {
+  id: number;
+  title: string;
+  content: string; // markdown / plain text
+  tags: string[];
+  linked_rules: string[]; // detection rule names / UUIDs this runbook applies to
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Create/update payload — tags & linked_rules are plain string lists. */
+export interface RunbookInput {
+  title: string;
+  content: string;
+  tags: string[];
+  linked_rules: string[];
+}
+
+/** All operator runbooks, most-recently-updated first. */
+export function getRunbooks(): Promise<Runbook[]> {
+  return request<Runbook[]>('/runbooks');
+}
+
+/** Author a new runbook. */
+export function createRunbook(body: RunbookInput): Promise<Runbook> {
+  return post<Runbook>('/runbooks', body);
+}
+
+/** Update a runbook (only the provided fields change). */
+export function updateRunbook(id: number, body: Partial<RunbookInput>): Promise<Runbook> {
+  return put<Runbook>(`/runbooks/${id}`, body);
+}
+
+/** Delete a runbook. */
+export function deleteRunbook(id: number): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/runbooks/${id}`);
+}
+
 // ── API keys (write-only enrichment provider secrets) ──────────────────────
 export interface ApiKeyField {
   key: string;
@@ -363,6 +439,20 @@ export function startHunt(alertId: string): Promise<string> {
 /** Cancel an in-flight hunt (lands the run as `cancelled`). 404 if not running. */
 export function cancelHunt(invId: string): Promise<{ cancelled: boolean }> {
   return post<{ cancelled: boolean }>(`/investigations/${invId}/cancel`);
+}
+
+/**
+ * Launch a FOCUSED re-investigation to close a `needs_more_info` verdict.
+ *
+ * Re-runs the investigation on the same alert but seeds the fresh run with the
+ * prior open questions, so it targets those gaps. Resolves to the new INV id
+ * (navigate + poll it like a re-hunt). 409 if the source verdict isn't
+ * `needs_more_info`.
+ */
+export function requestMoreInfo(invId: string): Promise<string> {
+  return post<{ investigation_id: string }>(
+    `/investigations/${encodeURIComponent(invId)}/request-more-info`,
+  ).then((r) => r.investigation_id);
 }
 
 /** Delete an investigation and its events + chat (admin only). */

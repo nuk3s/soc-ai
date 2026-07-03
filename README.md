@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.0.2-3fb950" alt="1.0.2">
+  <img src="https://img.shields.io/badge/status-1.0.3-3fb950" alt="1.0.3">
 </p>
 
 </div>
@@ -128,6 +128,9 @@ Full Docker options — required mounts, SELinux relabeling, upstream TLS trust 
 `ANALYST_MODEL` is the one model the agent triages with — whatever your gateway serves (model IDs drift, so re-probe `/v1/models`). The reasoning happens locally. The Oracle path is the only way anything reaches a cloud API, it's opt-in, and it only ever sees sanitized input.
 
 ## Documentation
+
+📖 **Full docs site: [nuk3s.github.io/soc-ai](https://nuk3s.github.io/soc-ai/)** — the same
+docs below, searchable, with dark mode. Build it locally with `uv run --group docs mkdocs serve`.
 
 - [docs/WEBUI_GUIDE.md](docs/WEBUI_GUIDE.md) — the console: triage, auto-triage, investigations, the admin config page
 - [docs/AGENT_TOOLS.md](docs/AGENT_TOOLS.md) — every tool the agent can call, and the guardrails on them

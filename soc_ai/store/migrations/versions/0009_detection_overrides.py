@@ -27,9 +27,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
         sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.true()),
     )
-    op.create_index(
-        "ix_detection_override_rule_name", "detection_override", ["rule_name"]
-    )
+    op.create_index("ix_detection_override_rule_name", "detection_override", ["rule_name"])
 
 
 def downgrade() -> None:

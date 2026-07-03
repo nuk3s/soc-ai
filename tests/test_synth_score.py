@@ -258,9 +258,7 @@ def test_score_counts_attempted_scenario_with_no_row_as_fn() -> None:
     # Scope to expected-TP scenarios only — the errored-as-FN backfill is a
     # positive-class (recall) concern; benign scenarios must not be dragged in.
     scenarios = [
-        s
-        for s in load_all_scenarios(SCENARIOS_DIR)
-        if s.ground_truth.verdict == "true_positive"
+        s for s in load_all_scenarios(SCENARIOS_DIR) if s.ground_truth.verdict == "true_positive"
     ]
     # Only the first scenario produced a (correct) result row; the rest errored.
     first = scenarios[0]

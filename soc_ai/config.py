@@ -101,6 +101,18 @@ class Settings(BaseSettings):
     and the pending status never gets stuck.  Bumped 180→300 after
     a legitimately-deep follow-up needed >180s; raise further for slower GPUs."""
 
+    auto_triage_per_target_timeout_s: int = 600
+    """Wall-clock backstop for a single auto-triage investigation (seconds).
+
+    An investigation is heavier than a chat turn — several tool calls plus the
+    synthesis pass — so this is larger than ``chat_turn_timeout_s``. It is NOT a
+    normal-path bound (the investigation's own request budget governs that); it
+    is the safety net for a HUNG LLM stream, which otherwise has no wall-clock
+    limit and stalls the entire sequential sweep behind it (the exact failure
+    that wedged a batch mid-run). On expiry the per-target ``asyncio.timeout``
+    raises ``TimeoutError`` — caught by the loop's per-target handler, counted as
+    a failure — and the sweep proceeds to the next target."""
+
     litellm_max_retries: int = 5
     """How many times the OpenAI client retries a gateway request on a transient
     error (connection drop, 429, 5xx). The openai default is 2, which can't ride
@@ -744,6 +756,20 @@ class Settings(BaseSettings):
 
     Off by default — this is a write action taken without analyst review.
     Enable only after validating the model's FP precision on your alert set.
+
+    COUPLING (important): auto-ack fires ONLY as a side-effect of an
+    investigation finalising with an FP verdict. It is NOT a retroactive
+    sweep — enabling it does not go back and acknowledge alerts that were
+    never investigated. An alert only gets auto-acked if it is investigated
+    *while* this is on. To acknowledge a standing backlog of FPs, run an
+    auto-triage sweep over it (the ⚡ button, or ``auto_triage_schedule_
+    enabled``); each finalised FP is then auto-acked as it completes.
+
+    Note the severity interaction: ``_is_high_stakes_alert`` never auto-acks a
+    critical/high-severity (or malware/exploit-class) alert, while
+    ``auto_triage_min_severity`` defaults to "high". If you want auto-ack to
+    actually clear a backlog, lower the auto-triage floor to "medium"/"low" so
+    the sweep investigates the low-severity FPs auto-ack is allowed to write.
     """
 
     auto_ack_fp_threshold: float = 0.7

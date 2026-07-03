@@ -269,3 +269,33 @@ class DetectionOverride(Base):
     created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Runbook(Base):
+    """An operator-authored runbook: a procedure / note the triage agent can cite.
+
+    Runbooks are the org's *own* guidance — how *this* team wants a class of
+    alert handled, what "normal" looks like on *this* network, which hosts are
+    known-benign, the exact steps to confirm/dismiss a detection. The triage
+    agent's ``lookup_runbook`` tool searches these so an investigation can ground
+    itself in real operator knowledge instead of hallucinating a false-positive
+    from thin data. Purely local — nothing here is ever written to Security Onion.
+
+    ``tags`` and ``linked_rules`` are stored as JSON string lists. ``linked_rules``
+    names the detection rules (Suricata rule names / SO rule UUIDs) a runbook
+    applies to; a rule-link match is the strongest search signal, ahead of a tag
+    match, ahead of plain keyword overlap in the title/content.
+    """
+
+    __tablename__ = "runbook"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(512))
+    content: Mapped[str] = mapped_column(Text, default="")  # markdown / plain text
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    linked_rules: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(), server_default=func.now(), onupdate=func.now()
+    )

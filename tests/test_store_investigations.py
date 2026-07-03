@@ -52,9 +52,7 @@ async def test_create_seeds_rule_name_at_birth(settings_kratos: Settings) -> Non
         assert none.rule_name is None
 
         # Over-long names are truncated to the column bound (512).
-        long = await inv_svc.create(
-            db, alert_es_id="a4", started_by="admin", rule_name="x" * 600
-        )
+        long = await inv_svc.create(db, alert_es_id="a4", started_by="admin", rule_name="x" * 600)
         assert long.rule_name is not None and len(long.rule_name) == 512
     await engine.dispose()
 

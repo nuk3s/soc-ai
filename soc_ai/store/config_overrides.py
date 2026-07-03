@@ -250,7 +250,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "When on, a completed investigation with verdict=false_positive at or above "
             "the threshold below is automatically acknowledged in Security Onion. "
-            "Off by default — this writes to SO without analyst review."
+            "Off by default — this writes to SO without analyst review. "
+            "Note: this fires only when an alert is INVESTIGATED — it does not "
+            "retroactively acknowledge a standing backlog. To clear existing FPs, "
+            "run an auto-triage sweep (⚡ or the schedule) with them in scope. High/"
+            "critical-severity alerts are never auto-acked, so lower the auto-triage "
+            "floor to medium/low if you want low-severity FPs cleared automatically."
         ),
     ),
     SettingSpec(

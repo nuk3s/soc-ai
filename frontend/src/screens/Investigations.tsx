@@ -1,5 +1,5 @@
 import { Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
-import { Fragment, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
@@ -66,9 +66,29 @@ function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: So
 export function Investigations() {
   const navigate = useNavigate();
   const [reloadKey, setReloadKey] = useState(0);
+  // useAsync captures pauseWhen at setup and can't see `data` there, so track
+  // whether any run is still live in a ref and let pauseWhen consult it: stop
+  // polling once every row has reached a terminal state.
+  const activeRef = useRef(false);
   const { data, loading, error } = useAsync(getInvestigations, [reloadKey], {
     refetchInterval: 10000, // live status (running → complete) without a reload
+    pauseWhen: () => !activeRef.current,
   });
+
+  // A run started elsewhere (another tab, auto-triage) won't be reflected while
+  // this list is idle — so force one refetch when the tab regains focus.
+  useEffect(() => {
+    const onFocus = () => setReloadKey((k) => k + 1);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') setReloadKey((k) => k + 1);
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
 
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]);
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
@@ -82,11 +102,21 @@ export function Investigations() {
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [rehunting, setRehunting] = useState(false);
   const [rehuntMsg, setRehuntMsg] = useState<string | null>(null);
+  // The re-investigate / delete status line is a transient toast, not a
+  // permanent banner — auto-dismiss it after a few seconds so it doesn't linger
+  // over the list. Errors get a little longer to be read.
+  useEffect(() => {
+    if (!rehuntMsg) return;
+    const isError = /failed/i.test(rehuntMsg);
+    const t = setTimeout(() => setRehuntMsg(null), isError ? 8000 : 4500);
+    return () => clearTimeout(t);
+  }, [rehuntMsg]);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   const rows = data ?? [];
+  activeRef.current = rows.some((r) => r.status === 'running' || r.status === 'awaiting');
   const running = rows.filter((r) => r.status === 'running').length;
   const tps = rows.filter((r) => r.verdict === 'true_positive').length;
 

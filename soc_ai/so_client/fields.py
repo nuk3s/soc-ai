@@ -111,6 +111,57 @@ FILE_MD5: tuple[str, ...] = ("file.hash.md5", "zeek.files.md5")
 FILE_SHA256: tuple[str, ...] = ("file.hash.sha256", "zeek.files.sha256")
 FILE_SIZE: tuple[str, ...] = ("file.size", "zeek.files.total_bytes")
 
+# --- kerberos (credential-access: Kerberoasting / AS-REP roasting) ---
+# The DECISIVE Kerberoasting signal is the ticket cipher — RC4-HMAC (etype 23,
+# often rendered "rc4-hmac" / "0x17") requested for a service principal. No stable
+# ECS mapping on SO, so read zeek.kerberos.* directly (ECS `kerberos.*` first in
+# case a future integration populates it).
+KERBEROS_CIPHER: tuple[str, ...] = ("kerberos.cipher", "zeek.kerberos.cipher")
+KERBEROS_SERVICE: tuple[str, ...] = ("kerberos.service", "zeek.kerberos.service")
+KERBEROS_CLIENT: tuple[str, ...] = ("kerberos.client", "zeek.kerberos.client")
+KERBEROS_REQUEST_TYPE: tuple[str, ...] = ("kerberos.request_type", "zeek.kerberos.request_type")
+KERBEROS_SUCCESS: tuple[str, ...] = ("kerberos.success", "zeek.kerberos.success")
+
+# --- smb / dce-rpc (lateral movement: PsExec-style service creation) ---
+# smb_files.name=PSEXESVC.exe + action=SMB::FILE_WRITE onto smb_mapping.service
+# ADMIN$, then dce_rpc svcctl / CreateServiceW — the PsExec execution chain.
+SMB_FILE_ACTION: tuple[str, ...] = ("smb.file.action", "zeek.smb_files.action")
+SMB_FILE_NAME: tuple[str, ...] = ("smb.file.name", "zeek.smb_files.name")
+SMB_FILE_PATH: tuple[str, ...] = ("smb.file.path", "zeek.smb_files.path")
+SMB_MAPPING_SERVICE: tuple[str, ...] = ("smb.mapping.service", "zeek.smb_mapping.service")
+SMB_MAPPING_SHARE_TYPE: tuple[str, ...] = ("smb.mapping.share_type", "zeek.smb_mapping.share_type")
+DCE_RPC_ENDPOINT: tuple[str, ...] = ("dce_rpc.endpoint", "zeek.dce_rpc.endpoint")
+DCE_RPC_OPERATION: tuple[str, ...] = ("dce_rpc.operation", "zeek.dce_rpc.operation")
+
+# --- ssh (interactive lateral movement; a completed auth from a bad-reputation
+# source is a confirmed intrusion) ---
+SSH_AUTH_SUCCESS: tuple[str, ...] = ("ssh.auth_success", "zeek.ssh.auth_success")
+SSH_AUTH_ATTEMPTS: tuple[str, ...] = ("ssh.auth_attempts", "zeek.ssh.auth_attempts")
+SSH_CLIENT: tuple[str, ...] = ("ssh.client", "zeek.ssh.client")
+SSH_SERVER: tuple[str, ...] = ("ssh.server", "zeek.ssh.server")
+
+# --- behavioral-summary pivots (derived/aggregated docs) ---
+# Some deployments surface a per-(host,dest) BEHAVIORAL SUMMARY document rather
+# than only raw per-connection rows: RITA-style beacon scoring (interval + data-
+# size consistency over a window) and DNS-tunnel aggregation (query volume +
+# subdomain entropy + qtype mix). These are the decisive signals for C2 beacons
+# and DNS covert channels — a single ET HUNTING/Informational alert plus one of
+# these profiles is a confirmed detection. We read the whole profile OBJECT (a
+# nested dict) via the candidate path; realistic integration names first, the
+# eval fixture name last. Absent on ordinary docs (returns None).
+BEACON_PROFILE: tuple[str, ...] = (
+    "rita.beacon",
+    "beacon.profile",
+    "network.beacon_profile",
+    "synth.beacon_profile",
+)
+DNS_TUNNEL_PROFILE: tuple[str, ...] = (
+    "dns.tunnel_profile",
+    "dns.summary",
+    "network.dns_profile",
+    "synth.dns_profile",
+)
+
 
 def _is_absent(value: Any) -> bool:
     """A value is *absent* iff it's ``None``, an empty string, or an empty list.

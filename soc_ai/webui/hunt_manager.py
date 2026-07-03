@@ -38,6 +38,7 @@ class HuntManager:
         alert_id: str,
         started_by: str,
         rule_name: str | None = None,
+        focus_hint: str | None = None,
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -47,6 +48,10 @@ class HuntManager:
 
         ``rule_name`` seeds the row's display name at creation so it is never
         anonymous even if the run dies before the first alert_context event.
+
+        ``focus_hint`` (optional): prior open questions from a re-launched
+        ``needs_more_info`` investigation ("request more info") — threaded into
+        the run so the fresh investigation targets those gaps.
 
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
@@ -60,6 +65,7 @@ class HuntManager:
             started_by=started_by,
             cancel_token=token,
             rule_name=rule_name,
+            focus_hint=focus_hint,
         )
 
         # Consume until the first event — must be "investigation_created".

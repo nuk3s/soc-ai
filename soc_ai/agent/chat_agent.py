@@ -21,6 +21,7 @@ from pydantic_ai.models import Model
 from soc_ai.agent.orchestrator import InvestigationContext
 from soc_ai.tools.crawl_page import crawl_page
 from soc_ai.tools.cvedb import cve_lookup
+from soc_ai.tools.discover import describe_dataset, field_values
 from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip
 from soc_ai.tools.get_event_raw import get_event_raw
 from soc_ai.tools.get_pcap import get_pcap_facts
@@ -202,7 +203,7 @@ def build_chat_agent(  # noqa: PLR0915
     async def t_query_zeek_logs(
         community_id: str, log_types: list[str] | None = None, time_range_minutes: int = 60
     ) -> list[dict[str, Any]] | dict[str, Any]:
-        """Fetch Zeek records sharing a network.community_id (conn/dns/http/ssl/files)."""
+        """Fetch Zeek records sharing a network.community_id (conn/dns/http/ssl/files/ssh)."""
         try:
             return await query_zeek_logs(
                 community_id,
@@ -215,6 +216,23 @@ def build_chat_agent(  # noqa: PLR0915
             )
         except Exception as e:
             return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_describe_dataset(dataset: str) -> dict[str, Any]:
+        """Discover the fields POPULATED on a dataset (e.g. `zeek.ssh`, `endpoint`,
+        `windows.security`) by sampling recent docs — field names + example values +
+        coverage. Works for network AND host datasets."""
+        return await describe_dataset(dataset, elastic=ctx.elastic, settings=s)
+
+    @agent.tool_plain
+    async def t_field_values(
+        field: str, dataset: str | None = None, size: int = 25
+    ) -> dict[str, Any]:
+        """List the top VALUES a field takes (terms aggregation), optionally within one
+        dataset — e.g. what `rule.name`s fire or what `event.dataset`s are present."""
+        return await field_values(
+            field, elastic=ctx.elastic, settings=s, dataset=dataset, size=size
+        )
 
     @agent.tool_plain
     async def t_enrich_ip(ip: str) -> dict[str, Any]:

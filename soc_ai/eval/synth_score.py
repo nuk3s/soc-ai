@@ -120,6 +120,20 @@ class SynthStratumScore:
     per_scenario: dict[str, ScenarioDetail]
     per_tier: dict[Tier, TierAggregate]
     unmatched_scenario_ids: list[str]
+    # Verdict-only recall: a correct-verdict escalation counts as detected
+    # REGARDLESS of confidence (the strict ``escalation_recall`` additionally
+    # requires confidence >= floor). Reported alongside so a well-reasoned but
+    # under-confident escalation isn't indistinguishable from a total miss, and
+    # the headline recall doesn't track the model's calibration verbosity.
+    escalation_recall_verdict_only: float = 0.0
+    escalation_recall_verdict_only_ci: tuple[float, float] = (0.0, 1.0)
+    # FN split so calibration + infra loss don't masquerade as detection misses:
+    #   missed         — wrong verdict on an expected-TP scenario (a real miss)
+    #   low_confidence — correct escalation, but below the confidence floor
+    #   errored        — no result row (run errored / triage doc deleted mid-run)
+    false_negative_breakdown: dict[str, int] = field(
+        default_factory=lambda: {"missed": 0, "low_confidence": 0, "errored": 0}
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +145,9 @@ class SynthStratumScore:
             "escalation_recall": self.escalation_recall,
             "escalation_precision_ci": list(self.escalation_precision_ci),
             "escalation_recall_ci": list(self.escalation_recall_ci),
+            "escalation_recall_verdict_only": self.escalation_recall_verdict_only,
+            "escalation_recall_verdict_only_ci": list(self.escalation_recall_verdict_only_ci),
+            "false_negative_breakdown": dict(self.false_negative_breakdown),
             "per_scenario": {k: v.to_dict() for k, v in self.per_scenario.items()},
             "per_tier": {k: v.to_dict() for k, v in self.per_tier.items()},
             "unmatched_scenario_ids": list(self.unmatched_scenario_ids),
@@ -208,6 +225,9 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
     per_tier_fn: defaultdict[Tier, int] = defaultdict(int)
     unmatched: list[str] = []
     tp = fp = fn = tn = 0
+    # Verdict-only escalations (correct verdict, ANY confidence) + FN split.
+    escalated_correct = 0
+    fn_missed = fn_low_conf = fn_errored = 0
 
     for row in rows:
         scenario = by_id.get(row.scenario_id)
@@ -218,14 +238,23 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
         per_scenario[scenario.id] = detail
 
         expected_tp = scenario.ground_truth.verdict == "true_positive"
-        emitted_tp = row.verdict == "true_positive" and detail.correct
+        # verdict-only escalation ignores the confidence floor; strict TP adds it.
+        escalated = row.verdict == "true_positive"
+        emitted_tp = escalated and detail.correct
+        if expected_tp and escalated:
+            escalated_correct += 1
         if expected_tp and emitted_tp:
             tp += 1
             per_tier_tp[scenario.tier] += 1
         elif expected_tp and not emitted_tp:
             fn += 1
             per_tier_fn[scenario.tier] += 1
-        elif not expected_tp and row.verdict == "true_positive":
+            # A correct escalation below the floor is a calibration FN, not a miss.
+            if escalated:
+                fn_low_conf += 1
+            else:
+                fn_missed += 1
+        elif not expected_tp and escalated:
             fp += 1
         else:
             tn += 1
@@ -241,6 +270,7 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
             continue
         if scenario.ground_truth.verdict == "true_positive":
             fn += 1
+            fn_errored += 1
             per_tier_fn[scenario.tier] += 1
             per_scenario[scenario.id] = ScenarioDetail(
                 scenario_id=scenario.id,
@@ -256,6 +286,13 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     precision_ci = wilson_ci(tp, tp + fp)
     recall_ci = wilson_ci(tp, tp + fn)
+    # Verdict-only recall shares the strict recall's denominator (all expected-TP
+    # scenarios = tp + fn) but credits every correct-verdict escalation, so it is
+    # unaffected by the confidence floor. Numerator = strict TP + low-confidence
+    # (correct-verdict) escalations = escalated_correct.
+    expected_tp_total = tp + fn
+    recall_verdict_only = escalated_correct / expected_tp_total if expected_tp_total else 0.0
+    recall_verdict_only_ci = wilson_ci(escalated_correct, expected_tp_total)
 
     per_tier: dict[Tier, TierAggregate] = {}
     for tier in ("easy", "medium", "hard"):
@@ -274,6 +311,13 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
         escalation_recall=recall,
         escalation_precision_ci=precision_ci,
         escalation_recall_ci=recall_ci,
+        escalation_recall_verdict_only=recall_verdict_only,
+        escalation_recall_verdict_only_ci=recall_verdict_only_ci,
+        false_negative_breakdown={
+            "missed": fn_missed,
+            "low_confidence": fn_low_conf,
+            "errored": fn_errored,
+        },
         per_scenario=per_scenario,
         per_tier=per_tier,
         unmatched_scenario_ids=unmatched,

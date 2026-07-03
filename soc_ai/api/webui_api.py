@@ -21,7 +21,7 @@ import secrets
 import time
 from collections import Counter
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
 from elastic_transport import TransportError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -52,6 +52,7 @@ from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import internal_identifiers as ids_store
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store import runbooks as runbooks_svc
 from soc_ai.store.models import ApiToken, Backtest, ConfigOverride, Hunt, HuntEvent, Investigation
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui import autotriage as at
@@ -212,6 +213,11 @@ def _verdict(value: str | None) -> str:
     return value or "untriaged"
 
 
+def _inv_ago(inv: Any) -> str | None:
+    """Short relative label for when an investigation ran (its created_at)."""
+    return _ago(inv.created_at.isoformat()) if inv.created_at else None
+
+
 def _ago(ts: str) -> str:
     """ES ``@timestamp`` (ISO-8601) → a short relative label (now/3m/2h/5d)."""
     if not ts:
@@ -232,6 +238,22 @@ def _ago(ts: str) -> str:
     return f"{int(secs // 86400)}d"
 
 
+def _iso_utc(dt: datetime | None) -> str:
+    """Serialize a stored timestamp as a TIMEZONE-AWARE ISO-8601 string.
+
+    Store timestamps are naive UTC (``store.auth.utcnow`` / SQLite ``func.now()``
+    both produce UTC). A NAIVE ISO string (``2026-07-02T11:23:49``) has no offset,
+    so a browser parses it as LOCAL time — off by the client's UTC offset (the
+    "1h-old run shows 8h ago" bug). Stamping ``+00:00`` lets the browser localize
+    it correctly. An already-aware datetime is passed through unchanged.
+    """
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+
+
 class AlertEventOut(BaseModel):
     id: str = ""  # es _id — needed by the upcoming per-event selection feature
     src: str
@@ -245,6 +267,11 @@ class AlertEventOut(BaseModel):
     investigated: bool = False  # True when this exact event was investigated
     invId: str | None = None  # investigation whose verdict applies to this event
     inheritedReason: str | None = None  # human-readable reason when verdict is inherited
+    # Relative time of the investigation that gave this event its verdict, for BOTH
+    # the direct-investigated and inherited cases ("8m" → "investigated 8m ago").
+    # The inheritedReason string also embeds it, but a structured field lets the row
+    # render the investigation's time next to the alert's own time without regex.
+    investigatedAt: str | None = None
 
 
 class AlertGroupOut(BaseModel):
@@ -282,7 +309,15 @@ class AlertGroupOut(BaseModel):
 
 
 def _inherited_reason(inv: Investigation) -> str:
-    return f"Inherited — same detection, investigated on {inv.src_ip or '?'} → {inv.dest_ip or '?'}"
+    """Human explanation for an inherited verdict — WHICH investigation and WHEN,
+    so the analyst can trust (and open) the source rather than seeing an opaque
+    'inherited' badge."""
+    when = _ago(inv.created_at.isoformat()) if inv.created_at else "?"
+    flow = f"{inv.src_ip or '?'} → {inv.dest_ip or '?'}"
+    return (
+        f"Inherited — same detection, investigated {when} ago on {flow} "
+        f"(investigation {inv.id[:8]}…)"
+    )
 
 
 @router.get("/alerts", response_model=list[AlertGroupOut])
@@ -508,21 +543,30 @@ async def list_group_events(
             ago=_ago(e.timestamp),
         )
         direct_inv = direct.get(e.es_id)
-        pair_inv = (
-            pair_map.get((rule_name, e.src_ip, e.dst_ip)) if e.src_ip and e.dst_ip else None
-        )
-        if direct_inv is not None:
+        pair_inv = pair_map.get((rule_name, e.src_ip, e.dst_ip)) if e.src_ip and e.dst_ip else None
+        # A DIRECT run of this exact alert only "owns" it (investigated, NOT
+        # inherited) when it is complete (a landed verdict) or still running (an
+        # in-flight re-run). An error/cancelled direct run produced no verdict, so
+        # it must NOT claim the alert — fall through to the inherited pair/rule
+        # verdict (same re-huntable treatment as blocks_rehunt). This is the fix
+        # for "re-ran ON this alert but the pill still says inherited": the fresh
+        # re-run's alert_es_id == this event's es_id, so it lands here and clears
+        # the inherited flag.
+        if direct_inv is not None and direct_inv.status in ("complete", "running"):
             base.investigated = True
             base.invId = direct_inv.id
             base.inheritedReason = None
+            base.investigatedAt = _inv_ago(direct_inv)
         elif pair_inv is not None:
             base.investigated = False
             base.invId = pair_inv.id
             base.inheritedReason = _inherited_reason(pair_inv)
+            base.investigatedAt = _inv_ago(pair_inv)
         elif rule_inv is not None:  # already complete + verdict-bearing
             base.investigated = False
             base.invId = rule_inv.id
             base.inheritedReason = _inherited_reason(rule_inv)
+            base.investigatedAt = _inv_ago(rule_inv)
         out.append(base)
     return out
 
@@ -926,8 +970,9 @@ def _row(
         host=inv.src_ip or "—",
         dst=getattr(inv, "dest_ip", None),
         status=_row_status(inv),
-        when=_ago(inv.created_at.isoformat()),
-        ts=inv.created_at.isoformat(),
+        when=_ago(_iso_utc(inv.created_at)),
+        # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
+        ts=_iso_utc(inv.created_at),
         chatCount=chat_count,
         alertId=getattr(inv, "alert_es_id", None) or inv.id,
         isPrimary=is_primary,
@@ -1377,9 +1422,7 @@ def _build_actions(
     never offers an "Acknowledge" button for an alert the system already acked.
     """
     # Auto-ack fired successfully? Then any ack action is already done.
-    auto_acked = any(
-        e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events
-    )
+    auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
     approval_events = [e for e in events if e.kind in ("approval_request", "approval_required")]
     out: list[RecommendedActionOut] = []
     if approval_events:
@@ -1541,7 +1584,9 @@ async def get_investigation(
         model=settings.analyst_model,
         oracle="escalated to Oracle" if has_oracle else "not escalated — local verdict",
         ranBy=inv.started_by or "—",
-        ranAt=inv.created_at.isoformat(sep=" ", timespec="seconds"),
+        # tz-AWARE ISO (with +00:00) so the value is unambiguous UTC — the raw
+        # naive string had no offset, so it couldn't be localized/interpreted.
+        ranAt=_iso_utc(inv.created_at),
         toolCalls=tool_calls,
         pivots=pivots,
     )
@@ -1830,7 +1875,9 @@ _HUNT_TL_GROUP = {
     "hunt_report": "Findings",
     "error": "Findings",
 }
-_HUNT_TL_SKIP = {"tool_result", "model_response", "done"}
+# chat_user/chat_assistant carry the follow-up "Chat about this hunt" thread —
+# surfaced via GET /hunts/{id}/chat, NOT the execution timeline.
+_HUNT_TL_SKIP = {"tool_result", "model_response", "done", "chat_user", "chat_assistant"}
 
 
 class HuntFindingOut(BaseModel):
@@ -1899,8 +1946,9 @@ def _hunt_row(hunt: Hunt) -> HuntRowOut:
         affectedHosts=len(report.get("affected_hosts") or []),
         confidence=report.get("confidence"),
         startedBy=hunt.started_by or "—",
-        when=_ago(hunt.created_at.isoformat()),
-        ts=hunt.created_at.isoformat(),
+        when=_ago(_iso_utc(hunt.created_at)),
+        # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
+        ts=_iso_utc(hunt.created_at),
     )
 
 
@@ -2003,9 +2051,7 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         affectedHosts=[str(h) for h in (report.get("affected_hosts") or [])],
         mitreTechniques=[str(m) for m in (report.get("mitre_techniques") or [])],
         recommendedActions=[
-            HuntActionOut(
-                title=str(a.get("title") or ""), rationale=str(a.get("rationale") or "")
-            )
+            HuntActionOut(title=str(a.get("title") or ""), rationale=str(a.get("rationale") or ""))
             for a in actions
             if isinstance(a, dict)
         ],
@@ -2013,7 +2059,8 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         startedBy=hunt.started_by or "—",
         elapsedLabel=(f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m {elapsed % 60}s"),
         elapsedSec=elapsed,
-        ts=hunt.created_at.isoformat(),
+        # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
+        ts=_iso_utc(hunt.created_at),
         timeline=_build_hunt_timeline(events),
     )
 
@@ -2095,6 +2142,114 @@ async def cancel_hunt_chat(hunt_id: str, request: Request) -> dict[str, bool]:
             detail={"reason": "no_live_hunt", "hint": "no in-flight hunt to cancel"},
         )
     return {"cancelled": True}
+
+
+@router.delete("/hunts/{hunt_id}", dependencies=[Depends(require_admin_api)])
+async def delete_hunt(hunt_id: str, request: Request) -> dict[str, bool]:
+    """Delete a hunt and its events (admin only).
+
+    For clearing broken/orphaned or no-longer-wanted hunts. Refuses to delete a
+    still-``running`` hunt (409) — cancel it first — so its background drainer
+    can't write rows back after the delete (mirrors delete_investigation).
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        hunt = await db.get(Hunt, hunt_id)
+        if hunt is None:
+            raise HTTPException(
+                status_code=404, detail={"reason": "not_found", "hint": "hunt not found"}
+            )
+        if hunt.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "still_running",
+                    "hint": "cancel the running hunt before deleting it",
+                },
+            )
+        await hunt_svc.delete(db, hunt_id)
+    return {"deleted": True}
+
+
+# ── "Chat about this hunt" — read-only follow-up Q&A on a COMPLETED hunt ──────
+#
+# Mirrors the investigation follow-up chat (GET+POST /investigations/{id}/chat):
+# a background turn writes a pending assistant row, the SPA polls the thread until
+# !pending. The thread lives as hunt_events (keyed by the hunt id); the agent is
+# the SAME read-only chat agent — no write tools, no Oracle, no verdict proposals
+# (a hunt never acks/escalates).
+
+
+class HuntChatMessageOut(BaseModel):
+    role: str  # "user" | "assistant"
+    text: str
+    tools: str | None = None
+
+
+class HuntChatThreadOut(BaseModel):
+    messages: list[HuntChatMessageOut]
+    pending: bool
+
+
+def _hunt_chat_msg_out(ev: HuntEvent) -> HuntChatMessageOut:
+    p = ev.payload or {}
+    meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+    tool_names = (meta or {}).get("tools") or []
+    tools = ", ".join(tool_names) if tool_names else None
+    role = "user" if ev.kind == "chat_user" else "assistant"
+    return HuntChatMessageOut(role=role, text=str(p.get("content") or ""), tools=tools)
+
+
+def _hunt_chat_thread(events: list[HuntEvent]) -> HuntChatThreadOut:
+    return HuntChatThreadOut(
+        messages=[_hunt_chat_msg_out(e) for e in events],
+        pending=any((e.payload or {}).get("status") == "pending" for e in events),
+    )
+
+
+@router.get("/hunts/{hunt_id}/chat", response_model=HuntChatThreadOut)
+async def get_hunt_chat(request: Request, hunt_id: str) -> HuntChatThreadOut:
+    """Poll target — the hunt's follow-up chat thread, with a pending flag while
+    the assistant works."""
+    async with request.app.state.db_sessionmaker() as db:
+        if await db.get(Hunt, hunt_id) is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        msgs = await hunt_svc.list_chat_messages(db, hunt_id)
+    return _hunt_chat_thread(msgs)
+
+
+class HuntChatIn2(BaseModel):
+    # Bound the follow-up turn: the value is stored and forwarded verbatim to the
+    # LLM, so an unbounded body burns tokens / can blow the context window.
+    message: str = Field(min_length=1, max_length=4000)
+
+
+@router.post("/hunts/{hunt_id}/chat", response_model=HuntChatThreadOut)
+async def post_hunt_chat(request: Request, hunt_id: str, body: HuntChatIn2) -> HuntChatThreadOut:
+    """Ask a follow-up about a COMPLETED hunt. Writes the user turn + a pending
+    assistant turn, spawns the background chat task, and returns the thread (poll
+    GET .../chat until !pending). Read-only — a hunt chat never acks/escalates."""
+    text = body.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail={"reason": "empty_message"})
+    async with request.app.state.db_sessionmaker() as db:
+        hunt = await db.get(Hunt, hunt_id)
+        if hunt is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        if hunt.status == "running":
+            # Can't chat about a hunt that hasn't landed its report yet.
+            raise HTTPException(status_code=409, detail={"reason": "still_running"})
+        existing = await hunt_svc.list_chat_messages(db, hunt_id)
+        if any((e.payload or {}).get("status") == "pending" for e in existing):
+            # A prior turn's assistant is still working — one in-flight turn at a
+            # time, or a second POST orphans a duplicate pending row.
+            raise HTTPException(status_code=409, detail={"reason": "chat_busy"})
+        await hunt_svc.add_chat_user_message(db, hunt_id, text)
+        pending = await hunt_svc.create_pending_chat_assistant(db, hunt_id)
+        msgs = await hunt_svc.list_chat_messages(db, hunt_id)
+    hunt_console_manager.get_chat_manager(request.app.state).start(
+        request.app.state, hunt_id=hunt_id, assistant_event_id=pending.id
+    )
+    return _hunt_chat_thread(msgs)
 
 
 # ── Mutations ──────────────────────────────────────────────────────────────
@@ -2276,14 +2431,24 @@ async def bulk_rehunt(
     started: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
 
-    for i, inv_id in enumerate(unique_ids):
-        if i >= _REHUNT_CAP:
-            skipped.append({"invId": inv_id, "reason": "cap"})
-            continue
+    # Anything beyond the cap is skipped up front; the rest are fetched in a
+    # SINGLE query (was one session-open + one SELECT per id — an N+1).
+    eligible = unique_ids[:_REHUNT_CAP]
+    for inv_id in unique_ids[_REHUNT_CAP:]:
+        skipped.append({"invId": inv_id, "reason": "cap"})
 
+    inv_by_id: dict[str, Investigation] = {}
+    if eligible:
         async with request.app.state.db_sessionmaker() as db:
-            inv = await db.get(Investigation, inv_id)
+            rows = (
+                (await db.execute(select(Investigation).where(Investigation.id.in_(eligible))))
+                .scalars()
+                .all()
+            )
+            inv_by_id = {inv.id: inv for inv in rows}
 
+    for inv_id in eligible:
+        inv = inv_by_id.get(inv_id)
         if inv is None:
             skipped.append({"invId": inv_id, "reason": "not_found"})
             continue
@@ -2311,6 +2476,85 @@ async def bulk_rehunt(
         started.append({"invId": inv_id, "newInvId": new_inv_id, "alertEsId": inv.alert_es_id})
 
     return RehuntResultOut(started=started, skipped=skipped)
+
+
+def _open_questions_of(inv: Investigation) -> list[str]:
+    """Pull the prior run's open questions off the stored report JSON."""
+    report = inv.report if isinstance(inv.report, dict) else {}
+    raw = report.get("open_questions") or []
+    return [str(q).strip() for q in raw if isinstance(q, str) and q.strip()]
+
+
+def _focus_hint_from_questions(questions: list[str]) -> str:
+    """Render prior open questions as a numbered focus block for the seed prompt."""
+    return "\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1))
+
+
+@router.post("/investigations/{inv_id}/request-more-info")
+async def request_more_info(
+    inv_id: str,
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> dict[str, str]:
+    """Launch a FOCUSED re-investigation to close a ``needs_more_info`` verdict.
+
+    "One-click request more info": re-runs the investigation on the SAME alert
+    as *inv_id* (identical mechanism to ``POST /hunt`` / rehunt), but SEEDS the
+    fresh run with the prior investigation's open questions as a ``focus_hint``
+    so the new investigation TARGETS those specific gaps instead of starting
+    cold.
+
+    Only valid when the source investigation landed ``needs_more_info`` — any
+    other verdict is a 409 (the button is only shown for that verdict, but we
+    guard server-side too). Returns ``{"investigation_id": <new_inv_id>}`` so
+    the SPA can navigate + poll it exactly like a re-hunt.
+    """
+    started_by = await identify_caller(request)
+
+    async with request.app.state.db_sessionmaker() as db:
+        inv = await db.get(Investigation, inv_id)
+
+    if inv is None:
+        raise HTTPException(status_code=404, detail={"reason": "not_found"})
+    if not inv.alert_es_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "no_alert",
+                "hint": "this investigation has no alert reference to re-investigate",
+            },
+        )
+    if (inv.verdict or "").strip() != "needs_more_info":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "not_needs_more_info",
+                "hint": (
+                    "request-more-info only applies to a needs_more_info verdict; "
+                    f"this investigation is '{inv.verdict or 'untriaged'}'"
+                ),
+            },
+        )
+
+    questions = _open_questions_of(inv)
+    focus_hint = _focus_hint_from_questions(questions) if questions else None
+
+    # Re-resolve the display name if the source row was created nameless.
+    rmi_name = inv.rule_name
+    if not rmi_name:
+        _, rmi_name = await resolve_alert_for_hunt(elastic, settings, inv.alert_es_id)
+
+    new_inv_id = await hunt_manager.get_manager(request.app.state).start(
+        request.app.state,
+        alert_id=inv.alert_es_id,
+        started_by=started_by,
+        rule_name=rmi_name,
+        focus_hint=focus_hint,
+    )
+    if new_inv_id is None:
+        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
+    return {"investigation_id": new_inv_id}
 
 
 class ChatThreadOut(BaseModel):
@@ -3903,6 +4147,130 @@ async def remove_detection_override(request: Request, override_id: int) -> dict[
     return {"removed": True}
 
 
+# ── Operator runbooks ──────────────────────────────────────────────────────────
+#
+# The org's own guidance the triage agent can cite (the ``lookup_runbook`` tool
+# searches these). Reads are analyst-readable; writes are admin-gated. Purely
+# local — nothing is ever written to Security Onion.
+
+
+# Bound stored runbooks: content is loaded + tokenized in-process on EVERY agent
+# ``lookup_runbook`` call, so an unbounded blob is a latency/memory footgun even
+# though writes are admin-only. Cap the body and both the count and per-item length
+# of the tag / linked-rule lists.
+_RB_LABEL = Annotated[str, Field(max_length=256)]
+_RB_CONTENT_MAX = 65536
+_RB_LIST_MAX = 128
+
+
+class RunbookIn(BaseModel):
+    title: str = Field(min_length=1, max_length=512)
+    content: str = Field(default="", max_length=_RB_CONTENT_MAX)
+    tags: list[_RB_LABEL] = Field(default_factory=list, max_length=_RB_LIST_MAX)
+    linked_rules: list[_RB_LABEL] = Field(default_factory=list, max_length=_RB_LIST_MAX)
+
+
+class RunbookPatch(BaseModel):
+    """All fields optional — only the provided ones are updated."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=512)
+    content: str | None = Field(default=None, max_length=_RB_CONTENT_MAX)
+    tags: list[_RB_LABEL] | None = Field(default=None, max_length=_RB_LIST_MAX)
+    linked_rules: list[_RB_LABEL] | None = Field(default=None, max_length=_RB_LIST_MAX)
+
+
+class RunbookOut(BaseModel):
+    id: int
+    title: str
+    content: str
+    tags: list[str]
+    linked_rules: list[str]
+    created_by: str
+    created_at: str
+    updated_at: str
+
+
+def _runbook_out(row: Any) -> RunbookOut:
+    return RunbookOut(
+        id=row.id,
+        title=row.title,
+        content=row.content or "",
+        tags=list(row.tags or []),
+        linked_rules=list(row.linked_rules or []),
+        created_by=row.created_by,
+        created_at=_iso_utc(row.created_at),
+        updated_at=_iso_utc(row.updated_at),
+    )
+
+
+@router.get("/runbooks", response_model=list[RunbookOut])
+async def list_runbooks(request: Request) -> list[RunbookOut]:
+    """All operator runbooks, most-recently-updated first (analyst-readable)."""
+    async with request.app.state.db_sessionmaker() as db:
+        rows = await runbooks_svc.list_all(db)
+    return [_runbook_out(r) for r in rows]
+
+
+@router.post(
+    "/runbooks",
+    response_model=RunbookOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def create_runbook(request: Request, body: RunbookIn) -> RunbookOut:
+    """Author a new runbook the triage agent can search + cite."""
+    created_by = await identify_caller(request)
+    async with request.app.state.db_sessionmaker() as db:
+        row = await runbooks_svc.create(
+            db,
+            title=body.title,
+            content=body.content,
+            tags=body.tags,
+            linked_rules=body.linked_rules,
+            created_by=created_by,
+        )
+    return _runbook_out(row)
+
+
+@router.put(
+    "/runbooks/{runbook_id}",
+    response_model=RunbookOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def update_runbook(request: Request, runbook_id: int, body: RunbookPatch) -> RunbookOut:
+    """Update a runbook's fields. 404 if it doesn't exist."""
+    async with request.app.state.db_sessionmaker() as db:
+        row = await runbooks_svc.update(
+            db,
+            runbook_id,
+            title=body.title,
+            content=body.content,
+            tags=body.tags,
+            linked_rules=body.linked_rules,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "not_found", "hint": "no runbook with that id"},
+        )
+    return _runbook_out(row)
+
+
+@router.delete(
+    "/runbooks/{runbook_id}",
+    dependencies=[Depends(require_admin_api)],
+)
+async def delete_runbook(request: Request, runbook_id: int) -> dict[str, bool]:
+    """Delete a runbook. 404 if it doesn't exist."""
+    async with request.app.state.db_sessionmaker() as db:
+        ok = await runbooks_svc.delete(db, runbook_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "not_found", "hint": "no runbook with that id"},
+        )
+    return {"deleted": True}
+
+
 # ── Oracle pre-egress redaction preview ────────────────────────────────────────
 
 
@@ -3993,9 +4361,7 @@ def _decision_record(
         # any validator notes and resolution/override provenance.
         "report": inv.report,
         # The agent trace, in order — the actual evidence the verdict rests on.
-        "trace": [
-            {"sequence": e.sequence, "kind": e.kind, "payload": e.payload} for e in events
-        ],
+        "trace": [{"sequence": e.sequence, "kind": e.kind, "payload": e.payload} for e in events],
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

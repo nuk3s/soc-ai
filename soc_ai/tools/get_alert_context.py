@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field
 from soc_ai.config import Settings
 from soc_ai.enrichment.zeek_parser import TypedZeekFields, parse_typed_zeek_fields
 from soc_ai.errors import SoNotFoundError
+from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools._registry import tool
@@ -175,13 +176,21 @@ async def get_alert_context(
     # window, so it catches a compromised host the narrow pivots miss. Gathered
     # in a separate inner call so the pivots keep return_exceptions semantics
     # while host-risk (which swallows its own failures) keeps its dict type.
-    raw_results, host_alert_profile = await asyncio.gather(
+    raw_results, host_alert_profile, behavioral_summaries = await asyncio.gather(
         asyncio.gather(*pivot_calls, return_exceptions=True),
         _host_risk(
             alert,
             elastic,
             settings,
             settings.host_risk_window_hours,
+            include_synth=include_synth,
+        ),
+        _behavioral_summary_pivot(
+            alert,
+            elastic,
+            settings,
+            window_seconds,
+            max_per_pivot,
             include_synth=include_synth,
         ),
     )
@@ -200,6 +209,15 @@ async def get_alert_context(
             )
         else:
             events_by_key[key] = result
+
+    # Prepend behavioral-summary docs (beacon / DNS-tunnel profiles) to the
+    # community-id pivot list so the materializer surfaces their decisive bullet.
+    # They are high-signal and rare, so they win the front slots; dedupe by id
+    # against whatever the community_id pivot already returned.
+    if behavioral_summaries:
+        seen_ids = {e.id for e in events_by_key.get("community_id", [])}
+        fresh = [e for e in behavioral_summaries if e.id not in seen_ids]
+        events_by_key["community_id"] = fresh + events_by_key.get("community_id", [])
 
     return AlertContext(
         alert=alert,
@@ -377,6 +395,83 @@ async def _pivot(
         size=max_results,
         sort=[{"@timestamp": {"order": "asc"}}],
     )
+    return [SoAlert.from_es_hit(h) for h in result.hits]
+
+
+_BEHAVIORAL_PROFILE_FIELDS: tuple[str, ...] = fields.BEACON_PROFILE + fields.DNS_TUNNEL_PROFILE
+
+
+async def _behavioral_summary_pivot(
+    alert: SoAlert,
+    elastic: ElasticClient,
+    settings: Settings,
+    window_seconds: int,
+    max_results: int,
+    *,
+    include_synth: bool = False,
+) -> list[SoAlert]:
+    """Fetch derived BEHAVIORAL-SUMMARY docs for the alert's endpoint IPs.
+
+    The five tight pivots key on ``community_id`` / ``host.name`` / ``user.name``;
+    a RITA-style beacon summary or a DNS-tunnel aggregate carries neither (it is a
+    per-host rollup written with only ``source.ip`` and a behavioral-profile
+    object). So the decisive beacon / DNS-tunnel signal was invisible to the
+    prefetch even though the detection logic downstream knows how to read it.
+
+    This pivot closes that gap: match any doc in the window whose source OR
+    destination IP is an alert endpoint AND that carries one of the behavioral-
+    profile objects (``exists`` on the candidate paths). The profile object is
+    rare — only summary docs have it — so this stays naturally low-volume without
+    a dataset-name whitelist. Best-effort: any failure returns ``[]`` rather than
+    poisoning the prefetch."""
+    ips = [ip for ip in (alert.source_ip, alert.destination_ip) if ip]
+    if not ips or alert.timestamp is None:
+        return []
+
+    delta = timedelta(seconds=window_seconds)
+    gte = (alert.timestamp - delta).isoformat()
+    lte = (alert.timestamp + delta).isoformat()
+
+    must_not: list[dict[str, Any]] = [{"ids": {"values": [alert.id]}}]
+    if not include_synth:
+        must_not.append({"exists": {"field": "synth.scenario_id"}})
+
+    query: dict[str, Any] = {
+        "bool": {
+            "must": [
+                {
+                    "bool": {
+                        "should": [
+                            {"terms": {"source.ip": ips}},
+                            {"terms": {"destination.ip": ips}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+                {
+                    "bool": {
+                        "should": [{"exists": {"field": f}} for f in _BEHAVIORAL_PROFILE_FIELDS],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ],
+            "filter": [{"range": {"@timestamp": {"gte": gte, "lte": lte}}}],
+            "must_not": must_not,
+        }
+    }
+
+    try:
+        result = await elastic.search(
+            settings.events_index_pattern,
+            query,
+            size=min(max_results, 8),
+            sort=[{"@timestamp": {"order": "asc"}}],
+        )
+    except Exception as exc:  # best-effort: never poison the prefetch (BLE001 ok)
+        _LOGGER.warning(
+            "behavioral-summary pivot for alert %s failed: %s", alert.id, type(exc).__name__
+        )
+        return []
     return [SoAlert.from_es_hit(h) for h in result.hits]
 
 

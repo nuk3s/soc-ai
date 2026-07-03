@@ -24,12 +24,35 @@ def _hits_response(hits: list[dict[str, Any]]) -> dict[str, Any]:
     return {"took": 1, "hits": {"total": {"value": len(hits)}, "hits": hits}}
 
 
+def _is_behavioral_summary_query(body: dict[str, Any]) -> bool:
+    """The behavioral-summary pivot is the one whose ``must`` is a pair of nested
+    ``bool``/``should`` clauses (IP match + profile-``exists``), not a single
+    ``term`` (the 5 tight pivots) or a top-level ``should`` (the host-risk agg)."""
+    must = (body.get("query", {}).get("bool", {}) or {}).get("must")
+    return isinstance(must, list) and bool(must) and "term" not in must[0]
+
+
 def _make_elastic(
     settings: Settings,
     responses: list[dict[str, Any]],
+    behavioral_response: dict[str, Any] | None = None,
 ) -> tuple[ElasticClient, AsyncMock]:
     fake_es = AsyncMock()
-    fake_es.search.side_effect = responses
+    # The behavioral-summary pivot (beacon / DNS-tunnel) is an ADDITIVE fan-out
+    # that these tests don't script; answer it from ``behavioral_response``
+    # (default empty) WITHOUT consuming a positional response, so each test's
+    # response list still maps 1:1 to the lookup + 5 tight pivots + host-risk agg
+    # it was written for.
+    _it = iter(responses)
+    _behavioral = behavioral_response if behavioral_response is not None else _EMPTY_HITS
+
+    def _search(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        body = kwargs.get("body") or (args[1] if len(args) > 1 else {})
+        if _is_behavioral_summary_query(body):
+            return _behavioral
+        return next(_it)
+
+    fake_es.search.side_effect = _search
     with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es):
         return ElasticClient(settings), fake_es
 
@@ -67,7 +90,8 @@ async def test_happy_path_all_pivots_empty(
         "file": 0,
     }
     assert ctx.host_alert_profile == {}
-    assert fake_es.search.call_count == 7  # 1 lookup + 5 pivots + host-risk agg
+    # 1 lookup + 5 pivots + host-risk agg + 1 behavioral-summary pivot.
+    assert fake_es.search.call_count == 8
 
 
 @pytest.mark.asyncio
@@ -177,7 +201,8 @@ async def test_skips_pivot_when_field_absent(
     ctx = await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
 
     assert ctx.pivot_summary["community_id"] == 0
-    assert fake_es.search.call_count == 6  # lookup + 4 pivots + host-risk agg
+    # lookup + 4 pivots + host-risk agg + behavioral-summary pivot.
+    assert fake_es.search.call_count == 7
 
 
 @pytest.mark.asyncio
@@ -326,12 +351,12 @@ async def test_pivots_exclude_alert_id(
     await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
 
     pivot_calls = fake_es.search.call_args_list[1:]  # skip the lookup
-    assert len(pivot_calls) == 6  # 5 pivots + host-risk agg
+    assert len(pivot_calls) == 7  # 5 pivots + host-risk agg + behavioral-summary
     for call in pivot_calls:
         body = call.kwargs["body"]
         must_not = body["query"]["bool"]["must_not"]
-        # Every fan-out query — the 5 pivots AND the host-risk agg — excludes
-        # the alert's own document.
+        # Every fan-out query — the 5 pivots, the host-risk agg, AND the
+        # behavioral-summary pivot — excludes the alert's own document.
         assert {"ids": {"values": ["alert-001"]}} in must_not
 
 
@@ -384,12 +409,13 @@ async def test_pivots_use_correct_field_names(
     seen_fields: set[str] = set()
     for call in pivot_calls:
         body = call.kwargs["body"]
-        # The host-risk agg is a should/terms query (no single `must` term) —
-        # skip it; this test only covers the 5 single-field term pivots.
-        if "must" not in body["query"]["bool"]:
+        must = body["query"]["bool"].get("must")
+        # The host-risk agg is a should/terms query (no `must`); the behavioral-
+        # summary pivot's `must` is a pair of nested bools (no single `term`).
+        # Skip both — this test only covers the 5 single-field term pivots.
+        if not must or "term" not in must[0]:
             continue
-        term_clause = body["query"]["bool"]["must"][0]["term"]
-        seen_fields.update(term_clause.keys())
+        seen_fields.update(must[0]["term"].keys())
     assert seen_fields == set(expected_fields)
 
 
@@ -449,7 +475,8 @@ async def test_host_risk_profile_aggregates_endpoint_rules(
     }
     # The agg query keys on BOTH endpoint IPs (should/terms), filters to
     # suricata alerts, excludes the focus alert + synth docs, and uses size=0.
-    agg_call = fake_es.search.call_args_list[-1]
+    # Find it by its aggregation (robust to fan-out dispatch order).
+    agg_call = next(c for c in fake_es.search.call_args_list if "aggs" in c.kwargs.get("body", {}))
     body = agg_call.kwargs["body"]
     assert body["size"] == 0
     assert "aggs" in body
@@ -458,6 +485,46 @@ async def test_host_risk_profile_aggregates_endpoint_rules(
     should_fields = {next(iter(s["terms"])) for s in bool_q["should"]}
     assert should_fields == {"source.ip", "destination.ip"}
     assert {"exists": {"field": "synth.scenario_id"}} in bool_q["must_not"]
+
+
+@pytest.mark.asyncio
+async def test_behavioral_summary_pivot_surfaces_beacon_into_pivots(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    """A derived beacon-summary doc (keyed on source.ip only, so the 5 tight
+    pivots miss it) is fetched by the behavioral-summary pivot and prepended into
+    community_id_events with its profile extracted — the decisive-evidence
+    surfacer downstream reads it from there."""
+    beacon_doc = {
+        "_id": "beacon-sum-1",
+        "_source": {
+            "event.dataset": "zeek.conn_summary",
+            "source.ip": "10.0.0.115",
+            "destination.ip": "104.18.42.69",
+            "synth": {
+                "beacon_profile": {
+                    "connection_count": 240,
+                    "mean_interval_seconds": 60.1,
+                    "interval_similarity": 0.95,
+                    "orig_bytes_cv": 0.04,
+                    "resp_bytes_cv": 0.06,
+                }
+            },
+        },
+    }
+    elastic, _fake = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(sample_alert), *([_EMPTY_HITS] * 6)],
+        behavioral_response=_hits_response([beacon_doc]),
+    )
+
+    ctx = await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
+
+    ids = [e.id for e in ctx.community_id_events]
+    assert "beacon-sum-1" in ids
+    doc = next(e for e in ctx.community_id_events if e.id == "beacon-sum-1")
+    assert doc.zeek_beacon_profile is not None
+    assert doc.zeek_beacon_profile.get("interval_similarity") == 0.95
 
 
 @pytest.mark.asyncio

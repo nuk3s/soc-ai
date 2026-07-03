@@ -20,6 +20,9 @@ coverage.xml
 .venv/
 .python-version
 
+# MkDocs build output (the docs site is built + deployed by CI, never committed)
+/site/
+
 # Environment
 .env
 .env.local

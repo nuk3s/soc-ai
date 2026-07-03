@@ -250,9 +250,7 @@ async def plan_samples(
         }
     )
     if severity_floor:
-        query["bool"]["filter"].append(
-            {"terms": {"event.severity_label": list(severity_floor)}}
-        )
+        query["bool"]["filter"].append({"terms": {"event.severity_label": list(severity_floor)}})
 
     try:
         result = await elastic.search(

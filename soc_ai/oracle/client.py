@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -270,14 +271,19 @@ def _verdict_to_report(verdict: OracleVerdict) -> TriageReport:
 # ---------------------------------------------------------------------------
 
 _MAX_RETRIES = 3
-# Exponential backoff between gateway retries (seconds): 0.5, 1.0, 2.0 … capped.
-# Gives a transient 5xx / gateway overload time to recover instead of hammering.
+# Full-jitter exponential backoff between gateway retries. The deterministic
+# ceiling grows 0.5, 1.0, 2.0 … capped at 8s; the actual sleep is a uniform draw
+# in [0, ceiling]. Jitter matters because Oracle is called from many concurrent
+# investigations — a fixed schedule makes them all retry in lockstep and re-hammer
+# the gateway the instant it starts to recover (thundering herd). This mirrors the
+# transport-layer policy in soc_ai/agent/_gateway_retry.py.
 _BACKOFF_BASE_S = 0.5
 _BACKOFF_MAX_S = 8.0
 
 
 def _backoff_s(attempt: int) -> float:
-    return float(min(_BACKOFF_BASE_S * (2.0 ** (attempt - 1)), _BACKOFF_MAX_S))
+    ceiling = min(_BACKOFF_BASE_S * (2.0 ** (attempt - 1)), _BACKOFF_MAX_S)
+    return float(random.random() * ceiling)  # noqa: S311 - jitter, not security-sensitive
 
 
 class _OracleGatewayError(RuntimeError):

@@ -345,10 +345,38 @@ def test_classify_reserved_default_suffix_dropped() -> None:
 
 
 def test_classify_associated_public_domain_active() -> None:
-    """An associated public domain (org's own AD domain via host.name) activates."""
-    cand = _Candidate(value="evil.com", host_count=10_000, associated=True)
-    # associated public registrable → eligible to activate (it IS the org's name)
+    """An associated public domain (org's own AD domain via host.name / resolving
+    to an internal IP) activates — that association is a real internal signal."""
+    cand = _Candidate(value="acme.com", host_count=10_000, associated=True)
     assert classify_suffix(cand, min_hosts=3) == "active"
+
+
+def test_classify_bare_public_tld_never_internal() -> None:
+    """A bare public TLD ("com"/"net"/"org") must NEVER be classified internal —
+    the 'claiming the entire .com is internal' dogfood bug. A single-label INTERNAL
+    suffix (lan/corp) is unaffected."""
+    from soc_ai.enrichment.discovery import is_clearly_internal_suffix
+
+    for tld in ("com", "net", "org", "io"):
+        assert is_clearly_internal_suffix(tld) is False
+        # even "associated", a bare public TLD is dropped, not activated.
+        bare = _Candidate(value=tld, host_count=999, associated=True)
+        assert classify_suffix(bare, min_hosts=3) is None
+    for internal in ("lan", "corp", "internal"):
+        assert is_clearly_internal_suffix(internal) is True
+
+
+def test_classify_machine_guid_suffix_dropped() -> None:
+    """A per-device Windows mDNS name (<guid>.local) is one ephemeral host, not an
+    org suffix — dropped, so the identifier list isn't flooded with unique GUIDs."""
+    guid = "05bc0f86-f13e-4904-a92b-11dee17856a1.local"
+    g = _Candidate(value=guid, host_count=5, associated=True)
+    assert classify_suffix(g, min_hosts=3) is None
+    dotted = _Candidate(value="." + guid, host_count=50, associated=True)
+    assert classify_suffix(dotted, min_hosts=3) is None
+    # A normal internal suffix is unaffected.
+    corp = _Candidate(value="corp.acme.local", host_count=5, associated=True)
+    assert classify_suffix(corp, min_hosts=3) == "active"
 
 
 # ---------------------------------------------------------------------------

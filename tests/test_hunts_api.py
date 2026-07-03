@@ -385,6 +385,159 @@ def test_start_hunt_chat_rejects_empty_objective(client: TestClient) -> None:
     assert resp.status_code == 422  # min_length=1 validation
 
 
+def test_delete_hunt_removes_row_and_events(client: TestClient, settings_kratos: Settings) -> None:
+    """DELETE /hunts/{id} removes a completed hunt and its events; a re-list is empty."""
+    hunt_id = _seed_complete_hunt(client)
+    # sanity: it's listed
+    assert any(r["id"] == hunt_id for r in client.get("/api/v1/hunts").json())
+
+    resp = client.delete(f"/api/v1/hunts/{hunt_id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": True}
+
+    # gone from the list AND the detail 404s
+    assert all(r["id"] != hunt_id for r in client.get("/api/v1/hunts").json())
+    assert client.get(f"/api/v1/hunts/{hunt_id}").status_code == 404
+
+
+def test_delete_hunt_not_found(client: TestClient) -> None:
+    assert client.delete("/api/v1/hunts/does-not-exist").status_code == 404
+
+
+def test_delete_running_hunt_conflicts(client: TestClient) -> None:
+    """A still-running hunt refuses to delete (409) — cancel it first."""
+
+    async def _seed_running() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective="live hunt", started_by="admin")
+            return hunt.id  # status defaults to "running", never finalized
+
+    hunt_id = asyncio.run(_seed_running())
+    resp = client.delete(f"/api/v1/hunts/{hunt_id}")
+    assert resp.status_code == 409
+    # still present (not deleted)
+    assert client.get(f"/api/v1/hunts/{hunt_id}").status_code == 200
+
+
+# ── Chat about this hunt (read-only follow-up) ───────────────────────────────
+
+
+def test_hunt_chat_thread_empty_and_404(client: TestClient) -> None:
+    hunt_id = _seed_complete_hunt(client)
+    # a completed hunt with no chat yet → empty, not pending
+    body = client.get(f"/api/v1/hunts/{hunt_id}/chat").json()
+    assert body == {"messages": [], "pending": False}
+    # unknown hunt → 404
+    assert client.get("/api/v1/hunts/nope/chat").status_code == 404
+
+
+def test_hunt_chat_rejects_running_hunt(client: TestClient) -> None:
+    async def _seed_running() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective="live", started_by="admin")
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed_running())
+    resp = client.post(f"/api/v1/hunts/{hunt_id}/chat", json={"message": "what did you find?"})
+    assert resp.status_code == 409
+
+
+def test_hunt_chat_rejects_second_turn_while_pending(client: TestClient) -> None:
+    """A 2nd POST while a prior turn's assistant is still pending → 409 chat_busy,
+    so we never orphan a duplicate pending assistant row."""
+    hunt_id = _seed_complete_hunt(client)
+
+    async def _seed_pending() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            await hunt_svc.add_chat_user_message(db, hunt_id, "first question")
+            await hunt_svc.create_pending_chat_assistant(db, hunt_id)
+
+    asyncio.run(_seed_pending())
+    resp = client.post(f"/api/v1/hunts/{hunt_id}/chat", json={"message": "second"})
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "chat_busy"
+
+
+def test_hunt_chat_rejects_empty_message(client: TestClient) -> None:
+    hunt_id = _seed_complete_hunt(client)
+    # min_length=1 → 422 pydantic validation
+    assert client.post(f"/api/v1/hunts/{hunt_id}/chat", json={"message": ""}).status_code == 422
+
+
+def _read_hunt_chat(settings: Settings, hunt_id: str) -> list[dict[str, Any]]:
+    """Read the persisted hunt chat thread via an independent engine on the same DB."""
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+    async def _go() -> list[dict[str, Any]]:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            msgs = await hunt_svc.list_chat_messages(db, hunt_id)
+        await engine.dispose()
+        return [{"kind": m.kind, "payload": dict(m.payload or {})} for m in msgs]
+
+    return asyncio.run(_go())
+
+
+def test_hunt_chat_message_runs_a_turn_and_round_trips(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """POST a follow-up on a completed hunt → the background turn lands a done
+    assistant answer (mocked model, no live gateway); GET returns the thread."""
+    import time
+
+    hunt_id = _seed_complete_hunt(client)
+
+    with patch(
+        "soc_ai.webui.hunt_console_manager.build_investigator_model",
+        return_value=TestModel(
+            call_tools=[], custom_output_text="The rare beacon was to 203.0.113.9."
+        ),
+    ):
+        resp = client.post(
+            f"/api/v1/hunts/{hunt_id}/chat",
+            json={"message": "which host was beaconing?"},
+        )
+        assert resp.status_code == 200
+        thread = resp.json()
+        # the user turn is present immediately; the assistant turn is pending
+        assert thread["messages"][0] == {
+            "role": "user",
+            "text": "which host was beaconing?",
+            "tools": None,
+        }
+        assert thread["pending"] is True
+
+        # poll the persisted thread until the assistant row flips to done
+        done: dict[str, Any] | None = None
+        for _ in range(50):  # up to ~5s
+            rows = _read_hunt_chat(settings_kratos, hunt_id)
+            assistant = [r for r in rows if r["kind"] == "chat_assistant"]
+            if assistant and assistant[-1]["payload"].get("status") == "done":
+                done = assistant[-1]
+                break
+            time.sleep(0.1)
+
+    assert done is not None
+    assert done["payload"]["content"] == "The rare beacon was to 203.0.113.9."
+
+    # GET now returns both turns, not pending
+    final = client.get(f"/api/v1/hunts/{hunt_id}/chat").json()
+    assert final["pending"] is False
+    roles = [m["role"] for m in final["messages"]]
+    assert roles == ["user", "assistant"]
+    assert final["messages"][1]["text"] == "The rare beacon was to 203.0.113.9."
+    # the chat thread must NOT leak into the hunt's execution timeline
+    detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    assert all("chat" not in (s.get("group", "").lower()) for s in detail["timeline"])
+    tl_titles = " ".join(s["title"] for s in detail["timeline"])
+    assert "which host was beaconing" not in tl_titles
+
+
 def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) -> None:
     """The recorded run emits hunt_created (with the row id) first, then tees the
     agent stream, and finalizes a complete row."""

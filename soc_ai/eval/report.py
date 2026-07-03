@@ -512,10 +512,7 @@ def _render_synth_stratum(synth_stratum: dict[str, Any] | None) -> str:
     pins to 1.0 or is undefined. Absent (real-only batch) → a short note.
     """
     if synth_stratum is None:
-        return (
-            "## Synthetic-scenario stratum\n\n"
-            "_(no synth-tagged rows in this batch)_\n"
-        )
+        return "## Synthetic-scenario stratum\n\n_(no synth-tagged rows in this batch)_\n"
 
     tp = synth_stratum.get("true_positive_count", 0)
     fp = synth_stratum.get("false_positive_count", 0)
@@ -523,8 +520,11 @@ def _render_synth_stratum(synth_stratum: dict[str, Any] | None) -> str:
     tn = synth_stratum.get("true_negative_count", 0)
     precision = synth_stratum.get("escalation_precision")
     recall = synth_stratum.get("escalation_recall")
+    recall_vo = synth_stratum.get("escalation_recall_verdict_only")
     p_ci = synth_stratum.get("escalation_precision_ci") or [None, None]
     r_ci = synth_stratum.get("escalation_recall_ci") or [None, None]
+    r_vo_ci = synth_stratum.get("escalation_recall_verdict_only_ci") or [None, None]
+    fn_break = synth_stratum.get("false_negative_breakdown") or {}
 
     def _ci(ci: list[Any]) -> str:
         lo, hi = [*ci, None, None][:2]
@@ -541,12 +541,27 @@ def _render_synth_stratum(synth_stratum: dict[str, Any] | None) -> str:
         "| metric | value | 95% CI |",
         "|---|---:|:---:|",
         f"| **Escalation precision** (TP / (TP+FP)) | {_fmt_pct(precision)} | {_ci(p_ci)} |",
-        f"| **Escalation recall** (TP / (TP+FN)) | {_fmt_pct(recall)} | {_ci(r_ci)} |",
+        f"| **Escalation recall — verdict-only** (correct escalation, any conf) "
+        f"| {_fmt_pct(recall_vo)} | {_ci(r_vo_ci)} |",
+        f"| Escalation recall — high-confidence (≥ floor) | {_fmt_pct(recall)} | {_ci(r_ci)} |",
         "",
         "| TP | FP | FN | TN |",
         "|---:|---:|---:|---:|",
         f"| {tp} | {fp} | {fn} | {tn} |",
     ]
+    if fn_break:
+        # Split FN so a confidence-floor miss or an errored run (infra loss) isn't
+        # read as a detection failure. `errored` in particular is infra, not the model.
+        lines += [
+            "",
+            "**False-negative breakdown** "
+            "(missed = wrong verdict · low_confidence = correct escalation below floor · "
+            "errored = no result row / infra loss)\n",
+            "| missed | low_confidence | errored |",
+            "|---:|---:|---:|",
+            f"| {fn_break.get('missed', 0)} | {fn_break.get('low_confidence', 0)} "
+            f"| {fn_break.get('errored', 0)} |",
+        ]
 
     per_tier = synth_stratum.get("per_tier") or {}
     if per_tier:
@@ -623,9 +638,7 @@ def write_report_markdown(
     synth_stratum: dict[str, Any] | None = None,
 ) -> Path:
     path = batch_dir / "report.md"
-    path.write_text(
-        render_markdown(batch_dir, rows, agg, synth_stratum), encoding="utf-8"
-    )
+    path.write_text(render_markdown(batch_dir, rows, agg, synth_stratum), encoding="utf-8")
     return path
 
 

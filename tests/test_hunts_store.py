@@ -52,11 +52,11 @@ async def test_migration_creates_hunts_tables(settings_kratos: Settings) -> None
 
 async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     # The store schema migrates cleanly to the current head. Bump this when a new
-    # migration lands (0010 hunts → 0011 backtests → …).
+    # migration lands (0010 hunts → 0011 backtests → 0012 runbooks → …).
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0011"
+        assert row.scalar_one() == "0012"
     await engine.dispose()
 
 
@@ -165,4 +165,56 @@ async def test_delete_removes_hunt_and_events(settings_kratos: Settings) -> None
         assert await hunt_svc.get_with_events(db, hunt.id) is None
         # deleting a missing id returns False
         assert await hunt_svc.delete(db, hunt.id) is False
+    await engine.dispose()
+
+
+async def test_hunt_chat_thread_round_trips(settings_kratos: Settings) -> None:
+    """The hunt follow-up chat helpers store/read a thread as hunt_events keyed by
+    hunt id: user turn, pending assistant, then finished; history excludes pending."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        hunt = await hunt_svc.create(db, objective="beaconing", started_by="a")
+        await hunt_svc.finalize(db, hunt.id, status="complete", report=REPORT)
+        # a real trace event first — chat rows must sequence AFTER it
+        await hunt_svc.append_events(
+            db, hunt.id, [{"sequence": 1, "kind": "hunt_started", "payload": {}}]
+        )
+
+        user = await hunt_svc.add_chat_user_message(db, hunt.id, "which host?")
+        pending = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+        assert pending.sequence > user.sequence > 1  # appended after the trace
+
+        # while pending, history_for_agent has only the user turn (the pending
+        # assistant row is excluded)
+        hist = await hunt_svc.chat_history_for_agent(db, hunt.id)
+        assert hist == [("user", "which host?")]
+
+        msgs = await hunt_svc.list_chat_messages(db, hunt.id)
+        assert [m.kind for m in msgs] == ["chat_user", "chat_assistant"]
+        assert (msgs[1].payload or {}).get("status") == "pending"
+
+        await hunt_svc.finish_chat_assistant(
+            db,
+            pending.id,
+            content="10.0.0.5 was beaconing.",
+            status="done",
+            meta={"tools": ["t_query_events_oql"]},
+        )
+        msgs = await hunt_svc.list_chat_messages(db, hunt.id)
+        assert (msgs[1].payload or {})["content"] == "10.0.0.5 was beaconing."
+        assert (msgs[1].payload or {})["status"] == "done"
+        assert (msgs[1].payload or {})["meta"]["tools"] == ["t_query_events_oql"]
+
+        # now both turns are complete
+        hist = await hunt_svc.chat_history_for_agent(db, hunt.id)
+        assert hist == [("user", "which host?"), ("assistant", "10.0.0.5 was beaconing.")]
+
+        # the chat rows are NOT part of the hunt's trace-only get_with_events? They
+        # ARE hunt_events, so get_with_events returns them too (the timeline builder
+        # is what filters them). Verify they co-exist with the trace event.
+        got = await hunt_svc.get_with_events(db, hunt.id)
+        assert got is not None
+        kinds = [e.kind for e in got[1]]
+        assert "hunt_started" in kinds
+        assert "chat_user" in kinds and "chat_assistant" in kinds
     await engine.dispose()

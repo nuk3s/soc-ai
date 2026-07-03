@@ -122,10 +122,14 @@ async def _dispatch_named_tool(
         "t_query_cases",
         "t_query_detections",
         "t_get_playbooks",
-        "t_lookup_runbook",
     }:
         base_kwargs["elastic"] = ctx.elastic
         base_kwargs["auth"] = getattr(ctx, "auth", None)
+    elif tool_name == "t_lookup_runbook":
+        # Operator-runbook search hits the local store, not ES — inject the
+        # session factory instead of elastic/auth. ``settings`` is unused by
+        # this tool, so drop it too (its signature has no **kwargs).
+        base_kwargs = {"db_sessionmaker": getattr(ctx, "db_sessionmaker", None)}
     elif tool_name == "t_get_pcap":
         # get_pcap_facts needs only settings (already in base_kwargs) +
         # alert_ts from the context time anchor.

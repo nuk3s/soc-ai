@@ -1,6 +1,6 @@
 [project]
 name = "soc-ai"
-version = "1.0.2"
+version = "1.0.3"
 description = "Self-hosted, privacy-respecting LLM-powered triage assistant for Security Onion"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -74,6 +74,12 @@ dev = [
     "playwright>=1.59.0",
     "pytest-playwright>=0.7.2",
     "pre-commit>=3.8.0",
+]
+docs = [
+    # Documentation site (Material for MkDocs). Build/serve with:
+    #   uv run --group docs mkdocs serve
+    #   uv run --group docs mkdocs build --strict
+    "mkdocs-material>=9.5",
 ]
 
 [project.scripts]

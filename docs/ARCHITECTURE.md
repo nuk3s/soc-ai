@@ -186,4 +186,4 @@ sanitizes the output, and grades it against the cloud oracle reached through the
 same LiteLLM gateway. This is the **only** component that makes an external
 (third-party model) call, it is opt-in, and the data is sanitized and
 refuse-gated before it leaves. The synthetic-scenario catalogue it can inject is
-documented in [`soc_ai/eval/synth_scenarios/README.md`](../soc_ai/eval/synth_scenarios/README.md).
+documented in [`soc_ai/eval/synth_scenarios/README.md`](https://github.com/nuk3s/soc-ai/blob/main/soc_ai/eval/synth_scenarios/README.md).

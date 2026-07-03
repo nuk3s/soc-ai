@@ -24,8 +24,10 @@ from soc_ai.agent.narrative_grounding import (
     UNVERIFIED_CAVEAT,
     check_narrative_grounding,
 )
+from soc_ai.agent.prompts import oql_primer_block
 from soc_ai.agent.proposal_validation import Proposal, validate_proposal
 from soc_ai.api.deps import ctx_from_state
+from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.get_alert_context import get_alert_context
@@ -176,7 +178,13 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
             rationale=inv.rationale,
             summary=inv.summary,
         )
-        sys_prompt = CHAT_SYSTEM_PROMPT.format(context=seed_context)
+        # The chat agent runs OQL — append the primer + the auto-discovered dataset
+        # inventory so it writes valid queries and knows what data exists on this grid.
+        sys_prompt = (
+            CHAT_SYSTEM_PROMPT.format(context=seed_context)
+            + oql_primer_block()
+            + await inventory_prompt_block(ctx.elastic, settings)
+        )
         proposal_sink: list[dict[str, Any]] = []
         agent = build_chat_agent(
             build_investigator_model(settings),

@@ -83,6 +83,7 @@ from __future__ import annotations
 import functools
 import ipaddress
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -301,12 +302,29 @@ def is_clearly_internal_suffix(suffix: str) -> bool:
     if s in RESERVED_SUFFIXES:
         return True
     if "." not in s:
-        return True  # single-label suffix (e.g. "lan") — never public
+        # A single label is internal ONLY if it is not itself a public TLD.
+        # "lan"/"corp" are internal; "com"/"net"/"org" are PUBLIC TLDs — treating
+        # them as internal is the "claiming the entire .com is internal" bug.
+        return s not in _load_public_tlds()
     tld = s.rsplit(".", 1)[-1]
     if tld in RESERVED_TLDS:
         return True
     # multi-label: internal iff NOT a public registrable domain
     return not is_public_registrable(s)
+
+
+# A UUID/GUID as the left-most label — Windows mDNS/LLMNR names like
+# "05bc0f86-f13e-4904-a92b-11dee17856a1.local". These are PER-DEVICE ephemeral
+# names, not org domain suffixes; tracking each as its own "internal suffix" is
+# noise that floods the identifier list.
+_MACHINE_GUID_LABEL_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.", re.IGNORECASE
+)
+
+
+def _is_machine_guid_suffix(suffix: str) -> bool:
+    """True if *suffix* begins with a UUID label (a per-machine mDNS/LLMNR name)."""
+    return bool(_MACHINE_GUID_LABEL_RE.match(suffix.strip(".")))
 
 
 def classify_suffix(candidate: _Candidate, min_hosts: int) -> str | None:
@@ -345,8 +363,14 @@ def classify_suffix(candidate: _Candidate, min_hosts: int) -> str | None:
     s = candidate.value.strip(".").lower()
     if not s:
         return None
-    if s in RESERVED_DEFAULT_SUFFIXES:
-        return None  # already a reserved default — no point re-detecting
+    if s in RESERVED_TLDS:
+        return None  # already a reserved suffix (lan/local/home/intranet/…) —
+        # no point re-detecting it as a "newly discovered" org suffix
+    # A per-device machine name (a UUID label, e.g. Windows mDNS "<guid>.local")
+    # is one ephemeral host, not an org suffix — drop it rather than flood the
+    # identifier list with hundreds of unique GUIDs.
+    if _is_machine_guid_suffix(s):
+        return None
     # Query-only signal: what internal hosts LOOK UP, not what they ARE.
     if not candidate.associated:
         # A public registrable domain seen only as a lookup is an external
@@ -355,13 +379,14 @@ def classify_suffix(candidate: _Candidate, min_hosts: int) -> str | None:
             return None
         # A clearly-internal lookup-only name is a weak suggestion (never active).
         return "muted"
-    # Associated (host.name / PTR-internal): both a public registrable parent
-    # (the org's own AD domain) and a clearly-internal suffix are eligible to
-    # activate from real internal-identity signal.
+    # Associated (host.name / PTR-internal): both a public registrable parent (the
+    # org's own AD domain, seen as host.name / resolving to an internal IP) and a
+    # clearly-internal suffix are eligible to activate from real internal-identity
+    # signal. A bare public TLD is neither (see is_clearly_internal_suffix).
     if is_public_registrable(s) or is_clearly_internal_suffix(s):
         return "active" if candidate.host_count >= min_hosts else "muted"
-    # Fallthrough (shouldn't happen): be conservative, suggest only.
-    return "muted"
+    # Fallthrough: a bare public TLD ("com"/"net") reaches here — never internal.
+    return None
 
 
 def classify_host(candidate: _Candidate, min_hosts: int) -> str:

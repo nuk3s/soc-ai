@@ -339,18 +339,13 @@ def test_build_report_synth_stratum_rendered_in_markdown(tmp_path: Path) -> None
     synth_tp["synth_scenario_id"] = "e1-emotet-feodo-c2"
     synth_tp["citations"] = ["blocklist_hit", "typed_path", "prefetch_pivot"]
 
-    synth_benign_closed = _row(
-        "synth-b1", verdict="false_positive", confidence=0.8
-    )
+    synth_benign_closed = _row("synth-b1", verdict="false_positive", confidence=0.8)
     synth_benign_closed["is_synth"] = True
     synth_benign_closed["synth_scenario_id"] = "b1-cdn-update-beacon"
     synth_benign_closed["citations"] = ["prefetch_pivot", "typed_path"]
 
     (tmp_path / "index.jsonl").write_text(
-        "\n".join(
-            json.dumps(r) for r in (real, synth_tp, synth_benign_closed)
-        )
-        + "\n",
+        "\n".join(json.dumps(r) for r in (real, synth_tp, synth_benign_closed)) + "\n",
         encoding="utf-8",
     )
 

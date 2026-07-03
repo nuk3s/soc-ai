@@ -34,10 +34,22 @@ bound    ::= bare | quoted | "*"
 - **bare** values: `tcp`, `203.0.113.50`, `2026-05-07`, `0`, `8080` — no spaces.
 - **quoted** values: `"ET MALWARE Suspicious User-Agent"` — required when the
   value contains spaces or special characters.
-- **wildcard** values: `*malware*`, `et?probe` — `*` matches any sequence,
-  `?` matches a single char.
+- **wildcard** values: `et?probe`, `PSEXESVC*` — `*` matches any sequence, `?` a
+  single char. **A LEADING wildcard (`*foo`, `*foo*`) is REJECTED as too expensive
+  — anchor the prefix (`foo*`).** There is no substring/"contains" match; if you
+  need one, pick a more specific field or an anchored prefix.
 - **ranges**: `[1 TO 100]`, `[now-7d TO now]`, `[* TO 1000]` (open-low),
   `[1024 TO *]` (open-high).
+
+### Two rejections that waste a turn — avoid them
+
+- **Parentheses group whole `field:value` expressions, NOT values.**
+  `source.ip:(203.0.113.10 OR 203.0.113.20)` is INVALID (LPAR parse error). Write it
+  as `(source.ip:203.0.113.10 OR source.ip:203.0.113.20)`, or use a range / two queries.
+- **Never assume a dataset is empty from a different dataset.** To check a
+  protocol, query ITS dataset: `event.dataset:zeek.ssh`, `event.dataset:zeek.kerberos`,
+  `event.dataset:zeek.smb_files`, etc. An empty `zeek.conn` slice says nothing
+  about SSH.
 
 ## Pipe stages
 

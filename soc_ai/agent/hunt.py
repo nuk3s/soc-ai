@@ -29,6 +29,7 @@ from pydantic_ai.models import Model
 from soc_ai.agent.orchestrator import InvestigationContext
 from soc_ai.tools.crawl_page import crawl_page
 from soc_ai.tools.cvedb import cve_lookup
+from soc_ai.tools.discover import describe_dataset, field_values
 from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip
 from soc_ai.tools.get_event_raw import get_event_raw
 from soc_ai.tools.get_pcap import get_pcap_facts
@@ -141,12 +142,21 @@ NARRATIVE. You are READ-ONLY: you investigate and report, you never take actions
 with the read tools. Correlate across hosts and time — a hunt is broader than a \
 single alert. Pivot on what you find (a suspicious host → its DNS → its peers → the \
 rule that fired).
-- Use `t_query_events_oql` as your primary lens — it works across ALL datasets \
-(suricata, zeek.conn/dns/http/ssl, endpoint), including RFC1918 hosts. Narrow with \
-`AND event.dataset:...`. Use `t_query_zeek_logs` to pull a flow's zeek records by \
-community_id, `t_host_summary` to identify an internal host by IP, `t_prevalence` to \
-judge how rare a host→dest/domain pairing is, `t_rule_prevalence` to judge whether a \
-firing rule is noise or notable, and the `t_enrich_*` tools for indicator reputation.
+- Use `t_query_events_oql` as your primary lens — it works across ALL datasets, \
+including RFC1918 hosts. Narrow with `AND event.dataset:...`. **The authoritative \
+list of what data exists on THIS grid is the auto-discovered "Data available on this \
+grid" block below** — consult it and query whatever is present, network OR host \
+(a network-only grid has suricata/zeek; a host-logging grid also has \
+endpoint/windows/sysmon/etc.). For lateral movement specifically, the decisive \
+datasets are `zeek.ssh`, `zeek.smb_files`, `zeek.smb_mapping`, `zeek.rdp`, \
+`zeek.kerberos`, `zeek.ntlm`, `zeek.dce_rpc`, and any host `endpoint`/`windows.*` \
+process/auth logs — IF they appear in the inventory. NEVER conclude a data type is \
+absent without querying its OWN dataset (e.g. `event.dataset:zeek.ssh` for SSH); an \
+empty `zeek.conn` slice does not mean there is no SSH. Use `t_query_zeek_logs` to pull a \
+flow's zeek records by community_id, `t_host_summary` to identify an internal host \
+by IP, `t_prevalence` to judge how rare a host→dest/domain pairing is, \
+`t_rule_prevalence` to judge whether a firing rule is noise or notable, and the \
+`t_enrich_*` tools for indicator reputation.
 - Map what you find to MITRE ATT&CK techniques where you can (technique IDs).
 - Produce a `HuntReport`: discrete `findings` (each with a title, grounded detail, \
 severity, the hosts involved, and citations), a `narrative` tying them together, the \
@@ -222,10 +232,7 @@ def build_hunt_prompt(objective: str, *, prior: str | None = None) -> str:
     is prepended so the agent can pivot within the same hunt thread.
     """
     if prior:
-        return (
-            f"Prior hunt so far:\n{prior}\n\n"
-            f"The analyst's follow-up / refinement: {objective}"
-        )
+        return f"Prior hunt so far:\n{prior}\n\nThe analyst's follow-up / refinement: {objective}"
     return objective
 
 
@@ -277,7 +284,7 @@ def build_hunt_agent(  # noqa: PLR0915 - tool registrations are inherently long
     async def t_query_zeek_logs(
         community_id: str, log_types: list[str] | None = None, time_range_minutes: int = 1440
     ) -> list[dict[str, Any]] | dict[str, Any]:
-        """Fetch Zeek records sharing a network.community_id (conn/dns/http/ssl/files)."""
+        """Fetch Zeek records sharing a network.community_id (conn/dns/http/ssl/files/ssh)."""
         try:
             return await query_zeek_logs(
                 community_id,
@@ -290,6 +297,25 @@ def build_hunt_agent(  # noqa: PLR0915 - tool registrations are inherently long
             )
         except Exception as e:
             return {"error": str(e)}
+
+    @agent.tool_plain
+    async def t_describe_dataset(dataset: str) -> dict[str, Any]:
+        """Discover the fields POPULATED on a dataset (e.g. `zeek.ssh`, `endpoint`,
+        `windows.security`) by sampling its recent docs. Returns each field + an
+        example value + coverage. Use this to learn a dataset's schema before
+        querying it — works for network AND host datasets."""
+        return await describe_dataset(dataset, elastic=ctx.elastic, settings=s)
+
+    @agent.tool_plain
+    async def t_field_values(
+        field: str, dataset: str | None = None, size: int = 25
+    ) -> dict[str, Any]:
+        """List the top VALUES a field takes (a terms aggregation), optionally within
+        one dataset. E.g. what `rule.name`s fire, what `host.name`s exist, what
+        `event.dataset`s are present. Use it to see what actually populates a field."""
+        return await field_values(
+            field, elastic=ctx.elastic, settings=s, dataset=dataset, size=size
+        )
 
     @agent.tool_plain
     async def t_enrich_ip(ip: str) -> dict[str, Any]:

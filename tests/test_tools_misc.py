@@ -286,12 +286,13 @@ async def test_get_playbooks_alert_without_rule_uuid_returns_empty(
 
 
 # =====================================================================
-# lookup_runbook (stub)
+# lookup_runbook (DB-backed; full CRUD/search coverage in test_runbooks.py)
 # =====================================================================
 
 
 @pytest.mark.asyncio
-async def test_lookup_runbook_returns_empty_in_v1() -> None:
+async def test_lookup_runbook_no_db_returns_empty() -> None:
+    # Without an injected sessionmaker (CLI / eval / no DB), the tool returns [].
     result = await lookup_runbook("how do I triage a beaconing alert")
     assert result == []
 

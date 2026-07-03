@@ -60,10 +60,12 @@ from soc_ai.enrichment.maxmind import MaxmindReader
 from soc_ai.errors import OqlValidationError, SoApiError
 from soc_ai.so_client.auth import SoAuthClient
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools._registry import ApprovalGate
 from soc_ai.tools.crawl_page import crawl_page
 from soc_ai.tools.cvedb import cve_lookup
+from soc_ai.tools.discover import describe_dataset, field_values
 from soc_ai.tools.enrichment import (
     MispClient,
     build_local_enrichment_context,
@@ -524,6 +526,189 @@ def _summarize_enrichment_for_evidence(ip: str, result: Any) -> str:
     return f"t_enrich_ip({ip})={summary} (tool t_enrich_ip)"
 
 
+def _pivot_decisive_evidence(ev: Any, ev_id: str) -> list[str]:
+    """Surface the DECISIVE typed protocol field(s) a Zeek pivot carries as
+    explicit, citable evidence bullets — the JA3/JA3S pair (C2 framework), the RC4
+    Kerberos ticket (Kerberoasting), the SMB/DCE-RPC service-creation chain
+    (PsExec), the delivered PE (malware delivery), the exfil byte-asymmetry, and
+    TXT-heavy DNS (tunnel). Returns ``[]`` when the pivot has no decisive typed
+    field, so the caller falls back to a bare ``(id ...)`` cite.
+    """
+
+    def g(attr: str) -> Any:
+        return getattr(ev, attr, None)
+
+    out: list[str] = []
+    ja3, ja3s = g("zeek_ssl_ja3"), g("zeek_ssl_ja3s")
+    if ja3 and ja3s:
+        out.append(
+            f"TLS JA3/JA3S pair ja3={ja3} ja3s={ja3s} (id {ev_id}) — a client+server "
+            "TLS fingerprint pair identifies a specific C2/beacon framework even behind "
+            "CDN fronting"
+        )
+    elif ja3:
+        out.append(f"TLS JA3={ja3} (id {ev_id}) — client TLS fingerprint")
+    cipher = g("zeek_kerberos_cipher")
+    if cipher:
+        svc = g("zeek_kerberos_service")
+        low = str(cipher).lower()
+        rc4 = "rc4" in low or low in ("23", "0x17")
+        note = " — RC4 ticket encryption on a TGS is the Kerberoasting signature" if rc4 else ""
+        out.append(
+            f"Kerberos ticket cipher={cipher}"
+            + (f" for service={svc}" if svc else "")
+            + f" (id {ev_id}){note}"
+        )
+    smb_name, smb_action = g("zeek_smb_name"), g("zeek_smb_action")
+    if smb_name or smb_action:
+        share = g("zeek_smb_mapping_service")
+        out.append(
+            f"SMB {smb_action or 'access'} of {smb_name or 'a file'}"
+            + (f" to {share}" if share else "")
+            + f" (id {ev_id}) — a service-binary write to an admin share is the PsExec pattern"
+        )
+    endpoint, op = g("zeek_dce_rpc_endpoint"), g("zeek_dce_rpc_operation")
+    if endpoint or op:
+        out.append(
+            f"DCE-RPC {endpoint or ''} {op or ''} (id {ev_id}) — remote service-control RPC "
+            "(svcctl / CreateServiceW) executes code on the target"
+        )
+    mime, sha = g("zeek_files_mime_type"), g("zeek_files_sha256")
+    if mime or sha:
+        exe = bool(mime) and any(m in str(mime) for m in ("dosexec", "executable", "x-msdownload"))
+        note = " — an executable delivered over the wire" if exe else ""
+        out.append(
+            f"transferred file mime={mime or '?'}"
+            + (f" sha256={sha}" if sha else "")
+            + f" (id {ev_id}){note}"
+        )
+    orig, resp = g("zeek_conn_orig_bytes"), g("zeek_conn_resp_bytes")
+    dur = g("zeek_conn_duration")
+    if (
+        isinstance(orig, int)
+        and isinstance(resp, int)
+        and orig > 1_000_000
+        and orig > 10 * max(resp, 1)
+    ):
+        # Fold in DURATION so a low-and-slow multi-hour exfil is distinguished from
+        # a quick bulk upload — a 4 GB transfer trickled over 9h is the classic
+        # low-and-slow shape, more suspicious than the same bytes in a burst.
+        slow = ""
+        if isinstance(dur, (int, float)) and dur >= 3600:
+            slow = f", sustained over {int(dur // 3600)}h (low-and-slow)"
+        out.append(
+            f"outbound-dominant transfer orig_bytes={orig} resp_bytes={resp}{slow} (id {ev_id}) "
+            "— a long connection sending far more than it receives is the data-exfil shape"
+        )
+    ssh_ok = g("zeek_ssh_auth_success")
+    if ssh_ok:
+        attempts = g("zeek_ssh_auth_attempts")
+        att = f" in {attempts} attempt(s)" if isinstance(attempts, int) else ""
+        out.append(
+            f"completed SSH login (auth_success=true{att}) (id {ev_id}) — an interactive shell "
+            "was established; a successful SSH auth from a bad-reputation / external source into "
+            "an internal asset is a confirmed intrusion, not policy noise"
+        )
+    qtype = g("zeek_dns_qtype")
+    if qtype and str(qtype).upper() in ("TXT", "NULL"):
+        out.append(
+            f"DNS qtype={qtype} (id {ev_id}) — TXT/NULL-heavy DNS is the covert-tunnel channel"
+        )
+    out.extend(_beacon_profile_bullet(g("zeek_beacon_profile"), ev_id))
+    out.extend(_dns_tunnel_profile_bullet(g("zeek_dns_profile"), ev_id))
+    return out
+
+
+def _num(d: dict[str, Any], *keys: str) -> float | None:
+    """First numeric value among ``keys`` in ``d`` (tolerates RITA vs eval naming)."""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    return None
+
+
+def _beacon_profile_bullet(profile: Any, ev_id: str) -> list[str]:
+    """A RITA-style beacon profile is decisive C2 evidence: regular inter-arrival
+    timing (high interval similarity / low stddev) with near-constant payload sizes
+    over many connections is a machine, not a human — even behind CDN fronting and
+    even when the alert is only an ET HUNTING/Minor rule."""
+    if not isinstance(profile, dict):
+        return []
+    similarity = _num(profile, "interval_similarity", "score", "beacon_score")
+    orig_cv = _num(profile, "orig_bytes_cv", "src_bytes_cv")
+    resp_cv = _num(profile, "resp_bytes_cv", "dst_bytes_cv")
+    low_byte_variance = (orig_cv is not None and orig_cv <= 0.15) or (
+        resp_cv is not None and resp_cv <= 0.15
+    )
+    if not ((similarity is not None and similarity >= 0.75) or low_byte_variance):
+        return []
+    count = _num(profile, "connection_count", "total_connections")
+    mean_int = _num(profile, "mean_interval_seconds", "interval_mean_seconds")
+    parts = []
+    if count is not None:
+        parts.append(f"{int(count)} connections")
+    if mean_int is not None:
+        parts.append(f"~{mean_int:g}s mean interval")
+    if similarity is not None:
+        parts.append(f"{similarity:.0%} interval similarity")
+    if orig_cv is not None or resp_cv is not None:
+        parts.append(
+            f"near-constant payload (orig cv={orig_cv:.2f}, resp cv={resp_cv:.2f})"
+            if orig_cv is not None and resp_cv is not None
+            else "near-constant payload size"
+        )
+    detail = "; ".join(parts) or "regular timing with constant payloads"
+    return [
+        f"periodic beacon profile: {detail} (id {ev_id}) — RITA-style regularity is an "
+        "automated C2 beacon, decisive even when the signature is only ET HUNTING"
+    ]
+
+
+def _dns_tunnel_profile_bullet(profile: Any, ev_id: str) -> list[str]:
+    """A DNS aggregate with high query volume, high subdomain cardinality/entropy,
+    and a TXT/NULL-dominant qtype mix under one parent domain is a covert DNS tunnel
+    — the data channel is the DNS itself, so a single low-severity alert plus this
+    profile is a confirmed exfil/C2 channel."""
+    if not isinstance(profile, dict):
+        return []
+    entropy = _num(profile, "qname_label_entropy_mean", "qname_entropy", "entropy")
+    query_count = _num(profile, "query_count", "queries")
+    unique_sub = _num(profile, "unique_subdomains", "distinct_subdomains")
+    qtypes = profile.get("qtype_distribution")
+    txt_null = 0.0
+    total_q = 0.0
+    if isinstance(qtypes, dict):
+        for k, v in qtypes.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                total_q += float(v)
+                if str(k).upper() in ("TXT", "NULL"):
+                    txt_null += float(v)
+    txt_dominant = total_q > 0 and (txt_null / total_q) >= 0.5
+    high_entropy = entropy is not None and entropy >= 3.5
+    high_volume = (query_count is not None and query_count >= 500) or (
+        unique_sub is not None and unique_sub >= 200
+    )
+    if not (high_entropy and (high_volume or txt_dominant)):
+        return []
+    parent = profile.get("parent_domain") or profile.get("domain")
+    parts = []
+    if query_count is not None:
+        parts.append(f"{int(query_count)} queries")
+    if unique_sub is not None:
+        parts.append(f"{int(unique_sub)} unique subdomains")
+    if entropy is not None:
+        parts.append(f"label entropy {entropy:g}")
+    if txt_dominant:
+        parts.append(f"{txt_null / total_q:.0%} TXT/NULL")
+    detail = ", ".join(parts) or "high-volume high-entropy queries"
+    dom = f" under {parent}" if parent else ""
+    return [
+        f"DNS-tunnel aggregate{dom}: {detail} (id {ev_id}) — high-entropy, high-volume, "
+        "TXT/NULL-dominant DNS is a covert exfil/C2 channel, not name resolution"
+    ]
+
+
 def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
     """Build a list of cited evidence items from the prefetched context.
 
@@ -566,14 +751,22 @@ def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
         excerpt = payload[:80] + "…" if len(payload) > 80 else payload
         evidence.append(f"payload_printable contains {excerpt!r} (path alert.payload_printable)")
 
-    # Community-id pivots — cite each by its ES _id. Up to 3 of the
-    # prefetched events (the orchestrator already capped at 5 for
-    # context budget).
+    # Community-id pivots — cite each by its ES _id, AND surface the DECISIVE
+    # typed protocol field(s) the pivot carries. Citing only "a zeek.ssl record
+    # (id X)" left the JA3/JA3S pair, the RC4 Kerberos ticket, the PsExec SMB/RPC
+    # chain, and the delivered PE's mime/hash buried in the JSON dump — the recall
+    # root cause. Materializing them as explicit bullets makes the model read them
+    # and the validator resolve them. Up to 3 events (already capped at 5 upstream).
     pivots = getattr(alert_ctx, "community_id_events", None) or []
     for ev in pivots[:3]:
         dataset = getattr(ev, "event_dataset", None) or "unknown dataset"
         ev_id = getattr(ev, "id", None)
-        if ev_id:
+        if not ev_id:
+            continue
+        decisive = _pivot_decisive_evidence(ev, ev_id)
+        if decisive:
+            evidence.extend(decisive)
+        else:
             evidence.append(f"community_id pivot: {dataset} record (id {ev_id})")
 
     # Host pivots — same idea, one entry for the existence of related
@@ -694,6 +887,31 @@ def _required_rubric_fields(alert_ctx: Any) -> set[str]:
     return required
 
 
+def _credit_prefetch_coverage(out: Any, alert_ctx: Any) -> None:
+    """Credit rubric coverage the enriched-prefetch pipeline already provided.
+
+    The prefetch runs enrichment on every indicator and fans out the community_id /
+    host pivots BEFORE the agent loop, then hands the result to the model. A verdict
+    that used that prefetched evidence must NOT be capped by the coverage gate for
+    failing to re-issue the same work as explicit tool calls — the orchestrator
+    already did it. This is what lets the synth-first path (where the prefetch IS the
+    primary evidence gathering) reach full confidence on a well-grounded escalation.
+    """
+    if alert_ctx is None:
+        return
+    if getattr(alert_ctx, "enrichments", None):
+        out.enrichment_called = True
+    if getattr(alert_ctx, "host_events", None) or getattr(alert_ctx, "host_alert_profile", None):
+        out.related_alerts_checked = True
+    # A community_id pivot that already retrieved a zeek.dns / zeek.ssl / zeek.http
+    # record IS the dns/sni pivot — the orchestrator performed it.
+    for ev in getattr(alert_ctx, "community_id_events", None) or []:
+        ds = (getattr(ev, "event_dataset", "") or "").lower()
+        if ds in ("zeek.dns", "zeek.ssl", "zeek.http"):
+            out.dns_or_sni_pivoted = True
+            break
+
+
 def _derive_rubric_coverage(
     messages: list[Any],
     alert_ctx: Any,
@@ -772,6 +990,8 @@ def _derive_rubric_coverage(
                         out.related_alerts_checked = True
             elif tool_name in ("t_get_playbooks", "t_lookup_runbook"):
                 out.playbook_consulted = True
+
+    _credit_prefetch_coverage(out, alert_ctx)
 
     # Class-aware auto-True: alerts with no DNS/SNI signal can't be
     # pivoted on — the rubric field is N/A.
@@ -1055,6 +1275,11 @@ def _resolve_citations(
 # old name. New code should use `_resolve_citations` directly.
 _validate_citations = _resolve_citations
 
+# The confidence a CONFIRMED escalation (true_positive grounded in a concrete IOC
+# hit or a cited decisive pivot) is floored to — so a correct catch the model
+# reported at 0.60-0.68 isn't scored as an under-confident near-miss.
+_ESCALATION_CONF_FLOOR = 0.70
+
 
 def _citation_confidence_cap(
     confidence: float,
@@ -1208,6 +1433,35 @@ def _synth_first_post_validate(
     # confidence it reports is its actual assessment — clamping it to the generic
     # template constant overrode real signal. Confidence stays the model's own,
     # still grounded by the citation cap above and the verdict floor below.
+
+    # Evidence-conditional confidence FLOOR (recall-v2 calibration).
+    # A settled true_positive grounded in a CONCRETE decisive signal — a
+    # blocklist/MISP IOC hit, or a cited decisive pivot record (JA3 pair, RC4
+    # Kerberos ticket, PE delivery, exfil asymmetry, completed SSH login, beacon/
+    # tunnel profile) — is not a hedge case. The model routinely lands a correct
+    # escalation at 0.60-0.68; that under-confidence then reads as a detection miss
+    # (and can trip the verdict-floor rewrite below). Floor it to the escalation
+    # confidence. Only RAISES, only for true_positive, only when real gathered
+    # evidence is present — so it can never manufacture a false escalation
+    # (precision is measured on benign scenarios, which are never true_positive).
+    if (
+        report.verdict == "true_positive"
+        and report.confidence < _ESCALATION_CONF_FLOOR
+        and (
+            _has_ioc_hit(enriched_ctx) or _verdict_cites_decisive_pivot_value(report, enriched_ctx)
+        )
+    ):
+        audit["confidence_floor_raise"] = {
+            "original_confidence": report.confidence,
+            "floored_confidence": _ESCALATION_CONF_FLOOR,
+            "grounded_by": "ioc_hit" if _has_ioc_hit(enriched_ctx) else "decisive_pivot_value",
+            "reason": (
+                "true_positive grounded in a concrete IOC / decisive pivot — a "
+                "confirmed catch, floored to escalation confidence rather than "
+                "left as an under-confident hedge"
+            ),
+        }
+        report = report.model_copy(update={"confidence": _ESCALATION_CONF_FLOOR})
 
     # Evidence-conditional verdict floor rewrite.
     # Coerce verdict to needs_more_info ONLY when:
@@ -1576,12 +1830,108 @@ def _has_ioc_hit(enriched_ctx: Any) -> bool:
     return False
 
 
+# Pivot event attributes whose values are distinctive enough to prove a verdict was
+# grounded in correlated evidence when cited (a JA3, a file hash, a Kerberos SPN, a
+# service binary name, an RPC endpoint — not generic fields like a port or state).
+_PIVOT_DECISIVE_ATTRS: tuple[str, ...] = (
+    "zeek_ssl_ja3",
+    "zeek_ssl_ja3s",
+    "zeek_files_sha256",
+    "zeek_files_md5",
+    "zeek_kerberos_service",
+    "zeek_kerberos_cipher",
+    "zeek_smb_name",
+    "zeek_dce_rpc_endpoint",
+    "zeek_dce_rpc_operation",
+)
+_PIVOT_ATTRS: tuple[str, ...] = (
+    "community_id_events",
+    "host_events",
+    "user_events",
+    "process_events",
+    "file_events",
+)
+
+
+def _pivot_evidence_tokens(enriched_ctx: Any) -> set[str]:
+    """Distinctive lowercased tokens from prefetched PIVOT documents — their ES ids
+    plus decisive typed values (JA3/JA3S, file hashes, Kerberos SPN, SMB file name,
+    DCE-RPC endpoint). A verdict that cites one of these is grounded in correlated
+    evidence the orchestrator gathered, not in the alert's own label."""
+    tokens: set[str] = set()
+    for attr in _PIVOT_ATTRS:
+        for ev in getattr(enriched_ctx, attr, None) or []:
+            eid = getattr(ev, "id", None)
+            if eid:
+                tokens.add(str(eid).lower())
+            for f in _PIVOT_DECISIVE_ATTRS:
+                v = getattr(ev, f, None)
+                if isinstance(v, str) and len(v) >= 4:
+                    tokens.add(v.lower())
+    return tokens
+
+
+def _verdict_grounded_in_pivot(report: Any, enriched_ctx: Any) -> bool:
+    """True iff the settled verdict CITES correlated pivot evidence the orchestrator
+    prefetched — a pivot doc's ES id, or one of its decisive typed values, appears in
+    the report's citations.
+
+    Prefetch pivots ARE gathered evidence: the orchestrator ran the community_id /
+    host fan-out as a tool call on the agent's behalf, so a verdict grounded in a
+    pivot record is not a zero-investigation rationalization. A verdict that cites
+    only the alert's own fields matches nothing here and stays gated — the QVOD
+    zero-tool-verdict defense is preserved. The value match is unforgeable: a cited
+    JA3/hash/SPN can only match a pivot the model was actually shown."""
+    tokens = _pivot_evidence_tokens(enriched_ctx)
+    if not tokens:
+        return False
+    cited = " ".join(str(c) for c in (getattr(report, "citations", None) or [])).lower()
+    if not cited:
+        return False
+    return any(tok in cited for tok in tokens)
+
+
+def _verdict_cites_decisive_pivot_value(report: Any, enriched_ctx: Any) -> bool:
+    """Stricter cousin of :func:`_verdict_grounded_in_pivot`: the verdict must cite a
+    decisive typed pivot VALUE (a JA3/JA3S, a file hash, a Kerberos SPN, an SMB file
+    name, a DCE-RPC endpoint) — NOT merely a pivot doc's ES id.
+
+    The id-inclusive check is right for the anti-hallucination hard gate ("did the
+    agent use gathered evidence?"), but for RAISING confidence a bare doc id is not
+    enough — every alert has correlated pivots, so citing one proves nothing about
+    maliciousness. Flooring confidence to the escalation level requires a concrete
+    malicious-leaning signal the model actually cited."""
+    values: set[str] = set()
+    for attr in _PIVOT_ATTRS:
+        for ev in getattr(enriched_ctx, attr, None) or []:
+            for f in _PIVOT_DECISIVE_ATTRS:
+                v = getattr(ev, f, None)
+                if isinstance(v, str) and len(v) >= 4:
+                    values.add(v.lower())
+    if not values:
+        return False
+    cited = " ".join(str(c) for c in (getattr(report, "citations", None) or [])).lower()
+    return bool(cited) and any(v in cited for v in values)
+
+
 # Keys on a tool result that are bookkeeping / classification flags, NOT gathered
 # evidence — a result carrying only these did not discriminate anything.
 _NON_EVIDENCE_RESULT_KEYS = frozenset(
     {
-        "error", "ok", "available", "reason", "hint", "internal", "indicator",
-        "indicator_type", "query", "ip", "domain", "hash", "algo", "note",
+        "error",
+        "ok",
+        "available",
+        "reason",
+        "hint",
+        "internal",
+        "indicator",
+        "indicator_type",
+        "query",
+        "ip",
+        "domain",
+        "hash",
+        "algo",
+        "note",
     }
 )
 
@@ -1653,11 +2003,21 @@ def _downgrade_unevidenced_verdict(
     strong_template = _is_strong_grounded_template(candidate, enriched_ctx) and (
         getattr(candidate, "verdict", None) == report.verdict
     )
+    grounded_in_pivot = _verdict_grounded_in_pivot(report, enriched_ctx)
     if (
         has_tool_evidence
         or strong_template
         or _has_ioc_hit(enriched_ctx)  # grounded in a concrete blocklist/MISP IOC
+        or grounded_in_pivot  # grounded in a cited, orchestrator-prefetched pivot record
     ):
+        if grounded_in_pivot and not (has_tool_evidence or strong_template):
+            audit["evidence_gate_pivot_exemption"] = {
+                "reason": (
+                    "verdict cites correlated pivot evidence the orchestrator "
+                    "prefetched (community_id/host fan-out) — gathered evidence, "
+                    "not a zero-investigation rationalization"
+                ),
+            }
         return report
 
     capped_conf = min(report.confidence, 0.4)
@@ -2004,6 +2364,24 @@ def build_investigator(  # noqa: PLR0915 - tool registrations are inherently lon
     # needs secondary-alert context, expose it through a renamed tool
     # (`t_get_other_alert_context(alert_id)`) so the model can't
     # accidentally re-fetch the alert under triage.
+
+    @agent.tool_plain
+    async def t_describe_dataset(dataset: str) -> dict[str, Any]:
+        """Discover the fields POPULATED on a dataset (e.g. `zeek.ssh`, `endpoint`,
+        `windows.security`) by sampling recent docs — field names + example values +
+        coverage. Use it to learn a dataset's schema before querying it (network or
+        host)."""
+        return await describe_dataset(dataset, elastic=ctx.elastic, settings=ctx.settings)
+
+    @agent.tool_plain
+    async def t_field_values(
+        field: str, dataset: str | None = None, size: int = 25
+    ) -> dict[str, Any]:
+        """List the top VALUES a field takes (terms aggregation), optionally within one
+        dataset — e.g. what `rule.name`s fire or which `event.dataset`s are present."""
+        return await field_values(
+            field, elastic=ctx.elastic, settings=ctx.settings, dataset=dataset, size=size
+        )
 
     @agent.tool_plain
     async def t_query_cases(
@@ -2526,12 +2904,12 @@ def build_investigator(  # noqa: PLR0915 - tool registrations are inherently lon
 
     @agent.tool_plain
     async def t_lookup_runbook(query: str, k: int = 5) -> list[dict[str, Any]] | dict[str, Any]:
-        """Semantic search over indexed runbooks (v1 stub returns [])."""
+        """Search the operator's own runbooks (keyword/tag/rule-linked)."""
         if dup := _dedup_result(ctx, "t_lookup_runbook", {"query": query, "k": k}):
             return dup
         k = min(k, 5)
         try:
-            rows = await lookup_runbook(query, k=k)
+            rows = await lookup_runbook(query, k=k, db_sessionmaker=ctx.db_sessionmaker)
         except Exception as e:
             _LOGGER.warning("t_lookup_runbook failed: %s", e)
             return _tool_error(e)
@@ -2755,7 +3133,9 @@ def _compact_alert_context(ac: Any) -> dict[str, Any]:
     }
 
 
-def _format_investigator_prompt(alert_id: str, alert_context_json: str) -> str:
+def _format_investigator_prompt(
+    alert_id: str, alert_context_json: str, focus_hint: str | None = None
+) -> str:
     """Investigator user message including pre-fetched alert context.
 
     Removes one source of non-determinism: the fast model used to skip
@@ -2768,8 +3148,11 @@ def _format_investigator_prompt(alert_id: str, alert_context_json: str) -> str:
     consults them before reaching for tools — many ET INFO alerts can
     be evaluated almost entirely from these fields.
     """
+    from soc_ai.agent.prompts import format_focus_hint_block  # noqa: PLC0415
+
     return (
         f"Triage alert {alert_id}.\n\n"
+        f"{format_focus_hint_block(focus_hint)}"
         f"## Pre-fetched alert context\n\n"
         f"```json\n{alert_context_json}\n```\n\n"
         f"## Read these typed fields FIRST\n\n"
@@ -3091,6 +3474,17 @@ async def maybe_auto_ack_fp(
     Best-effort: any write error is logged as a warning and does NOT propagate.
     The investigation is never failed by auto-ack.
 
+    The ack is written DIRECTLY (via :func:`execute_write_tool`) — it does NOT
+    go through the human-approval gate. That is the whole point of the opt-in:
+    ``auto_ack_fp_enabled`` is an explicit operator decision to let confident,
+    low-stakes FP acks write to SO unattended. The audit logger is routed
+    through so the unattended write is always recorded (fail-closed on intent).
+
+    Coupling: this only runs from investigation finalisation, so an alert is
+    auto-acked ONLY if it is investigated while the toggle is on — there is no
+    retroactive backlog sweep. See ``Settings.auto_ack_fp_enabled`` for how this
+    interacts with the auto-triage floor.
+
     Returns the ``auto_ack`` StepEvent (for the caller to yield into the stream)
     when the write was attempted, or ``None`` when any gate condition is unmet.
     """
@@ -3122,11 +3516,18 @@ async def maybe_auto_ack_fp(
     )
     success: bool
     try:
+        # Auto-ack is an unattended write. Route the audit logger through so the
+        # ack is recorded as a mutating tool_call intent BEFORE the SO write
+        # (fail-closed under audit_fail_closed) and a result record after — an
+        # analyst-review-free write must always land in the audit trail.
         _result, error = await execute_write_tool(
             "ack_alert",
             {"alert_id": es_id},
             auth=ctx.auth,
             settings=settings,
+            audit=ctx.audit,
+            session_id=f"auto-ack:{es_id}",
+            user="auto-ack",
         )
         if error:
             _LOGGER.warning("auto-ack write failed for alert %s: %s", es_id, error)
@@ -3164,8 +3565,14 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
     investigator: Agent[None, InvestigationTranscript] | None = None,
     synthesizer: Agent[None, TriageReport] | None = None,
     session_id: str | None = None,
+    focus_hint: str | None = None,
 ) -> AsyncIterator[StepEvent]:
     """Run a two-stage triage investigation, yielding SSE events.
+
+    ``focus_hint`` (optional): when this run was launched to close a prior
+    ``needs_more_info`` verdict (the "request more info" action), the prior
+    open questions are passed here and woven into the investigator/synth seed
+    prompt so the fresh run TARGETS those gaps. ``None`` ⇒ normal cold run.
 
     The pipeline is:
 
@@ -3192,6 +3599,7 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
         async for ev in _run_synth_first_pipeline(
             alert_id=alert_id,
             ctx=ctx,
+            focus_hint=focus_hint,
         ):
             yield ev
         return
@@ -3525,7 +3933,9 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
                 ctx,
             )
 
-        investigator_user_message = _format_investigator_prompt(alert_id, alert_ctx_json)
+        investigator_user_message = _format_investigator_prompt(
+            alert_id, alert_ctx_json, focus_hint=focus_hint
+        ) + await inventory_prompt_block(ctx.elastic, ctx.settings)
 
         # ----- Round 1: investigator -----
         try:
@@ -4582,10 +4992,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     *,
     alert_id: str,
     ctx: InvestigationContext,
+    focus_hint: str | None = None,
 ) -> AsyncGenerator[StepEvent, None]:
     """Phase A → B → C → optional D → C round 2 → done.
 
     The synth-first pipeline. Defaults OFF until v8 measurement validates.
+
+    ``focus_hint`` (optional): prior open questions from a re-launched
+    ``needs_more_info`` investigation, woven into the round-1 seed + the
+    investigation-loop investigator prompt so this run targets those gaps.
     """
     from soc_ai.agent.decision_templates import match_decision_template  # noqa: PLC0415
     from soc_ai.agent.prompts import (  # noqa: PLC0415
@@ -4723,6 +5138,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             enriched_ctx_json=enriched_json,
             materialized_evidence=materialized,
             candidate=candidate,
+            focus_hint=focus_hint,
         )
         synth_agent = build_synth_first_agent(
             build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature)
@@ -4816,7 +5232,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             ),
             ctx,
         )
-        inv_user_msg = _format_investigator_prompt(alert_id, enriched_json)
+        inv_user_msg = _format_investigator_prompt(
+            alert_id, enriched_json, focus_hint=focus_hint
+        ) + await inventory_prompt_block(ctx.elastic, ctx.settings)
         inv_result: Any = None
         budget_exc: BaseException | None = None
         try:
@@ -4853,9 +5271,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # when the loop-synth crashes. (This is the "conclude gracefully at the
             # budget boundary" behaviour, vs. the old "error out" one.)
             _LOGGER.warning("investigation loop hit budget limit: %s", e)
-            err_ev = _ev(
-                "error", _error_payload(e, phase="investigation_loop_budget", round_num=1)
-            )
+            err_ev = _ev("error", _error_payload(e, phase="investigation_loop_budget", round_num=1))
             await _audit(err_ev)
             yield err_ev
             budget_exc = e
@@ -5006,6 +5422,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             candidate=candidate,
             round1_gap=gap,
             targeted_tool_result=targeted_result,
+            focus_hint=focus_hint,
         )
         try:
             synth_result_round2 = await synth_agent.run(user_msg_round2)

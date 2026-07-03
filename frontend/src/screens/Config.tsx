@@ -1,5 +1,6 @@
 import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import { ApplyBadge, SourceBadge } from '../components/Badges';
 import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
@@ -10,6 +11,7 @@ import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 import { DetectionTuningPanel } from './DetectionTuningPanel';
+import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, getConfig, getDiscoveryScan, getInternalIdentifiers, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -48,9 +50,26 @@ export function Config() {
     return () => { active = false; };
   }, []);
 
-  const [toggles, setToggles] = useState<Record<string, boolean>>({});
+  // ── Staged settings edits (explicit save/apply) ────────────────────────────
+  // Controls no longer persist on change. Instead each edit is STAGED here as a
+  // string keyed by setting key (matching setSetting's value type). Controls read
+  // the staged value when present, else the server value. A sticky "Apply
+  // changes (N)" bar persists all staged edits at once; "Discard" drops them.
+  // This removes the "did that save?" ambiguity of the old per-field auto-save.
+  const [staged, setStaged] = useState<Record<string, string>>({});
+  // Bumped on discard/apply to force uncontrolled inputs (NumberField/text, which
+  // use defaultValue) to remount and re-read the current server/staged value.
+  const [formNonce, setFormNonce] = useState(0);
+  const [applying, setApplying] = useState(false);
+  // Per-key apply errors, surfaced inline beside the offending control.
+  const [applyErrors, setApplyErrors] = useState<Record<string, string>>({});
+  // Sticky-bar result after an Apply: how many saved, and whether any need a restart.
+  const [applyResult, setApplyResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  const dirtyKeys = Object.keys(staged);
+  const isDirty = dirtyKeys.length > 0;
+
   const [minted, setMinted] = useState('');
-  const [saveMsg, setSaveMsg] = useState('');
 
   // Auto-dismiss the freshly-minted token banner so the secret doesn't linger
   // on screen until reload. It still carries a manual ✕ for immediate dismissal.
@@ -110,6 +129,7 @@ export function Config() {
       ...groupEntries,
       { id: 'data-sources', label: 'Data sources' },
       { id: 'detection-tuning', label: 'Detection tuning' },
+      { id: 'runbooks', label: 'Runbooks' },
       { id: 'api-keys', label: 'API keys' },
       { id: 'agent-tools', label: 'Agent tools' },
       { id: 'users', label: 'Users' },
@@ -197,64 +217,184 @@ export function Config() {
     }
   };
 
-  // Derived: current value of the auto-ack toggle (local state takes precedence).
+  // Current value of a setting, honouring any staged (unapplied) edit. Used for
+  // dependent-field logic (e.g. the auto-ack threshold enable + the #7 warning).
+  const stagedBool = (key: string, fallback: boolean) =>
+    staged[key] !== undefined ? staged[key] === 'true' : fallback;
+  const stagedStr = (key: string, fallback: string) =>
+    staged[key] !== undefined ? staged[key] : fallback;
+
+  const findSetting = (key: string): Setting | undefined =>
+    data?.groups.flatMap((g) => g.items).find((i) => i.key === key);
+
+  // Derived: current value of the auto-ack toggle (staged edit takes precedence).
   const autoAckEnabled = (s: Setting | undefined) => {
     if (!s) return false;
-    return toggles['auto_ack_fp_enabled'] !== undefined
-      ? toggles['auto_ack_fp_enabled']
-      : (s.value as boolean);
+    return stagedBool('auto_ack_fp_enabled', s.value as boolean);
   };
 
   if (loading) return <div className="p-6"><LoadingState label="Loading settings…" /></div>;
   if (error) return <div className="p-6"><ErrorState error={error} /></div>;
   if (!data) return null;
 
-  const toggleValue = (s: Setting) =>
-    toggles[s.key] !== undefined ? toggles[s.key] : (s.value as boolean);
+  const toggleValue = (s: Setting) => stagedBool(s.key, s.value as boolean);
 
-  const save = (key: string, value: string) => {
-    setSaveMsg('');
-    setSetting(key, value)
-      .then((r) => setSaveMsg(r.restart_required ? `${key} saved — restart required` : `${key} saved`))
-      .catch((e) => setSaveMsg(`${key}: ${e?.message ?? e}`));
+  // Stage an edit locally (does NOT persist — Apply does that). Records the value
+  // as a string; clears back to "not staged" when it matches the server value so
+  // a no-op round-trip doesn't leave the form spuriously dirty.
+  const stage = (key: string, value: string, serverValue: string) => {
+    setApplyResult(null);
+    setApplyErrors((e) => {
+      if (!(key in e)) return e;
+      const next = { ...e };
+      delete next[key];
+      return next;
+    });
+    setStaged((s) => {
+      const next = { ...s };
+      if (value === serverValue) delete next[key];
+      else next[key] = value;
+      return next;
+    });
+  };
+
+  const discardStaged = () => {
+    setStaged({});
+    setApplyErrors({});
+    setApplyResult(null);
+    setFormNonce((n) => n + 1); // remount uncontrolled inputs so they reset
+  };
+
+  // Persist every staged edit. Each failure is surfaced inline on its control and
+  // that key stays staged; successful keys clear. Restart-required notes bubble up
+  // to the sticky bar. On full success we refetch the config to re-sync sources.
+  const applyStaged = async () => {
+    const entries = Object.entries(staged);
+    if (!entries.length) return;
+    setApplying(true);
+    setApplyErrors({});
+    setApplyResult(null);
+    const errors: Record<string, string> = {};
+    let restartRequired = false;
+    let saved = 0;
+    const savedKeys: string[] = [];
+    const results = await Promise.allSettled(
+      entries.map(([key, value]) => setSetting(key, value)),
+    );
+    results.forEach((r, i) => {
+      const key = entries[i][0];
+      if (r.status === 'fulfilled') {
+        saved += 1;
+        savedKeys.push(key);
+        if (r.value.restart_required) restartRequired = true;
+      } else {
+        const reason = r.reason;
+        errors[key] = reason instanceof Error ? reason.message : String(reason);
+      }
+    });
+    setApplyErrors(errors);
+    setStaged((s) => {
+      const next = { ...s };
+      for (const key of savedKeys) delete next[key];
+      return next;
+    });
+    const failed = Object.keys(errors).length;
+    if (failed === 0) {
+      setApplyResult({
+        ok: true,
+        msg: restartRequired
+          ? `Applied ${saved} change${saved === 1 ? '' : 's'} — service restart required for some to take effect`
+          : `Applied ${saved} change${saved === 1 ? '' : 's'}`,
+      });
+      setFormNonce((n) => n + 1);
+      setNonce((n) => n + 1); // refetch config → re-sync source badges / values
+    } else {
+      setApplyResult({
+        ok: false,
+        msg: `${saved} applied, ${failed} failed — see the highlighted field${failed === 1 ? '' : 's'}`,
+      });
+    }
+    setApplying(false);
   };
 
   const renderControl = (s: Setting) => {
+    const serverStr = String(s.value);
+    const err = applyErrors[s.key];
+    let control: ReactNode;
     if (s.type === 'toggle') {
-      return (
+      control = (
         <Toggle
           on={toggleValue(s)}
-          onChange={(next) => {
-            setToggles((t) => ({ ...t, [s.key]: next }));
-            save(s.key, String(next));
-          }}
+          onChange={(next) => stage(s.key, String(next), serverStr)}
           label={s.key}
         />
       );
-    }
-    if (s.type === 'number') {
+    } else if (s.type === 'number') {
       // The auto-ack threshold is only meaningful when the toggle is on.
       const isAutoAckThreshold = s.key === 'auto_ack_fp_threshold';
-      const thresholdEnabled = !isAutoAckThreshold || autoAckEnabled(
-        data?.groups.flatMap((g) => g.items).find((i) => i.key === 'auto_ack_fp_enabled')
-      );
-      return (
-        <div style={isAutoAckThreshold && !thresholdEnabled ? { opacity: 0.4, pointerEvents: 'none' } : undefined}>
-          <NumberField value={s.value as number} bounds={s.bounds} onChange={(v) => save(s.key, String(v))} />
+      const thresholdEnabled = !isAutoAckThreshold || autoAckEnabled(findSetting('auto_ack_fp_enabled'));
+      const current = Number(stagedStr(s.key, serverStr));
+      control = (
+        <div
+          aria-disabled={isAutoAckThreshold && !thresholdEnabled}
+          style={isAutoAckThreshold && !thresholdEnabled ? { opacity: 0.4, pointerEvents: 'none' } : undefined}
+        >
+          <NumberField
+            key={`${s.key}-${formNonce}`}
+            value={current}
+            bounds={s.bounds}
+            onChange={(v) => stage(s.key, String(v), serverStr)}
+          />
+          {isAutoAckThreshold && !thresholdEnabled && (
+            <div className="text-[11px] text-faint mt-1">Applies when auto-acknowledge is on</div>
+          )}
         </div>
       );
-    }
-    if (s.type === 'select') {
-      return <Select value={s.value as string} options={s.options} onChange={(v) => save(s.key, v)} />;
+    } else if (s.type === 'select') {
+      control = (
+        <Select
+          value={stagedStr(s.key, serverStr)}
+          options={s.options}
+          onChange={(v) => stage(s.key, v, serverStr)}
+        />
+      );
+    } else {
+      control = (
+        <input
+          key={`${s.key}-${formNonce}`}
+          defaultValue={stagedStr(s.key, serverStr)}
+          onChange={(e) => stage(s.key, e.target.value, serverStr)}
+          className="w-[200px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
+        />
+      );
     }
     return (
-      <input
-        defaultValue={String(s.value)}
-        onBlur={(e) => save(s.key, e.target.value)}
-        className="w-[200px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
-      />
+      <div className="flex flex-col items-end gap-1">
+        {control}
+        {err && <span className="max-w-[220px] text-right text-[11px] text-danger">{err}</span>}
+      </div>
     );
   };
+
+  // ── #7 Auto-ack coupling: does the current (staged) config actually let
+  // auto-ack do anything? Auto-ack only acks FPs that get INVESTIGATED, so it is
+  // inert unless auto-triage runs, and its severity floor is medium/low (high/
+  // critical are never auto-acked). Detect the inert case to escalate the note to
+  // a warning. Sibling settings may live in the DB config; fall back gracefully.
+  const autoAckToggle = findSetting('auto_ack_fp_enabled');
+  const autoAckOn = autoAckToggle ? autoAckEnabled(autoAckToggle) : false;
+  const scheduleSetting = findSetting('auto_triage_schedule_enabled');
+  const scheduleOn = scheduleSetting
+    ? stagedBool('auto_triage_schedule_enabled', scheduleSetting.value as boolean)
+    : undefined;
+  const minSevSetting = findSetting('auto_triage_min_severity');
+  const minSev = minSevSetting
+    ? stagedStr('auto_triage_min_severity', String(minSevSetting.value))
+    : undefined;
+  const floorTooHigh = minSev === 'high' || minSev === 'critical';
+  // Warn only when we can positively see a coupling problem: scheduled auto-triage
+  // is off, or the severity floor excludes everything auto-ack could ever clear.
+  const autoAckInert = autoAckOn && (scheduleOn === false || floorTooHigh);
 
   const handleDangerSave = async (key: string) => {
     if (dangerConfirm !== key) return;
@@ -376,12 +516,6 @@ export function Config() {
         environment variable.
       </div>
 
-      {saveMsg && (
-        <div className="mb-3 rounded-control border border-border-2 bg-surface-1 px-3 py-2 font-mono text-[12px] text-dim">
-          {saveMsg}
-        </div>
-      )}
-
       {/* settings groups — Internal identifiers is interleaved right after the
           Discovery group so it sits visually next to discovery tuning. */}
       {data.groups.map((g) => (
@@ -410,17 +544,44 @@ export function Config() {
             {!collapsed[g.title] && (
             <div className="overflow-hidden rounded-card border border-border bg-surface-1">
               {g.items.map((s) => (
-                <div key={s.key} className="flex items-center gap-3.5 border-b border-border-faint px-[15px] py-[13px]">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
-                      <span className="font-mono text-[11px] text-faint">{s.key}</span>
-                      <SourceBadge source={s.source} />
-                      <ApplyBadge apply={s.apply} />
+                <div key={s.key} className="border-b border-border-faint px-[15px] py-[13px]">
+                  <div className="flex items-center gap-3.5">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
+                        <span className="font-mono text-[11px] text-faint">{s.key}</span>
+                        <SourceBadge source={s.source} />
+                        <ApplyBadge apply={s.apply} />
+                        {staged[s.key] !== undefined && (
+                          <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}>
+                            unsaved
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1 text-[12px] text-dim">{s.help}</div>
                     </div>
-                    <div className="mt-1 text-[12px] text-dim">{s.help}</div>
+                    <div className="flex-none">{renderControl(s)}</div>
                   </div>
-                  <div className="flex-none">{renderControl(s)}</div>
+                  {/* #7 Auto-ack coupling note — auto-ack only acks FPs that get
+                      INVESTIGATED, so it is inert without auto-triage running and a
+                      medium/low floor. Warn when we can see the inert case; else hint. */}
+                  {s.key === 'auto_ack_fp_enabled' && autoAckOn && (
+                    <div
+                      className="mt-2.5 flex items-start gap-2 rounded-control border px-3 py-2 text-[11.5px] leading-relaxed"
+                      style={autoAckInert
+                        ? { borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)', color: '#f5a623' }
+                        : { borderColor: '#161c25', background: 'rgba(148,163,184,.05)', color: '#94a3b8' }}
+                    >
+                      <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
+                      <span>
+                        Auto-ack only acks false positives that get investigated — it does nothing on its own.
+                        {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off, so nothing is being investigated automatically.'}
+                        {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”, but high/critical are never auto-acked — so it can never fire.`}
+                        {' '}To clear a backlog, run a sweep or enable scheduled auto-triage (Agent settings) and set its
+                        severity floor to medium or low.
+                      </span>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -433,6 +594,7 @@ export function Config() {
 
       <DataSourcesPanel />
       <DetectionTuningPanel />
+      <RunbooksPanel />
       <ApiKeysPanel />
       <AgentToolsPanel />
 
@@ -806,6 +968,42 @@ export function Config() {
           </div>
         )}
       </div>
+
+      {/* Sticky save/apply bar (FIX #8) — settings above stage locally; nothing
+          persists until Apply. The bar is only shown when there are staged edits
+          or a fresh apply result to report, removing the "did that save?"
+          ambiguity of the old per-field auto-save. */}
+      {(isDirty || applyResult) && (
+        <div className="sticky bottom-4 z-20 mt-4 flex items-center gap-3 rounded-card border border-border-strong bg-surface-2/95 px-4 py-3 shadow-lg backdrop-blur">
+          <div className="min-w-0 flex-1 text-[12.5px]">
+            {isDirty ? (
+              <span className="text-text">
+                <span className="font-semibold">{dirtyKeys.length}</span> unsaved change{dirtyKeys.length === 1 ? '' : 's'}
+                <span className="ml-1 text-dim">— not applied yet</span>
+              </span>
+            ) : applyResult ? (
+              <span style={{ color: applyResult.ok ? '#12b76a' : '#f04438' }}>
+                {applyResult.ok ? '✓ ' : '✗ '}{applyResult.msg}
+              </span>
+            ) : null}
+          </div>
+          <button
+            onClick={discardStaged}
+            disabled={!isDirty || applying}
+            className="rounded-[7px] border border-border-strong bg-surface-3 px-[13px] py-[6px] text-[12px] font-semibold text-text hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Discard
+          </button>
+          <button
+            onClick={applyStaged}
+            disabled={!isDirty || applying}
+            className="inline-flex items-center gap-1.5 rounded-[7px] border border-accent bg-accent/15 px-[13px] py-[6px] text-[12px] font-semibold text-accent hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {applying && <Spinner size={12} />}
+            {applying ? 'Applying…' : `Apply changes${isDirty ? ` (${dirtyKeys.length})` : ''}`}
+          </button>
+        </div>
+      )}
       </div>
     </div>
   );

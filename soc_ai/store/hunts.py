@@ -12,7 +12,7 @@ from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
@@ -74,9 +74,7 @@ async def finalize(
     await db.commit()
 
 
-async def get_with_events(
-    db: AsyncSession, hunt_id: str
-) -> tuple[Hunt, list[HuntEvent]] | None:
+async def get_with_events(db: AsyncSession, hunt_id: str) -> tuple[Hunt, list[HuntEvent]] | None:
     hunt = await db.get(Hunt, hunt_id)
     if hunt is None:
         return None
@@ -148,3 +146,102 @@ async def delete(db: AsyncSession, hunt_id: str) -> bool:
     await db.delete(hunt)
     await db.commit()
     return True
+
+
+# ── Follow-up "Chat about this hunt" thread ──────────────────────────────────
+#
+# A completed hunt gets a read-only Q&A thread, exactly like an investigation's
+# follow-up chat. Rather than reuse ``chat_messages`` (whose ``investigation_id``
+# is a FK into ``investigations`` — a hunt id would violate it), the thread is
+# stored as ``hunt_events`` on the SAME hunt, keyed by these two kinds. They are
+# hidden from the hunt's execution timeline (see ``_HUNT_TL_SKIP``) and surfaced
+# only through the dedicated ``/hunts/{id}/chat`` endpoint.
+
+CHAT_USER = "chat_user"
+CHAT_ASSISTANT = "chat_assistant"
+
+
+async def _next_chat_sequence(db: AsyncSession, hunt_id: str) -> int:
+    """One past the hunt's max event sequence — chat rows append after the trace."""
+    top = (
+        await db.execute(select(func.max(HuntEvent.sequence)).where(HuntEvent.hunt_id == hunt_id))
+    ).scalar()
+    return int(top or 0) + 1
+
+
+async def add_chat_user_message(db: AsyncSession, hunt_id: str, content: str) -> HuntEvent:
+    ev = HuntEvent(
+        hunt_id=hunt_id,
+        sequence=await _next_chat_sequence(db, hunt_id),
+        kind=CHAT_USER,
+        payload={"content": content, "status": "done"},
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(ev)
+    return ev
+
+
+async def create_pending_chat_assistant(db: AsyncSession, hunt_id: str) -> HuntEvent:
+    ev = HuntEvent(
+        hunt_id=hunt_id,
+        sequence=await _next_chat_sequence(db, hunt_id),
+        kind=CHAT_ASSISTANT,
+        payload={"content": "", "status": "pending"},
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(ev)
+    return ev
+
+
+async def finish_chat_assistant(
+    db: AsyncSession,
+    event_id: int,
+    *,
+    content: str,
+    status: str = "done",
+    meta: dict[str, Any] | None = None,
+) -> None:
+    ev = await db.get(HuntEvent, event_id)
+    if ev is None:
+        return
+    payload = dict(ev.payload or {})
+    payload["content"] = content
+    payload["status"] = status
+    if meta is not None:
+        payload["meta"] = meta
+    ev.payload = payload
+    await db.commit()
+
+
+async def list_chat_messages(db: AsyncSession, hunt_id: str) -> list[HuntEvent]:
+    """The hunt's chat thread (user + assistant rows), in order."""
+    rows = (
+        await db.scalars(
+            select(HuntEvent)
+            .where(
+                HuntEvent.hunt_id == hunt_id,
+                HuntEvent.kind.in_((CHAT_USER, CHAT_ASSISTANT)),
+            )
+            .order_by(HuntEvent.sequence, HuntEvent.id)
+        )
+    ).all()
+    return list(rows)
+
+
+async def get_chat_event(db: AsyncSession, event_id: int) -> HuntEvent | None:
+    return await db.get(HuntEvent, event_id)
+
+
+async def chat_history_for_agent(db: AsyncSession, hunt_id: str) -> list[tuple[str, str]]:
+    """Completed (role, content) chat turns to seed the follow-up agent — excludes
+    the in-flight pending assistant row and any errored turns."""
+    out: list[tuple[str, str]] = []
+    for ev in await list_chat_messages(db, hunt_id):
+        p = ev.payload or {}
+        content = str(p.get("content") or "")
+        if p.get("status") == "done" and content:
+            role = "user" if ev.kind == CHAT_USER else "assistant"
+            out.append((role, content))
+    return out

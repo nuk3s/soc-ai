@@ -1,39 +1,70 @@
-"""``lookup_runbook`` tool - semantic search over indexed runbooks.
+"""``lookup_runbook`` tool - keyword/tag/rule-linked search over operator runbooks.
 
-**STUB for v1.** The real implementation lands in v1.1 using
-Qwen3-Embedding-8B (alias ``soc-ai-embed``) over a Qdrant dense index built
-from the operator's runbook collection. v1 ships the interface so the agent
-prompt can reference the tool without surprising it with a runtime error -
-the agent learns to fall back to ``query_cases`` / ``get_playbooks`` when the
-runbook search returns nothing.
+The operator authors runbooks (procedures / notes / "what normal looks like on
+*this* network") in the Runbooks config panel; they persist in the local store
+(:mod:`soc_ai.store.runbooks`). This tool searches them so an investigation can
+cite the org's *own* guidance instead of hallucinating a false-positive from
+thin data. Ranking is embedding-free (rule-link > tag > keyword overlap) — robust
+and fully air-gapped, no external index.
 
-The function signature is fixed: changing it in v1.1 would break the agent's
-expected tool surface.
+The tool needs a DB session but is a ``@tool_plain`` with no ``RunContext``, so
+the orchestrator wrapper injects the app's ``db_sessionmaker`` (threaded through
+:class:`~soc_ai.agent.orchestrator.InvestigationContext`). When no sessionmaker
+is available (CLI / eval / tests with no DB), it returns ``[]`` — the agent then
+falls back to ``query_cases`` / ``get_playbooks`` exactly as before.
+
+The function's LLM-facing signature is fixed at ``(query, k)`` so the agent's
+tool surface is stable. Return shape is fixed too: a list of
+``{"id", "title", "content", "score", "source": "operator_runbook"}``.
+
+Upgrade path (v1.1): back :func:`soc_ai.store.runbooks.search` with a
+Qwen3-Embedding-8B (alias ``soc-ai-embed``) dense index over Qdrant, keeping
+this return shape unchanged.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from soc_ai.tools._registry import tool
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 @tool(
     read_only=True,
-    description="Semantic search over indexed runbooks (v1: stub returns []).",
+    description="Search the operator's own runbooks (keyword/tag/rule-linked).",
 )
-async def lookup_runbook(query: str, k: int = 5) -> list[dict[str, Any]]:
-    """Return up to ``k`` runbook fragments matching ``query`` semantically.
+async def lookup_runbook(
+    query: str,
+    k: int = 5,
+    *,
+    db_sessionmaker: async_sessionmaker[AsyncSession] | None = None,
+    rule_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return up to ``k`` operator runbooks matching ``query``.
 
     Args:
-        query: natural-language description of the situation.
-        k: maximum number of fragments to return.
+        query: natural-language description of the situation (may include the
+            detection rule name — keyword/tag overlap will pick it up).
+        k: maximum number of runbooks to return.
+        db_sessionmaker: injected by the orchestrator wrapper; the store session
+            factory. ``None`` (CLI / eval / no DB) yields ``[]``.
+        rule_name: optional exact rule to prefer via ``linked_rules`` (strongest
+            signal). Not part of the LLM-facing signature; the orchestrator may
+            pass the alert's rule when known.
 
     Returns:
-        v1: always an empty list. v1.1 will return entries shaped like
-        ``{"id": ..., "title": ..., "content": ..., "score": float, "source": ...}``.
+        A list of ``{"id", "title", "content", "score", "source"}`` entries,
+        best match first. Empty when nothing matches or no DB is available.
     """
     if k <= 0:
         raise ValueError(f"k must be positive, got {k}")
-    _ = query  # silence "unused" - retained for v1.1 signature compatibility
-    return []
+    if db_sessionmaker is None:
+        return []
+
+    from soc_ai.store import runbooks as runbooks_svc  # noqa: PLC0415 - avoid import cycle
+
+    async with db_sessionmaker() as db:
+        return await runbooks_svc.search(db, query, k=k, rule_name=rule_name)

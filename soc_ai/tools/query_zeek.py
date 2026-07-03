@@ -18,7 +18,7 @@ from soc_ai.so_client.fields import first_present
 from soc_ai.tools._registry import tool
 from soc_ai.tools.query_events import _build_time_filter
 
-DEFAULT_LOG_TYPES: tuple[str, ...] = ("conn", "dns", "http", "ssl", "files")
+DEFAULT_LOG_TYPES: tuple[str, ...] = ("conn", "dns", "http", "ssl", "files", "ssh")
 
 # Logical-field -> ordered ES candidate names. Coalesced onto a STABLE logical
 # key on output so the agent reads the same key regardless of SO version. The
@@ -67,6 +67,14 @@ _STABLE_SOURCE_FIELDS: tuple[str, ...] = (
     "zeek.ssl.subject",
     "zeek.ssl.issuer",
     "zeek.files.filename",
+    # SSH — the lateral-movement workhorse. Without these on the projection an
+    # ssh hit came back field-stripped, reinforcing a false "no SSH" conclusion.
+    "zeek.ssh.auth_success",
+    "zeek.ssh.auth_attempts",
+    "zeek.ssh.client",
+    "zeek.ssh.server",
+    "zeek.ssh.version",
+    "zeek.ssh.direction",
 )
 
 

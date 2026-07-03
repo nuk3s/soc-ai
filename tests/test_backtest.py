@@ -274,6 +274,7 @@ async def _fake_investigate(
     investigator: Any = None,
     synthesizer: Any = None,
     session_id: str | None = None,
+    focus_hint: str | None = None,
 ) -> AsyncIterator[StepEvent]:
     sid = session_id or "fake-bt-sid"
     yield StepEvent(
@@ -353,9 +354,7 @@ def _poll_backtest(client: TestClient, *, deadline_s: float = 6.0) -> dict[str, 
 
 class TestBacktestEndpoints:
     def test_start_and_complete_scores_against_disposition(self, bt_client: TestClient) -> None:
-        resp = bt_client.post(
-            "/api/v1/backtest", json={"window_days": 30, "sample_size": 20}
-        )
+        resp = bt_client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 20})
         assert resp.status_code == 200
         started = resp.json()
         assert started["active"] is True
@@ -385,9 +384,7 @@ class TestBacktestEndpoints:
 
     def test_sample_size_is_capped(self, bt_client: TestClient) -> None:
         # Request far over the hard cap; the params must reflect the clamp.
-        resp = bt_client.post(
-            "/api/v1/backtest", json={"window_days": 30, "sample_size": 9999}
-        )
+        resp = bt_client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 9999})
         assert resp.status_code == 200
         data = _poll_backtest(bt_client)
         assert data["params"]["sample_size"] <= backtest_svc.DEFAULT_SAMPLE_SIZE * 10

@@ -231,12 +231,13 @@ def test_tee_route_seeds_rule_name_when_stream_crashes_before_context(
     """The /investigate route resolves the rule name up front and seeds the row, so
     a stream that crashes BEFORE emitting any alert_context event is still named —
     the userscript path no longer produces a nameless 'Alert <id>…' row."""
-    with patch(
-        "soc_ai.api.routes.resolve_alert_for_hunt",
-        AsyncMock(return_value=(True, "ET SCAN Seeded By Route")),
-    ), crash_client.stream(
-        "POST", "/investigate", json={"alert_id": "es-crash-named"}
-    ) as resp:
+    with (
+        patch(
+            "soc_ai.api.routes.resolve_alert_for_hunt",
+            AsyncMock(return_value=(True, "ET SCAN Seeded By Route")),
+        ),
+        crash_client.stream("POST", "/investigate", json={"alert_id": "es-crash-named"}) as resp,
+    ):
         body = "".join(chunk for chunk in resp.iter_text())
 
     inv_id = body.split('"investigation_id": "')[1].split('"')[0]
