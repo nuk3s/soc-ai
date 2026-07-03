@@ -9,6 +9,9 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.0.5** — Patch: the auto-triage scheduler now fires its first sweep on a
+  freshly-booted host (a monotonic-clock sentinel bug), plus Node 24-native CI
+  workflow actions.
 - **1.0.4** — Slow-stack resilience + detection: wall-clock timeouts on every long path
   (hunts/investigations degrade gracefully to a partial verdict), a malware-label payload
   gate, fast-path domain reputation, inventory-first hunts with correlation + lateral-movement

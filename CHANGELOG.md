@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-07-03
+
+Patch: a scheduler fresh-boot fix and green public CI.
+
+### Fixed
+
+- **Auto-triage scheduler fires its first sweep on a freshly-booted host.** The
+  "last swept" marker used a `0.0` sentinel compared against `time.monotonic()`,
+  whose epoch is arbitrary and near-zero right after boot — so on a fresh host the
+  first enabled wake read as "just swept" and skipped the sweep for up to one
+  interval. It now uses a `None` sentinel, so the first enabled wake always fires.
+  (Also fixes a CI test that was green only on long-uptime machines.)
+
+### CI
+
+- Workflows updated to Node 24-native action versions (`actions/checkout@v6`,
+  `actions/setup-python@v6`, `actions/setup-node@v6`,
+  `actions/upload-pages-artifact@v4`), clearing the Node 20 deprecation warnings.
+
 ## [1.0.4] - 2026-07-03
 
 Slow-stack resilience + detection release: bounded timeouts everywhere, a

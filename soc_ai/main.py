@@ -185,9 +185,12 @@ async def _auto_triage_scheduler_loop(app: FastAPI, settings: Any) -> None:
     # Fixed short wake cadence + an internal "is due" check (mirrors the discovery
     # scheduler). Sleeping the whole interval up front meant toggling the schedule
     # ON only took effect up to interval-length later; a 60s wake makes a fresh
-    # enable fire on the next wake. _last_sweep starts at 0 so the first enabled
-    # wake sweeps immediately.
-    _last_sweep = 0.0
+    # enable fire on the next wake. ``_last_sweep`` is None until the first sweep so
+    # the first enabled wake always fires — a 0.0 sentinel collided with a small
+    # ``time.monotonic()`` on a freshly-booted host (monotonic's epoch is arbitrary,
+    # near-zero right after boot), which wrongly read as "just swept" and skipped the
+    # first sweep for up to one interval.
+    _last_sweep: float | None = None
     while True:
         await asyncio.sleep(60)
         try:
@@ -195,7 +198,7 @@ async def _auto_triage_scheduler_loop(app: FastAPI, settings: Any) -> None:
                 continue
             interval_min = int(getattr(settings, "auto_triage_schedule_interval_minutes", 5))
             now = time.monotonic()
-            if now - _last_sweep < max(60, interval_min * 60):
+            if _last_sweep is not None and now - _last_sweep < max(60, interval_min * 60):
                 continue
             if at.get_status(app.state).active:
                 continue  # a sweep (manual or scheduled) is already in flight

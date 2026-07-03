@@ -496,6 +496,35 @@ async def test_at_loop_launches_sweep_when_enabled(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
+async def test_at_loop_first_sweep_fires_on_fresh_boot_small_monotonic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: on a freshly-booted host ``time.monotonic()`` is near zero
+    (its epoch is arbitrary). The first enabled wake must still sweep. A prior
+    ``_last_sweep = 0.0`` sentinel made ``now - _last_sweep`` tiny, which read as
+    'just swept' and skipped the first sweep — green on long-uptime dev boxes, red
+    on fresh CI runners (and a real fresh-boot delay in production)."""
+    app = _at_app()
+    launched: list[str] = []
+
+    async def _stub_sweep(_state: Any, *, started_by: str) -> int:
+        launched.append(started_by)
+        return 3
+
+    monkeypatch.setattr("soc_ai.webui.autotriage.start_config_sweep", _stub_sweep)
+    monkeypatch.setattr(
+        "soc_ai.webui.autotriage.get_status",
+        lambda _s: SimpleNamespace(active=False),
+    )
+    # Simulate a fresh boot: monotonic returns a small value (seconds since boot),
+    # far below the 5-minute interval.
+    monkeypatch.setattr(main_mod.time, "monotonic", lambda: 5.0)
+
+    await _run_at_iterations(monkeypatch, app, _at_settings(enabled=True))
+    assert launched == ["auto-triage:scheduler"]
+
+
+@pytest.mark.asyncio
 async def test_at_loop_noop_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Master switch off → the loop wakes but never plans or launches a sweep."""
     app = _at_app()
