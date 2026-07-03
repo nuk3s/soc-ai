@@ -23,7 +23,7 @@ README. This describes `main` as it stands after the v1 delivery.
 |---|---|
 | `POST /investigate` | Streams a triage as Server-Sent Events. Each message is `event: {kind}` + a JSON `StepEvent` payload. |
 | `POST /approve` | Applies a user's decision to a pending write-tool call; executes the tool exactly once on approval. |
-| `POST /find-alert` | Resolves an ES `_id` from row-level context the userscript scraped (SO 3.0 doesn't embed `_id`s in the DOM). |
+| `POST /find-alert` | Resolves an ES `_id` from row-level context supplied by a cross-origin API client (SO 3.0 doesn't embed `_id`s in the DOM). |
 | `GET /sessions/{id}` | Lists pending approvals (v1 has a single global gate; the id is informational). |
 | `GET /healthz` | Liveness + a minimal config snapshot (auth mode, MISP configured, pending-approval count). |
 | `GET /metrics` | Prometheus 0.0.4 plain-text exposition (`soc_ai/metrics.py`). |

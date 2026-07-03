@@ -116,7 +116,7 @@ async def investigate_endpoint(
     JSON body is the :class:`StepEvent` payload.
 
     The stream is teed into the investigations store so every run is
-    persisted regardless of caller (web UI, userscript, automation).
+    persisted regardless of caller (web UI, automation / integrations).
     The leading ``investigation_created`` event carries the new row's id.
     """
     started_by = await identify_caller(request)
@@ -195,9 +195,9 @@ async def find_alert_endpoint(
 
     The SO 3.0.0 frontend doesn't embed alert `_id`s in the DOM, only the
     field values shown in each cell (rule.uuid, source.ip, dest.ip,
-    timestamp, etc.). The userscript reads the row, posts whatever it
-    found here, and we run an ES search to resolve back to a concrete
-    alert.
+    timestamp, etc.). A cross-origin API client posts whatever row-level
+    context it has here, and we run an ES search to resolve back to a
+    concrete alert.
     """
     must: list[dict[str, Any]] = []
     if req.rule_uuid:
@@ -264,7 +264,7 @@ async def find_alert_endpoint(
     if hit is None:
         # Fall back to max_age_minutes window. SO analyst views often span
         # 10-24h; the default for this endpoint is set wide enough to cover
-        # those without requiring the userscript to override.
+        # those without requiring the caller to override.
         wide_filter = {"range": {"@timestamp": {"gte": f"now-{req.max_age_minutes}m"}}}
         hit, total = await _search_with_filter(wide_filter)
         if hit is not None:

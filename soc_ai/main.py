@@ -440,11 +440,11 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         redoc_url="/redoc" if _expose_docs else None,
         openapi_url="/openapi.json" if _expose_docs else None,
     )
-    # The Tampermonkey userscript runs in the SO web UI's origin and fetches
-    # soc-ai cross-origin (the React /app is same-origin and needs no CORS).
-    # Scope to CORS_ALLOW_ORIGINS if set, else the SO host; "*" only as a last
-    # resort (with a warning). allow_credentials stays False — the cross-origin
-    # caller authenticates with a bearer token, not a cookie.
+    # Cross-origin API clients (automation / integrations hosted on another
+    # origin) fetch soc-ai cross-origin (the React /app is same-origin and needs
+    # no CORS). Scope to CORS_ALLOW_ORIGINS if set, else the SO host; "*" only as
+    # a last resort (with a warning). allow_credentials stays False — the
+    # cross-origin caller authenticates with a bearer token, not a cookie.
     # get_settings() may raise at import-time construction if no .env is present
     # (e.g. CI just importing the module); fall back to a warned "*" then.
     try:
@@ -459,7 +459,7 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
     elif not cors_origins:
         _LOGGER.warning(
             "CORS allow_origins empty — no cross-origin callers permitted; "
-            "set CORS_ALLOW_ORIGINS (or SO_HOST) to enable the userscript"
+            "set CORS_ALLOW_ORIGINS (or SO_HOST) to enable cross-origin API clients"
         )
     app.add_middleware(
         CORSMiddleware,

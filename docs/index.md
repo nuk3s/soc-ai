@@ -31,7 +31,7 @@ on the hard ones — it's off until you turn it on, and its input is sanitized f
 
 ---
 
-## Two ways to use it
+## The web console
 
 <div class="grid cards" markdown>
 
@@ -45,18 +45,9 @@ on the hard ones — it's off until you turn it on, and its input is sanitized f
 
     [:octicons-arrow-right-24: Web console guide](WEBUI_GUIDE.md)
 
--   :material-cursor-default-click: **A button inside Security Onion**
-
-    ---
-
-    A Tampermonkey userscript drops a **Hunt with AI** button straight into the SO alerts
-    view, so you can triage without leaving the grid you already live in.
-
-    [:octicons-arrow-right-24: Quickstart](quickstart.md)
-
 </div>
 
-Under the hood, both run the same read-only agent. For one alert it will:
+Under the hood it runs a read-only agent. For one alert it will:
 
 - read the alert context, the related events (via [OQL](OQL_PRIMER.md)), and the host's
   recent alert history;

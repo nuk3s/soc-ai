@@ -407,9 +407,9 @@ error if a required field is missing.
 The default `start_period` is 60s to allow the DB migration to run on first boot. If it
 consistently fails, check `docker compose logs soc-ai` for the uvicorn startup traceback.
 
-**First "Hunt with AI" in the userscript fails with `TypeError: Failed to fetch`**
+**First page load fails with `TypeError: Failed to fetch`**
 The browser has not trusted the self-signed cert yet. Visit `https://<host>:8443/healthz`
-once in the same browser, accept the cert warning, then retry. See DEPLOYMENT.md §11.
+once in the same browser, accept the cert warning, then retry. See DEPLOYMENT.md §10.
 
 **Enrichment returns no GeoIP / ASN data**
 Either `MAXMIND_LICENSE_KEY` is not set in `.env`, or the blocklist refresh has not been

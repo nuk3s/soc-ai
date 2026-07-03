@@ -5168,7 +5168,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         """Build a ``usage`` event from a pydantic_ai result.
 
         The synth-first pipeline previously emitted NO usage events (only
-        the legacy investigate() path did), so the userscript's token KPI /
+        the legacy investigate() path did), so the UI's token KPI /
         sparkline / context meter stayed dead at 0. Mirror the legacy
         `_build_usage_event` shape so the panel populates.
         """

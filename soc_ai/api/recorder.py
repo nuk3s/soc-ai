@@ -1,7 +1,7 @@
 """Tees /investigate SSE streams into the investigations store.
 
 Lives at the route level so EVERY caller's runs are persisted (web UI,
-userscript, automation). Events are buffered and flushed in batches to
+automation / integrations). Events are buffered and flushed in batches to
 keep per-event write amplification off the SQLite WAL.
 """
 

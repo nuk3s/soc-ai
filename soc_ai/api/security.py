@@ -1,7 +1,7 @@
 """Session-or-bearer auth for the JSON API, gated by API_AUTH_REQUIRED.
 
 401 bodies always carry a machine-readable ``reason`` plus a human hint so
-callers (userscript included) never see an opaque failure.
+callers (cross-origin API clients included) never see an opaque failure.
 
 Also hosts the CSRF Origin/Referer guard (:func:`require_csrf_safe`) for
 cookie-authenticated mutating requests — see that function's docstring.
@@ -97,9 +97,8 @@ async def require_csrf_safe(request: Request) -> None:
     Rule, applied only to the gated ``/api/v1`` router:
 
     - GET/HEAD/OPTIONS are exempt (non-mutating).
-    - Bearer-``scai_`` requests are exempt: the userscript runs cross-origin in
-      the SO web UI and authenticates by token, not an ambient cookie, so it is
-      not CSRF-able.
+    - Bearer-``scai_`` requests are exempt: a cross-origin API client
+      authenticates by token, not an ambient cookie, so it is not CSRF-able.
     - Requests carrying NO session cookie are exempt: with no ambient credential
       there is nothing for a forged cross-site request to ride on. (In dev,
       ``api_auth_required=False`` and the SPA sends no cookie → skipped. But if a

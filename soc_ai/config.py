@@ -283,13 +283,13 @@ class Settings(BaseSettings):
     # --- Web UI / local store -------------------------------------------
     soc_ai_data_dir: Path = Path("data")
     # Secure default: require a login/token for the API. The admin console and
-    # the userscript both authenticate; only flip this off for an isolated,
-    # trusted-network demo where you understand the exposure.
+    # cross-origin API clients both authenticate; only flip this off for an
+    # isolated, trusted-network demo where you understand the exposure.
     api_auth_required: bool = True
-    # Cross-origin origins allowed to call the API (the Tampermonkey userscript
-    # runs in the SO web UI's origin). CSV; empty = scope to so_host; "*" = allow
-    # all (NOT recommended for a public deployment). The React /app is
-    # same-origin and needs none of this.
+    # Cross-origin origins allowed to call the API (e.g. an external automation
+    # or integration hosted on another origin). CSV; empty = scope to so_host;
+    # "*" = allow all (NOT recommended for a public deployment). The React /app
+    # is same-origin and needs none of this.
     cors_allow_origins: str = ""
     # Extra origins (CSV) that cookie-authenticated mutating requests may carry in
     # their Origin/Referer header, folded into the CSRF allowlist alongside the

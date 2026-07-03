@@ -9,4 +9,4 @@
 - [ ] `uv run pytest --ignore=tests/browser` passes
 - [ ] Frontend (if touched): `cd frontend && npm run build` succeeds
 - [ ] No secrets, real host IPs/hostnames, or grid data in the diff
-- [ ] Docs updated if behavior changed (and the userscript `@version` bumped if `userscript/` changed)
+- [ ] Docs updated if behavior changed

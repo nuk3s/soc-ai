@@ -11,9 +11,9 @@ This guide is a practical reference for the analyst/operator surfaces.
 > server-rendered `/ui` console has been removed.)
 
 > **First run / self-signed cert:** the UI serves over HTTPS with a self-signed
-> cert. Visit the base URL once and accept the cert before the Tampermonkey
-> "Hunt with AI" button (which fetches cross-origin) will work — otherwise the
-> userscript fails with an opaque `TypeError: Failed to fetch`.
+> cert. Visit the base URL once and accept the cert warning before signing in —
+> otherwise the browser refuses the connection with an opaque `TypeError: Failed
+> to fetch`.
 
 ## Sign in
 
@@ -115,8 +115,8 @@ and you can't disable or demote the **last enabled admin**.
 ### API tokens
 
 Mint API tokens (the `scai_…` value is shown **once** at creation — copy it then;
-only its hash is stored) and revoke them. Tokens are for programmatic/userscript
-access once `API_AUTH_REQUIRED` is enabled.
+only its hash is stored) and revoke them. Tokens are for programmatic API
+access (automation / integrations) once `API_AUTH_REQUIRED` is enabled.
 
 ## Safety model (recap)
 

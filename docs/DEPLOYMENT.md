@@ -281,26 +281,7 @@ automatically.
 
 ---
 
-## 9. Userscript (Tampermonkey)
-
-Browser-side install for the side-panel UI:
-
-1. Install Tampermonkey (Chrome / Firefox / Edge).
-2. Click the Tampermonkey icon → "Create a new script…"
-3. Paste `userscript/soc-ai.user.js` from the repo. Save.
-4. Click the script in the dashboard, set your soc-ai URL via the
-   userscript's settings (or accept the default
-   `https://localhost:8443`).
-5. Visit `https://<your-so-manager>/#/alerts`.
-6. Click "🔍 Hunt with AI" on any row. The side panel streams the
-   investigation.
-
-Detailed userscript notes (the fetch+XHR interception architecture,
-ES `_id` resolution, expand-panel fallback) live in `userscript/README.md`.
-
----
-
-## 10. Verification
+## 9. Verification
 
 ```bash
 # Health check from any host that can reach the soc-ai VM:
@@ -338,20 +319,18 @@ done           recommended_count=1 rounds=1
 
 ---
 
-## 11. Common errors + fixes
+## 10. Common errors + fixes
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | Missing audit-index role grant | Run `scripts/setup-audit-index.sh` on the SO manager. |
 | `ContextWindowExceededError … input_tokens 65537` | Tool result accumulation blew the 64K serving window | Either: cap `AGENT_TOOL_CALLS_LIMIT` (default 100) lower, set `SYNTHESIS_CONFIDENCE_FLOOR` higher (so retask happens later). |
-| Userscript "Could not find a matching alert (rule.uuid=…)" | Userscript loaded after SO's first /api/events/ fetched (cache empty) | Hard-refresh (Ctrl-F5). The userscript installs at @run-at document-start; refreshing puts it before the SO bundle. |
-| `TypeError: Failed to fetch` (userscript console; surfaces in the panel as a generic connection error) on first "Hunt with AI" | Browser hasn't trusted the self-signed cert, so the cross-origin request never reaches the server — it is *not* an HTTP 403 | Visit `https://<soc-ai-host>:8443/healthz` once in the same browser and accept the cert, then retry. |
 | "writes fail with `Kratos login flow init failed`" | Kratos auth prefix wrong for SO 3.0 | Set `SO_KRATOS_PATH_PREFIX=/auth` (the default). Writes use the SO web API + Kratos session, not the Connect API. |
 | Service won't start after pulling new code | venv out of sync | `cd /opt/soc-ai && uv sync && sudo systemctl restart soc-ai`. |
 
 ---
 
-## 12. Updating
+## 11. Updating
 
 ```bash
 # From the dev box. CRITICAL: --exclude=.env (and .env.*) so you do NOT
@@ -375,7 +354,7 @@ ssh soc-ai@<vm-host> '
 
 ---
 
-## 13. Authentication notes
+## 12. Authentication notes
 
 soc-ai authenticates to ES directly using the analyst basic-auth
 credentials — no separate ES service account is needed.

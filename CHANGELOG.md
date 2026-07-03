@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-07-03
+
+### Removed
+
+- **Retired the Tampermonkey userscript** ("Hunt with AI" in the Security Onion
+  alerts view). soc-ai is now driven entirely from its own web console at `/app`
+  (open a detection and **Investigate**, or sweep the queue with auto-triage) and
+  the Hunt Console — no browser extension to install or keep updated. The API's
+  cross-origin (CORS) support remains, config-gated and off by default, for
+  programmatic clients and integrations. Existing userscript installs keep calling
+  the API until you remove them; nothing server-side changed.
+
 ## [1.0.5] - 2026-07-03
 
 Patch: a scheduler fresh-boot fix and green public CI.

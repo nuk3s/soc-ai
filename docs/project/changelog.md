@@ -9,6 +9,7 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.0.6** — Retired the Tampermonkey userscript; soc-ai is now driven entirely from its web console (`/app`) and the Hunt Console.
 - **1.0.5** — Patch: the auto-triage scheduler now fires its first sweep on a
   freshly-booted host (a monotonic-clock sentinel bug), plus Node 24-native CI
   workflow actions.

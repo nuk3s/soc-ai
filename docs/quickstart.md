@@ -57,13 +57,13 @@ paths — see [Docker deployment](DOCKER.md).
 ## Work an alert in the browser
 
 Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick
-a detection, hit **Hunt with AI**, and watch the agent investigate live — it pulls the
+a detection, hit **Investigate**, and watch the agent work live — it pulls the
 alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited
 verdict. Anything it recommends writing back to Security Onion waits behind a one-click
 human approval.
 
 <p align="center">
-  <img src="img/install-browser-walkthrough.gif" alt="soc-ai web UI: sign in, open the alerts console, Hunt with AI on a detection, watch the live investigation stream, read the verdict, and approve the recommended action" width="900">
+  <img src="img/install-browser-walkthrough.gif" alt="soc-ai web UI: sign in, open the alerts console, Investigate a detection, watch the live investigation stream, read the verdict, and approve the recommended action" width="900">
 </p>
 
 Next steps:

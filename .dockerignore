@@ -57,8 +57,5 @@ TODO.md
 # ── Scripts not needed inside the image ───────────────────────────────────────
 scripts/
 
-# ── Userscript (browser extension; not part of the server) ────────────────────
-userscript/
-
 # ── Test suite ────────────────────────────────────────────────────────────────
 tests/

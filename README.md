@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.0.5-3fb950" alt="1.0.5">
+  <img src="https://img.shields.io/badge/status-1.0.6-3fb950" alt="1.0.6">
 </p>
 
 </div>
@@ -21,17 +21,15 @@ The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/)
 
 > Not affiliated with or endorsed by Security Onion Solutions, LLC. soc-ai is a separate service that talks to a grid you already run.
 
-## Two ways to use it
+## The web console
 
-**A web console** at `/app` shows your alert queue grouped by rule, with the AI verdict and confidence inline next to each one. Open an alert to investigate it, or sweep the whole untriaged queue with auto-triage. Every investigation gets a shareable permalink.
+soc-ai runs a **web console** at `/app`: your alert queue grouped by rule, with the AI verdict and confidence inline next to each one. Open an alert to investigate it, or sweep the whole untriaged queue with auto-triage. Every investigation gets a shareable permalink.
 
 <div align="center">
   <img src="docs/img/screenshot-alerts.png" alt="The alerts console: a queue of detections with AI verdicts and confidence shown inline" width="900">
 </div>
 
-**A button inside Security Onion** — a Tampermonkey userscript drops a "Hunt with AI" button straight into the SO alerts view, so you can triage without leaving the grid you already live in.
-
-Under the hood, both run the same agent. For one alert it will:
+Under the hood, for one alert the agent will:
 
 - read the alert context, the related events (via OQL), and the host's recent alert history;
 - enrich the indicators against on-disk threat intel — blocklists, GeoIP/ASN, cloud-prefix tagging;
@@ -109,10 +107,10 @@ git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 
 ### Then work an alert in the browser
 
-Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick a detection, hit **Hunt with AI**, and watch the agent investigate live — it pulls the alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited verdict. Anything it recommends writing back to Security Onion waits behind a one-click human approval:
+Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick a detection, hit **Investigate**, and watch the agent work live — it pulls the alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited verdict. Anything it recommends writing back to Security Onion waits behind a one-click human approval:
 
 <div align="center">
-  <img src="docs/img/install-browser-walkthrough.gif" alt="soc-ai web UI: sign in, open the alerts console, Hunt with AI on a detection, watch the live investigation stream, read the verdict, and approve the recommended action" width="900">
+  <img src="docs/img/install-browser-walkthrough.gif" alt="soc-ai web UI: sign in, open the alerts console, investigate a detection, watch the live investigation stream, read the verdict, and approve the recommended action" width="900">
 </div>
 
 > _Shown with an example Emotet detection; your grid's real alerts appear the same way._

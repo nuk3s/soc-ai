@@ -52,7 +52,7 @@ class FindAlertRequest(BaseModel):
     event_module: str | None = None
     event_dataset: str | None = None
     # Default 1440min (24h) covers SO's typical 10-24h analyst views without
-    # requiring the userscript to set this explicitly. Override for tighter
+    # requiring the caller to set this explicitly. Override for tighter
     # bounds when the caller knows it.
     max_age_minutes: int = 1440
 
