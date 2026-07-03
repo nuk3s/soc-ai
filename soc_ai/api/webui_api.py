@@ -702,6 +702,137 @@ async def ack_group(
     return AckGroupOut(acked=acked, failed=failed, total=total, capped=capped)
 
 
+# Escalate is capped far tighter than ack: each escalate opens a SOC case, so a
+# group escalate must not spray hundreds of cases. One case per matching event
+# mirrors the single-alert escalate_to_case action; the cap bounds the blast.
+_ESCALATE_CAP = 25
+
+
+async def _escalate_many(
+    request: Request,
+    events: list[Any],
+    *,
+    rule_name: str,
+    session_id: str,
+    caller: str,
+) -> tuple[int, int]:
+    """Escalate ``events`` to Security Onion cases under a bounded semaphore.
+
+    Each event goes through the same ``execute_write_tool`` write path as the
+    per-action escalate (identical auth/audit/correctness), fanning out via
+    ``asyncio.gather`` capped at ``_ACK_CONCURRENCY``. The escalate tool needs a
+    title + description, which the model supplies for the single-alert action;
+    here we synthesize a compact, secret-free case title/description from the
+    rule name and the event's endpoints. Returns ``(escalated, failed)``.
+    """
+    sem = asyncio.Semaphore(_ACK_CONCURRENCY)
+
+    async def _one(ev: Any) -> bool:
+        async with sem:
+            endpoints = f"{ev.src} → {ev.dst}" if getattr(ev, "src", None) else ""
+            _result, error = await execute_write_tool(
+                "escalate_to_case",
+                {
+                    "alert_id": ev.es_id,
+                    "case_title": f"{rule_name}"[:120] or "Escalated alert",
+                    "case_description": (
+                        f"Escalated from soc-ai: {rule_name}"
+                        + (f" ({endpoints})" if endpoints else "")
+                    ),
+                },
+                auth=request.app.state.auth,
+                settings=request.app.state.settings,
+                audit=request.app.state.audit,
+                session_id=session_id,
+                user=caller,
+            )
+            return error is None
+
+    results = await asyncio.gather(
+        *(_one(ev) for ev in events),
+        return_exceptions=True,
+    )
+    escalated = 0
+    failed = 0
+    for r in results:
+        if r is True:
+            escalated += 1
+        else:
+            failed += 1
+            if isinstance(r, BaseException):
+                _LOGGER.warning("bulk-escalate write raised (session=%s): %r", session_id, r)
+    return escalated, failed
+
+
+class EscalateGroupOut(BaseModel):
+    escalated: int
+    failed: int
+    total: int
+    capped: bool = False
+
+
+@router.post("/alerts/escalate-group", response_model=EscalateGroupOut)
+async def escalate_group(
+    request: Request,
+    body: AckGroupIn,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> EscalateGroupOut:
+    """Escalate a detection group to Security Onion cases.
+
+    Sibling of :func:`ack_group` — same auth/CSRF/signature and the same
+    ``fetch_group_events`` filters. Each matching event opens a case via the
+    ``escalate_to_case`` write tool; ``_ESCALATE_CAP`` bounds the number of
+    cases so a group escalate can never spray hundreds.
+    """
+    caller = await identify_caller(request)
+    try:
+        events = await aq.fetch_group_events(
+            elastic,
+            settings,
+            rule_name=body.rule_name,
+            kind=body.kind,
+            time_range=body.range,
+            severity=body.severity,
+            oql=body.q,
+            size=_ESCALATE_CAP + 1,  # fetch one extra to detect capping
+            abs_from=body.from_,
+            abs_to=body.to,
+            time_zone=settings.so_timezone,
+            hide_acked=True,
+        )
+    except OqlValidationError as exc:
+        raise HTTPException(
+            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
+        ) from exc
+
+    capped = len(events) > _ESCALATE_CAP
+    events = events[:_ESCALATE_CAP]
+
+    if not events:
+        return EscalateGroupOut(escalated=0, failed=0, total=0)
+
+    escalated, failed = await _escalate_many(
+        request,
+        events,
+        rule_name=body.rule_name,
+        session_id=f"escalate-group:{body.rule_name}",
+        caller=caller,
+    )
+
+    if capped:
+        logging.getLogger(__name__).warning(
+            "escalate-group capped at %d events for rule %r (caller=%s)",
+            _ESCALATE_CAP,
+            body.rule_name,
+            caller,
+        )
+
+    return EscalateGroupOut(
+        escalated=escalated, failed=failed, total=escalated + failed, capped=capped
+    )
+
+
 class AckEventsIn(BaseModel):
     es_ids: list[str]
 
@@ -4435,6 +4566,10 @@ async def decision_record_public_key(request: Request) -> dict[str, Any]:
 # ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────
 
 _PCAP_PROBE_TTL_S = 300.0  # SSH is heavy; cache the PCAP probe between polls.
+# ES + LLM probes are cheap HTTP, but the dashboard polls /health every ~30s and
+# several tabs can poll at once — a short TTL keeps a burst of near-simultaneous
+# polls from fanning out to the upstreams while still feeling live.
+_HEALTH_PROBE_TTL_S = 15.0
 
 
 class HealthComponentOut(BaseModel):
@@ -4458,18 +4593,36 @@ async def _cached_pcap_probe(state: Any, settings: Settings) -> dict[str, Any]:
     return result
 
 
+async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dict[str, Any]]:
+    """The ES + LLM probe results, TTL-cached on app state.
+
+    Both are cheap, but a 30s dashboard poll across several tabs would otherwise
+    hit ES + the gateway every time; the short TTL collapses those into one
+    probe per window. Returns ``{"es": {...}, "llm": {...}}``.
+    """
+    now = time.monotonic()
+    cached = getattr(state, "_health_probe_cache", None)
+    if cached is not None and now - cached[0] < _HEALTH_PROBE_TTL_S:
+        return cached[1]  # type: ignore[no-any-return]
+    result = {
+        "es": await probes.probe_es(state.elastic),
+        "llm": await probes.probe_llm(settings),
+    }
+    state._health_probe_cache = (now, result)
+    return result
+
+
 @router.get("/health", response_model=HealthOut)
 async def health(
     request: Request,
     settings: Settings = Depends(get_settings_dep),
 ) -> HealthOut:
-    """Live status of the upstreams the UI depends on. ES + LLM are probed each
-    call (cheap HTTP); PCAP (heavy SSH) is cached. Secret-free details."""
-    es = await probes.probe_es(request.app.state.elastic)
-    llm = await probes.probe_llm(settings)
+    """Live status of the upstreams the UI depends on. ES + LLM are cheap HTTP
+    probes (short-TTL cached); PCAP (heavy SSH) is cached longer. Secret-free."""
+    probed = await _cached_health_probes(request.app.state, settings)
     out = HealthOut(
-        es=HealthComponentOut(**es),
-        llm=HealthComponentOut(**llm),
+        es=HealthComponentOut(**probed["es"]),
+        llm=HealthComponentOut(**probed["llm"]),
     )
     if settings.pcap_enabled:
         out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))

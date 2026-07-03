@@ -77,6 +77,21 @@ def test_build_hunt_prompt_followup() -> None:
     assert "refine" in followup
 
 
+def test_hunt_prompt_is_inventory_first_and_teaches_correlation() -> None:
+    """The hunt prompt must steer inventory-first hunting + correlation patterns."""
+    p = HUNT_SYSTEM_PROMPT
+    # Inventory-first: read the auto-discovered inventory before planning/querying.
+    assert "READ THE INVENTORY FIRST" in p
+    assert "Data available on this grid" in p
+    # Absent-dataset handling: report the visibility gap instead of guessing.
+    assert "A visibility gap is a real result." in p
+    # The three correlation patterns (kill-chain, fan-out, decisive beacon/DNS C2).
+    assert "Correlation patterns" in p
+    assert "Kill-chain over time" in p
+    assert "Fan-out around one indicator" in p
+    assert "decisive C2" in p
+
+
 # ── Agent wiring ─────────────────────────────────────────────────────────────
 
 
@@ -185,6 +200,81 @@ def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: 
     report_ev = next(e for e in events if e.kind == "hunt_report")
     assert report_ev.payload["narrative"] == "partial — hunt was cut short"
     # the operator-visible note about the partial synthesis was emitted
+    assert any("partial report" in str(e.payload) for e in events)
+
+
+def test_run_hunt_wall_clock_timeout_synthesizes_partial_report(
+    settings_kratos: Settings,
+) -> None:
+    """A HUNG exploration stream is bounded by ``hunt_run_timeout_s``: on the
+    wall-clock backstop the runner falls through to the SAME partial-report path
+    as budget exhaustion (a grounded PARTIAL report, not an empty error)."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    class _HangingRun:
+        result = None
+
+        def __init__(self) -> None:
+            self._yielded = False
+
+        async def __aenter__(self) -> _HangingRun:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> _HangingRun:
+            return self
+
+        async def __anext__(self) -> Any:
+            if not self._yielded:
+                # One live step lands in `gathered`, then the stream wedges — the
+                # exact "ran some queries, then the LLM hung" failure mode.
+                self._yielded = True
+                return SimpleNamespace(
+                    model_response=ModelResponse(parts=[TextPart(content="ran a query")]),
+                    request=None,
+                )
+            await asyncio.sleep(3600)  # hang until the wall-clock backstop cancels
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    class _HangingAgent:
+        def iter(self, *a: Any, **k: Any) -> _HangingRun:
+            return _HangingRun()
+
+    partial = HuntReport(narrative="partial — hunt timed out", findings=[], confidence=0.2)
+
+    # A tiny wall-clock backstop so the hang is cut almost immediately (the one
+    # live node streams first; the second __anext__ then wedges and trips it).
+    settings_kratos.hunt_run_timeout_s = 1
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_HangingAgent()),
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(call_tools=[]),
+            ),
+            patch(
+                "soc_ai.api.hunt_runner._synthesize_partial_hunt",
+                AsyncMock(return_value=SimpleNamespace(output=partial)),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings_kratos), objective="hunt for beaconing"):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    kinds = [e.kind for e in events]
+    # The timeout routed to partial synthesis, NOT a bare error event.
+    assert "hunt_report" in kinds
+    assert kinds[-1] == "done"
+    assert "error" not in kinds
+    report_ev = next(e for e in events if e.kind == "hunt_report")
+    assert report_ev.payload["narrative"] == "partial — hunt timed out"
     assert any("partial report" in str(e.payload) for e in events)
 
 

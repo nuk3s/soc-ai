@@ -114,7 +114,14 @@ async def run_hunt(
     budget_exhausted = False
     try:
         node_msg: Any = None
-        async with agent.iter(user_msg, usage_limits=usage_limits) as run:
+        # Whole-hunt wall-clock safety net: a HUNG LLM stream has no budget-based
+        # stopping point and would otherwise stall the background task forever.
+        # On expiry the TimeoutError falls through to the same partial-report path
+        # as budget exhaustion so the hunt lands a grounded PARTIAL report.
+        async with (
+            asyncio.timeout(ctx.settings.hunt_run_timeout_s),
+            agent.iter(user_msg, usage_limits=usage_limits) as run,
+        ):
             async for node in run:
                 node_msg = getattr(node, "model_response", None)
                 if node_msg is None:
@@ -126,12 +133,15 @@ async def run_hunt(
         result = run.result
     except asyncio.CancelledError:
         raise  # cooperative cancel — propagate, never swallow
-    except UsageLimitExceeded as e:
-        # Budget exhaustion is an EXPECTED outcome of a broad hunt on a slow model,
-        # not an infra failure. The queries + results already streamed live — don't
-        # discard them with status=error and no report. Fall through to synthesize a
-        # PARTIAL report from what was gathered.
-        _LOGGER.warning("hunt hit budget limit; synthesizing partial report: %s", e)
+    except (UsageLimitExceeded, TimeoutError) as e:
+        # Budget exhaustion (UsageLimitExceeded) and the whole-hunt wall-clock
+        # backstop (TimeoutError) are both EXPECTED outcomes of a broad hunt on a
+        # slow stack, not infra failures. The queries + results already streamed
+        # live — don't discard them with status=error and no report. Fall through
+        # to synthesize a PARTIAL report from what was gathered.
+        _LOGGER.warning(
+            "hunt hit its exploration budget/time limit; synthesizing partial report: %s", e
+        )
         budget_exhausted = True
     except BaseException as e:
         _LOGGER.exception("hunt agent run failed")

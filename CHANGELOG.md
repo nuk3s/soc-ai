@@ -6,6 +6,49 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-07-03
+
+Slow-stack resilience + detection release: bounded timeouts everywhere, a
+malware-label payload gate, stronger hunts, and a settled-verdict action bar.
+
+### Added
+
+- **Wall-clock timeouts for a slow stack.** Dedicated, tunable knobs bound every
+  long-running path so a slow gateway degrades gracefully instead of hanging:
+  `hunt_run_timeout_s` (a hung hunt concludes with a grounded PARTIAL report, not
+  an error), `hunt_chat_turn_timeout_s`, `investigation_run_timeout_s`, and a
+  per-turn `investigation_turn_timeout_s` on every primary investigator/synthesizer
+  model call (a hung turn concludes with the round-1 verdict from evidence already
+  gathered).
+- **Stronger hunts.** The hunt agent now plans inventory-first (uses only datasets
+  that actually exist), reasons about correlation patterns (kill-chain sequencing,
+  cross-host attacker-indicator fan-out, beacon/DNS-tunnel decisiveness), and ships
+  prominent lateral-movement + behavioral OQL recipes (Kerberoasting, PsExec,
+  completed-SSH, RITA beacon / DNS-tunnel summaries).
+- **First-run "not connected" banner.** The Dashboard shows a clear banner when
+  Security Onion / the model gateway is unreachable, instead of silently-empty lists.
+- **Settled-verdict action bar.** A completed investigation always offers
+  Acknowledge / Escalate even when the agent recommended no actions, backed by a
+  new `POST /alerts/escalate-group` endpoint (same auth/CSRF as ack-group).
+- **Reliability metrics.** `investigation_fallback_verdicts_total` and
+  `investigation_zero_tool_verdicts_total` in `/metrics` — early warning for
+  fallback-verdict rate and QVOD-style zero-tool escalations.
+
+### Changed / Fixed
+
+- **Malware-label payload gate.** A `true_positive` on a malware-signalling rule
+  name is coerced to `needs_more_info` (→ investigated) unless corroborated by a
+  concrete IOC hit or a cited decisive typed pivot value (JA3/hash/SPN/RPC) — the
+  rule label alone is not corroboration (the BPFDoor false-escalation pattern). The
+  solicited-ICMP defense and real tool-evidence still stand.
+- **Fast-path reputation for domains.** The cheap fast-path now reputation-gates an
+  external destination *domain* (SNI/Host/DNS, port-stripped), not just external
+  IPs — an unknown or blocklisted domain forces the full investigation.
+- **Sharper citations.** A citation resolves semantically only on a distinctive
+  token (stop-word filtered, length/word-boundary checked), so a verdict can't
+  "cite" the bundle by echoing a generic word — while short domains/IPs still
+  resolve.
+
 ## [1.0.3] - 2026-07-03
 
 Dogfood + detection + resilience release: 11 dogfood fixes from live use, a docs

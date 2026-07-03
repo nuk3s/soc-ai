@@ -15,6 +15,8 @@ from soc_ai.agent.orchestrator import (
     _downgrade_unevidenced_verdict,
     _materialize_prefetch_evidence,
     _pivot_decisive_evidence,
+    _resolve_citations,
+    _synth_first_post_validate,
     _verdict_cites_decisive_pivot_value,
     _verdict_grounded_in_pivot,
 )
@@ -393,3 +395,208 @@ def test_recall_verdict_only_counts_wrong_verdict_as_missed() -> None:
     assert s.escalation_recall == 0.0
     assert s.escalation_recall_verdict_only == 0.0
     assert s.false_negative_breakdown["missed"] == 1
+
+
+# ── GATE A: malware-rule-name payload gate (#21) ────────────────────────────────
+# `_alert()` uses rule.name "ET HUNTING Possible Cobalt Strike" → contains
+# "cobalt" → `_rule_signals_malware` is True. A true_positive on such an alert
+# must be corroborated by a concrete IOC hit OR a cited decisive typed pivot
+# VALUE — never the rule label alone (the BPFDoor false-escalation defense).
+
+
+def _malware_ctx_no_ioc() -> EnrichedAlertContext:
+    """Malware-signalling alert (Cobalt Strike rule name), no IOC hit, one pivot
+    doc carrying a decisive JA3S value (so a value-citing verdict can resolve)."""
+    return EnrichedAlertContext(
+        alert=_alert(),
+        community_id_events=[
+            _zeek("piv-ssl-1", "zeek.ssl", {"zeek.ssl.ja3": "a0e9f5", "zeek.ssl.ja3s": "b742b4"})
+        ],
+    )
+
+
+def _malware_ctx_with_ioc() -> EnrichedAlertContext:
+    """Same malware alert, but the external indicator carries a blocklist IOC hit."""
+    from soc_ai.enrichment.blocklists import BlocklistHit
+    from soc_ai.tools.enrichment import IndicatorEnrichment
+
+    return EnrichedAlertContext(
+        alert=_alert(),
+        community_id_events=[
+            _zeek("piv-ssl-1", "zeek.ssl", {"zeek.ssl.ja3": "a0e9f5", "zeek.ssl.ja3s": "b742b4"})
+        ],
+        enrichments={
+            "104.18.42.69": IndicatorEnrichment(
+                indicator="104.18.42.69",
+                indicator_type="ip",
+                blocklist_hits=[
+                    BlocklistHit(
+                        indicator="104.18.42.69",
+                        indicator_type="ip",
+                        source="abuse.ch Feodo Tracker",
+                        tags=("cobalt-strike",),
+                    )
+                ],
+            )
+        },
+    )
+
+
+def _validate(report: TriageReport, ctx: EnrichedAlertContext) -> tuple[TriageReport, dict]:
+    # No tool evidence: targeted_messages=None, targeted_tool_called=None. This is
+    # the zero-investigation path Gate A defends.
+    return _synth_first_post_validate(
+        report, ctx, candidate=None, targeted_messages=None, targeted_tool_called=None
+    )
+
+
+def test_gate_a_malware_named_tp_without_ioc_or_pivot_is_downgraded() -> None:
+    # TP anchored on the malware rule label, citing only the alert's own field —
+    # no IOC hit, no decisive pivot value cited, no tool call.
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="Rule name says Cobalt Strike, so this is a beacon.",
+        citations=["alert.rule_name"],
+    )
+    out, audit = _validate(report, _malware_ctx_no_ioc())
+    assert out.verdict == "needs_more_info"
+    assert "malware_rule_name_ungrounded_downgrade" in audit
+    assert out.confidence <= 0.4
+
+
+def test_gate_a_malware_named_tp_with_ioc_hit_is_not_downgraded() -> None:
+    # A concrete blocklist IOC hit on the external indicator GROUNDS the escalation.
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="Beacon destination is on a Cobalt Strike blocklist.",
+        citations=["enrichments.104.18.42.69.blocklist_hits"],
+    )
+    out, audit = _validate(report, _malware_ctx_with_ioc())
+    assert out.verdict == "true_positive"
+    assert "malware_rule_name_ungrounded_downgrade" not in audit
+
+
+def test_gate_a_malware_named_tp_citing_decisive_pivot_value_is_not_downgraded() -> None:
+    # Citing a decisive typed pivot VALUE (the JA3S hash from a correlated pivot)
+    # is corroboration beyond the rule label → stays true_positive.
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="JA3S b742b4 matches a known Cobalt Strike team server.",
+        citations=["JA3S b742b4 on pivot ssl flow"],
+    )
+    out, audit = _validate(report, _malware_ctx_no_ioc())
+    assert out.verdict == "true_positive"
+    assert "malware_rule_name_ungrounded_downgrade" not in audit
+
+
+class _RetPart:
+    """ToolReturnPart-like stand-in: content + the real part_kind discriminator."""
+
+    def __init__(self, content: Any) -> None:
+        self.content = content
+        self.part_kind = "tool-return"
+
+
+class _Msg:
+    def __init__(self, parts: list[Any]) -> None:
+        self.parts = parts
+
+
+def _tool_evidence() -> list[Any]:
+    """One successful tool return → count_successful_tool_calls >= 1."""
+    return [_Msg([_RetPart({"result": "ok", "hits": 3})])]
+
+
+def test_gate_a_malware_named_tp_with_tool_evidence_is_not_downgraded() -> None:
+    # A TP that survived a REAL investigation (a successful tool call in the
+    # transcript) is exempt even without an IOC hit or a cited decisive value.
+    # The citation ("destination 104.18.42.69") resolves semantically (distinctive
+    # IP in the bundle) but is NOT a decisive pivot value — so ONLY the tool
+    # evidence keeps the verdict from being downgraded.
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="Investigated: confirmed C2 to destination 104.18.42.69.",
+        citations=["destination 104.18.42.69"],
+    )
+    without_tools, audit_no_tools = _synth_first_post_validate(
+        report,
+        _malware_ctx_no_ioc(),
+        candidate=None,
+        targeted_messages=None,
+        targeted_tool_called=None,
+    )
+    # Sanity: with NO tool evidence, Gate A fires on this same report.
+    assert without_tools.verdict == "needs_more_info"
+    assert "malware_rule_name_ungrounded_downgrade" in audit_no_tools
+
+    with_tools, audit_tools = _synth_first_post_validate(
+        report,
+        _malware_ctx_no_ioc(),
+        candidate=None,
+        targeted_messages=_tool_evidence(),
+        targeted_tool_called=None,
+    )
+    assert with_tools.verdict == "true_positive"
+    assert "malware_rule_name_ungrounded_downgrade" not in audit_tools
+
+
+# ── GATE C: citation semantic resolution requires a DISTINCTIVE token ────────────
+# A citation may resolve semantically only on a distinctive token (len >= 8, or an
+# alphanumeric-only token matched on word boundaries) — never a stop-word or a
+# bare generic short substring.
+
+
+def _cite_ctx() -> EnrichedAlertContext:
+    return EnrichedAlertContext(
+        alert=_alert(),
+        community_id_events=[_zeek("piv-ssl-1", "zeek.ssl", {"zeek.ssl.ja3s": "b742b4c0ffee1234"})],
+    )
+
+
+def test_gate_c_generic_short_token_does_not_resolve() -> None:
+    # "rule"/"name"/"true" are stop-words; "the"/"and" too. A citation made only of
+    # generic short tokens must NOT resolve semantically (coverage_ratio 0).
+    res = _resolve_citations(["the rule name is true"], _cite_ctx(), [])
+    assert res["coverage_ratio"] == 0.0
+    assert res["counts"]["semantic"] == 0
+
+
+def test_gate_c_distinctive_value_resolves() -> None:
+    # A long distinctive value (a JA3S hash present in the bundle) resolves.
+    res = _resolve_citations(["JA3S b742b4c0ffee1234"], _cite_ctx(), [])
+    assert res["coverage_ratio"] == 1.0
+    assert res["counts"]["semantic"] == 1
+
+
+def test_gate_c_domain_resolves_ip_resolves() -> None:
+    # A domain/IP-style distinctive token in the bundle still resolves semantically.
+    ctx = EnrichedAlertContext(
+        alert=_alert(),  # destination.ip 104.18.42.69
+        community_id_events=[
+            _zeek("piv-1", "zeek.ssl", {"zeek.ssl.server_name": "evil.example.com"})
+        ],
+    )
+    res_domain = _resolve_citations(["SNI evil.example.com observed"], ctx, [])
+    assert res_domain["coverage_ratio"] == 1.0
+    res_ip = _resolve_citations(["destination 104.18.42.69"], ctx, [])
+    assert res_ip["coverage_ratio"] == 1.0
+
+
+def test_gate_c_short_dotted_domain_resolves_on_word_boundary() -> None:
+    # A SHORT (<8 char) domain carrying a dot — e.g. "c2.xyz" — is distinctive but
+    # not alphanumeric; it must still resolve via the word-boundary path (the
+    # earlier isalnum() filter wrongly dropped every dotted/hyphenated domain).
+    ctx = EnrichedAlertContext(
+        alert=_alert(),
+        community_id_events=[_zeek("piv-d", "zeek.ssl", {"zeek.ssl.server_name": "c2.xyz"})],
+    )
+    res = _resolve_citations(["beacon to c2.xyz"], ctx, [])
+    assert res["coverage_ratio"] == 1.0
+    # But a bare short token that only appears as a FRAGMENT of a longer word does
+    # not resolve (word-boundary guard holds).
+    res_frag = _resolve_citations(["saw abc2xyzq somewhere"], ctx, [])
+    assert res_frag["coverage_ratio"] == 0.0

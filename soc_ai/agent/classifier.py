@@ -118,11 +118,52 @@ def classify_alert(alert: SoAlert) -> AlertClass:
     return AlertClass.UNKNOWN
 
 
+def _destination_domain(alert: SoAlert) -> str | None:
+    """Best-effort destination *domain* for an alert, or ``None``.
+
+    Mirrors ``destination_ip`` but for name-based destinations: the TLS
+    SNI, the HTTP Host header, or the queried DNS name — whichever the
+    prefetch typed onto the alert. These are the external endpoint the
+    alert points *at*, expressed as a name rather than an address. We
+    take the first populated field in that priority order.
+
+    An IP literal that happens to land in one of these fields is not a
+    domain (the IP path already handles it), so we skip anything that
+    parses as an address.
+    """
+    from ipaddress import ip_address  # noqa: PLC0415
+
+    for value in (
+        alert.zeek_ssl_server_name,
+        alert.zeek_http_host,
+        alert.zeek_dns_query,
+        alert.dns_query,
+    ):
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip().rstrip(".").lower()
+        # Strip a ``:port`` suffix (an HTTP Host header may carry one) so the
+        # blocklist lookup sees the bare hostname — "evil.example:443" must match
+        # an "evil.example" blocklist entry, not silently miss and fast-path a
+        # known-bad domain. (An IPv6 literal has no dot and is dropped below.)
+        host, sep, port = candidate.rpartition(":")
+        if sep and host and port.isdigit():
+            candidate = host
+        if not candidate or "." not in candidate:
+            continue
+        try:
+            ip_address(candidate)
+        except (ValueError, TypeError):
+            return candidate  # not an IP literal → treat as a domain
+    return None
+
+
 def is_fast_path_eligible(
     alert: SoAlert,
     alert_class: AlertClass,
     *,
     enrichment_cache: Any = None,
+    blocklist: Any = None,
 ) -> bool:
     """Whether the orchestrator may take the fast-path for this alert.
 
@@ -138,11 +179,21 @@ def is_fast_path_eligible(
       pipeline at least once to establish a verdict baseline. Pass
       ``enrichment_cache=None`` to disable this gate (the default —
       tests and direct callers that don't have a cache).
+    - If the destination is an external *domain* (a name-based endpoint —
+      SNI / HTTP Host / DNS query — rather than an IP), it MUST carry a
+      prior reputation signal before we cheap-path it: either a
+      blocklist lookup or an existing enrichment-cache hit. A domain
+      with a malicious blocklist hit is *never* fast-pathed, and a
+      domain we've never enriched routes to the full pipeline once to
+      establish a baseline — the name-based mirror of the external-IP
+      gate. This gate only applies when a ``blocklist`` and/or
+      ``enrichment_cache`` is supplied; direct callers that pass neither
+      keep the legacy (IP-only) behavior.
 
     This is a stricter gate than the classifier alone — informational
     signatures *can* still warrant the full pipeline when SO has bumped
     their severity (e.g. via correlation rules or analyst-set tags) or
-    when we haven't yet seen the destination IP.
+    when we haven't yet seen the destination IP / domain.
     """
     from ipaddress import ip_address  # noqa: PLC0415
 
@@ -166,6 +217,20 @@ def is_fast_path_eligible(
             )
             if is_external_dest and not enrichment_cache.contains(dest):
                 # External destination with no prior enrichment → not eligible.
+                return False
+
+    # Domain reputation gate: mirror the external-IP logic for name-based
+    # destinations. Only engages when a blocklist and/or cache is provided.
+    if blocklist is not None or enrichment_cache is not None:
+        domain = _destination_domain(alert)
+        if domain is not None:
+            # A malicious blocklist hit means never fast-path this domain.
+            if blocklist is not None and blocklist.lookup_domain(domain):
+                return False
+            # No reputation context at all (never enriched) → full pipeline
+            # once to establish a baseline, same as a first-encounter IP.
+            seen = enrichment_cache is not None and enrichment_cache.contains(domain)
+            if not seen:
                 return False
     return True
 

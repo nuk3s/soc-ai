@@ -9,6 +9,10 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.0.4** — Slow-stack resilience + detection: wall-clock timeouts on every long path
+  (hunts/investigations degrade gracefully to a partial verdict), a malware-label payload
+  gate, fast-path domain reputation, inventory-first hunts with correlation + lateral-movement
+  recipes, a first-run "not connected" banner, and a settled-verdict Acknowledge/Escalate bar.
 - **1.0.3** — Dogfood + detection + resilience release: dataset-agnostic grid discovery,
   behavioral-summary detections (beaconing + DNS tunneling), a docs site, operator
   runbooks, one-click "request more info" on any verdict, and a sweep of resilience /

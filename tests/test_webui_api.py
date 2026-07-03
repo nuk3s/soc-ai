@@ -1822,6 +1822,150 @@ def test_ack_group_passes_hide_acked_true(client: TestClient) -> None:
     )
 
 
+def test_escalate_group_calls_write_tool_per_event(client: TestClient) -> None:
+    """POST /alerts/escalate-group fetches events and calls escalate_to_case for each."""
+    from soc_ai.webui.alerts_query import AlertEvent
+
+    fake_events = [
+        AlertEvent(
+            es_id="ev-esc-1",
+            timestamp="t",
+            src="1.1.1.1:5",
+            dst="2.2.2.2:443",
+            severity="high",
+            host="wks-1",
+        ),
+        AlertEvent(
+            es_id="ev-esc-2",
+            timestamp="t",
+            src="1.1.1.1:6",
+            dst="2.2.2.2:443",
+            severity="high",
+            host="wks-1",
+        ),
+    ]
+    write_tool_calls: list[dict] = []
+
+    async def fake_execute_write_tool(
+        tool_name: str,
+        tool_args: dict,
+        *,
+        auth,
+        settings,
+        **_kwargs,
+    ):
+        write_tool_calls.append({"tool_name": tool_name, "tool_args": tool_args})
+        return {"id": "case-1"}, None
+
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_group_events",
+            AsyncMock(return_value=fake_events),
+        ),
+        patch(
+            "soc_ai.api.webui_api.execute_write_tool",
+            fake_execute_write_tool,
+        ),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/escalate-group",
+            json={"rule_name": "ET MALWARE X", "range": "24h"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["escalated"] == 2
+    assert body["failed"] == 0
+    assert body["total"] == 2
+    assert body["capped"] is False
+    # one escalate_to_case per event, each carrying that event's id plus a
+    # synthesized (non-empty) title + description the write tool requires.
+    assert len(write_tool_calls) == 2
+    assert {c["tool_name"] for c in write_tool_calls} == {"escalate_to_case"}
+    assert {c["tool_args"]["alert_id"] for c in write_tool_calls} == {"ev-esc-1", "ev-esc-2"}
+    for c in write_tool_calls:
+        assert c["tool_args"]["case_title"].strip()
+        assert c["tool_args"]["case_description"].strip()
+
+
+def test_escalate_group_empty_returns_zeros(client: TestClient) -> None:
+    """When there are no events in the window the endpoint returns escalated=0."""
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=[]),
+    ):
+        resp = client.post(
+            "/api/v1/alerts/escalate-group",
+            json={"rule_name": "ET NOTHING", "range": "24h"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["escalated"] == 0
+    assert body["total"] == 0
+
+
+def test_escalate_group_auth_gated(settings_kratos: Settings) -> None:
+    """With api_auth_required, an unauthenticated escalate-group POST is 401."""
+    auth = settings_kratos.model_copy(
+        update={"api_auth_required": True, "bootstrap_admin_password": SecretStr("pw")}
+    )
+    for client in _client(auth):
+        resp = client.post(
+            "/api/v1/alerts/escalate-group",
+            json={"rule_name": "ET MALWARE X", "range": "24h"},
+        )
+        assert resp.status_code == 401
+        assert resp.json()["detail"]["reason"] == "no_session"
+
+
+def test_escalate_group_cookie_cross_origin_is_csrf_rejected(settings_kratos: Settings) -> None:
+    """A cookie-authenticated cross-origin escalate-group POST is CSRF-rejected.
+
+    Mirrors the ack-group / me-status CSRF coverage: escalate-group is a sibling
+    write endpoint on the gated router, so it inherits the same Origin guard.
+    A real login (open router, exempt) sets a valid session cookie; a subsequent
+    cross-origin Origin header must be rejected before any SO write is attempted.
+    """
+    auth = settings_kratos.model_copy(
+        update={"api_auth_required": True, "bootstrap_admin_password": SecretStr("pw")}
+    )
+    for client in _client(auth):
+        login = client.post("/api/v1/login", json={"username": "admin", "password": "pw"})
+        assert login.status_code == 200, login.text
+        resp = client.post(
+            "/api/v1/alerts/escalate-group",
+            json={"rule_name": "ET MALWARE X", "range": "24h"},
+            headers={"Origin": "https://evil.example.com"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["reason"] == "bad_origin"
+
+
+def test_escalate_group_same_origin_cookie_write_is_allowed(settings_kratos: Settings) -> None:
+    """A cookie-authenticated SAME-origin escalate-group POST passes the CSRF guard.
+
+    The Origin header matches the app's own origin, so the write proceeds through
+    to fetch_group_events (mocked empty) rather than being CSRF-rejected.
+    """
+    auth = settings_kratos.model_copy(
+        update={"api_auth_required": True, "bootstrap_admin_password": SecretStr("pw")}
+    )
+    for client in _client(auth):
+        login = client.post("/api/v1/login", json={"username": "admin", "password": "pw"})
+        assert login.status_code == 200, login.text
+        with patch(
+            "soc_ai.api.webui_api.aq.fetch_group_events",
+            AsyncMock(return_value=[]),
+        ):
+            resp = client.post(
+                "/api/v1/alerts/escalate-group",
+                json={"rule_name": "ET MALWARE X", "range": "24h"},
+                headers={"Origin": "http://testserver"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["escalated"] == 0
+
+
 def test_ack_events_success(client: TestClient) -> None:
     """POST /alerts/ack-events dedupes ids and calls execute_write_tool for each unique id."""
 

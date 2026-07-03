@@ -29,6 +29,8 @@ def test_render_emits_required_help_and_type_lines(clean_metrics: metrics._Metri
         "socai_investigations_total",
         "socai_investigation_errors_total",
         "socai_investigation_retasks_total",
+        "socai_investigation_fallback_verdicts_total",
+        "socai_investigation_zero_tool_verdicts_total",
         "socai_tool_calls_total",
         "socai_llm_tokens_total",
         "socai_pending_approvals",
@@ -83,6 +85,18 @@ async def test_record_event_increments_retask_and_error_and_done_counters(
     assert "socai_investigation_retasks_total 1" in body
     assert "socai_investigation_errors_total 2" in body
     assert "socai_investigations_total 1" in body
+
+
+@pytest.mark.asyncio
+async def test_record_event_increments_fallback_and_zero_tool_counters(
+    clean_metrics: metrics._Metrics,
+) -> None:
+    await clean_metrics.record_event("fallback_verdict", {})
+    await clean_metrics.record_event("fallback_verdict", {})
+    await clean_metrics.record_event("zero_tool_verdict_blocked", {})
+    body = metrics.render(version="0.1.0", pending_approvals=0)
+    assert "socai_investigation_fallback_verdicts_total 2" in body
+    assert "socai_investigation_zero_tool_verdicts_total 1" in body
 
 
 @pytest.mark.asyncio

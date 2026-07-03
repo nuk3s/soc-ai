@@ -109,3 +109,159 @@ def test_classify_severity_case_insensitive() -> None:
     must not be case-sensitive."""
     alert = SoAlert(id="a", rule_metadata=RuleMetadata(signature_severity="INFORMATIONAL"))
     assert classify_alert(alert) is AlertClass.INFORMATIONAL_VISIBILITY
+
+
+# --- Domain-reputation fast-path gate ---------------------------------------
+
+
+class _StubCache:
+    """Minimal enrichment-cache stand-in exposing the ``contains`` probe."""
+
+    def __init__(self, seen: set[str] | None = None) -> None:
+        self._seen = seen or set()
+
+    def contains(self, key: str) -> bool:
+        return key in self._seen
+
+
+class _StubBlocklist:
+    """Minimal blocklist stand-in exposing ``lookup_domain``."""
+
+    def __init__(self, malicious: set[str] | None = None) -> None:
+        self._malicious = malicious or set()
+
+    def lookup_domain(self, domain: str) -> list[object]:
+        return ["hit"] if domain.lower() in self._malicious else []
+
+
+def _informational_low(**extra: object) -> SoAlert:
+    return SoAlert(
+        id="a",
+        severity_label="low",
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        **extra,  # type: ignore[arg-type]
+    )
+
+
+def test_fast_path_external_domain_without_reputation_not_eligible() -> None:
+    """An external destination *domain* with no prior reputation context
+    (no blocklist hit, never enriched) must NOT fast-path — it routes to
+    the full pipeline once, mirroring the first-encounter external-IP gate."""
+    alert = _informational_low(zeek_ssl_server_name="newly-registered.example")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(),
+            blocklist=_StubBlocklist(),
+        )
+        is False
+    )
+
+
+def test_fast_path_external_domain_with_malicious_signal_not_eligible() -> None:
+    """A domain with a malicious blocklist hit is never fast-pathed, even
+    if it was previously enriched."""
+    alert = _informational_low(zeek_http_host="evil.example")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(seen={"evil.example"}),
+            blocklist=_StubBlocklist(malicious={"evil.example"}),
+        )
+        is False
+    )
+
+
+def test_fast_path_external_domain_with_port_still_matches_blocklist() -> None:
+    """An HTTP Host carrying a ``:port`` suffix must be port-stripped before the
+    blocklist lookup — "evil.example:443" has to match the "evil.example" entry,
+    otherwise a known-bad domain wrongly fast-paths past the reputation gate."""
+    alert = _informational_low(zeek_http_host="evil.example:443")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(seen={"evil.example"}),
+            blocklist=_StubBlocklist(malicious={"evil.example"}),
+        )
+        is False
+    )
+
+
+def test_fast_path_external_domain_with_prior_enrichment_eligible() -> None:
+    """A benign domain we've already enriched (cache hit, no blocklist hit)
+    is eligible — the name-based mirror of a cached external IP."""
+    alert = _informational_low(zeek_dns_query="known-good.example")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(seen={"known-good.example"}),
+            blocklist=_StubBlocklist(),
+        )
+        is True
+    )
+
+
+def test_fast_path_domain_gate_inactive_without_blocklist_or_cache() -> None:
+    """When neither blocklist nor cache is supplied, the domain gate is a
+    no-op and legacy (IP-only) behavior stands — a domain-only alert is
+    still eligible."""
+    alert = _informational_low(zeek_ssl_server_name="anything.example")
+    cls = classify_alert(alert)
+    assert is_fast_path_eligible(alert, cls) is True
+
+
+def test_fast_path_external_ip_with_cache_still_eligible_unchanged() -> None:
+    """Regression guard: the external-IP path is unchanged. An external IP
+    with a prior cache hit remains fast-path eligible, and passing a
+    blocklist does not affect an IP-destination alert."""
+    alert = _informational_low(destination_ip="8.8.8.8")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(seen={"8.8.8.8"}),
+            blocklist=_StubBlocklist(),
+        )
+        is True
+    )
+
+
+def test_fast_path_external_ip_without_cache_not_eligible_unchanged() -> None:
+    """Regression guard: a first-encounter external IP (no cache hit) is
+    still rejected — the domain gate additions do not regress this."""
+    alert = _informational_low(destination_ip="8.8.8.8")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(),
+            blocklist=_StubBlocklist(),
+        )
+        is False
+    )
+
+
+def test_fast_path_ip_literal_in_domain_field_not_treated_as_domain() -> None:
+    """An IP literal that lands in a name field (e.g. SNI) is not a domain;
+    the domain gate skips it and the alert stays eligible (no IP dest set)."""
+    alert = _informational_low(zeek_ssl_server_name="203.0.113.9")
+    cls = classify_alert(alert)
+    assert (
+        is_fast_path_eligible(
+            alert,
+            cls,
+            enrichment_cache=_StubCache(),
+            blocklist=_StubBlocklist(),
+        )
+        is True
+    )

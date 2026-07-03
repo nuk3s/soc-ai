@@ -1,5 +1,5 @@
-import { Activity, ArrowUpRight, Crosshair, Database, ShieldAlert, ShieldCheck } from 'lucide-react';
-import { type ReactNode, useMemo, useRef, useState } from 'react';
+import { Activity, ArrowUpRight, Crosshair, Database, ShieldAlert, ShieldCheck, WifiOff, X } from 'lucide-react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, StatusTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
@@ -11,9 +11,11 @@ import {
   type AlertQuery,
   type AutoTriageStatus,
   type DataSource,
+  type Health,
   getAlerts,
   getAutoTriageStatus,
   getDataSources,
+  getHealth,
   getInvestigations,
 } from '../lib/api';
 import { VERDICT } from '../lib/tokens';
@@ -260,6 +262,24 @@ function EnrichmentPanel({
   );
 }
 
+// A dependency that's down, in operator terms. The `detail` comes verbatim from
+// the (secret-free) backend probe; `label` humanizes which upstream it is.
+interface DownDep {
+  key: 'es' | 'llm';
+  label: string;
+  detail: string;
+}
+
+// Which of the health components are unreachable — drives the connection banner.
+// Only ES + LLM are treated as blocking dependencies (PCAP is optional/advisory).
+function downDeps(h: Health | null): DownDep[] {
+  if (!h) return [];
+  const out: DownDep[] = [];
+  if (!h.es.ok) out.push({ key: 'es', label: 'Security Onion (Elasticsearch)', detail: h.es.detail });
+  if (!h.llm.ok) out.push({ key: 'llm', label: 'AI gateway (LLM)', detail: h.llm.detail });
+  return out;
+}
+
 // ---- screen ----------------------------------------------------------------
 
 export function Dashboard() {
@@ -290,6 +310,27 @@ export function Dashboard() {
   });
   triageActiveRef.current = !!triage.data?.active;
   const sources = useAsync(getDataSources, [], { refetchInterval: 60_000 });
+  // Upstream reachability — polled on mount + every 30s so a down dependency
+  // (ES / gateway) surfaces as a banner instead of a wall of empty widgets.
+  // Errors resolve to null (health data is null) → no banner, so a transient
+  // /health hiccup can't itself raise a false "not connected" alarm.
+  const health = useAsync(getHealth, [], { refetchInterval: 30_000 });
+  // Which down deps the operator has dismissed this session (by key). A dep that
+  // recovers then fails again re-shows: dismissal is cleared once it's healthy.
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const down = downDeps(health.data ?? null);
+  const banners = down.filter((d) => !dismissed.has(d.key));
+  // Re-arm the banner for a dep once it recovers: prune any dismissed key that
+  // is no longer down, so a later re-failure shows the banner again. Keyed on
+  // the current down set so it only runs when reachability actually changes.
+  const downKeys = down.map((d) => d.key).join(',');
+  useEffect(() => {
+    setDismissed((prev) => {
+      if (!prev.size) return prev;
+      const next = new Set([...prev].filter((k) => downKeys.split(',').includes(k)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [downKeys]);
 
   const groups = useMemo(() => alerts.data ?? [], [alerts.data]);
   const rows = useMemo(() => invs.data ?? [], [invs.data]);
@@ -312,6 +353,33 @@ export function Dashboard() {
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
+      {/* Connection banner — a down dependency (ES / gateway) is surfaced
+          prominently above content, styled like the Alerts.tsx danger strips.
+          Dismissible; re-shows if the dep recovers then fails again. */}
+      {banners.map((d) => (
+        <div
+          key={d.key}
+          role="alert"
+          className="mb-3.5 flex items-start gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
+          style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.08)' }}
+        >
+          <span className="mt-px flex flex-shrink-0" style={{ color: '#f04438' }}>
+            <WifiOff size={15} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-text-2">{d.label} not reachable</div>
+            <div className="mt-0.5 break-words text-[12px] leading-[1.5] text-dim">{d.detail}</div>
+          </div>
+          <button
+            onClick={() => setDismissed((s) => new Set(s).add(d.key))}
+            className="mt-px flex text-dim hover:text-text"
+            aria-label="Dismiss"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      ))}
+
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div>
           <div className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</div>

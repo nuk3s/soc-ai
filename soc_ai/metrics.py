@@ -15,6 +15,11 @@ Counters / gauges exposed:
   any ``error`` event.
 - ``socai_investigation_retasks_total`` — investigations where the
   retask round fired (synthesis confidence below floor).
+- ``socai_investigation_fallback_verdicts_total`` — investigations
+  where a synthesis-failure fallback (synthetic/M27) report was
+  emitted. Watch this stays under 5% of investigations.
+- ``socai_investigation_zero_tool_verdicts_total`` — zero-tool TP/FP
+  verdicts blocked/coerced by the evidence gate (QVOD early-warning).
 - ``socai_tool_calls_total`` (labeled by ``tool``) — per-tool call
   counts, for spotting which read tools are hot or broken.
 - ``socai_llm_tokens_total`` (labeled by ``phase``, ``direction``) —
@@ -45,6 +50,8 @@ class _Metrics:
         self.investigations_total = 0
         self.investigation_errors_total = 0
         self.investigation_retasks_total = 0
+        self.investigation_fallback_verdicts_total = 0
+        self.investigation_zero_tool_verdicts_total = 0
         self.tool_calls_total: dict[str, int] = defaultdict(int)
         # (phase, direction) -> tokens
         self.llm_tokens_total: dict[tuple[str, str], int] = defaultdict(int)
@@ -62,6 +69,10 @@ class _Metrics:
                 self.llm_tokens_total[(phase, "output")] += int(payload.get("output_tokens") or 0)
             elif kind == "retask":
                 self.investigation_retasks_total += 1
+            elif kind == "fallback_verdict":
+                self.investigation_fallback_verdicts_total += 1
+            elif kind == "zero_tool_verdict_blocked":
+                self.investigation_zero_tool_verdicts_total += 1
             elif kind == "error":
                 self.investigation_errors_total += 1
             elif kind == "done":
@@ -109,6 +120,24 @@ def render(version: str, pending_approvals: int) -> str:
     )
     lines.append("# TYPE socai_investigation_retasks_total counter")
     lines.append(f"socai_investigation_retasks_total {m.investigation_retasks_total}")
+
+    lines.append(
+        "# HELP socai_investigation_fallback_verdicts_total "
+        "Investigations that emitted a synthesis-failure fallback (synthetic/M27) report."
+    )
+    lines.append("# TYPE socai_investigation_fallback_verdicts_total counter")
+    lines.append(
+        f"socai_investigation_fallback_verdicts_total {m.investigation_fallback_verdicts_total}"
+    )
+
+    lines.append(
+        "# HELP socai_investigation_zero_tool_verdicts_total "
+        "Zero-tool TP/FP verdicts blocked/coerced by the evidence gate."
+    )
+    lines.append("# TYPE socai_investigation_zero_tool_verdicts_total counter")
+    lines.append(
+        f"socai_investigation_zero_tool_verdicts_total {m.investigation_zero_tool_verdicts_total}"
+    )
 
     lines.append("# HELP socai_tool_calls_total Per-tool call counts.")
     lines.append("# TYPE socai_tool_calls_total counter")

@@ -17,6 +17,10 @@ from typing import Any
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import CancelToken, run_recorded
 
+# Fallback whole-investigation wall-clock backstop (seconds) when the setting is
+# unavailable on state.settings. Mirrors config.investigation_run_timeout_s.
+_DEFAULT_INVESTIGATION_RUN_TIMEOUT_S = 900
+
 _LOGGER = logging.getLogger(__name__)
 
 _STATE_ATTR = "_hunt_manager"
@@ -88,7 +92,7 @@ class HuntManager:
 
         # Spawn a background task to drain the rest of the generator.
         task: asyncio.Task[None] = asyncio.create_task(
-            _drain(gen, alert_id=alert_id, inv_id=inv_id)
+            _drain(gen, state=state, alert_id=alert_id, inv_id=inv_id)
         )
         self._tasks[inv_id] = task
         self._tokens[inv_id] = token
@@ -122,6 +126,7 @@ class HuntManager:
 async def _drain(
     gen: Any,
     *,
+    state: Any,
     alert_id: str,
     inv_id: str,
 ) -> None:
@@ -130,10 +135,37 @@ async def _drain(
     The recorder inside run_recorded persists everything; _drain just
     exhausts the generator so the recorder can call finish().  Any
     exception is logged and swallowed so a failure never escapes the task.
+
+    The whole drain is bounded by an ``asyncio.timeout`` wall-clock backstop:
+    a wedged LLM stream has no budget-based stopping point and would otherwise
+    leave the background task (and the investigation row) ``running`` forever.
+    On expiry the timeout cancels the awaited ``run_recorded`` step — which the
+    recorder's ``except asyncio.CancelledError`` handler lands as
+    ``status='error'`` (the interrupted-run path) since no operator cancel was
+    requested — and ``asyncio.timeout`` re-raises the expiry as ``TimeoutError``
+    here, which we log and swallow like any other drain failure.
     """
+    run_timeout = getattr(
+        state.settings, "investigation_run_timeout_s", _DEFAULT_INVESTIGATION_RUN_TIMEOUT_S
+    )
     try:
-        async for _name, _data in gen:
-            pass
+        # Hold the generator so it can be closed if the wall-clock backstop fires
+        # mid-stream — a hung LLM read would otherwise leak the coroutine (mirrors
+        # the auto-triage worker's stream handling).
+        try:
+            async with asyncio.timeout(run_timeout):
+                async for _name, _data in gen:
+                    pass
+        finally:
+            await gen.aclose()
+    except TimeoutError:
+        _LOGGER.warning(
+            "hunt_manager: investigation exceeded %ss wall-clock backstop for "
+            "inv_id=%s alert_id=%s — recorder lands status=error",
+            run_timeout,
+            inv_id,
+            alert_id,
+        )
     except Exception:
         _LOGGER.exception(
             "hunt_manager: background drain failed for inv_id=%s alert_id=%s",

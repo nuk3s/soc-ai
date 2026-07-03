@@ -267,7 +267,7 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
         # proposal_sink=None → the read-only chat agent WITHOUT propose_verdict:
         # a hunt never dispositions an alert, so there is no verdict to propose.
         agent = build_chat_agent(build_investigator_model(settings), ctx, system_prompt=sys_prompt)
-        async with asyncio.timeout(settings.chat_turn_timeout_s):
+        async with asyncio.timeout(settings.hunt_chat_turn_timeout_s):
             result = await agent.run(_hunt_chat_build_prompt(prior, question))
         answer = (str(result.output) or "").strip() or "(no answer produced)"
         meta: dict[str, Any] = {"tools": _hunt_chat_extract_tools(result)}
@@ -276,7 +276,7 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
                 db, assistant_event_id, content=answer, status="done", meta=meta
             )
     except TimeoutError:
-        timeout_s = getattr(state.settings, "chat_turn_timeout_s", 180)
+        timeout_s = getattr(state.settings, "hunt_chat_turn_timeout_s", 600)
         _LOGGER.warning("hunt-chat turn timed out for hunt=%s after %ss", hunt_id, timeout_s)
         await _hunt_chat_persist_error(
             state,

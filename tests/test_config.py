@@ -258,6 +258,44 @@ def test_inherit_window_default(settings_kratos: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Timeout / wall-clock backstop knobs
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_knob_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The chat/hunt/investigation wall-clock backstops carry the intended
+    defaults, and the hunt tier is slower than the investigation-chat tier."""
+    _setenv_required(monkeypatch)
+    s = Settings()
+    assert s.chat_turn_timeout_s == 300
+    assert s.hunt_chat_turn_timeout_s == 600
+    assert s.hunt_run_timeout_s == 1800
+    assert s.investigation_run_timeout_s == 900
+    assert s.investigation_turn_timeout_s == 600
+    # A hunt-chat turn is granted more wall-clock than an investigation chat turn.
+    assert s.hunt_chat_turn_timeout_s > s.chat_turn_timeout_s
+    # The whole-hunt safety net outlasts a single hunt-chat turn.
+    assert s.hunt_run_timeout_s > s.hunt_chat_turn_timeout_s
+    # The per-turn backstop is a true backstop: larger than a single gateway
+    # request timeout so it doesn't cut a turn that is legitimately retrying.
+    assert s.investigation_turn_timeout_s > s.litellm_request_timeout_s
+
+
+def test_timeout_knobs_overridable_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each timeout knob is env-overridable (case-insensitive keys)."""
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("HUNT_CHAT_TURN_TIMEOUT_S", "720")
+    monkeypatch.setenv("HUNT_RUN_TIMEOUT_S", "2400")
+    monkeypatch.setenv("INVESTIGATION_RUN_TIMEOUT_S", "1200")
+    monkeypatch.setenv("INVESTIGATION_TURN_TIMEOUT_S", "420")
+    s = Settings()
+    assert s.hunt_chat_turn_timeout_s == 720
+    assert s.hunt_run_timeout_s == 2400
+    assert s.investigation_run_timeout_s == 1200
+    assert s.investigation_turn_timeout_s == 420
+
+
+# ---------------------------------------------------------------------------
 # Auto-ack false-positive settings
 # ---------------------------------------------------------------------------
 

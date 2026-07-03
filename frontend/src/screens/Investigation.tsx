@@ -33,7 +33,9 @@ import { Markdown } from '../components/Markdown';
 import { Spinner } from '../components/States';
 import {
   type ChatThread,
+  ackGroup,
   approveAction,
+  escalateGroup,
   executeAction,
   getChatThread,
   downloadInvestigationExport,
@@ -114,6 +116,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     Record<string, 'approved' | 'rejected' | 'executing' | 'failed'>
   >({});
   const [actionMsg, setActionMsg] = useState<Record<string, string>>({});
+  // Settled-verdict fallback action bar: when a complete run recommended no
+  // write actions, the analyst can still ack/escalate the whole group directly.
+  const [settledAction, setSettledAction] = useState<'ack' | 'escalate' | null>(null);
+  const [settledMsg, setSettledMsg] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
   const [openSteps, setOpenSteps] = useState<Record<string, boolean>>({});
   const [flashStep, setFlashStep] = useState<string | null>(null);
   const [timelineOpen, setTimelineOpen] = useState(true);
@@ -186,6 +192,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   useEffect(() => {
     setActions({});
     setActionMsg({});
+    setSettledAction(null);
+    setSettledMsg(null);
     setOpenSteps({});
     setChat(inv.seedChat);
     setPending(false);
@@ -607,6 +615,76 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </CollapsibleSection>
   );
 
+  // A complete run that recommended NO write actions still leaves the analyst
+  // with a decision to make. This fallback bar routes an ack (close it out) or
+  // an escalate (open a case) through the same group write path the Alerts
+  // console uses — writing to the live Security Onion grid, after a confirm.
+  const runSettled = (kind: 'ack' | 'escalate') => {
+    const verb = kind === 'ack' ? 'Acknowledge' : 'Escalate';
+    if (
+      !window.confirm(
+        `${verb} "${inv.name}" against Security Onion?\n\nThis writes to your live grid.`,
+      )
+    )
+      return;
+    setSettledAction(kind);
+    setSettledMsg(null);
+    const group = { name: inv.name, kind: inv.kind };
+    const call =
+      kind === 'ack'
+        ? ackGroup(group).then((r) => `Acknowledged ${r.acked} of ${r.total} event${r.total === 1 ? '' : 's'}.`)
+        : escalateGroup(group).then(
+            (r) => `Escalated ${r.escalated} of ${r.total} event${r.total === 1 ? '' : 's'} to a case.`,
+          );
+    call
+      .then((text) => setSettledMsg({ tone: 'ok', text }))
+      .catch((e) => setSettledMsg({ tone: 'err', text: e instanceof Error ? e.message : 'request failed' }))
+      .finally(() => setSettledAction(null));
+  };
+  const settledActionEl =
+    inv.status === 'complete' && inv.actions.length === 0 ? (
+      <div
+        className="rounded-card border px-3.5 py-3"
+        style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
+      >
+        <div className="mb-1.5 text-[12px] font-semibold uppercase tracking-[.05em]" style={{ color: '#f5a623' }}>
+          Verdict settled — take action
+        </div>
+        <p className="mb-2.5 text-[13px] leading-[1.5] text-text-2">
+          The investigation recommended no automatic actions. Acknowledge to close out
+          this detection, or escalate it to a Security Onion case.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => runSettled('ack')}
+            disabled={settledAction !== null}
+            className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-text-2 hover:text-text disabled:opacity-60"
+            style={{ borderColor: 'rgba(123,168,147,.4)', background: 'rgba(123,168,147,.10)' }}
+          >
+            {settledAction === 'ack' ? <Spinner size={13} /> : <Check size={13} />}
+            {settledAction === 'ack' ? 'Acknowledging…' : 'Acknowledge'}
+          </button>
+          <button
+            onClick={() => runSettled('escalate')}
+            disabled={settledAction !== null}
+            className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold disabled:opacity-60"
+            style={{ borderColor: 'rgba(240,68,56,.4)', background: 'rgba(240,68,56,.10)', color: '#fca5a5' }}
+          >
+            {settledAction === 'escalate' ? <Spinner size={13} /> : <Triangle size={13} />}
+            {settledAction === 'escalate' ? 'Escalating…' : 'Escalate to case'}
+          </button>
+          {settledMsg && (
+            <span
+              className="text-[12px] font-semibold"
+              style={{ color: settledMsg.tone === 'ok' ? '#7ba893' : '#f04438' }}
+            >
+              {settledMsg.text}
+            </span>
+          )}
+        </div>
+      </div>
+    ) : null;
+
   const timelineEl = (
     <CollapsibleSection
       title="Investigation timeline"
@@ -773,7 +851,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             <div className="mt-[18px] grid grid-cols-1 items-start gap-[18px] lg:grid-cols-[minmax(0,1fr)_360px]">
               <div className="flex min-w-0 flex-col gap-[18px]">
                 {inv.nodes.length > 0 && entityEl}
-                {actionsEl}
+                {inv.actions.length > 0 ? actionsEl : settledActionEl}
                 {timelineEl}
                 {reasoningEl}
               </div>
@@ -806,7 +884,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {running && runningEl}
           {verdictEl}
           {inv.nodes.length > 0 && <div className="mt-[18px]">{entityEl}</div>}
-          <div className="mt-[18px]">{actionsEl}</div>
+          <div className="mt-[18px]">{inv.actions.length > 0 ? actionsEl : settledActionEl}</div>
           <div className="mt-5">{timelineEl}</div>
           {reasoningEl && <div className="mt-5">{reasoningEl}</div>}
           <div className="mt-5">

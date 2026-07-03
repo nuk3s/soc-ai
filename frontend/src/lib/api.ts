@@ -660,6 +660,13 @@ export interface AckGroupResult {
   capped: boolean;
 }
 
+export interface EscalateGroupResult {
+  escalated: number;
+  failed: number;
+  total: number;
+  capped: boolean;
+}
+
 export interface AssignResult {
   rule_name: string;
   owner: string | null;
@@ -674,7 +681,10 @@ export function assignAlert(ruleName: string, unassign = false): Promise<AssignR
 }
 
 /** Acknowledge all events for a detection group via the SO ack_alert write tool. */
-export function ackGroup(group: AlertGroup, query: AlertQuery = {}): Promise<AckGroupResult> {
+export function ackGroup(
+  group: Pick<AlertGroup, 'name' | 'kind'>,
+  query: AlertQuery = {},
+): Promise<AckGroupResult> {
   const body: Record<string, string | undefined> = { rule_name: group.name, kind: group.kind };
   if (query.range === 'custom' && query.from && query.to) {
     body.from_ = query.from;
@@ -689,6 +699,26 @@ export function ackGroup(group: AlertGroup, query: AlertQuery = {}): Promise<Ack
 /** Acknowledge a specific set of events by ES id (per-event selection). */
 export function ackEvents(esIds: string[]): Promise<AckGroupResult> {
   return post<AckGroupResult>('/alerts/ack-events', { es_ids: esIds });
+}
+
+/**
+ * Escalate all events for a detection group to Security Onion cases via the
+ * escalate_to_case write tool. Sibling of {@link ackGroup} — same body shape
+ * and filters; the backend caps how many cases a single call may open.
+ */
+export function escalateGroup(
+  group: { name: string; kind: string },
+  query: AlertQuery = {},
+): Promise<EscalateGroupResult> {
+  const body: Record<string, string | undefined> = { rule_name: group.name, kind: group.kind };
+  if (query.range === 'custom' && query.from && query.to) {
+    body.from_ = query.from;
+    body.to = query.to;
+  } else if (query.range) {
+    body.range = query.range;
+  }
+  if (query.severity) body.severity = query.severity;
+  return post<EscalateGroupResult>('/alerts/escalate-group', body);
 }
 
 // ── Internal-identifier managed list ────────────────────────────────────────────

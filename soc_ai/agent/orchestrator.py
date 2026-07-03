@@ -1153,6 +1153,55 @@ def _coverage_cap(
 # can be checked independently against the bundle JSON.
 _FUZZY_TOKEN_RE = re.compile(r"[A-Za-z0-9][\w./\-]{2,}")
 
+# GATE C: generic tokens that must never, on their own, resolve a citation
+# semantically. A citation that "matches" the bundle only on one of these (or on
+# a short generic substring) is hollow — it proves the model echoed a common word,
+# not that it cited a specific piece of evidence. Distinctive values (JA3 hashes,
+# IPs, domains, SPNs, file names) are long and/or unambiguous and still resolve.
+_CITATION_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "rule",
+        "name",
+        "tag",
+        "alert",
+        "event",
+        "true",
+        "false",
+        "the",
+        "and",
+        "for",
+        "with",
+        "dataset",
+        "suricata",
+        "zeek",
+        "type",
+        "field",
+        "value",
+        "source",
+        "dest",
+        "destination",
+        "host",
+        "port",
+        "proto",
+        "protocol",
+        "src",
+        "dst",
+        "flow",
+        "conn",
+        "data",
+        "info",
+        "note",
+        "metadata",
+        "signature",
+        "category",
+        "severity",
+        "message",
+        "http",
+        "dns",
+        "null",
+    }
+)
+
 
 def _bundle_dump_text(alert_ctx: Any) -> str:
     """Lower-cased JSON dump of the prefetch bundle for substring matching."""
@@ -1236,7 +1285,26 @@ def _resolve_citations(
                 bundle_text = _bundle_dump_text(alert_ctx)
             tokens = _FUZZY_TOKEN_RE.findall(c)
             for tok in tokens:
-                if len(tok) >= 3 and tok.lower() in bundle_text:
+                low = tok.lower()
+                # GATE C: a citation may resolve semantically only on a
+                # DISTINCTIVE token — never a stop-word, and never a bare short
+                # generic substring. A token qualifies when it is either
+                #   (a) long (>= 8 chars — JA3 hashes, sha256, full IPs, SPNs):
+                #       a substring match is enough, OR
+                #   (b) medium (>= 5 chars — a domain label like "c2.xyz", a
+                #       hyphenated host "evil-server", a short FQDN): it must match
+                #       on WORD BOUNDARIES, not as a fragment of a longer word.
+                # Tokens carry dots/hyphens/slashes (_FUZZY_TOKEN_RE), so the (b)
+                # path must NOT require ``isalnum`` — that would drop every domain
+                # and dotted IP. This kills hollow <=4-char / generic-word
+                # "resolutions" while preserving resolution of specific values.
+                if low in _CITATION_STOP_WORDS:
+                    continue
+                if len(tok) >= 8 and low in bundle_text:
+                    resolved = True
+                    resolution_kind = "semantic"
+                    break
+                if len(tok) >= 5 and re.search(rf"\b{re.escape(low)}\b", bundle_text):
                     resolved = True
                     resolution_kind = "semantic"
                     break
@@ -1505,6 +1573,63 @@ def _synth_first_post_validate(
     report = _apply_targeted_downgrades(
         report, enriched_ctx, audit, blocklist=blocklist, internal_cidrs=internal_cidrs
     )
+
+    # ----- GATE A: malware-rule-name payload gate (#21) -----
+    # "Content match is not corroboration." A true_positive on an alert whose
+    # rule name / metadata SIGNALS a malware family (ET MALWARE, a named-tool
+    # signature, a malware_family tag) must be grounded in a CONCRETE IOC hit OR
+    # a cited decisive typed pivot VALUE (JA3/JA3S, file hash, Kerberos SPN, SMB
+    # name, DCE-RPC endpoint) — never the rule label alone. Anchoring a TP on the
+    # signature name is the BPFDoor false-escalation pattern (a benign gateway↔Mac
+    # ping called TP because the rule said "BPFDoor"). When neither corroboration
+    # is present, downgrade to needs_more_info so the alert is investigated rather
+    # than rationalized from its own label.
+    #
+    # Runs AFTER _apply_targeted_downgrades so the deterministic solicited-internal
+    # -ICMP-echo TP→FP downgrade is already applied and its verdict is no longer
+    # true_positive here — that FP defense is preserved. The malware predicate is
+    # evaluated defensively: if it can't be assessed for this context (e.g. a
+    # partial/mock ctx that only backs model_dump), the gate fails OPEN and leaves
+    # the verdict unchanged rather than manufacturing a downgrade.
+    #
+    # A TP that survived a REAL investigation — a successful tool call in the loop
+    # transcript, or a Phase-D targeted dispatch — is corroborated beyond the rule
+    # label and is exempt (mirrors the hard evidence gate). The gate targets the
+    # zero-investigation "rule name says malware → TP" rationalization.
+    has_tool_evidence = (
+        count_successful_tool_calls(targeted_messages) >= 1 or targeted_tool_called is not None
+    )
+    if report.verdict == "true_positive" and not has_tool_evidence:
+        try:
+            from soc_ai.agent.decision_templates import (  # noqa: PLC0415
+                _rule_signals_malware,
+            )
+
+            rule_is_malware = _rule_signals_malware(enriched_ctx)
+        except Exception:
+            rule_is_malware = False
+        if (
+            rule_is_malware
+            and not _has_ioc_hit(enriched_ctx)
+            and not _verdict_cites_decisive_pivot_value(report, enriched_ctx)
+        ):
+            audit["malware_rule_name_ungrounded_downgrade"] = {
+                "original_verdict": report.verdict,
+                "capped_verdict": "needs_more_info",
+                "original_confidence": report.confidence,
+                "reason": (
+                    "true_positive on a malware-signalling rule name with no "
+                    "concrete IOC hit and no cited decisive pivot value — the rule "
+                    "label is not corroboration; coerced to needs_more_info for "
+                    "investigation"
+                ),
+            }
+            report = report.model_copy(
+                update={
+                    "verdict": "needs_more_info",
+                    "confidence": min(report.confidence, 0.4),
+                }
+            )
 
     # ----- Ungrounded host-anchored TP downgrade -----
     # Catches the defect where the LLM escalates to TP solely because the
@@ -3772,6 +3897,7 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
         alert_ctx.alert,
         alert_class,
         enrichment_cache=enrichment_cache,
+        blocklist=ctx.blocklist,
     )
     sampled_to_full = (
         fast_path_eligible
@@ -3908,15 +4034,16 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
         # the fast path.  Previously this mistakenly passed the full usage_limits,
         # making fast_path_usage_limits defined but never wired here.
         try:
-            synth_result = await synthesizer.run(
-                build_fast_path_synth_user_message(
-                    alert_id,
-                    alert_class.value,
-                    alert_ctx_json,
-                    materialized_evidence=materialized_evidence,
-                ),
-                usage_limits=effective_usage_limits,
-            )
+            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                synth_result = await synthesizer.run(
+                    build_fast_path_synth_user_message(
+                        alert_id,
+                        alert_class.value,
+                        alert_ctx_json,
+                        materialized_evidence=materialized_evidence,
+                    ),
+                    usage_limits=effective_usage_limits,
+                )
         except Exception as e:
             _LOGGER.exception("synthesizer run (fast-path round 1) failed")
             err_ev = _ev("error", _error_payload(e, phase="synthesizer", round_num=1))
@@ -3939,10 +4066,11 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
 
         # ----- Round 1: investigator -----
         try:
-            inv_result = await investigator.run(
-                investigator_user_message,
-                usage_limits=effective_usage_limits,
-            )
+            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                inv_result = await investigator.run(
+                    investigator_user_message,
+                    usage_limits=effective_usage_limits,
+                )
         except Exception as e:
             # Don't bail out — emit an `error` event for the audit trail and
             # fabricate a synthetic transcript so the synthesizer can still
@@ -3992,10 +4120,11 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
 
         # ----- Round 1: synthesizer (standard path) -----
         try:
-            synth_result = await synthesizer.run(
-                _format_transcript_for_synthesizer(alert_id, transcripts),
-                usage_limits=usage_limits,
-            )
+            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                synth_result = await synthesizer.run(
+                    _format_transcript_for_synthesizer(alert_id, transcripts),
+                    usage_limits=usage_limits,
+                )
         except Exception as e:
             _LOGGER.exception("synthesizer run (round 1) failed")
             err_ev = _ev("error", _error_payload(e, phase="synthesizer", round_num=1))
@@ -4223,16 +4352,17 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
             tool_calls_limit=ctx.settings.agent_retask_tool_calls_limit,
         )
         try:
-            inv2_result = await retask_investigator.run(
-                _format_retask_prompt(
-                    alert_id,
-                    transcript,
-                    missing_rubric=missing_rubric or [],
-                    alert_ctx=alert_ctx,
-                    reason=retask_reason,
-                ),
-                usage_limits=retask_usage_limits,
-            )
+            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                inv2_result = await retask_investigator.run(
+                    _format_retask_prompt(
+                        alert_id,
+                        transcript,
+                        missing_rubric=missing_rubric or [],
+                        alert_ctx=alert_ctx,
+                        reason=retask_reason,
+                    ),
+                    usage_limits=retask_usage_limits,
+                )
         except Exception as e:
             _LOGGER.exception("investigator run (round 2 / retask) failed")
             err_ev = _ev(
@@ -4266,10 +4396,11 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
 
             # Round 2 synthesizer over BOTH transcripts.
             try:
-                synth2_result = await synthesizer.run(
-                    _format_transcript_for_synthesizer(alert_id, transcripts),
-                    usage_limits=usage_limits,
-                )
+                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                    synth2_result = await synthesizer.run(
+                        _format_transcript_for_synthesizer(alert_id, transcripts),
+                        usage_limits=usage_limits,
+                    )
             except Exception as e:
                 _LOGGER.exception("synthesizer run (round 2) failed")
                 err_ev = _ev(
@@ -5144,7 +5275,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature)
         )
         try:
-            synth_result_round1 = await synth_agent.run(user_msg_round1)
+            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                synth_result_round1 = await synth_agent.run(user_msg_round1)
         except Exception as e:
             # Emit error event for the audit trail, then
             # fall through with a fallback NMI TriageReport so the row in
@@ -5154,6 +5286,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(err_ev)
             yield err_ev
             triage_round1 = _synth_failure_fallback_report(alert_id, "synth_first_round1", e)
+            await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
             triage_round1 = synth_result_round1.output
             round1_ok = True
@@ -5246,7 +5379,20 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # the following ModelRequestNode carries that step's tool results.
             node_msg: Any = None
             async with investigator.iter(inv_user_msg, usage_limits=loop_usage_limits) as inv_run:
-                async for node in inv_run:
+                # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
+                # iterator step (the model-run await that produces the next node),
+                # NOT one timeout spanning the whole multi-turn loop. Event
+                # projection + yielding stays outside the timeout so streaming is
+                # unchanged. A per-turn TimeoutError propagates to the same
+                # except-handlers below (error event + honest stop) as any other
+                # investigator failure.
+                node_iter = inv_run.__aiter__()
+                while True:
+                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                        try:
+                            node = await node_iter.__anext__()
+                        except StopAsyncIteration:
+                            break
                     # CallToolsNode carries the model's response (text + tool
                     # requests); the following ModelRequestNode carries that
                     # step's tool results. Detect by attribute so the message is
@@ -5275,6 +5421,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(err_ev)
             yield err_ev
             budget_exc = e
+        except TimeoutError as e:
+            # A per-turn wall-clock timeout (investigation_turn_timeout_s) fired
+            # while advancing the investigator on a slow stack. The evidence
+            # gathered before the hung turn already streamed live, so conclude
+            # GRACEFULLY with the round-1 verdict via the same budget-boundary
+            # fallback as UsageLimitExceeded — do NOT discard the run with
+            # status=error. (Mirrors the hunt runner's timeout→partial-report
+            # behaviour; a slow stack is the expected trigger, not an infra fault.)
+            _LOGGER.warning("investigation loop turn timed out: %s", e)
+            err_ev = _ev(
+                "error", _error_payload(e, phase="investigation_loop_timeout", round_num=1)
+            )
+            await _audit(err_ev)
+            yield err_ev
+            budget_exc = e
         except BaseException as e:
             # The investigator could not gather evidence — most often a transient
             # LLM-gateway connection drop (the openai client has already retried
@@ -5293,6 +5454,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # the streamed timeline). loop_messages stays None — the downstream
             # evidence/citation checks already handle that.
             triage_final = _round2_failure_fallback(alert_id, triage_round1, budget_exc)
+            await metrics.get_metrics().record_event("fallback_verdict", {})
         elif inv_result is None:
             # The agent run ended without a final result (no End node reached, and
             # no exception raised). Emit an honest error instead of crashing with an
@@ -5339,12 +5501,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 )
             )
             try:
-                loop_synth_result = await loop_synth.run(
-                    _format_transcript_for_synthesizer(
-                        alert_id, [loop_transcript], candidate=candidate
-                    ),
-                    usage_limits=loop_usage_limits,
-                )
+                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                    loop_synth_result = await loop_synth.run(
+                        _format_transcript_for_synthesizer(
+                            alert_id, [loop_transcript], candidate=candidate
+                        ),
+                        usage_limits=loop_usage_limits,
+                    )
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
             except BaseException as e:
@@ -5358,6 +5521,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 await _audit(err_ev)
                 yield err_ev
                 triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+                await metrics.get_metrics().record_event("fallback_verdict", {})
             else:
                 triage_final = loop_synth_result.output
                 loop_synth_usage_ev = _usage_ev(2, loop_synth_result)
@@ -5425,7 +5589,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             focus_hint=focus_hint,
         )
         try:
-            synth_result_round2 = await synth_agent.run(user_msg_round2)
+            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                synth_result_round2 = await synth_agent.run(user_msg_round2)
         except asyncio.CancelledError:
             raise  # cooperative cancel — propagate, never swallow
         except BaseException as e:
@@ -5435,6 +5600,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(err_ev)
             yield err_ev
             triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+            await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
             triage_final = synth_result_round2.output
             usage2_ev = _usage_ev(2, synth_result_round2)
@@ -5513,10 +5679,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(ev)
         yield ev
 
+    if "malware_rule_name_ungrounded_downgrade" in validation_audit:
+        ev = _ev(
+            "malware_rule_name_ungrounded_downgrade",
+            validation_audit["malware_rule_name_ungrounded_downgrade"],
+        )
+        await _audit(ev)
+        yield ev
+
     if "evidence_gate_downgrade" in validation_audit:
         ev = _ev("evidence_gate_downgrade", validation_audit["evidence_gate_downgrade"])
         await _audit(ev)
         yield ev
+        # Metric: a zero-tool TP/FP was coerced to needs_more_info by the hard
+        # evidence gate. Counts how often the gate fires (reliability signal).
+        await metrics.get_metrics().record_event("zero_tool_verdict_blocked", {})
 
     # ----- Oracle escalation (optional, explicit opt-in) -----
     # After all post-validators, escalate to the frontier Oracle when the local

@@ -101,6 +101,58 @@ class Settings(BaseSettings):
     and the pending status never gets stuck.  Bumped 180→300 after
     a legitimately-deep follow-up needed >180s; raise further for slower GPUs."""
 
+    hunt_chat_turn_timeout_s: int = 600
+    """Wall-clock timeout for a single HUNT-chat follow-up turn (seconds).
+
+    Larger than ``chat_turn_timeout_s`` (the investigation chat): a hunt chat
+    turn reasons over a broad HuntReport (many findings/hosts) and can issue
+    wider OQL pivots, so it legitimately runs longer than an alert-scoped
+    follow-up. Bounded by the same ``asyncio.timeout`` block inside the turn
+    (raising ``TimeoutError``, caught by the turn's error handler → terminal
+    error row, never a stuck ``pending``). Raise on a slower stack."""
+
+    hunt_run_timeout_s: int = 1800
+    """Whole-hunt wall-clock safety net for a slow stack (seconds).
+
+    A hunt's own request/tool budget (``hunt_request_limit`` /
+    ``hunt_tool_calls_limit``) governs the NORMAL stopping point; this is the
+    backstop for a HUNG LLM stream that would otherwise stall the background
+    hunt task indefinitely (no wall-clock limit). On expiry the exploration
+    run's ``asyncio.timeout`` raises ``TimeoutError``, which falls through to
+    the SAME partial-report synthesis path used for budget exhaustion — so the
+    hunt lands a grounded PARTIAL report from what it gathered, not an empty
+    error. Generous (30 min) so a legitimately-broad hunt on a slow model is
+    never cut short; raise for an even slower stack."""
+
+    investigation_run_timeout_s: int = 900
+    """Whole interactive-investigation wall-clock safety net (seconds).
+
+    Bounds a single on-demand ("Investigate") background run end to end. Like
+    the hunt/chat backstops, this is NOT the normal-path bound (the agent's
+    request budget governs that) — it is the safety net for a wedged LLM stream
+    that would otherwise leave the background task (and the investigation row)
+    running forever. On expiry the run's ``asyncio.timeout`` cancels the drain,
+    which the recorder's terminal-state handler lands as ``status='error'``
+    (the interrupted-run path), so the row never sticks in ``running``. Larger
+    than a per-turn cap but tighter than a hunt (a single investigation is
+    narrower than a broad hunt)."""
+
+    investigation_turn_timeout_s: int = 600
+    """Per-primary-agent-run wall-clock backstop for an investigation (seconds).
+
+    Bounds a SINGLE investigator/synthesizer agent run inside the pipeline (the
+    per-turn analogue of ``chat_turn_timeout_s``), so one wedged model call can't
+    consume the whole ``investigation_run_timeout_s`` budget on its own. Consumed
+    by the orchestrator (it wraps the agent run in an ``asyncio.timeout`` and
+    surfaces a ``TimeoutError`` to the existing per-run handler, which now
+    concludes GRACEFULLY with the round-1 verdict rather than erroring out).
+
+    Deliberately larger than ``litellm_request_timeout_s`` (300) so it is a true
+    BACKSTOP for a genuinely hung stream, not a racer against a single turn that
+    is legitimately retrying the gateway (``litellm_max_retries`` with jittered
+    backoff) on a slow stack — cutting such a turn mid-retry would throw away work
+    that was about to succeed. Raise further for very slow GPUs."""
+
     auto_triage_per_target_timeout_s: int = 600
     """Wall-clock backstop for a single auto-triage investigation (seconds).
 

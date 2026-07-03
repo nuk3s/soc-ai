@@ -163,6 +163,48 @@ event.module:zeek AND zeek.conn.duration:[60 TO *]
 event.kind:alert | count
 ```
 
+## Lateral-movement & behavioral examples
+
+These target the datasets that reveal east-west movement and RITA-style rollups.
+**Use them ONLY IF the dataset appears in the auto-discovered inventory** — an
+absent dataset means the grid does not collect that log, which is itself a finding.
+
+### 11. Kerberoasting (TGS requests with RC4 — weak-cipher ticket harvesting)
+
+```oql
+event.dataset:zeek.kerberos AND zeek.kerberos.request_type:TGS AND zeek.kerberos.cipher:RC4-HMAC
+```
+
+### 12. PsExec service creation (classic remote-exec lateral movement)
+
+```oql
+event.dataset:zeek.smb_files AND zeek.smb_files.name:PSEXESVC*
+```
+
+### 13. Completed (successful) SSH logins — the ones that actually landed
+
+```oql
+event.dataset:zeek.ssh AND zeek.ssh.auth_success:true
+```
+
+### 14. RITA-style behavioral rollups (beacon / DNS-tunnel summaries)
+
+When the grid ships summary datasets, they pre-compute beaconing and DNS-tunnel
+scores — a single decisive lens instead of reconstructing from raw conn/dns:
+
+```oql
+event.dataset:zeek.conn_summary OR event.dataset:zeek.dns_summary
+```
+
+### 15. Every host that contacted one attacker indicator (cross-host fan-out)
+
+Given an external attacker IP, find the SET of internal hosts that touched it —
+the fan-out itself is a finding. Use TEST-NET `203.0.113.7` as the indicator:
+
+```oql
+destination.ip:203.0.113.7 | groupby host.name | sortby count desc
+```
+
 ## Common pitfalls (avoid these)
 
 - **Don't quote bare numbers or IPs.** `source.port:"443"` and `source.ip:"203.0.113.1"` work, but the unquoted forms are clearer and behave identically.
