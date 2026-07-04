@@ -1,8 +1,3 @@
----
-hide:
-  - navigation
----
-
 # soc-ai
 
 <p align="center">

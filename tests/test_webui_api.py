@@ -4071,8 +4071,8 @@ def test_tool_outcome_never_leaks_json_and_humanizes_known_shapes() -> None:
         return t
 
     # host_summary with data -> "<ip> — N events", not the {ip,event_count} dict
-    t = title("t_host_summary", {"ip": "10.61.61.247", "observations": True, "event_count": 699})
-    assert t == "Host summary: 10.61.61.247 — 699 events"
+    t = title("t_host_summary", {"ip": "192.0.2.247", "observations": True, "event_count": 699})
+    assert t == "Host summary: 192.0.2.247 — 699 events"
     assert "{" not in t
     # host_summary, no observations
     assert (
@@ -4167,11 +4167,11 @@ def test_prevalence_title_has_no_iso_ms_timestamps() -> None:
     from soc_ai.api.webui_api import _tool_step
 
     summary = (
-        "10.61.61.247 ↔ 184.29.90.68: common — 56 event(s) across 5 distinct "
+        "192.0.2.247 ↔ 203.0.113.68: common — 56 event(s) across 5 distinct "
         "day(s) (first 2026-06-24T11:48:12.684Z, last 2026-06-30T09:01:02.123Z) "
         "in the last 30d."
     )
-    title, detail = _tool_step("t_prevalence", {"ip": "10.61.61.247"}, {"summary": summary})
+    title, detail = _tool_step("t_prevalence", {"ip": "192.0.2.247"}, {"summary": summary})
     assert "T11:48" not in title and ".684Z" not in title
     assert "(first" not in title
     assert "56 event(s) across 5 distinct day(s)" in title
