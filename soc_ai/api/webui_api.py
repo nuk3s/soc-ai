@@ -1,14 +1,10 @@
-"""JSON API for the React frontend, mounted at ``/api/v1``.
+"""Back-compat shim: the implementation now lives in :mod:`soc_ai.api.webui`.
 
-These endpoints mirror the shapes in ``frontend/src/lib/types.ts`` so the SPA's
-``src/lib/api.ts`` can ``fetch()`` them with no screen changes. The whole router
-is guarded by :func:`require_api_auth` (session cookie OR ``scai_`` bearer),
-exactly like the rest of the JSON API — when ``API_AUTH_REQUIRED`` is off (lab
-default) it's open.
-
-Mutations (approve/reject, chat, auto-triage, config save, action execution)
-go through a shared service layer (``soc_ai.webui`` managers) so every write
-flows through one code path.
+The former 4.9k-line monolith was split into the ``soc_ai.api.webui`` router
+package. Every top-level name that used to live here (routers, route handlers,
+response models, helpers, and the imported service-module aliases like ``aq``/
+``at``/``probes``) is re-exported so existing imports and test patch targets
+keep resolving from ``soc_ai.api.webui_api``.
 """
 
 from __future__ import annotations
@@ -39,6 +35,255 @@ from soc_ai.api.deps import ctx_from_state, get_elastic, get_settings_dep
 from soc_ai.api.hunt_runner import hunt_recorded_run
 from soc_ai.api.hunt_runner import sse_encode as hunt_sse_encode
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
+from soc_ai.api.webui import (
+    _ACK_CAP,
+    _ACK_CONCURRENCY,
+    _ACTION_TAG,
+    _ACTION_TITLE,
+    _DANGER_TEST_TARGETS,
+    _DEV_ME,
+    _DISCOVERY_STATE_ATTR,
+    _ESCALATE_CAP,
+    _FE_KIND,
+    _FE_SEV,
+    _HEALTH_PROBE_TTL_S,
+    _HUNT_STATUS,
+    _HUNT_TL_GROUP,
+    _HUNT_TL_SKIP,
+    _IDENTIFIER_KINDS,
+    _PCAP_PROBE_TTL_S,
+    _PORT_PROTO,
+    _RB_CONTENT_MAX,
+    _RB_LABEL,
+    _RB_LIST_MAX,
+    _REHUNT_CAP,
+    _RESERVED_SUFFIXES,
+    _SETTING_TYPE,
+    _STATUS,
+    _TEMPLATE_LABELS,
+    _TL_GROUP,
+    _TL_SKIP,
+    _TOOL_NOUN,
+    _VALID_VERDICTS,
+    AckEventsIn,
+    AckGroupIn,
+    AckGroupOut,
+    AgentToolsOut,
+    AlertEventOut,
+    AlertGroupOut,
+    ApiKeyOut,
+    ApiTokenOut,
+    ApproveIn,
+    AssignIn,
+    AssignOut,
+    AutoTriageIn,
+    AutoTriageStatusOut,
+    BacktestIn,
+    BacktestStatusOut,
+    ChatIn,
+    ChatMessageOut,
+    ChatThreadOut,
+    ConfigOut,
+    ConnTestOut,
+    CreateUserIn,
+    DangerSettingOut,
+    DataSourcesOut,
+    DetectionNominationOut,
+    DetectionOverrideIn,
+    DetectionOverrideOut,
+    DetectionTuningOut,
+    DiscoveryStatusOut,
+    EscalateGroupOut,
+    ExecuteActionResult,
+    HealthComponentOut,
+    HealthOut,
+    HuntActionOut,
+    HuntChatIn,
+    HuntChatIn2,
+    HuntChatMessageOut,
+    HuntChatThreadOut,
+    HuntFindingOut,
+    HuntOut,
+    HuntRowOut,
+    HuntStartIn,
+    HuntStatOut,
+    InternalIdentifierGroupOut,
+    InternalIdentifierIn,
+    InternalIdentifierRowOut,
+    InternalIdentifiersOut,
+    InvestigationOut,
+    InvestigationRowOut,
+    InvMetaOut,
+    LoginIn,
+    MeOut,
+    NotificationOut,
+    OracleOut,
+    OverrideVerdictIn,
+    RecommendedActionOut,
+    RedactionPreviewOut,
+    RehuntIn,
+    RehuntResultOut,
+    RepresentativeOut,
+    ResolveIn,
+    RunbookIn,
+    RunbookOut,
+    RunbookPatch,
+    SaveApiKeyIn,
+    SaveDangerIn,
+    SetRoleIn,
+    SetStatusIn,
+    SettingGroupOut,
+    SettingIn,
+    SettingOut,
+    TimelineStepOut,
+    TokenCreateIn,
+    UserOut,
+    UsersListOut,
+    WorkspaceOut,
+    _ack_many,
+    _action_detail,
+    _ago,
+    _alert_currently_acked,
+    _alert_meta,
+    _always_on_source,
+    _at_status,
+    _bounds,
+    _bt_row_out,
+    _bt_status_out,
+    _build_actions,
+    _build_hunt_timeline,
+    _build_oracle,
+    _build_timeline,
+    _cached_health_probes,
+    _cached_pcap_probe,
+    _chat_msg_out,
+    _collect_reasoning,
+    _compact,
+    _decision_record,
+    _detail_for,
+    _discovery_status_out,
+    _DiscoveryStatus,
+    _elapsed,
+    _elapsed_sec,
+    _entity_graph,
+    _ep,
+    _escalate_many,
+    _executed_actions,
+    _focus_hint_from_questions,
+    _get_discovery_status,
+    _host_signals,
+    _humanize_id,
+    _hunt_chat_msg_out,
+    _hunt_chat_thread,
+    _hunt_elapsed_sec,
+    _hunt_report,
+    _hunt_row,
+    _inherited_reason,
+    _inv_ago,
+    _iso_utc,
+    _kind,
+    _open_questions_of,
+    _override_out,
+    _persist_action_executed,
+    _pick_representative,
+    _primary_run_ids,
+    _proto,
+    _request_is_https,
+    _row,
+    _row_status,
+    _run_discovery_task,
+    _runbook_out,
+    _set_identifier_state,
+    _setting_value,
+    _sev,
+    _template_label,
+    _thread,
+    _tl_group,
+    _tool_outcome,
+    _tool_step,
+    _verdict,
+    ack_events,
+    ack_group,
+    activate_internal_identifier,
+    add_internal_identifier,
+    api_clear_api_key,
+    api_danger_test_connection,
+    api_get_agent_tools,
+    api_get_api_keys,
+    api_get_danger_settings,
+    api_login,
+    api_logout,
+    api_save_api_key,
+    api_save_danger_setting,
+    approve,
+    assign_alert,
+    auto_triage_status,
+    backtest_by_id,
+    backtest_status,
+    bulk_rehunt,
+    cancel_hunt,
+    cancel_hunt_chat,
+    client_ip,
+    create_detection_override,
+    create_runbook,
+    create_token,
+    create_user_endpoint,
+    deactivate_internal_identifier,
+    decision_record_public_key,
+    delete_hunt,
+    delete_internal_identifier,
+    delete_investigation,
+    delete_runbook,
+    discovery_scan_status,
+    escalate_group,
+    execute_action,
+    export_investigation,
+    get_chat,
+    get_config,
+    get_data_sources,
+    get_detection_tuning,
+    get_hunt,
+    get_hunt_chat,
+    get_investigation,
+    get_me,
+    get_representative,
+    health,
+    hunt_stats,
+    list_alerts,
+    list_group_events,
+    list_hunts,
+    list_internal_identifiers,
+    list_investigations,
+    list_notifications,
+    list_runbooks,
+    list_users_endpoint,
+    list_workspaces,
+    open_router,
+    oracle_redaction_preview,
+    override_verdict,
+    post_chat,
+    post_hunt_chat,
+    remove_detection_override,
+    request_more_info,
+    require_admin_api,
+    reset_user_password_endpoint,
+    resolve_alert_for_hunt,
+    resolve_investigation,
+    revoke_token,
+    router,
+    set_my_status,
+    set_setting,
+    set_user_role_endpoint,
+    start_auto_triage,
+    start_backtest,
+    start_discovery_scan,
+    start_hunt,
+    start_hunt_chat,
+    stop_auto_triage,
+    stream_hunt_chat,
+    toggle_user_disabled,
+    update_runbook,
+)
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
@@ -66,4564 +311,321 @@ from soc_ai.webui import (
 )
 from soc_ai.webui.deps import current_user
 
-_LOGGER = logging.getLogger(__name__)
-
-router = APIRouter(dependencies=[Depends(require_api_auth), Depends(require_csrf_safe)])
-
-# Pre-auth endpoints (login / logout) — NOT covered by require_api_auth.
-# Mounted under the same /api/v1 prefix in main.py but on a separate router
-# so the blanket auth dependency above doesn't apply.
-open_router = APIRouter()
-
-
-class LoginIn(BaseModel):
-    username: str
-    password: str
-
-
-def _request_is_https(request: Request) -> bool:
-    """True when the client connection is HTTPS, honoring a TLS-terminating proxy.
-
-    The canonical deployment terminates TLS in uvicorn (``request.url.scheme`` is
-    already ``https``). When the app sits behind a reverse proxy that terminates
-    TLS and forwards over plain HTTP, ``request.url.scheme`` reports ``http`` but
-    the proxy sets ``X-Forwarded-Proto: https`` — honor that so the ``Secure``
-    cookie flag is still applied. Plain-HTTP dev (no forwarded header, scheme
-    ``http``) stays False so local login isn't broken by an unsendable Secure
-    cookie.
-    """
-    if request.url.scheme == "https":
-        return True
-    forwarded = request.headers.get("x-forwarded-proto", "")
-    # May be a comma-separated list (proxy chain); the left-most is the client.
-    return forwarded.split(",")[0].strip().lower() == "https"
-
-
-def client_ip(request: Request, settings: Any) -> str:
-    """The caller's IP for per-IP throttling / rate-limiting.
-
-    Normally the socket peer. When the app runs behind a reverse proxy whose IP is
-    listed in ``proxy_trusted_ips``, trust the left-most ``X-Forwarded-For`` entry
-    so per-IP controls attribute to the real client, not the shared proxy IP.
-    ``X-Forwarded-For`` is NEVER trusted from a peer that is not allowlisted — any
-    client could otherwise forge it and evade (or poison) the throttles.
-    """
-    peer = request.client.host if request.client else "?"
-    trusted = getattr(settings, "proxy_trusted_ips", None) or ()
-    if peer in set(trusted):
-        first = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        if first:
-            return first
-    return peer
-
-
-@open_router.post("/login")
-async def api_login(body: LoginIn, request: Request) -> JSONResponse:
-    """Authenticate and set the session cookie.  No auth gate — this IS the gate.
-
-    A per-(client IP, username) sliding-window throttle locks out further
-    attempts after repeated failures to blunt online password brute-forcing.
-    """
-    settings = request.app.state.settings
-    caller_ip = client_ip(request, settings)
-    throttle = auth_svc.login_throttle
-    ip_throttle = auth_svc.login_ip_throttle  # per-IP across all usernames (spray)
-    if throttle.is_locked(caller_ip, body.username) or ip_throttle.is_locked(caller_ip, ""):
-        _LOGGER.warning(
-            "login locked out for user=%r from ip=%s (too many failed attempts)",
-            body.username,
-            caller_ip,
-        )
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "reason": "too_many_attempts",
-                "hint": "Too many failed logins; try again later.",
-            },
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        user = await auth_svc.authenticate(db, body.username, body.password)
-        if user is None:
-            locked = throttle.record_failure(caller_ip, body.username)
-            ip_throttle.record_failure(caller_ip, "")  # count toward the per-IP spray limit
-            if locked:
-                _LOGGER.warning(
-                    "login throttle engaged for user=%r from ip=%s after repeated failures",
-                    body.username,
-                    caller_ip,
-                )
-            raise HTTPException(
-                status_code=401,
-                detail={"reason": "invalid_credentials", "hint": "Invalid username or password"},
-            )
-        throttle.clear(caller_ip, body.username)
-        raw = await auth_svc.create_session(db, user, settings.session_ttl_hours)
-    resp = JSONResponse({"ok": True, "username": user.username, "role": user.role})
-    resp.set_cookie(
-        auth_svc.SESSION_COOKIE,
-        raw,
-        httponly=True,  # always: keep the session token out of reach of JS / XSS
-        samesite="lax",  # blocks cross-site cookie replay (CSRF) on state-changing nav
-        # HTTPS-only flag, gated on the scheme so plain-HTTP dev login still works.
-        secure=_request_is_https(request),
-        max_age=settings.session_ttl_hours * 3600,
-        path="/",
-    )
-    return resp
-
-
-@open_router.post("/logout")
-async def api_logout(request: Request) -> JSONResponse:
-    """Delete the current session cookie (best-effort — no CSRF needed to log yourself out)."""
-    raw = request.cookies.get(auth_svc.SESSION_COOKIE)
-    if raw is not None:
-        async with request.app.state.db_sessionmaker() as db:
-            await auth_svc.delete_session(db, raw)
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(auth_svc.SESSION_COOKIE, path="/")
-    return resp
-
-
-async def require_admin_api(request: Request) -> None:
-    """Admin gate for sensitive reads (config). No-op when API auth is off (dev)."""
-    if not request.app.state.settings.api_auth_required:
-        return
-    user = await current_user(request)
-    if user is None or user.role != "admin":
-        raise HTTPException(status_code=403, detail={"reason": "admin_required"})
-
-
-# The React unions are narrower than what the backend can emit; coerce to them
-# so the client never sees a value outside its TypeScript types.
-_FE_SEV = {"critical", "high", "medium", "low"}
-_FE_KIND = {"suricata", "sigma", "notice"}
-
-
-def _sev(value: str | None) -> str:
-    v = (value or "").lower()
-    return v if v in _FE_SEV else "low"
-
-
-def _kind(value: str | None) -> str:
-    v = (value or "").lower()
-    return v if v in _FE_KIND else "suricata"
-
-
-def _verdict(value: str | None) -> str:
-    return value or "untriaged"
-
-
-def _inv_ago(inv: Any) -> str | None:
-    """Short relative label for when an investigation ran (its created_at)."""
-    return _ago(inv.created_at.isoformat()) if inv.created_at else None
-
-
-def _ago(ts: str) -> str:
-    """ES ``@timestamp`` (ISO-8601) → a short relative label (now/3m/2h/5d)."""
-    if not ts:
-        return ""
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return ts
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    secs = (datetime.now(UTC) - dt).total_seconds()
-    if secs < 60:
-        return "now"
-    if secs < 3600:
-        return f"{int(secs // 60)}m"
-    if secs < 86400:
-        return f"{int(secs // 3600)}h"
-    return f"{int(secs // 86400)}d"
-
-
-def _iso_utc(dt: datetime | None) -> str:
-    """Serialize a stored timestamp as a TIMEZONE-AWARE ISO-8601 string.
-
-    Store timestamps are naive UTC (``store.auth.utcnow`` / SQLite ``func.now()``
-    both produce UTC). A NAIVE ISO string (``2026-07-02T11:23:49``) has no offset,
-    so a browser parses it as LOCAL time — off by the client's UTC offset (the
-    "1h-old run shows 8h ago" bug). Stamping ``+00:00`` lets the browser localize
-    it correctly. An already-aware datetime is passed through unchanged.
-    """
-    if dt is None:
-        return ""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.isoformat()
-
-
-class AlertEventOut(BaseModel):
-    id: str = ""  # es _id — needed by the upcoming per-event selection feature
-    src: str
-    dst: str
-    host: str
-    proto: str = ""
-    sev: str = "low"  # normalized severity label
-    port: int | None = None  # destination port
-    ts: str = ""  # raw ISO @timestamp (for sorting / tooltip)
-    ago: str = ""  # short relative label ("3m")
-    investigated: bool = False  # True when this exact event was investigated
-    invId: str | None = None  # investigation whose verdict applies to this event
-    inheritedReason: str | None = None  # human-readable reason when verdict is inherited
-    # Relative time of the investigation that gave this event its verdict, for BOTH
-    # the direct-investigated and inherited cases ("8m" → "investigated 8m ago").
-    # The inheritedReason string also embeds it, but a structured field lets the row
-    # render the investigation's time next to the alert's own time without regex.
-    investigatedAt: str | None = None
-
-
-class AlertGroupOut(BaseModel):
-    id: str
-    name: str
-    kind: str
-    sev: str
-    count: int
-    verdict: str
-    conf: float | None = None
-    latest: str
-    latestTs: str = ""
-    inherited: bool = False
-    owner: str | None = None
-    # Representative flow (source → destination) from the group's latest event, so
-    # the collapsed row shows BOTH hosts at a glance instead of hiding them.
-    src: str | None = None
-    dst: str | None = None
-    events: list[AlertEventOut] = []
-    # The investigation whose verdict this badge shows — the drawer opens it
-    # directly (None when the rule has never been investigated).
-    invId: str | None = None
-    # When inherited, why (so the analyst knows it wasn't investigated directly).
-    inheritedReason: str | None = None
-    # True when the rule's latest investigation is still running — the badge
-    # will show "Triaging…" instead of "untriaged".
-    triaging: bool = False
-    # Count of acknowledged / escalated events in this group (from ES aggs).
-    ackedCount: int = 0
-    escalatedCount: int = 0
-    # True when an operator has muted this rule (detection tuning). Muted groups
-    # are EXCLUDED from the default feed; they appear (flagged) only with
-    # ?include_muted=true.
-    muted: bool = False
-
-
-def _inherited_reason(inv: Investigation) -> str:
-    """Human explanation for an inherited verdict — WHICH investigation and WHEN,
-    so the analyst can trust (and open) the source rather than seeing an opaque
-    'inherited' badge."""
-    when = _ago(inv.created_at.isoformat()) if inv.created_at else "?"
-    flow = f"{inv.src_ip or '?'} → {inv.dest_ip or '?'}"
-    return (
-        f"Inherited — same detection, investigated {when} ago on {flow} "
-        f"(investigation {inv.id[:8]}…)"
-    )
-
-
-@router.get("/alerts", response_model=list[AlertGroupOut])
-async def list_alerts(
-    request: Request,
-    range_: str = Query("24h", alias="range"),
-    severity: str | None = None,
-    q: str | None = None,
-    sort: str = "count",
-    from_: str | None = Query(None, alias="from"),
-    to: str | None = None,
-    hide_acked: bool = Query(False),
-    include_muted: bool = Query(False),
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> list[AlertGroupOut]:
-    """Grouped-by-detection rows for the Alerts console (events loaded lazily).
-
-    Rules an operator has muted (detection tuning) are EXCLUDED from the default
-    feed; pass ``include_muted=true`` to show them (each flagged ``muted: true``).
-    """
-    try:
-        async with asyncio.timeout(settings.webui_grid_timeout_s):
-            groups, _total = await aq.fetch_groups(
-                elastic,
-                settings,
-                time_range=range_,
-                severity=severity,
-                oql=q,
-                sort=sort,
-                abs_from=from_,
-                abs_to=to,
-                time_zone=settings.so_timezone,
-                hide_acked=hide_acked,
-            )
-    except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
-    except (TimeoutError, TransportError) as exc:
-        # Fail fast with a clean error instead of hanging the console while the
-        # ES client retries a slow/unreachable Security Onion grid.
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "reason": "grid_unavailable",
-                "hint": (
-                    "The Security Onion grid (Elasticsearch) is slow or unreachable "
-                    "— retry shortly."
-                ),
-            },
-        ) from exc
-
-    # Verdict badge per rule = the rule's STANDING verdict (its latest COMPLETE,
-    # verdict-bearing investigation). A later interrupted run (error/cancelled/
-    # still-running) must NOT erase that verdict — it only drives the separate
-    # "Triaging…" flag. This keeps the group badge consistent with the per-event
-    # labels (which already match on complete investigations). "inherited" = the
-    # verdict came from a different alert than this group's latest event.
-    # badge per rule: (verdict, conf, cross_alert_inherited, inv_id, investigated_pair)
-    badges: dict[str, tuple[str, float | None, bool, str, str]] = {}
-    owners: dict[str, str] = {}
-    verdicts: dict[str, Investigation] = {}
-    running_rules: set[str] = set()
-    muted_rules: set[str] = set()
-    if groups:
-        rule_names = [g.rule_name for g in groups]
-        async with request.app.state.db_sessionmaker() as db:
-            verdicts = await inv_svc.latest_complete_for_rules(db, rule_names)
-            latest_any = await inv_svc.latest_for_rules(db, rule_names)
-            owners = await assign_svc.owners_for_rules(db, rule_names)
-            muted_rules = await override_svc.muted_rule_names(db)
-        # The id of the in-flight run per rule, so a "Triaging…" row links straight
-        # to its live investigation (a running row has no completed verdict, so its
-        # id never lands in `badges`/`verdicts`) — fixes the "only a Hunt link" gap.
-        running_inv_ids = {r: inv.id for r, inv in latest_any.items() if inv.status == "running"}
-        running_rules = set(running_inv_ids)
-        latest_ids = {g.rule_name: g.latest_id for g in groups}
-        for rule, inv in verdicts.items():
-            inherited = inv.alert_es_id != latest_ids.get(rule)
-            pair = f"{inv.src_ip or '?'} → {inv.dest_ip or '?'}"
-            badges[rule] = (_verdict(inv.verdict), inv.confidence, inherited, inv.id, pair)
-
-    out: list[AlertGroupOut] = []
-    for g in groups:
-        is_muted = g.rule_name in muted_rules
-        # Detection tuning: a muted rule is hidden from the default feed (a soft,
-        # soc-ai-side suppression — SO is untouched). It only surfaces, flagged,
-        # when the caller explicitly asks to include muted rules.
-        if is_muted and not include_muted:
-            continue
-        verdict, conf, inherited, inv_id, pair = badges.get(
-            g.rule_name, ("untriaged", None, False, "", "")
-        )
-        is_running = g.rule_name in running_rules
-        # A verdict is reached by investigating ONE representative alert and then
-        # applied to the whole group — so the other events inherit it. Surface
-        # that coverage (the analyst should know it's a sampled verdict), and
-        # flag the stronger case where even the representative differs.
-        reason: str | None = None
-        _inv = verdicts.get(g.rule_name)
-        if inv_id and inherited and _inv is not None:
-            reason = _inherited_reason(_inv)
-        elif inv_id and g.count > 1:
-            reason = f"Verdict from 1 of {g.count} events investigated"
-        out.append(
-            AlertGroupOut(
-                id=g.latest_id or g.rule_name,
-                name=g.rule_name,
-                kind=_kind(g.kind),
-                sev=_sev(g.severity),
-                count=g.count,
-                verdict=verdict,
-                conf=conf,
-                latest=_ago(g.latest_ts),
-                latestTs=g.latest_ts or "",
-                inherited=inherited,
-                owner=owners.get(g.rule_name),
-                src=g.src_ip,
-                dst=g.dst_ip,
-                events=[],
-                # Completed verdict's investigation if there is one, else the
-                # in-flight run's id so a "Triaging…" row opens its live drawer.
-                invId=inv_id or running_inv_ids.get(g.rule_name) or None,
-                inheritedReason=reason,
-                # "Triaging…" means this group has a LIVE investigation right now —
-                # keyed off the DB (latest run status == "running"), not the sweep's
-                # queue. The worker is sequential, so exactly the in-flight group
-                # shows it; the pill clears the instant that run finishes, and the
-                # triaging count matches the running-investigations count. Queued
-                # groups stay "untriaged" (their true state) until their turn.
-                triaging=is_running,
-                ackedCount=g.acked_count,
-                escalatedCount=g.escalated_count,
-                muted=is_muted,
-            )
-        )
-    return out
-
-
-@router.get("/alerts/events", response_model=list[AlertEventOut])
-async def list_group_events(
-    request: Request,
-    rule_name: str,
-    kind: str = "suricata",
-    range_: str = Query("24h", alias="range"),
-    severity: str | None = None,
-    q: str | None = None,
-    size: int = Query(aq.EVENTS_PER_GROUP, ge=1, le=aq.MAX_EVENTS),
-    offset: int = Query(0, ge=0),
-    from_: str | None = Query(None, alias="from"),
-    to: str | None = None,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> list[AlertEventOut]:
-    """Flat events for one detection group, newest first (the row-expand view).
-
-    Paginate large groups with ``size`` + ``offset`` ("load more")."""
-    try:
-        async with asyncio.timeout(settings.webui_grid_timeout_s):
-            events = await aq.fetch_group_events(
-                elastic,
-                settings,
-                rule_name=rule_name,
-                kind=kind,
-                time_range=range_,
-                severity=severity,
-                oql=q,
-                size=size,
-                offset=offset,
-                abs_from=from_,
-                abs_to=to,
-                time_zone=settings.so_timezone,
-            )
-    except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
-    except (TimeoutError, TransportError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "reason": "grid_unavailable",
-                "hint": (
-                    "The Security Onion grid (Elasticsearch) is slow or unreachable "
-                    "— retry shortly."
-                ),
-            },
-        ) from exc
-
-    # Three batched DB lookups — no per-event queries (no N+1).
-    # 1. Direct: events whose exact es_id was investigated.
-    # 2. Pair: events matching a (rule, src_ip, dst_ip) from a complete investigation.
-    # 3. Rule: any complete investigation for this rule (rule-level fallback).
-    async with request.app.state.db_sessionmaker() as db:
-        direct = await inv_svc.latest_for_alerts(db, [e.es_id for e in events])
-        ip_events = [e for e in events if e.src_ip and e.dst_ip]
-        pairs: list[tuple[str, str, str]] = [
-            (rule_name, e.src_ip, e.dst_ip)  # type: ignore[misc]
-            for e in ip_events
-        ]
-        pair_map = await inv_svc.latest_for_pairs(
-            db, pairs, window_days=settings.webui_inherit_window_days
-        )
-        # Rule-level fallback uses the rule's STANDING verdict (latest complete,
-        # verdict-bearing) — same source as the group badge — so every event in a
-        # triaged group inherits consistently. (Using the most-recent run of ANY
-        # status would skip the fallback whenever a later run errored/was
-        # cancelled, leaving some events mislabelled "untriaged".)
-        rule_map = await inv_svc.latest_complete_for_rules(db, [rule_name])
-    rule_inv = rule_map.get(rule_name)
-
-    out: list[AlertEventOut] = []
-    for e in events:
-        base = AlertEventOut(
-            id=e.es_id,
-            src=e.src,
-            dst=e.dst,
-            host=e.host,
-            sev=_sev(e.severity),
-            port=e.dst_port,
-            ts=e.timestamp,
-            ago=_ago(e.timestamp),
-        )
-        direct_inv = direct.get(e.es_id)
-        pair_inv = pair_map.get((rule_name, e.src_ip, e.dst_ip)) if e.src_ip and e.dst_ip else None
-        # A DIRECT run of this exact alert only "owns" it (investigated, NOT
-        # inherited) when it is complete (a landed verdict) or still running (an
-        # in-flight re-run). An error/cancelled direct run produced no verdict, so
-        # it must NOT claim the alert — fall through to the inherited pair/rule
-        # verdict (same re-huntable treatment as blocks_rehunt). This is the fix
-        # for "re-ran ON this alert but the pill still says inherited": the fresh
-        # re-run's alert_es_id == this event's es_id, so it lands here and clears
-        # the inherited flag.
-        if direct_inv is not None and direct_inv.status in ("complete", "running"):
-            base.investigated = True
-            base.invId = direct_inv.id
-            base.inheritedReason = None
-            base.investigatedAt = _inv_ago(direct_inv)
-        elif pair_inv is not None:
-            base.investigated = False
-            base.invId = pair_inv.id
-            base.inheritedReason = _inherited_reason(pair_inv)
-            base.investigatedAt = _inv_ago(pair_inv)
-        elif rule_inv is not None:  # already complete + verdict-bearing
-            base.investigated = False
-            base.invId = rule_inv.id
-            base.inheritedReason = _inherited_reason(rule_inv)
-            base.investigatedAt = _inv_ago(rule_inv)
-        out.append(base)
-    return out
-
-
-_ACK_CAP = 200  # maximum events acknowledged per ack-group call
-_ACK_CONCURRENCY = 8  # bounded fan-out for bulk ack to keep ES/SO round-trips parallel-but-capped
-
-
-async def _ack_many(
-    request: Request,
-    alert_ids: list[str],
-    *,
-    session_id: str,
-    caller: str,
-) -> tuple[int, int]:
-    """Acknowledge ``alert_ids`` concurrently under a bounded semaphore.
-
-    Each id goes through the same ``execute_write_tool`` write path as the
-    serial version (identical auth/audit/correctness), but the calls fan out
-    via ``asyncio.gather`` capped at ``_ACK_CONCURRENCY`` so a 200-event group
-    no longer blocks the HTTP response on hundreds of sequential round-trips.
-
-    Returns ``(acked, failed)``.  A write that returns an error tuple OR raises
-    counts as a failure; exceptions never escape (``return_exceptions=True``).
-    """
-    sem = asyncio.Semaphore(_ACK_CONCURRENCY)
-
-    async def _one(alert_id: str) -> bool:
-        async with sem:
-            _result, error = await execute_write_tool(
-                "ack_alert",
-                {"alert_id": alert_id},
-                auth=request.app.state.auth,
-                settings=request.app.state.settings,
-                audit=request.app.state.audit,
-                session_id=session_id,
-                user=caller,
-            )
-            return error is None
-
-    results = await asyncio.gather(
-        *(_one(alert_id) for alert_id in alert_ids),
-        return_exceptions=True,
-    )
-    acked = 0
-    failed = 0
-    for r in results:
-        if r is True:
-            acked += 1
-        else:
-            # error tuple (r is False) OR a raised exception (BaseException)
-            failed += 1
-            if isinstance(r, BaseException):
-                _LOGGER.warning("bulk-ack write raised (session=%s): %r", session_id, r)
-    return acked, failed
-
-
-class AckGroupIn(BaseModel):
-    rule_name: str
-    kind: str = "suricata"
-    range: str = aq.DEFAULT_RANGE
-    q: str | None = None
-    severity: str | None = None
-    from_: str | None = None
-    to: str | None = None
-
-    model_config = {"populate_by_name": True}
-
-
-class AckGroupOut(BaseModel):
-    acked: int
-    failed: int
-    total: int
-    capped: bool = False
-
-
-@router.post("/alerts/ack-group", response_model=AckGroupOut)
-async def ack_group(
-    request: Request,
-    body: AckGroupIn,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> AckGroupOut:
-    """Acknowledge all events for a detection group in Security Onion.
-
-    Fetches up to ``_ACK_CAP`` events matching the rule+filters and calls
-    ``ack_alert`` for each via the write-tool path.  Returns counts of
-    successes, failures, and whether the cap was hit.
-    """
-    caller = await identify_caller(request)
-    try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=body.rule_name,
-            kind=body.kind,
-            time_range=body.range,
-            severity=body.severity,
-            oql=body.q,
-            size=_ACK_CAP + 1,  # fetch one extra to detect capping
-            abs_from=body.from_,
-            abs_to=body.to,
-            time_zone=settings.so_timezone,
-            hide_acked=True,
-        )
-    except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
-
-    capped = len(events) > _ACK_CAP
-    events = events[:_ACK_CAP]
-
-    if not events:
-        return AckGroupOut(acked=0, failed=0, total=0)
-
-    acked, failed = await _ack_many(
-        request,
-        [ev.es_id for ev in events],
-        session_id=f"ack-group:{body.rule_name}",
-        caller=caller,
-    )
-
-    total = acked + failed
-    if capped:
-        logging.getLogger(__name__).warning(
-            "ack-group capped at %d events for rule %r (caller=%s)",
-            _ACK_CAP,
-            body.rule_name,
-            caller,
-        )
-
-    return AckGroupOut(acked=acked, failed=failed, total=total, capped=capped)
-
-
-# Escalate is capped far tighter than ack: each escalate opens a SOC case, so a
-# group escalate must not spray hundreds of cases. One case per matching event
-# mirrors the single-alert escalate_to_case action; the cap bounds the blast.
-_ESCALATE_CAP = 25
-
-
-async def _escalate_many(
-    request: Request,
-    events: list[Any],
-    *,
-    rule_name: str,
-    session_id: str,
-    caller: str,
-) -> tuple[int, int]:
-    """Escalate ``events`` to Security Onion cases under a bounded semaphore.
-
-    Each event goes through the same ``execute_write_tool`` write path as the
-    per-action escalate (identical auth/audit/correctness), fanning out via
-    ``asyncio.gather`` capped at ``_ACK_CONCURRENCY``. The escalate tool needs a
-    title + description, which the model supplies for the single-alert action;
-    here we synthesize a compact, secret-free case title/description from the
-    rule name and the event's endpoints. Returns ``(escalated, failed)``.
-    """
-    sem = asyncio.Semaphore(_ACK_CONCURRENCY)
-
-    async def _one(ev: Any) -> bool:
-        async with sem:
-            endpoints = f"{ev.src} → {ev.dst}" if getattr(ev, "src", None) else ""
-            _result, error = await execute_write_tool(
-                "escalate_to_case",
-                {
-                    "alert_id": ev.es_id,
-                    "case_title": f"{rule_name}"[:120] or "Escalated alert",
-                    "case_description": (
-                        f"Escalated from soc-ai: {rule_name}"
-                        + (f" ({endpoints})" if endpoints else "")
-                    ),
-                },
-                auth=request.app.state.auth,
-                settings=request.app.state.settings,
-                audit=request.app.state.audit,
-                session_id=session_id,
-                user=caller,
-            )
-            return error is None
-
-    results = await asyncio.gather(
-        *(_one(ev) for ev in events),
-        return_exceptions=True,
-    )
-    escalated = 0
-    failed = 0
-    for r in results:
-        if r is True:
-            escalated += 1
-        else:
-            failed += 1
-            if isinstance(r, BaseException):
-                _LOGGER.warning("bulk-escalate write raised (session=%s): %r", session_id, r)
-    return escalated, failed
-
-
-class EscalateGroupOut(BaseModel):
-    escalated: int
-    failed: int
-    total: int
-    capped: bool = False
-
-
-@router.post("/alerts/escalate-group", response_model=EscalateGroupOut)
-async def escalate_group(
-    request: Request,
-    body: AckGroupIn,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> EscalateGroupOut:
-    """Escalate a detection group to Security Onion cases.
-
-    Sibling of :func:`ack_group` — same auth/CSRF/signature and the same
-    ``fetch_group_events`` filters. Each matching event opens a case via the
-    ``escalate_to_case`` write tool; ``_ESCALATE_CAP`` bounds the number of
-    cases so a group escalate can never spray hundreds.
-    """
-    caller = await identify_caller(request)
-    try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=body.rule_name,
-            kind=body.kind,
-            time_range=body.range,
-            severity=body.severity,
-            oql=body.q,
-            size=_ESCALATE_CAP + 1,  # fetch one extra to detect capping
-            abs_from=body.from_,
-            abs_to=body.to,
-            time_zone=settings.so_timezone,
-            hide_acked=True,
-        )
-    except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
-
-    capped = len(events) > _ESCALATE_CAP
-    events = events[:_ESCALATE_CAP]
-
-    if not events:
-        return EscalateGroupOut(escalated=0, failed=0, total=0)
-
-    escalated, failed = await _escalate_many(
-        request,
-        events,
-        rule_name=body.rule_name,
-        session_id=f"escalate-group:{body.rule_name}",
-        caller=caller,
-    )
-
-    if capped:
-        logging.getLogger(__name__).warning(
-            "escalate-group capped at %d events for rule %r (caller=%s)",
-            _ESCALATE_CAP,
-            body.rule_name,
-            caller,
-        )
-
-    return EscalateGroupOut(
-        escalated=escalated, failed=failed, total=escalated + failed, capped=capped
-    )
-
-
-class AckEventsIn(BaseModel):
-    es_ids: list[str]
-
-
-@router.post("/alerts/ack-events", response_model=AckGroupOut)
-async def ack_events(
-    request: Request,
-    body: AckEventsIn,
-    settings: Settings = Depends(get_settings_dep),
-) -> AckGroupOut:
-    """Acknowledge a specific set of events by ES id (per-event selection)."""
-    caller = await identify_caller(request)
-    ids = list(dict.fromkeys(body.es_ids))[:_ACK_CAP]  # dedupe, cap
-    capped = len(body.es_ids) > _ACK_CAP
-    if not ids:
-        return AckGroupOut(acked=0, failed=0, total=0)
-    acked, failed = await _ack_many(
-        request,
-        ids,
-        session_id="ack-events",
-        caller=caller,
-    )
-
-    if capped:
-        logging.getLogger(__name__).warning(
-            "ack-events capped at %d events (caller=%s)",
-            _ACK_CAP,
-            caller,
-        )
-
-    return AckGroupOut(acked=acked, failed=failed, total=acked + failed, capped=capped)
-
-
-# ── Alert assignment ───────────────────────────────────────────────────────
-
-
-class AssignIn(BaseModel):
-    rule_name: str
-    unassign: bool = False
-
-
-class AssignOut(BaseModel):
-    rule_name: str
-    owner: str | None
-
-
-@router.post("/alerts/assign", response_model=AssignOut)
-async def assign_alert(
-    request: Request,
-    body: AssignIn,
-) -> AssignOut:
-    """Persist (or clear) the owner for a detection rule.
-
-    When ``unassign`` is False the caller is resolved via
-    :func:`~soc_ai.api.security.identify_caller` and stored as the owner.
-    When ``unassign`` is True the row is removed.  The owner value is a plain
-    username when the caller is authenticated via session, or ``token:<name>``
-    when using a bearer token, or ``"anonymous"`` when API auth is off.
-    """
-    async with request.app.state.db_sessionmaker() as db:
-        if body.unassign:
-            await assign_svc.clear_assignment(db, body.rule_name)
-            return AssignOut(rule_name=body.rule_name, owner=None)
-        owner = await identify_caller(request)
-        await assign_svc.set_assignment(db, body.rule_name, owner)
-    return AssignOut(rule_name=body.rule_name, owner=owner)
-
-
-# ── Representative-event picker ────────────────────────────────────────────
-
-
-class RepresentativeOut(BaseModel):
-    alert_id: str
-    src_ip: str | None = None
-    dst_ip: str | None = None
-    dst_port: int | None = None
-    matched: int
-    total: int
-    reason: str
-
-
-def _pick_representative(
-    events: list[aq.AlertEvent],
-) -> tuple[aq.AlertEvent, int, str]:
-    """Return (event, matched_count, reason) for the most-representative event.
-
-    Selection rule:
-    1. Count occurrences of each (src_ip, dst_ip, dst_port) tuple across all
-       events that have at least src_ip + dst_ip populated.
-    2. Modal tuple wins; ties broken by the most-recent event in that tuple.
-    3. Within the winning tuple choose the *newest* event.
-    4. If no IP-bearing events exist, fall back to the globally newest event.
-    """
-    # Only consider events that have both IPs (port may be None).
-    ip_events = [e for e in events if e.src_ip and e.dst_ip]
-    if not ip_events:
-        # Fallback: newest overall.
-        newest = max(events, key=lambda e: e.timestamp)
-        return (
-            newest,
-            1,
-            "No IP-bearing events in cluster —"
-            f" representative = newest overall ({newest.timestamp}).",
-        )
-
-    # Count tuples.
-    FlowKey = tuple[str | None, str | None, int | None]
-    counts: Counter[FlowKey] = Counter((e.src_ip, e.dst_ip, e.dst_port) for e in ip_events)
-    # Find the maximum count, then among all tuples with that count pick the one
-    # whose most-recent event is latest (tie-break by recency of the tuple).
-    max_count = max(counts.values())
-    winning_tuples = [t for t, c in counts.items() if c == max_count]
-
-    def _tuple_newest_ts(tup: FlowKey) -> str:
-        return max(
-            (e.timestamp for e in ip_events if (e.src_ip, e.dst_ip, e.dst_port) == tup),
-            default="",
-        )
-
-    winning_tuple = max(winning_tuples, key=_tuple_newest_ts)
-    src_ip, dst_ip, dst_port = winning_tuple
-
-    # Pick the newest event within the winning tuple.
-    candidates = [e for e in ip_events if (e.src_ip, e.dst_ip, e.dst_port) == winning_tuple]
-    representative = max(candidates, key=lambda e: e.timestamp)
-
-    dst_label = f"{dst_ip}:{dst_port}" if dst_port is not None else str(dst_ip)
-    reason = (
-        f"Most common flow {src_ip} → {dst_label}"
-        f" — {max_count} of {len(events)} events;"
-        f" representative = newest ({representative.timestamp})."
-    )
-    return representative, max_count, reason
-
-
-@router.get("/alerts/representative", response_model=RepresentativeOut)
-async def get_representative(
-    rule_name: str,
-    kind: str = "suricata",
-    range_: str = Query(aq.DEFAULT_RANGE, alias="range"),
-    severity: str | None = None,
-    q: str | None = None,
-    from_: str | None = Query(None, alias="from"),
-    to: str | None = None,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> RepresentativeOut:
-    """Pick the most-representative event for a detection group.
-
-    Selects the event whose (src_ip, dst_ip, dst_port) tuple is the most
-    common across up to 200 events in the cluster, breaking ties by recency.
-    Returns the ES ``_id`` to hunt and a human-readable rationale so the UI
-    can show the operator which event was chosen and why.
-    """
-    try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=rule_name,
-            kind=kind,
-            time_range=range_,
-            severity=severity,
-            oql=q,
-            size=aq.MAX_EVENTS,
-            abs_from=from_,
-            abs_to=to,
-            time_zone=settings.so_timezone,
-        )
-    except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
-
-    if not events:
-        raise HTTPException(
-            status_code=404,
-            detail={"reason": "no_events", "hint": "No events in window for this rule."},
-        )
-
-    rep, matched, reason = _pick_representative(events)
-    return RepresentativeOut(
-        alert_id=rep.es_id,
-        src_ip=rep.src_ip,
-        dst_ip=rep.dst_ip,
-        dst_port=rep.dst_port,
-        matched=matched,
-        total=len(events),
-        reason=reason,
-    )
-
-
-# ── Investigations ─────────────────────────────────────────────────────────
-
-# Frontend status union: running | complete | awaiting | error | cancelled | interrupted.
-_STATUS = {
-    "running": "running",
-    "complete": "complete",
-    "error": "error",
-    "cancelled": "cancelled",
-    "awaiting": "awaiting",
-    "interrupted": "interrupted",
-}
-
-
-def _row_status(inv: Investigation) -> str:
-    """Effective display status for an investigation row.
-
-    An unknown stored status falls back to 'error' (never silently 'complete'),
-    and a finished run that produced NO verdict is reported as 'error' — it never
-    reached a triage decision, so labelling it 'complete' would be a lie (the
-    verdict shows 'untriaged'). A real verdict — including needs_more_info — keeps
-    the stored status.
-    """
-    status = _STATUS.get(inv.status, "error")
-    if status == "complete" and not (inv.verdict or "").strip():
-        return "error"
-    return status
-
-
-class InvestigationRowOut(BaseModel):
-    id: str
-    name: str
-    kind: str
-    verdict: str
-    conf: float | None = None
-    host: str
-    # Destination IP — paired with ``host`` (the source) so the list shows the
-    # full source → destination flow, not just one end.
-    dst: str | None = None
-    status: str
-    when: str
-    ts: str = ""
-    chatCount: int = 0
-    # The alert this run investigated — lets the UI cluster retries of the SAME
-    # alert so errored/cancelled re-runs nest under the one that produced a verdict.
-    alertId: str = ""
-    # The canonical run for its alert: the latest COMPLETE run, else the latest of
-    # any status. The UI surfaces this row and tucks the rest away as "earlier runs".
-    isPrimary: bool = True
-
-
-def _elapsed_sec(inv: Investigation) -> int:
-    created = inv.created_at
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=UTC)
-    end = inv.finished_at or datetime.now(UTC)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=UTC)
-    return max(0, int((end - created).total_seconds()))
-
-
-def _elapsed(inv: Investigation) -> str:
-    s = _elapsed_sec(inv)
-    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60}s"
-
-
-def _row(
-    inv: Investigation, chat_count: int = 0, *, is_primary: bool = True
-) -> InvestigationRowOut:
-    return InvestigationRowOut(
-        id=inv.id,
-        name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
-        kind="suricata",
-        verdict=_verdict(inv.verdict),
-        conf=inv.confidence,
-        host=inv.src_ip or "—",
-        dst=getattr(inv, "dest_ip", None),
-        status=_row_status(inv),
-        when=_ago(_iso_utc(inv.created_at)),
-        # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
-        ts=_iso_utc(inv.created_at),
-        chatCount=chat_count,
-        alertId=getattr(inv, "alert_es_id", None) or inv.id,
-        isPrimary=is_primary,
-    )
-
-
-def _primary_run_ids(rows: list[Investigation]) -> set[str]:
-    """The canonical run id per alert: the most recent COMPLETE run, else the most
-    recent run of any status. ``rows`` are newest-first (``list_recent`` order)."""
-    best_complete: dict[str, str] = {}
-    best_any: dict[str, str] = {}
-    for inv in rows:  # newest-first, so first-seen per key is the most recent
-        key = getattr(inv, "alert_es_id", None) or inv.id
-        best_any.setdefault(key, inv.id)
-        if inv.status == "complete":
-            best_complete.setdefault(key, inv.id)
-    return {best_complete.get(key, run_id) for key, run_id in best_any.items()}
-
-
-@router.get("/investigations", response_model=list[InvestigationRowOut])
-async def list_investigations(
-    request: Request,
-    status: str | None = None,
-    limit: int = 100,
-) -> list[InvestigationRowOut]:
-    if status not in (None, "running", "complete", "error", "cancelled", "awaiting", "interrupted"):
-        status = None
-    async with request.app.state.db_sessionmaker() as db:
-        rows = await inv_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
-        chat_counts = await chat_svc.counts_for(db, [inv.id for inv in rows])
-    primary = _primary_run_ids(rows)
-    return [_row(inv, chat_counts.get(inv.id, 0), is_primary=inv.id in primary) for inv in rows]
-
-
-# ── Investigation detail ───────────────────────────────────────────────────
-
-_TL_GROUP = {
-    "session_start": "Prefetch & pivots",
-    "investigation_loop_entered": "Prefetch & pivots",
-    "alert_context": "Indicator enrichment",
-    "enriched_alert_context": "Indicator enrichment",
-    "tool_call": "Tool calls",
-    "tool_result": "Tool calls",
-    "model_response": "Tool calls",
-    "decision_template_match": "Decision",
-    "template_ceiling": "Decision",
-    "triage_report": "Decision",
-    "approval_request": "Decision",
-    "approval_required": "Decision",
-    "citation_validation": "Validators",
-    "citation_cap": "Validators",
-    "error": "Validators",
-}
-_TL_SKIP = {"usage", "done", "tool_result", "model_response", "synth_round1_skipped"}
-_PORT_PROTO = {21: "FTP", 22: "SSH", 53: "DNS", 80: "HTTP", 443: "TLS", 445: "SMB", 3389: "RDP"}
-_ACTION_TITLE = {
-    "ack_alert": "Acknowledge alert",
-    "escalate_to_case": "Escalate to case",
-    "add_case_comment": "Add case comment",
-}
-_ACTION_TAG = {"ack_alert": "ack", "escalate_to_case": "escalate", "add_case_comment": "comment"}
-
-
-def _tl_group(kind: str) -> str:
-    if kind.startswith("oracle"):
-        return "Oracle"
-    return _TL_GROUP.get(kind, "Tool calls")
-
-
-def _compact(obj: Any, limit: int = 160) -> str:
-    s = obj if isinstance(obj, str) else json.dumps(obj, default=str, ensure_ascii=False)
-    return s if len(s) <= limit else s[: limit - 1] + "…"
-
-
-def _ep(ip: Any, port: Any) -> str:
-    if not ip:
-        return "—"
-    return f"{ip}:{port}" if port not in (None, "") else str(ip)
-
-
-def _proto(alert: dict[str, Any]) -> str:
-    p = alert.get("destination_port") or alert.get("source_port")
-    try:
-        return _PORT_PROTO.get(int(p), "TCP") if p is not None else "—"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def _alert_meta(
-    alert: dict[str, Any], host_profile: dict[str, int], inv: Investigation
-) -> dict[str, Any] | None:
-    """The triggering detection's raw facts, from the stored alert context."""
-    if not alert:
-        return None
-    rule = alert.get("rule_name") or inv.rule_name or "—"
-    return {
-        "id": inv.alert_es_id or "",
-        "rule": rule,
-        "sid": alert.get("rule_uuid"),
-        "classtype": alert.get("classtype"),
-        "category": alert.get("event_category"),
-        "src": _ep(alert.get("source_ip"), alert.get("source_port")),
-        "dst": _ep(alert.get("destination_ip"), alert.get("destination_port")),
-        "proto": _proto(alert),
-        "action": alert.get("alert_action") or alert.get("event_action") or "—",
-        "firstSeen": "—",
-        "lastSeen": inv.created_at.isoformat(sep=" ", timespec="seconds"),
-        "count": int(host_profile.get(rule, 1) or 1),
-    }
-
-
-def _host_signals(host_profile: dict[str, int]) -> list[dict[str, Any]]:
-    """The host's other alert activity (rule -> count), ranked by volume. The
-    tone reflects relative volume on the host, not absolute rule severity."""
-    if not host_profile:
-        return []
-    items = sorted(host_profile.items(), key=lambda kv: kv[1], reverse=True)[:6]
-    mx = max((c for _, c in items), default=1) or 1
-    out: list[dict[str, Any]] = []
-    for rule, cnt in items:
-        ratio = cnt / mx
-        if ratio > 0.8:
-            tone = "critical"
-        elif ratio > 0.5:
-            tone = "high"
-        elif ratio > 0.25:
-            tone = "medium"
-        else:
-            tone = "low"
-        out.append(
-            {
-                "time": "",
-                "label": rule,
-                "tone": tone,
-                "w": max(6, int(100 * ratio)),
-                "sev": f"{cnt}×",  # noqa: RUF001  (count multiplier badge)
-            }
-        )
-    return out
-
-
-def _entity_graph(
-    alert: dict[str, Any], enrichments: dict[str, Any], inv: Investigation
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
-    """A real (if small) blast-radius graph: the host, the peers it contacted,
-    and which of those enrichment flagged as malicious."""
-    src = alert.get("source_ip") or inv.src_ip
-    dst = alert.get("destination_ip") or inv.dest_ip
-    label = alert.get("host_name") or src
-    if not src:
-        return [], [], None
-    nodes: list[dict[str, Any]] = [
-        {
-            "id": str(src),
-            "x": 20,
-            "y": 50,
-            "kind": "compromised" if inv.verdict == "true_positive" else "host",
-            "label": str(label or src),
-        }
-    ]
-    peers: list[str] = []
-    if dst and dst != src:
-        peers.append(str(dst))
-    for ind in enrichments:
-        if str(ind) != str(src) and str(ind) not in peers:
-            peers.append(str(ind))
-    peers = peers[:5]
-    edges: list[dict[str, Any]] = []
-    flagged = 0
-    n = len(peers)
-    for i, ip in enumerate(peers):
-        enr = enrichments.get(ip) or {}
-        bad = bool(enr.get("blocklist_hits") or enr.get("misp_hits"))
-        internal = bool(enr.get("internal"))
-        if bad:
-            flagged += 1
-        y = 50 if n <= 1 else int(18 + 64 * i / (n - 1))
-        node_kind = "c2" if bad else "dc" if internal else "host"
-        nodes.append({"id": ip, "x": 78, "y": y, "kind": node_kind, "label": ip})
-        edges.append({"from": str(src), "to": ip, "kind": "beacon" if bad else "flow"})
-    note = f"{label or src} contacted {n} peer(s)" + (
-        f"; {flagged} flagged malicious by enrichment" if flagged else ""
-    )
-    return nodes, edges, note
-
-
-# Friendly nouns for the read tools so a timeline step says what was checked.
-_TOOL_NOUN = {
-    "t_enrich_ip": "IP reputation",
-    "t_enrich_domain": "Domain reputation",
-    "t_enrich_hash": "File-hash reputation",
-    "t_query_events_oql": "Event search",
-    "t_query_zeek_logs": "Zeek logs",
-    "t_query_cases": "Cases",
-    "t_query_detections": "Detections",
-    "t_get_playbooks": "Playbooks",
-    "t_lookup_runbook": "Runbook",
-    "t_get_pcap": "PCAP",
-    "t_web_search": "Web search",
-    "t_crawl_page": "Page fetch",
-    "t_get_alert_context": "Alert context",
-    "final_result": "Final synthesis",
-}
-# Display labels for decision-template ids (don't presume the verdict in the name).
-_TEMPLATE_LABELS = {"clean_internal_traffic": "internal traffic"}
-
-
-def _humanize_id(s: str | None) -> str:
-    return (s or "").removeprefix("t_").replace("_", " ").strip() or "tool"
-
-
-def _template_label(tid: str | None) -> str:
-    return _TEMPLATE_LABELS.get(tid or "", _humanize_id(tid))
-
-
-def _tool_outcome(result: Any) -> str:
-    """A short, tool-aware outcome — the point of the step (vs 'total: 0')."""
-    if result is None:
-        return "running…"
-    if isinstance(result, list):
-        return "no results" if not result else f"{len(result)} result(s)"
-    if isinstance(result, str):
-        return _compact(result, 80)
-    if not isinstance(result, dict):
-        return _compact(result, 80)
-    # enrichment result
-    if {"blocklist_hits", "misp_hits", "indicator"} & set(result):
-        bl = result.get("blocklist_hits") or []
-        misp = result.get("misp_hits") or []
-        if bl or misp:
-            srcs = [str(h["source"]) for h in bl if isinstance(h, dict) and h.get("source")]
-            return "flagged malicious" + (f" ({', '.join(srcs)})" if srcs else "")
-        # A miss is a COVERAGE statement, not a verdict — say so precisely.
-        return "internal address" if result.get("internal") else "no blocklist/MISP match"
-    # ES query / zeek result
-    if result.get("prefetch_already_has_this"):
-        return "already in alert context"
-    if "total" in result or "hits" in result:
-        total = result.get("total_display") or result.get("total", 0)
-        return f"{total} match" if str(total) == "1" else f"{total} matches"
-    # web_search / list-shaped results carrying a count
-    if "result_count" in result:
-        n = result.get("result_count", 0)
-        return "no results" if n == 0 else f"{n} result" if n == 1 else f"{n} results"
-    for k in ("summary", "verdict", "status", "note", "hint"):
-        if result.get(k):
-            return _compact(result[k], 120)
-    return _compact({k: result[k] for k in list(result)[:3]}, 110)
-
-
-def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, str]:
-    """Title carries the point (tool + a short outcome); detail (shown on expand)
-    carries the FULL headline result first, then the query and any enrichment chips.
-
-    The collapsed title is necessarily clipped, so the expanded row is where the
-    analyst reads the whole answer — never just the arguments (the old behaviour).
-    """
-    noun = _TOOL_NOUN.get(tool_name, _humanize_id(tool_name).capitalize())
-    title = f"{noun}: {_tool_outcome(result)}"
-
-    lines: list[str] = []
-    headline_key: str | None = None
-    if isinstance(result, dict):
-        # The full answer first — generously capped (the title was the clipped one).
-        for k in ("summary", "verdict", "status", "note", "hint"):
-            if result.get(k):
-                headline_key = k
-                lines.append(f"result: {_compact(result[k], 600)}")
-                break
-    lines.append(f"query: {_compact(args, 200)}" if args else "no arguments")
-    if isinstance(result, dict):
-        extra = []
-        geo = result.get("geoip") if isinstance(result.get("geoip"), dict) else None
-        asn = result.get("asn") if isinstance(result.get("asn"), dict) else None
-        if geo and geo.get("country_name"):
-            extra.append(str(geo["country_name"]))
-        if asn and asn.get("asn_org"):
-            extra.append(str(asn["asn_org"]))
-        if result.get("cloud_provider"):
-            extra.append(str(result["cloud_provider"]))
-        # Don't repeat the hint if it was already the headline line.
-        if headline_key != "hint" and result.get("hint"):
-            extra.append(_compact(result["hint"], 120))
-        if extra:
-            lines.append(" · ".join(extra))
-    return title, "\n".join(lines)
-
-
-def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
-    """A human-readable details+outcome line per event (vs a raw JSON dump)."""
-    p = p or {}
-    if kind in ("enriched_alert_context", "alert_context"):
-        enr = p.get("enrichments") or {}
-        prof = p.get("host_alert_profile") or {}
-        return (
-            f"Loaded the alert and enriched {len(enr)} indicator(s); the host shows "
-            f"{len(prof)} distinct alert type(s) in the window."
-        )
-    if kind == "decision_template_match":
-        if p.get("matched"):
-            return (
-                f"Matched the '{_template_label(p.get('template_id'))}' pattern → "
-                f"{p.get('verdict')} ({p.get('confidence')}). {p.get('rationale', '')}".strip()
-            )
-        return "No pattern matched — ran a full tool-using investigation."
-    if kind == "investigation_loop_entered":
-        return (
-            f"{p.get('reason', '')} (round-1 was {p.get('round1_verdict')} @ "
-            f"{p.get('round1_confidence')})".strip()
-        )
-    if kind == "triage_report":
-        return f"{p.get('verdict')} ({p.get('confidence')})\n{_compact(p.get('summary', ''), 300)}"
-    if kind == "citation_validation":
-        c = p.get("counts") or {}
-        valid, total, cov = c.get("valid", "?"), p.get("total", "?"), p.get("coverage_ratio")
-        return f"{valid}/{total} citations valid (coverage {cov})"
-    if kind == "citation_cap":
-        return (
-            f"confidence {p.get('original_confidence')} → {p.get('capped_confidence')} "
-            "to respect citation coverage"
-        )
-    if kind == "investigation_transcript":
-        ev = p.get("evidence") or []
-        return f"{p.get('tentative_summary', '')}\nevidence gathered: {len(ev)} item(s)".strip()
-    if kind == "error":
-        return _compact(p.get("message") or p.get("error") or "", 240)
-    if kind == "session_start":
-        return f"pipeline: {p.get('pipeline', '?')}"
-    return _compact(p, 220)
-
-
-class RecommendedActionOut(BaseModel):
-    id: str
-    title: str
-    tag: str
-    rationale: str
-    token: str | None = None
-    pending: bool = False
-    # True when this action was already carried out by the system (e.g. auto-ack
-    # fired on a high-confidence FP). The UI renders it as done, NOT actionable —
-    # the analyst must not be offered an "Acknowledge" button for an already-acked
-    # alert. Durable: derived from the persisted event stream, not client state.
-    applied: bool = False
-
-
-class TimelineStepOut(BaseModel):
-    id: str
-    group: str
-    title: str
-    time: str = ""
-    detail: str = ""
-
-
-class ChatMessageOut(BaseModel):
-    role: str
-    text: str
-    tools: str | None = None
-    messageId: int | None = None
-    kind: str | None = None
-    validation: str | None = None
-    objection: str | None = None
-    token: str | None = None
-    applied: bool | None = None
-    proposal: dict[str, Any] | None = None
-
-
-class InvMetaOut(BaseModel):
-    model: str
-    oracle: str | None = None
-    ranBy: str
-    ranAt: str
-    toolCalls: int
-    pivots: int
-
-
-class OracleOut(BaseModel):
-    escalated: bool = True
-    reason: str | None = None
-    localVerdict: str | None = None
-    localConfidence: float | None = None
-    oracleVerdict: str | None = None
-    oracleConfidence: float | None = None
-    model: str | None = None
-    redacted: bool = False
-    redactionNote: str | None = None
-    changed: bool = False  # oracleVerdict differs from localVerdict
-
-
-class InvestigationOut(BaseModel):
-    id: str
-    groupId: str
-    name: str
-    kind: str
-    host: str
-    ip: str
-    verdict: str
-    conf: float
-    rationale: str
-    summary: list[dict[str, Any]]
-    status: str
-    elapsedLabel: str
-    elapsedSec: int = 0
-    actions: list[RecommendedActionOut]
-    timeline: list[TimelineStepOut]
-    nodes: list[dict[str, Any]] = []
-    edges: list[dict[str, Any]] = []
-    seedChat: list[ChatMessageOut] = []
-    meta: InvMetaOut | None = None
-    oracle: OracleOut | None = None
-    sev: str | None = None
-    alert: dict[str, Any] | None = None
-    hostContext: list[dict[str, Any]] = []
-    graphNote: str | None = None
-    openQuestions: list[str] = []
-    resolution: dict[str, Any] | None = None
-    validatorNote: str | None = None
-    # Ordered model reasoning traces (the <think> blocks) captured per model turn.
-    # Surfaced so an analyst can see WHY a verdict was reached — the "show your
-    # work" explainability the timeline (which skips model_response) drops.
-    reasoning: list[str] = []
-
-
-def _collect_reasoning(events: list[Any]) -> list[str]:
-    """Ordered reasoning traces from model_response events.
-
-    ``_walk_message`` attaches the model's ``<think>`` trace to each
-    model_response event as ``reasoning_trace``; the analyst timeline skips
-    model_response, so those traces are otherwise invisible. Collect the
-    non-empty ones in order for the "Model reasoning" panel.
-    """
-    out: list[str] = []
-    for e in events:
-        if e.kind != "model_response":
-            continue
-        trace = (e.payload or {}).get("reasoning_trace")
-        if isinstance(trace, str) and trace.strip():
-            out.append(trace.strip())
-    return out
-
-
-def _build_actions(
-    events: list[Any], report: dict[str, Any], pending_tokens: set[Any]
-) -> list[RecommendedActionOut]:
-    """Recommended actions: prefer live approval tokens, else report recommendations.
-
-    An ack action already carried out by auto-ack is flagged ``applied`` so the UI
-    never offers an "Acknowledge" button for an alert the system already acked.
-    """
-    # Auto-ack fired successfully? Then any ack action is already done.
-    auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
-    approval_events = [e for e in events if e.kind in ("approval_request", "approval_required")]
-    out: list[RecommendedActionOut] = []
-    if approval_events:
-        for i, ev in enumerate(approval_events):
-            tok = ev.payload.get("token")
-            tn = ev.payload.get("tool_name", "")
-            applied = auto_acked and tn == "ack_alert"
-            out.append(
-                RecommendedActionOut(
-                    id=tok or f"a{i}",
-                    title=_ACTION_TITLE.get(tn, tn or "Action"),
-                    tag=_ACTION_TAG.get(tn, "comment"),
-                    rationale=ev.payload.get("rationale", ""),
-                    # An already-applied action exposes no live token to act on.
-                    token=None if applied else tok,
-                    pending=False if applied else (tok in pending_tokens if tok else False),
-                    applied=applied,
-                )
-            )
-        return out
-    for i, a in enumerate(report.get("recommended_actions", []) or []):
-        tn = a.get("tool_name", "")
-        out.append(
-            RecommendedActionOut(
-                id=f"a{i}",
-                title=_ACTION_TITLE.get(tn, tn or "Action"),
-                tag=_ACTION_TAG.get(tn, "comment"),
-                rationale=a.get("rationale", ""),
-                applied=auto_acked and tn == "ack_alert",
-            )
-        )
-    return out
-
-
-def _build_oracle(events: list[Any]) -> OracleOut | None:
-    """Scan event stream for oracle_escalation / oracle_adjudication and build OracleOut.
-
-    Returns None when neither event kind is present (Oracle was not consulted).
-    If only oracle_escalation exists (Oracle was called but errored before returning),
-    the returned OracleOut has escalated=True but oracleVerdict=None.
-    """
-    esc_payload: dict[str, Any] | None = None
-    adj_payload: dict[str, Any] | None = None
-    for e in events:
-        if e.kind == "oracle_escalation":
-            esc_payload = e.payload or {}
-        elif e.kind == "oracle_adjudication":
-            adj_payload = e.payload or {}
-    if esc_payload is None and adj_payload is None:
-        return None
-
-    reason = (esc_payload or {}).get("reason")
-    local_verdict = (esc_payload or {}).get("local_verdict")
-    local_confidence = (esc_payload or {}).get("local_confidence")
-    oracle_verdict = (adj_payload or {}).get("oracle_verdict")
-    oracle_confidence = (adj_payload or {}).get("oracle_confidence")
-    oracle_model = (adj_payload or {}).get("oracle_model")
-    redaction = (adj_payload or {}).get("redaction")
-    redacted = bool(redaction)
-    redaction_note = redaction if redacted else None
-    changed = bool(oracle_verdict and local_verdict and oracle_verdict != local_verdict)
-    return OracleOut(
-        escalated=True,
-        reason=reason,
-        localVerdict=local_verdict,
-        localConfidence=local_confidence,
-        oracleVerdict=oracle_verdict,
-        oracleConfidence=oracle_confidence,
-        model=oracle_model,
-        redacted=redacted,
-        redactionNote=redaction_note,
-        changed=changed,
-    )
-
-
-def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int, bool]:
-    """Build the analyst timeline (what + details + outcome per step) and the
-    tool-call / pivot counts. tool_result events are merged into their tool_call."""
-    result_by_call = {
-        (e.payload or {}).get("tool_call_id"): (e.payload or {}).get("result")
-        for e in events
-        if e.kind == "tool_result"
-    }
-    timeline: list[TimelineStepOut] = []
-    tool_calls = pivots = 0
-    has_oracle = False
-    for e in events:
-        if e.kind in _TL_SKIP:
-            continue
-        p = e.payload or {}
-        if e.kind.startswith("oracle"):
-            has_oracle = True
-        if e.kind == "tool_call":
-            tool_calls += 1
-            tn = str(p.get("tool_name", ""))
-            if "query" in tn or "zeek" in tn or "pcap" in tn:
-                pivots += 1
-            result = result_by_call.get(p.get("tool_call_id"))
-            title, detail = _tool_step(tn, p.get("args") or {}, result)
-        elif e.kind == "decision_template_match":
-            title = (
-                f"Matched pattern: {_template_label(p.get('template_id'))}"
-                if p.get("matched")
-                else "No pattern matched — ran a full investigation"
-            )
-            detail = _detail_for(e.kind, p)
-        else:
-            title = timeline_labels.title_for(e.kind, p)
-            detail = _detail_for(e.kind, p)
-        timeline.append(
-            TimelineStepOut(
-                id=f"e{e.sequence}", group=_tl_group(e.kind), title=title, detail=detail
-            )
-        )
-    return timeline, tool_calls, pivots, has_oracle
-
-
-@router.get("/investigations/{inv_id}", response_model=InvestigationOut)
-async def get_investigation(
-    request: Request,
-    inv_id: str,
-    settings: Settings = Depends(get_settings_dep),
-) -> InvestigationOut:
-    async with request.app.state.db_sessionmaker() as db:
-        got = await inv_svc.get_with_events(db, inv_id)
-        if got is None:
-            # The drawer opens groups by alert es-id — resolve to its latest run.
-            by_alert = await inv_svc.latest_for_alerts(db, [inv_id])
-            inv0 = by_alert.get(inv_id)
-            if inv0 is not None:
-                got = await inv_svc.get_with_events(db, inv0.id)
-        if got is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        inv, events = got
-        chat = await chat_svc.list_messages(db, inv.id)
-    pending_tokens = {p.token for p in await request.app.state.gate.pending()}
-
-    report = inv.report or {}
-    actions = _build_actions(events, report, pending_tokens)
-
-    # The enriched-alert-context event carries the alert, the host's alert
-    # profile, and indicator enrichments — everything the rail + graph need.
-    enr_p: dict[str, Any] = {}
-    for e in events:
-        if e.kind in ("enriched_alert_context", "alert_context"):
-            enr_p = e.payload or {}
-            break
-    _ao_raw = enr_p.get("alert") or {}
-    alert_obj: dict[str, Any] = _ao_raw if isinstance(_ao_raw, dict) else {}
-    _hp_raw = enr_p.get("host_alert_profile") or {}
-    host_profile: dict[str, Any] = _hp_raw if isinstance(_hp_raw, dict) else {}
-    _en_raw = enr_p.get("enrichments") or {}
-    enrichments: dict[str, Any] = _en_raw if isinstance(_en_raw, dict) else {}
-
-    timeline, tool_calls, pivots, has_oracle = _build_timeline(events)
-    nodes, edges, graph_note = _entity_graph(alert_obj, enrichments, inv)
-    summary_text = report.get("summary") or inv.summary or ""
-    meta = InvMetaOut(
-        model=settings.analyst_model,
-        oracle="escalated to Oracle" if has_oracle else "not escalated — local verdict",
-        ranBy=inv.started_by or "—",
-        # tz-AWARE ISO (with +00:00) so the value is unambiguous UTC — the raw
-        # naive string had no offset, so it couldn't be localized/interpreted.
-        ranAt=_iso_utc(inv.created_at),
-        toolCalls=tool_calls,
-        pivots=pivots,
-    )
-    return InvestigationOut(
-        id=inv.id,
-        groupId=inv.alert_es_id or inv.id,
-        name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
-        kind="suricata",
-        host=alert_obj.get("host_name") or inv.src_ip or "—",
-        ip=inv.dest_ip or inv.src_ip or "—",
-        verdict=_verdict(inv.verdict),
-        conf=inv.confidence if inv.confidence is not None else 0.0,
-        rationale=inv.rationale or summary_text,
-        summary=[{"t": "text", "v": summary_text}],
-        status=(
-            "investigating"
-            if inv.status == "running"
-            # Reaped/stuck runs are persisted as ``error`` — surface that to the
-            # drawer so it can render a terminal "failed/interrupted" state
-            # instead of an empty "complete" verdict.
-            else "error"
-            if inv.status == "error"
-            # Operator-cancelled runs: a distinct terminal state, not a crash.
-            else "cancelled"
-            if inv.status == "cancelled"
-            # Restart-interrupted runs: benign, re-huntable, not a failure.
-            else "interrupted"
-            if inv.status == "interrupted"
-            else "complete"
-        ),
-        elapsedLabel=_elapsed(inv),
-        elapsedSec=_elapsed_sec(inv),
-        actions=actions,
-        timeline=timeline,
-        reasoning=_collect_reasoning(events),
-        nodes=nodes,
-        edges=edges,
-        seedChat=[_chat_msg_out(m) for m in chat],
-        meta=meta,
-        oracle=_build_oracle(events),
-        sev=_sev(alert_obj.get("severity_label")) if alert_obj else None,
-        alert=_alert_meta(alert_obj, host_profile, inv),
-        hostContext=_host_signals(host_profile),
-        graphNote=graph_note,
-        openQuestions=report.get("open_questions") or [],
-        resolution=report.get("resolution") or None,
-        validatorNote=report.get("validator_note") or None,
-    )
-
-
-# ── Config (admin) ─────────────────────────────────────────────────────────
-
-_SETTING_TYPE = {"bool": "toggle", "int": "number", "float": "number", "str": "text", "csv": "text"}
-
-
-class SettingOut(BaseModel):
-    key: str
-    # Human label (what the console shows as the field title); the raw key is kept
-    # as a secondary mono hint. Without this the UI fell back to the snake_case key.
-    label: str
-    help: str
-    source: str
-    apply: str
-    type: str
-    value: bool | float | str
-    bounds: str | None = None
-    options: list[str] | None = None
-
-
-class SettingGroupOut(BaseModel):
-    title: str
-    items: list[SettingOut]
-
-
-class ApiTokenOut(BaseModel):
-    id: int
-    name: str
-    prefix: str
-    created: str
-    used: str
-
-
-class ConfigOut(BaseModel):
-    groups: list[SettingGroupOut]
-    tokens: list[ApiTokenOut]
-    dangerHost: str
-
-
-# ── Danger-zone models ────────────────────────────────────────────────────────
-
-
-class DangerSettingOut(BaseModel):
-    key: str
-    label: str
-    type: str  # "secret" | "text" | "bool" | "csv"
-    isSet: bool  # whether a non-empty value is configured
-    source: str  # "env" | "db" | "unset"
-    hot: bool  # True = hot-apply, False = restart-required
-
-
-class SaveDangerIn(BaseModel):
-    key: str
-    value: str
-    confirm: str  # must equal key (typed confirmation)
-
-
-class ConnTestOut(BaseModel):
-    ok: bool
-    detail: str
-
-
-def _setting_value(spec: cfg_svc.SettingSpec, settings: Settings) -> bool | float | str:
-    val = getattr(settings, spec.attr, None)
-    if spec.type == "csv":
-        return ", ".join(str(x) for x in (val or []))
-    if spec.type == "bool":
-        return bool(val)
-    if spec.type in ("int", "float"):
-        return val if val is not None else 0
-    return "" if val is None else str(val)
-
-
-def _bounds(spec: cfg_svc.SettingSpec) -> str | None:
-    lo, hi = spec.min_value, spec.max_value
-    if lo is None and hi is None:
-        return None
-
-    def fmt(x: float | None) -> str:
-        if x is None:
-            return "∞"
-        return str(int(x)) if spec.type == "int" and x == int(x) else str(x)
-
-    return f"{fmt(lo)} to {fmt(hi)}"
-
-
-@router.get("/config", response_model=ConfigOut, dependencies=[Depends(require_admin_api)])
-async def get_config(
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> ConfigOut:
-    async with request.app.state.db_sessionmaker() as db:
-        overrides = await cfg_svc.load_overrides(db)
-        tokens = (
-            (await db.execute(select(ApiToken).order_by(ApiToken.created_at.desc())))
-            .scalars()
-            .all()
-        )
-
-    groups: list[SettingGroupOut] = []
-    for section in cfg_svc.SECTION_ORDER:
-        items = [
-            SettingOut(
-                key=spec.key,
-                label=spec.label,
-                help=spec.help,
-                source="db" if spec.key in overrides else "env",
-                apply="hot-apply" if spec.hot else "restart",
-                type=_SETTING_TYPE.get(spec.type, "text"),
-                value=_setting_value(spec, settings),
-                bounds=_bounds(spec),
-            )
-            for spec in cfg_svc.WHITELIST
-            if spec.section == section and not spec.danger and not spec.secret
-        ]
-        if items:
-            groups.append(SettingGroupOut(title=section, items=items))
-
-    token_views = [
-        ApiTokenOut(
-            id=t.id,
-            name=t.name,
-            prefix="scai_••••",
-            created=_ago(t.created_at.isoformat()),
-            used=_ago(t.last_used_at.isoformat()) if t.last_used_at else "never",
-        )
-        for t in tokens
-        if not t.revoked
-    ]
-    return ConfigOut(
-        groups=groups, tokens=token_views, dangerHost=str(settings.so_host or "soc-ai")
-    )
-
-
-class DataSourcesOut(BaseModel):
-    sources: list[DataSourceOut]
-
-
-@router.get(
-    "/config/data-sources",
-    response_model=DataSourcesOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def get_data_sources(
-    settings: Settings = Depends(get_settings_dep),
-) -> DataSourcesOut:
-    """Every enrichment data source — local feeds + opt-in online lookups — with
-    freshness and key/enable status, for the config console's Data Sources panel."""
-    return DataSourcesOut(sources=collect_data_sources(settings))
-
-
-# ── Shell chrome: workspaces + notifications ───────────────────────────────
-
-
-class WorkspaceOut(BaseModel):
-    name: str
-    env: str
-
-
-class NotificationOut(BaseModel):
-    id: str
-    tone: str
-    title: str
-    when: str
-    href: str | None = None
-
-
-@router.get("/workspaces", response_model=list[WorkspaceOut])
-async def list_workspaces(settings: Settings = Depends(get_settings_dep)) -> list[WorkspaceOut]:
-    host = str(settings.so_host or "Security Onion")
-    name = host.replace("https://", "").replace("http://", "").rstrip("/") or "Security Onion"
-    return [WorkspaceOut(name=name, env="prod")]
-
-
-@router.get("/notifications", response_model=list[NotificationOut])
-async def list_notifications(request: Request) -> list[NotificationOut]:
-    out: list[NotificationOut] = []
-    for p in await request.app.state.gate.pending():
-        inv_id = p.metadata.get("investigation_id") if p.metadata else None
-        out.append(
-            NotificationOut(
-                id=f"approval:{p.token}",
-                tone="warn",
-                title=f"Action awaiting approval: {p.tool_name}",
-                when="",
-                href=f"/investigation/{inv_id}" if inv_id else None,
-            )
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        running = await inv_svc.list_recent(db, status="running", limit=20)
-    for inv in running:
-        out.append(
-            NotificationOut(
-                id=f"inv:{inv.id}",
-                tone="accent",
-                title=f"Investigating: {inv.rule_name or inv.id}",
-                when=_ago(inv.created_at.isoformat()),
-                href=f"/investigation/{inv.id}",
-            )
-        )
-    return out[:12]
-
-
-# ── Hunts (Hunt Console) ─────────────────────────────────────────────────────
-# A Hunt is broader than an Investigation: it correlates across hosts/time or a
-# free-form objective and lands findings + a narrative (HuntReport), rather than
-# a single-alert verdict. Read-only in this phase. The chat-driven hunt runs on
-# the hunt agent (soc_ai.agent.hunt) via the HuntConsoleManager background task.
-
-
-class HuntStatOut(BaseModel):
-    label: str
-    value: str
-    sub: str
-    tone: str
-
-
-class HuntRowOut(BaseModel):
-    id: str
-    objective: str
-    kind: str
-    status: str
-    findingCount: int = 0
-    affectedHosts: int = 0
-    confidence: float | None = None
-    startedBy: str = ""
-    when: str = ""
-    ts: str = ""
-
-
-# Hunt-timeline grouping. The hunt agent emits the same generic tool_call /
-# tool_result / model_response kinds as the investigator, so the shared
-# _tool_step / _compact formatters apply; only the group buckets differ.
-_HUNT_TL_GROUP = {
-    "hunt_started": "Objective",
-    "tool_call": "Tool calls",
-    "hunt_report": "Findings",
-    "error": "Findings",
-}
-# chat_user/chat_assistant carry the follow-up "Chat about this hunt" thread —
-# surfaced via GET /hunts/{id}/chat, NOT the execution timeline.
-_HUNT_TL_SKIP = {"tool_result", "model_response", "done", "chat_user", "chat_assistant"}
-
-
-class HuntFindingOut(BaseModel):
-    title: str
-    detail: str
-    severity: str = "info"
-    hosts: list[str] = []
-    citations: list[str] = []
-
-
-class HuntActionOut(BaseModel):
-    title: str
-    rationale: str
-
-
-class HuntOut(BaseModel):
-    id: str
-    objective: str
-    kind: str
-    status: str
-    narrative: str
-    findings: list[HuntFindingOut] = []
-    affectedHosts: list[str] = []
-    mitreTechniques: list[str] = []
-    recommendedActions: list[HuntActionOut] = []
-    confidence: float = 0.0
-    startedBy: str = ""
-    elapsedLabel: str = ""
-    elapsedSec: int = 0
-    ts: str = ""
-    timeline: list[TimelineStepOut] = []
-
-
-_HUNT_STATUS = {
-    "running": "running",
-    "complete": "complete",
-    "error": "error",
-    "cancelled": "cancelled",
-    "interrupted": "interrupted",
-}
-
-
-def _hunt_elapsed_sec(hunt: Hunt) -> int:
-    created = hunt.created_at
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=UTC)
-    end = hunt.finished_at or datetime.now(UTC)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=UTC)
-    return max(0, int((end - created).total_seconds()))
-
-
-def _hunt_report(hunt: Hunt) -> dict[str, Any]:
-    return hunt.report if isinstance(hunt.report, dict) else {}
-
-
-def _hunt_row(hunt: Hunt) -> HuntRowOut:
-    report = _hunt_report(hunt)
-    findings = report.get("findings") or []
-    return HuntRowOut(
-        id=hunt.id,
-        objective=hunt.objective,
-        kind=hunt.kind,
-        status=_HUNT_STATUS.get(hunt.status, "error"),
-        findingCount=len(findings) if isinstance(findings, list) else 0,
-        affectedHosts=len(report.get("affected_hosts") or []),
-        confidence=report.get("confidence"),
-        startedBy=hunt.started_by or "—",
-        when=_ago(_iso_utc(hunt.created_at)),
-        # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
-        ts=_iso_utc(hunt.created_at),
-    )
-
-
-def _build_hunt_timeline(events: list[HuntEvent]) -> list[TimelineStepOut]:
-    """Reuse the shared tool-step formatter; bucket by the hunt group map."""
-    result_by_call = {
-        (e.payload or {}).get("tool_call_id"): (e.payload or {}).get("result")
-        for e in events
-        if e.kind == "tool_result"
-    }
-    timeline: list[TimelineStepOut] = []
-    for e in events:
-        if e.kind in _HUNT_TL_SKIP:
-            continue
-        p = e.payload or {}
-        if e.kind == "tool_call":
-            tn = str(p.get("tool_name", ""))
-            result = result_by_call.get(p.get("tool_call_id"))
-            title, detail = _tool_step(tn, p.get("args") or {}, result)
-        elif e.kind == "hunt_started":
-            title = "Objective"
-            detail = _compact(p.get("objective") or "", 400)
-        elif e.kind == "hunt_report":
-            findings = p.get("findings") or []
-            n = len(findings) if isinstance(findings, list) else 0
-            title = f"Hunt report: {n} finding" + ("" if n == 1 else "s")
-            detail = _compact(p.get("narrative") or "", 400)
-        elif e.kind == "error":
-            title = "Hunt failed"
-            detail = _compact(p.get("message") or p.get("error") or "", 240)
-        else:
-            title = timeline_labels.title_for(e.kind, p)
-            detail = _compact(p, 220)
-        timeline.append(
-            TimelineStepOut(
-                id=f"h{e.sequence}",
-                group=_HUNT_TL_GROUP.get(e.kind, "Tool calls"),
-                title=title,
-                detail=detail,
-            )
-        )
-    return timeline
-
-
-@router.get("/hunts", response_model=list[HuntRowOut])
-async def list_hunts(
-    request: Request, status: str | None = None, limit: int = 100
-) -> list[HuntRowOut]:
-    if status not in (None, "running", "complete", "error", "cancelled", "interrupted"):
-        status = None
-    async with request.app.state.db_sessionmaker() as db:
-        rows = await hunt_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
-    return [_hunt_row(h) for h in rows]
-
-
-@router.get("/hunts/stats", response_model=list[HuntStatOut])
-async def hunt_stats(request: Request) -> list[HuntStatOut]:
-    async with request.app.state.db_sessionmaker() as db:
-        recent = await hunt_svc.list_recent(db, status=None, limit=500)
-    total = len(recent)
-    running = sum(1 for h in recent if h.status == "running")
-    findings = sum(
-        len(_hunt_report(h).get("findings") or []) for h in recent if h.status == "complete"
-    )
-    return [
-        HuntStatOut(label="Hunts", value=str(total), sub="recent", tone="accent"),
-        HuntStatOut(label="Findings", value=str(findings), sub="surfaced", tone="warn"),
-        HuntStatOut(label="In progress", value=str(running), sub="running now", tone="sigma"),
-    ]
-
-
-@router.get("/hunts/{hunt_id}", response_model=HuntOut)
-async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
-    async with request.app.state.db_sessionmaker() as db:
-        got = await hunt_svc.get_with_events(db, hunt_id)
-    if got is None:
-        raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    hunt, events = got
-    report = _hunt_report(hunt)
-    findings = report.get("findings") or []
-    actions = report.get("recommended_actions") or []
-    elapsed = _hunt_elapsed_sec(hunt)  # compute once, not four times inline below
-    return HuntOut(
-        id=hunt.id,
-        objective=hunt.objective,
-        kind=hunt.kind,
-        status=_HUNT_STATUS.get(hunt.status, "error"),
-        narrative=hunt.narrative or report.get("narrative") or "",
-        findings=[
-            HuntFindingOut(
-                title=str(f.get("title") or ""),
-                detail=str(f.get("detail") or ""),
-                severity=str(f.get("severity") or "info"),
-                hosts=[str(h) for h in (f.get("hosts") or [])],
-                citations=[str(c) for c in (f.get("citations") or [])],
-            )
-            for f in findings
-            if isinstance(f, dict)
-        ],
-        affectedHosts=[str(h) for h in (report.get("affected_hosts") or [])],
-        mitreTechniques=[str(m) for m in (report.get("mitre_techniques") or [])],
-        recommendedActions=[
-            HuntActionOut(title=str(a.get("title") or ""), rationale=str(a.get("rationale") or ""))
-            for a in actions
-            if isinstance(a, dict)
-        ],
-        confidence=float(report.get("confidence") or 0.0),
-        startedBy=hunt.started_by or "—",
-        elapsedLabel=(f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m {elapsed % 60}s"),
-        elapsedSec=elapsed,
-        # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
-        ts=_iso_utc(hunt.created_at),
-        timeline=_build_hunt_timeline(events),
-    )
-
-
-class HuntChatIn(BaseModel):
-    # Non-blank objective — an empty hunt objective is a no-op that would burn a
-    # model call for nothing.
-    objective: str = Field(min_length=1, max_length=2000)
-    # Optional prior hunt id for a follow-up turn: its narrative seeds the new
-    # hunt so the agent can pivot within the thread.
-    prior_hunt_id: str | None = None
-
-
-@router.post("/hunts/chat")
-async def start_hunt_chat(request: Request, body: HuntChatIn) -> dict[str, str]:
-    """Start a background chat-driven hunt; returns its id immediately.
-
-    The Hunt Console UI opens the new hunt's detail and polls it live (mirrors
-    the investigation-hunt POST /hunt flow). A dedicated SSE endpoint isn't used
-    by the SPA because a POST can't drive an EventSource; the background drainer
-    persists every event and the detail view polls the timeline.
-    """
-    started_by = await identify_caller(request)
-    prior: str | None = None
-    if body.prior_hunt_id:
-        async with request.app.state.db_sessionmaker() as db:
-            got = await hunt_svc.get_with_events(db, body.prior_hunt_id)
-        if got is not None:
-            prior_hunt, _ = got
-            prior = prior_hunt.narrative or _hunt_report(prior_hunt).get("narrative")
-    hunt_id = await hunt_console_manager.get_manager(request.app.state).start(
-        request.app.state, objective=body.objective, started_by=started_by, prior=prior
-    )
-    if hunt_id is None:
-        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
-    return {"hunt_id": hunt_id}
-
-
-@router.post("/hunts/chat/stream")
-async def stream_hunt_chat(request: Request, body: HuntChatIn) -> EventSourceResponse:
-    """Stream a chat-driven hunt as Server-Sent Events (mirror of /investigate).
-
-    Each SSE message is ``event: {kind}`` / ``data: {json}``. The stream is teed
-    into the hunts store so the run is persisted regardless of caller; the leading
-    ``hunt_created`` event carries the new row's id. The SPA uses the poll-based
-    ``POST /hunts/chat`` above (a POST can't drive an ``EventSource``); this route
-    is the streaming interface for API/CLI callers that read the trace live.
-    """
-    started_by = await identify_caller(request)
-    ctx = ctx_from_state(request.app.state)
-    prior: str | None = None
-    if body.prior_hunt_id:
-        async with request.app.state.db_sessionmaker() as db:
-            got = await hunt_svc.get_with_events(db, body.prior_hunt_id)
-        if got is not None:
-            prior_hunt, _ = got
-            prior = prior_hunt.narrative or _hunt_report(prior_hunt).get("narrative")
-
-    async def stream() -> Any:
-        async for name, data in hunt_recorded_run(
-            request.app.state,
-            ctx=ctx,
-            objective=body.objective,
-            started_by=started_by,
-            prior=prior,
-        ):
-            yield hunt_sse_encode(name, data)
-
-    return EventSourceResponse(stream())
-
-
-@router.post("/hunts/{hunt_id}/cancel")
-async def cancel_hunt_chat(hunt_id: str, request: Request) -> dict[str, bool]:
-    """Cancel an in-flight hunt (marks it ``cancelled``); 404 if none is live."""
-    cancelled = hunt_console_manager.get_manager(request.app.state).cancel(hunt_id)
-    if not cancelled:
-        raise HTTPException(
-            status_code=404,
-            detail={"reason": "no_live_hunt", "hint": "no in-flight hunt to cancel"},
-        )
-    return {"cancelled": True}
-
-
-@router.delete("/hunts/{hunt_id}", dependencies=[Depends(require_admin_api)])
-async def delete_hunt(hunt_id: str, request: Request) -> dict[str, bool]:
-    """Delete a hunt and its events (admin only).
-
-    For clearing broken/orphaned or no-longer-wanted hunts. Refuses to delete a
-    still-``running`` hunt (409) — cancel it first — so its background drainer
-    can't write rows back after the delete (mirrors delete_investigation).
-    """
-    async with request.app.state.db_sessionmaker() as db:
-        hunt = await db.get(Hunt, hunt_id)
-        if hunt is None:
-            raise HTTPException(
-                status_code=404, detail={"reason": "not_found", "hint": "hunt not found"}
-            )
-        if hunt.status == "running":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "reason": "still_running",
-                    "hint": "cancel the running hunt before deleting it",
-                },
-            )
-        await hunt_svc.delete(db, hunt_id)
-    return {"deleted": True}
-
-
-# ── "Chat about this hunt" — read-only follow-up Q&A on a COMPLETED hunt ──────
-#
-# Mirrors the investigation follow-up chat (GET+POST /investigations/{id}/chat):
-# a background turn writes a pending assistant row, the SPA polls the thread until
-# !pending. The thread lives as hunt_events (keyed by the hunt id); the agent is
-# the SAME read-only chat agent — no write tools, no Oracle, no verdict proposals
-# (a hunt never acks/escalates).
-
-
-class HuntChatMessageOut(BaseModel):
-    role: str  # "user" | "assistant"
-    text: str
-    tools: str | None = None
-
-
-class HuntChatThreadOut(BaseModel):
-    messages: list[HuntChatMessageOut]
-    pending: bool
-
-
-def _hunt_chat_msg_out(ev: HuntEvent) -> HuntChatMessageOut:
-    p = ev.payload or {}
-    meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
-    tool_names = (meta or {}).get("tools") or []
-    tools = ", ".join(tool_names) if tool_names else None
-    role = "user" if ev.kind == "chat_user" else "assistant"
-    return HuntChatMessageOut(role=role, text=str(p.get("content") or ""), tools=tools)
-
-
-def _hunt_chat_thread(events: list[HuntEvent]) -> HuntChatThreadOut:
-    return HuntChatThreadOut(
-        messages=[_hunt_chat_msg_out(e) for e in events],
-        pending=any((e.payload or {}).get("status") == "pending" for e in events),
-    )
-
-
-@router.get("/hunts/{hunt_id}/chat", response_model=HuntChatThreadOut)
-async def get_hunt_chat(request: Request, hunt_id: str) -> HuntChatThreadOut:
-    """Poll target — the hunt's follow-up chat thread, with a pending flag while
-    the assistant works."""
-    async with request.app.state.db_sessionmaker() as db:
-        if await db.get(Hunt, hunt_id) is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        msgs = await hunt_svc.list_chat_messages(db, hunt_id)
-    return _hunt_chat_thread(msgs)
-
-
-class HuntChatIn2(BaseModel):
-    # Bound the follow-up turn: the value is stored and forwarded verbatim to the
-    # LLM, so an unbounded body burns tokens / can blow the context window.
-    message: str = Field(min_length=1, max_length=4000)
-
-
-@router.post("/hunts/{hunt_id}/chat", response_model=HuntChatThreadOut)
-async def post_hunt_chat(request: Request, hunt_id: str, body: HuntChatIn2) -> HuntChatThreadOut:
-    """Ask a follow-up about a COMPLETED hunt. Writes the user turn + a pending
-    assistant turn, spawns the background chat task, and returns the thread (poll
-    GET .../chat until !pending). Read-only — a hunt chat never acks/escalates."""
-    text = body.message.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail={"reason": "empty_message"})
-    async with request.app.state.db_sessionmaker() as db:
-        hunt = await db.get(Hunt, hunt_id)
-        if hunt is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        if hunt.status == "running":
-            # Can't chat about a hunt that hasn't landed its report yet.
-            raise HTTPException(status_code=409, detail={"reason": "still_running"})
-        existing = await hunt_svc.list_chat_messages(db, hunt_id)
-        if any((e.payload or {}).get("status") == "pending" for e in existing):
-            # A prior turn's assistant is still working — one in-flight turn at a
-            # time, or a second POST orphans a duplicate pending row.
-            raise HTTPException(status_code=409, detail={"reason": "chat_busy"})
-        await hunt_svc.add_chat_user_message(db, hunt_id, text)
-        pending = await hunt_svc.create_pending_chat_assistant(db, hunt_id)
-        msgs = await hunt_svc.list_chat_messages(db, hunt_id)
-    hunt_console_manager.get_chat_manager(request.app.state).start(
-        request.app.state, hunt_id=hunt_id, assistant_event_id=pending.id
-    )
-    return _hunt_chat_thread(msgs)
-
-
-# ── Mutations ──────────────────────────────────────────────────────────────
-# CSRF: these are same-origin (the SPA at /app calls /api/v1) and the session
-# cookie is SameSite=lax, which blocks cross-site cookie-bearing POSTs — the same
-# protection the existing /approve JSON route relies on.
-
-
-class HuntStartIn(BaseModel):
-    # Non-blank: an empty id reaches ES as `ids:[""]` and 500s ("Ids can't be empty").
-    alert_id: str = Field(min_length=1)
-
-
-async def resolve_alert_for_hunt(
-    elastic: ElasticClient, settings: Settings, alert_id: str
-) -> tuple[bool, str | None]:
-    """Resolve ``alert_id`` to ``(exists, rule_name)`` in one ES lookup.
-
-    Mirrors the ``ids`` lookup ``get_alert_context`` does before fanning out
-    pivots. Used to guard ``/hunt`` so a bad id (e.g. an AlertGroup whose
-    ``latest_id`` was empty and fell back to the rule NAME, see alerts_query.py
-    ``_group_from_bucket`` + the ``id=g.latest_id or g.rule_name`` mapping)
-    fails VISIBLY with a 4xx instead of recording a synthetic 0.0 investigation.
-
-    Returns the doc's ``rule.name`` (falling back to ``event.dataset`` /
-    ``event.category`` for non-Suricata detections) so the caller can seed the
-    investigation's display name at creation — the row is then never anonymous,
-    even if the run dies before its first alert_context event.
-    """
-    lookup = await elastic.search(
-        settings.events_index_pattern,
-        {"ids": {"values": [alert_id]}},
-        size=1,
-    )
-    if not lookup.hits:
-        return False, None
-    source = lookup.hits[0].get("_source", {})
-    name = (
-        get_dotted(source, "rule.name")
-        or get_dotted(source, "event.dataset")
-        or get_dotted(source, "event.category")
-    )
-    return True, str(name) if name else None
-
-
-@router.post("/hunt")
-async def start_hunt(
-    request: Request,
-    body: HuntStartIn,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> dict[str, str]:
-    """Start a background investigation for an alert; returns its id immediately.
-
-    The supplied ``alert_id`` must resolve to a real ES document. A group whose
-    ``latest_id`` was blank surfaces its RULE NAME as the id (webui_api mapping
-    ``g.latest_id or g.rule_name``); hunting that would otherwise SoNotFoundError
-    deep in the prefetch and silently persist a degraded needs_more_info/0.0
-    investigation. We resolve up front and 404 instead.
-    """
-    started_by = await identify_caller(request)
-    exists, rule_name = await resolve_alert_for_hunt(elastic, settings, body.alert_id)
-    if not exists:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "reason": "alert_not_found",
-                "hint": ("alert not found — it may have aged out; re-open from the alerts list"),
-            },
-        )
-    # Block a duplicate hunt: if one is already running for this alert, send the
-    # caller to it instead of spawning a second investigation for the same alert.
-    async with request.app.state.db_sessionmaker() as db:
-        existing = (await inv_svc.latest_for_alerts(db, [body.alert_id])).get(body.alert_id)
-    if existing is not None and existing.status == "running":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "reason": "hunt_in_progress",
-                "running_inv_id": existing.id,
-                "hint": (
-                    "a hunt is already running for this alert — open it or cancel "
-                    "it before starting a new one"
-                ),
-            },
-        )
-    inv_id = await hunt_manager.get_manager(request.app.state).start(
-        request.app.state, alert_id=body.alert_id, started_by=started_by, rule_name=rule_name
-    )
-    if inv_id is None:
-        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
-    return {"investigation_id": inv_id}
-
-
-@router.post("/investigations/{inv_id}/cancel")
-async def cancel_hunt(inv_id: str, request: Request) -> dict[str, bool]:
-    """Cancel an in-flight hunt for an investigation.
-
-    200 ``{"cancelled": true}`` if a running background task was stopped (the
-    run lands as ``cancelled``); 404 if there is no in-flight hunt to cancel
-    (it already finished, errored, or completed).
-    """
-    cancelled = hunt_manager.get_manager(request.app.state).cancel(inv_id)
-    if not cancelled:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "reason": "not_running",
-                "hint": "no in-flight hunt to cancel — it already finished",
-            },
-        )
-    return {"cancelled": True}
-
-
-@router.delete("/investigations/{inv_id}", dependencies=[Depends(require_admin_api)])
-async def delete_investigation(inv_id: str, request: Request) -> dict[str, bool]:
-    """Delete an investigation and its events + chat messages (admin only).
-
-    For clearing broken/orphaned runs. Refuses to delete a still-``running``
-    investigation (409) — cancel it first — so its background worker can't write
-    rows back after the delete.
-    """
-    async with request.app.state.db_sessionmaker() as db:
-        inv = await db.get(Investigation, inv_id)
-        if inv is None:
-            raise HTTPException(
-                status_code=404, detail={"reason": "not_found", "hint": "investigation not found"}
-            )
-        if inv.status == "running":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "reason": "still_running",
-                    "hint": "cancel the running hunt before deleting it",
-                },
-            )
-        await inv_svc.delete(db, inv_id)
-    return {"deleted": True}
-
-
-_REHUNT_CAP = 50
-
-
-class RehuntIn(BaseModel):
-    # Cap at the input boundary so an oversized payload is rejected before the
-    # dedup loop deserializes/iterates it.
-    inv_ids: list[str] = Field(max_length=_REHUNT_CAP)
-
-
-class RehuntResultOut(BaseModel):
-    started: list[dict[str, str]]  # [{invId, newInvId, alertEsId}]
-    skipped: list[dict[str, str]]  # [{invId, reason}]
-
-
-@router.post("/investigations/rehunt", response_model=RehuntResultOut)
-async def bulk_rehunt(
-    request: Request,
-    body: RehuntIn,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> RehuntResultOut:
-    """Re-launch a fresh investigation for each of the supplied investigation ids.
-
-    Deduplicates the input list and caps at ``_REHUNT_CAP`` entries.  Entries
-    beyond the cap are skipped with reason ``"cap"``.  Unknown ids are skipped
-    with ``"not_found"``; ids whose investigation has no ``alert_es_id`` are
-    skipped with ``"no_alert"``.  Successful entries receive a new investigation
-    id via the same path as ``POST /hunt``.
-    """
-    started_by = await identify_caller(request)
-    # Deduplicate while preserving order.
-    seen: set[str] = set()
-    unique_ids: list[str] = []
-    for inv_id in body.inv_ids:
-        if inv_id not in seen:
-            seen.add(inv_id)
-            unique_ids.append(inv_id)
-
-    started: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
-
-    # Anything beyond the cap is skipped up front; the rest are fetched in a
-    # SINGLE query (was one session-open + one SELECT per id — an N+1).
-    eligible = unique_ids[:_REHUNT_CAP]
-    for inv_id in unique_ids[_REHUNT_CAP:]:
-        skipped.append({"invId": inv_id, "reason": "cap"})
-
-    inv_by_id: dict[str, Investigation] = {}
-    if eligible:
-        async with request.app.state.db_sessionmaker() as db:
-            rows = (
-                (await db.execute(select(Investigation).where(Investigation.id.in_(eligible))))
-                .scalars()
-                .all()
-            )
-            inv_by_id = {inv.id: inv for inv in rows}
-
-    for inv_id in eligible:
-        inv = inv_by_id.get(inv_id)
-        if inv is None:
-            skipped.append({"invId": inv_id, "reason": "not_found"})
-            continue
-
-        if not inv.alert_es_id:
-            skipped.append({"invId": inv_id, "reason": "no_alert"})
-            continue
-
-        # Prefer the stored name; if this row was itself created nameless (a pre-fix
-        # row, or a selected-id run that died early), re-resolve from ES so the new
-        # row is named rather than inheriting the NULL.
-        rehunt_name = inv.rule_name
-        if not rehunt_name:
-            _, rehunt_name = await resolve_alert_for_hunt(elastic, settings, inv.alert_es_id)
-        new_inv_id = await hunt_manager.get_manager(request.app.state).start(
-            request.app.state,
-            alert_id=inv.alert_es_id,
-            started_by=started_by,
-            rule_name=rehunt_name,
-        )
-        if new_inv_id is None:
-            skipped.append({"invId": inv_id, "reason": "could_not_start"})
-            continue
-
-        started.append({"invId": inv_id, "newInvId": new_inv_id, "alertEsId": inv.alert_es_id})
-
-    return RehuntResultOut(started=started, skipped=skipped)
-
-
-def _open_questions_of(inv: Investigation) -> list[str]:
-    """Pull the prior run's open questions off the stored report JSON."""
-    report = inv.report if isinstance(inv.report, dict) else {}
-    raw = report.get("open_questions") or []
-    return [str(q).strip() for q in raw if isinstance(q, str) and q.strip()]
-
-
-def _focus_hint_from_questions(questions: list[str]) -> str:
-    """Render prior open questions as a numbered focus block for the seed prompt."""
-    return "\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1))
-
-
-@router.post("/investigations/{inv_id}/request-more-info")
-async def request_more_info(
-    inv_id: str,
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-    elastic: ElasticClient = Depends(get_elastic),
-) -> dict[str, str]:
-    """Launch a FOCUSED re-investigation to close a ``needs_more_info`` verdict.
-
-    "One-click request more info": re-runs the investigation on the SAME alert
-    as *inv_id* (identical mechanism to ``POST /hunt`` / rehunt), but SEEDS the
-    fresh run with the prior investigation's open questions as a ``focus_hint``
-    so the new investigation TARGETS those specific gaps instead of starting
-    cold.
-
-    Only valid when the source investigation landed ``needs_more_info`` — any
-    other verdict is a 409 (the button is only shown for that verdict, but we
-    guard server-side too). Returns ``{"investigation_id": <new_inv_id>}`` so
-    the SPA can navigate + poll it exactly like a re-hunt.
-    """
-    started_by = await identify_caller(request)
-
-    async with request.app.state.db_sessionmaker() as db:
-        inv = await db.get(Investigation, inv_id)
-
-    if inv is None:
-        raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    if not inv.alert_es_id:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "reason": "no_alert",
-                "hint": "this investigation has no alert reference to re-investigate",
-            },
-        )
-    if (inv.verdict or "").strip() != "needs_more_info":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "reason": "not_needs_more_info",
-                "hint": (
-                    "request-more-info only applies to a needs_more_info verdict; "
-                    f"this investigation is '{inv.verdict or 'untriaged'}'"
-                ),
-            },
-        )
-
-    questions = _open_questions_of(inv)
-    focus_hint = _focus_hint_from_questions(questions) if questions else None
-
-    # Re-resolve the display name if the source row was created nameless.
-    rmi_name = inv.rule_name
-    if not rmi_name:
-        _, rmi_name = await resolve_alert_for_hunt(elastic, settings, inv.alert_es_id)
-
-    new_inv_id = await hunt_manager.get_manager(request.app.state).start(
-        request.app.state,
-        alert_id=inv.alert_es_id,
-        started_by=started_by,
-        rule_name=rmi_name,
-        focus_hint=focus_hint,
-    )
-    if new_inv_id is None:
-        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
-    return {"investigation_id": new_inv_id}
-
-
-class ChatThreadOut(BaseModel):
-    messages: list[ChatMessageOut]
-    pending: bool
-
-
-def _chat_msg_out(m: Any) -> ChatMessageOut:
-    meta = (m.meta or {}) if isinstance(m.meta, dict) else {}
-    tools = ", ".join(meta.get("tools", [])) if meta.get("tools") else None
-    is_prop = meta.get("kind") == "verdict_proposal"
-    return ChatMessageOut(
-        role=m.role,
-        text=m.content,
-        tools=tools,
-        messageId=m.id if is_prop else None,
-        kind=meta.get("kind") if is_prop else None,
-        validation=meta.get("validation") if is_prop else None,
-        objection=meta.get("objection") if is_prop else None,
-        token=meta.get("token") if (is_prop and meta.get("validation") == "pass") else None,
-        applied=bool(meta.get("applied")) if is_prop else None,
-        proposal=meta.get("proposal") if is_prop else None,
-    )
-
-
-def _thread(msgs: list[Any]) -> ChatThreadOut:
-    return ChatThreadOut(
-        messages=[_chat_msg_out(m) for m in msgs],
-        pending=any(m.status == "pending" for m in msgs),
-    )
-
-
-@router.get("/investigations/{inv_id}/chat", response_model=ChatThreadOut)
-async def get_chat(request: Request, inv_id: str) -> ChatThreadOut:
-    """Poll target — the chat thread, with a pending flag while the assistant works."""
-    async with request.app.state.db_sessionmaker() as db:
-        msgs = await chat_svc.list_messages(db, inv_id)
-    return _thread(msgs)
-
-
-class ChatIn(BaseModel):
-    # Bound the analyst's follow-up turn: the value is stored in SQLite and
-    # forwarded verbatim to the LLM, so an unbounded body burns tokens / can blow
-    # the context window. Mirrors HuntChatIn.objective's cap.
-    message: str = Field(min_length=1, max_length=4000)
-
-
-@router.post("/investigations/{inv_id}/chat", response_model=ChatThreadOut)
-async def post_chat(request: Request, inv_id: str, body: ChatIn) -> ChatThreadOut:
-    """Ask a follow-up. Writes the user turn + a pending assistant turn, spawns the
-    background chat task, and returns the thread (poll GET .../chat until !pending)."""
-    text = body.message.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail={"reason": "empty_message"})
-    async with request.app.state.db_sessionmaker() as db:
-        inv = await db.get(Investigation, inv_id)
-        if inv is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        if inv.status == "running":
-            raise HTTPException(status_code=409, detail={"reason": "still_running"})
-        await chat_svc.add_user_message(db, inv_id, text)
-        pending = await chat_svc.create_pending_assistant(db, inv_id)
-        msgs = await chat_svc.list_messages(db, inv_id)
-    chat_manager.get_manager(request.app.state).start(
-        request.app.state, inv_id=inv_id, assistant_msg_id=pending.id
-    )
-    return _thread(msgs)
-
-
-class ApproveIn(BaseModel):
-    token: str
-    approved: bool
-    reason: str | None = None
-
-
-@router.post("/approve")
-async def approve(request: Request, body: ApproveIn) -> dict[str, Any]:
-    """Apply an analyst decision to a pending write-tool approval."""
-    result = await apply_approval(
-        gate=request.app.state.gate,
-        auth=request.app.state.auth,
-        settings=request.app.state.settings,
-        token=body.token,
-        approved=body.approved,
-        reason=body.reason,
-        audit=request.app.state.audit,
-        user=await identify_caller(request),
-    )
-    return result.model_dump()
-
-
-# ── Advisory action execution ──────────────────────────────────────────────
-# Synth-first investigations recommend write actions in the report rather than
-# pausing the agent on an approval gate, so the analyst executes them on demand
-# from the report. These run through the *same* execute_write_tool path as the
-# gate, restricted to the three write tools, with the alert id defaulted from
-# the investigation when the model left it off.
-
-
-class ExecuteActionResult(BaseModel):
-    status: str  # "executed" | "error"
-    title: str
-    detail: str = ""
-    error: str | None = None
-
-
-def _action_detail(tool_name: str, result: Any) -> str:
-    """One-line, analyst-facing confirmation of what the write tool did."""
-    if not isinstance(result, dict):
-        return ""
-    if tool_name == "ack_alert":
-        return "Alert acknowledged in Security Onion."
-    if tool_name == "escalate_to_case":
-        case_id = result.get("id") or result.get("caseId") or result.get("case_id") or ""
-        return f"Case created: {case_id}" if case_id else "Case created in Security Onion."
-    if tool_name == "add_case_comment":
-        case_id = result.get("case_id") or ""
-        return f"Comment added to case {case_id}." if case_id else "Comment added to case."
-    return ""
-
-
-@router.post(
-    "/investigations/{inv_id}/actions/{index}/execute",
-    response_model=ExecuteActionResult,
-)
-async def execute_action(request: Request, inv_id: str, index: int) -> ExecuteActionResult:
-    """Execute one report-recommended write action against Security Onion.
-
-    ``index`` is the position in ``report.recommended_actions`` (the SPA's
-    advisory action cards are built in that order). Token-gated approvals use
-    ``/approve`` instead; this path is for the advisory recommendations.
-    """
-    async with request.app.state.db_sessionmaker() as db:
-        inv = await db.get(Investigation, inv_id)
-        if inv is None:
-            by_alert = await inv_svc.latest_for_alerts(db, [inv_id])
-            inv = by_alert.get(inv_id)
-        if inv is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        report = inv.report or {}
-        alert_es_id = inv.alert_es_id
-
-    recs = report.get("recommended_actions") or []
-    if index < 0 or index >= len(recs):
-        raise HTTPException(status_code=404, detail={"reason": "no_such_action"})
-
-    rec = recs[index]
-    tool_name = rec.get("tool_name", "")
-    title = _ACTION_TITLE.get(tool_name, tool_name or "Action")
-    if tool_name not in WRITE_TOOLS:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "not_executable", "tool": tool_name},
-        )
-
-    tool_args = dict(rec.get("tool_args") or {})
-    # The model usually fills alert_id, but default it from the investigation's
-    # own alert when missing so an ack/escalate never silently targets nothing.
-    if tool_name in ("ack_alert", "escalate_to_case") and not tool_args.get("alert_id"):
-        if not alert_es_id:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason": "missing_alert_id", "tool": tool_name},
-            )
-        tool_args["alert_id"] = alert_es_id
-
-    result, error = await execute_write_tool(
-        tool_name,
-        tool_args,
-        auth=request.app.state.auth,
-        settings=request.app.state.settings,
-        audit=request.app.state.audit,
-        session_id=f"action:{inv_id}",
-        user=await identify_caller(request),
-    )
-    if error is not None:
-        return ExecuteActionResult(status="error", title=title, error=error)
-    return ExecuteActionResult(
-        status="executed", title=title, detail=_action_detail(tool_name, result)
-    )
-
-
-# ── Chat verdict resolution ────────────────────────────────────────────────
-
-
-class ResolveIn(BaseModel):
-    message_id: int
-    token: str
-
-
-@router.post("/investigations/{inv_id}/resolve")
-async def resolve_investigation(request: Request, inv_id: str, body: ResolveIn) -> dict[str, Any]:
-    """Apply a validated chat verdict proposal. Token + message gated, idempotent."""
-    # Not owner-scoped: any authenticated caller may apply a proposal, consistent
-    # with /approve and the action-execute route. The actor is recorded for audit.
-    resolved_by = await identify_caller(request)
-    async with request.app.state.db_sessionmaker() as db:
-        msg = await chat_svc.get_message(db, body.message_id)
-        if msg is None or msg.investigation_id != inv_id:
-            raise HTTPException(status_code=404, detail={"reason": "proposal_not_found"})
-        meta = msg.meta or {}
-        if meta.get("kind") != "verdict_proposal" or meta.get("validation") != "pass":
-            raise HTTPException(status_code=400, detail={"reason": "not_applyable"})
-        if meta.get("token") != body.token:
-            raise HTTPException(status_code=403, detail={"reason": "bad_token"})
-        if meta.get("applied"):
-            raise HTTPException(status_code=409, detail={"reason": "already_applied"})
-        proposal = meta.get("proposal") or {}
-        verdict = proposal.get("verdict")
-        if not verdict:
-            raise HTTPException(status_code=400, detail={"reason": "malformed_proposal"})
-        updated = await inv_svc.resolve(
-            db,
-            inv_id,
-            verdict=verdict,
-            confidence=proposal.get("confidence"),
-            rationale=proposal.get("rationale"),
-            recommended_actions=proposal.get("recommended_actions"),
-            resolved_by=resolved_by,
-            source_message_id=body.message_id,
-        )
-        if updated is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    return {"ok": True, "verdict": verdict}
-
-
-# ── Manual verdict override ────────────────────────────────────────────────
-
-_VALID_VERDICTS = {"true_positive", "false_positive", "needs_more_info"}
-
-
-class OverrideVerdictIn(BaseModel):
-    verdict: str
-    rationale: str | None = None
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-
-
-@router.post("/investigations/{inv_id}/override")
-async def override_verdict(
-    request: Request, inv_id: str, body: OverrideVerdictIn
-) -> dict[str, Any]:
-    """Manually override a completed investigation's verdict with analyst provenance."""
-    if body.verdict not in _VALID_VERDICTS:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "invalid_verdict", "valid": sorted(_VALID_VERDICTS)},
-        )
-    resolved_by = await identify_caller(request)
-    async with request.app.state.db_sessionmaker() as db:
-        inv = await db.get(Investigation, inv_id)
-        if inv is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        if inv.status == "running":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "reason": "investigation_running",
-                    "hint": "Wait for the investigation to complete before overriding.",
-                },
-            )
-        updated = await inv_svc.resolve(
-            db,
-            inv_id,
-            verdict=body.verdict,
-            confidence=body.confidence if body.confidence is not None else 1.0,
-            rationale=body.rationale,
-            recommended_actions=None,
-            resolved_by=resolved_by,
-            resolved_via="manual",
-            source_message_id=None,
-        )
-        if updated is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    return {"ok": True, "verdict": body.verdict, "confidence": updated.confidence}
-
-
-# ── Config mutations (admin) ───────────────────────────────────────────────
-
-
-class SettingIn(BaseModel):
-    key: str
-    value: str  # stringified; coerced to the spec's declared type server-side
-
-
-@router.post("/config/setting", dependencies=[Depends(require_admin_api)])
-async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
-    """Persist + (if hot) hot-apply one whitelisted, non-Danger setting.
-
-    Danger-Zone (connection/secret) settings are deliberately NOT editable here —
-    they use the typed-confirm + Fernet path on POST /api/v1/config/danger/setting.
-    """
-    settings = request.app.state.settings
-    if not cfg_svc.is_editable(body.key):
-        raise HTTPException(status_code=400, detail={"reason": "unknown_setting"})
-    spec = cfg_svc.WHITELIST_BY_KEY[body.key]
-    if spec.danger:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "danger_zone", "hint": "use POST /api/v1/config/danger/setting"},
-        )
-    if spec.secret:
-        # Secrets never go through the plaintext (secret_box=None) path — that
-        # would raise deep in set_override (500). Route them to the dedicated
-        # write-only endpoint instead.
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "secret_setting", "hint": "use POST /api/v1/config/api-keys"},
-        )
-    try:
-        typed = cfg_svc.coerce(body.key, body.value)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "invalid_value", "hint": str(exc)}
-        ) from exc
-    user = await current_user(request)
-    async with request.app.state.db_sessionmaker() as db:
-        await cfg_svc.set_override(
-            db, body.key, typed, updated_by=user.id if user else None, secret_box=None
-        )
-    restart_required = not spec.hot
-    if spec.hot:
-        cfg_svc.apply_to_settings(settings, {body.key: typed}, secret_box=None)
-    return {"ok": True, "restart_required": restart_required}
-
-
-class TokenCreateIn(BaseModel):
-    # Charset-restricted: the token name surfaces in the alerts-grid owner field
-    # (owner = "token:<name>"), so keep it to a safe, non-injectable set.
-    name: str = Field(min_length=1, max_length=64, pattern=r"^[\w .\-]+$")
-
-
-@router.post("/config/tokens", dependencies=[Depends(require_admin_api)])
-async def create_token(request: Request, body: TokenCreateIn) -> dict[str, str]:
-    """Mint an API token — the raw ``scai_…`` value is returned ONCE.
-
-    Requires a real authenticated session user as the creator. ``created_by`` is
-    a non-null FK to ``users.id``; we refuse rather than persist a token attributed
-    to user 0 / null (which would happen for a bearer-token caller or a dev session
-    that passed the auth gate without a resolvable session user).
-    """
-    name = body.name.strip() or "token"
-    user = await current_user(request)
-    if user is None:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "reason": "no_session_user",
-                "hint": (
-                    "Minting an API token requires an authenticated admin session; "
-                    "log in at /app/login (bearer-token callers cannot mint tokens)."
-                ),
-            },
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        raw = await auth_svc.create_api_token(db, name, user.id)
-    return {"token": raw}
-
-
-@router.post("/config/tokens/{token_id}/revoke", dependencies=[Depends(require_admin_api)])
-async def revoke_token(request: Request, token_id: int) -> dict[str, bool]:
-    async with request.app.state.db_sessionmaker() as db:
-        await auth_svc.revoke_api_token(db, token_id)
-    return {"ok": True}
-
-
-@router.get(
-    "/config/danger",
-    response_model=list[DangerSettingOut],
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_get_danger_settings(
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> list[DangerSettingOut]:
-    """List all danger-zone settings. Secret values are NEVER returned — only isSet status."""
-    # Fetch all DB override keys in one query to avoid N+1.
-    async with request.app.state.db_sessionmaker() as db:
-        db_row_keys: set[str] = set(
-            (
-                await db.scalars(
-                    select(ConfigOverride.key).where(
-                        ConfigOverride.key.in_(
-                            [spec.key for spec in cfg_svc.WHITELIST_BY_KEY.values() if spec.danger]
-                        )
-                    )
-                )
-            ).all()
-        )
-
-    rows: list[DangerSettingOut] = []
-    for spec in cfg_svc.WHITELIST_BY_KEY.values():
-        if not spec.danger:
-            continue
-
-        # Determine source and isSet: DB takes precedence over env.
-        if spec.key in db_row_keys:
-            source = "db"
-            is_set = True
-        else:
-            # Check the live Settings attribute (populated from env / .env at startup).
-            attr_val = getattr(settings, spec.attr, None)
-            if attr_val is None:
-                source = "unset"
-                is_set = False
-            else:
-                # SecretStr fields must be unwrapped to check for emptiness.
-                raw = (
-                    attr_val.get_secret_value()
-                    if isinstance(attr_val, SecretStr)
-                    else str(attr_val)
-                )
-                if raw.strip():
-                    source = "env"
-                    is_set = True
-                else:
-                    source = "unset"
-                    is_set = False
-
-        # Map internal SettingType to the frontend type label.
-        if spec.secret:
-            field_type = "secret"
-        elif spec.type == "bool":
-            field_type = "bool"
-        elif spec.type == "csv":
-            field_type = "csv"
-        else:
-            field_type = "text"
-
-        rows.append(
-            DangerSettingOut(
-                key=spec.key,
-                label=spec.label,
-                type=field_type,
-                isSet=is_set,
-                source=source,
-                hot=spec.hot,
-            )
-        )
-    return rows
-
-
-@router.post(
-    "/config/danger/setting",
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_save_danger_setting(
-    body: SaveDangerIn,
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> dict[str, object]:
-    """Save a danger-zone setting. Requires typed confirmation (confirm must equal key).
-
-    Secret-typed settings are Fernet-encrypted before DB storage.
-    Never returns the plaintext value. A hot=True danger spec (PCAP SSH, the
-    crawl4ai token, internal_cidrs — all read fresh per tool-call) is applied
-    live; the SO/ES/LiteLLM connection settings feed startup clients and still
-    need a restart.
-    """
-    # 1. Typed confirmation guard
-    if body.confirm.strip() != body.key:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "confirm_mismatch", "hint": "confirm must equal the setting key"},
-        )
-
-    # 2. Validate key is a known danger spec
-    spec = cfg_svc.WHITELIST_BY_KEY.get(body.key)
-    if spec is None or not spec.danger:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "unknown_danger_key", "hint": "key is not a known danger setting"},
-        )
-
-    # 3. Coerce the string value to the spec's declared type
-    try:
-        typed = cfg_svc.coerce(body.key, body.value)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "invalid_value", "hint": str(exc)}
-        ) from exc
-
-    # 4. Determine actor for audit trail (id is int | None)
-    user = await current_user(request)
-    updated_by: int | None = user.id if user else None
-
-    # 5. Persist — set_override Fernet-encrypts secret-typed values when secret_box is set.
-    #    A secret-typed key with no CONFIG_SECRET_KEY makes set_override raise
-    #    ValueError; surface that as a 400 (operator must set the key) rather than
-    #    an uncaught 500. No plaintext is written on this path.
-    secret_box = request.app.state.secret_box
-    try:
-        async with request.app.state.db_sessionmaker() as db:
-            await cfg_svc.set_override(
-                db,
-                body.key,
-                typed,
-                updated_by=updated_by,
-                secret_box=secret_box if spec.secret else None,
-            )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "no_config_secret_key",
-                "hint": "Set CONFIG_SECRET_KEY to edit secret values via the UI.",
-            },
-        ) from exc
-
-    # Hot specs are read fresh per tool-call → apply live via setattr on the
-    # Settings singleton (validate_assignment coerces str→SecretStr, csv→typed).
-    # restart_required reflects whether it actually applied (a non-hot spec, or a
-    # value that fails live validation, still persists and applies on restart).
-    applied_live = False
-    if spec.hot:
-        try:
-            setattr(settings, spec.attr, typed)
-            applied_live = True
-        except (ValueError, TypeError, ValidationError):
-            applied_live = False
-
-    return {"ok": True, "restart_required": not applied_live}
-
-
-# ── API keys (hot, write-only enrichment provider secrets) ────────────────────
-# Distinct from the Danger-Zone secrets (SO/ES/LiteLLM, restart-required): these
-# enrichment keys are read per tool-call, so a save hot-applies live (no restart)
-# and no typed confirm is required. Values are Fernet-encrypted at rest and never
-# returned to the client.
-
-
-class ApiKeyOut(BaseModel):
-    key: str
-    label: str
-    help: str
-    isSet: bool
-    source: str  # "db" | "env" | "unset"
-
-
-class SaveApiKeyIn(BaseModel):
-    key: str
-    value: str
-
-
-@router.get(
-    "/config/api-keys",
-    response_model=list[ApiKeyOut],
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_get_api_keys(
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> list[ApiKeyOut]:
-    """List the enrichment API-key fields. Values are NEVER returned — only isSet."""
-    specs = cfg_svc.api_key_specs()
-    async with request.app.state.db_sessionmaker() as db:
-        db_keys: set[str] = set(
-            (
-                await db.scalars(
-                    select(ConfigOverride.key).where(ConfigOverride.key.in_([s.key for s in specs]))
-                )
-            ).all()
-        )
-    out: list[ApiKeyOut] = []
-    for spec in specs:
-        if spec.key in db_keys:
-            source, is_set = "db", True
-        else:
-            attr_val = getattr(settings, spec.attr, None)
-            raw = (
-                attr_val.get_secret_value()
-                if isinstance(attr_val, SecretStr)
-                else ("" if attr_val is None else str(attr_val))
-            )
-            source, is_set = ("env", True) if raw.strip() else ("unset", False)
-        out.append(
-            ApiKeyOut(key=spec.key, label=spec.label, help=spec.help, isSet=is_set, source=source)
-        )
-    return out
-
-
-@router.post(
-    "/config/api-keys",
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_save_api_key(
-    body: SaveApiKeyIn,
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> dict[str, object]:
-    """Save an enrichment API key (Fernet-encrypted, write-only) and hot-apply it."""
-    spec = cfg_svc.WHITELIST_BY_KEY.get(body.key)
-    if spec is None or not spec.secret or spec.danger:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "unknown_api_key", "hint": "key is not a known API-key setting"},
-        )
-    value = body.value.strip()
-    if not value:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "empty_value", "hint": "send a non-empty value, or DELETE to clear"},
-        )
-    user = await current_user(request)
-    updated_by: int | None = user.id if user else None
-    secret_box = request.app.state.secret_box
-    try:
-        async with request.app.state.db_sessionmaker() as db:
-            await cfg_svc.set_override(
-                db, body.key, value, updated_by=updated_by, secret_box=secret_box
-            )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "no_config_secret_key",
-                "hint": "Set CONFIG_SECRET_KEY to store API keys via the UI.",
-            },
-        ) from exc
-    # Hot-apply: enrichment keys are read fresh per tool-call. setattr the
-    # plaintext onto the live Settings singleton (validate_assignment coerces
-    # str → SecretStr). NOT apply_to_settings — that decrypts a stored token.
-    setattr(settings, spec.attr, value)
-    return {"ok": True, "isSet": True}
-
-
-@router.delete(
-    "/config/api-keys/{key}",
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_clear_api_key(
-    key: str,
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> dict[str, object]:
-    """Clear an enrichment API key: drop the DB override and unset the live value."""
-    spec = cfg_svc.WHITELIST_BY_KEY.get(key)
-    if spec is None or not spec.secret or spec.danger:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "unknown_api_key", "hint": "key is not a known API-key setting"},
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        await cfg_svc.delete_override(db, key)
-    # Hot-clear the live value (reverts to None until a restart re-applies env).
-    setattr(settings, spec.attr, None)
-    return {"ok": True, "isSet": False}
-
-
-class AgentToolsOut(BaseModel):
-    tools: list[agent_tools_svc.AgentToolOut]
-
-
-@router.get(
-    "/config/agent-tools",
-    response_model=AgentToolsOut,
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_get_agent_tools(
-    settings: Settings = Depends(get_settings_dep),
-) -> AgentToolsOut:
-    """List every tool available to the agent, with its description + dependencies."""
-    return AgentToolsOut(tools=agent_tools_svc.collect_agent_tools(settings))
-
-
-_DANGER_TEST_TARGETS: frozenset[str] = frozenset({"es", "llm"})
-
-
-@router.post(
-    "/config/danger/test/{target}",
-    response_model=ConnTestOut,
-    dependencies=[Depends(require_admin_api)],
-    tags=["config"],
-)
-async def api_danger_test_connection(
-    target: str,
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> ConnTestOut:
-    """Run a connectivity probe for target ∈ {es, llm}.
-    Returns {ok, detail}. Detail is secret-free — probes.py scrubs credentials internally.
-    """
-    if target not in _DANGER_TEST_TARGETS:
-        valid = sorted(_DANGER_TEST_TARGETS)
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "unknown_target", "hint": f"target must be one of {valid}"},
-        )
-
-    if target == "es":
-        result = await probes.probe_es(request.app.state.elastic)
-    else:
-        result = await probes.probe_llm(settings)
-
-    return ConnTestOut(ok=result["ok"], detail=result["detail"])
-
-
-# ── Current-user endpoints ────────────────────────────────────────────────
-
-
-class MeOut(BaseModel):
-    username: str
-    role: str
-    status: str
-
-
-class SetStatusIn(BaseModel):
-    status: str = Field(default="", max_length=120)
-
-
-_DEV_ME = MeOut(username="analyst", role="admin", status="")
-
-
-@router.get("/me", response_model=MeOut)
-async def get_me(request: Request) -> MeOut:
-    """Return the current user's username, role, and status.
-
-    When ``api_auth_required`` is False (dev / lab default) and there is no
-    active session, return a sensible dev fallback so the SPA always has a
-    user to render.  When auth IS required and there is no session, the
-    ``require_api_auth`` dependency already rejected the request with 401
-    before this handler runs.
-    """
-    user = await current_user(request)
-    if user is None:
-        return _DEV_ME
-    return MeOut(username=user.username, role=user.role, status=user.status)
-
-
-@router.post("/me/status")
-async def set_my_status(request: Request, body: SetStatusIn) -> dict[str, str | bool]:
-    """Update the current user's status string (trim + cap at 64 chars).
-
-    In dev mode with no session the request is a no-op that echoes back the
-    (sanitised) status — nothing is persisted.
-    """
-    trimmed = body.status.strip()[:64]
-    user = await current_user(request)
-    if user is None:
-        # Dev / no-auth mode: nothing to persist, just echo back.
-        return {"ok": True, "status": trimmed}
-    async with request.app.state.db_sessionmaker() as db:
-        await auth_svc.set_user_status(db, user.id, trimmed)
-    return {"ok": True, "status": trimmed}
-
-
-# ── User management (admin) ────────────────────────────────────────────────
-
-
-class UserOut(BaseModel):
-    id: int
-    username: str
-    role: str
-    disabled: bool
-    status: str
-    lastLoginAt: str | None
-
-
-class UsersListOut(BaseModel):
-    users: list[UserOut]
-
-
-class CreateUserIn(BaseModel):
-    username: str = Field(min_length=1, max_length=64, pattern=r"^[\w.\-@]+$")
-    password: str = Field(min_length=1, max_length=1024)
-    role: str
-
-
-class SetRoleIn(BaseModel):
-    role: str
-
-
-@router.get("/config/users", response_model=UsersListOut, dependencies=[Depends(require_admin_api)])
-async def list_users_endpoint(request: Request) -> UsersListOut:
-    async with request.app.state.db_sessionmaker() as db:
-        users = await auth_svc.list_users(db)
-    return UsersListOut(
-        users=[
-            UserOut(
-                id=u.id,
-                username=u.username,
-                role=u.role,
-                disabled=u.disabled,
-                status=u.status,
-                lastLoginAt=u.last_login_at.isoformat() if u.last_login_at is not None else None,
-            )
-            for u in users
-        ]
-    )
-
-
-@router.post("/config/users", dependencies=[Depends(require_admin_api)])
-async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str, bool]:
-    username = body.username.strip()
-    if not username:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "username_required", "hint": "Username must not be empty."},
-        )
-    if len(body.password) < 8:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "password_too_short",
-                "hint": "Password must be at least 8 characters.",
-            },
-        )
-    if body.role not in auth_svc.VALID_ROLES:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "invalid_role", "hint": "Role must be admin or analyst."},
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        existing = await auth_svc.list_users(db)
-        if any(u.username == username for u in existing):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "reason": "username_taken",
-                    "hint": f"Username {username!r} is already taken.",
-                },
-            )
-        try:
-            await auth_svc.create_user(db, username, body.password, role=body.role)
-        except IntegrityError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "reason": "username_taken",
-                    "hint": f"Username {username!r} is already taken.",
-                },
-            ) from exc
-    return {"ok": True}
-
-
-@router.post(
-    "/config/users/{user_id}/toggle-disabled",
-    dependencies=[Depends(require_admin_api)],
-)
-async def toggle_user_disabled(request: Request, user_id: int) -> dict[str, bool | int]:
-    # Resolve caller for self-disable guard: session user OR API-token bearer
-    caller = await current_user(request)
-    if caller is None and request.app.state.settings.api_auth_required:
-        # Bearer-token caller: resolve user from token so self-disable is blocked
-        authz = request.headers.get("authorization", "")
-        if authz.lower().startswith("bearer "):
-            raw_token = authz[7:].strip()
-            async with request.app.state.db_sessionmaker() as _db:
-                api_tok = await auth_svc.check_api_token(_db, raw_token)
-            if api_tok is not None:
-                async with request.app.state.db_sessionmaker() as _db:
-                    caller = await auth_svc.get_user_by_id(_db, api_tok.created_by)
-    if caller is not None and caller.id == user_id:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "cannot_disable_self",
-                "hint": "You cannot disable your own account.",
-            },
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        target = await auth_svc.get_user_by_id(db, user_id)
-        if target is None:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason": "user_not_found", "hint": f"No user with id {user_id}."},
-            )
-        will_disable = not target.disabled
-        if will_disable and target.role == "admin":
-            count = await auth_svc.count_enabled_admins(db)
-            if count <= 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "reason": "last_admin",
-                        "hint": "Cannot disable the last enabled admin.",
-                    },
-                )
-        await auth_svc.set_user_disabled(db, user_id, will_disable)
-    return {"ok": True, "disabled": will_disable}
-
-
-@router.post(
-    "/config/users/{user_id}/reset-password",
-    dependencies=[Depends(require_admin_api)],
-)
-async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[str, str | bool]:
-    async with request.app.state.db_sessionmaker() as db:
-        target = await auth_svc.get_user_by_id(db, user_id)
-        if target is None:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason": "user_not_found", "hint": f"No user with id {user_id}."},
-            )
-        new_pw = secrets.token_urlsafe(12)
-        await auth_svc.reset_user_password(db, user_id, new_pw)
-    return {"ok": True, "password": new_pw}
-
-
-@router.post(
-    "/config/users/{user_id}/set-role",
-    dependencies=[Depends(require_admin_api)],
-)
-async def set_user_role_endpoint(
-    request: Request, user_id: int, body: SetRoleIn
-) -> dict[str, bool]:
-    if body.role not in auth_svc.VALID_ROLES:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "invalid_role", "hint": "Role must be admin or analyst."},
-        )
-    async with request.app.state.db_sessionmaker() as db:
-        target = await auth_svc.get_user_by_id(db, user_id)
-        if target is None:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason": "user_not_found", "hint": f"No user with id {user_id}."},
-            )
-        if target.role == "admin" and body.role != "admin" and not target.disabled:
-            count = await auth_svc.count_enabled_admins(db)
-            if count <= 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"reason": "last_admin", "hint": "Cannot demote the last admin."},
-                )
-        await auth_svc.set_user_role(db, user_id, body.role)
-    return {"ok": True}
-
-
-# ── Auto-triage (bulk) ─────────────────────────────────────────────────────
-
-
-class AutoTriageStatusOut(BaseModel):
-    active: bool
-    total: int
-    hunted: int
-    skipped: int
-    failed: int
-    finished_at: str | None = None
-    severities: list[str] = []
-    note: str | None = None
-    current: str | None = None
-    tool_calls: int = 0
-
-
-def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
-    return AutoTriageStatusOut(
-        active=status.active,
-        total=status.total,
-        hunted=status.hunted,
-        skipped=status.skipped,
-        failed=status.failed,
-        finished_at=status.finished_at,
-        severities=list(status.severities),
-        note=note,
-        current=status.current,
-        tool_calls=status.tool_calls,
-    )
-
-
-class AutoTriageIn(BaseModel):
-    range: str = aq.DEFAULT_RANGE
-    q: str | None = None
-    severities: list[str] = []
-    # Explicit operator selection (alert ES ids). When present, auto-triage
-    # honours the selection — bypassing severity/range planning and the
-    # max-targets cap — and only skips ids that already carry a verdict.
-    alert_ids: list[str] = []
-
-
-@router.post("/auto-triage", response_model=AutoTriageStatusOut)
-async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageStatusOut:
-    """Plan + launch a background auto-triage batch (single-flight). Poll
-    GET /auto-triage for progress. With ``alert_ids`` it triages exactly that
-    selection (already-verdicted ids skipped); otherwise it sweeps the
-    critical+high detections in range."""
-    state = request.app.state
-    status = at.get_status(state)
-    if status.active:
-        return _at_status(status, note="already running")
-
-    selected = [a for a in body.alert_ids if a]
-    # Derive the config-default severity band: everything at or above the floor.
-    _ladder = list(aq.SEVERITIES)  # ("critical", "high", "medium", "low")
-    _settings = state.settings
-    _floor = getattr(_settings, "auto_triage_min_severity", "high")
-    _idx = _ladder.index(_floor) if _floor in _ladder else _ladder.index("high")
-    _config_band: tuple[str, ...] = tuple(_ladder[: _idx + 1])
-    chosen: tuple[str, ...] = _config_band
-    status.active = True  # claim the slot before any await
-    try:
-        if selected:
-            targets, skipped = await at.plan_targets_for_ids(state, alert_ids=selected)
-        else:
-            # Explicit severities from the caller take precedence over the config floor.
-            chosen = tuple(s for s in body.severities if s in aq.SEVERITIES) or _config_band
-            time_range = body.range if body.range in aq.TIME_RANGES else aq.DEFAULT_RANGE
-            oql = (body.q or "").strip() or None
-            targets, skipped = await at.plan_targets(
-                state, time_range=time_range, oql=oql, severities=chosen
-            )
-    except Exception:
-        status.active = False
-        raise HTTPException(status_code=500, detail={"reason": "planning_failed"}) from None
-
-    if not targets:
-        status.reset(active=False, total=0, skipped=skipped, severities=chosen)
-        status.finished_at = datetime.now(UTC).isoformat()
-        if selected:
-            empty_note = (
-                f"all {skipped} selected already triaged" if skipped else "nothing to triage"
-            )
-        else:
-            empty_note = "nothing to hunt"
-        return _at_status(status, note=empty_note)
-
-    status.reset(active=True, total=len(targets), skipped=skipped, severities=chosen)
-    started_by = f"auto-triage:{await identify_caller(request)}"
-    status._task = asyncio.create_task(
-        at.run_auto_triage(state, targets=targets, started_by=started_by)
-    )
-    note: str | None = None
-    if selected:
-        note = f"triaging {len(targets)} selected"
-        if skipped:
-            note += f" ({skipped} already triaged)"
-    return _at_status(status, note=note)
-
-
-@router.get("/auto-triage", response_model=AutoTriageStatusOut)
-async def auto_triage_status(request: Request) -> AutoTriageStatusOut:
-    return _at_status(at.get_status(request.app.state))
-
-
-@router.post("/auto-triage/stop", response_model=AutoTriageStatusOut)
-async def stop_auto_triage(request: Request) -> AutoTriageStatusOut:
-    """Request an in-flight auto-triage run to stop after its current target.
-
-    The current investigation is allowed to finish cleanly; no further targets
-    are started. Returns the (now winding-down) status; a no-op if idle.
-    """
-    state = request.app.state
-    at.request_stop(state)
-    return _at_status(at.get_status(state))
-
-
-# ── Backtest ("prove it on my last N days") ────────────────────────────────────
-#
-# Replays the agent over a diverse sample of ALREADY-DISPOSITIONED alerts and
-# reports how soc-ai's verdicts compare to the analyst's real Security Onion
-# disposition. Single-flight background job (BacktestStatus on app.state), the
-# same shape as auto-triage. Each sample is a FULL LLM investigation — expensive
-# — so the endpoint clamps sample_size to ``settings.backtest_max_sample``.
-
-
-class BacktestStatusOut(BaseModel):
-    active: bool
-    backtest_id: str | None = None
-    total: int
-    replayed: int
-    failed: int
-    finished_at: str | None = None
-    current: str | None = None
-    note: str | None = None
-    # The finished run's params + scored results (present once complete).
-    params: dict[str, Any] | None = None
-    results: dict[str, Any] | None = None
-    status: str | None = None
-    sampled: int | None = None
-
-
-class BacktestIn(BaseModel):
-    window_days: int = Field(default=30, ge=1, le=365)
-    sample_size: int = Field(default=backtest_svc.DEFAULT_SAMPLE_SIZE, ge=1)
-    min_severity: str | None = None
-
-
-def _bt_status_out(status: Any) -> BacktestStatusOut:
-    """Serialize the in-memory BacktestStatus (live progress, no stored results)."""
-    return BacktestStatusOut(
-        active=status.active,
-        backtest_id=status.backtest_id,
-        total=status.total,
-        replayed=status.replayed,
-        failed=status.failed,
-        finished_at=status.finished_at,
-        current=status.current,
-        note=status.note,
-    )
-
-
-def _bt_row_out(bt: Backtest, *, live: Any = None) -> BacktestStatusOut:
-    """Serialize a persisted Backtest row, overlaying live progress when it's the
-    active run (so a poll of GET /backtest shows both stored results AND the
-    in-flight replayed/failed counters)."""
-    active = bool(live and live.active and live.backtest_id == bt.id)
-    return BacktestStatusOut(
-        active=active,
-        backtest_id=bt.id,
-        total=(live.total if active else bt.sampled),
-        replayed=(live.replayed if active else bt.sampled),
-        failed=(live.failed if active else 0),
-        finished_at=(bt.finished_at.isoformat() if bt.finished_at else None),
-        current=(live.current if active else None),
-        note=(live.note if active else None),
-        params=bt.params,
-        results=bt.results,
-        status=bt.status,
-        sampled=bt.sampled,
-    )
-
-
-@router.post(
-    "/backtest",
-    response_model=BacktestStatusOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def start_backtest(request: Request, body: BacktestIn) -> BacktestStatusOut:
-    """Plan + launch a background backtest (single-flight). Poll GET /backtest.
-
-    Samples already-dispositioned alerts from the last ``window_days`` (analyst
-    escalated ⇒ expected true-positive; acknowledged-not-escalated ⇒ expected
-    false-positive), replays each through the agent, and scores soc-ai's verdicts
-    against the human disposition. ``sample_size`` is clamped to
-    ``settings.backtest_max_sample`` — each sample is a full LLM investigation.
-    Admin-gated (expensive + operator-facing).
-    """
-    state = request.app.state
-    started_by = f"backtest:{await identify_caller(request)}"
-    min_sev = (body.min_severity or "").strip().lower() or None
-    if min_sev is not None and min_sev not in aq.SEVERITIES:
-        min_sev = None
-    status = await backtest_svc.start_backtest(
-        state,
-        window_days=body.window_days,
-        sample_size=body.sample_size,
-        min_severity=min_sev,
-        started_by=started_by,
-    )
-    return _bt_status_out(status)
-
-
-@router.get("/backtest", response_model=BacktestStatusOut)
-async def backtest_status(request: Request) -> BacktestStatusOut:
-    """The current/last backtest: live progress if running, else the stored results."""
-    state = request.app.state
-    live = backtest_svc.get_status(state)
-    async with state.db_sessionmaker() as db:
-        bt = await bt_svc.latest(db)
-    if bt is None:
-        # Never run — return the idle in-memory status.
-        return _bt_status_out(live)
-    return _bt_row_out(bt, live=live)
-
-
-@router.get("/backtest/{backtest_id}", response_model=BacktestStatusOut)
-async def backtest_by_id(request: Request, backtest_id: str) -> BacktestStatusOut:
-    """A specific backtest run by id."""
-    state = request.app.state
-    live = backtest_svc.get_status(state)
-    async with state.db_sessionmaker() as db:
-        bt = await bt_svc.get(db, backtest_id)
-    if bt is None:
-        raise HTTPException(status_code=404, detail={"reason": "backtest_not_found"})
-    return _bt_row_out(bt, live=live)
-
-
-# ── Internal-identifier discovery: scan-now (single-flight) ────────────────────
-#
-# Learns internal domain suffixes + bare hostnames from ES and upserts them as
-# detected internal_identifier rows. Modeled on the auto-triage pattern: a
-# background asyncio task with an in-memory status on app.state, single-flight
-# (a second POST while a scan runs returns the running status, doesn't start a
-# second). Reuses app.state.elastic + app.state.db_sessionmaker.
-
-_DISCOVERY_STATE_ATTR = "_discovery_status"
-
-
-class _DiscoveryStatus:
-    """In-memory status for the discovery scan-now task on app.state."""
-
-    def __init__(self) -> None:
-        self.running: bool = False
-        self.last_scan: str | None = None
-        self.last_summary: dict[str, Any] | None = None
-        self._task: asyncio.Task[None] | None = None
-
-
-def _get_discovery_status(state: Any) -> _DiscoveryStatus:
-    if not hasattr(state, _DISCOVERY_STATE_ATTR):
-        setattr(state, _DISCOVERY_STATE_ATTR, _DiscoveryStatus())
-    return getattr(state, _DISCOVERY_STATE_ATTR)  # type: ignore[no-any-return]
-
-
-class DiscoveryStatusOut(BaseModel):
-    running: bool
-    last_scan: str | None = None
-    last_summary: dict[str, Any] | None = None
-    note: str | None = None
-
-
-def _discovery_status_out(status: _DiscoveryStatus, note: str | None = None) -> DiscoveryStatusOut:
-    return DiscoveryStatusOut(
-        running=status.running,
-        last_scan=status.last_scan,
-        last_summary=status.last_summary,
-        note=note,
-    )
-
-
-async def _run_discovery_task(state: Any) -> None:
-    """Background worker: run one discovery scan, stash the summary, never raise."""
-    from dataclasses import asdict  # noqa: PLC0415 - lazy
-
-    from soc_ai.enrichment.discovery import run_discovery  # noqa: PLC0415 - lazy
-
-    status = _get_discovery_status(state)
-    try:
-        summary = await run_discovery(state.elastic, state.db_sessionmaker, state.settings)
-        status.last_summary = asdict(summary)
-    except Exception:
-        _LOGGER.exception("discovery: scan-now task failed")
-        status.last_summary = {"errors": ["scan failed; see server logs"]}
-    finally:
-        status.running = False
-        status.last_scan = datetime.now(UTC).isoformat()
-
-
-@router.post(
-    "/discovery/scan",
-    response_model=DiscoveryStatusOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def start_discovery_scan(request: Request) -> DiscoveryStatusOut:
-    """Launch a background internal-identifier discovery scan (single-flight).
-
-    Poll ``GET /discovery/scan`` for status. A second POST while a scan is in
-    flight returns the running status instead of starting a second scan. Returns
-    a note when discovery is disabled (nothing is started)."""
-    state = request.app.state
-    status = _get_discovery_status(state)
-    if status.running:
-        return _discovery_status_out(status, note="already running")
-    if not state.settings.discovery_enabled:
-        return _discovery_status_out(status, note="discovery disabled")
-    status.running = True  # claim the slot before scheduling
-    status._task = asyncio.create_task(_run_discovery_task(state))
-    return _discovery_status_out(status, note="started")
-
-
-@router.get(
-    "/discovery/scan",
-    response_model=DiscoveryStatusOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def discovery_scan_status(request: Request) -> DiscoveryStatusOut:
-    return _discovery_status_out(_get_discovery_status(request.app.state))
-
-
-# ── Internal-identifier managed list: REST CRUD ────────────────────────────────
-#
-# Surfaces the ``internal_identifier`` table to the config console. Each kind
-# ('suffix' | 'host' | 'cidr') is presented as a group of MUTABLE DB rows plus
-# read-only ALWAYS-ON entries (the env/reserved identifiers from the effective
-# set that have no DB row). The always-on entries have no id, so the
-# deactivate/delete routes below (which take an id) cannot suppress a
-# reserved/env default — that enforces the spec's "deactivating cannot remove an
-# env/reserved default (the floor wins)" contract at the API surface.
-# Kind-generic: increment 3 adds a 'cidr' group with no rework here.
-
-# Reserved special-use suffixes that the egress sanitizer always re-adds as a
-# floor (mirrors ``soc_ai.oracle.sanitize._DEFAULT_SUFFIXES`` and the default
-# ``Settings.oracle_internal_suffixes``). Always-on suffixes in this set are
-# labeled 'reserved'; operator-configured env identifiers beyond it are 'env'.
-_RESERVED_SUFFIXES = (".lan", ".local", ".internal", ".corp")
-
-
-class InternalIdentifierRowOut(BaseModel):
-    """One managed-list entry. Mutable rows carry an ``id``; always-on don't."""
-
-    id: int | None = None
-    value: str
-    source: str  # 'detected' | 'manual' | 'reserved' | 'env'
-    state: str  # 'active' | 'muted'
-    evidence: dict[str, Any] | None = None
-    mutable: bool
-
-
-class InternalIdentifierGroupOut(BaseModel):
-    kind: str  # 'suffix' | 'host' | 'cidr'
-    rows: list[InternalIdentifierRowOut]
-
-
-class InternalIdentifiersOut(BaseModel):
-    groups: list[InternalIdentifierGroupOut]
-    last_scan: DiscoveryStatusOut
-
-
-class InternalIdentifierIn(BaseModel):
-    kind: str
-    # Domains / hostnames / IPs / CIDRs only — blocks injection payloads while
-    # allowing every legitimate identifier shape (the cidr path validates further).
-    value: str = Field(min_length=1, max_length=253, pattern=r"^[\w.\-:/]+$")
-
-
-_IDENTIFIER_KINDS = ("suffix", "host", "cidr")
-
-
-def _always_on_source(kind: str, value: str) -> str:
-    """Classify an always-on (no-DB-row) identifier as 'reserved' or 'env'.
-
-    Only suffixes have a hardcoded reserved floor; for those, a value in
-    ``_RESERVED_SUFFIXES`` is 'reserved', anything else is operator-set 'env'.
-    Hosts/CIDRs have no reserved defaults, so they're always 'env'.
-    """
-    if kind == "suffix" and value in _RESERVED_SUFFIXES:
-        return "reserved"
-    return "env"
-
-
-@router.get(
-    "/internal-identifiers",
-    response_model=InternalIdentifiersOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def list_internal_identifiers(
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> InternalIdentifiersOut:
-    """Managed internal-identifier list grouped by kind.
-
-    Each group is the mutable DB rows (``list_identifiers``) plus the read-only
-    always-on env/reserved entries: the values in the effective set that are NOT
-    represented by a DB row. Always-on entries have no id and no active toggle —
-    that's why ``.lan`` shows as an always-on row the operator can't deactivate.
-    Also returns the discovery ``last_scan`` status (reusing the 2b status object).
-    """
-    from soc_ai.oracle.identifiers import (  # noqa: PLC0415 - lazy
-        effective_internal_identifiers,
-    )
-
-    async with request.app.state.db_sessionmaker() as db:
-        effective = await effective_internal_identifiers(db, settings)
-        effective_by_kind: dict[str, list[str]] = {
-            "suffix": list(effective.suffixes),
-            "host": list(effective.hosts),
-            "cidr": [str(net) for net in effective.cidrs],
-        }
-        groups: list[InternalIdentifierGroupOut] = []
-        for kind in _IDENTIFIER_KINDS:
-            db_rows = await ids_store.list_identifiers(db, kind)
-            rows: list[InternalIdentifierRowOut] = [
-                InternalIdentifierRowOut(
-                    id=r.id,
-                    value=r.value,
-                    source=r.source,
-                    state=r.state,
-                    evidence=r.evidence,
-                    mutable=True,
-                )
-                for r in db_rows
-            ]
-            # Always-on = effective values not already present as a DB row. (An
-            # active DB row whose value is also an env default appears as its
-            # mutable row, not duplicated as always-on.)
-            db_values = {r.value for r in db_rows}
-            for value in effective_by_kind[kind]:
-                if value in db_values:
-                    continue
-                rows.append(
-                    InternalIdentifierRowOut(
-                        id=None,
-                        value=value,
-                        source=_always_on_source(kind, value),
-                        state="active",
-                        evidence=None,
-                        mutable=False,
-                    )
-                )
-            groups.append(InternalIdentifierGroupOut(kind=kind, rows=rows))
-
-    last_scan = _discovery_status_out(_get_discovery_status(request.app.state))
-    return InternalIdentifiersOut(groups=groups, last_scan=last_scan)
-
-
-@router.post(
-    "/internal-identifiers",
-    response_model=InternalIdentifierRowOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def add_internal_identifier(
-    request: Request, body: InternalIdentifierIn
-) -> InternalIdentifierRowOut:
-    """Add a manual identifier. Bad kind / invalid value → 400."""
-    async with request.app.state.db_sessionmaker() as db:
-        try:
-            row = await ids_store.add_manual(db, body.kind, body.value)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail={"reason": "invalid_identifier", "hint": str(exc)}
-            ) from exc
-        return InternalIdentifierRowOut(
-            id=row.id,
-            value=row.value,
-            source=row.source,
-            state=row.state,
-            evidence=row.evidence,
-            mutable=True,
-        )
-
-
-async def _set_identifier_state(
-    request: Request, ident_id: int, state: str
-) -> InternalIdentifierRowOut:
-    async with request.app.state.db_sessionmaker() as db:
-        row = await ids_store.set_state(db, ident_id, state)
-        if row is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        return InternalIdentifierRowOut(
-            id=row.id,
-            value=row.value,
-            source=row.source,
-            state=row.state,
-            evidence=row.evidence,
-            mutable=True,
-        )
-
-
-@router.post(
-    "/internal-identifiers/{ident_id}/deactivate",
-    response_model=InternalIdentifierRowOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def deactivate_internal_identifier(
-    request: Request, ident_id: int
-) -> InternalIdentifierRowOut:
-    return await _set_identifier_state(request, ident_id, "muted")
-
-
-@router.post(
-    "/internal-identifiers/{ident_id}/activate",
-    response_model=InternalIdentifierRowOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def activate_internal_identifier(request: Request, ident_id: int) -> InternalIdentifierRowOut:
-    return await _set_identifier_state(request, ident_id, "active")
-
-
-@router.delete(
-    "/internal-identifiers/{ident_id}",
-    dependencies=[Depends(require_admin_api)],
-)
-async def delete_internal_identifier(request: Request, ident_id: int) -> dict[str, Any]:
-    """Delete a manual identifier. Refuses a detected row → 409 (deactivate it)."""
-    async with request.app.state.db_sessionmaker() as db:
-        deleted = await ids_store.delete_manual(db, ident_id)
-        if not deleted:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "reason": "not_deletable",
-                    "hint": "Detected identifiers cannot be deleted — deactivate them instead.",
-                },
-            )
-    return {"ok": True}
-
-
-# ── Detection tuning (noisy-rule nomination + soft mutes) ──────────────────────
-
-
-class DetectionNominationOut(BaseModel):
-    """One nominated noisy rule from the detection-tuning analysis."""
-
-    rule_name: str
-    alert_count: int
-    investigations: int
-    fp: int
-    tp: int
-    nmi: int
-    recommendation: str  # 'mute' | 'monitor' | 'none'
-    reason: str
-    already_muted: bool
-
-
-class DetectionOverrideOut(BaseModel):
-    """One active operator override (a soft mute)."""
-
-    id: int
-    rule_name: str
-    action: str  # 'mute'
-    reason: str | None = None
-    created_by: str
-    created_at: str
-    active: bool
-
-
-class DetectionTuningOut(BaseModel):
-    nominations: list[DetectionNominationOut]
-    overrides: list[DetectionOverrideOut]
-
-
-class DetectionOverrideIn(BaseModel):
-    # Detection-rule / signature name. The value is whatever rule.name carries —
-    # bounded length, no pattern restriction (rule names contain spaces/punct).
-    rule_name: str = Field(min_length=1, max_length=512)
-    action: str = "mute"
-    reason: str | None = Field(default=None, max_length=512)
-
-
-def _override_out(row: Any) -> DetectionOverrideOut:
-    return DetectionOverrideOut(
-        id=row.id,
-        rule_name=row.rule_name,
-        action=row.action,
-        reason=row.reason,
-        created_by=row.created_by,
-        created_at=row.created_at.isoformat() if row.created_at else "",
-        active=row.active,
-    )
-
-
-@router.get(
-    "/detection-tuning",
-    response_model=DetectionTuningOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def get_detection_tuning(request: Request) -> DetectionTuningOut:
-    """Nominated noisy rules + the active soft-mute overrides (detection tuning).
-
-    Nominations join the live alert volume with each rule's completed-investigation
-    verdict trend (see :mod:`soc_ai.webui.detection_tuning`); the overrides are the
-    operator's active soft mutes. A mute hides a rule from the default alerts feed
-    — it never touches Security Onion.
-    """
-    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
-
-    nominations = await dt.nominate(request.app.state)
-    async with request.app.state.db_sessionmaker() as db:
-        overrides = await override_svc.list_active(db)
-    return DetectionTuningOut(
-        nominations=[DetectionNominationOut(**n) for n in nominations],
-        overrides=[_override_out(o) for o in overrides],
-    )
-
-
-@router.post(
-    "/detection-tuning/override",
-    response_model=DetectionOverrideOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def create_detection_override(
-    request: Request, body: DetectionOverrideIn
-) -> DetectionOverrideOut:
-    """Mute a noisy rule — create a soft, reversible suppression. SO is untouched."""
-    if body.action != "mute":
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "invalid_action", "hint": "only 'mute' is supported"},
-        )
-    created_by = await identify_caller(request)
-    async with request.app.state.db_sessionmaker() as db:
-        row = await override_svc.create(
-            db,
-            rule_name=body.rule_name,
-            action=body.action,
-            reason=body.reason,
-            created_by=created_by,
-        )
-    return _override_out(row)
-
-
-@router.post(
-    "/detection-tuning/override/{override_id}/remove",
-    dependencies=[Depends(require_admin_api)],
-)
-async def remove_detection_override(request: Request, override_id: int) -> dict[str, bool]:
-    """Un-mute: deactivate an override (kept for audit). 404 if not active."""
-    async with request.app.state.db_sessionmaker() as db:
-        ok = await override_svc.deactivate(db, override_id)
-    if not ok:
-        raise HTTPException(
-            status_code=404,
-            detail={"reason": "not_found", "hint": "no active override with that id"},
-        )
-    return {"removed": True}
-
-
-# ── Operator runbooks ──────────────────────────────────────────────────────────
-#
-# The org's own guidance the triage agent can cite (the ``lookup_runbook`` tool
-# searches these). Reads are analyst-readable; writes are admin-gated. Purely
-# local — nothing is ever written to Security Onion.
-
-
-# Bound stored runbooks: content is loaded + tokenized in-process on EVERY agent
-# ``lookup_runbook`` call, so an unbounded blob is a latency/memory footgun even
-# though writes are admin-only. Cap the body and both the count and per-item length
-# of the tag / linked-rule lists.
-_RB_LABEL = Annotated[str, Field(max_length=256)]
-_RB_CONTENT_MAX = 65536
-_RB_LIST_MAX = 128
-
-
-class RunbookIn(BaseModel):
-    title: str = Field(min_length=1, max_length=512)
-    content: str = Field(default="", max_length=_RB_CONTENT_MAX)
-    tags: list[_RB_LABEL] = Field(default_factory=list, max_length=_RB_LIST_MAX)
-    linked_rules: list[_RB_LABEL] = Field(default_factory=list, max_length=_RB_LIST_MAX)
-
-
-class RunbookPatch(BaseModel):
-    """All fields optional — only the provided ones are updated."""
-
-    title: str | None = Field(default=None, min_length=1, max_length=512)
-    content: str | None = Field(default=None, max_length=_RB_CONTENT_MAX)
-    tags: list[_RB_LABEL] | None = Field(default=None, max_length=_RB_LIST_MAX)
-    linked_rules: list[_RB_LABEL] | None = Field(default=None, max_length=_RB_LIST_MAX)
-
-
-class RunbookOut(BaseModel):
-    id: int
-    title: str
-    content: str
-    tags: list[str]
-    linked_rules: list[str]
-    created_by: str
-    created_at: str
-    updated_at: str
-
-
-def _runbook_out(row: Any) -> RunbookOut:
-    return RunbookOut(
-        id=row.id,
-        title=row.title,
-        content=row.content or "",
-        tags=list(row.tags or []),
-        linked_rules=list(row.linked_rules or []),
-        created_by=row.created_by,
-        created_at=_iso_utc(row.created_at),
-        updated_at=_iso_utc(row.updated_at),
-    )
-
-
-@router.get("/runbooks", response_model=list[RunbookOut])
-async def list_runbooks(request: Request) -> list[RunbookOut]:
-    """All operator runbooks, most-recently-updated first (analyst-readable)."""
-    async with request.app.state.db_sessionmaker() as db:
-        rows = await runbooks_svc.list_all(db)
-    return [_runbook_out(r) for r in rows]
-
-
-@router.post(
-    "/runbooks",
-    response_model=RunbookOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def create_runbook(request: Request, body: RunbookIn) -> RunbookOut:
-    """Author a new runbook the triage agent can search + cite."""
-    created_by = await identify_caller(request)
-    async with request.app.state.db_sessionmaker() as db:
-        row = await runbooks_svc.create(
-            db,
-            title=body.title,
-            content=body.content,
-            tags=body.tags,
-            linked_rules=body.linked_rules,
-            created_by=created_by,
-        )
-    return _runbook_out(row)
-
-
-@router.put(
-    "/runbooks/{runbook_id}",
-    response_model=RunbookOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def update_runbook(request: Request, runbook_id: int, body: RunbookPatch) -> RunbookOut:
-    """Update a runbook's fields. 404 if it doesn't exist."""
-    async with request.app.state.db_sessionmaker() as db:
-        row = await runbooks_svc.update(
-            db,
-            runbook_id,
-            title=body.title,
-            content=body.content,
-            tags=body.tags,
-            linked_rules=body.linked_rules,
-        )
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail={"reason": "not_found", "hint": "no runbook with that id"},
-        )
-    return _runbook_out(row)
-
-
-@router.delete(
-    "/runbooks/{runbook_id}",
-    dependencies=[Depends(require_admin_api)],
-)
-async def delete_runbook(request: Request, runbook_id: int) -> dict[str, bool]:
-    """Delete a runbook. 404 if it doesn't exist."""
-    async with request.app.state.db_sessionmaker() as db:
-        ok = await runbooks_svc.delete(db, runbook_id)
-    if not ok:
-        raise HTTPException(
-            status_code=404,
-            detail={"reason": "not_found", "hint": "no runbook with that id"},
-        )
-    return {"deleted": True}
-
-
-# ── Oracle pre-egress redaction preview ────────────────────────────────────────
-
-
-class RedactionPreviewOut(BaseModel):
-    original: dict[str, Any]
-    sanitized: dict[str, Any]
-    summary: dict[str, int]
-    note: str
-
-
-@router.get(
-    "/oracle/redaction-preview",
-    response_model=RedactionPreviewOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def oracle_redaction_preview(
-    settings: Settings = Depends(get_settings_dep),
-) -> RedactionPreviewOut:
-    """Show EXACTLY what leaves the network before an Oracle call.
-
-    Runs THIS deployment's own internal identifiers (derived from
-    ``oracle_internal_suffixes``) through the real pre-egress sanitizer and returns
-    the before → after, plus a per-category count. Lets an operator inspect and
-    trust the redaction before enabling the Oracle — and confirm that public
-    addresses pass through while every internal identifier is pseudonymized.
-    """
-    from soc_ai.oracle.sanitize import Mapping, redaction_summary, sanitize  # noqa: PLC0415
-
-    suffix = (settings.oracle_internal_suffixes or (".local",))[0]
-    # A representative sample: internal host/IP/MAC/user/email (all must redact) +
-    # one PUBLIC destination (must pass through so the Oracle sees real infra).
-    sample: dict[str, Any] = {
-        "host": {"name": f"dc01{suffix}", "ip": "10.0.0.15"},
-        "source": {"ip": "192.168.1.42", "mac": "00:1a:2b:3c:4d:5e"},
-        "user": {"name": "jsmith", "email": f"jsmith@corp{suffix}"},
-        "destination": {"ip": "8.8.8.8"},  # external — preserved
-        "note": f"beacon from dc01{suffix} (10.0.0.15) to 8.8.8.8 every 60s",
-    }
-    mapping = Mapping()
-    sanitized = sanitize(sample, mapping, extra_suffixes=settings.oracle_internal_suffixes)
-    return RedactionPreviewOut(
-        original=sample,
-        sanitized=sanitized,
-        summary=redaction_summary(mapping),
-        note=(
-            "Internal identifiers are replaced with stable opaque labels (IP_01, "
-            "HOST_01, …) before any Oracle call — the same real value always maps to "
-            "the same label so the model's reasoning stays coherent. Public/external "
-            "addresses pass through so the Oracle can reason about real infrastructure. "
-            "Nothing is sent at all unless you enable the Oracle."
-        ),
-    )
-
-
-# ── Audit-grade decision record ("show your work") export ──────────────────────
-
-
-def _decision_record(
-    inv: Investigation, events: list[Any], *, signer: Any | None = None
-) -> dict[str, Any]:
-    """A self-contained record of how a verdict was reached.
-
-    Bundles the verdict + rationale + the full agent trace (every tool call, every
-    cited event) + provenance. Integrity: a sha256 checksum over the canonical JSON
-    (accidental-corruption detection) AND — when a signing key is available — an
-    Ed25519 detached SIGNATURE over the same bytes with the public key embedded, so
-    an external auditor can prove the record was not altered using the public key
-    alone. The "show your work" artifact for audit, compliance, and hand-off.
-    """
-    body: dict[str, Any] = {
-        "schema": "soc-ai.decision-record/v1",
-        "soc_ai_version": __version__,
-        "investigation_id": inv.id,
-        "alert_es_id": inv.alert_es_id,
-        "rule_name": inv.rule_name,
-        "verdict": inv.verdict,
-        "confidence": inv.confidence,
-        "rationale": inv.rationale,
-        "summary": inv.summary,
-        "flow": {"src": inv.src_ip, "dst": inv.dest_ip},
-        "status": inv.status,
-        "provenance": {
-            "started_by": inv.started_by,
-            "created_at": inv.created_at.isoformat() if inv.created_at else None,
-            "finished_at": inv.finished_at.isoformat() if inv.finished_at else None,
-        },
-        # The full triage report: citations, recommended_actions, model metadata,
-        # any validator notes and resolution/override provenance.
-        "report": inv.report,
-        # The agent trace, in order — the actual evidence the verdict rests on.
-        "trace": [{"sequence": e.sequence, "kind": e.kind, "payload": e.payload} for e in events],
-    }
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    integrity: dict[str, Any] = {
-        "algo": "sha256",
-        "hash": digest,
-        "note": (
-            "sha256 checksum over the canonical JSON of this record with the "
-            "'integrity' field removed — detects accidental corruption in "
-            "transit/storage."
-        ),
-    }
-    if signer is not None:
-        # Detached Ed25519 signature over the SAME canonical bytes the checksum
-        # covers. Verify: recompute the canonical JSON (integrity field removed),
-        # then ed25519-verify(signature, canonical) against public_key. Tamper-
-        # evident — a post-export edit cannot be re-signed without the private key.
-        try:
-            integrity["signature"] = {
-                "algo": "ed25519",
-                "value": signer.sign_hex(canonical.encode("utf-8")),
-                "public_key": signer.public_key_hex(),
-                "note": (
-                    "detached Ed25519 signature over the canonical JSON (integrity "
-                    "field removed); verify with the public_key — no server secret needed."
-                ),
-            }
-        except Exception:  # pragma: no cover - signing must never break the export
-            _LOGGER.warning("decision-record signing failed; exporting with checksum only")
-    body["integrity"] = integrity
-    return body
-
-
-@router.get("/investigations/{inv_id}/export")
-async def export_investigation(inv_id: str, request: Request) -> JSONResponse:
-    """Download the audit-grade decision record for one investigation.
-
-    JSON with a sha256 integrity checksum AND (when a signing key is present) an
-    Ed25519 detached signature + public key — verifiable by an external auditor
-    with the public key alone (see GET /decision-record/public-key).
-    """
-    async with request.app.state.db_sessionmaker() as db:
-        got = await inv_svc.get_with_events(db, inv_id)
-    if got is None:
-        raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    inv, events = got
-    signer = getattr(request.app.state, "decision_signer", None)
-    record = _decision_record(inv, events, signer=signer)
-    return JSONResponse(
-        content=record,
-        headers={"Content-Disposition": f'attachment; filename="soc-ai-{inv.id}.json"'},
-    )
-
-
-@router.get("/decision-record/public-key")
-async def decision_record_public_key(request: Request) -> dict[str, Any]:
-    """The Ed25519 public key that verifies decision-record export signatures.
-
-    A verification key is meant to be published; it's also embedded in every
-    export's integrity block, so an external auditor can verify from the exported
-    file alone. Returns ``{"algo": "ed25519", "public_key": null}`` when signing is
-    unavailable (exports then carry the checksum only).
-    """
-    signer = getattr(request.app.state, "decision_signer", None)
-    return {
-        "algo": "ed25519",
-        "public_key": signer.public_key_hex() if signer is not None else None,
-    }
-
-
-# ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────
-
-_PCAP_PROBE_TTL_S = 300.0  # SSH is heavy; cache the PCAP probe between polls.
-# ES + LLM probes are cheap HTTP, but the dashboard polls /health every ~30s and
-# several tabs can poll at once — a short TTL keeps a burst of near-simultaneous
-# polls from fanning out to the upstreams while still feeling live.
-_HEALTH_PROBE_TTL_S = 15.0
-
-
-class HealthComponentOut(BaseModel):
-    ok: bool
-    detail: str
-
-
-class HealthOut(BaseModel):
-    es: HealthComponentOut
-    llm: HealthComponentOut
-    pcap: HealthComponentOut | None = None  # only when pcap_enabled
-
-
-async def _cached_pcap_probe(state: Any, settings: Settings) -> dict[str, Any]:
-    now = time.monotonic()
-    cached = getattr(state, "_pcap_probe_cache", None)
-    if cached is not None and now - cached[0] < _PCAP_PROBE_TTL_S:
-        return cached[1]  # type: ignore[no-any-return]
-    result = await probes.probe_pcap(settings)
-    state._pcap_probe_cache = (now, result)
-    return result
-
-
-async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dict[str, Any]]:
-    """The ES + LLM probe results, TTL-cached on app state.
-
-    Both are cheap, but a 30s dashboard poll across several tabs would otherwise
-    hit ES + the gateway every time; the short TTL collapses those into one
-    probe per window. Returns ``{"es": {...}, "llm": {...}}``.
-    """
-    now = time.monotonic()
-    cached = getattr(state, "_health_probe_cache", None)
-    if cached is not None and now - cached[0] < _HEALTH_PROBE_TTL_S:
-        return cached[1]  # type: ignore[no-any-return]
-    result = {
-        "es": await probes.probe_es(state.elastic),
-        "llm": await probes.probe_llm(settings),
-    }
-    state._health_probe_cache = (now, result)
-    return result
-
-
-@router.get("/health", response_model=HealthOut)
-async def health(
-    request: Request,
-    settings: Settings = Depends(get_settings_dep),
-) -> HealthOut:
-    """Live status of the upstreams the UI depends on. ES + LLM are cheap HTTP
-    probes (short-TTL cached); PCAP (heavy SSH) is cached longer. Secret-free."""
-    probed = await _cached_health_probes(request.app.state, settings)
-    out = HealthOut(
-        es=HealthComponentOut(**probed["es"]),
-        llm=HealthComponentOut(**probed["llm"]),
-    )
-    if settings.pcap_enabled:
-        out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))
-    return out
+__all__ = [
+    "UTC",
+    "WRITE_TOOLS",
+    "_ACK_CAP",
+    "_ACK_CONCURRENCY",
+    "_ACTION_TAG",
+    "_ACTION_TITLE",
+    "_DANGER_TEST_TARGETS",
+    "_DEV_ME",
+    "_DISCOVERY_STATE_ATTR",
+    "_ESCALATE_CAP",
+    "_FE_KIND",
+    "_FE_SEV",
+    "_HEALTH_PROBE_TTL_S",
+    "_HUNT_STATUS",
+    "_HUNT_TL_GROUP",
+    "_HUNT_TL_SKIP",
+    "_IDENTIFIER_KINDS",
+    "_PCAP_PROBE_TTL_S",
+    "_PORT_PROTO",
+    "_RB_CONTENT_MAX",
+    "_RB_LABEL",
+    "_RB_LIST_MAX",
+    "_REHUNT_CAP",
+    "_RESERVED_SUFFIXES",
+    "_SETTING_TYPE",
+    "_STATUS",
+    "_TEMPLATE_LABELS",
+    "_TL_GROUP",
+    "_TL_SKIP",
+    "_TOOL_NOUN",
+    "_VALID_VERDICTS",
+    "APIRouter",
+    "AckEventsIn",
+    "AckGroupIn",
+    "AckGroupOut",
+    "AgentToolsOut",
+    "AlertEventOut",
+    "AlertGroupOut",
+    "Annotated",
+    "Any",
+    "ApiKeyOut",
+    "ApiToken",
+    "ApiTokenOut",
+    "ApproveIn",
+    "AssignIn",
+    "AssignOut",
+    "AutoTriageIn",
+    "AutoTriageStatusOut",
+    "Backtest",
+    "BacktestIn",
+    "BacktestStatusOut",
+    "BaseModel",
+    "ChatIn",
+    "ChatMessageOut",
+    "ChatThreadOut",
+    "ConfigOut",
+    "ConfigOverride",
+    "ConnTestOut",
+    "Counter",
+    "CreateUserIn",
+    "DangerSettingOut",
+    "DataSourceOut",
+    "DataSourcesOut",
+    "Depends",
+    "DetectionNominationOut",
+    "DetectionOverrideIn",
+    "DetectionOverrideOut",
+    "DetectionTuningOut",
+    "DiscoveryStatusOut",
+    "ElasticClient",
+    "EscalateGroupOut",
+    "EventSourceResponse",
+    "ExecuteActionResult",
+    "Field",
+    "HTTPException",
+    "HealthComponentOut",
+    "HealthOut",
+    "Hunt",
+    "HuntActionOut",
+    "HuntChatIn",
+    "HuntChatIn2",
+    "HuntChatMessageOut",
+    "HuntChatThreadOut",
+    "HuntEvent",
+    "HuntFindingOut",
+    "HuntOut",
+    "HuntRowOut",
+    "HuntStartIn",
+    "HuntStatOut",
+    "IntegrityError",
+    "InternalIdentifierGroupOut",
+    "InternalIdentifierIn",
+    "InternalIdentifierRowOut",
+    "InternalIdentifiersOut",
+    "InvMetaOut",
+    "Investigation",
+    "InvestigationOut",
+    "InvestigationRowOut",
+    "JSONResponse",
+    "LoginIn",
+    "MeOut",
+    "NotificationOut",
+    "OqlValidationError",
+    "OracleOut",
+    "OverrideVerdictIn",
+    "Query",
+    "RecommendedActionOut",
+    "RedactionPreviewOut",
+    "RehuntIn",
+    "RehuntResultOut",
+    "RepresentativeOut",
+    "Request",
+    "ResolveIn",
+    "RunbookIn",
+    "RunbookOut",
+    "RunbookPatch",
+    "SaveApiKeyIn",
+    "SaveDangerIn",
+    "SecretStr",
+    "SetRoleIn",
+    "SetStatusIn",
+    "SettingGroupOut",
+    "SettingIn",
+    "SettingOut",
+    "Settings",
+    "TimelineStepOut",
+    "TokenCreateIn",
+    "TransportError",
+    "UserOut",
+    "UsersListOut",
+    "ValidationError",
+    "WorkspaceOut",
+    "_DiscoveryStatus",
+    "__version__",
+    "_ack_many",
+    "_action_detail",
+    "_ago",
+    "_alert_currently_acked",
+    "_alert_meta",
+    "_always_on_source",
+    "_at_status",
+    "_bounds",
+    "_bt_row_out",
+    "_bt_status_out",
+    "_build_actions",
+    "_build_hunt_timeline",
+    "_build_oracle",
+    "_build_timeline",
+    "_cached_health_probes",
+    "_cached_pcap_probe",
+    "_chat_msg_out",
+    "_collect_reasoning",
+    "_compact",
+    "_decision_record",
+    "_detail_for",
+    "_discovery_status_out",
+    "_elapsed",
+    "_elapsed_sec",
+    "_entity_graph",
+    "_ep",
+    "_escalate_many",
+    "_executed_actions",
+    "_focus_hint_from_questions",
+    "_get_discovery_status",
+    "_host_signals",
+    "_humanize_id",
+    "_hunt_chat_msg_out",
+    "_hunt_chat_thread",
+    "_hunt_elapsed_sec",
+    "_hunt_report",
+    "_hunt_row",
+    "_inherited_reason",
+    "_inv_ago",
+    "_iso_utc",
+    "_kind",
+    "_open_questions_of",
+    "_override_out",
+    "_persist_action_executed",
+    "_pick_representative",
+    "_primary_run_ids",
+    "_proto",
+    "_request_is_https",
+    "_row",
+    "_row_status",
+    "_run_discovery_task",
+    "_runbook_out",
+    "_set_identifier_state",
+    "_setting_value",
+    "_sev",
+    "_template_label",
+    "_thread",
+    "_tl_group",
+    "_tool_outcome",
+    "_tool_step",
+    "_verdict",
+    "ack_events",
+    "ack_group",
+    "activate_internal_identifier",
+    "add_internal_identifier",
+    "agent_tools_svc",
+    "api_clear_api_key",
+    "api_danger_test_connection",
+    "api_get_agent_tools",
+    "api_get_api_keys",
+    "api_get_danger_settings",
+    "api_login",
+    "api_logout",
+    "api_save_api_key",
+    "api_save_danger_setting",
+    "apply_approval",
+    "approve",
+    "aq",
+    "assign_alert",
+    "assign_svc",
+    "asyncio",
+    "at",
+    "auth_svc",
+    "auto_triage_status",
+    "backtest_by_id",
+    "backtest_status",
+    "backtest_svc",
+    "bt_svc",
+    "bulk_rehunt",
+    "cancel_hunt",
+    "cancel_hunt_chat",
+    "cfg_svc",
+    "chat_manager",
+    "chat_svc",
+    "client_ip",
+    "collect_data_sources",
+    "create_detection_override",
+    "create_runbook",
+    "create_token",
+    "create_user_endpoint",
+    "ctx_from_state",
+    "current_user",
+    "datetime",
+    "deactivate_internal_identifier",
+    "decision_record_public_key",
+    "delete_hunt",
+    "delete_internal_identifier",
+    "delete_investigation",
+    "delete_runbook",
+    "discovery_scan_status",
+    "escalate_group",
+    "execute_action",
+    "execute_write_tool",
+    "export_investigation",
+    "get_chat",
+    "get_config",
+    "get_data_sources",
+    "get_detection_tuning",
+    "get_dotted",
+    "get_elastic",
+    "get_hunt",
+    "get_hunt_chat",
+    "get_investigation",
+    "get_me",
+    "get_representative",
+    "get_settings_dep",
+    "hashlib",
+    "health",
+    "hunt_console_manager",
+    "hunt_manager",
+    "hunt_recorded_run",
+    "hunt_sse_encode",
+    "hunt_stats",
+    "hunt_svc",
+    "identify_caller",
+    "ids_store",
+    "inv_svc",
+    "json",
+    "list_alerts",
+    "list_group_events",
+    "list_hunts",
+    "list_internal_identifiers",
+    "list_investigations",
+    "list_notifications",
+    "list_runbooks",
+    "list_users_endpoint",
+    "list_workspaces",
+    "logging",
+    "open_router",
+    "oracle_redaction_preview",
+    "override_svc",
+    "override_verdict",
+    "post_chat",
+    "post_hunt_chat",
+    "probes",
+    "remove_detection_override",
+    "request_more_info",
+    "require_admin_api",
+    "require_api_auth",
+    "require_csrf_safe",
+    "reset_user_password_endpoint",
+    "resolve_alert_for_hunt",
+    "resolve_investigation",
+    "revoke_token",
+    "router",
+    "runbooks_svc",
+    "secrets",
+    "select",
+    "set_my_status",
+    "set_setting",
+    "set_user_role_endpoint",
+    "start_auto_triage",
+    "start_backtest",
+    "start_discovery_scan",
+    "start_hunt",
+    "start_hunt_chat",
+    "stop_auto_triage",
+    "stream_hunt_chat",
+    "time",
+    "timeline_labels",
+    "toggle_user_disabled",
+    "update_runbook",
+]

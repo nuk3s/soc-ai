@@ -511,3 +511,19 @@ async def test_fail_closed_does_not_advance_chain_head(settings_kratos: Settings
     ok, broken = verify_chain(es.docs)
     assert ok is True
     assert broken is None
+
+
+def test_auto_ack_is_a_valid_audit_kind() -> None:
+    """Regression: ``maybe_auto_ack_fp`` records the unattended ack as an audit
+    event with ``kind="auto_ack"`` and the WebUI reads it back to badge an alert
+    as auto-acked. When ``"auto_ack"`` was missing from the ``AuditKind`` Literal,
+    every auto-ack failed audit validation (silently caught) so no record ever
+    landed and the badge never showed. Constructing the event must not raise.
+    """
+    ev = AuditEvent(
+        session_id="auto-ack:abc",
+        user="auto-ack",
+        kind="auto_ack",
+        payload={"es_id": "abc", "success": True},
+    )
+    assert ev.kind == "auto_ack"

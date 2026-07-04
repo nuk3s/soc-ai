@@ -291,6 +291,15 @@ _SORTBY_RE = re.compile(r"^sortby\s+([@\w.\-]+)\s*(asc|desc)?$", re.IGNORECASE)
 _HEAD_RE = re.compile(r"^(?:head|limit)\s+(\d+)$", re.IGNORECASE)
 _COUNT_RE = re.compile(r"^count$", re.IGNORECASE)
 
+# The authoritative pipe-stage surface, spelled out in the unknown-stage error
+# so an LLM caller can self-correct on its next attempt (the tool wrappers
+# return this message verbatim to the agent).
+_VALID_PIPE_STAGES_HELP = (
+    "valid stages: 'groupby <field>[, <field2>]', 'sortby <field> [asc|desc]', "
+    "'head <N>' (alias 'limit <N>'), 'count'. There is NO 'fields'/projection "
+    "stage — results always return full documents; narrow the base filter instead"
+)
+
 
 def _parse_pipe_stage(text: str) -> PipeStage:
     text = text.strip()
@@ -308,7 +317,10 @@ def _parse_pipe_stage(text: str) -> PipeStage:
         return Head(limit=int(m.group(1)))
     if _COUNT_RE.match(text):
         return Count()
-    raise OqlValidationError(f"unknown pipe stage: {text!r}", fragment=text)
+    raise OqlValidationError(
+        f"unknown pipe stage: {text!r}; {_VALID_PIPE_STAGES_HELP}",
+        fragment=text,
+    )
 
 
 def parse_oql(query: str) -> OqlAst:
@@ -472,7 +484,8 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
     for pattern in collect_wildcard_patterns(ast.filter_):
         if pattern[:1] in ("*", "?"):
             raise OqlValidationError(
-                f"leading-wildcard patterns are too expensive; anchor the prefix: {pattern!r}",
+                f"leading-wildcard patterns are too expensive; anchor the "
+                f"wildcard (write foo*, not *foo): {pattern!r}",
                 fragment=pattern,
             )
 

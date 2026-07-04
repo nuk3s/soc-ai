@@ -25,6 +25,7 @@ import {
   stopAutoTriage,
 } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
+import { type SortDir, useSort } from '../lib/useSort';
 import type { AlertEvent, AlertGroup, Investigation as Inv, Severity } from '../lib/types';
 import { useShell } from '../shell/ShellContext';
 import { Investigation } from './Investigation';
@@ -32,7 +33,6 @@ import { Investigation } from './Investigation';
 type ViewId = 'myqueue' | 'critical' | 'decision' | 'all';
 type Density = 'comfortable' | 'compact';
 type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
-type SortDir = 'asc' | 'desc';
 
 // checkbox  DETECTION (name + flow, subtle count)  sev  verdict  conf  owner  last-seen  actions
 // The GROUP row is intentionally LEAN — the per-alert detail (each event's own
@@ -52,7 +52,9 @@ const EVENT_GRID = '16px 132px 56px minmax(150px,1fr) 116px 172px 92px';
 const EVENTS_PAGE_SIZE = 50;
 
 const SEV_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-const VERDICT_RANK: Record<string, number> = { true_positive: 5, false_positive: 4, needs_more_info: 3, untriaged: 1 };
+// inconclusive sorts with needs_more_info: both are terminal non-committed
+// verdicts that still need an analyst decision.
+const VERDICT_RANK: Record<string, number> = { true_positive: 6, false_positive: 5, needs_more_info: 4, inconclusive: 3, untriaged: 1 };
 // A row that is actively being investigated has no verdict yet (still "untriaged"
 // in the DB) but should not interleave with genuinely-untriaged rows when sorting
 // by verdict — rank it just above untriaged so triaging rows cluster together.
@@ -176,7 +178,8 @@ function matchView(g: AlertGroup, view: ViewId): boolean {
     case 'critical':
       return g.sev === 'critical';
     case 'decision':
-      return g.verdict === 'needs_more_info' || g.verdict === 'untriaged';
+      // Non-committed verdicts: NMI + inconclusive (terminal hedges) + untriaged.
+      return g.verdict === 'needs_more_info' || g.verdict === 'inconclusive' || g.verdict === 'untriaged';
     default:
       return true;
   }
@@ -225,7 +228,11 @@ export function Alerts() {
   const [selEvents, setSelEvents] = useState<Record<string, boolean>>({});
   const [ackingEvents, setAckingEvents] = useState(false);
   const [density, setDensity] = useState<Density>('comfortable');
-  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: 'sev', dir: 'desc' });
+  // Shared sort mechanics; clicking a new column here starts it descending.
+  const { sort, toggleSort, caret, headerCls: hdrCls } = useSort<SortKey>(
+    { key: 'sev', dir: 'desc' },
+    'desc',
+  );
 
   // ---- group-ack strip ---------------------------------------------------
   const [ackMsg, setAckMsg] = useState<string | null>(null);
@@ -336,14 +343,17 @@ export function Alerts() {
     if (huntReasonTimer.current) clearTimeout(huntReasonTimer.current);
   }, []);
 
-  // Reset row expansion + cached events when the time window changes.
+  // Reset row expansion + cached events when the query that produced them
+  // changes. hideAcked is part of alertQuery, so a per-group event page fetched
+  // with the old value is stale under the new filter — clear it too, else an
+  // expanded group shows acknowledged events after "Hide acknowledged" is on.
   useEffect(() => {
     setExpanded({});
     setGroupEvents({});
     setEventsLoading({});
     setEventsMore({});
     setEventsLoadingMore({});
-  }, [filterTime, customRange?.from, customRange?.to]);
+  }, [filterTime, customRange?.from, customRange?.to, hideAcked]);
 
   const setView = (v: ViewId) => {
     searchParams.set('view', v);
@@ -379,6 +389,28 @@ export function Alerts() {
         setStarting(null);
         // e.g. 409 hunt_in_progress — tell the operator a hunt is already
         // running for this alert instead of silently doing nothing.
+        showTriageMsg(err instanceof Error ? err.message : 'Could not start the investigation');
+      });
+  };
+
+  // Investigate ONE exact event from an expanded group row (not the group's
+  // representative). Opens the existing investigation when this event already
+  // has one; otherwise starts a hunt on this event's own es_id. Falls back to
+  // the group only when the event carries no id.
+  const huntEvent = (g: AlertGroup, ev: AlertEvent) => {
+    if (ev.invId) {
+      openDrawer(ev.invId);
+      return;
+    }
+    if (!ev.id) {
+      hunt(g);
+      return;
+    }
+    setStarting(g);
+    startHunt(ev.id)
+      .then((invId) => openDrawer(invId))
+      .catch((err: unknown) => {
+        setStarting(null);
         showTriageMsg(err instanceof Error ? err.message : 'Could not start the investigation');
       });
   };
@@ -443,15 +475,6 @@ export function Alerts() {
     [groups, view, filterSevs, filterVerdicts, sort],
   );
 
-  const toggleSort = (key: SortKey) => {
-    setSort((s) => ({ key, dir: s.key === key && s.dir === 'desc' ? 'asc' : 'desc' }));
-  };
-  const caret = (key: SortKey) => {
-    if (sort.key !== key) return null;
-    return <span className="ml-0.5 text-accent">{sort.dir === 'asc' ? '↑' : '↓'}</span>;
-  };
-  const hdrCls = (key: SortKey) =>
-    'cursor-pointer select-none hover:text-text ' + (sort.key === key ? 'text-text' : '');
   const visIds = visible.map((g) => g.id);
   const allSelected = visIds.length > 0 && visIds.every((id) => selected[id]);
   const selCount = Object.keys(selected).filter((k) => selected[k]).length;
@@ -476,7 +499,7 @@ export function Alerts() {
       counts: {
         myqueue: gs.filter((g) => !!g.owner && g.owner !== '').length,
         critical: gs.filter((g) => g.sev === 'critical').length,
-        decision: gs.filter((g) => g.verdict === 'needs_more_info' || g.verdict === 'untriaged').length,
+        decision: gs.filter((g) => g.verdict === 'needs_more_info' || g.verdict === 'inconclusive' || g.verdict === 'untriaged').length,
         all: gs.length,
       },
       untriaged: gs.filter((g) => g.verdict === 'untriaged').length,
@@ -677,6 +700,7 @@ export function Alerts() {
             { value: 'true_positive', label: 'True positive' },
             { value: 'false_positive', label: 'False positive' },
             { value: 'needs_more_info', label: 'Needs more info' },
+            { value: 'inconclusive', label: 'Inconclusive' },
           ]}
           value={filterVerdicts}
           onChange={setFilterVerdicts}
@@ -1145,12 +1169,12 @@ export function Alerts() {
                       {/* investigate this exact event */}
                       <div className="flex justify-end">
                         <button
-                          onClick={() => hunt(g)}
+                          onClick={() => huntEvent(g, ev)}
                           className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
                           style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
                         >
                           <Sparkles size={12} />
-                          {g.invId ? 'Open' : 'Investigate'}
+                          {ev.invId ? 'Open' : 'Investigate'}
                         </button>
                       </div>
                     </div>

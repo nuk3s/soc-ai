@@ -101,8 +101,17 @@ async def ack_alert(
 
     resp = await auth.request("POST", "/api/events/ack", json=body)
     if resp.status_code >= httpx.codes.BAD_REQUEST:
+        detail = f"ack_alert returned {resp.status_code}: {resp.text[:300]}"
+        if resp.status_code == httpx.codes.BAD_REQUEST:
+            # SO 3.0 returns this same generic 400 for an expired srv-token
+            # (CSRF), a zero-match event filter, and an already-acknowledged
+            # alert alike — the body does not distinguish them.
+            detail += (
+                " (note: SO 3.0 returns this generic 400 for expired srv-token, "
+                "zero-match filter, or already-acknowledged alerts alike)"
+            )
         raise SoApiError(
-            f"ack_alert returned {resp.status_code}: {resp.text[:300]}",
+            detail,
             status_code=resp.status_code,
             url="/api/events/ack",
         )

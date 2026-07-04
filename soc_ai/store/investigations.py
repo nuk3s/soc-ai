@@ -22,7 +22,8 @@ VERDICTS_RUNNING = "running"
 
 # The verdict strings the detection-tuning FP-trend tally buckets. Any other
 # verdict value a row carries is ignored, so the three buckets always sum to
-# their "total".
+# their "total". `inconclusive` (the self-consistency split outcome) is a
+# non-decision and is folded into the needs_more_info bucket at tally time.
 _COUNTED_VERDICTS = ("true_positive", "false_positive", "needs_more_info")
 
 
@@ -335,13 +336,21 @@ async def verdict_counts_by_rule(
         .group_by(Investigation.rule_name, Investigation.verdict)
     )
     for rule_name, verdict, count in rows.all():
-        if rule_name is None or verdict not in _COUNTED_VERDICTS:
+        if rule_name is None:
+            continue
+        # `inconclusive` is a terminal non-decision (self-consistency split) —
+        # count it with needs_more_info so the FP-trend never reads it as a
+        # committed verdict and the buckets still sum to `total`.
+        bucket_verdict = "needs_more_info" if verdict == "inconclusive" else verdict
+        if bucket_verdict not in _COUNTED_VERDICTS:
             continue
         bucket = out.setdefault(
             rule_name,
             {"true_positive": 0, "false_positive": 0, "needs_more_info": 0, "total": 0},
         )
-        bucket[verdict] = count
+        # += (not =): needs_more_info can receive two group-by rows (its own
+        # + folded inconclusive). Identical to `=` for un-merged verdicts.
+        bucket[bucket_verdict] += count
         bucket["total"] += count
     return out
 

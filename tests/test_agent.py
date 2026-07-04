@@ -101,6 +101,23 @@ def test_investigator_prompt_includes_rubric_and_oql_primer() -> None:
     assert "OQL primer" in prompt
 
 
+def test_oql_primer_block_teaches_exact_pipe_stage_surface() -> None:
+    """U3: every OQL-running agent's primer must state the complete pipe-stage
+    list, explicitly disclaim the invented `fields` projection stage, and
+    state the leading-wildcard restriction."""
+    from soc_ai.agent.prompts import oql_primer_block
+
+    block = oql_primer_block()
+    assert "the complete list" in block
+    for stage in ("groupby", "sortby", "head", "count"):
+        assert f"| {stage}" in block, f"pipe stage {stage!r} missing from primer"
+    assert "NO `fields` / projection stage" in block
+    assert "PARSE ERROR" in block
+    assert "`*foo`" in block and "anchor the wildcard" in block
+    # The addendum rides along wherever the primer goes — investigator included.
+    assert "NO `fields` / projection stage" in INVESTIGATOR_PROMPT
+
+
 def test_investigator_prompt_constant_matches_function() -> None:
     assert build_investigator_prompt() == INVESTIGATOR_PROMPT
 
@@ -2523,7 +2540,45 @@ def test_investigator_agent_has_higher_retry_budget(
 
     ctx = _make_ctx(settings_kratos)
     agent = build_investigator(TestModel(), ctx)
-    assert agent._max_result_retries >= 3
+    assert agent._max_output_retries >= 3
+
+
+# The four online-enrichment tools gated behind the master egress toggle.
+_ONLINE_ENRICHMENT_TOOLS = {
+    "t_greynoise",
+    "t_shodan_internetdb",
+    "t_shodan_host",
+    "t_cve_lookup",
+}
+
+
+def test_investigator_online_tools_not_registered_when_enrichment_off(
+    settings_kratos: Settings,
+) -> None:
+    """U4: with allow_online_enrichment=False the online tools must not be
+    REGISTERED at all — otherwise the model burns a tool-budget slot per call
+    just to receive a 'skipped (online enrichment off)' result."""
+    assert settings_kratos.allow_online_enrichment is False  # fixture default
+    agent = build_investigator(TestModel(), _make_ctx(settings_kratos))
+    tool_names = set(agent._function_toolset.tools.keys())  # type: ignore[attr-defined]
+    assert not (_ONLINE_ENRICHMENT_TOOLS & tool_names), (
+        f"online tools registered despite allow_online_enrichment=False: "
+        f"{sorted(_ONLINE_ENRICHMENT_TOOLS & tool_names)}"
+    )
+    # The core read surface is unaffected by the gate.
+    assert "t_query_events_oql" in tool_names
+
+
+def test_investigator_online_tools_registered_when_enrichment_on(
+    settings_kratos: Settings,
+) -> None:
+    settings_on = settings_kratos.model_copy(update={"allow_online_enrichment": True})
+    agent = build_investigator(TestModel(), _make_ctx(settings_on))
+    tool_names = set(agent._function_toolset.tools.keys())  # type: ignore[attr-defined]
+    assert tool_names >= _ONLINE_ENRICHMENT_TOOLS, (
+        f"missing online tools with allow_online_enrichment=True: "
+        f"{sorted(_ONLINE_ENRICHMENT_TOOLS - tool_names)}"
+    )
 
 
 def test_investigator_model_has_response_token_cap(
@@ -4096,6 +4151,188 @@ async def test_synth_first_pipeline_no_phase_d_emits_no_retask(
     assert "targeted_dispatch" not in kinds
 
 
+# ---------------------------------------------------------------------------
+# Synthesizer reasoning-trace emission (the "Model reasoning" panel for
+# no-loop investigations). The synth agent.run() results carry ThinkingParts
+# (deepseek reasoning_content via the model profile) that were previously
+# dropped — a round-1-settled run stored NO model_response event.
+# ---------------------------------------------------------------------------
+
+
+class _SynthStubResult:
+    """pydantic_ai-shaped run result: .output + .all_messages() with parts."""
+
+    def __init__(self, output: Any, messages: list[Any]) -> None:
+        self.output = output
+        self._messages = messages
+
+    def all_messages(self) -> list[Any]:
+        return self._messages
+
+    def usage(self) -> Any:  # _usage_ev() catches this and skips the event
+        raise RuntimeError("no usage in stub")
+
+
+class _SynthStubAgent:
+    """Returns canned _SynthStubResults sequentially (last one repeats)."""
+
+    def __init__(self, results: list[_SynthStubResult]) -> None:
+        self._results = results
+        self.calls = 0
+
+    async def run(self, *_a: Any, **_kw: Any) -> _SynthStubResult:
+        i = self.calls
+        self.calls += 1
+        return self._results[min(i, len(self._results) - 1)]
+
+
+def _thinking_message(thinking: str | None, text: str = "") -> Any:
+    """A fake ModelResponse whose part CLASS NAMES match what _walk_message /
+    _synth_reasoning_payload detect (ThinkingPart / TextPart)."""
+
+    class ThinkingPart:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class TextPart:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    from types import SimpleNamespace
+
+    parts: list[Any] = []
+    if thinking is not None:
+        parts.append(ThinkingPart(thinking))
+    if text:
+        parts.append(TextPart(text))
+    return SimpleNamespace(parts=parts)
+
+
+def _reasoning_test_setup(settings: Settings) -> tuple[Any, TriageReport, Any]:
+    """(ctx, fp_report, strong_candidate) for a round-1-settled synth-first run."""
+    settings.synth_first_pipeline = True
+    settings.investigate_when_unsure = False
+    ctx = _make_ctx(settings)
+    report = TriageReport(
+        verdict="false_positive",
+        confidence=0.85,
+        summary="Internal scanner; expected periodic ICMP.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    from soc_ai.agent.decision_templates import CandidateVerdict
+
+    candidate = CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.85,
+        cited_evidence=["alert.severity_label"],
+        template_id="clean_internal_traffic",
+        rationale="internal scanner",
+    )
+    return ctx, report, candidate
+
+
+async def _run_reasoning_pipeline(
+    settings: Settings, stub_agent: _SynthStubAgent, candidate: Any, ctx: Any
+) -> list[Any]:
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _stub_enriched_alert_context(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=object(),
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synth_first_agent",
+            return_value=stub_agent,
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=candidate,
+        ),
+    ):
+        return [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+
+@pytest.mark.asyncio
+async def test_synth_first_round1_emits_model_response_with_reasoning(
+    settings_kratos: Settings,
+) -> None:
+    """A round-1-settled run (no loop, no Phase D) emits ONE model_response
+    event carrying the synthesizer's thinking — the reasoning panel's source."""
+    ctx, report, candidate = _reasoning_test_setup(settings_kratos)
+    stub = _SynthStubAgent(
+        [
+            _SynthStubResult(
+                report,
+                [_thinking_message("Benign east-west ICMP; template corroborates.", "done")],
+            )
+        ]
+    )
+    events = await _run_reasoning_pipeline(settings_kratos, stub, candidate, ctx)
+
+    mrs = [e for e in events if e.kind == "model_response"]
+    assert len(mrs) == 1
+    payload = mrs[0].payload
+    assert payload["reasoning_trace"] == "Benign east-west ICMP; template corroborates."
+    assert payload["content"] == "done"
+    assert payload["phase"] == "synthesizer"
+    assert payload["round"] == 1
+    # The verdict itself is unchanged by the emission.
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+
+
+@pytest.mark.asyncio
+async def test_synth_first_round1_no_thinking_emits_no_model_response(
+    settings_kratos: Settings,
+) -> None:
+    """Defensive: no ThinkingPart / <think> block -> NO model_response event."""
+    ctx, report, candidate = _reasoning_test_setup(settings_kratos)
+    stub = _SynthStubAgent([_SynthStubResult(report, [_thinking_message(None, "just text")])])
+    events = await _run_reasoning_pipeline(settings_kratos, stub, candidate, ctx)
+    assert [e for e in events if e.kind == "model_response"] == []
+
+
+@pytest.mark.asyncio
+async def test_synth_first_inline_think_block_also_surfaces(
+    settings_kratos: Settings,
+) -> None:
+    """Models that embed <think>...</think> in the text (no ThinkingPart) still
+    surface reasoning — same extract_reasoning_trace projection as the loop."""
+    ctx, report, candidate = _reasoning_test_setup(settings_kratos)
+    stub = _SynthStubAgent(
+        [_SynthStubResult(report, [_thinking_message(None, "<think>weighing it</think>fine")])]
+    )
+    events = await _run_reasoning_pipeline(settings_kratos, stub, candidate, ctx)
+    mrs = [e for e in events if e.kind == "model_response"]
+    assert len(mrs) == 1
+    assert mrs[0].payload["reasoning_trace"] == "weighing it"
+    assert mrs[0].payload["content"] == "fine"
+
+
+@pytest.mark.asyncio
+async def test_self_consistency_samples_do_not_multiply_reasoning_events(
+    settings_kratos: Settings,
+) -> None:
+    """verdict_consistency_samples>1: only the PRIMARY synthesis emits reasoning
+    — the extra vote samples never add model_response events."""
+    settings_kratos.verdict_consistency_samples = 3
+    ctx, report, candidate = _reasoning_test_setup(settings_kratos)
+    stub = _SynthStubAgent([_SynthStubResult(report, [_thinking_message("thinking hard", "t")])])
+    events = await _run_reasoning_pipeline(settings_kratos, stub, candidate, ctx)
+    assert stub.calls == 3  # primary + 2 extra samples all ran...
+    mrs = [e for e in events if e.kind == "model_response"]
+    assert len(mrs) == 1  # ...but only the primary emitted reasoning
+    assert mrs[0].payload["round"] == 1
+
+
 @pytest.mark.asyncio
 async def test_synth_first_pipeline_flag_off_runs_legacy_path(
     settings_kratos: Settings,
@@ -4615,7 +4852,7 @@ def test_build_synth_first_agent_uses_three_retries() -> None:
 
     agent = build_synth_first_agent(TestModel(call_tools=[]))
     # pydantic_ai exposes the retries config on the agent instance.
-    assert agent._max_result_retries >= 3
+    assert agent._max_output_retries >= 3
 
 
 # =====================================================================
@@ -5322,10 +5559,24 @@ async def test_investigation_loop_runs_and_flips_verdict(
     class _ToolCallPart(SimpleNamespace):
         pass
 
+    class _ToolReturnPart(SimpleNamespace):
+        pass
+
     zeek_call = _ToolCallPart(
         tool_name="t_query_zeek_logs", args={"community_id": "1:abc"}, tool_call_id="tc1"
     )
-    loop_msg = SimpleNamespace(parts=[zeek_call])
+    # A REAL pydantic-ai history records the tool RETURN too — that non-error
+    # return is what count_successful_tool_calls() counts, and only a loop that
+    # produced >=1 successful call earns the evidence-gate exemption. Without it
+    # the loop gathered nothing and the verdict must NOT be laundered past the
+    # gate (see orchestrator._loop_evidence_marker).
+    zeek_return = _ToolReturnPart(
+        tool_name="t_query_zeek_logs",
+        content={"ssl": {"server_name": "evil.example.com"}},
+        tool_call_id="tc1",
+        part_kind="tool-return",
+    )
+    loop_msg = SimpleNamespace(parts=[zeek_call, zeek_return])
     loop_transcript = InvestigationTranscript(
         evidence=[
             "t_query_zeek_logs(community_id=1:abc) -> ssl.server_name=evil.example.com "

@@ -817,8 +817,9 @@ def test_row_status_is_honest() -> None:
     assert _row_status(inv(status="complete", verdict="")) == "error"
     # cancelled must NOT collapse to 'complete'
     assert _row_status(inv(status="cancelled", verdict=None)) == "cancelled"
-    assert _row_status(inv(status="awaiting", verdict=None)) == "awaiting"
     # an unknown stored status falls back to 'error', never 'complete'
+    # ("awaiting" was removed from _STATUS — the backend never writes it)
+    assert _row_status(inv(status="awaiting", verdict=None)) == "error"
     assert _row_status(inv(status="weird", verdict=None)) == "error"
 
 
@@ -1135,6 +1136,78 @@ def test_build_actions_ack_not_applied_without_successful_auto_ack() -> None:
     assert _build_actions([failed], report, set())[0].applied is False
 
 
+def test_build_actions_marks_ack_applied_when_alert_acked_in_es() -> None:
+    """An ack performed OUTSIDE this run (group-ack, SO web UI, another run's
+    auto-ack) arrives as alert_acked=True — the ack action is rendered done with
+    an "Already acknowledged" note, never re-offered."""
+    from soc_ai.api.webui_api import _build_actions
+
+    report = {
+        "recommended_actions": [
+            {"tool_name": "ack_alert", "rationale": "benign"},
+            {"tool_name": "escalate_to_case", "rationale": "case it"},
+        ]
+    }
+    by_tag = {a.tag: a for a in _build_actions([], report, set(), alert_acked=True)}
+    assert by_tag["ack"].applied is True
+    assert by_tag["ack"].appliedNote == "Already acknowledged"
+    assert by_tag["escalate"].applied is False  # only ack is satisfied by acked state
+    # auto-ack takes precedence over the ES-state note (keeps the existing UI wording)
+    ack_ev = SimpleNamespace(kind="auto_ack", payload={"success": True})
+    auto = _build_actions([ack_ev], report, set(), alert_acked=True)[0]
+    assert auto.applied is True and auto.appliedNote is None
+
+
+def test_build_actions_marks_persisted_execution_applied() -> None:
+    """FR-030: a persisted action_executed event marks THAT action applied on
+    reload (index-matched), with an attribution note — no re-offer of an
+    already-executed escalate."""
+    from soc_ai.api.webui_api import _build_actions
+
+    report = {
+        "recommended_actions": [
+            {"tool_name": "ack_alert", "rationale": "benign"},
+            {"tool_name": "escalate_to_case", "rationale": "case it"},
+        ]
+    }
+    exec_ev = SimpleNamespace(
+        kind="action_executed",
+        payload={"index": 1, "tool_name": "escalate_to_case", "success": True, "by": "alice"},
+    )
+    actions = _build_actions([exec_ev], report, set())
+    assert actions[0].applied is False  # untouched sibling stays actionable
+    assert actions[1].applied is True
+    assert actions[1].appliedNote == "Executed · alice"
+    # a FAILED execution must not suppress the offer
+    failed = SimpleNamespace(
+        kind="action_executed",
+        payload={"index": 1, "tool_name": "escalate_to_case", "success": False},
+    )
+    assert _build_actions([failed], report, set())[1].applied is False
+
+
+def test_alert_currently_acked_reads_es_and_swallows_errors(settings_kratos: Settings) -> None:
+    """Live acked-state probe: True on event.acknowledged, False on miss/error —
+    an ES failure must NEVER break the detail page."""
+    import asyncio
+
+    from soc_ai.api.webui_api import _alert_currently_acked
+
+    settings = settings_kratos
+
+    def _es(hits: list[dict]) -> SimpleNamespace:
+        return SimpleNamespace(search=AsyncMock(return_value=SimpleNamespace(hits=hits)))
+
+    acked = _es([{"_id": "es1", "_source": {"event": {"acknowledged": True}}}])
+    assert asyncio.run(_alert_currently_acked(acked, settings, "es1")) is True
+    unacked = _es([{"_id": "es1", "_source": {"event": {"acknowledged": False}}}])
+    assert asyncio.run(_alert_currently_acked(unacked, settings, "es1")) is False
+    assert asyncio.run(_alert_currently_acked(_es([]), settings, "es1")) is False
+    assert asyncio.run(_alert_currently_acked(acked, settings, None)) is False
+    boom = SimpleNamespace(search=AsyncMock(side_effect=RuntimeError("es down")))
+    assert asyncio.run(_alert_currently_acked(boom, settings, "es1")) is False
+
+
 def test_tool_step_expands_full_result_not_just_args() -> None:
     """#10: the expanded tool-call row carries the FULL result headline (generously
     capped) plus the query — not the arguments alone."""
@@ -1160,7 +1233,7 @@ def test_execute_action_acks_and_defaults_alert_id(client: TestClient) -> None:
     )
     calls: list[dict] = []
     with patch(
-        "soc_ai.api.approvals.get_tool",
+        "soc_ai.tools.write_exec.get_tool",
         return_value=_fake_write_tool(calls, {"acknowledged": True}),
     ):
         resp = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute")
@@ -1192,7 +1265,7 @@ def test_execute_action_surfaces_tool_error(client: TestClient) -> None:
         raise SoApiError("ack_alert returned 503: upstream down", status_code=503)
 
     spec = ToolSpec(name="ack_alert", read_only=False, description="", func=boom)
-    with patch("soc_ai.api.approvals.get_tool", return_value=spec):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=spec):
         body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
     assert body["status"] == "error"
     assert "503" in body["error"]
@@ -1225,6 +1298,110 @@ def test_execute_action_index_out_of_range(client: TestClient) -> None:
 def test_execute_action_unknown_investigation_404(client: TestClient) -> None:
     resp = client.post("/api/v1/investigations/NOPE/actions/0/execute")
     assert resp.status_code == 404
+
+
+def test_execute_action_persists_and_suppresses_reoffer(client: TestClient) -> None:
+    """FR-030: a successful execution is persisted as an action_executed event —
+    the detail response marks the card applied on reload, and a repeat execute
+    returns ok-with-note WITHOUT writing again (no duplicate SO case)."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-esc-1",
+            actions=[{"tool_name": "escalate_to_case", "tool_args": {}}],
+        )
+    )
+    calls: list[dict] = []
+    with patch(
+        "soc_ai.tools.write_exec.get_tool",
+        return_value=_fake_write_tool(calls, {"id": "CASE-1"}),
+    ):
+        first = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+        assert first["status"] == "executed"
+        assert len(calls) == 1
+
+        # Reload: the persisted execution marks the action applied — not re-offered.
+        detail = client.get(f"/api/v1/investigations/{inv_id}").json()
+        assert detail["actions"][0]["applied"] is True
+        assert (detail["actions"][0]["appliedNote"] or "").startswith("Executed")
+
+        # Repeat execute: ok-with-note, and the write tool was NOT called again.
+        second = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+        assert second["status"] == "executed"
+        assert "Already executed" in second["detail"]
+        assert len(calls) == 1
+
+
+def test_execute_action_ack_already_acked_in_es_is_idempotent(client: TestClient) -> None:
+    """Acking an alert that is ALREADY acked in SO (group-ack / SO web UI /
+    another run) returns ok-with-note without writing, and persists the state
+    so the card reads applied afterwards."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-acked-1",
+            actions=[{"tool_name": "ack_alert", "tool_args": {}}],
+        )
+    )
+    calls: list[dict] = []
+    with (
+        patch(
+            "soc_ai.api.webui._timeline._alert_currently_acked",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "soc_ai.tools.write_exec.get_tool",
+            return_value=_fake_write_tool(calls, {"acknowledged": True}),
+        ),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+        assert body["status"] == "executed"
+        assert "already acknowledged" in body["detail"].lower()
+        assert calls == []  # no duplicate write reached Security Onion
+
+        detail = client.get(f"/api/v1/investigations/{inv_id}").json()
+        assert detail["alertAcked"] is True
+        assert detail["actions"][0]["applied"] is True
+        assert detail["actions"][0]["appliedNote"] == "Already acknowledged"
+
+
+def test_get_investigation_marks_ack_applied_from_live_es_state(client: TestClient) -> None:
+    """An ack performed OUTSIDE any investigation (e.g. the SO web UI) surfaces
+    on the detail response: alertAcked=True and the ack action pre-applied."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-out-1",
+            actions=[
+                {"tool_name": "ack_alert", "tool_args": {}},
+                {"tool_name": "add_case_comment", "tool_args": {"case_id": "c1"}},
+            ],
+        )
+    )
+    with patch(
+        "soc_ai.api.webui._timeline._alert_currently_acked",
+        AsyncMock(return_value=True),
+    ):
+        body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body["alertAcked"] is True
+    assert body["actions"][0]["applied"] is True
+    assert body["actions"][0]["appliedNote"] == "Already acknowledged"
+    assert body["actions"][1]["applied"] is False  # non-ack actions still offered
+
+    # ES probe failure (helper returns False) — current behavior preserved.
+    with patch(
+        "soc_ai.api.webui._timeline._alert_currently_acked",
+        AsyncMock(return_value=False),
+    ):
+        body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body["alertAcked"] is False
+    assert body["actions"][0]["applied"] is False
 
 
 def test_execute_write_tool_refuses_non_write_tool() -> None:
@@ -1747,7 +1924,7 @@ def test_ack_group_calls_write_tool_per_event(client: TestClient) -> None:
             AsyncMock(return_value=fake_events),
         ),
         patch(
-            "soc_ai.api.webui_api.execute_write_tool",
+            "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
             fake_execute_write_tool,
         ),
     ):
@@ -1792,7 +1969,10 @@ def test_ack_group_notice_kind_threads_kind_to_fetch(client: TestClient) -> None
     mock_fetch = AsyncMock(return_value=[])
     with (
         patch("soc_ai.api.webui_api.aq.fetch_group_events", mock_fetch),
-        patch("soc_ai.api.webui_api.execute_write_tool", AsyncMock(return_value=(None, None))),
+        patch(
+            "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
+            AsyncMock(return_value=(None, None)),
+        ),
     ):
         resp = client.post(
             "/api/v1/alerts/ack-group",
@@ -1809,7 +1989,10 @@ def test_ack_group_passes_hide_acked_true(client: TestClient) -> None:
     mock_fetch = AsyncMock(return_value=[])
     with (
         patch("soc_ai.api.webui_api.aq.fetch_group_events", mock_fetch),
-        patch("soc_ai.api.webui_api.execute_write_tool", AsyncMock(return_value=(None, None))),
+        patch(
+            "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
+            AsyncMock(return_value=(None, None)),
+        ),
     ):
         resp = client.post(
             "/api/v1/alerts/ack-group",
@@ -1863,7 +2046,7 @@ def test_escalate_group_calls_write_tool_per_event(client: TestClient) -> None:
             AsyncMock(return_value=fake_events),
         ),
         patch(
-            "soc_ai.api.webui_api.execute_write_tool",
+            "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
             fake_execute_write_tool,
         ),
     ):
@@ -1979,7 +2162,7 @@ def test_ack_events_success(client: TestClient) -> None:
     ):
         return (None, None)  # success
 
-    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+    with patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write):
         resp = client.post(
             "/api/v1/alerts/ack-events",
             json={"es_ids": ["a", "b", "b", "c"]},
@@ -2006,7 +2189,7 @@ def test_ack_events_partial_failure(client: TestClient) -> None:
             return (None, "boom")
         return (None, None)
 
-    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+    with patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write):
         resp = client.post(
             "/api/v1/alerts/ack-events",
             json={"es_ids": ["a", "b", "c"]},
@@ -2047,7 +2230,7 @@ def test_ack_events_fans_out_concurrently_under_semaphore_bound(client: TestClie
         in_flight -= 1
         return (None, None)
 
-    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+    with patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write):
         resp = client.post(
             "/api/v1/alerts/ack-events",
             json={"es_ids": [f"e{i}" for i in range(n_events)]},
@@ -2070,7 +2253,7 @@ def test_ack_events_swallows_raised_exceptions_as_failures(client: TestClient) -
             raise RuntimeError("upstream blew up")
         return (None, None)
 
-    with patch("soc_ai.api.webui_api.execute_write_tool", fake_write):
+    with patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write):
         resp = client.post(
             "/api/v1/alerts/ack-events",
             json={"es_ids": ["a", "boom", "c"]},
@@ -2108,7 +2291,7 @@ def test_ack_group_fans_out_and_counts_mixed_results(client: TestClient) -> None
 
     with (
         patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)),
-        patch("soc_ai.api.webui_api.execute_write_tool", fake_write),
+        patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write),
     ):
         resp = client.post(
             "/api/v1/alerts/ack-group",
@@ -3097,7 +3280,7 @@ def test_rehunt_reresolves_rule_name_when_stored_row_is_nameless(client: TestCli
     with (
         patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
         patch(
-            "soc_ai.api.webui_api.resolve_alert_for_hunt",
+            "soc_ai.api.webui.routes_hunts.resolve_alert_for_hunt",
             AsyncMock(return_value=(True, "ET RE-RESOLVED Rule")),
         ),
     ):
@@ -3317,7 +3500,7 @@ def test_hunt_404_when_alert_id_does_not_resolve(client: TestClient) -> None:
     fake_mgr = AsyncMock()
     with (
         patch(
-            "soc_ai.api.webui_api.resolve_alert_for_hunt",
+            "soc_ai.api.webui.routes_hunts.resolve_alert_for_hunt",
             AsyncMock(return_value=(False, None)),
         ),
         patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
@@ -3338,7 +3521,7 @@ def test_hunt_starts_when_alert_id_resolves(client: TestClient) -> None:
     fake_mgr.start = AsyncMock(return_value="INV-OK")
     with (
         patch(
-            "soc_ai.api.webui_api.resolve_alert_for_hunt",
+            "soc_ai.api.webui.routes_hunts.resolve_alert_for_hunt",
             AsyncMock(return_value=(True, "ET MALWARE Some Rule Name")),
         ),
         patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
@@ -3751,11 +3934,13 @@ def test_login_cookie_has_httponly_samesite_and_no_secure_on_plain_http(
         assert "secure" not in set_cookie  # plain-http dev → no Secure
 
 
-def test_login_cookie_is_secure_behind_https_forwarded_proto(
+def test_login_cookie_is_secure_behind_trusted_https_forwarded_proto(
     settings_kratos: Settings,
 ) -> None:
-    """When a TLS-terminating proxy forwards X-Forwarded-Proto: https, the Secure
-    flag IS set even though the upstream hop to uvicorn is plain HTTP."""
+    """A TLS-terminating proxy IN proxy_trusted_ips that forwards
+    X-Forwarded-Proto: https gets the Secure flag even though the upstream hop to
+    uvicorn is plain HTTP. The TestClient's socket peer is 'testclient'."""
+    settings_kratos.proxy_trusted_ips = ["testclient"]
     for client in _auth_client(settings_kratos):
         resp = client.post(
             "/api/v1/login",
@@ -3769,22 +3954,50 @@ def test_login_cookie_is_secure_behind_https_forwarded_proto(
         assert "samesite=lax" in set_cookie
 
 
+def test_login_cookie_not_secure_from_untrusted_forwarded_proto(
+    settings_kratos: Settings,
+) -> None:
+    """X-Forwarded-Proto: https from a peer NOT in proxy_trusted_ips must NOT set
+    the Secure flag — otherwise any plain-HTTP client could forge it (FR-038)."""
+    settings_kratos.proxy_trusted_ips = []  # no trusted proxy
+    for client in _auth_client(settings_kratos):
+        resp = client.post(
+            "/api/v1/login",
+            json={"username": "admin", "password": ADMIN_PW_API},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        assert resp.status_code == 200
+        assert "secure" not in resp.headers["set-cookie"].lower()
+
+
 def test_request_is_https_helper_matrix() -> None:
-    """_request_is_https: true for https scheme OR https forwarded-proto; false otherwise."""
+    """_request_is_https: true for an https socket scheme always; for
+    X-Forwarded-Proto: https ONLY when the peer is a trusted proxy — an untrusted
+    peer can't flip the Secure flag by forging the header (FR-038)."""
     from soc_ai.api.webui_api import _request_is_https
 
-    def _req(scheme: str, xfp: str | None) -> SimpleNamespace:
+    def _req(scheme: str, xfp: str | None, peer: str = "192.0.2.1") -> SimpleNamespace:
         headers = {} if xfp is None else {"x-forwarded-proto": xfp}
         return SimpleNamespace(
             url=SimpleNamespace(scheme=scheme),
             headers=headers,
+            client=SimpleNamespace(host=peer),
         )
 
-    assert _request_is_https(_req("https", None)) is True
-    assert _request_is_https(_req("http", "https")) is True
-    assert _request_is_https(_req("http", "https, http")) is True  # left-most wins
-    assert _request_is_https(_req("http", None)) is False
-    assert _request_is_https(_req("http", "http")) is False
+    trusted = SimpleNamespace(proxy_trusted_ips=["192.0.2.1"])
+    # Real HTTPS socket → always true, regardless of proxy config.
+    assert _request_is_https(_req("https", None), trusted) is True
+    assert _request_is_https(_req("https", None), None) is True
+    # XFP honored from the trusted proxy peer.
+    assert _request_is_https(_req("http", "https"), trusted) is True
+    assert _request_is_https(_req("http", "https, http"), trusted) is True  # left-most wins
+    # XFP from an UNTRUSTED peer is ignored — no Secure-flag spoof.
+    assert _request_is_https(_req("http", "https", peer="203.0.113.9"), trusted) is False
+    # No proxy list configured → forwarded header never trusted.
+    assert _request_is_https(_req("http", "https"), None) is False
+    # Non-https forwarded / no header → false.
+    assert _request_is_https(_req("http", None), trusted) is False
+    assert _request_is_https(_req("http", "http"), trusted) is False
 
 
 def test_collect_reasoning_gathers_traces_in_order() -> None:
@@ -3845,3 +4058,158 @@ def test_internal_identifiers_admin_gate(settings_kratos: Settings) -> None:
         resp = client.get("/api/v1/internal-identifiers")
         assert resp.status_code == 403
         assert resp.json()["detail"]["reason"] == "admin_required"
+
+
+def test_tool_outcome_never_leaks_json_and_humanizes_known_shapes() -> None:
+    """Dogfood item 3: tool-call titles must be short + human, never a raw JSON
+    dump of the result, and online-tool short-circuits read as neutral 'skipped'
+    rows rather than the config lecture the tool returns for the model."""
+    from soc_ai.api.webui_api import _tool_step
+
+    def title(tn, res):
+        t, _ = _tool_step(tn, {}, res)
+        return t
+
+    # host_summary with data -> "<ip> — N events", not the {ip,event_count} dict
+    t = title("t_host_summary", {"ip": "10.61.61.247", "observations": True, "event_count": 699})
+    assert t == "Host summary: 10.61.61.247 — 699 events"
+    assert "{" not in t
+    # host_summary, no observations
+    assert (
+        title("t_host_summary", {"ip": "10.0.0.9", "observations": False, "event_count": 0})
+        == "Host summary: 10.0.0.9 — no observations"
+    )
+    # online enrichment off -> neutral skipped row (lecture stays in the expander)
+    assert (
+        title(
+            "t_greynoise",
+            {
+                "available": False,
+                "reason": "online_enrichment_disabled",
+                "summary": "online enrichment is off ...",
+            },
+        )
+        == "GreyNoise: skipped (online enrichment off)"
+    )
+    assert title("t_shodan_host", {"available": False, "reason": "not_configured"}) == (
+        "Shodan host: skipped (not configured)"
+    )
+    # error -> short, distinct failure phrase
+    assert title("t_query_events_oql", {"error": True, "message": "timeout after 30s"}) == (
+        "Event search: failed: timeout after 30s"
+    )
+    # a 0-hit query is a neutral finding, not a failure
+    assert title("t_query_events_oql", {"total": 0}) == "Event search: 0 matches"
+    # an unknown dict shape must NOT dump JSON into the title
+    weird = title("t_get_event_raw", {"weird": 1, "blob": {"nested": 2}})
+    assert "{" not in weird and weird == "Raw event: done"
+
+
+def test_final_result_pseudo_tool_excluded_from_timeline() -> None:
+    """The pydantic-ai `final_result` structured-output pseudo-tool must not appear
+    as a '…: running…' timeline row (it never lands a tool_result)."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui_api import _build_timeline
+
+    events = [
+        SimpleNamespace(
+            kind="tool_call",
+            sequence=1,
+            payload={"tool_name": "final_result", "tool_call_id": "f1"},
+        ),
+        SimpleNamespace(
+            kind="tool_call", sequence=2, payload={"tool_name": "t_enrich_ip", "tool_call_id": "c1"}
+        ),
+        SimpleNamespace(
+            kind="tool_result",
+            sequence=3,
+            payload={"tool_call_id": "c1", "result": {"internal": True}},
+        ),
+    ]
+    timeline, tool_calls, _pivots, _oracle = _build_timeline(events)
+    titles = [s.title for s in timeline]
+    assert not any("running" in t for t in titles)
+    assert not any("synthesis" in t.lower() for t in titles)
+    assert tool_calls == 1  # final_result not counted
+
+
+def test_tool_outcome_no_double_failed_prefix() -> None:
+    """U8: an error message that already reads as a failure ("failed to parse
+    filter…") must not get a second "failed: " prefix stuttered onto it."""
+    from soc_ai.api.webui_api import _tool_step
+
+    def title(tn, res):
+        t, _ = _tool_step(tn, {}, res)
+        return t
+
+    t = title("t_query_events_oql", {"error": True, "message": "failed to parse filter [x]"})
+    assert t == "Event search: failed to parse filter [x]"
+    assert "failed: failed" not in t
+    # Same for other failure-phrased openings, case-insensitive.
+    assert title("t_query_events_oql", {"error": True, "message": "Could not reach ES"}) == (
+        "Event search: Could not reach ES"
+    )
+    assert title("t_query_events_oql", {"error": True, "message": "Error: bad index"}) == (
+        "Event search: Error: bad index"
+    )
+    # A neutral message still gets the distinct failure phrase.
+    assert title("t_query_events_oql", {"error": True, "message": "timeout after 30s"}) == (
+        "Event search: failed: timeout after 30s"
+    )
+    # A non-string error payload keeps the short generic phrase.
+    assert title("t_query_events_oql", {"error": True}) == "Event search: failed: error"
+
+
+def test_prevalence_title_has_no_iso_ms_timestamps() -> None:
+    """U10: the collapsed prevalence title must not embed raw ISO-8601 ms
+    timestamps (they clip mid-value); the full summary stays in the detail."""
+    from soc_ai.api.webui_api import _tool_step
+
+    summary = (
+        "10.61.61.247 ↔ 184.29.90.68: common — 56 event(s) across 5 distinct "
+        "day(s) (first 2026-06-24T11:48:12.684Z, last 2026-06-30T09:01:02.123Z) "
+        "in the last 30d."
+    )
+    title, detail = _tool_step("t_prevalence", {"ip": "10.61.61.247"}, {"summary": summary})
+    assert "T11:48" not in title and ".684Z" not in title
+    assert "(first" not in title
+    assert "56 event(s) across 5 distinct day(s)" in title
+    # The expander detail keeps the full summary (timestamps included).
+    assert "2026-06-24T11:48:12.684Z" in detail
+    # The novel-variant "first/last <ISO>" phrasing is clipped to date-only.
+    novel = "1.2.3.4: seen on a single day only (3 event(s), first/last 2026-06-24T11:48:12.684Z)"
+    title2, _ = _tool_step("t_prevalence", {}, {"summary": novel})
+    assert "T11:48" not in title2
+    assert "2026-06-24" in title2
+
+
+def test_auto_ack_and_write_tools_grouped_as_decision_not_tool_calls() -> None:
+    """U5: a heuristic run's auto-ack (and write-action tool calls) must not
+    create a "Tool calls" timeline section — they are verdict consequences."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui_api import _build_timeline
+
+    events = [
+        SimpleNamespace(
+            kind="auto_ack",
+            sequence=1,
+            payload={"success": True, "alert_es_id": "abc"},
+        ),
+        SimpleNamespace(
+            kind="tool_call",
+            sequence=2,
+            payload={"tool_name": "t_ack_alert", "tool_call_id": "w1"},
+        ),
+        SimpleNamespace(
+            kind="tool_call",
+            sequence=3,
+            payload={"tool_name": "t_enrich_ip", "tool_call_id": "c1"},
+        ),
+    ]
+    timeline, _tool_calls, _pivots, _oracle = _build_timeline(events)
+    groups = {s.id: s.group for s in timeline}
+    assert groups["e1"] == "Decision"  # auto_ack
+    assert groups["e2"] == "Decision"  # write-action tool call
+    assert groups["e3"] == "Tool calls"  # investigative tool call unchanged

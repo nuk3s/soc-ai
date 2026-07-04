@@ -449,37 +449,44 @@ def build_hunt_agent(  # noqa: PLR0915 - tool registrations are inherently long
         except Exception as e:
             return {"error": str(e)}
 
-    @agent.tool_plain
-    async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
-        """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key)."""
-        try:
-            return await shodan_internetdb(ip, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+    # The four ONLINE-enrichment tools (GreyNoise / Shodan InternetDB / full
+    # Shodan / CVEDB) are only registered when the master egress toggle is on;
+    # otherwise every call would just return "skipped (online enrichment off)"
+    # and burn a tool-budget slot. InternetDB + CVEDB are keyless but still
+    # egress, so they sit behind the same toggle.
+    if s.allow_online_enrichment:
 
-    @agent.tool_plain
-    async def t_greynoise(ip: str) -> dict[str, Any]:
-        """GreyNoise lookup for an EXTERNAL IP — scanner/benign/classification."""
-        try:
-            return await greynoise(ip, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+        @agent.tool_plain
+        async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
+            """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key)."""
+            try:
+                return await shodan_internetdb(ip, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
 
-    @agent.tool_plain
-    async def t_shodan_host(ip: str) -> dict[str, Any]:
-        """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API key)."""
-        try:
-            return await shodan_host(ip, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+        @agent.tool_plain
+        async def t_greynoise(ip: str) -> dict[str, Any]:
+            """GreyNoise lookup for an EXTERNAL IP — scanner/benign/classification."""
+            try:
+                return await greynoise(ip, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
 
-    @agent.tool_plain
-    async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
-        """Score a named CVE via Shodan CVEDB (free, no key): CVSS/EPSS/KEV."""
-        try:
-            return await cve_lookup(cve_id, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+        @agent.tool_plain
+        async def t_shodan_host(ip: str) -> dict[str, Any]:
+            """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API key)."""
+            try:
+                return await shodan_host(ip, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
+
+        @agent.tool_plain
+        async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
+            """Score a named CVE via Shodan CVEDB (free, no key): CVSS/EPSS/KEV."""
+            try:
+                return await cve_lookup(cve_id, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
 
     if s.pcap_enabled:
 

@@ -112,6 +112,19 @@ def build_local_enrichment_context(settings: Settings) -> EnrichmentContext:
         sources=settings.blocklist_sources,
         spamhaus_license_acknowledged=settings.spamhaus_license_acknowledged,
     )
+    # One high-signal warning when NOTHING loaded — the Docker deploy seeds the
+    # blocklist volume with a manual `soc-ai blocklists refresh`, and if that step
+    # is skipped the agent silently loses the local-threat-intel signal (every IOC
+    # lookup misses). Point the operator straight at the remediation instead of
+    # only emitting a per-source "file missing" line buried in the logs.
+    if not blocklist.loaded_sources:
+        _LOGGER.warning(
+            "no blocklist sources loaded from %s — local IOC reputation is DISABLED. "
+            "Seed it with `soc-ai blocklists refresh` (Docker: "
+            "`docker compose run --rm soc-ai soc-ai blocklists refresh`); some feeds "
+            "(abuse.ch urlhaus/threatfox/feodo) also require ABUSE_CH_AUTH_KEY.",
+            settings.blocklist_data_dir,
+        )
     maxmind = MaxmindReader.from_dir(settings.maxmind_data_dir)
     cloud = CloudPrefixDB.from_dir(settings.cloud_prefix_data_dir)
     return EnrichmentContext(blocklist=blocklist, maxmind=maxmind, cloud=cloud)

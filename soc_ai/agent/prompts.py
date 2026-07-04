@@ -498,11 +498,40 @@ def build_fast_path_synth_user_message(
     )
 
 
+# Corrective addendum appended AFTER the on-disk primer. Live hunts showed the
+# agents inventing pipe stages the grammar does not have (`| fields …` above
+# all) and emitting leading-wildcard patterns, burning tool calls on parse
+# errors. This block restates the EXACT pipe-stage surface from
+# soc_ai/so_client/oql.py (_parse_pipe_stage) — keep the two in sync.
+_OQL_PIPE_STAGE_ADDENDUM = """\
+
+## Pipe stages — the complete list (nothing else parses)
+
+The ONLY pipe stages OQL supports:
+
+- `| groupby <field>[, <field2>]` — bucket counts. `event.kind:alert | groupby source.ip`
+- `| sortby <field> [asc|desc]` — `… | sortby @timestamp desc`
+  (`sortby count desc` only after a `groupby`)
+- `| head <N>` — top-N hits/buckets. `… | head 10`
+- `| count` — total hit count only. `event.kind:alert | count`
+
+There is **NO `fields` / projection stage** (and no `table`, `select`, `where`,
+`stats`, or `eval`). `| fields rule.name, source.ip` is a PARSE ERROR. You cannot
+choose returned columns — hits come back as full documents; make the base filter
+selective and read the fields you need from the results (or `groupby` a field to
+see just its values).
+
+Wildcards must be ANCHORED: `foo*` and `f?o` are accepted; a leading wildcard
+(`*foo`) is REJECTED — anchor the wildcard (write `foo*`, not `*foo`).
+"""
+
+
 def _load_oql_primer() -> str:
     try:
-        return _OQL_PRIMER_PATH.read_text(encoding="utf-8")
+        primer = _OQL_PRIMER_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:  # pragma: no cover - dev-only safeguard
-        return "# OQL primer\n\n> Primer file missing on disk; OQL is unavailable.\n"
+        primer = "# OQL primer\n\n> Primer file missing on disk; OQL is unavailable.\n"
+    return primer + _OQL_PIPE_STAGE_ADDENDUM
 
 
 def oql_primer_block() -> str:

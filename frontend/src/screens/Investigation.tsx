@@ -15,7 +15,6 @@ import {
   MessageSquare,
   RotateCw,
   Scale,
-  Send,
   Shield,
   Sparkles,
   Terminal,
@@ -25,11 +24,11 @@ import {
   Zap,
 } from 'lucide-react';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { EntityGraph } from '../components/EntityGraph';
-import { Panel, PanelHeader } from '../components/Panel';
+import { Panel } from '../components/Panel';
 import { KindBadge, SeverityTag, VerdictPill } from '../components/Badges';
-import { Markdown } from '../components/Markdown';
 import { Spinner } from '../components/States';
 import {
   type ChatThread,
@@ -277,7 +276,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   const send = () => {
     const t = draft.trim();
-    if (!t) return;
+    // Block double-submit while a turn is in flight (matches the hunt chat).
+    if (!t || pending) return;
     setChat((c) => [...c, { role: 'user', text: t }]);
     setDraft('');
     clearChatDraft(inv.id); // sent — drop the persisted draft
@@ -428,13 +428,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
         <VerdictPill verdict={inv.verdict} large />
         {inv.sev && <SeverityTag sev={inv.sev} />}
+        {/* min-w-0 + max-w-full + break-all: the badge may use the whole header
+            row and wraps internally when genuinely out of space — the FULL
+            destination is always visible, never clipped to a fragment. */}
         <span
-          className="rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
+          className="min-w-0 max-w-full rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
           title={`source ${inv.host} → destination ${inv.ip}`}
         >
-          <span className="text-mono-amber">{inv.host}</span>
+          <span className="break-all text-mono-amber">{inv.host}</span>
           <span className="text-faint"> → </span>
-          <span className="text-mono-green">{inv.ip}</span>
+          <span className="break-all text-mono-green">{inv.ip}</span>
         </span>
         {inv.oracle?.escalated && (
           <OracleBadge oracle={inv.oracle} />
@@ -463,17 +466,30 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     {inv.oracle?.escalated && (
       <OracleCard oracle={inv.oracle} />
     )}
-    {(inv.openQuestions?.length ?? 0) > 0 && (
+    {/* Open-questions / follow-up block. Also shown for an `inconclusive`
+        verdict (the self-consistency vote didn't converge) even without
+        structured open questions — it's a terminal non-committed verdict like
+        needs_more_info, and the request-more-info endpoint accepts it too. */}
+    {((inv.openQuestions?.length ?? 0) > 0 || inv.verdict === 'inconclusive') && (
       <div
         className="mb-3 rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
       >
         <div className="mb-1.5 text-[12px] font-semibold uppercase tracking-[.05em]" style={{ color: '#f5a623' }}>
-          {inv.verdict === 'needs_more_info' ? 'Open questions' : 'Residual open questions'}
+          {inv.verdict === 'needs_more_info' || inv.verdict === 'inconclusive'
+            ? 'Open questions'
+            : 'Residual open questions'}
         </div>
-        <ul className="mb-2.5 list-disc pl-5 text-[13px] text-text-2">
-          {inv.openQuestions!.map((q, i) => <li key={i} className="mb-0.5">{q}</li>)}
-        </ul>
+        {(inv.openQuestions?.length ?? 0) > 0 ? (
+          <ul className="mb-2.5 list-disc pl-5 text-[13px] text-text-2">
+            {inv.openQuestions!.map((q, i) => <li key={i} className="mb-0.5">{q}</li>)}
+          </ul>
+        ) : (
+          <div className="mb-2.5 text-[13px] text-text-2">
+            The model could not converge on a verdict — dig deeper with a focused
+            re-investigation, or resolve it in chat.
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={requestInfo}
@@ -654,6 +670,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           The investigation recommended no automatic actions. Acknowledge to close out
           this detection, or escalate it to a Security Onion case.
         </p>
+        {inv.alertAcked && (
+          <p className="mb-2.5 text-[12px] leading-[1.5] text-dim">
+            <span style={{ color: '#7ba893' }}>✓ This alert is already acknowledged in Security Onion</span>
+            {' '}— acknowledging here re-acks the whole detection group.
+          </p>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => runSettled('ack')}
@@ -900,6 +922,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 // Scoped follow-up chat. `fill` makes it stretch to its parent's height (the
 // viewport-tall sticky rail) with an internally-scrolling message list; without
 // it the message list is a fixed 260–460px band (the compact drawer).
+// Rendering (header, bubbles, typing dots, input row) is the shared
+// ChatPanelShell; this wrapper adds the investigation-specific bits — the
+// data-chat-panel scroll target and the chat-proposed-verdict cards.
 function ChatPanel({
   messages,
   pending,
@@ -921,11 +946,6 @@ function ChatPanel({
   invId: string;
   onResolved: () => void;
 }) {
-  const listRef = useRef<HTMLDivElement>(null);
-  const didMountRef = useRef(false);
-  // Tracks the highest message index seen at mount-time so subsequent new
-  // messages (added while the panel is open) can receive a fade-in.
-  const seedLengthRef = useRef<number>(-1);
   // Apply-verdict feedback, keyed by the proposal's message index: which one is
   // mid-apply, and a per-message error string so a failed apply surfaces (and
   // re-enables the button) instead of being silently swallowed.
@@ -950,53 +970,24 @@ function ChatPanel({
       .finally(() => setApplyingIdx(null));
   };
 
-  useEffect(() => {
-    if (!didMountRef.current) {
-      didMountRef.current = true;
-      seedLengthRef.current = messages.length;
-      return;
-    }
-    const el = listRef.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-  }, [messages.length, pending]);
-
   return (
     // wrapper carries the scroll target; h-full in fill mode preserves the
     // height chain ChatDock relies on (Panel's h-full resolves against it)
     <div data-chat-panel className={fill ? 'h-full' : undefined}>
-    <Panel className={`flex min-h-0 flex-col${fill ? ' h-full' : ''}`}>
-      <PanelHeader
-        icon={<MessageSquare size={15} />}
+      <ChatPanelShell
         title="Chat about this investigation"
-        right={
-          <div className="flex items-center gap-2.5">
-            {messages.length > 0 && (
-              <span className="font-mono text-[11px] text-accent">{messages.length} msg{messages.length !== 1 ? 's' : ''}</span>
-            )}
-            <div className="font-mono text-[11px] text-faint">scoped to this investigation</div>
-            {onClose && (
-              <button onClick={onClose} aria-label="Close chat" className="flex text-dim hover:text-text">
-                <X size={15} />
-              </button>
-            )}
-          </div>
-        }
-        className="py-[11px]"
-      />
-      <div ref={listRef} className={`flex flex-col gap-3 overflow-y-auto p-[15px] ${fill ? 'min-h-0 flex-1' : 'max-h-[460px] min-h-[260px]'}`}>
-        {messages.map((m, i) => {
-          // Messages that arrived after the panel mounted get a subtle fade-in.
-          // History / seed messages (present at mount) render immediately.
-          const isNew = i >= seedLengthRef.current;
-
-          return m.role === 'user' ? (
-            <div
-              key={i}
-              className="max-w-[82%] min-w-0 self-end break-words rounded-[12px_12px_3px_12px] border border-accent-deep bg-[#1d3a6b] px-[13px] py-[9px] text-[13px] leading-[1.5]"
-            >
-              {m.text}
-            </div>
-          ) : m.kind === 'verdict_proposal' && m.proposal ? (
+        scopeLabel="scoped to this investigation"
+        placeholder="Ask a follow-up… e.g. why not a false positive?"
+        listSizeClass={fill ? 'min-h-0 flex-1' : 'max-h-[460px] min-h-[260px]'}
+        messages={messages}
+        pending={pending}
+        draft={draft}
+        onDraft={onDraft}
+        onSend={onSend}
+        fill={fill}
+        onClose={onClose}
+        renderSpecial={(m, i) =>
+          m.role !== 'user' && m.kind === 'verdict_proposal' && m.proposal ? (
             <div key={i} className="max-w-[88%] min-w-0 self-start break-words rounded-card border px-3 py-2.5"
                  style={{ borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}>
               <div className="mb-1 flex items-center gap-2 text-[12px] font-semibold text-text-2">
@@ -1025,46 +1016,9 @@ function ChatPanel({
                 <div className="text-[12px] text-warn">Not evidence-backed{m.objection ? ` — ${m.objection}` : ''}</div>
               )}
             </div>
-          ) : (
-            <div key={i} className={`max-w-[88%] min-w-0 self-start${isNew ? ' animate-fadeUp' : ''}`}>
-              <div className="overflow-hidden break-words rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2 [&_pre]:max-w-full [&_pre]:overflow-x-auto" style={{ textWrap: 'pretty' }}>
-                <Markdown>{m.text ?? ''}</Markdown>
-              </div>
-              {m.tools && (
-                <div className="mt-1.5 flex items-center gap-1.5 font-mono text-[10.5px] text-faint">
-                  <span className="text-accent"><Wrench size={11} /></span>tools · {m.tools}
-                </div>
-              )}
-            </div>
-          );
-        })}
-        {pending && (
-          <div className="flex items-center gap-1 self-start rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-3.5 py-[11px]">
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" />
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.2s' }} />
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.4s' }} />
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-[9px] border-t border-border px-[13px] py-[11px]">
-        <input
-          value={draft}
-          onChange={(e) => onDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') onSend();
-          }}
-          placeholder="Ask a follow-up… e.g. why not a false positive?"
-          className="flex-1 rounded-control border border-border-input bg-bg px-3 py-[9px] text-[13px] text-text outline-none focus:border-accent"
-        />
-        <button
-          onClick={onSend}
-          aria-label="Send"
-          className="flex h-9 w-[38px] flex-none items-center justify-center rounded-control bg-accent text-white hover:bg-accent-deep"
-        >
-          <Send size={16} />
-        </button>
-      </div>
-    </Panel>
+          ) : null
+        }
+      />
     </div>
   );
 }
@@ -1075,23 +1029,11 @@ type ChatPanelProps = Parameters<typeof ChatPanel>[0];
 // scoped chat as a docked panel. Costs no layout space and stays reachable no
 // matter how far you've scrolled the evidence.
 function ChatDock(props: Omit<ChatPanelProps, 'fill' | 'onClose'>) {
-  const [open, setOpen] = useState(false);
   const msgCount = props.messages.length;
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="fixed bottom-6 right-6 z-40 flex items-center gap-2 rounded-pill border border-accent-deep bg-accent px-[18px] py-3 text-[13px] font-semibold text-white shadow-[0_12px_34px_rgba(75,139,245,.42)] transition-transform hover:-translate-y-0.5 hover:bg-accent-deep"
-      >
-        <MessageSquare size={16} />
-        {msgCount > 0 ? `Chat · ${msgCount}` : 'Chat about this'}
-      </button>
-    );
-  }
   return (
-    <div className="fixed bottom-6 right-6 z-40 h-[560px] max-h-[calc(100vh-96px)] w-[400px] max-w-[calc(100vw-32px)] animate-fadeUp drop-shadow-[0_24px_70px_rgba(0,0,0,.6)]">
-      <ChatPanel {...props} fill onClose={() => setOpen(false)} />
-    </div>
+    <ChatDockShell label={msgCount > 0 ? `Chat · ${msgCount}` : 'Chat about this'}>
+      {(close) => <ChatPanel {...props} fill onClose={close} />}
+    </ChatDockShell>
   );
 }
 
@@ -1563,10 +1505,19 @@ function ActionCard({
             className="flex items-center gap-2 text-[12.5px] font-semibold"
             style={{ color: eff === 'approved' ? '#3fb950' : '#f04438' }}
           >
-            {applied ? '✓ Auto-acknowledged' : eff === 'approved' ? '✓ Executed' : '✕ Rejected'}{' '}
-            <span className="font-mono text-[11px] font-normal text-faint">
-              {applied ? '· system · automatic' : '· analyst · just now'}
-            </span>
+            {applied
+              ? `✓ ${action.appliedNote ?? 'Auto-acknowledged'}`
+              : eff === 'approved'
+                ? '✓ Executed'
+                : '✕ Rejected'}{' '}
+            {/* appliedNote carries its own attribution ("Executed · analyst",
+                "Already acknowledged") — only the auto-ack default needs the
+                system suffix. */}
+            {(!applied || !action.appliedNote) && (
+              <span className="font-mono text-[11px] font-normal text-faint">
+                {applied ? '· system · automatic' : '· analyst · just now'}
+              </span>
+            )}
           </div>
           {eff === 'approved' && message && (
             <div className="mt-1 text-[12px] leading-[1.5] text-dim">{message}</div>

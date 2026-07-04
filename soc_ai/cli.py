@@ -11,13 +11,17 @@ The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
 
 The triage subcommand connects via HTTPS to the configured
 ``SOC_AI_HOST:SOC_AI_PORT`` and trusts a self-signed cert by default
-(matches the lab posture documented in ``docs/DEPLOYMENT.md``).
+(matches the lab posture documented in ``docs/DEPLOYMENT.md``); pass
+``--verify`` or ``--cafile`` to enable TLS verification. Against a
+secured deployment (``api_auth_required=true``, the shipped default),
+authenticate with ``--token scai_...`` or the ``SOC_AI_API_TOKEN``
+environment variable.
 
 Examples::
 
     uv run soc-ai serve
-    uv run soc-ai triage sB86B54BVBs3R9hX_qZR
-    uv run soc-ai healthz
+    uv run soc-ai triage sB86B54BVBs3R9hX_qZR --token scai_...
+    SOC_AI_API_TOKEN=scai_... uv run soc-ai healthz
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import sys
 from typing import Any
 
@@ -173,7 +178,13 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
     return f"{_label(kind)} {_short(json.dumps(payload), 160)}"
 
 
-async def _stream_investigation(base_url: str, alert_id: str) -> int:
+async def _stream_investigation(
+    base_url: str,
+    alert_id: str,
+    *,
+    token: str | None = None,
+    verify: bool | str = False,
+) -> int:
     """Connect, stream the SSE events, render each. Returns process exit code."""
     url = base_url.rstrip("/") + "/investigate"
     print(
@@ -182,15 +193,16 @@ async def _stream_investigation(base_url: str, alert_id: str) -> int:
     )
     saw_error = False
     saw_triage = False
-    # Self-signed cert in lab; SSE stream needs no client-side timeout
+    # verify defaults to False (lab self-signed posture; --verify/--cafile
+    # enable TLS verification); SSE stream needs no client-side timeout
     # because investigations can legitimately take many minutes.
     async with (
-        httpx.AsyncClient(verify=False, timeout=None) as client,  # noqa: S113, S501
+        httpx.AsyncClient(verify=verify, timeout=None) as client,  # noqa: S113
         client.stream(
             "POST",
             url,
             json={"alert_id": alert_id},
-            headers={"Accept": "text/event-stream"},
+            headers={"Accept": "text/event-stream", **_auth_headers(token)},
         ) as resp,
     ):
         if resp.status_code != 200:
@@ -275,17 +287,64 @@ def _resolve_base_url(url_arg: str | None) -> str:
     return f"{scheme}://{host}:{settings.soc_ai_port}"
 
 
+def _resolve_token(args: argparse.Namespace) -> str | None:
+    """API bearer token: explicit ``--token`` wins, then ``SOC_AI_API_TOKEN``.
+
+    Returns None when neither is set (unauthenticated request — only works
+    against a deployment with ``api_auth_required`` turned off).
+    """
+    token = getattr(args, "token", None)
+    if token:
+        return str(token)
+    return os.environ.get("SOC_AI_API_TOKEN") or None
+
+
+def _resolve_verify(args: argparse.Namespace) -> bool | str:
+    """TLS verification for CLI HTTP calls: ``--cafile`` > ``--verify`` > off.
+
+    Defaults to False (the lab self-signed posture) for backward
+    compatibility; a CA bundle path pins verification to that bundle.
+    """
+    cafile = getattr(args, "cafile", None)
+    if cafile:
+        return str(cafile)
+    return bool(getattr(args, "verify", False))
+
+
+def _auth_headers(token: str | None) -> dict[str, str]:
+    """Authorization header for the API token, or empty when unauthenticated."""
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _triage(args: argparse.Namespace) -> int:
     base_url = _resolve_base_url(args.url)
-    return asyncio.run(_stream_investigation(base_url, args.alert_id))
+    return asyncio.run(
+        _stream_investigation(
+            base_url,
+            args.alert_id,
+            token=_resolve_token(args),
+            verify=_resolve_verify(args),
+        )
+    )
 
 
 def _healthz(args: argparse.Namespace) -> int:
     base_url = _resolve_base_url(args.url)
     url = base_url.rstrip("/") + "/healthz"
-    with httpx.Client(verify=False, timeout=10.0) as client:  # noqa: S501
+    # verify defaults to False (lab self-signed); --verify/--cafile enable it.
+    with httpx.Client(
+        verify=_resolve_verify(args),
+        timeout=10.0,
+        headers=_auth_headers(_resolve_token(args)),
+    ) as client:
         resp = client.get(url)
-    print(json.dumps(resp.json(), indent=2))
+    try:
+        print(json.dumps(resp.json(), indent=2))
+    except ValueError:
+        # A non-JSON body (a proxy 502 page, an auth redirect, a plain-text
+        # error) must not crash healthz with a raw traceback — show the status
+        # and a snippet so the operator can see what answered.
+        print(f"HTTP {resp.status_code} (non-JSON body): {resp.text[:200]}")
     return 0 if resp.status_code == 200 else 1
 
 
@@ -361,7 +420,6 @@ def _validate_batch(args: argparse.Namespace) -> int:
     """
     from pathlib import Path  # noqa: PLC0415 - lazy
 
-    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
     from soc_ai.eval.batch import BatchConfig, run_batch  # noqa: PLC0415 - lazy
     from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
 
@@ -521,7 +579,6 @@ def _eval_report(args: argparse.Namespace) -> int:
     """
     from pathlib import Path  # noqa: PLC0415 - lazy
 
-    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
     from soc_ai.eval.report import (  # noqa: PLC0415 - lazy
         aggregates_to_json,
         build_report,
@@ -726,6 +783,31 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
         return 1
 
 
+def _add_api_client_args(p: argparse.ArgumentParser) -> None:
+    """Shared flags for subcommands that call the running soc-ai HTTP API."""
+    p.add_argument(
+        "--token",
+        default=None,
+        help="API bearer token (scai_...) for a secured deployment "
+        "(api_auth_required=true, the shipped default). Falls back to the "
+        "SOC_AI_API_TOKEN environment variable; omit both only if the "
+        "server allows unauthenticated access.",
+    )
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify the server's TLS certificate against the system CA store "
+        "(default: no verification, matching the lab self-signed posture)",
+    )
+    p.add_argument(
+        "--cafile",
+        default=None,
+        metavar="PATH",
+        help="CA bundle used to verify the server's TLS certificate "
+        "(implies verification; takes precedence over --verify)",
+    )
+
+
 def main() -> None:
     """CLI entry point bound by ``[project.scripts]``."""
     parser = argparse.ArgumentParser(prog="soc-ai", description=__doc__)
@@ -741,6 +823,7 @@ def main() -> None:
         default=None,
         help="Override base URL of the soc-ai instance (default: from SOC_AI_HOST/PORT)",
     )
+    _add_api_client_args(p_triage)
     p_triage.set_defaults(func=_triage)
 
     p_health = sub.add_parser("healthz", help="Print the soc-ai /healthz JSON")
@@ -749,6 +832,7 @@ def main() -> None:
         default=None,
         help="Override base URL (default: from SOC_AI_HOST/PORT)",
     )
+    _add_api_client_args(p_health)
     p_health.set_defaults(func=_healthz)
 
     p_val = sub.add_parser(

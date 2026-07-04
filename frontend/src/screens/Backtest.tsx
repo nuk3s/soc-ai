@@ -36,12 +36,14 @@ const VERDICT_LABEL: Record<SocVerdict, string> = {
   true_positive: 'True positive',
   false_positive: 'False positive',
   needs_more_info: 'Needs info',
+  inconclusive: 'Inconclusive',
   no_verdict: 'No verdict',
 };
 const VERDICT_COLOR: Record<SocVerdict, string> = {
   true_positive: '#f04438',
   false_positive: '#7ba893',
   needs_more_info: '#f5a623',
+  inconclusive: '#d29922',
   no_verdict: '#6b7484',
 };
 const DISPOSITION_LABEL: Record<HumanDisposition, string> = {
@@ -53,6 +55,7 @@ const SOC_ORDER: SocVerdict[] = [
   'true_positive',
   'false_positive',
   'needs_more_info',
+  'inconclusive',
   'no_verdict',
 ];
 

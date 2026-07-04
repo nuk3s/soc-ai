@@ -980,7 +980,7 @@ class TestMaybeAutoAckFp:
 
         alert = self._make_alert()
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-abc", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1011,7 +1011,7 @@ class TestMaybeAutoAckFp:
 
         alert = self._make_alert()
         mock_write = AsyncMock(return_value=(None, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-xyz", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1034,7 +1034,7 @@ class TestMaybeAutoAckFp:
 
             alert = self._make_alert()
             mock_write = AsyncMock(return_value=(None, None))
-            with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+            with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
                 result = asyncio.run(
                     maybe_auto_ack_fp(
                         report, "ev-tp", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1063,7 +1063,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-crit", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1093,7 +1093,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-mal", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1115,7 +1115,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-ok", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1138,7 +1138,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=(None, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-low", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1160,7 +1160,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-exact", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1183,7 +1183,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=(None, "SO API error: connection refused"))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             # Must not raise
             result = asyncio.run(
                 maybe_auto_ack_fp(
@@ -1219,7 +1219,7 @@ class TestMaybeAutoAckFp:
         ctx.gate.request = gate_spy  # type: ignore[method-assign]
 
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-direct", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
@@ -1253,7 +1253,7 @@ class TestMaybeAutoAckFp:
         _ev, _audit, _ = self._make_emit_audit()
 
         mock_write = AsyncMock(return_value=({"ok": True}, None))
-        with patch("soc_ai.api.approvals.execute_write_tool", mock_write):
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
                     report, "ev-audit", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit

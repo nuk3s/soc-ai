@@ -203,8 +203,14 @@ async def _auto_triage_scheduler_loop(app: FastAPI, settings: Any) -> None:
             if at.get_status(app.state).active:
                 continue  # a sweep (manual or scheduled) is already in flight
             n = await at.start_config_sweep(app.state, started_by="auto-triage:scheduler")
+            # Record the sweep time whether or not it launched targets. The ES
+            # planning pass (one grouped aggregation per severity + per-group
+            # fetches) is exactly what the interval throttles; on a drained
+            # backlog every sweep plans 0 targets, so gating the timestamp on
+            # ``n`` left ``_last_sweep`` unset and re-ran full planning every 60s,
+            # ignoring ``auto_triage_schedule_interval_minutes``.
+            _last_sweep = time.monotonic()
             if n:
-                _last_sweep = time.monotonic()
                 _LOGGER.info("auto-triage scheduler: launched a sweep of %d target(s)", n)
         except asyncio.CancelledError:
             raise
@@ -378,7 +384,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         # worker can't do a use-after-close ES search / DB write on shutdown.
         from soc_ai.webui import autotriage as _at  # noqa: PLC0415
         from soc_ai.webui import backtest as _bac  # noqa: PLC0415
+        from soc_ai.webui import chat_manager as _cm  # noqa: PLC0415
         from soc_ai.webui import hunt_console_manager as _hcm  # noqa: PLC0415
+        from soc_ai.webui import hunt_manager as _hm  # noqa: PLC0415
 
         _worker_tasks: list[asyncio.Task[Any]] = []
         _at_task = _at.get_status(app.state)._task
@@ -388,6 +396,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         if _bac_task is not None:
             _worker_tasks.append(_bac_task)
         _worker_tasks.extend(_hcm.get_manager(app.state)._tasks.values())
+        # HuntManager (per-alert manual Investigate via POST /hunt) and ChatManager
+        # (chat turns) hold the same ES/DB references via app.state — drain them too,
+        # else an in-flight Investigate or chat turn can use-after-close on shutdown.
+        _worker_tasks.extend(_hm.get_manager(app.state)._tasks.values())
+        _worker_tasks.extend(_cm.get_manager(app.state)._tasks.values())
         for _t in _worker_tasks:
             if not _t.done():
                 _t.cancel()

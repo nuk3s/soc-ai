@@ -2,15 +2,15 @@
 
 Catalog of safe, downloadable, labeled-**malicious** packet captures for validating
 the Security Onion (Suricata + Zeek) detection pipeline end-to-end. These are inert
-**network captures** (no live malware execution) — the standard material SOC analysts
+**network captures** (no live malware execution), the standard material SOC analysts
 use. Import with `sudo so-import-pcap <file.pcap>` on the sensor; alerts land in the
 SO 3.0 `logs-*` data streams (what soc-ai queries via `EVENTS_INDEX_PATTERN`,
 e.g. the `.ds-logs-suricata.alerts-so-...` backing indices) with the PCAP's
 original timestamps + an `import.id` tag.
 
-> Compiled 2026-06-16 (subagent research; URLs HEAD-verified live then).
+> Compiled 2026-06-16; URLs HEAD-verified live then.
 
-## START HERE (small, verified, guaranteed to pop)
+## Start here (small, verified, guaranteed to pop)
 
 1. **SMB EICAR** — 4.4 KB, no password. Suricata's own regression fixture → file-extraction smoke test, will fire deterministically. EICAR test string, not real malware.
    ```bash
@@ -48,10 +48,10 @@ original timestamps + an `import.id` tag.
 
 ## Safety / handling notes
 
-- **MTA password scheme changed:** no longer flat `infected`. Now `infected_<YYYYMMDD>` (the post date) — e.g. 2026-02-28 → `infected_20260228`. (Password shown in `about.gif` on the MTA about page.)
-- **Only download the `*.pcap.zip`** from MTA — NOT the `*-files-*.zip` / `files-from-the-infection.zip`, which contain **live malware binaries**.
+- **MTA password scheme changed:** no longer flat `infected`. Now `infected_<YYYYMMDD>` (the post date), e.g. 2026-02-28 → `infected_20260228`. (Password shown in `about.gif` on the MTA about page.)
+- **Only download the `*.pcap.zip`** from MTA, NOT the `*-files-*.zip` / `files-from-the-infection.zip`, which contain **live malware binaries**.
 - **Stratosphere/MCFP** pcaps are plain libpcap, no password, but the cert chain is old → use `curl -k`. Browsable index at `https://mcfp.felk.cvut.cz/publicDatasets/`.
 - **CTU-13:** use `botnet-capture-*.pcap` (full payloads → content rules fire); avoid the `*.truncated.pcap` siblings (payloads stripped).
 - **GitHub raw** (chrissanders, PCAP-ATTACK, suricata-verify): plaintext, no password; URL-encode spaces (`%20`) + quote local paths.
-- Named `ET MALWARE` hits on old datasets (CTU-13 2011, IoT-23 2018) are *likely not guaranteed* against a current ruleset — the **Zeek protocol behaviours** are the durable signal there. MTA-2026 + GitHub samples are most likely to fire named ET sigs.
+- Named `ET MALWARE` hits on old datasets (CTU-13 2011, IoT-23 2018) are *likely not guaranteed* against a current ruleset; the **Zeek protocol behaviours** are the durable signal there. MTA-2026 + GitHub samples are most likely to fire named ET sigs.
 - Timestamps are the PCAP's original time → imported alerts land historically. Hunt by `alert_es_id` works regardless; to see them in the live alerts pane, widen the time range or `editcap -t <offset>` the PCAP to ~now before importing.

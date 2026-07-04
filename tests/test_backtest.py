@@ -138,6 +138,30 @@ class TestScore:
         assert m["missed_tp"] == 0
         assert m["counts"]["total"] == 0
 
+    def test_inconclusive_is_a_non_decision(self) -> None:
+        """`inconclusive` (self-consistency split) buckets with needs_more_info:
+        it is NEVER a wrong TP/FP (no missed_tp, no false agreement) and never
+        a `no_verdict` error row."""
+        rows = [
+            _row(HUMAN_TP, "inconclusive", alert_id="t1"),
+            _row(HUMAN_FP, "inconclusive", alert_id="f1"),
+            _row(HUMAN_TP, "true_positive"),
+        ]
+        m = score(rows)
+        # Not an agreement with either disposition...
+        assert m["agreement_rate"] == pytest.approx(1 / 3)
+        # ...not a missed TP (the dangerous bucket is TP→false_positive only)...
+        assert m["missed_tp"] == 0
+        # ...not an FP clearance...
+        assert m["counts"]["fp_cleared"] == 0
+        # ...and counted as a hedge, in the needs_more_info confusion bucket,
+        # NOT as no_verdict.
+        assert m["n_needs_more_info"] == 2
+        assert m["confusion"][HUMAN_TP]["needs_more_info"] == 1
+        assert m["confusion"][HUMAN_FP]["needs_more_info"] == 1
+        assert m["confusion"][HUMAN_TP]["no_verdict"] == 0
+        assert m["confusion"][HUMAN_FP]["no_verdict"] == 0
+
 
 # ---------------------------------------------------------------------------
 # 2. Store CRUD + migration-creates-table

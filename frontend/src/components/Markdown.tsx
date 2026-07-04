@@ -41,11 +41,20 @@ export function Markdown({ children }: { children: string }) {
             {children}
           </a>
         ),
+        // Tables always get an overflow-x-auto wrapper: at narrow widths (the
+        // 400px chat dock) a multi-column table scrolls horizontally instead of
+        // crushing; on wide surfaces the wrapper is inert (no scrollbar when it
+        // fits). Header cells stay on one line so columns can't collapse below
+        // their label width — that's what forces the scroll instead of the crush.
         table: ({ children }) => (
-          <table className="mb-1.5 w-full border-collapse text-[12px] last:mb-0">{children}</table>
+          <div className="mb-1.5 overflow-x-auto last:mb-0">
+            <table className="w-full border-collapse text-[12px]">{children}</table>
+          </div>
         ),
         th: ({ children }) => (
-          <th className="border border-border px-2 py-1 text-left font-semibold">{children}</th>
+          <th className="whitespace-nowrap border border-border px-2 py-1 text-left font-semibold">
+            {children}
+          </th>
         ),
         td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
       }}

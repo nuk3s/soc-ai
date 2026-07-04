@@ -35,11 +35,10 @@ import logging
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
-from soc_ai.agent.triage import TriageReport
 from soc_ai.config import Settings
 from soc_ai.oracle.redact import Mapping, sanitize_case
 from soc_ai.oracle.sanitize import (
@@ -47,6 +46,10 @@ from soc_ai.oracle.sanitize import (
     redaction_summary,
     unsafe_residue,
 )
+from soc_ai.triage_models import TriageReport
+
+if TYPE_CHECKING:
+    from soc_ai.agent.orchestrator import InvestigationContext
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,7 +142,10 @@ class OracleVerdict(BaseModel):
     :func:`_verdict_to_report`.
     """
 
-    verdict: Literal["true_positive", "false_positive", "needs_more_info"]
+    # The prompt asks for the first three; ``inconclusive`` is accepted so an
+    # adjudication over a voted-inconclusive local report can echo the class
+    # without a validation crash (kept in sync with soc_ai.triage_models.Verdict).
+    verdict: Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
     confidence: float
     summary: str
     reasoning: str
@@ -395,7 +401,7 @@ def _assemble_case_dict(
 
 
 async def adjudicate(
-    ctx: Any,  # InvestigationContext — typed loosely to avoid circular import
+    ctx: InvestigationContext,
     *,
     enriched: Any,
     local_report: TriageReport,
@@ -407,11 +413,11 @@ async def adjudicate(
 
     Args:
         ctx: :class:`~soc_ai.agent.orchestrator.InvestigationContext` — used
-            to access ``ctx.settings`` (settings are not imported at module
-            level to avoid circular deps).
+            to access ``ctx.settings`` (type-only import; the runtime
+            dependency flows orchestrator → oracle, never back).
         enriched: :class:`~soc_ai.tools.get_alert_context.EnrichedAlertContext`
             — the full prefetched + enriched alert context.
-        local_report: The local :class:`~soc_ai.agent.triage.TriageReport` from
+        local_report: The local :class:`~soc_ai.triage_models.TriageReport` from
             the investigation loop.  Its text fields (summary/citations) are
             included in the payload so the Oracle has the local reasoning.
         transcript_text: Raw text transcript from the investigation loop

@@ -111,6 +111,34 @@ def test_build_hunt_agent_emits_hunt_report(settings_kratos: Settings) -> None:
     assert result.output.findings[0].title == "Beaconing to rare external IP"
 
 
+def test_hunt_online_tools_gated_by_master_toggle(settings_kratos: Settings) -> None:
+    """U4: t_greynoise/t_shodan_*/t_cve_lookup are only registered on the hunt
+    agent when allow_online_enrichment is on — an OFF toggle must not leave
+    tools that answer 'skipped (online enrichment off)' for the model to
+    waste budget on."""
+    online = {"t_greynoise", "t_shodan_internetdb", "t_shodan_host", "t_cve_lookup"}
+    prompt = HUNT_SYSTEM_PROMPT.format(objective="hunt for beaconing")
+
+    assert settings_kratos.allow_online_enrichment is False  # fixture default
+    agent_off = build_hunt_agent(
+        TestModel(call_tools=[], custom_output_args=FAKE_REPORT),
+        _ctx(settings_kratos),
+        system_prompt=prompt,
+    )
+    names_off = set(agent_off._function_toolset.tools.keys())  # type: ignore[attr-defined]
+    assert not (online & names_off), sorted(online & names_off)
+    assert "t_query_events_oql" in names_off  # core read surface unaffected
+
+    settings_on = settings_kratos.model_copy(update={"allow_online_enrichment": True})
+    agent_on = build_hunt_agent(
+        TestModel(call_tools=[], custom_output_args=FAKE_REPORT),
+        _ctx(settings_on),
+        system_prompt=prompt,
+    )
+    names_on = set(agent_on._function_toolset.tools.keys())  # type: ignore[attr-defined]
+    assert online <= names_on, sorted(online - names_on)
+
+
 def test_run_hunt_streams_report(settings_kratos: Settings) -> None:
     async def _go() -> list[Any]:
         events = []

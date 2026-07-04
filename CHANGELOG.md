@@ -6,6 +6,70 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-07-04
+
+### Fixed
+
+- **Acknowledge / escalate writes to Security Onion no longer fail after ~10
+  minutes.** SO 3.0 expires its CSRF (srv) token 600 seconds after login and
+  signals an expired token with a `400`, which the previous 401-only refresh
+  never caught, so any write more than ten minutes after login (and every
+  unattended auto-ack) failed. The token is now refreshed proactively and on a
+  `400`, so ack, escalate-to-case, and auto-ack work for the life of the session.
+- **Investigation timeline reads cleanly.** Tool-call rows show a short, plain
+  title (`Host summary: 10.0.0.5 — 699 events`) instead of raw JSON; a disabled
+  online lookup shows a neutral `skipped` line rather than a configuration notice;
+  write actions group under Decision, not Tool calls; the full result stays in the
+  row's expander.
+- **The "Model reasoning" panel now appears on every investigation**, not only the
+  ones that ran the deep investigation loop.
+- **Source → destination no longer truncates** on the investigation view or the
+  investigations list.
+- **The acknowledge action reflects an alert that was already acknowledged**
+  (elsewhere, or by an earlier run), and advisory-action executions are persisted
+  so a reload never re-offers an escalate that already opened a case.
+- **The hunt agent writes valid OQL** — the primer and parser errors now state the
+  exact supported pipe stages (`groupby`, `sortby`, `head`, `count`) and that there
+  is no `fields`/projection stage, ending a class of parse failures.
+- Comma-separated environment values for the Oracle privacy gate and
+  `PROXY_TRUSTED_IPS` load correctly instead of failing settings validation at
+  startup.
+- Phase-D targeted evidence tools (the Elasticsearch-query family) no longer fail
+  to dispatch; several evidence-gate and audit events that were being dropped are
+  now recorded.
+- `X-Forwarded-Proto` is trusted only from a proxy listed in `PROXY_TRUSTED_IPS`,
+  matching the existing `X-Forwarded-For` rule, so a client cannot forge the
+  `Secure` cookie flag.
+- A batch of web-console correctness fixes: idle polling no longer freezes the live
+  views, terminal statuses render correctly, and a duplicate-key warning in the
+  API-token list is gone.
+
+### Added
+
+- **Self-consistency vote on the final verdict**, off by default
+  (`VERDICT_CONSISTENCY_SAMPLES=1`). Set it to 2–5 to run the final synthesis
+  several times and majority-vote; a split lands the new `inconclusive` verdict.
+- **CLI authentication:** `soc-ai triage` / `healthz` accept `--token` (or
+  `SOC_AI_API_TOKEN`) and a `--verify` / `--cafile` TLS option, so the CLI works
+  against the shipped secure default.
+- A documentation-accuracy check in CI that keeps the agent-tools reference and the
+  audit-event list in sync with the code.
+- The online-enrichment tools (Shodan, GreyNoise, CVE lookup) register only when
+  `ALLOW_ONLINE_ENRICHMENT` is on, so the agent never spends a tool call on a
+  disabled lookup.
+
+### Security
+
+- Dependency updates clearing known CVEs: starlette, python-multipart, pyjwt,
+  aiohttp, cryptography, idna, joserfc, and pydantic-ai.
+
+### Changed
+
+- The web API implementation was reorganised into a package of route modules
+  (internal refactor; every endpoint path and response is unchanged).
+- Documentation pass across the README and guides for clarity, and the console
+  screenshots were regenerated against the current UI.
+
 ## [1.0.6] - 2026-07-03
 
 ### Removed

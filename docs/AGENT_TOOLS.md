@@ -1,12 +1,12 @@
-# What the soc-ai agent can actually do
+# What the soc-ai agent can do
 
-This is the complete capability surface of the triage agent: the tools it can
+The complete capability surface of the triage agent: the tools it can
 call, the enrichments applied to every alert before the agent runs, and the
 guardrails.
 
 > **Trust boundary:** every **read** tool is exposed read-only. Every **write**
 > tool (anything that changes Security Onion state) is gated behind an explicit
-> human **Approve/Reject** in the UI — the agent can *recommend* a write but
+> human **Approve/Reject** in the UI. The agent can *recommend* a write but
 > never executes one on its own. See `docs/SAFETY_MODEL.md`.
 
 ## Read tools (no approval needed)
@@ -18,20 +18,26 @@ guardrails.
 | `query_cases` | Search existing SOC cases by free-text query (has this been seen/escalated before?). | SO cases index |
 | `query_detections` | Search SOC detection rules by free-text query (what does this rule actually look for?). | SO detections index |
 | `get_playbooks` | Pull response playbooks, optionally scoped to a given alert. | SO playbooks index |
-| `lookup_runbook` | Retrieve internal runbook guidance (RAG). **Stub in v1** — wired in v1.1. | Qdrant (RAG) |
+| `lookup_runbook` | Search operator-authored runbooks (procedures / "what normal looks like on *this* network") so a verdict can cite the org's own guidance. Ranking is **embedding-free** (rule-link > tag > keyword), fully air-gapped — no external index. | Local store (`soc_ai/store/runbooks`) |
 | `enrich_ip` | Enrich an IP locally: vendored blocklist hits, GeoIP/ASN (MaxMind), cloud-prefix tag, internal-vs-external classification (`INTERNAL_CIDRS`), + optional MISP. Internal IPs short-circuit the external-only lookups. | Vendored blocklists / MaxMind / MISP |
 | `enrich_domain` | Enrich a domain via local blocklist lookup + optional MISP. | Vendored blocklists / MISP |
 | `enrich_hash` | Enrich a file hash via local blocklist lookup + optional MISP. | Vendored blocklists / MISP |
+| `get_event_raw` / `t_get_event_raw` | Fetch the full raw JSON of a single event by id when the summarized context isn't enough. | Elasticsearch events index |
+| `t_describe_dataset` / `t_field_values` | On-demand discovery: describe a dataset's shape, or list the observed values of a field. Lets the agent learn what's actually in *this* grid instead of assuming a fixed schema. | Elasticsearch (terms aggregations) |
+| `t_host_summary` | Summarize a host's recent activity (datasets seen, top peers, notable events) for the internal side of a flow. | Elasticsearch |
+| `t_prevalence` / `t_rule_prevalence` | How common is this indicator / this rule across the grid and window? Rare-vs-noisy is decisive for FP calls. | Elasticsearch (aggregations) |
+| `t_suggest_rule_tuning` | *Suggest* a tuning for a noisy detection (the analyst applies it in Detection Tuning; the agent never mutates a rule). | Local store + Elasticsearch |
+| `t_shodan_internetdb` / `t_shodan_host` / `t_greynoise` / `t_cve_lookup` | **External** reputation lookups on a single indicator — Shodan InternetDB (free), Shodan host (paid key), GreyNoise, CIRCL CVE DB. Outbound egress; used in the **hunt** and **chat** agents. Only the indicator leaves the network, never alert payloads. See `docs/SAFETY_MODEL.md` → external-intel egress. | Public Shodan / GreyNoise / CIRCL APIs |
 | `get_pcap` / `t_get_pcap` | Fetch + decode the raw packets for a bidirectional flow (five-tuples, SNI, DNS qnames, HTTP hosts, inter-arrival beacon stats). SSHes into the SO sensor's Suricata pcap-log ring and runs a BPF-filtered tcpdump. **Heavier than Elastic** — used only when packet/protocol confirmation is the deciding evidence (C2 beacon, exfil, kerberoast, ET MALWARE/EXPLOIT rules). **Disabled by default** (`PCAP_ENABLED=false`); requires provisioning the sensor SSH key. | SSH + Suricata `/nsm/suripcap` |
 | `web_search` / `t_web_search` | Search a self-hosted **SearXNG** instance to research an **external** indicator — domain reputation, what a host/service is, known-abuse reports — so a verdict rests on outside evidence, not a guess. **Privacy-guarded:** the query goes to public engines via SearXNG, so it must contain only external indicators; a query referencing an internal IP is refused. **Disabled by default** (`WEB_SEARCH_ENABLED=false`); needs `SEARXNG_URL` (and SearXNG's JSON API enabled). Configurable in the admin config console. | SearXNG |
 | `crawl_page` / `t_crawl_page` | Deep-read the full content of an **external** web page via a self-hosted **crawl4ai** instance — used *after* `web_search` to read a promising result (a reputation/abuse/threat-intel page) in full instead of a snippet. Returns the page's readable markdown + title. **SSRF-guarded:** fetches server-side, so internal IPs/hosts/localhost are refused. **Disabled by default** (`CRAWL4AI_ENABLED=false`); needs `CRAWL4AI_URL`. Configurable in the admin config console. | crawl4ai |
 
 > **Not a callable tool:** `get_alert_context` (fan-out across the 5 typed
-> pivots — community_id flow, host, user, process, file) is **not** registered
+> pivots: community_id flow, host, user, process, file) is **not** registered
 > for the agent to call. It runs deterministically in the **prefetch** stage and
 > its result is embedded directly in the agent's prompt, so the agent never has
-> to (and cannot accidentally skip pulling) the alert picture. See the prefetch
-> enrichments below.
+> to pull the alert picture itself (and cannot accidentally skip it). See the
+> prefetch enrichments below.
 
 ## Write tools (require human approval in the UI)
 
@@ -43,16 +49,16 @@ guardrails.
 
 ## Enrichments applied to every alert (before the agent runs)
 
-These run locally in the **prefetch** stage — no LLM, no runtime egress — and
+These run locally in the **prefetch** stage (no LLM, no runtime egress) and
 their results are handed to the agent as part of the alert context:
 
-- **Blocklist match** — vendored threat feeds: URLhaus, ThreatFox, Feodo Tracker,
-  Tor exit nodes (+ optional internal seed list). Flags src/dst IPs, domains, hashes.
-- **GeoIP + ASN** — MaxMind lookup on external IPs (country, ASN, org).
-- **Cloud-prefix tagging** — marks IPs belonging to known cloud providers.
-- **Internal-CIDR classification** — labels each endpoint internal vs external
+- **Blocklist match:** vendored threat feeds (URLhaus, ThreatFox, Feodo Tracker,
+  Tor exit nodes, + optional internal seed list). Flags src/dst IPs, domains, hashes.
+- **GeoIP + ASN:** MaxMind lookup on external IPs (country, ASN, org).
+- **Cloud-prefix tagging:** marks IPs belonging to known cloud providers.
+- **Internal-CIDR classification:** labels each endpoint internal vs external
   using `INTERNAL_CIDRS`.
-- **MISP IOC match** — if a MISP instance is configured (`MISP_URL`), indicators
+- **MISP IOC match:** if a MISP instance is configured (`MISP_URL`), indicators
   are checked against it.
 
 The UI surfaces these on the alert context / investigation timeline so an analyst
@@ -70,6 +76,7 @@ Several of these are on the v1.15 reliability track:
   inter-arrival timing, five-tuple stats).
 - **No active host/network actions** beyond the three SO write tools (no isolate,
   no block, no firewall change).
-- **`lookup_runbook` is a stub** in v1 (RAG lands in v1.1).
+- **`lookup_runbook`** searches operator-authored runbooks in the local store
+  (embedding-free ranking; a dense Qdrant index is the v1.1 upgrade path).
 - Read tools run against whatever indices the deployment's index-pattern settings
   point at; off-pattern data is invisible to the agent.

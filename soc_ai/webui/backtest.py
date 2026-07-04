@@ -87,6 +87,12 @@ def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     def _verdict(r: dict[str, Any]) -> str:
         v = r.get("soc_ai_verdict")
+        # `inconclusive` (self-consistency split) is a NON-DECISION: bucket it
+        # with needs_more_info in the confusion matrix / agreement math — it is
+        # neither a wrong TP/FP nor a missing/errored verdict. The raw string
+        # is preserved on the row itself (`soc_ai_verdict`).
+        if v == "inconclusive":
+            return "needs_more_info"
         return v if v in SOC_VERDICTS else NO_VERDICT
 
     agreements = sum(1 for r in rows if _verdict(r) == r.get("human_disposition"))

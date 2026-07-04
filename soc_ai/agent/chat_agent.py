@@ -386,58 +386,63 @@ def build_chat_agent(  # noqa: PLR0915
         except Exception as e:
             return {"error": str(e)}
 
-    @agent.tool_plain
-    async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
-        """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key).
+    # The four ONLINE-enrichment tools (GreyNoise / Shodan InternetDB / full
+    # Shodan / CVEDB) are only registered when the master egress toggle is on;
+    # otherwise every call would just return "skipped (online enrichment off)"
+    # and burn a tool call. InternetDB + CVEDB are keyless but still egress,
+    # so they sit behind the same toggle.
+    if s.allow_online_enrichment:
 
-        Returns the open ports, software CPEs, reverse-DNS hostnames, tags
-        (cdn/cloud/self-signed) and known CVEs Shodan last observed on that
-        address — use it to corroborate "what is this external host?" for an
-        alert against an unknown public IP. Opt-in ONLINE tool: when online
-        enrichment is disabled it returns a clean 'disabled' dict with no
-        network I/O, and private/reserved IPs are skipped (never sent off-box).
-        """
-        try:
-            return await shodan_internetdb(ip, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+        @agent.tool_plain
+        async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
+            """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key).
 
-    @agent.tool_plain
-    async def t_greynoise(ip: str) -> dict[str, Any]:
-        """GreyNoise lookup for an EXTERNAL IP — is it indiscriminately scanning
-        the internet (noise), a known-benign service (riot), and its
-        classification. EXTERNAL IPs only; internal IPs are skipped. Opt-in
-        ONLINE tool: returns a clean disabled/not-configured dict (no network
-        I/O) when online enrichment is off or the API key is unset."""
-        try:
-            return await greynoise(ip, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+            Returns the open ports, software CPEs, reverse-DNS hostnames, tags
+            (cdn/cloud/self-signed) and known CVEs Shodan last observed on that
+            address — use it to corroborate "what is this external host?" for an
+            alert against an unknown public IP. ONLINE tool; private/reserved IPs
+            are skipped (never sent off-box).
+            """
+            try:
+                return await shodan_internetdb(ip, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
 
-    @agent.tool_plain
-    async def t_shodan_host(ip: str) -> dict[str, Any]:
-        """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API
-        key): network owner (org/isp/asn), geo, guessed OS, open ports, the
-        per-service banners (product/version), and known CVEs — deeper than
-        t_shodan_internetdb. Opt-in ONLINE tool: returns a clean disabled/
-        not-configured dict (no network I/O) when online enrichment is off or
-        SHODAN_API_KEY is unset; private/internal IPs are skipped."""
-        try:
-            return await shodan_host(ip, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+        @agent.tool_plain
+        async def t_greynoise(ip: str) -> dict[str, Any]:
+            """GreyNoise lookup for an EXTERNAL IP — is it indiscriminately scanning
+            the internet (noise), a known-benign service (riot), and its
+            classification. EXTERNAL IPs only; internal IPs are skipped. ONLINE
+            tool: returns a clean not-configured dict (no network I/O) when the
+            API key is unset."""
+            try:
+                return await greynoise(ip, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
 
-    @agent.tool_plain
-    async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
-        """Score a named CVE via Shodan CVEDB (free, no key): CVSS base score,
-        EPSS exploit-probability + ranking, CISA KEV (actively-exploited) flag,
-        summary and references — use to judge HOW SEVERE / HOW LIKELY-EXPLOITED
-        a CVE is. Opt-in ONLINE tool: returns a clean 'disabled' dict (no network
-        I/O) when online enrichment is off."""
-        try:
-            return await cve_lookup(cve_id, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
+        @agent.tool_plain
+        async def t_shodan_host(ip: str) -> dict[str, Any]:
+            """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API
+            key): network owner (org/isp/asn), geo, guessed OS, open ports, the
+            per-service banners (product/version), and known CVEs — deeper than
+            t_shodan_internetdb. ONLINE tool: returns a clean not-configured dict
+            (no network I/O) when SHODAN_API_KEY is unset; private/internal IPs
+            are skipped."""
+            try:
+                return await shodan_host(ip, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
+
+        @agent.tool_plain
+        async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
+            """Score a named CVE via Shodan CVEDB (free, no key): CVSS base score,
+            EPSS exploit-probability + ranking, CISA KEV (actively-exploited) flag,
+            summary and references — use to judge HOW SEVERE / HOW LIKELY-EXPLOITED
+            a CVE is. ONLINE tool."""
+            try:
+                return await cve_lookup(cve_id, settings=s)
+            except Exception as e:
+                return {"error": str(e)}
 
     if s.pcap_enabled:
 

@@ -32,7 +32,7 @@ const SEV_META: Record<Severity, { label: string; color: string }> = {
 };
 const SEV_ORDER: Severity[] = ['critical', 'high', 'medium', 'low'];
 // Outcome order: most-actionable first.
-const VERDICT_ORDER: Verdict[] = ['true_positive', 'needs_more_info', 'false_positive', 'untriaged'];
+const VERDICT_ORDER: Verdict[] = ['true_positive', 'needs_more_info', 'inconclusive', 'false_positive', 'untriaged'];
 
 interface Metrics {
   events: number;
@@ -47,6 +47,7 @@ function computeMetrics(groups: AlertGroup[]): Metrics {
     true_positive: 0,
     false_positive: 0,
     needs_more_info: 0,
+    inconclusive: 0,
     untriaged: 0,
   };
   const sev: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -294,19 +295,30 @@ export function Dashboard() {
   const alerts = useAsync(() => getAlerts(alertQuery), [range, custom?.from, custom?.to], {
     refetchInterval: 30_000,
   });
-  // Idle the investigations poll once every run is terminal (pauseWhen consults
-  // a ref since useAsync captures config at setup), mirroring triageActiveRef.
+  // Poll fast while activity is live, THROTTLE (not fully pause) when idle. A
+  // hard pause deadlocked: the only thing that re-armed the "active" ref was a
+  // non-skipped poll, but every idle tick was skipped — so a run started from
+  // the scheduler or another tab never surfaced on this "live overview". Letting
+  // roughly every Nth idle tick through keeps it live at a slow cadence.
+  const idleThrottle = (activeRef: { current: boolean }, tickRef: { current: number }, everyN: number) => () => {
+    if (activeRef.current) {
+      tickRef.current = 0;
+      return false; // active → never skip
+    }
+    tickRef.current = (tickRef.current + 1) % everyN;
+    return tickRef.current !== 0; // idle → run only every Nth tick
+  };
   const invsActiveRef = useRef(false);
+  const invsTick = useRef(0);
   const invs = useAsync(getInvestigations, [], {
     refetchInterval: 10_000,
-    pauseWhen: () => !invsActiveRef.current,
+    pauseWhen: idleThrottle(invsActiveRef, invsTick, 3), // ~30s when idle
   });
-  // Only poll auto-triage status while a batch is actually running — idle it
-  // otherwise (pauseWhen consults a ref since useAsync captures config at setup).
   const triageActiveRef = useRef(false);
+  const triageTick = useRef(0);
   const triage = useAsync(getAutoTriageStatus, [], {
     refetchInterval: 5_000,
-    pauseWhen: () => !triageActiveRef.current,
+    pauseWhen: idleThrottle(triageActiveRef, triageTick, 6), // ~30s when idle
   });
   triageActiveRef.current = !!triage.data?.active;
   const sources = useAsync(getDataSources, [], { refetchInterval: 60_000 });
@@ -334,7 +346,7 @@ export function Dashboard() {
 
   const groups = useMemo(() => alerts.data ?? [], [alerts.data]);
   const rows = useMemo(() => invs.data ?? [], [invs.data]);
-  invsActiveRef.current = rows.some((r) => r.status === 'running' || r.status === 'awaiting');
+  invsActiveRef.current = rows.some((r) => r.status === 'running');
   const m = useMemo(() => computeMetrics(groups), [groups]);
   // Recent = real triage activity. Cancelled/interrupted runs are noise (a stop
   // press or a restart cut them off, no verdict) — keep them off the overview.
@@ -500,8 +512,12 @@ export function Dashboard() {
                       className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-2.5 text-left last:border-0 hover:bg-surface-3"
                     >
                       <KindBadge kind={r.kind} />
-                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{r.name}</span>
-                      <span className="hidden w-[150px] flex-none overflow-hidden sm:block">
+                      <span className="min-w-0 flex-[1.4] truncate text-[13px] font-medium">{r.name}</span>
+                      {/* Flow mirrors the Investigations column fix: a real minimum
+                          so two full IPv4s + the arrow fit, growing with spare width
+                          while the rule name shrinks — the old fixed 150px clipped
+                          the destination to a fragment. */}
+                      <span className="hidden min-w-[230px] flex-1 overflow-hidden sm:block">
                         <FlowBadge src={r.host === '—' ? null : r.host} dst={r.dst} className="text-[11px]" />
                       </span>
                       <span className="flex-none">

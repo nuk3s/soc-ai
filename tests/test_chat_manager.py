@@ -497,3 +497,34 @@ def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
     assert captured["meta"]["tools"] == []
     assert captured["meta"]["narrative_grounding"]["grounded"] is False
     assert UNVERIFIED_CAVEAT in captured["content"]
+
+
+# ---------------------------------------------------------------------------
+# U4: online-enrichment tool registration is gated by the master egress toggle
+# ---------------------------------------------------------------------------
+
+
+def test_chat_online_tools_gated_by_master_toggle(settings_kratos: Any) -> None:
+    """t_greynoise/t_shodan_*/t_cve_lookup are only registered on the chat
+    agent when allow_online_enrichment is on — an OFF toggle must not leave
+    tools that answer 'skipped (online enrichment off)' for the model to
+    waste a call on."""
+    from pydantic_ai.models.test import TestModel
+    from soc_ai.agent.chat_agent import build_chat_agent
+    from soc_ai.agent.orchestrator import InvestigationContext
+
+    online = {"t_greynoise", "t_shodan_internetdb", "t_shodan_host", "t_cve_lookup"}
+
+    def _tool_names(settings: Any) -> set[str]:
+        ctx = InvestigationContext(settings=settings, auth=AsyncMock(), elastic=AsyncMock())
+        agent = build_chat_agent(TestModel(call_tools=[]), ctx, system_prompt="chat")
+        return set(agent._function_toolset.tools.keys())  # type: ignore[attr-defined]
+
+    assert settings_kratos.allow_online_enrichment is False  # fixture default
+    names_off = _tool_names(settings_kratos)
+    assert not (online & names_off), sorted(online & names_off)
+    assert "t_query_events_oql" in names_off  # core read surface unaffected
+
+    settings_on = settings_kratos.model_copy(update={"allow_online_enrichment": True})
+    names_on = _tool_names(settings_on)
+    assert online <= names_on, sorted(online - names_on)

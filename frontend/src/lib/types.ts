@@ -7,6 +7,7 @@ export type Verdict =
   | 'true_positive'
   | 'false_positive'
   | 'needs_more_info'
+  | 'inconclusive'
   | 'untriaged';
 
 export type Severity = 'critical' | 'high' | 'medium' | 'low';
@@ -109,6 +110,8 @@ export interface RecommendedAction {
   pending?: boolean;
   /** already carried out by the system (e.g. auto-ack) — render done, not actionable. */
   applied?: boolean;
+  /** why it reads as done ("Already acknowledged", "Executed · analyst"); absent = auto-ack default. */
+  appliedNote?: string | null;
 }
 
 export interface ResolutionProvenance {
@@ -202,6 +205,8 @@ export interface Investigation {
   resolution?: ResolutionProvenance;
   /** Post-validator override note — present when a validator auto-corrected the verdict. */
   validatorNote?: string | null;
+  /** Live acked state of this investigation's alert in Security Onion (false on ES error). */
+  alertAcked?: boolean;
 }
 
 /** The triggering detection's raw facts — the "what fired" reference panel. */
@@ -258,7 +263,7 @@ export interface InvestigationRow {
   host: string;
   /** destination IP — paired with `host` (source) for the full flow. */
   dst?: string | null;
-  status: 'complete' | 'running' | 'awaiting' | 'error' | 'cancelled' | 'interrupted';
+  status: 'complete' | 'running' | 'error' | 'cancelled' | 'interrupted';
   when: string;
   ts?: string;
   chatCount?: number;
@@ -447,6 +452,7 @@ export type SocVerdict =
   | 'true_positive'
   | 'false_positive'
   | 'needs_more_info'
+  | 'inconclusive'
   | 'no_verdict';
 
 /** One replayed alert: what the analyst said vs. what soc-ai said. */

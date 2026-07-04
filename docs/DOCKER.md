@@ -1,4 +1,4 @@
-# Docker Deployment
+# Docker deployment
 
 This guide covers running soc-ai as a Docker container. It is an alternative to (or can
 eventually replace) the rsync + systemd path described in [DEPLOYMENT.md](DEPLOYMENT.md).
@@ -7,7 +7,7 @@ eventually replace) the rsync + systemd path described in [DEPLOYMENT.md](DEPLOY
 
 ## Quick start
 
-> **The fast path is `./setup.sh`** in the repo root — a guided installer that
+> **The fast path is `./setup.sh`** in the repo root, a guided installer that
 > does everything below (installs Docker if needed, writes `.env`, generates the
 > cert + secrets, brings the stack up, seeds enrichment). The steps here are the
 > manual equivalent / reference.
@@ -19,7 +19,7 @@ field reference is in `soc_ai/config.py`; the minimum required set is:
 
 > **Security Onion account requirements** (which login/role each feature needs, and the
 > audit-log grant that ack/escalate silently depends on) live in
-> [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md) — read it before your first write-back.
+> [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md); read it before your first write-back.
 
 ```ini
 # Security Onion grid
@@ -67,7 +67,7 @@ When unset, the config console still works for non-secret settings, but secret f
 
 ### 2. Generate a TLS cert pair
 
-uvicorn terminates TLS directly — no reverse proxy is needed. Create a `certs/` directory
+uvicorn terminates TLS directly; no reverse proxy is needed. Create a `certs/` directory
 in the repo root and generate a self-signed cert (or drop in your CA-signed pair):
 
 ```bash
@@ -98,7 +98,7 @@ mount them elsewhere.
 #### Replacing the TLS cert
 
 To swap the self-signed pair for a cert from your internal CA / Let's Encrypt,
-drop the new files at the same mounted paths and restart the container — the cert
+drop the new files at the same mounted paths and restart the container. The cert
 and key are read **once at startup**, so a swap is invisible until you restart:
 
 ```bash
@@ -140,7 +140,7 @@ curl -k https://localhost:8443/healthz
 
 Browse to **`https://<host>:8443/app`** and log in with the bootstrap admin
 (username `admin`). If you set `BOOTSTRAP_ADMIN_PASSWORD` in `.env`, use that;
-otherwise it was auto-generated and printed once to the container log — recover
+otherwise it was auto-generated and printed once to the container log. Recover
 it with:
 
 ```bash
@@ -230,7 +230,7 @@ docker compose cp soc-ai:/var/lib/soc-ai/data/soc-ai.db ./soc-ai.db.bak
 
 ### Rolling back
 
-Check out the previous tag and rebuild — the volumes are untouched, and the
+Check out the previous tag and rebuild. The volumes are untouched, and the
 schema only ever moves forward, so older code reads a newer DB fine for the
 additive changes a patch release makes:
 
@@ -272,7 +272,7 @@ supported.
 ## Gotchas worth knowing before your first hunt
 
 These bite people on a real install. None of them show up in `/healthz` (which only
-checks that the server is up — it never touches your upstreams), so they surface as a
+checks that the server is up; it never touches your upstreams), so they surface as a
 *failed first hunt*, not a failed boot.
 
 ### Upstream TLS trust (self-signed SO / ES / LiteLLM / MISP)
@@ -280,7 +280,7 @@ checks that the server is up — it never touches your upstreams), so they surfa
 The container image ships only the public CA bundle. If any upstream uses a self-signed
 or internal-CA certificate (typical for a lab Security Onion, Elasticsearch, LiteLLM, or
 MISP), the very first hunt fails with `CERTIFICATE_VERIFY_FAILED` in
-`docker compose logs soc-ai` — even though `/healthz` is green. Fix it in `.env`:
+`docker compose logs soc-ai`, even though `/healthz` is green. Fix it in `.env`:
 
 ```ini
 SO_VERIFY_SSL=false        # Security Onion web API (Kratos)
@@ -296,7 +296,7 @@ SO_CA_BUNDLE=/etc/soc-ai/so-ca.pem
 MISP_CA_BUNDLE=/etc/soc-ai/misp-ca.pem
 ```
 
-**Elasticsearch has no CA-bundle option** — for ES it's `ES_VERIFY_SSL=false` or a cert
+**Elasticsearch has no CA-bundle option**: for ES it's `ES_VERIFY_SSL=false` or a cert
 the container's public bundle already trusts. (If you bind-mount a CA file, add the `,Z`
 SELinux relabel suffix like the cert mounts do.)
 
@@ -321,12 +321,12 @@ sudo firewall-cmd --add-port=9443/tcp --permanent && sudo firewall-cmd --reload
 Docker inserts its own iptables/nftables rules ahead of firewalld, so a published
 port (the default `"${SOC_AI_PORT}:8443"` mapping binds `0.0.0.0`) is reachable
 from any host that can route to this box **even if firewalld shows the port
-closed** — `firewall-cmd --list-ports` won't list it, and adding/removing a
-firewalld rule won't change reachability. To actually restrict who can hit the
+closed**: `firewall-cmd --list-ports` won't list it, and adding/removing a
+firewalld rule won't change reachability. To restrict who can hit the
 admin console, do it at the Docker layer:
 
 - **Bind a specific host IP** in `.env` so the port isn't published on every
-  interface — e.g. localhost-only behind a reverse proxy, or just your mgmt LAN:
+  interface, e.g. localhost-only behind a reverse proxy, or just your mgmt LAN:
 
   ```ini
   SOC_AI_PORT=127.0.0.1:8443    # host side; container still listens on :8443
@@ -342,7 +342,7 @@ Auditing only the host firewall will wrongly suggest the console is closed.
 
 A URL like `https://litellm.example.com:4000` that resolves *on the host* (via the host's
 `/etc/hosts` or a local resolver) will **not** resolve inside the container's bridge
-network — the host's `/etc/hosts` does not propagate into the container. The first hunt
+network; the host's `/etc/hosts` does not propagate into the container. The first hunt
 then fails with a DNS/connection error. Three ways out:
 
 - Use an **IP address** in `.env` (simplest): `LITELLM_BASE_URL=https://10.0.0.5:4000`.

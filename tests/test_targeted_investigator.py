@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from soc_ai.agent.targeted_investigator import (
@@ -228,3 +228,46 @@ async def test_raise_arg_type_error_clamps_long_repr(
     # so without clamping the result would be much longer. With the 400-char clamp,
     # the total error string must be well under 600 chars.
     assert len(result) <= 600, f"clamped error string must be bounded; got {len(result)} chars"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_es_query_tools_bind_without_auth_typeerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: Phase D must bind the ES-query tool family without injecting
+    kwargs the target signatures reject.
+
+    The dispatcher injects ``elastic`` (and historically ``auth``) for the five
+    ES-query tools, but none of ``query_events_oql`` / ``query_zeek_logs`` /
+    ``query_cases`` / ``query_detections`` / ``get_playbooks`` declares ``auth``
+    or ``**kwargs`` — so an ``auth`` injection made every real dispatch raise
+    ``TypeError: ... unexpected keyword argument 'auth'``. Every prior test
+    monkeypatched ``_dispatch_named_tool`` itself, so the real binding was never
+    exercised. This test drives the real dispatcher with a stub elastic and
+    asserts the tool runs (no arg-binding TypeError leaks out as an error
+    string).
+    """
+    from soc_ai.agent.targeted_investigator import _dispatch_named_tool
+
+    class _StubElastic:
+        async def search(self, *a: Any, **k: Any) -> dict[str, Any]:
+            return {"hits": {"hits": [], "total": {"value": 0}}, "aggregations": {}}
+
+    class _Settings:
+        events_index_pattern = "logs-*"
+        oql_allowed_fields: ClassVar[set[str]] = set()
+
+    class _StubCtx:
+        settings = _Settings()
+        elastic = _StubElastic()
+        auth = object()  # present on ctx — must NOT be forwarded to the query tools
+
+    # A minimal valid OQL query; the stub elastic returns an empty result set.
+    out = await _dispatch_named_tool(
+        "t_query_events_oql",
+        {"query": "event.dataset:zeek.dns", "time_range_minutes": 240},
+        _StubCtx(),
+    )
+    # A successful bind returns a dict (model_dump of EsSearchResult); a binding
+    # failure would have raised TypeError inside the dispatcher.
+    assert isinstance(out, dict)

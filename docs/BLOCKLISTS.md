@@ -2,7 +2,7 @@
 
 soc-ai enriches alerts against locally-vendored public IOC blocklists
 (abuse.ch URLhaus / ThreatFox / Feodo Tracker, the Tor exit list, and an
-operator-curated seed list). **There is no runtime egress to these feeds** —
+operator-curated seed list). **There is no runtime egress to these feeds**:
 lookups are pure in-memory probes against files on disk. The files are kept
 fresh out-of-band by the `soc-ai blocklists refresh` job.
 
@@ -26,9 +26,9 @@ never corrupt a live feed file that triage is reading.
 
 Two configured sources are intentionally **not** network-fetched by this job:
 
-- `internal_seed` (`internal_seed.yaml`) — operator-curated; you maintain it
+- `internal_seed` (`internal_seed.yaml`): operator-curated; maintained
   by hand in the deployment repo.
-- `spamhaus_drop` (`spamhaus_drop.txt`) — license-gated and OFF by default;
+- `spamhaus_drop` (`spamhaus_drop.txt`): license-gated and OFF by default;
   fetch it out-of-band only after acknowledging the Spamhaus terms.
 
 ## abuse.ch Auth-Key (required for URLhaus / ThreatFox / Feodo)
@@ -52,7 +52,7 @@ Behaviour:
 - The key is sent **only** to the abuse.ch feeds, **only** by the refresh job
   (never during triage), and is **never logged**.
 - If `ABUSE_CH_AUTH_KEY` is **unset**, the abuse.ch feeds are **skipped** with a
-  clear message and the job does **not** fail hard — the Tor exit list (which
+  clear message and the job does **not** fail hard: the Tor exit list (which
   needs no key) still refreshes, and the job still exits 0.
 
 The free community API is fair-use; commercial/for-profit use may require a paid
@@ -85,8 +85,8 @@ The job writes only to the configured `blocklist_data_dir`
 
 Two units live under `scripts/systemd/`:
 
-- `soc-ai-blocklists.service` — `oneshot` unit running `soc-ai blocklists refresh`.
-- `soc-ai-blocklists.timer` — fires daily at 03:30 local (with up to 15 min
+- `soc-ai-blocklists.service`: `oneshot` unit running `soc-ai blocklists refresh`.
+- `soc-ai-blocklists.timer`: fires daily at 03:30 local (with up to 15 min
   jitter), `Persistent=true` so a powered-down host catches up on next boot.
 
 Install:
@@ -106,7 +106,7 @@ journalctl -u soc-ai-blocklists.service -n 50
 The service runs as `User=soc-ai` from `/opt/soc-ai` with `EnvironmentFile=
 /opt/soc-ai/.env` (so it picks up `ABUSE_CH_AUTH_KEY` and the data-dir paths),
 and is hardened to match `soc-ai.service`. `ReadWritePaths=/var/lib/soc-ai`
-grants write access to the data dirs under the `ProtectSystem=full` sandbox —
+grants write access to the data dirs under the `ProtectSystem=full` sandbox;
 adjust it if you point the data dirs elsewhere.
 
 `blocklist_stale_threshold_days` (default 7) controls when a stale feed file
@@ -127,7 +127,7 @@ entry works just as well. This block sources the host venv at
 Sourcing `.env` first makes `ABUSE_CH_AUTH_KEY` and the data-dir paths available
 to the process (cron does not read `.env` on its own).
 
-**Docker deploy:** there's no host venv to source — run the refresh inside the
+**Docker deploy:** there's no host venv to source; run the refresh inside the
 container with `python -m soc_ai blocklists refresh`. See the
 [`docker compose exec` cron example in DOCKER.md](DOCKER.md#blocklist-refresh-has-no-scheduler-in-the-docker-path).
 
@@ -138,7 +138,7 @@ Refreshing the live `blocklist_data_dir` must NOT silently change synth-eval
 results from run to run.
 
 The refresh job **only ever writes to the configured live `blocklist_data_dir`**.
-So the rule is simply: **point the eval harness at its own frozen snapshot dir,
+So the rule is: **point the eval harness at its own frozen snapshot dir,
 separate from the live dir.** For an eval run, override the data dir to a
 pinned copy:
 
@@ -151,12 +151,12 @@ That snapshot dir is never touched by `soc-ai blocklists refresh` (which reads
 `BLOCKLIST_DATA_DIR` from the production `.env`, i.e. the live dir), so the synth
 catalogue stays reproducible while the live dir refreshes daily for real triage.
 
-> Do **not** run `soc-ai blocklists refresh` against the synth snapshot dir — if
+> Do **not** run `soc-ai blocklists refresh` against the synth snapshot dir. If
 > you ever need to re-pin it, snapshot the live dir explicitly
 > (`cp -a /var/lib/soc-ai/blocklists /var/lib/soc-ai/blocklists-synth-snapshot`)
 > and record the date.
 
 ## MaxMind GeoIP
 
-MaxMind GeoLite2 `.mmdb` files are downloaded separately (license key + ZIP — a
+MaxMind GeoLite2 `.mmdb` files are downloaded separately (license key + ZIP, a
 different shape) and are covered in `docs/DEPLOYMENT.md`, not by this CLI.

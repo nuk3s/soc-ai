@@ -59,7 +59,7 @@ async def test_fail_closed_aborts_so_write(settings_kratos: Settings) -> None:
     audit = _audit(es, settings)
     executed: list[str] = []
 
-    with patch("soc_ai.api.approvals.get_tool", return_value=_fake_ack_tool(executed)):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=_fake_ack_tool(executed)):
         result, error = await execute_write_tool(
             "ack_alert",
             {"alert_id": "es-1"},
@@ -81,7 +81,7 @@ async def test_fail_open_proceeds_when_setting_off(settings_kratos: Settings) ->
     audit = _audit(es, settings)
     executed: list[str] = []
 
-    with patch("soc_ai.api.approvals.get_tool", return_value=_fake_ack_tool(executed)):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=_fake_ack_tool(executed)):
         result, error = await execute_write_tool(
             "ack_alert",
             {"alert_id": "es-1"},
@@ -100,7 +100,7 @@ async def test_no_audit_logger_is_unaudited_passthrough(settings_kratos: Setting
     """Without an audit logger the path behaves exactly as before (no abort)."""
     settings = settings_kratos.model_copy(update={"audit_fail_closed": True})
     executed: list[str] = []
-    with patch("soc_ai.api.approvals.get_tool", return_value=_fake_ack_tool(executed)):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=_fake_ack_tool(executed)):
         _result, error = await execute_write_tool(
             "ack_alert",
             {"alert_id": "es-1"},
@@ -119,7 +119,7 @@ async def test_successful_audit_then_so_write_records_both(settings_kratos: Sett
     es = _ES(index_fails=False)
     audit = _audit(es, settings)
     executed: list[str] = []
-    with patch("soc_ai.api.approvals.get_tool", return_value=_fake_ack_tool(executed)):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=_fake_ack_tool(executed)):
         _result, error = await execute_write_tool(
             "ack_alert",
             {"alert_id": "es-1"},
@@ -143,7 +143,7 @@ async def test_audit_records_resolved_approver(settings_kratos: Settings) -> Non
     es = _ES(index_fails=False)
     audit = _audit(es, settings)
     executed: list[str] = []
-    with patch("soc_ai.api.approvals.get_tool", return_value=_fake_ack_tool(executed)):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=_fake_ack_tool(executed)):
         _result, error = await execute_write_tool(
             "ack_alert",
             {"alert_id": "es-1"},
@@ -170,7 +170,7 @@ async def test_audit_records_anonymous_when_unauthenticated(
     es = _ES(index_fails=False)
     audit = _audit(es, settings)
     executed: list[str] = []
-    with patch("soc_ai.api.approvals.get_tool", return_value=_fake_ack_tool(executed)):
+    with patch("soc_ai.tools.write_exec.get_tool", return_value=_fake_ack_tool(executed)):
         # No `user=` passed → defaults to "unknown"; normalized to "anonymous".
         _result, error = await execute_write_tool(
             "ack_alert",

@@ -1,8 +1,8 @@
 # Sensor PCAP user (`socpcap`) — setup & recovery runbook
 
 `t_get_pcap` fetches packets by SSHing to the Security Onion **sensor** and
-running `sudo tcpdump -r <suripcap file>`. soc-ai connects as a dedicated,
-**low-privilege** user — `socpcap` — instead of a root-capable account, so a
+running `sudo tcpdump -r <suripcap file>`. soc-ai connects as `socpcap`, a
+dedicated **low-privilege** user, instead of a root-capable account, so a
 leaked PCAP key can only run `tcpdump`, never arbitrary commands.
 
 > **⚠ The grid can nuke this user.** `socpcap` is a manually-created system user
@@ -12,7 +12,7 @@ leaked PCAP key can only run `tcpdump`, never arbitrary commands.
 > working, re-run the setup below.
 >
 > **Recreate via a SENSOR ADMIN path** (the SO console, or your own admin SSH
-> account) — **NOT** via the soc-ai `so_pcap` key. That key is now `socpcap`
+> account), **not** via the soc-ai `so_pcap` key. That key is now `socpcap`
 > (tcpdump-only) and *cannot* recreate itself.
 
 ## What the setup establishes

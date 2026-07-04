@@ -2,7 +2,7 @@
 
 > **This is the non-Docker (systemd) path.** Most users want the guided
 > `./setup.sh` installer or the container path in
-> [DOCKER.md](DOCKER.md) — start there unless you specifically need a bare
+> [DOCKER.md](DOCKER.md); start there unless you specifically need a bare
 > rsync + systemd + uv deploy. This guide installs under a system user with a
 > hardened systemd unit and a uv-managed venv.
 
@@ -10,7 +10,7 @@ End-to-end deployment guide for soc-ai against a real Security Onion 3.0.0
 grid. The procedure should produce a working install in ≤30 minutes against
 a fresh VM.
 
-> **Addresses below are example/placeholder values — substitute your own.**
+> **Addresses below are example/placeholder values; substitute your own.**
 > The `203.0.113.x` / `198.51.100.x` IPs are RFC 5737 documentation ranges,
 > and `<soc-ai-host>` / `<so-host>` / `<vm-host>` are placeholders.
 
@@ -50,7 +50,7 @@ The shape of the install:
 ## 1. Prereqs
 
 - **A VM** running Fedora 43 (or any modern Linux) with sudo. v1 lab
-  used 4 vCPU / 8 GB RAM / 20 GB disk — adjust based on concurrent
+  used 4 vCPU / 8 GB RAM / 20 GB disk; adjust based on concurrent
   investigation load.
 - **Network reachability** from the soc-ai VM to:
   - The SO manager's port `:9200` (Elasticsearch)
@@ -167,9 +167,9 @@ SOC_AI_TLS_KEY=/etc/soc-ai/key.pem
 LOG_LEVEL=INFO
 
 # --- Agent execution limits --------------------------------------------
-# Generous defaults; tune from real audit data once landed.
-AGENT_TOOL_CALLS_LIMIT=100
-AGENT_REQUEST_LIMIT=50
+# These are the built-in defaults; tune from real audit data once landed.
+AGENT_TOOL_CALLS_LIMIT=25
+AGENT_REQUEST_LIMIT=18
 SYNTHESIS_CONFIDENCE_FLOOR=0.6
 ```
 
@@ -215,7 +215,7 @@ restricted address families, `MemoryDenyWriteExecute`, dropped
 capabilities, etc. See `scripts/systemd/soc-ai.service` for the full
 list and rationale.
 
-> **Don't use `ProtectSystem=strict`** — it makes /opt read-only,
+> **Don't use `ProtectSystem=strict`**: it makes /opt read-only,
 > which breaks uv's symlink-based venv layout.
 
 ---
@@ -234,7 +234,7 @@ sudo firewall-cmd --reload
 The default SO `analyst` role lacks `auto_configure` + `create_index`
 on `soc-ai-audit-*`, so the orchestrator's audit logger silently
 drops every event with a 403 (verifiable in `journalctl -u soc-ai`).
-Audit failures are non-fatal — investigations still complete — but
+Audit failures are non-fatal (investigations still complete), but
 you lose the forensic trail.
 
 To unlock the audit index:
@@ -251,10 +251,10 @@ bootstraps today's audit index.
 
 ## 8. Reasoning trace (LiteLLM/vLLM config, optional, model-specific)
 
-**Optional — only relevant if your gateway serves a `<think>`-emitting
+**Optional: only relevant if your gateway serves a `<think>`-emitting
 reasoning model.** soc-ai is plumbed to surface a model's `<think>` traces
 into the SSE stream as `model_response.reasoning_trace` payloads. If your
-`ANALYST_MODEL` doesn't emit reasoning, skip this section — nothing breaks.
+`ANALYST_MODEL` doesn't emit reasoning, skip this section; nothing breaks.
 
 To light it up, the LiteLLM/vLLM gateway needs to be configured to split
 `<think>` into the `reasoning_content` field on the response. Specifically:
@@ -324,7 +324,7 @@ done           recommended_count=1 rounds=1
 | Symptom | Cause | Fix |
 |---|---|---|
 | `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | Missing audit-index role grant | Run `scripts/setup-audit-index.sh` on the SO manager. |
-| `ContextWindowExceededError … input_tokens 65537` | Tool result accumulation blew the 64K serving window | Either: cap `AGENT_TOOL_CALLS_LIMIT` (default 100) lower, set `SYNTHESIS_CONFIDENCE_FLOOR` higher (so retask happens later). |
+| `ContextWindowExceededError … input_tokens 65537` | Tool result accumulation blew the 64K serving window | Cap `AGENT_TOOL_CALLS_LIMIT` (default 25) lower, or set `SYNTHESIS_CONFIDENCE_FLOOR` higher (so retask happens later). |
 | "writes fail with `Kratos login flow init failed`" | Kratos auth prefix wrong for SO 3.0 | Set `SO_KRATOS_PATH_PREFIX=/auth` (the default). Writes use the SO web API + Kratos session, not the Connect API. |
 | Service won't start after pulling new code | venv out of sync | `cd /opt/soc-ai && uv sync && sudo systemctl restart soc-ai`. |
 
@@ -357,11 +357,11 @@ ssh soc-ai@<vm-host> '
 ## 12. Authentication notes
 
 soc-ai authenticates to ES directly using the analyst basic-auth
-credentials — no separate ES service account is needed.
+credentials; no separate ES service account is needed.
 
 The write tools (`ack_alert`, `escalate_to_case`,
 `add_case_comment`) go through Security Onion's **web API** using the
-analyst's Kratos session cookie — e.g. `ack_alert` posts to
+analyst's Kratos session cookie: `ack_alert` posts to
 `POST /api/events/ack`, the same always-available endpoint the SO web
 UI uses when you click the bell icon on an alert. This path works on
 an OSS grid; it does **not** require the paywalled Connect API. SO
@@ -370,7 +370,7 @@ an OSS grid; it does **not** require the paywalled Connect API. SO
 
 `SO_CLIENT_ID` + `SO_CLIENT_SECRET` (Connect API OAuth, SO Pro grids
 with Hydra) remain accepted for environments that prefer it, but they
-are **optional** — the default web-API path covers ack/escalate/comment
+are **optional**; the default web-API path covers ack/escalate/comment
 without SO Pro. See [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md)
 for the full account/role breakdown (including the `soc-ai-audit-*`
 Elasticsearch write grant that ack/escalate silently depend on under

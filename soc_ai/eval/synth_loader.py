@@ -17,7 +17,10 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Tier = Literal["easy", "medium", "hard"]
-Verdict = Literal["true_positive", "false_positive", "needs_more_info"]
+# ``inconclusive`` kept in sync with soc_ai.agent.triage.Verdict (the
+# self-consistency vote's split outcome). No scenario should DECLARE it as
+# ground truth, but the scorer buckets it like needs_more_info (a non-decision).
+Verdict = Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
 
 # MITRE ATT&CK technique IDs: T<4 digits>, optionally .<3 digits> for sub-technique.
 _ATTACK_ID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")

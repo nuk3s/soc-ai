@@ -14,8 +14,12 @@ README. This describes `main` as it stands after the v1 delivery.
 - Request handlers pull these off `app.state` via the providers in
   `soc_ai/api/deps.py`. A fresh `InvestigationContext` is assembled per request
   (`get_investigation_ctx`) but shares the app-scoped clients.
-- Sessions are in-memory only; there is no database. The audit trail lives in
-  Elasticsearch (see *Audit pipeline*).
+- Application state persists in a local SQLite database (`soc_ai/store/`, Alembic
+  migrations): users, sessions, API tokens, investigations, hunts, backtests,
+  chat threads, config overrides, discovered internal identifiers, detection
+  overrides, and operator runbooks. The tamper-evident audit trail is written
+  separately to Elasticsearch (see *Audit pipeline*), so the immutable log lives
+  on an index the application cannot edit in place.
 
 ## Request surface (`soc_ai/api/routes.py`)
 
@@ -29,12 +33,12 @@ README. This describes `main` as it stands after the v1 delivery.
 | `GET /metrics` | Prometheus 0.0.4 plain-text exposition (`soc_ai/metrics.py`). |
 
 > **Security posture:** the JSON API requires authentication when
-> `API_AUTH_REQUIRED=true` — a session cookie (web login) or a bearer API token
+> `API_AUTH_REQUIRED=true`: a session cookie (web login) or a bearer API token
 > (`Authorization: Bearer scai_…`), enforced by `require_api_auth`
 > (`soc_ai/api/security.py`); admin-only routes sit behind a separate admin gate.
 > CORS is scoped to `CORS_ALLOW_ORIGINS` (else the configured `SO_HOST`), with
 > `"*"` only as a last-resort fallback that logs a warning (`soc_ai/main.py`).
-> Still deploy behind TLS on a trusted interface — see `docs/SAFETY_MODEL.md`
+> Still deploy behind TLS on a trusted interface; see `docs/SAFETY_MODEL.md`
 > and `SECURITY.md`.
 
 ## The two triage pipelines
@@ -70,7 +74,7 @@ fast model's large reasoning-trace overhead out of the common path:
   evidence + candidate and emits a `TriageReport`. It may include a
   `gap_for_investigator` naming **one** tool + exact args.
 - **Phase D — targeted investigator (optional):** if a gap was named, dispatch
-  that single tool **deterministically** (no LLM in the loop —
+  that single tool **deterministically** (no LLM in the loop;
   `soc_ai/agent/targeted_investigator.py`), then run synthesis round 2 on the
   combined evidence. Phase D runs at most once.
 
@@ -95,7 +99,7 @@ the final report (see below).
 
 Every tool function is registered in a global registry (`tools/_registry.py`)
 with a `read_only` flag and exposed to the agent as a closure that captures the
-`InvestigationContext` (so the LLM-facing signature stays semantic — no
+`InvestigationContext` (so the LLM-facing signature stays semantic: no
 `auth`/`elastic` params leak into the schema).
 
 - **Read tools** (`query_events_oql`, `query_cases`, `query_detections`,
@@ -120,7 +124,7 @@ Raw OQL **never** reaches ES. The pipeline is:
    hard 10,000-row ceiling.
 3. `ast_to_es_dsl` — translate the validated AST into an ES search body.
 
-`query_events_oql` additionally excludes synthetic-eval docs
+`query_events_oql` also excludes synthetic-eval docs
 (`synth.scenario_id`) by default so fixtures can't leak into real responses.
 
 ## Approval flow (`soc_ai/tools/_registry.py` → `ApprovalGate`)
@@ -144,7 +148,7 @@ emission (`_synth_first_post_validate` and the legacy equivalent in
 ceiling (a synth can't exceed its template anchor's confidence without
 evidence), a verdict floor rewrite (sub-floor confidence → `needs_more_info`),
 and targeted downgrades (e.g. solicited internal ICMP echo replies). These are
-**graders, not gatekeepers** — they reshape the report deterministically rather
+**graders, not gatekeepers**: they reshape the report deterministically rather
 than retrying the model.
 
 ## Reasoning-trace handling (`soc_ai/agent/reasoning.py`)
@@ -166,7 +170,7 @@ Optional regex redaction (`audit/redact.py`) runs in-place when
 ## MCP server (`soc_ai/mcp_server/`)
 
 A FastMCP server (`python -m soc_ai.mcp_server`) exposes the **read-only** tool
-subset to MCP clients — the three write tools are never registered. It reuses
+subset to MCP clients; the three write tools are never registered. It reuses
 the same tool functions as the FastAPI path.
 
 ## Local enrichment (`soc_ai/enrichment/`)

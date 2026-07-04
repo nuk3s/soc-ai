@@ -12,24 +12,28 @@ import { Checkbox } from '../components/Controls';
 import { ErrorState, LoadingState } from '../components/States';
 import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
+import { type SortDir, useSort } from '../lib/useSort';
 import type { InvestigationRow, Verdict } from '../lib/types';
 
-const GRID = '28px 1fr 150px 90px 120px 110px 120px 44px';
+// select | detection | verdict | conf | source→dest | status | when | delete.
+// Source→Dest gets a real minimum (two full IPv4s + arrow ≈ 220px at 12px mono)
+// and grows with spare width — the old fixed 120px clipped the destination to a
+// fragment while the verdict/conf/when gutters sat unused (register FR).
+const GRID = '28px minmax(0,1.4fr) 132px 64px minmax(230px,1fr) 110px 96px 44px';
 
 
 type SortKey = 'name' | 'verdict' | 'conf' | 'host' | 'status' | 'when';
-type SortDir = 'asc' | 'desc';
 
 const VERDICT_ORDER: Record<Verdict, number> = {
   true_positive: 0,
   false_positive: 1,
   needs_more_info: 2,
-  untriaged: 3,
+  inconclusive: 3,
+  untriaged: 4,
 };
 
 const STATUS_ORDER: Record<InvestigationRow['status'], number> = {
   running: 0,
-  awaiting: 1,
   error: 2,
   interrupted: 3,
   cancelled: 4,
@@ -94,7 +98,11 @@ export function Investigations() {
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
   const [range, setRange] = useState('24h');
   const [custom, setCustom] = useState<CustomRange | null>(null);
-  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: 'when', dir: 'desc' });
+  // Shared sort mechanics; clicking a new column here starts it ascending.
+  const { sort, toggleSort, caret, headerCls } = useSort<SortKey>(
+    { key: 'when', dir: 'desc' },
+    'asc',
+  );
   const [groupBy, setGroupBy] = useState<'none' | 'detection'>('none');
   // Alert ids whose earlier (non-primary) runs are expanded inline.
   const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>({});
@@ -116,7 +124,7 @@ export function Investigations() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   const rows = data ?? [];
-  activeRef.current = rows.some((r) => r.status === 'running' || r.status === 'awaiting');
+  activeRef.current = rows.some((r) => r.status === 'running');
   const running = rows.filter((r) => r.status === 'running').length;
   const tps = rows.filter((r) => r.verdict === 'true_positive').length;
 
@@ -156,23 +164,6 @@ export function Investigations() {
       groupCounts.set(k, (groupCounts.get(k) ?? 0) + 1);
     }
   }
-
-  const toggleSort = (key: SortKey) => {
-    setSort((prev) =>
-      prev.key === key
-        ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
-        : { key, dir: 'asc' }
-    );
-  };
-
-  const caret = (key: SortKey) => {
-    if (sort.key !== key) return null;
-    return <span className="ml-0.5 text-accent">{sort.dir === 'asc' ? '↑' : '↓'}</span>;
-  };
-
-  const headerCls = (key: SortKey) =>
-    'cursor-pointer select-none hover:text-text ' +
-    (sort.key === key ? 'text-text' : '');
 
   // Selection helpers
   const visibleIds = visible.map((r) => r.id);
@@ -281,6 +272,7 @@ export function Investigations() {
             { value: 'true_positive', label: 'True positive' },
             { value: 'false_positive', label: 'False positive' },
             { value: 'needs_more_info', label: 'Needs more info' },
+            { value: 'inconclusive', label: 'Inconclusive' },
             { value: 'untriaged', label: 'Untriaged' },
           ]}
           value={filterVerdicts}
@@ -290,9 +282,7 @@ export function Investigations() {
           label="Status"
           options={[
             { value: 'complete', label: 'Complete' },
-            { value: 'running', label: 'Investigating' },
-            { value: 'awaiting', label: 'Awaiting decision' },
-            { value: 'error', label: 'Error' },
+            { value: 'running', label: 'Investigating' },            { value: 'error', label: 'Error' },
             { value: 'interrupted', label: 'Interrupted' },
             { value: 'cancelled', label: 'Cancelled' },
           ]}

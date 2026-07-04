@@ -503,3 +503,101 @@ def test_fast_triage_toggle_default_and_whitelisted(monkeypatch: pytest.MonkeyPa
     spec = WHITELIST_BY_KEY["fast_triage_enabled"]
     assert spec.type == "bool"
     assert "shallower" in spec.help.lower()
+
+
+def test_csv_env_forms_for_oracle_and_proxy_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the documented comma-separated env forms for the Oracle
+    privacy-gate lists and proxy_trusted_ips must load, not crash Settings.
+
+    Without a ``NoDecode`` annotation, pydantic-settings JSON-decodes a
+    complex-typed env value BEFORE the before-validators run, so a bare CSV like
+    ``.lan,.local`` raised SettingsError at import/startup — making the app fail
+    to boot when the operator followed the docstring.
+    """
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("ORACLE_INTERNAL_SUFFIXES", ".lan,.local,.myco.internal")
+    monkeypatch.setenv("ORACLE_EXTRA_HOSTS", "WIN11-01,APPSERVER01,dbserver")
+    monkeypatch.setenv("PROXY_TRUSTED_IPS", "192.0.2.1,192.0.2.2")
+    s = Settings()
+    assert s.oracle_internal_suffixes == (".lan", ".local", ".myco.internal")
+    assert s.oracle_extra_hosts == ["WIN11-01", "APPSERVER01", "dbserver"]
+    assert s.proxy_trusted_ips == ["192.0.2.1", "192.0.2.2"]
+    # A single bare value must also work (not just multi-item CSV).
+    monkeypatch.setenv("PROXY_TRUSTED_IPS", "192.0.2.1")
+    assert Settings().proxy_trusted_ips == ["192.0.2.1"]
+
+
+def test_apply_to_settings_returns_only_applied_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """apply_to_settings reports which overrides actually took.
+
+    A value that is type-correct but rejected by a field validator at assignment
+    time is skipped silently (so a bad DB override never crashes startup). The
+    return value lets POST /config/setting tell that silent skip from success and
+    roll back instead of reporting ok on a value that never applied. Regression
+    for FR-072.
+    """
+    from soc_ai.store.config_overrides import apply_to_settings
+
+    _setenv_required(monkeypatch)
+    s = Settings()
+    applied = apply_to_settings(
+        s,
+        {
+            "oracle_enabled": True,  # valid → applied
+            "auto_ack_fp_threshold": 5.0,  # out of [0,1] → field validator rejects → skipped
+        },
+    )
+    assert "oracle_enabled" in applied
+    assert "auto_ack_fp_threshold" not in applied
+    assert s.oracle_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency vote flag — verdict_consistency_samples
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_consistency_samples_default_is_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The vote ships OFF: samples=1 ⇒ single synthesis call, no vote,
+    `inconclusive` never produced (byte-identical default behavior)."""
+    _setenv_required(monkeypatch)
+    assert Settings().verdict_consistency_samples == 1
+
+
+def test_verdict_consistency_samples_valid_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("VERDICT_CONSISTENCY_SAMPLES", "3")
+    assert Settings().verdict_consistency_samples == 3
+    monkeypatch.setenv("VERDICT_CONSISTENCY_SAMPLES", "5")
+    assert Settings().verdict_consistency_samples == 5
+
+
+@pytest.mark.parametrize("bad", ["0", "6", "-1", "100"])
+def test_verdict_consistency_samples_out_of_range_raises(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("VERDICT_CONSISTENCY_SAMPLES", bad)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+    assert "verdict_consistency_samples" in str(excinfo.value)
+
+
+def test_verdict_consistency_samples_junk_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("VERDICT_CONSISTENCY_SAMPLES", "three")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_verdict_consistency_samples_is_hot_whitelisted() -> None:
+    """The config console can hot-apply the flag (int, bounded 1..5)."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    spec = WHITELIST_BY_KEY["verdict_consistency_samples"]
+    assert spec.hot is True
+    assert spec.type == "int"
+    assert spec.min_value == 1
+    assert spec.max_value == 5
+    assert spec.secret is False
+    assert spec.danger is False

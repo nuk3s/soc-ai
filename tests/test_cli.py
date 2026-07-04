@@ -1,13 +1,24 @@
-"""Unit tests for ``soc_ai.cli`` event rendering.
+"""Unit tests for ``soc_ai.cli`` event rendering and HTTP client wiring.
 
 The CLI is mostly a thin SSE-stream printer. We exercise ``_render_event``
 directly with representative payloads to catch breakage when SSE event
 shapes evolve (e.g. when ``investigation_transcript`` or ``retask`` were
 added during the robustness pass).
+
+The auth/TLS tests drive ``_triage``/``_healthz`` through capturing
+httpx client subclasses (backed by ``httpx.MockTransport``) to assert the
+Authorization header and ``verify=`` wiring without a network.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+from typing import Any
+
+import httpx
+import pytest
+from soc_ai import cli
 from soc_ai.cli import _render_event
 
 
@@ -130,3 +141,180 @@ def test_render_unknown_kind_falls_back_to_json_dump() -> None:
     out = _strip_ansi(_render_event("future_kind", {"hello": "world"}))
     assert "future_kind" in out
     assert "world" in out
+
+
+# --- auth token + TLS verify wiring (FR-006 / FR-073) -----------------------
+
+
+_SSE_BODY = 'event: done\ndata: {"payload": {"recommended_count": 0, "rounds": 1}}\n\n'
+
+
+def _patch_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], list[httpx.Request]]:
+    """Swap cli's httpx.AsyncClient for one that captures kwargs + requests."""
+    captured_kwargs: dict[str, Any] = {}
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(200, text=_SSE_BODY, headers={"content-type": "text/event-stream"})
+
+    class _Client(httpx.AsyncClient):
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            super().__init__(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _Client)
+    return captured_kwargs, captured_requests
+
+
+def _patch_sync_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], list[httpx.Request]]:
+    """Swap cli's httpx.Client for one that captures kwargs + requests."""
+    captured_kwargs: dict[str, Any] = {}
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(200, json={"status": "ok"})
+
+    class _Client(httpx.Client):
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            headers = kwargs.get("headers")
+            super().__init__(transport=httpx.MockTransport(handler), headers=headers)
+
+    monkeypatch.setattr(cli.httpx, "Client", _Client)
+    return captured_kwargs, captured_requests
+
+
+def _triage_args(**overrides: Any) -> argparse.Namespace:
+    base: dict[str, Any] = {
+        "url": "https://127.0.0.1:8443",
+        "alert_id": "abc123",
+        "token": None,
+        "verify": False,
+        "cafile": None,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _healthz_args(**overrides: Any) -> argparse.Namespace:
+    base: dict[str, Any] = {
+        "url": "https://127.0.0.1:8443",
+        "token": None,
+        "verify": False,
+        "cafile": None,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_triage_sends_bearer_token_from_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    kwargs, requests = _patch_async_client(monkeypatch)
+    rc = cli._triage(_triage_args(token="scai_flagtoken"))
+    assert rc == 0
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == "Bearer scai_flagtoken"
+    assert requests[0].headers["accept"] == "text/event-stream"
+    assert kwargs["verify"] is False
+
+
+def test_healthz_sends_bearer_token_from_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    kwargs, requests = _patch_sync_client(monkeypatch)
+    rc = cli._healthz(_healthz_args(token="scai_flagtoken"))
+    assert rc == 0
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == "Bearer scai_flagtoken"
+    assert kwargs["verify"] is False
+
+
+def test_env_token_used_when_no_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SOC_AI_API_TOKEN", "scai_envtoken")
+    _, requests = _patch_sync_client(monkeypatch)
+    rc = cli._healthz(_healthz_args())
+    assert rc == 0
+    assert requests[0].headers["authorization"] == "Bearer scai_envtoken"
+
+
+def test_flag_token_takes_precedence_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SOC_AI_API_TOKEN", "scai_envtoken")
+    _, requests = _patch_sync_client(monkeypatch)
+    rc = cli._healthz(_healthz_args(token="scai_flagtoken"))
+    assert rc == 0
+    assert requests[0].headers["authorization"] == "Bearer scai_flagtoken"
+
+
+def test_no_token_sends_no_authorization_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    _, sync_requests = _patch_sync_client(monkeypatch)
+    assert cli._healthz(_healthz_args()) == 0
+    assert "authorization" not in sync_requests[0].headers
+
+    _, async_requests = _patch_async_client(monkeypatch)
+    assert cli._triage(_triage_args()) == 0
+    assert "authorization" not in async_requests[0].headers
+
+
+def test_verify_flag_flips_httpx_verify(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    sync_kwargs, _ = _patch_sync_client(monkeypatch)
+    assert cli._healthz(_healthz_args(verify=True)) == 0
+    assert sync_kwargs["verify"] is True
+
+    async_kwargs, _ = _patch_async_client(monkeypatch)
+    assert cli._triage(_triage_args(verify=True)) == 0
+    assert async_kwargs["verify"] is True
+
+
+def test_cafile_pins_verify_to_bundle_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    sync_kwargs, _ = _patch_sync_client(monkeypatch)
+    assert cli._healthz(_healthz_args(cafile="/etc/pki/lab-ca.pem")) == 0
+    assert sync_kwargs["verify"] == "/etc/pki/lab-ca.pem"
+
+
+def test_verify_defaults_to_false_without_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    async_kwargs, _ = _patch_async_client(monkeypatch)
+    assert cli._triage(_triage_args()) == 0
+    assert async_kwargs["verify"] is False
+
+
+def test_triage_and_healthz_parsers_accept_auth_flags() -> None:
+    """The flags are actually registered on both subparsers (wiring check)."""
+    # Reuse main()'s parser construction indirectly: build via _add_api_client_args
+    # on a fresh parser mirrors the registration; also smoke-parse real argv shapes.
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd")
+    t = sub.add_parser("triage")
+    t.add_argument("alert_id")
+    t.add_argument("--url", default=None)
+    cli._add_api_client_args(t)
+    h = sub.add_parser("healthz")
+    h.add_argument("--url", default=None)
+    cli._add_api_client_args(h)
+
+    args = p.parse_args(["triage", "abc", "--token", "scai_x", "--verify"])
+    assert args.token == "scai_x"
+    assert args.verify is True
+    args = p.parse_args(["healthz", "--cafile", "/tmp/ca.pem"])
+    assert args.cafile == "/tmp/ca.pem"
+
+
+def test_stream_investigation_renders_done_event(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end through the SSE parse loop with the mocked transport."""
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    _patch_async_client(monkeypatch)
+    rc = asyncio.run(cli._stream_investigation("https://127.0.0.1:8443", "abc", token="scai_t"))
+    assert rc == 0
+    out = _strip_ansi(capsys.readouterr().out)
+    assert "done" in out
+    assert "recommended_count=0" in out

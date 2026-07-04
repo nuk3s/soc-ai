@@ -1,4 +1,8 @@
-"""Tests for soc_ai.enrichment.refresh."""
+"""Tests for soc_ai.enrichment.refresh (cloud-prefix refresh + staleness).
+
+Blocklist refresh is owned by soc_ai.enrichment.blocklist_refresh — see
+tests/test_blocklist_refresh.py.
+"""
 
 from __future__ import annotations
 
@@ -10,47 +14,8 @@ import respx
 from soc_ai.enrichment.refresh import (
     REFRESH_URLS,
     cloud_prefix_staleness_days,
-    refresh_blocklists,
     refresh_cloud_prefixes,
 )
-
-
-@pytest.mark.asyncio
-async def test_refresh_blocklists_writes_files(tmp_path: Path) -> None:
-    """refresh_blocklists fetches each source URL and writes the local file."""
-    with respx.mock(assert_all_called=False) as mock:
-        mock.get(REFRESH_URLS["urlhaus"]).mock(
-            return_value=httpx.Response(200, text='"id","dateadded","url"\n"1","2026-04-01","x"\n')
-        )
-        mock.get(REFRESH_URLS["threatfox"]).mock(return_value=httpx.Response(200, text='{"1": []}'))
-        mock.get(REFRESH_URLS["feodo"]).mock(return_value=httpx.Response(200, text="# header\n"))
-        mock.get(REFRESH_URLS["tor"]).mock(return_value=httpx.Response(200, text="# header\n"))
-
-        results = await refresh_blocklists(
-            tmp_path,
-            sources=["urlhaus", "threatfox", "feodo", "tor"],
-        )
-
-    assert (tmp_path / "urlhaus.csv").exists()
-    assert (tmp_path / "threatfox.json").exists()
-    assert (tmp_path / "feodo.csv").exists()
-    assert (tmp_path / "tor_exits.txt").exists()
-    assert all(r.success for r in results)
-
-
-@pytest.mark.asyncio
-async def test_refresh_blocklists_failure_logs_but_continues(tmp_path: Path) -> None:
-    """One source 500ing doesn't kill the whole refresh; result.success=False for that one."""
-    with respx.mock(assert_all_called=False) as mock:
-        mock.get(REFRESH_URLS["urlhaus"]).mock(return_value=httpx.Response(500))
-        mock.get(REFRESH_URLS["tor"]).mock(
-            return_value=httpx.Response(200, text="# tor exits\n198.51.100.1\n")
-        )
-        results = await refresh_blocklists(tmp_path, sources=["urlhaus", "tor"])
-    by_src = {r.source: r for r in results}
-    assert by_src["urlhaus"].success is False
-    assert by_src["tor"].success is True
-    assert (tmp_path / "tor_exits.txt").exists()
 
 
 @pytest.mark.asyncio

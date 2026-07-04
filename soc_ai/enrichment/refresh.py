@@ -1,15 +1,17 @@
-"""Refresh CLI subcommand — fetches blocklist + cloud-prefix data files.
+"""Cloud-prefix refresh + staleness helpers.
 
-Run via `soc-ai blocklists refresh`. Wired to a systemd timer in the
-deployment runbook (see docs/SAFETY_MODEL.md).
+Owns fetching the cloud provider prefix lists (AWS/GCP/Azure/Cloudflare) and
+the ``cloud_refresh_status.json`` staleness bookkeeping that ``enrich_ip``
+reads. The `soc-ai blocklists refresh` CLI subcommand lives in
+:mod:`soc_ai.enrichment.blocklist_refresh`, which delegates the cloud-prefix
+half to :func:`refresh_cloud_prefixes` here.
 
-Privacy posture: this is the ONE place soc-ai talks to the public
-internet. Triggered by the operator on a schedule, never during triage.
+Privacy posture: this module only talks to the public internet when the
+operator-triggered refresh runs — never during triage.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
@@ -29,14 +31,7 @@ _CLOUD_STATUS_FILE = "cloud_refresh_status.json"
 
 
 REFRESH_URLS: dict[str, str] = {
-    # Blocklists
-    "urlhaus": "https://urlhaus.abuse.ch/downloads/csv_recent/",
-    "threatfox": "https://threatfox.abuse.ch/export/json/recent/",
-    "feodo": "https://feodotracker.abuse.ch/downloads/ipblocklist.csv",
-    "tor": "https://check.torproject.org/torbulkexitlist",
-    # Spamhaus is opt-in; URL still recorded so refresh can pick it up if enabled.
-    "spamhaus_drop": "https://www.spamhaus.org/drop/drop.txt",
-    # Cloud prefixes
+    # Cloud prefixes (blocklist feed URLs live in blocklist_refresh.BLOCKLIST_FEEDS)
     "aws_prefixes": "https://ip-ranges.amazonaws.com/ip-ranges.json",
     "gcp_prefixes": "https://www.gstatic.com/ipranges/cloud.json",
     # Azure URL encodes a publish date in the filename; override via
@@ -46,14 +41,6 @@ REFRESH_URLS: dict[str, str] = {
         "ServiceTags_Public_20241125.json"
     ),
     "cloudflare_v4": "https://www.cloudflare.com/ips-v4",
-}
-
-_BLOCKLIST_FILENAMES = {
-    "urlhaus": "urlhaus.csv",
-    "threatfox": "threatfox.json",
-    "feodo": "feodo.csv",
-    "tor": "tor_exits.txt",
-    "spamhaus_drop": "spamhaus_drop.txt",
 }
 
 _CLOUD_FILENAMES = {
@@ -182,28 +169,6 @@ async def _resolve_azure_service_tags_url(client: httpx.AsyncClient) -> str | No
     return None
 
 
-async def refresh_blocklists(data_dir: Path, *, sources: list[str]) -> list[RefreshResult]:
-    """Fetch each blocklist source and write to ``data_dir``."""
-    data_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 — httpx uses asyncio, not trio/anyio
-    results: list[RefreshResult] = []
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-        for source in sources:
-            url = REFRESH_URLS.get(source)
-            fname = _BLOCKLIST_FILENAMES.get(source)
-            if url is None or fname is None:
-                results.append(RefreshResult(source=source, success=False, error="unknown source"))
-                continue
-            try:
-                content = await _fetch_validated(client, url)
-            except (httpx.HTTPError, ValueError) as e:
-                _LOGGER.warning("refresh %s failed: %s", source, e)
-                results.append(RefreshResult(source=source, success=False, error=str(e)))
-                continue
-            (data_dir / fname).write_bytes(content)
-            results.append(RefreshResult(source=source, success=True, bytes_written=len(content)))
-    return results
-
-
 async def refresh_cloud_prefixes(
     data_dir: Path,
     *,
@@ -217,9 +182,10 @@ async def refresh_cloud_prefixes(
         sources: Which providers to fetch (``"aws"``, ``"gcp"``, ``"azure"``,
             ``"cloudflare"``).
         url_overrides: Optional mapping from the ``REFRESH_URLS`` key (e.g.
-            ``"azure_prefixes"``) to a replacement URL.  Used by
-            ``_refresh_cli`` to honour ``Settings.azure_service_tags_url``
-            without hardcoding the setting here.
+            ``"azure_prefixes"``) to a replacement URL.  Used by the
+            ``blocklist_refresh`` CLI handler to honour
+            ``Settings.azure_service_tags_url`` without hardcoding the
+            setting here.
 
     Cloudflare publishes a plain-text list of prefixes; we wrap them in
     a JSON envelope ``{"prefixes": [...]}`` so the CloudPrefixDB loader
@@ -295,55 +261,9 @@ async def refresh_cloud_prefixes(
     return results
 
 
-def _refresh_cli(args: argparse.Namespace) -> int:
-    """argparse handler for `soc-ai blocklists refresh`."""
-    from soc_ai.config import Settings  # noqa: PLC0415
-
-    # reads from .env; pydantic-settings populates fields from env, which mypy
-    # can't see (same documented limitation as config.get_settings()).
-    settings = Settings()  # type: ignore[call-arg]
-    blocklist_results = asyncio.run(
-        refresh_blocklists(settings.blocklist_data_dir, sources=settings.blocklist_sources)
-    )
-    cloud_results = asyncio.run(
-        refresh_cloud_prefixes(
-            settings.cloud_prefix_data_dir,
-            sources=["aws", "gcp", "azure", "cloudflare"],
-            # Honour the operator-configured Azure URL (e.g. a newer snapshot).
-            url_overrides={"azure_prefixes": str(settings.azure_service_tags_url)},
-        )
-    )
-    print("Blocklist refresh:")
-    for r in blocklist_results:
-        flag = "ok" if r.success else "FAIL"
-        suffix = f" — {r.error}" if r.error else ""
-        print(f"  {flag} {r.source}: {r.bytes_written} bytes{suffix}")
-    print("Cloud prefix refresh:")
-    for r in cloud_results:
-        flag = "ok" if r.success else "FAIL"
-        suffix = f" — {r.error}" if r.error else ""
-        print(f"  {flag} {r.source}: {r.bytes_written} bytes{suffix}")
-    # MaxMind is downloaded separately (license key + ZIP — different shape)
-    # — covered in deployment runbook, not in this CLI for v1.
-    failed = [r for r in (blocklist_results + cloud_results) if not r.success]
-    return 0 if not failed else 1
-
-
-def register_subparser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Called from soc_ai/cli.py main() to register `blocklists refresh`."""
-    p_bl = sub.add_parser("blocklists", help="Refresh local IOC + cloud-prefix data files")
-    bl_sub = p_bl.add_subparsers(dest="bl_cmd", required=True)
-    p_refresh = bl_sub.add_parser(
-        "refresh", help="Fetch all configured blocklist + cloud-prefix sources"
-    )
-    p_refresh.set_defaults(func=_refresh_cli)
-
-
 __all__ = [
     "REFRESH_URLS",
     "RefreshResult",
     "cloud_prefix_staleness_days",
-    "refresh_blocklists",
     "refresh_cloud_prefixes",
-    "register_subparser",
 ]

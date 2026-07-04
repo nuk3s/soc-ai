@@ -779,7 +779,7 @@ export function Config() {
 
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
           {data.tokens.map((tk) => (
-            <div key={tk.name} className="flex items-center gap-3 border-b border-border-faint px-[15px] py-3">
+            <div key={tk.id} className="flex items-center gap-3 border-b border-border-faint px-[15px] py-3">
               <span className="text-faint"><Key size={15} /></span>
               <div className="flex-1">
                 <div className="text-[13px] font-semibold">{tk.name}</div>

@@ -119,10 +119,14 @@ def _make_settings(
     pcap_max_packets: int = 50000,
     so_ssh_known_hosts: Path | None = None,
     soc_ai_data_dir: Path | None = None,
+    allow_online_enrichment: bool = False,
 ) -> Any:
     """Build a minimal Settings-like namespace for tests."""
     return SimpleNamespace(
         pcap_enabled=pcap_enabled,
+        # build_investigator reads this at registration time (online-enrichment
+        # tools are only registered when the master egress toggle is on).
+        allow_online_enrichment=allow_online_enrichment,
         so_ssh_host=so_ssh_host,
         so_ssh_user=so_ssh_user,
         so_ssh_key=so_ssh_key,

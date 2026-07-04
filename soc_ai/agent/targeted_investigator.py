@@ -74,7 +74,7 @@ def _raise_arg_type_error(tool_name: str, args: dict[str, Any], cause: TypeError
     ) from cause
 
 
-async def _dispatch_named_tool(
+async def _dispatch_named_tool(  # noqa: PLR0915 - a flat tool→callable dispatch table; splitting hurts readability
     tool_name: str,
     tool_args: dict[str, Any],
     ctx: Any,
@@ -134,6 +134,17 @@ async def _dispatch_named_tool(
         # get_pcap_facts needs only settings (already in base_kwargs) +
         # alert_ts from the context time anchor.
         base_kwargs["alert_ts"] = getattr(ctx, "default_time_anchor", None)
+
+    # Drop any injected base kwarg the target signature does not accept. The
+    # injection tables above are keyed by tool NAME, not by inspecting each
+    # signature, so a dependency that only some tools in a family take (e.g.
+    # ``auth`` — the SO web-API session — which the ES-query family does NOT
+    # accept, they are elastic-only) would otherwise raise an unconditional
+    # ``TypeError: unexpected keyword argument`` on every real dispatch. Honor
+    # ``**kwargs``: a function that declares VAR_KEYWORD accepts anything.
+    _sig = inspect.signature(fn)
+    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values()):
+        base_kwargs = {k: v for k, v in base_kwargs.items() if k in _sig.parameters}
 
     # Lenient kwarg dispatch. Some reasoning models can hallucinate
     # tool-arg names (e.g. ``'社区ID'``,

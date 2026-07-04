@@ -190,6 +190,20 @@ def test_parse_unknown_pipe_stage_rejected() -> None:
         parse_oql("* | take 10")
 
 
+def test_parse_unknown_pipe_stage_error_names_valid_stages() -> None:
+    """U3: the unknown-stage error is returned verbatim to the LLM agent, so
+    it must name the real pipe-stage surface (self-correcting error) and
+    explicitly disclaim the `fields` projection stage the agents keep
+    inventing."""
+    with pytest.raises(OqlValidationError) as exc_info:
+        parse_oql("event.kind:alert | fields rule.name, source.ip")
+    msg = str(exc_info.value)
+    assert "unknown pipe stage" in msg
+    for stage in ("groupby", "sortby", "head", "count"):
+        assert stage in msg, f"valid stage {stage!r} missing from error: {msg}"
+    assert "fields" in msg and "projection" in msg
+
+
 def test_parse_groupby_no_fields_rejected() -> None:
     with pytest.raises(OqlValidationError, match="groupby requires"):
         parse_oql("* | groupby   ,  ")
@@ -264,6 +278,13 @@ def test_validate_sortby_unknown_field() -> None:
 def test_validate_leading_wildcard_rejected() -> None:
     """A leading ``*`` forces per-shard term-index scans — reject it."""
     with pytest.raises(OqlValidationError, match="leading-wildcard"):
+        validate_oql(parse_oql("host.name:*foo"))
+
+
+def test_validate_leading_wildcard_error_says_anchor_the_wildcard() -> None:
+    """U3: the rejection is returned verbatim to the LLM agent, so it must
+    say HOW to fix the pattern (anchor it: foo*, not *foo)."""
+    with pytest.raises(OqlValidationError, match=r"anchor the wildcard \(write foo\*, not \*foo\)"):
         validate_oql(parse_oql("host.name:*foo"))
 
 

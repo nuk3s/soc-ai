@@ -48,9 +48,19 @@ AuditKind = Literal[
     "icmp_solicited_downgrade",
     "targeted_dispatch",
     "targeted_tool_result",
+    # flag-gated N-sample self-consistency vote on the final verdict
+    # (verdict_consistency_samples > 1; a split lands verdict=inconclusive)
+    "self_consistency_vote",
     # decision helpers
     "decision_template_match",
     "recommended_actions_blocked",
+    # evidence-gate / anchor downgrades (emitted by the synth-first + legacy
+    # post-validators). Without these the AuditEvent Literal rejected them and
+    # _audit swallowed the ValidationError — so every such downgrade was silently
+    # dropped from the audit trail (caught by the docs-vs-code accuracy gate).
+    "evidence_gate_downgrade",
+    "ungrounded_host_anchored_tp_downgrade",
+    "malware_rule_name_ungrounded_downgrade",
     # retask
     "usage",
     "retask",
@@ -58,6 +68,12 @@ AuditKind = Literal[
     # oracle frontier adjudication
     "oracle_escalation",
     "oracle_adjudication",
+    # unattended high-confidence-FP acknowledge (maybe_auto_ack_fp). Emitted as a
+    # StepEvent AND written to the audit trail; the WebUI reads it back
+    # (webui_api ``e.kind == "auto_ack"``) to badge an alert as auto-acked, so it
+    # MUST be a valid audit kind or every auto-ack fails to record and the badge
+    # never shows.
+    "auto_ack",
     "done",
     "error",
 ]

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
@@ -26,6 +27,12 @@ from soc_ai.config import Settings
 from soc_ai.errors import SoAuthError
 
 _LOGGER = logging.getLogger(__name__)
+
+# SO 3.0 expires the X-Srv-Token CSRF value 600s after issuance and signals
+# an expired token with a generic HTTP 400 (NOT a 401), so the 401-relogin
+# path never catches it. Refresh proactively well under that deadline —
+# SO's own web UI re-fetches its srv-token roughly every 60s.
+_SRV_TOKEN_TTL_S = 240.0
 
 
 @runtime_checkable
@@ -82,6 +89,9 @@ class KratosAuth:
         # POST to /api/events/ack etc. returns 400 "request could not be
         # processed" (logged server-side as "Missing SRV token on request").
         self._srv_token: str | None = None
+        # monotonic() timestamp of the last successful srv-token fetch;
+        # writes older than _SRV_TOKEN_TTL_S trigger a proactive refresh.
+        self._srv_token_at: float = 0.0
         self._lock = asyncio.Lock()
         # Separate lock to serialize mutating (non-GET) requests.
         # Must NOT reuse self._lock — request() calls login() which acquires
@@ -155,6 +165,7 @@ class KratosAuth:
             )
             if resp.status_code == httpx.codes.OK:
                 self._srv_token = resp.json().get("srvToken")
+                self._srv_token_at = time.monotonic()
                 _LOGGER.info("SO srvToken refreshed (set=%s)", self._srv_token is not None)
         except (httpx.HTTPError, ValueError) as e:
             _LOGGER.warning("could not refresh srv-token: %s", e)
@@ -164,6 +175,7 @@ class KratosAuth:
         self._logged_in = False
         self._session_token = None
         self._srv_token = None
+        self._srv_token_at = 0.0
 
     async def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Build headers and send, retrying once on 401.
@@ -200,7 +212,37 @@ class KratosAuth:
         # so serialize mutating requests. Reads stay concurrent (GETs are safe).
         if method.upper() not in ("GET", "HEAD", "OPTIONS"):
             async with self._write_lock:
-                return await self._send(method, url, **kwargs)
+                # Snapshot the caller's headers up front: _send pops "headers"
+                # out of its kwargs copy, so passing **kwargs to a retry would
+                # silently drop them. Pass the snapshot explicitly to BOTH
+                # sends (_send makes its own dict copy; the snapshot is never
+                # mutated).
+                caller_headers = dict(kwargs.pop("headers", None) or {})
+                # Proactive refresh: SO expires the srv-token after 600s and
+                # signals it with a 400 (not 401), so refresh on age here
+                # rather than waiting for a failure the 401 path can't see.
+                if self._session_token and (
+                    not self._srv_token or time.monotonic() - self._srv_token_at > _SRV_TOKEN_TTL_S
+                ):
+                    await self._refresh_srv_token()
+                resp = await self._send(method, url, headers=caller_headers, **kwargs)
+                # Reactive safety net: an expired srv-token still surfaces as
+                # a generic 400 "The request could not be processed". Refresh
+                # and retry ONCE — SO writes like ack are idempotent, so the
+                # retry is harmless even if the 400 was a benign zero-match /
+                # already-acknowledged response.
+                if resp.status_code == httpx.codes.BAD_REQUEST and resp.text.startswith(
+                    "The request could not be processed"
+                ):
+                    _LOGGER.info(
+                        "SO write %s %s returned 400 (possible expired srv-token); "
+                        "refreshing srv-token and retrying once",
+                        method,
+                        url,
+                    )
+                    await self._refresh_srv_token()
+                    resp = await self._send(method, url, headers=caller_headers, **kwargs)
+                return resp
         return await self._send(method, url, **kwargs)
 
     async def aclose(self) -> None:

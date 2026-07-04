@@ -600,3 +600,24 @@ def test_gate_c_short_dotted_domain_resolves_on_word_boundary() -> None:
     # not resolve (word-boundary guard holds).
     res_frag = _resolve_citations(["saw abc2xyzq somewhere"], ctx, [])
     assert res_frag["coverage_ratio"] == 0.0
+
+
+def test_loop_evidence_marker_requires_successful_tool_call() -> None:
+    """The investigation-loop evidence marker must gate on real tool evidence.
+
+    Regression for the gate-bypass: when the loop hit the budget/timeout, the
+    orchestrator fell back to the round-1 verdict with ``loop_messages=None`` but
+    still stamped ``targeted_tool="investigation_loop"`` unconditionally — which
+    exempted a non-evidence-backed TP/FP from the hard evidence gate + GATE A.
+    """
+    from soc_ai.agent.orchestrator import _loop_evidence_marker
+
+    # Budget/timeout fallback: loop ran, gathered nothing (None) -> NOT evidence.
+    assert _loop_evidence_marker(True, None) is None
+    # Loop ran but every call errored -> NOT evidence.
+    errored = [_Msg([_RetPart({"error": True, "message": "boom"})])]
+    assert _loop_evidence_marker(True, errored) is None
+    # Loop ran and gathered a real tool result -> marker set.
+    assert _loop_evidence_marker(True, _tool_evidence()) == "investigation_loop"
+    # Loop did not run -> no marker regardless of messages.
+    assert _loop_evidence_marker(False, _tool_evidence()) is None

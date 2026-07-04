@@ -219,6 +219,21 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=2.0,
     ),
     SettingSpec(
+        key="verdict_consistency_samples",
+        attr="verdict_consistency_samples",
+        type="int",
+        label="Verdict self-consistency samples",
+        section="Agent",
+        hot=True,
+        help=(
+            "Run the final verdict synthesis N times and majority-vote the verdict; "
+            "a split lands `inconclusive`. 1 disables the vote (default). Each extra "
+            "sample is a full synthesizer LLM call."
+        ),
+        min_value=1,
+        max_value=5,
+    ),
+    SettingSpec(
         key="auto_triage_max_targets",
         attr="auto_triage_max_targets",
         type="int",
@@ -1010,7 +1025,7 @@ def apply_to_settings(
     overrides: dict[str, Any],
     *,
     secret_box: SecretBox | None = None,
-) -> None:
+) -> list[str]:
     """Apply whitelisted overrides onto the live Settings singleton.
 
     For each whitelisted key present in *overrides*, ``setattr`` the typed value
@@ -1020,7 +1035,14 @@ def apply_to_settings(
     *secret_box*); a secret override with no usable box, a decrypt failure, or a
     value that fails validation is skipped defensively (the env value stands) so
     a bad override never crashes startup.
+
+    Returns the list of keys that were ACTUALLY applied. A caller doing an
+    interactive single-key hot-apply (``POST /config/setting``) uses this to tell
+    a silently-skipped value (type-correct but rejected by a field validator or
+    cross-field constraint at assignment time) from a successful save, instead of
+    reporting ``ok`` on a value that never took and would re-skip every restart.
     """
+    applied: list[str] = []
     for key, value in overrides.items():
         spec = WHITELIST_BY_KEY.get(key)
         if spec is None:
@@ -1033,6 +1055,8 @@ def apply_to_settings(
             else:
                 typed = _validate_typed(spec, value)
             setattr(settings, spec.attr, typed)
+            applied.append(key)
         except (ValueError, PydanticValidationError):
             _LOGGER.warning("skipping config override %s (invalid value)", key)
             continue
+    return applied

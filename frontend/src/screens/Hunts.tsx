@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { deleteHunt, getHunts, getHuntStats, startHuntConsole } from '../lib/api';
+import { HUNT_STATUS } from '../lib/statusMeta';
 import { useAsync } from '../lib/useAsync';
 import type { HuntRow, HuntStatus } from '../lib/types';
 
@@ -15,14 +16,6 @@ import type { HuntRow, HuntStatus } from '../lib/types';
 // ---------------------------------------------------------------------------
 
 const GRID = '1fr 120px 110px 110px 130px 44px';
-
-const STATUS_META: Record<HuntStatus, { label: string; color: string; pulse?: boolean }> = {
-  running: { label: 'Running', color: '#4b8bf5', pulse: true },
-  complete: { label: 'Complete', color: '#3fb950' },
-  error: { label: 'Error', color: '#f85149' },
-  cancelled: { label: 'Cancelled', color: '#8b949e' },
-  interrupted: { label: 'Interrupted', color: '#d29922' },
-};
 
 const TONE: Record<string, string> = {
   accent: '#4b8bf5',
@@ -68,7 +61,7 @@ const PRESETS: { label: string; objective: string }[] = [
 ];
 
 function StatusDot({ status }: { status: HuntStatus }) {
-  const m = STATUS_META[status] ?? STATUS_META.error;
+  const m = HUNT_STATUS[status] ?? HUNT_STATUS.error;
   return (
     <span className="flex items-center gap-1.5 text-[12px]" style={{ color: m.color }}>
       <span

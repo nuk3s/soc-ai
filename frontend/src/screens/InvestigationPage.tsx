@@ -71,6 +71,13 @@ export function InvestigationPage() {
               <span className="h-1.5 w-1.5 rounded-full bg-danger" />
               failed · {inv.elapsedLabel}
             </div>
+          ) : inv.status === 'cancelled' || inv.status === 'interrupted' ? (
+            // Don't render a cancelled/interrupted run as green "complete" — it
+            // contradicted the failure banner below. Amber, with the real status.
+            <div className="flex items-center gap-1.5 rounded-badge border border-[rgba(210,153,34,.3)] bg-[rgba(210,153,34,.07)] px-[9px] py-[3px] font-mono text-[11.5px] text-[#d29922]">
+              <span className="h-1.5 w-1.5 rounded-full bg-[#d29922]" />
+              {inv.status} · {inv.elapsedLabel}
+            </div>
           ) : (
             <div className="flex items-center gap-1.5 rounded-badge border border-[rgba(63,185,80,.3)] bg-[rgba(63,185,80,.07)] px-[9px] py-[3px] font-mono text-[11.5px] text-success">
               <span className="h-1.5 w-1.5 rounded-full bg-success" />

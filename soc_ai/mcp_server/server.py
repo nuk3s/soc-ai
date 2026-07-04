@@ -12,7 +12,7 @@ Run as a stdio MCP server::
 Or programmatically::
 
     from soc_ai.mcp_server.server import build_mcp
-    mcp = build_mcp(settings, auth, elastic, misp)
+    mcp = build_mcp(settings, elastic, misp=misp, enrichment=enrichment)
     await mcp.run_stdio_async()
 """
 
@@ -45,6 +45,7 @@ def build_mcp(
     elastic: ElasticClient,
     misp: MispClient | None = None,
     enrichment: EnrichmentContext | None = None,
+    db_sessionmaker: Any = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` server with the read-only tool surface.
 
@@ -179,10 +180,11 @@ def build_mcp(
     async def runbook(query: str, k: int = 5) -> list[dict[str, Any]]:
         """Search the operator's runbooks (keyword/tag/rule-linked).
 
-        The MCP server has no local-store session, so this surface returns ``[]``
-        here; runbook search is served by the in-app ``lookup_runbook`` tool
-        (which is handed the store ``db_sessionmaker``).
+        Served from the local store when the caller passed a ``db_sessionmaker``
+        (``__main__`` builds one over the app's SQLite DB). Without it — e.g. a
+        bare embedding with no store — this degrades to ``[]`` exactly like the
+        in-app tool does, rather than erroring.
         """
-        return await lookup_runbook(query, k=k)
+        return await lookup_runbook(query, k=k, db_sessionmaker=db_sessionmaker)
 
     return mcp

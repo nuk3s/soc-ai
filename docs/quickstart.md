@@ -10,7 +10,7 @@ You'll need:
 - **network reach** to your Security Onion grid, and
 - a **LiteLLM gateway** serving at least one model.
 
-`setup.sh` handles Docker for you — including the automatic install on RHEL / Rocky /
+`setup.sh` handles Docker for you, including the automatic install on RHEL / Rocky /
 Alma 10.
 
 !!! warning "Read the SO prerequisites first"
@@ -50,24 +50,22 @@ prints the URL and admin password.
     To stand up more hosts without the prompts, fill in `setup.conf` once and run
     `./setup.sh --auto`.
 
-For the full Docker story — required mounts, SELinux relabeling, upstream TLS trust
+Full Docker detail — required mounts, SELinux relabeling, upstream TLS trust
 (`*_VERIFY_SSL`), the port-8443-vs-SO-nginx conflict, and the manual + rsync/systemd
-paths — see [Docker deployment](DOCKER.md).
+paths — is in [Docker deployment](DOCKER.md).
 
 ## Work an alert in the browser
 
 Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick
-a detection, hit **Investigate**, and watch the agent work live — it pulls the
+a detection, hit **Investigate**, and watch the agent work live: it pulls the
 alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited
 verdict. Anything it recommends writing back to Security Onion waits behind a one-click
 human approval.
 
-<p align="center">
-  <img src="img/install-browser-walkthrough.gif" alt="soc-ai web UI: sign in, open the alerts console, Investigate a detection, watch the live investigation stream, read the verdict, and approve the recommended action" width="900">
-</p>
+![soc-ai web UI: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline](img/screenshot-investigation.png)
 
 Next steps:
 
-- [Web console guide](WEBUI_GUIDE.md) — triage, auto-triage, investigations, the admin config page
-- [Agent tools](AGENT_TOOLS.md) — every tool the agent can call, and the guardrails on them
-- [Safety model](SAFETY_MODEL.md) — the approval flow, audit schema, and Oracle redaction
+- [Web console guide](WEBUI_GUIDE.md): triage, auto-triage, investigations, the admin config page
+- [Agent tools](AGENT_TOOLS.md): every tool the agent can call, and the guardrails on them
+- [Safety model](SAFETY_MODEL.md): the approval flow, audit schema, and Oracle redaction

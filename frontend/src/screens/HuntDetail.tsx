@@ -5,8 +5,6 @@ import {
   Crosshair,
   GitBranch,
   Loader2,
-  MessageSquare,
-  Send,
   ShieldAlert,
   Trash2,
   Wrench,
@@ -14,6 +12,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
@@ -26,17 +25,10 @@ import {
   getHuntChat,
   postHuntChat,
 } from '../lib/api';
+import { HUNT_STATUS } from '../lib/statusMeta';
 import { TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
 import type { HuntDetailData, HuntFinding, HuntStatus, TimelineStep } from '../lib/types';
-
-const STATUS_META: Record<HuntStatus, { label: string; color: string; pulse?: boolean }> = {
-  running: { label: 'Running', color: '#4b8bf5', pulse: true },
-  complete: { label: 'Complete', color: '#3fb950' },
-  error: { label: 'Error', color: '#f85149' },
-  cancelled: { label: 'Cancelled', color: '#8b949e' },
-  interrupted: { label: 'Interrupted', color: '#d29922' },
-};
 
 const SEV_COLOR: Record<string, string> = {
   critical: '#f85149',
@@ -47,7 +39,7 @@ const SEV_COLOR: Record<string, string> = {
 };
 
 function StatusPill({ status }: { status: HuntStatus }) {
-  const m = STATUS_META[status] ?? STATUS_META.error;
+  const m = HUNT_STATUS[status] ?? HUNT_STATUS.error;
   return (
     <span
       className="flex items-center gap-1.5 rounded-chip border px-2 py-0.5 text-[11.5px] font-semibold"
@@ -266,8 +258,12 @@ export function HuntDetail() {
   const { data, loading, error } = useAsync<HuntDetailData>(() => getHunt(id), [id, reloadKey], {
     refetchInterval: 3000,
     pauseWhen: () => {
+      // Pause once the hunt reaches ANY terminal state. Only 'running' is live;
+      // enumerating the terminal set missed 'interrupted', which then polled
+      // every 3s forever. Gate on a known status that is not 'running' so a new
+      // terminal status can never reintroduce the leak.
       const s = statusRef.current;
-      return s === 'complete' || s === 'error' || s === 'cancelled';
+      return s !== undefined && s !== 'running';
     },
   });
   statusRef.current = data?.status;
@@ -300,7 +296,7 @@ export function HuntDetail() {
   // Terminal hunts (complete or errored/cancelled/interrupted) can be deleted
   // and support the read-only follow-up chat.
   const terminal = complete || failed;
-  const statusColor = status ? (STATUS_META[status]?.color ?? '#8b949e') : '#8b949e';
+  const statusColor = status ? (HUNT_STATUS[status]?.color ?? '#8b949e') : '#8b949e';
   const disp = data ? huntDisposition(data.status, data.findings) : null;
   const title = data ? huntTitle(data.objective) : '';
 
@@ -612,9 +608,9 @@ export function HuntDetail() {
 }
 
 // ── Read-only follow-up chat about a completed hunt ─────────────────────────
-// Mirrors the investigation ChatPanel UX (thread + input + typing indicator,
-// polls while the assistant works) but is strictly read-only: a hunt chat can
-// only answer questions — it can't ack, escalate, or change a verdict.
+// Same rendering as the investigation chat (the shared ChatPanelShell) but
+// strictly read-only: a hunt chat owns its own thread state and can only
+// answer questions — it can't ack, escalate, or change a verdict.
 function HuntChatPanel({
   huntId,
   fill,
@@ -627,10 +623,7 @@ function HuntChatPanel({
   const [messages, setMessages] = useState<HuntChatMessage[]>([]);
   const [pending, setPending] = useState(false);
   const [draft, setDraft] = useState('');
-  const listRef = useRef<HTMLDivElement>(null);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const didMountRef = useRef(false);
-  const seedLengthRef = useRef(-1);
 
   const NET_ERR_TEXT = 'Could not reach the server — please try again.';
 
@@ -665,17 +658,6 @@ function HuntChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [huntId]);
 
-  // autoscroll on new messages / typing indicator (skip the initial mount)
-  useEffect(() => {
-    if (!didMountRef.current) {
-      didMountRef.current = true;
-      seedLengthRef.current = messages.length;
-      return;
-    }
-    const el = listRef.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-  }, [messages.length, pending]);
-
   const send = () => {
     const t = draft.trim();
     if (!t || pending) return;
@@ -691,120 +673,35 @@ function HuntChatPanel({
   };
 
   return (
-    <Panel className={`flex min-h-0 flex-col${fill ? ' h-full' : ''}`}>
-      <PanelHeader
-        icon={<MessageSquare size={15} />}
-        title="Chat about this hunt"
-        right={
-          <div className="flex items-center gap-2.5">
-            {messages.length > 0 && (
-              <span className="font-mono text-[11px] text-accent">
-                {messages.length} msg{messages.length !== 1 ? 's' : ''}
-              </span>
-            )}
-            <div className="font-mono text-[11px] text-faint">read-only</div>
-            {onClose && (
-              <button
-                onClick={onClose}
-                aria-label="Close chat"
-                className="flex text-dim hover:text-text"
-              >
-                <X size={15} />
-              </button>
-            )}
-          </div>
-        }
-        className="py-[11px]"
-      />
-      <div
-        ref={listRef}
-        className={`flex flex-col gap-3 overflow-y-auto p-[15px]${
-          fill ? ' flex-1' : ' max-h-[460px] min-h-[180px]'
-        }`}
-      >
-        {messages.length === 0 && !pending && (
-          <div className="text-[12.5px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
-            Ask a follow-up about this hunt — e.g. “which host was worst?” or “show me the DNS for
-            host X”. The assistant answers from the hunt's evidence; it can't change the result.
-          </div>
-        )}
-        {messages.map((m, i) => {
-          const isNew = i >= seedLengthRef.current;
-          return m.role === 'user' ? (
-            <div
-              key={i}
-              className="max-w-[82%] min-w-0 self-end break-words rounded-[12px_12px_3px_12px] border border-accent-deep bg-[#1d3a6b] px-[13px] py-[9px] text-[13px] leading-[1.5]"
-            >
-              {m.text}
-            </div>
-          ) : (
-            <div key={i} className={`max-w-[88%] min-w-0 self-start${isNew ? ' animate-fadeUp' : ''}`}>
-              <div
-                className="overflow-hidden break-words rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2 [&_pre]:max-w-full [&_pre]:overflow-x-auto"
-                style={{ textWrap: 'pretty' }}
-              >
-                <Markdown>{m.text ?? ''}</Markdown>
-              </div>
-              {m.tools && (
-                <div className="mt-1.5 flex items-center gap-1.5 font-mono text-[10.5px] text-faint">
-                  <span className="text-accent">
-                    <Wrench size={11} />
-                  </span>
-                  tools · {m.tools}
-                </div>
-              )}
-            </div>
-          );
-        })}
-        {pending && (
-          <div className="flex items-center gap-1 self-start rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-3.5 py-[11px]">
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" />
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.2s' }} />
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.4s' }} />
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-[9px] border-t border-border px-[13px] py-[11px]">
-        <input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') send();
-          }}
-          placeholder="Ask a follow-up… e.g. which host was worst?"
-          className="flex-1 rounded-control border border-border-input bg-bg px-3 py-[9px] text-[13px] text-text outline-none focus:border-accent"
-        />
-        <button
-          onClick={send}
-          aria-label="Send"
-          className="flex h-9 w-[38px] flex-none items-center justify-center rounded-control bg-accent text-white hover:bg-accent-deep"
-        >
-          <Send size={16} />
-        </button>
-      </div>
-    </Panel>
+    <ChatPanelShell
+      title="Chat about this hunt"
+      scopeLabel="read-only"
+      placeholder="Ask a follow-up… e.g. which host was worst?"
+      listSizeClass={fill ? 'flex-1' : 'max-h-[460px] min-h-[180px]'}
+      emptyHint={
+        <div className="text-[12.5px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
+          Ask a follow-up about this hunt — e.g. “which host was worst?” or “show me the DNS for
+          host X”. The assistant answers from the hunt's evidence; it can't change the result.
+        </div>
+      }
+      messages={messages}
+      pending={pending}
+      draft={draft}
+      onDraft={setDraft}
+      onSend={send}
+      fill={fill}
+      onClose={onClose}
+    />
   );
 }
 
 // Floating "Chat about this" dock — a bottom-right launcher that opens the
-// hunt chat as an overlay, mirroring the investigation page's ChatDock so the
-// follow-up-chat UX is identical across investigations and hunts.
+// hunt chat as an overlay, sharing ChatDockShell with the investigation page
+// so the follow-up-chat UX is identical across investigations and hunts.
 function HuntChatDock({ huntId }: { huntId: string }) {
-  const [open, setOpen] = useState(false);
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="fixed bottom-6 right-6 z-40 flex items-center gap-2 rounded-pill border border-accent-deep bg-accent px-[18px] py-3 text-[13px] font-semibold text-white shadow-[0_12px_34px_rgba(75,139,245,.42)] transition-transform hover:-translate-y-0.5 hover:bg-accent-deep"
-      >
-        <MessageSquare size={16} />
-        Chat about this
-      </button>
-    );
-  }
   return (
-    <div className="fixed bottom-6 right-6 z-40 h-[560px] max-h-[calc(100vh-96px)] w-[400px] max-w-[calc(100vw-32px)] animate-fadeUp drop-shadow-[0_24px_70px_rgba(0,0,0,.6)]">
-      <HuntChatPanel huntId={huntId} fill onClose={() => setOpen(false)} />
-    </div>
+    <ChatDockShell label="Chat about this">
+      {(close) => <HuntChatPanel huntId={huntId} fill onClose={close} />}
+    </ChatDockShell>
   );
 }

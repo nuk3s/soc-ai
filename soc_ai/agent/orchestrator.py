@@ -26,10 +26,11 @@ import logging
 import random
 import re
 import uuid
+from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
@@ -58,6 +59,11 @@ from soc_ai.enrichment.blocklists import BlocklistDB
 from soc_ai.enrichment.cloud_tags import CloudPrefixDB
 from soc_ai.enrichment.maxmind import MaxmindReader
 from soc_ai.errors import OqlValidationError, SoApiError
+
+# Module import (not `from ... import adjudicate`) so tests patching
+# `soc_ai.oracle.client.adjudicate` keep intercepting the escalation call.
+from soc_ai.oracle import client as _oracle_client
+from soc_ai.oracle.identifiers import EffectiveIdentifiers, effective_internal_identifiers
 from soc_ai.so_client.auth import SoAuthClient
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.inventory import inventory_prompt_block
@@ -89,9 +95,7 @@ from soc_ai.tools.rule_tuning import suggest_rule_tuning
 from soc_ai.tools.shodan_host import shodan_host
 from soc_ai.tools.shodan_internetdb import shodan_internetdb
 from soc_ai.tools.web_search import web_search
-
-if TYPE_CHECKING:
-    from soc_ai.oracle.identifiers import EffectiveIdentifiers
+from soc_ai.tools.write_exec import execute_write_tool
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -351,6 +355,23 @@ def _tool_was_invoked(
             if tool_name in item:
                 return True
     return False
+
+
+def _loop_evidence_marker(
+    ran_investigation_loop: bool, loop_messages: list[Any] | None
+) -> str | None:
+    """Return the ``targeted_tool_called`` evidence marker for the investigation-loop path.
+
+    The marker (``"investigation_loop"``) exempts a verdict from the hard evidence
+    gate and GATE A, so it must be returned ONLY when the loop actually gathered
+    evidence — at least one SUCCESSFUL tool call. The budget/timeout fallback path
+    leaves ``loop_messages`` None (the round-1 verdict simply stands), and a loop
+    whose every tool call errored gathered nothing; neither is tool evidence, so
+    both return None and let the gate downgrade an unevidenced verdict.
+    """
+    if ran_investigation_loop and count_successful_tool_calls(loop_messages) >= 1:
+        return "investigation_loop"
+    return None
 
 
 def count_successful_tool_calls(messages: list[Any] | None) -> int:
@@ -1426,30 +1447,26 @@ def _synth_first_post_validate(
     blocklist: BlocklistDB | None = None,
     internal_cidrs: Sequence[Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Apply citation + template-confidence-cap + floor validators to a synth-first TriageReport.
+    """Apply citation + floor validators to a synth-first TriageReport.
 
     Returns (validated_report, audit_dict). The audit_dict carries the
     intermediate validator results so the orchestrator can emit SSE events
-    (citation_validation, citation_cap, template_ceiling, verdict_floor_rewrite)
-    in order.
+    (citation_validation, citation_cap, verdict_floor_rewrite) in order.
 
-    The four validators applied:
+    The validators applied:
 
     1. Citation validation — same ``_validate_citations`` as legacy, walking
        paths against ``enriched_ctx`` and IDs against the prefetch
        pivots. Tool refs only valid if matching the Phase-D targeted call
        (when one ran).
     2. Citation cap — same ``_citation_confidence_cap`` scaling by invalid_ratio.
-    3. Template-confidence ceiling — NEW. When no Phase D ran AND a
-       candidate matched, hard-clamp ``report.confidence ≤
-       candidate.confidence``. This reflects that synth-first verdicts
-       are bounded by the heuristic's certainty, not investigation depth.
-    4. Verdict floor rewrite — if final confidence < synthesis_confidence_floor
+    3. Verdict floor rewrite — if final confidence < synthesis_confidence_floor
        (0.6 default), set verdict=needs_more_info and clear recommended_actions.
 
     Coverage cap is NOT applied to synth-first runs because the orchestrator
     didn't run an investigator — there's no tool-call ledger to compute
-    rubric coverage from. The template-confidence ceiling is the analog.
+    rubric coverage from. (The template-confidence ceiling that used to fill
+    that role was removed — see the note in the body.)
 
     ``blocklist`` / ``internal_cidrs`` are forwarded to
     :func:`_apply_targeted_downgrades` (solicited-ICMP downgrade): the
@@ -1543,9 +1560,11 @@ def _synth_first_post_validate(
     # some models' varied citation shapes turned valid verdicts into
     # `unknown`/`needs_more_info`.
     no_evidence = _no_semantic_evidence(report, coverage_ratio)
+    # `inconclusive` (the self-consistency split outcome) is already a terminal
+    # non-committed verdict — like needs_more_info, it is never rewritten here.
     if (
         report.confidence < synthesis_confidence_floor
-        and report.verdict != "needs_more_info"
+        and report.verdict not in ("needs_more_info", "inconclusive")
         and no_evidence
     ):
         audit["verdict_floor_rewrite"] = {
@@ -1814,7 +1833,7 @@ def _apply_targeted_downgrades(
     """Apply final verdict-level targeted downgrades; returns the report.
 
     B2: extracted from `_synth_first_post_validate` so the LEGACY pipeline
-    (still the fallback when synth-first errors or the flag is off) applies
+    (still used when ``synth_first_pipeline`` is off) applies
     the identical overrides — it previously reproduced the BPFDoor false
     escalation unmitigated. Audit entries are written into ``audit`` under
     the same keys both pipelines emit as SSE events
@@ -2196,7 +2215,7 @@ def _is_solicited_internal_icmp_echo(
         (``None`` / zero loaded sources) or its lookup raising on the
         no-enrichment path. Absence of proof is not proof; wrongly
         suppressing a real TP is worse than letting a false escalation
-        through, and legacy is the fallback path.
+        through.
 
     Reads the prefetch via ``model_dump`` (consistent with the citation
     resolver) so it works against both real EnrichedAlertContext objects
@@ -2738,94 +2757,101 @@ def build_investigator(  # noqa: PLR0915 - tool registrations are inherently lon
             return _tool_error(e)
         return _clamp_tool_result(result)
 
-    @agent.tool_plain
-    async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
-        """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key).
+    # The four ONLINE-enrichment tools (Shodan InternetDB / GreyNoise / full
+    # Shodan / CVEDB) are only registered when the master egress toggle
+    # (`allow_online_enrichment`) is on. Registering them while the toggle is
+    # off just invites the model to burn tool-budget slots on "skipped (online
+    # enrichment off)" results (observed 4x GreyNoise + 4x Shodan in one run).
+    # InternetDB + CVEDB are keyless but still egress, so they sit behind the
+    # same toggle. The underlying tool functions keep their own runtime gates.
+    if ctx.settings.allow_online_enrichment:
 
-        Returns the open ports, software CPEs, reverse-DNS hostnames, tags
-        (cdn/cloud/self-signed) and known CVEs Shodan last observed on that
-        address. Call it to corroborate WHAT an unknown EXTERNAL IP is — exposed
-        service, hosting class, known vulns — when the verdict turns on the
-        nature of the public peer.
+        @agent.tool_plain
+        async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
+            """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key).
 
-        Opt-in ONLINE tool: when online enrichment is disabled it returns a clean
-        'disabled' dict with no network I/O, and private/reserved IPs are skipped
-        (never sent off-box). Pass a PUBLIC IP only.
-        """
-        if dup := _dedup_result(ctx, "t_shodan_internetdb", {"ip": ip}):
-            return dup
-        try:
-            result = await shodan_internetdb(ip, settings=ctx.settings)
-        except Exception as e:
-            _LOGGER.warning("t_shodan_internetdb failed: %s", e)
-            return _tool_error(e)
-        return _clamp_tool_result(result)
+            Returns the open ports, software CPEs, reverse-DNS hostnames, tags
+            (cdn/cloud/self-signed) and known CVEs Shodan last observed on that
+            address. Call it to corroborate WHAT an unknown EXTERNAL IP is — exposed
+            service, hosting class, known vulns — when the verdict turns on the
+            nature of the public peer.
 
-    @agent.tool_plain
-    async def t_greynoise(ip: str) -> dict[str, Any]:
-        """Look up an EXTERNAL IP in GreyNoise (Community API): is it scanning the
-        internet indiscriminately (noise), a known-benign service (riot), and its
-        classification.
+            ONLINE tool: private/reserved IPs are skipped (never sent off-box).
+            Pass a PUBLIC IP only.
+            """
+            if dup := _dedup_result(ctx, "t_shodan_internetdb", {"ip": ip}):
+                return dup
+            try:
+                result = await shodan_internetdb(ip, settings=ctx.settings)
+            except Exception as e:
+                _LOGGER.warning("t_shodan_internetdb failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
 
-        Strong fit when the alert involves an unfamiliar external IP and you need
-        to know whether it is a mass-scanner / benign crawler (de-escalate) vs. a
-        targeted actor. EXTERNAL IPs only — internal/non-routable IPs are skipped.
-        Opt-in ONLINE tool: returns a clean disabled/not_configured dict (no I/O)
-        when online enrichment is off or the API key is unset.
-        """
-        if dup := _dedup_result(ctx, "t_greynoise", {"ip": ip}):
-            return dup
-        try:
-            result = await greynoise(ip, settings=ctx.settings)
-        except Exception as e:
-            _LOGGER.warning("t_greynoise failed: %s", e)
-            return _tool_error(e)
-        return _clamp_tool_result(result)
+        @agent.tool_plain
+        async def t_greynoise(ip: str) -> dict[str, Any]:
+            """Look up an EXTERNAL IP in GreyNoise (Community API): is it scanning the
+            internet indiscriminately (noise), a known-benign service (riot), and its
+            classification.
 
-    @agent.tool_plain
-    async def t_shodan_host(ip: str) -> dict[str, Any]:
-        """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API key).
+            Strong fit when the alert involves an unfamiliar external IP and you need
+            to know whether it is a mass-scanner / benign crawler (de-escalate) vs. a
+            targeted actor. EXTERNAL IPs only — internal/non-routable IPs are skipped.
+            ONLINE tool: returns a clean not_configured dict (no I/O) when the API
+            key is unset.
+            """
+            if dup := _dedup_result(ctx, "t_greynoise", {"ip": ip}):
+                return dup
+            try:
+                result = await greynoise(ip, settings=ctx.settings)
+            except Exception as e:
+                _LOGGER.warning("t_greynoise failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
 
-        Deeper than t_shodan_internetdb: adds the network owner (org/isp/asn),
-        geolocation, guessed OS, and the per-service BANNERS Shodan collected
-        (product + version + module per open port), plus the union of known
-        CVEs. Reach for it when the verdict turns on WHAT an unknown external
-        host is actually running and WHO owns it.
+        @agent.tool_plain
+        async def t_shodan_host(ip: str) -> dict[str, Any]:
+            """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API key).
 
-        Opt-in ONLINE tool: returns a clean disabled/not_configured dict (no I/O)
-        when online enrichment is off or SHODAN_API_KEY is unset; private/
-        internal IPs are skipped (never sent off-box). PUBLIC IPs only.
-        """
-        if dup := _dedup_result(ctx, "t_shodan_host", {"ip": ip}):
-            return dup
-        try:
-            result = await shodan_host(ip, settings=ctx.settings)
-        except Exception as e:
-            _LOGGER.warning("t_shodan_host failed: %s", e)
-            return _tool_error(e)
-        return _clamp_tool_result(result)
+            Deeper than t_shodan_internetdb: adds the network owner (org/isp/asn),
+            geolocation, guessed OS, and the per-service BANNERS Shodan collected
+            (product + version + module per open port), plus the union of known
+            CVEs. Reach for it when the verdict turns on WHAT an unknown external
+            host is actually running and WHO owns it.
 
-    @agent.tool_plain
-    async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
-        """Score a named CVE via Shodan CVEDB (free, no key): CVSS base score,
-        EPSS exploit-probability + ranking, CISA KEV (actively-exploited) flag,
-        a short summary and references.
+            ONLINE tool: returns a clean not_configured dict (no I/O) when
+            SHODAN_API_KEY is unset; private/internal IPs are skipped (never
+            sent off-box). PUBLIC IPs only.
+            """
+            if dup := _dedup_result(ctx, "t_shodan_host", {"ip": ip}):
+                return dup
+            try:
+                result = await shodan_host(ip, settings=ctx.settings)
+            except Exception as e:
+                _LOGGER.warning("t_shodan_host failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
 
-        Call it whenever an alert, rule, or a Shodan host result names a CVE and
-        the verdict depends on HOW SEVERE / HOW LIKELY-EXPLOITED it is — KEV or a
-        high EPSS argues for escalation; an old, low-EPSS, non-KEV CVE does not.
+        @agent.tool_plain
+        async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
+            """Score a named CVE via Shodan CVEDB (free, no key): CVSS base score,
+            EPSS exploit-probability + ranking, CISA KEV (actively-exploited) flag,
+            a short summary and references.
 
-        Opt-in ONLINE tool (no API key): returns a clean 'disabled' dict (no
-        network I/O) when online enrichment is off.
-        """
-        if dup := _dedup_result(ctx, "t_cve_lookup", {"cve_id": cve_id}):
-            return dup
-        try:
-            result = await cve_lookup(cve_id, settings=ctx.settings)
-        except Exception as e:
-            _LOGGER.warning("t_cve_lookup failed: %s", e)
-            return _tool_error(e)
-        return _clamp_tool_result(result)
+            Call it whenever an alert, rule, or a Shodan host result names a CVE and
+            the verdict depends on HOW SEVERE / HOW LIKELY-EXPLOITED it is — KEV or a
+            high EPSS argues for escalation; an old, low-EPSS, non-KEV CVE does not.
+
+            ONLINE tool (no API key needed).
+            """
+            if dup := _dedup_result(ctx, "t_cve_lookup", {"cve_id": cve_id}):
+                return dup
+            try:
+                result = await cve_lookup(cve_id, settings=ctx.settings)
+            except Exception as e:
+                _LOGGER.warning("t_cve_lookup failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
 
     @agent.tool_plain
     async def t_get_pcap(
@@ -3613,8 +3639,6 @@ async def maybe_auto_ack_fp(
     Returns the ``auto_ack`` StepEvent (for the caller to yield into the stream)
     when the write was attempted, or ``None`` when any gate condition is unmet.
     """
-    from soc_ai.api.approvals import execute_write_tool  # noqa: PLC0415 — lazy to avoid circular
-
     settings = ctx.settings
     if not settings.auto_ack_fp_enabled:
         return None
@@ -4552,9 +4576,11 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
     # whose reasoning is sound. This evidence-conditional fix previously
     # landed on the synth-first path only.
     coverage_ratio_final = citation_validation["coverage_ratio"]
+    # `inconclusive` (self-consistency split) is terminal non-committed — never
+    # rewritten, mirroring the synth-first floor rewrite.
     if (
         report.confidence < ctx.settings.synthesis_confidence_floor
-        and report.verdict != "needs_more_info"
+        and report.verdict not in ("needs_more_info", "inconclusive")
         and _no_semantic_evidence(report, coverage_ratio_final)
     ):
         rewrite_ev = _ev(
@@ -4584,8 +4610,8 @@ async def investigate(  # noqa: PLR0912, PLR0915 - two-phase flow with retask is
     # ----- Targeted verdict downgrades (B2 parity) -----
     # Same shared `_apply_targeted_downgrades` the synth-first post-
     # validator runs (solicited-ICMP-echo TP downgrade). The legacy
-    # pipeline is still the fallback when synth-first errors or the flag
-    # is off — without this it reproduced the BPFDoor false escalation
+    # pipeline still runs when the synth-first flag is off — without
+    # this it reproduced the BPFDoor false escalation
     # the synth-first path already mitigates. Ordering mirrors
     # `_synth_first_post_validate`: floor rewrite first, downgrade last.
     # `alert_ctx` carries no enrichments, so the downgrade demands an
@@ -4867,6 +4893,48 @@ def _should_investigate(report: Any, enriched: Any, candidate: Any) -> bool:
     )
 
 
+def _synth_reasoning_payload(run_result: Any) -> dict[str, Any] | None:
+    """Project a synthesizer run's thinking into a ``model_response`` payload.
+
+    The synth-first synthesizer runs (round-1 / loop-synth / Phase-D round-2)
+    complete via ``agent.run`` — nothing walks their messages, so their
+    ThinkingParts (deepseek ``reasoning_content`` bound via the model profile)
+    were silently dropped and a no-loop investigation surfaced NO "Model
+    reasoning" panel. Same part projection as :func:`_walk_message` (named
+    ThinkingPart content, plus inline ``<think>`` blocks in TextParts), but
+    collapsed to ONE payload for the whole run since a no-tools synthesis is a
+    single model turn. Returns None when there is no non-empty trace (emit
+    nothing) or on any message-shape surprise (defensive: never fail a verdict
+    over explainability bookkeeping).
+    """
+    try:
+        messages = run_result.all_messages()
+    except Exception:
+        return None
+    traces: list[str] = []
+    texts: list[str] = []
+    try:
+        for msg in messages or []:
+            for part in getattr(msg, "parts", []) or []:
+                ptype = type(part).__name__
+                if ptype == "ThinkingPart":
+                    content = getattr(part, "content", "") or ""
+                    if content.strip():
+                        traces.append(content.strip())
+                elif ptype == "TextPart":
+                    content = getattr(part, "content", "") or ""
+                    trace, cleaned = extract_reasoning_trace(content)
+                    if trace and trace.strip():
+                        traces.append(trace.strip())
+                    if cleaned.strip():
+                        texts.append(cleaned.strip())
+    except Exception:
+        return None
+    if not traces:
+        return None
+    return {"content": "\n\n".join(texts), "reasoning_trace": "\n\n".join(traces)}
+
+
 async def _walk_message(
     msg: Any,
     ev_factory: Any,
@@ -5059,10 +5127,6 @@ async def _resolve_effective_identifiers(
     maker = ctx.db_sessionmaker
     if maker is None:
         return None
-    from soc_ai.oracle.identifiers import (  # noqa: PLC0415 — avoid import cycle / keep hot path light
-        effective_internal_identifiers,
-    )
-
     try:
         async with maker() as db:
             return await effective_internal_identifiers(db, ctx.settings)
@@ -5119,6 +5183,48 @@ def _round1_skipped_report(alert_id: str) -> TriageReport:
     )
 
 
+def _self_consistency_vote(reports: list[Any]) -> tuple[str, float, str]:
+    """Majority-vote a verdict across N independent final-synthesis samples.
+
+    Pure helper for the flag-gated self-consistency vote
+    (``settings.verdict_consistency_samples > 1``). Given the TriageReports
+    from N runs of the SAME final synthesis call, returns
+    ``(verdict, confidence, note)``:
+
+    - STRICT majority (count > N/2): that verdict wins; confidence is the mean
+      of the confidences of the samples that voted for it (3 dp); note =
+      ``"self-consistency K/N agreed on <verdict>"``.
+    - No strict majority (tie or 3-way split): ``("inconclusive", mean
+      confidence of ALL samples capped at 0.5, "self-consistency split M ways:
+      <tally> — inconclusive")``.
+    - Single report (defensive — the caller guards N>1): passthrough of that
+      report's verdict/confidence unchanged.
+    """
+    if len(reports) == 1:
+        r = reports[0]
+        return r.verdict, r.confidence, "self-consistency: single sample — no vote"
+    n = len(reports)
+    tally = Counter(r.verdict for r in reports)
+    top_verdict, top_count = tally.most_common(1)[0]
+    if top_count > n / 2:
+        confs = [r.confidence for r in reports if r.verdict == top_verdict]
+        mean_conf = round(sum(confs) / len(confs), 3)
+        return (
+            top_verdict,
+            mean_conf,
+            f"self-consistency {top_count}/{n} agreed on {top_verdict}",
+        )
+    conf = round(min(sum(r.confidence for r in reports) / n, 0.5), 3)
+    tally_str = ", ".join(
+        f"{v}={c}" for v, c in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    return (
+        "inconclusive",
+        conf,
+        f"self-consistency split {len(tally)} ways: {tally_str} — inconclusive",
+    )
+
+
 async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pipeline is inherently long
     *,
     alert_id: str,
@@ -5157,6 +5263,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # Audit must never crash the in-flight investigation. The audit logger
         # already swallows ES errors, but a Pydantic ValidationError on
         # AuditKind would propagate before the ES call - catch it here too.
+        # Also feed the per-process Prometheus counters so /metrics reflects this
+        # run — the synth-first pipeline is the DEFAULT path, and without this the
+        # /metrics counters stay frozen at 0 in production (mirrors the legacy
+        # investigate() _audit).
+        try:
+            await metrics.get_metrics().record_event(ev.kind, ev.payload)
+        except Exception as e:
+            _LOGGER.warning("metrics record failed (kind=%s): %s", ev.kind, e)
         if ctx.audit is None:
             return
         try:
@@ -5188,6 +5302,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 "total_tokens": u.total_tokens,
             },
         )
+
+    def _reasoning_ev(round_num: int, run_result: Any) -> StepEvent | None:
+        """``model_response`` event carrying the synthesizer's reasoning trace.
+
+        The loop's investigator turns already stream model_response via
+        ``_walk_message``; the synthesizer ``agent.run`` calls did not, so a
+        round-1/round-2-settled investigation had an empty "Model reasoning"
+        panel. None when the run produced no trace — no event is emitted.
+        Called ONLY for the primary/final synthesis runs, never for the
+        self-consistency extra samples.
+        """
+        payload = _synth_reasoning_payload(run_result)
+        if payload is None:
+            return None
+        return _ev("model_response", {**payload, "phase": "synthesizer", "round": round_num})
 
     yield _ev("session_start", {"alert_id": alert_id, "pipeline": "synth_first"})
 
@@ -5257,6 +5386,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         enriched, candidate
     )
     round1_ok = False
+    # (agent, user_message, usage_limits|None) describing how to RE-RUN the
+    # final verdict synthesis — consumed by the flag-gated self-consistency
+    # vote below. Set at each site whose output becomes ``triage_final``;
+    # cleared (None) on every fallback path so a vote never re-runs a call
+    # that just failed.
+    final_synth_rerun: tuple[Any, str, Any] | None = None
     if definitely_investigate:
         triage_round1 = _round1_skipped_report(alert_id)
         skip_ev = _ev("synth_round1_skipped", {"reason": "definitely_investigate"})
@@ -5290,6 +5425,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         else:
             triage_round1 = synth_result_round1.output
             round1_ok = True
+            # Round-1 IS the final synthesis when neither the loop nor Phase D
+            # supersedes it below (each overwrites/clears this on its own path).
+            final_synth_rerun = (synth_agent, user_msg_round1, None)
+            # Surface the synthesizer's thinking — without this a round-1-settled
+            # run stored NO model_response event and the reasoning panel was empty.
+            r1_reasoning_ev = _reasoning_ev(1, synth_result_round1)
+            if r1_reasoning_ev is not None:
+                await _audit(r1_reasoning_ev)
+                yield r1_reasoning_ev
             usage_ev = _usage_ev(1, synth_result_round1)
             if usage_ev is not None:
                 await _audit(usage_ev)
@@ -5454,6 +5598,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # the streamed timeline). loop_messages stays None — the downstream
             # evidence/citation checks already handle that.
             triage_final = _round2_failure_fallback(alert_id, triage_round1, budget_exc)
+            final_synth_rerun = None  # fallback verdict — never vote on it
             await metrics.get_metrics().record_event("fallback_verdict", {})
         elif inv_result is None:
             # The agent run ended without a final result (no End node reached, and
@@ -5500,12 +5645,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     ctx.settings, temperature=ctx.settings.synthesizer_temperature
                 )
             )
+            loop_synth_msg = _format_transcript_for_synthesizer(
+                alert_id, [loop_transcript], candidate=candidate
+            )
             try:
                 async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                     loop_synth_result = await loop_synth.run(
-                        _format_transcript_for_synthesizer(
-                            alert_id, [loop_transcript], candidate=candidate
-                        ),
+                        loop_synth_msg,
                         usage_limits=loop_usage_limits,
                     )
             except asyncio.CancelledError:
@@ -5521,9 +5667,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 await _audit(err_ev)
                 yield err_ev
                 triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+                final_synth_rerun = None  # fallback verdict — never vote on it
                 await metrics.get_metrics().record_event("fallback_verdict", {})
             else:
                 triage_final = loop_synth_result.output
+                # The loop synth is now the final synthesis (supersedes round-1).
+                final_synth_rerun = (loop_synth, loop_synth_msg, loop_usage_limits)
+                # The loop's investigator turns streamed their own reasoning via
+                # _walk_message above; this covers only the concluding synth run.
+                loop_reasoning_ev = _reasoning_ev(2, loop_synth_result)
+                if loop_reasoning_ev is not None:
+                    await _audit(loop_reasoning_ev)
+                    yield loop_reasoning_ev
                 loop_synth_usage_ev = _usage_ev(2, loop_synth_result)
                 if loop_synth_usage_ev is not None:
                     await _audit(loop_synth_usage_ev)
@@ -5600,9 +5755,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(err_ev)
             yield err_ev
             triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+            final_synth_rerun = None  # fallback verdict — never vote on it
             await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
             triage_final = synth_result_round2.output
+            # Round-2 is now the final synthesis (supersedes round-1).
+            final_synth_rerun = (synth_agent, user_msg_round2, None)
+            r2_reasoning_ev = _reasoning_ev(2, synth_result_round2)
+            if r2_reasoning_ev is not None:
+                await _audit(r2_reasoning_ev)
+                yield r2_reasoning_ev
             usage2_ev = _usage_ev(2, synth_result_round2)
             if usage2_ev is not None:
                 await _audit(usage2_ev)
@@ -5611,25 +5773,91 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             if triage_final.gap_for_investigator is not None:
                 triage_final = triage_final.model_copy(update={"gap_for_investigator": None})
 
+    # ----- Self-consistency vote (flag-gated; OFF by default) -----
+    # verdict_consistency_samples=1 (the default) skips this entirely: single
+    # synthesis call, no vote, `inconclusive` never produced — byte-identical
+    # to the pre-vote pipeline. When >1, re-run the SAME final synthesis
+    # (same agent + prompt) N-1 more times and majority-vote the verdict
+    # BEFORE the deterministic post-validators (the evidence/citation guards
+    # below still apply to the voted report). Defensive: a failed sample is
+    # dropped; fewer than 2 surviving samples ⇒ no vote (the single available
+    # report stands). Fallback-produced verdicts never vote (rerun is None).
+    vote_samples = int(getattr(ctx.settings, "verdict_consistency_samples", 1) or 1)
+    if vote_samples > 1 and final_synth_rerun is not None:
+        sample_agent, sample_msg, sample_limits = final_synth_rerun
+        sample_reports: list[TriageReport] = [triage_final]
+        for _ in range(vote_samples - 1):
+            try:
+                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                    if sample_limits is not None:
+                        extra_result = await sample_agent.run(
+                            sample_msg, usage_limits=sample_limits
+                        )
+                    else:
+                        extra_result = await sample_agent.run(sample_msg)
+            except asyncio.CancelledError:
+                raise  # cooperative cancel — propagate, never swallow
+            except BaseException as e:
+                _LOGGER.warning("self-consistency sample failed (dropped): %s", e)
+                continue
+            extra_report = extra_result.output
+            # Samples never trigger Phase D — strip any gap defensively.
+            if extra_report.gap_for_investigator is not None:
+                extra_report = extra_report.model_copy(update={"gap_for_investigator": None})
+            sample_reports.append(extra_report)
+        if len(sample_reports) >= 2:
+            voted_verdict, voted_conf, vote_note = _self_consistency_vote(sample_reports)
+            vote_tally = dict(Counter(r.verdict for r in sample_reports))
+            # Representative sample: first report matching the winning verdict;
+            # for an inconclusive split, the highest-confidence sample (its
+            # summary/citations/actions are kept — only verdict+confidence are
+            # overwritten by the vote, and the note is appended).
+            if voted_verdict == "inconclusive":
+                representative = max(sample_reports, key=lambda r: r.confidence)
+            else:
+                representative = next(r for r in sample_reports if r.verdict == voted_verdict)
+            triage_final = representative.model_copy(
+                update={
+                    "verdict": voted_verdict,
+                    "confidence": voted_conf,
+                    "summary": f"{representative.summary}\n\n[{vote_note}]",
+                }
+            )
+            vote_ev = _ev(
+                "self_consistency_vote",
+                {
+                    "samples": len(sample_reports),
+                    "tally": vote_tally,
+                    "chosen_verdict": voted_verdict,
+                    "note": vote_note,
+                },
+            )
+            await _audit(vote_ev)
+            yield vote_ev
+
     # ----- Post-synth validators -----
     # Mirror the legacy post-synth validator chain: citation validation,
-    # citation cap, template-confidence ceiling, and verdict floor rewrite.
-    # Coverage cap is NOT applied — no investigator ran, so there's no
-    # tool-call ledger. The template_ceiling is the synth-first analog.
+    # citation cap, and verdict floor rewrite. Coverage cap is NOT
+    # applied — no investigator ran, so there's no tool-call ledger.
     # When the investigation loop ran, it supersedes Phase D: thread the
     # loop's real message history into citation resolution (so tool/pivot
     # citations resolve against actual ToolCallParts) and treat it like an
-    # investigator round (suppress the template-confidence ceiling — gathered
-    # evidence legitimately lifts confidence past the heuristic, same as a
-    # Phase-D round-2). Otherwise keep the existing synth-first behavior.
+    # investigator round — gathered evidence legitimately grounds the
+    # verdict, same as a Phase-D round-2. Otherwise keep the existing
+    # synth-first behavior.
     targeted_tool: str | None = None
     targeted_messages: list[Any] | None = None
     if ran_investigation_loop:
         targeted_messages = loop_messages
-        # Mark "an investigation ran" so the template ceiling lifts; the
-        # synthetic-transcript path in post-validate is a no-op here because
-        # real messages are threaded for tool-citation resolution.
-        targeted_tool = "investigation_loop"
+        # Mark "an investigation gathered evidence" — which exempts the verdict
+        # from the hard evidence gate + GATE A — ONLY when the loop produced at
+        # least one SUCCESSFUL tool call. On the budget/timeout fallback path
+        # ``loop_messages`` is None (the round-1 verdict just stands), and a loop
+        # whose every call errored gathered nothing; treating either as tool
+        # evidence would launder a non-evidence-backed round-1 TP/FP straight
+        # past the gate. ``targeted_messages`` is still threaded for tool/pivot
+        # citation resolution regardless.
+        targeted_tool = _loop_evidence_marker(ran_investigation_loop, loop_messages)
     elif (
         triage_round1.gap_for_investigator is not None
         # Only a SUCCESSFUL Phase-D dispatch that returned DISCRIMINATING DATA
@@ -5657,10 +5885,6 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         yield ev
     if "citation_cap" in validation_audit:
         ev = _ev("citation_cap", {"round": 1, **validation_audit["citation_cap"]})
-        await _audit(ev)
-        yield ev
-    if "template_ceiling" in validation_audit:
-        ev = _ev("template_ceiling", validation_audit["template_ceiling"])
         await _audit(ev)
         yield ev
     if "verdict_floor_rewrite" in validation_audit:
@@ -5708,7 +5932,6 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             _rule_signals_attack,
             _rule_signals_malware,
         )
-        from soc_ai.oracle.client import adjudicate as _adjudicate  # noqa: PLC0415
 
         # Derive the audit reason to match the ACTUAL gate that fired in
         # _should_escalate_to_oracle (same flag + predicate order as above).
@@ -5764,7 +5987,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         oracle_suffixes = effective_idents.suffixes if effective_idents is not None else None
         oracle_hosts = effective_idents.hosts if effective_idents is not None else None
 
-        oracle_result = await _adjudicate(
+        oracle_result = await _oracle_client.adjudicate(
             ctx,
             enriched=enriched,
             local_report=triage_final,

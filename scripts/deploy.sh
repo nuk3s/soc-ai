@@ -41,5 +41,10 @@ rsync -az --delete \
   ./ "${TARGET}:${DEST}/"
 
 # Rebuild + replace the container, then wait for the app to answer on 8443.
+# The health-wait must FAIL the deploy if the app never comes up — a bare
+# `for … break` loop always exits 0, so a container that crash-loops would be
+# reported as a successful deploy. Track success explicitly and exit non-zero.
 ssh "${TARGET}" "cd ${DEST} && sudo docker compose up -d --build && \
-  for i in \$(seq 1 20); do curl -ksf https://127.0.0.1:8443/healthz && break; sleep 3; done && echo"
+  ok=0; for i in \$(seq 1 20); do if curl -ksf https://127.0.0.1:8443/healthz >/dev/null; then ok=1; break; fi; sleep 3; done; \
+  if [ \"\$ok\" != 1 ]; then echo 'DEPLOY HEALTHCHECK FAILED: app did not answer /healthz after ~60s' >&2; exit 1; fi; \
+  echo 'healthy'"

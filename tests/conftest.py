@@ -100,11 +100,6 @@ def kratos_init(fixture_loader: Callable[[str], dict[str, Any]]) -> dict[str, An
 
 
 @pytest.fixture
-def kratos_success(fixture_loader: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
-    return fixture_loader("kratos_login_success")
-
-
-@pytest.fixture
 def oauth_token(fixture_loader: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
     return fixture_loader("oauth_token")
 

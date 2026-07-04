@@ -320,7 +320,7 @@ class Settings(BaseSettings):
     # peer IP is used. Set to your proxy's IP(s) when fronting soc-ai with a
     # reverse proxy, else per-IP throttling buckets ALL clients under the proxy
     # IP. XFF is never trusted from a peer not in this list (it can be forged).
-    proxy_trusted_ips: list[str] = []
+    proxy_trusted_ips: Annotated[list[str], NoDecode] = []
     session_ttl_hours: int = 12
     bootstrap_admin_password: SecretStr | None = None
     config_secret_key: SecretStr | None = None
@@ -400,6 +400,28 @@ class Settings(BaseSettings):
     """Sampling temperature for the INVESTIGATOR (tool selection / pivots).
     Moderate — keep some exploration so it doesn't tunnel on one path, but low
     enough that the investigation is broadly reproducible."""
+
+    verdict_consistency_samples: int = 1
+    """Number of independent final-verdict synthesis samples for a
+    self-consistency majority vote; 1 disables the vote (the default —
+    a single synthesis call, no vote, and the ``inconclusive`` verdict is
+    never produced). When >1, the synth-first pipeline re-runs the FINAL
+    verdict synthesis (same inputs/prompt) that many times and majority-votes
+    the verdict: a strict majority wins (confidence = mean of the agreeing
+    samples); a split lands ``inconclusive`` (confidence capped at 0.5).
+    Bounded [1, 5] — each extra sample is a full synthesizer LLM call."""
+
+    @field_validator("verdict_consistency_samples", mode="before")
+    @classmethod
+    def _clamp_verdict_consistency_samples(cls, v: Any) -> Any:
+        """Validate verdict_consistency_samples is an integer in [1, 5]."""
+        try:
+            i = int(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verdict_consistency_samples must be an integer in [1, 5]") from exc
+        if i < 1 or i > 5:
+            raise ValueError(f"verdict_consistency_samples must be in [1, 5], got {i}")
+        return i
 
     # --- Two-stage investigation routing -------------------------------
     # The investigator (fast model) gathers evidence with the read tools;
@@ -746,18 +768,23 @@ class Settings(BaseSettings):
     regardless of verdict or rule class."""
 
     # --- Oracle privacy gate -------------------------------------------
-    oracle_internal_suffixes: tuple[str, ...] = (".lan", ".local", ".internal", ".corp")
+    oracle_internal_suffixes: Annotated[tuple[str, ...], NoDecode] = (
+        ".lan",
+        ".local",
+        ".internal",
+        ".corp",
+    )
     """DNS suffixes that identify internal hostnames.
 
     Any FQDN ending in one of these suffixes is redacted to an opaque
     ``HOST_NN`` label before the payload is sent to the frontier model.
     Public domains pass through untouched.  Extend via a comma-separated
     env var: ``ORACLE_INTERNAL_SUFFIXES=.lan,.local,.myco.internal``
-    (pydantic-settings' :class:`NoDecode` + ``_split_csv`` validator handle
-    the parsing).
+    (pydantic-settings' :class:`NoDecode` + the ``_parse_suffixes`` before-validator
+    handle the parsing).
     """
 
-    oracle_extra_hosts: list[str] = []
+    oracle_extra_hosts: Annotated[list[str], NoDecode] = []
     """Bare internal hostnames (without a suffix) to redact before the Oracle.
 
     The redacter already catches a lot automatically: private IPs/MACs, FQDNs on
@@ -850,8 +877,6 @@ class Settings(BaseSettings):
     Example: "high" triages critical + high; "medium" adds medium too.
     """
 
-    _VALID_SEVERITIES: frozenset[str] = frozenset({"critical", "high", "medium", "low"})
-
     @field_validator("auto_triage_min_severity", mode="before")
     @classmethod
     def _validate_auto_triage_min_severity(cls, v: Any) -> Any:
@@ -875,7 +900,9 @@ class Settings(BaseSettings):
 
     # ---- validators ---------------------------------------------------
 
-    @field_validator("es_hosts", "internal_cidrs", "blocklist_sources", mode="before")
+    @field_validator(
+        "es_hosts", "internal_cidrs", "blocklist_sources", "proxy_trusted_ips", mode="before"
+    )
     @classmethod
     def _split_csv(cls, v: Any) -> Any:
         """Accept both JSON-style and comma-separated env values for list fields."""

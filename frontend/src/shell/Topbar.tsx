@@ -39,11 +39,14 @@ export function Topbar() {
   const [healthFailed, setHealthFailed] = useState(false);
 
   useEffect(() => {
-    getWorkspaces().then((list) => {
-      setWorkspaces(list);
-      if (list.length > 0) setWs(list[0].name);
-    });
     let alive = true;
+    getWorkspaces()
+      .then((list) => {
+        if (!alive) return;
+        setWorkspaces(list);
+        if (list.length > 0) setWs(list[0].name);
+      })
+      .catch(() => {});
     const load = () =>
       getNotifications()
         .then((list) => {

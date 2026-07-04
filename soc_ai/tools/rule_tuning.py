@@ -38,7 +38,7 @@ from typing import Any
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools._registry import tool
-from soc_ai.webui import detection_tuning as dt
+from soc_ai.tools.tuning_heuristic import assess
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ async def suggest_rule_tuning(
 
     Derives the rule's alert volume and acknowledged-vs-escalated disposition
     trend from Elasticsearch and runs the shared
-    :func:`soc_ai.webui.detection_tuning.assess` heuristic to produce a
+    :func:`soc_ai.tools.tuning_heuristic.assess` heuristic to produce a
     ``mute`` / ``monitor`` / ``none`` recommendation. ``fp`` (acknowledged,
     not escalated) / ``tp`` (escalated) / ``nmi`` (the remainder) approximate the
     false-positive / true-positive / needs-more-info verdict trend from the
@@ -166,7 +166,7 @@ async def suggest_rule_tuning(
     fp = max(acked - escalated, 0)
     nmi = max(alert_count - acked - max(escalated - acked, 0), 0)
 
-    _is_noisy, recommendation, reason = dt.assess(alert_count, fp, tp, nmi)
+    _is_noisy, recommendation, reason = assess(alert_count, fp, tp, nmi)
 
     summary = (
         f"'{rule_name}' fired {alert_count}× in {lookback_days}d "

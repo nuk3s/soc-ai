@@ -239,6 +239,9 @@ def score_synth_stratum(rows: list[SynthRow], *, scenarios: list[Scenario]) -> S
 
         expected_tp = scenario.ground_truth.verdict == "true_positive"
         # verdict-only escalation ignores the confidence floor; strict TP adds it.
+        # `inconclusive` (self-consistency split) is a non-escalation here —
+        # identical bucketing to needs_more_info (an expected-TP scenario that
+        # lands inconclusive counts as a "missed" false negative).
         escalated = row.verdict == "true_positive"
         emitted_tp = escalated and detail.correct
         if expected_tp and escalated:

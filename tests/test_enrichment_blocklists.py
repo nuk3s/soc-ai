@@ -342,3 +342,31 @@ def test_blocklistdb_canonical_source_found_by_padded_lookup(tmp_path: Path) -> 
     hits = db.lookup_ip("198.051.100.005")
     assert len(hits) == 1
     assert hits[0].source == "abuse.ch Feodo Tracker"
+
+
+def test_empty_blocklist_dir_warns_at_build(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """build_local_enrichment_context emits ONE high-signal warning naming the
+    remediation when no blocklist source loads (e.g. the Docker volume was never
+    seeded), instead of only per-source 'file missing' lines. Regression for the
+    silent-degradation gap: an unseeded deploy loses local IOC reputation.
+    """
+    from types import SimpleNamespace
+
+    from soc_ai.tools.enrichment import build_local_enrichment_context
+
+    settings = SimpleNamespace(
+        blocklist_data_dir=tmp_path,  # empty dir → nothing loads
+        blocklist_sources=["urlhaus", "feodo"],
+        spamhaus_license_acknowledged=False,
+        maxmind_data_dir=tmp_path,
+        cloud_prefix_data_dir=tmp_path,
+    )
+    caplog.set_level("WARNING")
+    ctx = build_local_enrichment_context(settings)  # type: ignore[arg-type]
+    assert ctx.blocklist.loaded_sources == []
+    assert any(
+        "local IOC reputation is DISABLED" in rec.message and "blocklists refresh" in rec.message
+        for rec in caplog.records
+    )

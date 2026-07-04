@@ -7,6 +7,7 @@ by patching :class:`elasticsearch.AsyncElasticsearch`. No live grid is touched.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -17,7 +18,7 @@ import respx
 from elasticsearch import NotFoundError
 from soc_ai.config import Settings
 from soc_ai.errors import SoAuthError
-from soc_ai.so_client.auth import ConnectAuth, KratosAuth, make_auth
+from soc_ai.so_client.auth import _SRV_TOKEN_TTL_S, ConnectAuth, KratosAuth, make_auth
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 
 # =====================================================================
@@ -525,6 +526,140 @@ async def test_kratos_reads_are_concurrent(settings_kratos: Settings) -> None:
     assert max_in_flight > 1, (
         f"Expected reads to run concurrently (max_in_flight>1), got {max_in_flight}"
     )
+    await auth.aclose()
+
+
+# =====================================================================
+# srv-token TTL refresh — SO 3.0 expires the CSRF srv-token after 600s
+# and signals expiry with a generic 400 (not 401), so KratosAuth must
+# refresh proactively on age and reactively on the 400 sentinel.
+# =====================================================================
+
+
+def _primed_kratos(settings: Settings) -> KratosAuth:
+    """KratosAuth with an established fake session (login bypassed)."""
+    auth = KratosAuth(settings)
+    auth._logged_in = True
+    auth._session_token = "test-session-token"
+    auth._srv_token = "srv-old"
+    auth._srv_token_at = time.monotonic()  # fresh by default
+    return auth
+
+
+@pytest.mark.asyncio
+async def test_kratos_stale_srv_token_refreshed_before_write(
+    settings_kratos: Settings,
+) -> None:
+    """A write issued after the TTL re-fetches /api/info BEFORE sending."""
+    auth = _primed_kratos(settings_kratos)
+    auth._srv_token_at = time.monotonic() - (_SRV_TOKEN_TTL_S + 60)  # stale
+
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def fake_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+        calls.append((method.upper(), url, dict(kwargs.get("headers") or {})))
+        req = httpx.Request(method, "http://x")
+        if url == "/api/info":
+            return httpx.Response(200, json={"srvToken": "srv-new"}, request=req)
+        return httpx.Response(200, json={}, request=req)
+
+    auth._client.request = fake_request  # type: ignore[method-assign]
+
+    resp = await auth.request("POST", "/api/events/ack", json={})
+
+    assert resp.status_code == 200
+    assert [(m, u) for m, u, _ in calls] == [
+        ("GET", "/api/info"),  # proactive refresh fires first
+        ("POST", "/api/events/ack"),
+    ]
+    assert calls[1][2].get("X-Srv-Token") == "srv-new"  # write carries new token
+    assert auth._srv_token == "srv-new"
+    assert time.monotonic() - auth._srv_token_at < _SRV_TOKEN_TTL_S  # timestamp reset
+    await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_400_sentinel_refreshes_and_retries_once(
+    settings_kratos: Settings,
+) -> None:
+    """400 'The request could not be processed' → ONE refresh + ONE retry."""
+    auth = _primed_kratos(settings_kratos)  # fresh token → no proactive refresh
+
+    posts = 0
+    info_fetches = 0
+    post_headers: list[dict[str, Any]] = []
+
+    async def fake_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+        nonlocal posts, info_fetches
+        req = httpx.Request(method, "http://x")
+        if url == "/api/info":
+            info_fetches += 1
+            return httpx.Response(200, json={"srvToken": "srv-new"}, request=req)
+        posts += 1
+        post_headers.append(dict(kwargs.get("headers") or {}))
+        if posts == 1:
+            return httpx.Response(400, text="The request could not be processed.", request=req)
+        return httpx.Response(200, json={"acknowledged": True}, request=req)
+
+    auth._client.request = fake_request  # type: ignore[method-assign]
+
+    resp = await auth.request("POST", "/api/events/ack", json={}, headers={"X-Custom": "keep-me"})
+
+    assert resp.status_code == 200  # the retry's success is what's returned
+    assert info_fetches == 1  # exactly one srv-token refresh
+    assert posts == 2  # exactly one retry
+    # Caller headers were snapshotted before the first send and survive the retry.
+    assert post_headers[0].get("X-Custom") == "keep-me"
+    assert post_headers[1].get("X-Custom") == "keep-me"
+    assert post_headers[1].get("X-Srv-Token") == "srv-new"  # retry uses new token
+    await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_persistent_400_retries_only_once(settings_kratos: Settings) -> None:
+    """If the retry also 400s, return it — no refresh/retry loop."""
+    auth = _primed_kratos(settings_kratos)
+
+    posts = 0
+    info_fetches = 0
+
+    async def fake_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+        nonlocal posts, info_fetches
+        req = httpx.Request(method, "http://x")
+        if url == "/api/info":
+            info_fetches += 1
+            return httpx.Response(200, json={"srvToken": "srv-new"}, request=req)
+        posts += 1
+        return httpx.Response(400, text="The request could not be processed.", request=req)
+
+    auth._client.request = fake_request  # type: ignore[method-assign]
+
+    resp = await auth.request("POST", "/api/events/ack", json={})
+
+    assert resp.status_code == 400
+    assert posts == 2  # first send + exactly one retry
+    assert info_fetches == 1  # exactly one refresh
+    await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_fresh_write_skips_refresh(settings_kratos: Settings) -> None:
+    """A normal 2xx write with a fresh srv-token triggers no extra refresh."""
+    auth = _primed_kratos(settings_kratos)
+
+    calls: list[str] = []
+
+    async def fake_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+        calls.append(url)
+        return httpx.Response(200, json={}, request=httpx.Request(method, "http://x"))
+
+    auth._client.request = fake_request  # type: ignore[method-assign]
+
+    resp = await auth.request("POST", "/api/events/ack", json={})
+
+    assert resp.status_code == 200
+    assert calls == ["/api/events/ack"]  # no /api/info fetch, no retry
+    assert auth._srv_token == "srv-old"
     await auth.aclose()
 
 

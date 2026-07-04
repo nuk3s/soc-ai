@@ -20,7 +20,10 @@ from typing import Any, Literal, Protocol
 
 from soc_ai.tools.get_alert_context import EnrichedAlertContext
 
-Verdict = Literal["true_positive", "false_positive", "needs_more_info"]
+# Templates only ever emit the first three; ``inconclusive`` is included so the
+# alias stays assignment-compatible with soc_ai.agent.triage.Verdict (it is the
+# self-consistency vote's split outcome, never a template verdict).
+Verdict = Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
 
 
 @dataclass(frozen=True)

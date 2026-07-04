@@ -9,10 +9,13 @@ picture locally:
 * **verdict trend** — how its completed investigations landed
   (:func:`soc_ai.store.investigations.verdict_counts_by_rule`).
 
-:func:`assess` joins the two with a deliberately coarse heuristic and recommends
-``mute`` (clearly all-FP + high volume), ``monitor`` (FP-leaning but uncertain),
-or ``none``. :func:`nominate` runs it across the live feed and returns the noisy
-rules for the Detection Tuning panel, flagging the ones already muted.
+:func:`~soc_ai.tools.tuning_heuristic.assess` joins the two with a deliberately
+coarse heuristic and recommends ``mute`` (clearly all-FP + high volume),
+``monitor`` (FP-leaning but uncertain), or ``none``. The heuristic itself lives
+in the dependency-free :mod:`soc_ai.tools.tuning_heuristic` (shared with the
+``suggest_rule_tuning`` agent tool) and is re-exported here for compatibility.
+:func:`nominate` runs it across the live feed and returns the noisy rules for
+the Detection Tuning panel, flagging the ones already muted.
 
 A *mute* is a soft, soc-ai-side suppression (see
 :mod:`soc_ai.store.detection_overrides`) — NOTHING is written to Security Onion.
@@ -24,90 +27,27 @@ from typing import Any
 
 from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import investigations as inv_svc
+
+# Re-exported for compatibility: the heuristic + thresholds moved to the
+# dependency-free soc_ai.tools.tuning_heuristic so the tool layer (and MCP
+# server) no longer imports webui/store just to reuse assess().
+from soc_ai.tools.tuning_heuristic import (
+    MIN_ALERTS,
+    MIN_FP,
+    MIN_INVESTIGATIONS,
+    MUTE_MIN_ALERTS,
+    assess,
+)
 from soc_ai.webui import alerts_query as aq
 
-# Noisiness thresholds — deliberately coarse; this is a nomination, not a verdict.
-#
-# A rule must clear MIN_ALERTS firings in the window to be "high volume" at all
-# (a rule that fired 4× is not a tuning problem however its triage landed).
-# MUTE_MIN_ALERTS is the higher bar for a confident mute recommendation. A rule
-# is only nominated once it has been investigated MIN_INVESTIGATIONS times with
-# at least MIN_FP false positives and ZERO true positives — we never nominate a
-# rule that has ever caught a real positive, however noisy.
-MIN_ALERTS = 25  # floor to be considered "noisy" at all
-MUTE_MIN_ALERTS = 100  # high-volume floor for a confident "mute"
-MIN_INVESTIGATIONS = 3  # need a few data points before trusting the FP trend
-MIN_FP = 3  # at least this many false positives in the trend
-
-
-def assess(alert_count: int, fp: int, tp: int, nmi: int) -> tuple[bool, str, str]:
-    """Decide whether a rule is noisy and what to recommend.
-
-    Pure function (no I/O) so it is trivially testable. Inputs are the rule's
-    alert ``alert_count`` over the window and its completed-investigation verdict
-    tally: ``fp`` false-positive, ``tp`` true-positive, ``nmi`` needs-more-info.
-
-    Returns ``(is_noisy, recommendation, reason)`` where ``recommendation`` is one
-    of ``"mute"`` / ``"monitor"`` / ``"none"`` and ``reason`` is a one-line human
-    explanation. A rule with ANY true positive is never noisy (it has caught real
-    signal — tuning it would risk a miss). A rule below the volume floor, or never
-    investigated, is ``none``.
-    """
-    investigations = fp + tp + nmi
-
-    # A rule that ever caught a real positive is never a mute/monitor candidate —
-    # however noisy, suppressing it risks dropping a true positive.
-    if tp > 0:
-        return (
-            False,
-            "none",
-            (
-                f"fired {alert_count}×, investigated {investigations}× — "
-                f"{tp} true positive: keep (caught real signal)"
-            ),
-        )
-
-    # Below the volume floor it is not a tuning problem, whatever the verdicts.
-    if alert_count < MIN_ALERTS:
-        return (
-            False,
-            "none",
-            f"fired {alert_count}× — below the noisy-rule volume floor ({MIN_ALERTS})",
-        )
-
-    # High volume but not yet enough triage history to trust the trend → monitor.
-    if investigations < MIN_INVESTIGATIONS or fp < MIN_FP:
-        return (
-            False,
-            "monitor",
-            (
-                f"fired {alert_count}×, investigated {investigations}× "
-                f"({fp} FP / {nmi} NMI, 0 TP) — high volume but thin triage history; "
-                "watch it"
-            ),
-        )
-
-    # Clearly all-false-positive AND high volume → confident mute.
-    if alert_count >= MUTE_MIN_ALERTS:
-        return (
-            True,
-            "mute",
-            (
-                f"fired {alert_count}×, investigated {investigations}× — "
-                f"all false positive ({fp} FP / {nmi} NMI), 0 true positive"
-            ),
-        )
-
-    # All-FP and over the noisy floor but under the high-volume bar → monitor.
-    return (
-        True,
-        "monitor",
-        (
-            f"fired {alert_count}×, investigated {investigations}× — "
-            f"all false positive ({fp} FP / {nmi} NMI), 0 true positive, "
-            f"but under the high-volume bar ({MUTE_MIN_ALERTS})"
-        ),
-    )
+__all__ = [
+    "MIN_ALERTS",
+    "MIN_FP",
+    "MIN_INVESTIGATIONS",
+    "MUTE_MIN_ALERTS",
+    "assess",
+    "nominate",
+]
 
 
 async def nominate(state: Any) -> list[dict[str, Any]]:
