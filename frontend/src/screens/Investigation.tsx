@@ -33,7 +33,6 @@ import { Spinner } from '../components/States';
 import {
   type ChatThread,
   ackGroup,
-  approveAction,
   escalateGroup,
   executeAction,
   getChatThread,
@@ -45,6 +44,7 @@ import {
   startHunt,
 } from '../lib/api';
 import { clearChatDraft, loadChatDraft, saveChatDraft } from '../lib/chatDraft';
+import { absTime } from '../lib/timeRange';
 import { TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import type {
   ActionTag,
@@ -162,16 +162,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     return () => clearInterval(t);
   }, [running]);
 
-  // Stuck-guard timer: if the run is still 'investigating' after a generous cap,
-  // stop the spinner and surface the "seems stuck — re-run" state. Keyed on
-  // inv.id so re-running (a fresh id) resets the clock; the reset effect below
-  // also clears `stuck` on identity change.
+  // Stuck-guard timer: flips true only when the run is 'investigating' AND has
+  // made NO visible progress (no new timeline step from the poll) for the cap.
+  // The old guard was a flat wall-clock timer, so a legitimately long run on a
+  // contended gateway (each turn can take minutes) got branded "seems stuck"
+  // while it was still streaming steps — which taught analysts to distrust the
+  // banner. Keyed on the latest step id: every new step resets the clock and
+  // clears a prior stuck verdict; a fresh run id does too.
+  const lastStepId = inv.timeline.length > 0 ? inv.timeline[inv.timeline.length - 1].id : '';
   useEffect(() => {
     if (!investigating) return;
-    const STUCK_AFTER_MS = 5 * 60_000; // 5 min
+    setStuck(false); // progress arrived (or a fresh run) — clear a stale verdict
+    const STUCK_AFTER_MS = 5 * 60_000; // 5 min without a single new step
     const t = setTimeout(() => setStuck(true), STUCK_AFTER_MS);
     return () => clearTimeout(t);
-  }, [investigating, inv.id]);
+  }, [investigating, inv.id, lastStepId]);
 
   // Persist the draft so it survives the component unmounting (drawer close).
   // Skip the render where inv.id JUST changed: at that point `draft` still holds
@@ -578,12 +583,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   // Token-gated actions execute when the approval is approved; advisory ones (a
   // completed run's recommendations) execute on demand through the same write
-  // path, after an explicit confirm — these write to the live Security Onion grid.
+  // path. The card's explicit Approve click IS the human consent — these write
+  // to the live Security Onion grid.
   const runAdvisory = (a: RecommendedAction, index: number) => {
-    if (
-      !window.confirm(`Execute "${a.title}" against Security Onion?\n\nThis writes to your live grid.`)
-    )
-      return;
     setActions((s) => ({ ...s, [a.id]: 'executing' }));
     setActionMsg((m) => ({ ...m, [a.id]: '' }));
     executeAction(inv.id, index)
@@ -613,18 +615,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             action={a}
             decision={actions[a.id]}
             message={actionMsg[a.id]}
-            onApprove={() => {
-              if (a.token) {
-                setActions((s) => ({ ...s, [a.id]: 'approved' }));
-                approveAction(a.token, true).catch(() => {});
-              } else {
-                runAdvisory(a, i);
-              }
-            }}
-            onReject={() => {
-              setActions((s) => ({ ...s, [a.id]: 'rejected' }));
-              if (a.token) approveAction(a.token, false).catch(() => {});
-            }}
+            onApprove={() => runAdvisory(a, i)}
+            onReject={() => setActions((s) => ({ ...s, [a.id]: 'rejected' }))}
           />
         ))}
       </div>
@@ -634,15 +626,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // A complete run that recommended NO write actions still leaves the analyst
   // with a decision to make. This fallback bar routes an ack (close it out) or
   // an escalate (open a case) through the same group write path the Alerts
-  // console uses — writing to the live Security Onion grid, after a confirm.
+  // console uses — writing to the live Security Onion grid. The labeled button
+  // click is the consent; no extra popup.
   const runSettled = (kind: 'ack' | 'escalate') => {
-    const verb = kind === 'ack' ? 'Acknowledge' : 'Escalate';
-    if (
-      !window.confirm(
-        `${verb} "${inv.name}" against Security Onion?\n\nThis writes to your live grid.`,
-      )
-    )
-      return;
     setSettledAction(kind);
     setSettledMsg(null);
     const group = { name: inv.name, kind: inv.kind };
@@ -1059,8 +1045,7 @@ function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Sever
     ['dest', <span className="text-mono-green">{alert.dst}</span>],
     ['proto', alert.proto],
     ['action', alert.action],
-    ['first seen', alert.firstSeen],
-    ['last seen', alert.lastSeen],
+    ['alert time', <span title={alert.time ?? undefined}>{absTime(alert.time)}</span>],
     ['events', `${alert.count}`],
   ];
   return (
@@ -1273,7 +1258,7 @@ function InvMetaPanel({ meta, id }: { meta: InvMeta; id: string }) {
     ['tool calls', `${meta.toolCalls}`],
     ['pivots', `${meta.pivots}`],
     ['run by', meta.ranBy],
-    ['ran at', meta.ranAt],
+    ['ran at', absTime(meta.ranAt)],
   ];
   return (
     <CollapsiblePanel

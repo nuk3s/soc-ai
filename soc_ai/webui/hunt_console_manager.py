@@ -16,6 +16,7 @@ import logging
 from typing import Any
 
 from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT, build_chat_agent
+from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.prompts import oql_primer_block
 from soc_ai.api.deps import ctx_from_state
@@ -256,6 +257,15 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
         prior = history[:-1][-_MAX_HISTORY:] if history and history[-1][0] == "user" else history
 
         seed_context = _hunt_chat_seed_context(hunt)
+        # Cloud-egress guard (opt-in): same pattern as the orchestrator/hunt
+        # runner. Attach BEFORE building the agent so register_read_tools
+        # wraps the tool closures. `is True` (not truthiness) so a MagicMock
+        # settings double in tests can never flip redaction on.
+        if settings.analyst_cloud_redaction is True and ctx.egress_guard is None:
+            ctx.egress_guard = await EgressGuard.for_settings(
+                settings, getattr(state, "db_sessionmaker", None)
+            )
+        guard = ctx.egress_guard
         # The chat agent runs OQL too — give it the primer AND the auto-discovered
         # dataset inventory so a follow-up like "what about SSH?" both writes a valid
         # query and knows zeek.ssh (or endpoint/windows/etc.) actually exists here.
@@ -264,12 +274,25 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
             + oql_primer_block()
             + await inventory_prompt_block(ctx.elastic, settings)
         )
+        if guard is not None:
+            # The seed block (stored hunt narrative/findings/hosts) and the
+            # inventory both carry internal identifiers — sanitize the
+            # composed system prompt at the egress boundary.
+            sys_prompt = guard.sanitize_text(sys_prompt)
         # proposal_sink=None → the read-only chat agent WITHOUT propose_verdict:
         # a hunt never dispositions an alert, so there is no verdict to propose.
         agent = build_chat_agent(build_investigator_model(settings), ctx, system_prompt=sys_prompt)
+        turn_prompt = _hunt_chat_build_prompt(prior, question)
+        if guard is not None:
+            # The analyst's question + prior turns carry real identifiers.
+            turn_prompt = guard.sanitize_text(turn_prompt)
         async with asyncio.timeout(settings.hunt_chat_turn_timeout_s):
-            result = await agent.run(_hunt_chat_build_prompt(prior, question))
+            result = await agent.run(turn_prompt)
         answer = (str(result.output) or "").strip() or "(no answer produced)"
+        if guard is not None:
+            # The reply is in label space — restore real values before it is
+            # persisted/displayed.
+            answer = str(guard.desanitize_obj(answer))
         meta: dict[str, Any] = {"tools": _hunt_chat_extract_tools(result)}
         async with state.db_sessionmaker() as db:
             await hunt_svc.finish_chat_assistant(

@@ -27,10 +27,14 @@ from typing import get_args
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_TOOLS_DOC = REPO_ROOT / "docs" / "AGENT_TOOLS.md"
 
-# The three modules that register tools on a pydantic-ai agent as `t_*`
-# functions. A new agent module that registers tools must be added here (the
-# sanity test below keeps the scan honest).
+# The modules that register tools on a pydantic-ai agent as `t_*` functions.
+# Since the toolset unification every read tool is defined once in
+# soc_ai/agent/toolset.py; the three agent modules are kept in the scan so a
+# future inline registration is still caught. A new agent module that
+# registers tools must be added here (the sanity test below keeps the scan
+# honest).
 AGENT_TOOL_SOURCES = (
+    REPO_ROOT / "soc_ai" / "agent" / "toolset.py",
     REPO_ROOT / "soc_ai" / "agent" / "orchestrator.py",
     REPO_ROOT / "soc_ai" / "agent" / "hunt.py",
     REPO_ROOT / "soc_ai" / "agent" / "chat_agent.py",
@@ -184,7 +188,7 @@ def test_not_callable_note_still_documents_skip_set() -> None:
 #     written to the audit log, so it is deliberately out of scope — if hunts
 #     ever start auditing, add the file here and the kinds to AuditKind.
 #   * `.log_kind(<session>, "<kind>"` anywhere — direct audit writes
-#     (e.g. soc_ai/api/approvals.py).
+#     (e.g. soc_ai/tools/write_exec.py).
 #   * `StepEvent(kind="<kind>"` anywhere — direct literal constructions.
 #   * `record_event("<kind>"` anywhere — Prometheus metrics. Metric kinds are
 #     plain counter labels (MetricsRecorder.record_event takes `kind: str`),

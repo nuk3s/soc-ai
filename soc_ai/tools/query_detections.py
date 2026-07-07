@@ -30,10 +30,40 @@ async def query_detections(
         raise ValueError(f"max_results must be positive, got {max_results}")
 
     if query and query.strip() and query.strip() != "*":
+        # Both doc shapes. Live SO 3.x nests fields under `so_detection.*` and
+        # maps the metadata as KEYWORD (exact-value only — a multi_match never
+        # hits a substring), so those need case-insensitive wildcards; the rule
+        # body `so_detection.content` is text-mapped and full-text searchable.
+        # Flat paths keep older docs (and the SO /connect API shape) working.
+        q = query.strip()
         es_query: dict[str, Any] = {
-            "multi_match": {
-                "query": query,
-                "fields": ["title", "publicId", "author", "tags"],
+            "bool": {
+                "should": [
+                    {
+                        "multi_match": {
+                            "query": q,
+                            "fields": [
+                                "title",
+                                "publicId",
+                                "author",
+                                "tags",
+                                "so_detection.content",
+                            ],
+                        }
+                    },
+                    {
+                        "wildcard": {
+                            "so_detection.title": {"value": f"*{q}*", "case_insensitive": True}
+                        }
+                    },
+                    {"term": {"so_detection.publicId": q}},
+                    {
+                        "wildcard": {
+                            "so_detection.author": {"value": f"*{q}*", "case_insensitive": True}
+                        }
+                    },
+                ],
+                "minimum_should_match": 1,
             }
         }
     else:

@@ -167,13 +167,6 @@ def patch_investigate(monkeypatch: pytest.MonkeyPatch) -> list[StepEvent]:
 
     monkeypatch.setattr(harness_mod, "investigate", _fake_investigate)
     monkeypatch.setattr(harness_mod, "_build_context", _fake_build_context)
-    # build_investigator/build_synthesizer would call into PydanticAI;
-    # the stubbed investigate() ignores them, but they still get
-    # constructed and would try to build a model. Stub the pair.
-    monkeypatch.setattr(harness_mod, "build_investigator_model", lambda _s: None)
-    monkeypatch.setattr(harness_mod, "build_synthesizer_model", lambda _s: None)
-    monkeypatch.setattr(harness_mod, "build_investigator", lambda _m, _c: None)
-    monkeypatch.setattr(harness_mod, "build_synthesizer", lambda _m: None)
     return events
 
 
@@ -461,10 +454,6 @@ async def test_run_with_no_triage_report_still_succeeds(
 
     monkeypatch.setattr(harness_mod, "investigate", _fake_investigate)
     monkeypatch.setattr(harness_mod, "_build_context", _fake_build_context)
-    monkeypatch.setattr(harness_mod, "build_investigator_model", lambda _s: None)
-    monkeypatch.setattr(harness_mod, "build_synthesizer_model", lambda _s: None)
-    monkeypatch.setattr(harness_mod, "build_investigator", lambda _m, _c: None)
-    monkeypatch.setattr(harness_mod, "build_synthesizer", lambda _m: None)
 
     caller = _stub_oracle("partial-trail critique")
     result = await harness_run(

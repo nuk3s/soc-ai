@@ -20,6 +20,7 @@ from soc_ai.api.webui.routes_discovery import (
 )
 from soc_ai.config import Settings
 from soc_ai.store import internal_identifiers as ids_store
+from soc_ai.store.models import InternalIdentifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -99,7 +100,9 @@ async def list_internal_identifiers(
     always-on env/reserved entries: the values in the effective set that are NOT
     represented by a DB row. Always-on entries have no id and no active toggle —
     that's why ``.lan`` shows as an always-on row the operator can't deactivate.
-    Also returns the discovery ``last_scan`` status (reusing the 2b status object).
+    Dismissed tombstones are excluded (``list_identifiers`` default) — a
+    dismissed row never reaches the UI. Also returns the discovery
+    ``last_scan`` status (reusing the 2b status object).
     """
     from soc_ai.oracle.identifiers import (  # noqa: PLC0415 - lazy
         effective_internal_identifiers,
@@ -212,12 +215,43 @@ async def activate_internal_identifier(request: Request, ident_id: int) -> Inter
     return await _set_identifier_state(request, ident_id, "active")
 
 
+@router.post(
+    "/internal-identifiers/{ident_id}/dismiss",
+    dependencies=[Depends(require_admin_api)],
+)
+async def dismiss_internal_identifier(request: Request, ident_id: int) -> dict[str, Any]:
+    """Dismiss a DETECTED identifier — a terminal tombstone.
+
+    Unlike mute (which keeps the suggestion visible and subtracts it from the
+    effective set), a dismissed row vanishes from the list and is never
+    refreshed or resurrected by a re-scan; only an explicit manual add of the
+    same value brings it back. Unknown id → 404; a manual row → 409 (manual
+    rows are deleted, not dismissed).
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        row = await ids_store.dismiss(db, ident_id)
+        if row is not None:
+            return {"ok": True}
+        # dismiss() returns None for BOTH a missing id and a manual row —
+        # disambiguate for the HTTP status.
+        existing = await db.get(InternalIdentifier, ident_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "not_dismissable",
+                "hint": "Manual identifiers cannot be dismissed — delete them instead.",
+            },
+        )
+
+
 @router.delete(
     "/internal-identifiers/{ident_id}",
     dependencies=[Depends(require_admin_api)],
 )
 async def delete_internal_identifier(request: Request, ident_id: int) -> dict[str, Any]:
-    """Delete a manual identifier. Refuses a detected row → 409 (deactivate it)."""
+    """Delete a manual identifier. Refuses a detected row → 409 (dismiss it)."""
     async with request.app.state.db_sessionmaker() as db:
         deleted = await ids_store.delete_manual(db, ident_id)
         if not deleted:
@@ -225,7 +259,7 @@ async def delete_internal_identifier(request: Request, ident_id: int) -> dict[st
                 status_code=409,
                 detail={
                     "reason": "not_deletable",
-                    "hint": "Detected identifiers cannot be deleted — deactivate them instead.",
+                    "hint": "Detected identifiers cannot be deleted — dismiss them instead.",
                 },
             )
     return {"ok": True}

@@ -4,10 +4,10 @@ The core primitive is ``recorded_run``: given an already-created async
 iterator of StepEvents, it wraps them with the investigation recorder tee and
 yields ``(event_name, data_dict)`` pairs ready for SSE encoding or draining.
 
-``run_recorded`` is the higher-level convenience that also builds the
-investigator/synthesizer and calls ``investigate()``.  Routes keep their own
-patchable bindings for ``investigate`` etc. (needed by existing tests); the
-auto-triage worker calls this module's ``investigate`` directly.
+``run_recorded`` is the higher-level convenience that calls ``investigate()``
+itself.  Routes keep their own patchable ``investigate`` binding (needed by
+existing tests); the auto-triage worker calls this module's ``investigate``
+directly.
 """
 
 from __future__ import annotations
@@ -22,10 +22,6 @@ from typing import Any
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
     StepEvent,
-    build_investigator,
-    build_investigator_model,
-    build_synthesizer,
-    build_synthesizer_model,
     investigate,
 )
 from soc_ai.api.recorder import InvestigationRecorder
@@ -62,8 +58,7 @@ async def recorded_run(
     Yields ``(event_name, data_dict)`` pairs.  The leading
     ``investigation_created`` event is always first.  The caller is
     responsible for building the event stream (so the route can keep its
-    own patchable bindings for ``investigate``, ``build_investigator_model``
-    etc. without circular imports).
+    own patchable ``investigate`` binding without circular imports).
     """
     recorder = InvestigationRecorder(
         state.db_sessionmaker,
@@ -112,12 +107,11 @@ async def run_recorded(
     ctx: InvestigationContext,
     alert_id: str,
     started_by: str,
-    session_id: str | None = None,
     cancel_token: CancelToken | None = None,
     rule_name: str | None = None,
     focus_hint: str | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """Build investigator/synthesizer, call investigate(), and tee through the recorder.
+    """Call investigate() and tee it through the recorder.
 
     Used by the auto-triage worker.  The SSE route has its own ``stream()``
     that calls ``recorded_run`` directly so that unittest patches on
@@ -127,15 +121,9 @@ async def run_recorded(
     ``needs_more_info`` investigation ("request more info") — threaded into
     ``investigate()`` so the fresh run targets those gaps.
     """
-    investigator = build_investigator(build_investigator_model(ctx.settings), ctx)
-    synthesizer = build_synthesizer(build_synthesizer_model(ctx.settings))
-
     event_gen = investigate(
         alert_id,
         ctx=ctx,
-        investigator=investigator,
-        synthesizer=synthesizer,
-        session_id=session_id,
         focus_hint=focus_hint,
     )
 

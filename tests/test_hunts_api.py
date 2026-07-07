@@ -83,8 +83,11 @@ def test_hunt_prompt_is_inventory_first_and_teaches_correlation() -> None:
     # Inventory-first: read the auto-discovered inventory before planning/querying.
     assert "READ THE INVENTORY FIRST" in p
     assert "Data available on this grid" in p
-    # Absent-dataset handling: report the visibility gap instead of guessing.
-    assert "A visibility gap is a real result." in p
+    # Absent-dataset handling: report the visibility gap instead of guessing —
+    # and tag it as coverage, never as observed malicious activity.
+    assert "A visibility gap is a real result" in p
+    assert 'category: "visibility_gap"' in p
+    assert "Absence of telemetry is NOT evidence of malicious activity." in p
     # The three correlation patterns (kill-chain, fan-out, decisive beacon/DNS C2).
     assert "Correlation patterns" in p
     assert "Kill-chain over time" in p
@@ -380,6 +383,27 @@ def test_list_hunts_empty(client: TestClient) -> None:
     resp = client.get("/api/v1/hunts")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def test_finding_category_legacy_inference() -> None:
+    """Reports that predate the `category` field: a coverage/visibility finding
+    must never surface as a threat (it produced the dishonest "Malicious
+    activity found" headline over a telemetry gap)."""
+    from soc_ai.api.webui.routes_hunts import _finding_category
+
+    # Explicit categories pass through.
+    assert _finding_category({"category": "observation"}) == "observation"
+    assert _finding_category({"category": "VISIBILITY_GAP"}) == "visibility_gap"
+    # Unknown/missing category: gap-shaped titles infer visibility_gap …
+    assert (
+        _finding_category(
+            {"title": "Critical Visibility Gap: No SMB, RDP, SSH, or Kerberos Telemetry"}
+        )
+        == "visibility_gap"
+    )
+    assert _finding_category({"title": "No host process logging on the estate"}) == "visibility_gap"
+    # … everything else stays a threat finding (old behavior).
+    assert _finding_category({"title": "Beaconing to rare external IP"}) == "threat"
 
 
 def test_list_and_get_hunt(client: TestClient) -> None:

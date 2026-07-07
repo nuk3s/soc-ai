@@ -132,16 +132,23 @@ def _row(
 
 
 def _primary_run_ids(rows: list[Investigation]) -> set[str]:
-    """The canonical run id per alert: the most recent COMPLETE run, else the most
-    recent run of any status. ``rows`` are newest-first (``list_recent`` order)."""
-    best_complete: dict[str, str] = {}
+    """The canonical run id per alert: the most recent run that is RUNNING or
+    COMPLETE, else the most recent run of any status. ``rows`` are newest-first
+    (``list_recent`` order).
+
+    A running run that is newer than the last complete one wins — clicking
+    "re-investigate" must surface the in-flight run as the alert's current
+    state, not tuck it under the stale verdict as an "earlier run". Errored/
+    cancelled/interrupted re-runs still nest under the run that worked.
+    """
+    best_live: dict[str, str] = {}
     best_any: dict[str, str] = {}
     for inv in rows:  # newest-first, so first-seen per key is the most recent
         key = getattr(inv, "alert_es_id", None) or inv.id
         best_any.setdefault(key, inv.id)
-        if inv.status == "complete":
-            best_complete.setdefault(key, inv.id)
-    return {best_complete.get(key, run_id) for key, run_id in best_any.items()}
+        if inv.status in ("running", "complete"):
+            best_live.setdefault(key, inv.id)
+    return {best_live.get(key, run_id) for key, run_id in best_any.items()}
 
 
 @router.get("/investigations", response_model=list[InvestigationRowOut])
@@ -178,14 +185,13 @@ async def get_investigation(
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
         inv, events = got
         chat = await chat_svc.list_messages(db, inv.id)
-    pending_tokens = {p.token for p in await request.app.state.gate.pending()}
 
     report = inv.report or {}
     # Live acked state so an ack performed OUTSIDE this run (group-ack, another
     # run's auto-ack, the SO web UI) marks the ack action applied. False on any
     # ES error — the action is simply offered as before.
     alert_acked = await _timeline._alert_currently_acked(elastic, settings, inv.alert_es_id)
-    actions = _build_actions(events, report, pending_tokens, alert_acked=alert_acked)
+    actions = _build_actions(events, report, alert_acked=alert_acked)
 
     # The enriched-alert-context event carries the alert, the host's alert
     # profile, and indicator enrichments — everything the rail + graph need.

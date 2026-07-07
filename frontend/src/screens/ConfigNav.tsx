@@ -14,9 +14,11 @@ interface ConfigNavSection {
 interface ConfigNavProps {
   sections: ConfigNavSection[];
   activeId: string;
+  /** Called before scrolling so the page can expand a collapsed target. */
+  onNavigate?: (id: string) => void;
 }
 
-export function ConfigNav({ sections, activeId }: ConfigNavProps) {
+export function ConfigNav({ sections, activeId, onNavigate }: ConfigNavProps) {
   return (
     <nav className="sticky top-5 flex flex-col gap-0.5">
       <div className="px-2 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[.07em] text-faint">
@@ -30,7 +32,12 @@ export function ConfigNav({ sections, activeId }: ConfigNavProps) {
             href={`#${s.id}`}
             onClick={(e) => {
               e.preventDefault();
-              document.getElementById(s.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              // Expand a collapsed target first, then scroll (the freshly-shown
+              // body changes layout, so scroll on the next frame).
+              onNavigate?.(s.id);
+              requestAnimationFrame(() => {
+                document.getElementById(s.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              });
               history.replaceState(null, '', `#${s.id}`);
             }}
             className="rounded-control px-[9px] py-[6px] text-[12.5px] font-medium hover:bg-surface-3"

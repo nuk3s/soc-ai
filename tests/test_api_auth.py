@@ -67,24 +67,24 @@ def _mint_token(settings: Settings) -> str:
 
 
 def test_flag_off_keeps_api_open(open_client: TestClient) -> None:
-    assert open_client.get("/sessions/any").status_code == 200
+    assert open_client.get("/metrics").status_code == 200
 
 
 def test_flag_on_rejects_anonymous(auth_client: TestClient) -> None:
-    resp = auth_client.get("/sessions/any")
+    resp = auth_client.get("/metrics")
     assert resp.status_code == 401
     assert resp.json()["detail"]["reason"] == "no_session"
 
 
 def test_flag_on_rejects_bad_token(auth_client: TestClient) -> None:
-    resp = auth_client.get("/sessions/any", headers={"Authorization": "Bearer scai_bogus"})
+    resp = auth_client.get("/metrics", headers={"Authorization": "Bearer scai_bogus"})
     assert resp.status_code == 401
     assert resp.json()["detail"]["reason"] == "invalid_token"
 
 
 def test_flag_on_accepts_api_token(auth_client: TestClient, auth_settings: Settings) -> None:
     raw = _mint_token(auth_settings)
-    resp = auth_client.get("/sessions/any", headers={"Authorization": f"Bearer {raw}"})
+    resp = auth_client.get("/metrics", headers={"Authorization": f"Bearer {raw}"})
     assert resp.status_code == 200
 
 
@@ -94,7 +94,7 @@ def test_flag_on_accepts_session_cookie(auth_client: TestClient) -> None:
         json={"username": "admin", "password": ADMIN_PW},
     )
     assert login.status_code == 200
-    assert auth_client.get("/sessions/any").status_code == 200
+    assert auth_client.get("/metrics").status_code == 200
 
 
 def test_healthz_stays_open(auth_client: TestClient) -> None:

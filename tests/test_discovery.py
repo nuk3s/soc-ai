@@ -36,6 +36,7 @@ from soc_ai.enrichment.discovery import (
     _CidrCandidate,
     _ingest_ip_buckets,
     _is_rfc1918,
+    _junk_host_reason,
     _load_public_tlds,
     _slash24,
     classify_host,
@@ -427,6 +428,44 @@ def test_classify_host_active_and_muted() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Junk-host hardening (host-candidate drop rules)
+# ---------------------------------------------------------------------------
+
+
+def test_junk_host_reason_ip_literals() -> None:
+    """Any parseable IP literal — including link-local IPv6 — is junk as a host."""
+    assert _junk_host_reason("fe80::1ff:fe23:4567:890a") == "ip-literal"
+    assert _junk_host_reason("fe80::1") == "ip-literal"
+    assert _junk_host_reason("::1") == "ip-literal"
+    assert _junk_host_reason("192.168.1.10") == "ip-literal"
+    assert _junk_host_reason("8.8.8.8") == "ip-literal"
+
+
+def test_junk_host_reason_bare_public_tld() -> None:
+    """A bare public-TLD string as host.name is a parsing artifact, not a host —
+    but a reserved single label (lan/corp) is a legitimate bare name."""
+    assert _junk_host_reason("com") == "bare-public-tld"
+    assert _junk_host_reason("io") == "bare-public-tld"
+    assert _junk_host_reason("COM") == "bare-public-tld"  # case-insensitive
+    assert _junk_host_reason("lan") is None
+    assert _junk_host_reason("corp") is None
+
+
+def test_junk_host_reason_netbios_junk() -> None:
+    assert _junk_host_reason("WORKGROUP") == "netbios-workgroup"
+    assert _junk_host_reason("workgroup") == "netbios-workgroup"  # case-insensitive
+    assert _junk_host_reason("\\x01\\x02__MSBROWSE__\\x02") == "netbios-msbrowse"
+    assert _junk_host_reason("__msbrowse__") == "netbios-msbrowse"
+    assert _junk_host_reason("\\x01weird") == "netbios-escape"
+
+
+def test_junk_host_reason_legit_hosts_pass() -> None:
+    assert _junk_host_reason("WIN11-01") is None
+    assert _junk_host_reason("dc01") is None
+    assert _junk_host_reason("printer-3f") is None
+
+
+# ---------------------------------------------------------------------------
 # run_discovery — end-to-end with mocked ES
 # ---------------------------------------------------------------------------
 
@@ -565,6 +604,117 @@ async def test_run_discovery_preserves_operator_mute_on_rerun() -> None:
         rows = await ids.list_identifiers(db, kind="suffix")
         row = next(r for r in rows if r.value == ".corp.acme.local")
         assert row.state == "muted"  # operator mute preserved
+
+
+async def test_run_discovery_drops_junk_host_candidates() -> None:
+    """IP literals, bare TLDs, and NetBIOS junk never become host rows —
+    dropped before classification and counted in the summary."""
+    settings = _settings()
+    maker = await _sessionmaker(settings)
+    fake = FakeES(
+        host_buckets=[
+            _bucket("fe80::1ff:fe23:4567:890a", 10, 4),  # link-local IPv6 literal
+            _bucket("com", 5, 4),  # bare public TLD (parsing artifact)
+            _bucket("WORKGROUP", 30, 9),  # NetBIOS default group name
+            _bucket("\\x01\\x02__MSBROWSE__\\x02", 3, 3),  # browser-service junk
+            _bucket("WIN11-01", 30, 4),  # a real host → kept
+        ],
+    )
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+    assert summary.errors == []
+    assert summary.dropped_junk_hosts == 4
+    assert summary.hosts_found == 1
+    async with maker() as db:
+        host_rows = await ids.list_identifiers(db, kind="host")
+    assert [r.value for r in host_rows] == ["WIN11-01"]
+    assert host_rows[0].state == "active"
+
+
+# ---------------------------------------------------------------------------
+# Vestigial retirement sweep — auto-dismissal of pre-rule junk
+# ---------------------------------------------------------------------------
+
+
+async def test_retirement_sweep_dismisses_vestigial_rows() -> None:
+    """Rows only pre-current-rule scans could have produced are auto-dismissed:
+    a machine-guid suffix (even ACTIVE), junk host rows (any state), and a stale
+    muted public suffix the current scan did not re-produce. Untouched: an
+    ACTIVE public suffix (operator may have activated a legit corp domain), a
+    manual row (even a muted public one), a muted CLEARLY-INTERNAL suggestion,
+    and a muted public suffix that IS in this scan's candidates."""
+    settings = _settings()
+    maker = await _sessionmaker(settings)
+    guid = ".05bc0f86-f13e-4904-a92b-11dee17856a1.local"
+    async with maker() as db:
+        # machine-guid suffix, ACTIVE (predates _is_machine_guid_suffix) → dismissed
+        await ids.upsert_detected(db, "suffix", guid, {"host_count": 1}, "active")
+        # muted lookup-only public suffix (predates the public-drop rule) → dismissed
+        await ids.upsert_detected(db, "suffix", ".cdn.netflix.com", {"host_count": 2}, "muted")
+        # junk host rows (predate the junk-host hardening) → dismissed, ANY state
+        await ids.upsert_detected(db, "host", "WORKGROUP", {"host_count": 9}, "active")
+        await ids.upsert_detected(db, "host", "fe80::1", {"host_count": 1}, "muted")
+        # ACTIVE public suffix → NEVER swept (operator may have activated it)
+        await ids.upsert_detected(db, "suffix", ".corp.acme.com", {"host_count": 5}, "active")
+        # manual row → NEVER touched, even as a muted public value
+        manual = await ids.add_manual(db, "suffix", ".apple.com")
+        await ids.set_state(db, manual.id, "muted")
+        # muted CLEARLY-INTERNAL suggestion → still a valid suggestion, kept
+        await ids.upsert_detected(db, "suffix", ".printers.lan", {"host_count": 1}, "muted")
+        # muted public suffix that THIS scan re-produces (below threshold) → kept
+        await ids.upsert_detected(db, "suffix", ".corp.bigco.com", {"host_count": 1}, "muted")
+
+    fake = FakeES(
+        host_buckets=[
+            _bucket("dc01.corp.acme.local", 50, 5),
+            _bucket("ws1.corp.bigco.com", 10, 1),  # re-produces .corp.bigco.com (muted)
+        ]
+    )
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+    assert summary.errors == []
+    assert summary.retired == 4
+
+    async with maker() as db:
+        visible = {(r.kind, r.value): r for r in await ids.list_identifiers(db)}
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+
+    for key in (
+        ("suffix", guid),
+        ("suffix", ".cdn.netflix.com"),
+        ("host", "WORKGROUP"),
+        ("host", "fe80::1"),
+    ):
+        assert key not in visible, f"{key} should be hidden after dismissal"
+        assert full[key].state == "dismissed"
+        assert "retired" in (full[key].evidence or {})  # provenance appended
+
+    # untouched rows
+    assert visible[("suffix", ".corp.acme.com")].state == "active"
+    assert visible[("suffix", ".apple.com")].source == "manual"
+    assert visible[("suffix", ".apple.com")].state == "muted"
+    assert visible[("suffix", ".printers.lan")].state == "muted"
+    assert visible[("suffix", ".corp.bigco.com")].state == "muted"  # in-scan → kept
+
+
+async def test_retirement_sweep_is_terminal_across_rescans() -> None:
+    """A swept row stays dismissed on the next scan (upsert never resurrects),
+    and the sweep is idempotent — no double-count in summary.retired."""
+    settings = _settings()
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        await ids.upsert_detected(db, "suffix", ".cdn.netflix.com", {"host_count": 2}, "muted")
+
+    fake = FakeES(host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)])
+    first = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+    assert first.retired == 1
+    second = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+    assert second.retired == 0  # already dismissed — not re-swept
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("suffix", ".cdn.netflix.com")].state == "dismissed"
 
 
 async def test_run_discovery_no_cidrs_returns_error_summary() -> None:

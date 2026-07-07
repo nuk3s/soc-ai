@@ -1,42 +1,29 @@
 """Deterministic alert-class classifier.
 
-Tags every alert with one of four buckets so the orchestrator can pick
-a routing strategy: full pipeline vs fast-path vs heavy-priority.
+Tags every alert with a coarse class. The orchestrator uses it for
+high-stakes gating (e.g. an ``exploit_attempt`` / ``post_compromise``
+alert is never auto-acked on a confident false-positive verdict).
 
 The classifier is **deterministic** (no LLM call) and operates on the
 typed :class:`SoAlert` fields populated by :func:`SoAlert.from_es_hit`.
-It must not make any IO — the orchestrator runs it inline between
-prefetch and the investigator launch.
+It must not make any IO.
 
-The four classes:
+The classes:
 
 - ``informational_visibility`` — ET INFO / misc-activity / policy-only
-  signals. The dominant FP class on this grid; safe to fast-path with
-  a stripped-down "confirm-or-deny benign hypothesis" prompt and a
-  reduced retask floor.
+  signals. The dominant FP class on this grid.
 - ``recon`` — port scans, fingerprinting, attempted-recon classtypes.
-  Investigator should still run the full pipeline because correlation
-  with related alerts is the deciding factor.
+  Correlation with related alerts is the deciding factor.
 - ``exploit_attempt`` — active exploitation signatures (attempted-admin /
-  attempted-user / web-application-attack / shellcode-detect). Full
-  pipeline + the standard 0.6 floor; never fast-pathed.
-- ``post_compromise`` — confirmed C2 / exfil / trojan-activity. Full
-  pipeline; verdict bias should never tip toward false-positive without
-  strong evidence.
-- ``unknown`` — fallback when no signal matches. Full pipeline.
-
-Safe fast-path gating requires that the fast-path be gated on a
-**closed allowlist** rather than rule-name regex. We achieve this by
-making ``informational_visibility`` membership require BOTH
-``signature_severity == "Informational"`` AND
-``severity_label in {"low"}``. The combination is an explicit allowlist
-on rule-author-declared metadata, not a string match on the rule name.
+  attempted-user / web-application-attack / shellcode-detect).
+- ``post_compromise`` — confirmed C2 / exfil / trojan-activity. Verdict
+  bias should never tip toward false-positive without strong evidence.
+- ``unknown`` — fallback when no signal matches.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
 
 from soc_ai.so_client.models import SoAlert
 
@@ -118,125 +105,7 @@ def classify_alert(alert: SoAlert) -> AlertClass:
     return AlertClass.UNKNOWN
 
 
-def _destination_domain(alert: SoAlert) -> str | None:
-    """Best-effort destination *domain* for an alert, or ``None``.
-
-    Mirrors ``destination_ip`` but for name-based destinations: the TLS
-    SNI, the HTTP Host header, or the queried DNS name — whichever the
-    prefetch typed onto the alert. These are the external endpoint the
-    alert points *at*, expressed as a name rather than an address. We
-    take the first populated field in that priority order.
-
-    An IP literal that happens to land in one of these fields is not a
-    domain (the IP path already handles it), so we skip anything that
-    parses as an address.
-    """
-    from ipaddress import ip_address  # noqa: PLC0415
-
-    for value in (
-        alert.zeek_ssl_server_name,
-        alert.zeek_http_host,
-        alert.zeek_dns_query,
-        alert.dns_query,
-    ):
-        if not isinstance(value, str):
-            continue
-        candidate = value.strip().rstrip(".").lower()
-        # Strip a ``:port`` suffix (an HTTP Host header may carry one) so the
-        # blocklist lookup sees the bare hostname — "evil.example:443" must match
-        # an "evil.example" blocklist entry, not silently miss and fast-path a
-        # known-bad domain. (An IPv6 literal has no dot and is dropped below.)
-        host, sep, port = candidate.rpartition(":")
-        if sep and host and port.isdigit():
-            candidate = host
-        if not candidate or "." not in candidate:
-            continue
-        try:
-            ip_address(candidate)
-        except (ValueError, TypeError):
-            return candidate  # not an IP literal → treat as a domain
-    return None
-
-
-def is_fast_path_eligible(
-    alert: SoAlert,
-    alert_class: AlertClass,
-    *,
-    enrichment_cache: Any = None,
-    blocklist: Any = None,
-) -> bool:
-    """Whether the orchestrator may take the fast-path for this alert.
-
-    Eligibility is the AND of:
-
-    - ``alert_class == INFORMATIONAL_VISIBILITY``
-    - ``severity_label`` lowercases to ``low`` (Security Onion's
-      configured low-severity bucket — ``severity_score`` thresholds
-      vary per deployment, so we trust the SO-side label).
-    - If the destination IP is external, it MUST have a
-      prior enrichment-cache hit (i.e. we've enriched it once already
-      this process). First-encounter external IPs route to the full
-      pipeline at least once to establish a verdict baseline. Pass
-      ``enrichment_cache=None`` to disable this gate (the default —
-      tests and direct callers that don't have a cache).
-    - If the destination is an external *domain* (a name-based endpoint —
-      SNI / HTTP Host / DNS query — rather than an IP), it MUST carry a
-      prior reputation signal before we cheap-path it: either a
-      blocklist lookup or an existing enrichment-cache hit. A domain
-      with a malicious blocklist hit is *never* fast-pathed, and a
-      domain we've never enriched routes to the full pipeline once to
-      establish a baseline — the name-based mirror of the external-IP
-      gate. This gate only applies when a ``blocklist`` and/or
-      ``enrichment_cache`` is supplied; direct callers that pass neither
-      keep the legacy (IP-only) behavior.
-
-    This is a stricter gate than the classifier alone — informational
-    signatures *can* still warrant the full pipeline when SO has bumped
-    their severity (e.g. via correlation rules or analyst-set tags) or
-    when we haven't yet seen the destination IP / domain.
-    """
-    from ipaddress import ip_address  # noqa: PLC0415
-
-    if alert_class is not AlertClass.INFORMATIONAL_VISIBILITY:
-        return False
-    sev = (alert.severity_label or "").strip().lower()
-    if sev != "low":
-        return False
-
-    # Cache gate: only apply when a cache is provided (so unit tests
-    # that don't construct one keep the legacy behavior).
-    if enrichment_cache is not None:
-        dest = getattr(alert, "destination_ip", None)
-        if isinstance(dest, str):
-            try:
-                addr = ip_address(dest)
-            except (ValueError, TypeError):
-                addr = None
-            is_external_dest = addr is not None and not (
-                addr.is_private or addr.is_loopback or addr.is_link_local
-            )
-            if is_external_dest and not enrichment_cache.contains(dest):
-                # External destination with no prior enrichment → not eligible.
-                return False
-
-    # Domain reputation gate: mirror the external-IP logic for name-based
-    # destinations. Only engages when a blocklist and/or cache is provided.
-    if blocklist is not None or enrichment_cache is not None:
-        domain = _destination_domain(alert)
-        if domain is not None:
-            # A malicious blocklist hit means never fast-path this domain.
-            if blocklist is not None and blocklist.lookup_domain(domain):
-                return False
-            # No reputation context at all (never enriched) → full pipeline
-            # once to establish a baseline, same as a first-encounter IP.
-            seen = enrichment_cache is not None and enrichment_cache.contains(domain)
-            if not seen:
-                return False
-    return True
-
-
 __all__ = [
     "AlertClass",
     "classify_alert",
-    "is_fast_path_eligible",
 ]

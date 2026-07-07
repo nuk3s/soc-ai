@@ -11,7 +11,6 @@ from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
 from soc_ai.so_client.auth import SoAuthClient
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.tools._registry import ApprovalGate
 from soc_ai.tools.enrichment import MispClient
 
 
@@ -31,10 +30,6 @@ def get_misp(request: Request) -> MispClient | None:
     return request.app.state.misp  # type: ignore[no-any-return]
 
 
-def get_gate(request: Request) -> ApprovalGate:
-    return request.app.state.gate  # type: ignore[no-any-return]
-
-
 def get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit  # type: ignore[no-any-return]
 
@@ -51,7 +46,6 @@ def ctx_from_state(state: Any) -> InvestigationContext:
         auth=state.auth,
         elastic=state.elastic,
         misp=state.misp,
-        gate=state.gate,
         audit=state.audit,
         blocklist=enrichment.blocklist,
         maxmind=enrichment.maxmind,

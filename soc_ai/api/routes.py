@@ -1,4 +1,4 @@
-"""HTTP routes for soc-ai - SSE investigate, approval gate, health."""
+"""HTTP routes for soc-ai - SSE investigate, alert resolution, health."""
 
 from __future__ import annotations
 
@@ -14,38 +14,24 @@ from sse_starlette.sse import EventSourceResponse
 from soc_ai import __version__, metrics
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
-    build_investigator,
-    build_investigator_model,
-    build_synthesizer,
-    build_synthesizer_model,
     investigate,
 )
-from soc_ai.api.approvals import apply_approval
 from soc_ai.api.deps import (
-    get_audit,
-    get_auth,
     get_elastic,
-    get_gate,
     get_investigation_ctx,
     get_settings_dep,
 )
 from soc_ai.api.runner import recorded_run, sse_encode
 from soc_ai.api.schemas import (
-    ApproveRequest,
-    ApproveResponse,
     FindAlertRequest,
     FindAlertResponse,
     HealthResponse,
     InvestigateRequest,
-    SessionInfoResponse,
 )
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
 from soc_ai.api.webui_api import resolve_alert_for_hunt
-from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
-from soc_ai.so_client.auth import SoAuthClient
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.tools._registry import ApprovalGate
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,7 +50,7 @@ def _parse_so_timestamp(s: str) -> datetime:
 
 
 # require_csrf_safe is enforced router-wide so the legacy mutating routes
-# (/investigate, /approve, /find-alert) get the same cross-origin cookie-write
+# (/investigate, /find-alert) get the same cross-origin cookie-write
 # protection as /api/v1. GET routes (/healthz, /metrics) are exempt by method.
 router = APIRouter(dependencies=[Depends(require_csrf_safe)])
 
@@ -72,16 +58,13 @@ router = APIRouter(dependencies=[Depends(require_csrf_safe)])
 @router.get("/healthz", response_model=HealthResponse)
 async def healthz(
     settings: Settings = Depends(get_settings_dep),
-    gate: ApprovalGate = Depends(get_gate),
 ) -> HealthResponse:
     """Liveness + minimal config-snapshot endpoint."""
-    pending = await gate.pending()
     return HealthResponse(
         status="ok",
         version=__version__,
         so_auth="connect" if settings.use_connect_api else "kratos",
         misp_configured=settings.misp_url is not None,
-        pending_approvals=len(pending),
     )
 
 
@@ -90,17 +73,14 @@ async def healthz(
     response_class=PlainTextResponse,
     dependencies=[Depends(require_api_auth)],
 )
-async def metrics_endpoint(
-    gate: ApprovalGate = Depends(get_gate),
-) -> str:
+async def metrics_endpoint() -> str:
     """Prometheus 0.0.4 plain-text exposition.
 
     Counters are in-process — Prometheus's pull model handles per-scrape
     rates without any persistence on our side. See ``soc_ai/metrics.py``
     for the metric set + rationale.
     """
-    pending = await gate.pending()
-    return metrics.render(version=__version__, pending_approvals=len(pending))
+    return metrics.render(version=__version__)
 
 
 @router.post("/investigate", dependencies=[Depends(require_api_auth)])
@@ -129,19 +109,10 @@ async def investigate_endpoint(
         _, seed_rule_name = await resolve_alert_for_hunt(elastic, ctx.settings, req.alert_id)
     except Exception:
         seed_rule_name = None
-    # Build investigator/synthesizer here so tests can patch the routes-module
-    # bindings for investigate, build_investigator_model, build_synthesizer_model.
-    investigator = build_investigator(build_investigator_model(ctx.settings), ctx)
-    synthesizer = build_synthesizer(build_synthesizer_model(ctx.settings))
 
     async def stream() -> Any:
-        event_gen = investigate(
-            req.alert_id,
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-            session_id=req.session_id,
-        )
+        # `investigate` stays a routes-module binding so tests can patch it.
+        event_gen = investigate(req.alert_id, ctx=ctx)
         async for name, data in recorded_run(
             request.app.state,
             alert_id=req.alert_id,
@@ -152,33 +123,6 @@ async def investigate_endpoint(
             yield sse_encode(name, data)
 
     return EventSourceResponse(stream())
-
-
-@router.post("/approve", response_model=ApproveResponse, dependencies=[Depends(require_api_auth)])
-async def approve_endpoint(
-    req: ApproveRequest,
-    request: Request,
-    gate: ApprovalGate = Depends(get_gate),
-    auth: SoAuthClient = Depends(get_auth),
-    settings: Settings = Depends(get_settings_dep),
-    audit: AuditLogger = Depends(get_audit),
-) -> ApproveResponse:
-    """Apply the user's decision to a pending write-tool approval.
-
-    On approval, the underlying tool function is executed exactly once
-    (idempotent on duplicate POSTs via :meth:`ApprovalGate.consume`). The
-    execution is audited fail-closed (see :func:`execute_write_tool`).
-    """
-    return await apply_approval(
-        gate=gate,
-        auth=auth,
-        settings=settings,
-        token=req.token,
-        approved=req.approved,
-        reason=req.reason,
-        audit=audit,
-        user=await identify_caller(request),
-    )
 
 
 @router.post(
@@ -284,33 +228,4 @@ async def find_alert_endpoint(
         alert_index=hit["_index"],
         found_via=found_via,
         candidates_seen=total,
-    )
-
-
-@router.get(
-    "/sessions/{session_id}",
-    response_model=SessionInfoResponse,
-    dependencies=[Depends(require_api_auth)],
-)
-async def session_info(
-    session_id: str,
-    gate: ApprovalGate = Depends(get_gate),
-) -> SessionInfoResponse:
-    """Return the pending approvals known to the gate.
-
-    v1 has a single global gate; ``session_id`` is informational only and is
-    echoed back for the client's bookkeeping.
-    """
-    pending = await gate.pending()
-    return SessionInfoResponse(
-        session_id=session_id,
-        pending_approvals=[
-            {
-                "token": p.token,
-                "tool_name": p.tool_name,
-                "tool_args": p.tool_args,
-                "state": p.state,
-            }
-            for p in pending
-        ],
     )

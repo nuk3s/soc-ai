@@ -231,7 +231,7 @@ To let soc-ai ack/escalate/comment *and* keep a forensic trail:
 > Either way, the privilege must land on the **`ES_USERNAME`** account: the audit write
 > uses the Elasticsearch basic-auth identity, not the Kratos web login.
 
-> **ack/escalate "succeeds" in the approval flow but the alert is unchanged in SO**
+> **ack/escalate "succeeds" in the UI but the alert is unchanged in SO**
 >
 > If the audit write is failing (see above) under `AUDIT_FAIL_CLOSED=true`, the action is
 > aborted before it reaches SO. Fix the audit grant first.

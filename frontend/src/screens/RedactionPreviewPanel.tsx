@@ -1,6 +1,6 @@
 import { Eye, ShieldCheck } from 'lucide-react';
 import { getRedactionPreview } from '../lib/api';
-import { SectionTitle } from '../components/Panel';
+import { CollapseChevron, SectionTitle } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { useAsync } from '../lib/useAsync';
 
@@ -8,14 +8,30 @@ import { useAsync } from '../lib/useAsync';
 // from this deployment's own internal identifiers, before → after. Trust surface
 // for the opt-in cloud Oracle — the operator can confirm every internal
 // identifier is pseudonymized and public addresses pass through, before enabling.
-export function RedactionPreviewPanel() {
+export function RedactionPreviewPanel({
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+} = {}) {
   const { data, loading, error } = useAsync(getRedactionPreview, []);
 
   return (
     <div id="redaction-preview" className="mb-[22px] scroll-mt-6">
-      <SectionTitle right={<span className="text-faint"><Eye size={14} /></span>}>
+      <SectionTitle
+        right={
+          <span className="flex items-center gap-2 text-faint">
+            <Eye size={14} />
+            {onToggleCollapse && (
+              <CollapseChevron collapsed={collapsed} onToggle={onToggleCollapse} label="Toggle Redaction preview" />
+            )}
+          </span>
+        }
+      >
         Pre-egress redaction preview
       </SectionTitle>
+      {!collapsed && (
       <div className="overflow-hidden rounded-card border border-border bg-surface-1 p-[15px]">
         {loading && <LoadingState label="Loading preview…" />}
         {error && <ErrorState error={error} />}
@@ -61,6 +77,7 @@ export function RedactionPreviewPanel() {
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

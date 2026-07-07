@@ -105,15 +105,7 @@ def oauth_token(fixture_loader: Callable[[str], dict[str, Any]]) -> dict[str, An
 
 
 def _base_settings_kwargs() -> dict[str, Any]:
-    """Common kwargs for constructing Settings without env loading.
-
-    Test default keeps ``synth_first_pipeline=False`` so legacy
-    ``investigate()`` tests continue to exercise the two-stage path
-    without per-test opt-out. The production default (set in
-    ``soc_ai.config.Settings``) is ``True`` once the evidence-aware
-    validators cleared cross-validation. Synth-first integration tests
-    opt in explicitly with ``settings_kratos.synth_first_pipeline = True``.
-    """
+    """Common kwargs for constructing Settings without env loading."""
     return {
         "so_host": "https://so.example.com",
         "so_username": "analyst",
@@ -121,7 +113,6 @@ def _base_settings_kwargs() -> dict[str, Any]:
         "so_verify_ssl": False,
         "es_hosts": ["https://so.example.com:9200"],
         "litellm_base_url": "http://localhost:4000",
-        "synth_first_pipeline": False,
         # Tests opt into dev-open mode explicitly; the production default
         # (soc_ai.config.Settings) is True (secure-by-default).
         "api_auth_required": False,

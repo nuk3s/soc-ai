@@ -8,9 +8,9 @@ README. This describes `main` as it stands after the v1 delivery.
 - A **single FastAPI process**, async end-to-end (`soc_ai/main.py`).
 - All long-lived clients are constructed **once** in the lifespan manager
   (`lifespan()` in `main.py`) and stashed on `app.state`: the SO auth client,
-  the Elasticsearch client, the optional MISP client, the in-memory approval
-  gate, the audit logger, and the local-enrichment context (blocklists +
-  MaxMind + cloud-prefix DBs). They are torn down on shutdown.
+  the Elasticsearch client, the optional MISP client, the audit logger, and
+  the local-enrichment context (blocklists + MaxMind + cloud-prefix DBs).
+  They are torn down on shutdown.
 - Request handlers pull these off `app.state` via the providers in
   `soc_ai/api/deps.py`. A fresh `InvestigationContext` is assembled per request
   (`get_investigation_ctx`) but shares the app-scoped clients.
@@ -26,11 +26,14 @@ README. This describes `main` as it stands after the v1 delivery.
 | Route | Purpose |
 |---|---|
 | `POST /investigate` | Streams a triage as Server-Sent Events. Each message is `event: {kind}` + a JSON `StepEvent` payload. |
-| `POST /approve` | Applies a user's decision to a pending write-tool call; executes the tool exactly once on approval. |
 | `POST /find-alert` | Resolves an ES `_id` from row-level context supplied by a cross-origin API client (SO 3.0 doesn't embed `_id`s in the DOM). |
-| `GET /sessions/{id}` | Lists pending approvals (v1 has a single global gate; the id is informational). |
-| `GET /healthz` | Liveness + a minimal config snapshot (auth mode, MISP configured, pending-approval count). |
+| `GET /healthz` | Liveness + a minimal config snapshot (auth mode, MISP configured). |
 | `GET /metrics` | Prometheus 0.0.4 plain-text exposition (`soc_ai/metrics.py`). |
+
+Write actions (ack / escalate / comment) are **not** on this surface: the
+pipeline recommends them in the report, and the analyst executes them through
+the actions API (`POST /api/v1/investigations/{id}/actions/{index}/execute`,
+`soc_ai/api/webui/routes_actions.py`) — the single analyst write path.
 
 > **Security posture:** the JSON API requires authentication when
 > `API_AUTH_REQUIRED=true`: a session cookie (web login) or a bearer API token
@@ -41,27 +44,43 @@ README. This describes `main` as it stands after the v1 delivery.
 > Still deploy behind TLS on a trusted interface; see `docs/SAFETY_MODEL.md`
 > and `SECURITY.md`.
 
-## The two triage pipelines
+## The triage funnel
 
-soc-ai ships **two** orchestration strategies behind one entry point,
-`investigate()` in `soc_ai/agent/orchestrator.py`. The
-`SYNTH_FIRST_PIPELINE` setting (default **on**) selects between them.
+Every triage runs through one entry point, `investigate()` in
+`soc_ai/agent/orchestrator.py`, which delegates to
+`_run_synth_first_pipeline()`. One pipeline, staged escalation — each stage
+handles what the previous could not, at roughly 10× the cost.
 
-### Legacy two-stage (investigator → synthesizer)
+```mermaid
+flowchart TD
+    A[Alert] --> B[Prefetch + local enrichment<br/><i>deterministic, no LLM</i>]
+    B --> C[Phase B: decision template<br/><i>→ optional candidate anchor</i>]
+    C --> DI{"definitely-investigate?<br/><i>malware/exploit signal,<br/>threat-context flag,<br/>external-reputation template<br/>(requires investigate_when_unsure)</i>"}
+    DI -- yes → synth_round1_skipped --> G[Investigation loop<br/><i>LLM agent, full read-tool surface</i>]
+    DI -- no --> D[Synthesis round 1<br/><i>LLM, <b>no tools</b> — the verdict writer</i>]
+    D -- confident --> R2[TriageReport]
+    D -- names ONE gap --> E[Phase D: targeted dispatch<br/><i>deterministic — runs exactly the tool+args the synth named</i>]
+    E --> F[Synthesis round 2] --> R3[TriageReport]
+    D -- investigate_when_unsure trigger --> G
+    G --> H[Synthesizer over transcript] --> R4[TriageReport]
+    R2 & R3 & R4 --> I[Deterministic gates<br/>citation validation · evidence gate ·<br/>malware-label payload gate · downgrades]
+    I --> J{Oracle escalation?<br/><i>opt-in 2nd opinion, raw HTTP</i>}
+    J --> K[Final report + recommended actions<br/><i>analyst executes write tools on demand</i>]
+```
 
-1. **Prefetch** the alert context and embed it in the investigator's prompt.
-2. **Investigator** (fast model) gathers evidence with the read tools, emitting
-   an `InvestigationTranscript`.
-3. **Synthesizer** (heavy model) reads the transcript and emits a typed
-   `TriageReport` (verdict + confidence + citations + recommended actions).
-4. If the synthesizer's confidence is below `SYNTHESIS_CONFIDENCE_FLOOR`, the
-   investigator is **retasked once** with the synthesizer's open questions and
-   the synthesizer runs again. The retask is capped at one round.
+### Role glossary
 
-### Synth-first (A → B → C → optional D → C round 2)
+Names in code → what they actually are:
 
-The current default (`_run_synth_first_pipeline()`), introduced to cut the
-fast model's large reasoning-trace overhead out of the common path:
+| Code name | Actual role |
+|---|---|
+| `build_synth_first_agent` ("synthesizer") | **The primary verdict writer (settle path)** — tool-less by design; the loop path uses the sibling `build_synthesizer` over the transcript, and failure paths emit deterministic fallbacks |
+| `targeted_investigator` / Phase D | **Deterministic dispatcher** — not an agent, not an LLM; runs the one tool the synth named (`soc_ai/agent/targeted_investigator.py`) |
+| `build_investigator` | **The investigation loop** — full tool-equipped agent, entered for definitely-investigate, `investigate_when_unsure` trigger, or `fast_triage_enabled=false` (forces loop for every alert) |
+| Chat / Hunt agents | Share the read-tool surface from `soc_ai/agent/toolset.py`; chat adds `propose_verdict` + rule tuning, hunt uses wider windows and writes a `HuntReport` |
+| Oracle | Opt-in second opinion via raw HTTP completion — **not** a pydantic-ai agent |
+
+### Synth-first stage detail
 
 - **Phase A — rich precompute:** `get_enriched_alert_context()` pivots the
   alert across host / user / community-id and runs local enrichment, producing
@@ -70,16 +89,32 @@ fast model's large reasoning-trace overhead out of the common path:
   (`soc_ai/agent/decision_templates.py`) runs ordered, pure-function templates
   over the enriched context and may hand the synth a *candidate verdict* (an
   anchor it can keep, refine, or override).
+- **Definitely-investigate check (before Phase C):** `_definitely_investigate()`
+  tests for three triggers: malware/exploit signal on the rule, a concurrent
+  host threat-context flag, or an external-reputation decision-template match
+  (e.g. a template in `EXTERNAL_REPUTATION_TEMPLATES`). This pre-check only
+  runs when `investigate_when_unsure` is enabled. When true a
+  `synth_round1_skipped` event is emitted and the pipeline routes straight to
+  the investigation loop — Phase C is never called.
 - **Phase C — synthesis round 1:** the heavy model reads the materialized
-  evidence + candidate and emits a `TriageReport`. It may include a
-  `gap_for_investigator` naming **one** tool + exact args.
-- **Phase D — targeted investigator (optional):** if a gap was named, dispatch
-  that single tool **deterministically** (no LLM in the loop;
-  `soc_ai/agent/targeted_investigator.py`), then run synthesis round 2 on the
-  combined evidence. Phase D runs at most once.
+  evidence + candidate and emits a `TriageReport`. It has no tools and may
+  include a `gap_for_investigator` naming **one** tool + exact args.
+- **Phase D — targeted dispatch (optional):** if a gap was named and the loop
+  was not entered, `soc_ai/agent/targeted_investigator.py` dispatches that
+  single tool **deterministically** (no LLM in the loop), then synthesis
+  round 2 reads the combined evidence. Phase D runs at most
+  `phase_d_max_rounds` gap→dispatch→re-synthesize rounds (default 1); on a
+  non-final round the synth may chain one more gap (e.g.
+  `t_get_event_raw` → `t_decode_payload`).
+- **Investigation loop (optional):** full tool-equipped agent. Entered when
+  any of three conditions holds: `_definitely_investigate` returned true (loop
+  skipped round 1); `_should_investigate` triggers (evidence gap +
+  `investigate_when_unsure` setting); or `fast_triage_enabled=false` forces the
+  loop for every alert regardless of round-1 confidence (loop_reason
+  `"fast_triage_disabled"`). The synthesizer then runs over the full transcript.
 
-Both pipelines converge on the same **post-synth validators** before emitting
-the final report (see below).
+Every report passes through the **post-synth validators** before the final
+report is emitted (see below).
 
 ## Models & routing
 
@@ -87,30 +122,32 @@ the final report (see below).
   surface (`_build_provider` / `build_*_model` in `soc_ai/agent/models.py`). A
   Nemotron-specific model profile (`_nemotron_profile`) adjusts tool-call
   behavior for the served models.
-- Two aliases: a **fast** model (investigator / Phase D in the legacy path) and
-  a **heavy** model (synthesizer). In the synth-first default only the heavy
-  model is called per alert.
-- A **rule-class fast-path** (`ENABLE_RULE_CLASS_FAST_PATH`) routes
-  informational-visibility / low-severity alerts through a stripped-down
-  confirm-or-deny prompt with a tighter tool budget and a small sampling rate
-  back through the full pipeline for drift monitoring.
+- Two aliases: a **fast** model (the bounded investigation loop, hunts, chat)
+  and a **heavy** model (synthesizer). On the common triage path only the
+  heavy model is called per alert.
 
-## Tools & the read/write split (`soc_ai/tools/`)
+## Tools & the read/write split
 
-Every tool function is registered in a global registry (`tools/_registry.py`)
-with a `read_only` flag and exposed to the agent as a closure that captures the
-`InvestigationContext` (so the LLM-facing signature stays semantic: no
-`auth`/`elastic` params leak into the schema).
+Every tool function is registered in a global registry (`soc_ai/tools/_registry.py`)
+with a `read_only` flag. The **read-tool surface** — wrapping, dedup,
+result-clamping, and per-role registration — is the sole responsibility of
+`soc_ai/agent/toolset.py`, which defines all `t_*` tools once and exposes them
+per-role via `register_read_tools(agent, ctx, role)`. Closures over the runtime
+`InvestigationContext` keep the LLM-facing signatures semantic (no `auth` /
+`elastic` params leak into the schema).
 
-- **Read tools** (`query_events_oql`, `query_cases`, `query_detections`,
-  `query_zeek_logs`, `get_playbooks`, `get_alert_context`, the `enrich_*`
-  family, `lookup_runbook`) auto-execute.
-- **Write tools** (`ack_alert`, `escalate_to_case`, `add_case_comment`) **must**
-  pass through the `ApprovalGate` before the underlying function runs.
+- **Read tools** (`t_query_events_oql`, `t_query_cases`, `t_query_detections`,
+  `t_query_zeek_logs`, `t_get_playbooks`, `t_get_event_raw`, the `t_enrich_*`
+  family, `t_lookup_runbook`, and more) auto-execute.
+- **Write tools** (`ack_alert`, `escalate_to_case`, `add_case_comment`) are
+  never exposed to the LLM for execution — the report *recommends* them, and
+  they only run through the audited `execute_write_tool`
+  (`soc_ai/tools/write_exec.py`) on an explicit analyst action.
 
 Tool wrappers clamp result sizes and `max_results` to defend the model's
 serving window, dedupe identical calls within a run, and translate exceptions
-into structured error payloads rather than crashing the stream.
+into structured error payloads rather than crashing the stream. Phase D's
+dispatchable surface is the `PHASE_D_TOOLS` tuple exported from `toolset.py`.
 
 ## OQL trust boundary (`soc_ai/so_client/oql.py`)
 
@@ -127,29 +164,32 @@ Raw OQL **never** reaches ES. The pipeline is:
 `query_events_oql` also excludes synthetic-eval docs
 (`synth.scenario_id`) by default so fixtures can't leak into real responses.
 
-## Approval flow (`soc_ai/tools/_registry.py` → `ApprovalGate`)
+## Write-action flow (`soc_ai/tools/write_exec.py` → `execute_write_tool`)
 
-1. When the agent wants a write tool, the orchestrator calls
-   `gate.request(...)` to mint a token, surfaces it over SSE, and raises
-   `ApprovalRequired`.
-2. The user `POST /approve {token, approved}` → `gate.decide(...)`.
-3. On approval the route calls `gate.consume(...)`, which atomically transitions
-   the request to `consumed` (single-execution guarantee even under duplicate
-   `/approve` retries), then invokes the tool function once.
+1. The pipeline never executes a write itself — it lists write tools in
+   `TriageReport.recommended_actions` (advisory only).
+2. The analyst executes a recommendation from the report via the actions API
+   (`POST /api/v1/investigations/{id}/actions/{index}/execute`). Group ack /
+   escalate and the auto-ack (on by default, confidence- and severity-gated,
+   `auto_ack_fp_enabled=false` to disable) use the same path.
+3. Every execution runs through `execute_write_tool`: restricted to the three
+   write tools, audited fail-closed (the audit *intent* record is written
+   before Security Onion is touched), and idempotent for already-executed
+   actions (persisted `action_executed` events / already-acked alerts return
+   ok-with-note instead of writing twice).
 
-The gate is `asyncio.Lock`-guarded and idempotent on repeated decisions. Full
-spec in [SAFETY_MODEL.md](SAFETY_MODEL.md).
+Full spec in [SAFETY_MODEL.md](SAFETY_MODEL.md).
 
 ## Post-synth validators
 
-Both pipelines run a model-agnostic validator chain on the final report before
-emission (`_synth_first_post_validate` and the legacy equivalent in
-`orchestrator.py`): citation validation + capping, a template-confidence
-ceiling (a synth can't exceed its template anchor's confidence without
-evidence), a verdict floor rewrite (sub-floor confidence → `needs_more_info`),
-and targeted downgrades (e.g. solicited internal ICMP echo replies). These are
-**graders, not gatekeepers**: they reshape the report deterministically rather
-than retrying the model.
+The pipeline runs a model-agnostic validator chain on the final report before
+emission (`_synth_first_post_validate` in `soc_ai/agent/gates.py`): citation
+validation + capping, a verdict floor rewrite (sub-floor confidence →
+`needs_more_info`), targeted downgrades (e.g. solicited internal ICMP echo
+replies), the malware-label payload gate (GATE A), and the hard evidence gate
+(no tool call + no strong template + no IOC/pivot hit → `needs_more_info`).
+These are **graders, not gatekeepers**: they reshape the report
+deterministically rather than retrying the model.
 
 ## Reasoning-trace handling (`soc_ai/agent/reasoning.py`)
 

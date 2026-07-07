@@ -126,12 +126,23 @@ def build_synthesizer_model(settings: Settings, *, temperature: float | None = N
     pipeline passes a low value for the synthesizer (deterministic verdict) and a
     moderate one for the investigator (some exploration). ``None`` leaves the
     gateway default.
+
+    ``max_tokens`` is ALWAYS set (``synthesizer_max_response_tokens``): with no
+    explicit value the request falls to the provider/route default, and on a
+    REASONING model the thinking phase can burn that whole default budget before
+    the TriageReport JSON starts — the response truncates with zero content and
+    pydantic-ai raises "Model token limit (provider default) exceeded before any
+    response was generated", landing a fallback NMI verdict. Observed live on
+    qwen3.6-reason (investigation 01KWX3E9A4…). An explicit generous cap gives
+    the reasoning + report a real budget instead of an accidental one.
     """
     from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
 
-    model_settings = (
-        OpenAIChatModelSettings(temperature=temperature) if temperature is not None else None
+    model_settings = OpenAIChatModelSettings(
+        max_tokens=settings.synthesizer_max_response_tokens,
     )
+    if temperature is not None:
+        model_settings["temperature"] = temperature
     return OpenAIChatModel(
         settings.analyst_model,
         provider=_build_provider(settings),

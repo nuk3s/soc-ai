@@ -10,8 +10,6 @@ from __future__ import annotations
 from typing import Any
 
 from soc_ai.agent.orchestrator import (
-    _credit_prefetch_coverage,
-    _derive_rubric_coverage,
     _downgrade_unevidenced_verdict,
     _materialize_prefetch_evidence,
     _pivot_decisive_evidence,
@@ -20,7 +18,7 @@ from soc_ai.agent.orchestrator import (
     _verdict_cites_decisive_pivot_value,
     _verdict_grounded_in_pivot,
 )
-from soc_ai.agent.triage import RubricCoverage, TriageReport
+from soc_ai.agent.triage import TriageReport
 from soc_ai.enrichment.zeek_parser import parse_typed_zeek_fields
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools.get_alert_context import EnrichedAlertContext
@@ -317,37 +315,6 @@ def test_hard_gate_still_downgrades_alert_only_rationalization() -> None:
     )
     assert out.verdict == "needs_more_info"
     assert "evidence_gate_downgrade" in audit
-
-
-# ── Wave 3: coverage cap credits prefetch-provided coverage ─────────────────────
-
-
-def test_credit_prefetch_coverage_from_enriched_context() -> None:
-    ctx = EnrichedAlertContext(
-        alert=_alert(),
-        community_id_events=[_zeek("s1", "zeek.ssl", {"zeek.ssl.server_name": "cdn.example.com"})],
-        host_events=[_zeek("h1", "zeek.conn", {})],
-        enrichments={},
-    )
-    ctx.enrichments = {"10.0.0.115": object()}  # type: ignore[dict-item]
-    out = RubricCoverage()
-    _credit_prefetch_coverage(out, ctx)
-    assert out.enrichment_called is True
-    assert out.related_alerts_checked is True
-    assert out.dns_or_sni_pivoted is True
-
-
-def test_derive_rubric_coverage_credits_prefetch_without_tool_calls() -> None:
-    ctx = EnrichedAlertContext(
-        alert=_alert(),
-        community_id_events=[_zeek("s1", "zeek.ssl", {"zeek.ssl.ja3": "abc"})],
-        host_events=[_zeek("h1", "zeek.conn", {})],
-    )
-    ctx.enrichments = {"10.0.0.115": object()}  # type: ignore[dict-item]
-    cov = _derive_rubric_coverage([], ctx)
-    assert cov.enrichment_called is True
-    assert cov.related_alerts_checked is True
-    assert cov.dns_or_sni_pivoted is True
 
 
 # ── Wave 6: metric honesty — verdict-only recall + FN breakdown ─────────────────

@@ -461,6 +461,7 @@ _STATIC_TITLES: dict[str, str] = {
     "alert_context": "Loaded alert context + enrichments",
     "investigation_loop_entered": "Started a deeper investigation",
     "synth_round1_skipped": "Skipped first-pass synthesis — investigating first",
+    "context_trimmed": "Trimmed oldest related events to fit the model's context window",
     "retask_skipped_no_closeable_gap": "No re-task: no closeable evidence gap",
     "rubric_derivation": "Derived the evidence checklist for this alert type",
     "evidence_gate_downgrade": "Confidence lowered: verdict not evidence-backed",

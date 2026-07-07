@@ -11,11 +11,11 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from soc_ai.api.approvals import execute_write_tool
 from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools._registry import ToolSpec
+from soc_ai.tools.write_exec import execute_write_tool
 
 
 class _ES:

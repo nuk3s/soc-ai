@@ -5,9 +5,11 @@ The prompt has three pieces:
 1. **System prompt** — a short, role-specific instruction that frames
    the oracle as a critic of a SOC triage agent's run. Cached.
 2. **Architecture context block** — a brief description of the agent's
-   two-stage flow + the verbatim ``INVESTIGATOR_PROMPT`` and
-   ``SYNTHESIZER_PROMPT`` strings the agent itself runs against.
-   Cached. Lets the oracle critique prompt wording directly.
+   single synth-first pipeline + the verbatim system prompts the agent
+   itself runs against (``SYNTH_FIRST_SYSTEM_PROMPT`` for the verdict
+   writer, ``INVESTIGATOR_PROMPT`` for the investigation loop,
+   ``SYNTHESIZER_PROMPT`` for the loop-concluding synthesis). Cached.
+   Lets the oracle critique prompt wording directly.
 3. **User message** — the sanitized event trail, the final
    :class:`TriageReport`, and the three questions.
 
@@ -21,7 +23,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from soc_ai.agent.prompts import INVESTIGATOR_PROMPT, SYNTHESIZER_PROMPT
+from soc_ai.agent.prompts import (
+    INVESTIGATOR_PROMPT,
+    SYNTH_FIRST_SYSTEM_PROMPT,
+    SYNTHESIZER_PROMPT,
+)
 
 SYSTEM_PROMPT = """\
 You are evaluating a Security Onion triage agent's investigation.
@@ -47,40 +53,81 @@ Markdown with three sections matching the user's questions.
 _ARCH_SUMMARY = """\
 # soc-ai architecture (what the agent looks like under the hood)
 
-soc-ai is a two-stage Security Onion triage agent:
+soc-ai triages every alert through ONE pipeline with staged escalation —
+each stage handles what the previous could not:
 
-- **Investigator** (fast 30B model, e.g. Nemotron 3 Nano). Reads the
-  pre-fetched alert context, then uses a fixed read-tool surface to
-  gather evidence. Tools available: `t_query_events_oql`,
-  `t_query_zeek_logs`, `t_query_cases`, `t_query_detections`,
-  `t_get_playbooks`, `t_enrich_ip`, `t_enrich_domain`, `t_enrich_hash`,
-  `t_lookup_runbook`. Tool returns clamp at ~12KB per call;
-  `max_results` ceilings cap each tool's payload size to defend the
-  64K context window. Emits an `InvestigationTranscript`
-  (`evidence`, `tentative_summary`, `open_questions`).
-- **Synthesizer** (heavy 120B model, e.g. Nemotron 3 Super). No
-  tools. Reads the transcript and emits a `TriageReport`
-  (`verdict`, `confidence`, `summary`, `citations`,
-  `recommended_actions`).
-- **Retask** (conditional). If `synthesis_confidence_floor` (default
-  0.6) isn't met, the investigator runs ONE more round on the
-  HEAVY model with the round-1 transcript + open questions; the
-  synthesizer then synthesizes over the combined evidence. Round-2
-  is bounded tighter (15 tool calls vs 100) so it can't blow context.
+1. **Prefetch + local enrichment** (deterministic, no LLM). The
+   orchestrator pivots the alert across host / user / community-id and
+   enriches IPs/domains/hashes (blocklists, MaxMind ASN/GeoIP,
+   cloud-provider tags, optional MISP) into an enriched context.
+2. **Decision template** (deterministic). Ordered pure-function
+   templates may emit a *candidate verdict* — an anchor the synthesizer
+   can keep, refine, or override.
+3. **Definitely-investigate pre-check.** A malware/exploit rule signal,
+   a concurrent host threat-context flag, or an external-reputation
+   template match skips round 1 (`synth_round1_skipped`) and routes
+   straight to the investigation loop.
+4. **Synthesis round 1** (heavy model, NO tools) — the verdict writer.
+   Reads the enriched context + materialized evidence + candidate and
+   emits a `TriageReport` (`verdict`, `confidence`, `summary`,
+   `citations`, `recommended_actions`); instead of guessing it may name
+   ONE gap (`gap_for_investigator`: a specific tool + exact args).
+5. **Phase D — targeted dispatch** (optional). The orchestrator runs
+   exactly the tool call the synth named (a deterministic dispatcher —
+   no LLM picks the tool), then synthesis round 2 finalizes over the
+   combined evidence. At most one dispatch round by default.
+6. **Investigation loop** (optional; supersedes Phase D when entered).
+   A tool-equipped agent on the heavy model with the full read-tool
+   surface (OQL/Zeek/case/detection queries, dataset discovery, raw
+   event + payload decode, rule content, host/prevalence summaries,
+   IP/domain/hash enrichment; per-call result clamps). Entered for
+   definitely-investigate, when the round-1 verdict isn't
+   evidence-backed (`investigate_when_unsure`), or for every alert when
+   `fast_triage_enabled=false`. A synthesizer then concludes over the
+   gathered transcript.
+7. **Deterministic gates** (graders, not gatekeepers — they reshape the
+   final report; they never re-run the model): citation validation +
+   cap; the verdict floor (a TP/FP below `synthesis_confidence_floor`,
+   default 0.6, that also lacks semantic citation coverage is rewritten
+   to needs_more_info); targeted downgrades (e.g. solicited internal
+   ICMP echo replies, ungrounded host-anchored TPs); the malware-label
+   payload gate (a TP anchored only on a malware-named rule, without
+   payload/tool corroboration, is downgraded); and the hard
+   evidence gate (a TP/FP with zero tool evidence, no strong template,
+   and no IOC/pivot hit is coerced to needs_more_info).
+8. **Oracle** (opt-in second opinion). Uncertain / malware-non-TP /
+   below-confidence verdicts may be adjudicated by a frontier model
+   over a redacted payload; the local verdict is preserved alongside.
 
-The orchestrator emits SSE events at every step (the JSONL trail
-included below): `session_start`, `alert_context`, `tool_call`,
+Event kinds in the JSONL trail: `session_start`,
+`enriched_alert_context`, `decision_template_match`,
+`synth_round1_skipped`, `investigation_loop_entered`, `tool_call`,
 `tool_result`, `model_response` (with optional `reasoning_trace`),
-`investigation_transcript`, `usage`, `retask`, `triage_report`,
-`approval_required`, `done`, `error`.
+`usage`, `investigation_transcript`, `retask`, `targeted_dispatch`,
+`targeted_tool_result`, `self_consistency_vote`, `citation_validation`,
+`citation_cap`, `verdict_floor_rewrite`, downgrade audits
+(`icmp_solicited_downgrade`, `ungrounded_host_anchored_tp_downgrade`,
+`malware_rule_name_ungrounded_downgrade`, `evidence_gate_downgrade`),
+`oracle_escalation`, `oracle_adjudication`, `triage_report`,
+`auto_ack`, `done`, `error`.
 
-## Investigator system prompt (verbatim)
+Note: `retask` is co-emitted alongside every `targeted_dispatch` for
+metric continuity — `retask_count` counts Phase-D dispatches. There is
+no separate low-confidence re-investigation round.
+
+## Round-1 / round-2 synthesizer system prompt (verbatim)
+
+```
+{SYNTH_FIRST_SYSTEM_PROMPT}
+```
+
+## Investigation-loop investigator system prompt (verbatim)
 
 ```
 {INVESTIGATOR_PROMPT}
 ```
 
-## Synthesizer system prompt (verbatim)
+## Loop-concluding synthesizer system prompt (verbatim)
 
 ```
 {SYNTHESIZER_PROMPT}
@@ -91,10 +138,13 @@ included below): `session_start`, `alert_context`, `tool_call`,
 def architecture_block() -> str:
     """Return the architecture-context block (cached on the request).
 
-    Includes the verbatim INVESTIGATOR_PROMPT + SYNTHESIZER_PROMPT so
-    the oracle can critique their wording directly.
+    Includes the verbatim SYNTH_FIRST_SYSTEM_PROMPT (the verdict
+    writer), INVESTIGATOR_PROMPT (the investigation loop) and
+    SYNTHESIZER_PROMPT (the loop-concluding synthesis) so the oracle
+    can critique their wording directly.
     """
     return _ARCH_SUMMARY.format(
+        SYNTH_FIRST_SYSTEM_PROMPT=SYNTH_FIRST_SYSTEM_PROMPT,
         INVESTIGATOR_PROMPT=INVESTIGATOR_PROMPT,
         SYNTHESIZER_PROMPT=SYNTHESIZER_PROMPT,
     )
@@ -182,8 +232,9 @@ Please answer all three:
    `t_enrich_ip` result at sequence 7 returned …").
 3. **Architecture changes for better future results?** Given the
    prompts + flow shown above, what concrete changes (prompt
-   wording, tool surface, retask trigger, model routing, output
-   format, etc) would improve quality on this kind of alert? Be
+   wording, tool surface, dispatch/loop-entry triggers, gate
+   thresholds, model routing, output format, etc) would improve
+   quality on this kind of alert? Be
    specific. Prioritize by expected impact (high / medium / low)
    and call out which change is highest-leverage.
 

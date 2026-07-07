@@ -70,17 +70,6 @@ async def list_workspaces(settings: Settings = Depends(get_settings_dep)) -> lis
 @router.get("/notifications", response_model=list[NotificationOut])
 async def list_notifications(request: Request) -> list[NotificationOut]:
     out: list[NotificationOut] = []
-    for p in await request.app.state.gate.pending():
-        inv_id = p.metadata.get("investigation_id") if p.metadata else None
-        out.append(
-            NotificationOut(
-                id=f"approval:{p.token}",
-                tone="warn",
-                title=f"Action awaiting approval: {p.tool_name}",
-                when="",
-                href=f"/investigation/{inv_id}" if inv_id else None,
-            )
-        )
     async with request.app.state.db_sessionmaker() as db:
         running = await inv_svc.list_recent(db, status="running", limit=20)
     for inv in running:

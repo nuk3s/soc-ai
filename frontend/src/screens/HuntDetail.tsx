@@ -14,6 +14,7 @@ import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
+import { HuntVisuals } from '../components/HuntVisuals';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
@@ -70,6 +71,10 @@ function huntTitle(objective: string): string {
 // A hunt has no true/false-positive verdict — it has findings. Derive a
 // disposition BADGE (like the alerts verdict pill) from the worst finding
 // severity + status, so the analyst sees the conclusion at a glance up top.
+//
+// ONLY 'threat' findings may claim malicious/suspicious activity: a critical
+// VISIBILITY GAP is a coverage statement, and headlining it "Malicious
+// activity found" tells the analyst something the hunt never observed.
 const _SEV_ORDER = ['info', 'low', 'medium', 'high', 'critical'];
 function huntDisposition(
   status: HuntStatus | undefined,
@@ -77,14 +82,19 @@ function huntDisposition(
 ): { label: string; color: string } {
   if (status === 'running') return { label: 'Hunting…', color: '#4b8bf5' };
   if (status !== 'complete') return { label: 'Inconclusive', color: '#8b949e' };
-  const worst = findings.reduce(
+  const threats = findings.filter((f) => (f.category ?? 'threat') === 'threat');
+  const gaps = findings.filter((f) => f.category === 'visibility_gap');
+  const worst = threats.reduce(
     (w, f) => Math.max(w, _SEV_ORDER.indexOf((f.severity || 'info').toLowerCase())),
     -1,
   );
   if (worst >= 3) return { label: 'Malicious activity found', color: '#f85149' }; // high/critical
   if (worst === 2) return { label: 'Suspicious activity found', color: '#d29922' }; // medium
   if (worst === 1) return { label: 'Low-severity findings', color: '#d29922' }; // low
-  return { label: 'No malicious activity found', color: '#3fb950' }; // info-only or clean
+  // No threat evidence. Gaps mean the objective couldn't be fully tested —
+  // an honest grey "couldn't see", never a green all-clear.
+  if (gaps.length > 0) return { label: 'No threat observed — visibility gaps', color: '#8b949e' };
+  return { label: 'No malicious activity found', color: '#3fb950' }; // observations-only or clean
 }
 
 function DispositionBadge({ label, color }: { label: string; color: string }) {
@@ -125,6 +135,22 @@ function FindingCard({ f }: { f: HuntFinding }) {
         <span className="text-[13.5px] font-semibold text-text" style={{ textWrap: 'pretty' }}>
           {f.title}
         </span>
+        {f.category === 'visibility_gap' && (
+          <span
+            className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
+            title="A coverage statement — telemetry this grid doesn't have. Not observed malicious activity."
+          >
+            visibility gap
+          </span>
+        )}
+        {f.category === 'observation' && (
+          <span
+            className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
+            title="Benign/informational context — not a threat finding."
+          >
+            observation
+          </span>
+        )}
         <span
           className="ml-auto flex-none rounded-chip border px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em]"
           style={{ color, borderColor: `${color}55`, background: `${color}14` }}
@@ -483,6 +509,15 @@ export function HuntDetail() {
                       <Markdown>{data.narrative}</Markdown>
                     </div>
                   </Panel>
+                </CollapsibleSection>
+              )}
+
+              {/* Deterministic charts from the findings — only once the hunt has
+                  concluded WITH findings (a running or empty hunt has nothing
+                  to plot, and a chart must never render from nothing). */}
+              {complete && data.findings.length > 0 && (
+                <CollapsibleSection title="Visual summary">
+                  <HuntVisuals findings={data.findings} affectedHosts={data.affectedHosts} />
                 </CollapsibleSection>
               )}
 

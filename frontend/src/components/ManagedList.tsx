@@ -19,6 +19,12 @@ interface ManagedListProps {
   onAdd: (value: string) => void;
   onSetActive: (id: number, active: boolean) => void;
   onRemove: (id: number) => void;
+  /**
+   * Dismiss a DETECTED suggestion for good (terminal — the row vanishes from the
+   * list). Distinct from muting (keep-but-unused). Only wired for detected rows;
+   * manual rows keep the DELETE-backed Remove control.
+   */
+  onDismiss?: (id: number) => void;
   addPlaceholder?: string;
 }
 
@@ -91,9 +97,14 @@ export function ManagedList({
   onAdd,
   onSetActive,
   onRemove,
+  onDismiss,
   addPlaceholder,
 }: ManagedListProps) {
   const [value, setValue] = useState('');
+  // Inline "click twice to confirm" for a dismiss — keyed by row id so a mis-click
+  // never nukes a suggestion on the first press. Cleared on the next render cycle
+  // that removes the row (the list refetches after the mutation resolves).
+  const [pendingDismiss, setPendingDismiss] = useState<number | null>(null);
 
   const submit = () => {
     const v = value.trim();
@@ -141,6 +152,7 @@ export function ManagedList({
                     />
                     {!row.mutable && <span className="text-[10px] text-faint">always on</span>}
                   </div>
+                  {/* Manual rows: hard DELETE (backend 409s on a detected id). */}
                   {row.mutable && row.source === 'manual' && row.id != null && (
                     <button
                       onClick={() => onRemove(row.id as number)}
@@ -149,6 +161,38 @@ export function ManagedList({
                     >
                       Remove
                     </button>
+                  )}
+                  {/* Detected rows: dismiss the suggestion for good (mute keeps it,
+                      dismiss hides it). Two-press inline confirm. */}
+                  {onDismiss && row.mutable && row.source === 'detected' && row.id != null && (
+                    pendingDismiss === row.id ? (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => {
+                            onDismiss(row.id as number);
+                            setPendingDismiss(null);
+                          }}
+                          className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
+                          style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                        >
+                          Confirm
+                        </button>
+                        <button
+                          onClick={() => setPendingDismiss(null)}
+                          className="rounded-[7px] border border-border-strong bg-surface-3 px-[9px] py-[5px] text-[11.5px] font-semibold text-dim hover:text-text"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setPendingDismiss(row.id as number)}
+                        title="Dismiss — remove this suggestion for good (re-add manually to restore)"
+                        className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:border-accent hover:text-text"
+                      >
+                        Dismiss
+                      </button>
+                    )
                   )}
                 </div>
               </div>

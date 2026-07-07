@@ -57,9 +57,9 @@
   <text x="652" y="98" class="lbl">3 · Hunt report</text>
 
   <circle cx="656" cy="120" r="4" fill="#f0522f"/>
-  <text x="668" y="124" class="t">Findings, each with evidence</text>
+  <text x="668" y="124" class="t">Findings, evidence-cited</text>
   <circle cx="656" cy="142" r="4" fill="#e3a008"/>
-  <text x="668" y="146" class="t">+ severity &amp; affected hosts</text>
+  <text x="668" y="146" class="t">+ severity, category &amp; hosts</text>
 
   <line x1="652" y1="162" x2="852" y2="162" stroke="#1b2230" stroke-width="1"/>
 

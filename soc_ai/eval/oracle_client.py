@@ -26,7 +26,7 @@ Usage::
         base_url="https://your-litellm-gateway",
         api_key="<litellm key>",
         verify_ssl=True,
-        model="claude-opus-4-7",
+        model="claude-opus-4-8",
         max_tokens=8192,
         system_prompt=SYSTEM_PROMPT,
         arch_context=architecture_block(),

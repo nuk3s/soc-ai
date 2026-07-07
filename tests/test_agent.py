@@ -17,7 +17,6 @@ from pydantic_ai.models.test import TestModel
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
     build_investigator,
-    build_synthesizer,
     investigate,
 )
 from soc_ai.agent.prompts import (
@@ -40,7 +39,6 @@ from soc_ai.config import Settings
 from soc_ai.enrichment.blocklists import BlocklistDB, BlocklistHit
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.models import SoAlert
-from soc_ai.tools._registry import ApprovalGate
 from soc_ai.tools.get_alert_context import AlertContext
 
 # =====================================================================
@@ -189,9 +187,10 @@ async def test_triage_report_event_includes_field_reconciliation(
 ) -> None:
     """The orchestrator surfaces field_reconciliation in the
     triage_report SSE event so the WebUI can render it."""
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    events = await _run_synth_first(
+        ctx,
         report=TriageReport(
             verdict="false_positive",
             confidence=0.7,
@@ -199,68 +198,17 @@ async def test_triage_report_event_includes_field_reconciliation(
             citations=["alert.severity_label"],
             field_reconciliation="ICMP refers to the UDP flow",
         ),
-        ctx=ctx,
+        candidate=_strong_benign_candidate(),
     )
-
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
     report_ev = next(e for e in events if e.kind == "triage_report")
     assert report_ev.payload["field_reconciliation"] == "ICMP refers to the UDP flow"
+    # The verdict itself is untouched by the reconciliation note.
+    assert report_ev.payload["verdict"] == "false_positive"
 
 
 # =====================================================================
 # Orchestrator with TestModel
 # =====================================================================
-
-
-def _stub_alert_context(alert_id: str = "alert-001") -> AlertContext:
-    """Minimal AlertContext for orchestrator tests — no ES round-trip needed."""
-    return AlertContext(
-        alert=SoAlert(id=alert_id, severity_label="low"),
-        community_id_events=[],
-        host_events=[],
-        user_events=[],
-        process_events=[],
-        file_events=[],
-        pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-    )
-
-
-async def _stub_get_alert_context(alert_id: str, **_kw: Any) -> AlertContext:
-    """Drop-in replacement for the orchestrator's prefetch — returns a fixed shape."""
-    return _stub_alert_context(alert_id)
-
-
-@pytest.fixture(autouse=True)
-def _patch_orchestrator_prefetch():
-    """Autopatch get_alert_context so investigate() never reaches ES.
-
-    Tests that need a custom AlertContext or want to assert the prefetch
-    failure path can override the patch in their own with-block.
-    """
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_stub_get_alert_context,
-    ):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def _reset_enrichment_cache():
-    """Tests must not leak fast-path cache hits between
-    them. Reset the process-wide enrichment cache before each test."""
-    from soc_ai.agent.enrichment_cache import reset_global_cache
-
-    reset_global_cache()
-    yield
-    reset_global_cache()
 
 
 def _make_ctx(
@@ -279,7 +227,6 @@ def _make_ctx(
         settings=settings,
         auth=auth,
         elastic=elastic,
-        gate=ApprovalGate(),
         **kwargs,
     )
 
@@ -292,375 +239,281 @@ def _stub_transcript(open_qs: list[str] | None = None) -> InvestigationTranscrip
     )
 
 
-def _build_test_pair(
-    *,
-    transcript: InvestigationTranscript,
-    report: TriageReport,
+def _strong_benign_candidate() -> Any:
+    """A strong benign template match (clean_internal_traffic @ 0.85).
+
+    Rule-grounded and ≥0.8 confidence, so it exempts a zero-tool
+    false_positive verdict from the hard evidence gate — the production
+    shape for a trivially-benign settle."""
+    from soc_ai.agent.decision_templates import CandidateVerdict
+
+    return CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.85,
+        cited_evidence=["alert.severity_label"],
+        template_id="clean_internal_traffic",
+        rationale="internal scanner",
+    )
+
+
+async def _run_synth_first(
     ctx: InvestigationContext,
-) -> tuple[Any, Any]:
-    """Build (investigator, synthesizer) wired to TestModels with fixed outputs."""
-    inv_model = TestModel(call_tools=[], custom_output_args=transcript)
-    synth_model = TestModel(call_tools=[], custom_output_args=report)
-    return build_investigator(inv_model, ctx), build_synthesizer(synth_model)
+    *,
+    report: TriageReport,
+    candidate: Any = None,
+    enriched_factory: Any = None,
+    alert_id: str = "alert-001",
+) -> list[Any]:
+    """Drive investigate() end-to-end on the synth-first pipeline.
 
+    Stubs the enriched prefetch (``enriched_factory``, default
+    ``_stub_enriched_alert_context``), pins the decision-template match to
+    ``candidate``, and wires a fake synth agent that always returns
+    ``report``. Callers that need the investigation loop should set
+    ``settings.investigate_when_unsure`` / ``fast_triage_enabled`` and add
+    their own ``build_investigator`` / ``build_synthesizer`` patches
+    instead of using this helper."""
+    from unittest.mock import MagicMock
 
-@pytest.mark.asyncio
-async def test_investigate_yields_session_done_with_test_models(
-    settings_kratos: Settings,
-) -> None:
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.85,
-            summary="Internal traffic to internal target.",
-            citations=["alert.severity_label"],
-            recommended_actions=[],
-        ),
-        ctx=ctx,
+    from pydantic_ai import Agent
+
+    factory = enriched_factory or _stub_enriched_alert_context
+
+    async def _stub_enriched(aid: str, **_kw: Any) -> Any:
+        return factory(aid)
+
+    fake_agent = Agent(
+        model=TestModel(call_tools=[], custom_output_args=report),
+        system_prompt="stub",
+        output_type=TriageReport,
     )
-
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
-
-    kinds = [e.kind for e in events]
-    assert "session_start" in kinds
-    assert "investigation_transcript" in kinds
-    assert "triage_report" in kinds
-    assert "done" in kinds
-    # Sequence numbers increase
-    sequences = [e.sequence for e in events]
-    assert sequences == sorted(sequences)
-    # Confidence above floor → no retask.
-    assert "retask" not in kinds
-
-
-@pytest.mark.asyncio
-async def test_investigate_retasks_when_synthesis_below_floor(
-    settings_kratos: Settings,
-) -> None:
-    """Low-confidence synthesis triggers exactly one investigator retask.
-
-    The retask path builds a fresh round-2 investigator via
-    `build_synthesizer_model` (heavy model, ~120K ctx — see
-    ``soc_ai/agent/orchestrator.py``). Patch that factory so the test
-    runs without LiteLLM.
-    """
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(open_qs=["unenriched destination IP"]),
-        report=TriageReport(
-            verdict="needs_more_info",
-            confidence=0.3,  # below default floor of 0.6
-            summary="Not enough evidence yet.",
-            citations=[],
-        ),
-        ctx=ctx,
-    )
-    retask_round_2_transcript = InvestigationTranscript(
-        evidence=["enriched destination IP not on any TI list (id event-002)"],
-        tentative_summary="Round 2 closed the open question; no malicious indicators.",
-        open_questions=[],
-    )
-    retask_model = TestModel(call_tools=[], custom_output_args=retask_round_2_transcript)
-
-    with patch(
-        "soc_ai.agent.orchestrator.build_synthesizer_model",
-        return_value=retask_model,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    kinds = [e.kind for e in events]
-    assert kinds.count("retask") == 1
-    # Two investigation transcripts (round 1 + round 2) and two triage reports
-    # would be the *internal* count, but only ONE final triage_report is
-    # emitted (the retask synthesis replaces the round-1 report).
-    assert kinds.count("investigation_transcript") == 2
-    assert kinds.count("triage_report") == 1
-    # The retask payload should carry the floor + the original confidence.
-    retask_ev = next(e for e in events if e.kind == "retask")
-    assert retask_ev.payload["reason"] == "synthesis_below_floor"
-    assert retask_ev.payload["confidence"] == 0.3
-    assert retask_ev.payload["floor"] == ctx.settings.synthesis_confidence_floor
-    # The done event reports rounds=2 so the SSE consumer can render it.
-    done_ev = next(e for e in events if e.kind == "done")
-    assert done_ev.payload["rounds"] == 2
-
-
-def test_format_retask_prompt_names_missing_field_and_tool() -> None:
-    """F4: the retask user message names each missing rubric
-    field AND a specific tool call to satisfy it, with the alert's
-    actual identifiers pre-filled where possible."""
-    from soc_ai.agent.orchestrator import _format_retask_prompt
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(
-        alert=SoAlert(
-            id="a1",
-            host_name="endpoint-42",
-            destination_ip="8.8.8.8",
-            network_community_id="1:abc==",
-        )
-    )
-    prior = InvestigationTranscript(
-        evidence=["something (id evt-1)"],
-        tentative_summary="x",
-        open_questions=["unenriched destination IP"],
-    )
-    prompt = _format_retask_prompt(
-        "a1",
-        prior,
-        missing_rubric=["enrichment_called", "related_alerts_checked"],
-        alert_ctx=alert_ctx,
-        reason="rubric_gap",
-    )
-    # Mentions each missing field
-    assert "enrichment_called=False" in prompt
-    assert "related_alerts_checked=False" in prompt
-    # Specific tool calls with alert's actual identifiers
-    assert "t_enrich_ip" in prompt
-    assert "8.8.8.8" in prompt
-    assert "host.name" in prompt
-    assert "endpoint-42" in prompt
-    # Reason is named in the header
-    assert "rubric_gap" in prompt
-
-
-def test_format_retask_prompt_handles_empty_missing_rubric() -> None:
-    """F4: when missing_rubric is empty (legacy synthesis_below_floor
-    path), the prompt still works — just doesn't include the targeted
-    section."""
-    from soc_ai.agent.orchestrator import _format_retask_prompt
-
-    prior = InvestigationTranscript(
-        evidence=["x"],
-        tentative_summary="y",
-        open_questions=["q"],
-    )
-    prompt = _format_retask_prompt("a1", prior, missing_rubric=[], alert_ctx=None)
-    assert "missing rubric coverage" not in prompt
-    # Still names the alert + the open question
-    assert "a1" in prompt
-    assert "q" in prompt
-
-
-@pytest.mark.asyncio
-async def test_retask_fires_on_rubric_gap_even_above_floor(
-    settings_kratos: Settings,
-) -> None:
-    """F4: rubric-gap retask trigger fires when ≥2 required rubric
-    fields are missing, even if confidence is above the floor."""
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    # Confidence ABOVE the standard floor (0.6) — should NOT have triggered
-    # the legacy retask. But with 2 missing required fields, F4 fires
-    # the retask anyway.
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.85,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    # External-IOC alert WITH dns/sni signal — needs both enrichment_called
-    # AND dns_or_sni_pivoted. The stub investigator never called any tools,
-    # so both will be missing.
-    async def _ext_ioc_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(
-                id="alert-001",
-                source_ip="10.0.0.1",
-                destination_ip="8.8.8.8",
-                payload_printable=".....example.com.....",
-                severity_label="medium",  # so citation validates
-            ),
-            community_id_events=[],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    retask_round_2_transcript = InvestigationTranscript(
-        evidence=["round-2 enriched (id evt-2)"],
-        tentative_summary="closed gaps",
-        open_questions=[],
-    )
-    retask_model = TestModel(call_tools=[], custom_output_args=retask_round_2_transcript)
+    fake_agent.run = AsyncMock(return_value=MagicMock(output=report))
 
     with (
         patch(
-            "soc_ai.agent.orchestrator.get_alert_context",
-            side_effect=_ext_ioc_prefetch,
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
         ),
         patch(
             "soc_ai.agent.orchestrator.build_synthesizer_model",
-            return_value=retask_model,
+            return_value=TestModel(call_tools=[], custom_output_args=report),
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synth_first_agent",
+            return_value=fake_agent,
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=candidate,
         ),
     ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
+        return [ev async for ev in investigate(alert_id, ctx=ctx)]
 
-    retask_ev = next(e for e in events if e.kind == "retask")
-    assert retask_ev.payload["reason"] == "rubric_gap"
-    assert "enrichment_called" in retask_ev.payload["missing_rubric"]
-    assert "dns_or_sni_pivoted" in retask_ev.payload["missing_rubric"]
+
+def _fake_loop_investigator_with_zeek_call() -> Any:
+    """A fake investigation-loop investigator whose ``iter()`` streams one
+    successful ``t_query_zeek_logs`` call+return and then exposes a settled
+    transcript result.
+
+    The tool RETURN part matters: ``count_successful_tool_calls`` counts it,
+    and only a loop with ≥1 successful call earns the evidence-gate
+    exemption (see ``orchestrator._loop_evidence_marker``)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    class _ToolCallPart(SimpleNamespace):
+        pass
+
+    class _ToolReturnPart(SimpleNamespace):
+        pass
+
+    zeek_call = _ToolCallPart(
+        tool_name="t_query_zeek_logs", args={"community_id": "1:abc"}, tool_call_id="tc1"
+    )
+    zeek_return = _ToolReturnPart(
+        tool_name="t_query_zeek_logs",
+        content={"ssl": {"server_name": "evil.example.com"}},
+        tool_call_id="tc1",
+        part_kind="tool-return",
+    )
+    loop_msg = SimpleNamespace(parts=[zeek_call, zeek_return])
+    loop_transcript = InvestigationTranscript(
+        evidence=[
+            "t_query_zeek_logs(community_id=1:abc) -> ssl.server_name=evil.example.com "
+            "(tool t_query_zeek_logs)",
+        ],
+        tentative_summary="Zeek SSL SNI gathered.",
+        open_questions=[],
+    )
+    inv_result = MagicMock()
+    inv_result.output = loop_transcript
+    inv_result.all_messages = MagicMock(return_value=[loop_msg])
+    inv_result.usage = MagicMock(
+        return_value=SimpleNamespace(
+            tool_calls=1, requests=2, input_tokens=10, output_tokens=5, total_tokens=15
+        )
+    )
+    fake_investigator = MagicMock()
+    fake_investigator.run = AsyncMock(return_value=inv_result)
+    _install_fake_iter(fake_investigator, [loop_msg], inv_result)
+    return fake_investigator
 
 
 @pytest.mark.asyncio
-async def test_investigate_emits_approval_required_per_action(
+async def test_investigate_yields_session_transcript_report_done(
     settings_kratos: Settings,
 ) -> None:
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="true_positive",
-            confidence=0.92,
-            summary="Confirmed C2 beaconing.",
-            citations=["alert.severity_label", "alert.id"],
-            recommended_actions=[
-                RecommendedAction(
-                    tool_name="escalate_to_case",
-                    tool_args={
-                        "alert_id": "alert-001",
-                        "case_title": "C2 beaconing",
-                        "case_description": "Outbound beacon to known-bad host.",
-                    },
-                    rationale="Multiple alerts; community_id pivot confirms persistence.",
-                ),
-                RecommendedAction(
-                    tool_name="ack_alert",
-                    tool_args={"alert_id": "alert-001", "comment": "Escalated to case"},
-                    rationale="Closing the alert now that a case is open.",
-                ),
-            ],
-        ),
-        ctx=ctx,
-    )
+    """A loop-running synth-first investigation yields the canonical stream:
+    session_start first, an investigation_transcript stamped with the
+    investigation_loop phase, a triage_report, and done last — with
+    monotonically increasing sequence numbers and no Phase-D retask."""
+    from unittest.mock import MagicMock
 
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
-    approval_events = [e for e in events if e.kind == "approval_required"]
-    assert len(approval_events) == 2
-    tools = {e.payload["tool_name"] for e in approval_events}
-    assert tools == {"escalate_to_case", "ack_alert"}
-    for ev in approval_events:
-        token = ev.payload["token"]
-        req = await ctx.gate.get(token)
-        assert req is not None
-        assert req.tool_name == ev.payload["tool_name"]
+    settings_kratos.investigate_when_unsure = True
+    ctx = _make_ctx(settings_kratos)
+
+    fake_investigator = _fake_loop_investigator_with_zeek_call()
+    settled_report = TriageReport(
+        verdict="true_positive",
+        confidence=0.9,
+        summary="Confirmed beacon to evil.example.com via Zeek SSL SNI.",
+        citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    loop_synth_result = MagicMock()
+    loop_synth_result.output = settled_report
+    loop_synth_result.usage = MagicMock(side_effect=RuntimeError("no usage in stub"))
+    fake_loop_synth = MagicMock()
+    fake_loop_synth.run = AsyncMock(return_value=loop_synth_result)
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _malware_signal_enriched(alert_id)  # → definitely_investigate
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[]),
+        ),
+        patch("soc_ai.agent.orchestrator.build_investigator", return_value=fake_investigator),
+        patch("soc_ai.agent.orchestrator.build_synthesizer", return_value=fake_loop_synth),
+    ):
+        events = [ev async for ev in investigate("beacon-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert kinds[0] == "session_start"
+    assert "investigation_transcript" in kinds
+    transcript_ev = next(e for e in events if e.kind == "investigation_transcript")
+    assert transcript_ev.payload["phase"] == "investigation_loop"
+    assert "triage_report" in kinds
+    assert kinds[-1] == "done"
+    # Sequence numbers increase
+    sequences = [e.sequence for e in events]
+    assert sequences == sorted(sequences)
+    # The loop supersedes Phase D → no retask on a clean run.
+    assert "retask" not in kinds
+    # The settled verdict carries through the post-validators.
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "true_positive"
 
 
 @pytest.mark.asyncio
 async def test_investigate_session_id_consistent(settings_kratos: Settings) -> None:
+    """Every event in one synth-first run carries the SAME session_id.
+
+    The pipeline mints its own session id (the legacy caller-supplied
+    ``session_id`` kwarg is not threaded into the synth-first stream); the
+    invariant the SSE consumers rely on is per-run consistency."""
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="needs_more_info",
-            confidence=0.7,  # above floor → no retask, simpler trace
-            summary="Insufficient evidence.",
-            citations=[],
-        ),
-        ctx=ctx,
-    )
-
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-            session_id="custom-sid",
-        )
-    ]
-    assert all(e.session_id == "custom-sid" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_investigate_error_event_on_investigator_failure(
-    settings_kratos: Settings,
-) -> None:
-    """Investigator failure in round 1 surfaces as an error event but the
-    orchestrator continues with a synthetic transcript so the synthesizer
-    still produces a triage_report. Smoke testing against Nemotron-30B
-    showed structured-output retries are stochastic and we don't want
-    those failures to leave the eval batch with null verdicts."""
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    events = await _run_synth_first(
+        ctx,
         report=TriageReport(
             verdict="needs_more_info",
             confidence=0.7,
-            summary="x",
+            summary="Insufficient evidence.",
             citations=[],
         ),
-        ctx=ctx,
     )
-    investigator.run = AsyncMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
+    assert events, "pipeline must emit events"
+    sid = events[0].session_id
+    assert sid
+    assert all(e.session_id == sid for e in events)
 
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
+
+@pytest.mark.asyncio
+async def test_investigation_loop_synth_failure_falls_back_to_round1_verdict(
+    settings_kratos: Settings,
+) -> None:
+    """A loop-synthesizer crash surfaces as a typed error event AND the
+    stream still lands a structured triage_report — the settled round-1
+    verdict, annotated so the operator knows the loop did not complete.
+    (No verdict=None rows; failures must stay scoreable.)"""
+    from unittest.mock import MagicMock
+
+    from pydantic_ai import Agent
+
+    settings_kratos.fast_triage_enabled = False  # force the investigation loop
+    ctx = _make_ctx(settings_kratos)
+
+    round1_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.9,
+        summary="Benign east-west traffic.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    synth_first_agent = Agent(
+        model=TestModel(call_tools=[], custom_output_args=round1_report),
+        system_prompt="stub",
+        output_type=TriageReport,
+    )
+    synth_first_agent.run = AsyncMock(return_value=MagicMock(output=round1_report))
+
+    fake_investigator = _fake_loop_investigator_with_zeek_call()
+    fake_loop_synth = MagicMock()
+    fake_loop_synth.run = AsyncMock(side_effect=RuntimeError("boom"))
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _stub_enriched_alert_context(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[]),
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synth_first_agent",
+            return_value=synth_first_agent,
+        ),
+        patch("soc_ai.agent.orchestrator.build_investigator", return_value=fake_investigator),
+        patch("soc_ai.agent.orchestrator.build_synthesizer", return_value=fake_loop_synth),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    loop_ev = next(e for e in events if e.kind == "investigation_loop_entered")
+    assert loop_ev.payload["reason"] == "fast_triage_disabled"
     error_evs = [e for e in events if e.kind == "error"]
     assert len(error_evs) == 1
     assert error_evs[0].payload["type"] == "RuntimeError"
-    assert error_evs[0].payload["phase"] == "investigator"
-    assert error_evs[0].payload["round"] == 1
+    assert error_evs[0].payload["phase"] == "investigation_loop_synth"
+    assert error_evs[0].payload["round"] == 2
     assert "boom" in error_evs[0].payload["message"]
-    # Synthetic-transcript fallback: synth still runs, triage_report still emits.
-    assert any(e.kind == "triage_report" for e in events)
-    # The synthetic transcript event names the failure mode in tentative_summary.
-    transcript_evs = [e for e in events if e.kind == "investigation_transcript"]
-    assert len(transcript_evs) == 1
-    assert "did not produce" in transcript_evs[0].payload["tentative_summary"]
+    # Fallback: the settled round-1 verdict stands, annotated.
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+    assert report_ev.payload["confidence"] == pytest.approx(0.9)
+    assert "did not complete" in report_ev.payload["summary"]
+    assert [e.kind for e in events][-1] == "done"
 
 
 # =====================================================================
@@ -669,39 +522,30 @@ async def test_investigate_error_event_on_investigator_failure(
 
 
 @pytest.mark.asyncio
-async def test_investigate_emits_alert_context_event_before_investigator(
+async def test_investigate_emits_enriched_alert_context_event_first(
     settings_kratos: Settings,
 ) -> None:
-    """The pre-fetched alert context is yielded as an SSE event between
-    `session_start` and the first investigator activity, so the side panel
-    can render it immediately."""
+    """The pre-fetched (enriched) alert context is yielded as an SSE event
+    immediately after `session_start`, before any synthesis activity, so the
+    side panel can render it immediately."""
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    events = await _run_synth_first(
+        ctx,
         report=TriageReport(
             verdict="false_positive",
             confidence=0.9,
             summary="x",
             citations=["alert.severity_label"],
         ),
-        ctx=ctx,
+        candidate=_strong_benign_candidate(),
     )
 
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
-
     kinds = [e.kind for e in events]
-    # Order: session_start → alert_context → investigator activity → ... → done.
+    # Order: session_start → enriched_alert_context → synthesis → ... → done.
     assert kinds[0] == "session_start"
-    assert kinds[1] == "alert_context"
-    # The alert_context payload mirrors the AlertContext model_dump.
+    assert kinds[1] == "enriched_alert_context"
+    # The payload mirrors the EnrichedAlertContext model_dump.
     ac_ev = events[1]
     assert ac_ev.payload["alert"]["id"] == "alert-001"
     assert ac_ev.payload["alert"]["severity_label"] == "low"
@@ -709,96 +553,82 @@ async def test_investigate_emits_alert_context_event_before_investigator(
 
 
 @pytest.mark.asyncio
-async def test_investigate_passes_alert_context_to_investigator_user_message(
+async def test_investigation_loop_passes_enriched_context_to_investigator_user_message(
     settings_kratos: Settings,
 ) -> None:
-    """The investigator agent is invoked with a user message that contains the
-    pre-fetched alert context as JSON, so the fast model can never miss it."""
+    """The loop investigator is invoked with a user message that contains the
+    pre-fetched enriched alert context as JSON, so the model can never miss
+    it — and is told not to re-fetch it."""
+    from unittest.mock import MagicMock
+
+    settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.9,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
+
+    fake_investigator = _fake_loop_investigator_with_zeek_call()
+    settled_report = TriageReport(
+        verdict="true_positive",
+        confidence=0.9,
+        summary="Confirmed beacon.",
+        citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=[],
     )
-    captured: dict[str, str] = {}
-    real_run = investigator.run
+    loop_synth_result = MagicMock()
+    loop_synth_result.output = settled_report
+    loop_synth_result.usage = MagicMock(side_effect=RuntimeError("no usage in stub"))
+    fake_loop_synth = MagicMock()
+    fake_loop_synth.run = AsyncMock(return_value=loop_synth_result)
 
-    async def _spy(prompt: str, **kw: Any) -> Any:
-        captured["prompt"] = prompt
-        return await real_run(prompt, **kw)
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _malware_signal_enriched(alert_id)  # → definitely_investigate
 
-    investigator.run = _spy  # type: ignore[method-assign]
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[]),
+        ),
+        patch("soc_ai.agent.orchestrator.build_investigator", return_value=fake_investigator),
+        patch("soc_ai.agent.orchestrator.build_synthesizer", return_value=fake_loop_synth),
+    ):
+        [ev async for ev in investigate("beacon-001", ctx=ctx)]
 
-    [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
-
-    prompt = captured["prompt"]
-    assert "Triage alert alert-001" in prompt
+    fake_investigator.iter.assert_called_once()
+    prompt = fake_investigator.iter.call_args[0][0]
+    assert "Triage alert beacon-001" in prompt
     assert "Pre-fetched alert context" in prompt
-    # The actual JSON dump of the AlertContext lands in the prompt.
-    assert '"id": "alert-001"' in prompt
+    # The actual JSON dump of the EnrichedAlertContext lands in the prompt.
+    assert '"id":"beacon-001"' in prompt or '"id": "beacon-001"' in prompt
     # And the rubric instructs the model NOT to call get_alert_context again.
     assert "Do NOT call `t_get_alert_context`" in prompt
 
 
 @pytest.mark.asyncio
-async def test_investigate_aborts_when_prefetch_fails(
+async def test_investigate_stops_with_error_when_prefetch_fails(
     settings_kratos: Settings,
 ) -> None:
-    """If alert-context prefetch fails (alert not found, ES down), the stream
-    ends with a typed error event whose `phase=='prefetch'` and a non-empty
-    hint."""
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.9,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
+    """If enriched-context prefetch fails (alert not found, ES down), the
+    stream ends with a typed error event whose `phase=='prefetch'` and a
+    non-empty hint — and NO fabricated verdict. The recorder marks the run
+    error (retryable) instead of landing a fake needs_more_info."""
     from soc_ai.errors import SoNotFoundError
 
-    async def _fail(_alert_id: str, **_kw: Any) -> AlertContext:
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+
+    async def _fail(_alert_id: str, **_kw: Any) -> Any:
         raise SoNotFoundError("alert not found: alert-001")
 
-    # Override the autouse patch for this test only.
     with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
+        "soc_ai.tools.get_alert_context.get_enriched_alert_context",
         side_effect=_fail,
     ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
 
     kinds = [e.kind for e in events]
-    # Synthetic-failure-report contract (added after eval batches surfaced
-    # frequent prefetch ConnectionTimeouts): the orchestrator now ALWAYS
-    # emits a TriageReport so the supervisor never goes silent on terminal
-    # upstream failure. Stub the verdict at `needs_more_info`, summary names
-    # the failure mode, then a `done` event with `synthetic=True`.
-    assert kinds == ["session_start", "error", "triage_report", "done"]
+    assert kinds == ["session_start", "error"]
 
     err = events[1].payload
     assert err["phase"] == "prefetch"
@@ -807,78 +637,6 @@ async def test_investigate_aborts_when_prefetch_fails(
     assert "alert not found" in err["message"]
     assert err.get("hint")
 
-    report = events[2].payload
-    assert report["verdict"] == "needs_more_info"
-    assert report["confidence"] == 0.0
-    assert "SoNotFoundError" in report["summary"]
-    assert report["recommended_actions"] == []
-    assert report["citations"] == []
-
-    done = events[3].payload
-    assert done["synthetic"] is True
-    assert done["reason"] == "prefetch_failed"
-    assert done["recommended_count"] == 0
-    assert done["rounds"] == 0
-
-
-@pytest.mark.asyncio
-async def test_retask_uses_synthesizer_model_for_round_2_investigator(
-    settings_kratos: Settings,
-) -> None:
-    """When retask fires, the round-2 investigator is built off
-    `build_synthesizer_model` (structured-output config) — not
-    `build_investigator_model`. Both use the single analyst model."""
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(open_qs=["unenriched IP"]),
-        report=TriageReport(
-            verdict="needs_more_info",
-            confidence=0.3,  # forces retask
-            summary="x",
-            citations=[],
-        ),
-        ctx=ctx,
-    )
-    retask_round_2_transcript = InvestigationTranscript(
-        evidence=["enriched IP clean (id=event-x)"],
-        tentative_summary="Round 2 closed the gap.",
-        open_questions=[],
-    )
-    retask_model = TestModel(call_tools=[], custom_output_args=retask_round_2_transcript)
-
-    with (
-        patch(
-            "soc_ai.agent.orchestrator.build_synthesizer_model",
-            return_value=retask_model,
-        ) as synth_model_spy,
-        patch(
-            "soc_ai.agent.orchestrator.build_investigator_model",
-        ) as inv_model_spy,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    # build_investigator_model is for round-1 only; the orchestrator gets the
-    # round-1 investigator pre-built from the test, so the factory should
-    # never be called.
-    assert inv_model_spy.call_count == 0
-    # build_synthesizer_model is called exactly once: for the retask
-    # round-2 investigator. (The synthesizer was pre-built as a TestModel.)
-    assert synth_model_spy.call_count == 1
-
-    kinds = [e.kind for e in events]
-    assert kinds.count("retask") == 1
-    assert kinds.count("investigation_transcript") == 2
-    done_ev = next(e for e in events if e.kind == "done")
-    assert done_ev.payload["rounds"] == 2
-
 
 @pytest.mark.asyncio
 async def test_error_event_carries_phase_round_type_and_hint(
@@ -886,34 +644,36 @@ async def test_error_event_carries_phase_round_type_and_hint(
 ) -> None:
     """Errors flow through `_error_payload` and gain a hint when the exception
     type is recognized (OqlValidationError → field-name guidance)."""
+    from unittest.mock import MagicMock
+
     from soc_ai.errors import OqlValidationError
 
+    settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.9,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-    investigator.run = AsyncMock(  # type: ignore[method-assign]
+
+    fake_investigator = MagicMock()
+    fake_investigator.iter = MagicMock(
         side_effect=OqlValidationError("unknown or forbidden field: 'dest.ip'", fragment="dest.ip")
     )
 
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _malware_signal_enriched(alert_id)  # → definitely_investigate
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[]),
+        ),
+        patch("soc_ai.agent.orchestrator.build_investigator", return_value=fake_investigator),
+    ):
+        events = [ev async for ev in investigate("mal-001", ctx=ctx)]
+
     err = next(e for e in events if e.kind == "error").payload
-    assert err["phase"] == "investigator"
+    assert err["phase"] == "investigation_loop"
     assert err["round"] == 1
     assert err["type"] == "OqlValidationError"
     assert "dest.ip" in err["message"]
@@ -923,620 +683,8 @@ async def test_error_event_carries_phase_round_type_and_hint(
 
 
 # =====================================================================
-# Rule-class fast-path
+# F1: Enrichment cache + prefetch materialization
 # =====================================================================
-
-
-def _stub_informational_alert_context(alert_id: str = "alert-001") -> AlertContext:
-    """AlertContext for a fast-path-eligible alert (Informational + low)."""
-    from soc_ai.so_client.models import RuleMetadata
-
-    return AlertContext(
-        alert=SoAlert(
-            id=alert_id,
-            severity_label="low",
-            rule_metadata=RuleMetadata(signature_severity="Informational"),
-        ),
-        community_id_events=[],
-        host_events=[],
-        user_events=[],
-        process_events=[],
-        file_events=[],
-        pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-    )
-
-
-@pytest.mark.asyncio
-async def test_fast_path_classification_event_emitted(
-    settings_kratos: Settings,
-) -> None:
-    """The classification event surfaces the alert class and fast-path
-    routing decision so the SSE consumer + audit log can render them."""
-    settings_kratos.fast_path_sampling_rate = 0.0  # deterministic
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.8,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    cls_ev = next(e for e in events if e.kind == "classification")
-    assert cls_ev.payload["alert_class"] == "informational_visibility"
-    assert cls_ev.payload["fast_path_eligible"] is True
-    assert cls_ev.payload["fast_path_taken"] is True
-    assert cls_ev.payload["sampled_to_full"] is False
-
-
-@pytest.mark.asyncio
-async def test_fast_path_uses_lower_retask_floor(
-    settings_kratos: Settings,
-) -> None:
-    """Fast-path alerts with confidence ≥ fast_path_synthesis_floor (0.4)
-    skip the retask, even though the standard floor (0.6) would have
-    triggered one. This is the whole point of the fast-path."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.5,  # below 0.6 (would retask) but above 0.4 (no retask on fast-path)
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    kinds = [e.kind for e in events]
-    assert "retask" not in kinds  # fast-path floor=0.4 means 0.5 passes
-
-
-@pytest.mark.asyncio
-async def test_fast_path_disabled_via_setting_uses_full_pipeline(
-    settings_kratos: Settings,
-) -> None:
-    """When `enable_rule_class_fast_path=False`, the orchestrator never
-    fast-paths even for an INFORMATIONAL_VISIBILITY + low alert."""
-    settings_kratos.enable_rule_class_fast_path = False
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.5,  # below standard 0.6 → retask
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    retask_round_2_transcript = InvestigationTranscript(
-        evidence=["round-2 evidence (id=evt-2)"],
-        tentative_summary="closed gaps",
-        open_questions=[],
-    )
-    retask_model = TestModel(call_tools=[], custom_output_args=retask_round_2_transcript)
-
-    with (
-        patch(
-            "soc_ai.agent.orchestrator.get_alert_context",
-            side_effect=_fast_path_prefetch,
-        ),
-        patch(
-            "soc_ai.agent.orchestrator.build_synthesizer_model",
-            return_value=retask_model,
-        ),
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    kinds = [e.kind for e in events]
-    cls_ev = next(e for e in events if e.kind == "classification")
-    # Classifier still runs (always emits the event), but fast-path is gated.
-    assert cls_ev.payload["alert_class"] == "informational_visibility"
-    assert cls_ev.payload["fast_path_eligible"] is False
-    assert cls_ev.payload["fast_path_taken"] is False
-    # Standard floor (0.6) catches the 0.5 confidence and retasks.
-    assert "retask" in kinds
-
-
-@pytest.mark.asyncio
-async def test_fast_path_sampling_routes_to_full_pipeline(
-    settings_kratos: Settings,
-) -> None:
-    """When the sampling RNG selects this alert for drift monitoring,
-    `fast_path_taken` is False and the standard floor applies."""
-    settings_kratos.fast_path_sampling_rate = 1.0  # always sample
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.5,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    retask_round_2_transcript = InvestigationTranscript(
-        evidence=["round-2 evidence (id=evt-2)"],
-        tentative_summary="closed gaps",
-        open_questions=[],
-    )
-    retask_model = TestModel(call_tools=[], custom_output_args=retask_round_2_transcript)
-
-    with (
-        patch(
-            "soc_ai.agent.orchestrator.get_alert_context",
-            side_effect=_fast_path_prefetch,
-        ),
-        patch(
-            "soc_ai.agent.orchestrator.build_synthesizer_model",
-            return_value=retask_model,
-        ),
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    cls_ev = next(e for e in events if e.kind == "classification")
-    assert cls_ev.payload["fast_path_eligible"] is True
-    assert cls_ev.payload["sampled_to_full"] is True
-    assert cls_ev.payload["fast_path_taken"] is False
-    # Standard floor (0.6) wins on the sampled-to-full path.
-    assert "retask" in [e.kind for e in events]
-
-
-@pytest.mark.asyncio
-async def test_non_informational_alert_not_fast_pathed(
-    settings_kratos: Settings,
-) -> None:
-    """Recon / exploit / post-compromise classes always run the full
-    pipeline regardless of severity."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.8,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _recon_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(id="alert-001", severity_label="low", classtype="attempted-recon"),
-            community_id_events=[],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_recon_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    cls_ev = next(e for e in events if e.kind == "classification")
-    assert cls_ev.payload["alert_class"] == "recon"
-    assert cls_ev.payload["fast_path_eligible"] is False
-    assert cls_ev.payload["fast_path_taken"] is False
-
-
-# =====================================================================
-# F1: Real fast-path short-circuit
-# =====================================================================
-
-
-def test_enrichment_cache_lru_behavior() -> None:
-    """EnrichmentCache is a small LRU.
-    Capacity overflow evicts the oldest entry."""
-    from soc_ai.agent.enrichment_cache import EnrichmentCache
-
-    cache = EnrichmentCache(capacity=3)
-    cache.put("a", 1)
-    cache.put("b", 2)
-    cache.put("c", 3)
-    assert cache.contains("a")
-    assert cache.contains("b")
-    assert cache.contains("c")
-    # Overflow → "a" evicted (oldest).
-    cache.put("d", 4)
-    assert not cache.contains("a")
-    assert cache.contains("b")
-    assert cache.contains("c")
-    assert cache.contains("d")
-    # `get` refreshes recency, so re-inserting another should evict "c"
-    # next (not "b" which we just touched).
-    assert cache.get("b") == 2
-    cache.put("e", 5)
-    assert cache.contains("b")
-    assert cache.contains("d")
-    assert cache.contains("e")
-    assert not cache.contains("c")
-
-
-def test_is_fast_path_eligible_external_ip_requires_cache_hit() -> None:
-    """External-destination alerts require a prior
-    enrichment cache hit to fast-path; internal-only alerts skip the
-    cache check entirely."""
-    from soc_ai.agent.classifier import AlertClass, is_fast_path_eligible
-    from soc_ai.agent.enrichment_cache import EnrichmentCache
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-
-    cache = EnrichmentCache()
-    ext = SoAlert(
-        id="a1",
-        severity_label="low",
-        rule_metadata=RuleMetadata(signature_severity="Informational"),
-        destination_ip="8.8.8.8",
-    )
-    # First-encounter external → NOT eligible.
-    assert (
-        is_fast_path_eligible(ext, AlertClass.INFORMATIONAL_VISIBILITY, enrichment_cache=cache)
-        is False
-    )
-    # After cache hit → eligible.
-    cache.put("8.8.8.8", {})
-    assert (
-        is_fast_path_eligible(ext, AlertClass.INFORMATIONAL_VISIBILITY, enrichment_cache=cache)
-        is True
-    )
-    # Internal-only alert: cache check skipped entirely.
-    internal = SoAlert(
-        id="a2",
-        severity_label="low",
-        rule_metadata=RuleMetadata(signature_severity="Informational"),
-        destination_ip="10.0.0.2",
-    )
-    assert (
-        is_fast_path_eligible(internal, AlertClass.INFORMATIONAL_VISIBILITY, enrichment_cache=cache)
-        is True
-    )
-
-
-def test_is_fast_path_eligible_without_cache_keeps_pre_29_behavior() -> None:
-    """When enrichment_cache is None (test/legacy callers), the gate
-    is skipped — the earlier cache-free behavior is preserved."""
-    from soc_ai.agent.classifier import AlertClass, is_fast_path_eligible
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-
-    ext = SoAlert(
-        id="a",
-        severity_label="low",
-        rule_metadata=RuleMetadata(signature_severity="Informational"),
-        destination_ip="8.8.8.8",
-    )
-    # No cache passed → eligible regardless of cache state.
-    assert is_fast_path_eligible(ext, AlertClass.INFORMATIONAL_VISIBILITY) is True
-
-
-def test_has_closeable_rubric_gap_finds_unused_tool() -> None:
-    """A missing rubric field with an unused mapped tool
-    is closeable. Drives the retask trigger."""
-    from soc_ai.agent.orchestrator import _has_closeable_rubric_gap
-
-    # enrichment_called missing; no t_enrich_* call in messages → closeable.
-    msgs = [_msg(("t_query_zeek_logs", {"community_id": "x"}))]
-    assert _has_closeable_rubric_gap(["enrichment_called"], msgs) is True
-
-
-def test_has_closeable_rubric_gap_skips_when_all_tools_used() -> None:
-    """If all mapped tools for every missing field were called,
-    retasking won't help — closeable is False."""
-    from soc_ai.agent.orchestrator import _has_closeable_rubric_gap
-
-    msgs = [
-        _msg(
-            ("t_enrich_ip", {"ip": "8.8.8.8"}),
-            ("t_enrich_domain", {"domain": "x.com"}),
-            ("t_enrich_hash", {"hash_value": "deadbeef", "algo": "sha256"}),
-        )
-    ]
-    # All enrichment tools already called → enrichment_called is not closeable.
-    assert _has_closeable_rubric_gap(["enrichment_called"], msgs) is False
-
-
-def test_has_closeable_rubric_gap_skips_unmapped_fields() -> None:
-    """payload_inspected_if_banner_rule has no tool — not closeable."""
-    from soc_ai.agent.orchestrator import _has_closeable_rubric_gap
-
-    assert _has_closeable_rubric_gap(["payload_inspected_if_banner_rule"], []) is False
-
-
-def test_fast_path_external_indicator_picks_external_dest() -> None:
-    """Helper returns the highest-priority external IOC."""
-    from soc_ai.agent.orchestrator import _fast_path_external_indicator
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    ctx = AlertContext(alert=SoAlert(id="a", source_ip="10.0.0.1", destination_ip="8.8.8.8"))
-    assert _fast_path_external_indicator(ctx) == "8.8.8.8"
-
-
-def test_fast_path_external_indicator_returns_none_for_internal_only() -> None:
-    """Pure-internal alerts skip enrichment."""
-    from soc_ai.agent.orchestrator import _fast_path_external_indicator
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    ctx = AlertContext(alert=SoAlert(id="a", source_ip="10.0.0.1", destination_ip="10.0.0.2"))
-    assert _fast_path_external_indicator(ctx) is None
-
-
-def test_enrichment_has_threat_signal_misp_hit() -> None:
-    """A MISP IOC match flags the enrichment as a threat signal,
-    triggering escalation to the full pipeline."""
-    from soc_ai.agent.orchestrator import _enrichment_has_threat_signal
-    from soc_ai.tools.enrichment import EnrichmentResult, Finding
-
-    result_threat = EnrichmentResult(
-        indicator="8.8.8.8",
-        indicator_type="ip",
-        findings=[
-            Finding(
-                source="misp",
-                category="ioc_match",
-                description="MISP malware: known C2",
-            )
-        ],
-    )
-    assert _enrichment_has_threat_signal(result_threat) is True
-
-    # Empty findings → not a threat signal.
-    result_clean = EnrichmentResult(indicator="8.8.8.8", indicator_type="ip", findings=[])
-    assert _enrichment_has_threat_signal(result_clean) is False
-
-
-@pytest.mark.asyncio
-async def test_fast_path_runs_mandatory_enrichment_on_external_ip(
-    settings_kratos: Settings,
-) -> None:
-    """Fast-path with external IP emits a synthetic t_enrich_ip
-    tool_call/tool_result pair and adds the result to materialized
-    evidence. Pre-populates the enrichment cache to satisfy fast-path
-    eligibility for the external destination."""
-    from unittest.mock import AsyncMock
-
-    from soc_ai.agent.enrichment_cache import get_global_cache
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.enrichment import EnrichmentResult, Finding
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    # Pre-populate cache so the external dest IP is eligible for fast-path.
-    get_global_cache().put("8.8.8.8", {"prior": "enrichment"})
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.7,
-            summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _ctx_with_ext_ip(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(
-                id="alert-001",
-                severity_label="low",
-                rule_metadata=RuleMetadata(signature_severity="Informational"),
-                source_ip="10.0.0.1",
-                destination_ip="8.8.8.8",
-            ),
-            community_id_events=[],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    clean_result = EnrichmentResult(
-        indicator="8.8.8.8",
-        indicator_type="ip",
-        findings=[
-            Finding(
-                source="internal_cidr",
-                category="external_network",
-                description="external IP, not in internal_cidrs",
-            )
-        ],
-    )
-
-    with (
-        patch(
-            "soc_ai.agent.orchestrator.get_alert_context",
-            side_effect=_ctx_with_ext_ip,
-        ),
-        patch(
-            "soc_ai.agent.orchestrator.enrich_ip",
-            new=AsyncMock(return_value=clean_result),
-        ),
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    # Synthetic tool_call event with fast_path phase
-    tool_calls = [
-        e for e in events if e.kind == "tool_call" and e.payload.get("phase") == "fast_path"
-    ]
-    assert len(tool_calls) == 1
-    assert tool_calls[0].payload["tool_name"] == "t_enrich_ip"
-    assert tool_calls[0].payload["args"] == {"ip": "8.8.8.8"}
-    # Materialized evidence carries the enrichment summary
-    transcript_ev = next(e for e in events if e.kind == "investigation_transcript")
-    assert any("t_enrich_ip(8.8.8.8)" in item for item in transcript_ev.payload["evidence"])
-
-
-@pytest.mark.asyncio
-async def test_fast_path_escalates_on_misp_hit(
-    settings_kratos: Settings,
-) -> None:
-    """A MISP IOC match on fast-path enrichment escalates to the
-    FULL investigator pipeline. Emits fast_path_escalation SSE event."""
-    from unittest.mock import AsyncMock
-
-    from soc_ai.agent.enrichment_cache import get_global_cache
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.enrichment import EnrichmentResult, Finding
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    # Pre-populate cache so the external dest IP is eligible for fast-path.
-    get_global_cache().put("1.2.3.4", {"prior": "enrichment"})
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="needs_more_info",
-            confidence=0.7,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _ctx_with_ext_ip(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(
-                id="alert-001",
-                severity_label="low",
-                rule_metadata=RuleMetadata(signature_severity="Informational"),
-                destination_ip="1.2.3.4",
-            ),
-            community_id_events=[],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    threat_result = EnrichmentResult(
-        indicator="1.2.3.4",
-        indicator_type="ip",
-        findings=[
-            Finding(
-                source="misp",
-                category="ioc_match",
-                description="MISP malware: C2 infrastructure",
-            )
-        ],
-    )
-
-    with (
-        patch(
-            "soc_ai.agent.orchestrator.get_alert_context",
-            side_effect=_ctx_with_ext_ip,
-        ),
-        patch(
-            "soc_ai.agent.orchestrator.enrich_ip",
-            new=AsyncMock(return_value=threat_result),
-        ),
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    # Escalation event fires
-    esc_ev = next(e for e in events if e.kind == "fast_path_escalation")
-    assert "threat-signal" in esc_ev.payload["reason"]
-    # Standard pipeline runs — the test-model investigator emits a transcript
-    transcript_evs = [e for e in events if e.kind == "investigation_transcript"]
-    assert len(transcript_evs) == 1
-    # Fast-path skipped flag should NOT be set on escalated transcript
-    assert not transcript_evs[0].payload.get("fast_path_skipped")
 
 
 def test_materialize_prefetch_evidence_includes_rule_metadata_and_pivots() -> None:
@@ -1688,266 +836,6 @@ def test_materialize_prefetch_evidence_includes_misp_hits() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fast_path_emits_materialized_evidence(
-    settings_kratos: Settings,
-) -> None:
-    """Fast-path transcript includes orchestrator-materialized
-    evidence drawn from prefetch (rule_metadata, classtype, etc.), not
-    the empty list from F1's original design. Evidence list size is
-    surfaced in the investigation_transcript event."""
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.65,
-            summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _ctx_with_pivot(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(
-                id="alert-001",
-                severity_label="low",
-                rule_metadata=RuleMetadata(signature_severity="Informational"),
-                alert_action="allowed",
-                classtype="misc-activity",
-            ),
-            community_id_events=[SoAlert(id="pivot-evt-1", event_dataset="zeek.conn")],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 1, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_ctx_with_pivot,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    transcript_ev = next(e for e in events if e.kind == "investigation_transcript")
-    assert transcript_ev.payload.get("fast_path_skipped") is True
-    assert transcript_ev.payload.get("evidence_materialized", 0) > 0
-    # The transcript's evidence list itself is non-empty now.
-    assert transcript_ev.payload["evidence"]
-    # And one of the items cites the community_id pivot.
-    assert any("pivot-evt-1" in item for item in transcript_ev.payload["evidence"])
-
-
-@pytest.mark.asyncio
-async def test_fast_path_evidence_guard_downgrades_when_synth_emits_no_citations(
-    settings_kratos: Settings,
-) -> None:
-    """If the fast-path synth ignores the materialized
-    evidence and emits a non-NMI verdict with NO citations, the
-    orchestrator force-downgrades to needs_more_info. Closes the
-    'rubber-stamp without positive signal' failure mode."""
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",  # synth ignores prefetch...
-            confidence=0.7,
-            summary="x",
-            citations=[],  # ...and emits no citations
-        ),
-        ctx=ctx,
-    )
-
-    async def _ctx_with_pivot(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(
-                id="alert-001",
-                severity_label="low",
-                rule_metadata=RuleMetadata(signature_severity="Informational"),
-            ),
-            community_id_events=[SoAlert(id="pivot-evt-1", event_dataset="zeek.conn")],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 1, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_ctx_with_pivot,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    guard_ev = next(e for e in events if e.kind == "fast_path_evidence_guard")
-    assert guard_ev.payload["original_verdict"] == "false_positive"
-    assert guard_ev.payload["capped_verdict"] == "needs_more_info"
-    report_ev = next(e for e in events if e.kind == "triage_report")
-    assert report_ev.payload["verdict"] == "needs_more_info"
-
-
-@pytest.mark.asyncio
-async def test_fast_path_skips_investigator_entirely(
-    settings_kratos: Settings,
-) -> None:
-    """F1: when fast_path_taken=True, the investigator is not called.
-    The synthetic transcript has fast_path_skipped=True flag and no tool
-    calls flow into the event stream."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.65,
-            summary="ET INFO routine traffic.",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-    # Spy on investigator.run — it must NOT be called on fast-path.
-    investigator.run = AsyncMock(side_effect=AssertionError("investigator should be skipped"))  # type: ignore[method-assign]
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    investigator.run.assert_not_called()
-    transcript_ev = next(e for e in events if e.kind == "investigation_transcript")
-    assert transcript_ev.payload.get("fast_path_skipped") is True
-    # No investigator-phase tool_call / model_response events.
-    inv_phase_evs = [e for e in events if e.payload.get("phase") == "investigator"]
-    assert inv_phase_evs == []
-    # The triage_report still emerges.
-    assert any(e.kind == "triage_report" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_fast_path_verdict_ceiling_downgrades_true_positive(
-    settings_kratos: Settings,
-) -> None:
-    """F1: fast-path NEVER emits true_positive. If the synth disagrees
-    with the classifier and emits true_positive, the orchestrator
-    downgrades to needs_more_info and emits a fast_path_verdict_cap event."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="true_positive",  # synth disagrees with classifier
-            confidence=0.9,
-            summary="actually malicious",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    cap_ev = next(e for e in events if e.kind == "fast_path_verdict_cap")
-    assert cap_ev.payload["original_verdict"] == "true_positive"
-    assert cap_ev.payload["capped_verdict"] == "needs_more_info"
-    # Final report shows the capped verdict.
-    report_ev = next(e for e in events if e.kind == "triage_report")
-    assert report_ev.payload["verdict"] == "needs_more_info"
-
-
-@pytest.mark.asyncio
-async def test_fast_path_skips_coverage_cap(
-    settings_kratos: Settings,
-) -> None:
-    """F1: coverage_cap is bound to investigator-derived rubric.
-    On fast-path the investigator is skipped; coverage_cap MUST NOT fire."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.8,
-            summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    kinds = [e.kind for e in events]
-    assert "coverage_cap" not in kinds
-    # And no retask either (F1 unconditional skip).
-    assert "retask" not in kinds
-
-
-@pytest.mark.asyncio
 async def test_verdict_floor_rewrite_below_floor(
     settings_kratos: Settings,
 ) -> None:
@@ -1956,35 +844,17 @@ async def test_verdict_floor_rewrite_below_floor(
     needs_more_info AND the report carries no semantic evidence (zero
     citations here), the orchestrator mechanically rewrites verdict to
     needs_more_info and clears recommended_actions."""
-    settings_kratos.fast_path_sampling_rate = 0.0
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    events = await _run_synth_first(
+        ctx,
         report=TriageReport(
             verdict="false_positive",  # Synth says FP...
             confidence=0.45,  # ...but confidence below 0.6 floor
             summary="thin evidence",
             citations=[],  # ...and no evidence at all
         ),
-        ctx=ctx,
     )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
 
     rewrite_ev = next(e for e in events if e.kind == "verdict_floor_rewrite")
     assert rewrite_ev.payload["original_verdict"] == "false_positive"
@@ -2002,44 +872,29 @@ async def test_verdict_floor_rewrite_below_floor(
 async def test_verdict_floor_rewrite_survives_with_evidence(
     settings_kratos: Settings,
 ) -> None:
-    """B3: the LEGACY floor rewrite must be evidence-
-    conditional like `_synth_first_post_validate` — a verdict whose
+    """B3: the floor rewrite is evidence-conditional — a verdict whose
     citations semantically resolve SURVIVES low confidence. Citation-shape
-    noise must not erase a well-evidenced verdict on the fallback path."""
-    settings_kratos.fast_path_sampling_rate = 0.0
+    noise must not erase a well-evidenced verdict."""
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    events = await _run_synth_first(
+        ctx,
         report=TriageReport(
             verdict="false_positive",
             confidence=0.55,  # below the 0.6 floor...
             summary="well-evidenced but hedged",
             # ...but the citation resolves against the prefetched bundle.
-            citations=["alert.rule_metadata.signature_severity"],
+            citations=["alert.severity_label"],
         ),
-        ctx=ctx,
+        # Strong benign template: keeps the zero-tool FP past the hard
+        # evidence gate so this test isolates the floor-rewrite behavior.
+        candidate=_strong_benign_candidate(),
     )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
 
     assert not any(e.kind == "verdict_floor_rewrite" for e in events)
     report_ev = next(e for e in events if e.kind == "triage_report")
     assert report_ev.payload["verdict"] == "false_positive"
+    assert report_ev.payload["confidence"] == pytest.approx(0.55)
 
 
 @pytest.mark.asyncio
@@ -2049,37 +904,21 @@ async def test_verdict_floor_rewrite_skips_when_verdict_already_nmi(
     """Don't double-rewrite when verdict is already
     needs_more_info — the rewrite would be a no-op anyway, but emitting
     the SSE event would be noisy."""
-    settings_kratos.fast_path_sampling_rate = 0.0
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    events = await _run_synth_first(
+        ctx,
         report=TriageReport(
             verdict="needs_more_info",
-            confidence=0.3,
+            confidence=0.3,  # well below the floor, but already NMI
             summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
+            citations=["alert.severity_label"],
         ),
-        ctx=ctx,
     )
 
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
     assert not any(e.kind == "verdict_floor_rewrite" for e in events)
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "needs_more_info"
 
 
 def _stub_icmp_ping_alert_context(
@@ -2152,68 +991,114 @@ def _bpfdoor_tp_report() -> TriageReport:
     )
 
 
-async def _run_legacy_icmp_investigation(
+def _icmp_enriched_variant(
+    alert_id: str = "alert-001",
+    *,
+    icmp_echo: bool = True,
+    with_enrichments: bool = True,
+    blocklisted_dst: bool = False,
+) -> Any:
+    """EnrichedAlertContext variants for the BPFDoor-class ICMP ping (B2).
+
+    Default shape: typed_zeek proves the solicited echo (type-8 → type-0)
+    and both endpoints carry clean internal IndicatorEnrichment entries —
+    the ``"enrichment"`` verification branch of
+    ``_is_solicited_internal_icmp_echo``. ``blocklisted_dst`` seeds a
+    blocklist hit on the destination's enrichment (vetoes the downgrade);
+    ``with_enrichments=False`` drops the per-indicator enrichments (forces
+    the explicit-blocklist branch, which then demands ``ctx.blocklist``
+    proof); ``icmp_echo=False`` removes the echo signal (plain TCP conn —
+    the lateral-movement shape the downgrade must never touch)."""
+    from soc_ai.enrichment.zeek_parser import TypedZeekFields
+    from soc_ai.tools.enrichment import IndicatorEnrichment
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext
+
+    src, dst = "10.20.30.1", "10.20.30.15"
+    enrichments: dict[str, Any] = {}
+    if with_enrichments:
+        dst_hits = (
+            [
+                BlocklistHit(
+                    indicator=dst,
+                    indicator_type="ip",
+                    source="abuse.ch ThreatFox",
+                    tags=("c2",),
+                )
+            ]
+            if blocklisted_dst
+            else []
+        )
+        enrichments = {
+            src: IndicatorEnrichment(indicator=src, indicator_type="ip", internal=True),
+            dst: IndicatorEnrichment(
+                indicator=dst, indicator_type="ip", internal=True, blocklist_hits=dst_hits
+            ),
+        }
+    return EnrichedAlertContext(
+        alert=SoAlert(
+            id=alert_id,
+            rule_name="ET MALWARE BPFDoor ICMP Echo Reply, Heartbeat (Outbound)",
+            classtype="trojan-activity",
+            source_ip=src,
+            destination_ip=dst,
+            severity_label="high",
+        ),
+        community_id_events=[],
+        host_events=[],
+        user_events=[],
+        process_events=[],
+        file_events=[],
+        pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
+        typed_zeek=TypedZeekFields(icmp_echo_request_reply=icmp_echo),
+        enrichments=enrichments,
+    )
+
+
+async def _run_synth_first_icmp_investigation(
     ctx: InvestigationContext,
     *,
     report: TriageReport | None = None,
-    icmp_echo: bool = True,
+    **variant_kw: Any,
 ) -> list[Any]:
     """Drive investigate() end-to-end against the BPFDoor ping prefetch."""
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
+    ctx.settings.investigate_when_unsure = False  # isolate the validator chain
+    return await _run_synth_first(
+        ctx,
         report=report or _bpfdoor_tp_report(),
-        ctx=ctx,
+        enriched_factory=lambda aid: _icmp_enriched_variant(aid, **variant_kw),
     )
-
-    async def _icmp_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_icmp_ping_alert_context(icmp_echo=icmp_echo)
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_icmp_prefetch,
-    ):
-        return [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
 
 
 @pytest.mark.asyncio
-async def test_legacy_pipeline_downgrades_solicited_icmp_echo_tp(
+async def test_synth_first_downgrades_solicited_icmp_echo_tp(
     settings_kratos: Settings,
 ) -> None:
-    """B2: the LEGACY pipeline — still the fallback when
-    synth-first errors or the flag is off — must apply the same solicited-
-    ICMP-echo true_positive downgrade as `_synth_first_post_validate`.
-    Before B2 the downgrade lived only inside the synth-first validator, so
-    the legacy path reproduced the original BPFDoor false escalation.
+    """B2: a true_positive resting on a solicited internal ICMP echo
+    (the BPFDoor false-escalation shape) is deterministically downgraded to
+    false_positive by `_synth_first_post_validate` /
+    `_apply_targeted_downgrades`.
 
-    Legacy contexts carry no enrichments, so the downgrade requires an
-    EXPLICIT blocklist lookup against the same singleton BlocklistDB the
-    enrich_* tools use (ctx.blocklist) — and the audit reason must say
-    that's what was verified (no enrichment/MISP claims on this path)."""
-    ctx = _make_ctx(settings_kratos, blocklist=_loaded_blocklist())
-    events = await _run_legacy_icmp_investigation(ctx)
+    The enriched context carries clean internal enrichments for both
+    endpoints, so the verification that ran is the enrichment-derived
+    IOC scan — and the audit reason must say exactly that (not the
+    explicit-blocklist wording used for enrichment-less contexts)."""
+    ctx = _make_ctx(settings_kratos)
+    events = await _run_synth_first_icmp_investigation(ctx)
 
-    # Same audit entry the synth-first pipeline emits for this validator.
     dg_ev = next(e for e in events if e.kind == "icmp_solicited_downgrade")
     assert dg_ev.payload["original_verdict"] == "true_positive"
     assert dg_ev.payload["downgraded_verdict"] == "false_positive"
     assert "solicited" in dg_ev.payload["reason"]
-    # The reason states what actually ran: an explicit blocklist lookup —
-    # not the enrichment-derived "no blocklist/MISP hit" wording (no MISP
-    # check runs on this path, so the reason must not claim one).
-    assert "explicit blocklist lookup" in dg_ev.payload["reason"]
-    assert "MISP hit" not in dg_ev.payload["reason"]
-    # Final report downgraded identically to the synth-first behavior.
+    # The reason states what actually ran: the enrichment-derived IOC scan
+    # ("no blocklist/MISP hit") — NOT the explicit-blocklist wording, which
+    # is reserved for contexts that carry no enrichments.
+    assert "no blocklist/MISP hit" in dg_ev.payload["reason"]
+    assert "explicit blocklist lookup" not in dg_ev.payload["reason"]
+    # Final report downgraded, actions cleared, confidence capped at 0.8.
     report_ev = next(e for e in events if e.kind == "triage_report")
     assert report_ev.payload["verdict"] == "false_positive"
     assert report_ev.payload["recommended_actions"] == []
+    assert report_ev.payload["confidence"] == pytest.approx(0.8)
     # Summary must lead with the correct conclusion — no confusing inline bracket.
     assert not report_ev.payload["summary"].lower().startswith("[auto-corrected")
     assert "solicited" in report_ev.payload["summary"].lower()
@@ -2223,19 +1108,15 @@ async def test_legacy_pipeline_downgrades_solicited_icmp_echo_tp(
 
 
 @pytest.mark.asyncio
-async def test_legacy_icmp_downgrade_refused_when_endpoint_blocklisted(
+async def test_icmp_downgrade_refused_when_endpoint_blocklisted(
     settings_kratos: Settings,
 ) -> None:
-    """Safety parity with synth-first: a blocklist hit on either endpoint
-    (e.g. operator-curated internal_seed.yaml flagging a known-bad internal
-    host) must veto the legacy downgrade — the TP survives. Before this fix
-    the legacy IOC loop was vacuous (no enrichments on AlertContext), so the
-    blocklist was never consulted and the TP was wrongly suppressed."""
-    ctx = _make_ctx(
-        settings_kratos,
-        blocklist=_loaded_blocklist(hit_ips=("10.20.30.15",)),
-    )
-    events = await _run_legacy_icmp_investigation(ctx)
+    """A blocklist hit on either endpoint (e.g. operator-curated
+    internal_seed.yaml flagging a known-bad internal host) must veto the
+    downgrade — the TP survives end-to-end (the concrete IOC hit also
+    exempts it from the malware-rule-name and hard evidence gates)."""
+    ctx = _make_ctx(settings_kratos)
+    events = await _run_synth_first_icmp_investigation(ctx, blocklisted_dst=True)
 
     assert not any(e.kind == "icmp_solicited_downgrade" for e in events)
     report_ev = next(e for e in events if e.kind == "triage_report")
@@ -2243,33 +1124,40 @@ async def test_legacy_icmp_downgrade_refused_when_endpoint_blocklisted(
 
 
 @pytest.mark.asyncio
-async def test_legacy_icmp_downgrade_refused_when_blocklist_unavailable(
+async def test_icmp_downgrade_refused_when_blocklist_unavailable(
     settings_kratos: Settings,
 ) -> None:
-    """Absence of proof is not proof: when the blocklist source is
-    unavailable (default-empty BlocklistDB — zero loaded sources, as legacy
-    callers get when no data dir is provisioned) the legacy path must NOT
-    downgrade. Wrongly suppressing a real TP is worse than letting a false
-    escalation through."""
-    ctx = _make_ctx(settings_kratos)  # default BlocklistDB(): nothing loaded
-    events = await _run_legacy_icmp_investigation(ctx)
+    """Absence of proof is not proof: a context with NO per-indicator
+    enrichments demands an EXPLICIT blocklist probe, and when the blocklist
+    source is unavailable (default-empty BlocklistDB — zero loaded sources)
+    the downgrade must NOT fire. The alert is never auto-cleared to
+    false_positive; the uncorroborated zero-tool TP is instead coerced to
+    needs_more_info by the malware-rule-name gate (investigate, don't
+    rationalize) — wrongly suppressing a real TP as benign is worse than
+    letting a false escalation through."""
+    ctx = _make_ctx(settings_kratos)  # no blocklist on ctx
+    events = await _run_synth_first_icmp_investigation(ctx, with_enrichments=False)
 
     assert not any(e.kind == "icmp_solicited_downgrade" for e in events)
     report_ev = next(e for e in events if e.kind == "triage_report")
-    assert report_ev.payload["verdict"] == "true_positive"
+    assert report_ev.payload["verdict"] != "false_positive"
+    # GATE A (#21) picks it up instead: TP on a malware-signalling rule with
+    # no corroboration → needs_more_info for a real investigation.
+    assert any(e.kind == "malware_rule_name_ungrounded_downgrade" for e in events)
+    assert report_ev.payload["verdict"] == "needs_more_info"
 
 
 @pytest.mark.asyncio
-async def test_legacy_pipeline_keeps_internal_tp_without_icmp_echo(
+async def test_synth_first_keeps_internal_tp_without_icmp_echo(
     settings_kratos: Settings,
 ) -> None:
     """B2 scope guard: internal→internal WITHOUT a solicited ICMP echo
-    (e.g. SMB lateral movement) must NOT be downgraded on the legacy
-    path — protects h2-PsExec / h1-Kerberoasting class TPs. Uses a loaded,
-    clean blocklist so the test exercises the ICMP-echo scope gate, not
-    the blocklist-unavailable gate."""
-    ctx = _make_ctx(settings_kratos, blocklist=_loaded_blocklist())
-    events = await _run_legacy_icmp_investigation(
+    (e.g. SMB lateral movement) must NOT be touched by the ICMP downgrade —
+    protects h2-PsExec / h1-Kerberoasting class TPs from being auto-cleared
+    as benign. (The zero-tool TP still lands in needs_more_info via the
+    malware-rule-name gate — investigated, never suppressed to FP.)"""
+    ctx = _make_ctx(settings_kratos)
+    events = await _run_synth_first_icmp_investigation(
         ctx,
         report=TriageReport(
             verdict="true_positive",
@@ -2282,7 +1170,8 @@ async def test_legacy_pipeline_keeps_internal_tp_without_icmp_echo(
 
     assert not any(e.kind == "icmp_solicited_downgrade" for e in events)
     report_ev = next(e for e in events if e.kind == "triage_report")
-    assert report_ev.payload["verdict"] == "true_positive"
+    assert report_ev.payload["verdict"] != "false_positive"
+    assert report_ev.payload["verdict"] == "needs_more_info"
 
 
 def test_legacy_downgrade_internal_cidrs_narrower_than_rfc1918() -> None:
@@ -2372,112 +1261,6 @@ def test_legacy_downgrade_refused_when_endpoint_ip_missing() -> None:
         pivot_summary={"community_id": 1, "host": 0, "user": 0, "process": 0, "file": 0},
     )
     assert _is_solicited_internal_icmp_echo(alert_no_dst, blocklist=bl) is None
-
-
-@pytest.mark.asyncio
-async def test_recommended_actions_blocked_when_no_evidence_at_floor(
-    settings_kratos: Settings,
-) -> None:
-    """Block recommended_actions when the
-    fast-path produces evidence=[] AND confidence ≤ floor. The previous
-    behavior auto-acked alerts at 0.6 confidence with zero supporting
-    evidence — rubber-stamping under uncertainty."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.6,  # AT the floor
-            summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
-            recommended_actions=[
-                RecommendedAction(
-                    tool_name="ack_alert",
-                    tool_args={"alert_id": "alert-001", "comment": "ET INFO"},
-                    rationale="rubber-stamp test",
-                ),
-            ],
-        ),
-        ctx=ctx,
-    )
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    block_ev = next(e for e in events if e.kind == "recommended_actions_blocked")
-    assert block_ev.payload["reason"] == "no_evidence_at_or_below_floor"
-    assert block_ev.payload["blocked_count"] == 1
-    # Final triage_report has no recommended_actions, no approval events fire.
-    report_ev = next(e for e in events if e.kind == "triage_report")
-    assert report_ev.payload["recommended_actions"] == []
-    assert not any(e.kind == "approval_required" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_fast_path_synth_user_message_contains_alert_class(
-    settings_kratos: Settings,
-) -> None:
-    """F1: the fast-path synth user message names the alert class so the
-    synth can constrain its verdict appropriately."""
-    settings_kratos.fast_path_sampling_rate = 0.0
-    ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.65,
-            summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-    captured: dict[str, str] = {}
-    real_run = synthesizer.run
-
-    async def _spy(prompt: str, **kw: Any) -> Any:
-        captured["prompt"] = prompt
-        return await real_run(prompt, **kw)
-
-    synthesizer.run = _spy  # type: ignore[method-assign]
-
-    async def _fast_path_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        return _stub_informational_alert_context()
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_fast_path_prefetch,
-    ):
-        [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    prompt = captured["prompt"]
-    assert "FAST PATH" in prompt
-    assert "informational_visibility" in prompt
-    assert "MUST be `false_positive` or `needs_more_info`" in prompt
-    # The pre-fetched alert context goes into the prompt.
-    assert "alert-001" in prompt
 
 
 # =====================================================================
@@ -2599,16 +1382,25 @@ def test_investigator_model_has_response_token_cap(
     assert inv.settings.get("max_tokens") == settings_kratos.investigator_max_response_tokens
 
 
-def test_synthesizer_model_unrestricted(
+def test_synthesizer_model_has_explicit_response_cap(
     settings_kratos: Settings,
 ) -> None:
-    """The synth's reasoning is genuinely load-bearing for verdict
-    synthesis — keep it unrestricted (no max_tokens cap)."""
+    """The synth ALWAYS sends an explicit max_tokens. "Unrestricted" really
+    meant "provider default" — and on a reasoning model that accidental budget
+    can be consumed entirely by thinking, truncating before any TriageReport is
+    generated (observed live: 'Model token limit (provider default) exceeded
+    before any response was generated' → fallback NMI). The knob keeps the
+    budget generous but real."""
     from soc_ai.agent.orchestrator import build_synthesizer_model
 
     synth = build_synthesizer_model(settings_kratos)
-    if synth.settings is not None:
-        assert "max_tokens" not in synth.settings
+    assert synth.settings is not None
+    assert synth.settings.get("max_tokens") == settings_kratos.synthesizer_max_response_tokens
+    # temperature merges alongside the cap when given
+    warm = build_synthesizer_model(settings_kratos, temperature=0.1)
+    assert warm.settings is not None
+    assert warm.settings.get("max_tokens") == settings_kratos.synthesizer_max_response_tokens
+    assert warm.settings.get("temperature") == 0.1
 
 
 @pytest.mark.asyncio
@@ -2881,40 +1673,8 @@ def test_citation_confidence_cap_uses_banded_penalty() -> None:
     assert _citation_confidence_cap(0.3, coverage_ratio=0.5, floor=0.4) == pytest.approx(0.3)
 
 
-def test_required_rubric_fields_for_external_ioc_alert() -> None:
-    """F3: alerts with external IPs require enrichment.
-    `dns_or_sni_pivoted` only required when the alert ACTUALLY has a
-    DNS/SNI signal to pivot on (decoupled from the generic IOC check).
-    Pure-internal alerts have no enrichment requirement."""
-    from soc_ai.agent.orchestrator import _required_rubric_fields
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    # External-IP alert WITHOUT DNS/SNI signal — only enrichment required.
-    ext = SoAlert(id="a1", source_ip="10.0.0.1", destination_ip="8.8.8.8")
-    required = _required_rubric_fields(AlertContext(alert=ext))
-    assert "enrichment_called" in required
-    assert "dns_or_sni_pivoted" not in required  # no DNS/SNI signal to pivot on
-
-    # External-IP alert WITH payload_printable (a DNS/SNI signal proxy).
-    ext_dns = SoAlert(
-        id="a1b",
-        source_ip="10.0.0.1",
-        destination_ip="8.8.8.8",
-        payload_printable=".....example.com.....",
-    )
-    required_dns = _required_rubric_fields(AlertContext(alert=ext_dns))
-    assert "enrichment_called" in required_dns
-    assert "dns_or_sni_pivoted" in required_dns
-
-    # Pure-internal alert.
-    internal = SoAlert(id="a2", source_ip="10.0.0.1", destination_ip="10.0.0.2")
-    required_int = _required_rubric_fields(AlertContext(alert=internal))
-    assert "enrichment_called" not in required_int
-
-
 # =====================================================================
-# F3: orchestrator-derived rubric_coverage
+# pydantic-ai message stand-ins (shared unit-test fakes)
 # =====================================================================
 
 
@@ -2937,132 +1697,6 @@ def _msg(*tool_calls: tuple[str, dict[str, Any] | str]) -> _FakeMessage:
     return _FakeMessage([_FakeToolCallPart(t, a) for t, a in tool_calls])
 
 
-def test_derive_rubric_coverage_marks_enrichment_called() -> None:
-    """F3: a `t_enrich_*` tool call sets enrichment_called=True."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a", payload_printable="example.com"))
-    messages = [_msg(("t_enrich_domain", {"domain": "example.com"}))]
-    rubric = _derive_rubric_coverage(messages, alert_ctx)
-    assert rubric.enrichment_called is True
-
-
-def test_derive_rubric_coverage_marks_dns_pivot_from_log_types() -> None:
-    """F3: t_query_zeek_logs with log_types=['dns'] sets dns_or_sni_pivoted."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a", payload_printable="x.com"))
-    messages = [_msg(("t_query_zeek_logs", {"community_id": "1:abc", "log_types": ["dns"]}))]
-    rubric = _derive_rubric_coverage(messages, alert_ctx)
-    assert rubric.dns_or_sni_pivoted is True
-
-
-def test_derive_rubric_coverage_related_alerts_requires_host_pivot() -> None:
-    """F3 / F8: related_alerts_checked requires query filter on
-    host/user/process. A bare community_id query is the SAME alert —
-    not a related-alerts check.
-
-    Calibration dropped the previous co-requirement
-    that the query also include `event.kind` — the model often pivots
-    on host.name combined with a different kind filter (zeek.dns.query,
-    network.community_id of related conns, etc) and the strict rule
-    rejected those valid pivots."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a"))
-
-    # Bare community_id query — does NOT count.
-    bare_q = 'network.community_id:"1:abc" AND event.kind:alert'
-    rubric_bad = _derive_rubric_coverage(
-        [_msg(("t_query_events_oql", {"query": bare_q}))],
-        alert_ctx,
-    )
-    assert rubric_bad.related_alerts_checked is False
-
-    # host.name pivot WITH event.kind:alert — counts.
-    rubric_good = _derive_rubric_coverage(
-        [_msg(("t_query_events_oql", {"query": 'host.name:"foo" AND event.kind:alert'}))],
-        alert_ctx,
-    )
-    assert rubric_good.related_alerts_checked is True
-
-    # host.name pivot WITHOUT event.kind — also counts (relaxed rule).
-    rubric_zeek_pivot = _derive_rubric_coverage(
-        [_msg(("t_query_events_oql", {"query": 'host.name:"foo" AND zeek.dns.query:*'}))],
-        alert_ctx,
-    )
-    assert rubric_zeek_pivot.related_alerts_checked is True
-
-    # process.entity_id pivot — counts.
-    rubric_proc = _derive_rubric_coverage(
-        [_msg(("t_query_events_oql", {"query": 'process.entity_id:"abc"'}))],
-        alert_ctx,
-    )
-    assert rubric_proc.related_alerts_checked is True
-
-
-def test_derive_rubric_coverage_playbook_consulted() -> None:
-    """F3: t_get_playbooks or t_lookup_runbook sets playbook_consulted."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a"))
-    rubric = _derive_rubric_coverage(
-        [_msg(("t_get_playbooks", {"alert_id": "a"}))],
-        alert_ctx,
-    )
-    assert rubric.playbook_consulted is True
-
-
-def test_derive_rubric_coverage_dns_or_sni_auto_satisfied_when_no_signal() -> None:
-    """F3: dns_or_sni_pivoted is auto-True when alert has no DNS/SNI
-    signal at all — there's nothing to pivot on."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a"))  # no payload, no dns_query
-    rubric = _derive_rubric_coverage([], alert_ctx)
-    assert rubric.dns_or_sni_pivoted is True
-
-
-def test_derive_rubric_coverage_or_merges_seed() -> None:
-    """F3: cumulative across retask rounds. Round-2 derivation OR-merges
-    INTO the round-1 rubric so a field satisfied in round 1 isn't
-    re-failed by round 2."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.agent.triage import RubricCoverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a", payload_printable="x.com"))
-    seed = RubricCoverage(enrichment_called=True, related_alerts_checked=True)
-    # Round 2 doesn't fire any new tools; round-1 fields preserved.
-    rubric = _derive_rubric_coverage([], alert_ctx, seed=seed)
-    assert rubric.enrichment_called is True
-    assert rubric.related_alerts_checked is True
-
-
-def test_derive_rubric_coverage_handles_string_args() -> None:
-    """F3: ToolCallPart.args is sometimes a JSON-string instead of dict
-    (depending on PydanticAI version). Auto-parse and continue."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a"))
-    messages = [_msg(("t_enrich_ip", '{"ip": "8.8.8.8"}'))]
-    rubric = _derive_rubric_coverage(messages, alert_ctx)
-    assert rubric.enrichment_called is True
-
-
 class _FakeToolReturnPart:
     """Stand-in for pydantic_ai.messages.ToolReturnPart for unit tests."""
 
@@ -3072,236 +1706,6 @@ class _FakeToolReturnPart:
         # count_successful_tool_calls now discriminates on part_kind, so the
         # stub must carry the real ToolReturnPart discriminator.
         self.part_kind = "tool-return"
-
-
-def test_derive_rubric_coverage_payload_inspected_from_alert_payload() -> None:
-    """B5: `payload_inspected_if_banner_rule` is derived MECHANICALLY —
-    a banner-class alert whose payload_printable is non-empty was
-    embedded in the prompt the model received, so the field is True
-    with zero tool calls and regardless of any self-report."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(alert=SoAlert(id="a", payload_printable="GET /generate_204 HTTP/1.1"))
-    rubric = _derive_rubric_coverage([], alert_ctx)
-    assert rubric.payload_inspected_if_banner_rule is True
-
-
-def test_derive_rubric_coverage_payload_inspected_from_tool_return() -> None:
-    """B5: when the alert itself has no payload but a tool return in the
-    message history carried a record with non-empty payload_printable,
-    the model received payload evidence → field derived True."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    # Banner-class via Informational severity; alert payload empty.
-    alert_ctx = AlertContext(
-        alert=SoAlert(
-            id="a",
-            rule_metadata=RuleMetadata(signature_severity="Informational"),
-        )
-    )
-    messages = [
-        _FakeMessage(
-            [
-                _FakeToolReturnPart(
-                    "t_query_events_oql",
-                    {
-                        "hits": [
-                            {"id": "ev-1", "payload_printable": "POST /beacon HTTP/1.1"},
-                        ],
-                    },
-                ),
-            ]
-        )
-    ]
-    rubric = _derive_rubric_coverage(messages, alert_ctx)
-    assert rubric.payload_inspected_if_banner_rule is True
-
-
-def test_derive_rubric_coverage_payload_not_inspected_without_payload_data() -> None:
-    """B5: banner-class alert with NO payload data anywhere (not on the
-    alert, not in pivots, not in tool returns) derives False — the v5
-    meta-analysis showed model self-reports of payload inspection are
-    fabricated, so nothing the model claims can flip this field."""
-    from soc_ai.agent.orchestrator import _derive_rubric_coverage
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    alert_ctx = AlertContext(
-        alert=SoAlert(
-            id="a",
-            rule_metadata=RuleMetadata(signature_severity="Informational"),
-        )
-    )
-    # Tool calls fired, but none of the returned content carries payload.
-    messages = [
-        _msg(("t_enrich_ip", {"ip": "8.8.8.8"})),
-        _FakeMessage([_FakeToolReturnPart("t_enrich_ip", {"internal": False, "asn": 15169})]),
-    ]
-    rubric = _derive_rubric_coverage(messages, alert_ctx)
-    assert rubric.payload_inspected_if_banner_rule is False
-
-
-def test_content_has_payload_printable_depth_guard() -> None:
-    """Depth guard: deeply nested structure must not recurse past depth 10."""
-    from soc_ai.agent.orchestrator import _content_has_payload_printable
-
-    # Build a 20-deep nested dict with payload_printable at the bottom.
-    nested: dict = {"payload_printable": "found"}
-    for _ in range(20):
-        nested = {"child": nested}
-    # Should return False — depth guard fires before reaching the value.
-    assert _content_has_payload_printable(nested) is False
-
-    # Shallow nesting (depth ≤ 10) should still find it.
-    shallow: dict = {"payload_printable": "found"}
-    for _ in range(3):
-        shallow = {"child": shallow}
-    assert _content_has_payload_printable(shallow) is True
-
-
-@pytest.mark.asyncio
-async def test_legacy_pipeline_ignores_self_reported_payload_inspection(
-    settings_kratos: Settings,
-) -> None:
-    """B5: the orchestrator must NOT OR-merge the investigator's
-    self-reported `payload_inspected_if_banner_rule` into the derived
-    rubric. A banner-class alert with no payload data anywhere + a
-    fabricated self-report=True must still trip the coverage cap."""
-    from soc_ai.agent.triage import RubricCoverage
-    from soc_ai.so_client.models import RuleMetadata
-
-    ctx = _make_ctx(settings_kratos)
-    transcript = InvestigationTranscript(
-        evidence=["alert.rule_metadata.signature_severity=Informational (id=alert-001)"],
-        tentative_summary="Looked at everything, honest.",
-        open_questions=[],
-        # Fabricated self-report — the v5 meta-analysis failure mode.
-        rubric_coverage=RubricCoverage(payload_inspected_if_banner_rule=True),
-    )
-    investigator, synthesizer = _build_test_pair(
-        transcript=transcript,
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.9,
-            summary="x",
-            citations=["alert.rule_metadata.signature_severity"],
-        ),
-        ctx=ctx,
-    )
-
-    async def _banner_prefetch(_alert_id: str, **_kw: Any) -> AlertContext:
-        # Informational rule (banner-class) but severity HIGH → standard
-        # pipeline, not fast-path. No payload_printable anywhere.
-        return AlertContext(
-            alert=SoAlert(
-                id="alert-001",
-                severity_label="high",
-                rule_metadata=RuleMetadata(signature_severity="Informational"),
-            ),
-            community_id_events=[],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
-        side_effect=_banner_prefetch,
-    ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    # The derivation event surfaces the disagreement: model claimed True,
-    # orchestrator derived False.
-    deriv_ev = next(e for e in events if e.kind == "rubric_derivation")
-    assert deriv_ev.payload["model_reported"]["payload_inspected_if_banner_rule"] is True
-    assert deriv_ev.payload["orchestrator_derived"]["payload_inspected_if_banner_rule"] is False
-    # And the coverage cap fires on the missing required field.
-    cap_ev = next(e for e in events if e.kind == "coverage_cap")
-    assert "payload_inspected_if_banner_rule" in cap_ev.payload["missing_fields"]
-    report_ev = next(e for e in events if e.kind == "triage_report")
-    assert report_ev.payload["confidence"] == pytest.approx(0.6)
-
-
-def test_required_rubric_fields_for_banner_class_rule() -> None:
-    """Banner-class rules (Informational severity OR non-empty
-    payload_printable) require payload inspection."""
-    from soc_ai.agent.orchestrator import _required_rubric_fields
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    # Informational-severity → banner-class.
-    a = SoAlert(
-        id="x",
-        rule_metadata=RuleMetadata(signature_severity="Informational"),
-    )
-    required = _required_rubric_fields(AlertContext(alert=a))
-    assert "payload_inspected_if_banner_rule" in required
-
-    # Non-banner alert (no Informational, no payload).
-    b = SoAlert(
-        id="y",
-        rule_metadata=RuleMetadata(signature_severity="Major"),
-    )
-    required_b = _required_rubric_fields(AlertContext(alert=b))
-    assert "payload_inspected_if_banner_rule" not in required_b
-
-
-def test_coverage_cap_pins_confidence_when_required_field_missing() -> None:
-    """The coverage cap caps confidence at 0.6 when required fields
-    are False. Already-below-cap values are unchanged."""
-    from soc_ai.agent.orchestrator import _coverage_cap
-    from soc_ai.agent.triage import RubricCoverage
-
-    rubric = RubricCoverage(
-        related_alerts_checked=True,
-        playbook_consulted=True,
-        enrichment_called=False,  # missing
-        dns_or_sni_pivoted=False,  # missing
-        payload_inspected_if_banner_rule=True,
-    )
-    required = {"enrichment_called", "dns_or_sni_pivoted"}
-
-    # High-confidence with missing fields → capped to 0.6.
-    capped, missing = _coverage_cap(0.9, rubric, required)
-    assert capped == 0.6
-    assert set(missing) == {"enrichment_called", "dns_or_sni_pivoted"}
-
-    # Low-confidence already below cap → unchanged.
-    capped_low, _ = _coverage_cap(0.3, rubric, required)
-    assert capped_low == 0.3
-
-
-def test_coverage_cap_no_change_when_all_required_met() -> None:
-    """When the rubric has every required field True, confidence is
-    untouched."""
-    from soc_ai.agent.orchestrator import _coverage_cap
-    from soc_ai.agent.triage import RubricCoverage
-
-    rubric = RubricCoverage(
-        related_alerts_checked=True,
-        playbook_consulted=True,
-        enrichment_called=True,
-        dns_or_sni_pivoted=True,
-        payload_inspected_if_banner_rule=True,
-    )
-    required = {"enrichment_called", "dns_or_sni_pivoted"}
-    capped, missing = _coverage_cap(0.9, rubric, required)
-    assert capped == 0.9
-    assert missing == []
 
 
 def test_validate_citations_classifies_and_counts() -> None:
@@ -3450,36 +1854,19 @@ async def test_error_event_hint_for_es_unreachable(
     """When the prefetch fails because ES is unreachable (host restarting,
     network down), the error event carries a hint pointing the analyst at
     the SO grid + ES_HOSTS config."""
+    settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.9,
-            summary="x",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
 
-    async def _connection_refused(_alert_id: str, **_kw: Any) -> AlertContext:
+    async def _connection_refused(_alert_id: str, **_kw: Any) -> Any:
         raise ConnectionError(
             "Cannot connect to host 10.0.0.253:9200 ssl:default [Connect call failed]"
         )
 
     with patch(
-        "soc_ai.agent.orchestrator.get_alert_context",
+        "soc_ai.tools.get_alert_context.get_enriched_alert_context",
         side_effect=_connection_refused,
     ):
-        events = [
-            ev
-            async for ev in investigate(
-                "alert-001",
-                ctx=ctx,
-                investigator=investigator,
-                synthesizer=synthesizer,
-            )
-        ]
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
 
     err = next(e for e in events if e.kind == "error").payload
     assert err["phase"] == "prefetch"
@@ -3720,6 +2107,35 @@ def test_build_synth_first_round2_user_message_includes_targeted_result() -> Non
     assert "MUST emit a `gap_for_investigator=None`" in msg
 
 
+def test_build_synth_first_round2_user_message_allow_further_gap() -> None:
+    """allow_further_gap=True (non-final Phase-D round) permits ONE more gap;
+    the default (final round) keeps the hard MUST-emit-None instruction."""
+    from soc_ai.agent.prompts import build_synth_first_round2_user_message
+    from soc_ai.agent.triage import TargetedGap
+
+    gap = TargetedGap(
+        question="What was the SSL SNI?",
+        tool_name="t_query_zeek_logs",
+        tool_args={"community_id": "1:abc", "log_types": ["ssl"]},
+        why_this_matters="If api.giphy.com -> FP; else suspicious.",
+    )
+    msg = build_synth_first_round2_user_message(
+        alert_id="abc",
+        enriched_ctx_json="{}",
+        materialized_evidence=[],
+        candidate=None,
+        round1_gap=gap,
+        targeted_tool_result={"sni_servers": ["api.giphy.com"]},
+        allow_further_gap=True,
+    )
+    assert "MUST emit a `gap_for_investigator=None`" not in msg
+    assert "MAY" in msg
+    assert "emit another `gap_for_investigator`" in msg
+    # The rest of the round-2 message structure is unchanged.
+    assert "api.giphy.com" in msg
+    assert "What was the SSL SNI?" in msg
+
+
 # =====================================================================
 # Task 15c: Integration tests for _run_synth_first_pipeline
 # =====================================================================
@@ -3750,7 +2166,6 @@ async def test_synth_first_pipeline_template_match_path(
     decision_template_match, triage_report, done.  NO targeted_dispatch event
     (synth doesn't request a Phase D call).
     """
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -3835,7 +2250,6 @@ async def test_synth_first_pipeline_no_template_match_synth_reasons(
     Checks that decision_template_match event has matched=False and no
     Phase D dispatch (synth immediately produces a verdict).
     """
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -3897,7 +2311,6 @@ async def test_synth_first_pipeline_phase_d_dispatch_then_round2(
     """
     from soc_ai.agent.triage import TargetedGap
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -3997,6 +2410,219 @@ async def test_synth_first_pipeline_phase_d_dispatch_then_round2(
 
 
 @pytest.mark.asyncio
+async def test_synth_first_phase_d_bounded_loop_two_rounds(
+    settings_kratos: Settings,
+) -> None:
+    """phase_d_max_rounds=2: gap -> dispatch -> gap -> dispatch -> final report.
+
+    The synth names a SECOND gap after seeing the first targeted result and
+    the orchestrator honors it — two full retask/targeted_dispatch/
+    targeted_tool_result sequences — before the final synthesis lands with
+    no gap (e.g. the t_get_event_raw -> t_decode_payload chain).
+    """
+    from soc_ai.agent.triage import TargetedGap
+
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.phase_d_max_rounds = 2
+    ctx = _make_ctx(settings_kratos)
+
+    gap1 = TargetedGap(
+        question="What are the raw bytes of the alert payload?",
+        tool_name="t_get_event_raw",
+        tool_args={"event_id": "alert-001"},
+        why_this_matters="Need the encoded payload before decoding.",
+    )
+    gap2 = TargetedGap(
+        question="What does the base64 payload decode to?",
+        tool_name="t_decode_payload",
+        tool_args={"data": "aGVsbG8="},
+        why_this_matters="The decoded payload settles the verdict.",
+    )
+    round1_report = TriageReport(
+        verdict="needs_more_info",
+        confidence=0.4,
+        summary="Need the raw event first.",
+        citations=[],
+        recommended_actions=[],
+        gap_for_investigator=gap1,
+    )
+    round2_report = TriageReport(
+        verdict="needs_more_info",
+        confidence=0.5,
+        summary="Got the raw bytes; need them decoded.",
+        citations=[],
+        recommended_actions=[],
+        gap_for_investigator=gap2,
+    )
+    final_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.85,
+        summary="Payload decodes to a benign keepalive.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    targeted_results = [{"raw": "aGVsbG8="}, {"decoded": "hello"}]
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _stub_enriched_alert_context(alert_id)
+
+    from unittest.mock import MagicMock
+
+    from pydantic_ai import Agent
+
+    fake_agent = Agent(
+        model=TestModel(call_tools=[], custom_output_args=round1_report),
+        system_prompt="stub",
+        output_type=TriageReport,
+    )
+    run_results = [
+        MagicMock(output=round1_report),
+        MagicMock(output=round2_report),
+        MagicMock(output=final_report),
+    ]
+    fake_agent.run = AsyncMock(side_effect=run_results)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[], custom_output_args=round1_report),
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synth_first_agent",
+            return_value=fake_agent,
+        ),
+        patch(
+            "soc_ai.agent.targeted_investigator.run_targeted_investigation",
+            new=AsyncMock(side_effect=targeted_results),
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert kinds.count("retask") == 2
+    assert kinds.count("targeted_dispatch") == 2
+    assert kinds.count("targeted_tool_result") == 2
+
+    dispatches = [e for e in events if e.kind == "targeted_dispatch"]
+    assert dispatches[0].payload["tool_name"] == "t_get_event_raw"
+    assert dispatches[1].payload["tool_name"] == "t_decode_payload"
+    results = [e for e in events if e.kind == "targeted_tool_result"]
+    assert results[0].payload["result"] == {"raw": "aGVsbG8="}
+    assert results[1].payload["result"] == {"decoded": "hello"}
+
+    # Three synth runs: round 1 + one re-synthesis per dispatch round.
+    assert fake_agent.run.await_count == 3
+
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+    assert report_ev.payload.get("gap_for_investigator") is None
+    assert kinds[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_synth_first_phase_d_default_single_round_strips_round2_gap(
+    settings_kratos: Settings,
+) -> None:
+    """Regression pin: default phase_d_max_rounds=1 keeps the old behavior.
+
+    When the round-2 synth ignores the MUST-emit-None instruction and names
+    another gap, the orchestrator strips it defensively — exactly ONE
+    dispatch happens and the round-2 verdict stands.
+    """
+    from soc_ai.agent.triage import TargetedGap
+
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+    assert settings_kratos.phase_d_max_rounds == 1  # the default
+
+    gap1 = TargetedGap(
+        question="What was the SSL SNI for community_id 1:abc?",
+        tool_name="t_query_zeek_logs",
+        tool_args={"community_id": "1:abc", "log_types": ["ssl"]},
+        why_this_matters="If api.giphy.com -> FP; else suspicious.",
+    )
+    gap2 = TargetedGap(
+        question="One more pivot?",
+        tool_name="t_query_events_oql",
+        tool_args={"query": "event.dataset:zeek.conn"},
+        why_this_matters="Model over-asking despite the final-round rule.",
+    )
+    round1_report = TriageReport(
+        verdict="needs_more_info",
+        confidence=0.4,
+        summary="Waiting on SSL SNI data.",
+        citations=[],
+        recommended_actions=[],
+        gap_for_investigator=gap1,
+    )
+    # Round 2 misbehaves: emits a verdict AND another gap.
+    round2_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.9,
+        summary="SNI confirmed api.giphy.com — benign CDN traffic.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=gap2,
+    )
+    targeted_result = {"sni_servers": ["api.giphy.com"]}
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _stub_enriched_alert_context(alert_id)
+
+    from unittest.mock import MagicMock
+
+    from pydantic_ai import Agent
+
+    fake_agent = Agent(
+        model=TestModel(call_tools=[], custom_output_args=round1_report),
+        system_prompt="stub",
+        output_type=TriageReport,
+    )
+    fake_agent.run = AsyncMock(
+        side_effect=[MagicMock(output=round1_report), MagicMock(output=round2_report)]
+    )
+    dispatch_mock = AsyncMock(return_value=targeted_result)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[], custom_output_args=round1_report),
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synth_first_agent",
+            return_value=fake_agent,
+        ),
+        patch(
+            "soc_ai.agent.targeted_investigator.run_targeted_investigation",
+            new=dispatch_mock,
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    # ONE dispatch round only — the round-2 gap must NOT trigger another.
+    assert kinds.count("retask") == 1
+    assert kinds.count("targeted_dispatch") == 1
+    assert kinds.count("targeted_tool_result") == 1
+    assert dispatch_mock.await_count == 1
+    assert fake_agent.run.await_count == 2
+
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+    assert report_ev.payload.get("gap_for_investigator") is None
+    assert kinds[-1] == "done"
+
+
+@pytest.mark.asyncio
 async def test_synth_first_pipeline_phase_d_emits_retask_event(
     settings_kratos: Settings,
 ) -> None:
@@ -4012,7 +2638,6 @@ async def test_synth_first_pipeline_phase_d_emits_retask_event(
     """
     from soc_ai.agent.triage import TargetedGap
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4103,7 +2728,6 @@ async def test_synth_first_pipeline_no_phase_d_emits_no_retask(
     settings_kratos: Settings,
 ) -> None:
     """Negative path: when synth round 1 has no gap, no retask event."""
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4210,7 +2834,6 @@ def _thinking_message(thinking: str | None, text: str = "") -> Any:
 
 def _reasoning_test_setup(settings: Settings) -> tuple[Any, TriageReport, Any]:
     """(ctx, fp_report, strong_candidate) for a round-1-settled synth-first run."""
-    settings.synth_first_pipeline = True
     settings.investigate_when_unsure = False
     ctx = _make_ctx(settings)
     report = TriageReport(
@@ -4333,52 +2956,6 @@ async def test_self_consistency_samples_do_not_multiply_reasoning_events(
     assert mrs[0].payload["round"] == 1
 
 
-@pytest.mark.asyncio
-async def test_synth_first_pipeline_flag_off_runs_legacy_path(
-    settings_kratos: Settings,
-) -> None:
-    """When settings.synth_first_pipeline=False (default), legacy path runs.
-
-    Confirms that synth-first-only event kinds are absent and the standard
-    investigation_transcript/triage_report sequence appears.
-    """
-    # Default is False; be explicit for clarity.
-    settings_kratos.synth_first_pipeline = False
-    ctx = _make_ctx(settings_kratos)
-
-    investigator, synthesizer = _build_test_pair(
-        transcript=_stub_transcript(),
-        report=TriageReport(
-            verdict="false_positive",
-            confidence=0.85,
-            summary="Legacy path ran.",
-            citations=["alert.severity_label"],
-        ),
-        ctx=ctx,
-    )
-
-    events = [
-        ev
-        async for ev in investigate(
-            "alert-001",
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        )
-    ]
-
-    kinds = [e.kind for e in events]
-    # Legacy events present
-    assert "investigation_transcript" in kinds
-    assert "triage_report" in kinds
-    assert "done" in kinds
-    # Synth-first-only events absent
-    assert "enriched_alert_context" not in kinds
-    assert "decision_template_match" not in kinds
-    assert "targeted_dispatch" not in kinds
-    assert "targeted_tool_result" not in kinds
-
-
 # =====================================================================
 # Synth-first post-validators
 # =====================================================================
@@ -4395,7 +2972,6 @@ async def test_synth_first_no_template_ceiling_keeps_real_confidence(
     from pydantic_ai import Agent
     from soc_ai.agent.decision_templates import CandidateVerdict
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4470,7 +3046,6 @@ async def test_synth_first_post_validate_invalid_citation_caps_confidence(
     from pydantic_ai import Agent
     from soc_ai.agent.decision_templates import CandidateVerdict
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4558,7 +3133,6 @@ async def test_synth_first_post_validate_floor_rewrite_to_nmi(
 
     from pydantic_ai import Agent
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4635,7 +3209,6 @@ async def test_synth_first_phase_d_validators_run_on_round2(
     from soc_ai.agent.decision_templates import CandidateVerdict
     from soc_ai.agent.triage import TargetedGap
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4782,7 +3355,6 @@ async def test_synth_first_round1_failure_emits_fallback_nmi_triage_report(
     from pydantic_ai import Agent
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
@@ -4861,200 +3433,7 @@ def test_build_synth_first_agent_uses_three_retries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t_enrich_domain_populates_global_cache(
-    settings_kratos: Settings,
-) -> None:
-    """D1: t_enrich_domain must write to the
-    global enrichment cache on success, mirroring t_enrich_ip's
-    cache-write so the fast-path first-encounter gate works for domain
-    indicators too."""
-    from unittest.mock import AsyncMock, patch
-
-    from soc_ai.agent.enrichment_cache import get_global_cache
-    from soc_ai.tools.enrichment import EnrichmentResult, Finding
-
-    ctx = _make_ctx(settings_kratos)
-    agent = build_investigator(TestModel(call_tools=[]), ctx)
-
-    mock_result = EnrichmentResult(
-        indicator="evil.example.com",
-        indicator_type="domain",
-        findings=[Finding(source="misp", category="malware", description="known C2 domain")],
-    )
-
-    with patch(
-        "soc_ai.agent.orchestrator.enrich_domain",
-        new=AsyncMock(return_value=mock_result),
-    ):
-        tool = agent._function_toolset.tools["t_enrich_domain"]
-        await tool.function(domain="evil.example.com")
-
-    assert get_global_cache().contains("evil.example.com"), (
-        "t_enrich_domain should write the enrichment result to the global cache"
-    )
-
-
 @pytest.mark.asyncio
-async def test_t_enrich_hash_populates_global_cache(
-    settings_kratos: Settings,
-) -> None:
-    """D1: t_enrich_hash must write to the
-    global enrichment cache on success, mirroring t_enrich_ip's
-    cache-write so the fast-path first-encounter gate works for hash
-    indicators too."""
-    from unittest.mock import AsyncMock, patch
-
-    from soc_ai.agent.enrichment_cache import get_global_cache
-    from soc_ai.tools.enrichment import EnrichmentResult, Finding
-
-    ctx = _make_ctx(settings_kratos)
-    agent = build_investigator(TestModel(call_tools=[]), ctx)
-
-    mock_result = EnrichmentResult(
-        indicator="deadbeef01234567",
-        indicator_type="hash",
-        findings=[Finding(source="misp", category="malware", description="known ransomware hash")],
-    )
-
-    with patch(
-        "soc_ai.agent.orchestrator.enrich_hash",
-        new=AsyncMock(return_value=mock_result),
-    ):
-        tool = agent._function_toolset.tools["t_enrich_hash"]
-        await tool.function(hash_value="deadbeef01234567", algo="sha256")
-
-    assert get_global_cache().contains("deadbeef01234567"), (
-        "t_enrich_hash should write the enrichment result to the global cache"
-    )
-
-
-# =====================================================================
-# D2: EnrichmentCache.contains() refreshes LRU recency
-# =====================================================================
-
-
-def test_enrichment_cache_contains_refreshes_lru_recency() -> None:
-    """D2: contains() must bump the touched
-    entry to most-recent so that probing membership keeps it alive across
-    subsequent inserts."""
-    from soc_ai.agent.enrichment_cache import EnrichmentCache
-
-    cache = EnrichmentCache(capacity=3)
-    cache.put("a", 1)
-    cache.put("b", 2)
-    cache.put("c", 3)
-    # "a" is the LRU candidate; calling contains("a") must refresh its recency.
-    assert cache.contains("a") is True
-    # Insert a fourth entry — without the contains() recency bump, "a" would
-    # be evicted (it was still the oldest); with the fix "b" is evicted instead.
-    cache.put("d", 4)
-    assert cache.contains("a"), "'a' was touched by contains() and must survive eviction"
-    assert not cache.contains("b"), "'b' was the untouched second-oldest and should be evicted"
-    assert cache.contains("c")
-    assert cache.contains("d")
-
-
-# =====================================================================
-# D3: fast-path synthesizer runs under fast_path_usage_limits
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_fast_path_synth_uses_fast_path_usage_limits(
-    settings_kratos: Settings,
-) -> None:
-    """D3: the fast-path synthesizer run must
-    use fast_path_usage_limits (the tighter budget) rather than the full
-    usage_limits.  Verify by observing that the synthesizer's run() is
-    called with a UsageLimits whose request_limit matches
-    settings.fast_path_request_limit (not settings.agent_request_limit)."""
-    from unittest.mock import AsyncMock, patch
-
-    from pydantic_ai import UsageLimits
-    from soc_ai.agent.enrichment_cache import get_global_cache
-    from soc_ai.so_client.models import RuleMetadata, SoAlert
-    from soc_ai.tools.enrichment import EnrichmentResult, Finding
-    from soc_ai.tools.get_alert_context import AlertContext
-
-    # Ensure the fast path is taken: disable sampling, pre-populate cache.
-    settings_kratos.fast_path_sampling_rate = 0.0
-    # Set distinct limits so we can distinguish them.
-    settings_kratos.fast_path_request_limit = 3
-    settings_kratos.agent_request_limit = 20
-    ctx = _make_ctx(settings_kratos)
-    get_global_cache().put("8.8.8.8", {"prior": "enrichment"})
-
-    report = TriageReport(
-        verdict="false_positive",
-        confidence=0.75,
-        summary="fast-path test",
-        citations=["alert.severity_label"],
-    )
-    synth_model = TestModel(call_tools=[], custom_output_args=report)
-    synthesizer = build_synthesizer(synth_model)
-
-    # Spy on synthesizer.run to capture the usage_limits kwarg.
-    captured_limits: list[UsageLimits] = []
-    original_run = synthesizer.run
-
-    async def _spy_run(*args: Any, **kwargs: Any) -> Any:
-        if "usage_limits" in kwargs:
-            captured_limits.append(kwargs["usage_limits"])
-        return await original_run(*args, **kwargs)
-
-    synthesizer.run = _spy_run  # type: ignore[method-assign]
-
-    async def _ctx_with_ext_ip(_alert_id: str, **_kw: Any) -> AlertContext:
-        return AlertContext(
-            alert=SoAlert(
-                id="fp-alert-d3",
-                severity_label="low",
-                rule_metadata=RuleMetadata(signature_severity="Informational"),
-                source_ip="10.0.0.1",
-                destination_ip="8.8.8.8",
-            ),
-            community_id_events=[],
-            host_events=[],
-            user_events=[],
-            process_events=[],
-            file_events=[],
-            pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
-        )
-
-    clean_result = EnrichmentResult(
-        indicator="8.8.8.8",
-        indicator_type="ip",
-        findings=[Finding(source="internal_cidr", category="external_network", description="ext")],
-    )
-
-    with (
-        patch("soc_ai.agent.orchestrator.get_alert_context", side_effect=_ctx_with_ext_ip),
-        patch("soc_ai.agent.orchestrator.enrich_ip", new=AsyncMock(return_value=clean_result)),
-    ):
-        _ = [
-            ev
-            async for ev in investigate(
-                "fp-alert-d3",
-                ctx=ctx,
-                synthesizer=synthesizer,
-            )
-        ]
-
-    assert len(captured_limits) >= 1, "synthesizer.run must have been called"
-    fast_path_limit = captured_limits[0]
-    assert fast_path_limit.request_limit == settings_kratos.fast_path_request_limit, (
-        f"fast-path synth should run under fast_path_request_limit="
-        f"{settings_kratos.fast_path_request_limit}, "
-        f"not agent_request_limit={settings_kratos.agent_request_limit}; "
-        f"got {fast_path_limit.request_limit}"
-    )
-
-
-# =====================================================================
-# Theme-1 Task 1: bounded investigation loop
-# =====================================================================
-
-
 def _malware_signal_enriched(alert_id: str = "beacon-001") -> Any:
     """EnrichedAlertContext for a malware-signalling rule (Cobalt Strike beacon).
 
@@ -5531,7 +3910,6 @@ async def test_investigation_loop_runs_and_flips_verdict(
 
     from pydantic_ai import Agent
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
 
@@ -5673,7 +4051,6 @@ async def test_investigation_loop_investigator_failure_errors_not_nmi(
     agent had investigated and was unsure). The recorder then marks the run error."""
     from unittest.mock import MagicMock
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
 
@@ -5713,7 +4090,6 @@ async def test_investigation_loop_streams_tool_events(
 
     from pydantic_ai import Agent
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
 
@@ -5823,7 +4199,6 @@ async def test_investigation_loop_skipped_for_trivially_benign(
     from pydantic_ai import Agent
     from soc_ai.agent.decision_templates import CandidateVerdict
 
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = True
     ctx = _make_ctx(settings_kratos)
 
@@ -5945,7 +4320,6 @@ def _oracle_settings(**overrides: Any) -> Settings:
         "so_verify_ssl": False,
         "es_hosts": ["https://so.example.com:9200"],
         "litellm_base_url": "http://localhost:4000",
-        "synth_first_pipeline": False,
         "oracle_enabled": True,
         "oracle_model": "claude-sonnet-4-6",
         "oracle_escalate_needs_more_info": True,
@@ -6099,7 +4473,6 @@ async def test_oracle_wiring_escalated_fp_overridden_to_tp(
     - oracle_escalation and oracle_adjudication events are emitted
     - the local verdict is preserved as local_verdict in the triage_report payload.
     """
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     settings_kratos.oracle_enabled = True
     settings_kratos.oracle_escalate_malware_non_tp = True
@@ -6180,7 +4553,6 @@ async def test_oracle_wiring_adjudicate_returns_none_local_verdict_stands(
 ) -> None:
     """When adjudicate returns None (refusal or gateway failure), the local verdict
     is kept unchanged and no oracle_adjudication event is emitted."""
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     settings_kratos.oracle_enabled = True
     settings_kratos.oracle_escalate_malware_non_tp = True
@@ -6424,7 +4796,6 @@ async def test_oracle_wiring_post_validates_icmp_tp(
     gate fires).  The Oracle stub returns true_positive for the ICMP ping.
     After Fix 2, triage_final must be false_positive.
     """
-    settings_kratos.synth_first_pipeline = True
     settings_kratos.investigate_when_unsure = False
     settings_kratos.oracle_enabled = True
     settings_kratos.oracle_escalate_needs_more_info = True

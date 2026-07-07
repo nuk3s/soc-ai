@@ -5,11 +5,12 @@ call, the enrichments applied to every alert before the agent runs, and the
 guardrails.
 
 > **Trust boundary:** every **read** tool is exposed read-only. Every **write**
-> tool (anything that changes Security Onion state) is gated behind an explicit
-> human **Approve/Reject** in the UI. The agent can *recommend* a write but
+> tool (anything that changes Security Onion state) runs only when a human
+> explicitly executes it from the report's recommended actions in the UI (the
+> actions API — the single write path). The agent can *recommend* a write but
 > never executes one on its own. See `docs/SAFETY_MODEL.md`.
 
-## Read tools (no approval needed)
+## Read tools (run without a human in the loop)
 
 | Tool | What it does | Backing system |
 |------|--------------|----------------|
@@ -17,6 +18,8 @@ guardrails.
 | `query_zeek_logs` | Pivot into Zeek/connection logs by `network.community_id` to see the underlying flow (duration, bytes, conn state). | Elasticsearch (Zeek datasets) |
 | `query_cases` | Search existing SOC cases by free-text query (has this been seen/escalated before?). | SO cases index |
 | `query_detections` | Search SOC detection rules by free-text query (what does this rule actually look for?). | SO detections index |
+| `get_rule_content` / `t_get_rule_content` | Fetch a detection rule's **full text** by SID/`publicId` or exact title — what the signature actually matches (content strings, ports, dsize, PCRE), so a verdict rests on the rule body, not its name. | SO detections index |
+| `decode_payload` / `t_decode_payload` | Decode payload bytes already in evidence (Suricata base64 `payload`, hex, or `payload_printable` text) into printable strings, embedded domains/URLs/IPs, Shannon entropy, and DNS/HTTP/TLS protocol hints. **Local compute, no egress** — works even after the PCAP ring has rotated. | In-process (dpkt decode helpers) |
 | `get_playbooks` | Pull response playbooks, optionally scoped to a given alert. | SO playbooks index |
 | `lookup_runbook` | Search operator-authored runbooks (procedures / "what normal looks like on *this* network") so a verdict can cite the org's own guidance. Ranking is **embedding-free** (rule-link > tag > keyword), fully air-gapped — no external index. | Local store (`soc_ai/store/runbooks`) |
 | `enrich_ip` | Enrich an IP locally: vendored blocklist hits, GeoIP/ASN (MaxMind), cloud-prefix tag, internal-vs-external classification (`INTERNAL_CIDRS`), + optional MISP. Internal IPs short-circuit the external-only lookups. | Vendored blocklists / MaxMind / MISP |
@@ -39,7 +42,7 @@ guardrails.
 > to pull the alert picture itself (and cannot accidentally skip it). See the
 > prefetch enrichments below.
 
-## Write tools (require human approval in the UI)
+## Write tools (analyst-executed from the report in the UI)
 
 | Tool | What it does |
 |------|--------------|

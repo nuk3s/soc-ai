@@ -223,12 +223,15 @@ class InternalIdentifier(Base):
     Each row is one internal domain ``suffix`` (".corp.acme.com"), bare
     ``host`` name ("WIN11-01"), or ``cidr`` ("10.50.0.0/24"). ``source`` is
     ``detected`` (mined from ES discovery) or ``manual`` (operator-entered);
-    ``state`` is ``active`` or ``muted``. The Oracle egress sanitizer consumes
-    the *effective* merged set = env-config union active minus muted (see
-    ``soc_ai.oracle.identifiers``). A muted detected row is a tombstone -- an
-    operator's mute survives re-scans (detected rows are muted, never deleted).
-    ``evidence`` carries discovery provenance for detected rows; it is ``null``
-    for manual rows.
+    ``state`` is ``active``, ``muted``, or ``dismissed``. The Oracle egress
+    sanitizer consumes the *effective* merged set = env-config union active
+    minus muted (see ``soc_ai.oracle.identifiers``). A muted detected row is a
+    tombstone -- an operator's mute survives re-scans (detected rows are muted
+    or dismissed, never deleted). ``dismissed`` is a TERMINAL tombstone for
+    detected rows: hidden from listings, never refreshed/resurrected by a scan;
+    only an explicit manual add reactivates it (see
+    ``soc_ai.store.internal_identifiers``). ``evidence`` carries discovery
+    provenance for detected rows; it is ``null`` for manual rows.
     """
 
     __tablename__ = "internal_identifier"
@@ -238,7 +241,7 @@ class InternalIdentifier(Base):
     kind: Mapped[str] = mapped_column(String(16))  # 'suffix' | 'host' | 'cidr'
     value: Mapped[str] = mapped_column(String(256))  # normalized, unique per kind
     source: Mapped[str] = mapped_column(String(16))  # 'detected' | 'manual'
-    state: Mapped[str] = mapped_column(String(16))  # 'active' | 'muted'
+    state: Mapped[str] = mapped_column(String(16))  # 'active' | 'muted' | 'dismissed'
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

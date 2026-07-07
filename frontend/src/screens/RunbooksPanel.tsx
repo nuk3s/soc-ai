@@ -7,6 +7,7 @@ import {
   getRunbooks,
   updateRunbook,
 } from '../lib/api';
+import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { useAsync } from '../lib/useAsync';
 
@@ -57,7 +58,13 @@ const labelCls = 'mb-1 block text-[11px] font-semibold uppercase tracking-[.06em
  * instead of hallucinating a false-positive from thin data. Purely local —
  * nothing here is ever written to Security Onion.
  */
-export function RunbooksPanel() {
+export function RunbooksPanel({
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+} = {}) {
   const [nonce, setNonce] = useState(0);
   const { data, loading, error } = useAsync(getRunbooks, [nonce]);
   // null = form closed; 'new' = add form; a number = editing that runbook.
@@ -180,8 +187,13 @@ export function RunbooksPanel() {
   return (
     <div id="runbooks" className="mb-[22px] scroll-mt-6">
       <div className="mb-1 flex items-center justify-between">
-        <div className="text-[15px] font-semibold">Runbooks</div>
-        {editing === null && (
+        <div className="flex items-center gap-2">
+          <div className="text-[15px] font-semibold">Runbooks</div>
+          {onToggleCollapse && (
+            <CollapseChevron collapsed={collapsed} onToggle={onToggleCollapse} label="Toggle Runbooks" />
+          )}
+        </div>
+        {!collapsed && editing === null && (
           <button
             onClick={openNew}
             className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
@@ -190,6 +202,8 @@ export function RunbooksPanel() {
           </button>
         )}
       </div>
+      {!collapsed && (
+      <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         Your team's own triage guidance. The investigation agent searches these (via the{' '}
         <code className="text-[11.5px] text-text">lookup_runbook</code> tool) and cites the best
@@ -275,6 +289,8 @@ export function RunbooksPanel() {
             </div>
           ))}
       </div>
+      </>
+      )}
     </div>
   );
 }

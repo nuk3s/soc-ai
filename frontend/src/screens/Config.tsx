@@ -12,7 +12,7 @@ import { DataSourcesPanel } from './DataSourcesPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { RunbooksPanel } from './RunbooksPanel';
-import { addInternalIdentifier, createUser, getConfig, getDiscoveryScan, getInternalIdentifiers, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting } from '../lib/types';
@@ -21,6 +21,62 @@ import { ConfigNav } from './ConfigNav';
 /** Slugify a section title into a stable DOM id / anchor fragment. */
 function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+/**
+ * Collapsible section shell — the same chevron + toggle header the settings-group
+ * map uses, factored out so every standalone section on the Config page folds the
+ * same way. `title` doubles as the stable key into the parent `collapsed` map.
+ */
+function CollapsibleConfigSection({
+  id,
+  title,
+  right,
+  collapsed,
+  onToggle,
+  className,
+  children,
+}: {
+  id: string;
+  title: ReactNode;
+  right?: ReactNode;
+  collapsed: boolean;
+  onToggle: () => void;
+  className?: string;
+  children: ReactNode;
+}) {
+  // The clickable toggle is the title + chevron; any interactive `right` content
+  // (a Scan-now / Mint-token button) sits OUTSIDE the toggle button so we never
+  // nest a <button> inside a <button> (invalid HTML).
+  return (
+    <div id={id} className={className ?? 'mb-[22px] scroll-mt-6'}>
+      <SectionTitle
+        right={
+          <>
+            {right}
+            <button
+              type="button"
+              onClick={onToggle}
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? 'Expand section' : 'Collapse section'}
+              className="group flex-none text-faint hover:text-text-2"
+            >
+              <ChevronRight
+                size={15}
+                className="transition-transform"
+                style={{ transform: collapsed ? 'none' : 'rotate(90deg)' }}
+              />
+            </button>
+          </>
+        }
+      >
+        <button type="button" onClick={onToggle} className="text-left">
+          {title}
+        </button>
+      </SectionTitle>
+      {!collapsed && children}
+    </div>
+  );
 }
 
 export function Config() {
@@ -49,6 +105,18 @@ export function Config() {
       .finally(() => { if (active) setDangerLoading(false); });
     return () => { active = false; };
   }, []);
+
+  // Models the LiteLLM gateway serves — upgrades the analyst-model field from
+  // free text to a dropdown. Fetched separately from /config so a slow or down
+  // gateway never delays the page; on failure the free-text field remains.
+  const [gatewayModels, setGatewayModels] = useState<string[]>([]);
+  useEffect(() => {
+    let active = true;
+    getGatewayModels()
+      .then((r) => { if (active && r.ok) setGatewayModels(r.models); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [nonce]);
 
   // ── Staged settings edits (explicit save/apply) ────────────────────────────
   // Controls no longer persist on change. Instead each edit is STAGED here as a
@@ -171,14 +239,17 @@ export function Config() {
     const id = window.location.hash.replace('#', '');
     if (!id) return;
     // Force-expand a deep-linked section so the target is never hidden behind a
-    // collapsed header.
-    const target = data.groups.find((g) => slug(g.title) === id);
-    if (target) setCollapsed((c) => ({ ...c, [target.title]: false }));
+    // collapsed header. Every section is now foldable, and the `collapsed` map is
+    // keyed by section title/label — the same string as the nav entry's label
+    // (for groups that's the group title; slug(label) === id for standalone
+    // sections). Resolve the id back to its collapse key via SECTIONS and clear it.
+    const key = SECTIONS.find((s) => s.id === id)?.label;
+    if (key) setCollapsed((c) => ({ ...c, [key]: false }));
     const t = setTimeout(() => {
       document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 60);
     return () => clearTimeout(t);
-  }, [loading, data]);
+  }, [loading, data, SECTIONS]);
 
   // Wrap a mutation so any error surfaces inline and the list refetches on success.
   const identMutation = (p: Promise<unknown>) => {
@@ -358,6 +429,21 @@ export function Config() {
           onChange={(v) => stage(s.key, v, serverStr)}
         />
       );
+    } else if (s.key === 'analyst_model' && gatewayModels.length > 0) {
+      // The gateway told us what it serves — offer exactly that list instead of a
+      // blind free-text field. The current value stays selectable even if the
+      // gateway no longer lists it (so loading the page never mutates config).
+      const current = stagedStr(s.key, serverStr);
+      const options = gatewayModels.includes(current)
+        ? gatewayModels
+        : [current, ...gatewayModels];
+      control = (
+        <Select
+          value={current}
+          options={options}
+          onChange={(v) => stage(s.key, v, serverStr)}
+        />
+      );
     } else {
       control = (
         <input
@@ -433,32 +519,36 @@ export function Config() {
   // Internal-identifiers section, defined here so it can be interleaved into the
   // settings-group map (rendered immediately after the Discovery group).
   const internalIdentifiersSection = (
-    <div id="internal-identifiers" className="mb-[22px] scroll-mt-6">
-      <SectionTitle
-        right={
-          <div className="flex items-center gap-2">
-            {idents?.last_scan?.last_scan && !scanning && (
-              <span className="text-[11px] text-faint">
-                last scan: {new Date(idents.last_scan.last_scan).toLocaleString()}
-              </span>
-            )}
-            <button
-              onClick={runScanNow}
-              disabled={scanning}
-              className="inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              {scanning && <Spinner size={11} />}
-              {scanning ? 'Scanning…' : 'Scan now'}
-            </button>
-          </div>
-        }
-      >
-        Internal identifiers
-      </SectionTitle>
+    <CollapsibleConfigSection
+      id="internal-identifiers"
+      title="Internal identifiers"
+      collapsed={!!collapsed['Internal identifiers']}
+      onToggle={() => toggleSection('Internal identifiers')}
+      right={
+        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+          {idents?.last_scan?.last_scan && !scanning && (
+            <span className="text-[11px] text-faint">
+              last scan: {new Date(idents.last_scan.last_scan).toLocaleString()}
+            </span>
+          )}
+          <button
+            onClick={runScanNow}
+            disabled={scanning}
+            className="inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {scanning && <Spinner size={11} />}
+            {scanning ? 'Scanning…' : 'Scan now'}
+          </button>
+        </div>
+      }
+    >
       <div className="mb-2.5 text-[12px] text-dim">
         Redaction identifiers learned from your data and confirmed here — internal domain suffixes
         and bare hostnames are stripped from payloads before any cloud second opinion. On = soc-ai
-        uses this to redact and classify; off = ignored. Reserved defaults are always on.
+        uses this to redact and classify; off = ignored. Reserved defaults are always on. Suggestions
+        you don't want can be <strong>dismissed</strong> (removed for good) — distinct from turning
+        one off, which keeps it in the list but unused. Dismissed suggestions are hidden; re-add one
+        manually to restore it.
       </div>
 
       {identError && <div className="mb-2 text-[12px] text-danger">{identError}</div>}
@@ -496,18 +586,26 @@ export function Config() {
                 onAdd={(value) => identMutation(addInternalIdentifier(kind, value))}
                 onSetActive={(id, active) => identMutation(setIdentifierActive(id, active))}
                 onRemove={(id) => identMutation(removeIdentifier(id))}
+                onDismiss={(id) => identMutation(dismissIdentifier(id))}
               />
             </div>
           );
         })
       ) : null}
-    </div>
+    </CollapsibleConfigSection>
   );
 
   return (
     <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
       <aside className="hidden w-[180px] flex-none lg:block">
-        <ConfigNav sections={SECTIONS} activeId={activeId} />
+        <ConfigNav
+          sections={SECTIONS}
+          activeId={activeId}
+          onNavigate={(id) => {
+            const key = SECTIONS.find((s) => s.id === id)?.label;
+            if (key) setCollapsed((c) => ({ ...c, [key]: false }));
+          }}
+        />
       </aside>
       <div className="min-w-0 max-w-permalink flex-1">
       <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
@@ -588,22 +686,44 @@ export function Config() {
             )}
           </div>
           {g.title === 'Discovery' && internalIdentifiersSection}
-          {g.title === 'Oracle' && <RedactionPreviewPanel />}
+          {g.title === 'Oracle' && (
+            <RedactionPreviewPanel
+              collapsed={!!collapsed['Redaction preview']}
+              onToggleCollapse={() => toggleSection('Redaction preview')}
+            />
+          )}
         </Fragment>
       ))}
 
-      <DataSourcesPanel />
-      <DetectionTuningPanel />
-      <RunbooksPanel />
-      <ApiKeysPanel />
-      <AgentToolsPanel />
+      <DataSourcesPanel
+        collapsed={!!collapsed['Data sources']}
+        onToggleCollapse={() => toggleSection('Data sources')}
+      />
+      <DetectionTuningPanel
+        collapsed={!!collapsed['Detection tuning']}
+        onToggleCollapse={() => toggleSection('Detection tuning')}
+      />
+      <RunbooksPanel
+        collapsed={!!collapsed['Runbooks']}
+        onToggleCollapse={() => toggleSection('Runbooks')}
+      />
+      <ApiKeysPanel
+        collapsed={!!collapsed['API keys']}
+        onToggleCollapse={() => toggleSection('API keys')}
+      />
+      <AgentToolsPanel
+        collapsed={!!collapsed['Agent tools']}
+        onToggleCollapse={() => toggleSection('Agent tools')}
+      />
 
       {/* Users */}
-      <div id="users" className="mb-[22px] scroll-mt-6">
-        <SectionTitle right={<span className="text-faint"><Users size={14} /></span>}>
-          Users
-        </SectionTitle>
-
+      <CollapsibleConfigSection
+        id="users"
+        title="Users"
+        right={<Users size={14} />}
+        collapsed={!!collapsed['Users']}
+        onToggle={() => toggleSection('Users')}
+      >
         {resetPw && (
           <div className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3" style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}>
             <span className="text-warn"><Key size={15} /></span>
@@ -744,23 +864,25 @@ export function Config() {
         {userError && (
           <div className="mt-1.5 text-[12px] text-danger">{userError}</div>
         )}
-      </div>
+      </CollapsibleConfigSection>
 
       {/* API tokens */}
-      <div id="api-tokens" className="mb-[22px] scroll-mt-6">
-        <SectionTitle
-          right={
+      <CollapsibleConfigSection
+        id="api-tokens"
+        title="API tokens"
+        collapsed={!!collapsed['API tokens']}
+        onToggle={() => toggleSection('API tokens')}
+        right={
+          <span onClick={(e) => e.stopPropagation()}>
             <button
               onClick={() => mintToken().then((t) => { setMinted(t); setNonce((n) => n + 1); })}
               className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
             >
               + Mint token
             </button>
-          }
-        >
-          API tokens
-        </SectionTitle>
-
+          </span>
+        }
+      >
         {minted && (
           <div className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3" style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}>
             <span className="text-warn"><Key size={15} /></span>
@@ -797,11 +919,15 @@ export function Config() {
             </div>
           ))}
         </div>
-      </div>
+      </CollapsibleConfigSection>
 
       {/* Diagnostics */}
-      <div id="diagnostics" className="mb-[22px] scroll-mt-6">
-        <SectionTitle>Diagnostics</SectionTitle>
+      <CollapsibleConfigSection
+        id="diagnostics"
+        title="Diagnostics"
+        collapsed={!!collapsed['Diagnostics']}
+        onToggle={() => toggleSection('Diagnostics')}
+      >
         <div className="text-[12px] text-dim mb-2">Read-only connectivity checks — safe to run anytime.</div>
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
           <div className="flex gap-3 px-4 py-3">
@@ -826,7 +952,7 @@ export function Config() {
             })}
           </div>
         </div>
-      </div>
+      </CollapsibleConfigSection>
 
       {/* Danger Zone */}
       <div
@@ -837,18 +963,26 @@ export function Config() {
           background: 'linear-gradient(180deg,rgba(240,68,56,.05),rgba(11,14,19,0) 60%),#0b0e13',
         }}
       >
-        {/* Header */}
-        <div
-          className="flex items-center gap-[9px] border-b border-[rgba(240,68,56,.2)] px-4 py-[13px]"
+        {/* Header — its own chevron folds the settings rows (custom colored
+            header, not a SectionTitle, so the toggle lives inline here). */}
+        <button
+          type="button"
+          onClick={() => toggleSection('Danger Zone')}
+          className="group flex w-full items-center gap-[9px] border-b border-[rgba(240,68,56,.2)] px-4 py-[13px] text-left"
           style={{ background: 'rgba(240,68,56,.06)' }}
         >
           <ShieldAlert size={15} className="text-[#f04438]" />
           <span className="text-[13px] font-semibold text-[#f04438]">Danger Zone</span>
           <span className="ml-auto text-[11px] text-text-muted">Connection changes may need a restart</span>
-        </div>
+          <ChevronRight
+            size={15}
+            className="text-[#f04438] transition-transform"
+            style={{ transform: collapsed['Danger Zone'] ? 'none' : 'rotate(90deg)' }}
+          />
+        </button>
 
         {/* Settings rows */}
-        {dangerLoading ? (
+        {collapsed['Danger Zone'] ? null : dangerLoading ? (
           <div className="px-4 py-6 text-[12px] text-text-muted">Loading…</div>
         ) : dangerError ? (
           <div className="px-4 py-4 text-[12px] text-faint">{dangerError}</div>

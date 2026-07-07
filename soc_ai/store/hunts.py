@@ -234,6 +234,25 @@ async def get_chat_event(db: AsyncSession, event_id: int) -> HuntEvent | None:
     return await db.get(HuntEvent, event_id)
 
 
+async def chat_counts_for(db: AsyncSession, hunt_ids: list[str]) -> dict[str, int]:
+    """hunt_id -> chat-message count, one grouped COUNT query (mirrors
+    ``soc_ai.store.chat.counts_for``). Hunts with no chat rows are omitted —
+    callers treat missing keys as 0."""
+    if not hunt_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(HuntEvent.hunt_id, func.count().label("n"))
+            .where(
+                HuntEvent.hunt_id.in_(hunt_ids),
+                HuntEvent.kind.in_((CHAT_USER, CHAT_ASSISTANT)),
+            )
+            .group_by(HuntEvent.hunt_id)
+        )
+    ).all()
+    return {row.hunt_id: row.n for row in rows}
+
+
 async def chat_history_for_agent(db: AsyncSession, hunt_id: str) -> list[tuple[str, str]]:
     """Completed (role, content) chat turns to seed the follow-up agent — excludes
     the in-flight pending assistant row and any errored turns."""

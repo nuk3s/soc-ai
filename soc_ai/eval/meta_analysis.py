@@ -73,12 +73,13 @@ failure mode (e.g. all the disagreements share a missing tool).
 
 "High impact" is defined operationally as a change that would:
 - improve `agreement_rate` (the oracle agrees with the agent's verdict),
-- reduce `retask_rate` (the synthesizer hits the confidence floor
-  less often, meaning the investigator gathered enough first time),
-- cut p95 latency on `investigation_ms` or `claude_ms`.
+- reduce `retask_rate` (how often the tool-less round-1 synthesis had
+  to name a gap for a Phase-D targeted dispatch — i.e. the prefetched
+  evidence didn't settle the verdict on its own),
+- cut p95 latency on `investigation_ms`.
 
 Be specific and concrete. "Improve prompts" is useless; "tighten the
-investigator's stop condition to 'evidence + community_id pivot +
+investigation loop's stop condition to 'evidence + community_id pivot +
 one enrichment is enough'" is actionable.
 
 When you produce JSON output, output the JSON DIRECTLY — no preamble,
@@ -246,9 +247,9 @@ def build_map_prompt(chunk: list[RunSlim]) -> str:
         "\n---\n\n# Task\n\n"
         "Cluster the architecture suggestions above into THEMES. Each "
         "theme should be a specific, named architectural change "
-        '(e.g., `"investigator: tighten stop condition"`, `"tool '
-        'surface: add zeek http_status pivot"`, `"retask: trigger '
-        'on missing-enrichment, not just confidence floor"`).\n\n'
+        '(e.g., `"investigation loop: tighten stop condition"`, `"tool '
+        'surface: add zeek http_status pivot"`, `"phase-d dispatch: '
+        'trigger on missing-enrichment, not only a synth-named gap"`).\n\n'
         "Return a JSON array. Each element MUST have these keys:\n\n"
         "- `theme`: short name (~6 words).\n"
         "- `count_in_chunk`: integer, how many alerts in this chunk "
@@ -293,12 +294,12 @@ def build_reduce_prompt(
         "chunks, themes that show up in multiple disagreements, and "
         "themes whose `expected_impact` matches a metric the "
         "aggregates show is weak (e.g., low `agreement_rate`, high "
-        "`retask_rate`, high p95 `claude_ms`).\n\n"
+        "`retask_rate`, high p95 `investigation_ms`).\n\n"
         "For each change, return a JSON object with:\n\n"
         "- `change`: short name (~8 words).\n"
         "- `description`: 2-4 sentences on the concrete edit "
-        "(prompt change / new tool / flow tweak / retask trigger / "
-        "etc).\n"
+        "(prompt change / new tool / flow tweak / dispatch or "
+        "loop-entry trigger / etc).\n"
         "- `evidence`: cite specific theme names and counts and "
         "aggregate signals.\n"
         "- `expected_lift`: which of agreement_rate / retask_rate / "

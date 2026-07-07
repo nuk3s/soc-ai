@@ -106,6 +106,21 @@ _CATALOG: tuple[_ToolDef, ...] = (
         (_ES,),
     ),
     _ToolDef(
+        "get_rule_content",
+        "Query",
+        True,
+        "Fetch a detection rule's full text (what the signature matches) by SID or title.",
+        (_ES,),
+    ),
+    _ToolDef(
+        "decode_payload",
+        "Query",
+        True,
+        "Decode alert payload bytes (base64/hex) into strings, indicators, and "
+        "protocol facts — local, no egress.",
+        (),
+    ),
+    _ToolDef(
         "query_cases", "Query", True, "Search existing SO cases for related or prior work.", (_ES,)
     ),
     _ToolDef(
@@ -235,23 +250,27 @@ _CATALOG: tuple[_ToolDef, ...] = (
             _Req("SSH sensor host", _str_set("so_ssh_host")),
         ),
     ),
-    # ── Actions (write — analyst-approval gated) ─────────────────────────────
+    # ── Actions (write — analyst-executed) ───────────────────────────────────
     _ToolDef(
         "ack_alert",
         "Action",
         False,
-        "Acknowledge an alert in Security Onion (approval-gated).",
+        "Acknowledge an alert in Security Onion (analyst-executed).",
         (_SO,),
     ),
     _ToolDef(
         "escalate_to_case",
         "Action",
         False,
-        "Escalate an alert to a new SO case (approval-gated).",
+        "Escalate an alert to a new SO case (analyst-executed).",
         (_SO,),
     ),
     _ToolDef(
-        "add_case_comment", "Action", False, "Add a comment to an SO case (approval-gated).", (_SO,)
+        "add_case_comment",
+        "Action",
+        False,
+        "Add a comment to an SO case (analyst-executed).",
+        (_SO,),
     ),
 )
 

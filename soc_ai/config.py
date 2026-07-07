@@ -182,6 +182,31 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ANALYST_MODEL", "HEAVY_MODEL"),
     )
 
+    analyst_cloud_redaction: bool = False
+    """Redact internal identifiers from EVERYTHING sent to the analyst model.
+
+    Opt-in privacy gate for deployments that point ``analyst_model`` at a
+    CLOUD provider.  When True, every payload sent to the analyst model —
+    the enriched alert context, all tool results, and the composed prompts
+    (investigation, hunt, and chat) — has internal IPs, hostnames, usernames,
+    and domains replaced with stable opaque labels (``IP_01``, ``HOST_02``, …)
+    via the same reversible redaction tunnel the Oracle path uses
+    (:class:`soc_ai.agent.egress_guard.EgressGuard`).  Every model OUTPUT —
+    verdicts, rationales, reasoning traces, hunt reports, chat replies — has
+    those labels restored to the real values before storage/display, and tool
+    arguments coming FROM the model (e.g. a query string citing ``HOST_01``)
+    are label-restored before they hit Elasticsearch, so the agent loop still
+    works end to end.
+
+    COST: some verdict quality.  The model reasons over opaque labels, so it
+    cannot use identity knowledge it would otherwise infer — e.g. it can't
+    recognise ``dc01`` as a domain controller, or that ``HOST_03`` is the CEO's
+    laptop.  Cross-references between labels are preserved, so behavioural
+    reasoning (beaconing, lateral movement patterns) is unaffected.
+
+    Leave False (the default) for a local model — redaction is pure overhead
+    when the analyst model never leaves your network."""
+
     # --- Audit logging -------------------------------------------------
     audit_index_alias: str = "soc-ai-audit"
     audit_redact: bool = True
@@ -385,6 +410,14 @@ class Settings(BaseSettings):
     agent_tool_calls_limit: int = 25
     agent_request_limit: int = 18
 
+    # Schema-retry budget for the investigation-loop agent. 10 was sized for
+    # Nemotron-30B's schema wobble; stronger models may need far less.
+    investigator_retries: int = 10
+    # Max Phase-D targeted-dispatch rounds per investigation. 1 = the original
+    # hard cap (synth names one tool, one round-2, done). 2 lets the synth
+    # chain e.g. t_get_event_raw -> t_decode_payload.
+    phase_d_max_rounds: int = 1
+
     # Hunts explore FAR more broadly than a single-alert investigation (many hosts,
     # many queries, cross-time correlation), so they get a bigger budget — otherwise
     # the agent runs out of requests before it can synthesize its findings report.
@@ -423,23 +456,11 @@ class Settings(BaseSettings):
             raise ValueError(f"verdict_consistency_samples must be in [1, 5], got {i}")
         return i
 
-    # --- Two-stage investigation routing -------------------------------
-    # The investigator (fast model) gathers evidence with the read tools;
-    # the synthesizer (heavy model) reads the transcript and emits a
-    # TriageReport. If the synthesizer's confidence comes back below
-    # synthesis_confidence_floor, the investigator is retasked once with
-    # the prior transcript + the synthesizer's open_questions, and the
-    # synthesizer runs again on the combined evidence. The retask is
-    # capped at 1 — a still-low confidence after retask surfaces as-is.
+    # --- Synthesis confidence floor -------------------------------------
+    # A synthesized verdict whose confidence comes back below this floor is
+    # treated as not-actionable: the post-validators rewrite the verdict to
+    # needs_more_info when it also lacks semantic citation coverage.
     synthesis_confidence_floor: float = 0.6
-
-    # The retask round 2 is meant for FOCUSED gap-closing, not breadth
-    # gathering. Cap its tool calls tightly so a runaway second round
-    # can't accumulate enough tool-result history to blow either model's
-    # 64K context window on this grid (both Nemotron 3 Nano-30B and
-    # Super-120B are deployed with 64K serving windows).
-    agent_retask_tool_calls_limit: int = 15
-    agent_retask_request_limit: int = 12
 
     # --- Investigator response-token cap -------------------------------
     # Single investigator turns were observed producing ~13.6K
@@ -464,37 +485,29 @@ class Settings(BaseSettings):
     #   degenerate case. Per-turn, not per-investigation.
     investigator_max_response_tokens: int = 32000
 
-    # --- Rule-class fast-path ------------------------------------------
-    # Meta-analysis showed the large majority of verdicts (e.g. 33/38) were
-    # false_positive with mean investigation time ~12 min. Most of that work
-    # confirms noise. The fast-path routes informational_visibility +
-    # severity=low alerts through a stripped-down "confirm-or-deny benign
-    # hypothesis" prompt with a relaxed retask floor and a tighter tool budget.
-    enable_rule_class_fast_path: bool = True
-    # Lower confidence floor on the fast-path. The full-pipeline floor
-    # (synthesis_confidence_floor=0.6) errs on the side of retasking;
-    # informational-visibility alerts almost never benefit from a second
-    # round, so we let confidence ≥0.4 pass through.
-    fast_path_synthesis_floor: float = 0.4
-    # Tool-call cap on the fast-path investigator. Phase 1 smoke showed
-    # a healthy ET INFO triage uses 3 tool calls + 1-3 final_result schema
-    # retries → ~6 requests. The original 8-request cap was right on the
-    # edge (one bad retry overshoots). 15 / 12 give the model real headroom
-    # while staying tighter than the standard 100 / 50.
-    fast_path_tool_calls_limit: int = 15
-    fast_path_request_limit: int = 12
-    # Fraction of fast-path-eligible alerts to route through the FULL
-    # pipeline anyway, for drift monitoring. Setting to 0.0 disables
-    # sampling (fast-path always taken when eligible). Tests should
-    # also set 0.0 so they're deterministic.
-    fast_path_sampling_rate: float = 0.05
-    # Mandatory enrichment call on the fast-path. When an alert has
-    # an external destination IP, the orchestrator runs ONE t_enrich_ip
-    # call before the synth so the verdict rests on positive enrichment
-    # signal. If the result has a MISP hit / flagged ASN, the orchestrator
-    # escalates to the FULL investigator pipeline. Timeout bounds the
-    # extra wall-clock cost — 30s is generous for a local MISP call.
-    fast_path_enrichment_timeout_s: float = 30.0
+    synthesizer_max_response_tokens: int = 32000
+    """Per-call response cap (reasoning + TriageReport combined) for the
+    synthesizer paths, sent as OpenAI ``max_completion_tokens``.
+
+    Without an explicit value the gateway/route default applies — and a
+    REASONING model can spend that entire accidental budget thinking, so the
+    call truncates before any structured output is generated
+    ("Model token limit (provider default) exceeded…" → fallback
+    needs_more_info verdict). 32000 covers the worst observed reasoning trace
+    with ample headroom; lower it for latency, raise it for very verbose
+    reasoning models."""
+
+    model_context_window_tokens: int = 0
+    """The analyst model's input window in tokens, for proactive context
+    budgeting (``soc_ai.agent.context_budget``).
+
+    0 (the default) = auto-discover from the LiteLLM gateway's ``/model/info``
+    (``max_input_tokens``), fail-soft to no budgeting when the gateway doesn't
+    publish it. Set explicitly to override discovery (e.g. a gateway that
+    reports nothing, or to force a smaller budget). When a window is known,
+    an oversized enriched alert context is trimmed tail-first (oldest pivot
+    events dropped, ``context_trimmed`` event emitted) before the first model
+    call instead of blowing the window mid-investigation."""
 
     # --- Synth-first pipeline ------------------------------------------
     fast_triage_enabled: bool = True
@@ -502,13 +515,6 @@ class Settings(BaseSettings):
     full tool-driven investigation loop. Saves time but can yield shallower
     results (a verdict may land with few or no tool calls). Turn OFF to always
     investigate with tools. Exposed in the admin config console."""
-
-    synth_first_pipeline: bool = True
-    """Route alerts through the synth-first A→B→C→D pipeline (default).
-
-    Set to ``False`` only to A/B against the legacy two-stage investigator
-    pipeline (still wired through ``soc_ai.agent.orchestrator.investigate``
-    when this flag is False)."""
 
     investigate_when_unsure: bool = True
     """Run a real bounded investigation loop when the synth-first round-1
@@ -828,23 +834,24 @@ class Settings(BaseSettings):
         return v
 
     # --- Auto-acknowledge high-confidence false positives ---------------
-    auto_ack_fp_enabled: bool = False
-    """When True, an investigation that finalises with verdict=false_positive
-    at confidence >= auto_ack_fp_threshold will automatically acknowledge
-    that alert in Security Onion.
+    auto_ack_fp_enabled: bool = True
+    """When True, alerts the system is confident are false positives are
+    automatically acknowledged in Security Onion. Two paths:
 
-    Off by default — this is a write action taken without analyst review.
-    Enable only after validating the model's FP precision on your alert set.
+    - an investigation that finalises with verdict=false_positive at
+      confidence >= auto_ack_fp_threshold auto-acks its alert;
+    - an auto-triage sweep that SKIPS a cluster because it inherits a
+      qualifying FP verdict (``auto_triage_inheritance_enabled``) acks the
+      cluster's events too — before this, an inherited verdict never reached
+      SO and those alerts lingered unacked forever.
 
-    COUPLING (important): auto-ack fires ONLY as a side-effect of an
-    investigation finalising with an FP verdict. It is NOT a retroactive
-    sweep — enabling it does not go back and acknowledge alerts that were
-    never investigated. An alert only gets auto-acked if it is investigated
-    *while* this is on. To acknowledge a standing backlog of FPs, run an
-    auto-triage sweep over it (the ⚡ button, or ``auto_triage_schedule_
-    enabled``); each finalised FP is then auto-acked as it completes.
+    ON by default: both paths are gated by the confidence threshold AND the
+    high-stakes guard (``_is_high_stakes_alert`` — a critical/high-severity or
+    malware/exploit-class alert is never auto-acked, whatever the verdict),
+    and every unattended write is audited. Set False to require a human click
+    for every acknowledgement.
 
-    Note the severity interaction: ``_is_high_stakes_alert`` never auto-acks a
+    Note the severity interaction: the high-stakes guard never auto-acks a
     critical/high-severity (or malware/exploit-class) alert, while
     ``auto_triage_min_severity`` defaults to "high". If you want auto-ack to
     actually clear a backlog, lower the auto-triage floor to "medium"/"low" so
@@ -895,7 +902,7 @@ class Settings(BaseSettings):
     # proxy that holds the cloud credential). This reuses
     # `litellm_base_url` / `litellm_api_key` / `litellm_verify_ssl` —
     # only the model alias and max_tokens are eval-specific.
-    claude_oracle_model: str = "claude-opus-4-7"
+    claude_oracle_model: str = "claude-opus-4-8"
     claude_oracle_max_tokens: int = 8192
 
     # ---- validators ---------------------------------------------------

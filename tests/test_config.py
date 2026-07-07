@@ -172,9 +172,6 @@ def test_blocklist_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """New blocklist + maxmind settings have sane defaults."""
     _setenv_required(monkeypatch)
     s = Settings()
-    # Default is True once the evidence-aware validators cleared the
-    # real-stratum agreement_rate gate under cross-validation.
-    assert s.synth_first_pipeline is True
     assert s.blocklist_data_dir.name == "blocklists"
     assert s.maxmind_data_dir.name == "maxmind"
     assert s.blocklist_sources == ["urlhaus", "threatfox", "feodo", "tor", "internal_seed"]
@@ -301,10 +298,10 @@ def test_timeout_knobs_overridable_from_env(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_auto_ack_fp_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """auto_ack_fp_enabled defaults to False, threshold to 0.7."""
+    """auto_ack_fp_enabled defaults ON (threshold + high-stakes gated), threshold 0.7."""
     _setenv_required(monkeypatch)
     s = Settings()
-    assert s.auto_ack_fp_enabled is False
+    assert s.auto_ack_fp_enabled is True
     assert s.auto_ack_fp_threshold == 0.7
 
 
@@ -395,11 +392,7 @@ _INC1_SURFACED = frozenset(
         "playbooks_index_pattern",
         "webui_alerts_query",
         "webui_inherit_window_days",
-        "synth_first_pipeline",
-        "enable_rule_class_fast_path",
         "synthesis_confidence_floor",
-        "fast_path_synthesis_floor",
-        "fast_path_sampling_rate",
         "investigator_max_response_tokens",
     }
 )
@@ -467,9 +460,9 @@ def test_inc1_settings_coerce_from_form_strings() -> None:
         "events_index_pattern": ("logs-*", "logs-*"),
         "webui_alerts_query": ("event.dataset:suricata.alert", "event.dataset:suricata.alert"),
         "webui_inherit_window_days": ("14", 14),
-        "synth_first_pipeline": ("true", True),
-        "enable_rule_class_fast_path": ("", False),  # unchecked checkbox → False
-        "fast_path_synthesis_floor": ("0.4", 0.4),
+        "fast_triage_enabled": ("true", True),
+        "auto_ack_fp_enabled": ("", False),  # unchecked checkbox → False
+        "synthesis_confidence_floor": ("0.6", 0.6),
         "investigator_max_response_tokens": ("16000", 16000),
     }
     for key, (raw, expected) in samples.items():
@@ -601,3 +594,51 @@ def test_verdict_consistency_samples_is_hot_whitelisted() -> None:
     assert spec.max_value == 5
     assert spec.secret is False
     assert spec.danger is False
+
+
+def test_synth_first_flag_is_gone(settings_kratos: Settings) -> None:
+    """The pipeline selector was deleted; Settings must reject the old field.
+
+    Settings uses ``extra="ignore"``, so an unknown *init kwarg* is silently
+    dropped rather than rejected — the deletion is asserted structurally
+    instead: the field is gone from the model, and attribute assignment (the
+    old test-suite idiom ``settings.synth_first_pipeline = True``) raises.
+    """
+    import pydantic
+
+    assert "synth_first_pipeline" not in Settings.model_fields
+
+    with pytest.raises(pydantic.ValidationError):
+        settings_kratos.synth_first_pipeline = True
+
+
+# ---------------------------------------------------------------------------
+# Scaffolding knobs — investigator_retries + phase_d_max_rounds
+# ---------------------------------------------------------------------------
+
+
+def test_scaffolding_knobs_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defaults preserve the pre-knob behavior exactly."""
+    _setenv_required(monkeypatch)
+    s = Settings()
+    assert s.investigator_retries == 10  # current behavior preserved
+    assert s.phase_d_max_rounds == 1  # current behavior preserved
+
+
+def test_scaffolding_knobs_are_hot_whitelisted() -> None:
+    """Both knobs are editable live in the admin config console."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    retries = WHITELIST_BY_KEY["investigator_retries"]
+    assert retries.hot is True
+    assert retries.type == "int"
+    assert retries.min_value == 1
+    assert retries.max_value == 20
+    assert retries.section == "Agent"
+
+    rounds = WHITELIST_BY_KEY["phase_d_max_rounds"]
+    assert rounds.hot is True
+    assert rounds.type == "int"
+    assert rounds.min_value == 1
+    assert rounds.max_value == 3
+    assert rounds.section == "Agent"

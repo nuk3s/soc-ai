@@ -1,15 +1,10 @@
-"""Tests for write tools and the ApprovalGate flow.
+"""Tests for write tools.
 
-The approval flow is the v1 safety guarantee. These tests verify:
+Write tools are the v1 safety boundary. These tests verify:
 
 - A write tool registered as ``read_only=False`` lands correctly in the
-  registry and never auto-executes.
-- ``ApprovalGate.request -> decide -> consume`` runs cleanly through both
-  ``approved`` and ``rejected`` paths.
-- Repeat ``decide`` calls are idempotent (covers the SSE retry path where the
-  user double-clicks Approve).
-- Repeat ``consume`` calls raise :class:`ApprovalRejected` so the orchestrator
-  doesn't execute a write tool twice on a duplicate ``/approve`` POST.
+  registry and never auto-executes (it is excluded from the read-only set the
+  agent runs freely).
 - Each write tool issues the documented HTTP shape via the auth client.
 """
 
@@ -19,8 +14,8 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from soc_ai.errors import ApprovalRejected, ApprovalRequired, SoApiError
-from soc_ai.tools._registry import ApprovalGate, list_tools
+from soc_ai.errors import SoApiError
+from soc_ai.tools._registry import list_tools
 from soc_ai.tools.ack_alert import ack_alert
 from soc_ai.tools.add_case_comment import add_case_comment
 from soc_ai.tools.escalate_to_case import escalate_to_case
@@ -45,82 +40,6 @@ def test_registry_classifies_read_and_write_tools() -> None:
     assert write_names.isdisjoint(names_read)
     # ...but they must be in the full set
     assert write_names.issubset(names_all)
-
-
-# =====================================================================
-# ApprovalGate workflow
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_approval_gate_request_and_approve() -> None:
-    gate = ApprovalGate()
-    token = await gate.request("ack_alert", {"alert_id": "a1"})
-    assert isinstance(token, str)
-    assert len(token) > 0
-
-    # Pending -> consume raises ApprovalRequired
-    with pytest.raises(ApprovalRequired):
-        await gate.consume(token)
-
-    await gate.decide(token, approved=True)
-    req = await gate.consume(token)
-    assert req.tool_name == "ack_alert"
-    assert req.tool_args == {"alert_id": "a1"}
-
-
-@pytest.mark.asyncio
-async def test_approval_gate_reject_path() -> None:
-    gate = ApprovalGate()
-    token = await gate.request("ack_alert", {"alert_id": "a1"})
-    await gate.decide(token, approved=False, reason="not enough evidence")
-
-    with pytest.raises(ApprovalRejected, match="not enough evidence"):
-        await gate.consume(token)
-
-
-@pytest.mark.asyncio
-async def test_approval_gate_consume_is_idempotent() -> None:
-    """A second consume after a successful one must reject (write must not execute twice)."""
-    gate = ApprovalGate()
-    token = await gate.request("ack_alert", {"alert_id": "a1"})
-    await gate.decide(token, approved=True)
-
-    await gate.consume(token)  # first consume succeeds
-    with pytest.raises(ApprovalRejected, match="already executed"):
-        await gate.consume(token)
-
-
-@pytest.mark.asyncio
-async def test_approval_gate_decide_is_idempotent() -> None:
-    """Repeated decide calls (e.g. user double-clicks Approve) must not flip state."""
-    gate = ApprovalGate()
-    token = await gate.request("ack_alert", {"alert_id": "a1"})
-    await gate.decide(token, approved=True)
-    await gate.decide(token, approved=False)  # ignored
-    req = await gate.consume(token)
-    assert req.tool_name == "ack_alert"
-
-
-@pytest.mark.asyncio
-async def test_approval_gate_unknown_token_raises() -> None:
-    gate = ApprovalGate()
-    with pytest.raises(KeyError, match="unknown approval token"):
-        await gate.consume("garbage")
-    with pytest.raises(KeyError, match="unknown approval token"):
-        await gate.decide("garbage", approved=True)
-
-
-@pytest.mark.asyncio
-async def test_approval_gate_pending_snapshot() -> None:
-    gate = ApprovalGate()
-    t1 = await gate.request("ack_alert", {"alert_id": "a1"})
-    t2 = await gate.request("ack_alert", {"alert_id": "a2"})
-    await gate.decide(t1, approved=True)
-    await gate.consume(t1)  # consume t1
-
-    pending = await gate.pending()
-    assert {p.token for p in pending} == {t2}
 
 
 # =====================================================================

@@ -124,9 +124,13 @@ def _make_settings(
     """Build a minimal Settings-like namespace for tests."""
     return SimpleNamespace(
         pcap_enabled=pcap_enabled,
-        # build_investigator reads this at registration time (online-enrichment
-        # tools are only registered when the master egress toggle is on).
+        # build_investigator reads the schema-retry budget at construction time.
+        investigator_retries=10,
+        # register_read_tools reads these at registration time (settings-gated
+        # tools are only registered when their toggle is on).
         allow_online_enrichment=allow_online_enrichment,
+        web_search_enabled=False,
+        crawl4ai_enabled=False,
         so_ssh_host=so_ssh_host,
         so_ssh_user=so_ssh_user,
         so_ssh_key=so_ssh_key,
@@ -519,27 +523,32 @@ async def test_tcpdump_no_match_returns_empty_pcap_facts() -> None:
 
 
 def test_t_get_pcap_registered_in_investigator() -> None:
-    """build_investigator must register a tool named 't_get_pcap'."""
+    """build_investigator registers 't_get_pcap' iff the pcap gate is on.
+
+    (Toolset unification normalized gating to registration time in every
+    role — the investigator no longer registers a disabled t_get_pcap.)
+    """
     from pydantic_ai.models.test import TestModel
     from soc_ai.agent.orchestrator import InvestigationContext, build_investigator
 
-    ctx = MagicMock(spec=InvestigationContext)
-    ctx.settings = _make_settings(pcap_enabled=False)
-    ctx.elastic = MagicMock()
-    ctx.auth = MagicMock()
-    ctx.misp = None
-    ctx.blocklist = MagicMock()
-    ctx.maxmind = None
-    ctx.cloud = None
-    ctx.default_time_anchor = None
-    ctx.prefetched_community_ids = set()
-    ctx._tool_dedup_cache = {}  # type: ignore[attr-defined]
+    def _tool_names(*, pcap_enabled: bool) -> set[str]:
+        ctx = MagicMock(spec=InvestigationContext)
+        ctx.settings = _make_settings(pcap_enabled=pcap_enabled)
+        ctx.elastic = MagicMock()
+        ctx.auth = MagicMock()
+        ctx.misp = None
+        ctx.blocklist = MagicMock()
+        ctx.maxmind = None
+        ctx.cloud = None
+        ctx.default_time_anchor = None
+        ctx.prefetched_community_ids = set()
+        agent = build_investigator(TestModel(), ctx)
+        # pydantic-ai exposes registered tools via _function_toolset.tools (a dict keyed by name)
+        return set(agent._function_toolset.tools.keys())  # type: ignore[attr-defined]
 
-    agent = build_investigator(TestModel(), ctx)
-
-    # pydantic-ai exposes registered tools via _function_toolset.tools (a dict keyed by name)
-    tool_names = set(agent._function_toolset.tools.keys())  # type: ignore[attr-defined]
-    assert "t_get_pcap" in tool_names, f"t_get_pcap not found in investigator tools: {tool_names}"
+    names_on = _tool_names(pcap_enabled=True)
+    assert "t_get_pcap" in names_on, f"t_get_pcap not found in investigator tools: {names_on}"
+    assert "t_get_pcap" not in _tool_names(pcap_enabled=False)
 
 
 # ---------------------------------------------------------------------------

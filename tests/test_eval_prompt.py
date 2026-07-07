@@ -8,7 +8,11 @@ through the sanitizer.
 
 from __future__ import annotations
 
-from soc_ai.agent.prompts import INVESTIGATOR_PROMPT, SYNTHESIZER_PROMPT
+from soc_ai.agent.prompts import (
+    INVESTIGATOR_PROMPT,
+    SYNTH_FIRST_SYSTEM_PROMPT,
+    SYNTHESIZER_PROMPT,
+)
 from soc_ai.eval.prompt import (
     SYSTEM_PROMPT,
     architecture_block,
@@ -24,14 +28,61 @@ def test_system_prompt_calls_out_label_semantics_and_role() -> None:
     assert "Markdown" in SYSTEM_PROMPT
 
 
-def test_architecture_block_includes_both_verbatim_prompts() -> None:
+def test_architecture_block_includes_all_verbatim_prompts() -> None:
     block = architecture_block()
-    # Must include both system prompts verbatim so the oracle can suggest
-    # prompt-level edits.
+    # Must include all three live system prompts verbatim so the oracle can
+    # suggest prompt-level edits: the synth-first verdict writer, the
+    # investigation-loop investigator, and the loop-concluding synthesizer.
+    assert SYNTH_FIRST_SYSTEM_PROMPT in block
     assert INVESTIGATOR_PROMPT in block
     assert SYNTHESIZER_PROMPT in block
-    assert "two-stage" in block.lower()
     assert "synthesis_confidence_floor" in block
+
+
+def test_architecture_block_describes_the_current_pipeline() -> None:
+    """The grading input must describe the REAL pipeline, not the deleted
+    two-stage investigator->synthesizer->retask flow."""
+    block = architecture_block()
+    # Collapse the summary's hard line-wraps so multi-word phrase checks
+    # aren't broken by a wrap point.
+    flat = " ".join(block.split())
+    # The deleted flow must not be described to the judge. Scope the check to
+    # the summary itself — the verbatim agent prompts embedded below it are
+    # the live runtime prompts and are quoted as-is (the loop's
+    # investigator->synthesizer handoff legitimately self-describes as
+    # two-stage there).
+    summary = flat.split("## Round-1", 1)[0]
+    assert "two-stage" not in summary.lower()
+    assert "retask round" not in summary.lower()
+    # The real stages, in the summary.
+    assert "decision template" in summary.lower()
+    assert "definitely-investigate" in summary.lower()
+    assert "targeted dispatch" in summary.lower()
+    assert "investigation loop" in summary.lower()
+    assert "evidence gate" in summary.lower()
+    assert "malware-label payload gate" in summary.lower()
+    assert "Oracle" in summary
+    # Event kinds the pipeline actually emits (spot-check the ones the old
+    # text got wrong or omitted).
+    for kind in (
+        "`enriched_alert_context`",
+        "`decision_template_match`",
+        "`synth_round1_skipped`",
+        "`investigation_loop_entered`",
+        "`targeted_dispatch`",
+        "`targeted_tool_result`",
+        "`citation_validation`",
+        "`evidence_gate_downgrade`",
+        "`auto_ack`",
+    ):
+        assert kind in block, f"missing event kind {kind} in architecture block"
+    # Kinds the pipeline does NOT emit anymore must be gone.
+    assert "`alert_context`" not in block
+    assert "`approval_required`" not in block
+    # `retask` is still emitted (co-emitted with each Phase-D dispatch) and
+    # must be explained as such so the judge doesn't infer a re-run round.
+    assert "`retask`" in block
+    assert "Phase-D dispatches" in block
 
 
 def test_user_message_has_all_three_question_sections() -> None:

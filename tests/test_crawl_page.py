@@ -357,11 +357,9 @@ async def test_unresolvable_host_refused() -> None:
 
 
 def test_wiring_dispatch_and_literal() -> None:
-    import inspect
-
     from soc_ai.agent import targeted_investigator as ti
 
-    assert '"t_crawl_page": crawl_page' in inspect.getsource(ti._dispatch_named_tool)
+    assert ti._dispatch_table()["t_crawl_page"] is crawl_page
     from soc_ai.agent.triage import TargetedGap
 
     enum_vals = TargetedGap.model_json_schema()["properties"]["tool_name"].get("enum") or []

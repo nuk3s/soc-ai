@@ -2,26 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
 class InvestigateRequest(BaseModel):
+    # NOTE: a legacy `session_id` body field is silently ignored (pydantic's
+    # default extra="ignore") — the pipeline mints its own session id.
     alert_id: str = Field(min_length=1)
-    session_id: str | None = None
-
-
-class ApproveRequest(BaseModel):
-    token: str = Field(min_length=1)
-    approved: bool
-    reason: str | None = None
-
-
-class ApproveResponse(BaseModel):
-    status: Literal["executed", "rejected", "already_decided"]
-    result: dict[str, Any] | None = None
-    error: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -29,14 +18,6 @@ class HealthResponse(BaseModel):
     version: str
     so_auth: Literal["kratos", "connect"]
     misp_configured: bool
-    pending_approvals: int
-
-
-class SessionInfoResponse(BaseModel):
-    """Snapshot of an in-flight investigation's pending approvals."""
-
-    session_id: str
-    pending_approvals: list[dict[str, Any]]
 
 
 class FindAlertRequest(BaseModel):

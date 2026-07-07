@@ -188,6 +188,86 @@ async def test_delete_manual_refuses_detected(settings_kratos: Settings) -> None
 
 
 # ---------------------------------------------------------------------------
+# dismiss — terminal tombstone for detected rows
+# ---------------------------------------------------------------------------
+
+
+async def test_dismiss_detected_round_trip(settings_kratos: Settings) -> None:
+    """dismiss() tombstones a detected row; it vanishes from the default listing
+    but stays in the table (include_dismissed=True)."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        det = await ids.upsert_detected(db, "suffix", ".cdn.netflix.com", {"x": 1}, "muted")
+        row = await ids.dismiss(db, det.id)
+        assert row is not None
+        assert row.state == "dismissed"
+        assert row.source == "detected"  # source untouched
+        # hidden from the default listing (routes + oracle resolver path) ...
+        assert await ids.list_identifiers(db, "suffix") == []
+        # ... but preserved in the table for audit
+        full = await ids.list_identifiers(db, "suffix", include_dismissed=True)
+        assert [r.value for r in full] == [".cdn.netflix.com"]
+        assert full[0].state == "dismissed"
+    await engine.dispose()
+
+
+async def test_dismiss_missing_and_manual_return_none(settings_kratos: Settings) -> None:
+    """dismiss() returns None for unknown ids AND for manual rows (which are
+    deleted via delete_manual, never dismissed) — and leaves manual rows intact."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        assert await ids.dismiss(db, 9999) is None  # missing
+        manual = await ids.add_manual(db, "host", "WIN11-01")
+        assert await ids.dismiss(db, manual.id) is None  # manual → refused
+        rows = await ids.list_identifiers(db, "host")
+        assert rows[0].state == "active"  # untouched
+        assert rows[0].source == "manual"
+    await engine.dispose()
+
+
+async def test_set_state_cannot_reach_dismissed(settings_kratos: Settings) -> None:
+    """set_state stays active/muted-only — 'dismissed' is not a valid target."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        det = await ids.upsert_detected(db, "suffix", ".corp.acme.com", {"x": 1}, "active")
+        with pytest.raises(ValueError):
+            await ids.set_state(db, det.id, "dismissed")
+    await engine.dispose()
+
+
+async def test_upsert_detected_never_resurrects_dismissed(settings_kratos: Settings) -> None:
+    """A dismissed row is a TERMINAL tombstone: a re-scan neither refreshes its
+    evidence nor changes its state."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        det = await ids.upsert_detected(
+            db, "suffix", ".cdn.netflix.com", {"host_count": 1}, "muted"
+        )
+        await ids.dismiss(db, det.id)
+        # a later scan re-detects the same value with strong signal
+        row = await ids.upsert_detected(
+            db, "suffix", ".cdn.netflix.com", {"host_count": 99}, "active"
+        )
+        assert row.state == "dismissed"  # not resurrected
+        assert row.evidence == {"host_count": 1}  # evidence NOT refreshed
+        assert await ids.list_identifiers(db, "suffix") == []  # still hidden
+    await engine.dispose()
+
+
+async def test_add_manual_reactivates_dismissed(settings_kratos: Settings) -> None:
+    """An explicit operator add outranks a dismissal — the tombstone reactivates."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        det = await ids.upsert_detected(db, "suffix", ".corp.acme.com", {"x": 1}, "muted")
+        await ids.dismiss(db, det.id)
+        row = await ids.add_manual(db, "suffix", "corp.acme.com")
+        assert row.id == det.id  # same row, no duplicate
+        assert row.state == "active"
+        assert len(await ids.list_identifiers(db, "suffix")) == 1
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
 # effective_internal_identifiers
 # ---------------------------------------------------------------------------
 
@@ -243,4 +323,21 @@ async def test_effective_dedup(settings_kratos: Settings) -> None:
         await ids.upsert_detected(db, "suffix", ".lan", {"x": 1}, "active")
         eff = await effective_internal_identifiers(db, settings_kratos)
     assert eff.suffixes.count(".lan") == 1  # not duplicated
+    await engine.dispose()
+
+
+async def test_effective_ignores_dismissed(settings_kratos: Settings) -> None:
+    """A dismissed row contributes NOTHING to the effective set: it neither
+    activates its value nor subtracts an env default the way a muted row does."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # a dismissed ACTIVE detected suffix must not reach the sanitizer set
+        det = await ids.upsert_detected(db, "suffix", ".corp.acme.com", {"x": 1}, "active")
+        await ids.dismiss(db, det.id)
+        # a dismissed row whose value is an env default must NOT act as a mute
+        floor = await ids.upsert_detected(db, "suffix", ".corp", {"x": 1}, "muted")
+        await ids.dismiss(db, floor.id)
+        eff = await effective_internal_identifiers(db, settings_kratos)
+    assert ".corp.acme.com" not in eff.suffixes  # dismissed → not active
+    assert ".corp" in eff.suffixes  # dismissed ≠ muted: env default survives
     await engine.dispose()

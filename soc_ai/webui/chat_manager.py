@@ -19,6 +19,7 @@ from soc_ai.agent.chat_agent import (
     build_chat_agent,
     build_chat_context_block,
 )
+from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.narrative_grounding import (
     UNVERIFIED_CAVEAT,
@@ -178,6 +179,15 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
             rationale=inv.rationale,
             summary=inv.summary,
         )
+        # Cloud-egress guard (opt-in): same pattern as the orchestrator/hunt
+        # runner. Attach BEFORE building the agent so register_read_tools
+        # wraps the tool closures. `is True` (not truthiness) so a MagicMock
+        # settings double in tests can never flip redaction on.
+        if settings.analyst_cloud_redaction is True and ctx.egress_guard is None:
+            ctx.egress_guard = await EgressGuard.for_settings(
+                settings, getattr(state, "db_sessionmaker", None)
+            )
+        guard = ctx.egress_guard
         # The chat agent runs OQL — append the primer + the auto-discovered dataset
         # inventory so it writes valid queries and knows what data exists on this grid.
         sys_prompt = (
@@ -185,6 +195,13 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
             + oql_primer_block()
             + await inventory_prompt_block(ctx.elastic, settings)
         )
+        if guard is not None:
+            # seed_context (stored verdict/rationale from real investigation
+            # data) + inventory both carry internal identifiers; sanitize the
+            # composed system prompt at the egress boundary. seed_context
+            # itself stays RAW — the narrative-grounding check below compares
+            # against it in real-value space.
+            sys_prompt = guard.sanitize_text(sys_prompt)
         proposal_sink: list[dict[str, Any]] = []
         agent = build_chat_agent(
             build_investigator_model(settings),
@@ -198,11 +215,22 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
         # terminal error row — instead of `wait_for`'s CancelledError, which is a
         # BaseException that the except never catches and which leaves the row
         # stuck pending forever.
+        turn_prompt = _build_prompt(prior, question)
+        if guard is not None:
+            # The analyst's question + prior turns carry real identifiers.
+            turn_prompt = guard.sanitize_text(turn_prompt)
         async with asyncio.timeout(settings.chat_turn_timeout_s):
-            result = await agent.run(_build_prompt(prior, question))
+            result = await agent.run(turn_prompt)
         answer = (str(result.output) or "").strip() or "(no answer produced)"
         meta: dict[str, Any] = {"tools": _extract_tools(result)}
         tool_evidence = _extract_tool_evidence(result)
+        if guard is not None:
+            # Model output + captured tool evidence are in label space —
+            # restore real values BEFORE persistence and before the grounding
+            # check, so answer artifacts compare against seed_context /
+            # tool_evidence in the same (real-value) space.
+            answer = str(guard.desanitize_obj(answer))
+            tool_evidence = guard.desanitize_obj(tool_evidence)
 
         # Layer 2 — narrative grounding (defense-in-depth for the free-text answer).
         # Detect concrete per-event artifacts (hostnames, domains, IPs, JA3, SMB) the
@@ -249,6 +277,11 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
             # wins — it reflects its final reasoning and matches the narrative
             # answer persisted above.
             prop = proposal_sink[-1]
+            if guard is not None:
+                # propose_verdict is registered in chat_agent (not the guarded
+                # toolset), so its captured args are still in label space —
+                # restore before validation/persistence.
+                prop = guard.desanitize_obj(prop)
             v = validate_proposal(
                 Proposal(
                     verdict=prop["verdict"],

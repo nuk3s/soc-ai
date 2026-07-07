@@ -6,6 +6,7 @@ import {
   muteRule,
   unmuteRule,
 } from '../lib/api';
+import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { useAsync } from '../lib/useAsync';
 
@@ -16,7 +17,13 @@ function recBadge(rec: DetectionNomination['recommendation']): { color: string; 
   return { color: '#8b949e', label: '—' };
 }
 
-export function DetectionTuningPanel() {
+export function DetectionTuningPanel({
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+} = {}) {
   // A nonce drives an optimistic refetch after every mute / un-mute.
   const [nonce, setNonce] = useState(0);
   const { data, loading, error } = useAsync(getDetectionTuning, [nonce]);
@@ -39,7 +46,14 @@ export function DetectionTuningPanel() {
 
   return (
     <div id="detection-tuning" className="mb-[22px] scroll-mt-6">
-      <div className="mb-1 text-[15px] font-semibold">Detection tuning</div>
+      <div className="mb-1 flex items-center gap-2">
+        <div className="text-[15px] font-semibold">Detection tuning</div>
+        {onToggleCollapse && (
+          <CollapseChevron collapsed={collapsed} onToggle={onToggleCollapse} label="Toggle Detection tuning" />
+        )}
+      </div>
+      {!collapsed && (
+      <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         Rules that fire a lot and keep coming back false-positive are nominated here. Muting a
         rule hides its alerts from the default feed — a soft, reversible suppression that{' '}
@@ -164,6 +178,8 @@ export function DetectionTuningPanel() {
           </div>
         ))}
       </div>
+      </>
+      )}
     </div>
   );
 }

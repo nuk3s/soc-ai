@@ -6,6 +6,57 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed
+
+- **The dead approval-gate machinery.** `POST /approve` (both the legacy
+  prefix-less route and `/api/v1/approve`), the in-memory `ApprovalGate`
+  (plus `GET /sessions/{id}`, which only listed its pending tokens), the
+  `pending_approvals` field on `/healthz`, and the `socai_pending_approvals`
+  metric are gone. Nothing could create a pending approval since the
+  synth-first pipeline landed — the agent recommends write actions in the
+  report and the analyst executes them through the actions API
+  (`POST /api/v1/investigations/{id}/actions/{index}/execute`), which remains
+  the single audited write path (`execute_write_tool`). Historical
+  `approval_request`/`approval_required` events still render in old
+  investigation timelines, permanently non-actionable.
+
+### Added
+
+- **Cloud egress sanitizer for the analyst model** (`analyst_cloud_redaction`,
+  opt-in, off by default). For deployments that point `analyst_model` at a
+  cloud provider: every payload sent to the analyst model — enriched alert
+  context, prompts (investigation, hunt, chat), and all tool results — has
+  internal IPs/hostnames/usernames replaced with stable opaque labels
+  (`IP_01`, `HOST_02`, …) using the same reversible redaction tunnel as the
+  Oracle path; model outputs (verdicts, rationales, reasoning traces, hunt
+  reports, chat replies) are label-restored before storage/display, and tool
+  arguments coming from the model are restored before hitting Elasticsearch so
+  the agent loop keeps working. Costs some verdict quality (the model reasons
+  over opaque labels). See `docs/SAFETY_MODEL.md` → "Cloud analyst models".
+
+### Changed
+
+- **Auto-acknowledge of high-confidence false positives is now ON by default**
+  (`auto_ack_fp_enabled`). Both gates are unchanged — the confidence threshold
+  (default 0.7) and the high-stakes guard (critical/high-severity or
+  malware/exploit-class alerts are never auto-acked) — and every unattended ack
+  is audited. Set `auto_ack_fp_enabled` to false (env or config console) to
+  require a human click for every acknowledgement. Existing installs with a
+  saved config-console override keep their setting.
+- **Inherited verdicts now acknowledge their alerts.** An auto-triage sweep
+  that skips a cluster because it inherits a qualifying false-positive verdict
+  (same rule + source + destination within the inherit window) now acks those
+  events in Security Onion. Previously the inherited verdict was display-only
+  and the alerts lingered unacked forever.
+
+### Fixed
+
+- **The same flow is no longer investigated twice minutes apart.** The sweep
+  planner now sees pairs with an in-flight investigation — the pair-verdict
+  check is complete-only by design, so a newer event id in the same cluster
+  used to launch a duplicate investigation while the first run was still
+  executing (most visible with a short `webui_inherit_window_days`).
+
 ## [1.0.7] - 2026-07-04
 
 ### Fixed

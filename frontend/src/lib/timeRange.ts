@@ -27,3 +27,15 @@ export function inRange(ts: string | undefined, range: string, custom?: CustomRa
   const { from, to } = rangeBounds(range, custom);
   return t >= from && t <= to;
 }
+
+/** Format an ISO timestamp as a readable absolute LOCAL time ("Jul 06, 2026,
+ * 14:23:05"). Falls back to the raw string when unparseable, '—' when empty. */
+export function absTime(iso?: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}

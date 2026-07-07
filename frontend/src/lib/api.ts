@@ -249,6 +249,12 @@ export function getConfig(): Promise<Config> {
   return request<Config>('/config');
 }
 
+/** Model ids the LiteLLM gateway serves — feeds the analyst-model dropdown.
+ * ok=false (with a human `detail`) when the gateway can't be listed. */
+export function getGatewayModels(): Promise<{ ok: boolean; models: string[]; detail?: string | null }> {
+  return request<{ ok: boolean; models: string[]; detail?: string | null }>('/config/models');
+}
+
 export interface DataSource {
   id: string;
   name: string;
@@ -495,10 +501,6 @@ export function overrideVerdict(
     rationale: rationale ?? null,
     confidence: confidence ?? null,
   });
-}
-
-export function approveAction(token: string, approved: boolean, reason?: string): Promise<unknown> {
-  return post('/approve', { token, approved, reason: reason ?? null });
 }
 
 export interface ExecuteActionResult {
@@ -784,6 +786,15 @@ export function setIdentifierActive(id: number, active: boolean): Promise<Identi
 /** Remove a manual identifier. Throws (409) for a detected row — deactivate instead. */
 export function removeIdentifier(id: number): Promise<{ ok: boolean }> {
   return del<{ ok: boolean }>(`/internal-identifiers/${id}`);
+}
+
+/**
+ * Dismiss a DETECTED identifier suggestion for good — it vanishes from the list
+ * (re-add manually to restore). Distinct from muting (which keeps the row but
+ * unused). Throws (409) for a manual row — use removeIdentifier (DELETE) there.
+ */
+export function dismissIdentifier(id: number): Promise<{ ok: boolean }> {
+  return post<{ ok: boolean }>(`/internal-identifiers/${id}/dismiss`, {});
 }
 
 /** Launch a background discovery scan; returns the (running) status. */

@@ -80,12 +80,9 @@ def tee_client(tee_settings: Settings) -> Iterator[TestClient]:
         alert_id: str,
         *,
         ctx: Any,
-        agent: Any = None,
-        investigator: Any = None,
-        synthesizer: Any = None,
-        session_id: str | None = None,
+        focus_hint: str | None = None,
     ) -> AsyncIterator[StepEvent]:
-        sid = session_id or "fake-tee-sid"
+        sid = "fake-tee-sid"
         # The live synth-first path emits enriched_alert_context (EnrichedAlertContext
         # subclasses AlertContext: same {"alert": {"rule_name": ...}} dump shape); the
         # recorder must capture rule_name from it.
@@ -158,12 +155,9 @@ def crash_client(tee_settings: Settings) -> Iterator[TestClient]:
         alert_id: str,
         *,
         ctx: Any,
-        agent: Any = None,
-        investigator: Any = None,
-        synthesizer: Any = None,
-        session_id: str | None = None,
+        focus_hint: str | None = None,
     ) -> AsyncIterator[StepEvent]:
-        sid = session_id or "fake-crash-sid"
+        sid = "fake-crash-sid"
         yield StepEvent(
             kind="session_start",
             session_id=sid,
@@ -289,12 +283,9 @@ def test_tee_complete_without_report_stores_error(tee_settings: Settings) -> Non
         alert_id: str,
         *,
         ctx: Any,
-        agent: Any = None,
-        investigator: Any = None,
-        synthesizer: Any = None,
-        session_id: str | None = None,
+        focus_hint: str | None = None,
     ) -> AsyncIterator[StepEvent]:
-        sid = session_id or "fake-noreport-sid"
+        sid = "fake-noreport-sid"
         yield StepEvent(
             kind="session_start",
             session_id=sid,

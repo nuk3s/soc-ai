@@ -32,6 +32,9 @@ AuditKind = Literal[
     # Theme-1 investigation loop (synth-first pipeline)
     "investigation_loop_entered",
     "synth_round1_skipped",
+    # proactive context budgeting: oldest pivot events dropped to fit the
+    # analyst model's input window (soc_ai.agent.context_budget)
+    "context_trimmed",
     # citation validators (orchestrator synth-first path)
     "citation_validation",
     "citation_cap",
@@ -94,7 +97,7 @@ class AuditEvent(BaseModel):
     user: str = "unknown"
     # Structured approver identity for write-tool execution (ack/escalate/
     # comment). Resolved from the session/token via ``identify_caller`` at
-    # approval-execution time. ``None`` on non-approval events; the literal
+    # write-execution time. ``None`` on non-write events; the literal
     # string ``"anonymous"`` when a write is executed with no authenticated
     # caller (dev / no-auth) — distinct from the generic ``"unknown"`` default
     # so an unattributed write is explicit, not a missing field.

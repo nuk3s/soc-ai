@@ -41,7 +41,6 @@ from soc_ai.store.auth import bootstrap_admin
 from soc_ai.store.config_overrides import apply_to_settings, load_overrides
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.secret_box import make_secret_box
-from soc_ai.tools._registry import ApprovalGate
 from soc_ai.tools.enrichment import MispClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -322,7 +321,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     auth = make_auth(settings)
     elastic = ElasticClient(settings)
     misp = MispClient(settings) if settings.misp_url is not None else None
-    gate = ApprovalGate()
     audit = AuditLogger(settings, elastic)
     enrichment = build_local_enrichment_context(settings)
     # Ed25519 signer for decision-record exports (load-or-generate the key).
@@ -341,7 +339,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     app.state.auth = auth
     app.state.elastic = elastic
     app.state.misp = misp
-    app.state.gate = gate
     app.state.audit = audit
     app.state.enrichment = enrichment
     app.state.decision_signer = decision_signer

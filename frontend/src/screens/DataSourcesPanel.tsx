@@ -1,4 +1,5 @@
 import { type DataSource, getDataSources } from '../lib/api';
+import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { useAsync } from '../lib/useAsync';
 
@@ -19,13 +20,26 @@ function status(s: DataSource): { color: string; label: string } {
   return { color: '#8b949e', label: 'Off' };
 }
 
-export function DataSourcesPanel() {
+export function DataSourcesPanel({
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+} = {}) {
   const { data, loading, error } = useAsync(getDataSources, [], { refetchInterval: 30_000 });
   const sources = data?.sources ?? [];
 
   return (
     <div id="data-sources" className="mb-[22px] scroll-mt-6">
-      <div className="mb-1 text-[15px] font-semibold">Data sources</div>
+      <div className="mb-1 flex items-center gap-2">
+        <div className="text-[15px] font-semibold">Data sources</div>
+        {onToggleCollapse && (
+          <CollapseChevron collapsed={collapsed} onToggle={onToggleCollapse} label="Toggle Data sources" />
+        )}
+      </div>
+      {!collapsed && (
+      <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         What the agent draws on for enrichment — local-mirror feeds (zero-egress, refreshed
         out-of-band) and opt-in online lookups. API keys live in <code>.env</code>; the master
@@ -83,6 +97,8 @@ export function DataSourcesPanel() {
             );
           })}
       </div>
+      </>
+      )}
     </div>
   );
 }

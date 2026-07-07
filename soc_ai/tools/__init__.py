@@ -28,8 +28,6 @@ from soc_ai.tools import (  # noqa: F401
     shodan_internetdb,
 )
 from soc_ai.tools._registry import (
-    ApprovalGate,
-    PendingApproval,
     ToolSpec,
     get_tool,
     list_tools,
@@ -37,8 +35,6 @@ from soc_ai.tools._registry import (
 )
 
 __all__ = [
-    "ApprovalGate",
-    "PendingApproval",
     "ToolSpec",
     "get_tool",
     "list_tools",

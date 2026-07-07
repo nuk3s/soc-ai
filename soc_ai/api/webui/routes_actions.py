@@ -1,4 +1,4 @@
-"""Verdict/action mutations: approve, execute-action, resolve, override."""
+"""Verdict/action mutations: execute-action, resolve, override."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from soc_ai.api.approvals import WRITE_TOOLS, apply_approval, execute_write_tool
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui import _timeline
@@ -24,37 +23,16 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
+from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class ApproveIn(BaseModel):
-    token: str
-    approved: bool
-    reason: str | None = None
-
-
-@router.post("/approve")
-async def approve(request: Request, body: ApproveIn) -> dict[str, Any]:
-    """Apply an analyst decision to a pending write-tool approval."""
-    result = await apply_approval(
-        gate=request.app.state.gate,
-        auth=request.app.state.auth,
-        settings=request.app.state.settings,
-        token=body.token,
-        approved=body.approved,
-        reason=body.reason,
-        audit=request.app.state.audit,
-        user=await identify_caller(request),
-    )
-    return result.model_dump()
-
-
 # ── Advisory action execution ──────────────────────────────────────────────
 # Synth-first investigations recommend write actions in the report rather than
-# pausing the agent on an approval gate, so the analyst executes them on demand
-# from the report. These run through the *same* execute_write_tool path as the
-# gate, restricted to the three write tools, with the alert id defaulted from
+# pausing the agent mid-run, so the analyst executes them on demand from the
+# report. These run through the single audited execute_write_tool path,
+# restricted to the three write tools, with the alert id defaulted from
 # the investigation when the model left it off.
 
 
@@ -122,8 +100,8 @@ async def execute_action(
     """Execute one report-recommended write action against Security Onion.
 
     ``index`` is the position in ``report.recommended_actions`` (the SPA's
-    advisory action cards are built in that order). Token-gated approvals use
-    ``/approve`` instead; this path is for the advisory recommendations.
+    advisory action cards are built in that order). This is the single
+    analyst write path — the report recommends, the analyst executes here.
 
     Idempotent: a previously executed action (persisted ``action_executed``
     event) or an ack of an already-acked alert returns ok-with-note instead of
@@ -245,7 +223,7 @@ class ResolveIn(BaseModel):
 async def resolve_investigation(request: Request, inv_id: str, body: ResolveIn) -> dict[str, Any]:
     """Apply a validated chat verdict proposal. Token + message gated, idempotent."""
     # Not owner-scoped: any authenticated caller may apply a proposal, consistent
-    # with /approve and the action-execute route. The actor is recorded for audit.
+    # with the action-execute route. The actor is recorded for audit.
     resolved_by = await identify_caller(request)
     async with request.app.state.db_sessionmaker() as db:
         msg = await chat_svc.get_message(db, body.message_id)

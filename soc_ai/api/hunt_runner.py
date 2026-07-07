@@ -21,11 +21,14 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.usage import UsageLimits
 
+from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.hunt import (
     HUNT_SYSTEM_PROMPT,
+    HuntReport,
     build_hunt_agent,
     build_hunt_prompt,
     build_hunt_synthesizer,
@@ -38,6 +41,75 @@ from soc_ai.api.runner import CancelToken
 from soc_ai.so_client.inventory import inventory_prompt_block
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _build_hunt_run(
+    ctx: InvestigationContext, *, objective: str, prior: str | None
+) -> tuple[EgressGuard | None, Agent[None, HuntReport], str]:
+    """Compose the (guard, agent, user message) triple for one hunt run.
+
+    The egress guard MUST be attached to ``ctx`` before ``build_hunt_agent``
+    runs — ``register_read_tools`` wraps the tool closures at registration
+    time. When the guard is active, the system prompt (objective + dataset
+    inventory) and the user message (objective + prior-hunt summary) are
+    sanitized here — they are the hunt's prompt-side egress boundary.
+    """
+    guard = await _egress_guard_for(ctx)
+    # The hunt agent runs OQL — append the primer so it writes VALID queries
+    # (no parentheses, no leading wildcards) instead of churning through parse
+    # errors. And append the auto-discovered dataset inventory so the hunt knows
+    # what data ACTUALLY exists on this grid (network today, host logs later)
+    # instead of guessing from a hardcoded list.
+    system_prompt = (
+        HUNT_SYSTEM_PROMPT.format(objective=objective)
+        + oql_primer_block()
+        + await inventory_prompt_block(ctx.elastic, ctx.settings)
+    )
+    if guard is not None:
+        # The objective is analyst-typed free text that may name internal
+        # hosts, and the inventory block carries grid dataset detail.
+        system_prompt = guard.sanitize_text(system_prompt)
+    agent = build_hunt_agent(
+        build_investigator_model(ctx.settings), ctx, system_prompt=system_prompt
+    )
+    user_msg = build_hunt_prompt(objective, prior=prior)
+    if guard is not None:
+        user_msg = guard.sanitize_text(user_msg)
+    return guard, agent, user_msg
+
+
+async def _egress_guard_for(ctx: InvestigationContext) -> EgressGuard | None:
+    """Attach/return the opt-in cloud-egress guard for this hunt run.
+
+    Same pattern as the investigation pipeline: when
+    ``analyst_cloud_redaction`` is on, ONE guard (one label mapping) covers the
+    whole hunt — prompts out, tool results out (via the toolset's ``_guarded``
+    wrapper at registration), labels restored in everything persisted.
+    ``is True`` (not truthiness) so a non-Settings test double can never flip
+    redaction on. ``None`` = redaction off (the default).
+    """
+    if ctx.settings.analyst_cloud_redaction is True and ctx.egress_guard is None:
+        ctx.egress_guard = await EgressGuard.for_settings(ctx.settings, ctx.db_sessionmaker)
+    return ctx.egress_guard
+
+
+def _desanitize_hunt_report(report: Any, guard: EgressGuard | None) -> Any:
+    """Restore real identifiers in a labeled HuntReport before persistence.
+
+    The model wrote the report in label space (its inputs were sanitized);
+    round-trip every string field through the guard's mapping. Defensive: a
+    desanitize surprise must never cost the hunt its report — on failure the
+    labeled report is returned unchanged.
+    """
+    if guard is None:
+        return report
+    try:
+        return type(report).model_validate(guard.desanitize_obj(report.model_dump(mode="json")))
+    except Exception:
+        _LOGGER.warning(
+            "hunt: egress-guard desanitize failed; persisting labeled report", exc_info=True
+        )
+        return report
 
 
 async def _synthesize_partial_hunt(
@@ -84,19 +156,10 @@ async def run_hunt(
 
     yield _ev("hunt_started", {"objective": objective})
 
-    # The hunt agent runs OQL — append the primer so it writes VALID queries
-    # (no parentheses, no leading wildcards) instead of churning through parse
-    # errors. And append the auto-discovered dataset inventory so the hunt knows
-    # what data ACTUALLY exists on this grid (network today, host logs later)
-    # instead of guessing from a hardcoded list.
-    system_prompt = (
-        HUNT_SYSTEM_PROMPT.format(objective=objective)
-        + oql_primer_block()
-        + await inventory_prompt_block(ctx.elastic, ctx.settings)
-    )
-    agent = build_hunt_agent(
-        build_investigator_model(ctx.settings), ctx, system_prompt=system_prompt
-    )
+    # Guard (opt-in cloud-egress redaction) + agent + sanitized prompts. The
+    # guard is attached to ctx BEFORE the agent is built so the toolset wraps
+    # the tool closures at registration time.
+    guard, agent, user_msg = await _build_hunt_run(ctx, objective=objective, prior=prior)
     # Hunts get a bigger budget than a single-alert investigation — they explore
     # broadly (many hosts/queries) before synthesizing, and the investigation-sized
     # request_limit ran out mid-hunt, erroring before the findings report.
@@ -105,7 +168,6 @@ async def run_hunt(
         tool_calls_limit=ctx.settings.hunt_tool_calls_limit,
     )
 
-    user_msg = build_hunt_prompt(objective, prior=prior)
     result: Any = None
     # Accumulate the streamed node messages so that, if the hunt exhausts its budget
     # before emitting a report, we can synthesize a partial report from what it
@@ -129,7 +191,14 @@ async def run_hunt(
                 if node_msg is not None:
                     gathered.append(node_msg)
                     async for ev in _walk_message(node_msg, _ev, phase="hunt", round_num=1):
-                        yield ev
+                        # Streamed timeline events are local storage — restore
+                        # real values for display (`gathered` keeps the
+                        # labeled originals for the model).
+                        yield (
+                            ev
+                            if guard is None
+                            else ev.model_copy(update={"payload": guard.desanitize_obj(ev.payload)})
+                        )
         result = run.result
     except asyncio.CancelledError:
         raise  # cooperative cancel — propagate, never swallow
@@ -179,7 +248,7 @@ async def run_hunt(
         yield _ev("error", {"message": "hunt produced no report", "type": "EmptyResult"})
         return
 
-    report = result.output
+    report = _desanitize_hunt_report(result.output, guard)
     report_payload = report.model_dump(mode="json")
     yield _ev("hunt_report", report_payload)
     yield _ev("done", {"finding_count": len(report.findings)})

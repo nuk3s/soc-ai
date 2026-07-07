@@ -6,8 +6,12 @@ free-form objective the analyst types in plain language ("hunt for beaconing to
 rare external IPs", "look for credential-abuse lockouts") — and produces
 **findings + a narrative**, mapped to MITRE ATT&CK.
 
-The agent REUSES the investigator's read tools unchanged (OQL, zeek-by-host,
-enrichment, prevalence, PCAP facts, web search/crawl). What differs is:
+The agent's read-tool surface comes from
+:func:`soc_ai.agent.toolset.register_read_tools` (role ``"hunt"``): the
+**minimal** role surface — verdict-adjacent tools (detections, playbooks,
+runbook, rule-tuning) are excluded, and the windowed query tools default to a
+24-hour window because a hunt looks across time rather than centering on a
+single alert's ``@timestamp``. What else differs from the investigator:
 
 - a **hunt-oriented system prompt** — correlate across hosts/time, map to MITRE,
   report findings + a narrative rather than a single-alert verdict;
@@ -19,33 +23,12 @@ tools, no Oracle), exactly like the "Chat about this" agent.
 
 from __future__ import annotations
 
-import logging
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
 from soc_ai.agent.orchestrator import InvestigationContext
-from soc_ai.tools.crawl_page import crawl_page
-from soc_ai.tools.cvedb import cve_lookup
-from soc_ai.tools.discover import describe_dataset, field_values
-from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip
-from soc_ai.tools.get_event_raw import get_event_raw
-from soc_ai.tools.get_pcap import get_pcap_facts
-from soc_ai.tools.greynoise import greynoise
-from soc_ai.tools.host_summary import host_summary
-from soc_ai.tools.prevalence import prevalence
-from soc_ai.tools.query_cases import query_cases
-from soc_ai.tools.query_events import query_events_oql
-from soc_ai.tools.query_zeek import query_zeek_logs
-from soc_ai.tools.rule_prevalence import rule_prevalence
-from soc_ai.tools.shodan_host import shodan_host
-from soc_ai.tools.shodan_internetdb import shodan_internetdb
-from soc_ai.tools.web_search import web_search
-
-_LOGGER = logging.getLogger(__name__)
-
+from soc_ai.agent.toolset import register_read_tools
 
 # =====================================================================
 # Output schema
@@ -64,6 +47,17 @@ class HuntFinding(BaseModel):
     severity: str = Field(
         default="info",
         description="One of 'info' | 'low' | 'medium' | 'high' | 'critical'.",
+    )
+    category: str = Field(
+        default="threat",
+        description=(
+            "What KIND of finding this is: 'threat' (observed malicious or "
+            "suspicious activity), 'visibility_gap' (telemetry that does not "
+            "exist on this grid, so the objective can't be confirmed or ruled "
+            "out), or 'observation' (benign/informational context). A missing "
+            "dataset is ALWAYS 'visibility_gap', never 'threat' — severity on "
+            "a gap grades how badly it blinds the objective, not maliciousness."
+        ),
     )
     hosts: list[str] = Field(
         default_factory=list,
@@ -145,7 +139,9 @@ suricata/zeek; host-logging grids also have endpoint/windows/sysmon/etc.). If a 
 dataset you'd expect for this objective is ABSENT from the inventory (e.g. no \
 `zeek.ssh`, no `zeek.kerberos`, no host process logs), do NOT guess around it — say \
 so in a finding ("this grid has no SSH/Kerberos telemetry, so lateral movement over \
-those channels cannot be confirmed or ruled out"). A visibility gap is a real result.
+those channels cannot be confirmed or ruled out"). A visibility gap is a real result — \
+but it is a COVERAGE statement, not a detection: give it `category: "visibility_gap"`, \
+never `"threat"`. Absence of telemetry is NOT evidence of malicious activity.
 2. **PLAN.** Briefly state the hypotheses and the queries you'll run, chosen from the \
 datasets that are actually present.
 3. **EXECUTE broad → narrow.** `t_query_events_oql` is your primary lens — it works \
@@ -164,9 +160,13 @@ judge how rare a host→dest/domain pairing is, `t_rule_prevalence` to judge whe
 firing rule is noise or notable, and the `t_enrich_*` tools for indicator reputation.
 4. Map what you find to MITRE ATT&CK techniques where you can (technique IDs).
 5. Produce a `HuntReport`: discrete `findings` (each with a title, grounded detail, \
-severity, the hosts involved, and citations), a `narrative` tying them together, the \
-`affected_hosts`, the `mitre_techniques`, advisory `recommended_actions`, and an \
-overall `confidence`.
+severity, a `category`, the hosts involved, and citations), a `narrative` tying them \
+together, the `affected_hosts`, the `mitre_techniques`, advisory \
+`recommended_actions`, and an overall `confidence`. Categorize honestly: `"threat"` \
+ONLY for activity you actually observed in tool results; `"visibility_gap"` for \
+telemetry that doesn't exist here; `"observation"` for benign context. The console's \
+headline is derived from the worst THREAT finding — a mis-tagged gap would tell the \
+analyst "malicious activity found" when nothing malicious was seen.
 
 ## Correlation patterns (a hunt correlates — it doesn't just list alerts)
 - **Kill-chain over time (one host):** recon/scan → lateral movement on the same host \
@@ -265,7 +265,7 @@ def build_hunt_prompt(objective: str, *, prior: str | None = None) -> str:
 # =====================================================================
 
 
-def build_hunt_agent(  # noqa: PLR0915 - tool registrations are inherently long
+def build_hunt_agent(
     model: Model,
     ctx: InvestigationContext,
     *,
@@ -273,254 +273,18 @@ def build_hunt_agent(  # noqa: PLR0915 - tool registrations are inherently long
 ) -> Agent[None, HuntReport]:
     """A read-only hunt agent: the investigator's read tools + HuntReport output.
 
-    Mirrors :func:`soc_ai.agent.chat_agent.build_chat_agent` — same read tools,
-    same settings-gated online tools — but returns a structured
-    :class:`HuntReport` instead of free text, and carries the hunt-oriented
-    system prompt. No write tools, no Oracle (read-only phase).
+    The read-tool surface comes from
+    :func:`soc_ai.agent.toolset.register_read_tools` (role ``hunt`` — the
+    minimal surface: no verdict-adjacent tools, no per-rule tuning, and the
+    windowed query tools default to 24h because a hunt looks across time).
+    Returns a structured :class:`HuntReport` instead of free text and carries
+    the hunt-oriented system prompt. No write tools, no Oracle (read-only
+    phase).
     """
     agent: Agent[None, HuntReport] = Agent(
         model, output_type=HuntReport, system_prompt=system_prompt, retries=5
     )
-    s = ctx.settings
 
-    @agent.tool_plain
-    async def t_query_events_oql(
-        query: str, time_range_minutes: int = 1440, max_results: int = 25
-    ) -> dict[str, Any]:
-        """Run a validated OQL query against the SO events index across ALL datasets.
-
-        The default window is wide (24h) because a hunt looks across time; pass a
-        larger `time_range_minutes` for a broader sweep. Works on RFC1918 hosts."""
-        try:
-            result = await query_events_oql(
-                query,
-                elastic=ctx.elastic,
-                settings=s,
-                time_range_minutes=time_range_minutes,
-                max_results=min(max_results, 25),
-                time_anchor=ctx.default_time_anchor,
-            )
-            return result.model_dump(mode="json")
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_query_zeek_logs(
-        community_id: str, log_types: list[str] | None = None, time_range_minutes: int = 1440
-    ) -> list[dict[str, Any]] | dict[str, Any]:
-        """Fetch Zeek records sharing a network.community_id (conn/dns/http/ssl/files/ssh)."""
-        try:
-            return await query_zeek_logs(
-                community_id,
-                elastic=ctx.elastic,
-                settings=s,
-                log_types=log_types,
-                time_range_minutes=time_range_minutes,
-                max_results=25,
-                time_anchor=ctx.default_time_anchor,
-            )
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_describe_dataset(dataset: str) -> dict[str, Any]:
-        """Discover the fields POPULATED on a dataset (e.g. `zeek.ssh`, `endpoint`,
-        `windows.security`) by sampling its recent docs. Returns each field + an
-        example value + coverage. Use this to learn a dataset's schema before
-        querying it — works for network AND host datasets."""
-        return await describe_dataset(dataset, elastic=ctx.elastic, settings=s)
-
-    @agent.tool_plain
-    async def t_field_values(
-        field: str, dataset: str | None = None, size: int = 25
-    ) -> dict[str, Any]:
-        """List the top VALUES a field takes (a terms aggregation), optionally within
-        one dataset. E.g. what `rule.name`s fire, what `host.name`s exist, what
-        `event.dataset`s are present. Use it to see what actually populates a field."""
-        return await field_values(
-            field, elastic=ctx.elastic, settings=s, dataset=dataset, size=size
-        )
-
-    @agent.tool_plain
-    async def t_enrich_ip(ip: str) -> dict[str, Any]:
-        """Local IP enrichment (blocklists + MaxMind ASN/Geo + cloud tag + MISP)."""
-        try:
-            r = await enrich_ip(
-                ip,
-                settings=s,
-                misp=ctx.misp,
-                blocklist=ctx.blocklist,
-                maxmind=ctx.maxmind,
-                cloud=ctx.cloud,
-            )
-            return r.model_dump(mode="json")
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_enrich_domain(domain: str) -> dict[str, Any]:
-        """Local domain enrichment (blocklists + optional MISP)."""
-        try:
-            r = await enrich_domain(domain, settings=s, misp=ctx.misp, blocklist=ctx.blocklist)
-            return r.model_dump(mode="json")
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_enrich_hash(hash_value: str, algo: str = "sha256") -> dict[str, Any]:
-        """Local file-hash enrichment (blocklists + optional MISP)."""
-        try:
-            r = await enrich_hash(
-                hash_value, algo=algo, settings=s, misp=ctx.misp, blocklist=ctx.blocklist
-            )
-            return r.model_dump(mode="json")
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_query_cases(
-        query: str, status: str | None = None
-    ) -> list[dict[str, Any]] | dict[str, Any]:
-        """Search SOC cases by free text + optional status."""
-        try:
-            cases = await query_cases(
-                query, elastic=ctx.elastic, settings=s, status=status, max_results=10
-            )
-            return [c.model_dump(mode="json") for c in cases]
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_get_event_raw(event_id: str) -> dict[str, Any]:
-        """Fetch a single event's full raw _source by ES _id (deep-dive one event)."""
-        try:
-            return await get_event_raw(event_id, elastic=ctx.elastic, settings=s)
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_host_summary(ip: str, lookback_hours: int = 24) -> dict[str, Any]:
-        """Identify an internal host by IP: hostname, device/OS, role, peers, DNS."""
-        try:
-            return await host_summary(
-                ip,
-                elastic=ctx.elastic,
-                settings=s,
-                lookback_hours=lookback_hours,
-                time_anchor=ctx.default_time_anchor,
-            )
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_prevalence(
-        ip: str,
-        peer_ip: str | None = None,
-        domain: str | None = None,
-        lookback_days: int = 90,
-    ) -> dict[str, Any]:
-        """Has THIS host talked to THIS dest/domain before, and how rare is it?
-
-        Learned from the events index only (no external calls). Returns first/last
-        seen, distinct-day count, an `is_novel` flag and a `rarity` label."""
-        try:
-            return await prevalence(
-                ip,
-                elastic=ctx.elastic,
-                settings=s,
-                peer_ip=peer_ip,
-                domain=domain,
-                lookback_days=lookback_days,
-                time_anchor=ctx.default_time_anchor,
-            )
-        except Exception as e:
-            return {"error": str(e)}
-
-    @agent.tool_plain
-    async def t_rule_prevalence(rule_name: str, lookback_days: int = 30) -> dict[str, Any]:
-        """Base-rate / noisiness of a Suricata detection rule across the estate."""
-        try:
-            return await rule_prevalence(
-                rule_name,
-                elastic=ctx.elastic,
-                settings=s,
-                lookback_days=lookback_days,
-            )
-        except Exception as e:
-            return {"error": str(e)}
-
-    # The four ONLINE-enrichment tools (GreyNoise / Shodan InternetDB / full
-    # Shodan / CVEDB) are only registered when the master egress toggle is on;
-    # otherwise every call would just return "skipped (online enrichment off)"
-    # and burn a tool-budget slot. InternetDB + CVEDB are keyless but still
-    # egress, so they sit behind the same toggle.
-    if s.allow_online_enrichment:
-
-        @agent.tool_plain
-        async def t_shodan_internetdb(ip: str) -> dict[str, Any]:
-            """External-asset view of a PUBLIC IP from Shodan InternetDB (free, no key)."""
-            try:
-                return await shodan_internetdb(ip, settings=s)
-            except Exception as e:
-                return {"error": str(e)}
-
-        @agent.tool_plain
-        async def t_greynoise(ip: str) -> dict[str, Any]:
-            """GreyNoise lookup for an EXTERNAL IP — scanner/benign/classification."""
-            try:
-                return await greynoise(ip, settings=s)
-            except Exception as e:
-                return {"error": str(e)}
-
-        @agent.tool_plain
-        async def t_shodan_host(ip: str) -> dict[str, Any]:
-            """FULL Shodan host lookup for a PUBLIC IP (needs the operator's API key)."""
-            try:
-                return await shodan_host(ip, settings=s)
-            except Exception as e:
-                return {"error": str(e)}
-
-        @agent.tool_plain
-        async def t_cve_lookup(cve_id: str) -> dict[str, Any]:
-            """Score a named CVE via Shodan CVEDB (free, no key): CVSS/EPSS/KEV."""
-            try:
-                return await cve_lookup(cve_id, settings=s)
-            except Exception as e:
-                return {"error": str(e)}
-
-    if s.pcap_enabled:
-
-        @agent.tool_plain
-        async def t_get_pcap(
-            src_ip: str | None = None, dst_ip: str | None = None
-        ) -> dict[str, Any]:
-            """Real packet facts for a flow (five-tuples, SNI/DNS/HTTP, beacon CV)."""
-            try:
-                r = await get_pcap_facts(
-                    settings=s, src_ip=src_ip, dst_ip=dst_ip, alert_ts=ctx.default_time_anchor
-                )
-                return r.model_dump(mode="json") if hasattr(r, "model_dump") else r
-            except Exception as e:
-                return {"error": str(e)}
-
-    if s.web_search_enabled:
-
-        @agent.tool_plain
-        async def t_web_search(query: str) -> dict[str, Any]:
-            """Web search for EXTERNAL-indicator reputation (SearXNG). External only."""
-            try:
-                return await web_search(query, settings=s)
-            except Exception as e:
-                return {"error": str(e)}
-
-    if s.crawl4ai_enabled:
-
-        @agent.tool_plain
-        async def t_crawl_page(url: str) -> dict[str, Any]:
-            """Deep-read an EXTERNAL page to markdown (crawl4ai). External only."""
-            try:
-                return await crawl_page(url, settings=s)
-            except Exception as e:
-                return {"error": str(e)}
+    register_read_tools(agent, ctx, role="hunt")
 
     return agent

@@ -9,7 +9,6 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from soc_ai.api.approvals import execute_write_tool
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._shared import (
@@ -19,6 +18,7 @@ from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import assignments as assign_svc
+from soc_ai.tools.write_exec import execute_write_tool
 from soc_ai.webui import alerts_query as aq
 
 _LOGGER = logging.getLogger(__name__)

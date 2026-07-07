@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -64,6 +65,9 @@ class HuntRowOut(BaseModel):
     startedBy: str = ""
     when: str = ""
     ts: str = ""
+    # Follow-up chat messages on this hunt — lets the list show a chat badge
+    # (same affordance as the investigations list).
+    chatCount: int = 0
 
 
 # Hunt-timeline grouping. The hunt agent emits the same generic tool_call /
@@ -84,8 +88,28 @@ class HuntFindingOut(BaseModel):
     title: str
     detail: str
     severity: str = "info"
+    # 'threat' | 'visibility_gap' | 'observation' — drives the disposition
+    # headline (only THREAT findings may read as malicious/suspicious activity).
+    category: str = "threat"
     hosts: list[str] = []
     citations: list[str] = []
+
+
+# Legacy reports predate the finding `category` field. A coverage/visibility
+# finding mis-read as a threat produces the trust-destroying "Malicious activity
+# found" headline over a telemetry gap, so infer the gap category for old rows.
+_GAP_TITLE_RE = re.compile(
+    r"visibility gap|telemetry|coverage gap|blind spot|no .*(logs|logging|data)|"
+    r"data.source.* (absent|missing|unavailable)",
+    re.IGNORECASE,
+)
+
+
+def _finding_category(f: dict[str, Any]) -> str:
+    raw = str(f.get("category") or "").strip().lower()
+    if raw in ("threat", "visibility_gap", "observation"):
+        return raw
+    return "visibility_gap" if _GAP_TITLE_RE.search(str(f.get("title") or "")) else "threat"
 
 
 class HuntActionOut(BaseModel):
@@ -134,7 +158,7 @@ def _hunt_report(hunt: Hunt) -> dict[str, Any]:
     return hunt.report if isinstance(hunt.report, dict) else {}
 
 
-def _hunt_row(hunt: Hunt) -> HuntRowOut:
+def _hunt_row(hunt: Hunt, chat_count: int = 0) -> HuntRowOut:
     report = _hunt_report(hunt)
     findings = report.get("findings") or []
     return HuntRowOut(
@@ -149,6 +173,7 @@ def _hunt_row(hunt: Hunt) -> HuntRowOut:
         when=_ago(_iso_utc(hunt.created_at)),
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(hunt.created_at),
+        chatCount=chat_count,
     )
 
 
@@ -201,7 +226,8 @@ async def list_hunts(
         status = None
     async with request.app.state.db_sessionmaker() as db:
         rows = await hunt_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
-    return [_hunt_row(h) for h in rows]
+        chat_counts = await hunt_svc.chat_counts_for(db, [h.id for h in rows])
+    return [_hunt_row(h, chat_counts.get(h.id, 0)) for h in rows]
 
 
 @router.get("/hunts/stats", response_model=list[HuntStatOut])
@@ -242,6 +268,7 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
                 title=str(f.get("title") or ""),
                 detail=str(f.get("detail") or ""),
                 severity=str(f.get("severity") or "info"),
+                category=_finding_category(f),
                 hosts=[str(h) for h in (f.get("hosts") or [])],
                 citations=[str(c) for c in (f.get("citations") or [])],
             )
@@ -455,7 +482,7 @@ async def post_hunt_chat(request: Request, hunt_id: str, body: HuntChatIn2) -> H
 # ── Mutations ──────────────────────────────────────────────────────────────
 # CSRF: these are same-origin (the SPA at /app calls /api/v1) and the session
 # cookie is SameSite=lax, which blocks cross-site cookie-bearing POSTs — the same
-# protection the existing /approve JSON route relies on.
+# protection the other /api/v1 JSON mutation routes rely on.
 
 
 class HuntStartIn(BaseModel):

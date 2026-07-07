@@ -1,13 +1,19 @@
 # Safety model
 
-> Status: shipped. Approval flow, audit logger, and reasoning-trace plumbing are all live.
-> Reasoning surfacing on the synth-first path depends on the analyst model emitting a
-> `reasoning_content` field (gateway-config dependent). Blocklist license posture below.
+> Status: shipped. Analyst-executed write actions, audit logger, and reasoning-trace
+> plumbing are all live. Reasoning surfacing on the synth-first path depends on the
+> analyst model emitting a `reasoning_content` field (gateway-config dependent).
+> Blocklist license posture below.
 
 ## Tool classification
 
-- Read tools: auto-approved, registered with `@tool(read_only=True)`.
-- Write tools: explicit user approval per call, registered with `@tool(read_only=False)`.
+- Read tools: auto-executed, registered with `@tool(read_only=True)`.
+- Write tools: registered with `@tool(read_only=False)`; never executed by the
+  agent. The report *recommends* them and the analyst executes each one
+  explicitly through the actions API
+  (`POST /api/v1/investigations/{id}/actions/{index}/execute`) — the single
+  write path, running through the audited `execute_write_tool`
+  (`soc_ai/tools/write_exec.py`).
 
 ## Audit log hardening
 
@@ -58,6 +64,43 @@ GreyNoise / CVE lookups hit public endpoints when the agent chooses to call them
 None of them ever send alert payloads, only the single indicator being enriched.
 Leave them unused on an air-gapped grid; the local vendored blocklists + GeoIP
 cover the offline path.
+
+## Cloud analyst models — egress redaction (opt-in)
+
+By default soc-ai assumes `ANALYST_MODEL` points at a **local** model and sends
+it the enriched alert context, prompts, and tool results verbatim. If you point
+the analyst model at a cloud provider, set **`ANALYST_CLOUD_REDACTION=true`**
+(also editable live in the config console, section *Agent*).
+
+How it works: each investigation / hunt / chat turn gets one
+`EgressGuard` (`soc_ai/agent/egress_guard.py`) holding a single reversible
+label map — the same tunnel the Oracle path uses. Outbound, internal IPs,
+hostnames, usernames, MACs, and internal-domain emails are replaced with
+stable opaque labels (`IP_01`, `HOST_02`, …) in everything that crosses the
+gateway: the enriched context JSON, every composed prompt (investigation,
+hunt, chat, including the analyst's own question text), and every tool result
+(each read tool is wrapped at registration). Inbound, tool arguments the model
+sends (e.g. an OQL query citing `HOST_01`) are restored to real values before
+they hit Elasticsearch, and the model's outputs — verdicts, rationales,
+reasoning traces, hunt reports, chat replies — are label-restored before
+storage/display. The identifier set is the same *effective* set the Oracle
+uses: `ORACLE_INTERNAL_SUFFIXES` / `ORACLE_EXTRA_HOSTS` unioned with the
+DB-managed discovered identifiers.
+
+What it does NOT cover:
+
+- **It is best-effort, not fail-closed.** Unlike the Oracle path there is no
+  independent residue sweep that refuses to transmit — an internal FQDN on a
+  public-looking suffix that you have not enumerated will egress verbatim
+  (same caveat as the Oracle gate; configure your suffixes/hosts).
+- **Verdict quality costs.** The model reasons over opaque labels — it cannot
+  recognise `dc01` as a domain controller. Label cross-references are
+  preserved, so behavioural reasoning still works.
+- The Oracle second-opinion path keeps its own independent (fail-closed)
+  sanitization pipeline; this knob does not change it.
+
+Leave the knob off (the default) for a local analyst model — redaction is pure
+overhead when nothing leaves your network.
 
 ## Vendored blocklist data — license posture
 

@@ -1,5 +1,38 @@
+import { ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { cn } from '../lib/cn';
+
+/**
+ * Collapse chevron toggle — the shared fold/unfold affordance for a section
+ * header. Rotates 90° when expanded (mirrors the settings-group headers on the
+ * Config page). Renders as a button so it's independently clickable when it sits
+ * inside a panel header that isn't itself a toggle.
+ */
+export function CollapseChevron({
+  collapsed,
+  onToggle,
+  label,
+}: {
+  collapsed: boolean;
+  onToggle: () => void;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      aria-label={label ?? (collapsed ? 'Expand section' : 'Collapse section')}
+      className="group flex-none text-faint hover:text-text-2"
+    >
+      <ChevronRight
+        size={15}
+        className="transition-transform"
+        style={{ transform: collapsed ? 'none' : 'rotate(90deg)' }}
+      />
+    </button>
+  );
+}
 
 interface PanelProps {
   children: ReactNode;

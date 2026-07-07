@@ -29,7 +29,6 @@ from sse_starlette.sse import EventSourceResponse
 
 from soc_ai import __version__
 from soc_ai.api import agent_tools as agent_tools_svc
-from soc_ai.api.approvals import WRITE_TOOLS, apply_approval, execute_write_tool
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import ctx_from_state, get_elastic, get_settings_dep
 from soc_ai.api.hunt_runner import hunt_recorded_run
@@ -73,7 +72,6 @@ from soc_ai.api.webui import (
     AlertGroupOut,
     ApiKeyOut,
     ApiTokenOut,
-    ApproveIn,
     AssignIn,
     AssignOut,
     AutoTriageIn,
@@ -215,7 +213,6 @@ from soc_ai.api.webui import (
     api_logout,
     api_save_api_key,
     api_save_danger_setting,
-    approve,
     assign_alert,
     auto_triage_status,
     backtest_by_id,
@@ -299,6 +296,7 @@ from soc_ai.store import internal_identifiers as ids_store
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import runbooks as runbooks_svc
 from soc_ai.store.models import ApiToken, Backtest, ConfigOverride, Hunt, HuntEvent, Investigation
+from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui import autotriage as at
 from soc_ai.webui import backtest as backtest_svc
@@ -355,7 +353,6 @@ __all__ = [
     "ApiKeyOut",
     "ApiToken",
     "ApiTokenOut",
-    "ApproveIn",
     "AssignIn",
     "AssignOut",
     "AutoTriageIn",
@@ -521,8 +518,6 @@ __all__ = [
     "api_logout",
     "api_save_api_key",
     "api_save_danger_setting",
-    "apply_approval",
-    "approve",
     "aq",
     "assign_alert",
     "assign_svc",

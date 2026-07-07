@@ -21,7 +21,7 @@ interface NodeStyle {
 const NODE_STYLE: Record<EntityKind, NodeStyle> = {
   compromised: { c: '#f04438', r: 20, square: false, pulse: true },
   c2: { c: '#e0a83a', r: 16, square: false },
-  dc: { c: '#7ba893', r: 17, square: true },
+  internal: { c: '#7ba893', r: 17, square: true },
   host: { c: '#4b8bf5', r: 12, square: false },
 };
 
@@ -34,16 +34,21 @@ interface EdgeStyle {
 const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
   beacon: { c: '#e0a83a', w: 2, dash: '5 5', anim: true },
   lateral: { c: '#f04438', w: 3, dash: '6 5', anim: true },
-  flow: { c: '#242c39', w: 1.5, dash: '0', anim: false },
+  // flow was #242c39 (the border token) — near-invisible against the panel bg;
+  // same neutral-gray language, one step brighter so the baseline edges read.
+  flow: { c: '#2a3645', w: 1.5, dash: '0', anim: false },
   enrich: { c: '#4b8bf5', w: 1.8, dash: '4 4', anim: true },
 };
 
 const LEGEND: Record<EntityKind, { c: string; label: string; radius: string }> = {
   compromised: { c: '#f04438', label: 'compromised', radius: '50%' },
   c2: { c: '#e0a83a', label: 'C2 / external', radius: '50%' },
-  dc: { c: '#7ba893', label: 'domain controller', radius: '2px' },
+  internal: { c: '#7ba893', label: 'internal host', radius: '2px' },
   host: { c: '#4b8bf5', label: 'host', radius: '50%' },
 };
+
+// truncate for the on-canvas text; the full value stays in the hover <title>
+const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + '…' : s);
 
 export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: EntityGraphProps) {
   const VW = 600;
@@ -55,6 +60,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
   const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
 
   const presentKinds = [...new Set(nodes.map((n) => n.kind))];
+  const anyFlagged = nodes.some((n) => n.flagged);
 
   return (
     <div className="font-sans">
@@ -71,38 +77,68 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
           style={{ height: 'auto', display: 'block' }}
           preserveAspectRatio="xMidYMid meet"
         >
+          {/* one arrowhead per edge kind so flow direction reads at a glance */}
+          <defs>
+            {(Object.entries(EDGE_STYLE) as [EdgeKind, EdgeStyle][]).map(([k, s]) => (
+              <marker
+                key={k}
+                id={`eg-arrow-${k}`}
+                viewBox="0 0 8 8"
+                refX={7}
+                refY={4}
+                markerWidth={8}
+                markerHeight={8}
+                markerUnits="userSpaceOnUse"
+                orient="auto"
+              >
+                <path d="M0 0 L8 4 L0 8 Z" fill={s.c} />
+              </marker>
+            ))}
+          </defs>
           {/* edges first */}
           {edges.map((e, i) => {
             const a = byId[e.from];
             const b = byId[e.to];
             if (!a || !b) return null;
             const es = EDGE_STYLE[e.kind];
-            const cx = (px(a.x) + px(b.x)) / 2;
-            const cy = (py(a.y) + py(b.y)) / 2;
+            const x1 = px(a.x);
+            const y1 = py(a.y);
+            const x2 = px(b.x);
+            const y2 = py(b.y);
+            // pull the visible end back to the target's rim so the arrowhead
+            // lands on the node edge instead of vanishing under it
+            const tr = (NODE_STYLE[b.kind] ?? NODE_STYLE.host).r;
+            const d = Math.hypot(x2 - x1, y2 - y1) || 1;
+            const ex = x2 - ((x2 - x1) / d) * (tr + 5);
+            const ey = y2 - ((y2 - y1) / d) * (tr + 5);
+            const cx = (x1 + ex) / 2;
+            const cy = (y1 + ey) / 2;
             return (
               <g key={'e' + i}>
+                <title>{`${e.from} → ${e.to}${e.label ? ` · ${e.label}` : ''}`}</title>
                 <line
-                  x1={px(a.x)}
-                  y1={py(a.y)}
-                  x2={px(b.x)}
-                  y2={py(b.y)}
+                  x1={x1}
+                  y1={y1}
+                  x2={ex}
+                  y2={ey}
                   stroke={es.c}
                   strokeWidth={es.w}
                   strokeDasharray={es.dash}
                   opacity={e.kind === 'flow' ? 0.7 : 0.92}
+                  markerEnd={`url(#eg-arrow-${e.kind})`}
                   style={es.anim ? { animation: 'dash .6s linear infinite' } : undefined}
                 />
                 {e.label && (
                   <text
                     x={cx}
                     y={cy - 5}
-                    fill={es.c}
-                    fontSize={9.5}
+                    fill={e.kind === 'flow' ? '#5b6473' : es.c}
+                    fontSize={9}
                     fontFamily="JetBrains Mono, monospace"
                     textAnchor="middle"
                     fontWeight={e.kind === 'lateral' ? 600 : 400}
                   >
-                    {e.label}
+                    {clip(e.label, 20)}
                   </text>
                 )}
               </g>
@@ -113,8 +149,21 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
             const ns = NODE_STYLE[n.kind] ?? NODE_STYLE.host;
             const x = px(n.x);
             const y = py(n.y);
+            // right-column peers stack tightly — put their two text lines beside
+            // the node; the lone left (source) node keeps its label underneath
+            const side = n.x >= 60;
+            const tip = [
+              `${n.id} — ${LEGEND[n.kind]?.label ?? n.kind}`,
+              n.sub,
+              n.flagged
+                ? `flagged by: ${(n.flagSources ?? []).join(', ') || 'threat intel'}`
+                : null,
+            ]
+              .filter(Boolean)
+              .join('\n');
             return (
               <g key={'n' + i}>
+                <title>{tip}</title>
                 {ns.pulse && (
                   <circle
                     cx={x}
@@ -138,9 +187,38 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
                     <circle cx={x} cy={y} r={ns.r - 4} fill={ns.c} opacity={0.22} />
                   </>
                 )}
-                <text x={x} y={y + ns.r + 13} fill="#8b94a3" fontSize={9.5} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
-                  {n.label}
-                </text>
+                {/* flagged-by-intel badge (blocklist/MISP hit); sources in the tooltip */}
+                {n.flagged && (
+                  <g>
+                    <circle cx={x + ns.r * 0.8} cy={y - ns.r * 0.8} r={6} fill="#f04438" stroke="#0b0e13" strokeWidth={1.5} />
+                    <text x={x + ns.r * 0.8} y={y - ns.r * 0.8 + 2.8} fill="#fff" fontSize={8.5} fontWeight={700} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
+                      !
+                    </text>
+                  </g>
+                )}
+                {side ? (
+                  <>
+                    <text x={x + ns.r + 9} y={n.sub ? y - 1 : y + 3} fill="#8b94a3" fontSize={9.5} fontFamily="JetBrains Mono, monospace">
+                      {clip(n.label, 20)}
+                    </text>
+                    {n.sub && (
+                      <text x={x + ns.r + 9} y={y + 10} fill="#5b6473" fontSize={8.5} fontFamily="JetBrains Mono, monospace">
+                        {clip(n.sub, 24)}
+                      </text>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <text x={x} y={y + ns.r + 13} fill="#8b94a3" fontSize={9.5} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
+                      {clip(n.label, 22)}
+                    </text>
+                    {n.sub && (
+                      <text x={x} y={y + ns.r + 24} fill="#5b6473" fontSize={8.5} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
+                        {clip(n.sub, 26)}
+                      </text>
+                    )}
+                  </>
+                )}
               </g>
             );
           })}
@@ -158,6 +236,14 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
               </span>
             );
           })}
+          {anyFlagged && (
+            <span className="flex items-center gap-1.5">
+              <span className="flex h-[11px] w-[11px] items-center justify-center rounded-full bg-danger text-[8px] font-bold leading-none text-white">
+                !
+              </span>
+              flagged by intel
+            </span>
+          )}
         </div>
       )}
     </div>

@@ -187,13 +187,9 @@ async def _fake_investigate_success(
     alert_id: str,
     *,
     ctx: Any,
-    agent: Any = None,
-    investigator: Any = None,
-    synthesizer: Any = None,
-    session_id: str | None = None,
     focus_hint: str | None = None,
 ) -> AsyncIterator[StepEvent]:
-    sid = session_id or "fake-at-sid"
+    sid = "fake-at-sid"
     yield StepEvent(
         kind="session_start",
         session_id=sid,
@@ -308,6 +304,149 @@ class TestAutoTriageSkipsCoveredPairs:
         assert count == 1  # only the seeded one
 
 
+class TestInheritedFpAutoAck:
+    """In-flight pair suppression + the inherited-verdict auto-ack path."""
+
+    @staticmethod
+    def _seed_running(settings: Settings) -> None:
+        """A RUNNING (unfinalized) investigation on ev1's (rule, src, dst) pair,
+        under a DIFFERENT alert id — the shape that used to produce duplicate
+        investigations minutes apart."""
+
+        async def _go() -> None:
+            engine = make_engine(settings)
+            await run_migrations(engine)
+            maker = make_sessionmaker(engine)
+            async with maker() as db:
+                inv = await inv_svc.create(
+                    db,
+                    alert_es_id="ev-older",
+                    started_by="t",
+                    src_ip="10.0.0.41",
+                    dest_ip="10.0.0.1",
+                )
+                await inv_svc.set_rule_name(db, inv.id, "ET SCAN thing")
+            await engine.dispose()
+
+        asyncio.run(_go())
+
+    def test_running_pair_suppresses_duplicate_target(self, at_settings: Settings) -> None:
+        """A pair whose first run is still RUNNING is not planned again for a
+        newer event id (the 'same alert investigated minutes apart' bug: the
+        direct id check misses the new id, and latest_for_pairs is
+        complete-only so it couldn't see the in-flight run either)."""
+        from soc_ai.webui import autotriage as at
+
+        self._seed_running(at_settings)
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        targets, skipped, acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        assert targets == []
+        assert skipped >= 1
+        assert acks == []  # a running run hands out no verdict — no ack either
+
+    def test_inherited_fp_emits_ack_candidates(self, at_settings: Settings) -> None:
+        """A cluster skipped via a qualifying inherited FP queues its events for
+        acknowledgement — the verdict alone never reached Security Onion."""
+        from soc_ai.webui import autotriage as at
+
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="other-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        targets, skipped, acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        assert targets == []
+        assert skipped == 1
+        assert [a.alert_es_id for a in acks] == ["ev1"]
+        assert acks[0].rule_name == "ET SCAN thing"
+        assert acks[0].confidence == 0.9
+
+    def test_inherited_ack_gated_by_toggle_and_confidence(self, at_settings: Settings) -> None:
+        """No candidates when auto-ack is off, or the inherited confidence is
+        below the threshold — the skip itself is unaffected."""
+        from soc_ai.webui import autotriage as at
+
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="other-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        for override in (
+            {"auto_ack_fp_enabled": False},
+            {"auto_ack_fp_threshold": 0.95},  # seeded verdict is 0.9
+        ):
+            es = AsyncMock()
+            es.search.side_effect = _make_es_side_effect()
+            state = _FakeState(at_settings.model_copy(update=override), es)
+            targets, skipped, acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+            assert targets == []
+            assert skipped == 1
+            assert acks == []
+
+    def test_ack_inherited_fps_worker_gates(self, at_settings: Settings) -> None:
+        """The worker pass skips already-acked and high-stakes candidates and
+        acks the rest through the audited write path."""
+        from types import SimpleNamespace
+
+        from soc_ai.webui import autotriage as at
+
+        def _hit(es_id: str, sev: str, acked: bool = False) -> dict[str, Any]:
+            event: dict[str, Any] = {"severity_label": sev}
+            if acked:
+                event["acknowledged"] = True
+            return {
+                "_id": es_id,
+                "_source": {
+                    "@timestamp": "2026-06-12T06:41:00.000Z",
+                    "source": {"ip": "10.0.0.41"},
+                    "destination": {"ip": "10.0.0.1"},
+                    "rule": {"name": "ET SCAN thing"},
+                    "event": event,
+                },
+            }
+
+        es = AsyncMock()
+        es.search.return_value = {
+            "took": 1,
+            "hits": {
+                "total": {"value": 3, "relation": "eq"},
+                "hits": [
+                    _hit("ev-acked", "low", acked=True),
+                    _hit("ev-high", "high"),
+                    _hit("ev-low", "low"),
+                ],
+            },
+        }
+        state = _FakeState(at_settings, es)
+        status = at.AutoTriageStatus()
+        acks = [
+            at.InheritedAck(
+                alert_es_id=i, rule_name="ET SCAN thing", inherited_from="inv-1", confidence=0.9
+            )
+            for i in ("ev-acked", "ev-high", "ev-low")
+        ]
+        ctx = SimpleNamespace(auth=AsyncMock(), settings=at_settings, audit=None)
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.tools.write_exec.execute_write_tool", mock_write):
+            asyncio.run(at._ack_inherited_fps(state, ctx, acks, status))
+
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args.args[1] == {"alert_id": "ev-low"}
+        assert status.inherited_acked == 1
+
+
 class TestAutoTriageSingleFlight:
     def test_autotriage_single_flight(self, at_settings: Settings, fake_es: AsyncMock) -> None:
         """Second POST while one run is active returns the status, not a new run."""
@@ -317,13 +456,9 @@ class TestAutoTriageSingleFlight:
             alert_id: str,
             *,
             ctx: Any,
-            agent: Any = None,
-            investigator: Any = None,
-            synthesizer: Any = None,
-            session_id: str | None = None,
             focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
-            sid = session_id or "slow-sid"
+            sid = "slow-sid"
             yield StepEvent(
                 kind="session_start", session_id=sid, sequence=1, payload={"alert_id": alert_id}
             )
@@ -374,13 +509,9 @@ class TestAutoTriageFailedCountsStreamErrors:
             alert_id: str,
             *,
             ctx: Any,
-            agent: Any = None,
-            investigator: Any = None,
-            synthesizer: Any = None,
-            session_id: str | None = None,
             focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
-            sid = session_id or "err-sid"
+            sid = "err-sid"
             yield StepEvent(
                 kind="session_start", session_id=sid, sequence=1, payload={"alert_id": alert_id}
             )
@@ -419,13 +550,9 @@ class TestAutoTriageFailedCountsStreamErrors:
             alert_id: str,
             *,
             ctx: Any,
-            agent: Any = None,
-            investigator: Any = None,
-            synthesizer: Any = None,
-            session_id: str | None = None,
             focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
-            sid = session_id or "hang-sid"
+            sid = "hang-sid"
             yield StepEvent(
                 kind="session_start", session_id=sid, sequence=1, payload={"alert_id": alert_id}
             )
@@ -558,9 +685,9 @@ class TestAutoTriageSeveritySelector:
             time_range: str,
             oql: str | None,
             severities: tuple[str, ...],
-        ) -> tuple[list[Any], int]:
+        ) -> tuple[list[Any], int, list[Any]]:
             captured["severities"] = severities
-            return [], 0  # nothing to hunt → immediate "done" with chosen sevs
+            return [], 0, []  # nothing to hunt → immediate "done" with chosen sevs
 
         fake_auth = AsyncMock()
         with (
@@ -592,9 +719,9 @@ class TestAutoTriageSeveritySelector:
             time_range: str,
             oql: str | None,
             severities: tuple[str, ...],
-        ) -> tuple[list[Any], int]:
+        ) -> tuple[list[Any], int, list[Any]]:
             captured["severities"] = severities
-            return [], 0
+            return [], 0, []
 
         fake_auth = AsyncMock()
         with (
@@ -671,7 +798,7 @@ class TestAutoTriageMaxTargetsCap:
         )
         state = _FakeState(settings, es)
 
-        targets, _ = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        targets, _, _acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
         assert len(targets) == 5
 
     def test_plan_targets_cap_zero_disables(self, at_settings: Settings) -> None:
@@ -685,7 +812,7 @@ class TestAutoTriageMaxTargetsCap:
         )
         state = _FakeState(settings, es)
 
-        targets, _ = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        targets, _, _acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
         assert len(targets) == 30
 
 
@@ -755,13 +882,9 @@ class TestAutoTriageLiveProgress:
             alert_id: str,
             *,
             ctx: Any,
-            agent: Any = None,
-            investigator: Any = None,
-            synthesizer: Any = None,
-            session_id: str | None = None,
             focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
-            sid = session_id or "tc-sid"
+            sid = "tc-sid"
             yield StepEvent(
                 kind="session_start",
                 session_id=sid,
@@ -831,13 +954,9 @@ class TestAutoTriageLiveProgress:
             alert_id: str,
             *,
             ctx: Any,
-            agent: Any = None,
-            investigator: Any = None,
-            synthesizer: Any = None,
-            session_id: str | None = None,
             focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
-            sid = session_id or "gate-sid"
+            sid = "gate-sid"
             yield StepEvent(
                 kind="session_start",
                 session_id=sid,
@@ -999,13 +1118,13 @@ class TestMaybeAutoAckFp:
         assert result.payload["es_id"] == "ev-abc"
         assert result.payload["success"] is True
 
-    def test_auto_ack_disabled_by_default(self) -> None:
-        """No ack write when auto_ack_fp_enabled=False (the default)."""
+    def test_auto_ack_disabled_when_opted_out(self) -> None:
+        """No ack write when auto_ack_fp_enabled=False (operator opt-out)."""
         from unittest.mock import AsyncMock, patch
 
         from soc_ai.agent.orchestrator import maybe_auto_ack_fp
 
-        ctx = self._make_ctx({})  # defaults: auto_ack_fp_enabled=False
+        ctx = self._make_ctx({"auto_ack_fp_enabled": False})
         report = self._make_report(verdict="false_positive", confidence=0.99)
         _ev, _audit, _ = self._make_emit_audit()
 
@@ -1196,14 +1315,15 @@ class TestMaybeAutoAckFp:
         assert result.kind == "auto_ack"
         assert result.payload["success"] is False
 
-    def test_auto_ack_executes_directly_never_creates_approval_token(self) -> None:
-        """Auto-ack WRITES via execute_write_tool — it does NOT queue an approval.
+    def test_auto_ack_executes_directly(self) -> None:
+        """Auto-ack WRITES via execute_write_tool — no human step in between.
 
         This is the "auto isn't automatic" regression guard: a confident,
-        low-stakes FP with the toggle on must go straight to the SO write, never
-        park a token on ctx.gate for a human to approve. If auto-ack ever routed
-        through the approval gate, the operator's opt-in would silently do
-        nothing until manually approved — exactly the reported dogfood bug.
+        low-stakes FP with the toggle on must go straight to the SO write. If
+        auto-ack ever parked the write behind a human step, the operator's
+        opt-in would silently do nothing — exactly the reported dogfood bug.
+        (The old approval gate this once guarded against was removed entirely;
+        the direct-write guarantee is what remains load-bearing.)
         """
         from unittest.mock import AsyncMock, patch
 
@@ -1214,10 +1334,6 @@ class TestMaybeAutoAckFp:
         alert = self._make_alert()  # benign low-severity info-class FP
         _ev, _audit, _ = self._make_emit_audit()
 
-        # Spy on the real approval gate: it must never be asked for a token.
-        gate_spy = AsyncMock()
-        ctx.gate.request = gate_spy  # type: ignore[method-assign]
-
         mock_write = AsyncMock(return_value=({"ok": True}, None))
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
@@ -1226,11 +1342,9 @@ class TestMaybeAutoAckFp:
                 )
             )
 
-        # The write happened directly...
+        # The write happened directly.
         mock_write.assert_awaited_once()
         assert mock_write.call_args.args[0] == "ack_alert"
-        # ...and NO approval token was ever requested.
-        gate_spy.assert_not_awaited()
         assert result is not None
         assert result.payload["success"] is True
 
@@ -1291,13 +1405,9 @@ class TestAutoTriageProgress:
             alert_id: str,
             *,
             ctx: Any,
-            agent: Any = None,
-            investigator: Any = None,
-            synthesizer: Any = None,
-            session_id: str | None = None,
             focus_hint: str | None = None,
         ) -> AsyncIterator[StepEvent]:
-            sid = session_id or "pend-sid"
+            sid = "pend-sid"
             yield StepEvent(
                 kind="session_start",
                 session_id=sid,
@@ -1510,7 +1620,7 @@ class TestStartConfigSweep:
 
         async def _empty(_s: Any, *, time_range: str, oql: Any, severities: Any) -> Any:
             assert severities == ("critical", "high")  # planned the config band
-            return [], 4
+            return [], 4, []
 
         with patch("soc_ai.webui.autotriage.plan_targets", _empty):
             assert await at.start_config_sweep(state, started_by="scheduler") == 0
@@ -1529,9 +1639,11 @@ class TestStartConfigSweep:
 
         async def _plan(_s: Any, *, time_range: str, oql: Any, severities: Any) -> Any:
             assert severities == ("critical", "high", "medium", "low")
-            return targets, 2
+            return targets, 2, []
 
-        async def _run(_s: Any, *, targets: Any, started_by: str) -> None:
+        async def _run(
+            _s: Any, *, targets: Any, started_by: str, inherited_acks: Any = None
+        ) -> None:
             ran["targets"] = targets
             ran["started_by"] = started_by
 

@@ -12,8 +12,9 @@ packets off the sensor when that's what it takes. Then it hands you a **verdict,
 confidence number, and the reasoning that got it there.**
 
 The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway.
-Nothing about your network leaves it, and the agent never changes anything on the grid
-unless a human clicks **approve**. There's an optional cloud "Oracle" for a second opinion
+Nothing about your network leaves it, and write-backs stay yours: the agent recommends,
+you execute — the one exception is an audited auto-acknowledge for high-confidence,
+low-stakes false positives, on by default and one toggle to turn off. There's an optional cloud "Oracle" for a second opinion
 on the hard ones; it's off until you turn it on, and its input is sanitized first.
 
 !!! note
@@ -82,9 +83,11 @@ The whole point is that you stay in control of anything that changes state.
 
 - **Reads run freely:** pulling events, context, enrichment, and packets is safe, so the
   agent does it without asking.
-- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment.
-  Those only happen when you click approve. The agent can recommend a write, but it can't
-  execute one by itself.
+- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment —
+  the agent recommends them and you execute them with a click. One pragmatic carve-out
+  ships on by default: **confident false positives are auto-acknowledged** (confidence-
+  gated, never on critical/high-severity or malware/exploit-class alerts, every
+  unattended write audited). `auto_ack_fp_enabled=false` turns it off.
 - **Nothing leaves your network without your consent.** The reasoning runs on your own
   model, on your own hardware. The Oracle (an optional cloud second opinion) is **off by
   default**, and even when on, internal hostnames, usernames, and IPs are redacted before
@@ -106,15 +109,15 @@ soc-ai exists so you don't have to make that trade:
   off (the default), the whole pipeline works with no internet at all.
 - **Readable reasoning:** every verdict cites the events it rests on, and no
   true/false-positive call stands without evidence from a tool call.
-- **A human owns every change:** the agent recommends writes; it never executes one
-  without a click.
+- **You own every change:** the agent recommends writes and you execute them; the one
+  unattended write — the FP auto-ack — is bounded, audited, and yours to switch off.
 
 ---
 
 ## How it works
 
 <p align="center">
-  <img src="img/architecture.png" alt="Architecture: the analyst drives soc-ai, which reads Security Onion and local intel, reasons with a local model, and writes only what a human approves" width="900">
+  <img src="img/architecture.png" alt="Architecture: the analyst drives soc-ai, which reads Security Onion and local intel, reasons with a local model, and writes only what you allow" width="900">
 </p>
 
 `ANALYST_MODEL` is the one model the agent triages with: whatever your gateway serves.

@@ -161,6 +161,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key="analyst_cloud_redaction",
+        attr="analyst_cloud_redaction",
+        type="bool",
+        label="Redact internal identifiers before the analyst model (cloud)",
+        section="Agent",
+        hot=True,
+        help=(
+            "For a CLOUD analyst model: replace internal IPs/hostnames/usernames "
+            "with opaque labels in everything sent to it (context, prompts, tool "
+            "results) and restore them in its outputs. Costs some verdict quality "
+            "(the model reasons over labels). Leave off for a local model."
+        ),
+    ),
+    SettingSpec(
         key="host_risk_window_hours",
         attr="host_risk_window_hours",
         type="int",
@@ -195,6 +209,28 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help="Hard cap on model round-trips per investigation.",
         min_value=1,
         max_value=100,
+    ),
+    SettingSpec(
+        key="investigator_retries",
+        attr="investigator_retries",
+        type="int",
+        label="Investigation-loop schema retries",
+        section="Agent",
+        hot=True,
+        help="Pydantic-AI output-schema retry budget for the tool-equipped investigation loop.",
+        min_value=1,
+        max_value=20,
+    ),
+    SettingSpec(
+        key="phase_d_max_rounds",
+        attr="phase_d_max_rounds",
+        type="int",
+        label="Max targeted-dispatch rounds",
+        section="Agent",
+        hot=True,
+        help="How many gap→tool→re-synthesize rounds the synthesizer may chain per investigation.",
+        min_value=1,
+        max_value=3,
     ),
     SettingSpec(
         key="synthesizer_temperature",
@@ -256,6 +292,38 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=10,
     ),
     SettingSpec(
+        key="synthesizer_max_response_tokens",
+        attr="synthesizer_max_response_tokens",
+        type="int",
+        label="Synthesizer response cap (tokens)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Per-call cap on the synthesizer's reasoning + report, sent as "
+            "max_completion_tokens. Reasoning models can burn an unset/default "
+            "budget thinking and truncate before any verdict is produced "
+            "(fallback needs-more-info). Raise for very verbose reasoning models."
+        ),
+        min_value=1000,
+        max_value=200_000,
+    ),
+    SettingSpec(
+        key="model_context_window_tokens",
+        attr="model_context_window_tokens",
+        type="int",
+        label="Model context window (tokens)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Input window used for proactive context budgeting. 0 = discover from "
+            "the LiteLLM gateway's /model/info (recommended). When known, an "
+            "oversized alert context is trimmed (oldest pivot events first) before "
+            "the first model call instead of failing mid-investigation."
+        ),
+        min_value=0,
+        max_value=10_000_000,
+    ),
+    SettingSpec(
         key="auto_ack_fp_enabled",
         attr="auto_ack_fp_enabled",
         type="bool",
@@ -264,13 +332,15 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "When on, a completed investigation with verdict=false_positive at or above "
-            "the threshold below is automatically acknowledged in Security Onion. "
-            "Off by default — this writes to SO without analyst review. "
-            "Note: this fires only when an alert is INVESTIGATED — it does not "
-            "retroactively acknowledge a standing backlog. To clear existing FPs, "
-            "run an auto-triage sweep (⚡ or the schedule) with them in scope. High/"
-            "critical-severity alerts are never auto-acked, so lower the auto-triage "
-            "floor to medium/low if you want low-severity FPs cleared automatically."
+            "the threshold below is automatically acknowledged in Security Onion — and "
+            "auto-triage sweeps also acknowledge alerts that INHERIT such a verdict "
+            "(same rule + source + destination, within the inherit window). "
+            "On by default; every unattended ack is audited, and high/critical-severity "
+            "or malware/exploit-class alerts are NEVER auto-acked regardless of verdict. "
+            "To clear a standing FP backlog, run an auto-triage sweep (⚡ or the "
+            "schedule) with them in scope; lower the auto-triage floor to medium/low "
+            "if you want low-severity FPs cleared automatically. Turn off to require "
+            "a human click for every acknowledgement."
         ),
     ),
     SettingSpec(
@@ -337,68 +407,16 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=1440,
     ),
     SettingSpec(
-        key="synth_first_pipeline",
-        attr="synth_first_pipeline",
-        type="bool",
-        label="Synth-first pipeline",
-        section="Agent",
-        hot=True,
-        help=(
-            "Route alerts through the synth-first A→B→C→D pipeline (the default). "
-            "Off A/B-tests the legacy two-stage investigator pipeline."
-        ),
-    ),
-    SettingSpec(
-        key="enable_rule_class_fast_path",
-        attr="enable_rule_class_fast_path",
-        type="bool",
-        label="Rule-class fast path",
-        section="Agent",
-        hot=True,
-        help=(
-            "Route informational/low-severity alerts through a stripped-down "
-            "confirm-benign prompt with a tighter tool budget. Off runs the full "
-            "pipeline for every alert."
-        ),
-    ),
-    SettingSpec(
         key="synthesis_confidence_floor",
         attr="synthesis_confidence_floor",
         type="float",
-        label="Synthesis confidence floor (retask below)",
+        label="Synthesis confidence floor",
         section="Agent",
         hot=True,
         help=(
-            "A synthesizer verdict under this confidence (0-1) retasks the "
-            "investigator once with the open questions. 0.6 is the tuned default."
-        ),
-        min_value=0.0,
-        max_value=1.0,
-    ),
-    SettingSpec(
-        key="fast_path_synthesis_floor",
-        attr="fast_path_synthesis_floor",
-        type="float",
-        label="Fast-path confidence floor",
-        section="Agent",
-        hot=True,
-        help=(
-            "Lower confidence floor on the fast path - informational alerts rarely "
-            "benefit from a retask, so ≥0.4 passes through. Range 0-1."
-        ),
-        min_value=0.0,
-        max_value=1.0,
-    ),
-    SettingSpec(
-        key="fast_path_sampling_rate",
-        attr="fast_path_sampling_rate",
-        type="float",
-        label="Fast-path full-pipeline sampling rate",
-        section="Agent",
-        hot=True,
-        help=(
-            "Fraction (0-1) of fast-path-eligible alerts routed through the FULL "
-            "pipeline anyway, for drift monitoring. 0 disables sampling."
+            "A TP/FP verdict under this confidence (0-1) is rewritten to "
+            "needs_more_info when it also lacks semantic citation coverage. "
+            "0.6 is the tuned default."
         ),
         min_value=0.0,
         max_value=1.0,

@@ -42,7 +42,6 @@ def _make_settings(**kwargs: Any) -> Settings:
         "so_verify_ssl": False,
         "es_hosts": ["https://so.example.com:9200"],
         "litellm_base_url": "http://localhost:4000",
-        "synth_first_pipeline": False,
         "oracle_enabled": True,
         "oracle_model": "claude-sonnet-4-6",
         "oracle_timeout_s": 30.0,

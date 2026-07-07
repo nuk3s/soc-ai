@@ -58,12 +58,13 @@ def _safe_reason(exc: BaseException) -> str:
     return f"{name}: {msg}" if msg else name
 
 
-async def probe_llm(settings: Any) -> dict[str, Any]:
-    """Probe the LiteLLM gateway by listing models.
+async def list_gateway_models(settings: Any) -> tuple[list[str], str | None]:
+    """Model ids served by the LiteLLM gateway (``GET {base}/v1/models``).
 
-    Issues ``GET {base}/v1/models`` with a bearer header (when a key is set) and
-    counts the returned ``data`` array. Never raises; returns ``ok``/``detail``.
-    The API key is never placed into ``detail``.
+    Returns ``(ids, error)`` — ``error`` is a scrubbed, secret-free human
+    reason and ``ids`` is empty when the gateway can't be listed. Never
+    raises. Feeds both the connectivity probe and the config console's
+    analyst-model dropdown.
     """
     base = str(settings.litellm_base_url).rstrip("/")
     api_key = ""
@@ -82,32 +83,46 @@ async def probe_llm(settings: Any) -> dict[str, Any]:
         if resp.status_code != 200:
             # status_code + reason phrase are credential-free.
             reason = resp.reason_phrase or ""
-            return {"ok": False, "detail": _scrub(f"HTTP {resp.status_code} {reason}".strip())}
+            return [], _scrub(f"HTTP {resp.status_code} {reason}".strip())
         try:
             data = resp.json()
         except ValueError:
-            return {"ok": False, "detail": "200 OK but response was not JSON"}
+            return [], "200 OK but response was not JSON"
         models = data.get("data") if isinstance(data, dict) else None
         ids = (
-            [m.get("id") for m in models if isinstance(m, dict)] if isinstance(models, list) else []
+            [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
+            if isinstance(models, list)
+            else []
         )
-        count = len(ids)
-        # The gateway answering /v1/models doesn't mean ANALYST_MODEL is one of
-        # them — a misconfigured value returns 200 here but 400s every actual
-        # completion (every hunt silently falls back). Catch that up front.
-        analyst = getattr(settings, "analyst_model", None)
-        if analyst and analyst not in ids:
-            return {
-                "ok": False,
-                "detail": _scrub(
-                    f"gateway reachable ({count} models) but ANALYST_MODEL "
-                    f"'{analyst}' is not configured on it — set ANALYST_MODEL to a "
-                    f"model the gateway serves"
-                ),
-            }
-        return {"ok": True, "detail": f"200 OK — {count} models (analyst: {analyst})"}
-    except Exception as exc:  # a probe failure is a normal ✗ result, never a raise
-        return {"ok": False, "detail": _safe_reason(exc)}
+        return ids, None
+    except Exception as exc:  # a listing failure is a normal ✗ result, never a raise
+        return [], _safe_reason(exc)
+
+
+async def probe_llm(settings: Any) -> dict[str, Any]:
+    """Probe the LiteLLM gateway by listing models.
+
+    Never raises; returns ``ok``/``detail``. The API key is never placed into
+    ``detail``.
+    """
+    ids, err = await list_gateway_models(settings)
+    if err is not None:
+        return {"ok": False, "detail": err}
+    count = len(ids)
+    # The gateway answering /v1/models doesn't mean ANALYST_MODEL is one of
+    # them — a misconfigured value returns 200 here but 400s every actual
+    # completion (every hunt silently falls back). Catch that up front.
+    analyst = getattr(settings, "analyst_model", None)
+    if analyst and analyst not in ids:
+        return {
+            "ok": False,
+            "detail": _scrub(
+                f"gateway reachable ({count} models) but ANALYST_MODEL "
+                f"'{analyst}' is not configured on it — set ANALYST_MODEL to a "
+                f"model the gateway serves"
+            ),
+        }
+    return {"ok": True, "detail": f"200 OK — {count} models (analyst: {analyst})"}
 
 
 async def probe_es(elastic: Any) -> dict[str, Any]:

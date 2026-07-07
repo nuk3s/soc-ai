@@ -6,8 +6,6 @@ agent loop raise them at the boundaries of the trust model.
 
 from __future__ import annotations
 
-from typing import Any
-
 
 class SocAiError(Exception):
     """Root of the soc-ai error hierarchy."""
@@ -46,35 +44,6 @@ class OqlValidationError(SocAiError):
     def __init__(self, message: str, *, fragment: str | None = None) -> None:
         super().__init__(message)
         self.fragment = fragment
-
-
-class ApprovalRequired(SocAiError):
-    """A write tool was called without a matching approval token.
-
-    This is a control-flow signal, not a fault: the orchestrator catches it,
-    emits an SSE ``approval_required`` event, and resumes after the user
-    POSTs to ``/approve``.
-    """
-
-    def __init__(
-        self,
-        tool_name: str,
-        tool_args: dict[str, Any],
-        token: str,
-    ) -> None:
-        super().__init__(f"approval required for {tool_name}")
-        self.tool_name = tool_name
-        self.tool_args = tool_args
-        self.token = token
-
-
-class ApprovalRejected(SocAiError):
-    """The user explicitly rejected a write-tool approval request."""
-
-    def __init__(self, tool_name: str, *, reason: str | None = None) -> None:
-        super().__init__(f"user rejected {tool_name}" + (f": {reason}" if reason else ""))
-        self.tool_name = tool_name
-        self.reason = reason
 
 
 class ModelError(SocAiError):

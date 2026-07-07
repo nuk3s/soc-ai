@@ -58,7 +58,7 @@ def _top_source(resp: Any) -> dict[str, Any]:
 class AuditWriteError(RuntimeError):
     """Raised when a *mutating* audit write fails and fail-closed is enabled.
 
-    The caller (a write-tool / approval / auto-ack path) must treat this as a
+    The caller (a write-tool / auto-ack path) must treat this as a
     hard abort of the SO state change — no acknowledged/escalated alert without
     an audit record.
     """

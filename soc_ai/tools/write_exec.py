@@ -1,13 +1,10 @@
 """Write-tool execution primitive shared by the HTTP layer and the agent.
 
 :func:`execute_write_tool` is the single audited path through which ANY
-SO-mutating tool runs — the /approve endpoint, the web UI's direct actions
-(ack-group / escalate-group / apply-recommended-action), and the orchestrator's
-opt-in auto-ack all call it. It lives here — below both the api and agent
-packages — so the agent never has to import the HTTP layer to write an ack
-(the old ``soc_ai.api.approvals`` home forced a lazy agent→api import).
-
-``soc_ai.api.approvals`` re-exports both names for compatibility.
+SO-mutating tool runs — the web UI's direct actions (ack-group /
+escalate-group / apply-recommended-action) and the orchestrator's opt-in
+auto-ack all call it. It lives here — below both the api and agent
+packages — so the agent never has to import the HTTP layer to write an ack.
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from soc_ai.tools._registry import get_tool
 if TYPE_CHECKING:
     from soc_ai.audit.logger import AuditLogger
 
-# The only tools that may ever be executed via an approval / direct action.
+# The only tools that may ever be executed via a direct analyst action.
 WRITE_TOOLS = frozenset({"ack_alert", "escalate_to_case", "add_case_comment"})
 
 

@@ -560,15 +560,20 @@ class SoDetection(BaseModel):
 
     @classmethod
     def from_so_doc(cls, doc: dict[str, Any]) -> SoDetection:
+        # Live SO 3.x nests the detection under `so_detection.*`; older/flat
+        # docs (and the SO /connect API) keep the fields top-level.
+        det = doc.get("so_detection")
+        if not isinstance(det, dict):
+            det = doc
         return cls(
-            id=doc["id"],
-            title=doc.get("title", ""),
-            publicId=doc.get("publicId"),
-            severity=doc.get("severity"),
-            engine=doc.get("engine"),
-            is_enabled=bool(doc.get("isEnabled", True)),
-            author=doc.get("author"),
-            tags=list(doc.get("tags") or []),
+            id=str(det.get("id") or det.get("publicId") or ""),
+            title=det.get("title", ""),
+            publicId=det.get("publicId"),
+            severity=det.get("severity"),
+            engine=det.get("engine"),
+            is_enabled=bool(det.get("isEnabled", True)),
+            author=det.get("author"),
+            tags=list(det.get("tags") or []),
             raw=doc,
         )
 

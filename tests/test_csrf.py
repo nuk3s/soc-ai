@@ -188,10 +188,11 @@ def test_dev_mode_with_cookie_still_enforced(open_client: TestClient) -> None:
 
 
 def test_legacy_router_enforces_csrf(auth_client: TestClient) -> None:
-    """The prefix-less /approve route (routes.py) now enforces the CSRF Origin
-    guard too — a cookie-authenticated cross-origin POST is rejected 403."""
+    """The prefix-less legacy routes (routes.py, e.g. /find-alert) enforce the
+    CSRF Origin guard too — a cookie-authenticated cross-origin POST is
+    rejected 403."""
     _login(auth_client)
-    resp = auth_client.post("/approve", json={}, headers={"Origin": CROSS_ORIGIN})
+    resp = auth_client.post("/find-alert", json={}, headers={"Origin": CROSS_ORIGIN})
     assert resp.status_code == 403
     assert resp.json()["detail"]["reason"] == "bad_origin"
 

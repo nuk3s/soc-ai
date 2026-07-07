@@ -73,7 +73,6 @@ _KIND_COLOR: dict[str, str] = {
     "usage": _C["dim"],
     "retask": _C["yellow"],
     "triage_report": _C["bold"] + _C["green"],
-    "approval_required": _C["yellow"],
     "done": _C["dim"] + _C["green"],
     "error": _C["bold"] + _C["red"],
 }
@@ -154,12 +153,6 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
                 f"   {_C['yellow']}→ {a.get('tool_name')} ({rendered_rationale}){_C['reset']}"
             )
         return "\n".join(out)
-    if kind == "approval_required":
-        return (
-            f"{_label(kind)} {payload.get('tool_name')} "
-            f"token={payload.get('token')!r}\n   "
-            f"{_C['yellow']}→ {_short(payload.get('rationale', ''), 200)}{_C['reset']}"
-        )
     if kind == "done":
         return (
             f"{_label(kind)} recommended_count={payload.get('recommended_count')} "
@@ -978,3 +971,7 @@ def main() -> None:
     if not getattr(args, "func", None):
         args = parser.parse_args(["serve"])
     raise SystemExit(args.func(args))
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via a subprocess test
+    main()

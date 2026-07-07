@@ -2,18 +2,33 @@
 
 Async store functions over :class:`~soc_ai.store.models.InternalIdentifier`
 rows — internal domain suffixes, bare hostnames, and CIDRs tracked as
-``detected``|``manual`` / ``active``|``muted``. The Oracle egress sanitizer
-consumes the *effective* merged set (see ``soc_ai.oracle.identifiers``).
+``detected``|``manual`` / ``active``|``muted``|``dismissed``. The Oracle egress
+sanitizer consumes the *effective* merged set (see ``soc_ai.oracle.identifiers``).
+
+The three states:
+
+* ``active`` — applied by the effective set.
+* ``muted``  — a visible suggestion the operator declined (subtracts from the
+  effective set); survives re-scans.
+* ``dismissed`` — a TERMINAL tombstone for ``detected`` rows only. The row is
+  hidden from listings, never refreshed and never resurrected by a scan; only
+  an explicit ``add_manual`` of the same value reactivates it. This is how
+  vestigial detections (rows created by rules that no longer exist) are retired
+  without deleting the audit trail. Manual rows are deleted, never dismissed.
 
 Behavioral invariants enforced here:
 
 * ``upsert_detected`` refreshes evidence on re-scan but **preserves** the
   existing ``state`` — an operator's mute/unmute survives a re-scan, so a muted
-  detected row stays muted (a tombstone). It never edits a ``manual`` row's
-  source/state.
-* ``add_manual`` un-mutes (ensures an active row exists).
-* ``delete_manual`` refuses to delete a ``detected`` row — operators mute
-  detected rows, they never delete them.
+  detected row stays muted (a tombstone). A ``dismissed`` row is returned
+  UNTOUCHED — not even its evidence is refreshed. It never edits a ``manual``
+  row's source/state.
+* ``add_manual`` un-mutes / un-dismisses (ensures an active row exists) — an
+  explicit operator act outranks a mute or a dismissal.
+* ``delete_manual`` refuses to delete a ``detected`` row — operators mute or
+  dismiss detected rows, they never delete them.
+* ``dismiss`` refuses ``manual`` rows (returns ``None``) — those are deleted
+  via ``delete_manual`` instead.
 """
 
 from __future__ import annotations
@@ -61,9 +76,22 @@ def normalize(kind: str, value: str) -> str:
     return str(network)
 
 
-async def list_identifiers(db: AsyncSession, kind: str | None = None) -> list[InternalIdentifier]:
-    """Return all identifier rows, optionally filtered by *kind*, ordered."""
+async def list_identifiers(
+    db: AsyncSession,
+    kind: str | None = None,
+    *,
+    include_dismissed: bool = False,
+) -> list[InternalIdentifier]:
+    """Return identifier rows, optionally filtered by *kind*, ordered.
+
+    Dismissed tombstones are EXCLUDED by default — neither the config-console
+    list nor the oracle effective-set resolver must ever see them. Pass
+    ``include_dismissed=True`` only for maintenance paths that need the full
+    table (e.g. audit/debug).
+    """
     stmt = select(InternalIdentifier)
+    if not include_dismissed:
+        stmt = stmt.where(InternalIdentifier.state != "dismissed")
     if kind is not None:
         stmt = stmt.where(InternalIdentifier.kind == kind)
     stmt = stmt.order_by(InternalIdentifier.kind, InternalIdentifier.value)
@@ -92,6 +120,9 @@ async def upsert_detected(
 
     * Absent (kind, value) → insert ``source='detected'`` with *initial_state*
       and *evidence*.
+    * Present and ``state=='dismissed'`` → returned UNTOUCHED: a dismissed row
+      is a terminal tombstone — never refreshed, never resurrected by a scan.
+      Only an explicit ``add_manual`` reactivates it.
     * Present and ``source=='detected'`` → refresh *evidence* (and updated_at)
       but **preserve the existing state** (an operator's mute/unmute survives a
       re-scan).
@@ -109,6 +140,11 @@ async def upsert_detected(
             evidence=evidence,
         )
         db.add(row)
+    elif row.state == "dismissed":
+        # Terminal tombstone: a scan must never touch it (not even evidence),
+        # or the "retired" provenance would be silently overwritten and the
+        # row would look freshly supported again.
+        return row
     else:
         # Refresh evidence for both detected and manual rows; never change
         # source/state here (detected: preserve operator mute; manual: sticky).
@@ -122,7 +158,9 @@ async def add_manual(db: AsyncSession, kind: str, value: str) -> InternalIdentif
     """Ensure an active ``manual``-intent row exists for (kind, value).
 
     Absent → insert ``source='manual'``, ``state='active'``. Present (whatever
-    its source) → set ``state='active'`` (a manual add un-mutes).
+    its source or state — INCLUDING a ``dismissed`` tombstone) → set
+    ``state='active'``: a manual add un-mutes, and an explicit operator act
+    outranks a dismissal.
     """
     norm = normalize(kind, value)
     row = await _get(db, kind, norm)
@@ -143,13 +181,36 @@ async def add_manual(db: AsyncSession, kind: str, value: str) -> InternalIdentif
 
 
 async def set_state(db: AsyncSession, ident_id: int, state: str) -> InternalIdentifier | None:
-    """Set a row's *state* to ``active`` or ``muted``. ``None`` if not found."""
+    """Set a row's *state* to ``active`` or ``muted``. ``None`` if not found.
+
+    Deliberately NOT a path to ``dismissed`` — dismissal is a distinct terminal
+    act with its own semantics (see :func:`dismiss`).
+    """
     if state not in ("active", "muted"):
         raise ValueError(f"invalid state {state!r}; expected 'active' or 'muted'")
     row = await db.get(InternalIdentifier, ident_id)
     if row is None:
         return None
     row.state = state
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def dismiss(db: AsyncSession, ident_id: int) -> InternalIdentifier | None:
+    """Terminally dismiss a DETECTED row (``state='dismissed'`` tombstone).
+
+    A dismissed row is hidden from listings by default (``list_identifiers``),
+    is never refreshed or resurrected by a re-scan (``upsert_detected`` returns
+    it untouched), and only an explicit ``add_manual`` of the same value
+    reactivates it. Returns the dismissed row, or ``None`` when the id is
+    unknown OR the row is ``manual`` — manual rows are removed via
+    :func:`delete_manual`, never dismissed.
+    """
+    row = await db.get(InternalIdentifier, ident_id)
+    if row is None or row.source != "detected":
+        return None
+    row.state = "dismissed"
     await db.commit()
     await db.refresh(row)
     return row

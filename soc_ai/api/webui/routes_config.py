@@ -159,6 +159,29 @@ async def get_config(
     )
 
 
+class GatewayModelsOut(BaseModel):
+    ok: bool
+    models: list[str] = []
+    detail: str | None = None
+
+
+@router.get(
+    "/config/models",
+    response_model=GatewayModelsOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def api_gateway_models(
+    settings: Settings = Depends(get_settings_dep),
+) -> GatewayModelsOut:
+    """Model ids the LiteLLM gateway serves.
+
+    Feeds the analyst-model dropdown in the config console (fetched separately
+    from GET /config so a slow/down gateway never delays the page — the UI
+    falls back to a free-text field when this returns ok=false)."""
+    ids, err = await probes.list_gateway_models(settings)
+    return GatewayModelsOut(ok=err is None, models=ids, detail=err)
+
+
 # ── Config mutations (admin) ───────────────────────────────────────────────
 
 

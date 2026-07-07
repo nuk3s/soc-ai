@@ -433,3 +433,39 @@ async def latest_for_pairs(
         if key in wanted and key not in out:
             out[key] = inv
     return out
+
+
+async def running_for_pairs(
+    db: AsyncSession,
+    pairs: list[tuple[str, str, str]],
+) -> set[tuple[str, str, str]]:
+    """The subset of (rule_name, src_ip, dest_ip) pairs with an IN-FLIGHT run.
+
+    :func:`latest_for_pairs` is complete-only by design (a running run must not
+    hand out a verdict) — but a sweep planner that consults only completed runs
+    will queue a SECOND investigation of a pair whose first run is still
+    executing: a newer event id in the cluster defeats the direct id check, and
+    the pair check can't see the running row. That is how the same flow got
+    investigated twice minutes apart. The planner subtracts these pairs.
+    No window: wedged ``running`` rows are reaped to ``error``, so a crashed
+    run can't suppress its pair for long.
+    """
+    if not pairs:
+        return set()
+    rules = list({p[0] for p in pairs})
+    rows = (
+        await db.scalars(
+            select(Investigation).where(
+                Investigation.rule_name.in_(rules),
+                Investigation.status == "running",
+                Investigation.src_ip.is_not(None),
+                Investigation.dest_ip.is_not(None),
+            )
+        )
+    ).all()
+    wanted = set(pairs)
+    return {
+        key
+        for inv in rows
+        if (key := (inv.rule_name or "", inv.src_ip or "", inv.dest_ip or "")) in wanted
+    }

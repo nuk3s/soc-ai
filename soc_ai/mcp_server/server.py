@@ -1,9 +1,9 @@
 """FastMCP server exposing soc-ai's read-only tool subset.
 
 **Read tools only.** Write tools (``ack_alert``, ``escalate_to_case``,
-``add_case_comment``) require the SSE-based approval flow that lives in the
-FastAPI layer; that flow can't be enforced through MCP, where clients
-typically auto-approve. See ``docs/SAFETY_MODEL.md``.
+``add_case_comment``) require the explicit analyst-executed actions flow that
+lives in the FastAPI layer; that human-in-the-loop step can't be enforced
+through MCP, where clients typically auto-approve. See ``docs/SAFETY_MODEL.md``.
 
 Run as a stdio MCP server::
 

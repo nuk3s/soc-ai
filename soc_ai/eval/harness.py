@@ -21,11 +21,7 @@ from typing import Any
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
     StepEvent,
-    build_investigator,
-    build_investigator_model,
     build_local_enrichment_context,
-    build_synthesizer,
-    build_synthesizer_model,
     investigate,
 )
 from soc_ai.config import Settings, get_settings
@@ -34,7 +30,6 @@ from soc_ai.eval.oracle_client import OracleError, OracleResponse, call_oracle
 from soc_ai.eval.prompt import SYSTEM_PROMPT, architecture_block, build_user_message
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.tools._registry import ApprovalGate
 from soc_ai.tools.enrichment import MispClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -107,19 +102,12 @@ async def run(
     # `include_synth` lets the prefetch see this synth alert's own supporting
     # docs; real alerts leave it False so synth fixtures stay invisible.
     ctx = _build_context(settings, include_synth=include_synth)
-    investigator = build_investigator(build_investigator_model(settings), ctx)
-    synthesizer = build_synthesizer(build_synthesizer_model(settings))
 
     started = time.monotonic()
     events: list[StepEvent] = []
     final_report: dict[str, Any] | None = None
     try:
-        async for ev in investigate(
-            alert_id,
-            ctx=ctx,
-            investigator=investigator,
-            synthesizer=synthesizer,
-        ):
+        async for ev in investigate(alert_id, ctx=ctx):
             events.append(ev)
             if ev.kind == "triage_report":
                 final_report = ev.payload
@@ -238,7 +226,6 @@ def _build_context(settings: Settings, *, include_synth: bool = False) -> Invest
         auth=auth,
         elastic=elastic,
         misp=misp,
-        gate=ApprovalGate(),
         audit=None,
         blocklist=enrichment.blocklist,
         maxmind=enrichment.maxmind,

@@ -64,6 +64,7 @@ export function ChatPanelShell<M extends ChatDockMessage>({
   renderSpecial,
 }: ChatPanelShellProps<M>) {
   const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const didMountRef = useRef(false);
   // Tracks the highest message index seen at mount-time so subsequent new
   // messages (added while the panel is open) can receive a fade-in.
@@ -79,6 +80,15 @@ export function ChatPanelShell<M extends ChatDockMessage>({
     const el = listRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   }, [messages.length, pending]);
+
+  // Grow the draft box with its content (up to a cap) so a long question stays
+  // fully visible instead of scrolling off a single line.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+  }, [draft]);
 
   return (
     <Panel className={`flex min-h-0 flex-col${fill ? ' h-full' : ''}`}>
@@ -150,15 +160,20 @@ export function ChatPanelShell<M extends ChatDockMessage>({
           </div>
         )}
       </div>
-      <div className="flex items-center gap-[9px] border-t border-border px-[13px] py-[11px]">
-        <input
+      <div className="flex items-end gap-[9px] border-t border-border px-[13px] py-[11px]">
+        <textarea
+          ref={inputRef}
+          rows={1}
           value={draft}
           onChange={(e) => onDraft(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') onSend();
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              onSend();
+            }
           }}
           placeholder={placeholder}
-          className="flex-1 rounded-control border border-border-input bg-bg px-3 py-[9px] text-[13px] text-text outline-none focus:border-accent"
+          className="max-h-[120px] flex-1 resize-none overflow-y-auto rounded-control border border-border-input bg-bg px-3 py-[9px] text-[13px] leading-[1.45] text-text outline-none focus:border-accent"
         />
         <button
           onClick={onSend}

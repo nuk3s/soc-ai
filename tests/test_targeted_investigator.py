@@ -230,6 +230,84 @@ async def test_raise_arg_type_error_clamps_long_repr(
     assert len(result) <= 600, f"clamped error string must be bounded; got {len(result)} chars"
 
 
+def test_targeted_gap_accepts_new_tool_names() -> None:
+    """The synth can only name tools in the TargetedGap Literal — the three
+    2026-07-04 additions must be nameable or Phase D can never reach them."""
+    for name in ("t_get_rule_content", "t_decode_payload", "t_get_event_raw"):
+        gap = TargetedGap(
+            question="q",
+            tool_name=name,  # type: ignore[arg-type]
+            tool_args={},
+            why_this_matters="w",
+        )
+        assert gap.tool_name == name
+
+
+@pytest.mark.asyncio
+async def test_dispatch_get_rule_content_binds_elastic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase D must dispatch t_get_rule_content with elastic+settings injected."""
+    from soc_ai.agent.targeted_investigator import _dispatch_named_tool
+
+    seen: dict[str, Any] = {}
+
+    async def fake(rule_id: str, *, elastic: Any, settings: Any) -> dict[str, Any]:
+        seen.update(rule_id=rule_id, elastic=elastic, settings=settings)
+        return {"found": True, "content": "alert ..."}
+
+    monkeypatch.setattr("soc_ai.tools.get_rule_content.get_rule_content", fake)
+
+    class _StubCtx:
+        settings = object()
+        elastic = object()
+        auth = object()
+
+    out = await _dispatch_named_tool("t_get_rule_content", {"rule_id": "2054989"}, _StubCtx())
+    assert out == {"found": True, "content": "alert ..."}
+    assert seen["rule_id"] == "2054989"
+    assert seen["elastic"] is _StubCtx.elastic
+
+
+@pytest.mark.asyncio
+async def test_dispatch_get_event_raw_binds_elastic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soc_ai.agent.targeted_investigator import _dispatch_named_tool
+
+    async def fake(event_id: str, *, elastic: Any, settings: Any) -> dict[str, Any]:
+        return {"_ok": event_id}
+
+    monkeypatch.setattr("soc_ai.tools.get_event_raw.get_event_raw", fake)
+
+    class _StubCtx:
+        settings = object()
+        elastic = object()
+        auth = object()
+
+    out = await _dispatch_named_tool("t_get_event_raw", {"event_id": "abc123"}, _StubCtx())
+    assert out == {"_ok": "abc123"}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_decode_payload_runs_pure() -> None:
+    """t_decode_payload needs no ES/auth — the real function must bind and run
+    (the settings injection is dropped by the signature filter)."""
+    import base64
+
+    from soc_ai.agent.targeted_investigator import _dispatch_named_tool
+
+    class _StubCtx:
+        settings = object()
+        elastic = object()
+        auth = object()
+
+    data = base64.b64encode(b"GET / HTTP/1.1\r\nHost: evil.example.com\r\n\r\n").decode()
+    out = await _dispatch_named_tool("t_decode_payload", {"data": data}, _StubCtx())
+    assert isinstance(out, dict)
+    assert out["http_host"] == "evil.example.com"
+
+
 @pytest.mark.asyncio
 async def test_dispatch_es_query_tools_bind_without_auth_typeerror(
     monkeypatch: pytest.MonkeyPatch,

@@ -1,3 +1,4 @@
+import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { type AgentTool, getAgentTools } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -10,7 +11,13 @@ const CATEGORY_ORDER = ['Query', 'Enrichment', 'Web research', 'PCAP', 'Action']
  * the online-enrichment switch). Unavailable tools are greyed with their unmet
  * requirement flagged. Read-only against /config/agent-tools.
  */
-export function AgentToolsPanel() {
+export function AgentToolsPanel({
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+} = {}) {
   const { data, loading, error } = useAsync(getAgentTools, []);
   const tools: AgentTool[] = data?.tools ?? [];
   const groups = CATEGORY_ORDER.map((cat) => ({
@@ -20,7 +27,14 @@ export function AgentToolsPanel() {
 
   return (
     <div id="agent-tools" className="mb-[22px] scroll-mt-6">
-      <div className="mb-1 text-[15px] font-semibold">Agent tools</div>
+      <div className="mb-1 flex items-center gap-2">
+        <div className="text-[15px] font-semibold">Agent tools</div>
+        {onToggleCollapse && (
+          <CollapseChevron collapsed={collapsed} onToggle={onToggleCollapse} label="Toggle Agent tools" />
+        )}
+      </div>
+      {!collapsed && (
+      <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         Every tool the triage & chat agent can call, and what each needs turned on. Greyed tools are
         unavailable until their requirement (○) is met.
@@ -88,6 +102,8 @@ export function AgentToolsPanel() {
           </div>
         ))}
       </div>
+      </>
+      )}
     </div>
   );
 }

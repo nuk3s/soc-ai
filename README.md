@@ -13,7 +13,7 @@
 
 soc-ai reads the alerts on your [Security Onion](https://securityonionsolutions.com/) grid and triages them with an LLM you host yourself. For each alert it pulls the related events, checks what else the host has been doing, runs the indicators against local threat intel, and decodes the packets off the sensor when that's what it takes. Then it hands you a verdict, a confidence number, and the reasoning that got it there.
 
-The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway. Nothing about your network leaves it, and the agent never changes anything on the grid unless a human clicks approve. There's an optional cloud "Oracle" for a second opinion on the hard ones; it's off until you turn it on, and its input is sanitized first.
+The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway. Nothing about your network leaves it, and write-backs stay yours: the agent recommends, you execute — the one exception is an audited auto-acknowledge for high-confidence, low-stakes false positives, on by default and one toggle to turn off. There's an optional cloud "Oracle" for a second opinion on the hard ones; it's off until you turn it on, and its input is sanitized first.
 
 <div align="center">
   <img src="docs/img/screenshot-investigation.png" alt="An investigation: verdict, confidence, the reasoning, recommended actions, and the timeline of how the agent got there" width="900">
@@ -52,7 +52,7 @@ Hunts follow the **same safety model** as investigation: strictly read-only. The
 The whole point is that you stay in control of anything that changes state.
 
 - **Reads run freely:** pulling events, context, enrichment, and packets is safe, so the agent does it without asking.
-- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment. Those only happen when you click approve. The agent can recommend a write, but it can't execute one by itself.
+- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment — the agent recommends them and you execute them with a click. One pragmatic carve-out ships on by default: **confident false positives are auto-acknowledged** (confidence-gated, never on critical/high-severity or malware/exploit-class alerts, every unattended write audited). `auto_ack_fp_enabled=false` turns it off.
 - **Nothing leaves your network without your consent.** The reasoning runs on your own model, on your own hardware. The Oracle (an optional cloud second opinion) is **off by default**, and even when you turn it on, internal hostnames, usernames, and IPs are redacted before anything is sent. Leave it off and the whole pipeline stays on your network.
 
 More detail in [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md).
@@ -71,8 +71,9 @@ else's cloud. soc-ai exists so you don't have to make that trade:
 - **Readable reasoning:** every verdict cites the events it rests on, and no
   true/false-positive call stands without evidence from a tool call. The logic is
   in the open. Read exactly how a verdict was reached, and change it.
-- **A human owns every change:** the agent recommends writes; it never executes one
-  without a click.
+- **You own every change:** the agent recommends writes and you execute them; the
+  one unattended write — the FP auto-ack — is bounded, audited, and yours to
+  switch off.
 
 If you already run Security Onion, soc-ai is the self-hosted way to put a local
 model to work on your queue.
@@ -105,7 +106,7 @@ git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 
 ### Then work an alert in the browser
 
-Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick a detection, hit **Investigate**, and watch the agent work live: it pulls the alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited verdict. Anything it recommends writing back to Security Onion waits behind a one-click human approval:
+Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick a detection, hit **Investigate**, and watch the agent work live: it pulls the alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited verdict. The write-backs it recommends are yours to execute with a click:
 
 <div align="center">
   <img src="docs/img/screenshot-investigation.png" alt="soc-ai web UI: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline" width="900">
@@ -118,7 +119,7 @@ Full Docker options — required mounts, SELinux relabeling, upstream TLS trust 
 ## How it works
 
 <div align="center">
-  <img src="docs/img/architecture.png" alt="Architecture: the analyst drives soc-ai, which reads Security Onion and local intel, reasons with a local model, and writes only what a human approves" width="900">
+  <img src="docs/img/architecture.png" alt="Architecture: the analyst drives soc-ai, which reads Security Onion and local intel, reasons with a local model, and writes only what you allow" width="900">
 </div>
 
 `ANALYST_MODEL` is the one model the agent triages with: whatever your gateway serves (model IDs drift, so re-probe `/v1/models`). The reasoning happens locally. The Oracle path is the only way anything reaches a cloud API, it's opt-in, and it only ever sees sanitized input.
@@ -132,7 +133,7 @@ docs as below, searchable, with dark mode. Build it locally with `uv run --group
 - [docs/AGENT_TOOLS.md](docs/AGENT_TOOLS.md): every tool the agent can call, and the guardrails on them
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the pieces fit together
 - [docs/OQL_PRIMER.md](docs/OQL_PRIMER.md): the query language the agent searches with
-- [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md): the approval flow, audit schema, and Oracle redaction
+- [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md): the write-action flow, the audit schema, and redaction (Oracle + cloud analyst models)
 - [docs/DOCKER.md](docs/DOCKER.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): installing it
 - [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](.github/CONTRIBUTING.md) · [SECURITY.md](.github/SECURITY.md)
 
@@ -148,7 +149,7 @@ cd frontend && npm ci && npm run build   # the React console
 
 ## Where it's headed
 
-1.0 shipped the triage engine and the always-on console. 1.0.1 adds the **Hunt Console** (estate-wide, objective-driven hunting) plus a **backtest harness** that replays the agent against your own already-dispositioned alerts so you can measure agreement before you trust it. Next up: RAG-backed runbook lookup and wider enrichment coverage. Progress and proposals live in the issue tracker.
+1.0 shipped the triage engine and the always-on console. The 1.0.x line added the **Hunt Console** (estate-wide, objective-driven hunting — now with visual summaries and honest visibility-gap reporting), a **backtest harness** that replays the agent against your own already-dispositioned alerts so you can measure agreement before you trust it, live model selection from the gateway, context-window budgeting, and an opt-in **cloud-egress redaction tunnel** for teams that point the analyst model at a hosted provider. Next up: RAG-backed runbook lookup and wider enrichment coverage. Progress and proposals live in the issue tracker.
 
 ## License
 

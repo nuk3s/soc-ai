@@ -42,7 +42,7 @@ async def test_build_mcp_registers_read_tools(settings_kratos: Settings) -> None
 
 @pytest.mark.asyncio
 async def test_build_mcp_excludes_write_tools(settings_kratos: Settings) -> None:
-    """The MCP server MUST NOT expose write tools - the approval flow is FastAPI-only."""
+    """The MCP server MUST NOT expose write tools - the analyst write path is FastAPI-only."""
     elastic = _make_elastic(settings_kratos)
     mcp = build_mcp(settings_kratos, elastic)
 

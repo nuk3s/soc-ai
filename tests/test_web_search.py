@@ -180,12 +180,9 @@ async def test_connect_error_graceful() -> None:
 
 def test_wiring_dispatch_and_literal() -> None:
     # dispatch table includes t_web_search → web_search
-    import inspect
-
     from soc_ai.agent import targeted_investigator as ti
 
-    src = inspect.getsource(ti._dispatch_named_tool)
-    assert '"t_web_search": web_search' in src
+    assert ti._dispatch_table()["t_web_search"] is web_search
     # TargetedGap.tool_name Literal includes it
     from soc_ai.agent.triage import TargetedGap
 

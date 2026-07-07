@@ -41,6 +41,8 @@ _TL_GROUP = {
     # consequence, not an investigative tool call — a "no tools" heuristic run
     # must not grow a "Tool calls" timeline section from its own auto-ack.
     "auto_ack": "Decision",
+    # Proactive context budgeting happens during prefetch assembly.
+    "context_trimmed": "Prefetch & pivots",
 }
 # Write-action tools (ack/escalate/comment): their tool_call rows belong under
 # "Decision" too — they act on the verdict rather than investigate.
@@ -107,8 +109,11 @@ def _alert_meta(
         "dst": _ep(alert.get("destination_ip"), alert.get("destination_port")),
         "proto": _proto(alert),
         "action": alert.get("alert_action") or alert.get("event_action") or "—",
-        "firstSeen": "—",
-        "lastSeen": inv.created_at.isoformat(sep=" ", timespec="seconds"),
+        # The alert's own @timestamp (tz-aware ISO, stored with the context) —
+        # the detection's real fire time. The old shape surfaced the
+        # INVESTIGATION's created_at as "last seen", which never correlated
+        # with the alert (an alert triaged hours later showed the triage time).
+        "time": alert.get("timestamp"),
         "count": int(host_profile.get(rule, 1) or 1),
     }
 
@@ -143,25 +148,71 @@ def _host_signals(host_profile: dict[str, int]) -> list[dict[str, Any]]:
     return out
 
 
+def _peer_sub(enr: dict[str, Any]) -> str | None:
+    """The most informative one-line locator enrichment offers for a graph node:
+    country + ASN ("US · AS13335 Cloudflare") > cloud provider > "internal"."""
+    if enr.get("internal"):
+        return "internal"
+    geo_raw = enr.get("geoip")
+    geo: dict[str, Any] = geo_raw if isinstance(geo_raw, dict) else {}
+    asn_raw = enr.get("asn")
+    asn: dict[str, Any] = asn_raw if isinstance(asn_raw, dict) else {}
+    parts: list[str] = []
+    # Stored contexts carry the dataclass shape (country_iso / number / org);
+    # tool-result payloads use country_name / asn / asn_org — accept both.
+    country = geo.get("country_iso") or geo.get("country_name")
+    if country:
+        parts.append(str(country))
+    org = asn.get("org") or asn.get("asn_org")
+    num = asn.get("number") or asn.get("asn")
+    if org:
+        parts.append(f"AS{num} {org}" if num else str(org))
+    if parts:
+        return " · ".join(parts)
+    if enr.get("cloud_provider"):
+        return str(enr["cloud_provider"])
+    return None
+
+
+def _flag_sources(enr: dict[str, Any]) -> list[str]:
+    """Names of the intel sources that flagged the indicator (bounded for a badge)."""
+    srcs: list[str] = []
+    for h in enr.get("blocklist_hits") or []:
+        s = h.get("source") if isinstance(h, dict) else None
+        if s and str(s) not in srcs:
+            srcs.append(str(s))
+    if enr.get("misp_hits") and "MISP" not in srcs:
+        srcs.append("MISP")
+    return srcs[:3]
+
+
 def _entity_graph(
     alert: dict[str, Any], enrichments: dict[str, Any], inv: Investigation
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
     """A real (if small) blast-radius graph: the host, the peers it contacted,
-    and which of those enrichment flagged as malicious."""
+    and which of those enrichment flagged as malicious. Nodes carry the facts
+    enrichment already established (sub-label + intel flag sources) and edges
+    carry the flow's port/proto, so the diagram answers "who, where, why
+    flagged" at a glance instead of just drawing dots."""
     src = alert.get("source_ip") or inv.src_ip
     dst = alert.get("destination_ip") or inv.dest_ip
     label = alert.get("host_name") or src
     if not src:
         return [], [], None
-    nodes: list[dict[str, Any]] = [
-        {
-            "id": str(src),
-            "x": 20,
-            "y": 50,
-            "kind": "compromised" if inv.verdict == "true_positive" else "host",
-            "label": str(label or src),
-        }
-    ]
+    src_enr = enrichments.get(str(src)) or {}
+    src_node: dict[str, Any] = {
+        "id": str(src),
+        "x": 20,
+        "y": 50,
+        "kind": "compromised" if inv.verdict == "true_positive" else "host",
+        "label": str(label or src),
+        "sub": "source · internal" if src_enr.get("internal") else "source",
+    }
+    src_flags = _flag_sources(src_enr)
+    if src_flags:
+        src_node["flagged"] = True
+        src_node["flagSources"] = src_flags
+    nodes: list[dict[str, Any]] = [src_node]
     peers: list[str] = []
     if dst and dst != src:
         peers.append(str(dst))
@@ -170,20 +221,42 @@ def _entity_graph(
             peers.append(str(ind))
     peers = peers[:5]
     edges: list[dict[str, Any]] = []
-    flagged = 0
+    flagged_names: list[str] = []
     n = len(peers)
     for i, ip in enumerate(peers):
         enr = enrichments.get(ip) or {}
         bad = bool(enr.get("blocklist_hits") or enr.get("misp_hits"))
         internal = bool(enr.get("internal"))
         if bad:
-            flagged += 1
+            flagged_names.append(ip)
         y = 50 if n <= 1 else int(18 + 64 * i / (n - 1))
-        node_kind = "c2" if bad else "dc" if internal else "host"
-        nodes.append({"id": ip, "x": 78, "y": y, "kind": node_kind, "label": ip})
-        edges.append({"from": str(src), "to": ip, "kind": "beacon" if bad else "flow"})
+        # "internal" (green square), never "dc" — nothing in enrichment can know
+        # a host is a domain controller, and mislabeling one erodes trust fast.
+        node_kind = "c2" if bad else "internal" if internal else "host"
+        node: dict[str, Any] = {"id": ip, "x": 78, "y": y, "kind": node_kind, "label": ip}
+        sub = _peer_sub(enr)
+        if sub:
+            node["sub"] = sub
+        if bad:
+            node["flagged"] = True
+            node["flagSources"] = _flag_sources(enr)
+        nodes.append(node)
+        edge: dict[str, Any] = {"from": str(src), "to": ip, "kind": "beacon" if bad else "flow"}
+        # The alert's primary flow carries its real port/proto (":443 TLS");
+        # peers known only from enrichment carry a neutral "observed".
+        if dst and ip == str(dst):
+            port = alert.get("destination_port")
+            if port not in (None, ""):
+                proto = _proto(alert)
+                edge["label"] = f":{port} {proto}" if proto != "—" else f":{port}"
+        else:
+            edge["label"] = "observed"
+        edges.append(edge)
     note = f"{label or src} contacted {n} peer(s)" + (
-        f"; {flagged} flagged malicious by enrichment" if flagged else ""
+        f"; {len(flagged_names)} flagged malicious by enrichment"
+        f" ({_compact(', '.join(flagged_names), 60)})"
+        if flagged_names
+        else ""
     )
     return nodes, edges, note
 
@@ -389,6 +462,8 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
         return _compact(p.get("message") or p.get("error") or "", 240)
     if kind == "session_start":
         return f"pipeline: {p.get('pipeline', '?')}"
+    if kind == "context_trimmed":
+        return _compact(p.get("detail") or "", 300)
     return _compact(p, 220)
 
 
@@ -397,6 +472,8 @@ class RecommendedActionOut(BaseModel):
     title: str
     tag: str
     rationale: str
+    # Always None/False since the approval gate was removed — kept because the
+    # frontend still reads these fields (its removal is a separate task).
     token: str | None = None
     pending: bool = False
     # True when this action was already carried out by the system (e.g. auto-ack
@@ -561,11 +638,10 @@ def _executed_actions(events: list[Any]) -> dict[int, dict[str, Any]]:
 def _build_actions(
     events: list[Any],
     report: dict[str, Any],
-    pending_tokens: set[Any],
     *,
     alert_acked: bool = False,
 ) -> list[RecommendedActionOut]:
-    """Recommended actions: prefer live approval tokens, else report recommendations.
+    """Recommended actions from historical approval events or report recommendations.
 
     An ack action already carried out by auto-ack is flagged ``applied`` so the UI
     never offers an "Acknowledge" button for an alert the system already acked.
@@ -584,6 +660,9 @@ def _build_actions(
             return "Already acknowledged"
         return None
 
+    # Historical approval-gate events (the gate was removed; old DB rows still
+    # carry them). Render the recommendation, permanently non-actionable:
+    # no token, never pending — there is no /approve endpoint to redeem one.
     approval_events = [e for e in events if e.kind in ("approval_request", "approval_required")]
     out: list[RecommendedActionOut] = []
     if approval_events:
@@ -597,9 +676,8 @@ def _build_actions(
                     title=_ACTION_TITLE.get(tn, tn or "Action"),
                     tag=_ACTION_TAG.get(tn, "comment"),
                     rationale=ev.payload.get("rationale", ""),
-                    # An already-applied action exposes no live token to act on.
-                    token=None if applied else tok,
-                    pending=False if applied else (tok in pending_tokens if tok else False),
+                    token=None,
+                    pending=False,
                     applied=applied,
                     appliedNote=_ack_note(tn) if applied else None,
                 )

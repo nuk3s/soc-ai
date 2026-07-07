@@ -24,8 +24,6 @@ Counters / gauges exposed:
   counts, for spotting which read tools are hot or broken.
 - ``socai_llm_tokens_total`` (labeled by ``phase``, ``direction``) —
   cumulative token usage; ``direction`` is ``input`` / ``output``.
-- ``socai_pending_approvals`` (gauge) — current count of pending
-  approvals in the gate.
 
 The orchestrator's ``audit`` plumbing already produces every input;
 we just keep a small in-process counter set that ``/metrics``
@@ -92,7 +90,7 @@ def _esc(label_value: str) -> str:
     return label_value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def render(version: str, pending_approvals: int) -> str:
+def render(version: str) -> str:
     """Return the full Prometheus exposition text for the current state."""
     m = get_metrics()
     lines: list[str] = []
@@ -150,10 +148,6 @@ def render(version: str, pending_approvals: int) -> str:
         lines.append(
             f'socai_llm_tokens_total{{phase="{_esc(phase)}",direction="{_esc(direction)}"}} {count}'
         )
-
-    lines.append("# HELP socai_pending_approvals Pending approval-gate tokens.")
-    lines.append("# TYPE socai_pending_approvals gauge")
-    lines.append(f"socai_pending_approvals {pending_approvals}")
 
     lines.append("")  # trailing newline
     return "\n".join(lines)

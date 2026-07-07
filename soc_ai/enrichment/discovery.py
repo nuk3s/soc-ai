@@ -70,12 +70,33 @@ as a lookup would not be. Reserved-default suffixes (``lan``/``local``/``corp``/
 (``*.in-addr.arpa``/``*.ip6.arpa``) names are skipped (a pointer record is never a
 host's identity).
 
+**Junk-host hardening:** before classification, bare-host candidates that can
+never be a real hostname are dropped outright (counted in
+``summary.dropped_junk_hosts``): IP literals (anything ``ipaddress.ip_address``
+parses, incl. link-local IPv6 observed as a "host"), bare public-TLD strings
+("com"/"io" as a host.name is a parsing artifact), and NetBIOS/browser-service
+junk (``WORKGROUP``, ``__MSBROWSE__`` announcements, values carrying literal
+``\\x``-escape bytes). See :func:`_junk_host_reason`.
+
+**Vestigial retirement sweep:** at the end of each scan the existing
+``source='detected'`` rows are walked and rows the CURRENT rules can no longer
+produce are auto-dismissed (``state='dismissed'`` — a terminal tombstone hidden
+from the UI, never resurrected by a scan; see
+``soc_ai.store.internal_identifiers``): machine-GUID ``.{uuid}.<tld>`` suffixes
+(any state), junk hosts per the rules above (any state), and *muted* public
+registrable suffixes that this scan did not re-produce (the lookup-only-public
+drop means the suggestion is unsupported noise). ACTIVE public suffixes are
+never swept (an operator may have activated a legit corp domain) and
+``manual`` rows are never touched. Counted in ``summary.retired``; fail-soft
+like the rest of the scan. See :func:`_retire_vestigial_rows`.
+
 Graceful degradation: a missing field / mapping or an ES error on one sub-query
 is caught, recorded in ``summary.errors``, and the scan continues with whatever
 other signal is available. Zero yield is a valid result — never crash the scan.
 
 ``upsert_detected`` only ever **adds/refreshes**; it preserves an operator's
-mute/unmute across scans (a muted detected row is a tombstone).
+mute/unmute across scans (a muted detected row is a tombstone) and returns a
+dismissed row untouched (a terminal tombstone).
 """
 
 from __future__ import annotations
@@ -92,7 +113,7 @@ from typing import TYPE_CHECKING, Any
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.so_client import fields
 from soc_ai.so_client.fields import resolve_agg_field
-from soc_ai.store.internal_identifiers import upsert_detected
+from soc_ai.store.internal_identifiers import list_identifiers, upsert_detected
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -207,6 +228,11 @@ class DiscoverySummary:
     suffixes_muted: int = 0
     cidrs_found: int = 0
     cidrs_suggested: int = 0
+    # Bare-host candidates dropped by the junk-host hardening (IP literals,
+    # bare public TLDs, NetBIOS junk) before classification.
+    dropped_junk_hosts: int = 0
+    # Existing detected rows auto-dismissed by the vestigial retirement sweep.
+    retired: int = 0
     started_at: str | None = None
     finished_at: str | None = None
     errors: list[str] = field(default_factory=list)
@@ -400,6 +426,48 @@ def classify_host(candidate: _Candidate, min_hosts: int) -> str:
     if not candidate.associated:
         return "muted"
     return "active" if candidate.host_count >= min_hosts else "muted"
+
+
+def _junk_host_reason(value: str) -> str | None:
+    """Return a drop reason iff *value* is junk as a bare-host identifier.
+
+    Junk hosts are parsing/protocol artifacts that can never be a real
+    hostname; tracking them (even as muted suggestions) is pure noise:
+
+    * ``ip-literal`` — anything ``ipaddress.ip_address`` parses, including
+      link-local IPv6 (``fe80::…`` seen as a bare "host" is an address, not a
+      name; ``host.name`` sometimes carries the IP).
+    * ``bare-public-tld`` — a bare public-TLD string ("com"/"io") as a
+      host.name is an FQDN-parsing artifact, never a machine's name. Uses the
+      same vendored IANA snapshot as the suffix classifier, so a reserved
+      single label ("lan"/"corp") is NOT junk here.
+    * ``netbios-*`` — NetBIOS/browser-service junk: the ``WORKGROUP`` default
+      group name (case-insensitive), master-browser announcements containing
+      ``__MSBROWSE__``, or any value carrying a literal backslash-x escape
+      sequence (non-printable NetBIOS suffix bytes rendered as text, e.g.
+      ``\\x01\\x02__MSBROWSE__\\x02``).
+
+    Returns ``None`` for a legitimate candidate.
+    """
+    v = value.strip()
+    if not v:
+        return "empty"
+    try:
+        ipaddress.ip_address(v)
+    except ValueError:
+        pass
+    else:
+        return "ip-literal"
+    upper = v.upper()
+    if upper == "WORKGROUP":
+        return "netbios-workgroup"
+    if "__MSBROWSE__" in upper:
+        return "netbios-msbrowse"
+    if "\\x" in v.lower():
+        return "netbios-escape"
+    if v.lower() in _load_public_tlds():
+        return "bare-public-tld"
+    return None
 
 
 def _internal_source_filter(cidrs: list[IpNetwork]) -> dict[str, Any]:
@@ -927,6 +995,77 @@ def _evidence(cand: _Candidate) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Vestigial retirement sweep
+# ---------------------------------------------------------------------------
+
+
+async def _retire_vestigial_rows(
+    db: AsyncSession,
+    scan_suffix_values: set[str],
+    summary: DiscoverySummary,
+) -> None:
+    """Auto-dismiss existing detected rows the CURRENT rules can no longer produce.
+
+    ``upsert_detected`` preserves rows forever, so junk created by scans that
+    ran BEFORE a classifier rule shipped lingers as un-killable suggestions
+    (the operator can only mute them). This sweep tombstones them
+    (``state='dismissed'`` + an ``evidence["retired"]`` reason) so they vanish
+    from the UI and are never resurrected. The rules:
+
+    * ``suffix`` rows (ANY state, incl. active) matching
+      :func:`_is_machine_guid_suffix` — provably junk; the classifier drops
+      machine-GUID names outright, so even an active row is a pre-rule leftover.
+    * ``host`` rows (ANY state) matching the junk-host drop rules
+      (:func:`_junk_host_reason`) — same reasoning.
+    * ``suffix`` rows with ``state=='muted'`` where
+      :func:`is_public_registrable` is true AND the value is NOT among
+      *scan_suffix_values* (the suffixes THIS scan classified and upserted) —
+      the lookup-only-public drop means the current rules produce nothing for
+      them, so the muted suggestion is unsupported noise. ACTIVE public
+      suffixes are NEVER touched here: an operator may have activated a
+      legitimate corp domain.
+
+    ``source=='manual'`` rows are never touched anywhere in the sweep — an
+    operator's explicit entry outranks any rule. Already-dismissed rows are
+    excluded up front (``list_identifiers`` default), keeping the sweep
+    idempotent. Runs in the scan's own DB session; the caller wraps it
+    fail-soft (a sweep error is recorded, never crashes the scan).
+    """
+    rows = await list_identifiers(db)  # excludes already-dismissed tombstones
+    retired = 0
+    for row in rows:
+        if row.source != "detected":
+            continue  # NEVER touch manual rows
+        reason: str | None = None
+        if row.kind == "suffix" and _is_machine_guid_suffix(row.value):
+            reason = "machine-guid suffix — rule added after this row was detected"
+        elif row.kind == "host":
+            junk = _junk_host_reason(row.value)
+            if junk is not None:
+                reason = f"junk host ({junk}) — rule added after this row was detected"
+        elif (
+            row.kind == "suffix"
+            and row.state == "muted"
+            and is_public_registrable(row.value)
+            and row.value not in scan_suffix_values
+        ):
+            reason = (
+                "lookup-only public domain — dropped by current rules and not produced by this scan"
+            )
+        if reason is None:
+            continue
+        row.state = "dismissed"
+        # Reassign rather than mutate in place: plain JSON columns don't track
+        # in-place mutation, so an in-place update would silently not persist.
+        row.evidence = {**(row.evidence or {}), "retired": reason}
+        _LOGGER.info("discovery: retired %s %r: %s", row.kind, row.value, reason)
+        retired += 1
+    if retired:
+        await db.commit()
+    summary.retired += retired
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -943,11 +1082,16 @@ async def run_discovery(
     answers (associated), forward records that resolve to an internal IP
     (associated — the strongest signal) + raw DNS query names (not associated)
     over internal-source events in the lookback window, classifies each
-    candidate, and upserts via :func:`upsert_detected`. CIDR discovery is
-    additionally corroborated by Zeek's ``connection.local.originator``/
-    ``responder`` flags. Returns a :class:`DiscoverySummary`. Never raises on a
-    bad sub-query — degrades and records the error. ``started_at``/
-    ``finished_at`` are stamped here.
+    candidate, and upserts via :func:`upsert_detected`. Junk bare-host
+    candidates (IP literals, bare public TLDs, NetBIOS artifacts — see
+    :func:`_junk_host_reason`) are dropped before classification. CIDR
+    discovery is additionally corroborated by Zeek's
+    ``connection.local.originator``/``responder`` flags. After the upserts, a
+    fail-soft retirement sweep (:func:`_retire_vestigial_rows`) auto-dismisses
+    detected rows that only pre-current-rule scans could have produced.
+    Returns a :class:`DiscoverySummary`. Never raises on a bad sub-query —
+    degrades and records the error. ``started_at``/``finished_at`` are stamped
+    here.
     """
     summary = DiscoverySummary(started_at=datetime.now(UTC).isoformat())
 
@@ -979,12 +1123,17 @@ async def run_discovery(
     cidr_candidates = await _discover_cidrs(es_client, index, cidrs, lookback, summary)
 
     # 4. Classify + upsert.
+    #    scan_suffix_values collects the NORMALIZED suffix values this scan
+    #    classified and upserted — the retirement sweep (step 5) treats a muted
+    #    public suffix NOT in this set as unsupported by the current rules.
+    scan_suffix_values: set[str] = set()
     async with db_sessionmaker() as db:
         for cand in suffixes.values():
             state = classify_suffix(cand, min_hosts)
             if state is None:
                 continue  # dropped (reserved default)
-            await upsert_detected(db, "suffix", "." + cand.value, _evidence(cand), state)
+            row = await upsert_detected(db, "suffix", "." + cand.value, _evidence(cand), state)
+            scan_suffix_values.add(row.value)
             summary.suffixes_found += 1
             if state == "active":
                 summary.suffixes_active += 1
@@ -992,6 +1141,13 @@ async def run_discovery(
                 summary.suffixes_muted += 1
 
         for cand in hosts.values():
+            # Junk-host hardening: an IP literal / bare public TLD / NetBIOS
+            # artifact can never be a real hostname — drop before classification.
+            junk = _junk_host_reason(cand.value)
+            if junk is not None:
+                _LOGGER.debug("discovery: dropped junk host candidate %r (%s)", cand.value, junk)
+                summary.dropped_junk_hosts += 1
+                continue
             state = classify_host(cand, min_hosts)
             await upsert_detected(db, "host", cand.value, _evidence(cand), state)
             summary.hosts_found += 1
@@ -1003,6 +1159,14 @@ async def run_discovery(
             await upsert_detected(db, "cidr", cidr_cand.network, _cidr_evidence(cidr_cand), "muted")
             summary.cidrs_found += 1
             summary.cidrs_suggested += 1
+
+        # 5. Vestigial retirement sweep (fail-soft, same session): auto-dismiss
+        #    detected rows the current rules can no longer produce.
+        try:
+            await _retire_vestigial_rows(db, scan_suffix_values, summary)
+        except Exception as exc:
+            summary.errors.append(f"retirement sweep: {type(exc).__name__}: {exc}")
+            _LOGGER.warning("discovery: retirement sweep failed: %s", exc)
 
     summary.finished_at = datetime.now(UTC).isoformat()
     return summary

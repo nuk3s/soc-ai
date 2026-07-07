@@ -104,6 +104,18 @@ async def test_query_detections_full_text(
     assert len(detections) == 1
     assert detections[0].title == "ET MALWARE Suspicious User-Agent"
     assert fake_es.search.call_args.kwargs["index"] == settings_kratos.detections_index_pattern
+    should = fake_es.search.call_args.kwargs["body"]["query"]["bool"]["should"]
+    # Flat/legacy docs + the text-mapped SO 3.x rule body get full-text search…
+    mm = next(c["multi_match"] for c in should if "multi_match" in c)
+    assert mm["query"] == "ET MALWARE"
+    assert "so_detection.content" in mm["fields"]
+    # …while the keyword-mapped SO 3.x metadata needs case-insensitive wildcards
+    # (a multi_match on a keyword field only hits on the EXACT full value).
+    wc = next(
+        c["wildcard"] for c in should if "wildcard" in c and "so_detection.title" in c["wildcard"]
+    )
+    assert wc["so_detection.title"]["case_insensitive"] is True
+    assert "ET MALWARE" in wc["so_detection.title"]["value"]
 
 
 @pytest.mark.asyncio
@@ -112,6 +124,38 @@ async def test_query_detections_match_all(settings_kratos: Settings) -> None:
     await query_detections("*", elastic=elastic, settings=settings_kratos)
     body = fake_es.search.call_args.kwargs["body"]
     assert body["query"] == {"match_all": {}}
+
+
+@pytest.mark.asyncio
+async def test_query_detections_nested_so3_doc(settings_kratos: Settings) -> None:
+    """Live SO 3.x nests the detection under ``so_detection.*`` — both the
+    search fields and the doc parser must handle that shape (the flat fixture
+    shape hid a live-grid zero-results bug)."""
+    nested = {
+        "so_kind": "detection",
+        "so_detection": {
+            "id": "uuid-1",
+            "publicId": "2054989",
+            "title": "ET MALWARE Possible BPFDoor ICMP Activity",
+            "severity": "high",
+            "engine": "suricata",
+            "isEnabled": True,
+            "author": "Emerging Threats",
+            "tags": ["malware"],
+        },
+    }
+    elastic, fake_es = _make_elastic(settings_kratos, [_hits([_doc(nested)])])
+
+    detections = await query_detections("BPFDoor", elastic=elastic, settings=settings_kratos)
+
+    assert len(detections) == 1
+    assert detections[0].title == "ET MALWARE Possible BPFDoor ICMP Activity"
+    assert detections[0].id == "uuid-1"
+    assert detections[0].publicId == "2054989"
+    # Both shapes searched: flat fields full-text + nested keyword wildcards.
+    body = str(fake_es.search.call_args.kwargs["body"])
+    assert "so_detection.title" in body
+    assert "'title'" in body
 
 
 # =====================================================================

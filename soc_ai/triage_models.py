@@ -5,9 +5,9 @@ this shape - PydanticAI ensures the model emits valid JSON or retries.
 
 Recommended actions are **suggestions only** in v1 - they map to write
 tools (``ack_alert`` / ``escalate_to_case`` / ``add_case_comment``) but
-never auto-execute. The orchestrator emits one ``approval_required`` SSE
-event per recommended action; the user approves selectively via
-``POST /approve``.
+never auto-execute. They surface in the report, and the analyst executes
+them selectively through the actions API
+(``POST /api/v1/investigations/{id}/actions/{index}/execute``).
 
 These models live at the package root (below both ``soc_ai.agent`` and
 ``soc_ai.oracle``) so consumers like the Oracle client can import the report
@@ -33,9 +33,9 @@ Verdict = Literal["true_positive", "false_positive", "needs_more_info", "inconcl
 
 
 class RecommendedAction(BaseModel):
-    """One write-tool invocation the agent recommends, pending user approval."""
+    """One write-tool invocation the agent recommends for the analyst to execute."""
 
-    tool_name: WriteToolName = Field(description="Which write tool to invoke if approved.")
+    tool_name: WriteToolName = Field(description="Which write tool the analyst should invoke.")
     tool_args: dict[str, Any] = Field(
         default_factory=dict,
         description="Arguments to pass to the tool. Must match the tool's signature.",
@@ -202,6 +202,9 @@ class TargetedGap(BaseModel):
         "t_lookup_runbook",
         "t_query_cases",
         "t_query_detections",
+        "t_get_rule_content",
+        "t_get_event_raw",
+        "t_decode_payload",
         "t_get_pcap",
         "t_web_search",
         "t_crawl_page",
@@ -249,9 +252,9 @@ class TriageReport(BaseModel):
     recommended_actions: list[RecommendedAction] = Field(
         default_factory=list,
         description=(
-            "Write-tool invocations recommended for analyst approval. "
-            "DO NOT execute these automatically - the orchestrator surfaces each "
-            "for explicit human consent."
+            "Write-tool invocations recommended for the analyst to execute. "
+            "DO NOT execute these automatically - each runs only on an "
+            "explicit analyst action."
         ),
     )
     field_reconciliation: str | None = Field(

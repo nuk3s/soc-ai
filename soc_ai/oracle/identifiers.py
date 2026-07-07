@@ -116,6 +116,10 @@ async def effective_internal_identifiers(
     floor) regardless, so a muted reserved/env-default suffix is still redacted
     (fail-safe). See the module docstring for the full contract.
     """
+    # list_identifiers excludes dismissed tombstones by default, and the
+    # active/muted branches below ignore any other state (defense-in-depth):
+    # a dismissed row contributes NOTHING to the effective set — it neither
+    # activates nor subtracts an env default the way a muted row does.
     rows = await list_identifiers(db)
     active: dict[str, list[str]] = {"suffix": [], "host": [], "cidr": []}
     muted: dict[str, set[str]] = {"suffix": set(), "host": set(), "cidr": set()}

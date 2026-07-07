@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { type ApiKeyField, clearApiKey, getApiKeys, saveApiKey } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -8,7 +9,13 @@ import { useAsync } from '../lib/useAsync';
  * Values are Fernet-encrypted at rest, never returned to the client, and applied
  * live (no restart). Sits next to Data sources in the config console.
  */
-export function ApiKeysPanel() {
+export function ApiKeysPanel({
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+} = {}) {
   const [reload, setReload] = useState(0);
   const { data, loading, error } = useAsync(getApiKeys, [reload]);
   const [editKey, setEditKey] = useState<string | null>(null);
@@ -55,7 +62,14 @@ export function ApiKeysPanel() {
 
   return (
     <div id="api-keys" className="mb-[22px] scroll-mt-6">
-      <div className="mb-1 text-[15px] font-semibold">API keys</div>
+      <div className="mb-1 flex items-center gap-2">
+        <div className="text-[15px] font-semibold">API keys</div>
+        {onToggleCollapse && (
+          <CollapseChevron collapsed={collapsed} onToggle={onToggleCollapse} label="Toggle API keys" />
+        )}
+      </div>
+      {!collapsed && (
+      <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         Provider keys for the opt-in online enrichment tools. Stored encrypted, write-only (never
         shown again) and applied live — no restart. Turn on the master switch under "Online
@@ -153,6 +167,8 @@ export function ApiKeysPanel() {
           );
         })}
       </div>
+      </>
+      )}
     </div>
   );
 }

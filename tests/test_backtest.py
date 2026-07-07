@@ -294,13 +294,9 @@ async def _fake_investigate(
     alert_id: str,
     *,
     ctx: Any,
-    agent: Any = None,
-    investigator: Any = None,
-    synthesizer: Any = None,
-    session_id: str | None = None,
     focus_hint: str | None = None,
 ) -> AsyncIterator[StepEvent]:
-    sid = session_id or "fake-bt-sid"
+    sid = "fake-bt-sid"
     yield StepEvent(
         kind="session_start", session_id=sid, sequence=1, payload={"alert_id": alert_id}
     )

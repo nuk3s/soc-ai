@@ -59,8 +59,8 @@ paths — is in [Docker deployment](DOCKER.md).
 Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick
 a detection, hit **Investigate**, and watch the agent work live: it pulls the
 alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited
-verdict. Anything it recommends writing back to Security Onion waits behind a one-click
-human approval.
+verdict. Anything it recommends writing back to Security Onion waits in the report as a
+recommended action until you execute it with one click.
 
 ![soc-ai web UI: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline](img/screenshot-investigation.png)
 
@@ -68,4 +68,4 @@ Next steps:
 
 - [Web console guide](WEBUI_GUIDE.md): triage, auto-triage, investigations, the admin config page
 - [Agent tools](AGENT_TOOLS.md): every tool the agent can call, and the guardrails on them
-- [Safety model](SAFETY_MODEL.md): the approval flow, audit schema, and Oracle redaction
+- [Safety model](SAFETY_MODEL.md): the analyst write path, audit schema, and Oracle redaction

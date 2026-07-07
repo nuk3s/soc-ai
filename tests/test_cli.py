@@ -318,3 +318,28 @@ def test_stream_investigation_renders_done_event(
     out = _strip_ansi(capsys.readouterr().out)
     assert "done" in out
     assert "recommended_count=0" in out
+
+
+def test_python_dash_m_invocation_runs_main() -> None:
+    """``python -m soc_ai.cli …`` must execute main(), not silently import-and-exit-0.
+
+    Live-test regression (2026-07-04): without a ``__main__`` guard the module
+    invocation imported cli.py, did nothing, and exited 0 — a triage command
+    that "succeeded" without ever contacting the API.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "soc_ai.cli", "healthz", "--url", "https://127.0.0.1:1"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    # main() running means the unreachable healthz URL fails loudly (non-zero);
+    # the silent-import bug exits 0 with no output.
+    assert proc.returncode != 0, (
+        f"expected a non-zero exit from an unreachable healthz, got 0 "
+        f"(stdout={proc.stdout!r}, stderr={proc.stderr!r})"
+    )

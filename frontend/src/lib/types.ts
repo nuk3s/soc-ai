@@ -105,7 +105,8 @@ export interface RecommendedAction {
   title: string;
   tag: ActionTag;
   rationale: string;
-  /** live approval-gate token — present only while the action is actionable. */
+  /** LEGACY (removed approval gate): always null/false from current backends;
+   *  kept for wire-compat with old exports. Never actionable. */
   token?: string;
   pending?: boolean;
   /** already carried out by the system (e.g. auto-ack) — render done, not actionable. */
@@ -143,7 +144,7 @@ export interface ChatMessage {
   proposal?: VerdictProposal;
 }
 
-export type EntityKind = 'compromised' | 'c2' | 'dc' | 'host';
+export type EntityKind = 'compromised' | 'c2' | 'internal' | 'host';
 export type EdgeKind = 'beacon' | 'lateral' | 'flow' | 'enrich';
 
 export interface GraphNode {
@@ -153,6 +154,12 @@ export interface GraphNode {
   y: number;
   kind: EntityKind;
   label: string;
+  /** short locator line under the label ("US · AS13335 Cloudflare" / "internal"). */
+  sub?: string;
+  /** true when threat intel (blocklist/MISP) flagged this entity. */
+  flagged?: boolean;
+  /** intel sources behind the flag (bounded server-side; shown in the tooltip). */
+  flagSources?: string[];
 }
 
 export interface GraphEdge {
@@ -220,8 +227,8 @@ export interface AlertMeta {
   dst: string;
   proto: string;
   action: string; // 'allowed' | 'blocked'
-  firstSeen: string;
-  lastSeen: string;
+  /** The alert's own @timestamp (ISO) — when the detection actually fired. */
+  time?: string | null;
   count: number;
 }
 
@@ -293,6 +300,8 @@ export interface HuntRow {
   startedBy: string;
   when: string;
   ts: string;
+  /** Follow-up chat messages on this hunt (0 = no chat log). */
+  chatCount?: number;
 }
 
 export interface HuntStat {
@@ -307,6 +316,9 @@ export interface HuntFinding {
   title: string;
   detail: string;
   severity: string;
+  /** 'threat' | 'visibility_gap' | 'observation' — only threat findings drive
+   *  the "Malicious/Suspicious activity found" disposition headline. */
+  category?: string;
   hosts: string[];
   citations: string[];
 }

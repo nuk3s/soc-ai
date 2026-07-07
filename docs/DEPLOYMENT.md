@@ -313,7 +313,6 @@ triage_report  FALSE_POSITIVE  confidence=0.7
    The alert triggered on a DNS query for a-us.storyblok.com …
    citations: alert-KDG7CZ4BVBs3R9hXQbPY, event-lTG7CZ4BVBs3R9hXaLP3
    → ack_alert (Alert is benign DHCP traffic; can be acknowledged…)
-approval_required ack_alert  token='…'
 done           recommended_count=1 rounds=1
 ```
 

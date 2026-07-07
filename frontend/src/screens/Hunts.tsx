@@ -1,4 +1,4 @@
-import { Check, Crosshair, Loader2, Plus, Sparkles, Trash2, X } from 'lucide-react';
+import { Check, Crosshair, Loader2, MessageSquare, Plus, Sparkles, Trash2, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Panel } from '../components/Panel';
@@ -256,6 +256,15 @@ export function Hunts() {
               <div className="flex items-center gap-2 truncate">
                 <Crosshair size={14} className="flex-none text-accent" />
                 <span className="truncate text-[13px] text-text">{h.objective}</span>
+                {(h.chatCount ?? 0) > 0 && (
+                  <span
+                    className="flex flex-none items-center gap-[4px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-accent"
+                    title={`${h.chatCount} chat message${h.chatCount === 1 ? '' : 's'}`}
+                  >
+                    <MessageSquare size={10} />
+                    {h.chatCount}
+                  </span>
+                )}
               </div>
               <div className="text-[13px] tabular-nums text-text-2">{h.findingCount}</div>
               <div className="text-[13px] tabular-nums text-text-2">{h.affectedHosts}</div>

@@ -70,3 +70,6 @@ data/
 
 # Claude Code local state (worktrees, settings.local, remember)
 .claude/
+
+# eval batch artifacts (large; deploy already excludes) — repo-root only
+/evals/

@@ -16,8 +16,10 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Callable
 from typing import Any, NoReturn, cast
 
+from soc_ai.agent.toolset import PHASE_D_TOOLS
 from soc_ai.agent.triage import TargetedGap
 
 _LOGGER = logging.getLogger(__name__)
@@ -74,16 +76,19 @@ def _raise_arg_type_error(tool_name: str, args: dict[str, Any], cause: TypeError
     ) from cause
 
 
-async def _dispatch_named_tool(  # noqa: PLR0915 - a flat tool→callable dispatch table; splitting hurts readability
-    tool_name: str,
-    tool_args: dict[str, Any],
-    ctx: Any,
-) -> dict[str, Any]:
-    """Map tool_name → callable; invoke with kwargs. Imported lazily to dodge cycles."""
+def _dispatch_table() -> dict[str, Callable[..., Any]]:
+    """The Phase-D tool_name → callable table. Imported lazily to dodge cycles.
+
+    Its key set is drift-tested against :data:`PHASE_D_TOOLS`
+    (tests/test_toolset.py) — add new Phase-D tools in BOTH places.
+    """
     from soc_ai.tools.crawl_page import crawl_page  # noqa: PLC0415
+    from soc_ai.tools.decode_payload import decode_payload  # noqa: PLC0415
     from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip  # noqa: PLC0415
+    from soc_ai.tools.get_event_raw import get_event_raw  # noqa: PLC0415
     from soc_ai.tools.get_pcap import get_pcap_facts  # noqa: PLC0415
     from soc_ai.tools.get_playbooks import get_playbooks  # noqa: PLC0415
+    from soc_ai.tools.get_rule_content import get_rule_content  # noqa: PLC0415
     from soc_ai.tools.lookup_runbook import lookup_runbook  # noqa: PLC0415
     from soc_ai.tools.query_cases import query_cases  # noqa: PLC0415
     from soc_ai.tools.query_detections import query_detections  # noqa: PLC0415
@@ -91,7 +96,7 @@ async def _dispatch_named_tool(  # noqa: PLR0915 - a flat tool→callable dispat
     from soc_ai.tools.query_zeek import query_zeek_logs  # noqa: PLC0415
     from soc_ai.tools.web_search import web_search  # noqa: PLC0415
 
-    dispatch_table: dict[str, Any] = {
+    return {
         "t_enrich_ip": enrich_ip,
         "t_enrich_domain": enrich_domain,
         "t_enrich_hash": enrich_hash,
@@ -99,15 +104,28 @@ async def _dispatch_named_tool(  # noqa: PLR0915 - a flat tool→callable dispat
         "t_query_events_oql": query_events_oql,
         "t_query_cases": query_cases,
         "t_query_detections": query_detections,
+        "t_get_rule_content": get_rule_content,
+        "t_get_event_raw": get_event_raw,
+        "t_decode_payload": decode_payload,
         "t_get_playbooks": get_playbooks,
         "t_lookup_runbook": lookup_runbook,
         "t_get_pcap": get_pcap_facts,
         "t_web_search": web_search,
         "t_crawl_page": crawl_page,
     }
-    fn = dispatch_table.get(tool_name)
-    if fn is None:
+
+
+async def _dispatch_named_tool(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    ctx: Any,
+) -> dict[str, Any]:
+    """Validate tool_name against PHASE_D_TOOLS, then invoke it with kwargs."""
+    if tool_name not in PHASE_D_TOOLS:
         raise ValueError(f"unknown tool {tool_name!r}")
+    # The table's key set == PHASE_D_TOOLS (drift-tested), so this lookup
+    # cannot miss for a validated name.
+    fn = _dispatch_table()[tool_name]
 
     base_kwargs: dict[str, Any] = {"settings": ctx.settings}
     if tool_name in {"t_enrich_ip", "t_enrich_domain", "t_enrich_hash"}:
@@ -121,6 +139,8 @@ async def _dispatch_named_tool(  # noqa: PLR0915 - a flat tool→callable dispat
         "t_query_events_oql",
         "t_query_cases",
         "t_query_detections",
+        "t_get_rule_content",
+        "t_get_event_raw",
         "t_get_playbooks",
     }:
         base_kwargs["elastic"] = ctx.elastic

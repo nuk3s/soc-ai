@@ -202,8 +202,9 @@ def test_alerts_badge_survives_later_interrupted_run(client: TestClient) -> None
 
 
 def test_primary_run_ids_prefers_latest_complete() -> None:
-    """#2: the canonical run per alert is the latest COMPLETE one (else the latest
-    of any status) so a working verdict is never buried under later failed retries."""
+    """#2: the canonical run per alert is the latest RUNNING-or-COMPLETE one (else
+    the latest of any status) so a working verdict is never buried under later
+    failed retries."""
     from soc_ai.api.webui_api import _primary_run_ids
 
     # Newest-first (list_recent order): a later error retry of alert A, then the
@@ -217,6 +218,22 @@ def test_primary_run_ids_prefers_latest_complete() -> None:
     ]
     primary = _primary_run_ids(rows)
     assert primary == {"A-done", "B-err2"}  # A's complete run; B's latest error
+
+
+def test_primary_run_ids_surfaces_inflight_reinvestigation() -> None:
+    """Clicking re-investigate makes the NEW running run the alert's current
+    state — it must be the primary row, not an "earlier run" tucked under the
+    stale complete verdict. An old wedged 'running' run older than a complete
+    verdict does NOT outrank it (newest running-or-complete wins)."""
+    from soc_ai.api.webui_api import _primary_run_ids
+
+    rows = [  # newest-first
+        SimpleNamespace(id="A-rerun", alert_es_id="alertA", status="running"),
+        SimpleNamespace(id="A-done", alert_es_id="alertA", status="complete"),
+        SimpleNamespace(id="B-done", alert_es_id="alertB", status="complete"),
+        SimpleNamespace(id="B-stale-run", alert_es_id="alertB", status="running"),
+    ]
+    assert _primary_run_ids(rows) == {"A-rerun", "B-done"}
 
 
 def test_investigations_list(client: TestClient) -> None:
@@ -837,6 +854,27 @@ def test_config_surfaces_events_index_pattern(client: TestClient) -> None:
     assert spec["value"]  # the env/default value is rendered, not blank
 
 
+def test_config_models_lists_gateway_models(client: TestClient) -> None:
+    """GET /config/models proxies the gateway's model list (feeds the
+    analyst-model dropdown); a listing failure returns ok=false + detail, not
+    an error, so the UI can fall back to free text."""
+    ok = AsyncMock(return_value=(["deepseek-v4-flash", "qwen3.6-35b-reason"], None))
+    with patch("soc_ai.api.webui.routes_config.probes.list_gateway_models", ok):
+        body = client.get("/api/v1/config/models").json()
+    assert body == {
+        "ok": True,
+        "models": ["deepseek-v4-flash", "qwen3.6-35b-reason"],
+        "detail": None,
+    }
+
+    down = AsyncMock(return_value=([], "ConnectError: gateway unreachable"))
+    with patch("soc_ai.api.webui.routes_config.probes.list_gateway_models", down):
+        body = client.get("/api/v1/config/models").json()
+    assert body["ok"] is False
+    assert body["models"] == []
+    assert "unreachable" in body["detail"]
+
+
 def test_config_save_events_index_pattern_roundtrips(client: TestClient) -> None:
     """Saving the inc-1 events_index_pattern persists an override; GET reflects
     source=db and the new value, proving it's coercible + saveable."""
@@ -854,11 +892,6 @@ def test_config_save_events_index_pattern_roundtrips(client: TestClient) -> None
     }
     assert items["events_index_pattern"]["source"] == "db"
     assert items["events_index_pattern"]["value"] == "logs-*"
-
-
-def test_approve_unknown_token_404(client: TestClient) -> None:
-    resp = client.post("/api/v1/approve", json={"token": "nope", "approved": True})
-    assert resp.status_code == 404
 
 
 def test_health_shape(client: TestClient) -> None:
@@ -965,7 +998,7 @@ def test_auto_triage_status(client: TestClient) -> None:
 
 
 def test_auto_triage_nothing_to_hunt(client: TestClient) -> None:
-    with patch("soc_ai.api.webui_api.at.plan_targets", AsyncMock(return_value=([], 0))):
+    with patch("soc_ai.api.webui_api.at.plan_targets", AsyncMock(return_value=([], 0, []))):
         s = client.post("/api/v1/auto-triage", json={}).json()
     assert s["active"] is False
     assert s["note"] == "nothing to hunt"
@@ -994,7 +1027,9 @@ def test_auto_triage_selected_spawns_for_targets(client: TestClient) -> None:
     async def fake_plan_ids(state: object, *, alert_ids: list[str]) -> tuple[list, int]:
         return [Target(alert_es_id="a", rule_name="", src_ip="", dst_ip="")], 1
 
-    async def noop_run(state: object, *, targets: list, started_by: str) -> None:
+    async def noop_run(
+        state: object, *, targets: list, started_by: str, inherited_acks: list | None = None
+    ) -> None:
         return None
 
     with (
@@ -1015,7 +1050,7 @@ def test_auto_triage_sweep_uses_config_floor_medium(settings_kratos: Settings) -
 
     async def capturing_plan(state: object, *, time_range: str, oql, severities):
         captured["severities"] = severities
-        return [], 0
+        return [], 0, []
 
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
@@ -1040,7 +1075,7 @@ def test_auto_triage_sweep_uses_config_floor_critical(settings_kratos: Settings)
 
     async def capturing_plan(state: object, *, time_range: str, oql, severities):
         captured["severities"] = severities
-        return [], 0
+        return [], 0, []
 
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
@@ -1065,7 +1100,7 @@ def test_auto_triage_explicit_severities_override_config_floor(settings_kratos: 
 
     async def capturing_plan(state: object, *, time_range: str, oql, severities):
         captured["severities"] = severities
-        return [], 0
+        return [], 0, []
 
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
@@ -1098,7 +1133,7 @@ async def _seed_inv(client: TestClient, *, alert_es_id: str, actions: list[dict]
 
 
 def _fake_write_tool(calls: list[dict], result: dict):
-    """Patch target for approvals.get_tool — records the call, returns ``result``."""
+    """Patch target for write_exec.get_tool — records the call, returns ``result``."""
     from soc_ai.tools._registry import ToolSpec
 
     async def fn(alert_id: str, comment: str | None = None, *, auth, settings=None) -> dict:
@@ -1120,7 +1155,7 @@ def test_build_actions_marks_ack_applied_after_auto_ack() -> None:
             {"tool_name": "add_case_comment", "rationale": "note"},
         ]
     }
-    by_tag = {a.tag: a for a in _build_actions([ack_ev], report, set())}
+    by_tag = {a.tag: a for a in _build_actions([ack_ev], report)}
     assert by_tag["ack"].applied is True
     assert by_tag["ack"].token is None
     assert by_tag["comment"].applied is False  # non-ack actions untouched
@@ -1131,9 +1166,9 @@ def test_build_actions_ack_not_applied_without_successful_auto_ack() -> None:
     from soc_ai.api.webui_api import _build_actions
 
     report = {"recommended_actions": [{"tool_name": "ack_alert", "rationale": "benign"}]}
-    assert _build_actions([], report, set())[0].applied is False
+    assert _build_actions([], report)[0].applied is False
     failed = SimpleNamespace(kind="auto_ack", payload={"success": False})
-    assert _build_actions([failed], report, set())[0].applied is False
+    assert _build_actions([failed], report)[0].applied is False
 
 
 def test_build_actions_marks_ack_applied_when_alert_acked_in_es() -> None:
@@ -1148,13 +1183,13 @@ def test_build_actions_marks_ack_applied_when_alert_acked_in_es() -> None:
             {"tool_name": "escalate_to_case", "rationale": "case it"},
         ]
     }
-    by_tag = {a.tag: a for a in _build_actions([], report, set(), alert_acked=True)}
+    by_tag = {a.tag: a for a in _build_actions([], report, alert_acked=True)}
     assert by_tag["ack"].applied is True
     assert by_tag["ack"].appliedNote == "Already acknowledged"
     assert by_tag["escalate"].applied is False  # only ack is satisfied by acked state
     # auto-ack takes precedence over the ES-state note (keeps the existing UI wording)
     ack_ev = SimpleNamespace(kind="auto_ack", payload={"success": True})
-    auto = _build_actions([ack_ev], report, set(), alert_acked=True)[0]
+    auto = _build_actions([ack_ev], report, alert_acked=True)[0]
     assert auto.applied is True and auto.appliedNote is None
 
 
@@ -1174,7 +1209,7 @@ def test_build_actions_marks_persisted_execution_applied() -> None:
         kind="action_executed",
         payload={"index": 1, "tool_name": "escalate_to_case", "success": True, "by": "alice"},
     )
-    actions = _build_actions([exec_ev], report, set())
+    actions = _build_actions([exec_ev], report)
     assert actions[0].applied is False  # untouched sibling stays actionable
     assert actions[1].applied is True
     assert actions[1].appliedNote == "Executed · alice"
@@ -1183,7 +1218,7 @@ def test_build_actions_marks_persisted_execution_applied() -> None:
         kind="action_executed",
         payload={"index": 1, "tool_name": "escalate_to_case", "success": False},
     )
-    assert _build_actions([failed], report, set())[1].applied is False
+    assert _build_actions([failed], report)[1].applied is False
 
 
 def test_alert_currently_acked_reads_es_and_swallows_errors(settings_kratos: Settings) -> None:
@@ -1407,7 +1442,7 @@ def test_get_investigation_marks_ack_applied_from_live_es_state(client: TestClie
 def test_execute_write_tool_refuses_non_write_tool() -> None:
     import asyncio
 
-    from soc_ai.api.approvals import execute_write_tool
+    from soc_ai.tools.write_exec import execute_write_tool
 
     result, error = asyncio.run(
         execute_write_tool("search_events", {}, auth=AsyncMock(), settings=AsyncMock())
@@ -2844,7 +2879,6 @@ class TestDangerZoneSave:
             so_verify_ssl=False,
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
-            synth_first_pipeline=False,
             config_secret_key=SecretStr("0Y5eLjMDakyujfxGcb5ijyW_GL4pkxv3gHqWkfanOz0="),
             api_auth_required=False,  # dev-open; secure default is True
         )
@@ -2978,7 +3012,6 @@ class TestDangerZoneSave:
             so_verify_ssl=False,
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
-            synth_first_pipeline=False,
             api_auth_required=False,  # dev-open; secure default is True
         )
         for c in _client(no_key):
@@ -3017,7 +3050,6 @@ class TestApiKeys:
             so_verify_ssl=False,
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
-            synth_first_pipeline=False,
             config_secret_key=SecretStr("0Y5eLjMDakyujfxGcb5ijyW_GL4pkxv3gHqWkfanOz0="),
             api_auth_required=False,
         )
@@ -3109,7 +3141,6 @@ class TestApiKeys:
             so_verify_ssl=False,
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
-            synth_first_pipeline=False,
             api_auth_required=False,
         )
         for c in _client(no_key):
@@ -3137,7 +3168,6 @@ class TestDangerZoneTest:
             so_verify_ssl=False,
             es_hosts=["https://so.example.com:9200"],
             litellm_base_url="http://localhost:4000",
-            synth_first_pipeline=False,
             api_auth_required=False,  # dev-open; secure default is True
         )
 
@@ -3851,6 +3881,58 @@ def test_internal_identifiers_delete_detected_409(client: TestClient) -> None:
     resp = client.delete(f"/api/v1/internal-identifiers/{ident_id}")
     assert resp.status_code == 409
     assert resp.json()["detail"]["reason"] == "not_deletable"
+    # the hint steers the operator to the terminal tombstone, not the mute toggle
+    assert "dismiss" in resp.json()["detail"]["hint"]
+
+
+def test_internal_identifiers_dismiss_detected_ok(client: TestClient) -> None:
+    """POST .../dismiss tombstones a detected row; it vanishes from the GET
+    (dismissed rows are excluded from the managed list)."""
+    import asyncio
+
+    ident_id = asyncio.run(
+        _seed_identifier(
+            client,
+            kind="suffix",
+            value=".cdn.netflix.com",
+            source="detected",
+            state="muted",
+            evidence={"host_count": 2},
+        )
+    )
+    resp = client.post(f"/api/v1/internal-identifiers/{ident_id}/dismiss")
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    body = client.get("/api/v1/internal-identifiers").json()
+    groups = {g["kind"]: g["rows"] for g in body["groups"]}
+    assert all(r["value"] != ".cdn.netflix.com" for r in groups["suffix"])
+
+
+def test_internal_identifiers_dismiss_unknown_404(client: TestClient) -> None:
+    resp = client.post("/api/v1/internal-identifiers/999999/dismiss")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["reason"] == "not_found"
+
+
+def test_internal_identifiers_dismiss_manual_409(client: TestClient) -> None:
+    """Dismiss on a manual row is refused with 409 (delete manual rows instead)."""
+    import asyncio
+
+    ident_id = asyncio.run(
+        _seed_identifier(client, kind="host", value="WIN11-01", source="manual", state="active")
+    )
+    resp = client.post(f"/api/v1/internal-identifiers/{ident_id}/dismiss")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_dismissable"
+    assert "delete" in resp.json()["detail"]["hint"]
+
+    # the manual row survives untouched
+    body = client.get("/api/v1/internal-identifiers").json()
+    groups = {g["kind"]: g["rows"] for g in body["groups"]}
+    row = next(r for r in groups["host"] if r["value"] == "WIN11-01")
+    assert row["state"] == "active"
+    assert row["source"] == "manual"
 
 
 async def _seed_user_session(client: TestClient, *, username: str, role: str) -> str:
@@ -4051,6 +4133,7 @@ def test_internal_identifiers_admin_gate(settings_kratos: Settings) -> None:
     for client in _auth_client(settings_kratos):
         # Unauthenticated → router-level auth gate → 401.
         assert client.get("/api/v1/internal-identifiers").status_code == 401
+        assert client.post("/api/v1/internal-identifiers/1/dismiss").status_code == 401
 
         # An authenticated analyst (non-admin) → per-route admin gate → 403.
         token = asyncio.run(_seed_user_session(client, username="analyst1", role="analyst"))
@@ -4058,6 +4141,14 @@ def test_internal_identifiers_admin_gate(settings_kratos: Settings) -> None:
         resp = client.get("/api/v1/internal-identifiers")
         assert resp.status_code == 403
         assert resp.json()["detail"]["reason"] == "admin_required"
+        # Same-origin Origin header to satisfy the cookie-auth CSRF guard —
+        # this isolates the admin gate (not the origin gate) as the rejector.
+        dismiss = client.post(
+            "/api/v1/internal-identifiers/1/dismiss",
+            headers={"Origin": "http://testserver"},
+        )
+        assert dismiss.status_code == 403
+        assert dismiss.json()["detail"]["reason"] == "admin_required"
 
 
 def test_tool_outcome_never_leaks_json_and_humanizes_known_shapes() -> None:
@@ -4213,3 +4304,62 @@ def test_auto_ack_and_write_tools_grouped_as_decision_not_tool_calls() -> None:
     assert groups["e1"] == "Decision"  # auto_ack
     assert groups["e2"] == "Decision"  # write-action tool call
     assert groups["e3"] == "Tool calls"  # investigative tool call unchanged
+
+
+def test_entity_graph_carries_enrichment_facts() -> None:
+    """The blast-radius graph must surface what enrichment already knows: node
+    sub-labels (geo/ASN/cloud/internal), intel flag sources, and per-edge flow
+    labels — WITHOUT changing the existing kind semantics (compromised/c2/dc/host,
+    beacon/flow)."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui_api import _entity_graph
+
+    alert = {
+        "source_ip": "10.0.0.5",
+        "destination_ip": "203.0.113.9",
+        "destination_port": 443,
+        "host_name": "ws-finance-07",
+    }
+    enrichments = {
+        "10.0.0.5": {"internal": True},
+        "203.0.113.9": {
+            "blocklist_hits": [
+                {"source": "abuse.ch ThreatFox", "indicator": "203.0.113.9"},
+                {"source": "spamhaus DROP", "indicator": "203.0.113.9"},
+            ],
+            "geoip": {"country_iso": "US", "region": None, "city": None},
+            "asn": {"number": 13335, "org": "Cloudflare"},
+        },
+        "198.51.100.20": {"cloud_provider": "AWS"},
+        "10.0.0.99": {"internal": True},
+    }
+    inv = SimpleNamespace(src_ip="10.0.0.5", dest_ip="203.0.113.9", verdict="true_positive")
+    nodes, edges, note = _entity_graph(alert, enrichments, inv)
+
+    by_id = {n["id"]: n for n in nodes}
+    # kind semantics unchanged
+    assert by_id["10.0.0.5"]["kind"] == "compromised"
+    assert by_id["203.0.113.9"]["kind"] == "c2"
+    assert by_id["198.51.100.20"]["kind"] == "host"
+    assert by_id["10.0.0.99"]["kind"] == "internal"  # never "dc" — we can't know that
+    # the source node says which end it is (and that it's internal)
+    assert by_id["10.0.0.5"]["sub"] == "source · internal"
+    # peer sub-labels pick the most informative enrichment fact available
+    assert by_id["203.0.113.9"]["sub"] == "US · AS13335 Cloudflare"
+    assert by_id["198.51.100.20"]["sub"] == "AWS"
+    assert by_id["10.0.0.99"]["sub"] == "internal"
+    # intel flags carry their sources (bounded); unflagged nodes carry neither key
+    assert by_id["203.0.113.9"]["flagged"] is True
+    assert by_id["203.0.113.9"]["flagSources"] == ["abuse.ch ThreatFox", "spamhaus DROP"]
+    assert "flagged" not in by_id["198.51.100.20"]
+    # the alert's primary flow carries its port/proto; enrichment-only peers "observed"
+    by_edge = {e["to"]: e for e in edges}
+    assert by_edge["203.0.113.9"]["kind"] == "beacon"
+    assert by_edge["203.0.113.9"]["label"] == ":443 TLS"
+    assert by_edge["198.51.100.20"]["kind"] == "flow"
+    assert by_edge["198.51.100.20"]["label"] == "observed"
+    # graphNote keeps its shape but names the flagged peers (bounded)
+    assert note == (
+        "ws-finance-07 contacted 3 peer(s); 1 flagged malicious by enrichment (203.0.113.9)"
+    )

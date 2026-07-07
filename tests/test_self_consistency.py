@@ -25,7 +25,6 @@ from soc_ai.agent.triage import TriageReport
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.models import SoAlert
-from soc_ai.tools._registry import ApprovalGate
 
 
 def _rep(verdict: str, confidence: float, **kw: Any) -> TriageReport:
@@ -203,7 +202,6 @@ def _make_ctx(settings: Settings) -> InvestigationContext:
         settings=settings,
         auth=AsyncMock(),
         elastic=elastic,
-        gate=ApprovalGate(),
     )
 
 
@@ -244,7 +242,6 @@ def _fp_report(conf: float = 0.85) -> TriageReport:
 
 
 async def _run_pipeline(settings: Settings, stub_agent: _StubSynthAgent) -> list[Any]:
-    settings.synth_first_pipeline = True
     settings.investigate_when_unsure = False
     ctx = _make_ctx(settings)
 

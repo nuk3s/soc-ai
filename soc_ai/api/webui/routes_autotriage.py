@@ -33,6 +33,8 @@ class AutoTriageStatusOut(BaseModel):
     note: str | None = None
     current: str | None = None
     tool_calls: int = 0
+    # Inherited-verdict FP alerts this run acknowledged in SO (no LLM involved).
+    inherited_acked: int = 0
 
 
 def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
@@ -47,6 +49,7 @@ def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
         note=note,
         current=status.current,
         tool_calls=status.tool_calls,
+        inherited_acked=getattr(status, "inherited_acked", 0),
     )
 
 
@@ -80,6 +83,7 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
     _config_band: tuple[str, ...] = tuple(_ladder[: _idx + 1])
     chosen: tuple[str, ...] = _config_band
     status.active = True  # claim the slot before any await
+    inherited_acks: list[at.InheritedAck] = []
     try:
         if selected:
             targets, skipped = await at.plan_targets_for_ids(state, alert_ids=selected)
@@ -88,7 +92,7 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
             chosen = tuple(s for s in body.severities if s in aq.SEVERITIES) or _config_band
             time_range = body.range if body.range in aq.TIME_RANGES else aq.DEFAULT_RANGE
             oql = (body.q or "").strip() or None
-            targets, skipped = await at.plan_targets(
+            targets, skipped, inherited_acks = await at.plan_targets(
                 state, time_range=time_range, oql=oql, severities=chosen
             )
     except Exception:
@@ -98,7 +102,7 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
         _LOGGER.exception("auto-triage planning failed")
         raise HTTPException(status_code=500, detail={"reason": "planning_failed"}) from None
 
-    if not targets:
+    if not targets and not inherited_acks:
         status.reset(active=False, total=0, skipped=skipped, severities=chosen)
         status.finished_at = datetime.now(UTC).isoformat()
         if selected:
@@ -109,10 +113,14 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
             empty_note = "nothing to hunt"
         return _at_status(status, note=empty_note)
 
+    # 0 targets + N inherited acks still runs the worker: the ack pass is how a
+    # standing inherited-FP backlog drains (no LLM calls involved).
     status.reset(active=True, total=len(targets), skipped=skipped, severities=chosen)
     started_by = f"auto-triage:{await identify_caller(request)}"
     status._task = asyncio.create_task(
-        at.run_auto_triage(state, targets=targets, started_by=started_by)
+        at.run_auto_triage(
+            state, targets=targets, started_by=started_by, inherited_acks=inherited_acks
+        )
     )
     note: str | None = None
     if selected:
