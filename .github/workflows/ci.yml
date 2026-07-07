@@ -67,3 +67,51 @@ jobs:
 
       - name: build
         run: npm run build
+
+  # End-to-end browser smoke: drives the SEEDED DEMO STACK (seed + mock ES/LLM +
+  # the real app serving frontend/dist) through login → alerts → investigation
+  # permalink → hunt → config, asserting the walkthrough checklist + zero console
+  # errors. Excluded from the `ci` job's coverage-gated run (pyproject addopts
+  # `--ignore=tests/browser`); runs here in isolation under `-m browser`.
+  browser-smoke:
+    name: browser smoke (E2E)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ci, frontend]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # The app serves frontend/dist — build the SPA before the smoke drives it.
+      - name: build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Install chromium (+ system deps)
+        run: uv run playwright install --with-deps chromium
+
+      # Override the coverage-gated addopts (which also carries
+      # `--ignore=tests/browser`) so this job collects + runs ONLY the browser
+      # smoke, with no coverage gate applied.
+      - name: pytest (browser smoke)
+        run: uv run pytest --override-ini "addopts=" --no-header -v -m browser tests/browser/

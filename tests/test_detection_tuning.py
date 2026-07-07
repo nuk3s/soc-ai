@@ -93,6 +93,60 @@ def test_assess_threshold_boundary_mute() -> None:
 
 
 # ---------------------------------------------------------------------------
+# assess() — analyst FP-override signal (E4.3)
+# ---------------------------------------------------------------------------
+
+
+def test_assess_override_default_is_backcompat() -> None:
+    # override_fp defaults to 0 → identical to a call without it (positional
+    # callers — the agent tool + MCP — are unaffected).
+    assert dt.assess(412, 8, 0, 0) == dt.assess(412, 8, 0, 0, 0)
+    assert dt.assess(50, 4, 0, 1) == dt.assess(50, 4, 0, 1, 0)
+
+
+def test_assess_override_fp_upgrades_thin_ai_history() -> None:
+    # High volume, thin AI-FP history (would be a bare "monitor") but the analyst
+    # overrode it to FP repeatedly → stronger lean + a reason naming the feedback.
+    is_noisy, rec, reason = dt.assess(alert_count=300, fp=1, tp=0, nmi=0, override_fp=3)
+    assert is_noisy is True
+    assert rec == "mute"  # high volume + strong analyst signal
+    assert "analyst FP-overrides" in reason
+
+
+def test_assess_override_fp_surfaces_below_volume_floor() -> None:
+    # Below the volume floor (normally "none") but repeated analyst FP-overrides
+    # → surfaced as a monitor with a reason citing the human feedback.
+    is_noisy, rec, reason = dt.assess(alert_count=5, fp=0, tp=0, nmi=0, override_fp=2)
+    assert is_noisy is True
+    assert rec == "monitor"
+    assert "analyst FP-overrides" in reason
+
+
+def test_assess_override_fp_upgrades_monitor_to_mute_below_bar() -> None:
+    # All-FP over the noisy floor but under the high-volume bar would be "monitor";
+    # a strong analyst signal upgrades it to a confident mute.
+    is_noisy, rec, reason = dt.assess(alert_count=50, fp=4, tp=0, nmi=1, override_fp=2)
+    assert is_noisy is True
+    assert rec == "mute"
+    assert "analyst FP-overrides" in reason
+
+
+def test_assess_override_fp_below_signal_is_unchanged() -> None:
+    # A single override (below OVERRIDE_FP_SIGNAL) does not change assess's lean —
+    # nominate() surfaces the rule + notes the single override, but assess is coarse.
+    assert dt.assess(50, 4, 0, 1, override_fp=1) == dt.assess(50, 4, 0, 1)
+
+
+def test_assess_tp_veto_wins_over_override_fp() -> None:
+    # SAFETY: a rule that ever caught a real TP is never suppressed, even with
+    # many analyst FP-overrides — the tp>0 veto wins.
+    is_noisy, rec, reason = dt.assess(alert_count=999, fp=20, tp=1, nmi=0, override_fp=9)
+    assert is_noisy is False
+    assert rec == "none"
+    assert "true positive" in reason
+
+
+# ---------------------------------------------------------------------------
 # override store: create / list_active / muted_rule_names / deactivate
 # ---------------------------------------------------------------------------
 
@@ -227,6 +281,64 @@ async def test_nominate_joins_volume_and_verdicts(settings_kratos: Settings) -> 
     # sorted by alert_count desc
     counts = [n["alert_count"] for n in noms]
     assert counts == sorted(counts, reverse=True)
+    await engine.dispose()
+
+
+async def _resolve(db: AsyncSession, inv_id: str, *, verdict: str, resolved_via: str) -> None:
+    await inv_svc.resolve(
+        db,
+        inv_id,
+        verdict=verdict,
+        confidence=1.0,
+        rationale="analyst",
+        recommended_actions=None,
+        resolved_by="alice",
+        resolved_via=resolved_via,
+    )
+
+
+async def test_nominate_surfaces_analyst_overrides(settings_kratos: Settings) -> None:
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # ET FEEDBACK: moderate volume, thin AI-FP trend, but the analyst has
+        # overridden it to FP twice (once chat, once manual) — the human feedback
+        # should drive a nomination the AI trend alone would not.
+        i1 = await inv_svc.create(db, alert_es_id="fb1", started_by="t", rule_name="ET FEEDBACK")
+        await inv_svc.finalize(db, i1.id, status="complete", verdict="needs_more_info")
+        await _resolve(db, i1.id, verdict="false_positive", resolved_via="manual")
+        i2 = await inv_svc.create(db, alert_es_id="fb2", started_by="t", rule_name="ET FEEDBACK")
+        await inv_svc.finalize(db, i2.id, status="complete", verdict="needs_more_info")
+        await _resolve(db, i2.id, verdict="false_positive", resolved_via="chat")
+        # ET PLAIN: high volume, all AI-FP, no analyst overrides — behaves as before.
+        for i in range(8):
+            await _complete(db, rule_name="ET PLAIN", verdict="false_positive", alert_es_id=f"p{i}")
+
+    groups = [
+        AlertGroup(rule_name="ET PLAIN", count=412, severity="high", latest_ts="", latest_id="x"),
+        AlertGroup(rule_name="ET FEEDBACK", count=40, severity="low", latest_ts="", latest_id="f"),
+    ]
+    state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
+    with patch(
+        "soc_ai.webui.detection_tuning.aq.fetch_groups",
+        AsyncMock(return_value=(groups, 452)),
+    ):
+        noms = await dt.nominate(state)
+
+    by_name = {n["rule_name"]: n for n in noms}
+    # ET FEEDBACK: nominated purely on the analyst-override signal; the feedback
+    # fields + a reason naming it are surfaced.
+    fb = by_name["ET FEEDBACK"]
+    assert fb["override_fp"] == 2
+    assert fb["chat_resolved"] == 1
+    assert fb["manual_resolved"] == 1
+    assert fb["recommendation"] in ("mute", "monitor")
+    assert "analyst FP-override" in fb["reason"]
+    # ET PLAIN: unchanged AI-only behavior; no analyst feedback.
+    plain = by_name["ET PLAIN"]
+    assert plain["recommendation"] == "mute"
+    assert plain["override_fp"] == 0
+    assert plain["chat_resolved"] == 0
+    assert plain["manual_resolved"] == 0
     await engine.dispose()
 
 

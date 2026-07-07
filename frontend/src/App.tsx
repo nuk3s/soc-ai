@@ -4,6 +4,7 @@ import { Alerts } from './screens/Alerts';
 import { Backtest } from './screens/Backtest';
 import { Config } from './screens/Config';
 import { Dashboard } from './screens/Dashboard';
+import { Entity } from './screens/Entity';
 import { HuntDetail } from './screens/HuntDetail';
 import { Hunts } from './screens/Hunts';
 import { Investigations } from './screens/Investigations';
@@ -23,6 +24,7 @@ export function App() {
         <Route path="/notifications" element={<Notifications />} />
         <Route path="/hunts" element={<Hunts />} />
         <Route path="/hunts/:id" element={<HuntDetail />} />
+        <Route path="/entity/:value" element={<Entity />} />
         <Route path="/backtest" element={<Backtest />} />
         <Route path="/config" element={<Config />} />
       </Route>

@@ -148,6 +148,256 @@ _PCAP_BROKEN_HINT = (
 )
 
 
+# ── Model-fitness preflight probe ─────────────────────────────────────────────
+# WHY: pointing ``analyst_model`` at an unfit model (e.g. the A3B qwen variant
+# that can't hold structured-output discipline, or a model whose reasoning phase
+# eats the whole token budget before emitting JSON) silently produced ALL-fallback
+# NMI verdicts — every investigation degraded, and the gateway couldn't tell us:
+# a /v1/models listing (probe_llm) confirms the id is SERVED, not that it can DO
+# THE JOB. This probe exercises the three model behaviours the pipeline actually
+# depends on, against the real provider/retry/timeout path, and grades the model
+# so the operator sees "this model can't do structured output" BEFORE it silently
+# ruins a shift's triage.
+
+# Hard ceiling on the whole probe so a wedged gateway can't hang the admin UI.
+# Each leg also has its own bound (below); this is the belt to their suspenders.
+_FITNESS_TOTAL_TIMEOUT_S = 30.0
+# Per-leg wall-clock bound. A leg that blows this is graded (never raises) so one
+# slow leg degrades to a clear result instead of eating the whole budget.
+_FITNESS_LEG_TIMEOUT_S = 12.0
+
+# The canned structured-output fixture. A one-line benign-DNS prompt with an
+# unambiguous expected shape (false_positive / 0.9 / one citation) — trivial for a
+# fit model, but it still forces the model through the ENTIRE structured-output
+# machinery (tool-choice, schema-constrained JSON, pydantic validation, retries).
+_FITNESS_SO_PROMPT = (
+    "Return a false_positive verdict for this benign internal DNS lookup "
+    "with confidence 0.9 and one citation 'demo-1'."
+)
+# The tool-loop fixture. Requires exactly one tool call then a final answer — the
+# minimal shape of the investigate loop (call a read tool, then synthesise).
+_FITNESS_TOOL_PROMPT = (
+    "Call the echo tool once with x='ping', then reply with the single word it "
+    "returns. You MUST use the echo tool — do not answer from memory."
+)
+
+# Substrings that identify the "token limit exceeded before any response" class
+# raised by pydantic-ai (_agent_graph) when a reasoning model burns the whole
+# max_tokens budget on thinking and emits ZERO output content. Matching the
+# message (rather than a bespoke exception type) keeps this robust across the
+# two phrasings pydantic-ai uses ("before any response" / "while generating").
+_TRUNCATION_MARKERS: tuple[str, ...] = ("before any response", "token limit")
+
+
+def _fitness_leg(name: str, grade: str, detail: str, *, ok: bool | None = None) -> dict[str, Any]:
+    """Build one leg result. ``ok`` defaults to (grade == 'pass'); ``detail`` is
+    always scrubbed so a model/gateway error string can never leak a credential.
+    """
+    return {
+        "name": name,
+        "ok": ok if ok is not None else (grade == "pass"),
+        "grade": grade,
+        "detail": _scrub(detail)[:200],
+    }
+
+
+async def _leg_structured_output(settings: Any) -> dict[str, Any]:
+    """PASS if the model returns a valid ``TriageReport`` on the canned prompt.
+
+    This is the load-bearing capability: the synth-first pipeline's whole output
+    is a structured ``TriageReport``. A model that can't produce one (schema
+    exhaustion → ``UnexpectedModelBehavior``, or any validation failure) is unfit
+    regardless of how good its prose is — it will fall back on every alert.
+    """
+    # Local imports: the agent stack is heavy and only needed when a probe runs
+    # (the config console imports probes.py at startup). Also avoids an import
+    # cycle (agent.models → config → … ).
+    from pydantic_ai import Agent  # noqa: PLC0415
+    from pydantic_ai.exceptions import UnexpectedModelBehavior  # noqa: PLC0415
+
+    from soc_ai.agent.models import build_synthesizer_model  # noqa: PLC0415
+    from soc_ai.triage_models import TriageReport  # noqa: PLC0415
+
+    try:
+        model = build_synthesizer_model(settings)
+        agent = Agent(model=model, output_type=TriageReport)
+        result = await asyncio.wait_for(
+            agent.run(_FITNESS_SO_PROMPT), timeout=_FITNESS_LEG_TIMEOUT_S
+        )
+        # pydantic-ai guarantees a schema-valid TriageReport here or it would have
+        # raised UnexpectedModelBehavior (caught below) — reaching here is a PASS.
+        report = result.output
+        return _fitness_leg(
+            "structured_output", "pass", f"valid TriageReport (verdict={report.verdict})"
+        )
+    except UnexpectedModelBehavior as exc:
+        # Schema-validation exhaustion is THE unfit signal — the model kept
+        # emitting JSON the schema rejected until pydantic-ai gave up.
+        return _fitness_leg("structured_output", "fail", _safe_reason(exc))
+    except TimeoutError:
+        return _fitness_leg("structured_output", "fail", "timed out producing a TriageReport")
+    except Exception as exc:  # any other failure is a graded FAIL, never a raise
+        return _fitness_leg("structured_output", "fail", _safe_reason(exc))
+
+
+async def _leg_tool_loop(settings: Any) -> dict[str, Any]:
+    """PASS if the model calls the one trivial tool then answers.
+
+    Mirrors the investigate loop's minimal shape (invoke a read tool, then
+    synthesise). DEGRADED if the model answers WITHOUT calling the tool (it works
+    but won't use tools — the loop can't gather evidence); FAIL on any error.
+    """
+    from pydantic_ai import Agent  # noqa: PLC0415
+
+    from soc_ai.agent.models import build_synthesizer_model  # noqa: PLC0415
+
+    # A closure-captured flag is the cleanest in-process signal that the model
+    # actually invoked the tool — pydantic-ai runs the tool body, flipping it.
+    called = {"echo": False}
+
+    async def echo(x: str) -> str:  # the single trivial, in-process tool
+        """Echo the input back verbatim (probe-only; no side effects)."""
+        called["echo"] = True
+        return x
+
+    try:
+        model = build_synthesizer_model(settings)
+        agent = Agent(model=model, tools=[echo])
+        result = await asyncio.wait_for(
+            agent.run(_FITNESS_TOOL_PROMPT), timeout=_FITNESS_LEG_TIMEOUT_S
+        )
+        answered = bool((result.output or "").strip())
+        if called["echo"] and answered:
+            return _fitness_leg("tool_loop", "pass", "tool invoked + final answer")
+        if answered:
+            # It produced an answer but skipped the tool — usable for one-shot
+            # synth, but it won't drive the evidence-gathering loop.
+            return _fitness_leg(
+                "tool_loop", "degraded", "answered WITHOUT calling the tool", ok=True
+            )
+        return _fitness_leg("tool_loop", "fail", "no final answer")
+    except TimeoutError:
+        return _fitness_leg("tool_loop", "fail", "timed out on the tool-loop prompt")
+    except Exception as exc:  # any error → graded FAIL, never a raise
+        return _fitness_leg("tool_loop", "fail", _safe_reason(exc))
+
+
+async def _leg_reasoning_budget(settings: Any) -> dict[str, Any]:
+    """Re-run the structured-output call under a TIGHT ``max_tokens`` and detect the
+    "reasoning ate the whole budget" failure class.
+
+    A reasoning model can burn its entire token budget on the thinking phase and
+    emit ZERO output content — pydantic-ai then raises "token limit … exceeded
+    before any response was generated". When that happens under a deliberately
+    small budget we grade DEGRADED (not FAIL): the model IS structured-output
+    capable (proved by the first leg) but its reasoning is un-budgetable at the
+    pipeline's response cap — the operator needs the hint, not a hard block.
+    """
+    from pydantic_ai import Agent  # noqa: PLC0415
+    from pydantic_ai.exceptions import UnexpectedModelBehavior  # noqa: PLC0415
+    from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
+
+    from soc_ai.agent.models import build_synthesizer_model  # noqa: PLC0415
+    from soc_ai.triage_models import TriageReport  # noqa: PLC0415
+
+    # Deliberately tight cap: the pipeline's real cap, clamped to 2048 so a
+    # reasoning model that can't fit thinking+JSON there surfaces the truncation
+    # class here rather than silently on live alerts.
+    budget = min(int(getattr(settings, "synthesizer_max_response_tokens", 2048)), 2048)
+    try:
+        model = build_synthesizer_model(settings)
+        agent = Agent(
+            model=model,
+            output_type=TriageReport,
+            model_settings=OpenAIChatModelSettings(max_tokens=budget),
+        )
+        await asyncio.wait_for(agent.run(_FITNESS_SO_PROMPT), timeout=_FITNESS_LEG_TIMEOUT_S)
+        return _fitness_leg("reasoning_budget", "pass", f"produced output within {budget} tokens")
+    except UnexpectedModelBehavior as exc:
+        msg = str(exc).lower()
+        if any(marker in msg for marker in _TRUNCATION_MARKERS):
+            # THE target signal: thinking exhausted the budget before any JSON.
+            return _fitness_leg(
+                "reasoning_budget",
+                "degraded",
+                f"reasoning truncated at {budget} tokens before emitting output — "
+                "raise synthesizer_max_response_tokens or pick a lighter-reasoning model",
+                ok=True,
+            )
+        # A non-truncation UnexpectedModelBehavior here (e.g. schema exhaustion)
+        # is a real failure of the same class as leg 1.
+        return _fitness_leg("reasoning_budget", "fail", _safe_reason(exc))
+    except TimeoutError:
+        return _fitness_leg("reasoning_budget", "fail", "timed out under the tight budget")
+    except Exception as exc:  # any error → graded FAIL, never a raise
+        return _fitness_leg("reasoning_budget", "fail", _safe_reason(exc))
+
+
+def _reduce_fitness(legs: list[dict[str, Any]]) -> str:
+    """Grade reducer: FAIL if ANY leg failed; else DEGRADED if any degraded; else PASS.
+
+    Worst-wins — the model is only as trustworthy as its weakest required
+    behaviour. A single failing leg (can't do structured output) makes the whole
+    model unfit even if the others pass.
+    """
+    grades = {leg["grade"] for leg in legs}
+    if "fail" in grades:
+        return "fail"
+    if "degraded" in grades:
+        return "degraded"
+    return "pass"
+
+
+async def probe_model_fitness(settings: Any) -> dict[str, Any]:
+    """Grade whether ``settings.analyst_model`` can actually do the pipeline's job.
+
+    Runs three legs (structured output, tool loop, reasoning budget) against the
+    real provider path via :func:`build_synthesizer_model`, wraps each so a failure
+    is a GRADED result (never a raise), and reduces to one overall grade. The whole
+    probe is bounded by :data:`_FITNESS_TOTAL_TIMEOUT_S`; each leg by
+    :data:`_FITNESS_LEG_TIMEOUT_S`. NEVER issues a Security-Onion write — the only
+    tool it registers is an in-process ``echo``.
+
+    Returns ``{"grade": "pass"|"degraded"|"fail", "model": <id>, "legs":
+    [{name, ok, grade, detail}], "detail": <one-line>}``. Every ``detail`` string
+    is scrubbed of credential-shaped substrings.
+    """
+    model_id = str(getattr(settings, "analyst_model", "") or "")
+
+    async def _run_all() -> list[dict[str, Any]]:
+        # Sequential (not concurrent): the legs share the single gateway and a
+        # burst of 3 structured-output calls at once can trip the very
+        # concurrency limits we're trying to characterise. Order is cheapest-
+        # signal-first: structured output is the load-bearing gate.
+        return [
+            await _leg_structured_output(settings),
+            await _leg_tool_loop(settings),
+            await _leg_reasoning_budget(settings),
+        ]
+
+    try:
+        legs = await asyncio.wait_for(_run_all(), timeout=_FITNESS_TOTAL_TIMEOUT_S)
+    except TimeoutError:
+        # The overall cap tripped — treat as a hard FAIL with a clear reason
+        # rather than leaving the operator with a spinner.
+        return {
+            "grade": "fail",
+            "model": model_id,
+            "legs": [],
+            "detail": _scrub(f"model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)}s"),
+        }
+
+    grade = _reduce_fitness(legs)
+    if grade == "pass":
+        detail = f"{model_id or 'analyst model'} passed all fitness checks"
+    else:
+        # Lead with the worst legs so the one-line detail names what's wrong.
+        bad = [leg for leg in legs if leg["grade"] != "pass"]
+        parts = ", ".join(f"{leg['name']}={leg['grade']}" for leg in bad)
+        detail = f"{model_id or 'analyst model'}: {parts}"
+    return {"grade": grade, "model": model_id, "legs": legs, "detail": _scrub(detail)[:200]}
+
+
 async def probe_pcap(settings: Any) -> dict[str, Any]:
     """Probe the PCAP fetch path WITHOUT capturing packets.
 

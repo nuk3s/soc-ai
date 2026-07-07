@@ -5,18 +5,22 @@
 // page already fetched; the parent only mounts this when the hunt is complete
 // AND has findings, so a chart can never render from nothing.
 
-import { BarChart3, Network, Server } from 'lucide-react';
+import { BarChart3, LineChart as LineChartIcon, Network, Server } from 'lucide-react';
 import {
   Bar,
   BarChart,
+  CartesianGrid,
   Cell,
+  Line,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   type TooltipProps,
   XAxis,
   YAxis,
 } from 'recharts';
-import type { HuntFinding } from '../lib/types';
+import { useNavigate } from 'react-router-dom';
+import type { HuntChart, HuntFinding } from '../lib/types';
 import { Panel, PanelHeader } from './Panel';
 
 // Hunt severity palette — mirrors HuntDetail's SEV_COLOR. Ordered worst-first
@@ -227,6 +231,7 @@ function HostChart({ rows }: { rows: HostRow[] }) {
 // ── Host–finding map (dependency-free SVG, EntityGraph's visual language) ────
 
 function HostFindingMap({ findings, hosts }: { findings: HuntFinding[]; hosts: HostRow[] }) {
+  const navigate = useNavigate();
   const VW = 600;
   const mx = 46;
   const my = 26;
@@ -308,7 +313,13 @@ function HostFindingMap({ findings, hosts }: { findings: HuntFinding[]; hosts: H
               ? `${h.host}\nnamed in ${h.count} finding${h.count === 1 ? '' : 's'} · worst ${h.worst}`
               : `${h.host}\naffected host — no finding names it`;
           return (
-            <g key={'h' + i}>
+            // Clicking a host node pivots to its entity page (what we know about
+            // this box). SVG <g> takes onClick; cursor signals it's interactive.
+            <g
+              key={'h' + i}
+              onClick={() => navigate(`/entity/${encodeURIComponent(h.host)}`)}
+              style={{ cursor: 'pointer' }}
+            >
               <title>{tip}</title>
               <circle cx={HX} cy={y} r={10} fill="#0b0e13" stroke={c} strokeWidth={2} />
               <circle cx={HX} cy={y} r={6} fill={c} opacity={0.22} />
@@ -323,6 +334,99 @@ function HostFindingMap({ findings, hosts }: { findings: HuntFinding[]; hosts: H
   );
 }
 
+// ── Agent-authored charts (E3.3) ─────────────────────────────────────────────
+// The model may emit a numeric series a deterministic chart can't guess (a
+// beacon-interval histogram, bytes-over-time) — but only charts whose citations
+// resolved to gathered evidence reach us (the backend gate drops the rest). We
+// still guard against an empty series here so a chart never renders from nothing.
+// No default recharts palette: one fixed accent per chart, styled to the panels.
+
+// small fixed palette (accent-blue lead, then muted supporting tones) — mirrors
+// the file's SEV/accent language without recharts' rainbow default
+const AGENT_CHART_COLORS = ['#4b8bf5', '#3fb950', '#d29922', '#a371f7', '#6b87a8'];
+
+function AgentChartTip({ active, payload, label }: TooltipProps<number, string>) {
+  if (!active || !payload?.length) return null;
+  const v = payload[0].value;
+  return (
+    <div className={TIP_BOX}>
+      <div className="mb-0.5 font-mono text-mono-amber">{String(label)}</div>
+      <div className="font-mono text-text-2">{typeof v === 'number' ? v : String(v ?? '')}</div>
+    </div>
+  );
+}
+
+function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
+  // recharts wants {x,y} rows; x is the category/time axis, y the value.
+  const data = chart.series.map((p) => ({ x: p.x, y: p.y }));
+  const isBar = chart.kind === 'bar';
+  const height = 190;
+  const common = (
+    <>
+      <CartesianGrid stroke="#1c232e" vertical={false} />
+      <XAxis
+        dataKey="x"
+        tick={MONO_TICK}
+        tickFormatter={(x: string) => clip(String(x), 12)}
+        axisLine={AXIS_LINE}
+        tickLine={false}
+        interval="preserveStartEnd"
+        minTickGap={14}
+      />
+      <YAxis
+        tick={TICK}
+        axisLine={AXIS_LINE}
+        tickLine={false}
+        width={44}
+        label={
+          chart.yLabel
+            ? { value: clip(chart.yLabel, 22), angle: -90, position: 'insideLeft', fill: '#8b94a3', fontSize: 10.5 }
+            : undefined
+        }
+      />
+      <Tooltip cursor={CURSOR} content={<AgentChartTip />} isAnimationActive={false} />
+    </>
+  );
+  return (
+    <Panel>
+      <PanelHeader
+        icon={isBar ? <BarChart3 size={15} /> : <LineChartIcon size={15} />}
+        title={chart.title || 'Chart'}
+        right={<span className="font-mono text-[11px] text-accent">{data.length}</span>}
+      />
+      <div className="px-2 pb-1 pt-3">
+        <ResponsiveContainer width="100%" height={height}>
+          {isBar ? (
+            <BarChart data={data} margin={{ top: 4, right: 14, bottom: 2, left: 0 }}>
+              {common}
+              <Bar dataKey="y" fill={color} radius={[3, 3, 0, 0]} isAnimationActive={false} />
+            </BarChart>
+          ) : (
+            // line + timeline both render as a value-over-x line
+            <LineChart data={data} margin={{ top: 4, right: 14, bottom: 2, left: 0 }}>
+              {common}
+              <Line
+                type="monotone"
+                dataKey="y"
+                stroke={color}
+                strokeWidth={1.75}
+                dot={{ r: 2, fill: color }}
+                activeDot={{ r: 3.5 }}
+                isAnimationActive={false}
+              />
+            </LineChart>
+          )}
+        </ResponsiveContainer>
+      </div>
+      {chart.xLabel && (
+        <div className="border-t border-border px-3.5 py-[7px] font-mono text-[10.5px] text-dim">
+          {clip(chart.xLabel, 60)}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 // ── Public component ─────────────────────────────────────────────────────────
 
 interface HuntVisualsProps {
@@ -330,9 +434,11 @@ interface HuntVisualsProps {
   findings: HuntFinding[];
   /** hosts the hunt marked affected; backfills the map with unlinked hosts */
   affectedHosts?: string[];
+  /** model-authored charts that survived the post-hunt chart gate (optional) */
+  charts?: HuntChart[];
 }
 
-export function HuntVisuals({ findings, affectedHosts = [] }: HuntVisualsProps) {
+export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntVisualsProps) {
   const sevRows = breakdownRows(findings);
   const hostR = hostRows(findings);
 
@@ -356,61 +462,84 @@ export function HuntVisuals({ findings, affectedHosts = [] }: HuntVisualsProps) 
     ...(obs > 0 ? [{ swatch: OBS_COLOR, label: 'observation' }] : []),
   ];
 
+  // Agent charts render as an additional block AFTER the deterministic panels;
+  // guard against an empty series (the backend already dropped uncited charts).
+  const agentCharts = charts.filter((c) => c.series && c.series.length > 0);
+
   return (
-    <div className="grid grid-cols-1 gap-[18px] xl:grid-cols-2">
-      <Panel>
-        <PanelHeader
-          icon={<BarChart3 size={15} />}
-          title="Findings breakdown"
-          right={<span className="font-mono text-[11px] text-accent">{findings.length}</span>}
-        />
-        <div className="px-2 pt-3">
-          <BreakdownChart rows={sevRows} />
-        </div>
-        <LegendRow items={breakdownLegend} />
-      </Panel>
-
-      <Panel>
-        <PanelHeader
-          icon={<Server size={15} />}
-          title="Host involvement"
-          right={<span className="font-mono text-[11px] text-accent">{hostR.length}</span>}
-        />
-        {hostR.length === 0 ? (
-          <div className="px-4 py-3.5 text-[12.5px] text-dim">No findings name a host.</div>
-        ) : (
-          <div className="px-2 py-3">
-            <HostChart rows={hostR} />
+    <div className="flex flex-col gap-[18px]">
+      {/* Deterministic panels (unchanged) — always first. */}
+      <div className="grid grid-cols-1 gap-[18px] xl:grid-cols-2">
+        <Panel>
+          <PanelHeader
+            icon={<BarChart3 size={15} />}
+            title="Findings breakdown"
+            right={<span className="font-mono text-[11px] text-accent">{findings.length}</span>}
+          />
+          <div className="px-2 pt-3">
+            <BreakdownChart rows={sevRows} />
           </div>
-        )}
-      </Panel>
+          <LegendRow items={breakdownLegend} />
+        </Panel>
 
-      <Panel className="xl:col-span-2">
-        <PanelHeader
-          icon={<Network size={15} />}
-          title="Host–finding map"
-          right={
-            <span className="font-mono text-[11px] text-accent">
-              {findings.length}F · {mapHosts.length}H
-            </span>
-          }
-        />
-        {mapHosts.length === 0 ? (
-          <div className="px-4 py-3.5 text-[12.5px] text-dim">
-            No hosts to map — no finding names a host.
-          </div>
-        ) : (
-          <>
-            <HostFindingMap findings={findings} hosts={mapHosts} />
-            <LegendRow
-              items={[
-                { swatch: SEV_COLOR.high, label: 'finding (severity color)' },
-                { swatch: '#4b8bf5', round: true, label: 'host' },
-              ]}
+        <Panel>
+          <PanelHeader
+            icon={<Server size={15} />}
+            title="Host involvement"
+            right={<span className="font-mono text-[11px] text-accent">{hostR.length}</span>}
+          />
+          {hostR.length === 0 ? (
+            <div className="px-4 py-3.5 text-[12.5px] text-dim">No findings name a host.</div>
+          ) : (
+            <div className="px-2 py-3">
+              <HostChart rows={hostR} />
+            </div>
+          )}
+        </Panel>
+
+        <Panel className="xl:col-span-2">
+          <PanelHeader
+            icon={<Network size={15} />}
+            title="Host–finding map"
+            right={
+              <span className="font-mono text-[11px] text-accent">
+                {findings.length}F · {mapHosts.length}H
+              </span>
+            }
+          />
+          {mapHosts.length === 0 ? (
+            <div className="px-4 py-3.5 text-[12.5px] text-dim">
+              No hosts to map — no finding names a host.
+            </div>
+          ) : (
+            <>
+              <HostFindingMap findings={findings} hosts={mapHosts} />
+              <LegendRow
+                items={[
+                  { swatch: SEV_COLOR.high, label: 'finding (severity color)' },
+                  { swatch: '#4b8bf5', round: true, label: 'host' },
+                ]}
+              />
+            </>
+          )}
+        </Panel>
+      </div>
+
+      {/* Agent-authored charts — series the model pulled from tool results that a
+          deterministic chart can't guess. Every chart here already traced its
+          source_citations to gathered evidence (backend gate); an invented series
+          never reaches this point. Only render the block when some survived. */}
+      {agentCharts.length > 0 && (
+        <div className="grid grid-cols-1 gap-[18px] xl:grid-cols-2">
+          {agentCharts.map((c, i) => (
+            <AgentChart
+              key={`${c.title}-${i}`}
+              chart={c}
+              color={AGENT_CHART_COLORS[i % AGENT_CHART_COLORS.length]}
             />
-          </>
-        )}
-      </Panel>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

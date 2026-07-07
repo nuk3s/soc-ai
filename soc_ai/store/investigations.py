@@ -355,6 +355,84 @@ async def verdict_counts_by_rule(
     return out
 
 
+async def override_counts_by_rule(
+    db: AsyncSession, rule_names: list[str]
+) -> dict[str, dict[str, int]]:
+    """Per-rule ANALYST-override tallies over COMPLETE investigations (detection tuning).
+
+    Where :func:`verdict_counts_by_rule` reads the AI verdict trend, this reads the
+    HUMAN feedback: how often an analyst overrode a rule's verdict (via chat or a
+    manual UI override) and in which direction. That is a stronger tuning signal
+    than the AI verdict alone — a rule the analyst keeps correcting TO false-positive
+    is institutional memory that it is benign. The shape is::
+
+        {rule_name: {"overridden_to_fp": int, "overridden_to_tp": int,
+                     "chat_resolved": int, "manual_resolved": int}}
+
+    An analyst override is a completed investigation whose
+    ``report["resolution"]`` carries ``resolved_via`` in ``{"chat", "manual"}``
+    (stamped by :func:`resolve`). This is DELIBERATELY distinct from an E1.2
+    pipeline_fallback, whose ``report["resolution"]`` carries ``provenance ==
+    "pipeline_fallback"`` and NO ``resolved_via`` — so a synth-failure fallback is
+    never miscounted as human feedback. ``overridden_to_fp`` counts corrections TO
+    false-positive (current verdict is false_positive and the original was not);
+    ``overridden_to_tp`` the mirror TO true-positive. Only rules with ≥1 analyst
+    override appear in the result.
+
+    ``report`` is a portable JSON column, so this loads the rows and inspects the
+    resolution in Python rather than issuing a JSON-path query — bounded like
+    :func:`verdict_counts_by_rule` (a small multiple of ``len(rule_names)``).
+    """
+    out: dict[str, dict[str, int]] = {}
+    if not rule_names:
+        return out
+    rows = (
+        await db.scalars(
+            select(Investigation)
+            .where(
+                Investigation.rule_name.in_(rule_names),
+                Investigation.status == "complete",
+                Investigation.verdict.is_not(None),
+            )
+            .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+            # Bound the scan like verdict_counts_by_rule. Analyst overrides are
+            # rare relative to raw completions; a small multiple per rule covers
+            # the recent history that drives a nomination.
+            .limit(len(rule_names) * 25)
+        )
+    ).all()
+    for inv in rows:
+        if inv.rule_name is None:
+            continue
+        resolution = (inv.report or {}).get("resolution")
+        if not isinstance(resolution, dict):
+            continue
+        resolved_via = resolution.get("resolved_via")
+        # ONLY an analyst override counts. A pipeline_fallback stamps a resolution
+        # with `provenance` and no `resolved_via`, so it is skipped here.
+        if resolved_via not in ("chat", "manual"):
+            continue
+        bucket = out.setdefault(
+            inv.rule_name,
+            {
+                "overridden_to_fp": 0,
+                "overridden_to_tp": 0,
+                "chat_resolved": 0,
+                "manual_resolved": 0,
+            },
+        )
+        if resolved_via == "chat":
+            bucket["chat_resolved"] += 1
+        else:
+            bucket["manual_resolved"] += 1
+        original = resolution.get("original_verdict")
+        if inv.verdict == "false_positive" and original != "false_positive":
+            bucket["overridden_to_fp"] += 1
+        elif inv.verdict == "true_positive" and original != "true_positive":
+            bucket["overridden_to_tp"] += 1
+    return out
+
+
 async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str, Investigation]:
     """Most recent investigation per alert _id (badge on event rows)."""
     return await _latest_by(db, Investigation.alert_es_id, alert_ids)
@@ -398,6 +476,27 @@ async def list_recent(
     if status is not None:
         q = q.where(Investigation.status == status)
     q = q.limit(limit)
+    return list((await db.scalars(q)).all())
+
+
+async def for_entity(db: AsyncSession, value: str, *, limit: int = 50) -> list[Investigation]:
+    """Investigations touching an entity — where ``src_ip == value OR dest_ip == value``.
+
+    Powers the entity pivot page (E3.5): every investigation whose source OR
+    destination is this host/IP, newest first, bounded. ANY status (a running or
+    errored run is still part of "what we know about this box"). The
+    ``ix_investigations_similarity`` composite index leads with ``rule_name`` so it
+    doesn't serve this OR directly, but ``src_ip``/``dest_ip`` are low-cardinality
+    and the scan is ``limit``-bounded, so it stays cheap for the read-model.
+    """
+    if not value:
+        return []
+    q = (
+        select(Investigation)
+        .where((Investigation.src_ip == value) | (Investigation.dest_ip == value))
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .limit(limit)
+    )
     return list((await db.scalars(q)).all())
 
 

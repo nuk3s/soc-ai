@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.0.7-3fb950" alt="1.0.7">
+  <img src="https://img.shields.io/badge/status-1.0.8-3fb950" alt="1.0.8">
 </p>
 
 </div>

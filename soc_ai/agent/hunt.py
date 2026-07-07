@@ -23,6 +23,8 @@ tools, no Oracle), exactly like the "Chat about this" agent.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
@@ -67,6 +69,17 @@ class HuntFinding(BaseModel):
         default_factory=list,
         description="ES `_id`s / SOC ids / tool results that support the finding.",
     )
+    # Set by the deterministic post-hunt citation gate (soc_ai.agent.hunt_gates),
+    # NOT the model — a note surfaced to the analyst when the validator stripped
+    # non-resolving citations or capped the finding's severity. Mirrors
+    # TriageReport.validator_note on the investigation path.
+    validator_note: str | None = Field(
+        default=None,
+        description=(
+            "Deterministic-validator note (severity cap / stripped citations); "
+            "set by the citation gate, never by the model."
+        ),
+    )
 
 
 class HuntRecommendedAction(BaseModel):
@@ -76,6 +89,50 @@ class HuntRecommendedAction(BaseModel):
 
     title: str = Field(description="The recommended action, imperative (e.g. 'Isolate host X').")
     rationale: str = Field(description="One-line justification tied to a finding.")
+
+
+class HuntChartPoint(BaseModel):
+    """One (category/time, value) datum in a hunt chart's series."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: str = Field(
+        description="Category or time label for this datum (an interval bucket, a host, an hour)."
+    )
+    y: float = Field(description="The numeric value at x, taken from a tool result.")
+
+
+class HuntChart(BaseModel):
+    """A model-authored chart of a numeric series pulled from tool results.
+
+    The deterministic Visual Summary (findings breakdown, host involvement) can't
+    guess the interesting series — a beacon-interval histogram, bytes-over-time,
+    per-host event counts. The hunt agent may emit one when it has such a series
+    IN A TOOL RESULT it pulled this session. Held to the SAME trust bar as
+    findings: every chart carries ``source_citations`` and the deterministic
+    post-hunt chart gate (soc_ai.agent.hunt_gates) DROPS any chart whose citations
+    don't resolve to gathered evidence — an invented series is never rendered.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["bar", "line", "timeline"] = Field(
+        description="How to render: 'bar' (categorical), 'line' (continuous), 'timeline' (time)."
+    )
+    title: str = Field(description="Short chart title (analyst-scannable).")
+    x_label: str = Field(default="", description="Axis label for x (optional).")
+    y_label: str = Field(default="", description="Axis label for y (optional).")
+    series: list[HuntChartPoint] = Field(
+        default_factory=list,
+        description="The plotted points — every value must come from a cited tool result.",
+    )
+    source_citations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The ES `_id`s / tool-result markers the chart's numbers came from. A "
+            "chart whose citations don't resolve to gathered evidence is DROPPED."
+        ),
+    )
 
 
 class HuntReport(BaseModel):
@@ -114,6 +171,15 @@ class HuntReport(BaseModel):
         le=1.0,
         default=0.5,
         description="Overall confidence in the hunt's conclusions, 0.0-1.0.",
+    )
+    charts: list[HuntChart] = Field(
+        default_factory=list,
+        description=(
+            "Optional charts of numeric series pulled from tool results (e.g. a "
+            "beacon-interval histogram, bytes-over-time). Each MUST carry "
+            "source_citations; a chart whose citations don't resolve to gathered "
+            "evidence is dropped by the post-hunt gate and never rendered."
+        ),
     )
 
 
@@ -207,6 +273,19 @@ An empty result is a real answer — report an absent/empty result as **absent**
 plausible-sounding story. A finding you cannot cite is a hallucination, not a hunt \
 result. If the hunt turns up nothing, say so plainly with confidence and an empty \
 `findings` list — a clean hunt is a valid, valuable outcome.
+
+## Charts (optional — same trust bar as findings)
+If — and ONLY if — you have a NUMERIC SERIES that came straight out of a tool result \
+(a beacon-interval histogram, bytes-over-time for a flow, per-host event counts over \
+an hour, a DNS-query-length distribution), you MAY add it to `charts` so the analyst \
+sees what a generic chart can't guess. Each chart needs a `kind` ("bar" | "line" | \
+"timeline"), a `title`, a `series` of x/y points (x = the category or time label, y = the \
+measured value), and `source_citations` — the ES `_id`s / tool-result markers the numbers \
+came from. The SAME HARD RULE applies: \
+every value must trace to data you pulled THIS session. A chart whose `source_citations` \
+do not resolve to gathered evidence is DROPPED and never rendered — an invented series \
+is a hallucination, so do not chart a trend you did not actually measure. Only chart \
+when the series is genuinely informative; emit AT MOST 4 charts, and none at all is fine.
 
 ## Scope discipline
 - Stay on internal hosts and the estate's own data for identity/behaviour queries. \

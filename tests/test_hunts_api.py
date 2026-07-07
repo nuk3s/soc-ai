@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -678,6 +679,749 @@ def test_hunt_chat_message_runs_a_turn_and_round_trips(
     assert all("chat" not in (s.get("group", "").lower()) for s in detail["timeline"])
     tl_titles = " ".join(s["title"] for s in detail["timeline"])
     assert "which host was beaconing" not in tl_titles
+
+
+# ── E1.3: post-hunt citation gate ────────────────────────────────────────────
+
+
+def _tool_result(result: Any) -> dict[str, Any]:
+    """A canned tool_result event payload's ``result`` value (the shape the hunt
+    citation gate consumes — the JSON the hunt actually pulled)."""
+    return result
+
+
+def test_validate_hunt_findings_strips_fabricated_citation() -> None:
+    """A finding citing an id that appears in NO gathered tool result → the
+    non-resolving citations are stripped, severity capped to low, note set."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Beaconing to rare external IP",
+            detail="A host beacons on a 60s cadence.",
+            severity="high",
+            hosts=["10.0.0.5"],
+            citations=["sFABRICATED_ID_9xQ"],  # never pulled
+        )
+    ]
+    # The hunt pulled a zeek hit with a totally different id.
+    tool_results = [
+        _tool_result({"total": 1, "hits": [{"_id": "sREAL_PULLED_ID_42", "dataset": "zeek.conn"}]})
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    assert len(validated) == 1
+    f = validated[0]
+    assert f.citations == []  # fabricated citation stripped
+    assert f.severity == "low"  # capped down from high
+    assert f.validator_note is not None
+    assert "did not resolve" in f.validator_note.lower()
+    assert counts["findings_capped"] == 1
+    assert counts["citations_stripped"] == 1
+
+
+def test_validate_hunt_findings_keeps_resolving_citation() -> None:
+    """A finding citing a real gathered id → unchanged (severity, citations, no note)."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Beaconing to rare external IP",
+            detail="A host beacons on a 60s cadence.",
+            severity="high",
+            hosts=["10.0.0.5"],
+            citations=["sREAL_PULLED_ID_42"],
+        )
+    ]
+    tool_results = [
+        _tool_result({"total": 1, "hits": [{"_id": "sREAL_PULLED_ID_42", "dataset": "zeek.conn"}]})
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    f = validated[0]
+    assert f.citations == ["sREAL_PULLED_ID_42"]  # unchanged
+    assert f.severity == "high"  # NOT capped
+    assert f.validator_note is None
+    assert counts["findings_capped"] == 0
+    assert counts["citations_stripped"] == 0
+
+
+def test_validate_hunt_findings_high_sev_no_citations_capped() -> None:
+    """A high-severity finding with an EMPTY citations list → capped to medium + noted
+    (an empty-citation observation is otherwise left alone)."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Suspicious lateral movement",
+            detail="Cross-host SMB writes observed.",
+            severity="critical",
+            hosts=["10.0.0.9"],
+            citations=[],
+        ),
+        HuntFinding(
+            title="Benign context",
+            detail="An informational observation.",
+            severity="info",
+            citations=[],
+        ),
+    ]
+    validated, counts = _validate_hunt_findings(findings, [])
+
+    high = validated[0]
+    assert high.severity == "medium"  # critical capped to medium
+    assert high.validator_note is not None
+    assert "lacks citations" in high.validator_note.lower()
+    # the info observation with no citations is untouched
+    low = validated[1]
+    assert low.severity == "info"
+    assert low.validator_note is None
+    assert counts["findings_capped"] == 1
+
+
+def test_run_hunt_gate_strips_fabricated_citation_end_to_end(settings_kratos: Settings) -> None:
+    """Drive run_hunt with a report citing an id NOT in the streamed tool_result:
+    the emitted hunt_report has the citation stripped + severity capped, and a
+    citation_validation event is emitted before it."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+
+    # One tool_result the hunt actually pulled (a real id), then a report that
+    # cites a DIFFERENT (fabricated) id.
+    real_id = "sREAL_PULLED_ID_42"
+    report = HuntReport(
+        findings=[
+            HuntFinding(
+                title="Beaconing to rare external IP",
+                detail="A host beacons on a 60s cadence.",
+                severity="high",
+                hosts=["10.0.0.5"],
+                citations=["sFABRICATED_9xQ"],  # never pulled
+            )
+        ],
+        narrative="One host is beaconing.",
+        affected_hosts=["10.0.0.5"],
+        confidence=0.7,
+    )
+
+    class _Run:
+        def __init__(self) -> None:
+            self._nodes = iter(
+                [
+                    # a tool_call node then a tool_result node carrying the real id
+                    SimpleNamespace(
+                        model_response=ModelResponse(
+                            parts=[
+                                ToolCallPart(
+                                    tool_name="t_query_events_oql", args={}, tool_call_id="c1"
+                                )
+                            ]
+                        ),
+                        request=None,
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=SimpleNamespace(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_query_events_oql",
+                                    content={"total": 1, "hits": [{"_id": real_id}]},
+                                    tool_call_id="c1",
+                                )
+                            ]
+                        ),
+                    ),
+                ]
+            )
+            self.result = SimpleNamespace(output=report)
+
+        async def __aenter__(self) -> _Run:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> _Run:
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class _Agent:
+        def iter(self, *a: Any, **k: Any) -> _Run:
+            return _Run()
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_Agent()),
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(call_tools=[]),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings_kratos), objective="hunt for beaconing"):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    kinds = [e.kind for e in events]
+    # the gate emitted its per-hunt count, before the report
+    assert "citation_validation" in kinds
+    assert kinds.index("citation_validation") < kinds.index("hunt_report")
+    cv = next(e for e in events if e.kind == "citation_validation")
+    assert cv.payload["findings_capped"] == 1
+    assert cv.payload["citations_stripped"] == 1
+    # the report finding was stripped + capped
+    report_ev = next(e for e in events if e.kind == "hunt_report")
+    f = report_ev.payload["findings"][0]
+    assert f["citations"] == []
+    assert f["severity"] == "low"
+    assert "did not resolve" in (f["validator_note"] or "").lower()
+
+
+def test_hunt_detail_serializes_validator_note(client: TestClient) -> None:
+    """A stored finding carrying validator_note surfaces as validatorNote on the
+    hunt detail response (the FE reads it to render the post-validator note)."""
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        report = HuntReport(
+            findings=[
+                HuntFinding(
+                    title="Beaconing to rare external IP",
+                    detail="A host beacons on a 60s cadence.",
+                    severity="low",
+                    hosts=["10.0.0.5"],
+                    citations=[],
+                    validator_note="Citations did not resolve to gathered evidence; "
+                    "severity capped to low.",
+                )
+            ],
+            narrative="One host beaconed; the citation did not resolve.",
+            affected_hosts=["10.0.0.5"],
+            confidence=0.4,
+        )
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective="hunt for beaconing", started_by="admin")
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                narrative=report.narrative,
+                report=report.model_dump(mode="json"),
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    body = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    assert body["findings"][0]["severity"] == "low"
+    assert body["findings"][0]["validatorNote"]
+    assert "did not resolve" in body["findings"][0]["validatorNote"].lower()
+
+
+# ── E3.3: agent-authored charts (post-hunt chart gate) ───────────────────────
+
+
+def _chart(**kw: Any) -> Any:
+    from soc_ai.agent.hunt import HuntChart, HuntChartPoint
+
+    kw.setdefault("kind", "bar")
+    kw.setdefault("title", "Beacon interval histogram")
+    series = kw.pop("series", [("60s", 12.0), ("120s", 3.0)])
+    return HuntChart(series=[HuntChartPoint(x=x, y=y) for x, y in series], **kw)
+
+
+def test_hunt_report_charts_round_trip() -> None:
+    """HuntReport with charts serializes + re-validates through the schema."""
+    from soc_ai.agent.hunt import HuntChart, HuntChartPoint
+
+    report = HuntReport(
+        narrative="one beaconing host",
+        charts=[
+            HuntChart(
+                kind="bar",
+                title="Beacon interval histogram",
+                x_label="interval",
+                y_label="count",
+                series=[HuntChartPoint(x="60s", y=12.0), HuntChartPoint(x="120s", y=3.0)],
+                source_citations=["sREAL_PULLED_ID_42"],
+            )
+        ],
+    )
+    dumped = report.model_dump(mode="json")
+    assert dumped["charts"][0]["kind"] == "bar"
+    assert dumped["charts"][0]["series"][0] == {"x": "60s", "y": 12.0}
+    # round-trips back into the model unchanged
+    again = HuntReport.model_validate(dumped)
+    assert again.charts[0].source_citations == ["sREAL_PULLED_ID_42"]
+    # defaults: no charts on a bare report
+    assert HuntReport(narrative="x").charts == []
+
+
+def test_validate_hunt_charts_keeps_resolving_chart() -> None:
+    """A chart whose source_citations resolve to a gathered tool result SURVIVES."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_charts
+
+    charts = [_chart(source_citations=["sREAL_PULLED_ID_42"])]
+    tool_results = [
+        _tool_result({"total": 1, "hits": [{"_id": "sREAL_PULLED_ID_42", "dataset": "zeek.conn"}]})
+    ]
+    kept, counts = _validate_hunt_charts(charts, tool_results)
+    assert len(kept) == 1
+    assert counts["charts"] == 1
+    assert counts["charts_dropped"] == 0
+
+
+def test_validate_hunt_charts_drops_fabricated_chart() -> None:
+    """A chart citing an id that appears in NO gathered tool result is DROPPED."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_charts
+
+    charts = [_chart(source_citations=["sFABRICATED_ID_9xQ"])]
+    tool_results = [
+        _tool_result({"total": 1, "hits": [{"_id": "sREAL_PULLED_ID_42", "dataset": "zeek.conn"}]})
+    ]
+    kept, counts = _validate_hunt_charts(charts, tool_results)
+    assert kept == []
+    assert counts["charts_dropped"] == 1
+
+
+def test_validate_hunt_charts_drops_empty_or_uncited() -> None:
+    """A chart with no source_citations, or no series, is DROPPED (can't be traced)."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_charts
+
+    tool_results = [_tool_result({"hits": [{"_id": "sREAL_PULLED_ID_42"}]})]
+    # no citations at all
+    kept, counts = _validate_hunt_charts([_chart(source_citations=[])], tool_results)
+    assert kept == []
+    assert counts["charts_dropped"] == 1
+    # empty series (nothing to plot), even with a resolving citation
+    kept2, counts2 = _validate_hunt_charts(
+        [_chart(series=[], source_citations=["sREAL_PULLED_ID_42"])], tool_results
+    )
+    assert kept2 == []
+    assert counts2["charts_dropped"] == 1
+
+
+def test_validate_hunt_charts_caps_at_four() -> None:
+    """Beyond four charts, extras are dropped even when they'd otherwise resolve."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_charts
+
+    tool_results = [_tool_result({"hits": [{"_id": "sREAL_PULLED_ID_42"}]})]
+    charts = [_chart(title=f"c{i}", source_citations=["sREAL_PULLED_ID_42"]) for i in range(6)]
+    kept, counts = _validate_hunt_charts(charts, tool_results)
+    assert len(kept) == 4
+    assert counts["charts_dropped"] == 2
+
+
+def test_run_hunt_chart_gate_end_to_end(settings_kratos: Settings) -> None:
+    """Drive run_hunt with a report carrying ONE resolving chart + ONE fabricated
+    chart: the emitted hunt_report keeps only the resolving one, and the
+    citation_validation event carries the charts/charts_dropped counts."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+    from soc_ai.agent.hunt import HuntChart, HuntChartPoint
+
+    real_id = "sREAL_PULLED_ID_42"
+    report = HuntReport(
+        findings=[],
+        narrative="one beaconing host",
+        affected_hosts=["10.0.0.5"],
+        confidence=0.6,
+        charts=[
+            HuntChart(
+                kind="bar",
+                title="Beacon interval histogram",
+                series=[HuntChartPoint(x="60s", y=12.0)],
+                source_citations=[real_id],  # resolves
+            ),
+            HuntChart(
+                kind="line",
+                title="Invented bytes-over-time",
+                series=[HuntChartPoint(x="t0", y=1.0)],
+                source_citations=["sFABRICATED_9xQ"],  # never pulled → dropped
+            ),
+        ],
+    )
+
+    class _Run:
+        def __init__(self) -> None:
+            self._nodes = iter(
+                [
+                    SimpleNamespace(
+                        model_response=ModelResponse(
+                            parts=[
+                                ToolCallPart(
+                                    tool_name="t_query_events_oql", args={}, tool_call_id="c1"
+                                )
+                            ]
+                        ),
+                        request=None,
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=SimpleNamespace(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_query_events_oql",
+                                    content={"total": 1, "hits": [{"_id": real_id}]},
+                                    tool_call_id="c1",
+                                )
+                            ]
+                        ),
+                    ),
+                ]
+            )
+            self.result = SimpleNamespace(output=report)
+
+        async def __aenter__(self) -> _Run:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> _Run:
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class _Agent:
+        def iter(self, *a: Any, **k: Any) -> _Run:
+            return _Run()
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_Agent()),
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(call_tools=[]),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings_kratos), objective="hunt for beaconing"):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    cv = next(e for e in events if e.kind == "citation_validation")
+    assert cv.payload["charts"] == 2
+    assert cv.payload["charts_dropped"] == 1
+    report_ev = next(e for e in events if e.kind == "hunt_report")
+    charts = report_ev.payload["charts"]
+    assert len(charts) == 1  # only the resolving chart survived
+    assert charts[0]["title"] == "Beacon interval histogram"
+    assert charts[0]["source_citations"] == [real_id]
+
+
+def test_hunt_detail_serializes_accepted_charts(client: TestClient) -> None:
+    """A stored report's charts surface (camelCased) on the hunt detail response;
+    a malformed/empty-series chart is dropped by the serializer."""
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        report = HuntReport(
+            findings=[],
+            narrative="one beaconing host",
+            affected_hosts=["10.0.0.5"],
+            confidence=0.6,
+        )
+        payload = report.model_dump(mode="json")
+        # a good chart + a junk one the serializer should drop (empty series)
+        payload["charts"] = [
+            {
+                "kind": "bar",
+                "title": "Beacon interval histogram",
+                "x_label": "interval",
+                "y_label": "count",
+                "series": [{"x": "60s", "y": 12.0}, {"x": "120s", "y": 3.0}],
+                "source_citations": ["sREAL_PULLED_ID_42"],
+            },
+            {"kind": "line", "title": "empty", "series": [], "source_citations": ["x"]},
+        ]
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective="hunt for beaconing", started_by="admin")
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                narrative=report.narrative,
+                report=payload,
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    body = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    assert len(body["charts"]) == 1  # the empty-series chart was dropped
+    chart = body["charts"][0]
+    assert chart["kind"] == "bar"
+    assert chart["title"] == "Beacon interval histogram"
+    assert chart["xLabel"] == "interval"
+    assert chart["yLabel"] == "count"
+    assert chart["series"][0] == {"x": "60s", "y": 12.0}
+    assert chart["sourceCitations"] == ["sREAL_PULLED_ID_42"]
+
+
+# ── E3.4: hunt diffing (objective_hash + previous_completed_run + GET diff) ───
+
+
+def test_objective_hash_stable_and_normalized() -> None:
+    """_objective_hash is stable + case/whitespace-insensitive so re-runs link."""
+    from soc_ai.store.hunts import _objective_hash
+
+    base = _objective_hash("Hunt for beaconing")
+    # identical input → identical hash (stable)
+    assert base == _objective_hash("Hunt for beaconing")
+    # case-insensitive
+    assert base == _objective_hash("hunt for beaconing")
+    # whitespace-collapsed + trimmed (leading/trailing/internal runs, newlines/tabs)
+    assert base == _objective_hash("  hunt   for\tbeaconing\n")
+    # a genuinely different objective does NOT collide
+    assert base != _objective_hash("hunt for lateral movement")
+    # fits the indexed String(64) column
+    assert len(base) <= 64
+
+
+def _seed_hunt_at(
+    client: TestClient,
+    *,
+    objective: str,
+    status: str,
+    findings: list[HuntFinding],
+    created_at: datetime,
+) -> str:
+    """Insert a hunt with an explicit created_at + a report of the given findings."""
+    from soc_ai.store.models import Hunt
+
+    report = HuntReport(
+        findings=findings,
+        narrative="seeded",
+        affected_hosts=sorted({h for f in findings for h in f.hosts}),
+        confidence=0.5,
+    )
+
+    async def _go() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective=objective, started_by="admin")
+            # Pin created_at for deterministic ordering + finalize the report.
+            row = await db.get(Hunt, hunt.id)
+            assert row is not None
+            row.created_at = created_at
+            await db.commit()
+            if status == "complete":
+                await hunt_svc.finalize(
+                    db,
+                    hunt.id,
+                    status="complete",
+                    narrative=report.narrative,
+                    report=report.model_dump(mode="json"),
+                )
+            return hunt.id
+
+    return asyncio.run(_go())
+
+
+def _finding(title: str, host: str, severity: str = "medium") -> HuntFinding:
+    return HuntFinding(title=title, detail="d", severity=severity, hosts=[host], citations=[])
+
+
+def test_previous_completed_run_finds_prior_same_objective(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """previous_completed_run returns the prior COMPLETE run with the same hash;
+    NOT a different-objective run, NOT the current hunt, NOT a running run."""
+    from datetime import timedelta
+
+    from soc_ai.store.models import Hunt
+
+    t0 = datetime(2026, 7, 7, 12, 0, 0)
+    prior = _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[_finding("A", "10.0.0.1")],
+        created_at=t0,
+    )
+    # a DIFFERENT objective (different hash) — must be ignored
+    _seed_hunt_at(
+        client,
+        objective="hunt for lateral movement",
+        status="complete",
+        findings=[_finding("X", "10.0.0.9")],
+        created_at=t0 + timedelta(minutes=1),
+    )
+    # a RUNNING run of the same objective — must be ignored (not complete)
+    _seed_hunt_at(
+        client,
+        objective="Hunt for Beaconing",  # same normalized hash
+        status="running",
+        findings=[],
+        created_at=t0 + timedelta(minutes=2),
+    )
+    current = _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[_finding("A", "10.0.0.1")],
+        created_at=t0 + timedelta(minutes=5),
+    )
+
+    async def _go() -> str | None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            cur = await db.get(Hunt, current)
+            assert cur is not None
+            prev = await hunt_svc.previous_completed_run(
+                db,
+                objective_hash=cur.objective_hash,
+                before_created_at=cur.created_at,
+                exclude_id=cur.id,
+            )
+            return prev.id if prev is not None else None
+
+    assert asyncio.run(_go()) == prior
+
+
+def test_previous_completed_run_none_when_first_run(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """The first run of an objective has no prior COMPLETE run → None."""
+    from soc_ai.store.models import Hunt
+
+    only = _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[_finding("A", "10.0.0.1")],
+        created_at=datetime(2026, 7, 7, 12, 0, 0),
+    )
+
+    async def _go() -> str | None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            cur = await db.get(Hunt, only)
+            assert cur is not None
+            prev = await hunt_svc.previous_completed_run(
+                db,
+                objective_hash=cur.objective_hash,
+                before_created_at=cur.created_at,
+                exclude_id=cur.id,
+            )
+            return prev.id if prev is not None else None
+
+    assert asyncio.run(_go()) is None
+
+
+def test_get_hunt_diff_new_persisting_resolved(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """End-to-end via GET /hunts/{id}: seed a prior complete hunt (findings A,B,C)
+    + a later complete hunt same objective (findings A,B,D) → diff = 1 new (D) ·
+    2 persisting (A,B) · 1 resolved (C)."""
+    from datetime import timedelta
+
+    t0 = datetime(2026, 7, 7, 12, 0, 0)
+    _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[
+            _finding("Finding A", "10.0.0.1"),
+            _finding("Finding B", "10.0.0.2"),
+            _finding("Finding C", "10.0.0.3"),
+        ],
+        created_at=t0,
+    )
+    current = _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[
+            _finding("Finding A", "10.0.0.1"),  # persisting
+            _finding("Finding B", "10.0.0.2"),  # persisting
+            _finding("Finding D", "10.0.0.4"),  # new
+        ],
+        created_at=t0 + timedelta(minutes=5),
+    )
+
+    body = client.get(f"/api/v1/hunts/{current}").json()
+    diff = body["diff"]
+    assert diff is not None
+    assert sorted(e["title"] for e in diff["new"]) == ["Finding D"]
+    assert sorted(e["title"] for e in diff["persisting"]) == ["Finding A", "Finding B"]
+    assert sorted(e["title"] for e in diff["resolved"]) == ["Finding C"]
+    # the baseline run is referenced (for the "vs run from {ago}" label)
+    assert diff["previousHuntId"]
+    assert diff["previousTs"]
+
+
+def test_get_hunt_diff_absent_on_first_run(client: TestClient, settings_kratos: Settings) -> None:
+    """A hunt with no prior completed run of its objective has diff == None."""
+    only = _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[_finding("Finding A", "10.0.0.1")],
+        created_at=datetime(2026, 7, 7, 12, 0, 0),
+    )
+    body = client.get(f"/api/v1/hunts/{only}").json()
+    assert body["diff"] is None
+
+
+def test_get_hunt_diff_fuzzy_title_and_hosts_identity(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """Finding identity is fuzzy on (normalized title + hosts set): case/
+    punctuation/whitespace + host order don't matter, but distinct hosts do."""
+    from datetime import timedelta
+
+    t0 = datetime(2026, 7, 7, 12, 0, 0)
+    _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[
+            HuntFinding(
+                title="Beaconing to rare external IP",
+                detail="d",
+                severity="high",
+                hosts=["10.0.0.1", "10.0.0.2"],
+                citations=[],
+            ),
+        ],
+        created_at=t0,
+    )
+    current = _seed_hunt_at(
+        client,
+        objective="hunt for beaconing",
+        status="complete",
+        findings=[
+            # same finding, re-worded punctuation/case + reversed host order → persisting
+            HuntFinding(
+                title="beaconing to rare, external IP.",
+                detail="d",
+                severity="high",
+                hosts=["10.0.0.2", "10.0.0.1"],
+                citations=[],
+            ),
+        ],
+        created_at=t0 + timedelta(minutes=5),
+    )
+    diff = client.get(f"/api/v1/hunts/{current}").json()["diff"]
+    assert len(diff["persisting"]) == 1
+    assert diff["new"] == []
+    assert diff["resolved"] == []
 
 
 def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) -> None:

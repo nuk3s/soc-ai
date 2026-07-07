@@ -22,11 +22,12 @@ import inspect
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from soc_ai.agent.context import InvestigationContext
-from soc_ai.agent.egress_guard import EgressGuard
-from soc_ai.agent.orchestrator import _desanitize_report
+from soc_ai.agent.egress_guard import EgressGuard, EgressResidueError
+from soc_ai.agent.orchestrator import _desanitize_report, _guard_egress
 from soc_ai.agent.toolset import _guarded, register_read_tools
 from soc_ai.config import Settings
 from soc_ai.triage_models import TriageReport
@@ -227,3 +228,86 @@ def test_no_guard_leaves_closures_unwrapped(settings_kratos: Settings) -> None:
     tool = agent._function_toolset.tools["t_query_events_oql"]
     # No guard → no functools.wraps wrapper in the registered function.
     assert not hasattr(tool.function, "__wrapped__")
+
+
+# ---------------------------------------------------------------------------
+# 5. Fail-closed residue sweep (E5.1)
+# ---------------------------------------------------------------------------
+
+# An FQDN on an internal suffix the guard is configured to know about — the
+# independent unsafe_residue detector flags it, and (crucially for the test)
+# the guard never learned a label for it, so it stands in for a sanitize MISS.
+_RESIDUE_SUFFIX = ".secretcorp"
+_RESIDUE_FQDN = "payroll.secretcorp"
+
+
+def test_residue_flags_internal_fqdn_and_clean_is_empty() -> None:
+    """residue() runs the INDEPENDENT unsafe_residue sweep over a final string:
+    an internal FQDN on a configured suffix is flagged; a clean string → []."""
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=(_RESIDUE_SUFFIX,))
+    leaked = guard.residue(f"the model was told to reach {_RESIDUE_FQDN} on 443")
+    assert leaked, "an internal FQDN on a configured suffix must be flagged as residue"
+    assert all(isinstance(item, str) for item in leaked)
+    # A payload with no internal identifiers at all → clean.
+    assert guard.residue("public.example.com answered; hash a1b2c3; CVE-2024-0001") == []
+
+
+def test_residue_flags_learned_value_that_survived() -> None:
+    """A real value the guard LEARNED this run (mapping.reverse.values()) that
+    still appears verbatim in a later string is residue — the known_values net."""
+    guard = EgressGuard(extra_hosts=("appserver01",), extra_suffixes=())
+    # Learn the label by sanitizing a first payload (forward: real→label).
+    guard.sanitize_text("appserver01 was seen")
+    # A later composed string still carrying the RAW learned value is a leak.
+    assert guard.residue("pivot back to appserver01") != []
+    # The label itself is the desired output, never a leak.
+    assert guard.residue("pivot back to HOST_01") == []
+
+
+def test_check_or_raise_raises_on_residue_when_fail_closed() -> None:
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=(_RESIDUE_SUFFIX,))
+    with pytest.raises(EgressResidueError) as ei:
+        guard.check_or_raise(f"call {_RESIDUE_FQDN} now", fail_closed=True)
+    # The error carries the leak list for the count, but its message never
+    # echoes the raw value (logging it would defect on the block).
+    assert ei.value.leaked
+    assert _RESIDUE_FQDN not in str(ei.value)
+    assert "identifier" in str(ei.value)
+
+
+def test_check_or_raise_noop_when_fail_closed_off_or_clean() -> None:
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=(_RESIDUE_SUFFIX,))
+    # fail_closed off → best-effort: never raises even with residue present.
+    guard.check_or_raise(f"call {_RESIDUE_FQDN} now", fail_closed=False)
+    # fail_closed on but the string is clean → no raise.
+    guard.check_or_raise("public.example.com; nothing internal here", fail_closed=True)
+
+
+def test_guard_egress_passthrough_when_no_guard(settings_kratos: Settings) -> None:
+    """guard is None (analyst_cloud_redaction off) → returns the text unchanged,
+    byte-identical to the pre-feature path, regardless of the fail-closed flag."""
+    settings_kratos.analyst_redaction_fail_closed = True
+    text = f"contains {_RESIDUE_FQDN}"
+    assert _guard_egress(None, text, settings_kratos) == text
+
+
+def test_guard_egress_passthrough_when_fail_closed_off(settings_kratos: Settings) -> None:
+    """Guard present but fail-closed OFF → best-effort: passthrough even when the
+    (already-sanitized) string still carries residue."""
+    settings_kratos.analyst_redaction_fail_closed = False
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=(_RESIDUE_SUFFIX,))
+    text = f"call {_RESIDUE_FQDN}"
+    assert _guard_egress(guard, text, settings_kratos) == text
+
+
+def test_guard_egress_raises_when_fail_closed_and_residue(settings_kratos: Settings) -> None:
+    settings_kratos.analyst_redaction_fail_closed = True
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=(_RESIDUE_SUFFIX,))
+    with pytest.raises(EgressResidueError):
+        _guard_egress(guard, f"call {_RESIDUE_FQDN}", settings_kratos)
+    # A clean string still passes through.
+    assert _guard_egress(guard, "nothing internal", settings_kratos) == "nothing internal"
+
+
+def test_config_fail_closed_defaults_off(settings_kratos: Settings) -> None:
+    assert settings_kratos.analyst_redaction_fail_closed is False

@@ -324,11 +324,50 @@ async def ack_events(
 class AssignIn(BaseModel):
     rule_name: str
     unassign: bool = False
+    # Optional triage-state transition (E2.3). When omitted on an assign the state
+    # defaults to "owned"; passing e.g. "in_review"/"done" moves an ALREADY-owned
+    # rule through the triage flow without changing the owner. Ignored on unassign
+    # (clearing the row drops the state with it).
+    state: str | None = None
 
 
 class AssignOut(BaseModel):
     rule_name: str
     owner: str | None
+    state: str | None = None
+
+
+async def _audit_assignment(
+    request: Request,
+    *,
+    rule_name: str,
+    action: str,
+    owner: str | None,
+    state: str | None,
+) -> None:
+    """Best-effort audit of an assignment change (assign / state / unassign).
+
+    Mirrors E1.1's model_fitness audit: a failed audit index must never turn a
+    successful assignment into a 500, so the whole thing is wrapped and logged,
+    never raised. ``action`` is one of ``assign`` | ``state`` | ``unassign``.
+    """
+    try:
+        caller = await identify_caller(request)
+        audit = getattr(request.app.state, "audit", None)
+        if audit is not None:
+            await audit.log_kind(
+                session_id=f"assignment:{rule_name}",
+                kind="assignment",
+                payload={
+                    "rule_name": rule_name,
+                    "action": action,
+                    "owner": owner,
+                    "state": state,
+                },
+                user=caller,
+            )
+    except Exception:  # audit is best-effort — an assignment must never 500 on it
+        _LOGGER.warning("assignment audit write failed (continuing)", exc_info=True)
 
 
 @router.post("/alerts/assign", response_model=AssignOut)
@@ -336,18 +375,61 @@ async def assign_alert(
     request: Request,
     body: AssignIn,
 ) -> AssignOut:
-    """Persist (or clear) the owner for a detection rule.
+    """Persist (or clear) the owner + triage state for a detection rule.
 
-    When ``unassign`` is False the caller is resolved via
-    :func:`~soc_ai.api.security.identify_caller` and stored as the owner.
-    When ``unassign`` is True the row is removed.  The owner value is a plain
-    username when the caller is authenticated via session, or ``token:<name>``
-    when using a bearer token, or ``"anonymous"`` when API auth is off.
+    Three shapes, all through the one endpoint (an analyst action — same auth as
+    the surrounding ack/escalate routes, not admin-only):
+
+    * ``unassign=True`` — remove the row (owner + state gone; back to the
+      "unassigned" no-row state).
+    * ``state`` set (no unassign) — move an EXISTING assignment through the
+      triage flow (``owned`` → ``in_review`` → ``done``) without changing owner.
+      A 404 if the rule has no owner (state requires an owner).
+    * otherwise — assign the caller as owner (resetting state to ``owned``). The
+      owner value is a plain username when authenticated via session,
+      ``token:<name>`` for a bearer token, or ``"anonymous"`` when auth is off.
+
+    Every change is audited best-effort (``assignment`` kind).
     """
     async with request.app.state.db_sessionmaker() as db:
         if body.unassign:
             await assign_svc.clear_assignment(db, body.rule_name)
-            return AssignOut(rule_name=body.rule_name, owner=None)
+            await _audit_assignment(
+                request, rule_name=body.rule_name, action="unassign", owner=None, state=None
+            )
+            return AssignOut(rule_name=body.rule_name, owner=None, state=None)
+
+        # State-only transition on an existing assignment (owner unchanged).
+        if body.state is not None:
+            try:
+                applied = await assign_svc.set_state(db, body.rule_name, body.state)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail={"reason": "bad_state", "hint": str(exc)}
+                ) from exc
+            if not applied:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "reason": "not_assigned",
+                        "hint": "assign an owner before setting a triage state",
+                    },
+                )
+            record = await assign_svc.assignments_for_rules(db, [body.rule_name])
+            rec = record.get(body.rule_name, {})
+            await _audit_assignment(
+                request,
+                rule_name=body.rule_name,
+                action="state",
+                owner=rec.get("owner"),
+                state=body.state,
+            )
+            return AssignOut(rule_name=body.rule_name, owner=rec.get("owner"), state=body.state)
+
+        # Plain assign: caller becomes owner, state resets to "owned".
         owner = await identify_caller(request)
         await assign_svc.set_assignment(db, body.rule_name, owner)
-    return AssignOut(rule_name=body.rule_name, owner=owner)
+    await _audit_assignment(
+        request, rule_name=body.rule_name, action="assign", owner=owner, state="owned"
+    )
+    return AssignOut(rule_name=body.rule_name, owner=owner, state="owned")

@@ -29,7 +29,7 @@ import {
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
-import type { HuntDetailData, HuntFinding, HuntStatus, TimelineStep } from '../lib/types';
+import type { HuntDetailData, HuntDiff, HuntFinding, HuntStatus, TimelineStep } from '../lib/types';
 
 const SEV_COLOR: Record<string, string> = {
   critical: '#f85149',
@@ -120,6 +120,94 @@ const STEP_ICON: Record<string, ReactNode> = {
   Findings: <ShieldAlert size={14} />,
 };
 
+// "vs last run" diff strip — a compact summary above the findings that answers
+// "what changed" since the previous COMPLETE run of the SAME objective:
+// N new · M persisting · K resolved, with the baseline run's age. Expandable to
+// list the new/resolved finding titles (persisting is the boring bucket — it's
+// the count that matters, so it stays collapsed). Only rendered when a previous
+// run exists (data.diff present).
+function DiffCount({ n, label, color }: { n: number; label: string; color: string }) {
+  return (
+    <span className="inline-flex items-baseline gap-1">
+      <span className="font-mono text-[13px] font-bold" style={{ color }}>
+        {n}
+      </span>
+      <span className="text-[11.5px] text-dim">{label}</span>
+    </span>
+  );
+}
+
+function DiffList({ title, entries, color }: { title: string; entries: HuntDiff['new']; color: string }) {
+  if (entries.length === 0) return null;
+  return (
+    <div>
+      <div
+        className="mb-1 text-[10px] font-semibold uppercase tracking-[.05em]"
+        style={{ color }}
+      >
+        {title}
+      </div>
+      <ul className="flex flex-col gap-1">
+        {entries.map((e, i) => (
+          <li key={i} className="flex items-center gap-2 text-[12px] text-text-2">
+            <span className="h-1.5 w-1.5 flex-none rounded-full" style={{ background: color }} />
+            <span className="min-w-0 truncate" style={{ textWrap: 'pretty' }} title={e.title}>
+              {e.title}
+            </span>
+            <span className="ml-auto flex-none font-mono text-[10px] uppercase text-faint">
+              {e.severity}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
+  const [open, setOpen] = useState(false);
+  const expandable = diff.new.length > 0 || diff.resolved.length > 0;
+  return (
+    <div className="rounded-card border border-border-2 bg-surface-2">
+      <button
+        onClick={() => expandable && setOpen((o) => !o)}
+        className="flex w-full items-center gap-2.5 px-[15px] py-2.5 text-left"
+        aria-expanded={open}
+      >
+        <GitBranch size={14} className="flex-none text-dim" />
+        <span className="text-[11px] font-semibold uppercase tracking-[.05em] text-text-2">
+          vs last run
+        </span>
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <DiffCount n={diff.new.length} label="new" color="#f0883e" />
+          <span className="text-ghost">·</span>
+          <DiffCount n={diff.persisting.length} label="persisting" color="#8b949e" />
+          <span className="text-ghost">·</span>
+          <DiffCount n={diff.resolved.length} label="resolved" color="#3fb950" />
+        </div>
+        <div className="flex-1" />
+        {diff.previousWhen && (
+          <span className="flex-none font-mono text-[11px] text-faint">{diff.previousWhen}</span>
+        )}
+        {expandable && (
+          <span
+            className="flex flex-none text-ghost transition-transform"
+            style={{ transform: open ? 'rotate(180deg)' : 'rotate(0deg)' }}
+          >
+            <ChevronDown size={14} />
+          </span>
+        )}
+      </button>
+      {open && expandable && (
+        <div className="grid grid-cols-1 gap-4 border-t border-border-faint px-[15px] py-3 sm:grid-cols-2">
+          <DiffList title="New this run" entries={diff.new} color="#f0883e" />
+          <DiffList title="Resolved since last run" entries={diff.resolved} color="#3fb950" />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Rich finding card — mirrors the investigation timeline rows: a severity dot,
 // the title, prose detail, and mono host/citation chips.
 function FindingCard({ f }: { f: HuntFinding }) {
@@ -161,12 +249,29 @@ function FindingCard({ f }: { f: HuntFinding }) {
       <div className="text-[12.5px] leading-[1.6] text-text-2" style={{ textWrap: 'pretty' }}>
         {f.detail}
       </div>
+      {f.validatorNote && (
+        <div
+          className="mt-2 rounded-card border px-3 py-2 text-[11.5px] leading-[1.5] text-dim"
+          style={{ borderColor: 'rgba(107,135,168,.3)', background: 'rgba(107,135,168,.05)' }}
+        >
+          <span className="font-semibold" style={{ color: '#8fa3bf' }}>
+            Post-validator
+          </span>
+          {' — '}
+          {f.validatorNote}
+        </div>
+      )}
       {(f.hosts.length > 0 || f.citations.length > 0) && (
         <div className="mt-2 flex flex-wrap gap-1.5 font-mono text-[10.5px]">
           {f.hosts.map((h) => (
-            <span key={h} className="rounded-chip bg-surface-3 px-1.5 py-px text-mono-amber">
+            // Host chip → the entity pivot page ("what do we know about this box").
+            <Link
+              key={h}
+              to={`/entity/${encodeURIComponent(h)}`}
+              className="rounded-chip bg-surface-3 px-1.5 py-px text-mono-amber hover:brightness-125"
+            >
               {h}
-            </span>
+            </Link>
           ))}
           {f.citations.map((c) => (
             <span key={c} className="rounded-chip bg-surface-3 px-1.5 py-px text-accent">
@@ -517,9 +622,17 @@ export function HuntDetail() {
                   to plot, and a chart must never render from nothing). */}
               {complete && data.findings.length > 0 && (
                 <CollapsibleSection title="Visual summary">
-                  <HuntVisuals findings={data.findings} affectedHosts={data.affectedHosts} />
+                  <HuntVisuals
+                    findings={data.findings}
+                    affectedHosts={data.affectedHosts}
+                    charts={data.charts}
+                  />
                 </CollapsibleSection>
               )}
+
+              {/* "vs last run" diff — only when a prior COMPLETE run of this
+                  same objective exists (server omits diff otherwise). */}
+              {complete && data.diff && <HuntDiffStrip diff={data.diff} />}
 
               <CollapsibleSection
                 title="Findings"

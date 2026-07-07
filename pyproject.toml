@@ -1,6 +1,6 @@
 [project]
 name = "soc-ai"
-version = "1.0.7"
+version = "1.0.8"
 description = "Self-hosted, privacy-respecting LLM-powered triage assistant for Security Onion"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -172,11 +172,15 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "-ra --strict-markers --strict-config --cov=soc_ai --cov-report=term-missing --cov-fail-under=80"
+# `--ignore=tests/browser` keeps the default coverage-gated run from collecting
+# the Playwright E2E smoke: it needs the seeded demo stack + chromium and would
+# tank coverage. It runs in a DEDICATED CI job (`browser-smoke`) via `-m browser`.
+addopts = "-ra --strict-markers --strict-config --cov=soc_ai --cov-report=term-missing --cov-fail-under=80 --ignore=tests/browser"
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow",
     "integration: requires a live SO grid (skipped in CI)",
+    "browser: marks browser/E2E smoke tests (own CI job; needs the demo stack + chromium)",
 ]
 
 [tool.coverage.run]

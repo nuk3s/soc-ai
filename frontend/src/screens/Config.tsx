@@ -9,11 +9,13 @@ import { ErrorState, LoadingState, Spinner } from '../components/States';
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
+import { EgressPolicyPanel } from './EgressPolicyPanel';
+import { NotificationsPanel } from './NotificationsPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { RunbooksPanel } from './RunbooksPanel';
-import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
-import type { IdentifierKind, InternalIdentifiers } from '../lib/api';
+import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import type { IdentifierKind, InternalIdentifiers, ModelFitness } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting } from '../lib/types';
 import { ConfigNav } from './ConfigNav';
@@ -79,6 +81,55 @@ function CollapsibleConfigSection({
   );
 }
 
+// Grade chip + "Check fitness" button shown beside the analyst-model control.
+// green=pass / amber=degraded / red=fail. Fail-soft: with no grade yet (or after a
+// probe error) it shows only the button, never an error — the check is advisory
+// and NEVER blocks Apply.
+const _FITNESS_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
+  pass: { bg: '#12b76a22', fg: '#12b76a', label: 'fit' },
+  degraded: { bg: '#f79f0022', fg: '#f79009', label: 'degraded' },
+  fail: { bg: '#f0443822', fg: '#f04438', label: 'unfit' },
+};
+
+function ModelFitnessChip({
+  fitness,
+  loading,
+  onCheck,
+}: {
+  fitness: ModelFitness | null;
+  loading: boolean;
+  onCheck: () => void;
+}) {
+  const style = fitness ? _FITNESS_STYLE[fitness.grade] : undefined;
+  return (
+    <div className="flex items-center gap-2">
+      {loading && <span className="text-[11px] text-faint">Checking fitness…</span>}
+      {!loading && fitness && style && (
+        <span
+          className="rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide"
+          style={{ background: style.bg, color: style.fg }}
+          title={fitness.detail}
+        >
+          {style.label}
+        </span>
+      )}
+      {!loading && fitness && style && (
+        <span className="max-w-[190px] truncate text-[11px] text-dim" title={fitness.detail}>
+          {fitness.detail}
+        </span>
+      )}
+      <button
+        type="button"
+        className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
+        onClick={onCheck}
+        disabled={loading}
+      >
+        Check fitness
+      </button>
+    </div>
+  );
+}
+
 export function Config() {
   const [nonce, setNonce] = useState(0);
   // Collapsed config sections (the panel is long — let the operator fold away
@@ -133,6 +184,49 @@ export function Config() {
   const [applyErrors, setApplyErrors] = useState<Record<string, string>>({});
   // Sticky-bar result after an Apply: how many saved, and whether any need a restart.
   const [applyResult, setApplyResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  // ── Analyst-model fitness (E1.1) ───────────────────────────────────────────
+  // A model that LISTS on the gateway can still be unfit (all-fallback verdicts).
+  // We grade it: on the analyst-model dropdown changing (or a manual "Check
+  // fitness"), fire the probe and show the grade inline. Strictly non-blocking —
+  // it NEVER gates Apply; a fetch error shows nothing (neutral), never an error.
+  const [fitness, setFitness] = useState<ModelFitness | null>(null);
+  const [fitnessLoading, setFitnessLoading] = useState(false);
+  // The analyst model currently selected (staged edit wins over the server value).
+  const currentAnalystModel =
+    staged['analyst_model'] ??
+    data?.groups.flatMap((g) => g.items).find((i) => i.key === 'analyst_model')?.value ??
+    '';
+
+  const runFitness = () => {
+    setFitnessLoading(true);
+    getModelFitness()
+      .then((r) => setFitness(r))
+      // Fail-soft: a probe/gateway/permission error must not surface as an error
+      // chip — clear the stale grade and stay neutral.
+      .catch(() => setFitness(null))
+      .finally(() => setFitnessLoading(false));
+  };
+
+  // Auto-run (debounced) whenever the selected analyst model changes. The grade
+  // is model-specific, so a stale grade for the previous model would mislead —
+  // clear it immediately, then re-probe after a short settle so rapid dropdown
+  // changes don't spam the gateway.
+  useEffect(() => {
+    if (!currentAnalystModel) return;
+    setFitness(null);
+    const t = setTimeout(() => {
+      let cancelled = false;
+      setFitnessLoading(true);
+      getModelFitness()
+        .then((r) => { if (!cancelled) setFitness(r); })
+        .catch(() => { if (!cancelled) setFitness(null); })
+        .finally(() => { if (!cancelled) setFitnessLoading(false); });
+      return () => { cancelled = true; };
+    }, 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentAnalystModel]);
 
   const dirtyKeys = Object.keys(staged);
   const isDirty = dirtyKeys.length > 0;
@@ -192,9 +286,13 @@ export function Config() {
       if (g.title === 'Discovery') {
         groupEntries.push({ id: 'internal-identifiers', label: 'Internal identifiers' });
       }
+      if (g.title === 'Notifications') {
+        groupEntries.push({ id: 'notifications-webhook', label: 'Notification webhook' });
+      }
     }
     return [
       ...groupEntries,
+      { id: 'egress-policy', label: 'Egress policy' },
       { id: 'data-sources', label: 'Data sources' },
       { id: 'detection-tuning', label: 'Detection tuning' },
       { id: 'runbooks', label: 'Runbooks' },
@@ -429,6 +527,16 @@ export function Config() {
           onChange={(v) => stage(s.key, v, serverStr)}
         />
       );
+    } else if (s.key === 'notify_format') {
+      // Fixed-option webhook body shape — render a select over the three formats
+      // instead of a free-text field (the backend validates it to json|slack|matrix).
+      control = (
+        <Select
+          value={stagedStr(s.key, serverStr)}
+          options={['json', 'slack', 'matrix']}
+          onChange={(v) => stage(s.key, v, serverStr)}
+        />
+      );
     } else if (s.key === 'analyst_model' && gatewayModels.length > 0) {
       // The gateway told us what it serves — offer exactly that list instead of a
       // blind free-text field. The current value stays selectable even if the
@@ -438,11 +546,36 @@ export function Config() {
         ? gatewayModels
         : [current, ...gatewayModels];
       control = (
-        <Select
-          value={current}
-          options={options}
-          onChange={(v) => stage(s.key, v, serverStr)}
-        />
+        <div className="flex flex-col items-end gap-1.5">
+          <Select
+            value={current}
+            options={options}
+            onChange={(v) => stage(s.key, v, serverStr)}
+          />
+          <ModelFitnessChip
+            fitness={fitness}
+            loading={fitnessLoading}
+            onCheck={runFitness}
+          />
+        </div>
+      );
+    } else if (s.key === 'analyst_model') {
+      // No gateway list (gateway down / empty) — keep the free-text field, but
+      // still offer the fitness check on whatever id is typed.
+      control = (
+        <div className="flex flex-col items-end gap-1.5">
+          <input
+            key={`${s.key}-${formNonce}`}
+            defaultValue={stagedStr(s.key, serverStr)}
+            onChange={(e) => stage(s.key, e.target.value, serverStr)}
+            className="w-[200px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
+          />
+          <ModelFitnessChip
+            fitness={fitness}
+            loading={fitnessLoading}
+            onCheck={runFitness}
+          />
+        </div>
       );
     } else {
       control = (
@@ -686,6 +819,12 @@ export function Config() {
             )}
           </div>
           {g.title === 'Discovery' && internalIdentifiersSection}
+          {g.title === 'Notifications' && (
+            <NotificationsPanel
+              collapsed={!!collapsed['Notification webhook']}
+              onToggleCollapse={() => toggleSection('Notification webhook')}
+            />
+          )}
           {g.title === 'Oracle' && (
             <RedactionPreviewPanel
               collapsed={!!collapsed['Redaction preview']}
@@ -695,6 +834,10 @@ export function Config() {
         </Fragment>
       ))}
 
+      <EgressPolicyPanel
+        collapsed={!!collapsed['Egress policy']}
+        onToggleCollapse={() => toggleSection('Egress policy')}
+      />
       <DataSourcesPanel
         collapsed={!!collapsed['Data sources']}
         onToggleCollapse={() => toggleSection('Data sources')}

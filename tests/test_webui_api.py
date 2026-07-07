@@ -267,6 +267,340 @@ def test_investigations_list(client: TestClient) -> None:
     assert body[1]["name"] == "Alert INV-2…"
     assert body[1]["verdict"] == "untriaged"  # None verdict -> untriaged
     assert body[1]["status"] == "running"
+    # Neither row is a pipeline fallback (no marker on either report).
+    assert body[0]["fallback"] is False
+    assert body[1]["fallback"] is False
+
+
+# The persisted report dict shape a synth-failure fallback lands (E1.2). Mirrors
+# `_synth_failure_fallback_report`'s marker so the row/detail/badge derivations
+# are exercised against the real key.
+_FALLBACK_REPORT = {
+    "verdict": "needs_more_info",
+    "confidence": 0.3,
+    "summary": "Synth-first pipeline fallback: synth_first_round1 raised RuntimeError.",
+    "citations": ["synth_first_failure"],
+    "resolution": {
+        "provenance": "pipeline_fallback",
+        "phase": "synth_first_round1",
+        "error_type": "RuntimeError",
+        "hint": "the model hit its response-token cap while still reasoning.",
+    },
+}
+
+
+def test_investigations_list_marks_pipeline_fallback_row(client: TestClient) -> None:
+    """E1.2: a run whose report carries the pipeline_fallback marker → its row
+    `fallback` is True; a normal needs_more_info run → False. The verdict is
+    needs_more_info in BOTH — only the row flag distinguishes them."""
+    invs = [
+        SimpleNamespace(
+            id="INV-FB",
+            rule_name="ET Truncated",
+            verdict="needs_more_info",
+            confidence=0.3,
+            status="complete",
+            src_ip="10.0.0.9",
+            created_at=datetime(2026, 7, 7, 12, 0, tzinfo=UTC),
+            report=_FALLBACK_REPORT,
+        ),
+        SimpleNamespace(
+            id="INV-NMI",
+            rule_name="ET Genuine",
+            verdict="needs_more_info",
+            confidence=0.55,
+            status="complete",
+            src_ip="10.0.0.10",
+            created_at=datetime(2026, 7, 7, 12, 5, tzinfo=UTC),
+            report={"verdict": "needs_more_info", "citations": ["ev-1"]},
+        ),
+    ]
+    with patch("soc_ai.api.webui_api.inv_svc.list_recent", AsyncMock(return_value=invs)):
+        body = client.get("/api/v1/investigations").json()
+    by_id = {r["id"]: r for r in body}
+    assert by_id["INV-FB"]["verdict"] == "needs_more_info"
+    assert by_id["INV-FB"]["fallback"] is True
+    assert by_id["INV-NMI"]["verdict"] == "needs_more_info"
+    assert by_id["INV-NMI"]["fallback"] is False
+
+
+def test_investigation_detail_exposes_fallback_marker(client: TestClient) -> None:
+    """E1.2: the investigation drawer's `fallback` field carries the failure
+    provenance (phase / errorType / hint) so the panel can render "failed before
+    reaching a verdict: <hint>". A genuine needs_more_info leaves it null."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed(report: dict[str, object]) -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-fb", started_by="tester", rule_name="ET Truncated"
+            )
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.3,
+                rationale="fallback",
+                report=report,
+            )
+            return inv.id
+
+    fb_id = asyncio.run(_seed(_FALLBACK_REPORT))
+    detail = client.get(f"/api/v1/investigations/{fb_id}").json()
+    assert detail["verdict"] == "needs_more_info"
+    assert detail["fallback"] is not None
+    assert detail["fallback"]["provenance"] == "pipeline_fallback"
+    assert detail["fallback"]["phase"] == "synth_first_round1"
+    assert detail["fallback"]["errorType"] == "RuntimeError"
+    assert "response-token cap" in detail["fallback"]["hint"]
+
+    nmi_id = asyncio.run(_seed({"verdict": "needs_more_info", "citations": ["ev-1"]}))
+    nmi = client.get(f"/api/v1/investigations/{nmi_id}").json()
+    assert nmi["fallback"] is None
+
+
+def test_alerts_badge_marks_pipeline_fallback(client: TestClient) -> None:
+    """E1.2: a rule whose STANDING verdict run is a pipeline fallback exposes
+    `fallback: true` on its alert-group badge (derived from the representative
+    run's report marker). A rule with a genuine complete verdict → False."""
+    groups = [
+        AlertGroup(
+            rule_name="ET Truncated",
+            count=4,
+            severity="medium",
+            latest_ts="2026-07-07T10:00:00Z",
+            latest_id="cur",
+            kind="suricata",
+        )
+    ]
+    inv = SimpleNamespace(
+        id="INV-FB",
+        verdict="needs_more_info",
+        confidence=0.3,
+        status="complete",
+        alert_es_id="cur",
+        src_ip="10.0.0.9",
+        dest_ip="2.2.2.2",
+        created_at=datetime(2026, 7, 7, 9, 0, 0),
+        report=_FALLBACK_REPORT,
+    )
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 4))),
+        patch(
+            "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
+            AsyncMock(return_value={"ET Truncated": inv}),
+        ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        body = client.get("/api/v1/alerts").json()
+    assert body[0]["verdict"] == "needs_more_info"  # verdict unchanged
+    assert body[0]["fallback"] is True
+
+    # A genuine complete verdict on the same shape → not a fallback badge.
+    inv.report = {"verdict": "false_positive", "citations": ["ev-1"]}
+    inv.verdict = "false_positive"
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 4))),
+        patch(
+            "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
+            AsyncMock(return_value={"ET Truncated": inv}),
+        ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        body2 = client.get("/api/v1/alerts").json()
+    assert body2[0]["fallback"] is False
+
+
+# ── E2.1: rerun visibility (lastAttempt) ────────────────────────────────────
+
+
+def _seed_verdict_then_rerun(
+    client: TestClient,
+    rule: str,
+    *,
+    rerun_status: str,
+    rerun_report: dict[str, object] | None = None,
+) -> None:
+    """Seed a COMPLETE false_positive verdict, then a LATER rerun on the same
+    rule/alert with the given terminal status (and optional report marker). Uses
+    the real store so the route's own `latest_for_rules`/`latest_complete_for_rules`
+    resolve both rows (exercises the no-N+1 path end to end)."""
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            good = await inv_svc.create(db, alert_es_id="ev-1", started_by="t", rule_name=rule)
+            await inv_svc.finalize(
+                db,
+                good.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.82,
+                rationale="benign",
+                report={"verdict": "false_positive", "citations": ["ev-1"]},
+            )
+            good.src_ip = "10.0.0.1"
+            good.dest_ip = "1.2.3.4"
+            await db.commit()
+            # A LATER retry on the SAME alert that failed (or fell back).
+            bad = await inv_svc.create(db, alert_es_id="ev-1", started_by="t", rule_name=rule)
+            await inv_svc.finalize(db, bad.id, status=rerun_status, report=rerun_report)
+
+    asyncio.run(_seed())
+
+
+def _alerts_for_rule(client: TestClient, rule: str) -> dict[str, Any]:
+    groups = [
+        AlertGroup(
+            rule_name=rule,
+            count=5,
+            severity="low",
+            latest_ts="2026-07-07T10:00:00Z",
+            latest_id="ev-1",
+            kind="suricata",
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 5))):
+        body = client.get("/api/v1/alerts").json()
+    return body[0]
+
+
+def test_alerts_last_attempt_errored_rerun(client: TestClient) -> None:
+    """E2.1: a complete FP verdict + a LATER errored rerun on the same rule →
+    the badge KEEPS the FP verdict AND exposes lastAttempt.status == 'error'
+    with a relative `ago`."""
+    rule = "ET HUNTING errored-rerun"
+    _seed_verdict_then_rerun(client, rule, rerun_status="error")
+    g = _alerts_for_rule(client, rule)
+    assert g["verdict"] == "false_positive"  # standing verdict survives
+    assert g["fallback"] is False
+    assert g["lastAttempt"] is not None
+    assert g["lastAttempt"]["status"] == "error"
+    assert g["lastAttempt"]["ago"]  # a humanized relative label ("now"/"5m"/…)
+
+
+def test_alerts_last_attempt_cancelled_rerun(client: TestClient) -> None:
+    """E2.1: a cancelled rerun on top of a standing verdict → lastAttempt cancelled."""
+    rule = "ET HUNTING cancelled-rerun"
+    _seed_verdict_then_rerun(client, rule, rerun_status="cancelled")
+    g = _alerts_for_rule(client, rule)
+    assert g["verdict"] == "false_positive"
+    assert g["lastAttempt"]["status"] == "cancelled"
+
+
+def test_alerts_last_attempt_fallback_rerun(client: TestClient) -> None:
+    """E2.1: a pipeline-fallback rerun (a COMPLETE row carrying the E1.2 marker) on
+    top of a genuine verdict counts as a FAILED attempt → lastAttempt.status ==
+    'fallback'. The badge itself is NOT `fallback` (the standing verdict is real)."""
+    rule = "ET HUNTING fallback-rerun"
+    _seed_verdict_then_rerun(client, rule, rerun_status="complete", rerun_report=_FALLBACK_REPORT)
+    g = _alerts_for_rule(client, rule)
+    assert g["verdict"] == "false_positive"  # standing verdict unchanged
+    assert g["fallback"] is False  # the STANDING verdict is genuine, not a fallback
+    assert g["lastAttempt"]["status"] == "fallback"
+
+
+def test_alerts_last_attempt_none_when_standing_is_newest(client: TestClient) -> None:
+    """E2.1: a rule whose newest run IS the complete standing verdict (no later
+    failed retry) → lastAttempt is None."""
+    from soc_ai.store import investigations as inv_svc
+
+    rule = "ET HUNTING clean-standing"
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-1", started_by="t", rule_name=rule)
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.8,
+                report={"verdict": "false_positive"},
+            )
+
+    asyncio.run(_seed())
+    g = _alerts_for_rule(client, rule)
+    assert g["verdict"] == "false_positive"
+    assert g["lastAttempt"] is None
+
+
+def test_alerts_last_attempt_none_for_running_rerun(client: TestClient) -> None:
+    """E2.1: a rule with a RUNNING rerun on top of a standing verdict → lastAttempt
+    is None (a running retry is covered by `triaging`, not a failure)."""
+    rule = "ET HUNTING running-rerun"
+    _seed_verdict_then_rerun(client, rule, rerun_status="running")
+    g = _alerts_for_rule(client, rule)
+    assert g["verdict"] == "false_positive"
+    assert g["triaging"] is True  # the live rerun drives the triaging flag
+    assert g["lastAttempt"] is None  # running is not a failed attempt
+
+
+def test_alerts_last_attempt_none_when_standing_is_fallback(client: TestClient) -> None:
+    """E2.1: when the STANDING (newest complete) verdict is itself a pipeline
+    fallback, E1.2's chip owns the failure signal — E2.1 adds no lastAttempt (no
+    genuine verdict to stack a failed retry on)."""
+    from soc_ai.store import investigations as inv_svc
+
+    rule = "ET HUNTING fallback-standing"
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-1", started_by="t", rule_name=rule)
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.3,
+                report=_FALLBACK_REPORT,
+            )
+
+    asyncio.run(_seed())
+    g = _alerts_for_rule(client, rule)
+    assert g["fallback"] is True  # E1.2 owns this
+    assert g["lastAttempt"] is None
+
+
+def test_last_attempt_helper_unit() -> None:
+    """Direct unit coverage of the `_last_attempt` reducer over SimpleNamespace
+    rows (no DB) — the four gate conditions."""
+    from soc_ai.api.webui_api import _last_attempt
+
+    def _inv(id_: str, status: str, report: dict[str, Any] | None = None) -> Any:
+        return SimpleNamespace(
+            id=id_,
+            status=status,
+            report=report,
+            created_at=datetime(2026, 7, 7, 12, 0, tzinfo=UTC),
+        )
+
+    standing = _inv("STAND", "complete", {"verdict": "false_positive"})
+    errored = _inv("RERUN", "error")
+    fb = _inv("RERUN", "complete", _FALLBACK_REPORT)
+
+    # error rerun on top of a genuine verdict → surfaced.
+    la = _last_attempt(errored, standing)
+    assert la is not None and la.status == "error" and la.ago
+    # fallback rerun → surfaced as 'fallback'.
+    la_fb = _last_attempt(fb, standing)
+    assert la_fb is not None and la_fb.status == "fallback"
+    # newest IS the standing verdict → None.
+    assert _last_attempt(standing, standing) is None
+    # running rerun → None (not a failed status, not a fallback).
+    assert _last_attempt(_inv("RUN", "running"), standing) is None
+    # standing itself a fallback → None (E1.2 owns it).
+    assert _last_attempt(errored, _inv("STAND", "complete", _FALLBACK_REPORT)) is None
+    # missing either side → None.
+    assert _last_attempt(None, standing) is None
+    assert _last_attempt(errored, None) is None
 
 
 def test_group_events(client: TestClient) -> None:
@@ -875,6 +1209,191 @@ def test_config_models_lists_gateway_models(client: TestClient) -> None:
     assert "unreachable" in body["detail"]
 
 
+def _egress_client(settings: Settings) -> Iterator[TestClient]:
+    """A TestClient whose /config/egress-policy audit-count aggregation is stubbed
+    to all-zero, so the tests assert on the POLICY TABLE (enable state + posture)
+    deterministically without depending on a live ES aggregation."""
+
+    async def _zero_counts(_elastic, _alias, kinds, *, days=7):  # type: ignore[no-untyped-def]
+        return {k: 0 for k in kinds}
+
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+        patch("soc_ai.audit.counts.audit_counts_by_kind", _zero_counts),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            yield client
+
+
+def _egress_dest(client: TestClient, dest_id: str) -> dict[str, Any]:
+    """Fetch /config/egress-policy and return the destination row with ``dest_id``."""
+    body = client.get("/api/v1/config/egress-policy").json()
+    return next(d for d in body["destinations"] if d["id"] == dest_id)
+
+
+def test_egress_policy_all_off_is_zero_egress(settings_kratos: Settings) -> None:
+    """E5.3: with every egress knob off, the read-model reports zero_egress and
+    every destination row reads enabled=false — 'zero egress' is inspectable."""
+    for client in _egress_client(settings_kratos):
+        resp = client.get("/api/v1/config/egress-policy")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["zero_egress"] is True
+        ids = {d["id"] for d in body["destinations"]}
+        # every grounded destination is present
+        assert ids == {
+            "oracle",
+            "web_search",
+            "crawl",
+            "online_enrichment",
+            "analyst_cloud",
+            "notifications",
+        }
+        assert all(d["enabled"] is False for d in body["destinations"])
+        # posture strings are populated + honest for the analyst destination
+        analyst = next(d for d in body["destinations"] if d["id"] == "analyst_cloud")
+        assert analyst["redaction"].startswith("none")  # no redaction when off
+
+
+def test_egress_policy_flip_one_knob_breaks_zero_egress(settings_kratos: Settings) -> None:
+    """Flipping ONE destination on (web search — needs both the toggle AND a URL)
+    flips its row enabled=true and clears zero_egress; others stay off."""
+    settings = settings_kratos.model_copy(
+        update={"web_search_enabled": True, "searxng_url": "https://search.example.com"}
+    )
+    for client in _egress_client(settings):
+        body = client.get("/api/v1/config/egress-policy").json()
+        assert body["zero_egress"] is False
+        by_id = {d["id"]: d for d in body["destinations"]}
+        assert by_id["web_search"]["enabled"] is True
+        # the others remain disabled
+        assert by_id["oracle"]["enabled"] is False
+        assert by_id["notifications"]["enabled"] is False
+
+
+def test_egress_policy_web_search_needs_url_not_just_toggle(settings_kratos: Settings) -> None:
+    """web_search_enabled alone isn't a reachable egress — without a SearXNG URL
+    the row stays disabled (and zero_egress holds)."""
+    settings = settings_kratos.model_copy(update={"web_search_enabled": True})  # no URL
+    for client in _egress_client(settings):
+        body = client.get("/api/v1/config/egress-policy").json()
+        by_id = {d["id"]: d for d in body["destinations"]}
+        assert by_id["web_search"]["enabled"] is False
+        assert body["zero_egress"] is True
+
+
+def test_egress_policy_notify_needs_toggle_and_webhook(settings_kratos: Settings) -> None:
+    """Notifications need BOTH the master toggle AND a configured webhook URL."""
+    toggle_only = settings_kratos.model_copy(update={"notify_enabled": True})  # no webhook
+    for client in _egress_client(toggle_only):
+        assert _egress_dest(client, "notifications")["enabled"] is False
+
+    both = settings_kratos.model_copy(
+        update={
+            "notify_enabled": True,
+            "notify_webhook_url": SecretStr("https://hooks.example.com/x"),
+        }
+    )
+    for client in _egress_client(both):
+        body = client.get("/api/v1/config/egress-policy").json()
+        by_id = {d["id"]: d for d in body["destinations"]}
+        assert by_id["notifications"]["enabled"] is True
+        assert body["zero_egress"] is False
+
+
+def test_egress_policy_analyst_redaction_posture_is_honest(settings_kratos: Settings) -> None:
+    """The analyst-model destination reflects the TRUE redaction posture: off =
+    'none', on = best-effort, on+fail-closed = the fail-closed string."""
+    off = settings_kratos.model_copy(update={"analyst_cloud_redaction": False})
+    for client in _egress_client(off):
+        d = _egress_dest(client, "analyst_cloud")
+        assert d["enabled"] is False
+        assert d["redaction"].startswith("none")
+
+    best_effort = settings_kratos.model_copy(update={"analyst_cloud_redaction": True})
+    for client in _egress_client(best_effort):
+        d = _egress_dest(client, "analyst_cloud")
+        assert d["enabled"] is True
+        assert "best-effort" in d["redaction"]
+
+    fail_closed = settings_kratos.model_copy(
+        update={"analyst_cloud_redaction": True, "analyst_redaction_fail_closed": True}
+    )
+    for client in _egress_client(fail_closed):
+        assert _egress_dest(client, "analyst_cloud")["redaction"] == "sanitized + fail-closed"
+
+
+def test_egress_policy_counts_null_when_audit_errors(settings_kratos: Settings) -> None:
+    """The counters are BEST-EFFORT: when the audit-count path raises, the
+    endpoint still returns 200 with the full table and null counts — a down
+    audit index must never break the page."""
+
+    async def _boom(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("ES unreachable")
+
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings_kratos),
+        patch("soc_ai.audit.counts.audit_counts_by_kind", _boom),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            resp = client.get("/api/v1/config/egress-policy")
+            assert resp.status_code == 200
+            body = resp.json()
+            # table still returned in full
+            assert len(body["destinations"]) == 6
+            # every count is null (unknown), never a misleading 0
+            assert all(d["count_7d"] is None for d in body["destinations"])
+
+
+def test_egress_policy_oracle_count_reflects_audit(settings_kratos: Settings) -> None:
+    """A destination WITH a mapped audit kind (Oracle) surfaces its 7-day count;
+    a destination without one (web search) stays null."""
+
+    async def _counts(_elastic, _alias, kinds, *, days=7):  # type: ignore[no-untyped-def]
+        base = {k: 0 for k in kinds}
+        base["oracle_escalation"] = 3
+        base["oracle_adjudication"] = 2
+        return base
+
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings_kratos),
+        patch("soc_ai.audit.counts.audit_counts_by_kind", _counts),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            body = client.get("/api/v1/config/egress-policy").json()
+            by_id = {d["id"]: d for d in body["destinations"]}
+            # Oracle sums both mapped kinds
+            assert by_id["oracle"]["count_7d"] == 5
+            # web search has no dedicated kind → honest null, not 0
+            assert by_id["web_search"]["count_7d"] is None
+
+
+def test_egress_policy_admin_gated(settings_kratos: Settings) -> None:
+    """/config/egress-policy is admin-gated: with API auth required and no admin
+    session it 403s (mirrors /config/models, /config/model-fitness)."""
+    settings = settings_kratos.model_copy(
+        update={"api_auth_required": True, "bootstrap_admin_password": SecretStr("pw")}
+    )
+    for client in _egress_client(settings):
+        resp = client.get("/api/v1/config/egress-policy")
+        assert resp.status_code in (401, 403)
+
+
 def test_config_save_events_index_pattern_roundtrips(client: TestClient) -> None:
     """Saving the inc-1 events_index_pattern persists an override; GET reflects
     source=db and the new value, proving it's coercible + saveable."""
@@ -995,6 +1514,25 @@ def test_auto_triage_status(client: TestClient) -> None:
     s = client.get("/api/v1/auto-triage").json()
     assert s["active"] is False
     assert {"total", "hunted", "skipped", "failed", "severities"} <= set(s)
+    # E2.2: the status always carries a (possibly empty) per-reason skip breakdown.
+    assert s["skipped_reasons"] == {}
+
+
+def test_auto_triage_status_surfaces_skipped_reasons(client: TestClient) -> None:
+    """A planner-set per-reason skip breakdown is surfaced on the status
+    response so the FE completion note can explain WHY work was skipped."""
+    from soc_ai.webui import autotriage as at
+
+    # Reach the app.state the client's app exposes and stash a breakdown on it
+    # exactly as the planner would, then confirm the GET carries it verbatim.
+    status = at.get_status(client.app.state)
+    status.skipped = 4
+    status.skipped_reasons = {"already_triaged": 3, "no_ip": 1}
+
+    s = client.get("/api/v1/auto-triage").json()
+    assert s["skipped"] == 4
+    assert s["skipped_reasons"] == {"already_triaged": 3, "no_ip": 1}
+    assert sum(s["skipped_reasons"].values()) == s["skipped"]
 
 
 def test_auto_triage_nothing_to_hunt(client: TestClient) -> None:
@@ -2397,6 +2935,166 @@ def test_assign_unassign_clears_owner(client: TestClient) -> None:
         alerts = client.get("/api/v1/alerts").json()
 
     assert alerts[0]["owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# /alerts/assign — triage state (E2.3)
+# ---------------------------------------------------------------------------
+
+
+def test_assign_defaults_to_owned_state(client: TestClient) -> None:
+    """A plain assign lands state='owned' in the response and surfaces on the list."""
+    resp = client.post("/api/v1/alerts/assign", json={"rule_name": "ET STATE A"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["owner"] == "anonymous"
+    assert body["state"] == "owned"
+
+    groups = [
+        AlertGroup(
+            rule_name="ET STATE A",
+            count=1,
+            severity="high",
+            latest_ts="2026-07-07T10:00:00Z",
+            latest_id="es-sa1",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        alerts = client.get("/api/v1/alerts").json()
+    assert alerts[0]["owner"] == "anonymous"
+    assert alerts[0]["state"] == "owned"
+
+
+def test_assign_emits_audit_event(client: TestClient) -> None:
+    """POST /alerts/assign emits an ``assignment`` audit event on assign."""
+    with patch("soc_ai.audit.logger.AuditLogger.log_kind", new_callable=AsyncMock) as log_kind:
+        resp = client.post("/api/v1/alerts/assign", json={"rule_name": "ET AUDIT A"})
+    assert resp.status_code == 200
+    log_kind.assert_awaited()
+    _args, kwargs = log_kind.call_args
+    assert kwargs["kind"] == "assignment"
+    assert kwargs["payload"]["action"] == "assign"
+    assert kwargs["payload"]["state"] == "owned"
+    assert kwargs["payload"]["rule_name"] == "ET AUDIT A"
+
+
+def test_set_state_persists_and_surfaces(client: TestClient) -> None:
+    """Setting state on an owned rule persists it and surfaces on the alerts list."""
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET STATE B"})
+    resp = client.post(
+        "/api/v1/alerts/assign", json={"rule_name": "ET STATE B", "state": "in_review"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["owner"] == "anonymous"  # owner unchanged by a state transition
+    assert body["state"] == "in_review"
+
+    groups = [
+        AlertGroup(
+            rule_name="ET STATE B",
+            count=1,
+            severity="medium",
+            latest_ts="2026-07-07T10:00:00Z",
+            latest_id="es-sb1",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        alerts = client.get("/api/v1/alerts").json()
+    assert alerts[0]["state"] == "in_review"
+
+
+def test_set_state_on_unassigned_is_404(client: TestClient) -> None:
+    """State requires an owner: a state transition on an unassigned rule 404s."""
+    resp = client.post("/api/v1/alerts/assign", json={"rule_name": "ET NEVER", "state": "done"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["reason"] == "not_assigned"
+
+
+def test_set_state_rejects_bad_state(client: TestClient) -> None:
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET STATE C"})
+    resp = client.post(
+        "/api/v1/alerts/assign", json={"rule_name": "ET STATE C", "state": "unassigned"}
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "bad_state"
+
+
+def test_unassign_clears_state(client: TestClient) -> None:
+    """Unassign drops the row — owner AND state gone; the list shows both null."""
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET STATE D"})
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET STATE D", "state": "done"})
+    resp = client.post("/api/v1/alerts/assign", json={"rule_name": "ET STATE D", "unassign": True})
+    assert resp.status_code == 200
+    assert resp.json()["owner"] is None
+    assert resp.json()["state"] is None
+
+    groups = [
+        AlertGroup(
+            rule_name="ET STATE D",
+            count=1,
+            severity="low",
+            latest_ts="2026-07-07T10:00:00Z",
+            latest_id="es-sd1",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        alerts = client.get("/api/v1/alerts").json()
+    assert alerts[0]["owner"] is None
+    assert alerts[0]["state"] is None
+
+
+def test_ownership_survives_reinvestigation(client: TestClient) -> None:
+    """Assignment is rule-scoped: a fresh investigation of the rule does NOT clear it.
+
+    The assignment row is keyed by rule_name, independent of any investigation
+    run — so listing alerts after a (mocked) re-hunt still shows the owner/state.
+    """
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET SURVIVE"})
+    client.post("/api/v1/alerts/assign", json={"rule_name": "ET SURVIVE", "state": "in_review"})
+
+    # Simulate a re-investigation landing: a running investigation for the rule.
+    running_inv = SimpleNamespace(
+        id="inv-new",
+        status="running",
+        alert_es_id="es-sv2",
+        verdict=None,
+        confidence=None,
+        src_ip="10.0.0.9",
+        dest_ip="10.0.0.1",
+        report=None,
+    )
+    groups = [
+        AlertGroup(
+            rule_name="ET SURVIVE",
+            count=1,
+            severity="high",
+            latest_ts="2026-07-07T11:00:00Z",
+            latest_id="es-sv2",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch(
+            "soc_ai.api.webui_api.inv_svc.latest_for_rules",
+            AsyncMock(return_value={"ET SURVIVE": running_inv}),
+        ),
+    ):
+        alerts = client.get("/api/v1/alerts").json()
+    assert alerts[0]["owner"] == "anonymous"
+    assert alerts[0]["state"] == "in_review"
 
 
 # ---------------------------------------------------------------------------

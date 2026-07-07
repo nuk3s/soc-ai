@@ -8,7 +8,9 @@ narrative across hosts/time) but the lifecycle + tee/finalize shape is the same.
 
 from __future__ import annotations
 
-from datetime import timedelta
+import hashlib
+import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete as sa_delete
@@ -20,6 +22,23 @@ from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Hunt, HuntEvent
 
 STATUS_RUNNING = "running"
+STATUS_COMPLETE = "complete"
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _objective_hash(objective: str) -> str:
+    """Stable content hash of the NORMALIZED objective.
+
+    Normalization = lowercase + collapse all whitespace runs to a single space +
+    strip. So two re-runs whose objective text differs only in case or spacing
+    ("Hunt for beaconing" vs "hunt   for  beaconing\n") share a hash and link as
+    the same objective; a genuinely different objective does not. SHA-256 hex,
+    truncated to 32 chars — plenty of collision resistance for one deployment's
+    hunt history, and fits the indexed ``String(64)`` column.
+    """
+    normalized = _WS_RE.sub(" ", objective.strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
 
 
 async def create(
@@ -32,6 +51,7 @@ async def create(
     hunt = Hunt(
         id=str(ULID()),
         objective=objective,
+        objective_hash=_objective_hash(objective),
         started_by=started_by,
         kind=kind[:16],
     )
@@ -39,6 +59,38 @@ async def create(
     await db.commit()
     await db.refresh(hunt)
     return hunt
+
+
+async def previous_completed_run(
+    db: AsyncSession,
+    *,
+    objective_hash: str | None,
+    before_created_at: datetime,
+    exclude_id: str,
+) -> Hunt | None:
+    """The most recent COMPLETE hunt with the same objective_hash, before this one.
+
+    Powers the "vs last run" diff: given the current hunt's ``objective_hash`` and
+    ``created_at``, find the prior COMPLETE run of the SAME objective to diff
+    against. Excludes ``exclude_id`` (the current hunt) so a self-match can't
+    happen, and requires ``created_at`` strictly earlier so only an EARLIER run is
+    the baseline. Returns ``None`` when there is no prior run (first run of an
+    objective, or a legacy row with a NULL hash — the diff is then omitted).
+    """
+    if not objective_hash:
+        return None
+    q = (
+        select(Hunt)
+        .where(
+            Hunt.objective_hash == objective_hash,
+            Hunt.status == STATUS_COMPLETE,
+            Hunt.id != exclude_id,
+            Hunt.created_at < before_created_at,
+        )
+        .order_by(Hunt.created_at.desc(), Hunt.id.desc())
+        .limit(1)
+    )
+    return (await db.scalars(q)).first()
 
 
 async def append_events(db: AsyncSession, hunt_id: str, events: list[dict[str, Any]]) -> None:
@@ -100,6 +152,51 @@ async def list_recent(
         q = q.where(Hunt.status == status)
     q = q.limit(limit)
     return list((await db.scalars(q)).all())
+
+
+async def findings_for_entity(
+    db: AsyncSession, value: str, *, scan_limit: int = 100
+) -> list[dict[str, Any]]:
+    """Hunt findings that name an entity in their ``hosts[]`` — for the entity page.
+
+    Findings live inside the ``report`` JSON (``report["findings"][].hosts[]``),
+    which is NOT indexed, so this is the one potentially-costly bit of the E3.5
+    read-model: it scans the last ``scan_limit`` hunts' reports in Python. BOUND it
+    (default 100 hunts) so it stays cheap. A future index / denormalization of
+    finding→host is Epoch territory (a `hunt_findings` projection table) — until
+    then, the bound is the guardrail.
+
+    Returns light dicts (NOT the whole finding), newest hunt first:
+    ``{hunt_id, hunt_objective, title, severity, category, ts}`` where ``ts`` is the
+    hunt's ``created_at`` (findings have no own timestamp). Only COMPLETE hunts
+    carry a report worth scanning; running/errored rows are skipped.
+    """
+    if not value:
+        return []
+    recent = await list_recent(db, status=STATUS_COMPLETE, limit=scan_limit)
+    out: list[dict[str, Any]] = []
+    for hunt in recent:
+        report = hunt.report if isinstance(hunt.report, dict) else {}
+        findings = report.get("findings")
+        if not isinstance(findings, list):
+            continue
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            hosts = f.get("hosts") or []
+            if not isinstance(hosts, list) or value not in [str(h) for h in hosts]:
+                continue
+            out.append(
+                {
+                    "hunt_id": hunt.id,
+                    "hunt_objective": hunt.objective,
+                    "title": str(f.get("title") or ""),
+                    "severity": str(f.get("severity") or "info"),
+                    "category": str(f.get("category") or "threat"),
+                    "ts": hunt.created_at,
+                }
+            )
+    return out
 
 
 async def reap_stale_running(

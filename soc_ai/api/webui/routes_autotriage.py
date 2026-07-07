@@ -35,6 +35,8 @@ class AutoTriageStatusOut(BaseModel):
     tool_calls: int = 0
     # Inherited-verdict FP alerts this run acknowledged in SO (no LLM involved).
     inherited_acked: int = 0
+    # Per-reason breakdown of ``skipped`` (reason code -> count); sums to skipped.
+    skipped_reasons: dict[str, int] = {}
 
 
 def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
@@ -50,6 +52,7 @@ def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
         current=status.current,
         tool_calls=status.tool_calls,
         inherited_acked=getattr(status, "inherited_acked", 0),
+        skipped_reasons=dict(getattr(status, "skipped_reasons", {}) or {}),
     )
 
 

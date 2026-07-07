@@ -293,9 +293,55 @@ class TriageReport(BaseModel):
             "lost, just relocated."
         ),
     )
+    resolution: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Provenance marker for a report the pipeline did NOT reason its way "
+            "to. Set ONLY on the synth-failure fallback path (model truncation, "
+            "gateway 5xx, schema-validation exhaustion) to "
+            "``{'provenance': 'pipeline_fallback', 'phase', 'error_type', "
+            "'hint'}`` — so a failure-driven needs_more_info renders distinctly "
+            "from a genuine one, is filterable, and is excluded from the "
+            "Needs-info KPI. The verdict stays needs_more_info; only the "
+            "rendering differs. Distinct from the manual/chat override "
+            "``report['resolution']`` (which carries ``resolved_via``, added "
+            "post-hoc by the resolve endpoint) — the two never conflate because "
+            "``provenance`` and ``resolved_via`` are different keys."
+        ),
+    )
+
+
+# Sentinel written into ``TriageReport.resolution['provenance']`` (and, downstream,
+# the persisted ``report['resolution']`` dict) by the synth-failure fallback path.
+PIPELINE_FALLBACK_PROVENANCE = "pipeline_fallback"
+
+
+def is_pipeline_fallback(report: dict[str, Any] | None) -> bool:
+    """True iff a persisted report dict is a pipeline-failure fallback.
+
+    A run is a "pipeline fallback" iff its report's ``resolution`` marker carries
+    ``provenance == "pipeline_fallback"`` — set only by
+    ``_synth_failure_fallback_report`` when the synth path raises (model
+    truncation, gateway 5xx, schema-validation exhaustion). This is the single
+    shared predicate every downstream consumer (timeline builder, investigation
+    row, alerts badge, dashboard KPI) derives its boolean from, so the notion of
+    "failure vs. genuine needs_more_info" lives in exactly one place.
+
+    Defensive: a non-dict ``report`` / ``resolution`` (a manual override's
+    ``resolution`` is always a dict, but old rows or a mangled column may not be)
+    returns False rather than raising — a rendering predicate must never break a
+    page.
+    """
+    if not isinstance(report, dict):
+        return False
+    resolution = report.get("resolution")
+    if not isinstance(resolution, dict):
+        return False
+    return resolution.get("provenance") == PIPELINE_FALLBACK_PROVENANCE
 
 
 __all__ = [
+    "PIPELINE_FALLBACK_PROVENANCE",
     "InvestigationTranscript",
     "RecommendedAction",
     "RubricCoverage",
@@ -303,4 +349,5 @@ __all__ = [
     "TriageReport",
     "Verdict",
     "WriteToolName",
+    "is_pipeline_fallback",
 ]

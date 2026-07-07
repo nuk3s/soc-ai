@@ -64,7 +64,7 @@ from soc_ai.agent.context import (
     StepEvent,
     _DedupTracker,
 )
-from soc_ai.agent.egress_guard import EgressGuard
+from soc_ai.agent.egress_guard import EgressGuard, EgressResidueError
 
 # Backward-compat re-exports — evidence helpers now live in soc_ai.agent.evidence;
 # tests and callers reach these via orchestrator.
@@ -261,6 +261,29 @@ def build_synth_first_agent(model: Model) -> Agent[None, TriageReport]:
     )
 
 
+def _guard_egress(guard: EgressGuard | None, text: str, settings: Settings) -> str:
+    """Fail-closed residue check on a FINAL composed outbound analyst message.
+
+    Returns *text* unchanged when there is nothing to enforce — either no guard
+    (``analyst_cloud_redaction`` off ⇒ local model, byte-identical to the
+    pre-feature path) or fail-closed mode off (best-effort: a sanitize miss is
+    logged elsewhere but still egresses). When the guard is present AND
+    ``settings.analyst_redaction_fail_closed`` is on, run the INDEPENDENT residue
+    sweep on the (already-sanitized) composed string and raise
+    :class:`~soc_ai.agent.egress_guard.EgressResidueError` if an internal
+    identifier survived — the caller catches it, does NOT call the model, and
+    lands a pipeline error.
+
+    Wire it as ``msg = _guard_egress(guard, guard.sanitize_text(msg), settings)``
+    so the check runs on the FINAL string that is about to hit the model, not on
+    any single fragment composed into it.
+    """
+    if guard is None:
+        return text
+    guard.check_or_raise(text, fail_closed=settings.analyst_redaction_fail_closed)
+    return text
+
+
 def _synth_failure_fallback_report(alert_id: str, phase: str, exc: BaseException) -> Any:
     """Build a fallback TriageReport when the synth-first model raises.
 
@@ -279,8 +302,18 @@ def _synth_failure_fallback_report(alert_id: str, phase: str, exc: BaseException
     - ``summary`` names the failure phase + exception type
     - ``citations=['synth_first_failure']`` (single audit-trail marker)
     - ``gap_for_investigator=None`` (don't recurse into Phase D)
+    - ``resolution={'provenance': 'pipeline_fallback', ...}`` — the marker that
+      makes this failure-driven needs_more_info render distinctly from a genuine
+      one, filterable, and excluded from the Needs-info KPI (E1.2). The verdict
+      stays needs_more_info by design; only the presentation differs. This is a
+      DIFFERENT key from the manual/chat override's ``resolved_via`` (added
+      post-hoc by the resolve endpoint), so the two never conflate — see
+      :func:`soc_ai.triage_models.is_pipeline_fallback`.
     """
-    from soc_ai.agent.triage import TriageReport  # noqa: PLC0415
+    from soc_ai.agent.triage import (  # noqa: PLC0415
+        PIPELINE_FALLBACK_PROVENANCE,
+        TriageReport,
+    )
 
     return TriageReport(
         verdict="needs_more_info",
@@ -294,6 +327,12 @@ def _synth_failure_fallback_report(alert_id: str, phase: str, exc: BaseException
         citations=["synth_first_failure"],
         recommended_actions=[],
         gap_for_investigator=None,
+        resolution={
+            "provenance": PIPELINE_FALLBACK_PROVENANCE,
+            "phase": phase,
+            "error_type": type(exc).__name__,
+            "hint": _hint_for(exc),
+        },
     )
 
 
@@ -342,6 +381,15 @@ def build_agent(  # pragma: no cover - thin alias
 
 def _hint_for(exc: BaseException) -> str | None:
     """Return a short, actionable hint string for the analyst, or None."""
+    if isinstance(exc, EgressResidueError):
+        # Name only the COUNT/CLASS — never the leaked values (that would defect
+        # on the fail-closed block). This hint lands in the report summary.
+        return (
+            f"redacted egress blocked: {len(exc.leaked)} internal identifier(s) "
+            "survived sanitization on the outbound analyst payload, so the model "
+            "was not called (analyst_redaction_fail_closed is on). Investigate "
+            "locally or run with a local analyst model."
+        )
     if isinstance(exc, OqlValidationError):
         frag = getattr(exc, "fragment", None)
         base = "OQL validator rejected the query"
@@ -1218,6 +1266,26 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             payload = guard.desanitize_obj(payload)
         return _ev("model_response", {**payload, "phase": "synthesizer", "round": round_num})
 
+    async def _emit_egress_blocked(
+        phase: str, exc: EgressResidueError
+    ) -> AsyncGenerator[StepEvent, None]:
+        """Audit + stream a fail-closed egress block into the timeline.
+
+        Yields (and audits) an ``egress_blocked`` event carrying ONLY the
+        leaked-identifier COUNT + the call site — NEVER the leaked values
+        (logging them would defect on the whole point of the block) — then the
+        paired ``error`` event, so the block renders in the timeline exactly like
+        every other synth-failure path. Best-effort: a failed audit index must
+        never turn a blocked egress into an actual egress. Drive it with
+        ``async for ev in _emit_egress_blocked(...): yield ev``.
+        """
+        block_ev = _ev("egress_blocked", {"phase": phase, "leaked_count": len(exc.leaked)})
+        await _audit(block_ev)
+        yield block_ev
+        err_ev = _ev("error", _error_payload(exc, phase=phase, round_num=0))
+        await _audit(err_ev)
+        yield err_ev
+
     yield _ev("session_start", {"alert_id": alert_id, "pipeline": "synth_first"})
 
     # Resolve the effective internal-identifier set ONCE per investigation
@@ -1368,8 +1436,22 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature)
         )
         try:
+            # Fail-closed residue sweep on the FINAL composed outbound message
+            # (after every sanitize_text above): if fail-closed is on and an
+            # internal identifier survived, this raises BEFORE the model call so
+            # the payload never egresses. No-op when off / no guard.
+            user_msg_round1 = _guard_egress(guard, user_msg_round1, ctx.settings)
             async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                 synth_result_round1 = await synth_agent.run(user_msg_round1)
+        except EgressResidueError as e:
+            # Blocked egress: the model was NOT called. Audit the block (count
+            # only) + emit the paired error event, then land the SAME honest
+            # pipeline-fallback (E1.2) a synth crash would — the run couldn't
+            # safely proceed, so it IS a pipeline error.
+            async for ev in _emit_egress_blocked("synth_first_round1", e):
+                yield ev
+            triage_round1 = _synth_failure_fallback_report(alert_id, "egress_blocked", e)
+            await metrics.get_metrics().record_event("fallback_verdict", {})
         except Exception as e:
             # Emit error event for the audit trail, then
             # fall through with a fallback NMI TriageReport so the row in
@@ -1484,7 +1566,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             inv_user_msg = guard.sanitize_text(inv_user_msg)
         inv_result: Any = None
         budget_exc: BaseException | None = None
+        # Set when the fail-closed residue sweep blocks the loop's first model
+        # call: routes the budget-boundary convergence below to the HONEST
+        # pipeline-fallback (E1.2) instead of preserving a round-1 verdict, so a
+        # blocked egress renders as a pipeline error.
+        egress_blocked_exc: EgressResidueError | None = None
         try:
+            # Fail-closed residue sweep on the FINAL composed investigator prompt
+            # BEFORE the loop's first model call — if an internal identifier
+            # survived, this raises so the payload never reaches the model.
+            inv_user_msg = _guard_egress(guard, inv_user_msg, ctx.settings)
             # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
             # tool_result / model_response lands in the timeline THE MOMENT it
             # happens (the recorder persists every event immediately, FLUSH_EVERY=1)
@@ -1534,6 +1625,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             inv_result = inv_run.result
         except asyncio.CancelledError:
             raise  # cooperative cancel — propagate, never swallow
+        except EgressResidueError as e:
+            # Fail-closed block on the investigator prompt — the model was NEVER
+            # called. Audit the block (count only) + emit the paired error event,
+            # then route the convergence below to the HONEST pipeline-fallback.
+            async for ev in _emit_egress_blocked("investigation_loop", e):
+                yield ev
+            egress_blocked_exc = e
         except UsageLimitExceeded as e:
             # Budget exhaustion is an EXPECTED outcome of a thorough investigation,
             # NOT an infrastructure failure. The tool calls + model responses
@@ -1574,7 +1672,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             yield err_ev
             return
 
-        if budget_exc is not None:
+        if egress_blocked_exc is not None:
+            # A blocked egress is a pipeline error (the run couldn't safely
+            # proceed) — land the HONEST pipeline-fallback (E1.2), NOT the
+            # round-1-preserving budget fallback. loop_messages stays None.
+            triage_final = _synth_failure_fallback_report(
+                alert_id, "egress_blocked", egress_blocked_exc
+            )
+            final_synth_rerun = None  # fallback verdict — never vote on it
+            await metrics.get_metrics().record_event("fallback_verdict", {})
+        elif budget_exc is not None:
             # Round-1 verdict stands (evidence gathered pre-budget is preserved in
             # the streamed timeline). loop_messages stays None — the downstream
             # evidence/citation checks already handle that.
@@ -1638,6 +1745,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # candidate block woven into the synthesizer message.
                 loop_synth_msg = guard.sanitize_text(loop_synth_msg)
             try:
+                # Fail-closed residue sweep on the FINAL composed loop-synth
+                # message before the model call — raises BEFORE egress on residue.
+                loop_synth_msg = _guard_egress(guard, loop_synth_msg, ctx.settings)
                 async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                     loop_synth_result = await loop_synth.run(
                         loop_synth_msg,
@@ -1645,6 +1755,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     )
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
+            except EgressResidueError as e:
+                # Blocked egress: the model was NOT called. Audit the block (count
+                # only) + emit the paired error event, then land the HONEST
+                # pipeline-fallback (E1.2) — a blocked run IS a pipeline error.
+                async for ev in _emit_egress_blocked("investigation_loop_synth", e):
+                    yield ev
+                triage_final = _synth_failure_fallback_report(alert_id, "egress_blocked", e)
+                final_synth_rerun = None  # fallback verdict — never vote on it
+                await metrics.get_metrics().record_event("fallback_verdict", {})
             except BaseException as e:
                 # A BaseException here (e.g. a gateway timeout/cancel that escaped
                 # the client retries) previously propagated past the recorder,
@@ -1764,10 +1883,25 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # before this composed message crosses the egress boundary.
                 user_msg_round2 = guard.sanitize_text(user_msg_round2)
             try:
+                # Fail-closed residue sweep on the FINAL composed round-2 message
+                # before the model call — raises BEFORE egress on residue.
+                user_msg_round2 = _guard_egress(guard, user_msg_round2, ctx.settings)
                 async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                     synth_result_round2 = await synth_agent.run(user_msg_round2)
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
+            except EgressResidueError as e:
+                # Blocked egress: the model was NOT called. Audit the block (count
+                # only) + emit the paired error event, then land the HONEST
+                # pipeline-fallback (E1.2) and stop dispatching — a blocked run IS
+                # a pipeline error.
+                async for ev in _emit_egress_blocked("synth_first_round2", e):
+                    yield ev
+                triage_final = _synth_failure_fallback_report(alert_id, "egress_blocked", e)
+                final_synth_rerun = None  # fallback verdict — never vote on it
+                await metrics.get_metrics().record_event("fallback_verdict", {})
+                phase_d_synth_ok = False
+                break
             except BaseException as e:
                 # Emit a recorded error, then fall back to the round-1 verdict (or a
                 # scoreable NMI) so the row is never a silent status=error.
@@ -2095,6 +2229,20 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             ],
             "field_reconciliation": triage_final.field_reconciliation,
             "validator_note": triage_final.validator_note,
+            # Pipeline-fallback provenance marker (E1.2). Present ONLY on the
+            # synth-failure path (`_synth_failure_fallback_report`) — a real
+            # verdict leaves it None and it's dropped below. The persisted report
+            # dict (recorder captures THIS payload) then carries
+            # `resolution.provenance == "pipeline_fallback"`, which every
+            # downstream consumer reads via `is_pipeline_fallback`. Distinct key
+            # from the manual/chat override's `resolved_via`, so a later manual
+            # resolution overwrites it cleanly (a resolved run is no longer a
+            # "pipeline error to retry").
+            **(
+                {"resolution": triage_final.resolution}
+                if triage_final.resolution is not None
+                else {}
+            ),
             # Preserve local verdict in the audit when Oracle overrode it.
             "local_verdict": local_triage_final.verdict
             if triage_final is not local_triage_final

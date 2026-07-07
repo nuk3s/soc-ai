@@ -1,3 +1,5 @@
+import { Wrench } from 'lucide-react';
+
 import { KIND, SEVERITY, VERDICT } from '../lib/tokens';
 import type { DetectionKind, Severity, Verdict } from '../lib/types';
 
@@ -78,6 +80,28 @@ export function VerdictPill({ verdict, conf, inherited, large, showConf = true, 
       {showConf && conf != null && (
         <span className="font-mono opacity-80">{conf.toFixed(2)}</span>
       )}
+    </span>
+  );
+}
+
+// ---- pipeline-error chip (E1.2) --------------------------------------------
+// A needs_more_info run that FAILED before reaching a verdict (model truncation,
+// gateway 5xx) — NOT a genuine "needs more info". Rendered in slate/red with a
+// wrench so an analyst reads it as "infra broke, retry", not "dig deeper". Used
+// in place of the amber Needs-info VerdictPill on the Alerts + Investigations
+// rows, and as a filterable status.
+export function PipelineErrorChip({ hint, large }: { hint?: string | null; large?: boolean }) {
+  return (
+    <span
+      className={
+        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-pill border font-semibold ' +
+        (large ? 'px-3 py-[5px] text-[12.5px] uppercase tracking-[.01em]' : 'px-[9px] py-[2.5px] text-[11.5px]')
+      }
+      style={{ color: '#fca5a5', background: 'rgba(240,68,56,.09)', borderColor: 'rgba(240,68,56,.35)' }}
+      title={hint ?? 'This run failed before reaching a verdict — re-run it'}
+    >
+      <Wrench size={large ? 12 : 10} strokeWidth={2.5} />
+      Pipeline error
     </span>
   );
 }

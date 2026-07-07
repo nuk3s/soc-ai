@@ -26,6 +26,7 @@ from soc_ai.store import assignments as assign_svc
 from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
+from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import alerts_query as aq
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,6 +52,20 @@ class AlertEventOut(BaseModel):
     investigatedAt: str | None = None
 
 
+class LastAttemptOut(BaseModel):
+    """A FAILED retry stacked on top of a standing verdict (E2.1).
+
+    Present only when the NEWEST run for a rule is terminal-non-complete
+    (error/cancelled/interrupted) OR a pipeline fallback, AND an older, genuine
+    (non-fallback) complete verdict is still standing. It answers the "stayed at
+    Needs Info" mystery: the row keeps its real verdict, but this note surfaces
+    that the last re-run crashed. ``status`` ∈ {error, cancelled, interrupted,
+    fallback}; ``ago`` is a short relative label ("5m")."""
+
+    status: str
+    ago: str
+
+
 class AlertGroupOut(BaseModel):
     id: str
     name: str
@@ -63,6 +78,10 @@ class AlertGroupOut(BaseModel):
     latestTs: str = ""
     inherited: bool = False
     owner: str | None = None
+    # Human triage state on the assignment (E2.3): "owned" | "in_review" | "done".
+    # None when the rule is unassigned (no assignment row) — the "unassigned"
+    # state is the absence of an owner, so state is only meaningful with an owner.
+    state: str | None = None
     # Representative flow (source → destination) from the group's latest event, so
     # the collapsed row shows BOTH hosts at a glance instead of hiding them.
     src: str | None = None
@@ -83,6 +102,61 @@ class AlertGroupOut(BaseModel):
     # are EXCLUDED from the default feed; they appear (flagged) only with
     # ?include_muted=true.
     muted: bool = False
+    # True when the rule's STANDING verdict is a pipeline-failure fallback (E1.2)
+    # — a needs_more_info the pipeline never reasoned to (model truncation,
+    # gateway 5xx). The Alerts row renders a distinct "pipeline error — retry"
+    # chip, and the Dashboard excludes such groups from the Needs-info KPI.
+    fallback: bool = False
+    # A FAILED retry stacked on top of the STANDING verdict (E2.1): the newest run
+    # for this rule crashed (error/cancelled/interrupted) or fell back, while an
+    # older genuine verdict still stands. None when the newest run IS the standing
+    # verdict (no failed retry) — surfaces the "stayed at Needs Info" mystery.
+    lastAttempt: LastAttemptOut | None = None
+
+
+# Terminal statuses that mean a run FAILED without landing a verdict — the
+# re-huntable set (mirrors :func:`inv_svc.blocks_rehunt`'s complement, minus
+# "running" which is an in-flight retry surfaced by `triaging`, not a failure).
+_FAILED_STATUSES = frozenset({"error", "cancelled", "interrupted"})
+
+
+def _last_attempt(
+    newest: Investigation | None, standing: Investigation | None
+) -> LastAttemptOut | None:
+    """The failed-retry note for a rule, or None (E2.1).
+
+    ``newest`` is the rule's most-recent run of ANY status (``latest_for_rules``);
+    ``standing`` is its latest COMPLETE verdict (``latest_complete_for_rules``).
+    A failed retry is surfaced only when a GENUINE verdict is standing AND a LATER
+    attempt failed — so the standing verdict chip stays primary and this is a
+    secondary hint. Concretely:
+
+    * ``standing`` must exist and NOT itself be a pipeline fallback — if the
+      standing verdict is the fallback, E1.2's pipeline-error chip already owns the
+      failure signal (and there is no genuine verdict to stack a failed retry on).
+    * ``newest`` must be a DIFFERENT, LATER run than ``standing`` (a failed retry
+      on top of it) — if the newest run IS the standing complete verdict, there is
+      no failure to show.
+    * ``newest`` must be terminal-non-complete (error/cancelled/interrupted) OR a
+      pipeline fallback (a fallback is a ``complete`` row, so status alone misses
+      it — see E1.2).
+
+    No extra query: both inputs are already fetched by :func:`list_alerts`.
+    """
+    if newest is None or standing is None:
+        return None
+    # A fallback standing verdict is E1.2's job, not E2.1's.
+    if is_pipeline_fallback(getattr(standing, "report", None)):
+        return None
+    # The newest run IS the standing verdict → no failed retry on top of it.
+    if newest.id == standing.id:
+        return None
+    fell_back = is_pipeline_fallback(getattr(newest, "report", None))
+    if newest.status not in _FAILED_STATUSES and not fell_back:
+        return None
+    status = "fallback" if fell_back else newest.status
+    ago = _inv_ago(newest) or "?"
+    return LastAttemptOut(status=status, ago=ago)
 
 
 def _inherited_reason(inv: Investigation) -> str:
@@ -156,8 +230,12 @@ async def list_alerts(
     # verdict came from a different alert than this group's latest event.
     # badge per rule: (verdict, conf, cross_alert_inherited, inv_id, investigated_pair)
     badges: dict[str, tuple[str, float | None, bool, str, str]] = {}
-    owners: dict[str, str] = {}
+    assignments: dict[str, dict[str, str]] = {}
     verdicts: dict[str, Investigation] = {}
+    # Newest run of ANY status per rule — drives the "Triaging…" flag AND the E2.1
+    # failed-retry note. Already fetched below; hoisted here so the render loop can
+    # read it without a re-fetch (no N+1).
+    latest_any: dict[str, Investigation] = {}
     running_rules: set[str] = set()
     muted_rules: set[str] = set()
     if groups:
@@ -165,7 +243,7 @@ async def list_alerts(
         async with request.app.state.db_sessionmaker() as db:
             verdicts = await inv_svc.latest_complete_for_rules(db, rule_names)
             latest_any = await inv_svc.latest_for_rules(db, rule_names)
-            owners = await assign_svc.owners_for_rules(db, rule_names)
+            assignments = await assign_svc.assignments_for_rules(db, rule_names)
             muted_rules = await override_svc.muted_rule_names(db)
         # The id of the in-flight run per rule, so a "Triaging…" row links straight
         # to its live investigation (a running row has no completed verdict, so its
@@ -196,6 +274,15 @@ async def list_alerts(
         # flag the stronger case where even the representative differs.
         reason: str | None = None
         _inv = verdicts.get(g.rule_name)
+        # The badge is a pipeline fallback when the rule's STANDING verdict run
+        # carries the marker (E1.2). `latest_complete_for_rules` loads the full
+        # ORM row, so `.report` (the JSON column) is available.
+        is_fallback = _inv is not None and is_pipeline_fallback(getattr(_inv, "report", None))
+        # E2.1: a failed RETRY stacked on the standing verdict. The newest run of
+        # any status (`latest_any`) is the "last attempt"; it's a failure only when
+        # it's newer than the genuine standing verdict AND terminal-non-complete or
+        # a fallback. Reuses data already in hand — no per-rule query.
+        last_attempt = _last_attempt(latest_any.get(g.rule_name), _inv)
         if inv_id and inherited and _inv is not None:
             reason = _inherited_reason(_inv)
         elif inv_id and g.count > 1:
@@ -212,7 +299,8 @@ async def list_alerts(
                 latest=_ago(g.latest_ts),
                 latestTs=g.latest_ts or "",
                 inherited=inherited,
-                owner=owners.get(g.rule_name),
+                owner=(assignments.get(g.rule_name) or {}).get("owner"),
+                state=(assignments.get(g.rule_name) or {}).get("state"),
                 src=g.src_ip,
                 dst=g.dst_ip,
                 events=[],
@@ -230,6 +318,8 @@ async def list_alerts(
                 ackedCount=g.acked_count,
                 escalatedCount=g.escalated_count,
                 muted=is_muted,
+                fallback=is_fallback,
+                lastAttempt=last_attempt,
             )
         )
     return out

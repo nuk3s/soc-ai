@@ -71,12 +71,38 @@ AuditKind = Literal[
     # oracle frontier adjudication
     "oracle_escalation",
     "oracle_adjudication",
+    # model-fitness preflight probe (soc_ai/webui/probes.probe_model_fitness):
+    # emitted by GET /config/model-fitness with the overall grade so an operator
+    # switching analyst_model to an unfit model leaves an audit trail of the
+    # warning that was surfaced. Read-only probe; never a mutating write.
+    "model_fitness",
+    # alert ownership / triage-state changes (soc_ai/api/webui/routes_alert_actions.py
+    # POST /alerts/assign). Emitted best-effort on assign / state-change / unassign so a
+    # multi-analyst team has a trail of who took (or released) a rule and moved it through
+    # owned → in_review → done. A failed audit index must never break the assignment write.
+    "assignment",
+    # outbound notification webhook (soc_ai/notify.py::fire). Emitted best-effort on
+    # EVERY attempted send (high-confidence TP, hunt threat finding, model-fitness
+    # FAIL, or the canned Test event) so the ONLY new outbound egress path leaves an
+    # audit trail. The webhook URL is a secret and NEVER appears in the payload —
+    # only the format + outcome (ok/status/error). A failed audit index must never
+    # break a send (fail-soft).
+    "notification",
     # unattended high-confidence-FP acknowledge (maybe_auto_ack_fp). Emitted as a
     # StepEvent AND written to the audit trail; the WebUI reads it back
     # (webui_api ``e.kind == "auto_ack"``) to badge an alert as auto-acked, so it
     # MUST be a valid audit kind or every auto-ack fails to record and the badge
     # never shows.
     "auto_ack",
+    # analyst-egress fail-closed residue sweep (soc_ai/agent/orchestrator.py::
+    # _guard_egress). Emitted best-effort when analyst_redaction_fail_closed is on
+    # and the INDEPENDENT unsafe_residue detector finds an internal identifier that
+    # survived sanitization on a composed outbound message: the analyst model is
+    # NOT called and the run lands a pipeline error. The payload carries only the
+    # leaked-identifier COUNT + the call site — NEVER the leaked values (logging
+    # them would defect on the whole point of the block). A failed audit index
+    # must never turn a blocked-egress into an actual egress (fail-soft).
+    "egress_blocked",
     "done",
     "error",
 ]

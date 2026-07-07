@@ -33,6 +33,7 @@ from soc_ai.agent.hunt import (
     build_hunt_prompt,
     build_hunt_synthesizer,
 )
+from soc_ai.agent.hunt_gates import _validate_hunt_charts, _validate_hunt_findings
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.orchestrator import InvestigationContext, StepEvent, _walk_message
 from soc_ai.agent.prompts import oql_primer_block
@@ -129,6 +130,40 @@ async def _synthesize_partial_hunt(
     )
 
 
+async def _stream_node(
+    node: Any,
+    ev_factory: Any,
+    guard: EgressGuard | None,
+    gathered: list[Any],
+    gathered_tool_results: list[Any],
+) -> AsyncIterator[StepEvent]:
+    """Project one streamed hunt node into display StepEvents, capturing evidence.
+
+    Extracts the node's message (``model_response`` or ``request``), appends it to
+    ``gathered`` (the labeled originals the partial-report synthesizer replays),
+    then runs the shared ``_walk_message`` projector. Restores real identifiers
+    for display when a guard is active, and appends each ``tool_result`` payload
+    to ``gathered_tool_results`` — the desanitized evidence bundle the E1.3
+    citation gate resolves findings against (same values the desanitized report
+    cites). A node with no message yields nothing.
+    """
+    node_msg = getattr(node, "model_response", None)
+    if node_msg is None:
+        node_msg = getattr(node, "request", None)
+    if node_msg is None:
+        return
+    gathered.append(node_msg)
+    async for ev in _walk_message(node_msg, ev_factory, phase="hunt", round_num=1):
+        disp = (
+            ev
+            if guard is None
+            else ev.model_copy(update={"payload": guard.desanitize_obj(ev.payload)})
+        )
+        if disp.kind == "tool_result":
+            gathered_tool_results.append(disp.payload.get("result"))
+        yield disp
+
+
 async def run_hunt(
     ctx: InvestigationContext,
     *,
@@ -173,9 +208,13 @@ async def run_hunt(
     # before emitting a report, we can synthesize a partial report from what it
     # actually gathered instead of erroring with nothing.
     gathered: list[Any] = []
+    # Accumulate the tool-result PAYLOADS the hunt actually pulled — the evidence
+    # bundle the post-hunt citation gate resolves findings against (E1.3). Collected
+    # from the streamed tool_result events (desanitized to match the desanitized
+    # report's citations), so a finding citing an id the hunt never pulled is caught.
+    gathered_tool_results: list[Any] = []
     budget_exhausted = False
     try:
-        node_msg: Any = None
         # Whole-hunt wall-clock safety net: a HUNG LLM stream has no budget-based
         # stopping point and would otherwise stall the background task forever.
         # On expiry the TimeoutError falls through to the same partial-report path
@@ -185,20 +224,8 @@ async def run_hunt(
             agent.iter(user_msg, usage_limits=usage_limits) as run,
         ):
             async for node in run:
-                node_msg = getattr(node, "model_response", None)
-                if node_msg is None:
-                    node_msg = getattr(node, "request", None)
-                if node_msg is not None:
-                    gathered.append(node_msg)
-                    async for ev in _walk_message(node_msg, _ev, phase="hunt", round_num=1):
-                        # Streamed timeline events are local storage — restore
-                        # real values for display (`gathered` keeps the
-                        # labeled originals for the model).
-                        yield (
-                            ev
-                            if guard is None
-                            else ev.model_copy(update={"payload": guard.desanitize_obj(ev.payload)})
-                        )
+                async for disp in _stream_node(node, _ev, guard, gathered, gathered_tool_results):
+                    yield disp
         result = run.result
     except asyncio.CancelledError:
         raise  # cooperative cancel — propagate, never swallow
@@ -249,9 +276,46 @@ async def run_hunt(
         return
 
     report = _desanitize_hunt_report(result.output, guard)
+
+    # ── Post-hunt citation gate (E1.3) ───────────────────────────────────────
+    # Deterministically resolve each finding's citations against the evidence the
+    # hunt ACTUALLY gathered; strip non-resolving citations + cap such findings'
+    # severity. Returns the validated report + the citation_validation event (or
+    # None on a validator error — the gate is fail-soft).
+    report, citation_ev = _gate_hunt_citations(report, gathered_tool_results, _ev)
+    if citation_ev is not None:
+        yield citation_ev
+
     report_payload = report.model_dump(mode="json")
     yield _ev("hunt_report", report_payload)
     yield _ev("done", {"finding_count": len(report.findings)})
+
+
+def _gate_hunt_citations(
+    report: Any, tool_results: list[Any], ev_factory: Any
+) -> tuple[Any, StepEvent | None]:
+    """Run the E1.3 finding gate + E3.3 chart gate; return (validated_report, event).
+
+    Deterministically resolves each finding's citations against the evidence the
+    hunt gathered this run, strips non-resolving citations, caps such findings'
+    severity, and caps a high/critical finding that cites nothing. Then, over the
+    SAME gathered tool-results, resolves each chart's ``source_citations`` with the
+    SAME distinctive-token resolver and DROPS any chart whose citations don't
+    resolve (or which has no series / no citations), capped at 4 — an invented
+    series is never rendered. The event carries the per-hunt counts (finding tallies
+    plus ``charts`` / ``charts_dropped``), mirroring the investigation path's
+    ``citation_validation`` emission. Fail-soft: a validator surprise must never
+    cost the hunt its report — on error the unvalidated report is returned with a
+    ``None`` event.
+    """
+    try:
+        validated_findings, counts = _validate_hunt_findings(report.findings, tool_results)
+        kept_charts, chart_counts = _validate_hunt_charts(report.charts, tool_results)
+        report = report.model_copy(update={"findings": validated_findings, "charts": kept_charts})
+        return report, ev_factory("citation_validation", {"round": 1, **counts, **chart_counts})
+    except Exception:
+        _LOGGER.warning("hunt citation gate failed; persisting unvalidated report", exc_info=True)
+        return report, None
 
 
 async def hunt_recorded_run(
@@ -292,6 +356,12 @@ async def hunt_recorded_run(
                 },
             )
         await recorder.finish("complete")
+        # E2.4 notification trigger — a completed hunt whose report contains a
+        # threat-category finding pings on-call. THIN + fail-soft: build a
+        # NotifyEvent from the recorder's captured report and fire it (a hard
+        # no-op unless notifications are enabled + a webhook is configured). Wrapped
+        # so a webhook can never break the finalized hunt.
+        await _maybe_notify_hunt(state, recorder)
     except asyncio.CancelledError:
         # Only an EXPLICIT operator cancel is 'cancelled'; any other cancellation
         # (SSE client disconnect, app/container shutdown) is an interrupted run
@@ -307,6 +377,32 @@ async def hunt_recorded_run(
     finally:
         # no-op if already finished; lands rows abandoned by client disconnect
         await recorder.finish("error")
+
+
+async def _maybe_notify_hunt(state: Any, recorder: HuntRecorder) -> None:
+    """Fire the E2.4 hunt-threat notification for a finalized hunt (fail-soft).
+
+    Reads the recorder's captured HuntReport + hunt id, builds a NotifyEvent iff
+    the report has a threat-category finding (per settings), and fires it. Every
+    failure mode is swallowed — a notification must NEVER break the just-finalized
+    hunt. Zero egress unless notifications are enabled + a webhook is configured.
+    """
+    try:
+        from soc_ai import notify  # noqa: PLC0415 - local, keeps import graph light
+
+        hunt_id = recorder.hunt_id
+        report = recorder._report  # the captured hunt_report payload (or None)
+        if hunt_id is None or not report:
+            return
+        event = notify.event_for_hunt(
+            hunt_id=hunt_id,
+            report=report,
+            settings=state.settings,
+        )
+        if event is not None:
+            await notify.fire_safe(event, state.settings, getattr(state, "audit", None))
+    except Exception:  # a notification trigger must never break the primary flow
+        _LOGGER.warning("hunt notify trigger failed (continuing)", exc_info=True)
 
 
 def sse_encode(name: str, data: dict[str, Any]) -> dict[str, Any]:

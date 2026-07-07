@@ -471,11 +471,40 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     {inv.oracle?.escalated && (
       <OracleCard oracle={inv.oracle} />
     )}
+    {/* Pipeline-failure panel (E1.2). A fallback run is a needs_more_info the
+        pipeline never reasoned to (model truncation, gateway 5xx). Render an
+        honest "failed before reaching a verdict" panel + a Re-run (same
+        startHunt path as the terminal-failure banner) INSTEAD of the amber
+        open-questions block below — re-running is the fix, not "dig deeper". */}
+    {inv.fallback && (
+      <div
+        className="mb-3 rounded-card border px-3.5 py-3"
+        style={{ borderColor: 'rgba(240,68,56,.32)', background: 'rgba(240,68,56,.06)' }}
+      >
+        <div className="mb-1.5 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[.05em]" style={{ color: '#fca5a5' }}>
+          <Wrench size={13} /> Pipeline error
+        </div>
+        <div className="mb-2.5 text-[13px] leading-[1.55] text-text-2" style={{ textWrap: 'pretty' }}>
+          This run failed before reaching a verdict
+          {inv.fallback.hint ? <>: {inv.fallback.hint}</> : '.'}
+          {' '}It was recorded as needs_more_info as a placeholder — re-run it to get a real verdict.
+        </div>
+        <button
+          onClick={reRun}
+          disabled={reHunting}
+          className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
+        >
+          {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
+          {reHunting ? 'Re-running…' : 'Re-run investigation'}
+        </button>
+      </div>
+    )}
     {/* Open-questions / follow-up block. Also shown for an `inconclusive`
         verdict (the self-consistency vote didn't converge) even without
         structured open questions — it's a terminal non-committed verdict like
-        needs_more_info, and the request-more-info endpoint accepts it too. */}
-    {((inv.openQuestions?.length ?? 0) > 0 || inv.verdict === 'inconclusive') && (
+        needs_more_info, and the request-more-info endpoint accepts it too.
+        SUPPRESSED for a pipeline fallback — the panel above replaces it. */}
+    {!inv.fallback && ((inv.openQuestions?.length ?? 0) > 0 || inv.verdict === 'inconclusive') && (
       <div
         className="mb-3 rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}

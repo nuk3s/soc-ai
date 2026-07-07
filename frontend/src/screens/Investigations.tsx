@@ -1,7 +1,7 @@
 import { Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { KindBadge, VerdictPill } from '../components/Badges';
+import { KindBadge, PipelineErrorChip, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
@@ -13,7 +13,17 @@ import { ErrorState, LoadingState } from '../components/States';
 import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { type SortDir, useSort } from '../lib/useSort';
-import type { InvestigationRow, Verdict } from '../lib/types';
+import type { InvestigationRow, RehuntResult, Verdict } from '../lib/types';
+
+// Raw rehunt skip-reason codes (routes_investigations.py::bulk_rehunt) → friendly
+// text. Unknown codes fall through to the raw code so a new backend reason is
+// never silently swallowed.
+const REHUNT_SKIP_REASONS: Record<string, string> = {
+  not_found: 'not found',
+  no_alert: 'no alert to hunt',
+  could_not_start: "couldn't start",
+};
+const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
 // select | detection | verdict | conf | source→dest | status | when | delete.
 // Source→Dest gets a real minimum (two full IPv4s + arrow ≈ 220px at 12px mono)
@@ -119,6 +129,17 @@ export function Investigations() {
     const t = setTimeout(() => setRehuntMsg(null), isError ? 8000 : 4500);
     return () => clearTimeout(t);
   }, [rehuntMsg]);
+  // Structured rehunt outcome (E2.2): the collapsed "Started N · M skipped"
+  // header auto-dismisses like the toast, but once the operator expands the
+  // per-id detail it PERSISTS until they collapse or dismiss it — so a mixed
+  // batch's "which/why" isn't yanked away mid-read.
+  const [rehuntResult, setRehuntResult] = useState<RehuntResult | null>(null);
+  const [rehuntExpanded, setRehuntExpanded] = useState(false);
+  useEffect(() => {
+    if (!rehuntResult || rehuntExpanded) return;
+    const t = setTimeout(() => setRehuntResult(null), 6000);
+    return () => clearTimeout(t);
+  }, [rehuntResult, rehuntExpanded]);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
@@ -128,10 +149,27 @@ export function Investigations() {
   const running = rows.filter((r) => r.status === 'running').length;
   const tps = rows.filter((r) => r.verdict === 'true_positive').length;
 
-  // Apply filters then sort
+  // invId → detection/rule name, for labelling the rehunt result panel (E2.2).
+  // The rehunt targets the SOURCE investigation, whose row is still in the list.
+  const nameById = new Map(rows.map((r) => [r.id, r.name]));
+  const labelForInv = (invId: string): string => {
+    const name = nameById.get(invId);
+    return name && name.trim() ? name : invId;
+  };
+
+  // Apply filters then sort. The Verdict filter carries a synthetic
+  // 'pipeline_error' value (E1.2): a fallback row matches it regardless of its
+  // (needs_more_info) verdict, and — since the chip REPLACES the NMI pill — a
+  // fallback row is NOT matched by selecting 'needs_more_info' alone.
+  const matchesVerdict = (r: InvestigationRow): boolean => {
+    if (!filterVerdicts.length) return true;
+    if (filterVerdicts.includes('pipeline_error') && r.fallback) return true;
+    if (r.fallback) return false; // a fallback shows only under 'pipeline_error'
+    return filterVerdicts.includes(r.verdict);
+  };
   const visible = rows
     .filter((r) => inRange(r.ts, range, custom))
-    .filter((r) => !filterVerdicts.length || filterVerdicts.includes(r.verdict))
+    .filter(matchesVerdict)
     .filter((r) => !filterStatuses.length || filterStatuses.includes(r.status))
     .sort((a, b) => cmpRows(a, b, sort.key, sort.dir));
 
@@ -194,13 +232,12 @@ export function Investigations() {
     if (!ids.length) return;
     setRehunting(true);
     setRehuntMsg(null);
+    setRehuntResult(null);
+    setRehuntExpanded(false);
     try {
-      const result = await rehuntInvestigations(ids);
-      const n = result.started.length;
-      const s = result.skipped.length;
-      const parts = [`Started ${n} re-investigation${n !== 1 ? 's' : ''}`];
-      if (s > 0) parts.push(`${s} skipped`);
-      setRehuntMsg(parts.join(' · '));
+      // Surface the per-id started/skipped detail the API already returns —
+      // "Started N · M skipped" alone hides which ids skipped and why (E2.2).
+      setRehuntResult(await rehuntInvestigations(ids));
       setSelected({});
       setReloadKey((k) => k + 1);
     } catch (err) {
@@ -274,6 +311,7 @@ export function Investigations() {
             { value: 'needs_more_info', label: 'Needs more info' },
             { value: 'inconclusive', label: 'Inconclusive' },
             { value: 'untriaged', label: 'Untriaged' },
+            { value: 'pipeline_error', label: 'Pipeline error' },
           ]}
           value={filterVerdicts}
           onChange={setFilterVerdicts}
@@ -356,6 +394,67 @@ export function Investigations() {
           <span className="text-[12.5px] text-text-2">{rehuntMsg}</span>
         )}
       </div>
+
+      {/* Bulk re-investigate result (E2.2): a collapsed "Started N · M skipped"
+          header expands to the per-id detail the API already returns — WHICH
+          detections re-ran and WHY each skip happened — so a mixed batch is
+          never an opaque count. */}
+      {rehuntResult && (() => {
+        const started = rehuntResult.started;
+        const skipped = rehuntResult.skipped;
+        const total = started.length + skipped.length;
+        return (
+          <div
+            className="mb-3.5 overflow-hidden rounded-card border"
+            style={{ borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }}
+          >
+            <div className="flex items-center gap-2.5 px-3.5 py-2.5 text-[13px]">
+              <RefreshCw size={13} className="flex-none text-accent" />
+              <button
+                onClick={() => total > 0 && setRehuntExpanded((v) => !v)}
+                disabled={total === 0}
+                className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+              >
+                <span className="min-w-0 truncate font-semibold text-text-2">
+                  Started {started.length} re-investigation{started.length !== 1 ? 's' : ''}
+                  {skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}
+                </span>
+                {total > 0 && (
+                  <span className="flex flex-none items-center gap-1 text-[11.5px] text-dim">
+                    {rehuntExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    {rehuntExpanded ? 'Hide detail' : 'Show detail'}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => { setRehuntResult(null); setRehuntExpanded(false); }}
+                className="flex flex-none text-dim hover:text-text"
+                aria-label="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            {rehuntExpanded && total > 0 && (
+              <div className="border-t border-border-faint px-3.5 py-2 text-[12.5px]">
+                {started.map((s) => (
+                  <div key={s.invId} className="flex items-center gap-2 py-[3px]">
+                    <Check size={12} className="flex-none text-success" />
+                    <span className="min-w-0 truncate text-text-2">{labelForInv(s.invId)}</span>
+                    <span className="flex-none text-faint">→ new run</span>
+                  </div>
+                ))}
+                {skipped.map((s) => (
+                  <div key={s.invId} className="flex items-center gap-2 py-[3px]">
+                    <X size={12} className="flex-none text-faint" />
+                    <span className="min-w-0 truncate text-dim">{labelForInv(s.invId)}</span>
+                    <span className="flex-none text-faint">— {rehuntSkipReason(s.reason)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         <div
@@ -460,8 +559,11 @@ export function Investigations() {
               </div>
               {/* Only a finished run has a verdict. For running/awaiting/error/
                   cancelled/interrupted rows the Status column carries the state —
-                  an "untriaged" pill there reads as a contradiction. */}
-              <div>{r.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={r.verdict} />}</div>
+                  an "untriaged" pill there reads as a contradiction. A pipeline
+                  fallback (E1.2) replaces the amber NMI pill with a distinct
+                  pipeline-error chip so infra failures aren't mistaken for
+                  genuine "needs more info". */}
+              <div>{r.fallback ? <PipelineErrorChip /> : r.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={r.verdict} />}</div>
               <div className="font-mono text-[12.5px] text-text-2">{r.conf != null ? r.conf.toFixed(2) : '—'}</div>
               <div className="min-w-0 overflow-hidden"><FlowBadge src={r.host === '—' ? null : r.host} dst={r.dst} /></div>
               <div>
@@ -507,7 +609,7 @@ export function Investigations() {
                         <CornerDownRight size={12} className="flex-none" />
                         <span className="truncate text-[12px]">earlier run</span>
                       </div>
-                      <div>{rt.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={rt.verdict} />}</div>
+                      <div>{rt.fallback ? <PipelineErrorChip /> : rt.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={rt.verdict} />}</div>
                       <div className="font-mono text-[12px] text-faint">{rt.conf != null ? rt.conf.toFixed(2) : '—'}</div>
                       <div className="min-w-0 overflow-hidden opacity-70"><FlowBadge src={rt.host === '—' ? null : rt.host} dst={rt.dst} /></div>
                       <div>

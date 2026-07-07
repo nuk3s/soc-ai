@@ -35,6 +35,7 @@ from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import backtests as bt_svc
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import hunt_templates as hunt_templates_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import bootstrap_admin
@@ -217,6 +218,74 @@ async def _auto_triage_scheduler_loop(app: FastAPI, settings: Any) -> None:
             _LOGGER.exception("auto-triage scheduler iteration failed; continuing")
 
 
+async def _hunt_schedule_loop(app: FastAPI) -> None:
+    """Fire recurring (scheduled) hunts when they come due (E3.1).
+
+    Mirrors :func:`_auto_triage_scheduler_loop`: a fixed 60s wake, live settings
+    read each wake (a config-console toggle applies without a restart), a no-op
+    unless ``hunt_schedules_enabled``. Each wake fetches the DUE schedules
+    (:func:`soc_ai.store.hunt_schedules.due_schedules`) and spawns a normal hunt
+    per schedule via the shared ``HuntConsoleManager`` (tagged ``kind="scheduled"``),
+    then stamps ``last_run_at`` immediately.
+
+    **Single-flight** is per-SCHEDULE, not global: distinct schedules run
+    concurrently (the manager keys tasks by hunt_id, so they never collide), but a
+    schedule can't re-fire while its own hunt is still running because
+    :func:`mark_ran` resets its interval clock the instant it spawns — so the same
+    schedule is no longer "due" next wake until the interval elapses again. This
+    relies on the interval being ≥ the hunt runtime (enforced as a 60-min floor at
+    the store). A per-schedule failure is logged and skipped so one bad schedule
+    can never take out the others or the loop.
+
+    Note (workers>1): a second uvicorn worker would run its own copy of this loop
+    and double-fire every schedule — soc-ai runs a SINGLE worker today; distributed
+    scheduler coordination is Epoch 6.2, deliberately not built here.
+    """
+    from soc_ai.store import hunt_schedules as hs_svc  # noqa: PLC0415
+    from soc_ai.webui import hunt_console_manager as hcm  # noqa: PLC0415
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            settings = app.state.settings
+            if not getattr(settings, "hunt_schedules_enabled", False):
+                continue
+            now = datetime.now(UTC).replace(tzinfo=None)  # naive UTC, matches the store
+            async with app.state.db_sessionmaker() as db:
+                due = await hs_svc.due_schedules(db, now)
+            if not due:
+                continue
+            manager = hcm.get_manager(app.state)
+            launched = 0
+            for sched in due:
+                try:
+                    # Reset the interval clock BEFORE spawning: this is the
+                    # single-flight guard — even if the spawn is slow or the hunt
+                    # runs long, the schedule is no longer "due" next wake.
+                    async with app.state.db_sessionmaker() as db:
+                        await hs_svc.mark_ran(db, sched.id, now)
+                    hunt_id = await manager.start(
+                        app.state,
+                        objective=sched.objective,
+                        started_by="scheduler",
+                        kind="scheduled",
+                    )
+                    if hunt_id is not None:
+                        launched += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _LOGGER.exception(
+                        "hunt scheduler: schedule id=%s failed to fire; skipping", sched.id
+                    )
+            if launched:
+                _LOGGER.info("hunt scheduler: launched %d scheduled hunt(s)", launched)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("hunt scheduler iteration failed; continuing")
+
+
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
     """Migrate the store, bootstrap the admin, apply config overrides, reap orphans.
 
@@ -253,6 +322,19 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
     apply_to_settings(settings, overrides, secret_box=secret_box)
     if overrides:
         _LOGGER.info("applied %d persisted config override(s)", len(overrides))
+
+    # Seed the builtin hunt templates (E3.2) — idempotent upsert-by-name, so it's
+    # safe on every startup (never duplicates a builtin, never touches a custom
+    # template). Fail-soft: a seed failure must not block serving; the picker just
+    # falls back to whatever templates already exist (or the frontend's static
+    # pills if the store is empty).
+    try:
+        async with db_sessionmaker() as db:
+            seeded = await hunt_templates_svc.seed_builtins(db)
+        if seeded:
+            _LOGGER.info("seeded/refreshed %d builtin hunt template(s)", seeded)
+    except Exception:
+        _LOGGER.warning("builtin hunt-template seed failed; continuing", exc_info=True)
 
     # Reap investigations orphaned by the previous process: any row still
     # 'running' at startup can never finish (its background task is gone). Mark
@@ -348,6 +430,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     reaper_task = asyncio.create_task(_reaper_loop(db_sessionmaker, settings))
     discovery_task = asyncio.create_task(_discovery_scheduler_loop(app, settings))
     autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
+    hunt_schedule_task = asyncio.create_task(_hunt_schedule_loop(app))
 
     try:
         yield
@@ -362,6 +445,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         autotriage_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await autotriage_task
+        hunt_schedule_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hunt_schedule_task
         # A scheduled (or manual "Scan now") discovery worker may be mid-scan,
         # tracked on the shared single-flight status object (the same one the
         # scan-now endpoint uses). Cancel + drain it BEFORE the ES/DB clients it

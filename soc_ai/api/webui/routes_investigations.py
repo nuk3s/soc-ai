@@ -38,6 +38,7 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
+from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import (
     hunt_manager,
 )
@@ -93,6 +94,12 @@ class InvestigationRowOut(BaseModel):
     # The canonical run for its alert: the latest COMPLETE run, else the latest of
     # any status. The UI surfaces this row and tucks the rest away as "earlier runs".
     isPrimary: bool = True
+    # True when this run's verdict is a pipeline-failure fallback (E1.2) — a
+    # needs_more_info the pipeline never actually reasoned to (model truncation,
+    # gateway 5xx). The list renders it as a distinct "pipeline error — retry"
+    # chip (not the amber Needs-info pill), makes it filterable, and the Dashboard
+    # excludes it from the Needs-info KPI.
+    fallback: bool = False
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -128,6 +135,9 @@ def _row(
         chatCount=chat_count,
         alertId=getattr(inv, "alert_es_id", None) or inv.id,
         isPrimary=is_primary,
+        # `getattr` guard: list_recent yields ORM rows (report is the JSON column),
+        # but tests mock rows with SimpleNamespace and no `report` attr.
+        fallback=is_pipeline_fallback(getattr(inv, "report", None)),
     )
 
 
@@ -264,6 +274,10 @@ async def get_investigation(
         openQuestions=report.get("open_questions") or [],
         resolution=report.get("resolution") or None,
         validatorNote=report.get("validator_note") or None,
+        # Pipeline-failure provenance (E1.2) — non-None ONLY for a synth-failure
+        # fallback run; drives the drawer's "failed before reaching a verdict"
+        # panel instead of the amber Needs-info block.
+        fallback=_timeline._fallback_out(report),
         alertAcked=alert_acked,
     )
 

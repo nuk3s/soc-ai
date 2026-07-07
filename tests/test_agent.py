@@ -683,6 +683,67 @@ async def test_error_event_carries_phase_round_type_and_hint(
 
 
 # =====================================================================
+# E1.2: Honest pipeline-fallback provenance marker
+# =====================================================================
+
+
+def test_synth_failure_fallback_report_stamps_pipeline_fallback_marker() -> None:
+    """The synth-failure fallback report carries the pipeline_fallback marker
+    (E1.2): verdict stays needs_more_info, but the report's `resolution` names
+    the provenance, phase, error type, and an analyst hint — so downstream it
+    renders distinctly from a genuine needs_more_info and stays out of the KPI."""
+    from soc_ai.agent.orchestrator import _synth_failure_fallback_report
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    # A token-limit truncation → _hint_for produces the "burned the budget" hint.
+    exc = RuntimeError("token limit reached before any response was produced")
+    report = _synth_failure_fallback_report("alert-9", "synth_first_round1", exc)
+
+    # Verdict is unchanged — we do NOT invent a new verdict.
+    assert report.verdict == "needs_more_info"
+    assert report.confidence == pytest.approx(0.3)
+
+    # The marker lives in the report's serialized dict under `resolution`.
+    report_dict = report.model_dump(mode="json")
+    assert is_pipeline_fallback(report_dict) is True
+    marker = report_dict["resolution"]
+    assert marker["provenance"] == "pipeline_fallback"
+    assert marker["phase"] == "synth_first_round1"
+    assert marker["error_type"] == "RuntimeError"
+    # The hint is the analyst-actionable _hint_for string for a token-limit crash.
+    assert marker["hint"] is not None
+    assert "response-token cap" in marker["hint"]
+
+
+def test_is_pipeline_fallback_distinguishes_manual_resolution() -> None:
+    """`is_pipeline_fallback` keys on `resolution.provenance` ONLY — a manual/chat
+    override's `resolution` (keyed `resolved_via`, no `provenance`) is NOT a
+    pipeline fallback, so the two markers never conflate. A genuine
+    needs_more_info (no resolution) is likewise False."""
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    # Manual override shape (from store.investigations.resolve).
+    manual = {
+        "verdict": "false_positive",
+        "resolution": {
+            "original_verdict": "needs_more_info",
+            "resolved_via": "manual",
+            "resolved_by": "analyst",
+            "resolved_at": "2026-07-07T00:00:00+00:00",
+        },
+    }
+    assert is_pipeline_fallback(manual) is False
+
+    # Genuine needs_more_info — no resolution marker at all.
+    genuine = {"verdict": "needs_more_info", "citations": ["ev-1"]}
+    assert is_pipeline_fallback(genuine) is False
+
+    # Defensive: non-dict inputs never raise.
+    assert is_pipeline_fallback(None) is False
+    assert is_pipeline_fallback({"resolution": "not-a-dict"}) is False
+
+
+# =====================================================================
 # F1: Enrichment cache + prefetch materialization
 # =====================================================================
 
@@ -3408,6 +3469,220 @@ async def test_synth_first_round1_failure_emits_fallback_nmi_triage_report(
     assert report_ev.payload["verdict"] == "needs_more_info"
     assert report_ev.payload["confidence"] == pytest.approx(0.3)
     assert "synth_first_failure" in report_ev.payload["citations"]
+    assert kinds[-1] == "done"
+
+
+# =====================================================================
+# E5.1: fail-closed residue sweep for the analyst egress guard
+# =====================================================================
+
+# A NetBIOS-style bare hostname: the guard's sanitize pass does NOT redact it
+# (no internal suffix, not in extra_hosts), but the INDEPENDENT unsafe_residue
+# sweep flags it — so it stands in for a real sanitize MISS on a composed
+# outbound message. Threaded through the alert's host_name into enriched_json.
+_LEAK_HOST = "DESKTOP-AB12"
+
+
+def _leaky_enriched(alert_id: str = "alert-001") -> Any:
+    """Enriched context whose host_name survives sanitize but trips residue."""
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext
+
+    return EnrichedAlertContext(
+        alert=SoAlert(id=alert_id, severity_label="low", host_name=_LEAK_HOST),
+        community_id_events=[],
+        host_events=[],
+        user_events=[],
+        process_events=[],
+        file_events=[],
+        pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
+    )
+
+
+def _never_call_synth_agent() -> Any:
+    """A synth agent whose .run MUST NOT be reached when egress is blocked."""
+    from pydantic_ai import Agent
+
+    agent = Agent(
+        model=TestModel(call_tools=[]),
+        system_prompt="stub",
+        output_type=TriageReport,
+    )
+    agent.run = AsyncMock(
+        side_effect=AssertionError("analyst model was called despite a blocked egress")
+    )
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_egress_fail_closed_blocks_and_lands_pipeline_fallback(
+    settings_kratos: Settings,
+) -> None:
+    """With analyst_cloud_redaction + analyst_redaction_fail_closed ON, a payload
+    whose sanitized form still carries an internal identifier is BLOCKED: the
+    model is never called, the run lands a pipeline_fallback naming the leaked
+    COUNT (never the value), and an egress_blocked audit event is emitted."""
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.analyst_cloud_redaction = True
+    settings_kratos.analyst_redaction_fail_closed = True
+    ctx = _make_ctx(settings_kratos)
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _leaky_enriched(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[]),
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synth_first_agent",
+            return_value=_never_call_synth_agent(),
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    # The block was audited.
+    assert "egress_blocked" in kinds, "a blocked egress must emit an egress_blocked audit event"
+    block_ev = next(e for e in events if e.kind == "egress_blocked")
+    assert block_ev.payload["phase"] == "synth_first_round1"
+    assert block_ev.payload["leaked_count"] >= 1
+    # The audit payload carries ONLY the count — NEVER the raw leaked value.
+    assert _LEAK_HOST not in json.dumps(block_ev.payload)
+
+    # The run rendered as a pipeline error (E1.2 fallback), not a real verdict.
+    assert "triage_report" in kinds
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "needs_more_info"
+    assert is_pipeline_fallback(report_ev.payload) is True
+    assert report_ev.payload["resolution"]["phase"] == "egress_blocked"
+    # The summary names the leaked class/count, NEVER the raw value.
+    assert _LEAK_HOST not in json.dumps(report_ev.payload)
+    assert "survived sanitization" in report_ev.payload["summary"].lower() or (
+        "identifier" in report_ev.payload["resolution"]["hint"].lower()
+    )
+    assert kinds[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_egress_fail_closed_off_proceeds_best_effort(
+    settings_kratos: Settings,
+) -> None:
+    """Same leaky payload, but fail-closed OFF → the guard is best-effort: the
+    model IS called and the run proceeds (current behavior). No egress_blocked."""
+    from soc_ai.agent.decision_templates import CandidateVerdict
+
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.analyst_cloud_redaction = True
+    settings_kratos.analyst_redaction_fail_closed = False
+    ctx = _make_ctx(settings_kratos)
+
+    proceed_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.85,
+        summary="benign internal host",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    synth_model = TestModel(call_tools=[], custom_output_args=proceed_report)
+    # Strong benign template exempts the hard evidence gate so the FP verdict
+    # survives to the report (the point is that the model was CALLED, not blocked).
+    strong_candidate = CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.85,
+        cited_evidence=["alert.severity_label"],
+        template_id="clean_internal_traffic",
+        rationale="internal scanner",
+    )
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _leaky_enriched(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=synth_model,
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=strong_candidate,
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert "egress_blocked" not in kinds, "fail-closed OFF must not block egress"
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    # Proceeded to a real verdict, not a pipeline fallback.
+    assert report_ev.payload["verdict"] == "false_positive"
+    assert kinds[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_egress_local_model_unaffected(settings_kratos: Settings) -> None:
+    """analyst_cloud_redaction OFF (local model) → no guard is built at all, so
+    fail-closed is inert even when set: the leaky payload proceeds untouched."""
+    from soc_ai.agent.decision_templates import CandidateVerdict
+
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.analyst_cloud_redaction = False
+    settings_kratos.analyst_redaction_fail_closed = True  # set, but no guard exists
+    ctx = _make_ctx(settings_kratos)
+
+    proceed_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.85,
+        summary=f"benign host {_LEAK_HOST}",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    synth_model = TestModel(call_tools=[], custom_output_args=proceed_report)
+    strong_candidate = CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.85,
+        cited_evidence=["alert.severity_label"],
+        template_id="clean_internal_traffic",
+        rationale="internal scanner",
+    )
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _leaky_enriched(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=synth_model,
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=strong_candidate,
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert "egress_blocked" not in kinds
+    assert ctx.egress_guard is None, "no guard is built when analyst_cloud_redaction is off"
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+    # A local-model run leaves the host_name in the report verbatim (no redaction).
+    assert _LEAK_HOST in report_ev.payload["summary"]
     assert kinds[-1] == "done"
 
 

@@ -353,3 +353,118 @@ async def test_resolve_manual_sets_resolved_via_and_no_source_message(
     assert res["original_verdict"] == "needs_more_info"
     assert "source_message_id" not in res
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# override_counts_by_rule — the analyst-feedback signal (E4.3)
+# ---------------------------------------------------------------------------
+
+
+async def _complete_inv(
+    db,  # type: ignore[no-untyped-def]
+    *,
+    rule_name: str,
+    verdict: str,
+    alert_es_id: str,
+    report: dict | None = None,
+) -> Investigation:
+    inv = await inv_svc.create(db, alert_es_id=alert_es_id, started_by="t", rule_name=rule_name)
+    await inv_svc.finalize(
+        db, inv.id, status="complete", verdict=verdict, confidence=0.9, report=report
+    )
+    return inv
+
+
+async def test_override_counts_by_rule_counts_analyst_overrides(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # A manual override out of NMI to false_positive → overridden_to_fp + manual.
+        m = await _complete_inv(
+            db, rule_name="ET NOISE", verdict="needs_more_info", alert_es_id="o1"
+        )
+        await inv_svc.resolve(
+            db,
+            m.id,
+            verdict="false_positive",
+            confidence=1.0,
+            rationale="Analyst confirmed benign.",
+            recommended_actions=None,
+            resolved_by="alice",
+            resolved_via="manual",
+        )
+        # A chat resolution out of NMI to false_positive → overridden_to_fp + chat.
+        c = await _complete_inv(
+            db, rule_name="ET NOISE", verdict="needs_more_info", alert_es_id="o2"
+        )
+        await inv_svc.resolve(
+            db,
+            c.id,
+            verdict="false_positive",
+            confidence=0.95,
+            rationale="Chat proposal applied.",
+            recommended_actions=None,
+            resolved_by="bob",
+            resolved_via="chat",
+            source_message_id=3,
+        )
+        # An override the OTHER direction (to true_positive) → overridden_to_tp.
+        t = await _complete_inv(
+            db, rule_name="ET NOISE", verdict="needs_more_info", alert_es_id="o3"
+        )
+        await inv_svc.resolve(
+            db,
+            t.id,
+            verdict="true_positive",
+            confidence=1.0,
+            rationale="Analyst escalated.",
+            recommended_actions=None,
+            resolved_by="carol",
+            resolved_via="manual",
+        )
+
+        counts = await inv_svc.override_counts_by_rule(db, ["ET NOISE"])
+    assert counts["ET NOISE"] == {
+        "overridden_to_fp": 2,
+        "overridden_to_tp": 1,
+        "chat_resolved": 1,
+        "manual_resolved": 2,
+    }
+    await engine.dispose()
+
+
+async def test_override_counts_by_rule_ignores_pipeline_fallback_and_plain(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # A pipeline_fallback stamps report.resolution with `provenance` and NO
+        # `resolved_via` — it is NOT an analyst override and must not be counted.
+        await _complete_inv(
+            db,
+            rule_name="ET FB",
+            verdict="needs_more_info",
+            alert_es_id="f1",
+            report={
+                "resolution": {
+                    "provenance": "pipeline_fallback",
+                    "phase": "synth_first",
+                    "error_type": "TimeoutError",
+                }
+            },
+        )
+        # A plain completed investigation (no resolution at all) is not counted.
+        await _complete_inv(db, rule_name="ET FB", verdict="false_positive", alert_es_id="f2")
+
+        counts = await inv_svc.override_counts_by_rule(db, ["ET FB"])
+    # ET FB has no analyst overrides → absent from the result entirely.
+    assert "ET FB" not in counts
+    await engine.dispose()
+
+
+async def test_override_counts_by_rule_empty(settings_kratos: Settings) -> None:
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        assert await inv_svc.override_counts_by_rule(db, []) == {}
+    await engine.dispose()

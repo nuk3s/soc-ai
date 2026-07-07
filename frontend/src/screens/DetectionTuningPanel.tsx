@@ -17,6 +17,26 @@ function recBadge(rec: DetectionNomination['recommendation']): { color: string; 
   return { color: '#8b949e', label: '—' };
 }
 
+/**
+ * The analyst-feedback signal for a nomination — the human corrections that drove
+ * (or strengthened) it. Returns '' when the analyst has not touched the rule, so
+ * the caller can skip rendering the line entirely.
+ */
+function analystSignal(n: DetectionNomination): string {
+  const parts: string[] = [];
+  if (n.override_fp > 0) {
+    parts.push(`${n.override_fp} analyst FP-override${n.override_fp === 1 ? '' : 's'}`);
+  }
+  const resolved = n.chat_resolved + n.manual_resolved;
+  if (resolved > 0) {
+    const detail: string[] = [];
+    if (n.chat_resolved > 0) detail.push(`${n.chat_resolved} chat`);
+    if (n.manual_resolved > 0) detail.push(`${n.manual_resolved} manual`);
+    parts.push(`${resolved} analyst-resolved (${detail.join(' · ')})`);
+  }
+  return parts.join(' · ');
+}
+
 export function DetectionTuningPanel({
   collapsed = false,
   onToggleCollapse,
@@ -102,6 +122,11 @@ export function DetectionTuningPanel({
                     {n.rule_name}
                   </div>
                   <div className="mt-0.5 text-[11px] leading-[1.4] text-faint">{n.reason}</div>
+                  {analystSignal(n) && (
+                    <div className="mt-0.5 text-[11px] leading-[1.4] text-accent" title="Analyst feedback on this rule">
+                      {analystSignal(n)}
+                    </div>
+                  )}
                 </div>
                 <div className="font-mono text-[12px] text-dim">{n.alert_count}</div>
                 <div className="font-mono text-[11.5px] text-dim">

@@ -14,6 +14,21 @@ export type Severity = 'critical' | 'high' | 'medium' | 'low';
 
 export type DetectionKind = 'suricata' | 'sigma' | 'notice';
 
+/** Human triage state on an alert assignment (E2.3). "unassigned" (no owner) is
+ * modelled as the ABSENCE of state (null), so a set state is always one of these. */
+export type TriageState = 'owned' | 'in_review' | 'done';
+
+/** A FAILED retry stacked on top of a rule's STANDING verdict (E2.1): the newest
+ * run crashed (error/cancelled/interrupted) or fell back, while an older genuine
+ * verdict still stands. Surfaces the "stayed at Needs Info" mystery — the row
+ * keeps its real verdict, and this note flags that the last re-run died. */
+export interface LastAttempt {
+  /** error | cancelled | interrupted | fallback */
+  status: string;
+  /** short relative time the failed retry ran ("5m"). */
+  ago: string;
+}
+
 export interface AlertEvent {
   id?: string;
   src: string;
@@ -33,6 +48,14 @@ export interface AlertEvent {
   /** Relative time of the investigation that gave this event its verdict
    * ("8m" → "investigated 8m ago"), for both direct and inherited cases. */
   investigatedAt?: string | null;
+  /** true when the verdict this event carries came from a pipeline-failure
+   * fallback run (E1.2). Optional — the backend only stamps it on the group badge
+   * today; kept here so a future per-event marker degrades cleanly. */
+  fallback?: boolean;
+  /** A failed retry stacked on this event's standing verdict (E2.1). Optional —
+   * the backend stamps it on the group badge today; kept here for parity so a
+   * future per-event marker degrades cleanly. */
+  lastAttempt?: LastAttempt | null;
 }
 
 /** A grouped-by-detection row in the Alerts console. */
@@ -51,6 +74,10 @@ export interface AlertGroup {
   inherited: boolean;
   /** default owner initials, if any. */
   owner?: string;
+  /** human triage state on the assignment (E2.3): "owned" | "in_review" | "done".
+   * null/undefined when the rule is unassigned (no owner) — "unassigned" is the
+   * absence of an owner, so state is only meaningful alongside an owner. */
+  state?: TriageState | null;
   events: AlertEvent[];
   /** the investigation behind the verdict badge — the drawer opens it directly. */
   invId?: string;
@@ -65,6 +92,15 @@ export interface AlertGroup {
   ackedCount?: number;
   /** number of escalated events in this group (from ES aggs). */
   escalatedCount?: number;
+  /** true when the rule's standing verdict is a pipeline-failure fallback (E1.2) —
+   * the badge renders a "pipeline error — retry" chip and the Dashboard excludes it
+   * from the Needs-info KPI. */
+  fallback?: boolean;
+  /** a FAILED retry stacked on top of the standing verdict (E2.1): the newest run
+   * crashed or fell back while an older genuine verdict still stands. Renders a
+   * small red "· last retry failed {ago}" hint next to the verdict chip and a
+   * retry affordance on the row. None when the newest run IS the standing verdict. */
+  lastAttempt?: LastAttempt | null;
 }
 
 // ---- Representative-event picker -------------------------------------------
@@ -121,6 +157,18 @@ export interface ResolutionProvenance {
   resolved_by: string;
   resolved_at: string;
   source_message_id?: number;
+}
+
+/** Pipeline-failure provenance (E1.2). Present ONLY on a run whose verdict is a
+ * synth-failure fallback (model truncation, gateway 5xx) — a needs_more_info the
+ * pipeline never reasoned to. Renders as a distinct "pipeline error — retry"
+ * chip, NOT the amber Needs-info pill. Distinct from ResolutionProvenance
+ * (manual/chat override) so the two never conflate. */
+export interface FallbackProvenance {
+  provenance: 'pipeline_fallback' | string;
+  phase?: string | null;
+  errorType?: string | null;
+  hint?: string | null;
 }
 
 export interface VerdictProposal {
@@ -212,6 +260,10 @@ export interface Investigation {
   resolution?: ResolutionProvenance;
   /** Post-validator override note — present when a validator auto-corrected the verdict. */
   validatorNote?: string | null;
+  /** Pipeline-failure provenance (E1.2) — present ONLY when this run failed before
+   * reaching a verdict (model truncation / gateway 5xx). Drives the drawer's
+   * "failed before reaching a verdict" panel + Re-run, not the amber NMI block. */
+  fallback?: FallbackProvenance | null;
   /** Live acked state of this investigation's alert in Security Onion (false on ES error). */
   alertAcked?: boolean;
 }
@@ -278,6 +330,9 @@ export interface InvestigationRow {
   alertId?: string;
   /** the canonical run for its alert (latest complete, else latest); others nest under it. */
   isPrimary?: boolean;
+  /** true when this run's needs_more_info is a pipeline-failure fallback (E1.2) —
+   * rendered as a "pipeline error — retry" chip, filterable, excluded from the NMI KPI. */
+  fallback?: boolean;
 }
 
 // ---- Hunts -----------------------------------------------------------------
@@ -321,11 +376,52 @@ export interface HuntFinding {
   category?: string;
   hosts: string[];
   citations: string[];
+  /** Set by the deterministic post-hunt citation gate when it stripped
+   *  non-resolving citations or capped severity (mirrors Investigation). */
+  validatorNote?: string | null;
 }
 
 export interface HuntAction {
   title: string;
   rationale: string;
+}
+
+/** One (category/time, value) datum in a model-authored hunt chart. */
+export interface HuntChartPoint {
+  x: string;
+  y: number;
+}
+
+/** A model-authored chart of a numeric series pulled from tool results (e.g. a
+ *  beacon-interval histogram, bytes-over-time). Only charts that survived the
+ *  post-hunt chart gate (source_citations resolved to gathered evidence) reach
+ *  the client — an invented series is dropped and never rendered. */
+export interface HuntChart {
+  kind: 'bar' | 'line' | 'timeline';
+  title: string;
+  xLabel?: string;
+  yLabel?: string;
+  series: HuntChartPoint[];
+  sourceCitations?: string[];
+}
+
+/** One finding in a hunt-diff bucket — light: title + severity + category. */
+export interface HuntDiffEntry {
+  title: string;
+  severity: string;
+  category: string;
+}
+
+/** The finding-level diff of a hunt vs the previous COMPLETE run of the SAME
+ *  objective (new / persisting / resolved), with the baseline run's timestamp.
+ *  Present only when a previous completed run exists. */
+export interface HuntDiff {
+  new: HuntDiffEntry[];
+  persisting: HuntDiffEntry[];
+  resolved: HuntDiffEntry[];
+  previousHuntId: string;
+  previousTs: string;
+  previousWhen: string;
 }
 
 /** A hunt's full detail: objective, status, narrative, findings, trace timeline. */
@@ -336,6 +432,8 @@ export interface HuntDetailData {
   status: HuntStatus;
   narrative: string;
   findings: HuntFinding[];
+  /** Model-authored charts that survived the post-hunt chart gate (optional). */
+  charts?: HuntChart[];
   affectedHosts: string[];
   mitreTechniques: string[];
   recommendedActions: HuntAction[];
@@ -345,6 +443,8 @@ export interface HuntDetailData {
   elapsedSec: number;
   ts: string;
   timeline: TimelineStep[];
+  /** "vs last run" finding diff — null/absent on the first run of an objective. */
+  diff?: HuntDiff | null;
 }
 
 export interface HostSignal {
@@ -354,6 +454,43 @@ export interface HostSignal {
   /** bar width 0–100 */
   w: number;
   sev: string;
+}
+
+// ---- Entity pivot page (E3.5) ----------------------------------------------
+// A read-model merging an entity's (host or IP) investigations + hunt findings
+// into one time-sorted timeline — "what do we know about this box". Mirrors the
+// /api/v1/entity/{value} JSON shape (EntityOut). Distinct from the graph's
+// EntityKind (node role); this is the URL value's cheap ip-vs-host class.
+
+export type EntityValueKind = 'ip' | 'host' | 'unknown';
+
+/** One merged item in an entity's timeline — an investigation OR a hunt finding. */
+export interface EntityTimelineItem {
+  ts: string;
+  kind: 'investigation' | 'hunt_finding';
+  title: string;
+  /** investigation-only */
+  verdict?: Verdict | null;
+  confidence?: number | null;
+  /** hunt_finding-only */
+  severity?: string | null;
+  category?: string | null;
+  /** in-app SPA path to the source investigation / hunt. */
+  link: string;
+}
+
+export interface EntitySummary {
+  investigationCount: number;
+  huntFindingCount: number;
+  latestVerdict?: Verdict | null;
+}
+
+/** An entity's full pivot view: value + kind + merged newest-first timeline. */
+export interface EntityDetail {
+  value: string;
+  kind: EntityValueKind;
+  timeline: EntityTimelineItem[];
+  summary: EntitySummary;
 }
 
 // ---- Config ----------------------------------------------------------------

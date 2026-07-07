@@ -12,6 +12,7 @@ stable historical import path.
 from __future__ import annotations
 
 from soc_ai.triage_models import (
+    PIPELINE_FALLBACK_PROVENANCE,
     InvestigationTranscript,
     RecommendedAction,
     RubricCoverage,
@@ -19,9 +20,11 @@ from soc_ai.triage_models import (
     TriageReport,
     Verdict,
     WriteToolName,
+    is_pipeline_fallback,
 )
 
 __all__ = [
+    "PIPELINE_FALLBACK_PROVENANCE",
     "InvestigationTranscript",
     "RecommendedAction",
     "RubricCoverage",
@@ -29,4 +32,5 @@ __all__ = [
     "TriageReport",
     "Verdict",
     "WriteToolName",
+    "is_pipeline_fallback",
 ]

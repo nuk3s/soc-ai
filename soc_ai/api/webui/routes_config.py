@@ -182,6 +182,286 @@ async def api_gateway_models(
     return GatewayModelsOut(ok=err is None, models=ids, detail=err)
 
 
+class ModelFitnessLegOut(BaseModel):
+    name: str
+    ok: bool
+    grade: str  # "pass" | "degraded" | "fail"
+    detail: str
+
+
+class ModelFitnessOut(BaseModel):
+    grade: str  # "pass" | "degraded" | "fail"
+    model: str
+    legs: list[ModelFitnessLegOut] = []
+    detail: str
+
+
+@router.get(
+    "/config/model-fitness",
+    response_model=ModelFitnessOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def api_model_fitness(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> ModelFitnessOut:
+    """Grade whether ``analyst_model`` can actually do the pipeline's job.
+
+    Runs the three-leg fitness probe (structured output, tool loop, reasoning
+    budget) against the real gateway and returns the grade. Feeds the
+    "Check fitness" chip next to the analyst-model dropdown in the config console
+    — a model that lists on /config/models can still be UNFIT (all-fallback
+    verdicts), which this catches. Bounded + fail-soft in probes.py; never issues
+    a Security-Onion write.
+
+    Emits a ``model_fitness`` audit event with the grade so an operator switching
+    to an unfit model leaves a trail of the warning that was shown. The audit
+    write is best-effort: config routes are otherwise audit-free, and a failed
+    audit index must never turn a read-only diagnostic into a 500 — so it is
+    wrapped and logged, never raised.
+    """
+    result = await probes.probe_model_fitness(settings)
+
+    # Best-effort audit. request.app.state.audit is the shared AuditLogger; its
+    # own log() swallows ES write errors for non-mutating events, but we still
+    # guard defensively (a missing/None audit on a test double, etc.) so the
+    # diagnostic itself can never fail on the audit side.
+    try:
+        user = await current_user(request)
+        audit = getattr(request.app.state, "audit", None)
+        if audit is not None:
+            await audit.log_kind(
+                session_id=f"model-fitness:{result.get('model', '')}",
+                kind="model_fitness",
+                payload={
+                    "model": result.get("model", ""),
+                    "grade": result.get("grade", ""),
+                    "detail": result.get("detail", ""),
+                    "legs": result.get("legs", []),
+                },
+                user=user.username if user else "unknown",
+            )
+    except Exception:  # audit is best-effort — a diagnostic must never 500 on it
+        _LOGGER.warning("model_fitness audit write failed (continuing)", exc_info=True)
+
+    # E2.4 notification trigger — a FAIL grade pings on-call (an unfit analyst
+    # model silently ruins triage). THIN + fail-soft: build the event iff the probe
+    # graded FAIL + notify_on_model_fitness_fail is on, and fire it (a hard no-op
+    # unless notifications are enabled + a webhook is configured). Wrapped so a
+    # webhook can never turn this read-only diagnostic into a 500.
+    try:
+        from soc_ai import notify  # noqa: PLC0415
+
+        event = notify.event_for_model_fitness(result=result, settings=settings)
+        if event is not None:
+            await notify.fire_safe(event, settings, getattr(request.app.state, "audit", None))
+    except Exception:  # a notification must never break the diagnostic
+        _LOGGER.warning("model_fitness notify trigger failed (continuing)", exc_info=True)
+
+    return ModelFitnessOut(
+        grade=result["grade"],
+        model=result["model"],
+        legs=[ModelFitnessLegOut(**leg) for leg in result.get("legs", [])],
+        detail=result["detail"],
+    )
+
+
+# ── Egress policy (admin, read-model) — E5.3 ───────────────────────────────
+# ONE page listing every possible egress destination, its enable state, its
+# redaction posture, and a best-effort 7-day audit count — so "zero egress" is
+# INSPECTABLE, not asserted. Pure read over Settings (+ the audit index for the
+# counters); no writes, no new audit kind, no migration. The counters are
+# best-effort: a down/unreachable audit index yields null counts and the policy
+# table still renders (the table — enable state + posture — is the deliverable).
+
+
+class EgressDestinationOut(BaseModel):
+    id: str
+    label: str
+    enabled: bool
+    redaction: str  # short posture string
+    detail: str  # one-line human description
+    count_7d: int | None = None  # best-effort 7-day audit count; null = unknown
+
+
+class EgressPolicyOut(BaseModel):
+    destinations: list[EgressDestinationOut]
+    zero_egress: bool  # True iff EVERY destination is disabled
+
+
+def _secret_is_set(value: object) -> bool:
+    """True when a (possibly SecretStr) value holds a non-empty string."""
+    if value is None:
+        return False
+    raw = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+    return bool(raw.strip())
+
+
+# Egress destination → the audit kind(s) whose 7-day count reflects "this
+# destination actually fired". Web search / page fetch have no dedicated kind
+# (they're generic ``tool_call``s, indistinguishable at the index level without
+# a payload filter), so they map to no kind → count stays null (honest "unknown",
+# not a misleading 0). Oracle counts both the escalation and the adjudication.
+_EGRESS_AUDIT_KINDS: dict[str, list[str]] = {
+    "oracle": ["oracle_escalation", "oracle_adjudication"],
+    "web_search": [],
+    "crawl": [],
+    "online_enrichment": [],
+    "analyst_cloud": [],
+    "notifications": ["notification"],
+}
+
+
+def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
+    """Build the egress destination rows from live Settings (no counts yet).
+
+    "enabled" is derived TRUTHFULLY per destination: a toggle alone for Oracle /
+    online enrichment / analyst redaction; a toggle AND a reachable URL for web
+    search / page fetch; a toggle AND a configured webhook for notifications.
+
+    "redaction" is HONEST about posture. In particular, the analyst-model
+    destination reads ``analyst_cloud_redaction``: with it OFF, the analyst model
+    egresses with NO redaction — so the posture says exactly that (and names the
+    fail-closed upgrade when redaction IS on).
+    """
+    # Analyst redaction posture: off = no redaction; on = best-effort, unless
+    # fail-closed is also on (independent residue sweep, E5.1).
+    if not settings.analyst_cloud_redaction:
+        analyst_redaction = (
+            "none — pointed at your gateway; enable analyst_cloud_redaction "
+            "if that gateway routes to a cloud model"
+        )
+    elif settings.analyst_redaction_fail_closed:
+        analyst_redaction = "sanitized + fail-closed"
+    else:
+        analyst_redaction = "sanitized (best-effort)"
+
+    return [
+        {
+            "id": "oracle",
+            "label": "Oracle (cloud second opinion)",
+            "enabled": bool(settings.oracle_enabled),
+            "redaction": "sanitized + fail-closed residue gate",
+            "detail": (
+                f"Frontier adjudicator ({settings.oracle_model}) via the gateway; "
+                "internal identifiers pseudonymized before egress, residue-gated."
+            ),
+        },
+        {
+            "id": "web_search",
+            "label": "Web search (SearXNG)",
+            # A toggle alone isn't reachable — the tool also needs a SearXNG URL.
+            "enabled": bool(settings.web_search_enabled) and bool(settings.searxng_url.strip()),
+            "redaction": "refuses internal identifiers",
+            "detail": "Investigator web search; the query refuses internal identifiers.",
+        },
+        {
+            "id": "crawl",
+            "label": "Page fetch (crawl4ai)",
+            "enabled": bool(settings.crawl4ai_enabled) and bool(settings.crawl4ai_url.strip()),
+            "redaction": "refuses internal URLs",
+            "detail": "Deep page read of a URL; refuses internal/private URLs.",
+        },
+        {
+            "id": "online_enrichment",
+            "label": "Online enrichment (Shodan / GreyNoise / CVE)",
+            "enabled": bool(settings.allow_online_enrichment),
+            "redaction": "external indicators only",
+            "detail": "Third-party reputation/asset lookups; sends external indicators only.",
+        },
+        {
+            "id": "analyst_cloud",
+            "label": "Analyst model",
+            # The analyst model ALWAYS receives payloads — this "destination" is a
+            # real egress iff the model is pointed off-box. We can't know the
+            # gateway's downstream from here, so "enabled" tracks whether the
+            # redaction guard is engaged; the posture string carries the honesty.
+            "enabled": bool(settings.analyst_cloud_redaction),
+            "redaction": analyst_redaction,
+            "detail": (
+                f"The analyst model ({settings.analyst_model}) itself; "
+                "a real egress only if your gateway routes it to a cloud provider."
+            ),
+        },
+        {
+            "id": "notifications",
+            "label": "Notifications (webhook)",
+            # Needs BOTH the master toggle AND a configured webhook URL.
+            "enabled": bool(settings.notify_enabled)
+            and _secret_is_set(settings.notify_webhook_url),
+            "redaction": "synthetic, no internal data",
+            "detail": "Outbound alert/hunt webhook; synthetic bodies, no internal identifiers.",
+        },
+    ]
+
+
+@router.get(
+    "/config/egress-policy",
+    response_model=EgressPolicyOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_egress_policy(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> EgressPolicyOut:
+    """One page: every egress destination, its enable state, redaction posture,
+    and a best-effort 7-day audit count. Makes "zero egress" inspectable.
+
+    Pure read-model. ``zero_egress`` is True iff EVERY destination is disabled.
+    The counters are BEST-EFFORT: the 7-day audit aggregation is wrapped so ANY
+    ES error yields null counts and the table still renders — a down audit index
+    must never break the page. Destinations with no dedicated audit kind (web
+    search, page fetch, online enrichment, analyst model — generic ``tool_call``s
+    at the index level) return null counts by design (honest "unknown", not 0).
+    """
+    from soc_ai.audit.counts import audit_counts_by_kind  # noqa: PLC0415
+
+    rows = _egress_destinations(settings)
+    zero_egress = not any(row["enabled"] for row in rows)
+
+    # Best-effort counts. Aggregate ONCE over the union of mapped kinds, then fan
+    # the results back to each destination. Wrapped defensively so even an
+    # unexpected failure in the helper (which is itself fail-soft) can never turn
+    # this read-only diagnostic into a 500 — null counts, table still returned.
+    all_kinds = sorted({k for kinds in _EGRESS_AUDIT_KINDS.values() for k in kinds})
+    counts_by_kind: dict[str, int | None] = {}
+    if all_kinds:
+        try:
+            elastic = getattr(request.app.state, "elastic", None)
+            counts_by_kind = await audit_counts_by_kind(
+                elastic, settings.audit_index_alias, all_kinds, days=7
+            )
+        except Exception:  # the helper is fail-soft, but never trust it to a 500
+            _LOGGER.warning("egress-policy audit counts failed (continuing null)", exc_info=True)
+            counts_by_kind = {}
+
+    destinations: list[EgressDestinationOut] = []
+    for row in rows:
+        kinds = _EGRESS_AUDIT_KINDS.get(row["id"], [])
+        # Sum the per-kind counts for this destination. Null when the destination
+        # has no mapped kind, OR when any of its kinds' counts is unknown (a
+        # partial sum would understate — better an honest null).
+        count_7d: int | None
+        if not kinds:
+            count_7d = None
+        else:
+            per = [counts_by_kind.get(k) for k in kinds]
+            count_7d = None if any(c is None for c in per) else sum(c or 0 for c in per)
+        destinations.append(
+            EgressDestinationOut(
+                id=row["id"],
+                label=row["label"],
+                enabled=row["enabled"],
+                redaction=row["redaction"],
+                detail=row["detail"],
+                count_7d=count_7d,
+            )
+        )
+
+    return EgressPolicyOut(destinations=destinations, zero_egress=zero_egress)
+
+
 # ── Config mutations (admin) ───────────────────────────────────────────────
 
 
@@ -548,6 +828,154 @@ async def api_get_agent_tools(
 ) -> AgentToolsOut:
     """List every tool available to the agent, with its description + dependencies."""
     return AgentToolsOut(tools=agent_tools_svc.collect_agent_tools(settings))
+
+
+# ── Notifications (E2.4): the webhook secret + a "Send test" validation ────────
+# The master toggle / per-trigger toggles / format / threshold are ordinary
+# non-secret settings in the "Notifications" group (rendered by GET /config like
+# any other section). The webhook URL is a secret handled here on its OWN
+# endpoints (Fernet-encrypted, write-only) so it stays in the Notifications
+# section rather than the shared API-keys panel. The Test button posts a canned,
+# synthetic event — it requires a configured webhook URL but NOT the master
+# toggle, so an operator can validate the destination BEFORE enabling routing.
+
+
+class NotifyWebhookOut(BaseModel):
+    isSet: bool
+    source: str  # "db" | "env" | "unset"
+
+
+class SaveNotifyWebhookIn(BaseModel):
+    value: str
+
+
+@router.get(
+    "/config/notify/webhook",
+    response_model=NotifyWebhookOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_get_notify_webhook(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> NotifyWebhookOut:
+    """Report whether the notification webhook URL is set (never returns the value)."""
+    spec = cfg_svc.notify_webhook_spec()
+    async with request.app.state.db_sessionmaker() as db:
+        in_db = (
+            await db.scalars(select(ConfigOverride.key).where(ConfigOverride.key == spec.key))
+        ).first() is not None
+    if in_db:
+        return NotifyWebhookOut(isSet=True, source="db")
+    attr_val = getattr(settings, spec.attr, None)
+    raw = (
+        attr_val.get_secret_value()
+        if isinstance(attr_val, SecretStr)
+        else ("" if attr_val is None else str(attr_val))
+    )
+    return NotifyWebhookOut(isSet=bool(raw.strip()), source="env" if raw.strip() else "unset")
+
+
+@router.post(
+    "/config/notify/webhook",
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_save_notify_webhook(
+    body: SaveNotifyWebhookIn,
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, object]:
+    """Save the webhook URL (Fernet-encrypted, write-only) and hot-apply it.
+
+    Mirrors the API-key save path: an http(s) URL is required; it is encrypted at
+    rest and never returned. Requires CONFIG_SECRET_KEY (else a 400 telling the
+    operator to set it, not a 500).
+    """
+    spec = cfg_svc.notify_webhook_spec()
+    value = body.value.strip()
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "empty_value", "hint": "send a non-empty URL, or DELETE to clear"},
+        )
+    # Reject a non-http(s) scheme up front (SSRF hygiene, same as the URL settings).
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    scheme = urlparse(value).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "invalid_value", "hint": "webhook URL must be http(s)"},
+        )
+    user = await current_user(request)
+    updated_by: int | None = user.id if user else None
+    secret_box = request.app.state.secret_box
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            await cfg_svc.set_override(
+                db, spec.key, value, updated_by=updated_by, secret_box=secret_box
+            )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "no_config_secret_key",
+                "hint": "Set CONFIG_SECRET_KEY to store the webhook URL via the UI.",
+            },
+        ) from exc
+    # Hot-apply: notify.fire reads the URL fresh per send. setattr the plaintext
+    # onto the live Settings singleton (validate_assignment coerces str→SecretStr).
+    setattr(settings, spec.attr, value)
+    return {"ok": True, "isSet": True}
+
+
+@router.delete(
+    "/config/notify/webhook",
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_clear_notify_webhook(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, object]:
+    """Clear the webhook URL: drop the DB override and unset the live value."""
+    spec = cfg_svc.notify_webhook_spec()
+    async with request.app.state.db_sessionmaker() as db:
+        await cfg_svc.delete_override(db, spec.key)
+    setattr(settings, spec.attr, None)
+    return {"ok": True, "isSet": False}
+
+
+@router.post(
+    "/config/notify/test",
+    response_model=ConnTestOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_notify_test(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> ConnTestOut:
+    """Send a canned, synthetic test notification to the configured webhook.
+
+    Requires a webhook URL to be configured; does NOT require ``notify_enabled``
+    (this is an explicit operator validation — send the test, THEN enable routing).
+    The canned event contains NO internal identifier (a fixed "soc-ai notification
+    test" body), so validating the destination never leaks a real alert/hunt/host.
+    Returns ``{ok, detail}`` (scrubbed — never the webhook URL).
+    """
+    from soc_ai import notify  # noqa: PLC0415
+
+    if not notify.webhook_configured(settings):
+        return ConnTestOut(
+            ok=False,
+            detail="No webhook URL configured — set the Notifications webhook URL first.",
+        )
+
+    audit = getattr(request.app.state, "audit", None)
+    ok, detail = await notify.send_test(settings, audit)
+    return ConnTestOut(ok=ok, detail=detail)
 
 
 _DANGER_TEST_TARGETS: frozenset[str] = frozenset({"es", "llm"})

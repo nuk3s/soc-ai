@@ -529,6 +529,42 @@ class OracleOut(BaseModel):
     changed: bool = False  # oracleVerdict differs from localVerdict
 
 
+class FallbackOut(BaseModel):
+    """Pipeline-failure provenance surfaced to the drawer (E1.2).
+
+    Built from the report's ``resolution`` marker when it carries
+    ``provenance == "pipeline_fallback"``. ``hint`` is the analyst-actionable
+    ``_hint_for`` string (e.g. "the model hit its response-token cap …") when the
+    error class produced one; ``None`` for unclassified failures.
+    """
+
+    provenance: str
+    phase: str | None = None
+    errorType: str | None = None
+    hint: str | None = None
+
+
+def _fallback_out(report: dict[str, Any]) -> FallbackOut | None:
+    """Build the ``fallback`` view-model from a persisted report dict, or None.
+
+    Reads the SAME marker as :func:`is_pipeline_fallback` (the single shared
+    predicate) so the drawer's fallback state can never disagree with the row /
+    badge flag. Never raises on a malformed marker — a rendering builder must not
+    break the page.
+    """
+    from soc_ai.triage_models import is_pipeline_fallback  # noqa: PLC0415
+
+    if not is_pipeline_fallback(report):
+        return None
+    marker = report.get("resolution") or {}
+    return FallbackOut(
+        provenance=str(marker.get("provenance") or "pipeline_fallback"),
+        phase=marker.get("phase"),
+        errorType=marker.get("error_type"),
+        hint=marker.get("hint"),
+    )
+
+
 class InvestigationOut(BaseModel):
     id: str
     groupId: str
@@ -557,6 +593,12 @@ class InvestigationOut(BaseModel):
     openQuestions: list[str] = []
     resolution: dict[str, Any] | None = None
     validatorNote: str | None = None
+    # Pipeline-failure fallback provenance (E1.2). Present ONLY when the run's
+    # report is a synth-failure fallback (`is_pipeline_fallback`) — the drawer
+    # then renders "this run failed before reaching a verdict: <hint>" + a Re-run
+    # button instead of treating it as a genuine needs_more_info. Distinct from
+    # `resolution` (manual/chat override) so the two never conflate.
+    fallback: FallbackOut | None = None
     # Ordered model reasoning traces (the <think> blocks) captured per model turn.
     # Surfaced so an analyst can see WHY a verdict was reached — the "show your
     # work" explainability the timeline (which skips model_response) drops.

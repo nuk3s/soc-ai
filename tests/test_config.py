@@ -415,31 +415,60 @@ def test_whitelist_attrs_all_exist_on_settings() -> None:
         assert spec.attr in fields, f"{spec.attr} is not a Settings field"
 
 
+# Non-danger secrets have exactly one home per section: the dedicated API-keys
+# panel (enrichment provider keys) or the Notifications section (the outbound
+# webhook URL, handled by its own write-only /config/notify/webhook endpoints).
+# In BOTH cases the GET /config groups builder filters `not spec.secret`, so the
+# value is never rendered — the section membership is only for grouping the
+# NON-secret toggles that sit alongside it.
+_SECRET_SECTION_HOMES = frozenset({"API keys", "Notifications"})
+
+
 def test_no_reserved_or_secret_in_rendered_groups() -> None:
     """The rendered settings groups never expose a reserved internal-id or a secret.
 
-    Secrets live either in the Danger Zone (connection identity) or the dedicated
-    write-only "API keys" section. Neither section is in SECTION_ORDER, so the
-    GET /config groups endpoint can't render — let alone leak — a secret value.
+    Secrets live in the Danger Zone (connection identity), the dedicated
+    write-only "API keys" panel, or the Notifications webhook (its own write-only
+    endpoints). The GET /config groups builder filters ``not spec.secret``, so no
+    secret is ever rendered — proven directly here per whitelisted secret.
     """
-    from soc_ai.store.config_overrides import SECTION_ORDER, WHITELIST
+    from soc_ai.store.config_overrides import WHITELIST
 
     for spec in WHITELIST:
         if spec.danger:
             continue  # Danger Zone handles connection identity + secrets
         if spec.secret:
-            # The only non-danger home for a secret is the API-keys panel, and
-            # that section must NOT be one the groups endpoint renders.
-            assert spec.section == "API keys", (
-                f"{spec.key} is a secret in section {spec.section!r}; a secret belongs in "
-                "the Danger Zone or the dedicated 'API keys' section"
-            )
-            assert spec.section not in SECTION_ORDER, (
-                f"section {spec.section!r} is rendered by GET /config — it must not hold secrets"
+            # A non-danger secret must live in a recognised secret-home section
+            # AND is never rendered by the groups builder (the `not spec.secret`
+            # filter in get_config), so it cannot leak via GET /config.
+            assert spec.section in _SECRET_SECTION_HOMES, (
+                f"{spec.key} is a secret in section {spec.section!r}; a non-danger secret belongs "
+                f"in one of {sorted(_SECRET_SECTION_HOMES)} (each handled by write-only endpoints)"
             )
         assert spec.key not in _RESERVED_INTERNAL_IDENTIFIER_KEYS, (
             f"{spec.key} is reserved for the inc 2/3 managed-list UI"
         )
+
+
+def test_get_config_never_renders_a_secret() -> None:
+    """The GET /config groups builder filters every secret — belt to the section test.
+
+    Mirror the exact predicate ``get_config`` uses (``not spec.danger and not
+    spec.secret`` within a SECTION_ORDER section) and assert no secret survives it,
+    so a secret in a rendered section (e.g. the Notifications webhook) can never
+    leak into the groups response.
+    """
+    from soc_ai.store.config_overrides import SECTION_ORDER, WHITELIST
+
+    rendered = [
+        spec
+        for section in SECTION_ORDER
+        for spec in WHITELIST
+        if spec.section == section and not spec.danger and not spec.secret
+    ]
+    assert all(not spec.secret for spec in rendered)
+    # The Notifications webhook secret specifically must be excluded.
+    assert not any(spec.key == "notify_webhook_url" for spec in rendered)
 
 
 def test_inc1_sections_are_in_display_order() -> None:

@@ -4,24 +4,52 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
-## [Unreleased]
+## [1.0.8] - 2026-07-07
 
-### Removed
-
-- **The dead approval-gate machinery.** `POST /approve` (both the legacy
-  prefix-less route and `/api/v1/approve`), the in-memory `ApprovalGate`
-  (plus `GET /sessions/{id}`, which only listed its pending tokens), the
-  `pending_approvals` field on `/healthz`, and the `socai_pending_approvals`
-  metric are gone. Nothing could create a pending approval since the
-  synth-first pipeline landed — the agent recommends write actions in the
-  report and the analyst executes them through the actions API
-  (`POST /api/v1/investigations/{id}/actions/{index}/execute`), which remains
-  the single audited write path (`execute_write_tool`). Historical
-  `approval_request`/`approval_required` events still render in old
-  investigation timelines, permanently non-actionable.
+Trust, workflow, and threat-hunting release. This one is about honesty (the UI
+now tells you when a verdict came from the fallback, not the model, and when a
+hunt finding isn't backed by evidence), analyst throughput (assignment states,
+keyboard triage, bulk transparency), a much deeper Hunt Console (scheduling,
+templates, charts, run-to-run diffing, per-entity pages), and a hardened,
+inspectable egress boundary (fail-closed redaction + a policy page).
 
 ### Added
 
+- **Model-fitness check on the config page.** A probe reports whether the
+  configured analyst model and context window are actually large enough for
+  reliable triage, surfaced as a config chip — so an under-provisioned model is
+  caught up front instead of showing up as silently poor verdicts.
+- **Assignment / triage states for alerts.** An analyst can take ownership of an
+  alert and move it through owned → in-review → done. Every state change is
+  audited, so a shift handoff shows who has what and where it stands.
+- **Keyboard-driven triage on the Alerts screen.** `j`/`k` to move, `o` to open,
+  `a` to ack, `e` to escalate, `i` to investigate, `x` to select, and `?` for
+  the shortcut cheatsheet — full-speed keyboard triage without leaving the list.
+- **Opt-in notification webhooks** (`webui_notifications`, off by default). When
+  enabled, soc-ai can POST a notification to a secret webhook URL on the events
+  you choose; with the feature off there is zero outbound traffic. Useful for
+  wiring triage events into chat/on-call without adding a cloud dependency.
+- **Scheduled hunts.** A hunt objective can run on a recurring schedule
+  (`hunt_schedules_enabled`) instead of only on demand, so recurring threat
+  hunts run themselves and land in the console for review.
+- **Hunt template library.** A curated set of starter hunt objectives you can
+  launch with one click, so common hunts don't have to be re-typed from scratch.
+- **Run-to-run hunt diffing.** A completed hunt is automatically diffed against
+  the previous completed run of the same objective — new, resolved, and
+  persisting findings are called out, so you see what *changed* since last time.
+- **Charts in hunt reports.** The hunt agent can render charts from its
+  findings, and each chart must cite the evidence behind it (uncited, empty, or
+  runaway charts are dropped) — visual summaries you can still trace to data.
+- **Per-entity pages.** `/app/entity/<host-or-ip-or-user>` gives every entity a
+  single page aggregating the hunt findings that name it, so you can pivot from
+  a name to everything the system has seen about it.
+- **Feedback distillation for detection tuning.** Analyst overrides roll up
+  per-rule into suggestions for which detections are noisy or miscalibrated.
+  Nothing is auto-applied — a rule that has ever produced a true positive is
+  never suggested for suppression — it's decision support, not an auto-action.
+- **Egress-policy page.** A config page that shows exactly what categories of
+  data can leave the box under the current settings, plus best-effort 7-day
+  egress counts, so the trust boundary is inspectable instead of implied.
 - **Cloud egress sanitizer for the analyst model** (`analyst_cloud_redaction`,
   opt-in, off by default). For deployments that point `analyst_model` at a
   cloud provider: every payload sent to the analyst model — enriched alert
@@ -36,6 +64,21 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Fallback verdicts are now labelled as fallbacks.** When the deterministic
+  pipeline (not the LLM) produces a verdict — because the model was unavailable
+  or failed a gate — that verdict carries an explicit `pipeline_fallback`
+  marker, gets its own chip and filter in the UI, and is excluded from the
+  model-accuracy KPI. You can always tell whether a call was the model's or the
+  fallback's, and the accuracy number reflects only the model.
+- **Alerts show their last triage attempt.** Each alert badge now surfaces the
+  most recent attempt (including reruns), so a rerun is visible rather than
+  silently overwriting the prior result.
+- **Bulk actions explain what they skipped.** Bulk rehunt and the auto-triage
+  sweep now report per-item skip reasons instead of silently passing over
+  alerts, so a bulk run is auditable at a glance.
+- **Hunt findings must cite evidence.** A finding (or chart) that doesn't cite
+  real supporting evidence is dropped by a citation gate rather than rendered —
+  the console shows substantiated findings only.
 - **Auto-acknowledge of high-confidence false positives is now ON by default**
   (`auto_ack_fp_enabled`). Both gates are unchanged — the confidence threshold
   (default 0.7) and the high-stakes guard (critical/high-severity or
@@ -49,6 +92,15 @@ All notable changes to this project are documented here. The format is based on
   events in Security Onion. Previously the inherited verdict was display-only
   and the alerts lingered unacked forever.
 
+### Security
+
+- **Analyst-model redaction now fails closed.** Before any payload is sent to a
+  cloud analyst model, the composed string is re-scanned for un-redacted
+  internal identifiers; if residue is found, the request is blocked
+  (`egress_blocked` audit event) and the deterministic fallback verdict is used
+  instead of leaking. Redaction is no longer best-effort — a redaction miss
+  stops the egress rather than letting it through.
+
 ### Fixed
 
 - **The same flow is no longer investigated twice minutes apart.** The sweep
@@ -56,6 +108,20 @@ All notable changes to this project are documented here. The format is based on
   check is complete-only by design, so a newer event id in the same cluster
   used to launch a duplicate investigation while the first run was still
   executing (most visible with a short `webui_inherit_window_days`).
+
+### Removed
+
+- **The dead approval-gate machinery.** `POST /approve` (both the legacy
+  prefix-less route and `/api/v1/approve`), the in-memory `ApprovalGate`
+  (plus `GET /sessions/{id}`, which only listed its pending tokens), the
+  `pending_approvals` field on `/healthz`, and the `socai_pending_approvals`
+  metric are gone. Nothing could create a pending approval since the
+  synth-first pipeline landed — the agent recommends write actions in the
+  report and the analyst executes them through the actions API
+  (`POST /api/v1/investigations/{id}/actions/{index}/execute`), which remains
+  the single audited write path (`execute_write_tool`). Historical
+  `approval_request`/`approval_required` events still render in old
+  investigation timelines, permanently non-actionable.
 
 ## [1.0.7] - 2026-07-04
 

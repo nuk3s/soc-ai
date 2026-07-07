@@ -29,9 +29,12 @@ from soc_ai.api.webui._timeline import (
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
+from soc_ai.so_client.inventory import discover_datasets
+from soc_ai.store import hunt_schedules as hs_svc
+from soc_ai.store import hunt_templates as ht_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
-from soc_ai.store.models import Hunt, HuntEvent
+from soc_ai.store.models import Hunt, HuntEvent, HuntSchedule, HuntTemplate
 from soc_ai.webui import (
     hunt_console_manager,
     hunt_manager,
@@ -81,7 +84,18 @@ _HUNT_TL_GROUP = {
 }
 # chat_user/chat_assistant carry the follow-up "Chat about this hunt" thread —
 # surfaced via GET /hunts/{id}/chat, NOT the execution timeline.
-_HUNT_TL_SKIP = {"tool_result", "model_response", "done", "chat_user", "chat_assistant"}
+# citation_validation is the E1.3 post-hunt gate's bookkeeping count (per-hunt
+# tally of capped findings / stripped citations) — an audit record, not a hunt
+# trace step, so it is skipped from the timeline (the validator's effect shows on
+# the findings themselves via validatorNote).
+_HUNT_TL_SKIP = {
+    "tool_result",
+    "model_response",
+    "done",
+    "chat_user",
+    "chat_assistant",
+    "citation_validation",
+}
 
 
 class HuntFindingOut(BaseModel):
@@ -93,6 +107,9 @@ class HuntFindingOut(BaseModel):
     category: str = "threat"
     hosts: list[str] = []
     citations: list[str] = []
+    # Set by the E1.3 post-hunt citation gate when it stripped non-resolving
+    # citations or capped the severity (mirrors InvestigationOut.validatorNote).
+    validatorNote: str | None = None
 
 
 # Legacy reports predate the finding `category` field. A coverage/visibility
@@ -112,9 +129,86 @@ def _finding_category(f: dict[str, Any]) -> str:
     return "visibility_gap" if _GAP_TITLE_RE.search(str(f.get("title") or "")) else "threat"
 
 
+# Charts are stored inside the report dict already validated (the post-hunt chart
+# gate dropped any that didn't resolve). Serialize defensively — a malformed
+# stored point is skipped, never 500s the detail response — and drop a chart that
+# ended up with no plottable series.
+_CHART_KINDS = ("bar", "line", "timeline")
+
+
+def _chart_point_out(p: Any) -> HuntChartPointOut | None:
+    if not isinstance(p, dict):
+        return None
+    y = p.get("y")
+    if y is None:
+        return None
+    try:
+        return HuntChartPointOut(x=str(p.get("x") or ""), y=float(y))
+    except (TypeError, ValueError):
+        return None
+
+
+def _chart_out(c: dict[str, Any]) -> HuntChartOut | None:
+    kind = str(c.get("kind") or "").strip().lower()
+    if kind not in _CHART_KINDS:
+        return None
+    series = [pt for p in (c.get("series") or []) if (pt := _chart_point_out(p)) is not None]
+    if not series:  # nothing to plot — don't ship an empty chart
+        return None
+    return HuntChartOut(
+        kind=kind,
+        title=str(c.get("title") or ""),
+        xLabel=str(c.get("x_label") or ""),
+        yLabel=str(c.get("y_label") or ""),
+        series=series,
+        sourceCitations=[str(s) for s in (c.get("source_citations") or [])],
+    )
+
+
 class HuntActionOut(BaseModel):
     title: str
     rationale: str
+
+
+class HuntChartPointOut(BaseModel):
+    x: str
+    y: float
+
+
+class HuntChartOut(BaseModel):
+    # Mirrors soc_ai.agent.hunt.HuntChart. Only charts that SURVIVED the E3.3
+    # post-hunt chart gate (source_citations resolved to gathered evidence) are
+    # serialized here — an invented series is dropped upstream and never reaches
+    # the client.
+    kind: str  # 'bar' | 'line' | 'timeline'
+    title: str
+    xLabel: str = ""
+    yLabel: str = ""
+    series: list[HuntChartPointOut] = []
+    sourceCitations: list[str] = []
+
+
+class HuntDiffEntryOut(BaseModel):
+    # A single finding in a diff bucket — kept light: just enough to render the
+    # "vs last run" strip's expandable list (title + severity + category).
+    title: str
+    severity: str = "info"
+    category: str = "threat"
+
+
+class HuntDiffOut(BaseModel):
+    # The finding-level diff of THIS hunt vs the previous COMPLETE run of the same
+    # objective (same objective_hash). ``new`` = findings with no match in the
+    # prior run; ``persisting`` = findings that matched a prior finding;
+    # ``resolved`` = prior findings with no match in this run. Present only when a
+    # previous completed run exists (else HuntOut.diff is None).
+    new: list[HuntDiffEntryOut] = []
+    persisting: list[HuntDiffEntryOut] = []
+    resolved: list[HuntDiffEntryOut] = []
+    # The baseline run the diff is against (for the "· vs run from {ago}" label).
+    previousHuntId: str = ""
+    previousTs: str = ""
+    previousWhen: str = ""
 
 
 class HuntOut(BaseModel):
@@ -124,6 +218,7 @@ class HuntOut(BaseModel):
     status: str
     narrative: str
     findings: list[HuntFindingOut] = []
+    charts: list[HuntChartOut] = []
     affectedHosts: list[str] = []
     mitreTechniques: list[str] = []
     recommendedActions: list[HuntActionOut] = []
@@ -133,6 +228,9 @@ class HuntOut(BaseModel):
     elapsedSec: int = 0
     ts: str = ""
     timeline: list[TimelineStepOut] = []
+    # "vs last run" finding-level diff — None when this is the first run of the
+    # objective (no prior COMPLETE run with the same objective_hash to diff).
+    diff: HuntDiffOut | None = None
 
 
 _HUNT_STATUS = {
@@ -246,15 +344,115 @@ async def hunt_stats(request: Request) -> list[HuntStatOut]:
     ]
 
 
+# ── E3.4: hunt diffing ("what changed since the last run of this objective") ──
+#
+# Finding identity is a FUZZY match on (normalized title + hosts set): a finding
+# is the "same" finding across two runs when its normalized title AND its set of
+# hosts match. Normalization is forgiving of case/whitespace/punctuation so a
+# minor re-word doesn't spuriously flip persisting↔new, but two genuinely
+# distinct findings (different hosts, or a different title) stay distinct.
+
+_FINDING_PUNCT_RE = re.compile(r"[^a-z0-9\s]+")
+_FINDING_WS_RE = re.compile(r"\s+")
+
+
+def _norm_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — the title half of a
+    finding's fuzzy identity."""
+    low = _FINDING_PUNCT_RE.sub(" ", str(title or "").strip().lower())
+    return _FINDING_WS_RE.sub(" ", low).strip()
+
+
+def _finding_identity(f: dict[str, Any]) -> tuple[str, frozenset[str]]:
+    """A finding's fuzzy identity key: (normalized title, sorted hosts set).
+
+    Hosts are lowercased + de-duplicated into a frozenset so host ORDER never
+    matters and ["A","B"] == ["b","a"]. Two findings are the "same" finding iff
+    their identities are equal.
+    """
+    hosts = frozenset(str(h).strip().lower() for h in (f.get("hosts") or []) if str(h).strip())
+    return _norm_title(f.get("title") or ""), hosts
+
+
+def _diff_entry(f: dict[str, Any]) -> HuntDiffEntryOut:
+    return HuntDiffEntryOut(
+        title=str(f.get("title") or ""),
+        severity=str(f.get("severity") or "info"),
+        category=_finding_category(f),
+    )
+
+
+def _compute_hunt_diff(
+    current: list[dict[str, Any]],
+    previous: list[dict[str, Any]],
+    prev_hunt: Hunt,
+) -> HuntDiffOut:
+    """Finding-level diff of ``current`` vs ``previous`` findings (both raw dicts).
+
+    O(n·m) over small finding lists — fine. A current finding is ``persisting``
+    if a previous finding shares its fuzzy identity, else ``new``; a previous
+    finding with no match in the current run is ``resolved``.
+    """
+    prev_ids = [_finding_identity(f) for f in previous]
+    prev_matched = [False] * len(previous)
+
+    new: list[HuntDiffEntryOut] = []
+    persisting: list[HuntDiffEntryOut] = []
+    for f in current:
+        ident = _finding_identity(f)
+        match_idx = next(
+            (i for i, pid in enumerate(prev_ids) if pid == ident and not prev_matched[i]),
+            None,
+        )
+        if match_idx is None:
+            new.append(_diff_entry(f))
+        else:
+            prev_matched[match_idx] = True
+            persisting.append(_diff_entry(f))
+
+    resolved = [_diff_entry(previous[i]) for i, hit in enumerate(prev_matched) if not hit]
+
+    prev_ts = _iso_utc(prev_hunt.created_at)
+    return HuntDiffOut(
+        new=new,
+        persisting=persisting,
+        resolved=resolved,
+        previousHuntId=prev_hunt.id,
+        previousTs=prev_ts,
+        previousWhen=_ago(prev_ts),
+    )
+
+
 @router.get("/hunts/{hunt_id}", response_model=HuntOut)
 async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
+    diff: HuntDiffOut | None = None
     async with request.app.state.db_sessionmaker() as db:
         got = await hunt_svc.get_with_events(db, hunt_id)
+        if got is not None:
+            hunt, _ = got
+            # Diff vs the previous COMPLETE run of the same objective. Only a
+            # completed current hunt has settled findings worth diffing.
+            if hunt.status == "complete":
+                prev = await hunt_svc.previous_completed_run(
+                    db,
+                    objective_hash=hunt.objective_hash,
+                    before_created_at=hunt.created_at,
+                    exclude_id=hunt.id,
+                )
+                if prev is not None:
+                    cur_findings = [
+                        f for f in (_hunt_report(hunt).get("findings") or []) if isinstance(f, dict)
+                    ]
+                    prev_findings = [
+                        f for f in (_hunt_report(prev).get("findings") or []) if isinstance(f, dict)
+                    ]
+                    diff = _compute_hunt_diff(cur_findings, prev_findings, prev)
     if got is None:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
     hunt, events = got
     report = _hunt_report(hunt)
     findings = report.get("findings") or []
+    charts = report.get("charts") or []
     actions = report.get("recommended_actions") or []
     elapsed = _hunt_elapsed_sec(hunt)  # compute once, not four times inline below
     return HuntOut(
@@ -271,10 +469,12 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
                 category=_finding_category(f),
                 hosts=[str(h) for h in (f.get("hosts") or [])],
                 citations=[str(c) for c in (f.get("citations") or [])],
+                validatorNote=f.get("validator_note") or None,
             )
             for f in findings
             if isinstance(f, dict)
         ],
+        charts=[out for c in charts if isinstance(c, dict) and (out := _chart_out(c)) is not None],
         affectedHosts=[str(h) for h in (report.get("affected_hosts") or [])],
         mitreTechniques=[str(m) for m in (report.get("mitre_techniques") or [])],
         recommendedActions=[
@@ -289,6 +489,7 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(hunt.created_at),
         timeline=_build_hunt_timeline(events),
+        diff=diff,
     )
 
 
@@ -569,3 +770,319 @@ async def start_hunt(
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
     return {"investigation_id": inv_id}
+
+
+# ── E3.1: scheduled hunts (recurring hunts on an interval) ────────────────────
+#
+# A HuntSchedule row is one recurring hunt: an objective re-run every
+# ``intervalMinutes`` by ``soc_ai.main._hunt_schedule_loop`` when the
+# ``hunt_schedules_enabled`` master switch is on. Reads are analyst-readable;
+# mutate is admin-gated (mirrors the runbook CRUD). Interval is MINUTES (not cron)
+# and floored at the store's sane minimum — full cron is deliberately YAGNI.
+
+
+class HuntScheduleIn(BaseModel):
+    objective: str = Field(min_length=1, max_length=2000)
+    interval_minutes: int = Field(
+        default=hs_svc.MIN_INTERVAL_MINUTES, ge=hs_svc.MIN_INTERVAL_MINUTES, le=43200
+    )
+    enabled: bool = True
+
+
+class HuntSchedulePatch(BaseModel):
+    """All fields optional — only the provided ones are updated."""
+
+    objective: str | None = Field(default=None, min_length=1, max_length=2000)
+    interval_minutes: int | None = Field(default=None, ge=hs_svc.MIN_INTERVAL_MINUTES, le=43200)
+    enabled: bool | None = None
+
+
+class HuntScheduleOut(BaseModel):
+    id: int
+    objective: str
+    intervalMinutes: int
+    enabled: bool
+    lastRunAt: str | None = None
+    createdBy: str
+    createdAt: str
+
+
+def _schedule_out(row: HuntSchedule) -> HuntScheduleOut:
+    return HuntScheduleOut(
+        id=row.id,
+        objective=row.objective,
+        intervalMinutes=row.interval_minutes,
+        enabled=row.enabled,
+        lastRunAt=_iso_utc(row.last_run_at) if row.last_run_at is not None else None,
+        createdBy=row.created_by,
+        createdAt=_iso_utc(row.created_at),
+    )
+
+
+@router.get("/hunt-schedules", response_model=list[HuntScheduleOut])
+async def list_hunt_schedules(request: Request) -> list[HuntScheduleOut]:
+    """All recurring hunt schedules, most-recently-created first (analyst-readable)."""
+    async with request.app.state.db_sessionmaker() as db:
+        rows = await hs_svc.list_all(db)
+    return [_schedule_out(r) for r in rows]
+
+
+@router.post(
+    "/hunt-schedules",
+    response_model=HuntScheduleOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def create_hunt_schedule(request: Request, body: HuntScheduleIn) -> HuntScheduleOut:
+    """Create a recurring hunt schedule (admin)."""
+    created_by = await identify_caller(request)
+    async with request.app.state.db_sessionmaker() as db:
+        row = await hs_svc.create(
+            db,
+            objective=body.objective,
+            interval_minutes=body.interval_minutes,
+            enabled=body.enabled,
+            created_by=created_by,
+        )
+    return _schedule_out(row)
+
+
+@router.put(
+    "/hunt-schedules/{schedule_id}",
+    response_model=HuntScheduleOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def update_hunt_schedule(
+    request: Request, schedule_id: int, body: HuntSchedulePatch
+) -> HuntScheduleOut:
+    """Update a schedule's fields (admin). 404 if it doesn't exist."""
+    async with request.app.state.db_sessionmaker() as db:
+        row = await hs_svc.update(
+            db,
+            schedule_id,
+            objective=body.objective,
+            interval_minutes=body.interval_minutes,
+            enabled=body.enabled,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "not_found", "hint": "no hunt schedule with that id"},
+        )
+    return _schedule_out(row)
+
+
+@router.delete(
+    "/hunt-schedules/{schedule_id}",
+    dependencies=[Depends(require_admin_api)],
+)
+async def delete_hunt_schedule(request: Request, schedule_id: int) -> dict[str, bool]:
+    """Delete a schedule (admin). 404 if it doesn't exist."""
+    async with request.app.state.db_sessionmaker() as db:
+        ok = await hs_svc.delete(db, schedule_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "not_found", "hint": "no hunt schedule with that id"},
+        )
+    return {"deleted": True}
+
+
+# ── E3.2: hunt template library (curated, telemetry-filtered hunt starters) ───
+#
+# A HuntTemplate is a REUSABLE hunt objective the operator picks to seed a new
+# hunt — the evolution of the Hunt Console's six static "canned pill" strings.
+# ``GET /hunt-templates`` annotates each with ``available``/``missingDatasets``
+# against the LIVE, TTL-cached grid inventory: a template needing telemetry the
+# grid lacks renders FLAGGED ("missing telemetry: zeek.rdp"), NEVER hidden —
+# honesty over hiding. Reads are analyst-readable; custom-template mutate is
+# admin-gated (mirrors the runbook/schedule CRUD). Deleting a builtin is refused
+# (409); custom templates delete freely.
+
+
+class HuntTemplateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=256)
+    objective_template: str = Field(min_length=1, max_length=2000)
+    # The `event.dataset` names this hunt correlates over — a grid missing one
+    # flags the template. Bounded so a custom template can't carry a runaway list.
+    required_datasets: list[str] = Field(default_factory=list, max_length=32)
+    default_window_minutes: int = Field(default=1440, ge=1, le=43200)
+
+
+class HuntTemplatePatch(BaseModel):
+    """All fields optional — only the provided ones are updated."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    objective_template: str | None = Field(default=None, min_length=1, max_length=2000)
+    required_datasets: list[str] | None = Field(default=None, max_length=32)
+    default_window_minutes: int | None = Field(default=None, ge=1, le=43200)
+
+
+class HuntTemplateOut(BaseModel):
+    id: int
+    name: str
+    objectiveTemplate: str
+    requiredDatasets: list[str]
+    defaultWindowMinutes: int
+    builtin: bool
+    createdBy: str
+    createdAt: str
+    # Availability annotation vs the live grid inventory (E3.2's whole point):
+    # ``available`` is False iff any requiredDataset is absent from the grid;
+    # ``missingDatasets`` lists exactly which telemetry is absent. On an inventory
+    # DISCOVERY failure both default to available/[] — we never HIDE (or falsely
+    # flag) a template on an inventory error.
+    available: bool = True
+    missingDatasets: list[str] = []
+
+
+def _template_out(row: HuntTemplate, present: set[str] | None) -> HuntTemplateOut:
+    """Serialize a template, annotating availability against ``present`` dataset names.
+
+    ``present is None`` means the inventory couldn't be discovered — the template
+    is reported ``available=True, missingDatasets=[]`` (best-effort: an inventory
+    error must never hide or falsely flag a template).
+    """
+    required = [str(d) for d in (row.required_datasets or [])]
+    if present is None:
+        missing: list[str] = []
+    else:
+        missing = [d for d in required if d not in present]
+    return HuntTemplateOut(
+        id=row.id,
+        name=row.name,
+        objectiveTemplate=row.objective_template or "",
+        requiredDatasets=required,
+        defaultWindowMinutes=row.default_window_minutes,
+        builtin=row.builtin,
+        createdBy=row.created_by,
+        createdAt=_iso_utc(row.created_at),
+        available=not missing,
+        missingDatasets=missing,
+    )
+
+
+async def _present_dataset_names(request: Request) -> set[str] | None:
+    """The set of `event.dataset` names live on the grid, or ``None`` on failure.
+
+    Reuses the TTL-cached :func:`discover_datasets` (300s) — annotating the whole
+    template list is ONE inventory read, not one per template. Best-effort: any
+    discovery failure returns ``None`` so the caller reports every template
+    available rather than hiding them on an inventory error.
+    """
+    try:
+        elastic = request.app.state.elastic
+        settings = request.app.state.settings
+        inv = await discover_datasets(elastic, settings)
+    except Exception:
+        _LOGGER.warning("hunt-template availability: inventory discovery failed", exc_info=True)
+        return None
+    return set(inv.dataset_names())
+
+
+@router.get("/hunt-templates", response_model=list[HuntTemplateOut])
+async def list_hunt_templates(request: Request) -> list[HuntTemplateOut]:
+    """All hunt templates, builtins first, ANNOTATED with grid availability.
+
+    Each template is flagged ``available``/``missingDatasets`` against the live
+    (TTL-cached) grid inventory: a template needing telemetry this grid doesn't
+    have is FLAGGED, never hidden. The inventory is read ONCE for the whole list.
+    """
+    present = await _present_dataset_names(request)
+    async with request.app.state.db_sessionmaker() as db:
+        rows = await ht_svc.list_all(db)
+    return [_template_out(r, present) for r in rows]
+
+
+@router.post(
+    "/hunt-templates",
+    response_model=HuntTemplateOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def create_hunt_template(request: Request, body: HuntTemplateIn) -> HuntTemplateOut:
+    """Save a custom hunt template (admin; always ``builtin=False``)."""
+    created_by = await identify_caller(request)
+    async with request.app.state.db_sessionmaker() as db:
+        row = await ht_svc.create(
+            db,
+            name=body.name,
+            objective_template=body.objective_template,
+            required_datasets=body.required_datasets,
+            default_window_minutes=body.default_window_minutes,
+            builtin=False,
+            created_by=created_by,
+        )
+    # Annotate the freshly-created row too (cheap — the inventory is TTL-cached).
+    present = await _present_dataset_names(request)
+    return _template_out(row, present)
+
+
+@router.put(
+    "/hunt-templates/{template_id}",
+    response_model=HuntTemplateOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def update_hunt_template(
+    request: Request, template_id: int, body: HuntTemplatePatch
+) -> HuntTemplateOut:
+    """Update a template's fields (admin). 404 if it doesn't exist; 409 on a builtin.
+
+    A builtin's content is code-owned (re-seeded every startup), so editing one
+    through the API would silently revert on the next restart — refuse it instead.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        existing = await ht_svc.get(db, template_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"reason": "not_found", "hint": "no hunt template with that id"},
+            )
+        if existing.builtin:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "builtin_immutable",
+                    "hint": "builtin templates are code-owned; save a custom template instead",
+                },
+            )
+        row = await ht_svc.update(
+            db,
+            template_id,
+            name=body.name,
+            objective_template=body.objective_template,
+            required_datasets=body.required_datasets,
+            default_window_minutes=body.default_window_minutes,
+        )
+    present = await _present_dataset_names(request)
+    assert row is not None  # existed above + same session; narrow for mypy
+    return _template_out(row, present)
+
+
+@router.delete(
+    "/hunt-templates/{template_id}",
+    dependencies=[Depends(require_admin_api)],
+)
+async def delete_hunt_template(request: Request, template_id: int) -> dict[str, bool]:
+    """Delete a CUSTOM template (admin). 404 if none; 409 refusing a builtin.
+
+    Builtin templates are code-owned (re-seeded on every startup) — deleting one
+    would just resurrect it next restart, so refuse it (the picker flags an
+    unavailable builtin rather than removing it anyway). Only custom
+    (``builtin=False``) templates delete.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        existing = await ht_svc.get(db, template_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"reason": "not_found", "hint": "no hunt template with that id"},
+            )
+        if existing.builtin:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "builtin_undeletable",
+                    "hint": "builtin templates are code-owned and cannot be deleted",
+                },
+            )
+        await ht_svc.delete(db, template_id)
+    return {"deleted": True}

@@ -1,7 +1,7 @@
 import { ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { KindBadge, SeverityTag, VerdictPill } from '../components/Badges';
+import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { Checkbox } from '../components/Controls';
 import { Drawer } from '../components/Drawer';
@@ -15,10 +15,12 @@ import {
   ackGroup,
   assignAlert,
   cancelHunt,
+  escalateGroup,
   getAlertGroupEvents,
   getAlerts,
   getAutoTriageStatus,
   getInvestigation,
+  getMe,
   getRepresentative,
   startAutoTriage,
   startHunt,
@@ -26,11 +28,17 @@ import {
 } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { type SortDir, useSort } from '../lib/useSort';
-import type { AlertEvent, AlertGroup, Investigation as Inv, Severity } from '../lib/types';
+import type {
+  AlertEvent,
+  AlertGroup,
+  Investigation as Inv,
+  Severity,
+  TriageState,
+} from '../lib/types';
 import { useShell } from '../shell/ShellContext';
 import { Investigation } from './Investigation';
 
-type ViewId = 'myqueue' | 'critical' | 'decision' | 'all';
+type ViewId = 'mine' | 'inreview' | 'critical' | 'decision' | 'all';
 type Density = 'comfortable' | 'compact';
 type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 
@@ -51,6 +59,29 @@ const EVENT_GRID = '16px 132px 56px minmax(150px,1fr) 116px 172px 92px';
 // Page size for an expanded group's events ("Load more" pulls one page at a time).
 const EVENTS_PAGE_SIZE = 50;
 
+// Auto-triage skip-reason codes (webui/autotriage.py planner) → friendly text.
+// Unknown codes fall through to the raw code so a new backend reason is surfaced
+// rather than silently dropped.
+const TRIAGE_SKIP_REASONS: Record<string, string> = {
+  already_triaged: 'already triaged',
+  running: 'in-flight',
+  inherited: 'covered by a prior verdict',
+  no_ip: 'no source/dest IP',
+  not_found: 'not found',
+};
+
+// " (8 already triaged, 3 in-flight, 1 no source/dest IP)" — the per-reason
+// breakdown of a batch's skip count, or "" when the backend didn't carry one.
+function triageSkipDetail(s: AutoTriageStatus): string {
+  const reasons = s.skipped_reasons;
+  if (!reasons) return '';
+  const parts = Object.entries(reasons)
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([code, n]) => `${n} ${TRIAGE_SKIP_REASONS[code] ?? code}`);
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
 const SEV_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 // inconclusive sorts with needs_more_info: both are terminal non-committed
 // verdicts that still need an analyst decision.
@@ -68,6 +99,38 @@ function toInitials(owner: string): string {
   const parts = name.split(/[._\-\s]+/).filter(Boolean);
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
   return name.slice(0, 2).toUpperCase();
+}
+
+// Triage-state chip styling (E2.3). "unassigned" is the ABSENCE of an owner
+// (state null) — rendered faint; the three real states carry their own colour:
+// owned=accent, in_review=amber, done=green.
+const STATE_LABEL: Record<TriageState, string> = {
+  owned: 'Owned',
+  in_review: 'In review',
+  done: 'Done',
+};
+const STATE_CLS: Record<TriageState, string> = {
+  owned: 'border-accent/40 bg-accent/10 text-accent',
+  in_review: 'border-amber-400/40 bg-amber-400/10 text-amber-300',
+  done: 'border-emerald-400/40 bg-emerald-400/10 text-emerald-300',
+};
+
+/** A compact triage-state chip. `null` → the faint "Unassigned" pill. */
+function StateChip({ state }: { state?: TriageState | null }) {
+  if (!state) {
+    return (
+      <span className="inline-flex items-center rounded-pill border border-border-strong px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide text-faint">
+        Unassigned
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex items-center rounded-pill border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide ${STATE_CLS[state]}`}
+    >
+      {STATE_LABEL[state]}
+    </span>
+  );
 }
 
 /** A compact, glanceable clock time for an event row ("14:23:05"). The full
@@ -116,6 +179,24 @@ function ProvenanceBadge({ ev, onOpen }: { ev: AlertEvent; onOpen: (id: string) 
   return (
     <span title={title} className={`${cls} cursor-help`} style={tone}>
       <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+/** Secondary, subtle red hint next to a group's standing verdict chip (E2.1):
+ * the last RE-RUN of this rule crashed (error/cancelled/interrupted) or fell
+ * back, while the real verdict still stands. Answers the "stayed at Needs Info"
+ * mystery — the verdict chip stays primary; this is a quiet warning. */
+function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttempt']> }) {
+  // "fallback" reads as "failed" for the operator; the other statuses name the
+  // terminal state directly ("error"/"cancelled"/"interrupted").
+  const label = attempt.status === 'fallback' ? 'failed' : attempt.status;
+  return (
+    <span
+      title={`The last re-run of this detection ${attempt.status === 'fallback' ? 'failed (pipeline fallback)' : `ended in ${attempt.status}`} ${attempt.ago} ago — the standing verdict is from an earlier run. Retry it.`}
+      className="flex min-w-0 items-center truncate font-mono text-[10.5px] font-semibold text-danger"
+    >
+      <span className="truncate">· last retry {label} {attempt.ago} ago</span>
     </span>
   );
 }
@@ -171,10 +252,14 @@ function cmpGroups(a: AlertGroup, b: AlertGroup, key: SortKey, dir: SortDir): nu
   return dir === 'asc' ? result : -result;
 }
 
-function matchView(g: AlertGroup, view: ViewId): boolean {
+function matchView(g: AlertGroup, view: ViewId, me: string): boolean {
   switch (view) {
-    case 'myqueue':
-      return !!g.owner && g.owner !== '';
+    case 'mine':
+      // "Mine" = owned by the current user (E2.3). Falls back to "any owner"
+      // when the current user is unknown (getMe failed) so the tab still filters.
+      return me ? g.owner === me : !!g.owner && g.owner !== '';
+    case 'inreview':
+      return g.state === 'in_review';
     case 'critical':
       return g.sev === 'critical';
     case 'decision':
@@ -186,7 +271,7 @@ function matchView(g: AlertGroup, view: ViewId): boolean {
 }
 
 export function Alerts() {
-  const { triageNonce } = useShell();
+  const { triageNonce, paletteOpen } = useShell();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [reloadKey, setReloadKey] = useState(0);
@@ -195,6 +280,17 @@ export function Alerts() {
   const [filterSevs, setFilterSevs] = useState<string[]>([]); // [] = all
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]); // [] = all
   const [hideAcked, setHideAcked] = useState(true);
+  // Current username — the "Mine" filter matches g.owner against it, and the
+  // row actions use it to decide whose assignment they are toggling. Empty until
+  // getMe resolves (falls back to "any owner" for the filter until then).
+  const [me, setMe] = useState('');
+  useEffect(() => {
+    getMe()
+      .then((m) => setMe(m.username))
+      .catch(() => {
+        /* keep empty — the "Mine" filter degrades to "any owner" */
+      });
+  }, []);
 
   const alertQuery: AlertQuery = {
     ...(filterTime === 'custom' && customRange
@@ -228,6 +324,15 @@ export function Alerts() {
   const [selEvents, setSelEvents] = useState<Record<string, boolean>>({});
   const [ackingEvents, setAckingEvents] = useState(false);
   const [density, setDensity] = useState<Density>('comfortable');
+
+  // ---- keyboard-first triage (E2.5) --------------------------------------
+  // Index of the keyboard-focused group row within the visible list; -1 = none.
+  // Vim-style j/k (+ arrows) move it, o/Enter open, a/e/i act, x selects.
+  const [focusedIndex, setFocusedIndex] = useState(-1);
+  const [keyHelpOpen, setKeyHelpOpen] = useState(false);
+  // Per-row element refs so the focused row can be scrolled into view as focus
+  // moves. Keyed by group id; stale keys are harmless (a WeakMap-ish plain map).
+  const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
   // Shared sort mechanics; clicking a new column here starts it descending.
   const { sort, toggleSort, caret, headerCls: hdrCls } = useSort<SortKey>(
     { key: 'sev', dir: 'desc' },
@@ -274,9 +379,12 @@ export function Alerts() {
   };
 
   // A one-line summary of how a batch landed — never let it finish silently.
+  // When the backend carries a per-reason skip breakdown (E2.2), spell it out
+  // ("12 skipped: 8 already triaged, 3 in-flight, 1 no source/dest IP") instead
+  // of a bare count so an operator can see WHY work was skipped.
   const triageSummary = (s: AutoTriageStatus): string => {
     const parts = [`${s.hunted} investigated`];
-    if (s.skipped) parts.push(`${s.skipped} skipped`);
+    if (s.skipped) parts.push(`${s.skipped} skipped${triageSkipDetail(s)}`);
     if (s.failed) parts.push(`${s.failed} failed`);
     return parts.join(' · ');
   };
@@ -432,6 +540,45 @@ export function Alerts() {
       .finally(() => setHuntGroupPending((s) => ({ ...s, [g.id]: false })));
   };
 
+  // Acknowledge a single group (keyboard `a`) — reuses the same ackGroup write
+  // path + ack strip as the bulk bar, scoped to one detection.
+  const ackOneGroup = (g: AlertGroup) => {
+    setAckingCount(1);
+    setAckingAlertTotal(g.count || 0);
+    setAcking(true);
+    ackGroup(g, alertQuery)
+      .then((r) => {
+        const parts = [`Acknowledged ${r.acked} alert${r.acked !== 1 ? 's' : ''} in ${g.name}`];
+        if (r.failed) parts.push(`${r.failed} event${r.failed !== 1 ? 's' : ''} failed`);
+        showAckMsg(parts.join(' · ') + (r.capped ? ' — group exceeded the 200-event cap, press a again to finish.' : ''));
+        setReloadKey((k) => k + 1);
+      })
+      .catch(() => showAckMsg(`Failed to acknowledge ${g.name}`))
+      .finally(() => setAcking(false));
+  };
+
+  // Escalate a single group to a Security Onion case (keyboard `e`) — reuses
+  // the escalateGroup write path; result surfaces in the ack strip.
+  const escalateOneGroup = (g: AlertGroup) => {
+    escalateGroup(g, alertQuery)
+      .then((r) => {
+        showAckMsg(`Escalated ${r.escalated} of ${r.total} event${r.total !== 1 ? 's' : ''} in ${g.name} to a case`);
+        setReloadKey((k) => k + 1);
+      })
+      .catch(() => showAckMsg(`Failed to escalate ${g.name}`));
+  };
+
+  // Toggle a single group's selection (keyboard `x`) into the same `selected`
+  // map the checkboxes + bulk bar use.
+  const toggleSelectGroup = (g: AlertGroup) => {
+    setSelected((s) => {
+      const next = { ...s };
+      if (next[g.id]) delete next[g.id];
+      else next[g.id] = true;
+      return next;
+    });
+  };
+
   const toggleExpand = (g: AlertGroup) => {
     const opening = !expanded[g.id];
     setExpanded((s) => ({ ...s, [g.id]: !s[g.id] }));
@@ -465,18 +612,158 @@ export function Alerts() {
   };
 
   const ownerOf = (g: AlertGroup) => g.owner ?? '';
+
+  // ── E2.3 triage-state actions ──────────────────────────────────────────
+  // Each reuses the one /alerts/assign endpoint (assignAlert), then refreshes
+  // the list so the chip/owner update. Assign-to-me and release both change
+  // ownership; mark-in-review / mark-done only move the state on an owned rule.
+  const assignToMe = (g: AlertGroup) =>
+    assignAlert(g.name).then(() => setReloadKey((k) => k + 1));
+  const release = (g: AlertGroup) =>
+    assignAlert(g.name, true).then(() => setReloadKey((k) => k + 1));
+  const setTriage = (g: AlertGroup, state: TriageState) =>
+    assignAlert(g.name, false, state).then(() => setReloadKey((k) => k + 1));
+
+  // The Verdict filter carries a synthetic 'pipeline_error' value (E1.2): a
+  // fallback group matches it regardless of its (needs_more_info) verdict, and —
+  // since the chip REPLACES the NMI pill — a fallback group is NOT matched by
+  // selecting 'needs_more_info' alone.
+  const matchesVerdict = (g: AlertGroup): boolean => {
+    if (!filterVerdicts.length) return true;
+    if (filterVerdicts.includes('pipeline_error') && g.fallback) return true;
+    if (g.fallback) return false;
+    return filterVerdicts.includes(g.verdict);
+  };
   const visible = useMemo(
     () =>
       (groups ?? [])
-        .filter((g) => matchView(g, view))
+        .filter((g) => matchView(g, view, me))
         .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
-        .filter((g) => !filterVerdicts.length || filterVerdicts.includes(g.verdict))
+        .filter(matchesVerdict)
         .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir)),
-    [groups, view, filterSevs, filterVerdicts, sort],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [groups, view, me, filterSevs, filterVerdicts, sort],
   );
 
   const visIds = visible.map((g) => g.id);
   const allSelected = visIds.length > 0 && visIds.every((id) => selected[id]);
+
+  // ---- keyboard-first triage (E2.5): clamp + global handler ---------------
+  // Keep focusedIndex inside the (possibly changed) visible range: none when the
+  // list is empty, else clamp into bounds. Runs whenever the visible set changes.
+  useEffect(() => {
+    setFocusedIndex((i) => {
+      if (visible.length === 0) return -1;
+      if (i < 0) return -1; // stay "unfocused" until the user presses j/k
+      return Math.min(i, visible.length - 1);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible.length]);
+
+  // Scroll the keyboard-focused row into view as focus moves.
+  useEffect(() => {
+    if (focusedIndex < 0) return;
+    const g = visible[focusedIndex];
+    if (!g) return;
+    rowRefs.current[g.id]?.scrollIntoView({ block: 'nearest' });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedIndex]);
+
+  // Global keydown for row navigation + actions. Active ONLY when: the command
+  // palette is CLOSED (paletteOpen from the shell — the single shared signal, no
+  // DOM sniffing), focus is not in an input/textarea/[contenteditable], and no
+  // Cmd/Ctrl/Alt modifier is held. The palette owns `/` and Cmd+K; this owns
+  // j/k/o/a/e/i/x/?/Enter/Arrows — they can never both fire because a closed
+  // palette is a hard precondition here and an open one short-circuits.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // `?` help is closable from anywhere (Esc), but ALL shortcuts (incl. the
+      // help toggle) require the palette closed + focus outside an input.
+      if (paletteOpen) return;
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName ?? '';
+      if (/INPUT|TEXTAREA|SELECT/.test(tag) || el?.isContentEditable) return;
+
+      // The cheatsheet overlay owns Esc while it's open.
+      if (keyHelpOpen) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setKeyHelpOpen(false);
+        }
+        return;
+      }
+
+      // Shift is allowed (needed for `?`); Cmd/Ctrl/Alt are not — leave those to
+      // the browser / palette.
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      // `?` (Shift+/) opens the cheatsheet — check before the plain-key branch.
+      if (e.key === '?') {
+        e.preventDefault();
+        setKeyHelpOpen(true);
+        return;
+      }
+
+      const n = visible.length;
+      if (n === 0) return;
+
+      const move = (delta: number) => {
+        e.preventDefault();
+        setFocusedIndex((i) => {
+          if (i < 0) return delta > 0 ? 0 : n - 1;
+          return Math.min(n - 1, Math.max(0, i + delta)); // clamp, no wrap
+        });
+      };
+
+      switch (e.key) {
+        case 'j':
+        case 'ArrowDown':
+          move(1);
+          return;
+        case 'k':
+        case 'ArrowUp':
+          move(-1);
+          return;
+      }
+
+      // The remaining actions operate on the focused group; no-op gracefully
+      // when nothing is focused or the row vanished under a refresh.
+      const g = focusedIndex >= 0 ? visible[focusedIndex] : undefined;
+      if (!g) return;
+
+      switch (e.key) {
+        case 'o':
+        case 'Enter':
+          e.preventDefault();
+          // Same action as the row's primary button: open an existing report or
+          // investigate the representative event.
+          if (g.invId) openDrawer(g.invId);
+          else huntGroup(g);
+          return;
+        case 'a':
+          e.preventDefault();
+          ackOneGroup(g);
+          return;
+        case 'e':
+          e.preventDefault();
+          escalateOneGroup(g);
+          return;
+        case 'i':
+          e.preventDefault();
+          // Investigate — open the live/existing run or start one (huntGroup).
+          if (g.invId) openDrawer(g.invId);
+          else huntGroup(g);
+          return;
+        case 'x':
+          e.preventDefault();
+          toggleSelectGroup(g);
+          return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paletteOpen, keyHelpOpen, visible, focusedIndex]);
   const selCount = Object.keys(selected).filter((k) => selected[k]).length;
   const selectedEventIds = Object.entries(selEvents).filter(([, v]) => v).map(([k]) => k);
   const rowPad = density === 'compact' ? '7px 14px' : '11px 14px';
@@ -497,7 +784,10 @@ export function Alerts() {
     const gs = groups ?? [];
     return {
       counts: {
-        myqueue: gs.filter((g) => !!g.owner && g.owner !== '').length,
+        // "Mine" = owned by the current user (falls back to "any owner" until
+        // getMe resolves, matching matchView's fallback so the count is honest).
+        mine: gs.filter((g) => (me ? g.owner === me : !!g.owner && g.owner !== '')).length,
+        inreview: gs.filter((g) => g.state === 'in_review').length,
         critical: gs.filter((g) => g.sev === 'critical').length,
         decision: gs.filter((g) => g.verdict === 'needs_more_info' || g.verdict === 'inconclusive' || g.verdict === 'untriaged').length,
         all: gs.length,
@@ -505,10 +795,11 @@ export function Alerts() {
       untriaged: gs.filter((g) => g.verdict === 'untriaged').length,
       totalEvents: gs.reduce((a, g) => a + g.count, 0),
     };
-  }, [groups]);
+  }, [groups, me]);
 
   const TABS: Array<{ id: ViewId; label: string; count: number }> = [
-    { id: 'myqueue', label: 'My queue', count: counts.myqueue },
+    { id: 'mine', label: 'Mine', count: counts.mine },
+    { id: 'inreview', label: 'In review', count: counts.inreview },
     { id: 'critical', label: 'Critical', count: counts.critical },
     { id: 'decision', label: 'Needs decision', count: counts.decision },
     { id: 'all', label: 'All', count: counts.all },
@@ -917,17 +1208,24 @@ export function Alerts() {
           <div className="px-4 py-10 text-center text-[13px] text-faint">No detections match this view.</div>
         )}
 
-        {visible.map((g) => {
+        {visible.map((g, rowIdx) => {
           const isExp = !!expanded[g.id];
           const owner = ownerOf(g);
           const seld = !!selected[g.id];
+          const kbFocused = rowIdx === focusedIndex;
           return (
-            <div key={g.id}>
+            <div key={g.id} ref={(el) => { rowRefs.current[g.id] = el; }}>
               <div
                 onClick={() => toggleExpand(g)}
-                className="grid cursor-pointer items-center gap-2.5 border-b border-border-faint hover:bg-surface-hover"
+                className={`relative grid cursor-pointer items-center gap-2.5 border-b border-border-faint hover:bg-surface-hover${
+                  kbFocused ? ' bg-surface-hover ring-1 ring-inset ring-accent' : ''
+                }`}
                 style={{ gridTemplateColumns: GRID, minWidth: 720, padding: rowPad }}
               >
+                {/* keyboard-focus accent bar (E2.5) */}
+                {kbFocused && (
+                  <span className="pointer-events-none absolute inset-y-0 left-0 w-[3px] bg-accent" aria-hidden="true" />
+                )}
                 {(() => {
                   const loadedEvs = groupEvents[g.id] ?? [];
                   const loadedIds = loadedEvs.map((ev) => ev.id).filter(Boolean) as string[];
@@ -1023,6 +1321,23 @@ export function Alerts() {
                       <Spinner size={10} color="#fbbf24" />
                       Investigating…
                     </button>
+                  ) : g.fallback ? (
+                    // Pipeline fallback (E1.2): the standing verdict came from a
+                    // run that FAILED before reaching a verdict (model truncation,
+                    // gateway 5xx). Show the distinct pipeline-error chip (not the
+                    // amber NMI pill) and open the run so the analyst can re-run it.
+                    <button
+                      type="button"
+                      disabled={!g.invId}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (g.invId) openDrawer(g.invId);
+                      }}
+                      title="Standing verdict is a pipeline error — open the run to re-run it"
+                      className="flex min-w-0 items-center rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
+                    >
+                      <PipelineErrorChip />
+                    </button>
                   ) : g.inherited ? (
                     // Inherited verdict: make the whole thing a link to the source
                     // investigation (when + which is in the enriched reason), so the
@@ -1048,6 +1363,14 @@ export function Alerts() {
                   ) : (
                     <VerdictPill verdict={g.verdict} conf={g.conf} inherited={false} showConf={false} showInherited={false} />
                   )}
+                  {/* E2.1: a later re-run failed on top of the standing verdict —
+                      a secondary red hint; the verdict chip above stays primary.
+                      Backend nulls this for triaging + fallback-standing rows. */}
+                  {g.lastAttempt && <LastRetryHint attempt={g.lastAttempt} />}
+                  {/* E2.3: the human triage state (owned / in review / done). Only
+                      shown once a rule has an owner — an unassigned rule renders no
+                      chip here (the dashed "+" in the Owner cell is the affordance). */}
+                  {g.owner && <StateChip state={g.state} />}
                 </div>
                 <div className="text-right font-mono text-[12px] text-dim">
                   {g.conf != null ? g.conf.toFixed(2) : '—'}
@@ -1057,9 +1380,9 @@ export function Alerts() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        assignAlert(g.name, true).then(() => setReloadKey((k) => k + 1));
+                        release(g);
                       }}
-                      title={`Assigned to ${owner} — click to unassign`}
+                      title={`Assigned to ${owner} — click to release`}
                       className="flex h-[25px] w-[25px] items-center justify-center rounded-full border border-border-strong bg-[#1a2330] text-[9.5px] font-bold text-[#b9c2cf] hover:border-danger hover:text-danger"
                     >
                       {toInitials(owner)}
@@ -1068,7 +1391,7 @@ export function Alerts() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        assignAlert(g.name).then(() => setReloadKey((k) => k + 1));
+                        assignToMe(g);
                       }}
                       title="Assign to me"
                       className="flex h-[25px] w-[25px] items-center justify-center rounded-full border-[1.5px] border-dashed border-border-strong text-[14px] leading-none text-faint hover:border-accent hover:text-accent"
@@ -1083,7 +1406,58 @@ export function Alerts() {
                 >
                   {g.latest || '—'}
                 </div>
-                <div className="flex items-center justify-end">
+                <div className="flex items-center justify-end gap-1.5">
+                  {/* E2.3 triage-state actions: only on an OWNED row. "Review"
+                      moves owned → in_review; "Done" marks it done (from owned or
+                      in_review); the owner avatar in the Owner cell releases it.
+                      Hidden entirely on an unassigned row (assign first). */}
+                  {g.owner && g.state !== 'in_review' && g.state !== 'done' && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTriage(g, 'in_review');
+                      }}
+                      aria-label="Mark in review"
+                      title="Mark this detection as in review"
+                      className="inline-flex items-center rounded-badge border border-amber-400/40 bg-amber-400/10 px-[9px] py-[3px] font-sans text-[11px] font-semibold text-amber-300 hover:brightness-125"
+                    >
+                      Review
+                    </button>
+                  )}
+                  {g.owner && g.state !== 'done' && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTriage(g, 'done');
+                      }}
+                      aria-label="Mark done"
+                      title="Mark this detection's triage as done"
+                      className="inline-flex items-center rounded-badge border border-emerald-400/40 bg-emerald-400/10 px-[9px] py-[3px] font-sans text-[11px] font-semibold text-emerald-300 hover:brightness-125"
+                    >
+                      Done
+                    </button>
+                  )}
+                  {/* E2.1: the last re-run failed — offer an explicit RETRY that
+                      re-investigates the group's representative event (reuses the
+                      existing hunt path), so the analyst can act without opening
+                      the stale report first. Only when there IS a failed retry and
+                      no live run in flight. */}
+                  {g.lastAttempt && !g.triaging && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        huntGroup(g);
+                      }}
+                      disabled={!!huntGroupPending[g.id]}
+                      aria-label="Retry investigation"
+                      title="Last re-run failed — re-investigate the representative event"
+                      className="inline-flex items-center gap-1 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
+                      style={{ borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)', color: '#f87171' }}
+                    >
+                      {huntGroupPending[g.id] ? <Spinner size={11} color="#f87171" /> : <Zap size={11} />}
+                      Retry
+                    </button>
+                  )}
                   {g.invId || g.triaging ? (
                     // A report exists (or one is in flight) — one clean "Open" action.
                     <button
@@ -1151,17 +1525,47 @@ export function Alerts() {
                       </div>
                       {/* severity */}
                       <div><SeverityTag sev={(ev.sev ?? 'low') as Severity} /></div>
-                      {/* src → dst:port */}
+                      {/* src → dst:port — each endpoint pivots to its entity page */}
                       <div className="flex min-w-0 items-center gap-1.5 truncate">
-                        <span className="text-mono-green">{ev.src}</span>
+                        {ev.src ? (
+                          <span
+                            className="cursor-pointer text-mono-green hover:underline"
+                            onClick={() => navigate(`/entity/${encodeURIComponent(ev.src)}`)}
+                            title={`Pivot to ${ev.src}`}
+                          >
+                            {ev.src}
+                          </span>
+                        ) : (
+                          <span className="text-mono-green">{ev.src}</span>
+                        )}
                         <span className="text-ghost">→</span>
-                        <span className="text-mono-amber">{ev.dst}</span>
+                        {ev.dst ? (
+                          <span
+                            className="cursor-pointer text-mono-amber hover:underline"
+                            onClick={() => navigate(`/entity/${encodeURIComponent(ev.dst)}`)}
+                            title={`Pivot to ${ev.dst}`}
+                          >
+                            {ev.dst}
+                          </span>
+                        ) : (
+                          <span className="text-mono-amber">{ev.dst}</span>
+                        )}
                         {ev.port != null && (
                           <span className="text-faint">:{ev.port}</span>
                         )}
                       </div>
-                      {/* host */}
-                      <div className="truncate text-dim" title={ev.host}>{ev.host}</div>
+                      {/* host — pivots to its entity page */}
+                      {ev.host ? (
+                        <div
+                          className="cursor-pointer truncate text-dim hover:text-text hover:underline"
+                          title={`Pivot to ${ev.host}`}
+                          onClick={() => navigate(`/entity/${encodeURIComponent(ev.host)}`)}
+                        >
+                          {ev.host}
+                        </div>
+                      ) : (
+                        <div className="truncate text-dim" title={ev.host}>{ev.host}</div>
+                      )}
                       {/* verdict provenance + WHEN the investigation ran/inherited */}
                       <div className="flex min-w-0 items-center">
                         <ProvenanceBadge ev={ev} onOpen={openDrawer} />
@@ -1206,6 +1610,9 @@ export function Alerts() {
         {counts.all} detections · grouped · click a row to expand events
       </div>
 
+      {/* keyboard cheatsheet (E2.5) — `?` opens; Esc / backdrop closes */}
+      {keyHelpOpen && <KeyHelpOverlay onClose={() => setKeyHelpOpen(false)} />}
+
       {/* investigation drawer */}
       <AlertDrawer
         drawerId={drawerId}
@@ -1216,6 +1623,60 @@ export function Alerts() {
         onComplete={onDrawerComplete}
       />
     </div>
+  );
+}
+
+// ── keyboard cheatsheet overlay (E2.5) ──────────────────────────────────────
+// A small centered card + backdrop reusing the command-palette overlay styling.
+// Lists the Alerts-only row shortcuts AND the global ones (`/`, Cmd+K, `?`) so
+// one panel maps the whole keyboard surface. Closable via Esc (handled by the
+// Alerts keydown effect) or a backdrop click.
+const KEY_HELP: Array<{ keys: string; label: string }> = [
+  { keys: 'j / k', label: 'Move focus down / up' },
+  { keys: '↓ / ↑', label: 'Move focus down / up' },
+  { keys: 'o  ↵', label: 'Open the focused detection' },
+  { keys: 'a', label: 'Acknowledge the focused group' },
+  { keys: 'e', label: 'Escalate the focused group to a case' },
+  { keys: 'i', label: 'Investigate the focused group' },
+  { keys: 'x', label: 'Select / deselect the focused group' },
+  { keys: '/', label: 'Search — open the command palette' },
+  { keys: '⌘K', label: 'Toggle the command palette' },
+  { keys: '?', label: 'Show this shortcut help' },
+  { keys: 'esc', label: 'Close help / palette / drawer' },
+];
+
+function KeyHelpOverlay({ onClose }: { onClose: () => void }) {
+  return (
+    <>
+      <div onClick={onClose} className="fixed inset-0 z-[60] bg-[rgba(4,6,9,.55)] backdrop-blur-[2px]" />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Keyboard shortcuts"
+        className="fixed left-1/2 top-1/2 z-[61] -translate-x-1/2 -translate-y-1/2 animate-fadeUp overflow-hidden rounded-panel-lg border border-border-input bg-surface-card shadow-palette"
+        style={{ width: 'min(440px,92vw)' }}
+      >
+        <div className="flex items-center justify-between border-b border-border-2 px-4 py-[13px]">
+          <span className="text-[14px] font-semibold text-text">Keyboard shortcuts</span>
+          <button onClick={onClose} aria-label="Close" className="flex text-faint hover:text-text">
+            <X size={15} />
+          </button>
+        </div>
+        <div className="max-h-[60vh] overflow-y-auto p-2">
+          {KEY_HELP.map((k) => (
+            <div key={k.keys + k.label} className="flex items-center gap-3 rounded-control px-2.5 py-[7px]">
+              <kbd className="min-w-[42px] rounded-[4px] border border-border-input bg-surface-3 px-1.5 py-px text-center font-mono text-[11px] text-text-2">
+                {k.keys}
+              </kbd>
+              <span className="text-[13px] text-dim">{k.label}</span>
+            </div>
+          ))}
+        </div>
+        <div className="border-t border-border-2 px-4 py-[9px] font-mono text-[10.5px] text-faint">
+          Row shortcuts act on the highlighted detection · typing in a filter never triggers them
+        </div>
+      </div>
+    </>
   );
 }
 

@@ -52,11 +52,13 @@ async def test_migration_creates_hunts_tables(settings_kratos: Settings) -> None
 
 async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     # The store schema migrates cleanly to the current head. Bump this when a new
-    # migration lands (0010 hunts → 0011 backtests → 0012 runbooks → …).
+    # migration lands (0010 hunts → 0011 backtests → 0012 runbooks → 0013
+    # hunt_objective_hash → 0014 hunt_schedules → 0015 assignment_state → 0016
+    # hunt_templates → …).
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0012"
+        assert row.scalar_one() == "0016"
     await engine.dispose()
 
 

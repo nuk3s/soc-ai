@@ -63,6 +63,11 @@ function computeMetrics(groups: AlertGroup[]): Metrics {
       triaging += 1;
       continue;
     }
+    // A pipeline fallback (E1.2) reads verdict=needs_more_info in the DB but the
+    // pipeline never reasoned to it (model truncation / gateway 5xx). Excluding
+    // it from the NMI bucket keeps the "need more info" KPI honest — those are
+    // infra failures to retry, counted separately as "pipeline errors" below.
+    if (g.fallback) continue;
     verdict[g.verdict] = (verdict[g.verdict] ?? 0) + 1;
   }
   return { events, groups: groups.length, verdict, sev, triaging };
@@ -359,6 +364,11 @@ export function Dashboard() {
     [rows],
   );
   const running = rows.filter((r) => r.status === 'running').length;
+  // Pipeline errors (E1.2): runs whose needs_more_info is a failure fallback
+  // (model truncation / gateway 5xx), excluded from the NMI KPI above. Derived
+  // from the investigations list the dashboard already fetches — a small
+  // operator signal that infra, not evidence, blocked those verdicts.
+  const pipelineErrors = rows.filter((r) => r.fallback).length;
 
   const a = (n: number): string => (alerts.data ? n.toLocaleString() : alerts.error ? '—' : '…');
   const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : '…');
@@ -440,7 +450,17 @@ export function Dashboard() {
         <StatCard
           label={`True positives · ${range}`}
           value={a(m.verdict.true_positive)}
-          sub={`${a(m.verdict.needs_more_info)} need more info`}
+          sub={
+            <>
+              {a(m.verdict.needs_more_info)} need more info
+              {pipelineErrors > 0 && (
+                <>
+                  {' · '}
+                  <span style={{ color: '#fca5a5' }}>{i(pipelineErrors)} pipeline error{pipelineErrors === 1 ? '' : 's'}</span>
+                </>
+              )}
+            </>
+          }
           color="#f04438"
           icon={<ShieldCheck size={16} />}
         />

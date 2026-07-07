@@ -207,6 +207,25 @@ class Settings(BaseSettings):
     Leave False (the default) for a local model — redaction is pure overhead
     when the analyst model never leaves your network."""
 
+    analyst_redaction_fail_closed: bool = False
+    """Fail CLOSED on residual internal identifiers in the analyst egress path.
+
+    Only meaningful when ``analyst_cloud_redaction`` is on.  The redaction
+    tunnel above is best-effort — it sanitizes each payload but has no
+    independent check that the sanitize pass actually removed everything.  When
+    this is True, the FINAL composed outbound string for each analyst-model call
+    is swept by :func:`soc_ai.oracle.sanitize.unsafe_residue` (an INDEPENDENT
+    detector, re-implemented from scratch so a sanitize bug cannot blind it); if
+    any internal identifier survived, the model is NOT called and the run lands
+    a pipeline error (``resolution.provenance='pipeline_fallback'``, the same
+    honest-fallback shape a synth crash produces) naming only the leaked
+    identifier COUNT — never the values.
+
+    Leave False (the default) to keep the current best-effort behavior: a
+    sanitize miss is logged but the redacted payload still egresses.  Turn on
+    for a deployment where a leak is worse than a blocked investigation.  No
+    effect at all when ``analyst_cloud_redaction`` is off (no guard is built)."""
+
     # --- Audit logging -------------------------------------------------
     audit_index_alias: str = "soc-ai-audit"
     audit_redact: bool = True
@@ -392,6 +411,16 @@ class Settings(BaseSettings):
     """Minimum minutes between scheduled auto-triage sweeps (each sweep drains up
     to ``auto_triage_max_targets``). Lower = the backlog drains faster but more
     LLM calls; 5 is a calm default. Only used when the schedule is enabled."""
+
+    hunt_schedules_enabled: bool = False
+    """Master switch for recurring (scheduled) hunts. When on, a background loop
+    wakes every ~60s and spawns a hunt for every DUE ``hunt_schedules`` row (its
+    interval has elapsed), landing it tagged ``kind="scheduled"``. Each schedule
+    carries its own objective + interval-minutes (managed in the Hunt Console);
+    THIS flag is the global on/off — with it off no scheduled hunt ever fires,
+    regardless of the per-row ``enabled``. OFF by default (recurring LLM calls);
+    editable live in the config console. Single uvicorn worker only (workers>1
+    would double-fire — Epoch 6.2 territory)."""
 
     backtest_max_sample: int = 50
     """Hard ceiling on how many already-dispositioned alerts a single Backtest
@@ -716,6 +745,76 @@ class Settings(BaseSettings):
     authenticated /shodan/host lookup — banners, services, vulns). Without it
     that tool reports 'not configured' and makes no request; the free,
     keyless t_shodan_internetdb and t_cve_lookup still work (master flag on)."""
+
+    # --- Notification routing (opt-in outbound webhook) ---------------
+    # The ONLY new *outbound* egress path in soc-ai (everything else is local-
+    # feed / zero-egress). Treated like the Oracle: OFF by default, the webhook
+    # URL is a SECRET, and every send is audited. When disabled, soc_ai.notify.fire
+    # returns before constructing any HTTP client — NO httpx call is ever made.
+    notify_enabled: bool = False
+    """Master switch for outbound notification webhooks. OFF by default to
+    preserve the zero-egress posture. When off, ``soc_ai.notify.fire`` is a hard
+    no-op (returns before any network I/O). All the per-trigger toggles below are
+    inert unless this is on. Editable live in the config console."""
+
+    notify_webhook_url: SecretStr | None = None
+    """Destination webhook URL for notifications (a SECRET — Fernet-encrypted at
+    rest, never rendered back). No sends happen until this is set. Point it at a
+    generic JSON receiver, a Slack incoming-webhook, or a Matrix hook (pick the
+    body shape with ``notify_format``). Set via the config console's Notifications
+    section or ``NOTIFY_WEBHOOK_URL`` in ``.env``."""
+
+    notify_format: str = "json"
+    """Webhook body shape: ``json`` (a compact generic dict), ``slack``
+    (``{"text": ...}``), or ``matrix`` (``{"msgtype":"m.text","body":...}``).
+    An unknown value falls back to ``json``."""
+
+    @field_validator("notify_format", mode="before")
+    @classmethod
+    def _validate_notify_format(cls, v: Any) -> Any:
+        """Lowercase + validate notify_format ∈ {json, slack, matrix}."""
+        if not isinstance(v, str):
+            raise ValueError(f"notify_format must be a string, got {type(v).__name__}")
+        lowered = v.strip().lower()
+        if lowered not in ("json", "slack", "matrix"):
+            raise ValueError(f"notify_format must be one of: json, slack, matrix; got {v!r}")
+        return lowered
+
+    notify_verify_ssl: bool = True
+    """Verify the webhook's TLS certificate. Set False only for a self-signed
+    internal receiver (e.g. a homelab collector on an internal CA)."""
+
+    notify_tp_confidence_threshold: float = 0.9
+    """Minimum verdict confidence (0-1) for a true-positive to ping on-call. A TP
+    below this fires no notification — high-confidence TPs are the ones worth
+    waking someone for. Only used when ``notify_on_tp`` (and the master switch)
+    is on."""
+
+    @field_validator("notify_tp_confidence_threshold", mode="before")
+    @classmethod
+    def _clamp_notify_tp_threshold(cls, v: Any) -> Any:
+        """Clamp notify_tp_confidence_threshold to [0.0, 1.0]."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "notify_tp_confidence_threshold must be a number in [0.0, 1.0]"
+            ) from exc
+        if f < 0.0 or f > 1.0:
+            raise ValueError(f"notify_tp_confidence_threshold must be in [0.0, 1.0], got {f}")
+        return f
+
+    notify_on_tp: bool = True
+    """Notify when an investigation finalizes verdict=true_positive at/above
+    ``notify_tp_confidence_threshold``. Inert unless ``notify_enabled`` is on."""
+
+    notify_on_hunt_threat: bool = True
+    """Notify when a hunt lands a report containing a finding with
+    category='threat'. Inert unless ``notify_enabled`` is on."""
+
+    notify_on_model_fitness_fail: bool = True
+    """Notify when the model-fitness probe grades the analyst model FAIL (an unfit
+    model silently ruins triage). Inert unless ``notify_enabled`` is on."""
 
     # --- crawl4ai (deep page read) ------------------------------------
     crawl4ai_enabled: bool = False

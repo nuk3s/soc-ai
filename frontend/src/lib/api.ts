@@ -16,6 +16,7 @@ import type {
   Config,
   ConnTestResult,
   DangerSetting,
+  EntityDetail,
   HuntDetailData,
   HuntRow,
   HuntStat,
@@ -26,6 +27,7 @@ import type {
   RehuntResult,
   RepresentativeOut,
   StartBacktestOpts,
+  TriageState,
   Workspace,
 } from './types';
 
@@ -199,6 +201,16 @@ export function getHunt(id: string): Promise<HuntDetailData> {
 }
 
 /**
+ * Entity pivot page (E3.5): everything we know about a host/IP — its
+ * investigations + hunt findings merged into one newest-first timeline. An
+ * unknown entity resolves with an empty timeline (200), not an error.
+ * ``value`` may contain dots (IPs) — encoded so the path param captures it whole.
+ */
+export function getEntity(value: string): Promise<EntityDetail> {
+  return request<EntityDetail>(`/entity/${encodeURIComponent(value)}`);
+}
+
+/**
  * Start a chat-driven Hunt Console hunt; resolves with the new hunt's id (poll
  * it live). Distinct from ``startHunt``, which starts a single-alert
  * INVESTIGATION — a Hunt Console hunt is broad (findings + narrative).
@@ -245,6 +257,52 @@ export function postHuntChat(id: string, message: string): Promise<HuntChatThrea
   return post<HuntChatThread>(`/hunts/${encodeURIComponent(id)}/chat`, { message });
 }
 
+// ── Scheduled hunts (E3.1) ──────────────────────────────────────────────────
+// A recurring hunt: an objective re-run every ``intervalMinutes`` by the backend
+// schedule loop (when the ``hunt_schedules_enabled`` master switch is on), landing
+// a normal hunt tagged ``scheduled``. Reads are analyst-readable; mutate is admin.
+
+/** A recurring hunt schedule (interval-minutes, not cron). */
+export interface HuntSchedule {
+  id: number;
+  objective: string;
+  intervalMinutes: number;
+  enabled: boolean;
+  lastRunAt: string | null;
+  createdBy: string;
+  createdAt: string;
+}
+
+/** Create/update payload for a schedule (only provided fields change on update). */
+export interface HuntScheduleInput {
+  objective: string;
+  interval_minutes: number;
+  enabled: boolean;
+}
+
+/** All recurring hunt schedules, most-recently-created first. */
+export function getHuntSchedules(): Promise<HuntSchedule[]> {
+  return request<HuntSchedule[]>('/hunt-schedules');
+}
+
+/** Create a recurring hunt schedule (admin). */
+export function createHuntSchedule(body: HuntScheduleInput): Promise<HuntSchedule> {
+  return post<HuntSchedule>('/hunt-schedules', body);
+}
+
+/** Update a schedule (admin; only the provided fields change). */
+export function updateHuntSchedule(
+  id: number,
+  body: Partial<HuntScheduleInput>,
+): Promise<HuntSchedule> {
+  return put<HuntSchedule>(`/hunt-schedules/${id}`, body);
+}
+
+/** Delete a schedule (admin). */
+export function deleteHuntSchedule(id: number): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/hunt-schedules/${id}`);
+}
+
 export function getConfig(): Promise<Config> {
   return request<Config>('/config');
 }
@@ -253,6 +311,54 @@ export function getConfig(): Promise<Config> {
  * ok=false (with a human `detail`) when the gateway can't be listed. */
 export function getGatewayModels(): Promise<{ ok: boolean; models: string[]; detail?: string | null }> {
   return request<{ ok: boolean; models: string[]; detail?: string | null }>('/config/models');
+}
+
+export interface ModelFitnessLeg {
+  name: string;
+  ok: boolean;
+  grade: 'pass' | 'degraded' | 'fail';
+  detail: string;
+}
+
+export interface ModelFitness {
+  grade: 'pass' | 'degraded' | 'fail';
+  model: string;
+  legs: ModelFitnessLeg[];
+  detail: string;
+}
+
+/** Grade whether the configured analyst_model can actually do the pipeline's job
+ * (structured output, a tool loop, a budgetable reasoning phase). A model that
+ * merely LISTS on the gateway (getGatewayModels) can still be unfit — this runs
+ * the real fitness probe and returns the grade for the "Check fitness" chip. */
+export function getModelFitness(): Promise<ModelFitness> {
+  return request<ModelFitness>('/config/model-fitness');
+}
+
+// ── Egress policy (E5.3) — one inspectable page of every egress destination ──
+
+/** One egress destination: its enable state, redaction posture, and a
+ * best-effort 7-day audit count (null when the count can't be obtained). */
+export interface EgressDestination {
+  id: string;
+  label: string;
+  enabled: boolean;
+  redaction: string;
+  detail: string;
+  count_7d: number | null;
+}
+
+export interface EgressPolicy {
+  destinations: EgressDestination[];
+  /** True iff EVERY destination is disabled — "zero egress" is inspectable. */
+  zero_egress: boolean;
+}
+
+/** Every possible egress destination, its enable state + redaction posture, and
+ * a best-effort 7-day audit counter — so "zero egress" is inspectable, not
+ * asserted. Read-only; the counters are best-effort (null when unavailable). */
+export function getEgressPolicy(): Promise<EgressPolicy> {
+  return request<EgressPolicy>('/config/egress-policy');
 }
 
 export interface DataSource {
@@ -285,6 +391,10 @@ export interface DetectionNomination {
   recommendation: 'mute' | 'monitor' | 'none';
   reason: string;
   already_muted: boolean;
+  /** Analyst-feedback signal (E4.3): how the analyst corrected this rule. */
+  override_fp: number;
+  chat_resolved: number;
+  manual_resolved: number;
 }
 
 /** An active operator override (a soft, reversible mute). */
@@ -374,6 +484,50 @@ export function deleteRunbook(id: number): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/runbooks/${id}`);
 }
 
+// ── Hunt templates (curated, telemetry-filtered hunt starters) ─────────────
+// A HuntTemplate is a reusable hunt objective the operator picks to seed a new
+// hunt — the evolution of the Hunt Console's static "canned pill" strings. The
+// list is ANNOTATED with availability against the live grid inventory: a template
+// needing telemetry the grid lacks renders FLAGGED (`available=false` +
+// `missingDatasets`), never hidden — honesty over hiding.
+
+/** A curated hunt template, annotated with grid availability. */
+export interface HuntTemplate {
+  id: number;
+  name: string;
+  objectiveTemplate: string;
+  requiredDatasets: string[]; // the event.dataset names this hunt correlates over
+  defaultWindowMinutes: number;
+  builtin: boolean; // shipped (code-owned) vs operator-saved custom
+  createdBy: string;
+  createdAt: string;
+  available: boolean; // false iff any requiredDataset is absent from the grid
+  missingDatasets: string[]; // exactly which telemetry the grid lacks (for the flag)
+}
+
+/** Create payload for a custom template (always saved builtin=false). */
+export interface HuntTemplateInput {
+  name: string;
+  objective_template: string;
+  required_datasets: string[];
+  default_window_minutes?: number;
+}
+
+/** All hunt templates, builtins first, annotated with grid availability. */
+export function getHuntTemplates(): Promise<HuntTemplate[]> {
+  return request<HuntTemplate[]>('/hunt-templates');
+}
+
+/** Save a custom hunt template (admin). */
+export function createHuntTemplate(body: HuntTemplateInput): Promise<HuntTemplate> {
+  return post<HuntTemplate>('/hunt-templates', body);
+}
+
+/** Delete a custom hunt template (admin; a builtin returns 409). */
+export function deleteHuntTemplate(id: number): Promise<{ deleted: boolean }> {
+  return del<{ deleted: boolean }>(`/hunt-templates/${id}`);
+}
+
 // ── API keys (write-only enrichment provider secrets) ──────────────────────
 export interface ApiKeyField {
   key: string;
@@ -393,6 +547,35 @@ export function saveApiKey(key: string, value: string): Promise<{ ok: boolean; i
 
 export function clearApiKey(key: string): Promise<{ ok: boolean; isSet: boolean }> {
   return del<{ ok: boolean; isSet: boolean }>(`/config/api-keys/${encodeURIComponent(key)}`);
+}
+
+// ── Notifications (E2.4): the webhook secret + a "Send test" validation ─────
+// The master toggle / per-trigger toggles / format / threshold are ordinary
+// settings in the "Notifications" config group. The webhook URL is a secret
+// (write-only, Fernet-encrypted) on its own endpoints so it renders in the
+// Notifications section, not the shared API-keys panel.
+export interface NotifyWebhookStatus {
+  isSet: boolean;
+  source: string; // "db" | "env" | "unset"
+}
+
+export function getNotifyWebhook(): Promise<NotifyWebhookStatus> {
+  return request<NotifyWebhookStatus>('/config/notify/webhook');
+}
+
+export function saveNotifyWebhook(value: string): Promise<{ ok: boolean; isSet: boolean }> {
+  return post<{ ok: boolean; isSet: boolean }>('/config/notify/webhook', { value });
+}
+
+export function clearNotifyWebhook(): Promise<{ ok: boolean; isSet: boolean }> {
+  return del<{ ok: boolean; isSet: boolean }>('/config/notify/webhook');
+}
+
+/** Send a canned, synthetic test notification. Requires a configured webhook URL
+ * but NOT the master toggle, so the operator can validate the destination before
+ * enabling routing. Returns {ok, detail} — detail is scrubbed (never the URL). */
+export function testNotifyWebhook(): Promise<ConnTestResult> {
+  return post<ConnTestResult>('/config/notify/test');
 }
 
 // ── Agent tools (capabilities + dependency availability) ───────────────────
@@ -596,6 +779,8 @@ export interface AutoTriageStatus {
   note: string | null;
   current: string | null;
   tool_calls: number;
+  // Per-reason breakdown of `skipped` (reason code → count); sums to `skipped`.
+  skipped_reasons?: Record<string, number>;
 }
 
 const _SEV_LADDER = ['critical', 'high', 'medium', 'low'] as const;
@@ -672,14 +857,30 @@ export interface EscalateGroupResult {
 export interface AssignResult {
   rule_name: string;
   owner: string | null;
+  state?: TriageState | null;
 }
 
 /**
- * Assign (or unassign) the logged-in caller as owner of a detection rule.
- * Returns the persisted owner (username / token name) or null after unassign.
+ * Assign (or unassign) the logged-in caller as owner of a detection rule, or
+ * move an already-owned rule through the triage flow (E2.3).
+ *
+ * - `assignAlert(rule)` → assign the caller (state resets to "owned").
+ * - `assignAlert(rule, true)` → unassign (owner + state cleared).
+ * - `assignAlert(rule, false, "in_review")` → set the triage state on an
+ *   already-owned rule (owner unchanged). 404s if the rule has no owner.
+ *
+ * Returns the persisted owner + state (both null after unassign).
  */
-export function assignAlert(ruleName: string, unassign = false): Promise<AssignResult> {
-  return post<AssignResult>('/alerts/assign', { rule_name: ruleName, unassign });
+export function assignAlert(
+  ruleName: string,
+  unassign = false,
+  state?: TriageState,
+): Promise<AssignResult> {
+  return post<AssignResult>('/alerts/assign', {
+    rule_name: ruleName,
+    unassign,
+    ...(state ? { state } : {}),
+  });
 }
 
 /** Acknowledge all events for a detection group via the SO ack_alert write tool. */

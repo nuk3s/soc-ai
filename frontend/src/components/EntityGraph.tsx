@@ -2,6 +2,8 @@
 // Hunt detail). Recreated as React SVG per the prototype's coordinate math:
 //   viewBox 0 0 600 H, margins 46×30; px = 46 + x/100*(600-92), py = 30 + y/100*(H-60)
 
+import { useNavigate } from 'react-router-dom';
+
 import type { EdgeKind, EntityKind, GraphEdge, GraphNode } from '../lib/types';
 
 interface EntityGraphProps {
@@ -51,6 +53,7 @@ const LEGEND: Record<EntityKind, { c: string; label: string; radius: string }> =
 const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + '…' : s);
 
 export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: EntityGraphProps) {
+  const navigate = useNavigate();
   const VW = 600;
   const VH = height;
   const mx = 46;
@@ -162,7 +165,13 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
               .filter(Boolean)
               .join('\n');
             return (
-              <g key={'n' + i}>
+              // Clicking a node pivots to its entity page (its investigations +
+              // hunt findings). SVG <g> takes an onClick; cursor signals it.
+              <g
+                key={'n' + i}
+                onClick={() => navigate(`/entity/${encodeURIComponent(n.label)}`)}
+                style={{ cursor: 'pointer' }}
+              >
                 <title>{tip}</title>
                 {ns.pulse && (
                   <circle

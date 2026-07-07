@@ -82,6 +82,13 @@ async def recorded_run(
                 },
             )
         await recorder.finish("complete")
+        # E2.4 notification trigger — a completed investigation with a
+        # high-confidence true-positive verdict pings on-call. THIN + fail-soft:
+        # build a NotifyEvent from the recorder's captured report and fire it
+        # (notify.fire is a hard no-op unless notifications are enabled + a webhook
+        # is configured, so this is zero-egress by default). Wrapped so a webhook
+        # can never break the finalized investigation.
+        await _maybe_notify_investigation(state, recorder)
     except asyncio.CancelledError:
         # Land a clean terminal state, then let the cancellation propagate so the
         # task actually stops. Only an EXPLICIT operator cancel is 'cancelled';
@@ -136,6 +143,33 @@ async def run_recorded(
         rule_name=rule_name,
     ):
         yield name, data
+
+
+async def _maybe_notify_investigation(state: Any, recorder: InvestigationRecorder) -> None:
+    """Fire the E2.4 TP notification for a finalized investigation (fail-soft).
+
+    Reads the recorder's captured triage report + investigation id, builds a
+    NotifyEvent iff it's a high-confidence true-positive (per settings), and fires
+    it. Every failure mode is swallowed — a notification must NEVER break the
+    just-finalized investigation. Zero egress unless notifications are enabled +
+    a webhook is configured (enforced inside ``notify.fire``).
+    """
+    try:
+        from soc_ai import notify  # noqa: PLC0415 - local, keeps import graph light
+
+        inv_id = recorder.investigation_id
+        report = recorder._report  # the captured triage_report payload (or None)
+        if inv_id is None or not report:
+            return
+        event = notify.event_for_investigation(
+            investigation_id=inv_id,
+            report=report,
+            settings=state.settings,
+        )
+        if event is not None:
+            await notify.fire_safe(event, state.settings, getattr(state, "audit", None))
+    except Exception:  # a notification trigger must never break the primary flow
+        _LOGGER.warning("investigation notify trigger failed (continuing)", exc_info=True)
 
 
 def sse_encode(name: str, data: dict[str, Any]) -> dict[str, Any]:

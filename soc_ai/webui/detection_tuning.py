@@ -36,6 +36,7 @@ from soc_ai.tools.tuning_heuristic import (
     MIN_FP,
     MIN_INVESTIGATIONS,
     MUTE_MIN_ALERTS,
+    OVERRIDE_FP_SIGNAL,
     assess,
 )
 from soc_ai.webui import alerts_query as aq
@@ -45,6 +46,7 @@ __all__ = [
     "MIN_FP",
     "MIN_INVESTIGATIONS",
     "MUTE_MIN_ALERTS",
+    "OVERRIDE_FP_SIGNAL",
     "assess",
     "nominate",
 ]
@@ -54,16 +56,19 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
     """Nominate noisy, FP-leaning rules from the live feed for tuning.
 
     Pulls the grouped-by-rule alert volume from the alerts feed, joins each rule's
-    completed-investigation verdict trend, runs :func:`assess`, and returns the
-    nominated rules (anything :func:`assess` flags noisy OR recommends to act on)
-    sorted by ``alert_count`` descending. Each entry::
+    completed-investigation verdict trend AND the analyst-override tally (the human
+    feedback signal — verdicts an analyst corrected via chat/manual override), runs
+    :func:`assess`, and returns the nominated rules (anything :func:`assess` flags
+    noisy OR recommends to act on OR that carries analyst overrides) sorted by
+    ``alert_count`` descending. Each entry::
 
         {rule_name, alert_count, investigations, fp, tp, nmi,
-         recommendation, reason, already_muted}
+         recommendation, reason, already_muted,
+         override_fp, chat_resolved, manual_resolved}
 
     Reads ``state.elastic`` / ``state.settings`` for volume and
-    ``state.db_sessionmaker`` for the verdict trend + the active mutes. Never
-    raises on empty data — it returns ``[]``.
+    ``state.db_sessionmaker`` for the verdict trend, the analyst-override tally,
+    and the active mutes. Never raises on empty data — it returns ``[]``.
     """
     settings = state.settings
     elastic = state.elastic
@@ -80,6 +85,7 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
     rule_names = [g.rule_name for g in groups if g.rule_name]
     async with state.db_sessionmaker() as db:
         counts = await inv_svc.verdict_counts_by_rule(db, rule_names)
+        overrides = await inv_svc.override_counts_by_rule(db, rule_names)
         muted = await override_svc.muted_rule_names(db)
 
     nominations: list[dict[str, Any]] = []
@@ -90,13 +96,25 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
         fp = c.get("false_positive", 0)
         tp = c.get("true_positive", 0)
         nmi = c.get("needs_more_info", 0)
-        is_noisy, recommendation, reason = assess(g.count, fp, tp, nmi)
+        oc = overrides.get(g.rule_name, {})
+        override_fp = oc.get("overridden_to_fp", 0)
+        chat_resolved = oc.get("chat_resolved", 0)
+        manual_resolved = oc.get("manual_resolved", 0)
+        is_noisy, recommendation, reason = assess(g.count, fp, tp, nmi, override_fp)
         # Surface a rule if the heuristic flags it noisy OR recommends acting on it
-        # (so a high-volume "monitor" with thin history still shows up), and always
-        # surface an already-muted rule so the operator can see/keep it.
+        # (so a high-volume "monitor" with thin history still shows up), OR the
+        # analyst has overridden it to FP at all (institutional memory — a rule the
+        # analyst keeps correcting shows up even if the AI verdict trend is thin),
+        # and always surface an already-muted rule so the operator can see/keep it.
         already_muted = g.rule_name in muted
-        if not (is_noisy or recommendation != "none" or already_muted):
+        has_override_signal = override_fp > 0
+        if not (is_noisy or recommendation != "none" or already_muted or has_override_signal):
             continue
+        # Enrich the reason when analyst feedback is present but assess() did not
+        # already fold it in (assess only names it once the override signal is
+        # STRONG; a single override still surfaces the rule and deserves a note).
+        if override_fp > 0 and override_fp < OVERRIDE_FP_SIGNAL and tp == 0:
+            reason = f"{reason} · {override_fp} analyst FP-override"
         nominations.append(
             {
                 "rule_name": g.rule_name,
@@ -108,6 +126,9 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
                 "recommendation": recommendation,
                 "reason": reason,
                 "already_muted": already_muted,
+                "override_fp": override_fp,
+                "chat_resolved": chat_resolved,
+                "manual_resolved": manual_resolved,
             }
         )
 

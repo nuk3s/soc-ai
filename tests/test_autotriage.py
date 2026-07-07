@@ -1711,3 +1711,90 @@ class TestResolveRuleNames:
         es = AsyncMock()
         assert asyncio.run(at._resolve_rule_names(self._state(es), [])) == {}
         es.search.assert_not_called()
+
+
+class TestAutoTriageSkippedReasons:
+    """E2.2: the planner stashes a per-reason skip breakdown on the run's status
+    so the completion note can explain WHY work was skipped (not just a count)."""
+
+    def test_plan_targets_reasons_sum_to_skipped(self, at_settings: Settings) -> None:
+        """A direct verdict on the only candidate skips it under 'already_triaged',
+        and the per-reason tally sums to the returned skipped count."""
+        from soc_ai.webui import autotriage as at
+
+        # ev1 (the sole clustered event) already carries a verdict → direct hit.
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="ev1",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        targets, skipped, _acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        reasons = at.get_status(state).skipped_reasons
+        assert targets == []
+        assert skipped == 1
+        assert reasons == {"already_triaged": 1}
+        assert sum(reasons.values()) == skipped
+
+    def test_plan_targets_inherited_reason(self, at_settings: Settings) -> None:
+        """A pair-inherited skip is tallied under 'inherited'."""
+        from soc_ai.webui import autotriage as at
+
+        # A FP on the SAME (rule, src, dst) pair under a different id → ev1's
+        # cluster is skipped by inheritance, not a direct hit.
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="other-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        _targets, skipped, _acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        reasons = at.get_status(state).skipped_reasons
+        assert reasons == {"inherited": 1}
+        assert sum(reasons.values()) == skipped
+
+    def test_plan_targets_clean_run_has_empty_reasons(self, at_settings: Settings) -> None:
+        """A run with nothing to skip lands an empty (not stale) breakdown."""
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        targets, skipped, _acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        assert len(targets) == 1  # ev1 is fresh → one target
+        assert skipped == 0
+        assert at.get_status(state).skipped_reasons == {}
+
+    def test_plan_targets_for_ids_reasons_sum(self, at_settings: Settings) -> None:
+        """plan_targets_for_ids tallies already-verdicted skips under
+        'already_triaged', summing to the skipped count."""
+        from soc_ai.webui import autotriage as at
+
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="ev1",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        targets, skipped = asyncio.run(at.plan_targets_for_ids(state, alert_ids=["ev1", "ev2"]))
+        reasons = at.get_status(state).skipped_reasons
+        assert [t.alert_es_id for t in targets] == ["ev2"]
+        assert skipped == 1
+        assert reasons == {"already_triaged": 1}
+        assert sum(reasons.values()) == skipped

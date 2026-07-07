@@ -31,7 +31,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from soc_ai.oracle.identifiers import effective_internal_identifiers
-from soc_ai.oracle.sanitize import Mapping, desanitize, sanitize
+from soc_ai.oracle.sanitize import Mapping, desanitize, sanitize, unsafe_residue
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -39,6 +39,33 @@ if TYPE_CHECKING:
     from soc_ai.config import Settings
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class EgressResidueError(Exception):
+    """A composed outbound payload still carried internal identifiers.
+
+    Raised by :meth:`EgressGuard.check_or_raise` when fail-closed mode is on and
+    the INDEPENDENT :func:`~soc_ai.oracle.sanitize.unsafe_residue` sweep found
+    identifiers that survived sanitization on the final outbound string.  The
+    orchestrator catches it, refuses to call the analyst model, and lands a
+    pipeline-error verdict.
+
+    ``leaked`` holds the human-readable leak descriptions from
+    :func:`~soc_ai.oracle.sanitize.unsafe_residue` — used ONLY for the count and
+    for local diagnostics.  It MUST NOT be echoed into the persisted report or
+    the audit payload (that would leak the very values the block exists to
+    protect); callers surface ``len(leaked)`` and the leaked CLASS, never the
+    values.
+    """
+
+    def __init__(self, leaked: list[str]) -> None:
+        self.leaked = leaked
+        # The message names only the COUNT — never the values — so an exception
+        # string that lands in a log/summary cannot itself become the leak.
+        super().__init__(
+            f"{len(leaked)} internal identifier(s) survived sanitization on an "
+            "analyst-egress payload"
+        )
 
 
 class EgressGuard:
@@ -90,6 +117,46 @@ class EgressGuard:
         # str() is a type-narrowing no-op that keeps the signature honest.
         return str(self.sanitize_obj(text))
 
+    def residue(self, text: str) -> list[str]:
+        """Independent leak sweep over a FINAL composed outbound string.
+
+        Delegates to :func:`~soc_ai.oracle.sanitize.unsafe_residue`, which
+        re-implements identifier detection from scratch (it does NOT share code
+        with :meth:`sanitize_text`) so a bug in the sanitize path cannot blind
+        this safety net.  Threads the guard's own host/suffix/allowlist config
+        plus the real values learned so far this run.
+
+        Returns the human-readable leak descriptions from ``unsafe_residue`` —
+        an EMPTY list means the string is clean.  Callers MUST refuse to
+        transmit *text* when the result is non-empty (see
+        :meth:`check_or_raise`).
+        """
+        # ``mapping.reverse`` maps opaque label -> real value, so its VALUES are
+        # the real identifiers learned this run; any that still appear verbatim
+        # in the composed string are residue (a sanitize miss).
+        return unsafe_residue(
+            text,
+            allowlist=self._allowlist,
+            extra_hosts=self._extra_hosts,
+            extra_suffixes=self._extra_suffixes,
+            known_values=tuple(self._mapping.reverse.values()),
+        )
+
+    def check_or_raise(self, text: str, *, fail_closed: bool) -> None:
+        """Fail closed on residual identifiers in a composed outbound string.
+
+        When *fail_closed* is False this is a no-op (the current best-effort
+        behavior — a sanitize miss still egresses).  When True, run
+        :meth:`residue` and raise :class:`EgressResidueError` if it is
+        non-empty, carrying the leak list so the caller can block the model call
+        and land a pipeline error citing the COUNT (never the values).
+        """
+        if not fail_closed:
+            return
+        leaked = self.residue(text)
+        if leaked:
+            raise EgressResidueError(leaked)
+
     def desanitize_obj(self, obj: Any) -> Any:
         """Recursively restore opaque labels in *obj* to their real values."""
         return desanitize(obj, self._mapping)
@@ -131,4 +198,4 @@ class EgressGuard:
         return cls(extra_hosts=hosts, extra_suffixes=suffixes)
 
 
-__all__ = ["EgressGuard"]
+__all__ = ["EgressGuard", "EgressResidueError"]

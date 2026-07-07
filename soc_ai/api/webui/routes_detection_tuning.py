@@ -32,6 +32,11 @@ class DetectionNominationOut(BaseModel):
     recommendation: str  # 'mute' | 'monitor' | 'none'
     reason: str
     already_muted: bool
+    # Analyst-feedback signal (E4.3): how the analyst has corrected this rule —
+    # verdict overrides TO false-positive + the chat/manual resolution split.
+    override_fp: int = 0
+    chat_resolved: int = 0
+    manual_resolved: int = 0
 
 
 class DetectionOverrideOut(BaseModel):

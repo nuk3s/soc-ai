@@ -1,12 +1,41 @@
-import { Check, Crosshair, Loader2, MessageSquare, Plus, Sparkles, Trash2, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  CalendarClock,
+  Check,
+  Crosshair,
+  Loader2,
+  MessageSquare,
+  Pencil,
+  Plus,
+  Sparkles,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
-import { deleteHunt, getHunts, getHuntStats, startHuntConsole } from '../lib/api';
+import {
+  createHuntSchedule,
+  createHuntTemplate,
+  deleteHunt,
+  deleteHuntSchedule,
+  deleteHuntTemplate,
+  getHunts,
+  getHuntSchedules,
+  getHuntStats,
+  getHuntTemplates,
+  startHuntConsole,
+  updateHuntSchedule,
+} from '../lib/api';
+import type { HuntSchedule, HuntTemplate } from '../lib/api';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { useAsync } from '../lib/useAsync';
 import type { HuntRow, HuntStatus } from '../lib/types';
+
+// The backend floors a schedule's interval at 60 minutes (MIN_INTERVAL_MINUTES);
+// mirror that here so the picker can't offer an interval the API would clamp.
+const MIN_INTERVAL_MINUTES = 60;
 
 // ---------------------------------------------------------------------------
 // Hunt Console — describe a hunt in plain language; the agent correlates across
@@ -24,10 +53,11 @@ const TONE: Record<string, string> = {
   danger: '#f85149',
 };
 
-// Canned hunts — high-payoff, routine SOC hunts one click away. A chip fills the
-// objective box (so the analyst can tweak the scope, then launch) rather than
-// firing blind; label is the short name, `objective` is the full prompt.
-const PRESETS: { label: string; objective: string }[] = [
+// Fallback pills — the six canned hunts, used ONLY when the template API is
+// unreachable or empty (a fresh store before the builtin seed). Normally the
+// picker is fed by GET /hunt-templates (curated + availability-annotated). Kept
+// in sync with the backend builtins (soc_ai/store/hunt_templates.py::_BUILTINS).
+const FALLBACK_PRESETS: { label: string; objective: string }[] = [
   {
     label: 'Beaconing to rare IPs',
     objective:
@@ -70,6 +100,398 @@ function StatusDot({ status }: { status: HuntStatus }) {
       />
       {m.label}
     </span>
+  );
+}
+
+// Human-friendly interval label: 60 → "1h", 90 → "1h 30m", 1440 → "24h".
+function intervalLabel(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m}m`;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
+
+// ---------------------------------------------------------------------------
+// Template picker — curated, availability-annotated hunt starters (E3.2).
+// Fed by GET /hunt-templates: each chip fills the objective box (like the old
+// static pills), but a template needing telemetry this grid LACKS renders FLAGGED
+// (dimmed + a warning icon + "missing telemetry: zeek.rdp") rather than hidden —
+// honesty over hiding. Clicking it still fills the box (the operator may want to
+// see the objective, or knows the data is coming). Falls back to the six static
+// pills when the template API is unreachable/empty so the picker never disappears.
+// An admin can save a modest custom template inline.
+// ---------------------------------------------------------------------------
+function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
+  const [reloadKey, setReloadKey] = useState(0);
+  const { data, error } = useAsync<HuntTemplate[]>(getHuntTemplates, [reloadKey]);
+
+  // Inline "add custom template" form (collapsed by default — modest, like the
+  // schedule editor). builtin templates are code-owned; customs are operator-saved.
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState('');
+  const [objective, setObjective] = useState('');
+  const [datasets, setDatasets] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState<string | null>(null);
+
+  const resetForm = () => {
+    setName('');
+    setObjective('');
+    setDatasets('');
+    setFormErr(null);
+    setAdding(false);
+  };
+
+  const saveCustom = async () => {
+    const nm = name.trim();
+    const obj = objective.trim();
+    if (!nm || !obj || busy) return;
+    const required = datasets
+      .split(',')
+      .map((d) => d.trim())
+      .filter(Boolean);
+    setBusy(true);
+    setFormErr(null);
+    try {
+      await createHuntTemplate({ name: nm, objective_template: obj, required_datasets: required });
+      resetForm();
+      setReloadKey((k) => k + 1);
+    } catch (e: unknown) {
+      setFormErr(e instanceof Error ? e.message : 'Could not save the template.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeCustom = async (id: number) => {
+    try {
+      await deleteHuntTemplate(id);
+    } catch {
+      /* 409 on a builtin / admin-gated / transient — the next load reflects reality */
+    }
+    setReloadKey((k) => k + 1);
+  };
+
+  // Fallback to the static pills when the template API is unreachable or the
+  // store is empty (fresh install, pre-seed) — the picker must never vanish.
+  const templates = data ?? [];
+  const useFallback = !!error || templates.length === 0;
+
+  return (
+    <div className="mb-2.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {useFallback
+          ? FALLBACK_PRESETS.map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                onClick={() => onPick(p.objective)}
+                title={p.objective}
+                className="rounded-badge border border-border-strong bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-dim transition-colors hover:border-accent hover:text-accent"
+              >
+                {p.label}
+              </button>
+            ))
+          : templates.map((t) => {
+              const flagged = !t.available;
+              const missing = t.missingDatasets.join(', ');
+              const title = flagged
+                ? `${t.objectiveTemplate}\n\n⚠ missing telemetry: ${missing}`
+                : t.objectiveTemplate;
+              return (
+                <span key={t.id} className="inline-flex items-center">
+                  <button
+                    type="button"
+                    onClick={() => onPick(t.objectiveTemplate)}
+                    title={title}
+                    className={
+                      flagged
+                        ? 'flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/5 px-[9px] py-[3px] text-[11.5px] font-medium text-warn/80 opacity-70 transition-opacity hover:opacity-100'
+                        : 'flex items-center gap-1 rounded-badge border border-border-strong bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-dim transition-colors hover:border-accent hover:text-accent'
+                    }
+                  >
+                    {flagged && <AlertTriangle size={11} className="flex-none" />}
+                    {t.name}
+                  </button>
+                  {!t.builtin && (
+                    <button
+                      type="button"
+                      onClick={() => { void removeCustom(t.id); }}
+                      title="Delete custom template"
+                      className="ml-0.5 flex text-faint hover:text-danger"
+                    >
+                      <X size={11} />
+                    </button>
+                  )}
+                </span>
+              );
+            })}
+        {/* add-custom toggle */}
+        <button
+          type="button"
+          onClick={() => setAdding((v) => !v)}
+          title="Save a custom hunt template"
+          className="flex items-center gap-1 rounded-badge border border-dashed border-border-strong bg-transparent px-[9px] py-[3px] text-[11.5px] font-medium text-faint transition-colors hover:border-accent hover:text-accent"
+        >
+          <Plus size={11} /> Template
+        </button>
+      </div>
+
+      {/* flag legend — only when at least one template is unavailable */}
+      {!useFallback && templates.some((t) => !t.available) && (
+        <div className="mt-1.5 flex items-center gap-1 text-[10.5px] text-warn/80">
+          <AlertTriangle size={10} /> dimmed templates need telemetry this grid isn&apos;t seeing.
+        </div>
+      )}
+
+      {/* inline custom-template form */}
+      {adding && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 rounded-control border border-border bg-surface-2 px-3 py-2">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Template name"
+            className="min-w-[140px] flex-none rounded-control border border-border-input bg-bg px-2.5 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+          />
+          <input
+            value={objective}
+            onChange={(e) => setObjective(e.target.value)}
+            placeholder="Objective the chip loads…"
+            className="min-w-[220px] flex-1 rounded-control border border-border-input bg-bg px-2.5 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+          />
+          <input
+            value={datasets}
+            onChange={(e) => setDatasets(e.target.value)}
+            placeholder="required datasets (comma-sep, e.g. zeek.dns)"
+            className="min-w-[180px] flex-none rounded-control border border-border-input bg-bg px-2.5 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+          />
+          <button
+            type="button"
+            onClick={() => { void saveCustom(); }}
+            disabled={!name.trim() || !objective.trim() || busy}
+            className="flex items-center gap-1 rounded-control bg-accent px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />} Save
+          </button>
+          <button
+            type="button"
+            onClick={resetForm}
+            className="rounded-control border border-border-strong bg-bg px-3 py-1.5 text-[12px] font-semibold text-dim hover:text-text"
+          >
+            Cancel
+          </button>
+          {formErr && <div className="w-full text-[11.5px] text-danger">{formErr}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled hunts — recurring hunts fired on an interval by the backend loop
+// (gated behind the ``hunt_schedules_enabled`` master switch in Config). Each
+// schedule is an objective + interval-minutes + enable toggle; add / edit /
+// delete inline. Landing hunts are tagged ``scheduled`` and appear in the list
+// above like any other hunt.
+// ---------------------------------------------------------------------------
+function ScheduledHunts() {
+  const [reloadKey, setReloadKey] = useState(0);
+  const { data, loading, error } = useAsync<HuntSchedule[]>(getHuntSchedules, [reloadKey]);
+
+  // The add/edit form state. ``editing`` holds the id being edited (null = the
+  // add form). Kept flat (not a modal) — modest inline editor, like ManagedList.
+  const [editing, setEditing] = useState<number | null>(null);
+  const [objective, setObjective] = useState('');
+  const [interval, setIntervalMin] = useState(MIN_INTERVAL_MINUTES);
+  const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<number | null>(null);
+
+  const reload = () => setReloadKey((k) => k + 1);
+  const resetForm = () => {
+    setEditing(null);
+    setObjective('');
+    setIntervalMin(MIN_INTERVAL_MINUTES);
+    setFormErr(null);
+  };
+
+  const startEdit = (s: HuntSchedule) => {
+    setEditing(s.id);
+    setObjective(s.objective);
+    setIntervalMin(s.intervalMinutes);
+    setFormErr(null);
+  };
+
+  const save = async () => {
+    const obj = objective.trim();
+    if (!obj || busy) return;
+    const mins = Math.max(MIN_INTERVAL_MINUTES, Math.round(interval) || MIN_INTERVAL_MINUTES);
+    setBusy(true);
+    setFormErr(null);
+    try {
+      if (editing !== null) {
+        await updateHuntSchedule(editing, { objective: obj, interval_minutes: mins });
+      } else {
+        await createHuntSchedule({ objective: obj, interval_minutes: mins, enabled: true });
+      }
+      resetForm();
+      reload();
+    } catch (e: unknown) {
+      setFormErr(e instanceof Error ? e.message : 'Could not save the schedule.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleEnabled = async (s: HuntSchedule) => {
+    try {
+      await updateHuntSchedule(s.id, { enabled: !s.enabled });
+      reload();
+    } catch {
+      /* transient — the next poll reflects reality */
+    }
+  };
+
+  const removeOne = async (id: number) => {
+    try {
+      await deleteHuntSchedule(id);
+    } catch {
+      /* admin-gated / transient */
+    }
+    setPendingDelete(null);
+    if (editing === id) resetForm();
+    reload();
+  };
+
+  return (
+    <Panel className="mt-5">
+      <div className="flex items-center gap-1.5 border-b border-border px-4 py-3 text-[13px] font-semibold">
+        <CalendarClock size={15} className="text-accent" /> Scheduled hunts
+        <span className="ml-2 text-[11.5px] font-normal text-dim">
+          Recurring hunts on an interval — enable the master switch in Config to run them.
+        </span>
+      </div>
+
+      {loading && !data ? (
+        <LoadingState label="Loading schedules…" />
+      ) : error ? (
+        <ErrorState error={error} onRetry={reload} />
+      ) : (
+        <>
+          {!data || data.length === 0 ? (
+            <EmptyState>No scheduled hunts yet — add one below.</EmptyState>
+          ) : (
+            data.map((s) => (
+              <div
+                key={s.id}
+                className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-0"
+              >
+                <button
+                  type="button"
+                  onClick={() => { void toggleEnabled(s); }}
+                  title={s.enabled ? 'Enabled — click to pause' : 'Paused — click to enable'}
+                  className={`flex-none rounded-badge border px-[8px] py-[2px] text-[10.5px] font-semibold uppercase tracking-[.04em] ${
+                    s.enabled
+                      ? 'border-accent/40 bg-accent/10 text-accent'
+                      : 'border-border-strong bg-surface-2 text-faint'
+                  }`}
+                >
+                  {s.enabled ? 'on' : 'paused'}
+                </button>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] text-text">{s.objective}</div>
+                  <div className="mt-0.5 text-[11.5px] text-faint">
+                    every {intervalLabel(s.intervalMinutes)}
+                    {s.lastRunAt
+                      ? ` · last ran ${new Date(s.lastRunAt).toLocaleString()}`
+                      : ' · never run'}
+                  </div>
+                </div>
+                <div className="flex flex-none items-center gap-2">
+                  <button
+                    onClick={() => startEdit(s)}
+                    title="Edit schedule"
+                    className="flex text-faint hover:text-accent"
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  {pendingDelete === s.id ? (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => { void removeOne(s.id); }}
+                        title="Confirm delete"
+                        className="flex text-danger hover:opacity-80"
+                      >
+                        <Check size={14} />
+                      </button>
+                      <button
+                        onClick={() => setPendingDelete(null)}
+                        title="Cancel"
+                        className="flex text-faint hover:text-text"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setPendingDelete(s.id)}
+                      title="Delete schedule"
+                      className="flex text-faint hover:text-danger"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+
+          {/* add / edit form */}
+          <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+            <input
+              value={objective}
+              onChange={(e) => setObjective(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void save();
+              }}
+              placeholder={
+                editing !== null ? 'Edit the hunt objective…' : 'New recurring hunt objective…'
+              }
+              className="min-w-[240px] flex-1 rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
+            />
+            <label className="flex items-center gap-1.5 text-[12px] text-dim">
+              every
+              <input
+                type="number"
+                min={MIN_INTERVAL_MINUTES}
+                step={30}
+                value={interval}
+                onChange={(e) => setIntervalMin(Number(e.target.value))}
+                className="w-[80px] rounded-control border border-border-input bg-bg px-2 py-2 text-[13px] tabular-nums text-text outline-none focus:border-accent"
+              />
+              min
+            </label>
+            <button
+              onClick={() => { void save(); }}
+              disabled={!objective.trim() || busy}
+              className="flex items-center gap-1.5 rounded-control bg-accent px-[13px] py-2 text-[13px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+              {editing !== null ? 'Save' : 'Add'}
+            </button>
+            {editing !== null && (
+              <button
+                onClick={resetForm}
+                className="rounded-control border border-border-strong bg-surface-2 px-[13px] py-2 text-[13px] font-semibold text-dim hover:text-text"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+          {formErr && <div className="px-4 pb-3 text-[12px] text-danger">{formErr}</div>}
+        </>
+      )}
+    </Panel>
   );
 }
 
@@ -181,24 +603,15 @@ export function Hunts() {
         <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold">
           <Sparkles size={15} className="text-accent" /> New hunt
         </div>
-        {/* Canned hunts — click a chip to load a high-payoff objective, then
-            tweak the scope and launch. */}
-        <div className="mb-2.5 flex flex-wrap gap-1.5">
-          {PRESETS.map((p) => (
-            <button
-              key={p.label}
-              type="button"
-              onClick={() => {
-                setObjective(p.objective);
-                setStartError(null);
-              }}
-              title={p.objective}
-              className="rounded-badge border border-border-strong bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-dim transition-colors hover:border-accent hover:text-accent"
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
+        {/* Curated hunt templates — click a chip to load a high-payoff objective,
+            then tweak the scope and launch. A template needing telemetry this grid
+            lacks renders dimmed + flagged (not hidden). */}
+        <TemplatePicker
+          onPick={(obj) => {
+            setObjective(obj);
+            setStartError(null);
+          }}
+        />
         <div className="flex items-center gap-2">
           <input
             value={objective}
@@ -304,6 +717,9 @@ export function Hunts() {
           ))
         )}
       </Panel>
+
+      {/* recurring/scheduled hunts */}
+      <ScheduledHunts />
     </div>
   );
 }

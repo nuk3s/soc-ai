@@ -75,6 +75,12 @@ class AutoTriageStatus:
     tool_calls: int = 0
     # inherited-verdict FP alerts this run acknowledged in SO (auto_ack_fp_enabled)
     inherited_acked: int = 0
+    # per-reason breakdown of ``skipped`` for this run (reason code -> count).
+    # Written by the planner (plan_targets / plan_targets_for_ids) so the polling
+    # status can explain WHICH class of skip happened, not just a bare count.
+    # The values always sum to ``skipped``. reset() leaves this alone — the
+    # planner is its sole writer and runs before every reset in production.
+    skipped_reasons: dict[str, int] = field(default_factory=dict)
     # set by the stop endpoint; the worker checks it between targets and aborts.
     cancelled: bool = False
     # internal: keep a reference to the running task to prevent GC
@@ -122,6 +128,45 @@ def get_status(state: Any) -> AutoTriageStatus:
     return getattr(state, _STATE_ATTR)  # type: ignore[no-any-return]
 
 
+def _stash_skipped_reasons(state: Any, reasons: dict[str, int]) -> None:
+    """Record the planner's per-reason skip breakdown on the run's status.
+
+    Written by the planner before it returns (and before the caller's
+    ``status.reset(...)``, which deliberately leaves this field alone). The
+    planner is the sole writer, so it always overwrites any prior run's tally —
+    a fresh run with no skips lands an empty dict, never stale reasons.
+    """
+    get_status(state).skipped_reasons = dict(reasons)
+
+
+def _bump(counts: dict[str, int], reason: str) -> None:
+    """Increment a per-reason skip tally in place."""
+    counts[reason] = counts.get(reason, 0) + 1
+
+
+def _cluster_events(
+    rule_events: dict[str, list[aq.AlertEvent]],
+) -> tuple[dict[tuple[str, str, str], aq.AlertEvent], dict[str, int]]:
+    """Cluster events by (rule, src_ip, dst_ip), keeping the newest per cluster.
+
+    Events missing either IP can't be keyed/deduped, so they are dropped and
+    tallied under ``"no_ip"``. Returns ``(clusters, skipped_reasons)`` where
+    ``skipped_reasons`` seeds the run's per-reason skip breakdown.
+    """
+    clusters: dict[tuple[str, str, str], aq.AlertEvent] = {}
+    skipped_reasons: dict[str, int] = {}
+    for rule_name, events in rule_events.items():
+        for ev in events:
+            if ev.src_ip is None or ev.dst_ip is None:
+                _bump(skipped_reasons, "no_ip")
+                continue
+            key = (rule_name, ev.src_ip, ev.dst_ip)
+            if key not in clusters:
+                # events are newest-first from fetch_group_events
+                clusters[key] = ev
+    return clusters, skipped_reasons
+
+
 async def plan_targets(
     state: Any,
     *,
@@ -149,7 +194,10 @@ async def plan_targets(
       :class:`InheritedAck` candidates for the worker to acknowledge in SO
       (inheritance used to leave them unacked forever).
 
-    Returns (targets, skipped_count, inherited_acks).
+    Returns (targets, skipped_count, inherited_acks). A per-reason breakdown of
+    the skip count (``{"no_ip"|"already_triaged"|"running"|"inherited": n}``) is
+    additionally stashed on the run's :class:`AutoTriageStatus` so the polling
+    status can explain the skips without widening this tuple's signature.
     """
     settings = state.settings
     elastic = state.elastic
@@ -170,6 +218,7 @@ async def plan_targets(
             _LOGGER.exception("auto-triage: fetch_groups failed for severity=%s", severity)
 
     if not all_groups:
+        _stash_skipped_reasons(state, {})
         return [], 0, []
 
     # For each group, fetch up to 20 recent events
@@ -189,24 +238,14 @@ async def plan_targets(
         except Exception:
             _LOGGER.exception("auto-triage: fetch_group_events failed for rule=%s", group.rule_name)
 
-    skipped = 0
-    # Cluster events by (rule_name, src_ip, dst_ip)
-    # Key: (rule_name, src_ip, dst_ip) -> newest AlertEvent in that cluster
-    clusters: dict[tuple[str, str, str], aq.AlertEvent] = {}
-
-    for rule_name, events in rule_events.items():
-        for ev in events:
-            if ev.src_ip is None or ev.dst_ip is None:
-                # Can't dedupe: count as skipped (no target produced)
-                skipped += 1
-                continue
-            key = (rule_name, ev.src_ip, ev.dst_ip)
-            if key not in clusters:
-                # events are newest-first from fetch_group_events
-                clusters[key] = ev
+    # Per-reason tally of ``skipped`` — surfaced on the status so the completion
+    # note can say WHICH class of skip happened, not just a bare count. Events
+    # missing an IP can't be clustered/deduped, so they are skipped up front.
+    clusters, skipped_reasons = _cluster_events(rule_events)
 
     if not clusters:
-        return [], skipped, []
+        _stash_skipped_reasons(state, skipped_reasons)
+        return [], sum(skipped_reasons.values()), []
 
     direct_hits, running_pairs, pair_hits = await _coverage_maps(state, clusters)
 
@@ -217,19 +256,19 @@ async def plan_targets(
         # errored/cancelled run stays re-huntable (see blocks_rehunt).
         direct = direct_hits.get(ev.es_id)
         if direct is not None and inv_svc.blocks_rehunt(direct):
-            skipped += 1
+            _bump(skipped_reasons, "already_triaged")
             continue
         # Skip if the pair is being investigated RIGHT NOW — the running run's
         # verdict will cover this cluster via inheritance when it completes.
         if (rule_name, src_ip, dst_ip) in running_pairs:
-            skipped += 1
+            _bump(skipped_reasons, "running")
             continue
         # Skip if (rule, src, dst) pair has a verdict in the window. A
         # qualifying inherited FP additionally queues the cluster's events for
         # acknowledgement — the verdict alone never reached SO.
         inherited = pair_hits.get((rule_name, src_ip, dst_ip))
         if inherited is not None:
-            skipped += 1
+            _bump(skipped_reasons, "inherited")
             inherited_acks.extend(
                 _inherited_ack_candidates(
                     settings, inherited, rule_events.get(rule_name, []), src_ip, dst_ip
@@ -256,7 +295,8 @@ async def plan_targets(
         )
         targets = targets[:max_targets]
 
-    return targets, skipped, inherited_acks
+    _stash_skipped_reasons(state, skipped_reasons)
+    return targets, sum(skipped_reasons.values()), inherited_acks
 
 
 async def _coverage_maps(
@@ -334,7 +374,9 @@ async def plan_targets_for_ids(
     applies no max-targets cap — the operator picked these alerts on purpose.
     Ids that already carry a verdict (complete *or* running) are skipped so a
     click never re-runs work that is already done or in-flight.  Order is
-    preserved and duplicates collapse.  Returns ``(targets, skipped_count)``.
+    preserved and duplicates collapse.  Returns ``(targets, skipped_count)``; a
+    per-reason breakdown (``{"already_triaged": n}``) is stashed on the run's
+    :class:`AutoTriageStatus` (see :func:`plan_targets`).
     """
     # De-dupe while preserving the operator's order; drop blanks.
     seen: set[str] = set()
@@ -344,6 +386,7 @@ async def plan_targets_for_ids(
             seen.add(aid)
             ids.append(aid)
     if not ids:
+        _stash_skipped_reasons(state, {})
         return [], 0
 
     async with state.db_sessionmaker() as db:
@@ -358,17 +401,20 @@ async def plan_targets_for_ids(
 
     targets: list[Target] = []
     skipped = 0
+    skipped_reasons: dict[str, int] = {}
     for aid in ids:
         # Skip only settled/in-flight runs; errored/cancelled stay re-huntable.
         direct = direct_hits.get(aid)
         if direct is not None and inv_svc.blocks_rehunt(direct):
             skipped += 1
+            _bump(skipped_reasons, "already_triaged")
             continue
         # src/dst are only used by plan_targets() clustering; the worker resolves
         # those from alert_es_id. rule_name is seeded so the row is named at birth.
         targets.append(
             Target(alert_es_id=aid, rule_name=id_to_rule.get(aid, ""), src_ip="", dst_ip="")
         )
+    _stash_skipped_reasons(state, skipped_reasons)
     return targets, skipped
 
 

@@ -45,6 +45,7 @@ class HuntConsoleManager:
         objective: str,
         started_by: str,
         prior: str | None = None,
+        kind: str = "chat",
     ) -> str | None:
         """Create the hunt row and spawn a background drainer task.
 
@@ -52,6 +53,10 @@ class HuntConsoleManager:
         capture the hunt id, then hands the remaining generator to a background
         task that runs it to completion. Returns the hunt id, or None if the
         generator ended/errored before emitting ``hunt_created``.
+
+        ``kind`` tags the hunt row (``"chat"`` for an operator-typed hunt,
+        ``"scheduled"`` for a recurring hunt fired by the schedule loop) — it is
+        threaded straight into ``hunt_recorded_run`` → ``hunt_svc.create``.
         """
         ctx = ctx_from_state(state)
         token = CancelToken()
@@ -61,6 +66,7 @@ class HuntConsoleManager:
             objective=objective,
             started_by=started_by,
             prior=prior,
+            kind=kind,
             cancel_token=token,
         )
 

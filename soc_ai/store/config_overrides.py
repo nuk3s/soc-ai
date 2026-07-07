@@ -175,6 +175,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key="analyst_redaction_fail_closed",
+        attr="analyst_redaction_fail_closed",
+        type="bool",
+        label="Fail closed on residual identifiers (analyst egress)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Only meaningful when the redaction above is ON. When on, an outbound "
+            "payload with residual internal identifiers is BLOCKED (the model is "
+            "NOT called) and the run lands a pipeline error naming the leaked "
+            "count. Off = best-effort (a sanitize miss still egresses)."
+        ),
+    ),
+    SettingSpec(
         key="host_risk_window_hours",
         attr="host_risk_window_hours",
         type="int",
@@ -405,6 +419,19 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help="Minimum minutes between scheduled sweeps. Lower drains faster but costs more LLM.",
         min_value=1,
         max_value=1440,
+    ),
+    SettingSpec(
+        key="hunt_schedules_enabled",
+        attr="hunt_schedules_enabled",
+        type="bool",
+        label="Scheduled hunts (recurring hunts on an interval)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Run saved hunts automatically on their per-hunt interval (managed in the "
+            "Hunt Console). Master switch — off means no scheduled hunt fires. Off by "
+            "default (recurring LLM calls); applies live."
+        ),
     ),
     SettingSpec(
         key="synthesis_confidence_floor",
@@ -693,6 +720,98 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="abuse.ch auth key",
         help="Refreshes the URLhaus / Feodo blocklists (used by the next `blocklists refresh`).",
     ),
+    # ---- NOTIFICATIONS: opt-in outbound webhook (the only new egress path) ----
+    # All hot=True (read fresh per send by soc_ai.notify.fire, so a save applies
+    # live). The webhook URL is a secret (Fernet-encrypted, write-only) — but it
+    # lives in its OWN "Notifications" section + endpoints, NOT the shared API-keys
+    # panel (api_key_specs excludes this section). The master toggle + per-trigger
+    # toggles + format + threshold are ordinary non-secret settings that render in
+    # the Notifications settings group.
+    SettingSpec(
+        key="notify_enabled",
+        attr="notify_enabled",
+        type="bool",
+        label="Notifications enabled (outbound webhook)",
+        section="Notifications",
+        hot=True,
+        help=(
+            "Master switch. Off (default) = zero egress: no webhook is ever called. "
+            "On lets soc-ai POST a notification to your configured webhook on the "
+            "triggers below. The webhook URL is a secret set separately."
+        ),
+    ),
+    SettingSpec(
+        key="notify_format",
+        attr="notify_format",
+        type="str",
+        label="Webhook body format (json | slack | matrix)",
+        section="Notifications",
+        hot=True,
+        help=(
+            'json = a compact generic dict; slack = {"text": …}; matrix = '
+            '{"msgtype":"m.text","body":…}. Match your receiver.'
+        ),
+    ),
+    SettingSpec(
+        key="notify_verify_ssl",
+        attr="notify_verify_ssl",
+        type="bool",
+        label="Verify the webhook TLS certificate",
+        section="Notifications",
+        hot=True,
+        help="Off only for a self-signed internal receiver.",
+    ),
+    SettingSpec(
+        key="notify_tp_confidence_threshold",
+        attr="notify_tp_confidence_threshold",
+        type="float",
+        label="True-positive notify confidence threshold",
+        section="Notifications",
+        hot=True,
+        help="Only notify on a true-positive at/above this confidence (0-1). 0.9 default.",
+        min_value=0.0,
+        max_value=1.0,
+    ),
+    SettingSpec(
+        key="notify_on_tp",
+        attr="notify_on_tp",
+        type="bool",
+        label="Notify on high-confidence true-positive",
+        section="Notifications",
+        hot=True,
+        help="Ping on a true-positive verdict at/above the confidence threshold above.",
+    ),
+    SettingSpec(
+        key="notify_on_hunt_threat",
+        attr="notify_on_hunt_threat",
+        type="bool",
+        label="Notify on hunt threat finding",
+        section="Notifications",
+        hot=True,
+        help="Ping when a hunt report contains a finding categorized as a threat.",
+    ),
+    SettingSpec(
+        key="notify_on_model_fitness_fail",
+        attr="notify_on_model_fitness_fail",
+        type="bool",
+        label="Notify on model-fitness FAIL",
+        section="Notifications",
+        hot=True,
+        help="Ping when the analyst-model fitness probe grades the model unfit.",
+    ),
+    SettingSpec(
+        key="notify_webhook_url",
+        attr="notify_webhook_url",
+        type="str",
+        section="Notifications",
+        hot=True,
+        secret=True,
+        label="Webhook URL",
+        help=(
+            "Destination for notifications (Fernet-encrypted, write-only). No sends "
+            "happen until this is set. Use 'Send test' to validate it."
+        ),
+    ),
     # ---- DANGER ZONE: connection identity + secrets (typed-confirm) ----------
     # The SO/ES/LiteLLM connection settings are hot=False: they feed clients
     # built at startup, so a change needs a restart (the lifespan applies
@@ -863,6 +982,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "Web research",
     "Online enrichment",
     "Discovery",
+    "Notifications",
 )
 
 
@@ -875,9 +995,16 @@ def api_key_specs() -> tuple[SettingSpec, ...]:
     """The hot, write-only API-key specs surfaced by the dedicated API-keys panel.
 
     These are the secret, non-danger provider keys (enrichment) — distinct from
-    the restart-required Danger-Zone connection secrets (SO/ES/LiteLLM).
+    the restart-required Danger-Zone connection secrets (SO/ES/LiteLLM) AND from
+    the Notifications webhook secret (which lives in its own Notifications section
+    + dedicated endpoints, not the shared API-keys panel).
     """
-    return tuple(s for s in WHITELIST if s.secret and not s.danger)
+    return tuple(s for s in WHITELIST if s.secret and not s.danger and s.section != "Notifications")
+
+
+def notify_webhook_spec() -> SettingSpec:
+    """The write-only, Fernet-encrypted webhook-URL secret spec (Notifications)."""
+    return WHITELIST_BY_KEY["notify_webhook_url"]
 
 
 def _coerce_bool(raw: str) -> bool:
