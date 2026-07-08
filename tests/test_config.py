@@ -518,6 +518,20 @@ def test_inc1_sections_are_in_display_order() -> None:
         assert section in SECTION_ORDER, f"{section!r} (for {key}) missing from SECTION_ORDER"
 
 
+def test_every_rendered_section_has_a_parent() -> None:
+    """Every SECTION_ORDER section maps to a top-level parent (and vice versa).
+
+    GET /config serves ``parent`` per group from SECTION_PARENTS — the Config
+    page's two-level nav is built from it. An unmapped section falls back to a
+    self-titled top-level bucket (fail-soft), but that's a bug to catch here."""
+    from soc_ai.store.config_overrides import SECTION_ORDER, SECTION_PARENTS
+
+    for section in SECTION_ORDER:
+        assert section in SECTION_PARENTS, f"{section!r} has no parent in SECTION_PARENTS"
+    for section in SECTION_PARENTS:
+        assert section in SECTION_ORDER, f"SECTION_PARENTS has stale section {section!r}"
+
+
 def test_inc1_settings_coerce_from_form_strings() -> None:
     """Each inc1 setting coerces a representative raw form string to its type."""
     from soc_ai.store import config_overrides as cfg

@@ -514,6 +514,8 @@ export interface Setting {
 
 export interface SettingGroup {
   title: string;
+  /** Top-level Config-page header this group nests under (server-owned map). */
+  parent?: string;
   items: Setting[];
 }
 

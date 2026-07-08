@@ -1,5 +1,5 @@
 import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ApplyBadge, SourceBadge } from '../components/Badges';
 import { NumberField, Select, Toggle } from '../components/Controls';
@@ -17,12 +17,76 @@ import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
-import type { AdminUser, ConnTestResult, DangerSetting, Setting } from '../lib/types';
+import type { AdminUser, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav } from './ConfigNav';
 
 /** Slugify a section title into a stable DOM id / anchor fragment. */
 function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+/** Nearest scrollable ancestor (the AppShell's overflow-y-auto content pane). */
+function scrollContainerOf(el: HTMLElement): HTMLElement | null {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const oy = getComputedStyle(p).overflowY;
+    if (oy === 'auto' || oy === 'scroll') return p;
+  }
+  return null;
+}
+
+// ── Config-page information architecture ─────────────────────────────────────
+// Top-level parent headers, in display order. The server-driven settings groups
+// carry their parent in GET /config (SECTION_PARENTS in
+// soc_ai/store/config_overrides.py — the single source of truth for THEIR
+// grouping); the frontend-owned standalone panels declare theirs in PANELS
+// below. A parent the frontend doesn't know yet is appended after these.
+const PARENT_ORDER = [
+  'Models & Reasoning',
+  'Triage & Workflow',
+  'Retrieval & Memory',
+  'Privacy & Egress',
+  'Data & Enrichment',
+  'System',
+];
+
+// Standalone (frontend-owned) sections: stable DOM id (deep-link anchor — these
+// ids predate the grouped nav and MUST NOT change), label (doubles as the
+// `collapsed`-map key), parent header, and placement relative to the parent's
+// server-driven groups: after a specific group title, at the start, or
+// (default) appended at the end of the parent.
+interface PanelDef {
+  id: string;
+  label: string;
+  parent: string;
+  placement?: { afterGroup?: string; at?: 'start' };
+}
+const PANELS: PanelDef[] = [
+  { id: 'agent-tools', label: 'Agent tools', parent: 'Models & Reasoning' },
+  { id: 'notifications-webhook', label: 'Notification webhook', parent: 'Triage & Workflow', placement: { afterGroup: 'Notifications' } },
+  { id: 'runbooks', label: 'Runbooks', parent: 'Retrieval & Memory' },
+  { id: 'egress-policy', label: 'Egress policy', parent: 'Privacy & Egress', placement: { at: 'start' } },
+  { id: 'internal-identifiers', label: 'Internal identifiers', parent: 'Privacy & Egress', placement: { afterGroup: 'Discovery' } },
+  { id: 'redaction-preview', label: 'Redaction preview', parent: 'Privacy & Egress' },
+  { id: 'data-sources', label: 'Data sources', parent: 'Data & Enrichment', placement: { at: 'start' } },
+  { id: 'detection-tuning', label: 'Detection tuning', parent: 'Data & Enrichment' },
+  { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment' },
+  { id: 'users', label: 'Users', parent: 'System' },
+  { id: 'api-tokens', label: 'API tokens', parent: 'System' },
+  { id: 'diagnostics', label: 'Diagnostics', parent: 'System' },
+  { id: 'danger-zone', label: 'Danger Zone', parent: 'System' },
+];
+
+// Ids the group-id generator must never produce: every standalone panel id plus
+// in-page anchors that aren't nav sections.
+const RESERVED_IDS: ReadonlySet<string> = new Set([...PANELS.map((p) => p.id), 'rag-reembed']);
+
+type ConfigChild =
+  | { kind: 'group'; id: string; label: string; group: SettingGroup }
+  | { kind: 'panel'; id: string; label: string };
+
+interface ConfigParent {
+  label: string;
+  children: ConfigChild[];
 }
 
 // The Retrieval (RAG) model settings — rendered as gateway-fed dropdowns (same
@@ -302,62 +366,122 @@ export function Config() {
 
   const refetchIdents = () => setIdentNonce((n) => n + 1);
 
-  // ── Left-nav section model ─────────────────────────────────────────────────
-  // One nav entry per settings group, with the standalone sections appended.
-  // To keep nav order == visual order, Internal identifiers is spliced in right
-  // after the Discovery group (mirrors the in-page reorder below).
-  const SECTIONS = useMemo(() => {
-    const groupEntries: { id: string; label: string }[] = [];
+  // ── Left-nav / page section model ──────────────────────────────────────────
+  // Two-level: PARENT_ORDER headers, each holding the server-driven settings
+  // groups whose `parent` (from GET /config) matches, with the frontend-owned
+  // standalone panels spliced in per their PANELS placement. Nav order ==
+  // render order == DOM order by construction (both come from this structure).
+  const layout = useMemo<ConfigParent[]>(() => {
+    // Collision-proof group ids: slugs are deduped against the reserved panel
+    // ids AND each other, so a future server section titled e.g. "Users" can
+    // never produce a duplicate DOM id (which would make anchor clicks resolve
+    // to the wrong section). Current titles slug cleanly, so the historical
+    // anchors (#agent, #retrieval-rag, …) are unchanged.
+    const used = new Set(RESERVED_IDS);
+    const idFor = (title: string) => {
+      const base = slug(title) || 'section';
+      let id = base;
+      for (let n = 2; used.has(id); n++) id = `${base}-${n}`;
+      used.add(id);
+      return id;
+    };
+    const parentOrder = [...PARENT_ORDER];
+    const byParent = new Map<string, ConfigChild[]>();
+    const bucket = (parent: string) => {
+      let children = byParent.get(parent);
+      if (!children) {
+        children = [];
+        byParent.set(parent, children);
+        if (!parentOrder.includes(parent)) parentOrder.push(parent);
+      }
+      return children;
+    };
     for (const g of data?.groups ?? []) {
-      groupEntries.push({ id: slug(g.title), label: g.title });
-      if (g.title === 'Oracle') {
-        groupEntries.push({ id: 'redaction-preview', label: 'Redaction preview' });
-      }
-      if (g.title === 'Discovery') {
-        groupEntries.push({ id: 'internal-identifiers', label: 'Internal identifiers' });
-      }
-      if (g.title === 'Notifications') {
-        groupEntries.push({ id: 'notifications-webhook', label: 'Notification webhook' });
+      bucket(g.parent ?? g.title).push({ kind: 'group', id: idFor(g.title), label: g.title, group: g });
+    }
+    for (const p of PANELS) {
+      const children = bucket(p.parent);
+      const child: ConfigChild = { kind: 'panel', id: p.id, label: p.label };
+      const after = p.placement?.afterGroup;
+      if (p.placement?.at === 'start') {
+        children.unshift(child);
+      } else if (after) {
+        const i = children.findIndex((c) => c.kind === 'group' && c.label === after);
+        children.splice(i === -1 ? children.length : i + 1, 0, child);
+      } else {
+        children.push(child);
       }
     }
-    return [
-      ...groupEntries,
-      { id: 'egress-policy', label: 'Egress policy' },
-      { id: 'data-sources', label: 'Data sources' },
-      { id: 'detection-tuning', label: 'Detection tuning' },
-      { id: 'runbooks', label: 'Runbooks' },
-      { id: 'api-keys', label: 'API keys' },
-      { id: 'agent-tools', label: 'Agent tools' },
-      { id: 'users', label: 'Users' },
-      { id: 'api-tokens', label: 'API tokens' },
-      { id: 'diagnostics', label: 'Diagnostics' },
-      { id: 'danger-zone', label: 'Danger Zone' },
-    ];
+    return parentOrder
+      .filter((label) => byParent.has(label))
+      .map((label) => ({ label, children: byParent.get(label) ?? [] }));
   }, [data?.groups]);
 
-  // Active-section highlight via IntersectionObserver. root:null (viewport) is
-  // correct here: the AppShell scroll container scrolls within the viewport, and
-  // config is the only thing in that scroll area. rootMargin -65% makes the
-  // active section the one near the top third of the view.
+  // Flat section list in DOM order — drives the scroll-spy and collapse lookup.
+  const flatSections = useMemo(() => layout.flatMap((p) => p.children), [layout]);
+
+  // ── Active-section highlight (deterministic scroll-spy) ────────────────────
+  // The previous IntersectionObserver version misattributed nav clicks: it
+  // derived the active id from only the threshold-crossing entries and took the
+  // topmost intersecting one, while scrollIntoView's landing position leaves the
+  // PREVIOUS section's tail 2px inside the scrollport (24px scroll-margin vs the
+  // 22px inter-section gap) — so clicking "Retrieval (RAG)" highlighted "Online
+  // enrichment". Instead: the active section is the LAST one whose top edge has
+  // crossed an activation line just under the scrollport top. Exactly one
+  // winner, immune to the previous section's sliver, correct for short sections.
   const [activeId, setActiveId] = useState('');
+  // Nav clicks / deep-links pin the highlight to the user's intent and hold the
+  // spy off until the programmatic jump's scroll events have flushed.
+  const spyHoldUntil = useRef(0);
   useEffect(() => {
-    const ids = SECTIONS.map((s) => s.id);
-    const els = ids
-      .map((id) => document.getElementById(id))
-      .filter((el): el is HTMLElement => el != null);
-    if (!els.length) return;
-    const obs = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-        if (visible[0]) setActiveId(visible[0].target.id);
-      },
-      { rootMargin: '0px 0px -65% 0px', threshold: 0 },
-    );
-    els.forEach((el) => obs.observe(el));
-    return () => obs.disconnect();
-  }, [SECTIONS, nonce, identNonce]);
+    if (!flatSections.length) return;
+    let raf = 0;
+    const compute = () => {
+      raf = 0;
+      if (performance.now() < spyHoldUntil.current) return;
+      const els = flatSections
+        .map((s) => document.getElementById(s.id))
+        .filter((el): el is HTMLElement => el != null);
+      if (!els.length) return;
+      const sc = scrollContainerOf(els[0]);
+      // 30px = the 24px scroll-margin anchors land at, plus slack.
+      const line = (sc ? sc.getBoundingClientRect().top : 0) + 30;
+      let current = els[0].id;
+      for (const el of els) {
+        if (el.getBoundingClientRect().top <= line) current = el.id;
+      }
+      // Pinned to the bottom → the last section is the destination even though
+      // it may be too short to ever reach the activation line.
+      if (sc && Math.ceil(sc.scrollTop + sc.clientHeight) >= sc.scrollHeight - 2) {
+        current = els[els.length - 1].id;
+      }
+      setActiveId(current);
+    };
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(compute);
+    };
+    // Capture-phase listener: the page scrolls inside the AppShell's
+    // overflow-y-auto pane, whose scroll events don't bubble to window.
+    document.addEventListener('scroll', schedule, true);
+    window.addEventListener('resize', schedule);
+    schedule();
+    return () => {
+      document.removeEventListener('scroll', schedule, true);
+      window.removeEventListener('resize', schedule);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [flatSections, nonce, identNonce]);
+
+  // Nav click / deep-link entry: force-expand a collapsed target so the anchor
+  // is never hidden behind a folded header (the `collapsed` map is keyed by the
+  // section label — for groups that's the group title), pin the highlight, and
+  // hold the scroll-spy briefly (see above).
+  const navigateToSection = (id: string) => {
+    const label = flatSections.find((s) => s.id === id)?.label;
+    if (label) setCollapsed((c) => ({ ...c, [label]: false }));
+    setActiveId(id);
+    spyHoldUntil.current = performance.now() + 400;
+  };
 
   // Deep-link support: when arriving at /config#<section> (e.g. the dashboard's
   // "Manage data sources" link → #data-sources), scroll that section into view
@@ -366,20 +490,15 @@ export function Config() {
     if (loading || !data) return;
     const id = window.location.hash.replace('#', '');
     if (!id) return;
-    // Force-expand a deep-linked section so the target is never hidden behind a
-    // collapsed header. Every section is now foldable, and the `collapsed` map is
-    // keyed by section title/label — the same string as the nav entry's label
-    // (for groups that's the group title; slug(label) === id for standalone
-    // sections). Resolve the id back to its collapse key via SECTIONS and clear it.
-    const key = SECTIONS.find((s) => s.id === id)?.label;
-    if (key) setCollapsed((c) => ({ ...c, [key]: false }));
+    navigateToSection(id);
     const t = setTimeout(() => {
       // Instant snap ('auto', not 'smooth') — smooth-scrolling this long page
       // is slow/choppy; same treatment as the ConfigNav click handler.
       document.getElementById(id)?.scrollIntoView({ behavior: 'auto', block: 'start' });
     }, 60);
     return () => clearTimeout(t);
-  }, [loading, data, SECTIONS]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, data, flatSections]);
 
   // Wrap a mutation so any error surfaces inline and the list refetches on success.
   const identMutation = (p: Promise<unknown>) => {
@@ -846,139 +965,84 @@ export function Config() {
     </div>
   );
 
-  return (
-    <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
-      <aside className="hidden w-[180px] flex-none lg:block">
-        <ConfigNav
-          sections={SECTIONS}
-          activeId={activeId}
-          onNavigate={(id) => {
-            const key = SECTIONS.find((s) => s.id === id)?.label;
-            if (key) setCollapsed((c) => ({ ...c, [key]: false }));
-          }}
-        />
-      </aside>
-      <div className="min-w-0 max-w-permalink flex-1">
-      <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
-      <div className="mb-[18px] mt-0.5 text-[13px] text-dim">
-        Runtime settings · users · API tokens. Source badges show whether a value is set in the database or pinned by an
-        environment variable.
-      </div>
-
-      {/* settings groups — Internal identifiers is interleaved right after the
-          Discovery group so it sits visually next to discovery tuning. */}
-      {data.groups.map((g) => (
-        <Fragment key={g.title}>
-          <div id={slug(g.title)} className="mb-[22px] scroll-mt-6">
-            <button
-              type="button"
-              onClick={() => toggleSection(g.title)}
-              className="group w-full text-left"
-            >
-              <SectionTitle
-                right={
-                  <span className="flex items-center gap-2 text-faint">
-                    <span className="font-mono text-[11px]">{g.items.length}</span>
-                    <ChevronRight
-                      size={15}
-                      className="transition-transform group-hover:text-text-2"
-                      style={{ transform: collapsed[g.title] ? 'none' : 'rotate(90deg)' }}
-                    />
-                  </span>
-                }
-              >
-                {g.title}
-              </SectionTitle>
-            </button>
-            {!collapsed[g.title] && (
-            <div className="overflow-hidden rounded-card border border-border bg-surface-1">
-              {g.items.map((s) => (
-                <div key={s.key} className="border-b border-border-faint px-[15px] py-[13px]">
-                  <div className="flex items-center gap-3.5">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
-                        <span className="font-mono text-[11px] text-faint">{s.key}</span>
-                        <SourceBadge source={s.source} />
-                        <ApplyBadge apply={s.apply} />
-                        {staged[s.key] !== undefined && (
-                          <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}>
-                            unsaved
-                          </span>
-                        )}
-                      </div>
-                      <div className="mt-1 text-[12px] text-dim">{s.help}</div>
-                    </div>
-                    <div className="flex-none">{renderControl(s)}</div>
-                  </div>
-                  {/* #7 Auto-ack coupling note — auto-ack only acks FPs that get
-                      INVESTIGATED, so it is inert without auto-triage running and a
-                      medium/low floor. Warn when we can see the inert case; else hint. */}
-                  {s.key === 'auto_ack_fp_enabled' && autoAckOn && (
-                    <div
-                      className="mt-2.5 flex items-start gap-2 rounded-control border px-3 py-2 text-[11.5px] leading-relaxed"
-                      style={autoAckInert
-                        ? { borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)', color: '#f5a623' }
-                        : { borderColor: '#161c25', background: 'rgba(148,163,184,.05)', color: '#94a3b8' }}
-                    >
-                      <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
-                      <span>
-                        Auto-ack only acks false positives that get investigated — it does nothing on its own.
-                        {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off, so nothing is being investigated automatically.'}
-                        {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”, but high/critical are never auto-acked — so it can never fire.`}
-                        {' '}To clear a backlog, run a sweep or enable scheduled auto-triage (Agent settings) and set its
-                        severity floor to medium or low.
+  // One server-driven settings group (id = the pre-computed collision-proof
+  // slug from `layout`). The RAG group carries the re-embed card as an appendix.
+  const renderGroup = (id: string, g: SettingGroup) => (
+    <>
+      <div id={id} className="mb-[22px] scroll-mt-6">
+        <button
+          type="button"
+          onClick={() => toggleSection(g.title)}
+          className="group w-full text-left"
+        >
+          <SectionTitle
+            right={
+              <span className="flex items-center gap-2 text-faint">
+                <span className="font-mono text-[11px]">{g.items.length}</span>
+                <ChevronRight
+                  size={15}
+                  className="transition-transform group-hover:text-text-2"
+                  style={{ transform: collapsed[g.title] ? 'none' : 'rotate(90deg)' }}
+                />
+              </span>
+            }
+          >
+            {g.title}
+          </SectionTitle>
+        </button>
+        {!collapsed[g.title] && (
+        <div className="overflow-hidden rounded-card border border-border bg-surface-1">
+          {g.items.map((s) => (
+            <div key={s.key} className="border-b border-border-faint px-[15px] py-[13px]">
+              <div className="flex items-center gap-3.5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
+                    <span className="font-mono text-[11px] text-faint">{s.key}</span>
+                    <SourceBadge source={s.source} />
+                    <ApplyBadge apply={s.apply} />
+                    {staged[s.key] !== undefined && (
+                      <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}>
+                        unsaved
                       </span>
-                    </div>
-                  )}
+                    )}
+                  </div>
+                  <div className="mt-1 text-[12px] text-dim">{s.help}</div>
                 </div>
-              ))}
+                <div className="flex-none">{renderControl(s)}</div>
+              </div>
+              {/* #7 Auto-ack coupling note — auto-ack only acks FPs that get
+                  INVESTIGATED, so it is inert without auto-triage running and a
+                  medium/low floor. Warn when we can see the inert case; else hint. */}
+              {s.key === 'auto_ack_fp_enabled' && autoAckOn && (
+                <div
+                  className="mt-2.5 flex items-start gap-2 rounded-control border px-3 py-2 text-[11.5px] leading-relaxed"
+                  style={autoAckInert
+                    ? { borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)', color: '#f5a623' }
+                    : { borderColor: '#161c25', background: 'rgba(148,163,184,.05)', color: '#94a3b8' }}
+                >
+                  <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
+                  <span>
+                    Auto-ack only acks false positives that get investigated — it does nothing on its own.
+                    {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off, so nothing is being investigated automatically.'}
+                    {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”, but high/critical are never auto-acked — so it can never fire.`}
+                    {' '}To clear a backlog, run a sweep or enable continuous auto-investigate (in this group) and set its
+                    severity floor to medium or low.
+                  </span>
+                </div>
+              )}
             </div>
-            )}
-          </div>
-          {g.title === 'Discovery' && internalIdentifiersSection}
-          {g.title === 'Retrieval (RAG)' && ragReembedSection}
-          {g.title === 'Notifications' && (
-            <NotificationsPanel
-              collapsed={!!collapsed['Notification webhook']}
-              onToggleCollapse={() => toggleSection('Notification webhook')}
-            />
-          )}
-          {g.title === 'Oracle' && (
-            <RedactionPreviewPanel
-              collapsed={!!collapsed['Redaction preview']}
-              onToggleCollapse={() => toggleSection('Redaction preview')}
-            />
-          )}
-        </Fragment>
-      ))}
+          ))}
+        </div>
+        )}
+      </div>
+      {g.title === 'Retrieval (RAG)' && ragReembedSection}
+    </>
+  );
 
-      <EgressPolicyPanel
-        collapsed={!!collapsed['Egress policy']}
-        onToggleCollapse={() => toggleSection('Egress policy')}
-      />
-      <DataSourcesPanel
-        collapsed={!!collapsed['Data sources']}
-        onToggleCollapse={() => toggleSection('Data sources')}
-      />
-      <DetectionTuningPanel
-        collapsed={!!collapsed['Detection tuning']}
-        onToggleCollapse={() => toggleSection('Detection tuning')}
-      />
-      <RunbooksPanel
-        collapsed={!!collapsed['Runbooks']}
-        onToggleCollapse={() => toggleSection('Runbooks')}
-      />
-      <ApiKeysPanel
-        collapsed={!!collapsed['API keys']}
-        onToggleCollapse={() => toggleSection('API keys')}
-      />
-      <AgentToolsPanel
-        collapsed={!!collapsed['Agent tools']}
-        onToggleCollapse={() => toggleSection('Agent tools')}
-      />
-
-      {/* Users */}
+  // Standalone System-parent sections, lifted out of the return so the
+  // two-level layout loop can place them by id (see PANELS).
+  const usersSection = (
       <CollapsibleConfigSection
         id="users"
         title="Users"
@@ -1127,8 +1191,9 @@ export function Config() {
           <div className="mt-1.5 text-[12px] text-danger">{userError}</div>
         )}
       </CollapsibleConfigSection>
+  );
 
-      {/* API tokens */}
+  const apiTokensSection = (
       <CollapsibleConfigSection
         id="api-tokens"
         title="API tokens"
@@ -1182,8 +1247,9 @@ export function Config() {
           ))}
         </div>
       </CollapsibleConfigSection>
+  );
 
-      {/* Diagnostics */}
+  const diagnosticsSection = (
       <CollapsibleConfigSection
         id="diagnostics"
         title="Diagnostics"
@@ -1215,8 +1281,9 @@ export function Config() {
           </div>
         </div>
       </CollapsibleConfigSection>
+  );
 
-      {/* Danger Zone */}
+  const dangerZoneSection = (
       <div
         id="danger-zone"
         className="overflow-hidden rounded-card border scroll-mt-6"
@@ -1364,6 +1431,95 @@ export function Config() {
           </div>
         )}
       </div>
+  );
+
+  // Renderable node per standalone-panel id; PANELS placement decides where
+  // each lands in the two-level layout.
+  const panelNodes: Record<string, ReactNode> = {
+    'agent-tools': (
+      <AgentToolsPanel
+        collapsed={!!collapsed['Agent tools']}
+        onToggleCollapse={() => toggleSection('Agent tools')}
+      />
+    ),
+    'notifications-webhook': (
+      <NotificationsPanel
+        collapsed={!!collapsed['Notification webhook']}
+        onToggleCollapse={() => toggleSection('Notification webhook')}
+      />
+    ),
+    runbooks: (
+      <RunbooksPanel
+        collapsed={!!collapsed['Runbooks']}
+        onToggleCollapse={() => toggleSection('Runbooks')}
+      />
+    ),
+    'egress-policy': (
+      <EgressPolicyPanel
+        collapsed={!!collapsed['Egress policy']}
+        onToggleCollapse={() => toggleSection('Egress policy')}
+      />
+    ),
+    'internal-identifiers': internalIdentifiersSection,
+    'redaction-preview': (
+      <RedactionPreviewPanel
+        collapsed={!!collapsed['Redaction preview']}
+        onToggleCollapse={() => toggleSection('Redaction preview')}
+      />
+    ),
+    'data-sources': (
+      <DataSourcesPanel
+        collapsed={!!collapsed['Data sources']}
+        onToggleCollapse={() => toggleSection('Data sources')}
+      />
+    ),
+    'detection-tuning': (
+      <DetectionTuningPanel
+        collapsed={!!collapsed['Detection tuning']}
+        onToggleCollapse={() => toggleSection('Detection tuning')}
+      />
+    ),
+    'api-keys': (
+      <ApiKeysPanel
+        collapsed={!!collapsed['API keys']}
+        onToggleCollapse={() => toggleSection('API keys')}
+      />
+    ),
+    users: usersSection,
+    'api-tokens': apiTokensSection,
+    diagnostics: diagnosticsSection,
+    'danger-zone': dangerZoneSection,
+  };
+
+  return (
+    <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
+      <aside className="hidden w-[190px] flex-none lg:block">
+        <ConfigNav groups={layout} activeId={activeId} onNavigate={navigateToSection} />
+      </aside>
+      <div className="min-w-0 max-w-permalink flex-1">
+      <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
+      <div className="mb-[18px] mt-0.5 text-[13px] text-dim">
+        Runtime settings · users · API tokens. Source badges show whether a value is set in the database or pinned by an
+        environment variable.
+      </div>
+
+      {/* Two-level body: parent header, then its sub-sections (server-driven
+          settings groups + standalone panels), in exactly the nav's order. */}
+      {layout.map((p) => (
+        <Fragment key={p.label}>
+          <div className="mb-[14px] mt-[36px] flex items-center gap-2.5">
+            <div className="text-[11.5px] font-bold uppercase tracking-[.09em] text-accent">
+              {p.label}
+            </div>
+            <div className="h-px flex-1 bg-border" />
+          </div>
+          {p.children.map((c) => (
+            <Fragment key={c.id}>
+              {c.kind === 'group' ? renderGroup(c.id, c.group) : (panelNodes[c.id] ?? null)}
+            </Fragment>
+          ))}
+        </Fragment>
+      ))}
 
       {/* Sticky save/apply bar (FIX #8) — settings above stage locally; nothing
           persists until Apply. The bar is only shown when there are staged edits

@@ -47,6 +47,9 @@ class SettingOut(BaseModel):
 
 class SettingGroupOut(BaseModel):
     title: str
+    # Top-level Config-page header this group nests under (SECTION_PARENTS —
+    # server-owned so the frontend nav never hardcodes a divergent grouping).
+    parent: str
     items: list[SettingOut]
 
 
@@ -141,7 +144,15 @@ async def get_config(
             if spec.section == section and not spec.danger and not spec.secret
         ]
         if items:
-            groups.append(SettingGroupOut(title=section, items=items))
+            groups.append(
+                SettingGroupOut(
+                    title=section,
+                    # Fail-soft: an unmapped section becomes its own top-level
+                    # bucket rather than 500ing the whole config page.
+                    parent=cfg_svc.SECTION_PARENTS.get(section, section),
+                    items=items,
+                )
+            )
 
     token_views = [
         ApiTokenOut(

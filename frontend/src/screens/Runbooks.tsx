@@ -287,8 +287,12 @@ export function Runbooks() {
     }
   };
 
+  // On lg+ the form is a flex column filling the editor pane: the content
+  // field is the flex-1 middle, so the textarea/preview grow with the
+  // viewport instead of a fixed 12-row box. Below lg it keeps a generous
+  // min-height (55vh) and stays resizable.
   const form = (
-    <div className="rounded-card border border-border bg-surface-1 p-3.5">
+    <div className="flex min-h-0 flex-col rounded-card border border-border bg-surface-1 p-3.5 lg:flex-1">
       <div className="mb-3">
         <label className={labelCls}>Title</label>
         <input
@@ -298,8 +302,8 @@ export function Runbooks() {
           className={inputCls}
         />
       </div>
-      <div className="mb-3">
-        <div className="mb-1 flex items-center justify-between">
+      <div className="mb-3 flex min-h-0 flex-1 flex-col">
+        <div className="mb-1 flex flex-none items-center justify-between">
           <label className="block text-[11px] font-semibold uppercase tracking-[.06em] text-faint">
             Content (markdown)
           </label>
@@ -313,7 +317,7 @@ export function Runbooks() {
           </button>
         </div>
         {preview ? (
-          <div className="min-h-[200px] rounded-control border border-border-input bg-bg px-3 py-2 text-[12.5px] leading-[1.55] text-text">
+          <div className="min-h-[55vh] flex-1 overflow-y-auto rounded-control border border-border-input bg-bg px-3 py-2 text-[12.5px] leading-[1.55] text-text lg:min-h-[240px]">
             {draft.content.trim() ? (
               <Markdown>{draft.content}</Markdown>
             ) : (
@@ -326,11 +330,11 @@ export function Runbooks() {
             onChange={(e) => setDraft({ ...draft, content: e.target.value })}
             placeholder="The procedure the agent should cite. What normal looks like on this network, the confirm/dismiss steps, known-benign hosts, pivot queries…"
             rows={12}
-            className={`${inputCls} resize-y font-mono leading-[1.55]`}
+            className={`${inputCls} min-h-[55vh] flex-1 resize-y font-mono leading-[1.55] lg:min-h-[240px] lg:resize-none`}
           />
         )}
       </div>
-      <div className="mb-3 grid grid-cols-2 gap-3">
+      <div className="mb-3 grid flex-none grid-cols-2 gap-3">
         <div>
           <label className={labelCls}>Tags</label>
           <input
@@ -369,13 +373,20 @@ export function Runbooks() {
     </div>
   );
 
+  // Two-pane workspace on lg+: list (search + rows) on the left ~1/3, editor
+  // filling the rest. DOM order puts the editor pane FIRST so it stacks above
+  // the list on narrow screens (the old inline-form behavior);
+  // lg:flex-row-reverse flips it to the right visually. The page goes
+  // full-width (the Alerts idiom — the shell imposes no max-width) and on lg+
+  // pins to the viewport height with each pane scrolling internally, so the
+  // editor always gets the whole window.
   return (
-    <div className="mx-auto max-w-permalink px-[22px] pb-[60px] pt-5">
-      <div className="flex items-center gap-2.5">
+    <div className="flex flex-col px-[22px] pb-[60px] pt-5 lg:h-full lg:pb-4">
+      <div className="flex flex-none items-center gap-2.5">
         <BookOpen size={19} className="text-accent" />
         <div className="text-[20px] font-semibold tracking-[-.015em]">Runbooks</div>
       </div>
-      <div className="mb-4 mt-0.5 text-[13px] leading-[1.55] text-dim">
+      <div className="mb-4 mt-0.5 max-w-[880px] flex-none text-[13px] leading-[1.55] text-dim">
         Your team's own triage guidance — the investigation agent searches these (via the{' '}
         <code className="text-[12px] text-text">lookup_runbook</code> tool) and cites the best
         match, so verdicts ground in <strong>your</strong> procedures instead of guessing from thin
@@ -383,14 +394,8 @@ export function Runbooks() {
         whenever that rule fires. Purely local — nothing here is ever written to Security Onion.
       </div>
 
-      {/* toolbar: search + bulk actions + new */}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder={`Search ${runbooks.length} runbook${runbooks.length === 1 ? '' : 's'}…`}
-          className="w-[260px] rounded-control border border-border-input bg-bg px-3 py-1.5 text-[12.5px] text-text outline-none focus:border-accent"
-        />
+      {/* toolbar: bulk actions + new (search lives in the list pane) */}
+      <div className="mb-3 flex flex-none flex-wrap items-center gap-2">
         <div className="flex-1" />
         {/* Import: hidden file input driven by the button (browser File API). */}
         <input
@@ -431,98 +436,126 @@ export function Runbooks() {
       </div>
 
       {bulkSummary && (
-        <div className="mb-3 rounded-control border border-border bg-surface-1 px-3 py-2 text-[12px] text-text">
+        <div className="mb-3 flex-none rounded-control border border-border bg-surface-1 px-3 py-2 text-[12px] text-text">
           {bulkSummary}
         </div>
       )}
       {actionError && editing === null && (
-        <div className="mb-3 text-[12px] text-danger">{actionError}</div>
+        <div className="mb-3 flex-none text-[12px] text-danger">{actionError}</div>
       )}
 
-      {editing === 'new' && <div className="mb-4">{form}</div>}
+      <div className="flex min-h-0 flex-col gap-4 lg:flex-1 lg:flex-row-reverse">
+        {/* editor pane — the form when open, else a hint card (lg+ only; on
+            narrow screens the pane vanishes entirely when nothing is open). */}
+        <div className={`${editing === null ? 'hidden lg:flex' : 'flex'} min-w-0 flex-1 flex-col lg:min-h-0`}>
+          {editing !== null ? (
+            form
+          ) : (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-card border border-dashed border-border bg-surface-1/50 px-6 py-10 text-center">
+              <BookOpen size={22} className="text-faint" />
+              <div className="text-[13px] font-medium text-dim">No runbook open</div>
+              <div className="max-w-[380px] text-[12px] text-faint">
+                Pick a runbook from the list to edit it here, or start a new one.
+              </div>
+              <button onClick={openNew} disabled={busy} className={`${toolbarBtnCls} mt-1`}>
+                <Plus size={13} />
+                New runbook
+              </button>
+            </div>
+          )}
+        </div>
 
-      <div className="overflow-hidden rounded-card border border-border bg-surface-1">
-        {loading && <LoadingState />}
-        {error && (
-          <div className="p-3">
-            <ErrorState error={error} />
-          </div>
-        )}
-        {!loading && !error && runbooks.length === 0 && editing !== 'new' && (
-          <div className="px-3.5 py-5 text-[12.5px] text-faint">
-            No runbooks yet. Write one, import your existing .md procedures, or load the starter
-            pack to give the agent something to cite.
-          </div>
-        )}
-        {!loading && !error && runbooks.length > 0 && visible.length === 0 && (
-          <div className="px-3.5 py-4 text-[12.5px] text-faint">
-            No runbooks match “{query}”.
-          </div>
-        )}
-        {!loading &&
-          !error &&
-          visible.map((rb) => (
-            <div key={rb.id} className="border-b border-border-faint px-3.5 py-3 last:border-b-0">
-              {editing === rb.id ? (
-                form
-              ) : (
-                <div className="flex items-start gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="truncate text-[13px] font-medium" title={rb.title}>
-                        {rb.title}
-                      </span>
-                      <EmbedChip rb={rb} />
-                      <span className="text-[10.5px] text-faint">
-                        updated {new Date(rb.updated_at).toLocaleString()}
-                      </span>
-                    </div>
-                    {rb.content && (
-                      <div className="mt-0.5 line-clamp-2 text-[11.5px] leading-[1.4] text-faint">
-                        {rb.content}
+        {/* list pane: search + rows; scrolls internally on lg+ */}
+        <div className="flex min-h-0 flex-none flex-col lg:w-1/3 lg:min-w-[300px] lg:max-w-[440px]">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={`Search ${runbooks.length} runbook${runbooks.length === 1 ? '' : 's'}…`}
+            className="mb-2 w-full flex-none rounded-control border border-border-input bg-bg px-3 py-1.5 text-[12.5px] text-text outline-none focus:border-accent"
+          />
+          <div className="overflow-hidden rounded-card border border-border bg-surface-1 lg:flex-1 lg:overflow-y-auto">
+            {loading && <LoadingState />}
+            {error && (
+              <div className="p-3">
+                <ErrorState error={error} />
+              </div>
+            )}
+            {!loading && !error && runbooks.length === 0 && editing !== 'new' && (
+              <div className="px-3.5 py-5 text-[12.5px] text-faint">
+                No runbooks yet. Write one, import your existing .md procedures, or load the starter
+                pack to give the agent something to cite.
+              </div>
+            )}
+            {!loading && !error && runbooks.length > 0 && visible.length === 0 && (
+              <div className="px-3.5 py-4 text-[12.5px] text-faint">
+                No runbooks match “{query}”.
+              </div>
+            )}
+            {!loading &&
+              !error &&
+              visible.map((rb) => (
+                <div
+                  key={rb.id}
+                  className={`border-b border-border-faint px-3.5 py-3 last:border-b-0 ${editing === rb.id ? 'bg-[#11161e]' : ''}`}
+                >
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="truncate text-[13px] font-medium" title={rb.title}>
+                          {rb.title}
+                        </span>
+                        <EmbedChip rb={rb} />
+                        <span className="text-[10.5px] text-faint">
+                          updated {new Date(rb.updated_at).toLocaleString()}
+                        </span>
                       </div>
-                    )}
-                    <div className="mt-1.5 flex flex-wrap gap-1.5">
-                      {rb.linked_rules.map((r) => (
-                        <span
-                          key={`r-${r}`}
-                          className="rounded border border-accent/40 px-1.5 py-0.5 text-[10.5px] text-accent"
-                          title="linked rule"
-                        >
-                          {r}
-                        </span>
-                      ))}
-                      {rb.tags.map((t) => (
-                        <span
-                          key={`t-${t}`}
-                          className="rounded border border-border-strong bg-surface-3 px-1.5 py-0.5 text-[10.5px] text-dim"
-                        >
-                          {t}
-                        </span>
-                      ))}
+                      {rb.content && (
+                        <div className="mt-0.5 line-clamp-2 text-[11.5px] leading-[1.4] text-faint">
+                          {rb.content}
+                        </div>
+                      )}
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {rb.linked_rules.map((r) => (
+                          <span
+                            key={`r-${r}`}
+                            className="rounded border border-accent/40 px-1.5 py-0.5 text-[10.5px] text-accent"
+                            title="linked rule"
+                          >
+                            {r}
+                          </span>
+                        ))}
+                        {rb.tags.map((t) => (
+                          <span
+                            key={`t-${t}`}
+                            className="rounded border border-border-strong bg-surface-3 px-1.5 py-0.5 text-[10.5px] text-dim"
+                          >
+                            {t}
+                          </span>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex flex-none items-center gap-1.5">
-                    <button
-                      onClick={() => openEdit(rb)}
-                      disabled={busy || editing !== null}
-                      className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      Edit
-                    </button>
-                    <button
-                      onClick={() => void remove(rb.id)}
-                      disabled={busy || editing !== null}
-                      className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:cursor-not-allowed disabled:opacity-40"
-                      style={{ borderColor: 'rgba(240,68,56,.3)' }}
-                    >
-                      Delete
-                    </button>
+                    <div className="flex flex-none items-center gap-1.5">
+                      <button
+                        onClick={() => openEdit(rb)}
+                        disabled={busy || editing !== null}
+                        className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => void remove(rb.id)}
+                        disabled={busy || editing !== null}
+                        className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:cursor-not-allowed disabled:opacity-40"
+                        style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                      >
+                        Delete
+                      </button>
+                    </div>
                   </div>
                 </div>
-              )}
-            </div>
-          ))}
+              ))}
+          </div>
+        </div>
       </div>
     </div>
   );

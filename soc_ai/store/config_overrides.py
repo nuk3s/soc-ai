@@ -144,7 +144,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="webui_extra_detections",
         type="bool",
         label="Show non-Suricata SO detections in the feed",
-        section="Agent",
+        section="Queries",
         hot=True,
         help="Union Sigma hits + Zeek ATTACK notices into the alerts feed (tagged by kind).",
     ),
@@ -288,7 +288,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_triage_max_targets",
         type="int",
         label="Investigate sweep: max alerts per run",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help="Cap on how many alerts a single Bulk/Auto-Investigate run will investigate.",
         min_value=1,
@@ -342,7 +342,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_ack_fp_enabled",
         type="bool",
         label="Auto-acknowledge high-confidence false positives",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help=(
             "When on, a completed investigation with verdict=false_positive at or above "
@@ -362,7 +362,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_ack_fp_threshold",
         type="float",
         label="Auto-ack confidence threshold (FP only)",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help="Minimum confidence for auto-ack. Recommended: 0.7. Range: 0.0-1.0.",
         min_value=0.0,
@@ -373,7 +373,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_triage_min_severity",
         type="str",
         label="Auto-Investigate minimum severity",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help=(
             "Sweeps triage this severity and above (critical, high, medium, low). "
@@ -387,7 +387,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_triage_inheritance_enabled",
         type="bool",
         label="Inherit verdicts for similar alerts",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help=(
             "Auto-Investigate skips an alert when a similar one (same rule, source "
@@ -401,7 +401,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_triage_schedule_enabled",
         type="bool",
         label="Continuous auto-investigate (drain the backlog automatically)",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help=(
             "Run Auto-Investigate on a schedule so the untriaged backlog drains itself — "
@@ -414,7 +414,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="auto_triage_schedule_interval_minutes",
         type="int",
         label="Continuous auto-investigate interval (minutes)",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help="Minimum minutes between scheduled sweeps. Lower drains faster but costs more LLM.",
         min_value=1,
@@ -425,7 +425,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="hunt_schedules_enabled",
         type="bool",
         label="Scheduled hunts (recurring hunts on an interval)",
-        section="Agent",
+        section="Triage automation",
         hot=True,
         help=(
             "Run saved hunts automatically on their per-hunt interval (managed in the "
@@ -1064,19 +1064,46 @@ WHITELIST: tuple[SettingSpec, ...] = (
 
 WHITELIST_BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in WHITELIST}
 
-# Section display order for the console.
+# Section display order for the console (grouped by top-level parent — see
+# SECTION_PARENTS below; within a parent this tuple is the sub-section order).
 SECTION_ORDER: tuple[str, ...] = (
-    "Oracle",
+    # Models & Reasoning
     "Agent",
+    "Oracle",
+    # Triage & Workflow
+    "Triage automation",
+    "Notifications",
+    # Retrieval & Memory
+    "Retrieval (RAG)",
+    "Memory",
+    # Privacy & Egress
+    "Discovery",
+    # Data & Enrichment
     "Queries",
     "PCAP",
     "Web research",
     "Online enrichment",
-    "Retrieval (RAG)",
-    "Memory",
-    "Discovery",
-    "Notifications",
 )
+
+# Top-level Config-page information architecture: sub-section → parent header.
+# This is the single source of truth for how the server-driven settings groups
+# nest on the Config page; GET /config serves each group's parent so the
+# frontend never hardcodes a divergent copy of this map. (The frontend's own
+# standalone panels — Data sources, Egress policy, Users, … — declare their
+# parent client-side, since they don't originate from SettingSpec sections.)
+SECTION_PARENTS: dict[str, str] = {
+    "Agent": "Models & Reasoning",
+    "Oracle": "Models & Reasoning",
+    "Triage automation": "Triage & Workflow",
+    "Notifications": "Triage & Workflow",
+    "Retrieval (RAG)": "Retrieval & Memory",
+    "Memory": "Retrieval & Memory",
+    "Discovery": "Privacy & Egress",
+    "Queries": "Data & Enrichment",
+    "PCAP": "Data & Enrichment",
+    "Web research": "Data & Enrichment",
+    "Online enrichment": "Data & Enrichment",
+}
 
 
 def is_editable(key: str) -> bool:
