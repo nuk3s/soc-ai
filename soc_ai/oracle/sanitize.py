@@ -716,3 +716,28 @@ def redaction_summary(mapping: Mapping) -> dict[str, int]:
         {"IP": 3, "HOST": 1, "MAC": 2}
     """
     return dict(mapping.counters)
+
+
+@dataclass(frozen=True)
+class Replacement:
+    """One redaction pair: the opaque label, the real value it replaced, and
+    the sanitizer category (``IP``, ``HOST``, ``USER``, ``EMAIL``, ``MAC``)."""
+
+    label: str
+    value: str
+    category: str
+
+
+def redaction_replacements(mapping: Mapping) -> list[Replacement]:
+    """Return every (label ↔ value) pair *mapping* has allocated, read-only.
+
+    UNLIKE :func:`redaction_summary` this DOES carry the real values — use it
+    only where the caller already sees the raw text (the admin-gated redaction
+    previews, which return the original alongside the sanitized output).  The
+    category is recovered from the label's ``{CATEGORY}_{NN}`` shape, so the
+    result never depends on state beyond the mapping itself.
+    """
+    return [
+        Replacement(label=label, value=value, category=label.rsplit("_", 1)[0])
+        for value, label in mapping.forward.items()
+    ]

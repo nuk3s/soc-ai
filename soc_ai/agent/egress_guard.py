@@ -33,7 +33,9 @@ from typing import TYPE_CHECKING, Any
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.oracle.sanitize import (
     Mapping,
+    Replacement,
     desanitize,
+    redaction_replacements,
     redaction_summary,
     sanitize,
     unsafe_residue,
@@ -177,6 +179,17 @@ class EgressGuard:
         render identically to the Oracle preview's.
         """
         return redaction_summary(self._mapping)
+
+    def redaction_replacements(self) -> list[Replacement]:
+        """Every (label ↔ value ↔ category) pair this guard has allocated.
+
+        Read-only view of the lifetime mapping, via
+        :func:`~soc_ai.oracle.sanitize.redaction_replacements`.  It DOES carry
+        the real values — for the admin-gated redaction previews only (which
+        already return the raw original to the same caller); never log it and
+        never let it ride an egress payload.
+        """
+        return redaction_replacements(self._mapping)
 
     @classmethod
     async def for_settings(

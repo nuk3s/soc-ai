@@ -418,10 +418,21 @@ export function getDetectionTuning(): Promise<DetectionTuning> {
   return request<DetectionTuning>('/detection-tuning');
 }
 
+/** One redacted span: the opaque label, the real value it replaced, and the
+ * sanitizer category (IP, HOST, USER, EMAIL, MAC). Safe here because both
+ * preview endpoints are admin-gated and already return the raw original. */
+export interface RedactionReplacement {
+  label: string;
+  value: string;
+  category: string;
+}
+
 export interface RedactionPreview {
   original: Record<string, unknown>;
   sanitized: Record<string, unknown>;
   summary: Record<string, number>;
+  /** Pairs that actually occur in THIS preview — drives the pane highlights. */
+  replacements: RedactionReplacement[];
   note: string;
 }
 
@@ -432,6 +443,8 @@ export function getRedactionPreview(): Promise<RedactionPreview> {
 
 /** Analyst-path redaction preview for one PAST investigation (E5.2). */
 export interface AnalystRedactionPreview {
+  /** Literal discriminator — pairs with the non-fatal 200 shapes below. */
+  status: 'ok';
   investigation_id: string;
   /** Current analyst_cloud_redaction setting — when false the preview is a
    * simulation of what WOULD be redacted, and a real call today sends raw text. */
@@ -442,19 +455,30 @@ export interface AnalystRedactionPreview {
   /** The same prompt after the egress guard redacts it (CURRENT identifier config). */
   sanitized: string;
   summary: Record<string, number>;
+  /** Pairs that actually occur in THIS preview — drives the pane highlights. */
+  replacements: RedactionReplacement[];
   note: string;
 }
 
-/** Discriminated result: a 409 (run predates the required stored events) is a
- * first-class outcome the panel renders as a friendly note, not an error state. */
+/** The two non-fatal preview outcomes — HTTP 200 with a status-discriminated
+ * body (NOT a 4xx, which would log a browser console error): the investigation
+ * exists but its stored events can't honestly rebuild the analyst prompt. */
+export interface AnalystRedactionPreviewUnavailable {
+  status: 'events_missing' | 'context_unparseable';
+  detail: string;
+  missing?: string[];
+}
+
+/** Discriminated result: "run can't be previewed" is a first-class outcome the
+ * panel renders as a friendly note, not an error state. */
 export type AnalystRedactionPreviewResult =
   | { kind: 'ok'; preview: AnalystRedactionPreview }
-  | { kind: 'events_missing' };
+  | { kind: 'events_missing' | 'context_unparseable'; detail: string };
 
 /**
  * What the analyst model would have received for a past investigation —
- * original vs sanitized, rebuilt from its stored events. Raw fetch (not
- * request()) because the 409 status must be distinguishable from real errors.
+ * original vs sanitized, rebuilt from its stored events. The endpoint always
+ * answers 200 with a `status`-discriminated body (404 only for unknown ids).
  */
 export async function getAnalystRedactionPreview(
   invId: string,
@@ -466,9 +490,10 @@ export async function getAnalystRedactionPreview(
     credentials: 'include',
     headers,
   });
-  if (res.status === 409) return { kind: 'events_missing' };
   if (!res.ok) throw new Error(`Preview failed (${res.status} ${res.statusText})`);
-  return { kind: 'ok', preview: (await res.json()) as AnalystRedactionPreview };
+  const body = (await res.json()) as AnalystRedactionPreview | AnalystRedactionPreviewUnavailable;
+  if (body.status !== 'ok') return { kind: body.status, detail: body.detail };
+  return { kind: 'ok', preview: body };
 }
 
 /** Mute a noisy rule (soft, reversible suppression — Security Onion is untouched). */

@@ -47,14 +47,17 @@ type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 // timestamp + the time of the investigation it ran/inherited from) lives on the
 // expanded event rows, where an analyst actually needs it. The old dedicated
 // "Fired" column and the copyable short-id chip were removed as noise; the fire
-// count is now a subtle inline chip and `actions` is wide enough that the primary
-// button never overlaps the "Last seen" column.
-const GRID = '28px minmax(240px,1fr) 104px 136px 48px 40px 100px 128px';
+// count is now a subtle inline chip. `actions` fits Done + "Open report" on one
+// line and the cell flex-wraps, so an owned row's third button drops BELOW
+// instead of overlapping the "Last seen" column.
+const GRID = '28px minmax(240px,1fr) 104px 136px 48px 40px 100px 170px';
 
 // Per-alert (expanded) event row: checkbox | alert time (abs+rel) | sev |
 // src→dst:port | host | verdict provenance (+ when) | investigate. Each row now
-// carries the alert's OWN timestamp AND the investigation's timestamp.
-const EVENT_GRID = '16px 132px 56px minmax(150px,1fr) 116px 172px 92px';
+// carries the alert's OWN timestamp AND the investigation's timestamp. The sev
+// column fits the widest label ("Critical") — narrower and the tag bleeds into
+// the src endpoint with zero gap.
+const EVENT_GRID = '16px 132px 76px minmax(150px,1fr) 116px 172px 92px';
 
 // Page size for an expanded group's events ("Load more" pulls one page at a time).
 const EVENTS_PAGE_SIZE = 50;
@@ -115,18 +118,20 @@ const STATE_CLS: Record<TriageState, string> = {
   done: 'border-emerald-400/40 bg-emerald-400/10 text-emerald-300',
 };
 
-/** A compact triage-state chip. `null` → the faint "Unassigned" pill. */
+/** A compact triage-state chip. `null` → the faint "Unassigned" pill.
+ * flex-none + nowrap: these short labels must never be truncated or broken
+ * mid-word — in a tight cell the whole chip wraps below instead. */
 function StateChip({ state }: { state?: TriageState | null }) {
   if (!state) {
     return (
-      <span className="inline-flex items-center rounded-pill border border-border-strong px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide text-faint">
+      <span className="inline-flex flex-none items-center whitespace-nowrap rounded-pill border border-border-strong px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide text-faint">
         Unassigned
       </span>
     );
   }
   return (
     <span
-      className={`inline-flex items-center rounded-pill border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide ${STATE_CLS[state]}`}
+      className={`inline-flex flex-none items-center whitespace-nowrap rounded-pill border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide ${STATE_CLS[state]}`}
     >
       {STATE_LABEL[state]}
     </span>
@@ -1304,7 +1309,10 @@ export function Alerts() {
                   )}
                 </div>
                 <div><SeverityTag sev={g.sev} /></div>
-                <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+                {/* flex-wrap (not overflow-hidden): the E2.3 StateChip drops to
+                    a second line in this fixed-width cell rather than clipping
+                    at the column edge ("OWN…", "IN REV…"). */}
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                   {g.triaging ? (
                     // Clickable so the analyst can open the LIVE investigation
                     // straight from the grid (invId now points at the running run).
@@ -1406,7 +1414,12 @@ export function Alerts() {
                 >
                   {g.latest || '—'}
                 </div>
-                <div className="flex items-center justify-end gap-1.5">
+                {/* flex-wrap keeps the action pills INSIDE this cell: when an
+                    owned row shows all three (Review/Done/Open report) the
+                    overflow wraps to a second line below, never left into the
+                    "Last seen" column; each button is nowrap so its own label
+                    can't break mid-word. */}
+                <div className="flex flex-wrap items-center justify-end gap-1.5">
                   {/* E2.3 triage-state actions: only on an OWNED row. "Review"
                       moves owned → in_review; "Done" marks it done (from owned or
                       in_review); the owner avatar in the Owner cell releases it.
@@ -1419,7 +1432,7 @@ export function Alerts() {
                       }}
                       aria-label="Mark in review"
                       title="Mark this detection as in review"
-                      className="inline-flex items-center rounded-badge border border-amber-400/40 bg-amber-400/10 px-[9px] py-[3px] font-sans text-[11px] font-semibold text-amber-300 hover:brightness-125"
+                      className="inline-flex items-center whitespace-nowrap rounded-badge border border-amber-400/40 bg-amber-400/10 px-[9px] py-[3px] font-sans text-[11px] font-semibold text-amber-300 hover:brightness-125"
                     >
                       Review
                     </button>
@@ -1432,7 +1445,7 @@ export function Alerts() {
                       }}
                       aria-label="Mark done"
                       title="Mark this detection's triage as done"
-                      className="inline-flex items-center rounded-badge border border-emerald-400/40 bg-emerald-400/10 px-[9px] py-[3px] font-sans text-[11px] font-semibold text-emerald-300 hover:brightness-125"
+                      className="inline-flex items-center whitespace-nowrap rounded-badge border border-emerald-400/40 bg-emerald-400/10 px-[9px] py-[3px] font-sans text-[11px] font-semibold text-emerald-300 hover:brightness-125"
                     >
                       Done
                     </button>
@@ -1451,7 +1464,7 @@ export function Alerts() {
                       disabled={!!huntGroupPending[g.id]}
                       aria-label="Retry investigation"
                       title="Last re-run failed — re-investigate the representative event"
-                      className="inline-flex items-center gap-1 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                       style={{ borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)', color: '#f87171' }}
                     >
                       {huntGroupPending[g.id] ? <Spinner size={11} color="#f87171" /> : <Zap size={11} />}
@@ -1467,7 +1480,7 @@ export function Alerts() {
                       }}
                       aria-label="Open investigation"
                       title="Open the investigation report"
-                      className="inline-flex items-center gap-1 rounded-badge border border-border-input px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent hover:border-accent hover:bg-[#141b25]"
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border border-border-input px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent hover:border-accent hover:bg-[#141b25]"
                     >
                       Open report
                       <ArrowUpRight size={12} />
@@ -1482,7 +1495,7 @@ export function Alerts() {
                       disabled={!!huntGroupPending[g.id]}
                       title="Investigate the most-representative event in this group"
                       aria-label="Investigate"
-                      className="inline-flex items-center gap-1 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                       style={{ borderColor: 'rgba(139,92,246,.35)', background: 'rgba(139,92,246,.07)', color: '#a78bfa' }}
                     >
                       {huntGroupPending[g.id] ? <Spinner size={11} color="#a78bfa" /> : <Sparkles size={11} />}
@@ -1525,7 +1538,10 @@ export function Alerts() {
                       </div>
                       {/* severity */}
                       <div><SeverityTag sev={(ev.sev ?? 'low') as Severity} /></div>
-                      {/* src → dst:port — each endpoint pivots to its entity page */}
+                      {/* src → dst:port — each endpoint pivots to its entity page.
+                          The backend sends BARE endpoints (the pivot value); the
+                          destination port renders exactly once here, hugging the
+                          dst (inside the same span group, outside the flex gap). */}
                       <div className="flex min-w-0 items-center gap-1.5 truncate">
                         {ev.src ? (
                           <span
@@ -1539,20 +1555,22 @@ export function Alerts() {
                           <span className="text-mono-green">{ev.src}</span>
                         )}
                         <span className="text-ghost">→</span>
-                        {ev.dst ? (
-                          <span
-                            className="cursor-pointer text-mono-amber hover:underline"
-                            onClick={() => navigate(`/entity/${encodeURIComponent(ev.dst)}`)}
-                            title={`Pivot to ${ev.dst}`}
-                          >
-                            {ev.dst}
-                          </span>
-                        ) : (
-                          <span className="text-mono-amber">{ev.dst}</span>
-                        )}
-                        {ev.port != null && (
-                          <span className="text-faint">:{ev.port}</span>
-                        )}
+                        <span className="flex min-w-0 items-center truncate">
+                          {ev.dst ? (
+                            <span
+                              className="cursor-pointer truncate text-mono-amber hover:underline"
+                              onClick={() => navigate(`/entity/${encodeURIComponent(ev.dst)}`)}
+                              title={`Pivot to ${ev.dst}`}
+                            >
+                              {ev.dst}
+                            </span>
+                          ) : (
+                            <span className="text-mono-amber">{ev.dst}</span>
+                          )}
+                          {ev.port != null && (
+                            <span className="text-faint">:{ev.port}</span>
+                          )}
+                        </span>
                       </div>
                       {/* host — pivots to its entity page */}
                       {ev.host ? (

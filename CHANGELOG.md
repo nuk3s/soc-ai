@@ -36,12 +36,29 @@ All notable changes to this project are documented here. The format is based on
   off. Read-only, nothing is sent anywhere
   (`GET /api/v1/analyst/redaction-preview/{id}`).
 
+- **Redaction previews highlight exactly what was redacted.** Both the Oracle
+  sample and the Analyst path preview now mark every internal value (amber, in
+  the original pane) and every opaque label (green, in the sanitized pane),
+  with hover tooltips naming the counterpart and a per-category span count.
+  The replacement pairs come from the sanitizer's own mapping, filtered to
+  what the preview actually redacted — never the whole identifier config.
+
 ### Fixed
 
 - **The browser E2E now actually runs in CI.** The `browser-smoke` GitHub
   Actions job referenced tests that were excluded from the public repository,
   so it failed on every run. The Playwright smoke and the demo-stack harness
   it drives now ship publicly (all demo data is RFC 5737 TEST-NET fiction).
+- **Alerts-queue layout fixes** from a full visual audit: action buttons no
+  longer overlap the "last seen" column on assigned rows, the assignment
+  state chip no longer clips ("OWN…"), the severity tag no longer touches the
+  source IP, and the destination port is no longer printed twice — which also
+  fixes the source/destination entity pivots, which previously navigated to a
+  port-suffixed value the entity page could not match.
+- **The analyst redaction preview's "events missing" state no longer logs a
+  browser console error** — it is a normal 200 response with a status field
+  instead of an HTTP 409, and the panel shows the server's explanation for
+  both non-previewable states.
 
 ## [1.0.8] - 2026-07-07
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -26,10 +26,27 @@ _LOGGER = logging.getLogger(__name__)
 # ── Oracle pre-egress redaction preview ────────────────────────────────────────
 
 
+class RedactionReplacementOut(BaseModel):
+    """One redacted span: the opaque label ↔ the real value it replaced.
+
+    Drives the before/after highlight in the preview UI.  Carrying the real
+    value is deliberate and safe HERE ONLY: both preview endpoints are
+    admin-gated and already return the raw original text in the same response,
+    so the pair reveals nothing the caller doesn't have.
+    """
+
+    label: str
+    value: str
+    category: str
+
+
 class RedactionPreviewOut(BaseModel):
     original: dict[str, Any]
     sanitized: dict[str, Any]
     summary: dict[str, int]
+    # Only the pairs that actually occur in THIS preview's sanitized output —
+    # never the whole identifier config.
+    replacements: list[RedactionReplacementOut]
     note: str
 
 
@@ -49,7 +66,12 @@ async def oracle_redaction_preview(
     trust the redaction before enabling the Oracle — and confirm that public
     addresses pass through while every internal identifier is pseudonymized.
     """
-    from soc_ai.oracle.sanitize import Mapping, redaction_summary, sanitize  # noqa: PLC0415
+    from soc_ai.oracle.sanitize import (  # noqa: PLC0415
+        Mapping,
+        redaction_replacements,
+        redaction_summary,
+        sanitize,
+    )
 
     suffix = (settings.oracle_internal_suffixes or (".local",))[0]
     # A representative sample: internal host/IP/MAC/user/email (all must redact) +
@@ -63,10 +85,19 @@ async def oracle_redaction_preview(
     }
     mapping = Mapping()
     sanitized = sanitize(sample, mapping, extra_suffixes=settings.oracle_internal_suffixes)
+    # The mapping only ever holds what sanitize() actually matched, but filter
+    # by occurrence in the sanitized output anyway — the contract is "what YOU
+    # see highlighted", not "what the sanitizer learned along the way".
+    sanitized_json = json.dumps(sanitized)
     return RedactionPreviewOut(
         original=sample,
         sanitized=sanitized,
         summary=redaction_summary(mapping),
+        replacements=[
+            RedactionReplacementOut(label=r.label, value=r.value, category=r.category)
+            for r in redaction_replacements(mapping)
+            if r.label in sanitized_json
+        ],
         note=(
             "Internal identifiers are replaced with stable opaque labels (IP_01, "
             "HOST_01, …) before any Oracle call — the same real value always maps to "
@@ -81,6 +112,9 @@ async def oracle_redaction_preview(
 
 
 class AnalystRedactionPreviewOut(BaseModel):
+    # Literal discriminator (mirrors HealthResponse's status idiom) — pairs with
+    # AnalystRedactionPreviewUnavailableOut in the endpoint's union response.
+    status: Literal["ok"] = "ok"
     investigation_id: str
     # Current settings, so the UI can say "this is a simulation; redaction is
     # currently off" — the preview itself ALWAYS shows what redaction would do.
@@ -91,13 +125,31 @@ class AnalystRedactionPreviewOut(BaseModel):
     original: str
     sanitized: str
     summary: dict[str, int]
+    # (label ↔ value) pairs occurring in this preview — see RedactionReplacementOut.
+    replacements: list[RedactionReplacementOut]
     note: str
 
 
 # Event kinds the rebuild cannot proceed without. Both are emitted
-# unconditionally by the synth-first pipeline; investigations from before
-# these kinds existed (or from the legacy pipeline) 409 with events_missing.
+# unconditionally by the synth-first pipeline; investigations from before these
+# kinds existed (or from the legacy pipeline) get a 200 events_missing body.
 _REQUIRED_PREVIEW_KINDS = ("enriched_alert_context", "decision_template_match")
+
+
+class AnalystRedactionPreviewUnavailableOut(BaseModel):
+    """A NON-FATAL preview outcome: the investigation exists, but its stored
+    events cannot honestly rebuild the analyst prompt.
+
+    Deliberately HTTP 200, not 4xx — the UI renders these as a friendly note,
+    and a 4xx would land a console error in the browser (tripping the
+    browser-smoke's zero-console-error gate) for a state that is not a failure.
+    Discriminated from the OK shape by the literal ``status`` field.
+    """
+
+    status: Literal["events_missing", "context_unparseable"]
+    detail: str
+    # The required event kinds absent from this run (events_missing only).
+    missing: list[str] = []
 
 
 def _analyst_preview_note(
@@ -151,14 +203,14 @@ def _analyst_preview_note(
 
 @router.get(
     "/analyst/redaction-preview/{inv_id}",
-    response_model=AnalystRedactionPreviewOut,
+    response_model=AnalystRedactionPreviewOut | AnalystRedactionPreviewUnavailableOut,
     dependencies=[Depends(require_admin_api)],
 )
 async def analyst_redaction_preview(
     inv_id: str,
     request: Request,
     settings: Settings = Depends(get_settings_dep),
-) -> AnalystRedactionPreviewOut:
+) -> AnalystRedactionPreviewOut | AnalystRedactionPreviewUnavailableOut:
     """Show what the ANALYST model would receive for a PAST investigation.
 
     Rebuilds the round-1 synthesizer user message from the investigation's
@@ -184,9 +236,13 @@ async def analyst_redaction_preview(
       is recovered by re-running the pure template matcher on the stored
       context, and used only when that reproduces the SAME template id.
 
-    Errors: 404 unknown id; 409 ``{"code": "events_missing"}`` when the run
-    predates the required event kinds; 409 ``{"code": "context_unparseable"}``
-    when the stored context no longer validates against the current schema.
+    Outcomes: 404 for an unknown id; otherwise ALWAYS 200 with a
+    status-discriminated body — ``{"status": "ok", ...}`` for a full preview,
+    ``{"status": "events_missing", ...}`` when the run predates the required
+    event kinds, ``{"status": "context_unparseable", ...}`` when the stored
+    context no longer validates against the current schema. The two non-ok
+    shapes are non-fatal states the UI renders as a friendly note; a 4xx here
+    would log a browser console error for a perfectly healthy page.
     """
     # Lazy agent-layer imports (mirrors the oracle preview above): the export
     # routes module stays import-light for every request that isn't this one.
@@ -214,34 +270,28 @@ async def analyst_redaction_preview(
 
     missing = [k for k in _REQUIRED_PREVIEW_KINDS if k not in by_kind]
     if missing:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "events_missing",
-                "missing": missing,
-                "hint": (
-                    "This investigation predates the stored events needed to "
-                    "rebuild the analyst prompt — only newer runs can be previewed."
-                ),
-            },
+        return AnalystRedactionPreviewUnavailableOut(
+            status="events_missing",
+            missing=missing,
+            detail=(
+                "This investigation predates the stored events needed to "
+                "rebuild the analyst prompt — only newer runs can be previewed."
+            ),
         )
 
     try:
         enriched = EnrichedAlertContext.model_validate(by_kind["enriched_alert_context"])
-    except Exception as exc:
+    except Exception:
         # Schema drift on an old run: the stored payload no longer parses.
-        # Distinct code from events_missing — the events exist, we just can't
-        # honestly rebuild from them.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "context_unparseable",
-                "hint": (
-                    "The stored enriched context no longer parses against the "
-                    "current schema, so the analyst prompt cannot be rebuilt honestly."
-                ),
-            },
-        ) from exc
+        # Distinct status from events_missing — the events exist, we just
+        # can't honestly rebuild from them.
+        return AnalystRedactionPreviewUnavailableOut(
+            status="context_unparseable",
+            detail=(
+                "The stored enriched context no longer parses against the "
+                "current schema, so the analyst prompt cannot be rebuilt honestly."
+            ),
+        )
 
     # ----- Decision-template candidate (Phase B) -----
     # The stored event carries verdict/confidence/template_id/rationale but NOT
@@ -321,6 +371,14 @@ async def analyst_redaction_preview(
         original=original,
         sanitized=sanitized,
         summary=guard.redaction_summary(),
+        # Same occurrence filter as the Oracle preview: the guard's lifetime
+        # mapping IS this one preview here, but only pairs whose label made it
+        # into the final composed string get highlighted.
+        replacements=[
+            RedactionReplacementOut(label=r.label, value=r.value, category=r.category)
+            for r in guard.redaction_replacements()
+            if r.label in sanitized
+        ],
         note=_analyst_preview_note(
             redaction_enabled=redaction_enabled,
             event_kinds=set(by_kind),

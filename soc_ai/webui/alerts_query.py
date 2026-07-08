@@ -290,11 +290,12 @@ async def fetch_groups(
 
 
 def _endpoint(source: dict[str, Any], side: str) -> str:
+    """Bare endpoint host/IP for display AND entity pivots — deliberately NO
+    port. The frontend appends the destination port once from the separate
+    ``dst_port`` field; embedding it here duplicated the render (":8080 :8080")
+    and broke the ``/entity/<value>`` pivot, which matches bare IPs/hosts only."""
     ip = _dig(source, f"{side}.ip")
-    if ip is None:
-        return "—"
-    port = _dig(source, f"{side}.port")
-    return f"{ip}:{port}" if port is not None else str(ip)
+    return str(ip) if ip is not None else "—"
 
 
 async def fetch_group_events(

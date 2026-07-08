@@ -5,6 +5,7 @@ import {
   getInvestigations,
   getRedactionPreview,
   type AnalystRedactionPreviewResult,
+  type RedactionReplacement,
 } from '../lib/api';
 import { CollapseChevron, SectionTitle } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
@@ -41,35 +42,109 @@ function SummaryChips({ summary }: { summary: Record<string, number> }) {
   );
 }
 
-/** Shared before/after panes; `right` labels the egress destination. */
+/** Escape a literal string for embedding in a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Amber mark: an internal value the sanitizer replaces (original pane). */
+const MARK_VALUE = 'rounded-[3px] bg-[rgba(245,166,35,.18)] px-[2px] text-[#f5a623]';
+/** Green mark: the opaque label that replaced it (sanitized pane). */
+const MARK_LABEL = 'rounded-[3px] bg-[rgba(63,185,80,.18)] px-[2px] text-success';
+
+/**
+ * Render `text` with every redacted span wrapped in a styled <mark> — pure
+ * string splitting in React (plain text nodes; nothing is injected as HTML).
+ * `side` picks which half of each pair to highlight (real values in the
+ * original pane, opaque labels in the sanitized pane); the tooltip names the
+ * counterpart. Needles are matched longest-first so a substring can never
+ * double-match, and value matching is case-insensitive (the sanitizer
+ * lowercases host/email/MAC). With no replacements this renders plain text —
+ * the honest fallback.
+ */
+function HighlightedText({
+  text,
+  replacements,
+  side,
+}: {
+  text: string;
+  replacements: RedactionReplacement[];
+  side: 'original' | 'sanitized';
+}) {
+  const needles = replacements
+    .map((r) => ({ needle: side === 'original' ? r.value : r.label, pair: r }))
+    .filter((n) => n.needle.length > 0)
+    .sort((a, b) => b.needle.length - a.needle.length);
+  if (needles.length === 0) return <>{text}</>;
+  const byNeedle = new Map(needles.map((n) => [n.needle.toLowerCase(), n.pair]));
+  const re = new RegExp(
+    `(${needles.map((n) => escapeRegExp(n.needle)).join('|')})`,
+    side === 'original' ? 'i' : undefined,
+  );
+  // split() with ONE capture group interleaves matches at odd indices.
+  return (
+    <>
+      {text.split(re).map((part, i) => {
+        if (i % 2 === 0) return part;
+        const pair = byNeedle.get(part.toLowerCase());
+        return (
+          <mark
+            key={i}
+            className={side === 'original' ? MARK_VALUE : MARK_LABEL}
+            title={
+              pair && (side === 'original' ? `redacted as ${pair.label}` : `replaces ${pair.value}`)
+            }
+          >
+            {part}
+          </mark>
+        );
+      })}
+    </>
+  );
+}
+
+/** Shared before/after panes; `right` labels the egress destination.
+ * `replacements` drives the redaction highlights in both panes. */
 function BeforeAfter({
   original,
   sanitized,
+  replacements,
   right,
 }: {
   original: string;
   sanitized: string;
+  replacements: RedactionReplacement[];
   right: string;
 }) {
   return (
-    <div className="grid gap-3 md:grid-cols-2">
-      <div>
-        <div className="mb-1 text-[11px] font-semibold uppercase tracking-[.05em] text-faint">
-          On your grid
+    <>
+      {replacements.length > 0 && (
+        <div className="mb-2 text-[11px] text-faint">
+          <mark className={MARK_VALUE}>internal value</mark>
+          {' → '}
+          <mark className={MARK_LABEL}>opaque label</mark>
+          {` — ${replacements.length} redacted (hover a highlight for its counterpart)`}
         </div>
-        <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-control border border-border-faint bg-bg p-2.5 font-mono text-[11.5px] leading-[1.5] text-text-2">
-          {original}
-        </pre>
-      </div>
-      <div>
-        <div className="mb-1 text-[11px] font-semibold uppercase tracking-[.05em] text-success">
-          {right}
+      )}
+      <div className="grid gap-3 md:grid-cols-2">
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-[.05em] text-faint">
+            On your grid
+          </div>
+          <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-control border border-border-faint bg-bg p-2.5 font-mono text-[11.5px] leading-[1.5] text-text-2">
+            <HighlightedText text={original} replacements={replacements} side="original" />
+          </pre>
         </div>
-        <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-control border border-[rgba(63,185,80,.25)] bg-[rgba(63,185,80,.04)] p-2.5 font-mono text-[11.5px] leading-[1.5] text-text-2">
-          {sanitized}
-        </pre>
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-[.05em] text-success">
+            {right}
+          </div>
+          <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-control border border-[rgba(63,185,80,.25)] bg-[rgba(63,185,80,.04)] p-2.5 font-mono text-[11.5px] leading-[1.5] text-text-2">
+            <HighlightedText text={sanitized} replacements={replacements} side="sanitized" />
+          </pre>
+        </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -89,6 +164,7 @@ function OracleSample() {
           <BeforeAfter
             original={JSON.stringify(data.original, null, 2)}
             sanitized={JSON.stringify(data.sanitized, null, 2)}
+            replacements={data.replacements}
             right="Sent to the Oracle"
           />
         </>
@@ -139,13 +215,12 @@ function AnalystPath() {
       {invId && preview.loading && <LoadingState label="Rebuilding analyst prompt…" />}
       {invId && preview.error && <ErrorState error={preview.error} />}
 
-      {preview.data?.kind === 'events_missing' && (
+      {/* Non-fatal outcomes (events_missing / context_unparseable): the run
+          can't be previewed — a friendly note carrying the backend's reason. */}
+      {preview.data && preview.data.kind !== 'ok' && (
         <div className="flex items-start gap-2 rounded-control border border-border-faint bg-surface-2 px-3 py-2 text-[12.5px] leading-[1.55] text-dim">
           <span className="mt-0.5 flex-none"><Eye size={15} /></span>
-          <span>
-            This investigation predates the stored events needed to rebuild the analyst
-            prompt — only newer runs can be previewed.
-          </span>
+          <span>{preview.data.detail}</span>
         </div>
       )}
 
@@ -169,6 +244,7 @@ function AnalystPath() {
           <BeforeAfter
             original={data.original}
             sanitized={data.sanitized}
+            replacements={data.replacements}
             right="Sent to the analyst model"
           />
         </>

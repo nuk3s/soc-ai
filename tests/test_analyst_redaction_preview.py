@@ -120,6 +120,7 @@ def test_happy_path_rebuilds_and_redacts(settings_kratos: Settings) -> None:
         resp = client.get(f"/api/v1/analyst/redaction-preview/{inv_id}")
         assert resp.status_code == 200
         body = resp.json()
+        assert body["status"] == "ok"  # the union discriminator
         assert body["investigation_id"] == inv_id
         assert body["redaction_enabled"] is True
         assert body["fail_closed"] is True
@@ -139,6 +140,19 @@ def test_happy_path_rebuilds_and_redacts(settings_kratos: Settings) -> None:
         # Same summary shape as the Oracle preview: per-category counts.
         assert body["summary"].get("IP", 0) >= 1
         assert body["note"]
+        # Highlight pairs (same shape as the Oracle preview): every label
+        # occurs in the sanitized pane, every value in the original (case-
+        # insensitive — the sanitizer lowercases host/email/MAC values).
+        repl = body["replacements"]
+        assert repl
+        for r in repl:
+            assert r["label"] in body["sanitized"]
+            assert r["value"].lower() in body["original"].lower()
+            assert r["label"].startswith(r["category"] + "_")
+        values = {r["value"] for r in repl}
+        assert "10.0.0.5" in values
+        assert "dc01.corp.local" in values
+        assert "8.8.8.8" not in values  # preserved public infra is never a pair
 
 
 def test_redaction_off_still_previews(client: TestClient) -> None:
@@ -151,6 +165,7 @@ def test_redaction_off_still_previews(client: TestClient) -> None:
     assert body["redaction_enabled"] is False
     assert body["fail_closed"] is False
     assert "10.0.0.5" not in body["sanitized"]  # the simulation still redacts
+    assert body["replacements"]  # … and still reports the highlight pairs
     assert "currently OFF" in body["note"]  # and the note says it's a simulation
 
 
@@ -182,17 +197,37 @@ def test_prior_outcomes_event_included(client: TestClient) -> None:
     assert "rationale digests are not stored" in body["note"].lower()
 
 
-def test_missing_events_409(client: TestClient) -> None:
-    """An old investigation without the rebuild events → 409 events_missing
-    (machine-readable, so the UI shows a friendly note, not an error)."""
+def test_missing_events_200_status(client: TestClient) -> None:
+    """An old investigation without the rebuild events → HTTP 200 with the
+    ``events_missing`` discriminated body (NOT a 4xx: the UI shows a friendly
+    note, and a 4xx would log a browser console error for a non-fatal state)."""
     inv_id = _seed(
         client, [{"sequence": 1, "kind": "tool_call", "payload": {"tool": "prevalence"}}]
     )
     resp = client.get(f"/api/v1/analyst/redaction-preview/{inv_id}")
-    assert resp.status_code == 409
-    detail = resp.json()["detail"]
-    assert detail["code"] == "events_missing"
-    assert "enriched_alert_context" in detail["missing"]
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "events_missing"
+    assert "enriched_alert_context" in body["missing"]
+    assert "predates the stored events" in body["detail"]
+
+
+def test_unparseable_context_200_status(client: TestClient) -> None:
+    """Stored enriched context that no longer validates → HTTP 200 with the
+    ``context_unparseable`` discriminated body (same non-fatal treatment)."""
+    inv_id = _seed(
+        client,
+        [
+            # Present but schema-drifted: fails EnrichedAlertContext validation.
+            {"sequence": 1, "kind": "enriched_alert_context", "payload": {"drifted": True}},
+            {"sequence": 2, "kind": "decision_template_match", "payload": dict(_TEMPLATE_EVENT)},
+        ],
+    )
+    resp = client.get(f"/api/v1/analyst/redaction-preview/{inv_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "context_unparseable"
+    assert "no longer parses" in body["detail"]
 
 
 def test_unknown_investigation_404(client: TestClient) -> None:

@@ -608,8 +608,8 @@ def test_group_events(client: TestClient) -> None:
         AlertEvent(
             es_id="abc123",
             timestamp="2026-06-22T10:00:00Z",
-            src="1.1.1.1:5",
-            dst="2.2.2.2:443",
+            src="1.1.1.1",
+            dst="2.2.2.2",
             severity="high",
             host="wks-1",
             dst_port=443,
@@ -619,8 +619,10 @@ def test_group_events(client: TestClient) -> None:
         resp = client.get("/api/v1/alerts/events", params={"rule_name": "ET X", "kind": "suricata"})
     assert resp.status_code == 200
     ev = resp.json()[0]
-    assert ev["src"] == "1.1.1.1:5"
-    assert ev["dst"] == "2.2.2.2:443"
+    # src/dst are bare endpoints; the destination port rides `port` alone (the
+    # frontend renders "dst:port" once and pivots on the bare value).
+    assert ev["src"] == "1.1.1.1"
+    assert ev["dst"] == "2.2.2.2"
     assert ev["host"] == "wks-1"
     assert ev["proto"] == ""
     # enriched fields
@@ -695,8 +697,8 @@ def test_group_events_provenance_direct_and_inherited(client: TestClient) -> Non
         AlertEvent(
             es_id="ev-direct",
             timestamp="2026-06-22T10:00:00Z",
-            src="10.0.0.1:5001",
-            dst="1.2.3.4:443",
+            src="10.0.0.1",
+            dst="1.2.3.4",
             severity="high",
             host="wks-1",
             src_ip="10.0.0.1",
@@ -706,8 +708,8 @@ def test_group_events_provenance_direct_and_inherited(client: TestClient) -> Non
         AlertEvent(
             es_id="ev-rule",
             timestamp="2026-06-22T10:01:00Z",
-            src="10.0.0.2:5002",
-            dst="5.5.5.5:80",
+            src="10.0.0.2",
+            dst="5.5.5.5",
             severity="medium",
             host="wks-2",
             src_ip="10.0.0.2",
@@ -1128,6 +1130,19 @@ def test_oracle_redaction_preview(client: TestClient) -> None:
     # opaque labels + a per-category summary are produced
     assert "IP_01" in san
     assert body["summary"].get("IP", 0) >= 2
+    # replacements drive the UI highlight: every pair is consistent with the
+    # two panes (label in sanitized, value in original) and carries a sane
+    # category matching its label prefix.
+    repl = body["replacements"]
+    assert repl
+    for r in repl:
+        assert r["label"] in san
+        assert r["value"] in orig
+        assert r["category"] in {"IP", "HOST", "USER", "EMAIL", "MAC"}
+        assert r["label"].startswith(r["category"] + "_")
+    values = {r["value"] for r in repl}
+    assert "10.0.0.15" in values  # the internal IP is a highlightable pair …
+    assert "8.8.8.8" not in values  # … the preserved public address is not
 
 
 def test_config_set_setting_rejects_danger(client: TestClient) -> None:

@@ -244,8 +244,11 @@ async def test_fetch_group_events(settings_kratos: Settings) -> None:
         elastic, settings_kratos, rule_name="ET SCAN thing", time_range="24h"
     )
     assert [e.es_id for e in events] == ["ev1", "ev2", "ev3"]
-    assert events[0].src == "10.0.0.41:51515"
-    assert events[0].dst == "10.0.0.1:443"
+    # src/dst are BARE endpoints (no embedded port): they feed the /entity/<value>
+    # pivot, and the frontend renders the destination port once from dst_port.
+    assert events[0].src == "10.0.0.41"
+    assert events[0].dst == "10.0.0.1"
+    assert events[0].dst_port == 443
     assert events[0].severity == "medium"
     assert events[1].src == "—"  # missing fields render as em-dash
     assert events[2].src == "10.0.0.7"
