@@ -387,7 +387,13 @@ def test_memory_settings_visible_and_settable_via_config(settings_kratos: Settin
         groups = {g["title"]: g["items"] for g in client.get("/api/v1/config").json()["groups"]}
         assert "Memory" in groups
         keys = {item["key"] for item in groups["Memory"]}
-        assert keys == {"memory_enabled", "memory_window_days", "memory_max_items"}
+        assert keys == {
+            "memory_enabled",
+            "memory_window_days",
+            "memory_max_items",
+            # chat-transcript memory sub-switch (context only, never evidence)
+            "memory_include_chat",
+        }
 
         # All three are hot-apply (the orchestrator reads settings per run).
         # Values are stringified — the route coerces server-side (SettingIn.value).

@@ -151,3 +151,79 @@ def test_redos_adversarial_inputs_complete_fast() -> None:
         san.unsafe_residue(payload, extra_suffixes=[".lan"])
         elapsed = time.perf_counter() - start
         assert elapsed < 1.0, f"ReDoS: sanitize took {elapsed:.2f}s on {payload[:20]!r}…"
+
+
+# ---------------------------------------------------------------------------
+# DNS-SD / underscore-led suffix-FQDNs (incident 2026-07-08 — this module's
+# unsafe_residue is what refused the eval oracle send; see eval/harness.py)
+# ---------------------------------------------------------------------------
+
+_INCIDENT_DECODED = ".C..........\n_aaplcache._tcp.corp.lan....."
+_INCIDENT_PRINTABLE = "2~..........._aaplcache1._tcp.corp.lan....."
+
+
+def test_dns_sd_incident_string_redacted_and_residue_clean() -> None:
+    """Regression: the exact free-text incident string (real newline = the DNS
+    length byte 0x0a) is redacted to a HOST label, and the residue sweep over
+    the json.dumps outbound form passes afterwards."""
+    import json
+
+    out, m = san.sanitize(_INCIDENT_DECODED)
+    assert "_aaplcache" not in out
+    assert "corp.lan" not in out
+    assert "HOST_" in out
+    assert san.unsafe_residue(json.dumps(out)) == []
+    # Reversible: the oracle's answer rehydrates to the original bytes.
+    assert san.desanitize(out, m) == _INCIDENT_DECODED
+
+
+def test_dns_sd_dot_run_prefixed_form_redacted() -> None:
+    """payload_printable renders nonprintables as dots, so the service label
+    follows a dot-run — previously missed by BOTH sanitize and the detector."""
+    import json
+
+    out, _ = san.sanitize(_INCIDENT_PRINTABLE)
+    assert "_aaplcache1" not in out
+    assert "corp.lan" not in out
+    assert san.unsafe_residue(json.dumps(out)) == []
+
+
+def test_dns_sd_joined_token_redacts_whole_fqdn() -> None:
+    """Boundary pin: word-joined text redacts the whole token; no partial-label
+    mangling that leaves `.corp.lan` behind."""
+    out, _ = san.sanitize("seen dns_aaplcache._tcp.corp.lan in logs")
+    assert out == "seen HOST_01 in logs"
+
+
+def test_public_dns_sd_untouched() -> None:
+    """DNS-SD names on non-internal suffixes are high-signal — must pass."""
+    text = "SRV _ldap._tcp.example.com and _service._tcp.evil.org queried"
+    out, _ = san.sanitize(text)
+    assert out == text
+    assert san.unsafe_residue(text) == []
+
+
+def test_suffix_fqdn_detector_replacer_invariant() -> None:
+    """INVARIANT: anything unsafe_residue would flag as a residual internal
+    host on the outbound (json.dumps) string must be caught by sanitize first.
+    (In this module both share _build_internal_host_re, so the invariant is
+    structural — this test guards against the paths being split later.)"""
+    import json
+
+    first_labels = ("host01", "_aaplcache", "_x-9", "svc-01", "_MiXeD", "0start", "_0start")
+    middles = ("", "._tcp", ".sub.zone")
+    suffixes = (".lan", ".local", ".internal", ".corp")
+    contexts = ("seen {} in traffic", "payload:\n{} end", 'k="{}" v', "...{}...")
+    for first in first_labels:
+        for mid in middles:
+            for suffix in suffixes:
+                fqdn = f"{first}{mid}{suffix}"
+                for ctx in contexts:
+                    raw = ctx.format(fqdn)
+                    out, _ = san.sanitize(raw)
+                    outbound = json.dumps(out)
+                    residue = [i for i in san.unsafe_residue(outbound) if "internal host" in i]
+                    assert residue == [], (raw, out, residue)
+                # Detector coverage: the raw dumped form IS flagged.
+                issues = san.unsafe_residue(json.dumps(f"seen {fqdn} x"))
+                assert any("internal host" in i for i in issues), fqdn

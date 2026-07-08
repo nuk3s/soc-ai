@@ -391,7 +391,13 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
     <Panel>
       <PanelHeader
         icon={isBar ? <BarChart3 size={15} /> : <LineChartIcon size={15} />}
-        title={chart.title || 'Chart'}
+        title={
+          // Machine-generated chart titles run long — two lines before the
+          // ellipsis; the tooltip carries the full text.
+          <span className="line-clamp-2" title={chart.title || 'Chart'}>
+            {chart.title || 'Chart'}
+          </span>
+        }
         right={<span className="font-mono text-[11px] text-accent">{data.length}</span>}
       />
       <div className="px-2 pb-1 pt-3">

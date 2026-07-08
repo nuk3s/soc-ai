@@ -1,7 +1,8 @@
 # soc-ai compose stack.
 #
 # Usage:
-#   docker compose up -d        # build + start soc-ai
+#   docker compose up -d                              # build from source + start
+#   docker compose pull soc-ai && docker compose up -d  # run the published GHCR image
 #
 # soc-ai talks to a LiteLLM gateway you run separately (most setups put it on a
 # GPU host). The RAG/reranker engine and its vector store arrive with the v1.1
@@ -18,10 +19,18 @@
 services:
 
   soc-ai:
+    # ── Image: published release (pull) or local build ───────────────────────
+    # With both `image:` and `build:` declared, plain `docker compose up` still
+    # BUILDS from source when the image isn't in the local store (Compose
+    # prefers `build:` over pulling) — so the existing setup.sh / `up --build`
+    # flow is unchanged. To run the prebuilt release image instead, pull it
+    # explicitly first:
+    #     docker compose pull soc-ai && docker compose up -d
+    # (or `./setup.sh --prebuilt`). Pin a release: SOC_AI_IMAGE_TAG=1.1.0
+    image: ghcr.io/nuk3s/soc-ai:${SOC_AI_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
-    image: soc-ai:latest
     container_name: soc-ai
 
     # ── Port ─────────────────────────────────────────────────────────────────

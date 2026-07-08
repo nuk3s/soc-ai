@@ -42,7 +42,12 @@ class HuntFinding(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    title: str = Field(description="Short headline for the finding (analyst-scannable).")
+    title: str = Field(
+        description=(
+            "Short headline for the finding (analyst-scannable). HARD STYLE RULE: "
+            "max ~8 words / 60 characters, no trailing punctuation."
+        )
+    )
     detail: str = Field(
         description="2-4 sentences: what was observed and why it matters, grounded in tool results."
     )
@@ -119,7 +124,12 @@ class HuntChart(BaseModel):
     kind: Literal["bar", "line", "timeline"] = Field(
         description="How to render: 'bar' (categorical), 'line' (continuous), 'timeline' (time)."
     )
-    title: str = Field(description="Short chart title (analyst-scannable).")
+    title: str = Field(
+        description=(
+            "Short chart title (analyst-scannable). HARD STYLE RULE: max ~8 words / "
+            "60 characters, no trailing punctuation."
+        )
+    )
     x_label: str = Field(default="", description="Axis label for x (optional).")
     y_label: str = Field(default="", description="Axis label for y (optional).")
     series: list[HuntChartPoint] = Field(
@@ -225,9 +235,10 @@ community_id, `t_host_summary` to identify an internal host by IP, `t_prevalence
 judge how rare a host→dest/domain pairing is, `t_rule_prevalence` to judge whether a \
 firing rule is noise or notable, and the `t_enrich_*` tools for indicator reputation.
 4. Map what you find to MITRE ATT&CK techniques where you can (technique IDs).
-5. Produce a `HuntReport`: discrete `findings` (each with a title, grounded detail, \
-severity, a `category`, the hosts involved, and citations), a `narrative` tying them \
-together, the `affected_hosts`, the `mitre_techniques`, advisory \
+5. Produce a `HuntReport`: discrete `findings` (each with a SHORT title — max ~8 words \
+/ 60 characters, no trailing punctuation — grounded detail, severity, a `category`, the \
+hosts involved, and citations), a `narrative` tying them together, the \
+`affected_hosts`, the `mitre_techniques`, advisory \
 `recommended_actions`, and an overall `confidence`. Categorize honestly: `"threat"` \
 ONLY for activity you actually observed in tool results; `"visibility_gap"` for \
 telemetry that doesn't exist here; `"observation"` for benign context. The console's \
@@ -248,10 +259,10 @@ jitter) or a high-entropy / high-volume TXT or NULL DNS pattern to ONE destinati
 decisive C2 evidence on its own — even when the only alert is ET HUNTING / \
 Informational. Confirm the periodicity or the DNS pattern (or a `*_summary` rollup if \
 present) and grade it accordingly; do not discount it because the alert was low-sev.
-- Produce a `HuntReport`: discrete `findings` (each with a title, grounded detail, \
-severity, the hosts involved, and citations), a `narrative` tying them together, the \
-`affected_hosts`, the `mitre_techniques`, advisory `recommended_actions`, and an \
-overall `confidence`.
+- Produce a `HuntReport`: discrete `findings` (each with a SHORT title — max ~8 words \
+/ 60 characters, no trailing punctuation — grounded detail, severity, the hosts \
+involved, and citations), a `narrative` tying them together, the `affected_hosts`, \
+the `mitre_techniques`, advisory `recommended_actions`, and an overall `confidence`.
 
 ## Budget & conclusion (important)
 You have a BOUNDED tool budget — hunt efficiently and CONCLUDE. A focused hunt \
@@ -279,7 +290,8 @@ If — and ONLY if — you have a NUMERIC SERIES that came straight out of a too
 (a beacon-interval histogram, bytes-over-time for a flow, per-host event counts over \
 an hour, a DNS-query-length distribution), you MAY add it to `charts` so the analyst \
 sees what a generic chart can't guess. Each chart needs a `kind` ("bar" | "line" | \
-"timeline"), a `title`, a `series` of x/y points (x = the category or time label, y = the \
+"timeline"), a `title` (same style rule: max ~8 words / 60 characters, no trailing \
+punctuation), a `series` of x/y points (x = the category or time label, y = the \
 measured value), and `source_citations` — the ES `_id`s / tool-result markers the numbers \
 came from. The SAME HARD RULE applies: \
 every value must trace to data you pulled THIS session. A chart whose `source_citations` \

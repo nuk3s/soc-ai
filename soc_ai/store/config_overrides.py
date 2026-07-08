@@ -673,6 +673,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
         min_value=1,
         max_value=5,
     ),
+    SettingSpec(
+        key="memory_include_chat",
+        attr="memory_include_chat",
+        type="bool",
+        label="Include past chat excerpts (context only, never evidence)",
+        section="Memory",
+        hot=True,
+        help=(
+            "Recall relevant snippets from past analyst/AI chat threads into the "
+            "memory block. Framed as unverified context — user statements may be "
+            "wrong and nothing from a transcript can ground a verdict. Only takes "
+            "effect when investigation memory is enabled."
+        ),
+    ),
     # ---- DISCOVERY: internal-identifier auto-discovery tuning (hot) ----------
     # All hot=True: the discovery job (CLI / timer / scan-now endpoint) reads
     # these fresh from settings on each run, so a change applies to the next

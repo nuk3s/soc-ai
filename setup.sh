@@ -7,6 +7,7 @@
 #                             ./setup.sh --auto
 #   Automated, named file:    ./setup.sh --auto myhost.conf
 #   Pre-seed interactive:     ./setup.sh --config myhost.conf
+#   Prebuilt image (no build): ./setup.sh --prebuilt   # pulls ghcr.io/nuk3s/soc-ai
 #
 # It installs Docker if missing, collects connection settings (validating them
 # before the build), generates the encryption key + admin password + a TLS cert,
@@ -16,12 +17,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ── args ──────────────────────────────────────────────────────────────────────
-AUTO=0; CONF=""; SHOW_HELP=0
+AUTO=0; CONF=""; SHOW_HELP=0; PREBUILT=0
 DEFAULT_CONF="setup.conf"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -a|--auto|-y|--yes) AUTO=1 ;;
     -c|--config|--file) CONF="${2:-}"; shift ;;
+    -p|--prebuilt) PREBUILT=1 ;;
     -h|--help) SHOW_HELP=1 ;;
     *.conf|*.txt|*.env) CONF="$1" ;;     # bare filename → config file
     *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -30,7 +32,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $SHOW_HELP -eq 1 ]]; then
-  sed -n '3,14p' "$0" | sed 's/^#\s\{0,1\}//; s/^#$//'
+  sed -n '3,15p' "$0" | sed 's/^#\s\{0,1\}//; s/^#$//'
   exit 0
 fi
 
@@ -336,8 +338,16 @@ fi
 
 # ── 4. build + start ──────────────────────────────────────────────────────────
 hr
-info "Building and starting the stack (first build pulls deps — ~3 min)…"
-$DC up -d --build
+if [[ $PREBUILT -eq 1 ]]; then
+  # Pull the published release image (SOC_AI_IMAGE_TAG pins a version; default
+  # latest). With the image in the local store, `up` uses it instead of building.
+  info "Pulling the prebuilt image (ghcr.io/nuk3s/soc-ai) and starting the stack…"
+  $DC pull soc-ai
+  $DC up -d
+else
+  info "Building and starting the stack (first build pulls deps — ~3 min)…"
+  $DC up -d --build
+fi
 info "Waiting for the service to report healthy…"
 healthy=0
 for _ in $(seq 1 60); do
@@ -365,5 +375,9 @@ else
   echo "    Password: unchanged (your existing .env, or the first-boot logs)"
 fi
 echo
-echo "    Logs:   ${DC} logs -f soc-ai      Stop: ${DC} down      Update: git pull && ${DC} up -d --build"
+if [[ $PREBUILT -eq 1 ]]; then
+  echo "    Logs:   ${DC} logs -f soc-ai      Stop: ${DC} down      Update: git pull && ${DC} pull soc-ai && ${DC} up -d"
+else
+  echo "    Logs:   ${DC} logs -f soc-ai      Stop: ${DC} down      Update: git pull && ${DC} up -d --build"
+fi
 hr

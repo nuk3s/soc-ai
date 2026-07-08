@@ -838,3 +838,139 @@ class TestOracleExtraHosts:
         assert "FINANCE-PC" not in sanitized
         leaks = unsafe_residue(sanitized, extra_hosts=extra_hosts)
         assert leaks == [], f"unexpected residue: {leaks}"
+
+
+# ---------------------------------------------------------------------------
+# 17. DNS-SD / underscore-led suffix-FQDNs  (incident 2026-07-08)
+# ---------------------------------------------------------------------------
+#
+# Real eval traffic carried mDNS/DNS-SD service names in free text
+# (``payload_printable`` / ``network.data.decoded``):
+#
+#   ".C..........\n_aaplcache._tcp.corp.lan....."   (real 0x0a DNS length byte)
+#   "2~..........._aaplcache1._tcp.corp.lan....."   (nonprintables -> dots)
+#
+# The old replacement pattern required the first label to start [A-Za-z0-9],
+# so ``_aaplcache._tcp.corp.lan`` sailed through sanitize un-redacted.  The
+# residue detector (same first-label class) caught the first form only by
+# ACCIDENT: json.dumps turned the newline into a literal ``\n``, handing it a
+# fake alnum lead-in (flagged as ``n_aaplcache._tcp.corp.lan``).  The second
+# (dot-prefixed) form was missed by BOTH paths — a silent-leak class.
+
+_INCIDENT_DECODED = ".C..........\n_aaplcache._tcp.corp.lan....."
+_INCIDENT_PRINTABLE = "2~..........._aaplcache1._tcp.corp.lan....."
+
+
+class TestDnsSdServiceFqdns:
+    def test_incident_decoded_string_redacted_in_json_context(self) -> None:
+        """The exact incident string, inside a realistic case-dict context."""
+        m = _clean_mapping()
+        case = {
+            "network": {"data": {"decoded": _INCIDENT_DECODED}},
+            "message": "ET MALWARE Potential DNS C2 via TXT on sensor",
+        }
+        out = sanitize(case, m)
+        outbound = json.dumps(out)
+        assert "_aaplcache" not in outbound
+        assert "corp.lan" not in outbound
+        assert "HOST_" in outbound
+        assert unsafe_residue(outbound) == []
+
+    def test_incident_raw_form_flagged_by_detector(self) -> None:
+        """Detector coverage of the incident shape on an UN-sanitized outbound
+        string (this is what fail-closed refused on 2026-07-08)."""
+        outbound = json.dumps({"decoded": _INCIDENT_DECODED})
+        issues = unsafe_residue(outbound)
+        assert any("aaplcache._tcp.corp.lan" in i for i in issues)
+
+    def test_dot_run_prefixed_dns_sd_redacted(self) -> None:
+        """payload_printable renders the DNS length byte as '.', so the
+        service label follows a dot-run — must still be redacted."""
+        m = _clean_mapping()
+        out = sanitize(_INCIDENT_PRINTABLE, m)
+        assert isinstance(out, str)
+        assert "_aaplcache1" not in out
+        assert "corp.lan" not in out
+        assert unsafe_residue(json.dumps(out)) == []
+
+    def test_clean_underscore_fqdn_redacts_whole_token(self) -> None:
+        m = _clean_mapping()
+        out = sanitize("query for _aaplcache._tcp.corp.lan observed", m)
+        assert out == "query for HOST_01 observed"
+
+    def test_joined_prefix_redacts_whole_token_not_partial(self) -> None:
+        """Boundary pin: word-joined text redacts the WHOLE token — no
+        partial-label mangling that leaves `.corp.lan` behind."""
+        m = _clean_mapping()
+        out = sanitize("seen dns_aaplcache._tcp.corp.lan in logs", m)
+        assert out == "seen HOST_01 in logs"
+
+    def test_public_dns_sd_untouched(self) -> None:
+        """Non-internal suffix: DNS-SD names on public domains must pass."""
+        m = _clean_mapping()
+        text = "SRV _ldap._tcp.example.com and _service._tcp.evil.org queried"
+        out = sanitize(text, m)
+        assert out == text
+        assert unsafe_residue(json.dumps(out)) == []
+
+    def test_desanitize_round_trip(self) -> None:
+        m = _clean_mapping()
+        out = sanitize(_INCIDENT_DECODED, m)
+        assert desanitize(out, m) == _INCIDENT_DECODED
+
+
+class TestSuffixFqdnDetectorReplacerInvariant:
+    """INVARIANT: any suffix-FQDN the residue detector would flag on the final
+    outbound string must have been caught by the replacement pattern first
+    (detector is a SUBSET of the replacer for the suffix-FQDN class).
+
+    The two patterns are deliberately re-declared (sanitize path vs residue
+    path must not fail together) — this test is what keeps their accepted
+    label alphabets aligned.
+    """
+
+    _FIRST_LABELS = (
+        "host01",
+        "_aaplcache",
+        "_x-9",
+        "svc-01",
+        "_MiXeD",
+        "0start",
+        "_0start",
+        "_dns-sd",
+    )
+    _MIDDLES = ("", "._tcp", ".sub.zone", "._dns-sd._udp")
+    _SUFFIXES = (".lan", ".local", ".internal", ".corp")
+    _CONTEXTS = (
+        "seen {} in traffic",
+        "payload:\n{} end",
+        'k="{}" v',
+        "...{}...",
+        "\\{} tail",
+    )
+
+    def test_detector_flag_implies_replacer_caught(self) -> None:
+        """Loop the corpus through sanitize then the detector: nothing the
+        detector accepts may survive the replacer (json.dumps included, since
+        the detector runs on the dumped outbound string)."""
+        for first in self._FIRST_LABELS:
+            for mid in self._MIDDLES:
+                for suffix in self._SUFFIXES:
+                    fqdn = f"{first}{mid}{suffix}"
+                    for ctx in self._CONTEXTS:
+                        raw = ctx.format(fqdn)
+                        m = _clean_mapping()
+                        sanitized = sanitize(raw, m)
+                        outbound = json.dumps(sanitized)
+                        residue = [i for i in unsafe_residue(outbound) if "internal host" in i]
+                        assert residue == [], (raw, sanitized, residue)
+
+    def test_detector_coverage_of_underscore_labels(self) -> None:
+        """The corpus is IN the detector's language: on a raw (un-sanitized)
+        outbound string the detector flags every first-label shape — including
+        underscore-led DNS-SD labels, no longer only by json-escape accident."""
+        for first in self._FIRST_LABELS:
+            fqdn = f"{first}._tcp.corp.lan"
+            outbound = json.dumps(f"seen {fqdn} in traffic")
+            issues = [i for i in unsafe_residue(outbound) if "internal host" in i]
+            assert issues, f"detector missed {fqdn!r}"

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
@@ -1227,6 +1228,58 @@ def _format_prior_outcomes_block(digests: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# Header framing the chat-transcript memory block. Like the priors header the
+# anti-grounding instruction lives HERE (read before any excerpt line) — and it
+# is stronger, per the operator's hard rule: a transcript's USER turns are an
+# analyst's unverified opinion (the user is NOT always right), and its
+# ASSISTANT turns reasoned about DIFFERENT alerts. Context only, never evidence.
+_CHAT_MEMORY_HEADER = (
+    "## Prior discussion excerpts (CONTEXT ONLY — NOT evidence. These are past "
+    "chat messages; USER statements are unverified operator opinions and may be "
+    "wrong; ASSISTANT statements were about different alerts. Do not cite; "
+    "weigh current evidence on its own merits.)"
+)
+
+
+def _chat_memory_query_terms(
+    rule_name: str | None, src_ip: str | None, dest_ip: str | None
+) -> list[str]:
+    """Alert-derived FTS query terms for the chat-transcript recall.
+
+    Rule-name WORDS (split here, so each word matches independently — the
+    store would treat a multi-word term as an exact phrase) plus the endpoint
+    IPs as whole terms (the store turns each into an FTS phrase, keeping an IP
+    selective). Everything is deterministic alert-row data — no model in the
+    loop, mirroring the E4.2 (rule, src, dest) keying.
+    """
+    terms: list[str] = re.findall(r"[A-Za-z0-9]+", rule_name or "")
+    terms.extend(ip for ip in (src_ip, dest_ip) if ip)
+    return terms
+
+
+def _format_chat_memory_block(digests: list[dict[str, Any]]) -> str:
+    """Render chat-snippet digests into the round-1 "prior discussion" block.
+
+    One compact line per snippet — ``[age · source · ROLE] "snippet"`` — under
+    the context-NEVER-evidence header. The ROLE is uppercased so a USER line is
+    visibly labeled as operator opinion right where it's read, not only in the
+    header. Same egress contract as the priors block: the returned text is
+    composed BEFORE the final sanitize sweep + ``_guard_egress``, so internal
+    identifiers inside a snippet are redacted on the cloud-analyst path.
+    """
+    from soc_ai.store.auth import utcnow  # noqa: PLC0415 - lazy: store dep only when memory is on
+
+    now = utcnow()
+    lines = [_CHAT_MEMORY_HEADER, ""]
+    for d in digests:
+        role = str(d.get("role") or "").upper() or "UNKNOWN"
+        lines.append(
+            f"- [{_prior_age_phrase(d.get('created_at'), now)} · {d.get('source')} · "
+            f'{role}] "{d.get("snippet")}"'
+        )
+    return "\n".join(lines)
+
+
 async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pipeline is inherently long
     *,
     alert_id: str,
@@ -1537,6 +1590,64 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             )
             await _audit(mem_ev)
             yield mem_ev
+        # ----- Chat-transcript memory (round-1 ONLY, sub-switch of E4.2) -----
+        # Operator intent, verbatim rule: past chat transcripts are CONTEXT,
+        # never evidence — the user is not always right. Same fail-soft +
+        # same window/limit knobs as the priors; gated on memory_enabled AND
+        # memory_include_chat (both `is True` so a test double can't flip it).
+        chat_memory_block: str | None = None
+        chat_digests: list[dict[str, Any]] = []
+        if (
+            getattr(ctx.settings, "memory_enabled", False) is True
+            and getattr(ctx.settings, "memory_include_chat", False) is True
+            and ctx.db_sessionmaker is not None
+        ):
+            from soc_ai.store import chat_memory as chat_memory_store  # noqa: PLC0415
+
+            chat_terms = _chat_memory_query_terms(
+                enriched.alert.rule_name,
+                enriched.alert.source_ip,
+                enriched.alert.destination_ip,
+            )
+            if chat_terms:
+                try:
+                    async with ctx.db_sessionmaker() as mem_db:
+                        chat_digests = await chat_memory_store.relevant_chat_snippets(
+                            mem_db,
+                            query_terms=chat_terms,
+                            # This run has no chat thread yet (chats attach to
+                            # COMPLETED investigations), so there is no own
+                            # thread to exclude from inside the pipeline —
+                            # mirrors the prior_outcomes exclude_id=None note.
+                            exclude_thread=None,
+                            window_days=ctx.settings.memory_window_days,
+                            limit=ctx.settings.memory_max_items,
+                        )
+                except Exception as e:
+                    _LOGGER.warning("chat-transcript memory lookup failed (skipping): %s", e)
+                    chat_digests = []
+        if chat_digests:
+            chat_memory_block = _format_chat_memory_block(chat_digests)
+            # Sibling of the prior_outcomes event, same light-payload rule:
+            # source/thread/role only — snippet text lives in the prompt,
+            # never in the timeline payload. Emitted ONLY on injection.
+            chat_ev = _ev(
+                "chat_memory",
+                {
+                    "count": len(chat_digests),
+                    "window_days": ctx.settings.memory_window_days,
+                    "items": [
+                        {
+                            "source": d.get("source"),
+                            "thread_id": d.get("thread_id"),
+                            "role": d.get("role"),
+                        }
+                        for d in chat_digests
+                    ],
+                },
+            )
+            await _audit(chat_ev)
+            yield chat_ev
         user_msg_round1 = build_synth_first_user_message(
             alert_id=alert_id,
             enriched_ctx_json=enriched_json,
@@ -1546,6 +1657,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # Included BEFORE the final sanitize sweep + _guard_egress below,
             # so prior rationale text is redacted on the cloud-analyst path.
             prior_outcomes_block=prior_outcomes_block,
+            # Same egress contract as the priors block (composed pre-sweep).
+            chat_memory_block=chat_memory_block,
         )
         if guard is not None:
             # Final sweep over the COMPOSED message — catches the decision-

@@ -18,6 +18,15 @@ export function Spinner({ size = 15, color = '#4b8bf5' }: { size?: number; color
   );
 }
 
+/** Shared Suspense fallback for lazily-loaded route screens. */
+export function RouteFallback() {
+  return (
+    <div className="flex min-h-[50vh] items-center justify-center">
+      <Spinner size={20} />
+    </div>
+  );
+}
+
 export function LoadingState({ label = 'Loading…' }: { label?: string }) {
   return (
     <div className="flex items-center gap-3 px-1 py-10 text-[13px] text-dim">

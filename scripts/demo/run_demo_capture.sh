@@ -29,6 +29,15 @@ APP_PORT="${APP_PORT:-8901}"
 mkdir -p "$WORK"
 rm -rf "$SHOTS"
 
+# Pre-flight: a server already on $APP_PORT is a STALE app from a previous
+# run (its SQLite fd points at the about-to-be-deleted database, so the
+# capture would screenshot a mix of old and new data). Refuse loudly.
+if curl -fsS "http://127.0.0.1:$APP_PORT/healthz" >/dev/null 2>&1; then
+  echo "ERROR: something already serves :$APP_PORT — kill the stale demo app first" >&2
+  echo "       (pkill -f 'uvicorn soc_ai.main' usually does it)" >&2
+  exit 1
+fi
+
 echo "== seeding demo store =="
 "$PY" "$REPO/scripts/demo/seed_demo.py" --data-dir "$DATA"
 
@@ -48,12 +57,18 @@ echo "== starting soc-ai on :$APP_PORT (cwd=$WORK, no .env reachable) =="
     SO_PASSWORD="demo-password-unused" \
     ES_HOSTS="http://127.0.0.1:$ES_PORT" \
     LITELLM_BASE_URL="http://127.0.0.1:$ES_PORT" \
+    NOTIFY_WEBHOOK_URL="https://hooks.example.com/soc-ai-demo-placeholder" \
     "$PY" -m uvicorn soc_ai.main:app --host 127.0.0.1 --port "$APP_PORT" \
       >"$WORK/app.log" 2>&1
 ) &
 APP_PID=$!
 
 cleanup() {
+  # Kill the app's whole subtree, not just the subshell wrapper: uvicorn is a
+  # CHILD of $APP_PID, and killing only the wrapper orphans it — the orphan
+  # keeps :$APP_PORT bound with an fd to the deleted database and silently
+  # serves stale data to the NEXT capture run.
+  pkill -TERM -P "$APP_PID" 2>/dev/null || true
   kill "$APP_PID" "$MOCK_PID" 2>/dev/null || true
   wait "$APP_PID" "$MOCK_PID" 2>/dev/null || true
 }

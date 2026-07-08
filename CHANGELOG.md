@@ -8,6 +8,39 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **A first-class Runbooks page** (`/app/runbooks`, in the sidebar): search,
+  markdown editor with preview, tags and linked rules, multi-file `.md` import
+  with lenient front-matter parsing, and embed-status chips when the semantic
+  tier is on. Ships with a **starter pack of ten vendor-neutral SOC runbooks**
+  (`runbooks/starter-pack/`) loadable in one click — idempotent, never
+  overwrites your own. The old Config section is now a compact signpost.
+- **Chat-transcript memory (context, never evidence).** When investigation
+  memory is on, synthesis also recalls relevant excerpts from past analyst↔AI
+  chats (investigation and hunt threads) via a new local full-text index.
+  Excerpts are hard-framed as context only — user statements are labeled as
+  unverified operator opinion on every line, transcript-grounded citations are
+  rejected by the evidence gate, and excerpts ride the full egress-redaction
+  path. New hot setting `memory_include_chat` (effective only with
+  `memory_enabled`).
+- **`soc-ai doctor`** — one command that checks the whole dependency surface
+  in ~15 seconds: config, database + migration head, FTS5 availability,
+  Security Onion and Elasticsearch auth vs reachability, gateway + configured
+  models, the model-fitness probe, egress posture, and blocklist freshness —
+  each with a concrete fix hint. `--json` for automation; the bug-report
+  template asks for its output.
+- **Published container image on GHCR.** Every `v*` tag now builds the
+  Dockerfile (linux/amd64 + linux/arm64) and pushes
+  `ghcr.io/nuk3s/soc-ai:{version}` + `:latest`, gated on the full CI suite
+  passing first (`.github/workflows/release.yml`). `./setup.sh --prebuilt`
+  (or `docker compose pull soc-ai && docker compose up -d`) runs the published
+  image with no local build; `SOC_AI_IMAGE_TAG` pins a version. Plain
+  `docker compose up`/`up --build` still builds from source, unchanged — note
+  the compose image name is now `ghcr.io/nuk3s/soc-ai` (was `soc-ai:latest`),
+  so the next `up` on an existing install rebuilds once under the new name.
+- **Contributor surface.** A root `CONTRIBUTING.md` (dev setup, the exact CI
+  gates, the browser-smoke how-to, and privacy-first scope guidance citing
+  the safety model), structured GitHub issue forms (the bug form asks for
+  `soc-ai doctor --json` output), and a PR checklist mirroring the CI gates.
 - **Runbook retrieval upgraded to full-text search, with an optional semantic
   tier.** Runbook lookup (both the agent tool and the console) now uses SQLite
   FTS5/BM25 ranking — built into the SQLite already shipped, zero new
@@ -42,6 +75,27 @@ All notable changes to this project are documented here. The format is based on
   with hover tooltips naming the counterpart and a per-category span count.
   The replacement pairs come from the sanitizer's own mapping, filtered to
   what the preview actually redacted — never the whole identifier config.
+
+### Changed
+
+- **RAG model settings are dropdowns** fed by your gateway's model list, with
+  an explicit "(off)" and an "Other…" escape hatch for unlisted ids.
+- **Config page section navigation snaps instantly** instead of a slow smooth
+  scroll.
+- **Hunt template affordance reads positively**: templates your grid can run
+  are highlighted; ones needing missing telemetry keep their flag (wording
+  inverted from "dimmed").
+- **Machine-generated hunt titles stay short**: the agent is instructed to
+  keep finding/chart titles to ~8 words, a deterministic 90-character clamp
+  backstops it, and the hunt page wraps to two lines before ellipsizing.
+- **The app loads faster**: route-level code splitting cut the initial
+  JavaScript bundle from ~1 MB to ~214 kB; screens load on first visit.
+- **Banner wording corrected** to match the safety model: "can run on
+  self-hosted models" and "nothing leaves your network without your consent".
+- **The demo dataset exercises every headline feature** (failed retries,
+  pipeline-fallback chips, hunt diffs, redaction preview with highlighting,
+  runbooks, assignment states, memory recalls) and the README screenshots are
+  regenerated from it.
 
 ### Fixed
 

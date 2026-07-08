@@ -203,8 +203,17 @@ def _build_internal_host_re(
         # Label quantifiers bounded to DNS limits (label ≤63, ≤127 labels) so a
         # long ``a-a-a…`` run cannot trigger catastrophic backtracking (ReDoS).
         # Mirrors ``soc_ai.oracle.sanitize._build_host_re``.
+        # First label: ``(?<!\.)[A-Za-z0-9_]`` (no preceding dot — email-domain
+        # guard) OR ``_`` even after a dot: DNS-SD service labels
+        # (``_aaplcache._tcp.corp.lan``, incident 2026-07-08) are underscore-led
+        # and appear after dot-runs when nonprintable bytes render as ``.``.
+        # INVARIANT: sanitize() and unsafe_residue() both build their host
+        # pattern HERE, so whatever the residue detector can flag the replacer
+        # matched first (detector ⊆ replacer) — do not split the two paths onto
+        # diverging label alphabets.  Enforced by tests/test_eval_sanitize.py::
+        # test_suffix_fqdn_detector_replacer_invariant.
         parts.append(
-            rf"(?<![\w@.])[A-Za-z0-9][\w-]{{0,62}}(?:\.[\w-]{{1,63}}){{0,126}}"
+            rf"(?<![\w@])(?:(?<!\.)[A-Za-z0-9_]|_)[\w-]{{0,62}}(?:\.[\w-]{{1,63}}){{0,126}}"
             rf"{re.escape(suffix)}(?![\w-])"
         )
     for host in explicit_hosts:

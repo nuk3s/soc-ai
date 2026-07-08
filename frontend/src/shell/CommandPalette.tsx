@@ -1,4 +1,4 @@
-import { ChevronsLeft, Crosshair, Search, Settings, Triangle, Zap } from 'lucide-react';
+import { BookOpen, ChevronsLeft, Crosshair, Search, Settings, Triangle, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -29,6 +29,7 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Alerts', icon: <Triangle size={15} />, run: go('/alerts') },
       { group: 'Go to', label: 'Investigations', icon: <Search size={15} />, run: go('/investigations') },
       { group: 'Go to', label: 'Hunts', icon: <Crosshair size={15} />, run: go('/hunts') },
+      { group: 'Go to', label: 'Runbooks', icon: <BookOpen size={15} />, run: go('/runbooks') },
       { group: 'Go to', label: 'Config', icon: <Settings size={15} />, run: go('/config') },
       {
         group: 'Action',

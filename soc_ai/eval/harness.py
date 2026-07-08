@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
@@ -30,7 +30,11 @@ from soc_ai.eval.oracle_client import OracleError, OracleResponse, call_oracle
 from soc_ai.eval.prompt import SYSTEM_PROMPT, architecture_block, build_user_message
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.store.db import make_engine, make_sessionmaker
 from soc_ai.tools.enrichment import MispClient
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,7 +105,8 @@ async def run(
     # ----- Run the investigation in-process -----
     # `include_synth` lets the prefetch see this synth alert's own supporting
     # docs; real alerts leave it False so synth fixtures stay invisible.
-    ctx = _build_context(settings, include_synth=include_synth)
+    engine, db_sessionmaker = _store_sessionmaker(settings)
+    ctx = _build_context(settings, include_synth=include_synth, db_sessionmaker=db_sessionmaker)
 
     started = time.monotonic()
     events: list[StepEvent] = []
@@ -118,6 +123,9 @@ async def run(
             await ctx.elastic.aclose()
         with contextlib.suppress(Exception):
             await ctx.auth.aclose()
+        if engine is not None:
+            with contextlib.suppress(Exception):
+                await engine.dispose()
     investigation_elapsed_ms = int((time.monotonic() - started) * 1000)
 
     # ----- Sanitize -----
@@ -210,12 +218,49 @@ async def run(
 # --------------------------------------------------------------------
 
 
-def _build_context(settings: Settings, *, include_synth: bool = False) -> InvestigationContext:
+def _store_sessionmaker(
+    settings: Settings,
+) -> tuple[AsyncEngine | None, async_sessionmaker[AsyncSession] | None]:
+    """Wire the app's local SQLite store into the eval context (fail-soft).
+
+    The production API passes ``app.state.db_sessionmaker`` into every
+    :class:`InvestigationContext`, so the investigator's ``t_lookup_runbook``
+    tool can search operator runbooks. The eval harness historically passed
+    nothing, which silently pinned ``lookup_runbook`` to ``[]`` on every eval
+    run (E4.1 reachability finding, 2026-07-08: 6/32 investigations called it,
+    all got ``[]`` regardless of the runbook table). Wire the same store here
+    WHEN it already exists (``settings.soc_ai_data_dir / soc-ai.db``); the
+    harness never creates or migrates the DB (that's the app's — or the eval
+    driver script's — job), and a missing/unopenable store degrades to the old
+    no-DB behavior, never an error. The caller owns disposal of the returned
+    engine.
+    """
+    try:
+        db_path = settings.soc_ai_data_dir / "soc-ai.db"
+        if not db_path.is_file():
+            return None, None
+        engine = make_engine(settings)
+        return engine, make_sessionmaker(engine)
+    except Exception as e:  # fail-soft by design (eval must run DB-less)
+        _LOGGER.warning("eval store wiring failed; lookup_runbook sees no DB: %s", e)
+        return None, None
+
+
+def _build_context(
+    settings: Settings,
+    *,
+    include_synth: bool = False,
+    db_sessionmaker: async_sessionmaker[AsyncSession] | None = None,
+) -> InvestigationContext:
     """Build an InvestigationContext from settings, no audit logger.
 
     The eval harness deliberately skips the audit logger — every event
     is captured locally and saved to the bundle, so duplicating into
     the audit ES index would double-cost the storage for no value.
+
+    ``db_sessionmaker`` (from :func:`_store_sessionmaker`) mirrors the API
+    layer's store injection so ``t_lookup_runbook`` — and any future
+    store-backed read tool — behaves in evals as it does in production.
     """
     auth = make_auth(settings)
     elastic = ElasticClient(settings)
@@ -231,6 +276,7 @@ def _build_context(settings: Settings, *, include_synth: bool = False) -> Invest
         maxmind=enrichment.maxmind,
         cloud=enrichment.cloud,
         include_synth=include_synth,
+        db_sessionmaker=db_sessionmaker,
     )
 
 

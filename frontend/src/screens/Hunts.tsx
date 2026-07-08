@@ -114,12 +114,13 @@ function intervalLabel(minutes: number): string {
 // ---------------------------------------------------------------------------
 // Template picker — curated, availability-annotated hunt starters (E3.2).
 // Fed by GET /hunt-templates: each chip fills the objective box (like the old
-// static pills), but a template needing telemetry this grid LACKS renders FLAGGED
-// (dimmed + a warning icon + "missing telemetry: zeek.rdp") rather than hidden —
-// honesty over hiding. Clicking it still fills the box (the operator may want to
-// see the objective, or knows the data is coming). Falls back to the six static
-// pills when the template API is unreachable/empty so the picker never disappears.
-// An admin can save a modest custom template inline.
+// static pills). Templates the grid CAN run are HIGHLIGHTED (accent styling —
+// "the telemetry for these is here"); one needing telemetry this grid LACKS
+// stays muted + flagged (a warning icon + "missing telemetry: zeek.rdp") rather
+// than hidden — honesty over hiding. Clicking it still fills the box (the
+// operator may want to see the objective, or knows the data is coming). Falls
+// back to the six static pills when the template API is unreachable/empty so
+// the picker never disappears. An admin can save a modest custom template inline.
 // ---------------------------------------------------------------------------
 function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
   const [reloadKey, setReloadKey] = useState(0);
@@ -207,7 +208,7 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
                     className={
                       flagged
                         ? 'flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/5 px-[9px] py-[3px] text-[11.5px] font-medium text-warn/80 opacity-70 transition-opacity hover:opacity-100'
-                        : 'flex items-center gap-1 rounded-badge border border-border-strong bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-dim transition-colors hover:border-accent hover:text-accent'
+                        : 'flex items-center gap-1 rounded-badge border border-accent/40 bg-accent/5 px-[9px] py-[3px] text-[11.5px] font-medium text-accent transition-colors hover:border-accent hover:bg-accent/10'
                     }
                   >
                     {flagged && <AlertTriangle size={11} className="flex-none" />}
@@ -237,10 +238,12 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
         </button>
       </div>
 
-      {/* flag legend — only when at least one template is unavailable */}
+      {/* legend — only when at least one template is unavailable (nothing to
+          contrast otherwise). Positive framing: the highlighted ones are the
+          runnable ones; the AlertTriangle stays on the unavailable chips only. */}
       {!useFallback && templates.some((t) => !t.available) && (
-        <div className="mt-1.5 flex items-center gap-1 text-[10.5px] text-warn/80">
-          <AlertTriangle size={10} /> dimmed templates need telemetry this grid isn&apos;t seeing.
+        <div className="mt-1.5 text-[10.5px] text-accent/80">
+          highlighted templates match telemetry this grid is seeing.
         </div>
       )}
 
@@ -604,8 +607,9 @@ export function Hunts() {
           <Sparkles size={15} className="text-accent" /> New hunt
         </div>
         {/* Curated hunt templates — click a chip to load a high-payoff objective,
-            then tweak the scope and launch. A template needing telemetry this grid
-            lacks renders dimmed + flagged (not hidden). */}
+            then tweak the scope and launch. Templates the grid can run are
+            highlighted; one needing telemetry this grid lacks stays muted +
+            flagged (not hidden). */}
         <TemplatePicker
           onPick={(obj) => {
             setObjective(obj);

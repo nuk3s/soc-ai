@@ -95,6 +95,12 @@ COPY --from=builder --chown=soc-ai:soc-ai /build/.venv /opt/soc-ai/.venv
 COPY --chown=soc-ai:soc-ai soc_ai/       /opt/soc-ai/soc_ai/
 COPY --chown=soc-ai:soc-ai pyproject.toml /opt/soc-ai/pyproject.toml
 
+# runbooks/: the shipped starter-pack markdown (runbooks/starter-pack/*.md).
+# POST /runbooks/starter-pack resolves it as parent-of-package (soc_ai/store/
+# runbook_pack.py:STARTER_PACK_DIR → /opt/soc-ai/runbooks) — same layout trick
+# as the frontend bundle below. Without this COPY the endpoint 404s honestly.
+COPY --chown=soc-ai:soc-ai runbooks/     /opt/soc-ai/runbooks/
+
 # ── Copy the built React SPA ───────────────────────────────────────────────────
 # FastAPI serves this at /app (mounted only when the dir exists). Without it the
 # app still boots and the JSON API works, but /app 404s.

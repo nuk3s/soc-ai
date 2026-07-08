@@ -15,6 +15,9 @@ The story the dataset tells (for the docs screenshots):
   - assorted benign noise (curl policy hits, stream retransmissions) plus a
     needs_more_info DNS case and an inconclusive Zeek ATTACK::Discovery notice,
     so every verdict class appears in the UI.
+  - a self-signed-TLS group whose only run is a pipeline-failure fallback
+    (E1.2 "Pipeline error" chip) and a curl group whose newest re-run errored
+    on top of a standing verdict (E2.1 failed-retry hint).
 """
 
 from __future__ import annotations
@@ -82,6 +85,23 @@ GROUPS: list[dict] = [
         "dport": 53,
         "host": "hr-ws-023",
         "prefix": "demo-ev-dnstop",
+        "acked": False,
+    },
+    {
+        # STANDING verdict for this group is a pipeline-failure fallback (E1.2)
+        # → the alerts grid renders the distinct "Pipeline error" chip and the
+        # Dashboard excludes it from the Needs-info KPI.
+        "rule": "ET INFO Observed Self-Signed TLS Certificate (External)",
+        "kind": "suricata",
+        "dataset": "suricata.alert",
+        "sev": "medium",
+        "count": 6,
+        "latest_min": 33,
+        "src": "198.51.100.66",
+        "dst": "203.0.113.29",
+        "dport": 8443,
+        "host": "mkt-ws-019",
+        "prefix": "demo-ev-selfsigned",
         "acked": False,
     },
     {

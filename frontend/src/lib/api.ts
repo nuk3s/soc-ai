@@ -520,6 +520,9 @@ export interface Runbook {
   created_by: string;
   created_at: string;
   updated_at: string;
+  /** Semantic-tier status — BOTH null when the RAG tier is off (rag_embed_model unset). */
+  embedded: boolean | null; // a vector exists for this runbook
+  stale: boolean | null; // the vector came from a different model than currently configured
 }
 
 /** Create/update payload — tags & linked_rules are plain string lists. */
@@ -548,6 +551,18 @@ export function updateRunbook(id: number, body: Partial<RunbookInput>): Promise<
 /** Delete a runbook. */
 export function deleteRunbook(id: number): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/runbooks/${id}`);
+}
+
+/** Counts from installing the shipped starter pack (idempotent by title). */
+export interface StarterPackResult {
+  created: number; // runbooks added this call
+  skipped: number; // pack titles already present
+}
+
+/** Load the shipped starter-pack runbooks (admin). Safe to re-run — skips
+ * any pack runbook whose title already exists, so operator edits survive. */
+export function installStarterPack(): Promise<StarterPackResult> {
+  return post<StarterPackResult>('/runbooks/starter-pack');
 }
 
 // ── Runbook retrieval (RAG) — the opt-in gateway semantic tier (E4.1) ──────

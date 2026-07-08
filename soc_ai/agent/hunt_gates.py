@@ -7,8 +7,11 @@ pulled. This module closes that gap: after the agent lands a
 against the evidence the hunt ACTUALLY gathered (the ``tool_result`` payloads
 that streamed this run). A finding whose citations resolve to nothing has its
 non-resolving citations stripped and its severity capped; a high/critical
-finding that cites nothing at all is capped too. No LLM calls — this is the
-trust layer, one layer down from the investigation citation gate.
+finding that cites nothing at all is capped too. Finding and chart ``title``s
+are also clamped to a display-safe length (:func:`_clamp_title`) — the schema
+asks the model for short headlines, but the clamp is what guarantees it. No LLM
+calls — this is the trust layer, one layer down from the investigation citation
+gate.
 
 Resolver choice — the TOKEN fallback, not ``gates._resolve_citations``: hunt
 citations are overwhelmingly bare ES ``_id`` strings, and
@@ -39,6 +42,27 @@ _HIGH_NO_CITE_NOTE = "High-severity finding lacks citations; capped to medium."
 # Chart budget — a model that emits plausible-but-uncited charts freely is the whole
 # risk, so beyond this ceiling extras are dropped even if they'd otherwise resolve.
 _MAX_CHARTS = 4
+
+# Title clamp — the HuntReport schema + prompt ask for <= ~60-char headlines, but a
+# model can't be trusted to comply, and an overlong title just ellipsizes in the UI.
+# This is the deterministic backstop: anything past the ceiling is word-boundary
+# truncated here so the model can't overflow the display regardless.
+_MAX_TITLE_CHARS = 90
+
+
+def _clamp_title(title: str) -> str:
+    """Word-boundary truncate ``title`` to at most :data:`_MAX_TITLE_CHARS` chars.
+
+    A compliant title passes through untouched (modulo surrounding whitespace).
+    An overlong one is cut at the last word boundary that fits and gets a
+    trailing ellipsis; a single overlong token is hard-cut (no boundary to use).
+    """
+    text = (title or "").strip()
+    if len(text) <= _MAX_TITLE_CHARS:
+        return text
+    cut = text[: _MAX_TITLE_CHARS - 1]  # leave room for the ellipsis
+    head = cut.rpartition(" ")[0].rstrip()
+    return f"{head or cut.rstrip()}…"
 
 
 def _cap_severity(severity: str, ceiling: str) -> str:
@@ -123,6 +147,10 @@ def _validate_hunt_findings(
       grounded. (A partial-coverage finding keeps its severity; only zero
       coverage is a trust failure.)
 
+    Independently of citations, every finding's ``title`` is clamped via
+    :func:`_clamp_title` — an overlong machine headline is word-boundary
+    truncated so the UI never has to ellipsize it.
+
     Returns ``(validated_findings, counts)`` where ``counts`` carries per-hunt
     tallies for the ``citation_validation`` audit event:
     ``{findings, findings_capped, citations_total, citations_stripped}``.
@@ -136,7 +164,17 @@ def _validate_hunt_findings(
         "citations_stripped": 0,
     }
 
-    for finding in findings:
+    for raw_finding in findings:
+        # Deterministic title clamp (independent of citations): the schema/prompt
+        # ask for short headlines, but the clamp is what guarantees it.
+        title = str(getattr(raw_finding, "title", None) or "")
+        clamped_title = _clamp_title(title)
+        finding = (
+            raw_finding
+            if clamped_title == title
+            else raw_finding.model_copy(update={"title": clamped_title})
+        )
+
         citations = list(getattr(finding, "citations", None) or [])
         severity = str(getattr(finding, "severity", None) or "info")
         counts["citations_total"] += len(citations)
@@ -206,7 +244,8 @@ def _validate_hunt_charts(
 
     Surviving charts are capped at :data:`_MAX_CHARTS` (extras beyond the ceiling
     are dropped) — bias is toward DROPPING; a chart that can't be traced to
-    evidence is never rendered.
+    evidence is never rendered. Kept charts get their ``title`` clamped via
+    :func:`_clamp_title` (same word-boundary truncation as findings).
 
     Returns ``(kept_charts, counts)`` where ``counts`` carries per-hunt tallies
     for the ``citation_validation`` audit event:
@@ -226,6 +265,11 @@ def _validate_hunt_charts(
         if not any(_citation_resolves(c, evidence_text) for c in citations):
             counts["charts_dropped"] += 1
             continue
-        kept.append(chart)
+        # Same deterministic title clamp as findings — only for kept charts.
+        title = str(getattr(chart, "title", None) or "")
+        clamped_title = _clamp_title(title)
+        kept.append(
+            chart if clamped_title == title else chart.model_copy(update={"title": clamped_title})
+        )
 
     return kept, counts

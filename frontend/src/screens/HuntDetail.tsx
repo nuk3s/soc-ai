@@ -151,7 +151,9 @@ function DiffList({ title, entries, color }: { title: string; entries: HuntDiff[
         {entries.map((e, i) => (
           <li key={i} className="flex items-center gap-2 text-[12px] text-text-2">
             <span className="h-1.5 w-1.5 flex-none rounded-full" style={{ background: color }} />
-            <span className="min-w-0 truncate" style={{ textWrap: 'pretty' }} title={e.title}>
+            {/* Machine-generated finding titles run long — give them two lines
+                before the ellipsis; the tooltip carries the full text. */}
+            <span className="min-w-0 line-clamp-2" style={{ textWrap: 'pretty' }} title={e.title}>
               {e.title}
             </span>
             <span className="ml-auto flex-none font-mono text-[10px] uppercase text-faint">

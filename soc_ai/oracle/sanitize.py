@@ -149,15 +149,28 @@ def _build_host_re(suffixes: Iterable[str], extra_hosts: Iterable[str]) -> Patte
 
     Matches FQDNs ending in any *suffix* and bare *extra_hosts*.
     Negative-lookahead ``(?![\\w-])`` prevents partial matches on
-    ``evil.local-ai.com``; negative-lookbehind ``(?<![\\w@.])`` prevents
-    matching the domain part of an email address.
+    ``evil.local-ai.com``; negative-lookbehind ``(?<![\\w@])`` prevents
+    matching the domain part of an email address (the first-label
+    alternation additionally rejects a preceding ``.`` unless the label is
+    underscore-led — see below).
+
+    INVARIANT (suffix-FQDN class): every string :func:`unsafe_residue` can
+    flag as a residual internal host MUST be matched here first (detector ⊆
+    replacer).  The residue detector deliberately re-declares this pattern
+    (the two paths must not fail together); keep the accepted label
+    alphabets aligned when editing either.  Enforced by
+    ``tests/test_oracle_sanitize.py::TestSuffixFqdnDetectorReplacerInvariant``.
     """
     parts: list[str] = []
     for suffix in suffixes:
         # Label quantifiers bounded to DNS limits (label ≤63, ≤127 labels) so a
         # long ``a-a-a…`` run cannot trigger catastrophic backtracking (ReDoS).
+        # First label: ``(?<!\.)[A-Za-z0-9_]`` (no preceding dot — email-domain
+        # / mid-FQDN guard) OR ``_`` even after a dot: DNS-SD service labels
+        # (``_aaplcache._tcp.corp.lan``, incident 2026-07-08) are underscore-led
+        # and appear after dot-runs when nonprintable bytes render as ``.``.
         parts.append(
-            rf"(?<![\w@.])[A-Za-z0-9][\w-]{{0,62}}(?:\.[\w-]{{1,63}}){{0,126}}"
+            rf"(?<![\w@])(?:(?<!\.)[A-Za-z0-9_]|_)[\w-]{{0,62}}(?:\.[\w-]{{1,63}}){{0,126}}"
             rf"{re.escape(suffix)}(?!\.?[\w-])"
         )
     for host in extra_hosts:
@@ -462,8 +475,15 @@ def unsafe_residue(
     host_parts: list[str] = []
     for suffix in suffixes:
         # Bounded label quantifiers (DNS limits) — ReDoS-safe; see _build_host_re.
+        # Deliberately re-declared (NOT shared with _build_host_re) so the two
+        # detection paths cannot fail together.  INVARIANT: this detector must
+        # accept a SUBSET of what _build_host_re's replacer matches (same label
+        # alphabet, incl. underscore-led DNS-SD first labels) — anything flagged
+        # here must have been redacted there first.  Keep the alphabets aligned;
+        # enforced by tests/test_oracle_sanitize.py::
+        # TestSuffixFqdnDetectorReplacerInvariant.
         host_parts.append(
-            rf"(?<![\w@.])[A-Za-z0-9][\w-]{{0,62}}(?:\.[\w-]{{1,63}}){{0,126}}"
+            rf"(?<![\w@])(?:(?<!\.)[A-Za-z0-9_]|_)[\w-]{{0,62}}(?:\.[\w-]{{1,63}}){{0,126}}"
             rf"{re.escape(suffix)}(?!\.?[\w-])"
         )
     for host in hosts:

@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
+from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Hunt, HuntEvent
 
@@ -240,6 +241,10 @@ async def delete(db: AsyncSession, hunt_id: str) -> bool:
     if hunt is None:
         return False
     await db.execute(sa_delete(HuntEvent).where(HuntEvent.hunt_id == hunt_id))
+    # The hunt's chat thread was projected into chat_memory (dual-write below) —
+    # remove it in the same transaction so a deleted hunt can't keep echoing
+    # into future prompts via retrieval.
+    await chat_memory.delete_thread(db, hunt_id)
     await db.delete(hunt)
     await db.commit()
     return True
@@ -274,6 +279,16 @@ async def add_chat_user_message(db: AsyncSession, hunt_id: str, content: str) ->
         payload={"content": content, "status": "done"},
     )
     db.add(ev)
+    # Dual-write into the chat_memory projection (same transaction — atomic).
+    # App-level rather than a SQL trigger because content/status live inside
+    # the JSON payload here; see soc_ai.store.chat_memory.
+    chat_memory.record_message(
+        db,
+        source=chat_memory.SOURCE_HUNT,
+        thread_id=hunt_id,
+        role="user",
+        content=content,
+    )
     await db.commit()
     await db.refresh(ev)
     return ev
@@ -309,6 +324,16 @@ async def finish_chat_assistant(
     if meta is not None:
         payload["meta"] = meta
     ev.payload = payload
+    # Project the COMPLETED assistant turn into chat_memory (mirrors
+    # soc_ai.store.chat.finish_assistant — done-only, same transaction).
+    if status == "done":
+        chat_memory.record_message(
+            db,
+            source=chat_memory.SOURCE_HUNT,
+            thread_id=ev.hunt_id,
+            role="assistant",
+            content=content,
+        )
     await db.commit()
 
 

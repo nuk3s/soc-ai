@@ -15,6 +15,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
+from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import ChatMessage, Investigation, InvestigationEvent
 from soc_ai.triage_models import is_pipeline_fallback
@@ -461,6 +462,10 @@ async def delete(db: AsyncSession, inv_id: str) -> bool:
         sa_delete(InvestigationEvent).where(InvestigationEvent.investigation_id == inv_id)
     )
     await db.execute(sa_delete(ChatMessage).where(ChatMessage.investigation_id == inv_id))
+    # The chat thread was projected into chat_memory (dual-write in
+    # soc_ai.store.chat) — remove it in the same transaction so a deleted
+    # investigation can't keep echoing into future prompts via retrieval.
+    await chat_memory.delete_thread(db, inv_id)
     await db.delete(inv)
     await db.commit()
     return True

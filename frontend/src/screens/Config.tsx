@@ -25,6 +25,13 @@ function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 }
 
+// The Retrieval (RAG) model settings — rendered as gateway-fed dropdowns (same
+// list as the analyst model) instead of free text. Empty string = tier off.
+const RAG_MODEL_KEYS = new Set(['rag_embed_model', 'rag_rerank_model']);
+// Sentinel for the dropdowns' "Other…" escape hatch (reveals a free-text input
+// for a custom model id the gateway doesn't list). Never a real model id.
+const OTHER_MODEL_OPTION = '__other__';
+
 /**
  * Collapsible section shell — the same chevron + toggle header the settings-group
  * map uses, factored out so every standalone section on the Config page folds the
@@ -168,6 +175,10 @@ export function Config() {
       .catch(() => {});
     return () => { active = false; };
   }, [nonce]);
+
+  // Which RAG-model dropdowns are in "Other…" mode (free-text custom-id input
+  // revealed under the select). Keyed by setting key; reset on Discard.
+  const [ragCustomModel, setRagCustomModel] = useState<Record<string, boolean>>({});
 
   // ── Staged settings edits (explicit save/apply) ────────────────────────────
   // Controls no longer persist on change. Instead each edit is STAGED here as a
@@ -363,7 +374,9 @@ export function Config() {
     const key = SECTIONS.find((s) => s.id === id)?.label;
     if (key) setCollapsed((c) => ({ ...c, [key]: false }));
     const t = setTimeout(() => {
-      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      // Instant snap ('auto', not 'smooth') — smooth-scrolling this long page
+      // is slow/choppy; same treatment as the ConfigNav click handler.
+      document.getElementById(id)?.scrollIntoView({ behavior: 'auto', block: 'start' });
     }, 60);
     return () => clearTimeout(t);
   }, [loading, data, SECTIONS]);
@@ -450,6 +463,7 @@ export function Config() {
     setStaged({});
     setApplyErrors({});
     setApplyResult(null);
+    setRagCustomModel({}); // drop "Other…" modes so the selects re-show server values
     setFormNonce((n) => n + 1); // remount uncontrolled inputs so they reset
   };
 
@@ -576,6 +590,47 @@ export function Config() {
             loading={fitnessLoading}
             onCheck={runFitness}
           />
+        </div>
+      );
+    } else if (RAG_MODEL_KEYS.has(s.key) && gatewayModels.length > 0) {
+      // RAG model pickers — the analyst-model dropdown pattern (the gateway told
+      // us what it serves) with two extras: "(off)" (empty string = the tier's
+      // documented OFF semantics) and "Other…" (a free-text input for a custom
+      // id — /v1/models can't distinguish embed/rerank/chat models, so ALL served
+      // ids are listed rather than filtered). The current value stays selectable
+      // even if the gateway no longer lists it (loading the page never mutates
+      // config). Falls through to plain free text when the gateway list is empty.
+      const current = stagedStr(s.key, serverStr);
+      const custom = !!ragCustomModel[s.key];
+      const options = [
+        { value: '', label: '(off)' },
+        ...(current !== '' && !custom && !gatewayModels.includes(current) ? [current] : []),
+        ...gatewayModels,
+        { value: OTHER_MODEL_OPTION, label: 'Other…' },
+      ];
+      control = (
+        <div className="flex flex-col items-end gap-1.5">
+          <Select
+            value={custom ? OTHER_MODEL_OPTION : current}
+            options={options}
+            onChange={(v) => {
+              if (v === OTHER_MODEL_OPTION) {
+                setRagCustomModel((m) => ({ ...m, [s.key]: true }));
+                return; // nothing staged yet — the input below stages the id
+              }
+              setRagCustomModel((m) => ({ ...m, [s.key]: false }));
+              stage(s.key, v, serverStr);
+            }}
+          />
+          {custom && (
+            <input
+              key={`${s.key}-other-${formNonce}`}
+              defaultValue={current}
+              placeholder="custom model id"
+              onChange={(e) => stage(s.key, e.target.value, serverStr)}
+              className="w-[200px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
+            />
+          )}
         </div>
       );
     } else if (s.key === 'analyst_model') {

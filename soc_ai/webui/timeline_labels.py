@@ -78,6 +78,7 @@ _ICON: dict[str, str] = {
     "model_response": "🧠",
     "decision_template_match": "🧩",
     "prior_outcomes": "📚",
+    "chat_memory": "💬",
     "citation_validation": "✅",
     "citation_cap": "📉",
     "coverage_cap": "📉",
@@ -366,6 +367,34 @@ def _t_prior_outcomes(p: dict[str, Any]) -> str:
     return base
 
 
+def _t_chat_memory(p: dict[str, Any]) -> str:
+    """Chat-transcript memory recall — count plus a compact source tally.
+
+    Mirrors :func:`_t_prior_outcomes`; the "(context only)" suffix keeps the
+    operator's hard rule visible right in the timeline row: nothing recalled
+    from a chat can ground the verdict.
+    """
+    n = p.get("count")
+    base = (
+        f"Recalled {n} past discussion excerpt(s)"
+        if isinstance(n, int)
+        else "Recalled past discussion excerpts"
+    )
+    items = p.get("items")
+    if isinstance(items, list) and items:
+        tally: dict[str, int] = {}
+        for it in items:
+            s = _humanize(it.get("source")) if isinstance(it, dict) else ""
+            if s:
+                tally[s] = tally.get(s, 0) + 1
+        if tally:
+            chips = ", ".join(
+                f"{c}x {s}" for s, c in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            return f"{base} ({chips}) — context only"
+    return f"{base} — context only"
+
+
 def _t_citation_validation(p: dict[str, Any]) -> str:
     valid = (p.get("counts") or {}).get("valid")
     return "Validated evidence citations" + (f" — {valid} valid" if valid is not None else "")
@@ -514,6 +543,7 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "retask": _t_retask,
     "decision_template_match": _t_template_match,
     "prior_outcomes": _t_prior_outcomes,
+    "chat_memory": _t_chat_memory,
     "citation_validation": _t_citation_validation,
     "citation_cap": _t_citation_cap,
     "template_ceiling": _t_template_ceiling,

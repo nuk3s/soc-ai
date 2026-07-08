@@ -190,6 +190,34 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
 
 
+class ChatMemory(Base):
+    """One completed chat message, projected for cross-source FTS retrieval.
+
+    The chat-transcript memory feature ("prior discussion excerpts") searches
+    past analyst↔AI chats from BOTH sources — investigation follow-up threads
+    (``chat_messages`` rows) and hunt follow-up threads (``hunt_events`` rows
+    with the chat kinds). Their shapes are incompatible (real columns vs JSON
+    payload fields, which FTS5 cannot index), so completed messages are
+    projected here at write time (:func:`soc_ai.store.chat_memory.record_message`)
+    and indexed by the ``chat_memory_fts`` external-content FTS5 table via SQL
+    triggers (migration 0018).
+
+    Append-only from the app's perspective; rows are removed only when their
+    investigation/hunt is deleted (the delete paths cascade here). ``thread_id``
+    is the investigation or hunt ULID — globally unique across both sources,
+    so exclusion filters need no ``source`` qualifier.
+    """
+
+    __tablename__ = "chat_memory"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(16))  # "investigation" | "hunt"
+    thread_id: Mapped[str] = mapped_column(String(32), index=True)  # inv/hunt ULID
+    role: Mapped[str] = mapped_column(String(16))  # "user" | "assistant"
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+
+
 class AlertAssignment(Base):
     """Persisted owner assignment for a detection rule.
 

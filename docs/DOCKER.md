@@ -398,6 +398,11 @@ container restarting mid-hunt, raise `deploy.resources.limits.memory` in
 
 ## Troubleshooting
 
+**First move: run the doctor.** `docker exec soc-ai python -m soc_ai doctor` checks the whole
+dependency surface (config, store + migration head, Security Onion, Elasticsearch, gateway,
+model fitness) and prints a pass/fail table with a fix hint on every failing line — start
+there before the per-symptom entries below.
+
 **Container exits immediately after start**
 Check that `.env` exists and `SOC_AI_TLS_CERT` / `SOC_AI_TLS_KEY` point at files that are
 actually mounted. `docker compose logs soc-ai` will show the pydantic-settings validation

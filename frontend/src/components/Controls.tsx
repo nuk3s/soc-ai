@@ -53,13 +53,17 @@ export function NumberField({ value, bounds, onChange }: NumberFieldProps) {
 }
 
 // ---- Select (styled box) ---------------------------------------------------
+// Plain strings are the common case; an object option carries a display label
+// distinct from its value (e.g. '' rendered as "(off)").
+export type SelectOption = string | { value: string; label: string };
 interface SelectProps {
   value: string;
-  options?: string[];
+  options?: SelectOption[];
   onChange?: (v: string) => void;
 }
 export function Select({ value, options, onChange }: SelectProps) {
-  if (!options || options.length <= 1) {
+  const opts = (options ?? []).map((o) => (typeof o === 'string' ? { value: o, label: o } : o));
+  if (opts.length <= 1) {
     return (
       <div className="flex cursor-default items-center gap-[9px] rounded-control border border-border-input bg-bg px-[11px] py-[7px]">
         <span className="font-mono text-[12.5px] text-text">{value}</span>
@@ -76,9 +80,9 @@ export function Select({ value, options, onChange }: SelectProps) {
         onChange={(e) => onChange?.(e.target.value)}
         className="cursor-pointer appearance-none bg-transparent py-[7px] pl-[11px] pr-5 font-mono text-[12.5px] text-text outline-none"
       >
-        {options.map((o) => (
-          <option key={o} value={o} className="bg-surface-1 text-text">
-            {o}
+        {opts.map((o) => (
+          <option key={o.value} value={o.value} className="bg-surface-1 text-text">
+            {o.label}
           </option>
         ))}
       </select>

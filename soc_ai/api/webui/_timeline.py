@@ -46,6 +46,8 @@ _TL_GROUP = {
     # E4.2 memory recall happens while assembling the round-1 prompt (before
     # any synthesis/decision), so it reads as part of the prefetch story.
     "prior_outcomes": "Prefetch & pivots",
+    # Chat-transcript memory recall — same prompt-assembly moment as priors.
+    "chat_memory": "Prefetch & pivots",
 }
 # Write-action tools (ack/escalate/comment): their tool_call rows belong under
 # "Decision" too — they act on the verdict rather than investigate.
@@ -476,6 +478,18 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
         )
         return (
             f"Context only — never evidence. {p.get('count')} prior verdict(s) "
+            f"within {p.get('window_days')}d shown to the synthesizer: {chips}"
+        )
+    if kind == "chat_memory":
+        # Chat-transcript recall: source/role chips only — the payload carries
+        # no snippet text (it lives in the prompt), and the framing repeats the
+        # operator's hard rule so the timeline can't oversell a chat opinion.
+        items = p.get("items") or []
+        chips = ", ".join(
+            f"{it.get('source')} ({it.get('role')})" for it in items if isinstance(it, dict)
+        )
+        return (
+            f"Context only — never evidence. {p.get('count')} past chat excerpt(s) "
             f"within {p.get('window_days')}d shown to the synthesizer: {chips}"
         )
     return _compact(p, 220)

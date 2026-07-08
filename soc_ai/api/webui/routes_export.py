@@ -252,7 +252,10 @@ async def analyst_redaction_preview(
     )
     from soc_ai.agent.egress_guard import EgressGuard  # noqa: PLC0415
     from soc_ai.agent.evidence import _materialize_prefetch_evidence  # noqa: PLC0415
-    from soc_ai.agent.orchestrator import _format_prior_outcomes_block  # noqa: PLC0415
+    from soc_ai.agent.orchestrator import (  # noqa: PLC0415
+        _format_chat_memory_block,
+        _format_prior_outcomes_block,
+    )
     from soc_ai.agent.prompts import build_synth_first_user_message  # noqa: PLC0415
     from soc_ai.tools.get_alert_context import EnrichedAlertContext  # noqa: PLC0415
 
@@ -333,6 +336,25 @@ async def analyst_redaction_preview(
         if digests:
             prior_block = _format_prior_outcomes_block(digests)
 
+    # ----- Chat-transcript memory block (sibling of priors, same contract) ----
+    # The chat_memory event stores source/thread/role ONLY — never snippet
+    # text — so the rebuilt block renders the same structure with an explicit
+    # placeholder where the excerpt was (mirrors the priors' honesty note).
+    chat_block: str | None = None
+    if "chat_memory" in by_kind:
+        chat_items = by_kind["chat_memory"].get("items") or []
+        chat_digests = [
+            {
+                "source": it.get("source"),
+                "role": it.get("role"),
+                "snippet": "(no transcript text stored in the event)",
+            }
+            for it in chat_items
+            if isinstance(it, dict)
+        ]
+        if chat_digests:
+            chat_block = _format_chat_memory_block(chat_digests)
+
     # ----- Compose, mirroring the orchestrator's order -----
     # Orchestrator: trim+serialize enriched → sanitize it → materialize evidence
     # → sanitize it → compose (candidate + priors ride the composed message) →
@@ -349,6 +371,7 @@ async def analyst_redaction_preview(
         candidate=candidate,
         focus_hint=None,
         prior_outcomes_block=prior_block,
+        chat_memory_block=chat_block,
     )
 
     guard = await EgressGuard.for_settings(settings, request.app.state.db_sessionmaker)
@@ -360,6 +383,7 @@ async def analyst_redaction_preview(
             candidate=candidate,
             focus_hint=None,
             prior_outcomes_block=prior_block,
+            chat_memory_block=chat_block,
         )
     )
 

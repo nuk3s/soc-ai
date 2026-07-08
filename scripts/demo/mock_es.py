@@ -36,7 +36,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import demo_dataset as dd
 
-MAX_EVENTS_PER_GROUP = 8  # enough rows for the expanded-group screenshot
+# Enough rows for the expanded-group screenshot while still leaving the lower
+# groups (curl's E2.1 "last retry error" hint, stream retrans) in the viewport.
+MAX_EVENTS_PER_GROUP = 5
 
 # Deterministic inter-event spacing (minutes) per group prefix; the Emotet
 # beacon keeps its ~7.4-minute cadence so the story matches the investigation.
@@ -47,6 +49,7 @@ _STEP_MIN = {
     "demo-ev-dnstop": 9.0,
     "demo-ev-nmap": 2.0,
     "demo-ev-attackdisc": 1.0,
+    "demo-ev-selfsigned": 6.0,
 }
 
 

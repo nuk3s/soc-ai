@@ -80,6 +80,8 @@ Several of these are on the v1.15 reliability track:
 - **No active host/network actions** beyond the three SO write tools (no isolate,
   no block, no firewall change).
 - **`lookup_runbook`** searches operator-authored runbooks in the local store
-  (embedding-free ranking; a dense Qdrant index is the v1.1 upgrade path).
+  (FTS5 BM25 with rule-link/tag boosts; gateway embeddings are the opt-in
+  semantic tier). Author them on the console's **Runbooks** page — write,
+  import `.md` files, or load the shipped starter pack (`runbooks/starter-pack/`).
 - Read tools run against whatever indices the deployment's index-pattern settings
   point at; off-pattern data is invisible to the agent.

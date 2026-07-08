@@ -64,6 +64,13 @@ AuditKind = Literal[
     # injected; must be a valid audit kind or _audit silently drops it (same
     # trap the downgrade kinds hit above).
     "prior_outcomes",
+    # Chat-transcript memory (sibling of prior_outcomes): past-chat snippet
+    # digests injected into the synth round-1 prompt as CONTEXT ONLY (never
+    # evidence — user statements in transcripts may be wrong). Payload is
+    # deliberately light — count/window plus per-item source/thread_id/role,
+    # never snippet text. Emitted ONLY when a non-empty block was actually
+    # injected; must be a valid audit kind or _audit silently drops it.
+    "chat_memory",
     # evidence-gate / anchor downgrades (emitted by the synth-first + legacy
     # post-validators). Without these the AuditEvent Literal rejected them and
     # _audit swallowed the ValidationError — so every such downgrade was silently

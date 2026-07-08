@@ -900,6 +900,32 @@ class Settings(BaseSettings):
     and the deterministic tiers already put the most-similar verdicts first.
     Only consulted when ``memory_enabled`` is on."""
 
+    memory_include_chat: bool = True
+    """Include past chat-transcript excerpts in the investigation-memory block.
+
+    When on (the default), the round-1 memory context ALSO recalls relevant
+    snippets from past analyst↔AI chat threads (investigation follow-up chats
+    + hunt chats), retrieved by FTS5 BM25 over the ``chat_memory`` projection
+    (migration 0018) using the alert's rule-name words and endpoint IPs as
+    query terms. Past chats carry real institutional knowledge ("we know that
+    host, it's the vuln scanner") that never lands in a stored verdict.
+
+    HARD RULE — context, NEVER evidence: the user in a transcript is not
+    always right, so the block frames USER lines as unverified operator
+    opinion (labeled per-line) and ASSISTANT lines as statements about
+    different alerts; the citation gate independently refuses to resolve
+    citations against any of it. Nothing from a transcript can ground a
+    verdict.
+
+    **Only takes effect when ``memory_enabled`` is on** — this is a
+    sub-switch of investigation memory, not an independent feature: with
+    ``memory_enabled`` off (the shipped default) no memory of any kind is
+    injected regardless of this value. It defaults True (vs memory's
+    default-off) so that enabling memory brings the full context in one
+    flip; turn this off to keep prior VERDICTS while excluding chatter.
+    Shares ``memory_window_days`` / ``memory_max_items`` (snippets are
+    capped at 5 like prior outcomes). Editable live in the config console."""
+
     @field_validator("memory_window_days", mode="before")
     @classmethod
     def _clamp_memory_window_days(cls, v: Any) -> Any:

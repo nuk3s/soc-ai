@@ -1511,3 +1511,21 @@ async def test_muted_cidr_row_does_not_classify_inside_ip_internal(
     assert not any(target in net for net in cidrs), (
         "a MUTED (suggested) CIDR must not reclassify a host as internal"
     )
+
+
+class TestDnsSdFreeText:
+    """Incident 2026-07-08: DNS-SD service FQDNs in free-text fields must be
+    redacted by sanitize_case's shape rules (Pass 2 → _sanitize_str)."""
+
+    def test_incident_strings_redacted_via_sanitize_case(self) -> None:
+        m = Mapping()
+        case = {
+            "alert": {"payload_printable": "2~..........._aaplcache1._tcp.corp.lan....."},
+            "network": {"data": {"decoded": ".C..........\n_aaplcache._tcp.corp.lan....."}},
+            "message": "mDNS query for _aaplcache._tcp.corp.lan observed",
+        }
+        out = sanitize_case(case, m)
+        outbound = json.dumps(out)
+        assert "aaplcache" not in outbound
+        assert "corp.lan" not in outbound
+        assert unsafe_residue(outbound) == []

@@ -19,17 +19,35 @@ delete the data dir to re-seed from scratch.
 What it seeds
 -------------
 * admin user  (demo-only credentials from demo_dataset.py)
-* 6 investigations covering every verdict class:
+* 10 investigations covering every verdict class AND the failure states:
     - true_positive  0.92  Emotet-style beacon → full timeline (prefetch,
-      enrichment, 5 tool calls with results, reasoning traces, verdict,
-      citation validation) + recommended escalate/comment actions + chat.
+      enrichment, decision-template candidate, E4.2 memory recall events,
+      5 tool calls with results, reasoning traces, verdict, citation
+      validation) + recommended escalate/comment actions + chat. Its
+      enriched_alert_context/decision_template_match payloads VALIDATE
+      against the current schema so the E5.2 analyst redaction preview
+      rebuilds from it (the demo hostnames are seeded as manual internal
+      identifiers so redaction fires on them).
+    - 2 older completed Emotet runs (prior outcomes for the E4.2 memory
+      timeline events; one carries a chat thread dual-written into the
+      chat_memory projection).
     - false_positive 0.88  authorized-scanner Nmap hits, auto-acknowledged.
     - needs_more_info 0.55 suspicious .top DNS with open questions.
     - inconclusive   0.52  Zeek ATTACK::Discovery notice (split vote).
-    - false_positive 0.83  curl policy noise (older run → inherited badge).
+    - false_positive 0.83  curl policy noise (older run → inherited badge)
+      + a NEWER errored re-run of the same rule (E2.1 failed-retry hint).
+    - needs_more_info 0.3  pipeline-failure fallback on the self-signed-TLS
+      group (E1.2 "Pipeline error" chip, excluded from the Needs-info KPI).
     - (untriaged)          stream-retransmission run interrupted by a restart.
-* 1 completed hunt (lateral-movement sweep) with findings + timeline.
-* an owner assignment on the Emotet rule.
+* 2 completed hunts with the SAME objective (E3.4 "vs last run" diff strip:
+  1 new / 3 persisting / 1 resolved finding) + a daily hunt schedule row.
+* 3 starter-pack runbooks (via the shipped loader) so /app/runbooks and the
+  lookup_runbook tool demo non-empty.
+* alert assignments in every state: Emotet owned, dnstop in_review,
+  ATTACK::Discovery done (curl stays unassigned).
+* manual internal-identifier rows (demo workstation hostnames + org suffix).
+* config overrides: memory_enabled=true, analyst_cloud_redaction=true
+  (DEMO-database-only — production defaults are untouched).
 """
 
 from __future__ import annotations
@@ -48,16 +66,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import demo_dataset as dd  # noqa: E402
 from soc_ai.config import Settings  # noqa: E402
+from soc_ai.enrichment.blocklists import BlocklistHit  # noqa: E402
+from soc_ai.so_client.models import RuleMetadata, SoAlert  # noqa: E402
+from soc_ai.store import chat as chat_svc  # noqa: E402
+from soc_ai.store import runbook_pack  # noqa: E402
+from soc_ai.store import runbooks as runbooks_svc  # noqa: E402
 from soc_ai.store.auth import create_user, utcnow  # noqa: E402
+from soc_ai.store.config_overrides import set_override  # noqa: E402
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations  # noqa: E402
+from soc_ai.store.hunts import _objective_hash  # noqa: E402
 from soc_ai.store.models import (  # noqa: E402
     AlertAssignment,
+    ChatMemory,
     ChatMessage,
     Hunt,
     HuntEvent,
+    HuntSchedule,
+    InternalIdentifier,
     Investigation,
     InvestigationEvent,
 )
+from soc_ai.tools.enrichment import IndicatorEnrichment  # noqa: E402
+from soc_ai.tools.get_alert_context import EnrichedAlertContext  # noqa: E402
+from sqlalchemy import update  # noqa: E402
 from ulid import ULID  # noqa: E402
 
 
@@ -89,12 +120,38 @@ def _tool_pair(inv_id: str, seq: int, call_id: str, tool: str, args: dict, resul
     ]
 
 
+def _enriched_payload(
+    alert: SoAlert,
+    *,
+    host_alert_profile: dict[str, int] | None = None,
+    enrichments: dict[str, IndicatorEnrichment] | None = None,
+) -> dict:
+    """A VALIDATING ``enriched_alert_context`` event payload.
+
+    Built through the real models — exactly what the orchestrator persists
+    (``model_dump(mode="json")`` of :class:`EnrichedAlertContext`) — so the
+    E5.2 analyst redaction preview can rebuild the round-1 prompt from it.
+    Hand-rolled dicts drift against the schema and land the preview in
+    ``context_unparseable``.
+    """
+    ctx = EnrichedAlertContext(
+        alert=alert,
+        host_alert_profile=host_alert_profile or {},
+        enrichments=enrichments or {},
+    )
+    return ctx.model_dump(mode="json")
+
+
+def _internal_ip(ip: str) -> IndicatorEnrichment:
+    return IndicatorEnrichment(indicator=ip, indicator_type="ip", internal=True)
+
+
 # --------------------------------------------------------------------------
 # Investigation builders (each returns (Investigation, [events], [chat rows]))
 # --------------------------------------------------------------------------
 
 
-def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
+def build_emotet(inv_id: str, prior_ids: tuple[str, str]) -> tuple[Investigation, list, list]:
     g = dd.group_by_rule("ET MALWARE Win32/Emotet CnC Activity (POST)")
     rule, src, dst, host = g["rule"], g["src"], g["dst"], g["host"]
     alert_id = dd.event_id(g, 1)
@@ -147,40 +204,42 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
         created_at=created,
         finished_at=created + timedelta(seconds=74),
     )
-    alert_ctx = {
-        "rule_name": rule,
+    alert = SoAlert(
+        id=alert_id,
+        rule_name=rule,
         # The detection's own fire time — feeds the "alert time" row on the
         # investigation page (a few minutes before triage started).
-        "timestamp": (created - timedelta(minutes=4)).isoformat(),
-        "rule_uuid": "2404302",
-        "classtype": "trojan-activity",
-        "event_category": "network",
-        "source_ip": src,
-        "source_port": 49812,
-        "destination_ip": dst,
-        "destination_port": 8080,
-        "alert_action": "allowed",
-        "host_name": host,
-        "severity_label": "critical",
-    }
+        timestamp=created - timedelta(minutes=4),
+        rule_uuid="2404302",
+        classtype="trojan-activity",
+        event_category="network",
+        source_ip=src,
+        source_port=49812,
+        destination_ip=dst,
+        destination_port=8080,
+        alert_action="allowed",
+        host_name=host,
+        severity_label="critical",
+        # signature_severity Critical + a blocklist hit below reproduce the
+        # blocklist_hit_major_severity decision template when the analyst
+        # redaction preview re-runs the matcher on this stored context.
+        rule_metadata=RuleMetadata(signature_severity="Critical", attack_target="Client_Endpoint"),
+    )
     host_profile = {
         rule: 12,
         "SURICATA STREAM excessive retransmissions": 5,
         "ET POLICY curl User-Agent Outbound": 2,
     }
     enrichments = {
-        dst: {
-            "indicator": dst,
-            "blocklist_hits": [{"source": "feodo_c2", "indicator": dst}],
-            "misp_hits": [],
-            "internal": False,
-        },
-        dd.DNS_SERVER: {
-            "indicator": dd.DNS_SERVER,
-            "blocklist_hits": [],
-            "misp_hits": [],
-            "internal": True,
-        },
+        dst: IndicatorEnrichment(
+            indicator=dst,
+            indicator_type="ip",
+            internal=False,
+            blocklist_hits=[
+                BlocklistHit(indicator=dst, indicator_type="ip", source="feodo_c2", tags=("c2",))
+            ],
+        ),
+        dd.DNS_SERVER: _internal_ip(dd.DNS_SERVER),
     }
     events: list = [
         _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
@@ -188,17 +247,54 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
             inv_id,
             2,
             "enriched_alert_context",
+            _enriched_payload(alert, host_alert_profile=host_profile, enrichments=enrichments),
+        ),
+        _ev(
+            inv_id,
+            3,
+            "decision_template_match",
             {
-                "alert": alert_ctx,
-                "host_alert_profile": host_profile,
-                "enrichments": enrichments,
+                "matched": True,
+                "template_id": "blocklist_hit_major_severity",
+                "verdict": "true_positive",
+                "confidence": 0.7,
+                "rationale": (
+                    "Blocklist hit + signature_severity=Critical → strong escalation signal."
+                ),
             },
         ),
-        _ev(inv_id, 3, "decision_template_match", {"matched": False}),
+        # E4.2 memory recall — exactly the light payloads the orchestrator
+        # emits (ids/verdicts/tier and source/thread/role; never text).
+        _ev(
+            inv_id,
+            4,
+            "prior_outcomes",
+            {
+                "count": 2,
+                "window_days": 90,
+                "items": [
+                    {"id": prior_ids[0], "verdict": "true_positive", "matched_on": "rule+src+dest"},
+                    {"id": prior_ids[1], "verdict": "true_positive", "matched_on": "rule+endpoint"},
+                ],
+            },
+        ),
+        _ev(
+            inv_id,
+            5,
+            "chat_memory",
+            {
+                "count": 2,
+                "window_days": 90,
+                "items": [
+                    {"source": "investigation", "thread_id": prior_ids[0], "role": "user"},
+                    {"source": "investigation", "thread_id": prior_ids[0], "role": "assistant"},
+                ],
+            },
+        ),
     ]
     events += _tool_pair(
         inv_id,
-        4,
+        6,
         "c1",
         "t_enrich_ip",
         {"ip": dst},
@@ -213,7 +309,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     events.append(
         _ev(
             inv_id,
-            6,
+            8,
             "model_response",
             {
                 "reasoning_trace": (
@@ -227,7 +323,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     )
     events += _tool_pair(
         inv_id,
-        7,
+        9,
         "c2",
         "t_query_zeek_logs",
         {"log": "conn", "filter": f"destination.ip:{dst}"},
@@ -242,7 +338,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     )
     events += _tool_pair(
         inv_id,
-        9,
+        11,
         "c3",
         "t_prevalence",
         {"indicator": dst},
@@ -254,7 +350,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     events.append(
         _ev(
             inv_id,
-            11,
+            13,
             "model_response",
             {
                 "reasoning_trace": (
@@ -267,7 +363,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     )
     events += _tool_pair(
         inv_id,
-        12,
+        14,
         "c4",
         "t_host_summary",
         {"ip": src},
@@ -279,7 +375,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     )
     events += _tool_pair(
         inv_id,
-        14,
+        16,
         "c5",
         "t_query_events_oql",
         {"query": f"event.dataset:suricata.alert AND source.ip:{src} | groupby rule.name"},
@@ -292,7 +388,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     events.append(
         _ev(
             inv_id,
-            16,
+            18,
             "model_response",
             {
                 "reasoning_trace": (
@@ -308,7 +404,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
     events += [
         _ev(
             inv_id,
-            17,
+            19,
             "triage_report",
             {
                 "verdict": "true_positive",
@@ -318,7 +414,7 @@ def build_emotet(inv_id: str) -> tuple[Investigation, list, list]:
         ),
         _ev(
             inv_id,
-            18,
+            20,
             "citation_validation",
             {
                 "counts": {"valid": 5},
@@ -395,35 +491,34 @@ def build_nmap(inv_id: str) -> tuple[Investigation, list, list]:
         created_at=created,
         finished_at=created + timedelta(seconds=41),
     )
-    alert_ctx = {
-        "rule_name": rule,
+    alert = SoAlert(
+        id=alert_id,
+        rule_name=rule,
         # The detection's own fire time — feeds the "alert time" row on the
         # investigation page (a few minutes before triage started).
-        "timestamp": (created - timedelta(minutes=4)).isoformat(),
-        "rule_uuid": "2024364",
-        "classtype": "attempted-recon",
-        "event_category": "network",
-        "source_ip": src,
-        "source_port": 51820,
-        "destination_ip": dst,
-        "destination_port": 443,
-        "alert_action": "allowed",
-        "host_name": host,
-        "severity_label": "medium",
-    }
+        timestamp=created - timedelta(minutes=4),
+        rule_uuid="2024364",
+        classtype="attempted-recon",
+        event_category="network",
+        source_ip=src,
+        source_port=51820,
+        destination_ip=dst,
+        destination_port=443,
+        alert_action="allowed",
+        host_name=host,
+        severity_label="medium",
+    )
     events: list = [
         _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
         _ev(
             inv_id,
             2,
             "enriched_alert_context",
-            {
-                "alert": alert_ctx,
-                "host_alert_profile": {rule: 38},
-                "enrichments": {
-                    src: {"indicator": src, "blocklist_hits": [], "misp_hits": [], "internal": True}
-                },
-            },
+            _enriched_payload(
+                alert,
+                host_alert_profile={rule: 38},
+                enrichments={src: _internal_ip(src)},
+            ),
         ),
         _ev(inv_id, 3, "decision_template_match", {"matched": False}),
     ]
@@ -437,7 +532,7 @@ def build_nmap(inv_id: str) -> tuple[Investigation, list, list]:
             "summary": (
                 "Runbook 'Authorized vulnerability scanning — sec-scan hosts' matches: "
                 f"{src} is the team's Nessus/Nmap scanner; expected window Mon "
-                "02:00–04:00 UTC across all subnets."
+                "02:00-04:00 UTC across all subnets."
             ),
         },
     )
@@ -532,34 +627,34 @@ def build_dnstop(inv_id: str) -> tuple[Investigation, list, list]:
         created_at=created,
         finished_at=created + timedelta(seconds=58),
     )
+    alert = SoAlert(
+        id=dd.event_id(g, 1),
+        rule_name=rule,
+        # The detection's own fire time — feeds the "alert time" row on the
+        # investigation page (a few minutes before triage started).
+        timestamp=created - timedelta(minutes=4),
+        rule_uuid="2028712",
+        classtype="bad-unknown",
+        event_category="network",
+        source_ip=src,
+        source_port=58231,
+        destination_ip=dst,
+        destination_port=53,
+        alert_action="allowed",
+        host_name=host,
+        severity_label="medium",
+    )
     events: list = [
         _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
         _ev(
             inv_id,
             2,
             "enriched_alert_context",
-            {
-                "alert": {
-                    "rule_name": rule,
-                    # The detection's own fire time — feeds the "alert time" row on the
-                    # investigation page (a few minutes before triage started).
-                    "timestamp": (created - timedelta(minutes=4)).isoformat(),
-                    "rule_uuid": "2028712",
-                    "classtype": "bad-unknown",
-                    "event_category": "network",
-                    "source_ip": src,
-                    "source_port": 58231,
-                    "destination_ip": dst,
-                    "destination_port": 53,
-                    "alert_action": "allowed",
-                    "host_name": host,
-                    "severity_label": "medium",
-                },
-                "host_alert_profile": {rule: 4},
-                "enrichments": {
-                    dst: {"indicator": dst, "blocklist_hits": [], "misp_hits": [], "internal": True}
-                },
-            },
+            _enriched_payload(
+                alert,
+                host_alert_profile={rule: 4},
+                enrichments={dst: _internal_ip(dst)},
+            ),
         ),
         _ev(inv_id, 3, "decision_template_match", {"matched": False}),
     ]
@@ -664,32 +759,32 @@ def build_attack_discovery(inv_id: str) -> tuple[Investigation, list, list]:
         created_at=created,
         finished_at=created + timedelta(seconds=66),
     )
+    alert = SoAlert(
+        id=dd.event_id(g, 1),
+        rule_name=rule,
+        # The detection's own fire time — feeds the "alert time" row on the
+        # investigation page (a few minutes before triage started).
+        timestamp=created - timedelta(minutes=4),
+        event_category="intrusion_detection",
+        source_ip=src,
+        source_port=49733,
+        destination_ip=dst,
+        destination_port=445,
+        event_action="notice",
+        host_name=host,
+        severity_label="medium",
+    )
     events: list = [
         _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
         _ev(
             inv_id,
             2,
             "enriched_alert_context",
-            {
-                "alert": {
-                    "rule_name": rule,
-                    # The detection's own fire time — feeds the "alert time" row on the
-                    # investigation page (a few minutes before triage started).
-                    "timestamp": (created - timedelta(minutes=4)).isoformat(),
-                    "event_category": "intrusion_detection",
-                    "source_ip": src,
-                    "source_port": 49733,
-                    "destination_ip": dst,
-                    "destination_port": 445,
-                    "event_action": "notice",
-                    "host_name": host,
-                    "severity_label": "medium",
-                },
-                "host_alert_profile": {rule: 3},
-                "enrichments": {
-                    dst: {"indicator": dst, "blocklist_hits": [], "misp_hits": [], "internal": True}
-                },
-            },
+            _enriched_payload(
+                alert,
+                host_alert_profile={rule: 3},
+                enrichments={dst: _internal_ip(dst)},
+            ),
         ),
         _ev(inv_id, 3, "decision_template_match", {"matched": False}),
     ]
@@ -774,39 +869,34 @@ def build_curl(inv_id: str) -> tuple[Investigation, list, list]:
         created_at=created,
         finished_at=created + timedelta(seconds=37),
     )
+    alert = SoAlert(
+        id=dd.event_id(g, 4),
+        rule_name=rule,
+        # The detection's own fire time — feeds the "alert time" row on the
+        # investigation page (a few minutes before triage started).
+        timestamp=created - timedelta(minutes=4),
+        rule_uuid="2013028",
+        classtype="policy-violation",
+        event_category="network",
+        source_ip=src,
+        source_port=44102,
+        destination_ip=dst,
+        destination_port=443,
+        alert_action="allowed",
+        host_name=host,
+        severity_label="low",
+    )
     events: list = [
         _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
         _ev(
             inv_id,
             2,
             "enriched_alert_context",
-            {
-                "alert": {
-                    "rule_name": rule,
-                    # The detection's own fire time — feeds the "alert time" row on the
-                    # investigation page (a few minutes before triage started).
-                    "timestamp": (created - timedelta(minutes=4)).isoformat(),
-                    "rule_uuid": "2013028",
-                    "classtype": "policy-violation",
-                    "event_category": "network",
-                    "source_ip": src,
-                    "source_port": 44102,
-                    "destination_ip": dst,
-                    "destination_port": 443,
-                    "alert_action": "allowed",
-                    "host_name": host,
-                    "severity_label": "low",
-                },
-                "host_alert_profile": {rule: 9},
-                "enrichments": {
-                    dst: {
-                        "indicator": dst,
-                        "blocklist_hits": [],
-                        "misp_hits": [],
-                        "internal": False,
-                    }
-                },
-            },
+            _enriched_payload(
+                alert,
+                host_alert_profile={rule: 9},
+                enrichments={dst: IndicatorEnrichment(indicator=dst, indicator_type="ip")},
+            ),
         ),
         _ev(inv_id, 3, "decision_template_match", {"matched": False}),
     ]
@@ -846,6 +936,181 @@ def build_curl(inv_id: str) -> tuple[Investigation, list, list]:
     return inv, events, []
 
 
+def build_emotet_prior(
+    inv_id: str, *, days_ago: int, src: str, alert_n: int, confidence: float, summary: str
+) -> tuple[Investigation, list, list]:
+    """An OLDER completed run on the Emotet rule — E4.2 prior-outcome material.
+
+    Two of these share the rule (one also the exact src→dst flow) with the
+    current Emotet run, so its timeline's ``prior_outcomes`` event references
+    real rows and the memory feature demos honestly.
+    """
+    g = dd.group_by_rule("ET MALWARE Win32/Emotet CnC Activity (POST)")
+    rule, dst = g["rule"], g["dst"]
+    created = utcnow() - timedelta(days=days_ago, minutes=17)
+    inv = Investigation(
+        id=inv_id,
+        alert_es_id=dd.event_id(g, alert_n),
+        rule_name=rule,
+        verdict="true_positive",
+        confidence=confidence,
+        rationale=summary,
+        summary=summary,
+        report={
+            "verdict": "true_positive",
+            "confidence": confidence,
+            "summary": summary,
+            "recommended_actions": [],
+            "open_questions": [],
+        },
+        src_ip=src,
+        dest_ip=dst,
+        status="complete",
+        started_by="auto-triage:scheduler",
+        created_at=created,
+        finished_at=created + timedelta(seconds=68),
+    )
+    events = [
+        _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
+        _ev(
+            inv_id,
+            2,
+            "triage_report",
+            {"verdict": "true_positive", "confidence": confidence, "summary": summary},
+        ),
+    ]
+    return inv, events, []
+
+
+def build_curl_retry(inv_id: str) -> tuple[Investigation, list, list]:
+    """A NEWER errored re-run stacked on the curl group's standing FP verdict.
+
+    Drives the E2.1 rerun-visibility hint on the alerts row: the standing
+    verdict chip stays primary while "last retry error <ago> ago" + the Retry
+    affordance surface that the most recent attempt crashed.
+    """
+    g = dd.group_by_rule("ET POLICY curl User-Agent Outbound")
+    created = _mins_ago(19)
+    inv = Investigation(
+        id=inv_id,
+        alert_es_id=dd.event_id(g, 1),
+        rule_name=g["rule"],
+        verdict=None,
+        confidence=None,
+        src_ip=g["src"],
+        dest_ip=g["dst"],
+        status="error",
+        started_by="admin",
+        created_at=created,
+        finished_at=created + timedelta(seconds=11),
+    )
+    events = [
+        _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
+        _ev(
+            inv_id,
+            2,
+            "error",
+            {"message": "model gateway returned 502 during round-1 synthesis; run aborted"},
+        ),
+    ]
+    return inv, events, []
+
+
+def build_fallback(inv_id: str) -> tuple[Investigation, list, list]:
+    """A pipeline-failure fallback verdict (E1.2) on the self-signed-TLS group.
+
+    ``report.resolution.provenance == "pipeline_fallback"`` — the exact marker
+    ``_synth_failure_fallback_report`` persists — so the alerts row renders the
+    distinct "Pipeline error" chip, the drawer shows the failure panel, and the
+    Dashboard excludes this needs_more_info from the Needs-info KPI.
+    """
+    g = dd.group_by_rule("ET INFO Observed Self-Signed TLS Certificate (External)")
+    rule, src, dst, host = g["rule"], g["src"], g["dst"], g["host"]
+    created = _mins_ago(31)
+    summary = (
+        "Synth-first pipeline fallback: synth_first_round1 raised "
+        "UnexpectedModelBehavior. The alert is recorded as needs_more_info "
+        "pending investigator-path retry. Underlying error: model output "
+        "failed schema validation after 2 retries."
+    )
+    inv = Investigation(
+        id=inv_id,
+        alert_es_id=dd.event_id(g, 1),
+        rule_name=rule,
+        verdict="needs_more_info",
+        confidence=0.3,
+        rationale=summary,
+        summary=summary,
+        report={
+            "verdict": "needs_more_info",
+            "confidence": 0.3,
+            "summary": summary,
+            "citations": ["synth_first_failure"],
+            "recommended_actions": [],
+            "open_questions": [],
+            "resolution": {
+                "provenance": "pipeline_fallback",
+                "phase": "synth_first_round1",
+                "error_type": "UnexpectedModelBehavior",
+                "hint": "Re-run this detection once the model gateway is healthy.",
+            },
+        },
+        src_ip=src,
+        dest_ip=dst,
+        status="complete",
+        started_by="auto-triage:scheduler",
+        created_at=created,
+        finished_at=created + timedelta(seconds=24),
+    )
+    alert = SoAlert(
+        id=dd.event_id(g, 1),
+        rule_name=rule,
+        timestamp=created - timedelta(minutes=2),
+        rule_uuid="2230002",
+        classtype="misc-activity",
+        event_category="network",
+        source_ip=src,
+        source_port=52114,
+        destination_ip=dst,
+        destination_port=8443,
+        alert_action="allowed",
+        host_name=host,
+        severity_label="medium",
+    )
+    events = [
+        _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
+        _ev(
+            inv_id,
+            2,
+            "enriched_alert_context",
+            _enriched_payload(
+                alert,
+                host_alert_profile={rule: 6},
+                enrichments={dst: IndicatorEnrichment(indicator=dst, indicator_type="ip")},
+            ),
+        ),
+        _ev(inv_id, 3, "decision_template_match", {"matched": False}),
+        _ev(
+            inv_id,
+            4,
+            "error",
+            {
+                "message": (
+                    "synth_first_round1: UnexpectedModelBehavior — model output "
+                    "failed schema validation after 2 retries"
+                )
+            },
+        ),
+        _ev(
+            inv_id,
+            5,
+            "triage_report",
+            {"verdict": "needs_more_info", "confidence": 0.3, "summary": summary},
+        ),
+    ]
+    return inv, events, []
+
+
 def build_interrupted(inv_id: str) -> tuple[Investigation, list, list]:
     g = dd.group_by_rule("SURICATA STREAM excessive retransmissions")
     created = utcnow() - timedelta(hours=3, minutes=12)
@@ -866,6 +1131,115 @@ def build_interrupted(inv_id: str) -> tuple[Investigation, list, list]:
         _ev(inv_id, 1, "session_start", {"pipeline": "agentic"}),
     ]
     return inv, events, []
+
+
+# Shared objective for BOTH hunt runs — identical text ⇒ identical
+# objective_hash ⇒ the newer run's page renders the E3.4 "vs last run" strip.
+HUNT_OBJECTIVE = (
+    "Sweep the last 24h for lateral movement from fin-ws-041 "
+    "(SMB admin shares, new service installs, Kerberos anomalies)."
+)
+
+
+def build_hunt_prev(hunt_id: str) -> tuple[Hunt, list]:
+    """The OLDER completed run of the same objective (E3.4 hunt-diff baseline).
+
+    Its findings overlap the newer run's: three persist (same fuzzy identity —
+    normalized title + hosts set), one resolves (present here, absent in the
+    newer run), and the newer run adds one ("Only new external peer…"), so the
+    diff strip shows 1 new · 3 persisting · 1 resolved.
+    """
+    src = "198.51.100.23"
+    created = utcnow() - timedelta(hours=26, minutes=40)
+    narrative = (
+        "First 24h sweep for lateral movement from fin-ws-041. No admin-share "
+        "writes and the Kerberos burst matches the fleet-wide inventory pass, "
+        "but an unexplained SMB write burst to the finance file server needs "
+        "a follow-up look, and the finance VLAN still has no RDP telemetry."
+    )
+    report = {
+        "findings": [
+            {
+                "title": "No SMB admin-share access from fin-ws-041",
+                "detail": (
+                    f"zeek.smb_files shows zero ADMIN$/C$ or IPC$ writes from {src} "
+                    "in the window."
+                ),
+                "severity": "info",
+                "category": "observation",
+                "hosts": [src],
+                "citations": ["zeek.smb_files 24h sweep: 0 admin-share hits"],
+            },
+            {
+                "title": "Kerberos TGS burst matches fleet-wide inventory pass",
+                "detail": (
+                    "A burst of 14 TGS requests at 09:12 UTC matches the same-minute "
+                    "burst on 6 other finance workstations — the logon-script "
+                    "inventory job."
+                ),
+                "severity": "low",
+                "category": "observation",
+                "hosts": [src, dd.DNS_SERVER],
+                "citations": ["demo-krb-3382"],
+            },
+            {
+                # RESOLVED in the newer run: absent from build_hunt's findings.
+                "title": "Unexplained SMB write burst to the finance file server",
+                "detail": (
+                    f"{src} wrote 31 files to fs-fin-02's department share in 4 "
+                    "minutes — above its baseline. Could be a user bulk-save; "
+                    "re-check on the next sweep."
+                ),
+                "severity": "low",
+                "category": "observation",
+                "hosts": [src],
+                "citations": ["zeek.smb_files write burst 09:41 UTC"],
+            },
+            {
+                "title": "Visibility gap: no RDP telemetry on the finance segment",
+                "detail": (
+                    "The grid inventory has no zeek.rdp data for the finance VLAN, "
+                    "so RDP lateral movement can be neither confirmed nor ruled out."
+                ),
+                "severity": "medium",
+                "category": "visibility_gap",
+                "hosts": [src],
+                "citations": ["grid inventory: zeek.rdp absent"],
+            },
+        ],
+        "narrative": narrative,
+        "confidence": 0.78,
+        "affected_hosts": [src],
+        "mitre_techniques": ["T1021.002", "T1558.003"],
+        "recommended_actions": [
+            {
+                "title": "Re-run this sweep tomorrow",
+                "rationale": "Confirm the SMB write burst was a one-off before closing it.",
+            },
+        ],
+    }
+    hunt = Hunt(
+        id=hunt_id,
+        objective=HUNT_OBJECTIVE,
+        objective_hash=_objective_hash(HUNT_OBJECTIVE),
+        kind="chat",
+        status="complete",
+        narrative=narrative,
+        report=report,
+        started_by="admin",
+        created_at=created,
+        finished_at=created + timedelta(minutes=2, seconds=2),
+    )
+    events = [
+        HuntEvent(hunt_id=hunt_id, sequence=1, kind="hunt_started", payload={"objective": HUNT_OBJECTIVE}),
+        HuntEvent(
+            hunt_id=hunt_id,
+            sequence=2,
+            kind="hunt_report",
+            payload={"findings": report["findings"], "narrative": narrative},
+        ),
+    ]
+    return hunt, events
 
 
 def build_hunt(hunt_id: str) -> tuple[Hunt, list]:
@@ -897,7 +1271,7 @@ def build_hunt(hunt_id: str) -> tuple[Hunt, list]:
                 "title": "Kerberos TGS burst matches fleet-wide inventory pass",
                 "detail": (
                     "A burst of 14 TGS requests to distinct SPNs at 09:12 UTC is "
-                    "above this host's baseline (2–3/hr) but occurred in the same "
+                    "above this host's baseline (2-3/hr) but occurred in the same "
                     "minute on 6 other finance workstations — consistent with the "
                     "logon-script inventory job, not targeted Kerberoasting."
                 ),
@@ -951,10 +1325,8 @@ def build_hunt(hunt_id: str) -> tuple[Hunt, list]:
     }
     hunt = Hunt(
         id=hunt_id,
-        objective=(
-            "Sweep the last 24h for lateral movement from fin-ws-041 "
-            "(SMB admin shares, new service installs, Kerberos anomalies)."
-        ),
+        objective=HUNT_OBJECTIVE,
+        objective_hash=_objective_hash(HUNT_OBJECTIVE),
         kind="chat",
         status="complete",
         narrative=narrative,
@@ -1083,8 +1455,8 @@ def build_hunt(hunt_id: str) -> tuple[Hunt, list]:
 
 
 async def seed(data_dir: Path) -> dict:
-    if data_dir.exists():
-        shutil.rmtree(data_dir)
+    # Nuke-to-reseed (ignore_errors: a missing dir is the normal first run).
+    shutil.rmtree(data_dir, ignore_errors=True)
     settings = demo_settings(data_dir)
     engine = make_engine(settings)
     await run_migrations(engine)
@@ -1092,45 +1464,185 @@ async def seed(data_dir: Path) -> dict:
 
     ids = {
         name: str(ULID())
-        for name in ("emotet", "nmap", "dnstop", "attack", "curl", "interrupted", "hunt")
+        for name in (
+            "emotet",
+            "prior1",
+            "prior2",
+            "nmap",
+            "dnstop",
+            "attack",
+            "curl",
+            "curl_retry",
+            "fallback",
+            "interrupted",
+            "hunt",
+            "hunt_prev",
+        )
     }
 
+    prior1 = build_emotet_prior(
+        ids["prior1"],
+        days_ago=8,
+        src="198.51.100.23",  # same src→dst flow as the current run → tier "rule+src+dest"
+        alert_n=6,
+        confidence=0.9,
+        summary=(
+            "fin-ws-041 beaconed to the same Feodo-listed C2 on a ~7-minute "
+            "cadence; escalated and the host was reimaged."
+        ),
+    )
+    prior2 = build_emotet_prior(
+        ids["prior2"],
+        days_ago=3,
+        src="198.51.100.62",  # same rule + destination only → tier "rule+endpoint"
+        alert_n=5,
+        confidence=0.88,
+        summary=(
+            "eng-ws-233 contacted the known Emotet C2 once after a phishing "
+            "attachment; blocked at egress and credentials rotated."
+        ),
+    )
     builders = [
-        build_emotet(ids["emotet"]),
+        build_emotet(ids["emotet"], (ids["prior1"], ids["prior2"])),
+        prior1,
+        prior2,
         build_nmap(ids["nmap"]),
         build_dnstop(ids["dnstop"]),
         build_attack_discovery(ids["attack"]),
         build_curl(ids["curl"]),
+        build_curl_retry(ids["curl_retry"]),
+        build_fallback(ids["fallback"]),
         build_interrupted(ids["interrupted"]),
     ]
     hunt, hunt_events = build_hunt(ids["hunt"])
+    hunt_prev, hunt_prev_events = build_hunt_prev(ids["hunt_prev"])
 
     async with sm() as db:
-        await create_user(db, dd.DEMO_ADMIN_USER, dd.DEMO_ADMIN_PASSWORD, role="admin")
+        admin = await create_user(db, dd.DEMO_ADMIN_USER, dd.DEMO_ADMIN_PASSWORD, role="admin")
         # Parents first: no ORM relationships are declared, so SQLAlchemy can't
         # order the flush itself — child rows (events/chat) go in a second flush.
         for inv, _events, _chat in builders:
             db.add(inv)
         db.add(hunt)
+        db.add(hunt_prev)
         await db.flush()
         for _inv, events, chat in builders:
             for e in events:
                 db.add(e)
             for m in chat:
                 db.add(m)
-        for e in hunt_events:
+        for e in hunt_events + hunt_prev_events:
             db.add(e)
+        # E2.3 assignment states — one group per chip (curl stays unassigned).
         db.add(
-            AlertAssignment(rule_name="ET MALWARE Win32/Emotet CnC Activity (POST)", owner="admin")
+            AlertAssignment(
+                rule_name="ET MALWARE Win32/Emotet CnC Activity (POST)",
+                owner="admin",
+                state="owned",
+            )
+        )
+        db.add(
+            AlertAssignment(
+                rule_name="ET DNS Query to a *.top domain - Likely Hostile",
+                owner="admin",
+                state="in_review",
+            )
+        )
+        db.add(AlertAssignment(rule_name="ATTACK::Discovery", owner="admin", state="done"))
+        # Manual internal identifiers: the demo workstation names are what the
+        # E5.2 analyst redaction preview must redact (TEST-NET IPs are already
+        # is_private to the sanitizer); also demos the identifiers panel.
+        for host in ("fin-ws-041", "eng-ws-112", "hr-ws-023", "it-ws-007", "sec-scan-01", "mkt-ws-019", "eng-ws-233"):
+            db.add(InternalIdentifier(kind="host", value=host, source="manual", state="active"))
+        db.add(
+            InternalIdentifier(
+                kind="suffix", value=".demo.example.com", source="manual", state="active"
+            )
+        )
+        # Scheduled re-run of the lateral-movement sweep (display-only row on
+        # the Hunts page; the newer hunt above reads as its last firing).
+        db.add(
+            HuntSchedule(
+                objective=HUNT_OBJECTIVE,
+                interval_minutes=1440,
+                enabled=True,
+                last_run_at=hunt.created_at,
+                created_by="admin",
+            )
         )
         await db.commit()
+
+    # DEMO-database-only config: memory timeline events + redaction preview
+    # render with their features "on" (production defaults are untouched —
+    # these are override rows in the throwaway store, applied at app startup).
+    async with sm() as db:
+        await set_override(db, "memory_enabled", True, updated_by=admin.id)
+        await set_override(db, "analyst_cloud_redaction", True, updated_by=admin.id)
+
+    # Chat thread on the older prior via the REAL store fns, so the messages
+    # dual-write into the chat_memory projection (E4.2 chat-transcript memory).
+    async with sm() as db:
+        await chat_svc.add_user_message(
+            db,
+            ids["prior1"],
+            "We saw this exact beacon from fin-ws-041 before — did the isolation stick?",
+        )
+        pending = await chat_svc.create_pending_assistant(db, ids["prior1"])
+        await chat_svc.finish_assistant(
+            db,
+            pending.id,
+            content=(
+                "The host was isolated and reimaged after this verdict. If the "
+                "same beacon recurs from fin-ws-041, treat it as a failed "
+                "remediation and re-escalate immediately rather than re-triaging "
+                "from scratch."
+            ),
+            meta={"tools": []},
+        )
+        # The store fns stamp "now" — backdate the thread (and its projection
+        # rows) into the prior's own era so the demo timestamps read honestly.
+        thread_ts = prior1[0].created_at + timedelta(hours=2)
+        await db.execute(
+            update(ChatMessage)
+            .where(ChatMessage.investigation_id == ids["prior1"])
+            .values(created_at=thread_ts)
+        )
+        await db.execute(
+            update(ChatMemory)
+            .where(ChatMemory.thread_id == ids["prior1"])
+            .values(created_at=thread_ts)
+        )
+        await db.commit()
+
+    # 3 starter-pack runbooks through the shipped loader — /app/runbooks and
+    # the lookup_runbook tool demo non-empty, with story-relevant picks.
+    wanted_titles = {
+        "Beaconing / C2 callback triage",
+        "Authorized scanner false positives",
+        "Lateral movement triage (SMB / PsExec / RDP)",
+    }
+    picked = [p for p in runbook_pack.load_starter_pack() if p.title in wanted_titles]
+    async with sm() as db:
+        for p in picked:
+            await runbooks_svc.create(
+                db,
+                title=p.title,
+                content=p.content,
+                tags=p.tags,
+                linked_rules=p.linked_rules,
+                created_by="admin",
+            )
+
     await engine.dispose()
 
     manifest = {
         "inv_emotet": ids["emotet"],
         "inv_nmap": ids["nmap"],
         "inv_dnstop": ids["dnstop"],
+        "inv_fallback": ids["fallback"],
+        "inv_prior_chat": ids["prior1"],
         "hunt": ids["hunt"],
+        "hunt_prev": ids["hunt_prev"],
         "admin_user": dd.DEMO_ADMIN_USER,
         "admin_password": dd.DEMO_ADMIN_PASSWORD,
     }

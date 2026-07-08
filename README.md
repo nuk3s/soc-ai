@@ -47,6 +47,12 @@ Some questions are bigger than a single detection: *"is anything beaconing to a 
 
 Hunts follow the **same safety model** as investigation: strictly read-only. The agent queries and correlates; it never acks, escalates, or edits a case. It runs on a bounded budget and concludes with what it found, and if it's cut short it still writes up a grounded partial report rather than erroring out. Kick one off ad hoc from the Hunt Console, from an alert group, or on a schedule.
 
+## Runbooks — ship your procedures to the agent
+
+The agent grounds its verdicts in **your team's own runbooks**: what "normal" looks like on your network, which hosts are known-benign, how *you* triage each class of alert. During an investigation it searches them (rule-link > tag > keyword, plus an optional embeddings tier) and cites the best match instead of guessing from thin data.
+
+The **Runbooks** page in the console is the authoring space: write them in markdown, **import your existing `.md` procedures** (front-matter `title:` / `tags:` / `rules:` is picked up, leniently), or click **Load starter pack** to seed ten generic, vendor-neutral SOC runbooks that ship with the repo (`runbooks/starter-pack/` — beaconing/C2, scanner false positives, brute force, DNS tunneling, phishing, lateral movement, exfiltration, cryptomining, TLS anomalies, and a rule-tuning methodology). The pack is idempotent — it never overwrites a runbook you've written — and everything stays local.
+
 ## What it won't do on its own
 
 The whole point is that you stay in control of anything that changes state.
@@ -93,8 +99,10 @@ sudo apt install -y git curl
 
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
-./setup.sh
+./setup.sh --prebuilt
 ```
+
+`--prebuilt` pulls the released image from [GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai) instead of building locally — the fastest path (pin a version with `SOC_AI_IMAGE_TAG=<x.y.z>`). Prefer building from source? Drop the flag: `./setup.sh` builds the Dockerfile in-place (~3 min).
 
 `setup.sh` walks you through the connection settings and checks them *before* it builds anything (a wrong password or an unreachable gateway fails in seconds, not after a three-minute build), lets you pick your model from the gateway's live list (it authenticates to fetch it), generates the secrets and a TLS cert, brings the stack up, and prints the URL and admin password:
 
@@ -103,6 +111,8 @@ git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 </div>
 
 > Replay it in your terminal: `asciinema play docs/demo/install-walkthrough.cast`. To stand up more hosts without the prompts, fill in `setup.conf` once and run `./setup.sh --auto`.
+
+> **Something not working?** Run the doctor: `docker exec soc-ai python -m soc_ai doctor` (or `uv run soc-ai doctor` from a source checkout). It checks the whole dependency surface — config, local store + migrations, Security Onion, Elasticsearch, the gateway, and the analyst model's actual fitness — and prints a pass/fail table with a fix hint on every failing line.
 
 ### Then work an alert in the browser
 
@@ -135,7 +145,7 @@ docs as below, searchable, with dark mode. Build it locally with `uv run --group
 - [docs/OQL_PRIMER.md](docs/OQL_PRIMER.md): the query language the agent searches with
 - [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md): the write-action flow, the audit schema, and redaction (Oracle + cloud analyst models)
 - [docs/DOCKER.md](docs/DOCKER.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): installing it
-- [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](.github/CONTRIBUTING.md) · [SECURITY.md](.github/SECURITY.md)
+- [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](.github/SECURITY.md)
 
 ## Building on it
 

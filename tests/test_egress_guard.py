@@ -311,3 +311,25 @@ def test_guard_egress_raises_when_fail_closed_and_residue(settings_kratos: Setti
 
 def test_config_fail_closed_defaults_off(settings_kratos: Settings) -> None:
     assert settings_kratos.analyst_redaction_fail_closed is False
+
+
+# ---------------------------------------------------------------------------
+# 5. DNS-SD suffix-FQDNs on the analyst path (incident 2026-07-08)
+# ---------------------------------------------------------------------------
+
+
+def test_dns_sd_free_text_sanitized_before_fail_closed_gate() -> None:
+    """A DNS-SD service FQDN (underscore-led labels) in a tool result must be
+    redacted by sanitize_text so the fail-closed residue gate passes — on this
+    path analyst_redaction_fail_closed defaults False, so a sanitize miss here
+    EGRESSES silently instead of refusing."""
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=())
+    raw = "tool result: .C..........\n_aaplcache._tcp.corp.lan..... seen on vlan 80"
+    # The INDEPENDENT detector flags the raw form directly (not merely via the
+    # json-escape accident that fired in the eval incident) ...
+    assert guard.residue(raw) != []
+    # ... and the replacer catches it FIRST, so fail-closed egress is clean.
+    cleaned = guard.sanitize_text(raw)
+    assert "_aaplcache" not in cleaned
+    assert "corp.lan" not in cleaned
+    guard.check_or_raise(cleaned, fail_closed=True)  # must not raise

@@ -8,6 +8,11 @@ The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
   for terminal-first analysts and incident-response work where opening a
   browser is overhead.
 - ``healthz``: prints the health endpoint's JSON.
+- ``doctor``: checks the whole dependency surface (config, local store +
+  migration head, Security Onion, Elasticsearch, gateway, analyst-model
+  fitness, egress posture, blocklist freshness) and prints a pass/fail
+  table. Exit 0 only when every required check passes (warnings don't
+  fail it); ``--json`` emits the results for automation.
 
 The triage subcommand connects via HTTPS to the configured
 ``SOC_AI_HOST:SOC_AI_PORT`` and trusts a self-signed cert by default
@@ -339,6 +344,55 @@ def _healthz(args: argparse.Namespace) -> int:
         # and a snippet so the operator can see what answered.
         print(f"HTTP {resp.status_code} (non-JSON body): {resp.text[:200]}")
     return 0 if resp.status_code == 200 else 1
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    """Run the dependency-surface health checks and print a pass/fail table.
+
+    Exit codes:
+      0   every required check passed (WARN/INFO lines don't fail the doctor)
+      1   at least one required check FAILed
+    """
+    from soc_ai.doctor import CheckResult, exit_code, run_doctor  # noqa: PLC0415 - lazy
+
+    results = asyncio.run(run_doctor())
+    rc = exit_code(results)
+
+    if args.json:
+        print(
+            json.dumps(
+                {"ok": rc == 0, "results": [r.as_dict() for r in results]},
+                indent=2,
+            )
+        )
+        return rc
+
+    status_color = {
+        "PASS": _C["green"],
+        "WARN": _C["yellow"],
+        "FAIL": _C["bold"] + _C["red"],
+        "INFO": _C["dim"],
+    }
+    name_w = max(len(r.name) for r in results)
+
+    def _line(r: CheckResult) -> str:
+        color = status_color.get(r.status, "")
+        out = f"{color}{r.status:<4}{_C['reset']}  {r.name:<{name_w}}  {r.detail}"
+        if r.hint:
+            # Hint on its own indented line, aligned under the detail column.
+            out += f"\n{' ' * (6 + name_w + 2)}{_C['yellow']}fix: {r.hint}{_C['reset']}"
+        return out
+
+    for r in results:
+        print(_line(r))
+    n_pass = sum(1 for r in results if r.status == "PASS")
+    n_warn = sum(1 for r in results if r.status == "WARN")
+    n_fail = sum(1 for r in results if r.status == "FAIL")
+    summary_color = _C["red"] if n_fail else _C["green"]
+    print(
+        f"\n{summary_color}{n_pass} passed, {n_warn} warning(s), {n_fail} failure(s){_C['reset']}"
+    )
+    return rc
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -776,6 +830,22 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
         return 1
 
 
+def _register_doctor(sub: Any) -> None:
+    """Register the ``doctor`` subparser (split out of :func:`main` for size)."""
+    p_doc = sub.add_parser(
+        "doctor",
+        help="Check the whole dependency surface (config, store, SO/ES, gateway, "
+        "model fitness) and print a pass/fail table; exit 0 iff all required "
+        "checks pass",
+    )
+    p_doc.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the check results as JSON instead of the table (for automation)",
+    )
+    p_doc.set_defaults(func=_doctor)
+
+
 def _add_api_client_args(p: argparse.ArgumentParser) -> None:
     """Shared flags for subcommands that call the running soc-ai HTTP API."""
     p.add_argument(
@@ -827,6 +897,8 @@ def main() -> None:
     )
     _add_api_client_args(p_health)
     p_health.set_defaults(func=_healthz)
+
+    _register_doctor(sub)
 
     p_val = sub.add_parser(
         "validate",

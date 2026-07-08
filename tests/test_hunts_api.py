@@ -781,6 +781,45 @@ def test_validate_hunt_findings_high_sev_no_citations_capped() -> None:
     assert counts["findings_capped"] == 1
 
 
+def test_validate_hunt_findings_clamps_overlong_title() -> None:
+    """An overlong machine-generated title (> 90 chars) is word-boundary truncated
+    with a trailing ellipsis; a compliant title passes through untouched."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    long_title = (
+        "Sustained periodic beaconing from an internal workstation to a rare external "
+        "IP with low data volume and a highly regular sixty-second cadence"
+    )
+    assert len(long_title) > 90
+    findings = [
+        HuntFinding(title=long_title, detail="A host beacons on a 60s cadence."),
+        HuntFinding(title="Beaconing to rare external IP", detail="Compliant title."),
+    ]
+    validated, _ = _validate_hunt_findings(findings, [])
+
+    clamped = validated[0].title
+    assert len(clamped) <= 90
+    assert clamped.endswith("…")
+    # cut on a word boundary: the kept text is a prefix of the original that
+    # ended exactly at a space (no mid-word chop)
+    kept = clamped[:-1]
+    assert long_title.startswith(kept)
+    assert long_title[len(kept)] == " "
+    # compliant title untouched
+    assert validated[1].title == "Beaconing to rare external IP"
+
+
+def test_validate_hunt_findings_clamps_unbroken_title() -> None:
+    """A single overlong token (no word boundary to cut at) is hard-cut to the
+    ceiling rather than left to overflow."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [HuntFinding(title="x" * 200, detail="d")]
+    validated, _ = _validate_hunt_findings(findings, [])
+    assert len(validated[0].title) <= 90
+    assert validated[0].title.endswith("…")
+
+
 def test_run_hunt_gate_strips_fabricated_citation_end_to_end(settings_kratos: Settings) -> None:
     """Drive run_hunt with a report citing an id NOT in the streamed tool_result:
     the emitted hunt_report has the citation stripped + severity capped, and a
@@ -1018,6 +1057,24 @@ def test_validate_hunt_charts_caps_at_four() -> None:
     kept, counts = _validate_hunt_charts(charts, tool_results)
     assert len(kept) == 4
     assert counts["charts_dropped"] == 2
+
+
+def test_validate_hunt_charts_clamps_overlong_title() -> None:
+    """A kept chart's overlong title gets the same word-boundary clamp as findings."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_charts
+
+    long_title = (
+        "Distribution of beacon intervals observed between the internal workstation "
+        "and the rare external destination over the whole lookback window"
+    )
+    assert len(long_title) > 90
+    tool_results = [_tool_result({"hits": [{"_id": "sREAL_PULLED_ID_42"}]})]
+    charts = [_chart(title=long_title, source_citations=["sREAL_PULLED_ID_42"])]
+    kept, _ = _validate_hunt_charts(charts, tool_results)
+    assert len(kept) == 1
+    assert len(kept[0].title) <= 90
+    assert kept[0].title.endswith("…")
+    assert long_title.startswith(kept[0].title[:-1])
 
 
 def test_run_hunt_chart_gate_end_to_end(settings_kratos: Settings) -> None:

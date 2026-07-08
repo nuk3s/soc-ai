@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that soc-ai makes hard today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you'd like to see. If it touches the agent's tools or the human-approval safety model, say how.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Anything you've already tried or considered.
+
+  - type: textarea
+    id: egress
+    attributes:
+      label: Privacy / egress impact
+      description: >
+        soc-ai is privacy-first — features must not add default-on egress
+        (see docs/SAFETY_MODEL.md). If this needs a new network destination,
+        describe how it stays opt-in and off by default.

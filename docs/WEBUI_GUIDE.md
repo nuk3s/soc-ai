@@ -73,6 +73,31 @@ marked `error` (its worker died with the previous process), and a periodic sweep
 marks any run still `running` past `investigation_reaper_minutes` (default 30).
 No manual SQL needed to clear orphans.
 
+## Runbooks — `/app/runbooks`
+
+The authoring space for your team's own triage guidance — the corpus the
+investigation agent searches (its `lookup_runbook` tool) and cites in verdicts.
+Reading is open to analysts; creating/editing/deleting is admin-gated.
+
+- **Editor**: title, markdown content (with a write/preview toggle), tags, and
+  **linked rules** — detection rule names/UUIDs this runbook applies to. A
+  rule-link is the strongest retrieval signal: when that rule fires, this
+  runbook wins.
+- **Import files…**: bulk-import existing `.md` procedures from your wiki or
+  repo. Optional YAML front-matter (`title:`, `tags:`, `rules:`) is parsed
+  leniently — malformed metadata is ignored and the body still imports; the
+  title falls back to the first `#` heading, then the filename.
+- **Load starter pack**: seeds ten generic, vendor-neutral SOC runbooks shipped
+  with the repo (`runbooks/starter-pack/`). Idempotent by title — it never
+  duplicates or overwrites a runbook you already have, so it's safe to re-run
+  after upgrades. Edit the seeded copies freely; your edits stick.
+- When the optional **Retrieval (RAG)** embeddings tier is configured, each row
+  shows its embed status (`embedded` / `not embedded` / `stale embedding`);
+  the catch-up pass lives at Config → Retrieval → "Re-embed runbooks".
+
+The Config page keeps a compact summary (count + manage link) next to the
+Retrieval settings.
+
 ## Config console — `/app/config` (admin only)
 
 In-UI configuration. A non-admin who reaches it gets a clean 403 (no login loop).

@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import ChatMessage
 
@@ -20,6 +21,15 @@ from soc_ai.store.models import ChatMessage
 async def add_user_message(db: AsyncSession, inv_id: str, content: str) -> ChatMessage:
     msg = ChatMessage(investigation_id=inv_id, role="user", content=content, status="done")
     db.add(msg)
+    # Dual-write into the chat_memory projection (same transaction, so message
+    # and projection land atomically) — user turns are complete on arrival.
+    chat_memory.record_message(
+        db,
+        source=chat_memory.SOURCE_INVESTIGATION,
+        thread_id=inv_id,
+        role="user",
+        content=content,
+    )
     await db.commit()
     await db.refresh(msg)
     return msg
@@ -47,6 +57,17 @@ async def finish_assistant(
     msg.content = content
     msg.status = status
     msg.meta = meta
+    # An assistant turn only becomes institutional knowledge once it COMPLETES —
+    # project it into chat_memory now (pending rows are empty; errored rows are
+    # apology strings; neither is worth recalling). Same-transaction, atomic.
+    if status == "done":
+        chat_memory.record_message(
+            db,
+            source=chat_memory.SOURCE_INVESTIGATION,
+            thread_id=msg.investigation_id,
+            role="assistant",
+            content=content,
+        )
     await db.commit()
 
 

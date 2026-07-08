@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------------------
-// ConfigNav — sticky in-page section nav for the config page. Smooth-scrolls
-// to each section anchor (honoring `scroll-mt-*` on the targets) and highlights
-// the active section. Styled to match the app Sidebar nav items. Pure anchors:
+// ConfigNav — sticky in-page section nav for the config page. Snaps instantly
+// to each section anchor (honoring `scroll-mt-*` on the targets — smooth-scroll
+// was slow/choppy on this long page) and highlights the active section. Styled
+// to match the app Sidebar nav items. Pure anchors:
 // the click handler is progressive enhancement — the `href="#id"` jump still
 // works if JS/IntersectionObserver are unavailable.
 // ---------------------------------------------------------------------------
@@ -33,10 +34,12 @@ export function ConfigNav({ sections, activeId, onNavigate }: ConfigNavProps) {
             onClick={(e) => {
               e.preventDefault();
               // Expand a collapsed target first, then scroll (the freshly-shown
-              // body changes layout, so scroll on the next frame).
+              // body changes layout, so scroll on the next frame). Instant snap
+              // ('auto', not 'smooth') — smooth-scrolling this long page is
+              // slow/choppy.
               onNavigate?.(s.id);
               requestAnimationFrame(() => {
-                document.getElementById(s.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                document.getElementById(s.id)?.scrollIntoView({ behavior: 'auto', block: 'start' });
               });
               history.replaceState(null, '', `#${s.id}`);
             }}
