@@ -32,6 +32,7 @@ _PREFIXES = (
     "SOC_AI_",
     "HEAVY_",
     "FAST_",
+    "MEMORY_",
     "EMBED_",
     "LOG_",
     "API_AUTH_REQUIRED",

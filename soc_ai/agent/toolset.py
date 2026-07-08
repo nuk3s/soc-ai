@@ -991,7 +991,11 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             if dup := _dedup_result(ctx, "t_lookup_runbook", {"query": query, "k": k}):
                 return dup
             try:
-                rows = await lookup_runbook(query, k=k, db_sessionmaker=ctx.db_sessionmaker)
+                # ctx.settings enables the opt-in semantic tier (rag_embed_model);
+                # with the tier unconfigured, retrieval stays 100% local (FTS5).
+                rows = await lookup_runbook(
+                    query, k=k, db_sessionmaker=ctx.db_sessionmaker, settings=ctx.settings
+                )
             except Exception as e:
                 _LOGGER.warning("t_lookup_runbook failed: %s", e)
                 return _tool_error(e)

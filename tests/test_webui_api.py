@@ -1253,6 +1253,7 @@ def test_egress_policy_all_off_is_zero_egress(settings_kratos: Settings) -> None
             "online_enrichment",
             "analyst_cloud",
             "notifications",
+            "rag_gateway",
         }
         assert all(d["enabled"] is False for d in body["destinations"])
         # posture strings are populated + honest for the analyst destination
@@ -1306,6 +1307,27 @@ def test_egress_policy_notify_needs_toggle_and_webhook(settings_kratos: Settings
         assert body["zero_egress"] is False
 
 
+def test_egress_policy_rag_gateway_tracks_model_config(settings_kratos: Settings) -> None:
+    """E4.1: the runbook-retrieval destination reads enabled iff EITHER rag model
+    id is configured (each one independently makes retrieval call the gateway),
+    and its posture is honest that runbook text + queries leave unredacted."""
+    for client in _egress_client(settings_kratos):  # both unset → off
+        d = _egress_dest(client, "rag_gateway")
+        assert d["enabled"] is False
+        assert "runbook" in d["redaction"]
+
+    embed_only = settings_kratos.model_copy(update={"rag_embed_model": "qwen3-embed"})
+    for client in _egress_client(embed_only):
+        body = client.get("/api/v1/config/egress-policy").json()
+        by_id = {d["id"]: d for d in body["destinations"]}
+        assert by_id["rag_gateway"]["enabled"] is True
+        assert body["zero_egress"] is False
+
+    rerank_only = settings_kratos.model_copy(update={"rag_rerank_model": "bge-reranker"})
+    for client in _egress_client(rerank_only):
+        assert _egress_dest(client, "rag_gateway")["enabled"] is True
+
+
 def test_egress_policy_analyst_redaction_posture_is_honest(settings_kratos: Settings) -> None:
     """The analyst-model destination reflects the TRUE redaction posture: off =
     'none', on = best-effort, on+fail-closed = the fail-closed string."""
@@ -1350,7 +1372,7 @@ def test_egress_policy_counts_null_when_audit_errors(settings_kratos: Settings) 
             assert resp.status_code == 200
             body = resp.json()
             # table still returned in full
-            assert len(body["destinations"]) == 6
+            assert len(body["destinations"]) == 7
             # every count is null (unknown), never a misleading 0
             assert all(d["count_7d"] is None for d in body["destinations"])
 

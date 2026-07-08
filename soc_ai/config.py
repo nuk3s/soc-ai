@@ -840,6 +840,90 @@ class Settings(BaseSettings):
     crawl_max_chars: int = 6000
     """Cap on extracted page content (chars) returned to the agent per crawl."""
 
+    # --- Runbook retrieval (RAG) — opt-in gateway tier -----------------
+    # The DEFAULT runbook retrieval is SQLite FTS5 BM25 (migration 0017): zero
+    # new dependencies, zero egress, always on. These two knobs add an OPTIONAL
+    # semantic tier via the SAME operator-configured gateway the analyst model
+    # uses (litellm_base_url) — both default EMPTY = tier off, no gateway call
+    # is ever made for retrieval. Editable live in the config console.
+    rag_embed_model: str = ""
+    """OpenAI-compatible ``/v1/embeddings`` model id on the configured gateway
+    used to embed runbooks + search queries for the semantic retrieval tier
+    (e.g. a LiteLLM embeddings alias). EMPTY (default) disables the tier:
+    runbook retrieval stays pure-local FTS5/keyword and issues no gateway call.
+    When set, runbook writes embed fail-soft (a down gateway just leaves the
+    row un-embedded until the next write or ``POST /config/rag/reembed``) and
+    ``lookup_runbook`` unions semantic hits into its ranking. Changing the model
+    marks existing vectors stale — run "Re-embed runbooks" after switching."""
+
+    rag_rerank_model: str = ""
+    """Cohere-shape ``/rerank`` model id on the configured gateway used to
+    rerank the merged keyword+semantic candidates (e.g. a LiteLLM rerank
+    alias). EMPTY (default) disables reranking — the weighted merge order
+    stands. Only consulted when a search actually has candidates; a rerank
+    failure is fail-soft (the merged order is returned, never an error)."""
+
+    # --- Investigation memory (prior outcomes) -------------------------
+    memory_enabled: bool = False
+    """Deterministic prior-outcome context ("investigation memory") for the
+    synth-first round-1 prompt.
+
+    When on, the round-1 synthesis user message gains a small, clearly-framed
+    block of the most relevant PRIOR verdicts for similar alerts — matched by
+    deterministic SQL feature tiers over the local ``investigations`` table
+    (exact rule+src+dest triple, then same rule + one shared endpoint, then
+    same rule only; newest first within a tier). NO embeddings, NO new tables,
+    NO extra model calls — one indexed query per investigation (see
+    :func:`soc_ai.store.investigations.prior_outcomes`).
+
+    The block is presented to the model as CONTEXT ONLY, never evidence: its
+    header instructs the model not to cite it, and the citation gate
+    independently guarantees a citation quoting prior-outcome text never
+    resolves (priors are prompt context, not part of the evidence bundle).
+    Pipeline-fallback verdicts are excluded, so memory reflects model/analyst
+    conclusions rather than failure noise.
+
+    OFF by default: surfacing prior verdicts risks ANCHORING BIAS (the model
+    repeating an old wrong verdict instead of weighing the fresh evidence) —
+    keep it off until an anchoring-bias A/B validates default-on. Editable
+    live in the config console."""
+
+    memory_window_days: int = 90
+    """How far back (days) the prior-outcome lookup searches for similar
+    COMPLETED investigations. Bounded [1, 365]. 90 balances institutional
+    memory against replaying stale conclusions from a since-changed network.
+    Only consulted when ``memory_enabled`` is on."""
+
+    memory_max_items: int = 3
+    """Maximum prior-outcome digests injected into the round-1 prompt. Bounded
+    [1, 5] — the block must stay small (context budget + anchoring surface),
+    and the deterministic tiers already put the most-similar verdicts first.
+    Only consulted when ``memory_enabled`` is on."""
+
+    @field_validator("memory_window_days", mode="before")
+    @classmethod
+    def _clamp_memory_window_days(cls, v: Any) -> Any:
+        """Validate memory_window_days is an integer in [1, 365]."""
+        try:
+            i = int(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("memory_window_days must be an integer in [1, 365]") from exc
+        if i < 1 or i > 365:
+            raise ValueError(f"memory_window_days must be in [1, 365], got {i}")
+        return i
+
+    @field_validator("memory_max_items", mode="before")
+    @classmethod
+    def _clamp_memory_max_items(cls, v: Any) -> Any:
+        """Validate memory_max_items is an integer in [1, 5]."""
+        try:
+            i = int(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("memory_max_items must be an integer in [1, 5]") from exc
+        if i < 1 or i > 5:
+            raise ValueError(f"memory_max_items must be in [1, 5], got {i}")
+        return i
+
     # --- Oracle frontier adjudication ---------------------------------
     oracle_enabled: bool = False
     """Explicit cloud opt-in.  When False, _should_escalate_to_oracle() is

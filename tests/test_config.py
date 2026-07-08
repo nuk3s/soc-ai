@@ -377,6 +377,43 @@ def test_auto_triage_min_severity_rejects_invalid(monkeypatch: pytest.MonkeyPatc
 # Admin config-console whitelist integrity (inc 1: env-only settings surfaced)
 # ---------------------------------------------------------------------------
 
+
+def test_memory_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """E4.2 investigation memory ships OFF (anchoring-bias A/B pending) with the
+    documented window/item defaults."""
+    _setenv_required(monkeypatch)
+    s = Settings()
+    assert s.memory_enabled is False
+    assert s.memory_window_days == 90
+    assert s.memory_max_items == 3
+
+
+def test_memory_settings_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """memory_window_days ∈ [1, 365] and memory_max_items ∈ [1, 5]; boundary
+    values pass, out-of-range and junk are rejected."""
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("MEMORY_WINDOW_DAYS", "365")
+    monkeypatch.setenv("MEMORY_MAX_ITEMS", "5")
+    s = Settings()
+    assert s.memory_window_days == 365
+    assert s.memory_max_items == 5
+
+    monkeypatch.setenv("MEMORY_WINDOW_DAYS", "366")
+    with pytest.raises(ValidationError, match="memory_window_days"):
+        Settings()
+    monkeypatch.setenv("MEMORY_WINDOW_DAYS", "0")
+    with pytest.raises(ValidationError, match="memory_window_days"):
+        Settings()
+
+    monkeypatch.setenv("MEMORY_WINDOW_DAYS", "90")
+    monkeypatch.setenv("MEMORY_MAX_ITEMS", "0")
+    with pytest.raises(ValidationError, match="memory_max_items"):
+        Settings()
+    monkeypatch.setenv("MEMORY_MAX_ITEMS", "six")
+    with pytest.raises(ValidationError, match="memory_max_items"):
+        Settings()
+
+
 # Settings reserved for the internal-identifier discovery managed-list UI
 # (increments 2/3) — these must NOT be surfaced as plain config rows now.
 _RESERVED_INTERNAL_IDENTIFIER_KEYS = frozenset(

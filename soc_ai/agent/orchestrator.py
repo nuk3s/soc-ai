@@ -46,6 +46,7 @@ import logging
 import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from datetime import datetime
 from typing import Any
 
 from pydantic_ai import Agent
@@ -1167,6 +1168,65 @@ def _self_consistency_vote(reports: list[Any]) -> tuple[str, float, str]:
     )
 
 
+# Header framing the E4.2 prior-outcome memory block. The anti-anchoring
+# instruction lives HERE (read before any verdict line), because the whole
+# point of the default-off flag is that prior verdicts can bias the model —
+# the block must present as fallible context, never as evidence to cite.
+_PRIOR_OUTCOMES_HEADER = (
+    "## Prior outcomes for similar alerts (CONTEXT ONLY — NOT evidence. "
+    "Do not cite these; they may be wrong; weigh the current evidence on its "
+    "own merits.)"
+)
+
+
+def _prior_age_phrase(created_at: datetime | None, now: datetime) -> str:
+    """Compact "how long ago" phrase for one prior-outcome line ("3d ago").
+
+    Both datetimes are naive UTC (the store's convention — ``created_at`` is
+    stamped by SQLite ``func.now()`` and compared against
+    :func:`soc_ai.store.auth.utcnow` everywhere else). Sub-hour ages render
+    "<1h ago". A missing value or an aware/naive mismatch renders "recently"
+    instead of raising — the memory block is advisory context and must never
+    kill an investigation over a timestamp quirk (fail-soft, like the fetch).
+    """
+    if created_at is None:
+        return "recently"
+    try:
+        delta_s = max((now - created_at).total_seconds(), 0.0)
+    except TypeError:  # aware vs naive mismatch from an exotic backend
+        return "recently"
+    days = int(delta_s // 86400)
+    if days >= 1:
+        return f"{days}d ago"
+    hours = int(delta_s // 3600)
+    return f"{hours}h ago" if hours >= 1 else "<1h ago"
+
+
+def _format_prior_outcomes_block(digests: list[dict[str, Any]]) -> str:
+    """Render prior-outcome digests into the round-1 memory block (E4.2).
+
+    One compact line per digest — age, match tier, verdict (+confidence), and
+    the word-boundary-truncated rationale — under the anti-anchoring header.
+    The returned block is passed into :func:`build_synth_first_user_message`
+    BEFORE the composed message's final sanitize sweep + ``_guard_egress``, so
+    internal identifiers inside a prior rationale are redacted on the
+    cloud-analyst path exactly like the rest of the prompt.
+    """
+    from soc_ai.store.auth import utcnow  # noqa: PLC0415 - lazy: store dep only when memory is on
+
+    now = utcnow()
+    lines = [_PRIOR_OUTCOMES_HEADER, ""]
+    for d in digests:
+        conf = d.get("confidence")
+        conf_part = f" ({conf:.2f})" if isinstance(conf, int | float) else ""
+        digest = d.get("rationale_digest") or "(no rationale recorded)"
+        lines.append(
+            f"- {_prior_age_phrase(d.get('created_at'), now)} · {d.get('matched_on')} · "
+            f"{d.get('verdict')}{conf_part} — {digest}"
+        )
+    return "\n".join(lines)
+
+
 async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pipeline is inherently long
     *,
     alert_id: str,
@@ -1417,12 +1477,75 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # redact before it joins the synth prompt (labels stay stable
             # because the guard's mapping is shared with enriched_json above).
             materialized = guard.sanitize_obj(materialized)
+        # ----- E4.2: deterministic prior-outcome memory (round-1 ONLY) -----
+        # Flag-gated context block: the most relevant PRIOR verdicts for this
+        # alert's (rule, src, dest), fetched with one indexed SQL query — no
+        # embeddings, no extra model calls. Fail-SOFT end to end: no DB on ctx
+        # (CLI / eval / tests), no rule name, a store error, or zero matches
+        # all just skip the block — memory must never kill an investigation.
+        # ``is True`` (not truthiness) so a non-Settings test double can never
+        # flip it on. The loop / round-2 / retask prompts are deliberately
+        # untouched: they reason over GATHERED evidence, where a prior verdict
+        # would compete with real tool results.
+        prior_outcomes_block: str | None = None
+        prior_digests: list[dict[str, Any]] = []
+        if (
+            getattr(ctx.settings, "memory_enabled", False) is True
+            and ctx.db_sessionmaker is not None
+            and enriched.alert.rule_name
+        ):
+            from soc_ai.store import investigations as investigations_store  # noqa: PLC0415
+
+            try:
+                async with ctx.db_sessionmaker() as mem_db:
+                    prior_digests = await investigations_store.prior_outcomes(
+                        mem_db,
+                        rule_name=enriched.alert.rule_name,
+                        src_ip=enriched.alert.source_ip,
+                        dest_ip=enriched.alert.destination_ip,
+                        # This run's own row is still status='running' (finalize
+                        # lands after the stream ends) and prior_outcomes is
+                        # complete-only, so it can never self-match — there is
+                        # no row id to exclude from inside the pipeline.
+                        exclude_id=None,
+                        window_days=ctx.settings.memory_window_days,
+                        limit=ctx.settings.memory_max_items,
+                    )
+            except Exception as e:
+                _LOGGER.warning("prior-outcome memory lookup failed (skipping block): %s", e)
+                prior_digests = []
+        if prior_digests:
+            prior_outcomes_block = _format_prior_outcomes_block(prior_digests)
+            # Timeline transparency: record WHAT was recalled — ids/verdicts/
+            # tier only, never rationale text (the digests live in the prompt;
+            # the event payload stays light). Emitted ONLY when a non-empty
+            # block is actually injected.
+            mem_ev = _ev(
+                "prior_outcomes",
+                {
+                    "count": len(prior_digests),
+                    "window_days": ctx.settings.memory_window_days,
+                    "items": [
+                        {
+                            "id": d.get("id"),
+                            "verdict": d.get("verdict"),
+                            "matched_on": d.get("matched_on"),
+                        }
+                        for d in prior_digests
+                    ],
+                },
+            )
+            await _audit(mem_ev)
+            yield mem_ev
         user_msg_round1 = build_synth_first_user_message(
             alert_id=alert_id,
             enriched_ctx_json=enriched_json,
             materialized_evidence=materialized,
             candidate=candidate,
             focus_hint=focus_hint,
+            # Included BEFORE the final sanitize sweep + _guard_egress below,
+            # so prior rationale text is redacted on the cloud-analyst path.
+            prior_outcomes_block=prior_outcomes_block,
         )
         if guard is not None:
             # Final sweep over the COMPOSED message — catches the decision-

@@ -43,6 +43,9 @@ _TL_GROUP = {
     "auto_ack": "Decision",
     # Proactive context budgeting happens during prefetch assembly.
     "context_trimmed": "Prefetch & pivots",
+    # E4.2 memory recall happens while assembling the round-1 prompt (before
+    # any synthesis/decision), so it reads as part of the prefetch story.
+    "prior_outcomes": "Prefetch & pivots",
 }
 # Write-action tools (ack/escalate/comment): their tool_call rows belong under
 # "Decision" too — they act on the verdict rather than investigate.
@@ -464,6 +467,17 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
         return f"pipeline: {p.get('pipeline', '?')}"
     if kind == "context_trimmed":
         return _compact(p.get("detail") or "", 300)
+    if kind == "prior_outcomes":
+        # E4.2 memory recall: compact verdict/tier chips, framed the way the
+        # prompt frames them — context the model saw, never evidence.
+        items = p.get("items") or []
+        chips = ", ".join(
+            f"{it.get('verdict')} ({it.get('matched_on')})" for it in items if isinstance(it, dict)
+        )
+        return (
+            f"Context only — never evidence. {p.get('count')} prior verdict(s) "
+            f"within {p.get('window_days')}d shown to the synthesizer: {chips}"
+        )
     return _compact(p, 220)
 
 

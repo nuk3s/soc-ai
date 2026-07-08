@@ -14,6 +14,7 @@ from soc_ai.api.webui._shared import (
     require_admin_api,
     router,
 )
+from soc_ai.rag import runbook_embeddings as rag_svc
 from soc_ai.store import runbooks as runbooks_svc
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,6 +100,11 @@ async def create_runbook(request: Request, body: RunbookIn) -> RunbookOut:
             linked_rules=body.linked_rules,
             created_by=created_by,
         )
+        # Opt-in semantic tier: keep the vector fresh at write time. Fail-SOFT —
+        # a down gateway must never fail a runbook save (the row just lacks an
+        # embedding until the next write or an admin re-embed). No-op when
+        # rag_embed_model is unset.
+        await rag_svc.embed_runbook_safe(db, row, settings=request.app.state.settings)
     return _runbook_out(row)
 
 
@@ -118,6 +124,10 @@ async def update_runbook(request: Request, runbook_id: int, body: RunbookPatch) 
             tags=body.tags,
             linked_rules=body.linked_rules,
         )
+        if row is not None:
+            # Same fail-soft write-time embed as create — an edited runbook's
+            # stale vector would otherwise mis-rank semantic retrieval.
+            await rag_svc.embed_runbook_safe(db, row, settings=request.app.state.settings)
     if row is None:
         raise HTTPException(
             status_code=404,

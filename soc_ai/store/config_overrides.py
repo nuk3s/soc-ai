@@ -596,6 +596,83 @@ WHITELIST: tuple[SettingSpec, ...] = (
         min_value=1,
         max_value=25,
     ),
+    # ---- RETRIEVAL (RAG): the opt-in gateway tier for runbook search (hot) ----
+    # Both hot=True: search() and the runbook write paths read these fresh from
+    # settings per call, so a save applies to the very next lookup. Both default
+    # EMPTY = tier off (retrieval stays pure-local FTS5/keyword, zero egress).
+    SettingSpec(
+        key="rag_embed_model",
+        attr="rag_embed_model",
+        type="str",
+        label="Embeddings model (semantic runbook retrieval)",
+        section="Retrieval (RAG)",
+        hot=True,
+        help=(
+            "OpenAI-compatible /v1/embeddings model id on your gateway. Empty (default) = "
+            "semantic tier off; runbook search stays pure-local FTS5. After changing it, "
+            "run Re-embed runbooks below — vectors from the old model are stale."
+        ),
+    ),
+    SettingSpec(
+        key="rag_rerank_model",
+        attr="rag_rerank_model",
+        type="str",
+        label="Rerank model (Cohere-shape /rerank)",
+        section="Retrieval (RAG)",
+        hot=True,
+        help=(
+            "Rerank model id on your gateway for the merged keyword+semantic candidates. "
+            "Empty (default) = no rerank (weighted merge order stands). Rerank failures "
+            "are fail-soft — search never errors because the gateway is down."
+        ),
+    ),
+    # ---- MEMORY: deterministic prior-outcome context for synthesis (hot) -----
+    # All hot=True: the orchestrator reads these fresh from ctx.settings at the
+    # start of every investigation, so a save applies to the very next run.
+    # Default OFF pending an anchoring-bias A/B (see the Settings docstrings).
+    SettingSpec(
+        key="memory_enabled",
+        attr="memory_enabled",
+        type="bool",
+        label="Investigation memory (prior outcomes in synthesis)",
+        section="Memory",
+        hot=True,
+        help=(
+            "Show the verdict synthesis a small block of PRIOR verdicts for similar "
+            "alerts (same rule / shared endpoints — deterministic SQL match, no "
+            "embeddings). Framed as context, never evidence; the citation gate still "
+            "rejects it as grounding. Off by default pending an anchoring-bias A/B."
+        ),
+    ),
+    SettingSpec(
+        key="memory_window_days",
+        attr="memory_window_days",
+        type="int",
+        label="Memory window (days)",
+        section="Memory",
+        hot=True,
+        help=(
+            "How far back the prior-outcome lookup searches for similar completed "
+            "investigations. 90 is the default; shorter forgets faster on a "
+            "changing network."
+        ),
+        min_value=1,
+        max_value=365,
+    ),
+    SettingSpec(
+        key="memory_max_items",
+        attr="memory_max_items",
+        type="int",
+        label="Memory items per investigation",
+        section="Memory",
+        hot=True,
+        help=(
+            "Max prior-outcome digests injected into the round-1 prompt. Keep small "
+            "(1-5): each item is anchoring surface and context-budget spend."
+        ),
+        min_value=1,
+        max_value=5,
+    ),
     # ---- DISCOVERY: internal-identifier auto-discovery tuning (hot) ----------
     # All hot=True: the discovery job (CLI / timer / scan-now endpoint) reads
     # these fresh from settings on each run, so a change applies to the next
@@ -981,6 +1058,8 @@ SECTION_ORDER: tuple[str, ...] = (
     "PCAP",
     "Web research",
     "Online enrichment",
+    "Retrieval (RAG)",
+    "Memory",
     "Discovery",
     "Notifications",
 )

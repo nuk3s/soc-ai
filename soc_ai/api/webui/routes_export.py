@@ -77,6 +77,259 @@ async def oracle_redaction_preview(
     )
 
 
+# ── Analyst-path redaction preview (E5.2) ──────────────────────────────────────
+
+
+class AnalystRedactionPreviewOut(BaseModel):
+    investigation_id: str
+    # Current settings, so the UI can say "this is a simulation; redaction is
+    # currently off" — the preview itself ALWAYS shows what redaction would do.
+    redaction_enabled: bool
+    fail_closed: bool
+    # The rebuilt round-1 analyst prompt — text, not the Oracle preview's dict
+    # (the analyst egress boundary is a composed message string).
+    original: str
+    sanitized: str
+    summary: dict[str, int]
+    note: str
+
+
+# Event kinds the rebuild cannot proceed without. Both are emitted
+# unconditionally by the synth-first pipeline; investigations from before
+# these kinds existed (or from the legacy pipeline) 409 with events_missing.
+_REQUIRED_PREVIEW_KINDS = ("enriched_alert_context", "decision_template_match")
+
+
+def _analyst_preview_note(
+    *,
+    redaction_enabled: bool,
+    event_kinds: set[str],
+    prior_block_present: bool,
+    cited_dropped: bool,
+) -> str:
+    """Assemble the preview's honesty note from what the rebuild actually did.
+
+    Every sentence is conditional on observed state — the note never claims a
+    caveat that doesn't apply to THIS investigation's stored events.
+    """
+    parts = [
+        "Rebuilt from this investigation's stored events and redacted with the "
+        "CURRENT identifier configuration — a simulation of the analyst-path "
+        "egress, not a byte-replay of the original run.",
+        "The stored enriched context is written before any redaction (local "
+        "storage never egresses), so the original side is the true raw prompt "
+        "material even for runs that executed with redaction on.",
+    ]
+    if not redaction_enabled:
+        parts.append(
+            "analyst_cloud_redaction is currently OFF — a real analyst call "
+            "would send the original text unredacted; the sanitized side shows "
+            "what WOULD be sent if you enable it."
+        )
+    if "synth_round1_skipped" in event_kinds:
+        parts.append(
+            "This run skipped the round-1 synthesis (routed straight to the "
+            "investigation loop); shown is the message round 1 WOULD have received."
+        )
+    if "context_trimmed" in event_kinds:
+        parts.append(
+            "The original run trimmed the enriched context to the model window; "
+            "the trim is not replayed here (window discovery would call the gateway)."
+        )
+    if prior_block_present:
+        parts.append(
+            "Prior-outcome rationale digests are not stored in events; the "
+            "rebuilt memory block carries placeholders for them."
+        )
+    if cited_dropped:
+        parts.append(
+            "The candidate's cited-evidence lines could not be reproduced "
+            "(template logic changed since this run) and are omitted."
+        )
+    return " ".join(parts)
+
+
+@router.get(
+    "/analyst/redaction-preview/{inv_id}",
+    response_model=AnalystRedactionPreviewOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def analyst_redaction_preview(
+    inv_id: str,
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> AnalystRedactionPreviewOut:
+    """Show what the ANALYST model would receive for a PAST investigation.
+
+    Rebuilds the round-1 synthesizer user message from the investigation's
+    stored events — enriched context + decision-template candidate + the E4.2
+    prior-outcomes block when that event exists — in the orchestrator's exact
+    composition order, then runs it through a THROWAWAY
+    :class:`~soc_ai.agent.egress_guard.EgressGuard` built from the CURRENT
+    settings/identifier config. Read-only: no model call, no egress, no writes;
+    the guard (and its label mapping) is discarded with the response.
+
+    Honesty notes (each verified against ``_run_synth_first_pipeline``):
+
+    - The stored ``enriched_alert_context`` event carries the RAW context: the
+      orchestrator emits it BEFORE any sanitization (deliberately — "local
+      storage, never egress"), so the ``original`` side is genuinely raw even
+      for runs that executed with redaction ON.
+    - The preview redacts with the CURRENT identifier configuration, not the
+      run-time one, and skips the context-window trim (window discovery calls
+      the gateway, and this endpoint must not egress).
+    - The ``prior_outcomes`` event deliberately stores no rationale text, so a
+      rebuilt memory block carries "(no rationale recorded)" placeholders.
+    - The ``decision_template_match`` event stores no ``cited_evidence``; it
+      is recovered by re-running the pure template matcher on the stored
+      context, and used only when that reproduces the SAME template id.
+
+    Errors: 404 unknown id; 409 ``{"code": "events_missing"}`` when the run
+    predates the required event kinds; 409 ``{"code": "context_unparseable"}``
+    when the stored context no longer validates against the current schema.
+    """
+    # Lazy agent-layer imports (mirrors the oracle preview above): the export
+    # routes module stays import-light for every request that isn't this one.
+    from soc_ai.agent.decision_templates import (  # noqa: PLC0415
+        CandidateVerdict,
+        match_decision_template,
+    )
+    from soc_ai.agent.egress_guard import EgressGuard  # noqa: PLC0415
+    from soc_ai.agent.evidence import _materialize_prefetch_evidence  # noqa: PLC0415
+    from soc_ai.agent.orchestrator import _format_prior_outcomes_block  # noqa: PLC0415
+    from soc_ai.agent.prompts import build_synth_first_user_message  # noqa: PLC0415
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext  # noqa: PLC0415
+
+    async with request.app.state.db_sessionmaker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+    if got is None:
+        raise HTTPException(status_code=404, detail={"reason": "not_found"})
+    inv, events = got
+
+    # First payload per kind, in sequence order (each rebuild input is emitted
+    # at most once per run).
+    by_kind: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        by_kind.setdefault(ev.kind, ev.payload or {})
+
+    missing = [k for k in _REQUIRED_PREVIEW_KINDS if k not in by_kind]
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "events_missing",
+                "missing": missing,
+                "hint": (
+                    "This investigation predates the stored events needed to "
+                    "rebuild the analyst prompt — only newer runs can be previewed."
+                ),
+            },
+        )
+
+    try:
+        enriched = EnrichedAlertContext.model_validate(by_kind["enriched_alert_context"])
+    except Exception as exc:
+        # Schema drift on an old run: the stored payload no longer parses.
+        # Distinct code from events_missing — the events exist, we just can't
+        # honestly rebuild from them.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "context_unparseable",
+                "hint": (
+                    "The stored enriched context no longer parses against the "
+                    "current schema, so the analyst prompt cannot be rebuilt honestly."
+                ),
+            },
+        ) from exc
+
+    # ----- Decision-template candidate (Phase B) -----
+    # The stored event carries verdict/confidence/template_id/rationale but NOT
+    # cited_evidence. The matcher is a pure function of the enriched context,
+    # so re-run it to recover the cited lines — but trust it only when it
+    # reproduces the SAME template the run recorded (template logic may have
+    # changed since); otherwise omit the lines and say so in the note.
+    tm = by_kind["decision_template_match"]
+    candidate: CandidateVerdict | None = None
+    cited_dropped = False
+    if tm.get("matched") and tm.get("template_id"):
+        recomputed = match_decision_template(enriched)
+        if recomputed is not None and recomputed.template_id == tm.get("template_id"):
+            cited = recomputed.cited_evidence
+        else:
+            cited = []
+            cited_dropped = True
+        candidate = CandidateVerdict(
+            # Defensive default keeps a malformed stored payload a 200-preview
+            # rather than a 500 (the verdict text is display material here).
+            verdict=tm.get("verdict") or "needs_more_info",
+            confidence=float(tm.get("confidence") or 0.0),
+            cited_evidence=cited,
+            template_id=str(tm.get("template_id")),
+            rationale=str(tm.get("rationale") or ""),
+        )
+
+    # ----- E4.2 prior-outcomes block (round-1 only, when the run recalled any) --
+    # The event stores ids/verdicts/tier ONLY — never rationale text — so the
+    # rebuilt block renders the same structure with placeholder digests/ages.
+    prior_block: str | None = None
+    if "prior_outcomes" in by_kind:
+        items = by_kind["prior_outcomes"].get("items") or []
+        digests = [
+            {"verdict": it.get("verdict"), "matched_on": it.get("matched_on")}
+            for it in items
+            if isinstance(it, dict)
+        ]
+        if digests:
+            prior_block = _format_prior_outcomes_block(digests)
+
+    # ----- Compose, mirroring the orchestrator's order -----
+    # Orchestrator: trim+serialize enriched → sanitize it → materialize evidence
+    # → sanitize it → compose (candidate + priors ride the composed message) →
+    # final sanitize sweep → residue gate. Here: same order minus the trim (see
+    # docstring) and minus the residue gate (nothing egresses). focus_hint is
+    # not persisted in events, so re-launched runs rebuild without it.
+    enriched_json = enriched.model_dump_json()
+    materialized = _materialize_prefetch_evidence(enriched)
+    alert_id = inv.alert_es_id or inv.id
+    original = build_synth_first_user_message(
+        alert_id=alert_id,
+        enriched_ctx_json=enriched_json,
+        materialized_evidence=materialized,
+        candidate=candidate,
+        focus_hint=None,
+        prior_outcomes_block=prior_block,
+    )
+
+    guard = await EgressGuard.for_settings(settings, request.app.state.db_sessionmaker)
+    sanitized = guard.sanitize_text(
+        build_synth_first_user_message(
+            alert_id=alert_id,
+            enriched_ctx_json=guard.sanitize_text(enriched_json),
+            materialized_evidence=guard.sanitize_obj(materialized),
+            candidate=candidate,
+            focus_hint=None,
+            prior_outcomes_block=prior_block,
+        )
+    )
+
+    redaction_enabled = settings.analyst_cloud_redaction is True
+    return AnalystRedactionPreviewOut(
+        investigation_id=inv.id,
+        redaction_enabled=redaction_enabled,
+        fail_closed=settings.analyst_redaction_fail_closed is True,
+        original=original,
+        sanitized=sanitized,
+        summary=guard.redaction_summary(),
+        note=_analyst_preview_note(
+            redaction_enabled=redaction_enabled,
+            event_kinds=set(by_kind),
+            prior_block_present=prior_block is not None,
+            cited_dropped=cited_dropped,
+        ),
+    )
+
+
 # ── Audit-grade decision record ("show your work") export ──────────────────────
 
 

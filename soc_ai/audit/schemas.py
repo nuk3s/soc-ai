@@ -57,6 +57,13 @@ AuditKind = Literal[
     # decision helpers
     "decision_template_match",
     "recommended_actions_blocked",
+    # E4.2 deterministic investigation memory: prior-outcome digests injected
+    # into the synth round-1 prompt (soc_ai/agent/orchestrator.py). Payload is
+    # deliberately light — count/window plus per-item id/verdict/matched_on,
+    # never rationale text. Emitted ONLY when a non-empty block was actually
+    # injected; must be a valid audit kind or _audit silently drops it (same
+    # trap the downgrade kinds hit above).
+    "prior_outcomes",
     # evidence-gate / anchor downgrades (emitted by the synth-first + legacy
     # post-validators). Without these the AuditEvent Literal rejected them and
     # _audit swallowed the ValidationError — so every such downgrade was silently

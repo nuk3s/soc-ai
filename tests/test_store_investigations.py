@@ -468,3 +468,215 @@ async def test_override_counts_by_rule_empty(settings_kratos: Settings) -> None:
     async with maker() as db:
         assert await inv_svc.override_counts_by_rule(db, []) == {}
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# prior_outcomes — deterministic investigation memory (E4.2)
+# ---------------------------------------------------------------------------
+
+_MEM_RULE = "ET MALWARE Memory Beacon"
+_MEM_SRC = "10.0.0.1"
+_MEM_DST = "10.0.0.2"
+
+
+async def _seed_prior(
+    db,  # type: ignore[no-untyped-def]
+    *,
+    alert_es_id: str,
+    rule_name: str = _MEM_RULE,
+    verdict: str | None = "false_positive",
+    src_ip: str | None = _MEM_SRC,
+    dest_ip: str | None = _MEM_DST,
+    rationale: str | None = "benign gateway heartbeat",
+    report: dict | None = None,
+    age_days: int = 0,
+) -> Investigation:
+    """Seed one COMPLETE candidate row (optionally backdated) for memory tests."""
+    inv = await inv_svc.create(
+        db,
+        alert_es_id=alert_es_id,
+        started_by="t",
+        rule_name=rule_name,
+        src_ip=src_ip,
+        dest_ip=dest_ip,
+    )
+    await inv_svc.finalize(
+        db,
+        inv.id,
+        status="complete",
+        verdict=verdict,
+        confidence=0.9,
+        rationale=rationale,
+        report=report,
+    )
+    if age_days:
+        row = await db.get(Investigation, inv.id)
+        row.created_at = utcnow() - timedelta(days=age_days)
+        await db.commit()
+    return inv
+
+
+async def _lookup(
+    db,  # type: ignore[no-untyped-def]
+    *,
+    src_ip: str | None = _MEM_SRC,
+    dest_ip: str | None = _MEM_DST,
+    exclude_id: str | None = None,
+    window_days: int = 30,
+    limit: int = 5,
+) -> list[dict]:
+    return await inv_svc.prior_outcomes(
+        db,
+        rule_name=_MEM_RULE,
+        src_ip=src_ip,
+        dest_ip=dest_ip,
+        exclude_id=exclude_id,
+        window_days=window_days,
+        limit=limit,
+    )
+
+
+async def test_prior_outcomes_tier_ordering_beats_recency(settings_kratos: Settings) -> None:
+    """Exact triple outranks endpoint-share outranks rule-only, whatever the age;
+    WITHIN a tier the newest row wins."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # Oldest row is the exact triple; the freshest is rule-only — tier must win.
+        exact = await _seed_prior(db, alert_es_id="m1", age_days=5)
+        ep_src = await _seed_prior(db, alert_es_id="m2", dest_ip="10.9.9.9", age_days=2)
+        ep_dst = await _seed_prior(db, alert_es_id="m3", src_ip="10.5.5.5", age_days=3)
+        rule_only = await _seed_prior(
+            db, alert_es_id="m4", src_ip="10.7.7.7", dest_ip="10.9.9.9", age_days=0
+        )
+
+        got = await _lookup(db)
+        # Tier first; within the endpoint tier, m2 (2d) is newer than m3 (3d).
+        assert [d["id"] for d in got] == [exact.id, ep_src.id, ep_dst.id, rule_only.id]
+        assert [d["matched_on"] for d in got] == [
+            "rule+src+dest",
+            "rule+endpoint",
+            "rule+endpoint",
+            "rule",
+        ]
+        # Digest shape: light fields only, rationale collapsed into the digest.
+        assert got[0]["verdict"] == "false_positive"
+        assert got[0]["confidence"] == pytest.approx(0.9)
+        assert got[0]["rationale_digest"] == "benign gateway heartbeat"
+    await engine.dispose()
+
+
+async def test_prior_outcomes_filters_window_status_verdict_exclude(
+    settings_kratos: Settings,
+) -> None:
+    """Only complete, verdict-bearing rows inside the window count; exclude_id
+    drops the caller's own row."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        keeper = await _seed_prior(db, alert_es_id="k1", age_days=1)
+        # Outside the window.
+        await _seed_prior(db, alert_es_id="k2", age_days=40)
+        # Still running (never finalized) — must never hand out a verdict.
+        await inv_svc.create(
+            db,
+            alert_es_id="k3",
+            started_by="t",
+            rule_name=_MEM_RULE,
+            src_ip=_MEM_SRC,
+            dest_ip=_MEM_DST,
+        )
+        # Complete but verdictless (e.g. an interrupted finalize) — no verdict, no memory.
+        await _seed_prior(db, alert_es_id="k4", verdict=None)
+
+        got = await _lookup(db, window_days=30)
+        assert [d["id"] for d in got] == [keeper.id]
+
+        # exclude_id drops the caller's own (completed) row.
+        assert await _lookup(db, exclude_id=keeper.id) == []
+    await engine.dispose()
+
+
+async def test_prior_outcomes_drops_pipeline_fallback_keeps_analyst_override(
+    settings_kratos: Settings,
+) -> None:
+    """A pipeline-fallback verdict is failure noise, not memory; an analyst
+    override (resolution with resolved_via, no provenance) is the OPPOSITE —
+    the strongest conclusion we have — and must be kept."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _seed_prior(
+            db,
+            alert_es_id="f1",
+            age_days=0,
+            report={
+                "resolution": {
+                    "provenance": "pipeline_fallback",
+                    "phase": "synth_first_round1",
+                    "error_type": "TimeoutError",
+                }
+            },
+        )
+        overridden = await _seed_prior(
+            db,
+            alert_es_id="f2",
+            age_days=1,
+            report={"resolution": {"resolved_via": "manual", "resolved_by": "alice"}},
+        )
+        got = await _lookup(db)
+        assert [d["id"] for d in got] == [overridden.id]
+    await engine.dispose()
+
+
+async def test_prior_outcomes_limit_applies_after_fallback_filter(
+    settings_kratos: Settings,
+) -> None:
+    """``limit`` bounds the RETURNED digests (newest first within the tier), and
+    a fallback row between real ones doesn't eat a slot (bounded overscan)."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        rows = [
+            await _seed_prior(db, alert_es_id=f"l{i}", age_days=i) for i in range(1, 5)
+        ]  # ages 1..4 — newest first is l1, l2, l3, l4
+        await _seed_prior(
+            db,
+            alert_es_id="l0",
+            age_days=0,  # newest of all, but a fallback → filtered out
+            report={"resolution": {"provenance": "pipeline_fallback"}},
+        )
+        got = await _lookup(db, limit=3)
+        assert [d["id"] for d in got] == [rows[0].id, rows[1].id, rows[2].id]
+    await engine.dispose()
+
+
+async def test_prior_outcomes_unknown_endpoints_rank_rule_only(
+    settings_kratos: Settings,
+) -> None:
+    """With no known endpoint on the CURRENT alert, NULL never 'matches' NULL —
+    every candidate is a rule-only match (shared absence isn't a shared endpoint)."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _seed_prior(db, alert_es_id="n1")
+        got = await _lookup(db, src_ip=None, dest_ip=None)
+        assert [d["matched_on"] for d in got] == ["rule"]
+    await engine.dispose()
+
+
+async def test_prior_outcomes_rationale_digest_truncates_on_word_boundary(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        long_rationale = "Solicited echo replies from the gateway monitor. " * 12  # ~588 chars
+        await _seed_prior(db, alert_es_id="d1", rationale=long_rationale, age_days=1)
+        await _seed_prior(db, alert_es_id="d2", rationale="short\n note", age_days=2)
+        await _seed_prior(db, alert_es_id="d3", rationale=None, age_days=3)
+
+        got = await _lookup(db)
+        digest = got[0]["rationale_digest"]
+        assert digest is not None and digest.endswith("…")
+        assert len(digest) <= 281  # 280 + the ellipsis
+        # Word boundary: the last token before the ellipsis is a whole word.
+        assert digest[:-1].rstrip().split()[-1] in long_rationale.split()
+        # Short rationales pass through with whitespace collapsed; None stays None.
+        assert got[1]["rationale_digest"] == "short note"
+        assert got[2]["rationale_digest"] is None
+    await engine.dispose()

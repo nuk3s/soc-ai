@@ -17,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -312,6 +313,37 @@ class Runbook(Base):
     linked_rules: Mapped[list[str]] = mapped_column(JSON, default=list)
     created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class RunbookEmbedding(Base):
+    """One gateway-produced embedding vector per runbook (the OPT-IN semantic tier).
+
+    Empty until the operator configures ``rag_embed_model`` — the default
+    retrieval path (FTS5 BM25, migration 0017) never reads this table. When the
+    tier is on, runbook writes embed fail-soft (a gateway outage just leaves the
+    row absent until the next write or an admin re-embed), and
+    :func:`soc_ai.rag.runbook_embeddings.semantic_search` cosines the stored
+    vectors in pure Python (the corpus is small; no numpy, no vector DB).
+
+    ``model`` records WHICH embeddings model produced the vector: rows whose
+    model no longer matches the configured ``rag_embed_model`` are STALE —
+    skipped at query time (mixing vector spaces produces garbage cosines) and
+    refreshed by ``POST /config/rag/reembed``. ``vector`` is the raw float32
+    little-endian bytes (``dim`` * 4); ``dim`` is kept alongside so a corrupt
+    blob is detectable without decoding.
+    """
+
+    __tablename__ = "runbook_embedding"
+
+    runbook_id: Mapped[int] = mapped_column(
+        ForeignKey("runbook.id", ondelete="CASCADE"), primary_key=True
+    )
+    model: Mapped[str] = mapped_column(String(128))
+    dim: Mapped[int] = mapped_column(Integer)
+    vector: Mapped[bytes] = mapped_column(LargeBinary)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(), server_default=func.now(), onupdate=func.now()
     )

@@ -10,13 +10,14 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import ChatMessage, Investigation, InvestigationEvent
+from soc_ai.triage_models import is_pipeline_fallback
 
 VERDICTS_RUNNING = "running"
 
@@ -531,6 +532,139 @@ async def latest_for_pairs(
         key = (inv.rule_name or "", inv.src_ip or "", inv.dest_ip or "")
         if key in wanted and key not in out:
             out[key] = inv
+    return out
+
+
+# Tier-rank → matched_on label for prior_outcomes(). Index == the CASE rank the
+# query computes: 0 = exact triple, 1 = same rule + one shared endpoint, 2 = rule.
+_PRIOR_TIER_LABELS = ("rule+src+dest", "rule+endpoint", "rule")
+
+# Digest budget for a prior-outcome rationale. ~280 chars keeps one digest to a
+# single compact prompt line; truncation lands on a word boundary (below).
+_PRIOR_DIGEST_CHARS = 280
+
+
+def _digest_rationale(rationale: str | None, *, max_chars: int = _PRIOR_DIGEST_CHARS) -> str | None:
+    """Collapse + truncate a rationale into a compact single-line digest.
+
+    All whitespace (including newlines) collapses to single spaces so one digest
+    is one prompt line. Over-long text is cut at the last WORD BOUNDARY at or
+    before ``max_chars`` and marked with an ellipsis — a mid-word fragment reads
+    like corruption to both analysts and models. Falls back to a hard cut only
+    when the boundary would discard more than half the budget (one enormous
+    unbroken token, e.g. a base64 blob). ``None``/empty stays ``None`` so the
+    caller can render an explicit "(no rationale recorded)" placeholder.
+    """
+    if not rationale:
+        return None
+    text = " ".join(rationale.split())
+    if len(text) <= max_chars:
+        return text
+    cut = text.rfind(" ", 0, max_chars + 1)
+    if cut < max_chars // 2:
+        cut = max_chars
+    return text[:cut].rstrip() + "…"
+
+
+async def prior_outcomes(
+    db: AsyncSession,
+    *,
+    rule_name: str,
+    src_ip: str | None,
+    dest_ip: str | None,
+    exclude_id: str | None,
+    window_days: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """The most relevant PRIOR verdicts for a (rule, src, dest) alert — E4.2 memory.
+
+    Deterministic feature-match generalization of the exact-triple inheritance
+    in :func:`latest_for_pairs`: analysts generalize ("I've seen this rule on
+    this host before"), so the synth round-1 prompt can too — via plain SQL,
+    never embeddings. Candidates are COMPLETE, verdict-bearing investigations
+    for the same ``rule_name`` within ``window_days``, ranked into three
+    similarity tiers (higher tier first):
+
+    1. ``rule+src+dest`` — exact triple (both endpoints match).
+    2. ``rule+endpoint`` — same rule plus one shared endpoint (prior ``src_ip``
+       == our src OR prior ``dest_ip`` == our dest; same-position match, so a
+       reversed flow ranks as rule-only — deterministic and cheap over guessing
+       direction semantics).
+    3. ``rule`` — same rule only.
+
+    Within a tier: newest first (``created_at`` desc, id desc as tiebreak).
+    Implemented as ONE query with a CASE ranking rather than 3 stacked queries:
+    the ``rule_name`` equality prefix rides ``ix_investigations_similarity``
+    either way, and a single ordered scan keeps the tier/recency ordering in
+    SQL where it is trivially deterministic. A ``None`` endpoint contributes no
+    tier condition (NULL == NULL is shared *absence*, not a shared endpoint).
+
+    Post-filter in Python: rows whose report is an E1.2 pipeline fallback
+    (``report.resolution.provenance == "pipeline_fallback"``, read via the
+    shared :func:`~soc_ai.triage_models.is_pipeline_fallback` predicate) are
+    dropped — memory must reflect model/analyst conclusions, not failure noise.
+    ``report`` is a portable JSON column, so this is inspected in Python (like
+    :func:`override_counts_by_rule`) with a bounded SQL overscan (``limit * 5``)
+    to survive a streak of fallback rows without an unbounded scan.
+
+    ``exclude_id`` drops the caller's own row. The orchestrator's in-flight row
+    is still ``running`` (complete-only already excludes it) — this is for
+    callers/tests that hold a concrete completed row id.
+
+    Returns light digests (never full reports)::
+
+        {id, created_at, verdict, confidence,
+         matched_on ("rule+src+dest" | "rule+endpoint" | "rule"),
+         rationale_digest (rationale collapsed + word-boundary-truncated ~280)}
+    """
+    if not rule_name or limit <= 0:
+        return []
+    cutoff = utcnow() - timedelta(days=window_days)
+    whens: list[tuple[Any, int]] = []
+    if src_ip is not None and dest_ip is not None:
+        whens.append((and_(Investigation.src_ip == src_ip, Investigation.dest_ip == dest_ip), 0))
+    endpoint_terms = []
+    if src_ip is not None:
+        endpoint_terms.append(Investigation.src_ip == src_ip)
+    if dest_ip is not None:
+        endpoint_terms.append(Investigation.dest_ip == dest_ip)
+    if endpoint_terms:
+        whens.append((or_(*endpoint_terms), 1))
+    # No known endpoint at all ⇒ every candidate is tier 2 (rule-only).
+    tier = case(*whens, else_=2) if whens else literal(2)
+    q = (
+        select(Investigation, tier.label("tier"))
+        .where(
+            Investigation.rule_name == rule_name,
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+            Investigation.created_at >= cutoff,
+        )
+        .order_by(tier, Investigation.created_at.desc(), Investigation.id.desc())
+        # Bounded overscan: the fallback post-filter below drops rows AFTER the
+        # SQL limit, so fetch a small multiple. Fallbacks are rare relative to
+        # real completions; 5x is generous without becoming a table scan.
+        .limit(limit * 5)
+    )
+    if exclude_id is not None:
+        q = q.where(Investigation.id != exclude_id)
+    rows = (await db.execute(q)).all()
+    out: list[dict[str, Any]] = []
+    for inv, tier_rank in rows:
+        if is_pipeline_fallback(inv.report):
+            continue
+        out.append(
+            {
+                "id": inv.id,
+                "created_at": inv.created_at,
+                "verdict": inv.verdict,
+                "confidence": inv.confidence,
+                "matched_on": _PRIOR_TIER_LABELS[int(tier_rank)],
+                "rationale_digest": _digest_rationale(inv.rationale),
+            }
+        )
+        if len(out) >= limit:
+            break
     return out
 
 

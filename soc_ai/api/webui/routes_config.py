@@ -309,6 +309,7 @@ _EGRESS_AUDIT_KINDS: dict[str, list[str]] = {
     "online_enrichment": [],
     "analyst_cloud": [],
     "notifications": ["notification"],
+    "rag_gateway": [],
 }
 
 
@@ -392,6 +393,23 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "redaction": "synthetic, no internal data",
             "detail": "Outbound alert/hunt webhook; synthetic bodies, no internal identifiers.",
         },
+        {
+            "id": "rag_gateway",
+            "label": "Runbook retrieval (embeddings / rerank)",
+            # Either model id makes retrieval call the gateway. Same host as the
+            # analyst model (litellm_base_url) — like analyst_cloud, a REAL
+            # egress only if that gateway routes off-box; the posture is honest
+            # about what leaves the process either way.
+            "enabled": bool(settings.rag_embed_model.strip())
+            or bool(settings.rag_rerank_model.strip()),
+            "redaction": "none — sends runbook text + agent search queries",
+            "detail": (
+                "Opt-in semantic tier for lookup_runbook: runbooks + search "
+                "queries go to your gateway's embeddings/rerank models "
+                f"({settings.rag_embed_model or 'unset'} / "
+                f"{settings.rag_rerank_model or 'unset'}). Off = pure-local FTS5."
+            ),
+        },
     ]
 
 
@@ -460,6 +478,53 @@ async def api_egress_policy(
         )
 
     return EgressPolicyOut(destinations=destinations, zero_egress=zero_egress)
+
+
+# ── Runbook retrieval (RAG) admin: re-embed (E4.1) ─────────────────────────
+# The semantic tier embeds runbooks at write time (fail-soft), so vectors go
+# MISSING when the gateway was down during a save, and STALE when the operator
+# switches rag_embed_model. This endpoint is the catch-up: one pass embedding
+# every missing/stale runbook, returning honest counts (a gateway failure is
+# counted, never raised — the button shows "N failed", not a 500).
+
+
+class RagReembedOut(BaseModel):
+    ok: bool  # True iff nothing failed
+    total: int  # runbooks in the store
+    embedded: int  # vectors written this pass
+    skipped: int  # already embedded by the current model
+    failed: int  # gateway failures (vectors NOT written)
+
+
+@router.post(
+    "/config/rag/reembed",
+    response_model=RagReembedOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_rag_reembed(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> RagReembedOut:
+    """Embed every runbook whose vector is missing or stale (wrong model).
+
+    Requires ``rag_embed_model`` to be configured (400 otherwise — the button
+    is pointless with the tier off). Purely local except the one batched
+    gateway embeddings call; never writes to Security Onion.
+    """
+    if not settings.rag_embed_model.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "rag_disabled",
+                "hint": "set rag_embed_model (Retrieval settings) before re-embedding",
+            },
+        )
+    from soc_ai.rag import runbook_embeddings as rag_svc  # noqa: PLC0415
+
+    async with request.app.state.db_sessionmaker() as db:
+        counts = await rag_svc.reembed_missing(db, settings=settings)
+    return RagReembedOut(ok=counts["failed"] == 0, **counts)
 
 
 # ── Config mutations (admin) ───────────────────────────────────────────────

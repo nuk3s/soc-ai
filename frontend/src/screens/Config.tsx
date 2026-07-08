@@ -14,8 +14,8 @@ import { NotificationsPanel } from './NotificationsPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { RunbooksPanel } from './RunbooksPanel';
-import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
-import type { IdentifierKind, InternalIdentifiers, ModelFitness } from '../lib/api';
+import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting } from '../lib/types';
 import { ConfigNav } from './ConfigNav';
@@ -255,6 +255,25 @@ export function Config() {
   const [dangerSaving, setDangerSaving] = useState(false);
   const [dangerSaveMsg, setDangerSaveMsg] = useState<{ key: string; msg: string; ok: boolean } | null>(null);
   const [connTestResults, setConnTestResults] = useState<Record<string, ConnTestResult & { loading?: boolean }>>({});
+
+  // ── Runbook re-embed (E4.1) ────────────────────────────────────────────────
+  // One admin action for the opt-in semantic tier: embed every runbook whose
+  // vector is missing (gateway was down during a save) or stale (the embed
+  // model id changed). Counts are shown verbatim — honest, incl. failures.
+  const [reembedding, setReembedding] = useState(false);
+  const [reembedResult, setReembedResult] = useState<RagReembedResult | null>(null);
+  const [reembedError, setReembedError] = useState('');
+  const runReembed = () => {
+    setReembedding(true);
+    setReembedResult(null);
+    setReembedError('');
+    reembedRunbooks()
+      .then((r) => setReembedResult(r))
+      .catch((e: unknown) =>
+        setReembedError(e instanceof Error ? e.message : 'Re-embed failed'),
+      )
+      .finally(() => setReembedding(false));
+  };
 
   // Internal-identifier managed list (separate nonce so its mutations refetch
   // independently of the settings/users blocks above).
@@ -728,6 +747,50 @@ export function Config() {
     </CollapsibleConfigSection>
   );
 
+  // Runbook re-embed card, interleaved right after the Retrieval (RAG) settings
+  // group. The button is only meaningful once an embed model is configured AND
+  // APPLIED (the endpoint reads the live setting, so a merely-staged edit still
+  // 400s) — until then it renders disabled with the hint.
+  const ragEmbedModelApplied = String(findSetting('rag_embed_model')?.value ?? '').trim() !== '';
+  const ragReembedSection = (
+    <div id="rag-reembed" className="mb-[22px] -mt-2.5">
+      <div className="rounded-card border border-border bg-surface-1 px-[15px] py-[13px]">
+        <div className="flex items-center gap-3.5">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-semibold text-text">Re-embed runbooks</div>
+            <div className="mt-1 text-[12px] text-dim">
+              Embeds every runbook whose vector is missing (the gateway was down during a save) or
+              stale (the embeddings model changed). Runbooks embed automatically on save; this is
+              the catch-up pass. Requires an applied embeddings model above.
+            </div>
+          </div>
+          <div className="flex-none">
+            <button
+              type="button"
+              onClick={runReembed}
+              disabled={reembedding || !ragEmbedModelApplied}
+              className="inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {reembedding && <Spinner size={11} />}
+              {reembedding ? 'Re-embedding…' : 'Re-embed runbooks'}
+            </button>
+          </div>
+        </div>
+        {reembedResult && (
+          <div
+            className="mt-2 text-[12px]"
+            style={{ color: reembedResult.ok ? '#12b76a' : '#f79009' }}
+          >
+            {reembedResult.embedded} embedded · {reembedResult.skipped} already current ·{' '}
+            {reembedResult.failed} failed · {reembedResult.total} total
+            {reembedResult.failed > 0 && ' — gateway trouble? Check the embeddings model + Diagnostics.'}
+          </div>
+        )}
+        {reembedError && <div className="mt-2 text-[12px] text-danger">{reembedError}</div>}
+      </div>
+    </div>
+  );
+
   return (
     <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
       <aside className="hidden w-[180px] flex-none lg:block">
@@ -819,6 +882,7 @@ export function Config() {
             )}
           </div>
           {g.title === 'Discovery' && internalIdentifiersSection}
+          {g.title === 'Retrieval (RAG)' && ragReembedSection}
           {g.title === 'Notifications' && (
             <NotificationsPanel
               collapsed={!!collapsed['Notification webhook']}

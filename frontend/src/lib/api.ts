@@ -430,6 +430,47 @@ export function getRedactionPreview(): Promise<RedactionPreview> {
   return request<RedactionPreview>('/oracle/redaction-preview');
 }
 
+/** Analyst-path redaction preview for one PAST investigation (E5.2). */
+export interface AnalystRedactionPreview {
+  investigation_id: string;
+  /** Current analyst_cloud_redaction setting — when false the preview is a
+   * simulation of what WOULD be redacted, and a real call today sends raw text. */
+  redaction_enabled: boolean;
+  fail_closed: boolean;
+  /** The rebuilt round-1 analyst prompt, composed from the raw stored events. */
+  original: string;
+  /** The same prompt after the egress guard redacts it (CURRENT identifier config). */
+  sanitized: string;
+  summary: Record<string, number>;
+  note: string;
+}
+
+/** Discriminated result: a 409 (run predates the required stored events) is a
+ * first-class outcome the panel renders as a friendly note, not an error state. */
+export type AnalystRedactionPreviewResult =
+  | { kind: 'ok'; preview: AnalystRedactionPreview }
+  | { kind: 'events_missing' };
+
+/**
+ * What the analyst model would have received for a past investigation —
+ * original vs sanitized, rebuilt from its stored events. Raw fetch (not
+ * request()) because the 409 status must be distinguishable from real errors.
+ */
+export async function getAnalystRedactionPreview(
+  invId: string,
+): Promise<AnalystRedactionPreviewResult> {
+  const token = import.meta.env.VITE_API_TOKEN as string | undefined;
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${API_BASE}/analyst/redaction-preview/${encodeURIComponent(invId)}`, {
+    credentials: 'include',
+    headers,
+  });
+  if (res.status === 409) return { kind: 'events_missing' };
+  if (!res.ok) throw new Error(`Preview failed (${res.status} ${res.statusText})`);
+  return { kind: 'ok', preview: (await res.json()) as AnalystRedactionPreview };
+}
+
 /** Mute a noisy rule (soft, reversible suppression — Security Onion is untouched). */
 export function muteRule(rule_name: string, reason?: string): Promise<DetectionOverride> {
   return post<DetectionOverride>('/detection-tuning/override', {
@@ -482,6 +523,27 @@ export function updateRunbook(id: number, body: Partial<RunbookInput>): Promise<
 /** Delete a runbook. */
 export function deleteRunbook(id: number): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/runbooks/${id}`);
+}
+
+// ── Runbook retrieval (RAG) — the opt-in gateway semantic tier (E4.1) ──────
+// Default retrieval is local FTS5 (always on, zero egress). When the operator
+// configures rag_embed_model, runbook writes embed fail-soft — so vectors can be
+// MISSING (gateway was down during a save) or STALE (the model id changed).
+// The re-embed endpoint is the catch-up pass; it returns honest counts.
+
+/** Counts from a re-embed pass. `ok` is true iff nothing failed. */
+export interface RagReembedResult {
+  ok: boolean;
+  total: number; // runbooks in the store
+  embedded: number; // vectors written this pass
+  skipped: number; // already embedded by the current model
+  failed: number; // gateway failures (vectors NOT written)
+}
+
+/** Embed every runbook whose vector is missing or stale (admin). 400s when
+ * rag_embed_model is unset — the semantic tier is off. */
+export function reembedRunbooks(): Promise<RagReembedResult> {
+  return post<RagReembedResult>('/config/rag/reembed');
 }
 
 // ── Hunt templates (curated, telemetry-filtered hunt starters) ─────────────

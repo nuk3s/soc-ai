@@ -31,7 +31,13 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from soc_ai.oracle.identifiers import effective_internal_identifiers
-from soc_ai.oracle.sanitize import Mapping, desanitize, sanitize, unsafe_residue
+from soc_ai.oracle.sanitize import (
+    Mapping,
+    desanitize,
+    redaction_summary,
+    sanitize,
+    unsafe_residue,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -160,6 +166,17 @@ class EgressGuard:
     def desanitize_obj(self, obj: Any) -> Any:
         """Recursively restore opaque labels in *obj* to their real values."""
         return desanitize(obj, self._mapping)
+
+    def redaction_summary(self) -> dict[str, int]:
+        """Per-category redaction counts for this guard's lifetime mapping.
+
+        Delegates to :func:`~soc_ai.oracle.sanitize.redaction_summary` — the
+        same ``{"IP": 3, "HOST": 1, …}`` shape the Oracle preview reports, and
+        equally safe to log/display: counts only, never the redacted values.
+        Used by the E5.2 analyst-path redaction preview so its summary chips
+        render identically to the Oracle preview's.
+        """
+        return redaction_summary(self._mapping)
 
     @classmethod
     async def for_settings(

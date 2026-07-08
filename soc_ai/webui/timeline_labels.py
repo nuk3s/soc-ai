@@ -77,6 +77,7 @@ _ICON: dict[str, str] = {
     "targeted_tool_result": "📥",
     "model_response": "🧠",
     "decision_template_match": "🧩",
+    "prior_outcomes": "📚",
     "citation_validation": "✅",
     "citation_cap": "📉",
     "coverage_cap": "📉",
@@ -342,6 +343,29 @@ def _t_template_match(p: dict[str, Any]) -> str:
     return f"Matched pattern: {_humanize(tid)}" if tid else "No decision-template match"
 
 
+def _t_prior_outcomes(p: dict[str, Any]) -> str:
+    """E4.2 memory recall — count plus a compact verdict tally, never JSON."""
+    n = p.get("count")
+    base = (
+        f"Recalled {n} prior outcome(s) for similar alerts"
+        if isinstance(n, int)
+        else "Recalled prior outcomes for similar alerts"
+    )
+    items = p.get("items")
+    if isinstance(items, list) and items:
+        tally: dict[str, int] = {}
+        for it in items:
+            v = _humanize(it.get("verdict")) if isinstance(it, dict) else ""
+            if v:
+                tally[v] = tally.get(v, 0) + 1
+        if tally:
+            chips = ", ".join(
+                f"{c}x {v}" for v, c in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            return f"{base} — {chips}"
+    return base
+
+
 def _t_citation_validation(p: dict[str, Any]) -> str:
     valid = (p.get("counts") or {}).get("valid")
     return "Validated evidence citations" + (f" — {valid} valid" if valid is not None else "")
@@ -489,6 +513,7 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "targeted_tool_result": _t_targeted_tool_result,
     "retask": _t_retask,
     "decision_template_match": _t_template_match,
+    "prior_outcomes": _t_prior_outcomes,
     "citation_validation": _t_citation_validation,
     "citation_cap": _t_citation_cap,
     "template_ceiling": _t_template_ceiling,

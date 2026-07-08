@@ -310,6 +310,30 @@ def test_vote_oracle_and_fast_path_kinds() -> None:
     assert "suspicious" in title_for("fast_path_verdict_cap", {"capped_verdict": "suspicious"})
 
 
+def test_prior_outcomes_kind() -> None:
+    """E4.2 memory recall: count plus a compact verdict tally, never JSON;
+    count-only and empty payloads still read clean."""
+    t = title_for(
+        "prior_outcomes",
+        {
+            "count": 3,
+            "window_days": 90,
+            "items": [
+                {"id": "01A", "verdict": "false_positive", "matched_on": "rule+src+dest"},
+                {"id": "01B", "verdict": "false_positive", "matched_on": "rule+endpoint"},
+                {"id": "01C", "verdict": "true_positive", "matched_on": "rule"},
+            ],
+        },
+    )
+    assert t == (
+        "Recalled 3 prior outcome(s) for similar alerts — 2x false positive, 1x true positive"
+    )
+    assert title_for("prior_outcomes", {"count": 1}) == (
+        "Recalled 1 prior outcome(s) for similar alerts"
+    )
+    assert "{" not in title_for("prior_outcomes", {})
+
+
 # --------------------------------------------------------------------------
 # Catch-all: every audit kind must yield a short, JSON-free, non-empty title
 # --------------------------------------------------------------------------
@@ -338,6 +362,11 @@ _REPRESENTATIVE_PAYLOADS: dict[str, dict[str, Any]] = {
     "approval_required": {"tool_name": "ack_alert"},
     "approval_decision": {"approved": True},
     "usage": {"phase": "synth", "round": 1, "tool_calls": 3},
+    "prior_outcomes": {
+        "count": 2,
+        "window_days": 90,
+        "items": [{"id": "01A", "verdict": "false_positive", "matched_on": "rule+src+dest"}],
+    },
     "error": {"message": "boom"},
     "fast_path_verdict_cap": {"original_verdict": "true_positive", "capped_verdict": "suspicious"},
     "fast_path_evidence_guard": {"capped_verdict": "needs_more_info"},

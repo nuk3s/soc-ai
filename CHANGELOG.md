@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
+## [Unreleased]
+
+### Added
+
+- **Runbook retrieval upgraded to full-text search, with an optional semantic
+  tier.** Runbook lookup (both the agent tool and the console) now uses SQLite
+  FTS5/BM25 ranking — built into the SQLite already shipped, zero new
+  dependencies, zero egress; installs whose SQLite lacks FTS5 fall back to the
+  previous scorer transparently. For large corpora, a new "Retrieval (RAG)"
+  config section can point `rag_embed_model` / `rag_rerank_model` at your
+  OpenAI-compatible gateway (both off by default): embeddings are stored
+  locally, retrieval blends keyword and semantic hits, and a "Re-embed
+  runbooks" button (plus `POST /api/v1/config/rag/reembed`) refreshes the
+  index. The egress-policy page lists the retrieval gateway as a destination
+  when enabled.
+- **Investigation memory (opt-in, off by default).** With `memory_enabled` on,
+  verdict synthesis sees up to `memory_max_items` prior verdicts for similar
+  alerts — matched deterministically (same rule + source/destination overlap,
+  most-specific match first, `memory_window_days` window), no embeddings, no
+  new services. Prior outcomes are explicitly framed as context, never
+  evidence: they cannot be cited, fallback-produced verdicts are excluded, the
+  block passes through the analyst egress guard, and a `prior_outcomes`
+  timeline event records exactly what was recalled. Leave it off until you've
+  evaluated anchoring effects on your own alert mix.
+- **Analyst-path redaction preview.** The redaction preview panel gains an
+  "Analyst path" tab: pick any past completed investigation and see exactly
+  what a cloud analyst model would receive — the rebuilt synthesis prompt,
+  original vs redacted under your current identifier config, with per-category
+  redaction counts and an explicit banner when analyst redaction is currently
+  off. Read-only, nothing is sent anywhere
+  (`GET /api/v1/analyst/redaction-preview/{id}`).
+
+### Fixed
+
+- **The browser E2E now actually runs in CI.** The `browser-smoke` GitHub
+  Actions job referenced tests that were excluded from the public repository,
+  so it failed on every run. The Playwright smoke and the demo-stack harness
+  it drives now ship publicly (all demo data is RFC 5737 TEST-NET fiction).
+
 ## [1.0.8] - 2026-07-07
 
 Trust, workflow, and threat-hunting release. This one is about honesty (the UI
