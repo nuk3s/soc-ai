@@ -55,8 +55,11 @@ uv run mypy soc_ai/                  # strict mode (configured in pyproject.toml
 uv run pytest                        # coverage gate: 80% (browser E2E excluded)
 
 # Frontend
-cd frontend && npm run typecheck && npm run build
+cd frontend && npm run typecheck && npm test && npm run build
 ```
+
+Frontend unit tests are vitest + Testing Library (`frontend/src/**/*.test.{ts,tsx}`,
+happy-dom environment); `npm run test:watch` gives the watch mode.
 
 `pre-commit` hooks are available: `uv run pre-commit install`.
 

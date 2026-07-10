@@ -4,10 +4,47 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
-## [Unreleased]
+## [1.1.0] - 2026-07-10
+
+The measurement release. 1.0.8 built the honesty machinery; 1.1.0 makes it
+continuously measured (nightly quality trend with a regression alarm),
+inspectable down to the span (highlighted redaction previews), and fed by your
+own institution's knowledge (a real runbooks workspace, history-distilled
+drafts, chat-transcript memory). Plus the ops floor a self-hosted tool owes
+you: one-command diagnosis, WAL-safe backups, published container images, and
+an install hardened by literally role-playing an impatient analyst on a bare
+box.
 
 ### Added
 
+- **Runbook drafts distilled from your own history.** The Runbooks page lists
+  rules with three or more completed investigations and no covering runbook;
+  one click turns the observed verdicts, rationales, and analyst chat into an
+  org-specific DRAFT runbook. Drafts are excluded from every agent retrieval
+  tier until you approve them, the distillation call honors the analyst
+  egress redaction end to end, and every promotion is audited.
+- **`soc-ai backup` / `soc-ai restore`.** WAL-safe snapshots via SQLite's
+  backup API — safe while the app runs — with a manifest, the signing key and
+  sensor trust anchors included, and re-downloadable caches excluded unless
+  `--full`. Restore refuses to clobber an existing store or a running app
+  without an explicit `--yes`, and refuses archives from a newer soc-ai
+  outright. Copy-paste docker command blocks in docs/DOCKER.md.
+- **Continuous quality measurement (`soc-ai eval-nightly` + the Verdict
+  quality card).** A nightly micro-eval investigates a few real alerts through
+  the normal pipeline and trends the results locally (new `quality_snapshots`
+  table, pruned to 90 rows), so a silent verdict regression — e.g. after an
+  inference-engine swap — bends a sparkline on the dashboard instead of going
+  unnoticed. Two honest modes, never blended: **oracle-graded** (agreement
+  rate; one cloud call per alert, the default only when `oracle_enabled`) and
+  **zero-egress local** (fallback/error rates, verdict distribution, latency
+  p50 — no oracle at all; the card labels which mode measured each point). A
+  regression against the trend's own trailing same-mode median (agreement drop
+  > `quality_alarm_drop`, error rate > 30%, or a fallback-rate jump) fires a
+  `quality_regression` audit event plus the opt-in notification webhook, and
+  red-flags the card. Scheduling stays on the host (cron → `docker exec`, see
+  docs/DOCKER.md); new admin-editable settings `quality_nightly_n` and
+  `quality_alarm_drop` live in the config console's Quality section, with
+  `GET /api/v1/quality/trend` as the admin read-model.
 - **A first-class Runbooks page** (`/app/runbooks`, in the sidebar): search,
   markdown editor with preview, tags and linked rules, multi-file `.md` import
   with lenient front-matter parsing, and embed-status chips when the semantic
@@ -76,8 +113,25 @@ All notable changes to this project are documented here. The format is based on
   The replacement pairs come from the sanitizer's own mapping, filtered to
   what the preview actually redacted — never the whole identifier config.
 
+### Security
+
+- **DNS-SD / mDNS hostnames now redact correctly.** Service-record names with
+  underscore-led labels (`_service._proto.<your-suffix>`) escaped the
+  redaction pattern at every layer; the fail-closed egress gate caught one in
+  real eval traffic and refused the send — investigating it showed the
+  detection was partly luck, and a sibling form would have leaked silently.
+  The pattern now accepts underscore-led labels at all three declaration
+  sites, and a 640-case property test pins the invariant: anything the
+  residue detector flags, the redactor must have caught first.
+
 ### Changed
 
+- **The Config page is organized into six sections** (Models & Reasoning,
+  Triage & Workflow, Retrieval & Memory, Privacy & Egress, Data & Enrichment,
+  System) with a two-level nav, and the section highlight now tracks clicks
+  correctly — the old scroll-spy could light the wrong row after a jump.
+- **The Runbooks page uses the full screen**: searchable list on the left,
+  editor filling the rest of the viewport, stacking on narrow windows.
 - **RAG model settings are dropdowns** fed by your gateway's model list, with
   an explicit "(off)" and an "Other…" escape hatch for unlisted ids.
 - **Config page section navigation snaps instantly** instead of a slow smooth
@@ -99,6 +153,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **`./setup.sh --prebuilt` no longer strands you when no published image
+  exists.** A failed registry pull now explains itself and offers to build
+  from source in the same run, the README leads with the always-working
+  command, and the health-check timeout points at `soc-ai doctor` before raw
+  logs. Found by re-running the whole install on a bare Rocky Linux 10 box
+  with an analyst's patience: clone to healthy container in 43 seconds.
 - **An open tab now survives a redeploy.** Previously a deploy replaced the
   app's content-hashed chunks and an already-open tab could go blank on its
   next navigation (stale chunk → 404 → the whole page unmounted) until a hard

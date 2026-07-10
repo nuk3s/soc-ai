@@ -687,6 +687,42 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "effect when investigation memory is enabled."
         ),
     ),
+    # ---- QUALITY: nightly micro-eval trend + alarm tuning (hot) --------------
+    # Both hot=True: `soc-ai eval-nightly` is a fresh CLI process that reads
+    # Settings (with overrides applied) at startup, and the regression detector
+    # reads quality_alarm_drop per run — so a console save applies to the very
+    # next nightly without touching the running server.
+    SettingSpec(
+        key="quality_nightly_n",
+        attr="quality_nightly_n",
+        type="int",
+        label="Nightly eval sample size (alerts per run)",
+        section="Quality",
+        hot=True,
+        help=(
+            "How many real alerts each `soc-ai eval-nightly` run investigates. "
+            "Keep small — it's a smoke-trend, not a benchmark; each alert is a "
+            "full investigation."
+        ),
+        min_value=1,
+        max_value=10,
+    ),
+    SettingSpec(
+        key="quality_alarm_drop",
+        attr="quality_alarm_drop",
+        type="float",
+        label="Quality alarm: agreement drop threshold",
+        section="Quality",
+        hot=True,
+        help=(
+            "Absolute agreement-rate drop below the trailing 7-run median that "
+            "fires the quality_regression alarm. Only meaningful for "
+            "oracle-graded nightlies; local-mode runs alarm on error/fallback "
+            "rates instead."
+        ),
+        min_value=0.05,
+        max_value=0.5,
+    ),
     # ---- DISCOVERY: internal-identifier auto-discovery tuning (hot) ----------
     # All hot=True: the discovery job (CLI / timer / scan-now endpoint) reads
     # these fresh from settings on each run, so a change applies to the next
@@ -891,6 +927,18 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help="Ping when the analyst-model fitness probe grades the model unfit.",
     ),
     SettingSpec(
+        key="notify_on_quality_regression",
+        attr="notify_on_quality_regression",
+        type="bool",
+        label="Notify on nightly quality regression",
+        section="Notifications",
+        hot=True,
+        help=(
+            "Ping when soc-ai eval-nightly detects a verdict-quality regression "
+            "(agreement drop, error spike, or fallback jump vs its own history)."
+        ),
+    ),
+    SettingSpec(
         key="notify_webhook_url",
         attr="notify_webhook_url",
         type="str",
@@ -1070,6 +1118,7 @@ SECTION_ORDER: tuple[str, ...] = (
     # Models & Reasoning
     "Agent",
     "Oracle",
+    "Quality",
     # Triage & Workflow
     "Triage automation",
     "Notifications",
@@ -1094,6 +1143,10 @@ SECTION_ORDER: tuple[str, ...] = (
 SECTION_PARENTS: dict[str, str] = {
     "Agent": "Models & Reasoning",
     "Oracle": "Models & Reasoning",
+    # Quality lives with the model knobs: the nightly micro-eval measures the
+    # very thing the Agent/Oracle sections configure (verdict honesty), and its
+    # alarm is the tripwire for a bad analyst_model / engine swap.
+    "Quality": "Models & Reasoning",
     "Triage automation": "Triage & Workflow",
     "Notifications": "Triage & Workflow",
     "Retrieval (RAG)": "Retrieval & Memory",

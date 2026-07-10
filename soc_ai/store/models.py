@@ -330,6 +330,12 @@ class Runbook(Base):
     names the detection rules (Suricata rule names / SO rule UUIDs) a runbook
     applies to; a rule-link match is the strongest search signal, ahead of a tag
     match, ahead of plain keyword overlap in the title/content.
+
+    ``draft`` (migration 0020) marks a machine-authored promotion draft
+    (:mod:`soc_ai.webui.runbook_promotion`): visible + editable in the Runbooks
+    page, but EXCLUDED from every agent retrieval path until the operator
+    approves it — a draft can never shape a verdict. Operator-authored rows are
+    always ``False``.
     """
 
     __tablename__ = "runbook"
@@ -339,6 +345,7 @@ class Runbook(Base):
     content: Mapped[str] = mapped_column(Text, default="")  # markdown / plain text
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     linked_rules: Mapped[list[str]] = mapped_column(JSON, default=list)
+    draft: Mapped[bool] = mapped_column(Boolean, default=False)
     created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -437,3 +444,56 @@ class HuntTemplate(Base):
     builtin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+
+
+class QualitySnapshot(Base):
+    """One ``soc-ai eval-nightly`` run's quality metrics (I4 — measured always).
+
+    The nightly micro-eval converts "the verdicts were validated once" into a
+    LOCAL TREND: each run investigates a handful of real alerts through the
+    normal pipeline and lands one row here, so a silent verdict regression
+    (an inference-engine swap, a bad model bump) shows up as a bend in the
+    dashboard's Quality card instead of going unnoticed for weeks.
+
+    ``mode`` records HOW the point was measured — the two modes are not
+    comparable and are never blended:
+
+    * ``"graded"`` — the cloud oracle critiqued each investigation, so
+      ``agreement_rate`` is populated (the strong signal, costs egress).
+    * ``"local"`` — zero-egress: ``agreement_rate`` is NULL and the trend
+      leans on the local proxies (fallback/error rates, verdict distribution,
+      latency) that need no oracle.
+
+    ``alarmed``/``alarm_reasons`` persist the regression-detector outcome for
+    THIS point (vs the trailing same-mode median — see
+    :func:`soc_ai.eval.quality.detect_regression`) so the Quality card can
+    flag the latest run without re-deriving the rule client-side. The table is
+    pruned to the newest 90 rows on every insert (~3 months of nightlies) —
+    a trend, not an archive; the full batch artifacts live on disk at
+    ``batch_dir``.
+    """
+
+    __tablename__ = "quality_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    mode: Mapped[str] = mapped_column(String(8))  # "local" | "graded"
+    n_ok: Mapped[int] = mapped_column(Integer, default=0)
+    n_error: Mapped[int] = mapped_column(Integer, default=0)
+    # NULL in local mode (no oracle → no agreement signal) and on graded runs
+    # where the oracle classified nothing — an honest "unknown", never 0.0.
+    agreement_rate: Mapped[float | None] = mapped_column(Float, default=None)
+    # Fraction of OK runs whose report was a pipeline-failure fallback
+    # (is_pipeline_fallback) — infra noise, not model reasoning. NULL when no
+    # run succeeded (no denominator).
+    fallback_rate: Mapped[float | None] = mapped_column(Float, default=None)
+    error_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    # {"true_positive": 2, "false_positive": 3, ...} over the OK runs — the
+    # verdict-distribution-drift signal for local mode.
+    verdict_counts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    latency_p50_ms: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Where the run's full artifacts (index.jsonl, bundles, report.md) live.
+    batch_dir: Mapped[str | None] = mapped_column(String(512), default=None)
+    alarmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # Human-readable detector reasons (JSON list of strings); NULL when clean.
+    alarm_reasons: Mapped[list[str] | None] = mapped_column(JSON, default=None)

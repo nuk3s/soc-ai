@@ -1,8 +1,9 @@
-import { Activity, ArrowUpRight, Crosshair, Database, ShieldAlert, ShieldCheck, WifiOff, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Crosshair, Database, Gauge, ShieldAlert, ShieldCheck, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, StatusTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
+import { QualityCard } from '../components/QualityCard';
 import { INV_STATUS } from '../lib/statusMeta';
 import { Panel, PanelHeader } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
@@ -17,6 +18,7 @@ import {
   getDataSources,
   getHealth,
   getInvestigations,
+  getQualityTrend,
 } from '../lib/api';
 import { VERDICT } from '../lib/tokens';
 import type { AlertGroup, Severity, Verdict } from '../lib/types';
@@ -327,6 +329,10 @@ export function Dashboard() {
   });
   triageActiveRef.current = !!triage.data?.active;
   const sources = useAsync(getDataSources, [], { refetchInterval: 60_000 });
+  // Quality trend — one point per NIGHTLY run, so a slow cadence is plenty;
+  // 60s only exists to catch a manually-triggered eval-nightly without a
+  // hard page refresh.
+  const quality = useAsync(getQualityTrend, [], { refetchInterval: 60_000 });
   // Upstream reachability — polled on mount + every 30s so a down dependency
   // (ES / gateway) surfaces as a banner instead of a wall of empty widgets.
   // Errors resolve to null (health data is null) → no banner, so a transient
@@ -565,6 +571,15 @@ export function Dashboard() {
           <Panel>
             <PanelHeader icon={<Activity size={15} />} title="Auto-Investigate" />
             <AutoTriagePanel s={triage.data} loading={triage.loading && !triage.data} />
+          </Panel>
+
+          <Panel>
+            <PanelHeader icon={<Gauge size={15} />} title="Verdict quality" />
+            <QualityCard
+              points={quality.data?.points ?? []}
+              error={quality.error}
+              loading={quality.loading && !quality.data}
+            />
           </Panel>
 
           <Panel>

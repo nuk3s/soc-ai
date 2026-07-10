@@ -240,8 +240,13 @@ async def reembed_missing(db: AsyncSession, *, settings: Settings) -> dict[str, 
     always returns honest counts.
 
     Returns ``{"total", "embedded", "skipped", "failed"}``.
+
+    Drafts are excluded from the pass entirely (not even counted in ``total``):
+    an unapproved promotion draft is invisible to retrieval by contract, so a
+    vector for it is dead weight — the approve endpoint embeds it the moment it
+    becomes retrievable.
     """
-    runbooks = list((await db.scalars(select(Runbook))).all())
+    runbooks = list((await db.scalars(select(Runbook).where(Runbook.draft.is_(False)))).all())
     existing = {e.runbook_id: e for e in (await db.scalars(select(RunbookEmbedding))).all()}
 
     pending = [
@@ -299,6 +304,12 @@ async def semantic_search(
     vector — both mean a different vector space, where cosine is meaningless).
     Raises :class:`RagGatewayError` if the query embedding fails; ``search()``
     catches it and proceeds keyword-only (fail-soft).
+
+    Draft runbooks (unapproved promotion drafts, migration 0020) are excluded
+    at the JOIN — the semantic tier honors the same "a draft never reaches a
+    prompt" guarantee as the FTS/legacy/rule-link tiers in
+    :func:`soc_ai.store.runbooks.search`, even if a draft somehow acquired a
+    vector (e.g. it was edited through a write path that embeds).
     """
     if k <= 0 or not query.strip() or not settings.rag_embed_model:
         return []
@@ -306,9 +317,9 @@ async def semantic_search(
     rows: list[Any] = list(
         (
             await db.execute(
-                select(Runbook, RunbookEmbedding).join(
-                    RunbookEmbedding, RunbookEmbedding.runbook_id == Runbook.id
-                )
+                select(Runbook, RunbookEmbedding)
+                .join(RunbookEmbedding, RunbookEmbedding.runbook_id == Runbook.id)
+                .where(Runbook.draft.is_(False))
             )
         ).all()
     )

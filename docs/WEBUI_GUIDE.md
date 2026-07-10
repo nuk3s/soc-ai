@@ -146,7 +146,9 @@ access (automation / integrations) once `API_AUTH_REQUIRED` is enabled.
 ## Safety model (recap)
 
 Every **read** tool the agent uses is read-only. Every **write** tool (anything
-that changes Security Onion state: ack, escalate-to-case, comment) requires an
-explicit human **Approve/Reject** in the UI. The agent can *recommend* a write
-but never executes one on its own. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the
+that changes Security Onion state: ack, escalate-to-case, comment) is something
+the agent can only *recommend* — you execute it with a click from the report,
+and every execution is audited. The one bounded exception is the
+confidence-gated auto-acknowledge for low-stakes false positives
+(`auto_ack_fp_enabled`), which never touches critical or malware-class alerts. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the
 agent capability surface in [AGENT_TOOLS.md](AGENT_TOOLS.md).

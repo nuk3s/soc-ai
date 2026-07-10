@@ -36,16 +36,17 @@
 
   <!-- Stage 2: read-only agent loop -->
   <rect class="card" x="330" y="70" width="250" height="250" rx="12"/>
-  <text x="350" y="98" class="lbl">2 · Read-only agent loop</text>
-  <rect x="486" y="84" width="76" height="18" rx="9" fill="#0f2417" stroke="#1f5133" stroke-width="1"/>
-  <text x="498" y="97" font-size="10" font-weight="700" fill="#3fb950" letter-spacing=".05em">READ-ONLY</text>
+  <text x="350" y="98" class="lbl">2 · Agent loop</text>
+  <rect x="476" y="84" width="84" height="18" rx="9" fill="#0f2417" stroke="#1f5133" stroke-width="1"/>
+  <text x="518" y="97" text-anchor="middle" font-size="10" font-weight="700" fill="#3fb950" letter-spacing=".05em">READ-ONLY</text>
   <text x="350" y="124" class="t">Correlates across hosts × time:</text>
-  <text x="350" y="150" class="mono">▸ t_query_events_oql</text>
-  <text x="350" y="170" class="mono">▸ t_query_zeek_logs</text>
-  <text x="350" y="190" class="mono">▸ t_host_summary</text>
-  <text x="350" y="210" class="mono">▸ t_prevalence · t_rule_prevalence</text>
-  <text x="350" y="230" class="mono">▸ t_enrich_ip / domain / hash</text>
-  <text x="350" y="250" class="mono">▸ t_get_pcap · t_web_search</text>
+  <text x="350" y="148" class="mono">▸ t_query_events_oql</text>
+  <text x="350" y="166" class="mono">▸ t_query_zeek_logs</text>
+  <text x="350" y="184" class="mono">▸ t_host_summary</text>
+  <text x="350" y="202" class="mono">▸ t_prevalence</text>
+  <text x="350" y="220" class="mono">▸ t_rule_prevalence</text>
+  <text x="350" y="238" class="mono">▸ t_enrich_ip / domain / hash</text>
+  <text x="350" y="256" class="mono">▸ t_get_pcap · t_web_search</text>
   <text x="350" y="286" class="dim">No writes. No acks. No case edits.</text>
   <text x="350" y="304" class="dim">Concludes on a bounded budget.</text>
 
@@ -67,10 +68,10 @@
   <text x="652" y="204" class="mono" fill="#b6becb">the story across hosts/time</text>
 
   <text x="652" y="232" class="dim">MITRE ATT&amp;CK</text>
-  <rect x="652" y="240" width="66" height="18" rx="4" fill="#101a2c" stroke="#284066"/>
-  <text x="660" y="253" class="mono" fill="#7fa8f0">T1071.001</text>
-  <rect x="724" y="240" width="54" height="18" rx="4" fill="#101a2c" stroke="#284066"/>
-  <text x="732" y="253" class="mono" fill="#7fa8f0">T1048</text>
+  <rect x="652" y="240" width="80" height="18" rx="4" fill="#101a2c" stroke="#284066"/>
+  <text x="692" y="253" text-anchor="middle" class="mono" fill="#7fa8f0">T1071.001</text>
+  <rect x="740" y="240" width="56" height="18" rx="4" fill="#101a2c" stroke="#284066"/>
+  <text x="768" y="253" text-anchor="middle" class="mono" fill="#7fa8f0">T1048</text>
 
   <text x="652" y="284" class="dim">RECOMMENDED ACTIONS</text>
   <text x="652" y="302" class="t" font-size="12">advisory — you decide</text>

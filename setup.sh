@@ -342,8 +342,25 @@ if [[ $PREBUILT -eq 1 ]]; then
   # Pull the published release image (SOC_AI_IMAGE_TAG pins a version; default
   # latest). With the image in the local store, `up` uses it instead of building.
   info "Pulling the prebuilt image (ghcr.io/nuk3s/soc-ai) and starting the stack…"
-  $DC pull soc-ai
-  $DC up -d
+  # If the image isn't published yet (no release tag), the registry answers
+  # `denied` — catch that and offer to build from source in the same run, so a
+  # stranger who copy-pasted --prebuilt still gets to a running stack. Everything
+  # up to here (config, cert) is already done, so there's nothing to redo.
+  if ! $DC pull soc-ai; then
+    echo
+    warn "Couldn't pull the prebuilt image ghcr.io/nuk3s/soc-ai:${SOC_AI_IMAGE_TAG:-latest}."
+    warn "No tagged release is published yet, so there's no image to pull — this is expected right now."
+    yesno BUILD_NOW "Build the image from source instead? (~3 min)" y
+    if [[ $BUILD_NOW == y ]]; then
+      info "Building and starting the stack (first build pulls deps — ~3 min)…"
+      $DC up -d --build
+    else
+      info "Nothing built. When you're ready, run:  ${B}./setup.sh${N}  (no --prebuilt) to build from source."
+      die "no image to run yet."
+    fi
+  else
+    $DC up -d
+  fi
 else
   info "Building and starting the stack (first build pulls deps — ~3 min)…"
   $DC up -d --build
@@ -355,7 +372,13 @@ for _ in $(seq 1 60); do
   if [[ -n $out ]]; then ok "Healthy — ${out}"; healthy=1; break; fi
   sleep 3
 done
-[[ $healthy -eq 1 ]] || warn "Health check timed out. Inspect logs:  ${DC} logs soc-ai"
+if [[ $healthy -ne 1 ]]; then
+  warn "Health check timed out. Two things to try, in order:"
+  warn "  1. Run the doctor — it pinpoints which dependency is unhappy (config, store, SO, ES, gateway, model):"
+  printf '          %s\n' "${B}${DC/ compose/} exec soc-ai python -m soc_ai doctor${N}"
+  warn "  2. Read the container logs:"
+  printf '          %s\n' "${B}${DC} logs soc-ai${N}"
+fi
 
 # ── 5. seed enrichment ────────────────────────────────────────────────────────
 hr

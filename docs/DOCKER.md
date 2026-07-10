@@ -220,12 +220,42 @@ docker compose ps                          # soc-ai should be "healthy"
 curl -k https://localhost:8443/healthz      # → {"status":"ok","version":"…"}
 ```
 
-### Back up before a major upgrade (optional, cheap)
+### Backup and restore
 
-The whole state is one SQLite file. Copy it out first if you want a restore point:
+`soc-ai backup` snapshots the store through the SQLite backup API, so it is
+**safe while the app is running** — don't `docker cp` the bare `.db` out of a
+live container; the store runs WAL journaling and a raw copy of a hot
+database can tear pages. The archive carries the DB snapshot, the app-owned
+sidecar files next to it (the decision-record signing key, the pinned sensor
+`known_hosts`), and a manifest recording the schema migration head.
 
 ```bash
-docker compose cp soc-ai:/var/lib/soc-ai/data/soc-ai.db ./soc-ai.db.bak
+# Back up — the app can stay running.
+docker exec soc-ai python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz
+docker cp soc-ai:/var/lib/soc-ai/data/backup.tar.gz \
+  ./soc-ai-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz
+docker exec soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
+```
+
+The enrichment caches (blocklists, MaxMind, cloud prefixes) are **excluded by
+default** — they are re-downloadable with `soc-ai blocklists refresh`, and they
+dwarf the DB. Add `--full` to include them (worth it on an air-gapped host).
+
+Restore refuses every dangerous step unless you say `--yes`: it won't overwrite
+an existing store (it prints exactly what it would replace), and it won't
+restore under a live-looking app (a write-ahead log with recent activity).
+It also refuses — regardless of `--yes` — an archive made by a **newer** soc-ai,
+because schema downgrades are unsupported. An **older** archive is always fine:
+the app migrates it to head at the next startup.
+
+```bash
+# Restore — stop the app first, run the restore in a one-off container.
+docker cp ./soc-ai-backup-<stamp>.tar.gz soc-ai:/var/lib/soc-ai/data/restore.tar.gz
+docker compose stop soc-ai
+docker compose run --rm soc-ai \
+  python -m soc_ai restore /var/lib/soc-ai/data/restore.tar.gz --yes
+docker compose up -d soc-ai
+docker exec soc-ai rm /var/lib/soc-ai/data/restore.tar.gz
 ```
 
 ### Rolling back
@@ -385,6 +415,30 @@ cron (or any scheduler) that execs the refresh on a cadence:
 # /etc/cron.d/soc-ai-blocklists — weekly refresh, Sundays 03:17
 17 3 * * 0  root  docker compose -f /opt/soc-ai/docker-compose.yml exec -T soc-ai python -m soc_ai blocklists refresh
 ```
+
+### The nightly quality micro-eval is also host-scheduled
+
+`soc-ai eval-nightly` investigates a handful of real alerts and lands one row in
+the local quality trend (the dashboard's **Verdict quality** card), alarming
+through the notification webhook when the new point regresses against its own
+history. It converts "the verdicts were validated once" into "the verdicts are
+measured every night" — the tripwire for a silent degradation after an
+inference-engine or analyst-model swap. Like the blocklist refresh, soc-ai
+ships **no in-app scheduler** for it; add a host cron:
+
+```cron
+# /etc/cron.d/soc-ai-quality — nightly micro-eval, 02:17
+17 2 * * *  root  docker compose -f /opt/soc-ai/docker-compose.yml exec -T soc-ai python -m soc_ai eval-nightly
+```
+
+Mode is automatic and honest about egress: with `oracle_enabled` on, each run
+is **oracle-graded** (one cloud call per alert; agreement rate joins the
+trend); otherwise it runs **zero-egress local** mode (no oracle at all — the
+trend carries fallback/error rates, verdict distribution, and latency instead,
+and the dashboard card labels which mode measured each point). Force either
+with `--graded` / `--local`. Tune the sample size (`quality_nightly_n`) and the
+alarm threshold (`quality_alarm_drop`) live in the config console's Quality
+section.
 
 ### 1 GB memory cap can OOM-kill a runaway hunt
 

@@ -27,6 +27,7 @@ import {
   stopAutoTriage,
 } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
+import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
 import { type SortDir, useSort } from '../lib/useSort';
 import type {
   AlertEvent,
@@ -680,87 +681,52 @@ export function Alerts() {
   // Cmd/Ctrl/Alt modifier is held. The palette owns `/` and Cmd+K; this owns
   // j/k/o/a/e/i/x/?/Enter/Arrows — they can never both fire because a closed
   // palette is a hard precondition here and an open one short-circuits.
+  //
+  // The guard order + key table live in the PURE `resolveTriageKey` (see
+  // lib/triageKeys.ts, unit-tested); this effect is only the adapter: build
+  // the context from component state, preventDefault on anything ours, and
+  // dispatch to the local handlers.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // `?` help is closable from anywhere (Esc), but ALL shortcuts (incl. the
-      // help toggle) require the palette closed + focus outside an input.
-      if (paletteOpen) return;
-      const el = e.target as HTMLElement | null;
-      const tag = el?.tagName ?? '';
-      if (/INPUT|TEXTAREA|SELECT/.test(tag) || el?.isContentEditable) return;
-
-      // The cheatsheet overlay owns Esc while it's open.
-      if (keyHelpOpen) {
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          setKeyHelpOpen(false);
-        }
-        return;
-      }
-
-      // Shift is allowed (needed for `?`); Cmd/Ctrl/Alt are not — leave those to
-      // the browser / palette.
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-
-      // `?` (Shift+/) opens the cheatsheet — check before the plain-key branch.
-      if (e.key === '?') {
-        e.preventDefault();
-        setKeyHelpOpen(true);
-        return;
-      }
-
-      const n = visible.length;
-      if (n === 0) return;
-
-      const move = (delta: number) => {
-        e.preventDefault();
-        setFocusedIndex((i) => {
-          if (i < 0) return delta > 0 ? 0 : n - 1;
-          return Math.min(n - 1, Math.max(0, i + delta)); // clamp, no wrap
-        });
-      };
-
-      switch (e.key) {
-        case 'j':
-        case 'ArrowDown':
-          move(1);
-          return;
-        case 'k':
-        case 'ArrowUp':
-          move(-1);
-          return;
-      }
-
-      // The remaining actions operate on the focused group; no-op gracefully
-      // when nothing is focused or the row vanished under a refresh.
       const g = focusedIndex >= 0 ? visible[focusedIndex] : undefined;
+      const action = resolveTriageKey(e, {
+        paletteOpen,
+        keyHelpOpen,
+        targetIsEditable: isEditableTarget(e.target as HTMLElement | null),
+        rowCount: visible.length,
+        hasFocusedRow: g !== undefined,
+      });
+      if (!action) return; // not ours — leave the key to the browser/palette
+      e.preventDefault();
+      switch (action.kind) {
+        case 'close-help':
+          setKeyHelpOpen(false);
+          return;
+        case 'open-help':
+          setKeyHelpOpen(true);
+          return;
+        case 'move':
+          setFocusedIndex((i) => nextFocusIndex(i, action.delta, visible.length));
+          return;
+      }
+      // Row actions: resolveTriageKey only emits these with hasFocusedRow, so
+      // `g` is defined here — the check is for TypeScript narrowing.
       if (!g) return;
-
-      switch (e.key) {
-        case 'o':
-        case 'Enter':
-          e.preventDefault();
+      switch (action.kind) {
+        case 'open':
+        case 'investigate':
           // Same action as the row's primary button: open an existing report or
           // investigate the representative event.
           if (g.invId) openDrawer(g.invId);
           else huntGroup(g);
           return;
-        case 'a':
-          e.preventDefault();
+        case 'ack':
           ackOneGroup(g);
           return;
-        case 'e':
-          e.preventDefault();
+        case 'escalate':
           escalateOneGroup(g);
           return;
-        case 'i':
-          e.preventDefault();
-          // Investigate — open the live/existing run or start one (huntGroup).
-          if (g.invId) openDrawer(g.invId);
-          else huntGroup(g);
-          return;
-        case 'x':
-          e.preventDefault();
+        case 'toggle-select':
           toggleSelectGroup(g);
           return;
       }

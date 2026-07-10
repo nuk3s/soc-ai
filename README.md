@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.0.8-3fb950" alt="1.0.8">
+  <img src="https://img.shields.io/badge/status-1.1.0-3fb950" alt="1.1.0">
 </p>
 
 </div>
@@ -99,10 +99,12 @@ sudo apt install -y git curl
 
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
-./setup.sh --prebuilt
+./setup.sh
 ```
 
-`--prebuilt` pulls the released image from [GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai) instead of building locally — the fastest path (pin a version with `SOC_AI_IMAGE_TAG=<x.y.z>`). Prefer building from source? Drop the flag: `./setup.sh` builds the Dockerfile in-place (~3 min).
+`setup.sh` builds the image from the Dockerfile in place (~3 min on first run) and starts the stack.
+
+> **Prefer a prebuilt image?** Once a tagged release is published, `./setup.sh --prebuilt` pulls it from [GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai) instead of building — a faster path (pin a version with `SOC_AI_IMAGE_TAG=<x.y.z>`). Until the first release tag lands, no image is published yet, so `--prebuilt` will report `error from registry: denied` — use plain `./setup.sh` (above) to build from source. [Watch the releases page](https://github.com/nuk3s/soc-ai/releases) for the first tag.
 
 `setup.sh` walks you through the connection settings and checks them *before* it builds anything (a wrong password or an unreachable gateway fails in seconds, not after a three-minute build), lets you pick your model from the gateway's live list (it authenticates to fetch it), generates the secrets and a TLS cert, brings the stack up, and prints the URL and admin password:
 
@@ -113,6 +115,8 @@ git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 > Replay it in your terminal: `asciinema play docs/demo/install-walkthrough.cast`. To stand up more hosts without the prompts, fill in `setup.conf` once and run `./setup.sh --auto`.
 
 > **Something not working?** Run the doctor: `docker exec soc-ai python -m soc_ai doctor` (or `uv run soc-ai doctor` from a source checkout). It checks the whole dependency surface — config, local store + migrations, Security Onion, Elasticsearch, the gateway, and the analyst model's actual fitness — and prints a pass/fail table with a fix hint on every failing line.
+
+> **Your data is one command to save:** `soc-ai backup` snapshots the live store (investigations, audit history, runbooks, config) into a portable tar.gz — safe while the app runs — and `soc-ai restore` puts it back. See [docs/DOCKER.md](docs/DOCKER.md#backup-and-restore).
 
 ### Then work an alert in the browser
 

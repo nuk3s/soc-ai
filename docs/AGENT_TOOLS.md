@@ -69,7 +69,7 @@ can see exactly which enrichments fired.
 
 ## What the agent CANNOT do today (known gaps)
 
-Several of these are on the v1.15 reliability track:
+Known gaps, in rough roadmap order:
 
 - **PCAP retrieval is disabled by default.** The `get_pcap` / `t_get_pcap` tool
   is wired but gated behind `PCAP_ENABLED=true` + a provisioned SSH key

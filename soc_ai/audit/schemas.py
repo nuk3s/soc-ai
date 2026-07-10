@@ -90,6 +90,22 @@ AuditKind = Literal[
     # switching analyst_model to an unfit model leaves an audit trail of the
     # warning that was surfaced. Read-only probe; never a mutating write.
     "model_fitness",
+    # investigation-history → runbook-draft promotion (soc_ai/webui/
+    # runbook_promotion.py, POST /runbooks/promote). Emitted best-effort when a
+    # distillation lands a DRAFT runbook so "the machine wrote a runbook from N
+    # investigations of rule X" is provable from the trail. Payload is
+    # deliberately light — rule name + input counts + the new runbook id, never
+    # the distilled content (it may carry internal identifiers, and the row
+    # itself is already in the store). Must be a valid audit kind or _audit
+    # silently drops it (the recurring trap documented on the downgrade kinds).
+    "runbook_promotion",
+    # nightly quality micro-eval regression (soc_ai/cli.py eval-nightly). Emitted
+    # best-effort when the trend detector trips — payload carries the mode, the
+    # detector's reason strings, and the snapshot metrics, so "quality degraded
+    # on <date>" is provable from the audit trail even after the 90-row snapshot
+    # prune. Must be a valid audit kind or the write is silently dropped (the
+    # same trap the downgrade kinds document above).
+    "quality_regression",
     # alert ownership / triage-state changes (soc_ai/api/webui/routes_alert_actions.py
     # POST /alerts/assign). Emitted best-effort on assign / state-change / unassign so a
     # multi-analyst team has a trail of who took (or released) a rule and moved it through

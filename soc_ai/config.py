@@ -816,6 +816,14 @@ class Settings(BaseSettings):
     """Notify when the model-fitness probe grades the analyst model FAIL (an unfit
     model silently ruins triage). Inert unless ``notify_enabled`` is on."""
 
+    notify_on_quality_regression: bool = True
+    """Notify when the nightly quality micro-eval (``soc-ai eval-nightly``)
+    detects a regression against its own trailing history — an agreement drop,
+    an error-rate spike, or a fallback-rate jump (see
+    :func:`soc_ai.eval.quality.detect_regression`). This is the alarm that
+    catches silent verdict degradation after an inference-engine swap. Inert
+    unless ``notify_enabled`` is on."""
+
     # --- crawl4ai (deep page read) ------------------------------------
     crawl4ai_enabled: bool = False
     """Enable the ``crawl_page`` investigator tool (crawl4ai). When False the
@@ -1113,6 +1121,29 @@ class Settings(BaseSettings):
     # only the model alias and max_tokens are eval-specific.
     claude_oracle_model: str = "claude-opus-4-8"
     claude_oracle_max_tokens: int = 8192
+
+    # --- Nightly quality micro-eval (trend + alarm) ---------------------
+    # `soc-ai eval-nightly` runs a tiny batch of REAL investigations on a
+    # schedule and trends the results locally (quality_snapshots table), so
+    # "the verdicts are honest" is measured continuously — not once. The two
+    # knobs below are the whole tuning surface; both are admin-editable live
+    # in the config console (Quality section).
+    quality_nightly_n: int = 5
+    """How many alerts each ``soc-ai eval-nightly`` run investigates. Small by
+    design — the nightly is a smoke-trend, not a benchmark: 5 real
+    investigations is enough to catch an engine swap that broke verdict
+    quality, while staying cheap enough to run unattended every night. The
+    CLI clamps the effective value to [1, 10] (the config console enforces
+    the same bounds), so a stray env value can't turn the nightly into an
+    hour-long batch."""
+
+    quality_alarm_drop: float = 0.15
+    """Absolute agreement-rate drop (0-1) below the trailing 7-point same-mode
+    median that trips the ``quality_regression`` alarm. 0.15 default: on the
+    n=5 nightly a single flipped grade moves agreement by 0.2, so anything
+    tighter alarms on one-alert noise while anything looser sleeps through a
+    real regression until the median itself decays. Bounded [0.05, 0.5] in
+    the config console; the CLI clamps the same way."""
 
     # ---- validators ---------------------------------------------------
 

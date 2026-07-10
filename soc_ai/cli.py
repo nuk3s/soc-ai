@@ -13,6 +13,10 @@ The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
   fitness, egress posture, blocklist freshness) and prints a pass/fail
   table. Exit 0 only when every required check passes (warnings don't
   fail it); ``--json`` emits the results for automation.
+- ``backup`` / ``restore``: snapshot the live SQLite store (+ app-owned
+  sidecar files) into a portable tar.gz, and put one back. Backup is safe
+  while the app runs; restore wants the app stopped and gates every
+  overwrite behind ``--yes``. Logic lives in ``soc_ai.backup``.
 
 The triage subcommand connects via HTTPS to the configured
 ``SOC_AI_HOST:SOC_AI_PORT`` and trusts a self-signed cert by default
@@ -37,6 +41,7 @@ import contextlib
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -568,6 +573,269 @@ def _validate_batch(args: argparse.Namespace) -> int:
     return rc
 
 
+async def _fire_quality_alarm(
+    settings: Any,
+    *,
+    elastic: Any,
+    mode: str,
+    reasons: list[str],
+    metrics: Any,
+) -> None:
+    """Best-effort alarm side effects for a nightly quality regression.
+
+    Two channels, both fail-soft: an audit event (kind ``quality_regression``,
+    so the degradation is provable from the trail even after the snapshot
+    table prunes) and the opt-in notification webhook (a hard no-op unless
+    notifications are enabled + configured — the nightly must never grow an
+    egress path the operator didn't turn on). The committed snapshot row is
+    the durable record; neither channel failing can lose the alarm itself.
+    """
+    from soc_ai import notify  # noqa: PLC0415 - lazy
+    from soc_ai.audit.logger import AuditLogger  # noqa: PLC0415 - lazy
+
+    audit = None
+    try:
+        audit = AuditLogger(settings, elastic)
+        await audit.log_kind(
+            session_id="quality-nightly",
+            kind="quality_regression",
+            payload={
+                "mode": mode,
+                "reasons": reasons,
+                "n_ok": metrics.n_ok,
+                "n_error": metrics.n_error,
+                "agreement_rate": metrics.agreement_rate,
+                "fallback_rate": metrics.fallback_rate,
+                "error_rate": metrics.error_rate,
+            },
+        )
+    except Exception as e:  # audit is best-effort — never break the alarm on it
+        print(
+            f"{_C['dim']}quality_regression audit write failed (continuing): "
+            f"{type(e).__name__}{_C['reset']}",
+            file=sys.stderr,
+        )
+
+    event = notify.event_for_quality_regression(mode=mode, reasons=reasons, settings=settings)
+    if event is not None:
+        # fire_safe respects the master toggle + webhook config and never raises.
+        await notify.fire_safe(event, settings, audit)
+
+
+def _eval_nightly(args: argparse.Namespace) -> int:  # noqa: PLR0915 - one place that wires the whole nightly
+    """Nightly quality micro-eval: a tiny real-alert batch, trended locally.
+
+    Thin orchestration over the existing batch machinery (`validate-batch`'s
+    engine room): investigate ``quality_nightly_n`` real alerts at
+    concurrency 1, aggregate, land ONE row in the ``quality_snapshots``
+    table (pruned to the newest 90), and alarm — audit event + opt-in
+    webhook — when the new point regresses against its own trailing
+    same-mode history. Converts "the verdicts were validated once" into
+    "the verdicts are measured every night".
+
+    Two measurement modes (never blended in the trend):
+
+    * ``graded``  — the cloud oracle critiques every run; ``agreement_rate``
+      joins the trend. One cloud call per alert.
+    * ``local``   — ZERO egress: no oracle at all; the trend carries the
+      local proxies (fallback rate, error rate, verdict distribution,
+      latency p50).
+
+    Default mode follows the install's posture: ``oracle_enabled`` is the
+    operator's standing declaration that cloud-oracle egress is acceptable,
+    so it gates the nightly grader too; ``--graded`` / ``--local`` override.
+    NO synth scenarios and NO meta-analysis — the nightly is a cheap smoke-
+    trend over real traffic, not a benchmark.
+
+    Scheduling is the HOST's job (cron → ``docker exec``, see
+    docs/DOCKER.md); soc-ai deliberately ships no in-app scheduler for this.
+
+    Exit codes:
+      0   ok — snapshot written (a fired alarm still exits 0: the run worked)
+      2   sampler returned no eligible alerts (no snapshot)
+      4   batch aborted by failure budget (snapshot IS still written — a
+          fully-broken engine is exactly what the trend must record)
+      5   unexpected internal error
+    """
+    from pathlib import Path  # noqa: PLC0415 - lazy
+
+    settings = get_settings()
+
+    # Mode: explicit flag wins (argparse enforces mutual exclusion); otherwise
+    # follow the oracle posture — a zero-egress install trends locally without
+    # any flag juggling in its crontab.
+    if args.graded:
+        mode = "graded"
+    elif args.local:
+        mode = "local"
+    else:
+        mode = "graded" if settings.oracle_enabled else "local"
+
+    # Clamp to the documented bounds even for env-sourced values: the config
+    # console enforces [1,10] / [0.05,0.5], but a stray .env must not turn the
+    # unattended nightly into an hour-long batch or a hair-trigger pager.
+    n = max(1, min(10, settings.quality_nightly_n))
+    alarm_drop = max(0.05, min(0.5, settings.quality_alarm_drop))
+    oql = args.oql or settings.webui_alerts_query
+
+    print(
+        f"{_C['dim']}eval-nightly · mode={mode} n={n} oql={oql!r}{_C['reset']}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    def _emit(line: str) -> None:
+        print(f"{_C['dim']}{line}{_C['reset']}", file=sys.stderr, flush=True)
+
+    async def _go() -> int:
+        import functools  # noqa: PLC0415 - lazy
+
+        from soc_ai.eval.batch import BatchConfig, run_batch  # noqa: PLC0415 - lazy
+        from soc_ai.eval.harness import run as harness_run  # noqa: PLC0415 - lazy
+        from soc_ai.eval.quality import (  # noqa: PLC0415 - lazy
+            TrendPoint,
+            compute_snapshot_metrics,
+            detect_regression,
+        )
+        from soc_ai.eval.report import build_report, load_index  # noqa: PLC0415 - lazy
+        from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+        from soc_ai.store import quality as quality_store  # noqa: PLC0415 - lazy
+        from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+            make_engine,
+            make_sessionmaker,
+            run_migrations,
+        )
+
+        cfg = BatchConfig(
+            oql=oql,
+            n=n,
+            # Concurrency 1: the nightly runs unattended on possibly-shared
+            # inference infra — it must never contend with live triage.
+            concurrency=1,
+            out_dir=Path(args.out_dir),
+            per_run_timeout_s=args.per_run_timeout_s,
+        )
+
+        elastic = ElasticClient(settings)
+        try:
+            try:
+                summary = await run_batch(
+                    cfg,
+                    settings=settings,
+                    elastic=elastic,
+                    # grade=False keeps the per-alert oracle call OUT of local
+                    # mode — the whole zero-egress contract hangs on this kwarg.
+                    runner=functools.partial(harness_run, grade=(mode == "graded")),
+                    progress=_emit,
+                )
+            except RuntimeError as e:
+                print(f"{_C['red']}eval-nightly failed{_C['reset']}: {e}", file=sys.stderr)
+                return 5
+            except Exception as e:
+                print(
+                    f"{_C['red']}eval-nightly failed (transport){_C['reset']}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                return 5
+
+            if summary.n_planned == 0:
+                print(
+                    f"{_C['yellow']}no eligible alerts for {oql!r} — "
+                    f"no snapshot written{_C['reset']}",
+                    file=sys.stderr,
+                )
+                return 2
+            if summary.aborted_reason:
+                # Still record the point below: a fully-broken engine (every
+                # run failing) is precisely the regression the trend exists
+                # to catch — swallowing it would blind the alarm.
+                print(f"{_C['red']}{summary.aborted_reason}{_C['reset']}", file=sys.stderr)
+
+            # Aggregate (pure; no oracle, no meta-analysis) + reduce to a point.
+            _json_path, _md_path, agg = build_report(summary.batch_dir)
+            rows = load_index(summary.batch_dir)
+            metrics = compute_snapshot_metrics(rows, agg, mode=mode)
+
+            # Trend: read same-mode history, detect, insert + prune in one txn.
+            engine = make_engine(settings)
+            try:
+                # The CLI may run before the app ever booted against this
+                # store (fresh install, cron-first) — same idiom as
+                # discover-internal-identifiers.
+                await run_migrations(engine)
+                maker = make_sessionmaker(engine)
+                async with maker() as db:
+                    history = await quality_store.recent_snapshots(db, limit=7, mode=mode)
+                    reasons = detect_regression(
+                        metrics,
+                        [
+                            TrendPoint(
+                                agreement_rate=h.agreement_rate,
+                                fallback_rate=h.fallback_rate,
+                            )
+                            for h in history
+                        ],
+                        alarm_drop=alarm_drop,
+                    )
+                    await quality_store.insert_snapshot(
+                        db,
+                        mode=mode,
+                        n_ok=metrics.n_ok,
+                        n_error=metrics.n_error,
+                        agreement_rate=metrics.agreement_rate,
+                        fallback_rate=metrics.fallback_rate,
+                        error_rate=metrics.error_rate,
+                        verdict_counts=metrics.verdict_counts,
+                        latency_p50_ms=metrics.latency_p50_ms,
+                        batch_dir=str(summary.batch_dir),
+                        alarmed=bool(reasons),
+                        alarm_reasons=reasons or None,
+                    )
+            finally:
+                with contextlib.suppress(Exception):
+                    await engine.dispose()
+
+            def _pct(v: float | None) -> str:
+                return "—" if v is None else f"{v * 100:.0f}%"
+
+            print(
+                f"{_C['bold']}quality snapshot{_C['reset']} ({mode}) — "
+                f"ok={metrics.n_ok} err={metrics.n_error} · "
+                f"agreement={_pct(metrics.agreement_rate)} · "
+                f"fallback={_pct(metrics.fallback_rate)} · "
+                f"error={_pct(metrics.error_rate)} · "
+                f"p50={metrics.latency_p50_ms or '—'}ms\n"
+                f"{_C['dim']}batch: {summary.batch_dir}{_C['reset']}",
+                file=sys.stderr,
+            )
+
+            if reasons:
+                print(f"{_C['bold']}{_C['red']}QUALITY REGRESSION{_C['reset']}", file=sys.stderr)
+                for r in reasons:
+                    print(f"  {_C['yellow']}- {r}{_C['reset']}", file=sys.stderr)
+                await _fire_quality_alarm(
+                    settings, elastic=elastic, mode=mode, reasons=reasons, metrics=metrics
+                )
+
+            return 4 if summary.aborted_reason else 0
+        finally:
+            with contextlib.suppress(Exception):
+                await elastic.aclose()
+
+    rc = asyncio.run(_go())
+    if rc == 0:
+        # The nightly only trends if something schedules it — hand the operator
+        # the exact host-cron line (docs/DOCKER.md carries the same one).
+        print(
+            f"\n{_C['dim']}schedule it (host cron — see docs/DOCKER.md):{_C['reset']}\n"
+            "  17 2 * * *  root  docker compose -f /opt/soc-ai/docker-compose.yml "
+            "exec -T soc-ai python -m soc_ai eval-nightly",
+            file=sys.stderr,
+        )
+    return rc
+
+
 def _auto_aggregate_after_batch(args: argparse.Namespace) -> None:
     """Best-effort eval-report after a successful validate-batch.
 
@@ -830,6 +1098,254 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
         return 1
 
 
+def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
+    """Data directory for backup/restore: ``--data-dir`` wins, then settings.
+
+    Returns None (the caller prints the error) when neither resolves — e.g.
+    no .env on this host and no explicit flag.
+    """
+    override = getattr(args, "data_dir", None)
+    if override:
+        return Path(override)
+    try:
+        return get_settings().soc_ai_data_dir
+    except Exception:
+        return None
+
+
+def _resolve_cache_dirs() -> dict[str, Path] | None:
+    """The enrichment-cache directories from settings, or None if no settings."""
+    try:
+        settings = get_settings()
+    except Exception:
+        return None
+    return {
+        "blocklists": settings.blocklist_data_dir,
+        "maxmind": settings.maxmind_data_dir,
+        "cloud_prefixes": settings.cloud_prefix_data_dir,
+    }
+
+
+def _backup(args: argparse.Namespace) -> int:
+    """Snapshot the store into a tar.gz (safe while the app is running).
+
+    Exit codes:
+      0   archive written
+      1   backup failed (no store, unreadable data dir, I/O error)
+      2   cannot resolve the data dir / cache dirs (pass --data-dir or fix .env)
+    """
+    from soc_ai.backup import (  # noqa: PLC0415 - lazy
+        BackupError,
+        create_backup,
+        default_backup_name,
+    )
+
+    data_dir = _resolve_data_dir(args)
+    if data_dir is None:
+        print(
+            f"{_C['red']}could not resolve the data directory{_C['reset']}: settings "
+            "did not load and no --data-dir was given. Pass --data-dir PATH, or run "
+            "from a directory with a populated .env.",
+            file=sys.stderr,
+        )
+        return 2
+    cache_dirs = _resolve_cache_dirs()
+    if args.full and cache_dirs is None:
+        print(
+            f"{_C['red']}--full needs the cache directories from settings{_C['reset']}, "
+            "which did not load. Run from a directory with a populated .env (or drop "
+            "--full — the caches are re-downloadable via `soc-ai blocklists refresh`).",
+            file=sys.stderr,
+        )
+        return 2
+
+    out = Path(args.out) if args.out else Path.cwd() / default_backup_name()
+    try:
+        result = create_backup(data_dir, out, full=args.full, cache_dirs=cache_dirs)
+    except BackupError as e:
+        print(f"{_C['red']}backup failed{_C['reset']}: {e}", file=sys.stderr)
+        return 1
+
+    m = result.manifest
+    head = m.alembic_head or "(fresh — no migrations applied)"
+    print(
+        f"backed up {data_dir / 'soc-ai.db'} "
+        f"({result.db_bytes / 1_048_576:.1f} MiB, migration head {head})"
+    )
+    print(f"  sidecars: {', '.join(m.sidecars) or '(none)'}")
+    if m.full:
+        print(f"  caches:   {', '.join(m.caches) or '(none found)'}")
+    else:
+        print(
+            f"  caches:   excluded {_C['dim']}(re-downloadable — `soc-ai blocklists "
+            f"refresh` re-seeds them; --full includes them){_C['reset']}"
+        )
+    print(f"{_C['bold']}archive: {result.archive}{_C['reset']}")
+    return 0
+
+
+def _restore(args: argparse.Namespace) -> int:
+    """Restore a backup archive into the data directory.
+
+    Exit codes:
+      0   restored
+      1   bad archive / I/O failure
+      2   refused (existing store or live WAL without --yes; archive from a
+          NEWER soc-ai = unsupported downgrade) or unresolvable data dir
+    """
+    from soc_ai.backup import BackupError, RestoreRefused, restore_backup  # noqa: PLC0415 - lazy
+
+    data_dir = _resolve_data_dir(args)
+    if data_dir is None:
+        print(
+            f"{_C['red']}could not resolve the data directory{_C['reset']}: settings "
+            "did not load and no --data-dir was given. Pass --data-dir PATH, or run "
+            "from a directory with a populated .env.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        result = restore_backup(
+            Path(args.archive),
+            data_dir,
+            assume_yes=args.yes,
+            cache_dirs=_resolve_cache_dirs(),
+        )
+    except RestoreRefused as e:
+        print(f"{_C['red']}restore refused{_C['reset']}: {e}", file=sys.stderr)
+        return 2
+    except BackupError as e:
+        print(f"{_C['red']}restore failed{_C['reset']}: {e}", file=sys.stderr)
+        return 1
+
+    for w in result.warnings:
+        print(f"{_C['yellow']}warning: {w}{_C['reset']}", file=sys.stderr)
+    head = result.archive_head or "(fresh — no migrations applied)"
+    print(f"restored store → {result.db_path} (migration head {head})")
+    if result.archive_head and result.code_head and result.archive_head != result.code_head:
+        print(
+            f"  archive head {result.archive_head} is older than code head "
+            f"{result.code_head} — the app migrates it to head at next startup"
+        )
+    print(f"  sidecars: {', '.join(result.sidecars) or '(none)'}")
+    if result.caches:
+        print(f"  caches:   {', '.join(result.caches)}")
+    print(
+        f"{_C['bold']}restart the app to pick up the restored store{_C['reset']} "
+        f"{_C['dim']}(docker compose up -d soc-ai / systemctl restart soc-ai){_C['reset']}"
+    )
+    return 0
+
+
+def _register_backup(sub: Any) -> None:
+    """Register the ``backup`` + ``restore`` subparsers (split out for size)."""
+    p_bak = sub.add_parser(
+        "backup",
+        help="Snapshot the live SQLite store + app-owned sidecar files into a "
+        "portable tar.gz (uses the SQLite backup API — safe while the app runs)",
+    )
+    p_bak.add_argument(
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="Archive path to write (default: ./soc-ai-backup-<UTC-stamp>.tar.gz)",
+    )
+    p_bak.add_argument(
+        "--full",
+        action="store_true",
+        help="Also include the enrichment caches (blocklists, MaxMind, cloud "
+        "prefixes). Excluded by default: they are re-downloadable via "
+        "`soc-ai blocklists refresh` and dwarf the DB",
+    )
+    p_bak.add_argument(
+        "--data-dir",
+        default=None,
+        metavar="PATH",
+        help="Override the data directory (default: SOC_AI_DATA_DIR from env/.env)",
+    )
+    p_bak.set_defaults(func=_backup)
+
+    p_res = sub.add_parser(
+        "restore",
+        help="Restore a `soc-ai backup` archive into the data directory. Refuses "
+        "to overwrite an existing store (or restore under a live-looking app) "
+        "without --yes; refuses archives from a newer soc-ai (downgrade). "
+        "Stop the app first",
+    )
+    p_res.add_argument("archive", help="Path to the soc-ai-backup-*.tar.gz to restore")
+    p_res.add_argument(
+        "--yes",
+        action="store_true",
+        help="Overwrite existing state, and proceed even when the store looks "
+        "live (recent WAL activity) — the restore prints what it overwrites",
+    )
+    p_res.add_argument(
+        "--data-dir",
+        default=None,
+        metavar="PATH",
+        help="Override the data directory (default: SOC_AI_DATA_DIR from env/.env)",
+    )
+    p_res.set_defaults(func=_restore)
+
+
+def _register_synth_clean(sub: Any) -> None:
+    """Register the ``synth-clean`` subparser (split out of :func:`main` for size)."""
+    p_sc = sub.add_parser(
+        "synth-clean",
+        help="Delete synthetic-eval docs (synth.scenario_id) from logs-synth-* "
+        "so fixtures don't accumulate forever",
+    )
+    p_sc.add_argument(
+        "--older-than-days",
+        type=int,
+        default=None,
+        help="Only delete synth docs older than N days (default: delete all)",
+    )
+    p_sc.set_defaults(func=_synth_clean)
+
+
+def _register_eval_nightly(sub: Any) -> None:
+    """Register the ``eval-nightly`` subparser (split out of :func:`main` for size)."""
+    p_en = sub.add_parser(
+        "eval-nightly",
+        help="Nightly quality micro-eval: investigate a few real alerts, land one "
+        "row in the local quality trend, and alarm on regression. Schedule it "
+        "from host cron (see docs/DOCKER.md); the mode defaults to oracle-graded "
+        "iff oracle_enabled, else zero-egress local",
+    )
+    p_en.add_argument(
+        "--oql",
+        default=None,
+        help="OQL selecting candidate alerts (default: the web-UI alerts feed "
+        "query, webui_alerts_query — the same population the dashboard shows)",
+    )
+    nightly_mode = p_en.add_mutually_exclusive_group()
+    nightly_mode.add_argument(
+        "--graded",
+        action="store_true",
+        help="Force oracle grading (one cloud call per alert; agreement_rate joins the trend)",
+    )
+    nightly_mode.add_argument(
+        "--local",
+        action="store_true",
+        help="Force zero-egress local mode (no oracle; trends fallback/error "
+        "rates, verdict distribution and latency only)",
+    )
+    p_en.add_argument(
+        "--out-dir",
+        default="evals",
+        help="Parent directory for the batch-<ts>/ artifact subdir (default: ./evals)",
+    )
+    p_en.add_argument(
+        "--per-run-timeout-s",
+        type=int,
+        default=1800,
+        help="Per-alert harness wall-clock cap in seconds (default: 1800 = 30min)",
+    )
+    p_en.set_defaults(func=_eval_nightly)
+
+
 def _register_doctor(sub: Any) -> None:
     """Register the ``doctor`` subparser (split out of :func:`main` for size)."""
     p_doc = sub.add_parser(
@@ -899,6 +1415,7 @@ def main() -> None:
     p_health.set_defaults(func=_healthz)
 
     _register_doctor(sub)
+    _register_backup(sub)
 
     p_val = sub.add_parser(
         "validate",
@@ -991,6 +1508,8 @@ def main() -> None:
     )
     p_vb.set_defaults(func=_validate_batch)
 
+    _register_eval_nightly(sub)
+
     p_er = sub.add_parser(
         "eval-report",
         help="Aggregate a batch's index.jsonl into aggregates.json + report.md",
@@ -1008,18 +1527,7 @@ def main() -> None:
     )
     p_er.set_defaults(func=_eval_report)
 
-    p_sc = sub.add_parser(
-        "synth-clean",
-        help="Delete synthetic-eval docs (synth.scenario_id) from logs-synth-* "
-        "so fixtures don't accumulate forever",
-    )
-    p_sc.add_argument(
-        "--older-than-days",
-        type=int,
-        default=None,
-        help="Only delete synth docs older than N days (default: delete all)",
-    )
-    p_sc.set_defaults(func=_synth_clean)
+    _register_synth_clean(sub)
 
     # Blocklist + cloud-prefix refresh (`soc-ai blocklists refresh`).
     # The blocklist_refresh module owns the abuse.ch Auth-Key handling, atomic

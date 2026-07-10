@@ -28,6 +28,15 @@ meaning ranks above either alone); when ``rag_rerank_model`` is also set the
 merged candidates are reranked via the gateway ``/rerank`` (fail-soft to the
 merged order). The rule-link boost dominates every tier by construction.
 
+**Draft exclusion (migration 0020):** rows with ``draft=True`` — machine-
+authored promotion drafts awaiting operator approval — are filtered out of
+EVERY retrieval tier here (FTS SQL, the legacy scorer's scan, the rule-link
+scan) and out of :func:`~soc_ai.rag.runbook_embeddings.semantic_search`'s
+candidate join. That filter IS the "nothing auto-applies" guarantee: a draft
+can sit in the store indefinitely without ever reaching a prompt.
+:func:`list_all` deliberately still returns drafts (the Runbooks page shows
+them, badged, for review).
+
 The public signature/return shape is the agent-tool contract — unchanged
 (``settings`` is an injected keyword like ``rule_name``, invisible to the LLM).
 """
@@ -78,7 +87,7 @@ _FTS_SQL = f"""
 SELECT rb.id AS id, -bm25(runbook_fts, {_W_TITLE_TOKEN}, {_W_CONTENT_TOKEN}, {_W_TAG}) AS score
 FROM runbook_fts
 JOIN runbook AS rb ON rb.id = runbook_fts.rowid
-WHERE runbook_fts MATCH :match
+WHERE runbook_fts MATCH :match AND rb.draft = 0
 ORDER BY score DESC
 LIMIT :limit
 """  # noqa: S608 — constants + bound params only; no user text is interpolated
@@ -113,14 +122,21 @@ async def create(
     tags: list[str] | None = None,
     linked_rules: list[str] | None = None,
     created_by: str = "anonymous",
+    draft: bool = False,
 ) -> Runbook:
-    """Create a runbook. ``tags`` / ``linked_rules`` are normalized to str lists."""
+    """Create a runbook. ``tags`` / ``linked_rules`` are normalized to str lists.
+
+    ``draft=True`` is used ONLY by the promotion path
+    (:mod:`soc_ai.webui.runbook_promotion`): the row is stored but invisible to
+    every retrieval tier until approved. Operator authoring keeps the default.
+    """
     runbook = Runbook(
         title=title[:512],
         content=content,
         tags=_norm_list(tags),
         linked_rules=_norm_list(linked_rules),
         created_by=created_by[:128],
+        draft=draft,
     )
     db.add(runbook)
     await db.commit()
@@ -148,8 +164,15 @@ async def update(
     content: str | None = None,
     tags: list[str] | None = None,
     linked_rules: list[str] | None = None,
+    draft: bool | None = None,
 ) -> Runbook | None:
-    """Patch the given fields (``None`` = leave unchanged). Returns the row or None."""
+    """Patch the given fields (``None`` = leave unchanged). Returns the row or None.
+
+    ``draft`` is deliberately NOT exposed through the PUT route's patch body —
+    the only caller that passes it is the admin approve endpoint (``draft=False``),
+    so the draft→published transition stays a single explicit gate (which also
+    owns the embed-on-approve step) rather than a side effect of a field edit.
+    """
     runbook = await db.get(Runbook, runbook_id)
     if runbook is None:
         return None
@@ -161,6 +184,8 @@ async def update(
         runbook.tags = _norm_list(tags)
     if linked_rules is not None:
         runbook.linked_rules = _norm_list(linked_rules)
+    if draft is not None:
+        runbook.draft = draft
     await db.commit()
     await db.refresh(runbook)
     return runbook
@@ -299,8 +324,12 @@ async def search(
         # Legacy fallback — identical to the pre-FTS behavior. Cap the working
         # set (matches ``list_all``); scoring is in-process, so an unbounded
         # fetch is a latency/memory footgun on every agent tool call. _score
-        # already folds in the rule-link boost.
-        rows = list((await db.scalars(select(Runbook).limit(500))).all())
+        # already folds in the rule-link boost. Drafts are excluded IN SQL
+        # (mirrors the FTS SQL's ``rb.draft = 0``) so they never consume the
+        # scan cap either.
+        rows = list(
+            (await db.scalars(select(Runbook).where(Runbook.draft.is_(False)).limit(500))).all()
+        )
         for rb in rows:
             s = _score(rb, query_tokens, rule_name=rule_name)
             if s > 0:
@@ -318,8 +347,13 @@ async def search(
         if rule_name:
             # Rule-linked runbooks rank first even with ZERO text overlap, so
             # they're fetched independently of the MATCH (same bounded scan as
-            # the legacy path) and boosted above every BM25 hit.
-            rows = list((await db.scalars(select(Runbook).limit(500))).all())
+            # the legacy path) and boosted above every BM25 hit. Draft-filtered
+            # like every other tier — a promotion draft ALWAYS links its rule,
+            # so without this filter the strongest boost would be the exact
+            # path that leaks unapproved drafts into prompts.
+            rows = list(
+                (await db.scalars(select(Runbook).where(Runbook.draft.is_(False)).limit(500))).all()
+            )
             for rb in rows:
                 if _rule_link_match(rb, rule_name):
                     linked_ids.add(rb.id)

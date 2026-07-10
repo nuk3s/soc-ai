@@ -44,8 +44,16 @@ NOTIFY_FORMATS: tuple[str, ...] = ("json", "slack", "matrix")
 
 # Trigger kinds a NotifyEvent may carry. ``test`` is the canned validation event
 # fired by the Test button — it bypasses the per-trigger toggles (below) but still
-# requires a configured webhook URL.
-NOTIFY_KINDS: tuple[str, ...] = ("tp", "hunt_threat", "model_fitness_fail", "test")
+# requires a configured webhook URL. ``quality_regression`` is fired by the
+# ``soc-ai eval-nightly`` CLI (not the server) when the nightly micro-eval trips
+# its regression detector.
+NOTIFY_KINDS: tuple[str, ...] = (
+    "tp",
+    "hunt_threat",
+    "model_fitness_fail",
+    "quality_regression",
+    "test",
+)
 
 # Per-send bound. Short: a webhook is fire-and-forget on-call plumbing, not on the
 # investigation's critical path — a slow endpoint must not stall the trigger.
@@ -160,6 +168,7 @@ def _trigger_enabled(settings: Any, kind: str) -> bool:
         "tp": "notify_on_tp",
         "hunt_threat": "notify_on_hunt_threat",
         "model_fitness_fail": "notify_on_model_fitness_fail",
+        "quality_regression": "notify_on_quality_regression",
     }.get(kind)
     if flag is None:
         return False
@@ -346,6 +355,33 @@ def event_for_model_fitness(*, result: dict[str, Any], settings: Any) -> NotifyE
         title=f"Analyst model unfit: {model}",
         body=(detail or "Model-fitness probe graded FAIL.")[:500],
         url="",
+        severity="warning",
+    )
+
+
+def event_for_quality_regression(
+    *, mode: str, reasons: list[str], settings: Any
+) -> NotifyEvent | None:
+    """Build a quality-regression NotifyEvent from a nightly's alarm, or None.
+
+    Returns None unless ``notify_on_quality_regression`` is on AND the detector
+    produced at least one reason. The body carries the measurement mode (so
+    on-call knows whether "agreement" even applies) plus the detector's own
+    reason strings — they already embed the numbers. Permalink is the dashboard
+    (the Quality card lives there); it doubles as the dedup entity, so repeated
+    nightly alarms collapse to one ping per hour.
+    """
+    if not bool(getattr(settings, "notify_on_quality_regression", False)):
+        return None
+    if not reasons:
+        return None
+    mode_label = "oracle graded" if mode == "graded" else "locally measured"
+    body = f"Nightly micro-eval ({mode_label}): " + "; ".join(reasons)
+    return NotifyEvent(
+        kind="quality_regression",
+        title="Verdict quality regression",
+        body=body[:500],
+        url="/app/",
         severity="warning",
     )
 

@@ -70,6 +70,7 @@ async def run(
     oracle_caller: OracleCaller = call_oracle,
     include_synth: bool = False,
     expected_verdict: str | None = None,
+    grade: bool = True,
 ) -> EvalResult:
     """Run the eval pipeline end-to-end.
 
@@ -85,10 +86,19 @@ async def run(
             known-correct verdict from ``Scenario.ground_truth.verdict``.
             When set, the oracle prompt gains a ground-truth block so
             grading is factual rather than subjective.
+        grade: when False (the ``soc-ai eval-nightly`` local mode), the
+            investigation runs and the bundle is saved but the ORACLE IS
+            NEVER CALLED — zero cloud egress. ``response.md`` is empty,
+            ``oracle_response`` is a zero-usage stub, and the residue
+            refusal gate is skipped (it exists to protect an egress that
+            isn't happening). The local trend signals (verdict, fallback,
+            latency) are all still real.
     """
     settings = settings or get_settings()
     out_dir = out_dir or Path("evals")
 
+    # The key gates the ANALYST model calls too (the whole pipeline runs
+    # through the LiteLLM gateway), so ungraded runs still require it.
     if not settings.litellm_api_key:
         raise RuntimeError(
             "LITELLM_API_KEY not set; LiteLLM gateway will reject the "
@@ -135,6 +145,80 @@ async def run(
     ]
     sanitized_report = _sanitize_dict(final_report, mapping) if final_report else None
 
+    if grade:
+        response, response_md, user_message, arch = _grade_with_oracle(
+            alert_id=alert_id,
+            settings=settings,
+            out_dir=out_dir,
+            oracle_caller=oracle_caller,
+            expected_verdict=expected_verdict,
+            sanitized_events=sanitized_events,
+            sanitized_report=sanitized_report,
+            mapping=mapping,
+        )
+    else:
+        # Ungraded (local) mode: NO oracle, NO egress of any kind. The bundle
+        # keeps its normal shape (an empty response.md, a zero-usage stub
+        # OracleResponse) so downstream readers — the batch runner reads
+        # response.md unconditionally — never need a special case. The
+        # residue gate is skipped on purpose: it guards an egress that this
+        # mode never performs, and refusing a purely-local run over a
+        # sanitizer gap would fail nightlies for no protective benefit.
+        user_message = ""
+        arch = ""
+        response = OracleResponse(text="", model="(ungraded)", usage={}, elapsed_ms=0)
+        response_md = ""
+
+    # ----- Save the artifact bundle -----
+    bundle_dir = _new_bundle_dir(out_dir, alert_id)
+    _save_bundle(
+        bundle_dir,
+        alert_id=alert_id,
+        events=sanitized_events,
+        report=sanitized_report,
+        mapping=mapping,
+        user_message=user_message,
+        arch_context=arch,
+        system_prompt=SYSTEM_PROMPT,
+        response=response,
+        response_md=response_md,
+        investigation_elapsed_ms=investigation_elapsed_ms,
+    )
+
+    return EvalResult(
+        bundle_dir=bundle_dir,
+        response_md=response_md,
+        sanitized_events=sanitized_events,
+        sanitized_report=sanitized_report,
+        mapping=mapping,
+        oracle_response=response,
+        investigation_elapsed_ms=investigation_elapsed_ms,
+    )
+
+
+# --------------------------------------------------------------------
+# Internals
+# --------------------------------------------------------------------
+
+
+def _grade_with_oracle(
+    *,
+    alert_id: str,
+    settings: Settings,
+    out_dir: Path,
+    oracle_caller: OracleCaller,
+    expected_verdict: str | None,
+    sanitized_events: list[dict[str, Any]],
+    sanitized_report: dict[str, Any] | None,
+    mapping: san.Mapping,
+) -> tuple[OracleResponse, str, str, str]:
+    """The graded half of :func:`run`: residue-gate, prompt, oracle, de-sanitize.
+
+    This is the ONLY egress in the harness, so the whole chain lives together:
+    the residue check that must pass before anything leaves, the prompt build,
+    the LiteLLM/oracle call, and the de-sanitization of the critique for local
+    display. Returns ``(response, response_md, user_message, arch_context)``.
+    """
     # Build a single string of everything we'll send for the residue check.
     # Cheaper than walking the dicts again — `unsafe_residue` uses the
     # same regexes as `sanitize` so this catches drift either way.
@@ -167,12 +251,17 @@ async def run(
     )
     arch = architecture_block()
 
+    # run() already refused a missing key before doing any work; this re-check
+    # exists for the type narrowing (SecretStr | None) now that the oracle call
+    # lives in its own function.
+    api_key = settings.litellm_api_key
+    if api_key is None:  # pragma: no cover - unreachable via run()
+        raise RuntimeError("LITELLM_API_KEY not set")
+
     try:
         response = oracle_caller(
             base_url=str(settings.litellm_base_url),
-            api_key=settings.litellm_api_key.get_secret_value()
-            if hasattr(settings.litellm_api_key, "get_secret_value")
-            else settings.litellm_api_key,
+            api_key=api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else api_key,
             verify_ssl=settings.litellm_verify_ssl,
             model=settings.claude_oracle_model,
             max_tokens=settings.claude_oracle_max_tokens,
@@ -185,37 +274,7 @@ async def run(
 
     # ----- De-sanitize the response for local display -----
     response_md = san.desanitize(response.text, mapping)
-
-    # ----- Save the artifact bundle -----
-    bundle_dir = _new_bundle_dir(out_dir, alert_id)
-    _save_bundle(
-        bundle_dir,
-        alert_id=alert_id,
-        events=sanitized_events,
-        report=sanitized_report,
-        mapping=mapping,
-        user_message=user_message,
-        arch_context=arch,
-        system_prompt=SYSTEM_PROMPT,
-        response=response,
-        response_md=response_md,
-        investigation_elapsed_ms=investigation_elapsed_ms,
-    )
-
-    return EvalResult(
-        bundle_dir=bundle_dir,
-        response_md=response_md,
-        sanitized_events=sanitized_events,
-        sanitized_report=sanitized_report,
-        mapping=mapping,
-        oracle_response=response,
-        investigation_elapsed_ms=investigation_elapsed_ms,
-    )
-
-
-# --------------------------------------------------------------------
-# Internals
-# --------------------------------------------------------------------
+    return response, response_md, user_message, arch
 
 
 def _store_sessionmaker(

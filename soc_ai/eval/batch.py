@@ -30,6 +30,7 @@ from soc_ai.eval.harness import run as harness_run
 from soc_ai.eval.sampler import DEFAULT_DIVERSITY_KEYS, sample_diverse_alerts
 from soc_ai.eval.synth_ingest import IngestResult, ingest_scenarios
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.triage_models import is_pipeline_fallback
 
 if TYPE_CHECKING:
     from soc_ai.eval.synth_loader import Scenario
@@ -69,6 +70,12 @@ class IndexRow:
     # here so synth_score._score_one can verify citation-kind coverage without
     # re-reading bundle files.
     citations: list[str] = field(default_factory=list)
+    # True when the run's report was a pipeline-failure fallback (see
+    # soc_ai.triage_models.is_pipeline_fallback): the model call died and the
+    # orchestrator fabricated a needs_more_info. Stamped here so the nightly
+    # quality trend can compute a fallback RATE without re-reading bundles —
+    # a fallback spike is the classic silent-engine-swap symptom.
+    is_fallback: bool = False
     # synth-TP stratum tagging. False/None for real alerts;
     # set when the alert was ingested as a known synthetic-TP scenario.
     is_synth: bool = False
@@ -346,6 +353,7 @@ async def _run_one(
         output_tokens=usage.get("output_tokens"),
         cache_read_tokens=usage.get("cache_read_input_tokens"),
         citations=list(report.get("citations") or []),
+        is_fallback=is_pipeline_fallback(report),
         error=None,
         is_synth=is_synth,
         synth_scenario_id=synth_scenario_id,

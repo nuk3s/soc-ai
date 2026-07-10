@@ -2,7 +2,8 @@
 
 soc-ai is security tooling that runs with privileged access to a Security Onion
 grid (Elasticsearch, the SOC API, and — when PCAP is enabled — SSH to a sensor).
-We take its security seriously.
+A vulnerability here is a vulnerability in the SOC that runs it; I treat
+reports accordingly.
 
 ## Supported versions
 
@@ -17,7 +18,7 @@ Report privately via [GitHub Security Advisories](https://docs.github.com/en/cod
 on this repository (Security → Advisories → Report a vulnerability).
 
 Please include: affected version/commit, a description, reproduction steps, and
-the impact. We aim to acknowledge within a few days and to ship a fix or
+the impact. I aim to acknowledge within a few days and to ship a fix or
 mitigation as fast as the severity warrants.
 
 ## Security model (what to keep in mind)
@@ -34,7 +35,7 @@ as vulnerabilities:
   Oracle is **opt-in** (`ORACLE_ENABLED=false` by default); nothing leaves your
   network unless you turn it on.
 
-  The redacter automatically tokenises private IPs/MACs, FQDNs on an internal
+  The redactor automatically tokenises private IPs/MACs, FQDNs on an internal
   suffix, NetBIOS-shaped computer names, every identifier learned from a
   structured host/user field (propagated into free text), and usernames in an
   explicit credential context (`user=jdoe`, `DOMAIN\jdoe`). It then runs an

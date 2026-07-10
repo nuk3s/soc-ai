@@ -61,8 +61,11 @@ const MARK_LABEL = 'rounded-[3px] bg-[rgba(63,185,80,.18)] px-[2px] text-success
  * double-match, and value matching is case-insensitive (the sanitizer
  * lowercases host/email/MAC). With no replacements this renders plain text —
  * the honest fallback.
+ *
+ * Exported for unit tests (this is the security-UX surface that claims "this
+ * exact value was redacted" — a highlighting bug misleads the operator).
  */
-function HighlightedText({
+export function HighlightedText({
   text,
   replacements,
   side,

@@ -507,3 +507,39 @@ async def test_expected_verdict_absent_leaves_prompt_unchanged(
 
     sent = caller.captured["user_message"]  # type: ignore[attr-defined]
     assert "Ground truth" not in sent
+
+
+async def test_ungraded_run_never_calls_oracle(
+    tmp_path: Path,
+    patch_investigate: list[StepEvent],
+) -> None:
+    """grade=False (eval-nightly local mode): the ZERO-EGRESS contract.
+
+    The oracle caller must never be invoked — the stub raises if it is — while
+    the bundle still lands in its normal shape (empty response.md, zero-usage
+    stub OracleResponse) and the triage report (the local trend's real signal)
+    is still captured.
+    """
+
+    def _explode(**_kw: Any) -> OracleResponse:
+        raise AssertionError("oracle_caller must not be invoked when grade=False")
+
+    result = await harness_run(
+        "KDG7CZ4BVBs3R9hXQbPY",
+        settings=_settings_for_eval(),
+        out_dir=tmp_path,
+        oracle_caller=_explode,
+        grade=False,
+    )
+
+    assert result.response_md == ""
+    assert (result.bundle_dir / "response.md").read_text(encoding="utf-8") == ""
+    assert result.oracle_response.model == "(ungraded)"
+    assert result.oracle_response.usage == {}
+    assert result.oracle_response.elapsed_ms == 0
+    # The investigation itself still ran and reported a verdict.
+    assert (result.sanitized_report or {}).get("verdict")
+    # Bundle keeps the standard five-file layout so downstream readers
+    # (the batch runner reads response.md unconditionally) need no special case.
+    for fname in ("response.md", "events.jsonl", "request.json", "mapping.json", "meta.json"):
+        assert (result.bundle_dir / fname).exists(), f"missing {fname}"

@@ -44,10 +44,11 @@ jobs:
       - name: pytest
         run: uv run pytest -v
 
-  # The React SPA (frontend/) — typecheck + production build so a broken UI can't
-  # land silently. No eslint config is committed yet, so `lint` is omitted.
+  # The React SPA (frontend/) — typecheck + unit tests (vitest) + production
+  # build so a broken UI can't land silently. No eslint config is committed
+  # yet, so `lint` is omitted.
   frontend:
-    name: frontend typecheck + build
+    name: frontend typecheck + test + build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -67,6 +68,9 @@ jobs:
 
       - name: typecheck
         run: npm run typecheck
+
+      - name: test
+        run: npm test
 
       - name: build
         run: npm run build

@@ -361,6 +361,39 @@ export function getEgressPolicy(): Promise<EgressPolicy> {
   return request<EgressPolicy>('/config/egress-policy');
 }
 
+// ── Quality trend (I4) — the nightly micro-eval history for the Quality card ──
+
+/** One `soc-ai eval-nightly` snapshot. `mode` labels the instrument: `graded`
+ * points carry an oracle `agreement_rate`; `local` points are zero-egress and
+ * lean on the fallback/error-rate proxies (`agreement_rate` is null there —
+ * an honest "not measured", never 0). `alarmed`/`alarm_reasons` are the
+ * regression-detector verdict persisted at write time. */
+export interface QualityPoint {
+  id: number;
+  ts: string;
+  mode: 'local' | 'graded';
+  n_ok: number;
+  n_error: number;
+  agreement_rate: number | null;
+  fallback_rate: number | null;
+  error_rate: number;
+  latency_p50_ms: number | null;
+  verdict_counts: Record<string, number>;
+  alarmed: boolean;
+  alarm_reasons: string[];
+}
+
+export interface QualityTrend {
+  /** Oldest → newest (server-ordered), ready to plot left-to-right. */
+  points: QualityPoint[];
+}
+
+/** The last 30 nightly quality snapshots (admin-gated, like the other posture
+ * read-models). Empty points = the nightly has never run on this install. */
+export function getQualityTrend(): Promise<QualityTrend> {
+  return request<QualityTrend>('/quality/trend');
+}
+
 export interface DataSource {
   id: string;
   name: string;
@@ -517,6 +550,8 @@ export interface Runbook {
   content: string; // markdown / plain text
   tags: string[];
   linked_rules: string[]; // detection rule names / UUIDs this runbook applies to
+  /** Unapproved machine-authored promotion draft — excluded from agent retrieval until approved. */
+  draft: boolean;
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -563,6 +598,40 @@ export interface StarterPackResult {
  * any pack runbook whose title already exists, so operator edits survive. */
 export function installStarterPack(): Promise<StarterPackResult> {
   return post<StarterPackResult>('/runbooks/starter-pack');
+}
+
+// ── Runbook promotion — draft org-specific runbooks from investigation history ─
+// The deployment already knows how each rule's alerts resolved here (verdicts,
+// rationales, analyst chat). Promotion distills that into a DRAFT runbook the
+// operator reviews in this page. Drafts are invisible to agent retrieval until
+// approved — nothing auto-applies.
+
+/** One rule with enough completed investigation history to distill. */
+export interface PromotableRule {
+  rule_name: string;
+  investigations: number; // completed, verdict-bearing, non-fallback
+  false_positive: number;
+  true_positive: number;
+  needs_more_info: number;
+  dominant_verdict: string;
+  last_activity: string; // ISO-8601 of the newest counted investigation
+}
+
+/** Rules promotable into a draft runbook (admin). Cheap local read. */
+export function getPromotableRules(): Promise<PromotableRule[]> {
+  return request<PromotableRule[]>('/runbooks/promotable');
+}
+
+/** Distill one rule's history into a DRAFT runbook (admin). SYNCHRONOUS —
+ * one analyst-model call, typically seconds to ~a minute; show progress. */
+export function promoteRunbook(rule_name: string): Promise<Runbook> {
+  return post<Runbook>('/runbooks/promote', { rule_name });
+}
+
+/** Approve a draft (admin): makes it retrievable by the agent and embeds it
+ * when the semantic tier is on. */
+export function approveRunbook(id: number): Promise<Runbook> {
+  return post<Runbook>(`/runbooks/${id}/approve`);
 }
 
 // ── Runbook retrieval (RAG) — the opt-in gateway semantic tier (E4.1) ──────

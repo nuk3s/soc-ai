@@ -1,17 +1,22 @@
-import { BookOpen, Eye, FileUp, Pencil, PackagePlus, Plus } from 'lucide-react';
+import { BookOpen, Eye, FileUp, History, Pencil, PackagePlus, Plus } from 'lucide-react';
 import { useMemo, useRef, useState } from 'react';
 import {
+  type PromotableRule,
   type Runbook,
   type RunbookInput,
+  approveRunbook,
   createRunbook,
   deleteRunbook,
+  getPromotableRules,
   getRunbooks,
   installStarterPack,
+  promoteRunbook,
   updateRunbook,
 } from '../lib/api';
 import { Markdown } from '../components/Markdown';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
 import { useAsync } from '../lib/useAsync';
+import { dominantVerdictLabel, formatVerdictMix } from '../lib/verdictMix';
 
 // ---------------------------------------------------------------------------
 // Runbooks — the first-class authoring space for the org's own triage
@@ -138,6 +143,20 @@ const labelCls = 'mb-1 block text-[11px] font-semibold uppercase tracking-[.06em
 const toolbarBtnCls =
   'inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-40';
 
+/** Amber DRAFT chip — a machine-authored promotion draft awaiting approval.
+ * The agent never retrieves a draft, so the badge is the "not live yet" cue. */
+function DraftChip() {
+  return (
+    <span
+      title="Drafted from investigation history — the agent will NOT cite this runbook until you approve it."
+      className="rounded px-1.5 py-0.5 text-[10px] font-bold"
+      style={{ background: '#f5a62322', color: '#f5a623' }}
+    >
+      DRAFT
+    </span>
+  );
+}
+
 /** Embed-status chip — rendered only when the semantic tier is on (non-null). */
 function EmbedChip({ rb }: { rb: Runbook }) {
   if (rb.embedded === null || rb.embedded === undefined) return null; // tier off → not applicable
@@ -179,6 +198,19 @@ export function Runbooks() {
   // One-line outcome summaries for the two bulk actions (import / pack).
   const [bulkSummary, setBulkSummary] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // ── Draft-from-history (promotion) panel state ────────────────────────────
+  // promotable: null = loading (panel open, fetch in flight); [] = none left.
+  const [promoOpen, setPromoOpen] = useState(false);
+  const [promotable, setPromotable] = useState<PromotableRule[] | null>(null);
+  const [promoError, setPromoError] = useState('');
+  // The rule whose distillation is in flight — the promote call is synchronous
+  // on the server (one model call, seconds to ~a minute), so a per-rule
+  // progress state keeps the rest of the panel honest and clickable-looking.
+  const [draftingRule, setDraftingRule] = useState<string | null>(null);
+  // Whether the runbook open in the editor is an unapproved draft — drives the
+  // DRAFT banner + Approve button. Tracked as state (not derived from the list)
+  // so a just-promoted draft shows the banner before the list refetch lands.
+  const [editingDraft, setEditingDraft] = useState(false);
 
   const runbooks: Runbook[] = useMemo(() => data ?? [], [data]);
 
@@ -199,17 +231,20 @@ export function Runbooks() {
     setActionError('');
     setDraft(EMPTY_DRAFT);
     setPreview(false);
+    setEditingDraft(false);
     setEditing('new');
   };
   const openEdit = (rb: Runbook) => {
     setActionError('');
     setDraft(toDraft(rb));
     setPreview(false);
+    setEditingDraft(rb.draft);
     setEditing(rb.id);
   };
   const cancel = () => {
     setEditing(null);
     setDraft(EMPTY_DRAFT);
+    setEditingDraft(false);
     setActionError('');
   };
 
@@ -287,12 +322,89 @@ export function Runbooks() {
     }
   };
 
+  // ── Draft from history (promotion) ──────────────────────────────────────────
+
+  const togglePromo = async () => {
+    setPromoError('');
+    if (promoOpen) {
+      setPromoOpen(false);
+      return;
+    }
+    setPromoOpen(true);
+    setPromotable(null); // loading state
+    try {
+      setPromotable(await getPromotableRules());
+    } catch (e) {
+      setPromotable([]);
+      setPromoError(e instanceof Error ? e.message : 'Failed to load promotable rules');
+    }
+  };
+
+  // One synchronous model call per click — the button shows its own spinner
+  // for the duration; success lands the draft OPEN in the editor with the
+  // DRAFT banner, and the rule leaves the list (it's now linked by a runbook).
+  const draftFromHistory = async (ruleName: string) => {
+    setDraftingRule(ruleName);
+    setPromoError('');
+    try {
+      const rb = await promoteRunbook(ruleName);
+      setPromotable((rows) => (rows ?? []).filter((r) => r.rule_name !== ruleName));
+      setNonce((n) => n + 1);
+      openEdit(rb);
+    } catch (e) {
+      setPromoError(e instanceof Error ? e.message : `Drafting failed for ${ruleName}`);
+    } finally {
+      setDraftingRule(null);
+    }
+  };
+
+  // Approve = publish: saves any pending edits FIRST (approval must publish
+  // what's on screen, not a stale draft body), then flips the flag — from that
+  // moment the agent can retrieve it (and it embeds when the RAG tier is on).
+  const approve = async () => {
+    if (typeof editing !== 'number' || !draft.title.trim()) return;
+    setBusy(true);
+    setActionError('');
+    try {
+      await updateRunbook(editing, toInput(draft));
+      await approveRunbook(editing);
+      setEditingDraft(false);
+      setNonce((n) => n + 1);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Approve failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // On lg+ the form is a flex column filling the editor pane: the content
   // field is the flex-1 middle, so the textarea/preview grow with the
   // viewport instead of a fixed 12-row box. Below lg it keeps a generous
   // min-height (55vh) and stays resizable.
   const form = (
     <div className="flex min-h-0 flex-col rounded-card border border-border bg-surface-1 p-3.5 lg:flex-1">
+      {/* DRAFT banner: visible whenever an unapproved promotion draft is open.
+          Approve is the ONLY way a draft becomes agent-retrievable. */}
+      {editingDraft && typeof editing === 'number' && (
+        <div
+          className="mb-3 flex flex-none flex-wrap items-center gap-2.5 rounded-control border px-3 py-2"
+          style={{ borderColor: 'rgba(245,166,35,.45)', background: 'rgba(245,166,35,.08)' }}
+        >
+          <DraftChip />
+          <span className="min-w-[200px] flex-1 text-[12px] leading-[1.45] text-dim">
+            Drafted from this rule's investigation history. Review and edit — the agent will
+            not cite it until you approve.
+          </span>
+          <button
+            onClick={() => void approve()}
+            disabled={busy || !draft.title.trim()}
+            className="rounded-[7px] border px-[13px] py-1.5 text-[12px] font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+            style={{ borderColor: '#f5a623', color: '#f5a623' }}
+          >
+            {busy ? 'Working…' : 'Approve'}
+          </button>
+        </div>
+      )}
       <div className="mb-3">
         <label className={labelCls}>Title</label>
         <input
@@ -427,6 +539,15 @@ export function Runbooks() {
           {busy ? <Spinner size={12} /> : <PackagePlus size={13} />}
           Load starter pack
         </button>
+        <button
+          onClick={() => void togglePromo()}
+          disabled={busy}
+          title="Turn what this deployment already learned into runbooks: rules with enough completed investigations get an AI-drafted, org-specific runbook you review and approve."
+          className={toolbarBtnCls}
+        >
+          <History size={13} />
+          Draft from history
+        </button>
         {editing === null && (
           <button onClick={openNew} disabled={busy} className={toolbarBtnCls}>
             <Plus size={13} />
@@ -434,6 +555,62 @@ export function Runbooks() {
           </button>
         )}
       </div>
+
+      {/* Draft-from-history panel: the promotable rules with per-rule Draft it.
+          Kept above the workspace so drafting flows straight into the editor. */}
+      {promoOpen && (
+        <div className="mb-3 flex-none rounded-card border border-border bg-surface-1 px-3.5 py-3">
+          <div className="mb-1.5 text-[12px] font-semibold text-text">
+            Draft a runbook from investigation history
+          </div>
+          <div className="mb-2 max-w-[720px] text-[11.5px] leading-[1.5] text-faint">
+            Rules with 3+ completed investigations and no runbook yet. Drafting distills the
+            observed verdicts, rationales and analyst chat into an org-specific draft — nothing
+            is used by the agent until you approve it.
+          </div>
+          {promoError && <div className="mb-2 text-[12px] text-danger">{promoError}</div>}
+          {promotable === null && <LoadingState />}
+          {promotable !== null && promotable.length === 0 && !promoError && (
+            <div className="py-1 text-[12.5px] text-faint">
+              Nothing to draft right now — every rule with enough history already has a runbook
+              (drafts count), or no rule has 3+ completed investigations yet.
+            </div>
+          )}
+          {(promotable ?? []).map((r) => (
+            <div
+              key={r.rule_name}
+              className="flex flex-wrap items-center gap-2.5 border-t border-border-faint py-2 first:border-t-0"
+            >
+              <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium" title={r.rule_name}>
+                {r.rule_name}
+              </span>
+              <span className="text-[11.5px] text-faint">
+                {r.investigations} investigation{r.investigations === 1 ? '' : 's'} ·{' '}
+                {formatVerdictMix(r)}
+              </span>
+              <span
+                className="rounded border border-border-strong bg-surface-3 px-1.5 py-0.5 text-[10.5px] text-dim"
+                title={`dominant verdict: ${r.dominant_verdict}`}
+              >
+                {dominantVerdictLabel(r.dominant_verdict)}
+              </span>
+              <button
+                onClick={() => void draftFromHistory(r.rule_name)}
+                disabled={busy || draftingRule !== null || editing !== null}
+                title={
+                  editing !== null
+                    ? 'Close the open editor first — the new draft opens there.'
+                    : 'Run one analyst-model call to distill this rule’s history into a draft (may take up to a minute).'
+                }
+                className={toolbarBtnCls}
+              >
+                {draftingRule === r.rule_name ? <Spinner size={12} /> : <History size={13} />}
+                {draftingRule === r.rule_name ? 'Drafting…' : 'Draft it'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {bulkSummary && (
         <div className="mb-3 flex-none rounded-control border border-border bg-surface-1 px-3 py-2 text-[12px] text-text">
@@ -504,6 +681,7 @@ export function Runbooks() {
                         <span className="truncate text-[13px] font-medium" title={rb.title}>
                           {rb.title}
                         </span>
+                        {rb.draft && <DraftChip />}
                         <EmbedChip rb={rb} />
                         <span className="text-[10.5px] text-faint">
                           updated {new Date(rb.updated_at).toLocaleString()}

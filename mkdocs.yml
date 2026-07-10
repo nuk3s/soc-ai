@@ -108,6 +108,8 @@ nav:
   - How it works:
       - Architecture: ARCHITECTURE.md
       - Safety model: SAFETY_MODEL.md
+  - Blog:
+      - Getting an LLM to show its work: blog/2026-07-getting-an-llm-to-show-its-work.md
   - Project:
       - Changelog: project/changelog.md
       - Contributing: project/contributing.md

@@ -1,6 +1,6 @@
 [project]
 name = "soc-ai"
-version = "1.0.8"
+version = "1.1.0"
 description = "Self-hosted, privacy-respecting LLM-powered triage assistant for Security Onion"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
