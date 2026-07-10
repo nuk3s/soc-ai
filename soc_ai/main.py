@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -53,7 +54,15 @@ FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 class SpaStaticFiles(StaticFiles):
     """StaticFiles that falls back to index.html on 404 so client-side
-    (BrowserRouter) deep links like /app/investigation/INV-1 resolve."""
+    (BrowserRouter) deep links like /app/investigation/INV-1 resolve.
+
+    index.html is additionally served ``Cache-Control: no-cache`` (revalidate
+    every load — NOT "don't cache"): a deploy replaces the content-hashed
+    ``/assets/*`` files, so a browser reusing a stale cached index.html points
+    at chunk filenames that no longer exist and the SPA dynamic-imports 404
+    until a hard refresh. The hashed assets themselves keep StaticFiles'
+    default ETag/Last-Modified caching.
+    """
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         try:
@@ -62,6 +71,23 @@ class SpaStaticFiles(StaticFiles):
             if exc.status_code == 404:
                 return await super().get_response("index.html", scope)
             raise
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        # Every path that ends up serving index.html funnels through here: the
+        # direct file, the html-mode directory root (/app/), and the SPA
+        # fallback above. Setting the header on the returned response also
+        # covers the 304 NotModifiedResponse branch (revalidation replies must
+        # keep carrying the policy so clients don't regress to heuristics).
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        if Path(full_path).name == "index.html":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:

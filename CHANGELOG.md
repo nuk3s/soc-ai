@@ -99,6 +99,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **An open tab now survives a redeploy.** Previously a deploy replaced the
+  app's content-hashed chunks and an already-open tab could go blank on its
+  next navigation (stale chunk → 404 → the whole page unmounted) until a hard
+  refresh. Now: a failed chunk load auto-reloads the page exactly once (never
+  loops), an error card inside the still-mounted shell backstops anything
+  else, `index.html` is served `no-cache`, and the app checks for a newer
+  build every minute (and on focus) — showing a "soc-ai was updated — reload
+  for the latest" banner instead of silently running old code.
 - **The browser E2E now actually runs in CI.** The `browser-smoke` GitHub
   Actions job referenced tests that were excluded from the public repository,
   so it failed on every run. The Playwright smoke and the demo-stack harness

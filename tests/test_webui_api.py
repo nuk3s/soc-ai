@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -5098,3 +5099,61 @@ def test_entity_graph_carries_enrichment_facts() -> None:
     assert note == (
         "ws-finance-07 contacted 3 peer(s); 1 flagged malicious by enrichment (203.0.113.9)"
     )
+
+
+# ---------------------------------------------------------------------------
+# SPA static serving (SpaStaticFiles) — index.html cache policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def spa_client(settings_kratos: Settings, tmp_path: Path) -> Iterator[TestClient]:
+    """App booted against a temp frontend dist (index.html + one hashed asset).
+
+    The real ``frontend/dist`` is absent in source checkouts (and mutates with
+    every build), so static-serving behaviour is pinned against a minimal
+    stand-in patched over ``FRONTEND_DIST``.
+    """
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<!doctype html><script type="module" src="/app/assets/index-abc123.js"></script>'
+    )
+    (dist / "assets" / "index-abc123.js").write_text("// entry")
+    with patch("soc_ai.main.FRONTEND_DIST", dist):
+        yield from _client(settings_kratos)
+
+
+def test_spa_index_html_is_no_cache(spa_client: TestClient) -> None:
+    """Every way index.html is served must say revalidate-every-load.
+
+    A deploy replaces the content-hashed chunks; a browser reusing a stale
+    cached index.html then imports dead filenames (blank page until a hard
+    refresh — a real incident). ``no-cache`` = revalidate, not don't-cache.
+    """
+    # direct hit
+    resp = spa_client.get("/app/index.html")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-cache"
+    # html-mode directory root (/app/)
+    resp = spa_client.get("/app/")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-cache"
+    # SPA fallback: a BrowserRouter deep link serves index.html too
+    resp = spa_client.get("/app/investigation/INV-1")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-cache"
+    # conditional revalidation (304) keeps carrying the policy
+    etag = spa_client.get("/app/index.html").headers["etag"]
+    resp = spa_client.get("/app/index.html", headers={"If-None-Match": etag})
+    assert resp.status_code == 304
+    assert resp.headers["cache-control"] == "no-cache"
+
+
+def test_spa_hashed_assets_keep_default_caching(spa_client: TestClient) -> None:
+    """Hashed /assets/* stay on StaticFiles' default ETag/Last-Modified policy
+    — the no-cache override is index.html-only."""
+    resp = spa_client.get("/app/assets/index-abc123.js")
+    assert resp.status_code == 200
+    assert "cache-control" not in resp.headers
+    assert "etag" in resp.headers
