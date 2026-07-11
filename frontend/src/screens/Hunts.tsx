@@ -15,6 +15,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
+import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
+import { rangeToSinceUntil } from '../lib/timeRange';
 import {
   createHuntSchedule,
   createHuntTemplate,
@@ -509,19 +511,35 @@ export function Hunts() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleteMsg, setDeleteMsg] = useState<string | null>(null);
 
+  // Time filter — same pattern as Alerts/Investigations: a preset (default 24h)
+  // or a custom from/to, held in plain component state. Unlike those screens the
+  // range feeds the FETCH (GET /hunts?since=&until= — server-side filtering);
+  // bounds are recomputed inside the loader so every 8s poll re-anchors "now".
+  const [range, setRange] = useState('24h');
+  const [custom, setCustom] = useState<CustomRange | null>(null);
+
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // whether any hunt is still running in a ref and let pauseWhen (on both polls)
   // consult it: stop polling once every hunt has reached a terminal state.
   const activeRef = useRef(false);
-  const { data, loading, error } = useAsync<HuntRow[]>(getHunts, [reloadKey], {
-    refetchInterval: 8000, // live status (running → complete) without a reload
-    pauseWhen: () => !activeRef.current,
-  });
+  const { data, loading, error } = useAsync<HuntRow[]>(
+    () => getHunts(rangeToSinceUntil(range, custom)),
+    [reloadKey, range, custom],
+    {
+      refetchInterval: 8000, // live status (running → complete) without a reload
+      pauseWhen: () => !activeRef.current,
+    },
+  );
   const stats = useAsync(getHuntStats, [reloadKey], {
     refetchInterval: 8000,
     pauseWhen: () => !activeRef.current,
   });
   activeRef.current = (data ?? []).some((h) => h.status === 'running');
+
+  // The list is server-filtered, so an empty page can't tell "no hunts at all"
+  // from "none in this window" on its own — the UNFILTERED stats total (already
+  // polled for the cards) is the signal. Stats not loaded yet → onboarding text.
+  const huntsExist = (stats.data?.find((s) => s.label === 'Hunts')?.value ?? '0') !== '0';
 
   // A hunt started elsewhere won't appear while this list is idle — force one
   // refetch when the tab regains focus.
@@ -639,6 +657,20 @@ export function Hunts() {
         {deleteMsg && <div className="mt-2 text-[12px] text-danger">{deleteMsg}</div>}
       </Panel>
 
+      {/* filter bar — same placement as Alerts/Investigations: directly above
+          the list. The stat cards above stay UNFILTERED, mirroring the
+          Investigations header counts (which ignore its time filter). */}
+      <div className="mb-3.5 flex flex-wrap items-center gap-2">
+        <TimeRangeFilter
+          value={range}
+          custom={custom}
+          onChange={(v, r) => {
+            setRange(v);
+            if (r) setCustom(r);
+          }}
+        />
+      </div>
+
       {/* hunts list */}
       <Panel>
         <div
@@ -659,8 +691,14 @@ export function Hunts() {
           <ErrorState error={error} onRetry={() => setReloadKey((k) => k + 1)} />
         ) : !data || data.length === 0 ? (
           <EmptyState>
-            No hunts yet. Describe one above — try &ldquo;look for hosts beaconing to rare external
-            IPs&rdquo;.
+            {huntsExist ? (
+              'No hunts in this window — widen the time range above.'
+            ) : (
+              <>
+                No hunts yet. Describe one above — try &ldquo;look for hosts beaconing to rare
+                external IPs&rdquo;.
+              </>
+            )}
           </EmptyState>
         ) : (
           data.map((h) => (

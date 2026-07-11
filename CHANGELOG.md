@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
+## [Unreleased]
+
+### Fixed
+
+- **Hunts that hit their exploration budget now produce the partial report
+  instead of erroring.** Exhausting the tool-call budget always left the
+  transcript ending in unexecuted tool calls, which the partial-report
+  synthesizer refused to replay — every budget-capped hunt errored and its
+  gathered evidence was discarded. The transcript tail is now repaired (each
+  unexecuted call closed out as "not executed — hunt budget exhausted") before
+  synthesis. The default hunt budget was also raised from 60 to 90 tool calls
+  to match current model behavior — the 2026-07-08 inference-engine change
+  roughly doubled per-hunt tool appetite, making the old cap a wall every
+  hunt hit.
+
 ## [1.1.0] - 2026-07-10
 
 The measurement release. 1.0.8 built the honesty machinery; 1.1.0 makes it

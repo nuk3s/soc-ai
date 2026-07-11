@@ -146,11 +146,25 @@ async def list_recent(
     *,
     status: str | None = None,
     limit: int = 100,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[Hunt]:
-    """Return hunts ordered by created_at desc, with optional status filter."""
+    """Return hunts ordered by created_at desc, with optional status filter.
+
+    ``since``/``until`` bound ``created_at`` INCLUSIVELY on both ends
+    (``since <= created_at <= until``) — matching the frontend's ``inRange``
+    inclusive ``[from, to]`` (lib/timeRange.ts) and the store's inclusive
+    lower-bound convention (``created_at >= cutoff``). Bounds must be naive
+    UTC, like every stored timestamp (:func:`soc_ai.store.auth.utcnow`).
+    Absent bounds keep the original unbounded behavior.
+    """
     q = select(Hunt).order_by(Hunt.created_at.desc(), Hunt.id.desc())
     if status is not None:
         q = q.where(Hunt.status == status)
+    if since is not None:
+        q = q.where(Hunt.created_at >= since)
+    if until is not None:
+        q = q.where(Hunt.created_at <= until)
     q = q.limit(limit)
     return list((await db.scalars(q)).all())
 

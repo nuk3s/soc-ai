@@ -28,6 +28,26 @@ export function inRange(ts: string | undefined, range: string, custom?: CustomRa
   return t >= from && t <= to;
 }
 
+/** Convert the selected range to the hunts API's `since`/`until` ISO params.
+ * Presets ("last 24h") send only `since` — the upper edge is implicitly "now",
+ * and sending a client-clock `until` could exclude a row the server creates a
+ * moment later (clock skew). Custom sends both edges (inclusive, matching
+ * `inRange`'s [from, to]). */
+export function rangeToSinceUntil(
+  range: string,
+  custom?: CustomRange | null,
+  now = Date.now(),
+): { since: string; until?: string } {
+  if (range === 'custom' && custom?.from && custom?.to) {
+    return {
+      since: new Date(custom.from).toISOString(),
+      until: new Date(custom.to).toISOString(),
+    };
+  }
+  const { from } = rangeBounds(range, custom, now);
+  return { since: new Date(from).toISOString() };
+}
+
 /** Format an ISO timestamp as a readable absolute LOCAL time ("Jul 06, 2026,
  * 14:23:05"). Falls back to the raw string when unparseable, '—' when empty. */
 export function absTime(iso?: string | null): string {

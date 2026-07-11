@@ -316,14 +316,39 @@ def _build_hunt_timeline(events: list[HuntEvent]) -> list[TimelineStepOut]:
     return timeline
 
 
+def _naive_utc(dt: datetime | None) -> datetime | None:
+    """Normalize an (optionally tz-aware) query datetime to naive UTC.
+
+    Stored timestamps are naive UTC (``store.auth.utcnow``); comparing them
+    against a tz-aware bound is wrong on Postgres and undefined on SQLite
+    (string-compared), so convert to UTC and strip the offset first.
+    """
+    if dt is None or dt.tzinfo is None:
+        return dt
+    return dt.astimezone(UTC).replace(tzinfo=None)
+
+
 @router.get("/hunts", response_model=list[HuntRowOut])
 async def list_hunts(
-    request: Request, status: str | None = None, limit: int = 100
+    request: Request,
+    status: str | None = None,
+    limit: int = 100,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[HuntRowOut]:
+    """Hunt rows, newest first. ``since``/``until`` (ISO datetimes) bound
+    ``created_at`` inclusively on both ends; absent params keep the original
+    unbounded behavior. An unparseable datetime is a 422 (FastAPI-validated)."""
     if status not in (None, "running", "complete", "error", "cancelled", "interrupted"):
         status = None
     async with request.app.state.db_sessionmaker() as db:
-        rows = await hunt_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
+        rows = await hunt_svc.list_recent(
+            db,
+            status=status,
+            limit=min(max(limit, 1), 500),
+            since=_naive_utc(since),
+            until=_naive_utc(until),
+        )
         chat_counts = await hunt_svc.chat_counts_for(db, [h.id for h in rows])
     return [_hunt_row(h, chat_counts.get(h.id, 0)) for h in rows]
 

@@ -188,8 +188,17 @@ export async function downloadInvestigationExport(invId: string): Promise<void> 
 // the detail live (mirrors the investigation-hunt flow).
 // ---------------------------------------------------------------------------
 
-export function getHunts(): Promise<HuntRow[]> {
-  return request<HuntRow[]>('/hunts');
+export interface HuntsQuery {
+  since?: string; // ISO datetime — inclusive lower bound on created_at
+  until?: string; // ISO datetime — inclusive upper bound on created_at
+}
+
+export function getHunts(query: HuntsQuery = {}): Promise<HuntRow[]> {
+  const p = new URLSearchParams();
+  if (query.since) p.set('since', query.since);
+  if (query.until) p.set('until', query.until);
+  const qs = p.toString();
+  return request<HuntRow[]>('/hunts' + (qs ? `?${qs}` : ''));
 }
 
 export function getHuntStats(): Promise<HuntStat[]> {

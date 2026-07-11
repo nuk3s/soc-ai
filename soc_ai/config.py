@@ -450,7 +450,12 @@ class Settings(BaseSettings):
     # Hunts explore FAR more broadly than a single-alert investigation (many hosts,
     # many queries, cross-time correlation), so they get a bigger budget — otherwise
     # the agent runs out of requests before it can synthesize its findings report.
-    hunt_tool_calls_limit: int = 60
+    # 60 → 90 on 2026-07-10: the 2026-07-08 inference-engine change moved measured
+    # per-hunt tool appetite from a median of ~29 calls to ~55-60, so at 60 the
+    # budget was a wall EVERY hunt hit (4/4 prod hunts capped that night). 90
+    # restores the pre-swap headroom ratio (~1.5x the median appetite); a hunt
+    # that still hits it lands a partial report via the synthesizer, not an error.
+    hunt_tool_calls_limit: int = 90
     hunt_request_limit: int = 45
 
     synthesizer_temperature: float = 0.2

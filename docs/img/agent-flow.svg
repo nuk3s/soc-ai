@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <!--
+    Investigation pipeline — "how a verdict gets made"
+    Layout sketch:
+      title row (y~34)
+      dashed EGRESS GUARD boundary enclosing everything (x22..878, y56..518),
+        label pill straddling the bottom edge
+      row 1 (y76..280): 1 Alert in  ->  2 Deterministic pass  ->  3 Synthesis
+      elbow connector from card 3 bottom down into row 2
+      row 2 (y308..492): 4 GATES (wide, amber, the centerpiece)  ->  5 Verdict out
+    Verified against soc_ai/agent/orchestrator.py (_run_synth_first_pipeline,
+    _synth_failure_fallback_report, maybe_auto_ack_fp), gates.py
+    (_resolve_citations, _citation_confidence_cap, verdict floor rewrite),
+    egress_guard.py (fail-closed check_or_raise), toolset.py (tool names),
+    decision_templates.py (blocklist_hit template, CandidateVerdict).
+  -->
+  <defs>
+    <style>
+      .card { fill: #0e1117; stroke: #1b2230; stroke-width: 1; }
+      .lbl  { fill: #8b94a3; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+      .h    { fill: #e6e9ef; font-size: 15px; font-weight: 600; }
+      .t    { fill: #b6becb; font-size: 12.5px; }
+      .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size: 11.5px; fill: #9fb2d6; }
+      .dim  { fill: #6b7482; font-size: 11.5px; }
+      .pill { font-size: 10px; font-weight: 700; letter-spacing: .05em; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#2c5fd0"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="900" height="560" rx="14" fill="#080a0e"/>
+
+  <!-- title -->
+  <circle cx="34" cy="34" r="6" fill="#4b8bf5"/>
+  <text x="50" y="38" class="h" font-size="16">Investigation Pipeline</text>
+  <text x="236" y="38" class="dim">how a verdict gets made — deterministic first, model second, gates always</text>
+
+  <!-- egress guard boundary -->
+  <rect x="22" y="56" width="856" height="462" rx="12" fill="none" stroke="#2f6b45" stroke-width="1.2" stroke-dasharray="6 5"/>
+  <rect x="240" y="508" width="420" height="20" rx="10" fill="#0f2417" stroke="#1f5133" stroke-width="1"/>
+  <text x="450" y="522" text-anchor="middle" class="pill" fill="#3fb950">EGRESS GUARD — NOTHING LEAVES WITHOUT CONSENT · FAIL-CLOSED</text>
+
+  <!-- Stage 1: alert in -->
+  <rect class="card" x="36" y="76" width="250" height="204" rx="12"/>
+  <text x="56" y="104" class="lbl">1 · Alert in</text>
+  <text x="56" y="130" class="t">Pivot + enrich the alert,</text>
+  <text x="56" y="148" class="t">before any model runs:</text>
+  <text x="56" y="172" class="mono">▸ events via OQL</text>
+  <text x="56" y="190" class="mono">▸ host history</text>
+  <text x="56" y="208" class="mono">▸ blocklists · GeoIP · ASN</text>
+  <text x="56" y="246" class="dim">All local reads. This bundle is</text>
+  <text x="56" y="264" class="dim">the evidence later stages cite.</text>
+
+  <!-- arrow 1 -->
+  <line x1="292" y1="178" x2="317" y2="178" stroke="#2c5fd0" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Stage 2: deterministic pass -->
+  <rect class="card" x="325" y="76" width="250" height="204" rx="12"/>
+  <text x="345" y="104" class="lbl">2 · Deterministic pass</text>
+  <text x="345" y="130" class="t">Decision templates match</text>
+  <text x="345" y="148" class="t">the bundle → candidate:</text>
+  <rect x="345" y="160" width="210" height="56" rx="10" fill="#11161e" stroke="#233043" stroke-width="1"/>
+  <text x="359" y="184" class="mono">blocklist_hit →</text>
+  <text x="359" y="202" class="mono">true_positive (0.70)</text>
+  <text x="345" y="246" class="dim">No model yet — a hint the</text>
+  <text x="345" y="264" class="dim">synthesis must verify.</text>
+
+  <!-- arrow 2 -->
+  <line x1="581" y1="178" x2="606" y2="178" stroke="#2c5fd0" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Stage 3: model synthesis -->
+  <rect class="card" x="614" y="76" width="250" height="204" rx="12"/>
+  <text x="634" y="104" class="lbl">3 · Synthesis</text>
+  <rect x="760" y="90" width="84" height="18" rx="9" fill="#0f2417" stroke="#1f5133" stroke-width="1"/>
+  <text x="802" y="103" text-anchor="middle" class="pill" fill="#3fb950">READ-ONLY</text>
+  <text x="634" y="130" class="t">Self-hosted LLM via your</text>
+  <text x="634" y="148" class="t">gateway; digs when unsure:</text>
+  <text x="634" y="172" class="mono">▸ t_query_events_oql</text>
+  <text x="634" y="190" class="mono">▸ t_host_summary</text>
+  <text x="634" y="208" class="mono">▸ t_lookup_runbook</text>
+  <text x="634" y="226" class="mono">▸ t_get_pcap</text>
+  <text x="634" y="246" class="dim">Memory recall = context,</text>
+  <text x="634" y="264" class="dim">never evidence.</text>
+
+  <!-- elbow connector: stage 3 down into the gates -->
+  <path d="M739 280 L739 294 L316 294 L316 301" fill="none" stroke="#2c5fd0" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Stage 4: GATES (centerpiece) -->
+  <rect x="36" y="308" width="560" height="184" rx="12" fill="#0e1117" stroke="#9a7412" stroke-width="1.5"/>
+  <text x="56" y="336" class="lbl" fill="#e3a008">4 · Gates</text>
+  <rect x="378" y="322" width="198" height="18" rx="9" fill="#241c06" stroke="#6b520f" stroke-width="1"/>
+  <text x="477" y="335" text-anchor="middle" class="pill" fill="#e3a008">DETERMINISTIC · ALWAYS RUNS</text>
+
+  <circle cx="60" cy="364" r="4" fill="#e3a008"/>
+  <text x="74" y="368" class="t">Citation doesn't resolve to tool evidence</text>
+  <text x="340" y="368" class="mono" fill="#e3a008">→ confidence capped</text>
+
+  <circle cx="60" cy="394" r="4" fill="#f0522f"/>
+  <text x="74" y="398" class="t">No resolvable evidence at all</text>
+  <text x="340" y="398" class="mono" fill="#f0522f">→ verdict: needs_more_info</text>
+
+  <circle cx="60" cy="424" r="4" fill="#e5534b"/>
+  <text x="74" y="428" class="t">Model fails — crash, timeout, bad output</text>
+  <text x="340" y="428" class="mono" fill="#e5534b">→ labeled pipeline fallback</text>
+
+  <line x1="56" y1="446" x2="576" y2="446" stroke="#1b2230" stroke-width="1"/>
+  <text x="56" y="468" class="dim">Code, not the model, gets the last word — failure is never dressed up.</text>
+
+  <!-- arrow 4 -->
+  <line x1="604" y1="400" x2="624" y2="400" stroke="#2c5fd0" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Stage 5: verdict out -->
+  <rect class="card" x="632" y="308" width="232" height="184" rx="12"/>
+  <text x="652" y="336" class="lbl">5 · Verdict out</text>
+
+  <circle cx="656" cy="358" r="4" fill="#3fb950"/>
+  <text x="668" y="362" class="t">verdict + confidence</text>
+  <circle cx="656" cy="380" r="4" fill="#4b8bf5"/>
+  <text x="668" y="384" class="t">citations you can check</text>
+
+  <line x1="652" y1="400" x2="844" y2="400" stroke="#1b2230" stroke-width="1"/>
+
+  <text x="652" y="424" class="dim">RECOMMENDED ACTIONS</text>
+  <text x="652" y="442" class="t">advisory — you execute</text>
+  <text x="652" y="464" class="dim">one opt-in exception:</text>
+  <text x="652" y="480" class="dim">audited FP auto-ack</text>
+</svg>

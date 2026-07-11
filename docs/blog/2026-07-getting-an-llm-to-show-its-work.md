@@ -1,74 +1,111 @@
 # Getting an LLM to show its work
 
-*July 2026*
+*2026-07-10*
 
-During an eval run a few days ago, my own software refused to do what I built it to do. It was right.
+I built [soc-ai](https://github.com/nuk3s/soc-ai) because I wanted an LLM
+triaging my Security Onion alerts and I wasn't willing to ship my network's
+hostnames, usernames, and traffic to someone else's cloud to get it. That's
+the whole origin story. Alert triage is the most repetitive, most
+LLM-shaped job in a SOC, and it's also the job that touches the most
+sensitive data you have. Every commercial offering resolves that tension in
+the vendor's favor. I resolved it in mine: the model runs on my hardware, the
+data stays on my network, and the code is Apache-2.0 so it can be yours too.
 
-soc-ai has one optional cloud path: the Oracle, a second opinion on hard alerts. It's off by default, and when you do turn it on, everything that leaves is sanitized first — internal hostnames, usernames, and IPs replaced before the prompt goes anywhere. Behind the sanitizer sits a second, dumber check: an egress gate whose only job is to look at the sanitizer's *output* and refuse to send it if anything internal-looking survived. Fail closed. No retry with fingers crossed. Just stop.
+There was a second reason, and it's the one that shaped the architecture: an
+LLM that triages alerts will sometimes be wrong, and a wrong verdict
+presented confidently is worse than no verdict at all. So the real design
+problem wasn't "get a model to write verdicts." It was **"make it impossible
+for a verdict to look better than the evidence behind it."**
 
-Mid-eval, the gate stopped. It had found a hostname in a supposedly clean prompt: a DNS-SD service record, one of those underscore-led mDNS names shaped like `_aaplcache._tcp.<your-suffix>` (an Apple content-cache advertisement). My redaction regex had a mental picture of what a hostname looks like, and labels starting with underscores weren't in it. That form had walked past redaction at every layer.
+## How it works
 
-So far, the system working as designed — a fail-closed check catching a real leak class before it left the building. The uncomfortable part came when I dug into *why* the gate had seen it at all. The detector flagged the name by accident: a JSON-escaping quirk happened to make the string visible to it. A sibling form of the same name would have gone through silently. And the bug wasn't new. It had been there through every eval I'd run before that day. All of them passed.
+![The investigation pipeline: enrichment, deterministic pass, synthesis, gates, verdict — inside a fail-closed egress boundary](../img/agent-flow.svg)
 
-The fix was not a cleverer regex; regexes are how I got into this. The fix was a property test: 640 generated combinations of leading labels, middle labels, suffixes, and surrounding context, pinning one invariant — **anything the detector flags, the replacer must already have caught**. The detector and the replacer are two separate pieces of code with two separate pictures of "hostname," and they can no longer drift apart without CI going red.
+An alert comes in and gets enriched before any model is involved: related
+events pulled by query, the host's recent history, indicators checked against
+local threat intel — blocklists, GeoIP, ASN. All local reads. This bundle
+matters because it's the only thing later stages are allowed to cite.
 
-Two things I keep from that day. Fail-closed design saved me from my own regex. And "it passed the evals" is a claim about the evals, not about the system.
+Then a deterministic pass runs decision templates against the bundle. A
+blocklist hit on the destination of a critical-severity alert produces a
+candidate verdict with no model involved. The model's job is to verify or
+overturn that hint, not to freestyle.
 
-## The problem I'm actually solving
+Synthesis is where the LLM works — a model you host, reached through your
+OpenAI-compatible gateway. When it's unsure, it digs: querying events,
+summarizing hosts, checking rule prevalence, looking up your runbooks,
+pulling packets off the sensor. Every tool is read-only. If investigation
+memory is enabled, it also sees prior verdicts and past analyst chats for
+similar alerts — injected as *context, never evidence*, because an analyst's
+old opinion shouldn't be citable proof of anything.
 
-[soc-ai](https://github.com/nuk3s/soc-ai) is self-hosted LLM triage for Security Onion. It reads the alerts on your grid, pulls the related events and the host's recent history, runs the indicators through local threat intel, decodes packets off the sensor when the payload matters, and writes a verdict with a confidence number and the reasoning that got it there. The reasoning runs on a model *you* host, behind an OpenAI-compatible gateway. By default nothing about your network leaves it. Apache-2.0, no meter, no phone-home.
+Then the gates, which are the point of the whole system. They're code, not
+model, and they always run:
 
-Alert triage is the one job in a SOC that LLMs are genuinely good at, and the one place you least want to ship data to someone else's cloud — because an alert queue is the most sensitive map of your network that exists: hostnames, usernames, internal IPs, which servers talk to which at 3 a.m. That tension is why this project exists.
+- A verdict that cites evidence which doesn't resolve to an actual tool
+  result gets its confidence capped.
+- A damning verdict with no resolvable evidence at all becomes
+  `needs_more_info`.
+- A model failure — crash, timeout, malformed output — produces a verdict
+  **labeled as a pipeline fallback**. The UI shows a distinct chip. The
+  accuracy dashboard excludes it. It is never dressed up as the model's work.
 
-But self-hosting only removes one trust problem. The other one is the model itself.
+What comes out: a verdict, a confidence number, and citations you can click.
+Write actions — acknowledge, escalate, comment — are recommendations you
+execute. The one exception is an opt-out auto-acknowledge for
+high-confidence, low-stakes false positives, and every one of those is
+audited.
 
-## An analyst you can't fully trust
-
-Language models are confidently wrong in a way human junior analysts are not. A junior analyst who's guessing usually looks like they're guessing. A model that's guessing writes three paragraphs of assured, well-structured rationale citing events it never looked at. If that's going in front of a security team, "we prompt it to be careful" is not a control. A prompt is a request; a gate is a guarantee.
-
-So most of what makes soc-ai worth using is deterministic code that sits outside the model and assumes it lies:
-
-- **A verdict has to cite tool-call evidence, or a gate downgrades it.** If the model calls something a false positive but the investigation record holds no evidence behind that call, code — not another prompt — forces the verdict down to "needs more info" and logs why. The model doesn't get to say "trust me."
-
-- **When the pipeline fails, the UI says so.** If the model errors out or produces something unusable mid-investigation, the result is labelled *pipeline fallback* — its own chip in the queue, filterable. It was tempting to call these "preliminary assessments." They're fallbacks. The label says fallback.
-
-- **Unfit models get caught at the door.** `soc-ai doctor` probes the configured analyst model for actual fitness for this job — not "does it respond," but whether it can drive tools and produce a valid verdict at the context sizes triage needs. That check exists because I burned an afternoon on a model that chatted beautifully and could not emit a well-formed verdict to save its life. It would have produced garbage silently in production; instead it fails loudly at setup.
-
-- **The gates themselves are regression-tested.** A golden harness replays realistic alerts through the real pipeline in CI using scripted model doubles — a fake model that plays its part from a script — and asserts not just the final verdict but *which gates fired*. If a refactor quietly disarms the evidence gate, the build fails.
-
-- **The trust boundary is inspectable.** The console has an egress policy page, and redaction previews that show the original next to the sanitized version with every changed span highlighted. You don't have to take my word for what would leave your network; you can look at it, on your own data, before you enable anything.
-
-## The features that aren't there
-
-The strongest claims I can make about soc-ai are about things I measured and then refused to ship on.
-
-Self-consistency voting — sample the verdict several times, take the majority — is a popular reliability trick, and I had it built and ready. Measured on 32 real alerts from my own queue: zero split votes. Not one disagreement for the vote to resolve. What it did reliably produce was 18% more latency. It ships off (`verdict_consistency_samples = 1`), and the A/B writeup lives in the repo.
-
-A starter pack of generic SOC runbooks — beaconing, brute force, DNS tunneling, the classics — measured as zero effect on verdicts. No verdict flips across paired alerts; agreement moved from 0.89 to 0.90, which is noise. Generic knowledge doesn't move a model that already knows what beaconing is. Your knowledge is different: which hosts are known-benign, how your team actually tunes each rule class. So the product now distills your own investigation history into org-specific draft runbooks — once a rule has a few completed investigations behind it, you get a one-click draft grounded in what actually happened on your network.
-
-And investigation memory — letting the agent see prior verdicts on similar alerts — sounds obviously useful, and is also exactly the shape of anchoring bias: yesterday's "false positive" whispering in today's ear. It ships off. I have an A/B running right now to measure the anchoring effect before it earns a default.
-
-The pattern behind all three: every feature that defaults on is something an operator has to trust without having chosen it. I measure first.
+Around all of it sits the egress guard. By default nothing leaves your
+network. If you opt into the cloud second-opinion path, everything outbound
+goes through a reversible redaction tunnel, and a separate fail-closed check
+inspects the sanitizer's *output* — if anything internal survived, the send
+is refused. That check earned its keep last week: it refused a real prompt
+because an mDNS service name had slipped past my redaction regex. The
+refusal was the system working; the investigation that followed found and
+fixed the regex, and the invariant is now pinned by a 640-case property
+test. My own gate caught my own bug before it became a leak.
 
 ## What it runs on
 
-My lab runs soc-ai against DeepSeek-V4-Flash with a 1M-token context window, served from a two-node NVIDIA DGX Spark (GB10) cluster behind LiteLLM. Two years ago that sentence would have been science fiction for a home lab, and it's the part of this story I find most hopeful: capable open-weight models on hardware you own are no longer exotic, which is what makes "zero egress by default" a real design decision rather than a compliance checkbox.
+My deployment: **DeepSeek-V4-Flash** (1M context) on a two-node **NVIDIA DGX
+Spark** cluster, behind a **LiteLLM** gateway, against a **Security Onion
+3.0** grid. But nothing in soc-ai knows or cares about that stack — it talks
+to any OpenAI-compatible endpoint, so an Ollama box, a llama.cpp server, or
+vLLM on a spare GPU all work. There's a model-fitness probe that tells you
+up front whether the model you picked can actually do the job, because I
+learned the hard way that an unfit model fails *silently* — every verdict
+quietly becomes a fallback.
 
-Nothing in soc-ai assumes my hardware, though. It talks to whatever your OpenAI-compatible gateway serves, lets you pick from the gateway's live model list at setup, and the doctor tells you honestly whether the model you picked is up to the job.
+The app itself is one Docker container with SQLite inside. `setup.sh` checks
+your Security Onion and gateway connections before it builds anything, so a
+wrong password fails in seconds. On a bare Rocky Linux box, clone to healthy
+container took me 43 seconds this week. `soc-ai doctor` diagnoses the whole
+dependency surface in one command when something's off.
 
-The rest is the unglamorous kind of engineering: 2,466 tests at 84% coverage, a Playwright end-to-end run against a seeded demo in CI, a nightly micro-eval that tracks verdict quality over time and alarms on regressions, WAL-safe backups you can take while it runs, and a console that has grown to about thirty screens. A setup script walks you through install and checks your connections before it builds anything, so a wrong password fails in seconds rather than after a build. I re-ran the whole install from a bare Rocky Linux box this week, pretending to be an analyst with twenty minutes of patience: clone to healthy container in under a minute once Docker was on.
+## Measured, not promised
 
-## Try it
+Claims about LLM systems are cheap, so soc-ai measures itself. A nightly
+micro-eval runs real alerts through the pipeline and trends verdict quality
+on the dashboard — if an engine swap quietly degrades verdicts, a sparkline
+bends and an alarm fires. And when the data says a feature isn't worth it, it
+stays off: majority-vote self-consistency measured as pure cost (zero split
+votes across 32 real alerts, +18% latency) — off. Generic runbook packs
+measured as zero effect on verdicts — so instead, soc-ai distills *your own
+investigation history* into draft runbooks you approve. Negative results are
+results.
 
-If you run Security Onion and can serve a model, you can point this at your own queue today:
+2,466 tests, 84% coverage, a Playwright end-to-end run in CI, and every
+number in this post checked against the repo before publishing.
+
+## Get it
 
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
-./setup.sh --prebuilt
+./setup.sh
 ```
 
-Repo: [github.com/nuk3s/soc-ai](https://github.com/nuk3s/soc-ai) · Docs: [nuk3s.github.io/soc-ai](https://nuk3s.github.io/soc-ai/)
-
-If the egress gate ever refuses you, go look at why. Mine was right.
-
-It's free, it's Apache-2.0, and it's yours.
+Free, Apache-2.0, no meter, no phone-home:
+[github.com/nuk3s/soc-ai](https://github.com/nuk3s/soc-ai). If you run
+Security Onion, it will triage your queue with a model you own — and when it
+can't defend a verdict, it will tell you that too.

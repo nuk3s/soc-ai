@@ -32,6 +32,7 @@ from soc_ai.api.hunt_runner import hunt_recorded_run, run_hunt
 from soc_ai.config import Settings
 from soc_ai.main import create_app
 from soc_ai.store import hunts as hunt_svc
+from soc_ai.store.models import Hunt
 
 # A valid HuntReport the TestModel emits as the agent's structured output.
 FAKE_REPORT = HuntReport(
@@ -167,20 +168,70 @@ def test_run_hunt_streams_report(settings_kratos: Settings) -> None:
     assert done_ev.payload["finding_count"] == 1
 
 
+def _dangling_batch_response() -> Any:
+    """A ModelResponse ending in an UNEXECUTED tool-call batch — the exact tail a
+    budget-exhausted hunt leaves behind (pydantic-ai raises UsageLimitExceeded
+    after the response lands in history but before its calls execute; prod
+    batches ran ~3 calls)."""
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+
+    return ModelResponse(
+        parts=[
+            TextPart(content="Pivoting: querying three hosts for beacon cadence."),
+            ToolCallPart(tool_name="t_query_events_oql", args={"q": "a"}, tool_call_id="c1"),
+            ToolCallPart(tool_name="t_query_events_oql", args={"q": "b"}, tool_call_id="c2"),
+            ToolCallPart(tool_name="t_query_events_oql", args={"q": "c"}, tool_call_id="c3"),
+        ]
+    )
+
+
+def _capturing_synth_model(narrative: str, seen: list[Any]) -> Any:
+    """A FunctionModel synthesizer that records the messages it was shown and
+    returns a valid HuntReport via the output tool."""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    def _fn(messages: list[Any], info: AgentInfo) -> Any:
+        seen.append(list(messages))
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"narrative": narrative, "findings": [], "confidence": 0.2},
+                )
+            ]
+        )
+
+    return FunctionModel(_fn)
+
+
 def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: Settings) -> None:
     """When a hunt exhausts its budget mid-run, the runner synthesizes a PARTIAL
-    report from what it gathered instead of erroring with nothing — the live
-    25-minute-then-error failure mode."""
+    report from what it gathered instead of erroring with nothing — running the
+    REAL ``_synthesize_partial_hunt`` (no mock) against a transcript that ends in
+    dangling tool calls, exactly as pydantic-ai leaves it (UsageLimitExceeded is
+    raised AFTER the tool-call ModelResponse lands in history but BEFORE the
+    calls execute). Pre-fix, the replay died with UserError "Cannot provide a new
+    user prompt when the message history contains unprocessed tool calls" and the
+    hunt errored — 4/4 prod hunts on 2026-07-08."""
     from types import SimpleNamespace
 
     from pydantic_ai.exceptions import UsageLimitExceeded
-    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
 
     class _BudgetRun:
         result = None
 
         def __init__(self) -> None:
-            self._yielded = False
+            self._nodes = iter(
+                [
+                    SimpleNamespace(
+                        model_response=None,
+                        request=ModelRequest(parts=[UserPromptPart(content="hunt for beaconing")]),
+                    ),
+                    SimpleNamespace(model_response=_dangling_batch_response(), request=None),
+                ]
+            )
 
         async def __aenter__(self) -> _BudgetRun:
             return self
@@ -192,31 +243,26 @@ def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: 
             return self
 
         async def __anext__(self) -> Any:
-            if not self._yielded:
-                self._yielded = True  # one live step, then the budget runs out
-                return SimpleNamespace(
-                    model_response=ModelResponse(parts=[TextPart(content="ran a query")]),
-                    request=None,
-                )
-            raise UsageLimitExceeded("request_limit exceeded")
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                # the batch above was never executed — the budget ran out first
+                raise UsageLimitExceeded("tool_calls_limit exceeded") from None
 
     class _BudgetAgent:
         def iter(self, *a: Any, **k: Any) -> _BudgetRun:
             return _BudgetRun()
 
-    partial = HuntReport(narrative="partial — hunt was cut short", findings=[], confidence=0.2)
+    seen: list[Any] = []
 
     async def _go() -> list[Any]:
         events = []
         with (
             patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_BudgetAgent()),
+            # The REAL _synthesize_partial_hunt runs; only the model is a double.
             patch(
                 "soc_ai.api.hunt_runner.build_investigator_model",
-                return_value=TestModel(call_tools=[]),
-            ),
-            patch(
-                "soc_ai.api.hunt_runner._synthesize_partial_hunt",
-                AsyncMock(return_value=SimpleNamespace(output=partial)),
+                return_value=_capturing_synth_model("partial — hunt was cut short", seen),
             ),
         ):
             async for ev in run_hunt(_ctx(settings_kratos), objective="hunt for beaconing"):
@@ -225,7 +271,7 @@ def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: 
 
     events = asyncio.run(_go())
     kinds = [e.kind for e in events]
-    # A report was produced (from partial synthesis), NOT a bare error.
+    # A report was produced (from real partial synthesis), NOT a bare error.
     assert "hunt_report" in kinds
     assert kinds[-1] == "done"
     assert "error" not in kinds
@@ -233,6 +279,84 @@ def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: 
     assert report_ev.payload["narrative"] == "partial — hunt was cut short"
     # the operator-visible note about the partial synthesis was emitted
     assert any("partial report" in str(e.payload) for e in events)
+    # The synthesizer model saw the REPAIRED transcript: one synthetic
+    # ToolReturnPart per dangling call, plus the model's final reasoning intact.
+    assert len(seen) == 1
+    flat_parts = [p for msg in seen[0] for p in msg.parts]
+    synthetic = [
+        p
+        for p in flat_parts
+        if isinstance(p, ToolReturnPart) and p.content == "not executed — hunt budget exhausted"
+    ]
+    assert {p.tool_call_id for p in synthetic} == {"c1", "c2", "c3"}
+    assert any(
+        getattr(p, "content", None) == "Pivoting: querying three hosts for beacon cadence."
+        for p in flat_parts
+    )
+
+
+def test_synthesize_partial_hunt_trims_malformed_tail(settings_kratos: Settings) -> None:
+    """Defensive path: a trailing ModelResponse the repair can't read (simulating
+    message-class drift after a pydantic-ai bump) is TRIMMED off rather than
+    crashing — the synthesizer still lands a partial report from the rest."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+    from soc_ai.api.hunt_runner import _synthesize_partial_hunt
+
+    # An UN-initialized ModelResponse: isinstance passes but .parts raises.
+    malformed = ModelResponse.__new__(ModelResponse)
+    gathered: list[Any] = [
+        ModelRequest(parts=[UserPromptPart(content="hunt for beaconing")]),
+        ModelResponse(parts=[TextPart(content="queried host inventory")]),
+        malformed,
+    ]
+
+    seen: list[Any] = []
+    with patch(
+        "soc_ai.api.hunt_runner.build_investigator_model",
+        return_value=_capturing_synth_model("partial — tail trimmed", seen),
+    ):
+        result = asyncio.run(
+            _synthesize_partial_hunt(
+                _ctx(settings_kratos), objective="hunt for beaconing", gathered=gathered
+            )
+        )
+
+    assert result.output.narrative == "partial — tail trimmed"
+    # The malformed tail was dropped from what the model replayed; the good
+    # transcript (and the caller's gathered list) survived intact.
+    assert len(seen) == 1
+    # identity check — dataclass __eq__ on the un-initialized instance raises
+    assert all(m is not malformed for m in seen[0])
+    assert gathered[-1] is malformed  # never mutated in place
+    flat = [getattr(p, "content", None) for msg in seen[0] for p in msg.parts]
+    assert "queried host inventory" in flat
+
+
+def test_dangling_history_replay_raises_without_repair(settings_kratos: Settings) -> None:
+    """Regression anchor for the pre-fix failure mode: replaying a transcript
+    that ends in unprocessed tool calls DIRECTLY (no tail repair) is rejected by
+    pydantic-ai with UserError — proving ``_repair_dangling_tool_calls`` is what
+    saves the partial-report path, not a behavior change in the library."""
+    from pydantic_ai.exceptions import UserError
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+    from pydantic_ai.usage import UsageLimits
+    from soc_ai.agent.hunt import build_hunt_synthesizer
+
+    synth = build_hunt_synthesizer(
+        _capturing_synth_model("never reached", []), objective="hunt for beaconing"
+    )
+    dangling_history: list[Any] = [
+        ModelRequest(parts=[UserPromptPart(content="hunt for beaconing")]),
+        _dangling_batch_response(),
+    ]
+    with pytest.raises(UserError, match="unprocessed tool calls"):
+        asyncio.run(
+            synth.run(
+                "Write the HuntReport now from the evidence already gathered above.",
+                message_history=dangling_history,
+                usage_limits=UsageLimits(request_limit=3, tool_calls_limit=0),
+            )
+        )
 
 
 def test_run_hunt_wall_clock_timeout_synthesizes_partial_report(
@@ -447,6 +571,68 @@ def test_list_and_get_hunt(client: TestClient) -> None:
 def test_get_hunt_not_found(client: TestClient) -> None:
     resp = client.get("/api/v1/hunts/does-not-exist")
     assert resp.status_code == 404
+
+
+def _set_created_at(client: TestClient, hunt_id: str, when: datetime) -> None:
+    """Pin a seeded hunt's created_at (server_default=now() at insert)."""
+
+    async def _go() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            row.created_at = when
+            await db.commit()
+
+    asyncio.run(_go())
+
+
+def test_list_hunts_since_until_filters(client: TestClient) -> None:
+    """``since``/``until`` bound created_at inclusively on both ends; a tz-aware
+    bound is normalized to the store's naive UTC; no params = original behavior."""
+    early = _seed_complete_hunt(client)
+    late = _seed_complete_hunt(client)
+    _set_created_at(client, early, datetime(2026, 7, 1, 10, 0, 0))
+    _set_created_at(client, late, datetime(2026, 7, 3, 10, 0, 0))
+
+    # no params → default behavior unchanged (both rows, newest first)
+    rows = client.get("/api/v1/hunts").json()
+    assert [r["id"] for r in rows] == [late, early]
+
+    # since alone (inclusive lower bound)
+    rows = client.get("/api/v1/hunts", params={"since": "2026-07-02T00:00:00"}).json()
+    assert [r["id"] for r in rows] == [late]
+
+    # until alone (inclusive upper bound)
+    rows = client.get("/api/v1/hunts", params={"until": "2026-07-02T00:00:00"}).json()
+    assert [r["id"] for r in rows] == [early]
+
+    # both bounds — window around the early row only
+    rows = client.get(
+        "/api/v1/hunts",
+        params={"since": "2026-07-01T00:00:00", "until": "2026-07-02T00:00:00"},
+    ).json()
+    assert [r["id"] for r in rows] == [early]
+
+    # edges landing exactly ON a row keep it — both ends inclusive
+    rows = client.get(
+        "/api/v1/hunts",
+        params={"since": "2026-07-01T10:00:00", "until": "2026-07-01T10:00:00"},
+    ).json()
+    assert [r["id"] for r in rows] == [early]
+
+    # tz-aware bounds are converted to naive UTC before comparing: 12:00+03:00
+    # is 09:00 UTC, so the late row (10:00 UTC that day) is included …
+    rows = client.get("/api/v1/hunts", params={"since": "2026-07-03T12:00:00+03:00"}).json()
+    assert [r["id"] for r in rows] == [late]
+    # … and a Z-suffixed bound works too
+    rows = client.get("/api/v1/hunts", params={"since": "2026-07-02T00:00:00Z"}).json()
+    assert [r["id"] for r in rows] == [late]
+
+
+def test_list_hunts_invalid_datetime_is_422(client: TestClient) -> None:
+    assert client.get("/api/v1/hunts", params={"since": "not-a-datetime"}).status_code == 422
+    assert client.get("/api/v1/hunts", params={"until": "yesterday-ish"}).status_code == 422
 
 
 def test_hunt_stats(client: TestClient) -> None:

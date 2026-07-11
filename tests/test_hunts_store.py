@@ -10,9 +10,12 @@ a per-test temp dir (so the sqlite file is fresh each test).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from soc_ai.config import Settings
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+from soc_ai.store.models import Hunt
 from sqlalchemy import inspect, text
 
 REPORT = {
@@ -135,6 +138,44 @@ async def test_list_recent_and_status_filter(settings_kratos: Settings) -> None:
         assert [h.id for h in complete] == [h1.id]
         running = await hunt_svc.list_recent(db, status="running")
         assert [h.id for h in running] == [h2.id]
+    await engine.dispose()
+
+
+async def test_list_recent_since_until_inclusive(settings_kratos: Settings) -> None:
+    """``since``/``until`` bound created_at INCLUSIVELY on both ends (matching
+    the frontend's inRange [from, to]); either bound may be given alone, and no
+    bounds keeps the original unbounded behavior."""
+    engine, maker = await _db(settings_kratos)
+    t0 = datetime(2026, 7, 1, 12, 0, 0)  # naive UTC, like every stored timestamp
+    async with maker() as db:
+        hunts = [
+            await hunt_svc.create(db, objective=obj, started_by="a")
+            for obj in ("old", "mid", "new")
+        ]
+        # Pin created_at to known instants (server_default=now() at insert).
+        for h, hours in zip(hunts, (0, 1, 2), strict=True):
+            row = await db.get(Hunt, h.id)
+            assert row is not None
+            row.created_at = t0 + timedelta(hours=hours)
+        await db.commit()
+        old, mid, new = (h.id for h in hunts)
+
+        # a window whose edges land exactly ON a row keeps it — both ends inclusive
+        got = await hunt_svc.list_recent(
+            db, since=t0 + timedelta(hours=1), until=t0 + timedelta(hours=1)
+        )
+        assert [h.id for h in got] == [mid]
+        # since alone (inclusive lower bound); newest-first order preserved
+        got = await hunt_svc.list_recent(db, since=t0 + timedelta(hours=1))
+        assert [h.id for h in got] == [new, mid]
+        # until alone (inclusive upper bound)
+        got = await hunt_svc.list_recent(db, until=t0 + timedelta(hours=1))
+        assert [h.id for h in got] == [mid, old]
+        # a window before everything → empty
+        assert await hunt_svc.list_recent(db, until=t0 - timedelta(seconds=1)) == []
+        # no bounds → default behavior unchanged (all rows, newest first)
+        got = await hunt_svc.list_recent(db)
+        assert [h.id for h in got] == [new, mid, old]
     await engine.dispose()
 
 

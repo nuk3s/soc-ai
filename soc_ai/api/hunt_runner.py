@@ -23,6 +23,7 @@ from typing import Any
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.usage import UsageLimits
 
 from soc_ai.agent.egress_guard import EgressGuard
@@ -113,19 +114,75 @@ def _desanitize_hunt_report(report: Any, guard: EgressGuard | None) -> Any:
         return report
 
 
+def _repair_dangling_tool_calls(gathered: list[Any]) -> list[Any]:
+    """Close out unexecuted trailing tool calls so the transcript can be replayed.
+
+    pydantic-ai raises :class:`UsageLimitExceeded` AFTER the ``ModelResponse``
+    carrying the next tool-call batch has landed in the history but BEFORE the
+    calls execute — so a budget-exhausted hunt transcript ALWAYS ends with
+    unprocessed tool calls, and replaying it with a new user prompt is rejected
+    with ``UserError: Cannot provide a new user prompt when the message history
+    contains unprocessed tool calls`` (the 2026-07 prod failure: every
+    budget-capped hunt errored and its evidence was discarded). Repair: append a
+    synthetic ``ModelRequest`` with one ``ToolReturnPart`` per dangling call in
+    the trailing batch (prod batches ran ~3 calls), preserving the model's final
+    reasoning for the synthesizer. Returns a NEW list; ``gathered`` is never
+    mutated.
+
+    Defensive by design — this path must never be able to crash the hunt again:
+    if the trailing ``ModelResponse`` is any shape we can't repair (message-class
+    drift after a pydantic-ai bump, surprise part payloads), fall back to
+    TRIMMING it off — losing the final unexecuted step beats losing the whole
+    report. The caller's error handling remains the LAST resort, not the first.
+    """
+    if not gathered:
+        return gathered
+    last = gathered[-1]
+    if not isinstance(last, ModelResponse):
+        return gathered  # tail already ends on a request — replayable as-is
+    try:
+        dangling = [p for p in last.parts if isinstance(p, ToolCallPart)]
+        if not dangling:
+            return gathered  # plain text/thinking tail — replayable as-is
+        return [
+            *gathered,
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name=part.tool_name,
+                        tool_call_id=part.tool_call_id,
+                        content="not executed — hunt budget exhausted",
+                    )
+                    for part in dangling
+                ]
+            ),
+        ]
+    except Exception:
+        # Unexpected tail shape: trim the trailing ModelResponse rather than
+        # replay a history pydantic-ai will reject.
+        _LOGGER.warning(
+            "hunt: could not close out dangling tool calls; trimming the trailing "
+            "model response before partial synthesis",
+            exc_info=True,
+        )
+        return gathered[:-1]
+
+
 async def _synthesize_partial_hunt(
     ctx: InvestigationContext, *, objective: str, gathered: list[Any]
 ) -> Any:
     """Force a :class:`HuntReport` from an already-gathered transcript (no tools).
 
-    Called when a hunt exhausts its budget before emitting a report: replays the
-    accumulated message history through the no-tools hunt synthesizer so the
-    analyst still gets a grounded partial report instead of a bare error.
+    Called when a hunt exhausts its budget before emitting a report: repairs the
+    transcript tail (budget exhaustion always leaves unprocessed tool calls —
+    see :func:`_repair_dangling_tool_calls`), then replays the accumulated
+    message history through the no-tools hunt synthesizer so the analyst still
+    gets a grounded partial report instead of a bare error.
     """
     synth = build_hunt_synthesizer(build_investigator_model(ctx.settings), objective=objective)
     return await synth.run(
         "Write the HuntReport now from the evidence already gathered above.",
-        message_history=gathered,
+        message_history=_repair_dangling_tool_calls(gathered),
         usage_limits=UsageLimits(request_limit=3, tool_calls_limit=0),
     )
 
