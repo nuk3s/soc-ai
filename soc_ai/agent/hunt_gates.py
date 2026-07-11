@@ -38,6 +38,48 @@ _SEV_RANK: dict[str, int] = {s: i for i, s in enumerate(_SEV_ORDER)}
 
 _UNRESOLVED_NOTE = "Citations did not resolve to gathered evidence; severity capped to low."
 _HIGH_NO_CITE_NOTE = "High-severity finding lacks citations; capped to medium."
+_ALERT_ONLY_NOTE = (
+    "Only detector alerts cited — corroborate before asserting compromise; "
+    "severity capped to medium."
+)
+
+# ── Corroboration gate: alert-query vs corroborating-evidence tools ───────────
+# The trust-erosion failure this closes (two real prod hunts, 2026-07): a
+# wall-clock-truncated hunt gets written up from a transcript DOMINATED by
+# Suricata alert documents, and the synthesizer asserts compromise at HIGH
+# severity citing the very alert that IS the claim. The E1.3 gate above passes
+# such a finding because the cited id genuinely EXISTS in the transcript — it
+# checks existence, not corroboration. This gate adds the missing check: a
+# high/critical THREAT finding must cite at least one item that resolves into a
+# NON-alert (corroborating) tool result, or its severity is capped.
+#
+# ``_ALERT_QUERY_TOOLS`` is a DENY-set — the tools whose results ARE the
+# detector's claim (Suricata alert documents, rule text, rule base-rates), which
+# therefore CANNOT corroborate a threat asserted from those same alerts:
+#   * t_query_events_oql   — the primary lens; returns raw event docs INCLUDING
+#     suricata.alert documents (the loud alert titles that dominated the
+#     truncated prod transcripts). It can also return zeek/host docs, but a
+#     citation resolving into one is indistinguishable from one resolving into an
+#     alert doc, so it is conservatively treated as non-corroborating.
+#   * t_query_detections   — searches detection RULES (the claim source itself).
+#   * t_get_rule_content   — returns the signature's own definition (the claim).
+#   * t_rule_prevalence    — a rule's base-rate/noisiness (rule metadata).
+#   * t_suggest_rule_tuning — rule disposition trend (rule metadata).
+# Every OTHER tool is corroborating evidence BEYOND the alert document —
+# t_get_pcap / t_decode_payload (decoded packets), t_enrich_* (blocklist/MISP/
+# ASN), t_prevalence (host novelty), t_host_summary (host artifact/OS),
+# t_query_zeek_logs / t_get_event_raw (the underlying flow records), the online
+# quartet (greynoise/shodan/cve) and the web tools. A finding grounded in ANY of
+# those has looked past the alert title, which is exactly what the gate requires.
+_ALERT_QUERY_TOOLS: frozenset[str] = frozenset(
+    {
+        "t_query_events_oql",
+        "t_query_detections",
+        "t_get_rule_content",
+        "t_rule_prevalence",
+        "t_suggest_rule_tuning",
+    }
+)
 
 # Chart budget — a model that emits plausible-but-uncited charts freely is the whole
 # risk, so beyond this ceiling extras are dropped even if they'd otherwise resolve.
@@ -113,6 +155,48 @@ def _citation_resolves(citation: str, evidence_text: str) -> bool:
     return False
 
 
+def _corroborating_evidence_text(tool_results: list[Any]) -> str:
+    """Lower-cased JSON dump of ONLY the corroborating (non-alert) tool results.
+
+    ``tool_results`` are labeled ``{tool_name, result}`` items (the shape
+    :func:`soc_ai.api.hunt_runner._stream_node` now gathers). Items whose
+    ``tool_name`` is in :data:`_ALERT_QUERY_TOOLS` are the detector's own claim
+    (Suricata alert documents, rule text, rule base-rates) and are EXCLUDED, so a
+    citation that resolves only into an alert document does NOT resolve here.
+    Everything else — decoded payloads, enrichment, host/prevalence, zeek flow
+    records — is corroboration and its ``result`` is included.
+
+    Defensive: a bare (un-labeled) item — a legacy shape, or a tool_result that
+    somehow arrived without a ``tool_name`` — is treated as corroborating (it is
+    not a KNOWN alert-query tool), so this can only ever ADD trust, never
+    silently strip a real corroboration on a shape surprise.
+    """
+    corroborating: list[Any] = []
+    for item in tool_results:
+        if isinstance(item, dict) and "tool_name" in item and "result" in item:
+            if item.get("tool_name") in _ALERT_QUERY_TOOLS:
+                continue  # a detector-claim result cannot corroborate itself
+            corroborating.append(item["result"])
+        else:
+            # Un-labeled / legacy item: not a known alert-query tool → corroborating.
+            corroborating.append(item)
+    return _gathered_evidence_text(corroborating)
+
+
+def _has_corroborating_citation(citations: list[str], corroborating_text: str) -> bool:
+    """True iff ANY citation resolves into a NON-alert (corroborating) tool result.
+
+    Uses the same distinctive-token resolver as citation resolution, but against
+    ``corroborating_text`` — the JSON dump of only the non-alert tool results (see
+    :func:`_corroborating_evidence_text`). This is what a high/critical THREAT
+    finding must satisfy: at least one piece of support that looked BEYOND the
+    detector alert that raised the claim.
+    """
+    if not corroborating_text:
+        return False
+    return any(_citation_resolves(c, corroborating_text) for c in citations)
+
+
 def _resolve_finding_citations(citations: list[str], evidence_text: str) -> tuple[list[str], float]:
     """Return (resolved_citations, coverage_ratio) for one finding's citations.
 
@@ -143,9 +227,16 @@ def _validate_hunt_findings(
     * EMPTY citation list: left alone UNLESS severity is high/critical, in which
       case cap to ``"medium"`` with the "lacks citations" note.
     * Otherwise (at least one citation resolves): keep only the resolving
-      citations if some didn't resolve, but do NOT cap severity — the finding is
-      grounded. (A partial-coverage finding keeps its severity; only zero
-      coverage is a trust failure.)
+      citations if some didn't resolve. The finding is GROUNDED — but a
+      ``category == "threat"`` finding at high/critical severity gets one more
+      check (the CORROBORATION gate): at least one of its resolving citations
+      must resolve into a NON-alert tool result (a tool NOT in
+      :data:`_ALERT_QUERY_TOOLS`). If EVERY resolving citation resolves only into
+      detector-alert documents (Suricata alerts / rule text / rule base-rates),
+      the claim is asserted purely from the alert that raised it — severity is
+      capped to ``"medium"`` with :data:`_ALERT_ONLY_NOTE`. A non-threat finding,
+      or a threat below high, keeps its severity (only the loud high/critical
+      alert-title write-up is the trust failure this closes).
 
     Independently of citations, every finding's ``title`` is clamped via
     :func:`_clamp_title` — an overlong machine headline is word-boundary
@@ -156,6 +247,10 @@ def _validate_hunt_findings(
     ``{findings, findings_capped, citations_total, citations_stripped}``.
     """
     evidence_text = _gathered_evidence_text(tool_results)
+    # The corroboration subset: only NON-alert tool results. A high/critical
+    # threat finding must cite at least one item resolving into THIS, or the
+    # claim rests solely on the detector alert that raised it. Computed once.
+    corroborating_text = _corroborating_evidence_text(tool_results)
     validated: list[Any] = []
     counts = {
         "findings": len(findings),
@@ -214,14 +309,55 @@ def _validate_hunt_findings(
             counts["findings_capped"] += 1
         elif len(resolved) < len(citations):
             # Partial coverage: keep only the resolving citations (drop the
-            # fabricated ones) but leave the severity — the finding is grounded.
+            # fabricated ones). The finding is grounded, but a high/critical
+            # threat still faces the corroboration gate on its RESOLVING cites.
             counts["citations_stripped"] += len(citations) - len(resolved)
-            validated.append(finding.model_copy(update={"citations": resolved}))
+            grounded = finding.model_copy(update={"citations": resolved})
+            validated.append(
+                _apply_corroboration_cap(grounded, resolved, corroborating_text, counts)
+            )
         else:
-            # Fully grounded — unchanged.
-            validated.append(finding)
+            # Fully grounded — but a high/critical threat must still corroborate
+            # beyond the detector alert (the E1.3 pass above only proved the
+            # cited ids EXIST, not that they look past the alert).
+            validated.append(
+                _apply_corroboration_cap(finding, resolved, corroborating_text, counts)
+            )
 
     return validated, counts
+
+
+def _apply_corroboration_cap(
+    finding: Any,
+    resolved_citations: list[str],
+    corroborating_text: str,
+    counts: dict[str, int],
+) -> Any:
+    """Cap a high/critical THREAT finding that cites only detector alerts.
+
+    Given a finding that already PASSED citation resolution (its
+    ``resolved_citations`` all exist in the gathered evidence), enforce the extra
+    corroboration bar: if it is a ``category == "threat"`` finding at high/critical
+    severity and NONE of its resolving citations resolve into a non-alert
+    (corroborating) tool result, its claim rests solely on the detector alert that
+    raised it — cap severity to ``"medium"`` and set :data:`_ALERT_ONLY_NOTE`
+    (incrementing ``findings_capped``). Anything else passes through untouched:
+    a non-threat finding, a threat below high, or a threat with real
+    corroboration keeps its severity. PURE aside from the ``counts`` tally.
+    """
+    category = str(getattr(finding, "category", None) or "").strip().lower()
+    severity = str(getattr(finding, "severity", None) or "info")
+    if category != "threat" or _SEV_RANK.get(severity.lower(), 0) < _SEV_RANK["high"]:
+        return finding
+    if _has_corroborating_citation(resolved_citations, corroborating_text):
+        return finding  # grounded in evidence beyond the detector alert
+    counts["findings_capped"] += 1
+    return finding.model_copy(
+        update={
+            "severity": _cap_severity(severity, "medium"),
+            "validator_note": _ALERT_ONLY_NOTE,
+        }
+    )
 
 
 def _validate_hunt_charts(

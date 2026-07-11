@@ -72,6 +72,12 @@ def test_walkthrough_smoke(page: Page, demo_stack: dict) -> None:
     expect(page.get_by_text(_DISPOSITION_RE).first).to_be_visible(timeout=_WAIT_MS)
     expect(page.get_by_text("Visual summary", exact=False).first).to_be_visible(timeout=_WAIT_MS)
 
+    # ---- failed hunt: the prominent "Re-hunt" affordance (accent on a failed
+    # run) — the seed's status="error" hunt exercises the HuntDetail failed→
+    # re-hunt path. Assert the control exists; don't couple to its styling.
+    page.goto(f"{base}/app/hunts/{manifest['hunt_error']}", wait_until="networkidle")
+    expect(page.get_by_role("button", name="Re-hunt").first).to_be_visible(timeout=_WAIT_MS)
+
     # ---- config: analyst-model control + at least one section chevron -------
     page.goto(f"{base}/app/config", wait_until="networkidle")
     # The analyst-model row is the only one carrying a "Check fitness" button.

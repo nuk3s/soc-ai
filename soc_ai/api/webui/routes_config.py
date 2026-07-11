@@ -277,6 +277,82 @@ async def api_model_fitness(
     )
 
 
+# ── Audit chain verification (admin) ───────────────────────────────────────
+# The audit trail carries a tamper-evident hash chain (soc_ai.audit.chain). This
+# endpoint lets an operator actually RUN that verification against the live audit
+# index — the whole point of tamper-evidence is being able to check it. Shares the
+# ES-fetch + verify_chain path with the `soc-ai audit verify` CLI
+# (soc_ai.audit.verify.verify_audit_chain).
+
+
+class AuditChainVerifyOut(BaseModel):
+    ok: bool  # True iff the chain (over the scanned records) is intact
+    records_verified: int  # number of chained records checked
+    first_broken_seq: int | None = None  # seq of the first break, else null
+    first_seq: int | None = None  # seq span actually covered (null on empty)
+    last_seq: int | None = None
+    capped: bool = False  # True iff the scan hit the record cap (prefix only)
+    checked_at: str  # ISO-8601 UTC timestamp of this verification
+
+
+@router.get(
+    "/config/audit/verify-chain",
+    response_model=AuditChainVerifyOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_audit_verify_chain(
+    request: Request,
+    days: int | None = None,
+    settings: Settings = Depends(get_settings_dep),
+) -> AuditChainVerifyOut:
+    """Verify the tamper-evident audit hash chain against the live ES audit index.
+
+    Pulls every audit record (optionally the last ``?days=N`` days) sorted by
+    ``seq`` and recomputes the chain (see :mod:`soc_ai.audit.chain`). ``ok`` is
+    True iff no record was edited, reordered, inserted, or deleted since it was
+    written; ``first_broken_seq`` names the first break otherwise. An empty index
+    is intact by definition.
+
+    Unlike the other config diagnostics this is NOT fail-soft: a verification
+    against an unreachable audit index is "could not run", never a clean chain —
+    so an ES error propagates to a 5xx rather than being reported as ``ok``. A
+    windowed (``days``) scan verifies contiguity within the window but cannot
+    verify linkage across the window boundary.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from soc_ai.audit.verify import verify_audit_chain  # noqa: PLC0415
+
+    elastic = getattr(request.app.state, "elastic", None)
+    if elastic is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"reason": "audit_verify_unavailable", "message": "no ES client"},
+        )
+
+    try:
+        result = await verify_audit_chain(elastic, settings.audit_index_alias, days=days)
+    except Exception as exc:
+        # A verification is meaningless if we couldn't read the records — surface
+        # it as "could not run", never as an intact chain.
+        _LOGGER.warning("audit chain verification failed to run", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail={"reason": "audit_verify_failed", "message": f"{type(exc).__name__}"},
+        ) from exc
+
+    return AuditChainVerifyOut(
+        ok=result.ok,
+        records_verified=result.records_verified,
+        first_broken_seq=result.first_broken_seq,
+        first_seq=result.first_seq,
+        last_seq=result.last_seq,
+        capped=result.capped,
+        checked_at=datetime.now(UTC).isoformat(),
+    )
+
+
 # ── Egress policy (admin, read-model) — E5.3 ───────────────────────────────
 # ONE page listing every possible egress destination, its enable state, its
 # redaction posture, and a best-effort 7-day audit count — so "zero egress" is

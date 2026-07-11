@@ -6,8 +6,50 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-07-11
+
+### Added
+
+- **Re-hunt and multi-select on the Hunts page.** A hunt can now be re-run
+  directly: a "Re-hunt" button on the hunt detail (prominent on failed /
+  interrupted hunts, a quiet secondary action on completed ones) and a per-row
+  re-hunt icon on the hunts list. Re-hunt is a **clean re-run of the objective as
+  a fresh hunt** — it does NOT seed the prior hunt's narrative (that would poison
+  a re-run of a broken hunt); because the objective hash matches, the fresh run
+  automatically gets the "vs last run" diff. The hunts list also gained
+  Investigations-style **multi-select** (a checkbox column + header select-all)
+  with bulk **Re-hunt selected** and **Delete selected** actions and an
+  expandable "Started N · M skipped" result panel. Bulk re-hunt is **throttled**
+  — it starts only the first few hunts and returns the rest as `queued` — so a
+  large selection can't launch many concurrent hunts at the single model route.
+  New endpoints `POST /hunts/rehunt` and `POST /hunts/bulk-delete`.
+- **Host summaries now infer OS from telemetry-domain evidence** (Apple / Windows
+  / Linux / Android) when no User-Agent is available, so an OS-specific compromise
+  claim can be checked against what the host actually is. `t_host_summary` gained
+  an additive, evidence-bearing `os_hint` (`{os, confidence, signals, basis}`)
+  derived from the vendor telemetry the host queried / SNI'd — the DNS/TLS traffic
+  a modern TLS-only device leaves even with an empty User-Agent. A User-Agent guess
+  stays primary and the hint corroborates it (or notes a conflict); the hint only
+  becomes `device_os_guess` when there is no UA. "Linux" is only ever inferred from
+  positive distro telemetry, never from the absence of other families — so a "Linux
+  backdoor" alert on a MacBook is now contradicted by the host's own Apple traffic.
+
 ### Fixed
 
+- **Hunts no longer assert compromise from alert titles alone.** A high/critical
+  threat finding now requires corroborating evidence beyond the detector alert
+  that raised it (a decoded payload, a measured beacon cadence, a blocklist/MISP
+  or enrichment hit, host prevalence, or a host artifact) or its severity is
+  capped — citing the Suricata alert that IS the claim no longer satisfies the
+  gate. The hunt prompts now require reading the signature and confirming the
+  host's OS before claiming an OS-specific implant (Apple/icloud telemetry means
+  macOS/iOS, not a "Linux backdoor"), and treat a solicited ICMP echo reply that
+  merely matches a heartbeat signature as an uncorroborated false positive.
+  Budget/timeout-truncated hunts are now marked low-confidence (their overall
+  confidence is clamped and their threat findings capped), and the exploration
+  model's own reasoning — where it had already debunked the false positive — is
+  fed into the partial-report write-up so a loud alert title no longer overrides
+  it.
 - **Hunts that hit their exploration budget now produce the partial report
   instead of erroring.** Exhausting the tool-call budget always left the
   transcript ending in unexecuted tool calls, which the partial-report
@@ -18,6 +60,64 @@ All notable changes to this project are documented here. The format is based on
   to match current model behavior — the 2026-07-08 inference-engine change
   roughly doubled per-hunt tool appetite, making the old cap a wall every
   hunt hit.
+- **Bulk investigation re-hunt is now throttled like the hunts side.** Selecting
+  many investigations to re-hunt started every one at once against the single
+  model route; it now starts only the first few and returns the rest as `queued`,
+  the same concurrency cap the hunts page already had (a real incident showed
+  simultaneous runs all hitting the wall-clock and producing garbage). The cap is
+  checked before the per-row alert-name lookup, so it also bounds those queries.
+- **Interactive investigations now honour the whole-run wall-clock timeout.** The
+  `investigation_run_timeout_s` backstop was only enforced on background hunts; a
+  slow-but-progressing interactive "Investigate" run could exceed it because only
+  the per-turn timeout applied. The whole-run cap now lives in the shared recorded
+  runner, covering the interactive SSE path and the background path in one place.
+- **`soc-ai <command>` works inside the Docker container.** The image builds with
+  `uv sync --no-install-project`, which never generated the `soc-ai` console entry
+  point, so documented commands like `docker exec soc-ai soc-ai backup` and
+  `soc-ai blocklists refresh` failed with "executable not found". A small wrapper
+  now ships on the image PATH so the CLI (backup/restore/blocklists/audit/doctor)
+  works in-container, matching the from-source install.
+
+### Changed
+
+- **Container logs are now size-capped** (`json-file`, 5 × 50 MB) so an always-on
+  triage loop plus the healthcheck can't grow the log unbounded and fill the disk.
+- **Prebuilt (`--prebuilt`) installs pin the image tag.** `setup.sh` resolves the
+  release version and writes `SOC_AI_IMAGE_TAG` into `.env` instead of tracking the
+  mutable `:latest`, so an upgrade is a deliberate re-pin, not a surprise pull.
+- **Guided install collects the abuse.ch key and offers blocklist scheduling.**
+  `setup.sh` now prompts for `ABUSE_CH_AUTH_KEY` (blank to skip) so URLhaus / Feodo
+  / ThreatFox actually seed, and a cron example (`scripts/cron.d/`) refreshes
+  blocklists on the Docker deployment (previously only the host-venv systemd timer
+  did). `docs/DOCKER.md` gained a backup-scheduling recipe and a "back up before
+  upgrading" step.
+- **`.env.example` no longer weakens the secure audit default** (`AUDIT_REDACT`
+  ships commented so installs inherit the code's redact-on default) and documents
+  the timeout/retry knobs for discoverability.
+- Frontend build stage moved to Node 22 (Node 20 is end-of-life); `vitest` bumped
+  to 3.2.7 for a dev-only advisory (GHSA-5xrq-8626-4rwp).
+
+### Security
+
+- **The audit hash chain can now be verified.** The tamper-evident chain already
+  existed, but nothing let an operator check it — the whole point of the property.
+  Added `soc-ai audit verify` (CLI) and an admin-gated
+  `GET /api/v1/config/audit/verify-chain`; both page the audit index and report
+  whether the chain is intact or where it broke.
+- **Agent-rendered markdown pins a link allow-list in code.** The shared renderer
+  for all agent output now applies an explicit URL transform (http/https/mailto +
+  relative only) rather than relying on react-markdown's library default, closing
+  a latent stored-XSS vector should that default ever change. Agent output is
+  derived from attacker-influenced data.
+- **OQL pipe-splitting tracks single- and double-quoted strings**, so a `|` inside
+  a single-quoted value can no longer smuggle a spurious pipe-stage break through
+  the read-only query boundary.
+- **Startup warns loudly when `API_AUTH_REQUIRED=false`** — with auth off the admin
+  gate is a no-op (secret edit, user/token creation are open); the warning is
+  escalated when the bind is non-loopback.
+- **Supply-chain hardening for CI.** Third-party GitHub Actions are pinned to commit
+  SHAs (the tj-actions compromise class), workflows run with least-privilege
+  `permissions`, and the public-mirror leak scan now hard-fails instead of warning.
 
 ## [1.1.0] - 2026-07-10
 

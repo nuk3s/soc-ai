@@ -81,6 +81,21 @@ yesno(){ local __v=$1 __p=$2 __d=${3:-y} ans
 
 httpcode(){ curl -k -s -o /dev/null -w '%{http_code}' -m "${2:-8}" "$1" 2>/dev/null || echo 000; }
 
+# Resolve the release version to pin the prebuilt GHCR image to, so --prebuilt
+# never rides the mutable `:latest` tag (an unaudited moving target — every pull
+# would be a silent upgrade). Prefer the repo VERSION in pyproject.toml; fall
+# back to the newest `v*` git tag. Prints nothing if neither is resolvable.
+resolve_release_version(){
+  local v=""
+  if [[ -r pyproject.toml ]]; then
+    v=$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+  fi
+  if [[ -z $v ]] && command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    v=$(git tag --list 'v*' --sort=-v:refname 2>/dev/null | head -1 | sed 's/^v//')
+  fi
+  printf '%s' "$v"
+}
+
 # Detect the events index pattern that actually matches THIS grid, so it's right
 # on a single-node grid (local `logs-*` data streams) AND a multi-node one
 # (reached cross-cluster as `*:logs-*`). Counts Suricata alerts under each
@@ -257,8 +272,18 @@ if [[ $RECFG == y ]]; then
   EIDX_PFX=""; [[ ${EVENTS_INDEX_PATTERN} == \*:* ]] && EIDX_PFX="*:"
   yesno APIAUTH "  Require login/token for the API? (recommended)" "$(b2yn "${API_AUTH_REQUIRED:-true}")"
 
+  echo
+  info "Enrichment feeds (optional):"
+  # abuse.ch (URLhaus / ThreatFox / Feodo) now requires a free Auth-Key. Without
+  # it those three feeds are skipped on every `blocklists refresh` (Tor + cloud
+  # prefixes still work). Blank = skip. Register at https://auth.abuse.ch/ .
+  ask ABUSE_CH_AUTH_KEY "  abuse.ch Auth-Key (blank to skip URLhaus/ThreatFox/Feodo)" "${ABUSE_CH_AUTH_KEY:-}"
+
   CONFIG_SECRET_KEY=${CONFIG_SECRET_KEY:-$(genfernet)}
   BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-$(genpw)}
+  # Pin the prebuilt image to the release version, so --prebuilt never rides the
+  # mutable :latest tag. Resolved from pyproject.toml (fallback: newest v* tag).
+  SOC_AI_IMAGE_TAG=${SOC_AI_IMAGE_TAG:-$(resolve_release_version)}
 
   [[ -f .env ]] || cp .env.example .env
   sed -i '/# >>> soc-ai setup.sh >>>/,/# <<< soc-ai setup.sh <<</d' .env 2>/dev/null || true
@@ -276,6 +301,16 @@ if [[ $RECFG == y ]]; then
     echo "LITELLM_API_KEY=${LITELLM_API_KEY}"
     echo "LITELLM_VERIFY_SSL=$([[ $LLM_TLS == y ]] && echo true || echo false)"
     echo "ANALYST_MODEL=${ANALYST_MODEL}"
+    [[ -n ${ABUSE_CH_AUTH_KEY:-} ]] && echo "ABUSE_CH_AUTH_KEY=${ABUSE_CH_AUTH_KEY}"
+    # Prebuilt installs pin the image to a specific release rather than :latest
+    # (an unaudited moving target). Source builds don't pull, so no pin is written.
+    if [[ $PREBUILT -eq 1 ]]; then
+      if [[ -n ${SOC_AI_IMAGE_TAG:-} ]]; then
+        echo "SOC_AI_IMAGE_TAG=${SOC_AI_IMAGE_TAG}"
+      else
+        echo "# SOC_AI_IMAGE_TAG=   # PIN THIS to a release (e.g. 1.1.0); :latest is an unaudited moving target"
+      fi
+    fi
     echo "WEBUI_ALERTS_QUERY=${WEBUI_ALERTS_QUERY}"
     echo "EVENTS_INDEX_PATTERN=${EVENTS_INDEX_PATTERN}"
     echo "CASES_INDEX_PATTERN=${EIDX_PFX}so-case*"
@@ -339,8 +374,20 @@ fi
 # ── 4. build + start ──────────────────────────────────────────────────────────
 hr
 if [[ $PREBUILT -eq 1 ]]; then
-  # Pull the published release image (SOC_AI_IMAGE_TAG pins a version; default
-  # latest). With the image in the local store, `up` uses it instead of building.
+  # Pull the published release image, pinned to SOC_AI_IMAGE_TAG from .env (never
+  # the mutable :latest). With the image in the local store, `up` uses it instead
+  # of building. If .env carries no pin yet (e.g. the operator kept an existing
+  # .env), append one now so this pull — and every future `docker compose pull` —
+  # is a deliberate, versioned upgrade rather than a silent :latest ride.
+  if [[ -f .env ]] && ! grep -qE '^[[:space:]]*SOC_AI_IMAGE_TAG=' .env; then
+    _pin=$(resolve_release_version)
+    if [[ -n $_pin ]]; then
+      printf 'SOC_AI_IMAGE_TAG=%s\n' "$_pin" >> .env
+      ok "Pinned SOC_AI_IMAGE_TAG=${_pin} in .env (prebuilt image; :latest is an unaudited moving target)."
+    else
+      warn "Couldn't resolve a release version to pin — this pull will use :latest. Set SOC_AI_IMAGE_TAG in .env to pin it."
+    fi
+  fi
   info "Pulling the prebuilt image (ghcr.io/nuk3s/soc-ai) and starting the stack…"
   # If the image isn't published yet (no release tag), the registry answers
   # `denied` — catch that and offer to build from source in the same run, so a
@@ -348,7 +395,7 @@ if [[ $PREBUILT -eq 1 ]]; then
   # up to here (config, cert) is already done, so there's nothing to redo.
   if ! $DC pull soc-ai; then
     echo
-    warn "Couldn't pull the prebuilt image ghcr.io/nuk3s/soc-ai:${SOC_AI_IMAGE_TAG:-latest}."
+    warn "Couldn't pull the prebuilt image ghcr.io/nuk3s/soc-ai:${SOC_AI_IMAGE_TAG:-<unpinned>}."
     warn "No tagged release is published yet, so there's no image to pull — this is expected right now."
     yesno BUILD_NOW "Build the image from source instead? (~3 min)" y
     if [[ $BUILD_NOW == y ]]; then
@@ -382,7 +429,9 @@ fi
 
 # ── 5. seed enrichment ────────────────────────────────────────────────────────
 hr
-yesno SEED "Seed enrichment data now (Tor + AWS/GCP/Cloudflare; abuse.ch needs a free key)?" y
+if [[ -n ${ABUSE_CH_AUTH_KEY:-} ]]; then _seed_q="Seed enrichment data now (Tor + AWS/GCP/Cloudflare + abuse.ch)?"
+else _seed_q="Seed enrichment data now (Tor + AWS/GCP/Cloudflare; abuse.ch skipped — no key)?"; fi
+yesno SEED "$_seed_q" y
 [[ $SEED == y ]] && { info "Seeding…"; $DC run --rm soc-ai python -m soc_ai blocklists refresh \
   || warn "Some optional feeds were skipped (see above) — non-fatal."; }
 
@@ -403,4 +452,10 @@ if [[ $PREBUILT -eq 1 ]]; then
 else
   echo "    Logs:   ${DC} logs -f soc-ai      Stop: ${DC} down      Update: git pull && ${DC} up -d --build"
 fi
+echo
+echo "    ${B}Recommended next steps:${N}"
+echo "      • Back up before every upgrade:  ${DC} exec soc-ai python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz"
+echo "      • Schedule the blocklist refresh (feeds go stale without it):"
+echo "          cp scripts/cron.d/soc-ai-blocklists.example /etc/cron.d/soc-ai-blocklists   # edit the path first"
+echo "      • Schedule backups with retention — see docs/DOCKER.md → Backup and restore."
 hr

@@ -379,10 +379,17 @@ def _parse_filter_with_fallback(filter_text: str) -> FilterNode:
 
 
 def _split_pipe(query: str) -> list[str]:
-    """Split on ``|`` at the top level (i.e. not inside double quotes)."""
+    """Split on ``|`` at the top level — i.e. not inside a quoted string.
+
+    Both single- and double-quoted strings are tracked (the OQL grammar's
+    ``ESCAPED_STRING`` accepts either quote style), so a ``|`` inside a quoted
+    value such as ``rule.name:'a | b'`` is NOT mistaken for a pipe-stage
+    separator. A quote of the *other* kind inside an already-open string is
+    literal and does not toggle state.
+    """
     parts: list[str] = []
     buf: list[str] = []
-    in_quote = False
+    quote: str | None = None  # the open quote char (" or '), or None outside a string
     escape = False
     for ch in query:
         if escape:
@@ -393,11 +400,17 @@ def _split_pipe(query: str) -> list[str]:
             buf.append(ch)
             escape = True
             continue
-        if ch == '"':
-            in_quote = not in_quote
+        if quote is not None:
+            # Inside a string: only the matching quote closes it.
+            if ch == quote:
+                quote = None
             buf.append(ch)
             continue
-        if ch == "|" and not in_quote:
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == "|":
             parts.append("".join(buf))
             buf = []
             continue

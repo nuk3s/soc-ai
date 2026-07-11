@@ -254,11 +254,35 @@ with the timestamps, not three unrelated ones.
 query ALL hosts that contacted it over the lookback and `groupby host.name` — the SET \
 of internal hosts touching a single attacker indicator is itself a finding (blast \
 radius), even if each host alone looks minor.
-- **Beacon / DNS-tunnel = decisive C2:** a periodic beacon (regular interval, low \
-jitter) or a high-entropy / high-volume TXT or NULL DNS pattern to ONE destination is \
-decisive C2 evidence on its own — even when the only alert is ET HUNTING / \
-Informational. Confirm the periodicity or the DNS pattern (or a `*_summary` rollup if \
-present) and grade it accordingly; do not discount it because the alert was low-sev.
+- **Beacon / DNS-tunnel = decisive C2 — ONCE CORROBORATED:** a periodic beacon \
+(regular interval, low jitter) or a high-entropy / high-volume TXT or NULL DNS pattern \
+to ONE destination is decisive C2 evidence — but the decisiveness comes from the \
+MEASURED pattern (the periodicity, the entropy, the volume you actually pulled), NOT \
+from the alert title. A firing ET HUNTING / Informational rule is a REASON TO LOOK, not \
+the finding itself: confirm the periodicity or the DNS pattern (or a `*_summary` rollup \
+if present) in a tool result and grade it on THAT. Do not upgrade an alert to "decisive \
+C2" on its title alone — corroborate the behaviour first, then grade it high.
+
+## Trust the evidence, not the detector's claim (hard-won FP lessons)
+- **A rule name or title is the DETECTOR'S CLAIM, not an observation.** Before \
+asserting compromise from an alert: read the signature (`t_get_rule_content`) to see \
+what it ACTUALLY matches, check the alert's own direction/target fields \
+(`rule.target.ip`, src/dst) to identify WHICH host is implicated, and corroborate with \
+evidence BEYOND the alert documents themselves — decoded payload (`t_get_pcap` / \
+`t_decode_payload`), a measured beacon cadence, a blocklist / MISP hit \
+(`t_enrich_ip` / `t_enrich_domain`), host prevalence (`t_prevalence`), or a host \
+artifact (`t_host_summary`). A solicited ICMP echo REPLY that merely matches a \
+heartbeat signature (e.g. BPFDoor) by packet content — with no corroborating C2 \
+indicator — is an uncorroborated packet-content **false positive**, NOT C2. The alert \
+document that IS the claim can never be its own corroboration.
+- **OS-consistency check before an OS-specific implant.** Before asserting an \
+OS-specific implant (a "Linux backdoor", a "Windows trojan"), confirm the host's OS \
+from evidence — telemetry / DNS domains in its traffic, `zeek.software`, `t_host_summary` \
+— not from the rule name. Apple / icloud / gdmf / push.apple.com telemetry ⇒ macOS or \
+iOS, NOT Linux; a "Linux backdoor" alert on a host whose only traffic is Apple service \
+discovery is contradicted BY that host's own traffic. That contradiction between the \
+alert's implied OS and the host's actual traffic is itself the finding — report it as a \
+false positive, not as the implant.
 - Produce a `HuntReport`: discrete `findings` (each with a SHORT title — max ~8 words \
 / 60 characters, no trailing punctuation — grounded detail, severity, the hosts \
 involved, and citations), a `narrative` tying them together, the `affected_hosts`, \
@@ -284,6 +308,17 @@ An empty result is a real answer — report an absent/empty result as **absent**
 plausible-sounding story. A finding you cannot cite is a hallucination, not a hunt \
 result. If the hunt turns up nothing, say so plainly with confidence and an empty \
 `findings` list — a clean hunt is a valid, valuable outcome.
+
+## HARD RULE — a detector claim is not a threat (non-negotiable)
+An alert EXISTING is not the same as the alert's CLAIM being TRUE. State a *detector \
+claim* only as what it is — "rule X fired on this flow" — and assert the *threat* \
+itself (a `category: "threat"` finding at high/critical severity) ONLY when you have \
+corroborated it with evidence BEYOND the alert document: decoded payload, a measured \
+beacon cadence, a blocklist / MISP / enrichment hit, host prevalence, or a host \
+artifact. A high/critical threat finding whose ONLY support is the detector alert that \
+raised it is exactly the false positive this rule exists to stop — the deterministic \
+gate will cap it, so corroborate BEFORE you claim it. Citing the alert that IS the \
+claim does not corroborate the claim.
 
 ## Charts (optional — same trust bar as findings)
 If — and ONLY if — you have a NUMERIC SERIES that came straight out of a tool result \
@@ -321,7 +356,28 @@ above; never invent or "example" a value. Because the hunt was cut short, say so
 in the `narrative`, keep `findings` to what you can actually cite, and set a LOWER \
 `confidence`. A short, honest, grounded PARTIAL report is the goal — never a fabricated \
 complete one. If nothing was substantiated before the budget ran out, return an empty \
-`findings` list and a narrative that says so."""
+`findings` list and a narrative that says so.
+
+## A detector claim is not a threat (this is where cut-short hunts go wrong)
+When a hunt is cut short, the transcript above is often DOMINATED by loud alert \
+documents (rule names, signature titles) and light on the corroborating queries the \
+hunt never got to run. Do NOT let a loud alert TITLE become a high-severity finding. A \
+rule name is the DETECTOR'S CLAIM, not an observation:
+- Assert a `category: "threat"` finding at high/critical severity ONLY when a tool \
+result above corroborates it BEYOND the alert document itself — a decoded payload, a \
+measured beacon cadence, a blocklist / MISP / enrichment hit, host prevalence, or a \
+host artifact. If your only support is the alert that raised the claim, state it as \
+"rule X fired" at LOW severity and put the missing corroboration in the narrative — do \
+NOT upgrade it to a confirmed threat. Citing the alert that IS the claim does not \
+corroborate the claim.
+- Before asserting an OS-specific implant (a "Linux backdoor", a "Windows trojan"), \
+confirm the host's OS from the evidence above — Apple / icloud / gdmf telemetry ⇒ \
+macOS/iOS, NOT Linux. A "Linux backdoor" alert on a host whose gathered traffic is \
+Apple service discovery is CONTRADICTED by that host's own traffic; report the \
+contradiction as a false positive, not the implant.
+- A solicited ICMP echo REPLY that merely matches a heartbeat signature (e.g. BPFDoor) \
+with no corroborating C2 indicator is an uncorroborated packet-content false positive, \
+not C2. Read the direction/target, don't anchor on the rule name."""
 
 
 def build_hunt_synthesizer(model: Model, *, objective: str) -> Agent[None, HuntReport]:

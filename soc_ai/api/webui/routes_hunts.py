@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 from soc_ai.api.deps import ctx_from_state, get_elastic, get_settings_dep
@@ -621,6 +622,155 @@ async def delete_hunt(hunt_id: str, request: Request) -> dict[str, bool]:
             )
         await hunt_svc.delete(db, hunt_id)
     return {"deleted": True}
+
+
+# ── Bulk hunt actions (re-hunt / delete selected) ────────────────────────────
+#
+# Mirrors routes_investigations.py::bulk_rehunt, with one CRITICAL difference:
+# a re-hunt is a CLEAN re-run of the objective — it starts a fresh hunt via the
+# same path as a brand-new hunt (``hunt_console_manager.start(objective=…)`` with
+# ``prior=None``), NEVER seeding the prior hunt's (possibly broken) narrative.
+# Seeding a failed/partial run's narrative as a follow-up turn would poison the
+# re-run; the objective_hash still matches, so the fresh run automatically gets
+# the "vs last run" diff.
+#
+# CONCURRENCY GUARD: ``hunt_console_manager.start()`` is FIRE-AND-FORGET — it
+# spawns one unbounded background ``asyncio.Task`` per call with no queue or
+# semaphore (see soc_ai.webui.hunt_console_manager.HuntConsoleManager). Launching
+# every selected hunt at once would put N concurrent hunts on the single model
+# route; a real incident showed 7 simultaneous hunts all hitting the wall-clock
+# and producing garbage. So the bulk endpoint starts at most ``_REHUNT_START_CAP``
+# hunts per call and skips the rest with reason ``"queued"`` (re-hunt them in a
+# smaller batch once these land) — it does NOT silently fire the whole selection.
+
+_REHUNT_CAP = 50
+# How many hunts a single bulk re-hunt actually STARTS. The rest are returned as
+# skipped/"queued" so the operator re-hunts them in a follow-up batch — bounding
+# concurrent load on the one model route (the 7-concurrent-hunts garbage incident).
+_REHUNT_START_CAP = 3
+
+
+class HuntRehuntIn(BaseModel):
+    # Cap at the input boundary so an oversized payload is rejected before the
+    # dedup loop deserializes/iterates it (mirrors RehuntIn on investigations).
+    hunt_ids: list[str] = Field(max_length=_REHUNT_CAP)
+
+
+class HuntRehuntResultOut(BaseModel):
+    started: list[dict[str, str]]  # [{old_id, new_id, objective}]
+    skipped: list[dict[str, str]]  # [{id, reason}]
+
+
+@router.post("/hunts/rehunt", response_model=HuntRehuntResultOut)
+async def bulk_rehunt(request: Request, body: HuntRehuntIn) -> HuntRehuntResultOut:
+    """Re-run each supplied hunt as a CLEAN fresh hunt of the same objective.
+
+    Deduplicates the input (order-preserving). The ``_REHUNT_CAP`` input cap is
+    enforced by request validation (``HuntRehuntIn.hunt_ids`` ``max_length``, so
+    an oversized request 422s before reaching here). A hunt that is unknown is
+    skipped ``"not_found"``; one currently ``running`` is skipped ``"running"``
+    (nothing to re-run yet — cancel/let it finish first). To bound concurrent
+    load on the single model route, at most ``_REHUNT_START_CAP`` hunts are
+    actually STARTED; any eligible ids past that cap are skipped ``"queued"`` so
+    the operator re-hunts them in a smaller follow-up batch.
+
+    A re-hunt starts via the same path as a brand-new hunt (``prior=None``) — it
+    NEVER seeds the prior hunt's narrative, so a failed/partial run's broken
+    narrative can't poison the re-run. The objective_hash still matches, so the
+    fresh run automatically gets the "vs last run" diff.
+    """
+    started_by = await identify_caller(request)
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    unique_ids: list[str] = []
+    for hunt_id in body.hunt_ids:
+        if hunt_id not in seen:
+            seen.add(hunt_id)
+            unique_ids.append(hunt_id)
+
+    started: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+
+    # Fetch all rows in a SINGLE query (no N+1), then re-run in input order.
+    hunt_by_id: dict[str, Hunt] = {}
+    if unique_ids:
+        async with request.app.state.db_sessionmaker() as db:
+            rows = (await db.scalars(select(Hunt).where(Hunt.id.in_(unique_ids)))).all()
+            hunt_by_id = {h.id: h for h in rows}
+
+    manager = hunt_console_manager.get_manager(request.app.state)
+    for hunt_id in unique_ids:
+        hunt = hunt_by_id.get(hunt_id)
+        if hunt is None:
+            skipped.append({"id": hunt_id, "reason": "not_found"})
+            continue
+        if hunt.status == "running":
+            skipped.append({"id": hunt_id, "reason": "running"})
+            continue
+        # Concurrency guard: only start up to _REHUNT_START_CAP hunts this call —
+        # the manager is fire-and-forget with no internal limit, so the cap lives
+        # here. Ids past the cap are eligible but deferred ("queued").
+        if len(started) >= _REHUNT_START_CAP:
+            skipped.append({"id": hunt_id, "reason": "queued"})
+            continue
+        # CLEAN re-run: fresh-start path, NO prior seeding (prior defaults None).
+        new_id = await manager.start(
+            request.app.state, objective=hunt.objective, started_by=started_by
+        )
+        if new_id is None:
+            skipped.append({"id": hunt_id, "reason": "could_not_start"})
+            continue
+        started.append({"old_id": hunt_id, "new_id": new_id, "objective": hunt.objective})
+
+    return HuntRehuntResultOut(started=started, skipped=skipped)
+
+
+class HuntBulkDeleteIn(BaseModel):
+    hunt_ids: list[str] = Field(max_length=_REHUNT_CAP)
+
+
+class HuntBulkDeleteResultOut(BaseModel):
+    deleted: list[str]
+    not_found: list[str]
+
+
+@router.post("/hunts/bulk-delete", dependencies=[Depends(require_admin_api)])
+async def bulk_delete_hunts(request: Request, body: HuntBulkDeleteIn) -> HuntBulkDeleteResultOut:
+    """Delete each supplied hunt (admin — mirrors the single DELETE /hunts/{id}).
+
+    Deduplicates the input (order-preserving). Each id is removed via the store's
+    ``delete`` (hunt + events + chat projection, one transaction); a row that
+    isn't there is reported in ``not_found`` rather than failing the batch. A
+    still-``running`` hunt is NOT deleted — its background drainer could write
+    rows back after the delete (same guard the single DELETE enforces with a 409)
+    — and is reported in ``not_found`` so the caller re-lists it; the bulk UI only
+    selects terminal rows, so this is the belt-and-braces path.
+    """
+    seen: set[str] = set()
+    unique_ids: list[str] = []
+    for hunt_id in body.hunt_ids:
+        if hunt_id not in seen:
+            seen.add(hunt_id)
+            unique_ids.append(hunt_id)
+
+    deleted: list[str] = []
+    not_found: list[str] = []
+    async with request.app.state.db_sessionmaker() as db:
+        for hunt_id in unique_ids:
+            hunt = await db.get(Hunt, hunt_id)
+            if hunt is None:
+                not_found.append(hunt_id)
+                continue
+            # Refuse a still-running hunt (its drainer can still write rows) —
+            # report it as not-removed via not_found so the caller re-lists.
+            if hunt.status == "running":
+                not_found.append(hunt_id)
+                continue
+            if await hunt_svc.delete(db, hunt_id):
+                deleted.append(hunt_id)
+            else:
+                not_found.append(hunt_id)
+    return HuntBulkDeleteResultOut(deleted=deleted, not_found=not_found)
 
 
 # ── "Chat about this hunt" — read-only follow-up Q&A on a COMPLETED hunt ──────

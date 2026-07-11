@@ -168,6 +168,47 @@ def _repair_dangling_tool_calls(gathered: list[Any]) -> list[Any]:
         return gathered[:-1]
 
 
+def _replay_reasoning_context(gathered: list[Any]) -> str:
+    """Surface the exploration model's own reasoning as explicit synthesizer input.
+
+    The trust-erosion bug (two prod hunts, 2026-07): the exploration model had
+    ALREADY debunked the false positive IN ITS REASONING ("Apple service
+    discovery, not C2"), but that debunking lived in ``ThinkingPart``s the
+    partial synthesizer never saw — pydantic-ai does NOT feed a prior turn's
+    thinking back into a fresh agent's ``message_history`` (thinking is stripped
+    from replayed context), so only the loud alert TITLES survived and the
+    synthesizer reasserted the FP. This lifts the reasoning text back out of the
+    gathered ``ModelResponse`` ``ThinkingPart``s and returns it as a plain-text
+    block to prepend to the synthesizer's user message, so the model's own
+    debunking is in front of it when it writes up a cut-short hunt.
+
+    Returns ``""`` when there is no reasoning to replay (a non-reasoning model, or
+    an empty trace) — the caller then simply omits the block. Defensive: any
+    surprise part shape is skipped, never raised.
+    """
+    traces: list[str] = []
+    for msg in gathered:
+        for part in getattr(msg, "parts", None) or []:
+            if type(part).__name__ != "ThinkingPart":
+                continue
+            content = str(getattr(part, "content", "") or "").strip()
+            if content:
+                traces.append(content)
+    if not traces:
+        return ""
+    joined = "\n\n".join(traces)
+    return (
+        "## Your own reasoning from the exploration above (do NOT ignore it)\n"
+        "While hunting you already reasoned about this evidence — including any "
+        "false positives you debunked. That reasoning is NOT in the replayed "
+        "message history, so it is reproduced here verbatim. Weight it: if you "
+        "concluded an alert was a false positive (e.g. 'solicited echo reply, not "
+        "C2' / 'Apple service discovery, not a Linux backdoor'), do NOT reassert "
+        "it as a threat now just because the alert title is loud.\n\n"
+        f"{joined}\n\n---\n\n"
+    )
+
+
 async def _synthesize_partial_hunt(
     ctx: InvestigationContext, *, objective: str, gathered: list[Any]
 ) -> Any:
@@ -178,10 +219,21 @@ async def _synthesize_partial_hunt(
     see :func:`_repair_dangling_tool_calls`), then replays the accumulated
     message history through the no-tools hunt synthesizer so the analyst still
     gets a grounded partial report instead of a bare error.
+
+    The exploration model's own reasoning (its ``ThinkingPart``s, where the
+    debunking of a false positive lives) is NOT carried into a fresh agent's
+    replayed history by pydantic-ai, so it is lifted out via
+    :func:`_replay_reasoning_context` and prepended to the synthesizer's user
+    message — otherwise only the loud alert titles survive and the write-up
+    reasserts an FP the hunt had already dismissed.
     """
     synth = build_hunt_synthesizer(build_investigator_model(ctx.settings), objective=objective)
+    reasoning_block = _replay_reasoning_context(gathered)
+    user_msg = (
+        reasoning_block + "Write the HuntReport now from the evidence already gathered above."
+    )
     return await synth.run(
-        "Write the HuntReport now from the evidence already gathered above.",
+        user_msg,
         message_history=_repair_dangling_tool_calls(gathered),
         usage_limits=UsageLimits(request_limit=3, tool_calls_limit=0),
     )
@@ -217,7 +269,19 @@ async def _stream_node(
             else ev.model_copy(update={"payload": guard.desanitize_obj(ev.payload)})
         )
         if disp.kind == "tool_result":
-            gathered_tool_results.append(disp.payload.get("result"))
+            # Capture a LABELED evidence item ({tool_name, result}) — not just the
+            # bare result. The E1.3 finding gate resolves citations against
+            # ``result`` (unchanged — the JSON dump still contains it, so existing
+            # resolution is unaffected), and the corroboration gate additionally
+            # classifies each item by ``tool_name`` to tell a detector-alert
+            # citation apart from a corroborating-evidence one. ``_walk_message``
+            # already surfaces the ToolReturnPart's ``tool_name`` on the payload.
+            gathered_tool_results.append(
+                {
+                    "tool_name": disp.payload.get("tool_name", ""),
+                    "result": disp.payload.get("result"),
+                }
+            )
         yield disp
 
 
@@ -301,6 +365,9 @@ async def run_hunt(
         yield _ev("error", {"message": str(e), "type": type(e).__name__})
         return
 
+    # True ONLY when the report below came from the budget/timeout partial path —
+    # gates the deterministic humility clamp (a full-run report is never clamped).
+    partial_synthesis = False
     if result is None and budget_exhausted and gathered:
         # Replay the accumulated transcript through a no-tools synthesizer to land a
         # grounded partial HuntReport rather than an empty error.
@@ -315,6 +382,7 @@ async def run_hunt(
         )
         try:
             result = await _synthesize_partial_hunt(ctx, objective=objective, gathered=gathered)
+            partial_synthesis = True
         except asyncio.CancelledError:
             raise
         except BaseException as e:
@@ -334,6 +402,17 @@ async def run_hunt(
 
     report = _desanitize_hunt_report(result.output, guard)
 
+    # ── Partial-report humility clamp (deterministic) ────────────────────────
+    # A budget/timeout-truncated hunt is written up by the no-tools synthesizer
+    # from a transcript dominated by loud alert titles — the prompt ASKS for lower
+    # confidence and threat skepticism, but two prod hunts still emitted HIGH
+    # severity at 0.75-0.78 conf. Make the humility a RULE, not a request: on the
+    # partial path clamp overall confidence to <= 0.5 and cap any threat finding to
+    # medium with a note. Runs BEFORE the citation gate so a partial's caps compose
+    # with the corroboration cap (min-severity wins either way).
+    if partial_synthesis:
+        report = _apply_partial_humility(report)
+
     # ── Post-hunt citation gate (E1.3) ───────────────────────────────────────
     # Deterministically resolve each finding's citations against the evidence the
     # hunt ACTUALLY gathered; strip non-resolving citations + cap such findings'
@@ -346,6 +425,54 @@ async def run_hunt(
     report_payload = report.model_dump(mode="json")
     yield _ev("hunt_report", report_payload)
     yield _ev("done", {"finding_count": len(report.findings)})
+
+
+_PARTIAL_HUMILITY_NOTE = "budget/timeout-partial — uncorroborated; corroborate before acting"
+
+
+def _apply_partial_humility(report: Any) -> Any:
+    """Clamp a budget/timeout-PARTIAL HuntReport's confidence + threat severities.
+
+    A cut-short hunt is synthesized (no tools) from a transcript that is often
+    dominated by loud detector-alert titles. Even with the synth prompt asking for
+    humility, the model over-claimed on two prod hunts (HIGH severity, 0.75-0.78
+    conf). This makes it deterministic:
+
+    * ``confidence`` is clamped to at most ``0.5`` (the mid default) — a partial
+      hunt cannot report high confidence in its conclusions.
+    * every ``category == "threat"`` finding at high/critical severity is capped to
+      ``"medium"`` and annotated with :data:`_PARTIAL_HUMILITY_NOTE` (preserving any
+      note the citation gate later sets is handled by ordering — this runs first).
+
+    Fail-soft and PURE: on any surprise shape the original report is returned
+    unchanged (a humility clamp must never cost the hunt its report). Uses the
+    hunt-gate severity machinery so "cap" only ever LOWERS a severity.
+    """
+    try:
+        from soc_ai.agent.hunt_gates import _SEV_RANK, _cap_severity  # noqa: PLC0415
+
+        new_findings: list[Any] = []
+        for finding in report.findings:
+            category = str(getattr(finding, "category", None) or "").strip().lower()
+            severity = str(getattr(finding, "severity", None) or "info")
+            if category == "threat" and _SEV_RANK.get(severity.lower(), 0) >= _SEV_RANK["high"]:
+                new_findings.append(
+                    finding.model_copy(
+                        update={
+                            "severity": _cap_severity(severity, "medium"),
+                            "validator_note": _PARTIAL_HUMILITY_NOTE,
+                        }
+                    )
+                )
+            else:
+                new_findings.append(finding)
+        confidence = min(float(getattr(report, "confidence", 0.5) or 0.0), 0.5)
+        return report.model_copy(update={"findings": new_findings, "confidence": confidence})
+    except Exception:
+        _LOGGER.warning(
+            "hunt partial-humility clamp failed; persisting report as-is", exc_info=True
+        )
+        return report
 
 
 def _gate_hunt_citations(

@@ -2,22 +2,28 @@ import {
   AlertTriangle,
   CalendarClock,
   Check,
+  ChevronDown,
+  ChevronRight,
   Crosshair,
   Loader2,
   MessageSquare,
   Pencil,
   Plus,
+  RefreshCw,
+  RotateCw,
   Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Checkbox } from '../components/Controls';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { rangeToSinceUntil } from '../lib/timeRange';
 import {
+  bulkDeleteHunts,
   createHuntSchedule,
   createHuntTemplate,
   deleteHunt,
@@ -27,13 +33,14 @@ import {
   getHuntSchedules,
   getHuntStats,
   getHuntTemplates,
+  rehuntHunts,
   startHuntConsole,
   updateHuntSchedule,
 } from '../lib/api';
 import type { HuntSchedule, HuntTemplate } from '../lib/api';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { useAsync } from '../lib/useAsync';
-import type { HuntRow, HuntStatus } from '../lib/types';
+import type { HuntRehuntResult, HuntRow, HuntStatus } from '../lib/types';
 
 // The backend floors a schedule's interval at 60 minutes (MIN_INTERVAL_MINUTES);
 // mirror that here so the picker can't offer an interval the API would clamp.
@@ -46,7 +53,20 @@ const MIN_INTERVAL_MINUTES = 60;
 // run and navigates to its live detail.
 // ---------------------------------------------------------------------------
 
-const GRID = '1fr 120px 110px 110px 130px 44px';
+// 28px checkbox · objective · findings · hosts · status · started · actions
+// (re-hunt + delete). The actions gutter grew from 44px to fit two icon buttons.
+const GRID = '28px 1fr 120px 110px 110px 130px 72px';
+
+// Raw rehunt skip-reason codes (routes_hunts.py::bulk_rehunt) → friendly text.
+// Unknown codes fall through to the raw code so a new backend reason is never
+// silently swallowed (mirrors Investigations' rehuntSkipReason).
+const REHUNT_SKIP_REASONS: Record<string, string> = {
+  not_found: 'not found',
+  running: 'still running',
+  queued: 'queued — re-hunt in a smaller batch',
+  could_not_start: "couldn't start",
+};
+const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
 const TONE: Record<string, string> = {
   accent: '#4b8bf5',
@@ -510,6 +530,23 @@ export function Hunts() {
   // just that hunt. A running hunt returns 409 (cancel it first).
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleteMsg, setDeleteMsg] = useState<string | null>(null);
+  // Per-row re-hunt: an in-flight guard keyed by the source hunt id so a
+  // double-click doesn't fire two fresh hunts for the same objective.
+  const [rehuntingId, setRehuntingId] = useState<string | null>(null);
+
+  // Multi-select (mirrors Investigations): a plain id→bool map, independent of
+  // the time filter (`range`/`custom` feed the fetch, not the selection). The
+  // bulk action bar appears when selCount > 0.
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [rehunting, setRehunting] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [bulkMsg, setBulkMsg] = useState<string | null>(null);
+  // Structured bulk-rehunt outcome: the collapsed "Started N · M skipped" header
+  // auto-dismisses, but once expanded it PERSISTS until collapsed/dismissed so a
+  // mixed batch's which/why isn't yanked away mid-read (mirrors Investigations).
+  const [rehuntResult, setRehuntResult] = useState<HuntRehuntResult | null>(null);
+  const [rehuntExpanded, setRehuntExpanded] = useState(false);
 
   // Time filter — same pattern as Alerts/Investigations: a preset (default 24h)
   // or a custom from/to, held in plain component state. Unlike those screens the
@@ -556,6 +593,21 @@ export function Hunts() {
     };
   }, []);
 
+  // The bulk status line is a transient toast; auto-dismiss it (errors linger a
+  // little longer to be read).
+  useEffect(() => {
+    if (!bulkMsg) return;
+    const isError = /fail/i.test(bulkMsg);
+    const t = setTimeout(() => setBulkMsg(null), isError ? 8000 : 4500);
+    return () => clearTimeout(t);
+  }, [bulkMsg]);
+  // The collapsed rehunt-result header auto-dismisses; once expanded it stays.
+  useEffect(() => {
+    if (!rehuntResult || rehuntExpanded) return;
+    const t = setTimeout(() => setRehuntResult(null), 6000);
+    return () => clearTimeout(t);
+  }, [rehuntResult, rehuntExpanded]);
+
   const deleteOne = async (id: string) => {
     setDeleteMsg(null);
     try {
@@ -567,6 +619,87 @@ export function Hunts() {
       );
     }
     setPendingDelete(null);
+    setReloadKey((k) => k + 1);
+  };
+
+  // Per-row re-hunt: a CLEAN re-run of the row's objective as a fresh hunt (no
+  // prior-narrative seeding), then navigate to the new hunt's live view — same
+  // optimistic navigation the "Start hunt" box does. objective_hash matches, so
+  // the fresh run automatically gets the "vs last run" diff.
+  const rehuntOne = (h: HuntRow) => {
+    if (rehuntingId) return;
+    setRehuntingId(h.id);
+    setBulkMsg(null);
+    startHuntConsole(h.objective)
+      .then((r) => navigate(`/hunts/${r.hunt_id}`))
+      .catch((e: unknown) => {
+        setBulkMsg(`Re-hunt failed: ${e instanceof Error ? e.message : String(e)}`);
+        setRehuntingId(null);
+      });
+  };
+
+  // Selection helpers (independent of the time filter — operate over the fetched
+  // rows). Mirrors Investigations' toggleSelectAll / selCount / allSelected.
+  const rows = data ?? [];
+  const rowIds = rows.map((h) => h.id);
+  const selCount = Object.values(selected).filter(Boolean).length;
+  const allSelected = rowIds.length > 0 && rowIds.every((id) => selected[id]);
+  const someSelected = rowIds.some((id) => selected[id]);
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelected((prev) => {
+        const next = { ...prev };
+        rowIds.forEach((id) => delete next[id]);
+        return next;
+      });
+    } else {
+      setSelected((prev) => {
+        const next = { ...prev };
+        rowIds.forEach((id) => (next[id] = true));
+        return next;
+      });
+    }
+  };
+
+  const handleBulkRehunt = async () => {
+    const ids = Object.keys(selected).filter((k) => selected[k]);
+    if (!ids.length) return;
+    setRehunting(true);
+    setBulkMsg(null);
+    setRehuntResult(null);
+    setRehuntExpanded(false);
+    try {
+      // Surface the per-id started/skipped detail (the batch is throttled — only
+      // the first few start, the rest come back "queued").
+      setRehuntResult(await rehuntHunts(ids));
+      setSelected({});
+      setReloadKey((k) => k + 1);
+    } catch (err) {
+      setBulkMsg(`Re-hunt failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setRehunting(false);
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    const ids = Object.keys(selected).filter((k) => selected[k]);
+    if (!ids.length) return;
+    setBulkDeleting(true);
+    setBulkMsg(null);
+    try {
+      const res = await bulkDeleteHunts(ids);
+      const nf = res.not_found.length;
+      setBulkMsg(
+        `Deleted ${res.deleted.length} hunt${res.deleted.length !== 1 ? 's' : ''}` +
+          (nf ? ` · ${nf} skipped (missing or still running — cancel it first)` : ''),
+      );
+    } catch (err) {
+      setBulkMsg(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    setSelected({});
+    setConfirmDelete(false);
+    setBulkDeleting(false);
     setReloadKey((k) => k + 1);
   };
 
@@ -657,9 +790,9 @@ export function Hunts() {
         {deleteMsg && <div className="mt-2 text-[12px] text-danger">{deleteMsg}</div>}
       </Panel>
 
-      {/* filter bar — same placement as Alerts/Investigations: directly above
-          the list. The stat cards above stay UNFILTERED, mirroring the
-          Investigations header counts (which ignore its time filter). */}
+      {/* filter bar + bulk action — same placement as Alerts/Investigations:
+          directly above the list. The stat cards above stay UNFILTERED, mirroring
+          the Investigations header counts (which ignore its time filter). */}
       <div className="mb-3.5 flex flex-wrap items-center gap-2">
         <TimeRangeFilter
           value={range}
@@ -669,7 +802,121 @@ export function Hunts() {
             if (r) setCustom(r);
           }}
         />
+
+        {selCount > 0 && (
+          <>
+            <div className="h-4 w-px bg-border-strong" />
+            <span className="text-[12.5px] text-dim">
+              <span className="font-mono text-accent">{selCount}</span> selected
+            </span>
+            <button
+              disabled={rehunting}
+              onClick={() => { void handleBulkRehunt(); }}
+              title="Re-run the selected objectives as fresh hunts (throttled — starts a few, queues the rest)"
+              className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
+              style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+            >
+              <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
+              {rehunting ? 'Starting…' : `Re-hunt selected (${selCount})`}
+            </button>
+            {confirmDelete ? (
+              <>
+                <button
+                  disabled={bulkDeleting}
+                  onClick={() => { void handleBulkDelete(); }}
+                  className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
+                >
+                  <Trash2 size={12} />
+                  {bulkDeleting ? 'Deleting…' : `Confirm delete (${selCount})`}
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                title="Delete the selected hunts (admin)"
+                className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+              >
+                <Trash2 size={12} /> Delete selected ({selCount})
+              </button>
+            )}
+            <button
+              onClick={() => setSelected({})}
+              className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+            >
+              Clear
+            </button>
+          </>
+        )}
+
+        {bulkMsg && <span className="text-[12.5px] text-text-2">{bulkMsg}</span>}
       </div>
+
+      {/* Bulk re-hunt result: a collapsed "Started N · M skipped" header expands
+          to the per-id detail the API returns — WHICH objectives re-ran and WHY
+          each skip happened (throttle "queued", running, not found) — so a mixed
+          batch is never an opaque count (mirrors Investigations E2.2). */}
+      {rehuntResult && (() => {
+        const started = rehuntResult.started;
+        const skipped = rehuntResult.skipped;
+        const total = started.length + skipped.length;
+        return (
+          <div
+            className="mb-3.5 overflow-hidden rounded-card border"
+            style={{ borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }}
+          >
+            <div className="flex items-center gap-2.5 px-3.5 py-2.5 text-[13px]">
+              <RefreshCw size={13} className="flex-none text-accent" />
+              <button
+                onClick={() => total > 0 && setRehuntExpanded((v) => !v)}
+                disabled={total === 0}
+                className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+              >
+                <span className="min-w-0 truncate font-semibold text-text-2">
+                  Started {started.length} re-hunt{started.length !== 1 ? 's' : ''}
+                  {skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}
+                </span>
+                {total > 0 && (
+                  <span className="flex flex-none items-center gap-1 text-[11.5px] text-dim">
+                    {rehuntExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    {rehuntExpanded ? 'Hide detail' : 'Show detail'}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => { setRehuntResult(null); setRehuntExpanded(false); }}
+                className="flex flex-none text-dim hover:text-text"
+                aria-label="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            {rehuntExpanded && total > 0 && (
+              <div className="border-t border-border-faint px-3.5 py-2 text-[12.5px]">
+                {started.map((s) => (
+                  <div key={s.old_id} className="flex items-center gap-2 py-[3px]">
+                    <Check size={12} className="flex-none text-success" />
+                    <span className="min-w-0 truncate text-text-2">{s.objective}</span>
+                    <span className="flex-none text-faint">→ new hunt</span>
+                  </div>
+                ))}
+                {skipped.map((s) => (
+                  <div key={s.id} className="flex items-center gap-2 py-[3px]">
+                    <X size={12} className="flex-none text-faint" />
+                    <span className="min-w-0 truncate text-dim">{s.id}</span>
+                    <span className="flex-none text-faint">— {rehuntSkipReason(s.reason)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* hunts list */}
       <Panel>
@@ -677,6 +924,14 @@ export function Hunts() {
           className="grid items-center gap-3 border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-[.04em] text-dim"
           style={{ gridTemplateColumns: GRID }}
         >
+          <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
+            <Checkbox
+              checked={allSelected}
+              indeterminate={!allSelected && someSelected}
+              onChange={toggleSelectAll}
+              title="Select all"
+            />
+          </div>
           <div>Objective</div>
           <div>Findings</div>
           <div>Hosts</div>
@@ -708,6 +963,15 @@ export function Hunts() {
               className="group grid w-full cursor-pointer items-center gap-3 border-b border-border px-4 py-3 text-left last:border-0 hover:bg-surface-2"
               style={{ gridTemplateColumns: GRID }}
             >
+              <div
+                className="flex items-center"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSelected((prev) => ({ ...prev, [h.id]: !prev[h.id] }));
+                }}
+              >
+                <Checkbox checked={!!selected[h.id]} title="Select" />
+              </div>
               <div className="flex items-center gap-2 truncate">
                 <Crosshair size={14} className="flex-none text-accent" />
                 <span className="truncate text-[13px] text-text">{h.objective}</span>
@@ -727,7 +991,29 @@ export function Hunts() {
                 <StatusDot status={h.status} />
               </div>
               <div className="text-[12px] text-dim">{h.when}</div>
-              <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-end gap-2" onClick={(e) => e.stopPropagation()}>
+                {/* Re-hunt: a clean re-run of this objective as a fresh hunt.
+                    Nothing to re-run while still running. Prominent (always
+                    visible, accent) on error/interrupted rows — the ones that
+                    need it; a quiet hover-reveal on a completed row. */}
+                {h.status !== 'running' && (
+                  <button
+                    onClick={() => rehuntOne(h)}
+                    disabled={rehuntingId === h.id}
+                    title="Re-run this objective as a fresh hunt"
+                    className={
+                      h.status === 'error' || h.status === 'interrupted'
+                        ? 'flex text-accent transition-opacity hover:opacity-80 disabled:opacity-50'
+                        : 'flex text-faint opacity-0 transition-opacity hover:text-accent group-hover:opacity-100 disabled:opacity-50'
+                    }
+                  >
+                    {rehuntingId === h.id ? (
+                      <Loader2 size={13} className="animate-spin" />
+                    ) : (
+                      <RotateCw size={13} />
+                    )}
+                  </button>
+                )}
                 {pendingDelete === h.id ? (
                   <div className="flex items-center gap-1.5">
                     <button

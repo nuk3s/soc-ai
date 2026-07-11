@@ -160,6 +160,26 @@ def test_parse_pipe_split_respects_quotes() -> None:
     assert ast.filter_ == Term(field="rule.name", value=QuotedValue(text="ET | MALWARE"))
 
 
+def test_parse_pipe_split_respects_single_quotes() -> None:
+    """A `|` inside a SINGLE-quoted string must NOT be treated as a pipe separator
+    (the grammar accepts either quote style; the top-level splitter must track both
+    so a single-quoted value can't smuggle a spurious stage break)."""
+    ast = parse_oql("rule.name:'ET | MALWARE'")
+    assert ast.pipes == ()
+    assert ast.filter_ == Term(field="rule.name", value=QuotedValue(text="ET | MALWARE"))
+
+
+def test_split_pipe_tracks_both_quote_styles() -> None:
+    """A double quote inside a single-quoted string (and vice versa) is literal and
+    does not toggle quote state, so an embedded `|` still doesn't split."""
+    from soc_ai.so_client.oql import _split_pipe
+
+    # `"` inside a single-quoted value is literal — the whole thing is one segment.
+    assert _split_pipe("""rule.name:'a " | b'""") == ["""rule.name:'a " | b'"""]
+    # A genuine top-level pipe still splits.
+    assert _split_pipe("* | groupby source.ip") == ["* ", " groupby source.ip"]
+
+
 def test_parse_empty_query_rejected() -> None:
     with pytest.raises(OqlValidationError, match="empty"):
         parse_oql("")

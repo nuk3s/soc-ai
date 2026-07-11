@@ -337,3 +337,197 @@ async def test_host_summary_centers_window_on_time_anchor(settings_kratos: Setti
     # Anchored mode produces an explicit gte/lte straddling the anchor.
     assert "gte" in time_filter and "lte" in time_filter
     assert time_filter["gte"] < anchor.isoformat() < time_filter["lte"]
+
+
+# ---------------------------------------------------------------------------
+# Telemetry-domain OS hint — the BPFDoor-vs-MacBook fix. A TLS-only host with no
+# User-Agent must still get an OS from its Apple/Windows/Linux/Android telemetry.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_host_summary_tls_only_apple_dns_backfills_os_guess(
+    settings_kratos: Settings,
+) -> None:
+    """A TLS-only host with NO User-Agent but Apple telemetry DNS → the os_hint
+    becomes device_os_guess (basis telemetry-domains), with the matched domains
+    as evidence. This is the case where device_os_guess was previously None and a
+    'Linux backdoor' alert on a MacBook went unchallenged."""
+    hits = [
+        {
+            "@timestamp": "2026-06-27T10:00:00Z",
+            "source.ip": "192.0.2.15",
+            "destination.ip": "17.253.5.202",
+            "destination.port": 443,
+            "dns": {"query": {"name": "gdmf.apple.com"}},
+        },
+        {
+            "@timestamp": "2026-06-27T10:01:00Z",
+            "source.ip": "192.0.2.15",
+            "destination.ip": "17.253.5.203",
+            "destination.port": 443,
+            "dns": {"query": {"name": "gateway.icloud.com"}},
+        },
+        {
+            "@timestamp": "2026-06-27T10:02:00Z",
+            "source.ip": "192.0.2.15",
+            "destination.ip": "17.253.5.204",
+            "destination.port": 443,
+            "dns": {"query": {"name": "_aaplcache._tcp.local"}},
+        },
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("192.0.2.15", elastic=elastic, settings=settings_kratos)
+
+    # No UA was present, so the telemetry hint BECOMES the device_os_guess.
+    assert out["os_hint"] is not None
+    assert out["os_hint"]["os"] == "macos"
+    assert out["os_hint"]["confidence"] == "strong"
+    assert out["os_hint"]["basis"] == "telemetry-domains"
+    assert out["device_os_guess"] == "macos"
+    # Evidence is load-bearing: the matched Apple domains must be visible.
+    os_evidence = out["evidence"]["os_hint"]
+    assert any("apple.com" in e or "icloud.com" in e or "aaplcache" in e for e in os_evidence)
+    # And crucially — this is a MacBook, NEVER a Linux host.
+    assert out["device_os_guess"] != "Linux"
+    assert out["os_hint"]["os"] != "linux"
+
+
+@pytest.mark.asyncio
+async def test_host_summary_tls_only_apple_sni_backfills_os_guess(
+    settings_kratos: Settings,
+) -> None:
+    """When the grid never sees plaintext DNS (DoH/upstream resolver) the TLS SNI
+    server-name still carries the telemetry domain → os_hint from SNI alone."""
+    hits = [
+        {
+            "@timestamp": "2026-06-27T10:00:00Z",
+            "source.ip": "192.0.2.15",
+            "destination.ip": "17.253.5.202",
+            "destination.port": 443,
+            "ssl": {"server_name": "gdmf.apple.com"},
+        },
+        {
+            "@timestamp": "2026-06-27T10:01:00Z",
+            "source.ip": "192.0.2.15",
+            "destination.ip": "17.253.5.203",
+            "destination.port": 443,
+            "ssl": {"server_name": "gateway.icloud.com"},
+        },
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("192.0.2.15", elastic=elastic, settings=settings_kratos)
+
+    assert out["os_hint"] is not None
+    assert out["os_hint"]["os"] == "apple"
+    assert out["device_os_guess"] == "apple"
+    assert out["os_hint"]["basis"] == "telemetry-domains"
+
+
+@pytest.mark.asyncio
+async def test_host_summary_ua_wins_over_conflicting_dns_hint(
+    settings_kratos: Settings,
+) -> None:
+    """A host WITH a Windows UA but Apple telemetry DNS → the UA stays PRIMARY
+    (device_os_guess == 'Windows'), and the conflict is NOTED, not silently
+    resolved. A weak/other-family DNS hint never overwrites a UA signal."""
+    windows_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0"
+    hits = [
+        {
+            "@timestamp": "2026-06-27T10:00:00Z",
+            "source.ip": "192.0.2.20",
+            "destination.ip": "93.184.216.34",
+            "destination.port": 443,
+            "user_agent.original": windows_ua,
+        },
+        {
+            "@timestamp": "2026-06-27T10:01:00Z",
+            "source.ip": "192.0.2.20",
+            "destination.ip": "17.253.5.202",
+            "destination.port": 443,
+            "dns": {"query": {"name": "gdmf.apple.com"}},
+        },
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("192.0.2.20", elastic=elastic, settings=settings_kratos)
+
+    # UA wins primary — existing device_os_guess consumers see the UA label.
+    assert out["device_os_guess"] == "Windows"
+    # The DNS hint is still surfaced, basis user-agent, with a noted conflict.
+    assert out["os_hint"] is not None
+    assert out["os_hint"]["os"] == "apple"
+    assert out["os_hint"]["basis"] == "user-agent"
+    assert "conflict" in out["os_hint"]
+    assert "apple" in out["os_hint"]["conflict"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_ua_corroborated_by_dns_hint(settings_kratos: Settings) -> None:
+    """An iPhone UA + Apple telemetry DNS → UA primary (device_os_guess ==
+    'iPhone'), hint agrees, basis 'both', no conflict. Existing consumers see the
+    unchanged 'iPhone' label."""
+    hits = [
+        {
+            "@timestamp": "2026-06-27T10:00:00Z",
+            "source.ip": "192.0.2.30",
+            "destination.ip": "93.184.216.34",
+            "destination.port": 443,
+            "user_agent.original": IPHONE_UA,
+        },
+        {
+            "@timestamp": "2026-06-27T10:01:00Z",
+            "source.ip": "192.0.2.30",
+            "destination.ip": "17.253.5.202",
+            "destination.port": 443,
+            "dns": {"query": {"name": "gateway.icloud.com"}},
+        },
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("192.0.2.30", elastic=elastic, settings=settings_kratos)
+
+    # The iPhone-vs-Mac fix still holds and is untouched by the hint.
+    assert out["device_os_guess"] == "iPhone"
+    assert out["os_hint"] is not None
+    assert out["os_hint"]["os"] == "apple"
+    assert out["os_hint"]["basis"] == "both"
+    assert "conflict" not in out["os_hint"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_no_os_telemetry_leaves_os_hint_none(
+    settings_kratos: Settings,
+) -> None:
+    """A host whose DNS is only non-OS services (no vendor telemetry) → os_hint
+    None, and device_os_guess is whatever the UA said (here None). Never a Linux
+    label invented from the absence of Apple/Windows/Android."""
+    hits = [
+        {
+            "@timestamp": "2026-06-27T10:00:00Z",
+            "source.ip": "192.0.2.40",
+            "destination.ip": "1.1.1.1",
+            "destination.port": 443,
+            "dns": {"query": {"name": "drive-api.proton.me"}},
+        },
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("192.0.2.40", elastic=elastic, settings=settings_kratos)
+
+    assert out["os_hint"] is None
+    assert out["device_os_guess"] is None
+    assert "os_hint" not in out["evidence"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_os_hint_present_in_empty_result(settings_kratos: Settings) -> None:
+    """The no-observations result carries os_hint: None for a stable shape."""
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+
+    out = await host_summary("192.0.2.99", elastic=elastic, settings=settings_kratos)
+
+    assert out["observations"] is False
+    assert out["os_hint"] is None

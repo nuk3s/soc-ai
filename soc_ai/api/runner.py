@@ -28,6 +28,10 @@ from soc_ai.api.recorder import InvestigationRecorder
 
 _LOGGER = logging.getLogger(__name__)
 
+# Fallback whole-run wall-clock backstop when the setting is absent (older config
+# overlays / test doubles). Mirrors ``Settings.investigation_run_timeout_s``.
+_DEFAULT_INVESTIGATION_RUN_TIMEOUT_S = 900
+
 
 @dataclass
 class CancelToken:
@@ -70,17 +74,30 @@ async def recorded_run(
 
     yield "investigation_created", {"investigation_id": inv_id}
 
+    # Whole-run wall-clock backstop. The per-turn timeouts inside the orchestrator
+    # bound each model turn, but a slow-but-progressing multi-turn run (or a wedged
+    # stream that keeps resetting the per-turn clock) has no whole-run stop. This
+    # wraps the event-stream consumption for EVERY caller — the interactive SSE
+    # route consumes recorded_run directly, and the background hunt path reaches it
+    # via run_recorded — so the backstop is applied in exactly one place instead of
+    # per call site.
+    run_timeout = getattr(
+        getattr(state, "settings", None),
+        "investigation_run_timeout_s",
+        _DEFAULT_INVESTIGATION_RUN_TIMEOUT_S,
+    )
     try:
-        async for ev in event_stream:
-            await recorder.record(ev.kind, ev.sequence, ev.payload)
-            yield (
-                ev.kind,
-                {
-                    "session_id": ev.session_id,
-                    "sequence": ev.sequence,
-                    "payload": ev.payload,
-                },
-            )
+        async with asyncio.timeout(run_timeout):
+            async for ev in event_stream:
+                await recorder.record(ev.kind, ev.sequence, ev.payload)
+                yield (
+                    ev.kind,
+                    {
+                        "session_id": ev.session_id,
+                        "sequence": ev.sequence,
+                        "payload": ev.payload,
+                    },
+                )
         await recorder.finish("complete")
         # E2.4 notification trigger — a completed investigation with a
         # high-confidence true-positive verdict pings on-call. THIN + fail-soft:
@@ -89,6 +106,26 @@ async def recorded_run(
         # is configured, so this is zero-egress by default). Wrapped so a webhook
         # can never break the finalized investigation.
         await _maybe_notify_investigation(state, recorder)
+    except TimeoutError:
+        # Whole-run backstop tripped: land the partial run as error and tell the
+        # client, rather than propagating (mirrors the generic-crash handler below).
+        # asyncio.timeout converts its own expiry to TimeoutError at the `async with`
+        # boundary, so an EXTERNAL cancel (operator/ shutdown) still surfaces as
+        # CancelledError to the handler below — only a real deadline lands here.
+        _LOGGER.warning(
+            "investigation exceeded %ss wall-clock backstop for inv_id=%s alert_id=%s",
+            run_timeout,
+            inv_id,
+            alert_id,
+        )
+        await recorder.finish("error")
+        yield (
+            "error",
+            {
+                "message": f"investigation exceeded {run_timeout}s wall-clock limit",
+                "type": "TimeoutError",
+            },
+        )
     except asyncio.CancelledError:
         # Land a clean terminal state, then let the cancellation propagate so the
         # task actually stops. Only an EXPLICIT operator cancel is 'cancelled';

@@ -100,6 +100,16 @@ services:
 
     restart: unless-stopped
 
+    # ── Log rotation ──────────────────────────────────────────────────────────
+    # The always-on triage loop + the 30s healthcheck curl write to the default
+    # json-file driver, which grows UNBOUNDED without a cap — the failure mode
+    # most likely to fill the disk over months. Cap at 5×50m (250m ceiling).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
     # ── Hardening ─────────────────────────────────────────────────────────────
     # The app runs as non-root (UID 1000) and binds 8443 (>1024), so it needs no
     # Linux capabilities: drop them all and block privilege escalation (setuid).

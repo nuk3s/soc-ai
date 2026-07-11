@@ -1704,3 +1704,777 @@ def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) ->
     assert hunt_id
     assert "hunt_report" in names
     asyncio.run(engine.dispose())  # type: ignore[union-attr]
+
+
+# ── Corroboration gate: a high threat citing ONLY detector alerts is capped ──
+
+
+def _labeled(tool_name: str, result: Any) -> dict[str, Any]:
+    """A labeled gathered-evidence item, the shape hunt_runner now collects
+    ({tool_name, result}) so the corroboration gate can classify a citation's
+    source tool."""
+    return {"tool_name": tool_name, "result": result}
+
+
+def test_validate_hunt_findings_caps_high_threat_citing_only_alerts() -> None:
+    """The core trust-erosion fix: a high-severity THREAT finding whose only
+    resolving citation lands in an alert-query result (t_query_events_oql on the
+    suricata.alert doc that IS the claim) is capped to medium with the
+    corroborate-first note — even though the cited id genuinely exists."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="BPFDoor backdoor on 192.0.2.15",
+            detail="An ICMP heartbeat alert matched the BPFDoor signature.",
+            severity="high",
+            category="threat",
+            hosts=["192.0.2.15"],
+            citations=["sALERT_DOC_7Zk"],  # the alert that IS the claim
+        )
+    ]
+    # The ONLY gathered evidence is the alert document itself (an alert-query tool).
+    tool_results = [
+        _labeled(
+            "t_query_events_oql",
+            {
+                "total": 1,
+                "hits": [
+                    {"_id": "sALERT_DOC_7Zk", "rule.name": "ET MALWARE BPFDoor ICMP heartbeat"}
+                ],
+            },
+        )
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    f = validated[0]
+    assert f.severity == "medium"  # capped from high — cited only the alert
+    assert f.citations == ["sALERT_DOC_7Zk"]  # citation still resolves (it exists)
+    assert f.validator_note is not None
+    assert "only detector alerts cited" in f.validator_note.lower()
+    assert counts["findings_capped"] == 1
+    # the citation resolved, so nothing was stripped
+    assert counts["citations_stripped"] == 0
+
+
+def test_validate_hunt_findings_high_threat_with_corroboration_stays_high() -> None:
+    """The SAME finding, but also citing a t_get_pcap (corroborating) result →
+    stays HIGH. Corroboration beyond the detector alert is exactly what unlocks
+    the severity."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Confirmed C2 beacon on 10.0.0.5",
+            detail="Alert plus a measured 60s beacon cadence in the pcap.",
+            severity="high",
+            category="threat",
+            hosts=["10.0.0.5"],
+            citations=["sALERT_DOC_7Zk", "sPCAP_EVIDENCE_9Qm"],
+        )
+    ]
+    tool_results = [
+        _labeled(
+            "t_query_events_oql",
+            {"total": 1, "hits": [{"_id": "sALERT_DOC_7Zk", "rule.name": "ET HUNTING beacon"}]},
+        ),
+        _labeled(
+            "t_get_pcap",
+            {"beacon": {"interval_s": 60, "jitter": 0.02}, "marker": "sPCAP_EVIDENCE_9Qm"},
+        ),
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    f = validated[0]
+    assert f.severity == "high"  # NOT capped — corroborated by the pcap
+    assert f.validator_note is None
+    assert counts["findings_capped"] == 0
+
+
+def test_validate_hunt_findings_corroboration_only_applies_to_high_threat() -> None:
+    """A MEDIUM threat, and a HIGH non-threat (observation), citing only an alert
+    result are BOTH left alone — the corroboration cap targets only the loud
+    high/critical threat write-up."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Rule fired on internal ICMP",
+            detail="A heartbeat rule fired; noted for context.",
+            severity="medium",
+            category="threat",
+            citations=["sALERT_DOC_7Zk"],
+        ),
+        HuntFinding(
+            title="High-volume informational alerting",
+            detail="This grid alerts heavily on informational ICMP.",
+            severity="high",
+            category="observation",
+            citations=["sALERT_DOC_7Zk"],
+        ),
+    ]
+    tool_results = [
+        _labeled("t_query_events_oql", {"hits": [{"_id": "sALERT_DOC_7Zk"}]}),
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    assert validated[0].severity == "medium"  # medium threat untouched
+    assert validated[0].validator_note is None
+    assert validated[1].severity == "high"  # high OBSERVATION untouched
+    assert validated[1].validator_note is None
+    assert counts["findings_capped"] == 0
+
+
+def test_validate_hunt_findings_rule_content_is_not_corroboration() -> None:
+    """t_get_rule_content is an alert-query tool (the signature is the detector's
+    OWN claim), so a high threat citing only the alert + the rule text is STILL
+    capped — reading the rule you're accused-by is not independent corroboration."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="BPFDoor implant confirmed",
+            detail="Alert fired and the rule content mentions BPFDoor.",
+            severity="critical",
+            category="threat",
+            citations=["sALERT_DOC_7Zk", "sRULE_TEXT_3Xp"],
+        )
+    ]
+    tool_results = [
+        _labeled("t_query_events_oql", {"hits": [{"_id": "sALERT_DOC_7Zk"}]}),
+        _labeled("t_get_rule_content", {"sid": "sRULE_TEXT_3Xp", "content": "BPFDoor magic"}),
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    f = validated[0]
+    assert f.severity == "medium"  # critical → medium: no non-alert corroboration
+    assert "only detector alerts cited" in (f.validator_note or "").lower()
+    assert counts["findings_capped"] == 1
+
+
+def test_validate_hunt_findings_labeled_evidence_resolution_unaffected() -> None:
+    """The hunt_runner labeled-evidence change ({tool_name, result}) must NOT
+    break the existing distinctive-token citation resolver — a fabricated id is
+    still stripped, a real id still resolves, exactly as with the bare-result
+    shape."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    tool_results = [
+        _labeled("t_get_pcap", {"total": 1, "hits": [{"_id": "sREAL_PULLED_ID_42"}]}),
+    ]
+    # fabricated → stripped + capped
+    fabricated = [
+        HuntFinding(
+            title="x", detail="d", severity="high", category="threat", citations=["sBOGUS_ID_9x"]
+        )
+    ]
+    v1, c1 = _validate_hunt_findings(fabricated, tool_results)
+    assert v1[0].citations == []
+    assert v1[0].severity == "low"
+    assert c1["citations_stripped"] == 1
+    # real id → resolves AND corroborates (t_get_pcap is non-alert) → stays high
+    real = [
+        HuntFinding(
+            title="x",
+            detail="d",
+            severity="high",
+            category="threat",
+            citations=["sREAL_PULLED_ID_42"],
+        )
+    ]
+    v2, c2 = _validate_hunt_findings(real, tool_results)
+    assert v2[0].citations == ["sREAL_PULLED_ID_42"]
+    assert v2[0].severity == "high"
+    assert c2["findings_capped"] == 0
+
+
+def test_run_hunt_gathers_labeled_evidence_and_caps_alert_only_threat(
+    settings_kratos: Settings,
+) -> None:
+    """End-to-end: run_hunt collects labeled {tool_name, result} evidence, and a
+    high threat citing ONLY the streamed alert-query result is capped to medium
+    with the corroborate-first note in the emitted hunt_report."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+
+    alert_id = "sALERT_DOC_7Zk"
+    report = HuntReport(
+        findings=[
+            HuntFinding(
+                title="BPFDoor backdoor on 192.0.2.15",
+                detail="ICMP heartbeat alert matched BPFDoor.",
+                severity="high",
+                category="threat",
+                hosts=["192.0.2.15"],
+                citations=[alert_id],
+            )
+        ],
+        narrative="An ICMP heartbeat alert fired.",
+        affected_hosts=["192.0.2.15"],
+        confidence=0.7,
+    )
+
+    class _Run:
+        def __init__(self) -> None:
+            self._nodes = iter(
+                [
+                    SimpleNamespace(
+                        model_response=ModelResponse(
+                            parts=[
+                                ToolCallPart(
+                                    tool_name="t_query_events_oql", args={}, tool_call_id="c1"
+                                )
+                            ]
+                        ),
+                        request=None,
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=SimpleNamespace(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_query_events_oql",
+                                    content={"total": 1, "hits": [{"_id": alert_id}]},
+                                    tool_call_id="c1",
+                                )
+                            ]
+                        ),
+                    ),
+                ]
+            )
+            self.result = SimpleNamespace(output=report)
+
+        async def __aenter__(self) -> _Run:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> _Run:
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class _Agent:
+        def iter(self, *a: Any, **k: Any) -> _Run:
+            return _Run()
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_Agent()),
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(call_tools=[]),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings_kratos), objective="hunt BPFDoor"):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    report_ev = next(e for e in events if e.kind == "hunt_report")
+    f = report_ev.payload["findings"][0]
+    assert f["severity"] == "medium"  # capped: cited only the detector alert
+    assert "only detector alerts cited" in (f["validator_note"] or "").lower()
+
+
+# ── Layer 3: deterministic partial-report humility ───────────────────────────
+
+
+def test_apply_partial_humility_clamps_confidence_and_threat_severity() -> None:
+    """A budget/timeout-partial report with conf 0.75 + a high threat finding →
+    confidence clamped to <= 0.5, the threat capped to medium with the partial
+    note; a non-threat finding and the narrative are untouched."""
+    from soc_ai.api.hunt_runner import _apply_partial_humility
+
+    report = HuntReport(
+        findings=[
+            HuntFinding(
+                title="BPFDoor backdoor on 192.0.2.15",
+                detail="Loud alert title.",
+                severity="high",
+                category="threat",
+                citations=["sALERT_DOC_7Zk"],
+            ),
+            HuntFinding(
+                title="No SSH telemetry on this grid",
+                detail="Coverage gap.",
+                severity="high",
+                category="visibility_gap",
+            ),
+        ],
+        narrative="Partial hunt — budget hit.",
+        confidence=0.75,
+    )
+
+    clamped = _apply_partial_humility(report)
+
+    assert clamped.confidence == 0.5  # clamped down from 0.75
+    threat = clamped.findings[0]
+    assert threat.severity == "medium"  # high threat capped
+    assert threat.validator_note is not None
+    assert "budget/timeout-partial" in threat.validator_note.lower()
+    # the visibility_gap finding keeps its severity (only threats are capped)
+    assert clamped.findings[1].severity == "high"
+    assert clamped.findings[1].validator_note is None
+
+
+def test_apply_partial_humility_leaves_low_confidence_untouched() -> None:
+    """A partial report already below 0.5 keeps its confidence (clamp is a
+    ceiling, never a floor)."""
+    from soc_ai.api.hunt_runner import _apply_partial_humility
+
+    report = HuntReport(narrative="clean partial", findings=[], confidence=0.2)
+    assert _apply_partial_humility(report).confidence == 0.2
+
+
+def test_run_hunt_partial_path_applies_humility(settings_kratos: Settings) -> None:
+    """A budget-exhausted hunt whose synthesizer returns an over-confident report
+    (conf 0.78, a high threat) has the humility clamp applied on the partial path:
+    the emitted hunt_report is <= 0.5 conf with the threat capped to medium. A
+    NON-partial run (separately covered) is never clamped."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.exceptions import UsageLimitExceeded
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    over_confident = HuntReport(
+        findings=[
+            HuntFinding(
+                title="BPFDoor backdoor on 192.0.2.15",
+                detail="Asserted from a loud alert title.",
+                severity="high",
+                category="threat",
+                citations=[],
+            )
+        ],
+        narrative="Partial — budget hit mid-hunt.",
+        confidence=0.78,
+    )
+
+    class _BudgetRun:
+        result = None
+
+        def __init__(self) -> None:
+            self._nodes = iter(
+                [
+                    SimpleNamespace(
+                        model_response=ModelResponse(parts=[TextPart(content="ran one query")]),
+                        request=None,
+                    )
+                ]
+            )
+
+        async def __aenter__(self) -> _BudgetRun:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> _BudgetRun:
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                raise UsageLimitExceeded("tool_calls_limit exceeded") from None
+
+    class _BudgetAgent:
+        def iter(self, *a: Any, **k: Any) -> _BudgetRun:
+            return _BudgetRun()
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_BudgetAgent()),
+            patch(
+                "soc_ai.api.hunt_runner._synthesize_partial_hunt",
+                AsyncMock(return_value=SimpleNamespace(output=over_confident)),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings_kratos), objective="hunt BPFDoor"):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    report_ev = next(e for e in events if e.kind == "hunt_report")
+    assert report_ev.payload["confidence"] <= 0.5  # humility clamp applied
+    f = report_ev.payload["findings"][0]
+    assert f["severity"] == "medium"  # high threat capped on the partial path
+    assert "budget/timeout-partial" in (f["validator_note"] or "").lower()
+
+
+def test_run_hunt_full_run_report_not_clamped(settings_kratos: Settings) -> None:
+    """A NORMAL (non-partial) hunt that legitimately reports conf 0.7 + a
+    corroborated high threat is NOT touched by the partial-humility clamp — the
+    clamp is gated strictly to the budget/timeout synthesis path."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+
+    real_id = "sPCAP_EVIDENCE_9Qm"
+    report = HuntReport(
+        findings=[
+            HuntFinding(
+                title="Confirmed C2 beacon",
+                detail="Measured 60s cadence in the pcap.",
+                severity="high",
+                category="threat",
+                citations=[real_id],
+            )
+        ],
+        narrative="A confirmed beacon.",
+        confidence=0.7,
+    )
+
+    class _Run:
+        def __init__(self) -> None:
+            self._nodes = iter(
+                [
+                    SimpleNamespace(
+                        model_response=ModelResponse(
+                            parts=[ToolCallPart(tool_name="t_get_pcap", args={}, tool_call_id="c1")]
+                        ),
+                        request=None,
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=SimpleNamespace(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_get_pcap",
+                                    content={"beacon": {"interval_s": 60}, "marker": real_id},
+                                    tool_call_id="c1",
+                                )
+                            ]
+                        ),
+                    ),
+                ]
+            )
+            self.result = SimpleNamespace(output=report)
+
+        async def __aenter__(self) -> _Run:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> _Run:
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class _Agent:
+        def iter(self, *a: Any, **k: Any) -> _Run:
+            return _Run()
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch("soc_ai.api.hunt_runner.build_hunt_agent", return_value=_Agent()),
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(call_tools=[]),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings_kratos), objective="hunt beacon"):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    report_ev = next(e for e in events if e.kind == "hunt_report")
+    assert report_ev.payload["confidence"] == 0.7  # full-run confidence untouched
+    f = report_ev.payload["findings"][0]
+    assert f["severity"] == "high"  # corroborated threat kept high, not clamped
+    assert f["validator_note"] is None
+
+
+def test_replay_reasoning_context_lifts_thinking_into_synth_input(
+    settings_kratos: Settings,
+) -> None:
+    """The reasoning-trace replay finding: the exploration model's ThinkingParts
+    (where an FP was debunked) are lifted out of the gathered transcript and
+    prepended to the synthesizer's user message, since pydantic-ai does NOT feed a
+    prior turn's thinking into replayed history."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    try:
+        from pydantic_ai.messages import ThinkingPart
+    except ImportError:  # pragma: no cover - pydantic-ai always ships ThinkingPart
+        pytest.skip("ThinkingPart unavailable")
+
+    from soc_ai.api.hunt_runner import _replay_reasoning_context, _synthesize_partial_hunt
+
+    debunk = "192.0.2.15 shows Apple service discovery, not C2 — this is a false positive."
+    gathered: list[Any] = [
+        ModelRequest(parts=[UserPromptPart(content="hunt BPFDoor")]),
+        ModelResponse(parts=[ThinkingPart(content=debunk), TextPart(content="Writing up.")]),
+    ]
+
+    # unit: the block carries the debunk verbatim
+    block = _replay_reasoning_context(gathered)
+    assert debunk in block
+    assert "do NOT ignore it" in block
+
+    # integration: the synthesizer's user message begins with the reasoning block
+    seen: list[Any] = []
+    with patch(
+        "soc_ai.api.hunt_runner.build_investigator_model",
+        return_value=_capturing_synth_model("partial writeup", seen),
+    ):
+        asyncio.run(
+            _synthesize_partial_hunt(
+                _ctx(settings_kratos), objective="hunt BPFDoor", gathered=gathered
+            )
+        )
+    # the FunctionModel saw the reasoning block in the replayed user prompt
+    flat = [getattr(p, "content", "") for msg in seen[0] for p in msg.parts]
+    assert any(debunk in str(c) for c in flat)
+
+
+def test_replay_reasoning_context_empty_when_no_thinking() -> None:
+    """No ThinkingParts in the transcript → an empty reasoning block (the caller
+    then omits it), so a non-reasoning model's synthesis is unchanged."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+    from soc_ai.api.hunt_runner import _replay_reasoning_context
+
+    gathered: list[Any] = [
+        ModelRequest(parts=[UserPromptPart(content="hunt")]),
+        ModelResponse(parts=[TextPart(content="no thinking here")]),
+    ]
+    assert _replay_reasoning_context(gathered) == ""
+
+
+# ── Layer 1: hunt-prompt skepticism language ─────────────────────────────────
+
+
+def test_hunt_prompts_carry_detector_claim_skepticism() -> None:
+    """Both hunt prompts must teach: a rule name is a claim, corroborate beyond the
+    alert, run the OS-consistency check, and treat a solicited ICMP echo reply
+    matching a heartbeat sig as an uncorroborated FP (the ported triage lesson)."""
+    from soc_ai.agent.hunt import HUNT_SYNTH_PROMPT, HUNT_SYSTEM_PROMPT
+
+    for p in (HUNT_SYSTEM_PROMPT, HUNT_SYNTH_PROMPT):
+        low = p.lower()
+        # a rule name is the detector's CLAIM, not an observation
+        assert "detector's claim" in low or "detector claim" in low
+        # corroborate beyond the alert document
+        assert "corroborat" in low
+        # OS-consistency: Apple telemetry ⇒ macOS/iOS, not a Linux backdoor
+        assert "apple" in low
+        assert "linux backdoor" in low
+        # the specific solicited ICMP echo-reply / BPFDoor FP lesson
+        assert "echo reply" in low
+        assert "bpfdoor" in low
+
+
+def test_hunt_system_prompt_softens_title_upgrade_pressure() -> None:
+    """The old 'decisive C2 … do not discount because low-sev' pressure that
+    pushed title-upgrading is reframed so decisiveness requires CORROBORATION, not
+    the title (the measured pattern, not the alert name)."""
+    from soc_ai.agent.hunt import HUNT_SYSTEM_PROMPT
+
+    p = HUNT_SYSTEM_PROMPT
+    assert "decisive C2" in p  # phrase kept (existing snapshot assertion)
+    assert "ONCE CORROBORATED" in p
+    # the reframed guidance ties decisiveness to the measured pattern, not the title
+    low = p.lower()
+    assert "not from the alert title" in low or "not\nfrom the alert title" in low
+
+
+# ── Bulk hunt actions: re-hunt (clean re-run) + bulk delete ──────────────────
+
+
+class _RecordingManager:
+    """A stand-in for HuntConsoleManager that records every ``start`` call and
+    hands back a synthetic new hunt id, so the bulk-rehunt endpoint's
+    orchestration (dedup / skip reasons / concurrency cap / NO prior seeding) is
+    tested deterministically without a live model or the background drainer.
+
+    ``fail_ids`` lets a test simulate a start that returns None (could_not_start).
+    """
+
+    def __init__(self, fail_objectives: set[str] | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._fail = fail_objectives or set()
+        self._n = 0
+
+    async def start(self, _state: Any, **kwargs: Any) -> str | None:
+        self.calls.append(kwargs)
+        if kwargs.get("objective") in self._fail:
+            return None
+        self._n += 1
+        return f"new-hunt-{self._n}"
+
+
+def _seed_hunt(client: TestClient, *, objective: str, status: str) -> str:
+    """Insert a hunt with a given status; returns its id."""
+
+    async def _go() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective=objective, started_by="admin")
+            if status != "running":
+                await hunt_svc.finalize(db, hunt.id, status=status, narrative="n")
+            return hunt.id
+
+    return asyncio.run(_go())
+
+
+def test_bulk_rehunt_starts_fresh_hunts_without_prior_seeding(client: TestClient) -> None:
+    """POST /hunts/rehunt starts a CLEAN fresh hunt per eligible id — same
+    objective, and CRUCIALLY no ``prior`` (a re-hunt must not seed the old
+    narrative). The response maps old→new ids + objective."""
+    h1 = _seed_hunt(client, objective="hunt for beaconing", status="error")
+    h2 = _seed_hunt(client, objective="hunt for lateral movement", status="complete")
+
+    mgr = _RecordingManager()
+    with patch("soc_ai.api.webui.routes_hunts.hunt_console_manager.get_manager", return_value=mgr):
+        resp = client.post("/api/v1/hunts/rehunt", json={"hunt_ids": [h1, h2]})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # both started, each mapped old→new with its objective
+    started = {s["old_id"]: s for s in body["started"]}
+    assert set(started) == {h1, h2}
+    assert started[h1]["objective"] == "hunt for beaconing"
+    assert started[h2]["new_id"].startswith("new-hunt-")
+    assert body["skipped"] == []
+
+    # NO prior seeding: every start passed the objective but never a `prior`.
+    assert len(mgr.calls) == 2
+    for call in mgr.calls:
+        assert "prior" not in call or call["prior"] is None
+    assert {c["objective"] for c in mgr.calls} == {
+        "hunt for beaconing",
+        "hunt for lateral movement",
+    }
+
+
+def test_bulk_rehunt_skips_running_and_not_found(client: TestClient) -> None:
+    """A running hunt is skipped ('running' — nothing to re-run yet); an unknown
+    id is skipped ('not_found'). Neither reaches the manager."""
+    running = _seed_hunt(client, objective="live hunt", status="running")
+    done = _seed_hunt(client, objective="done hunt", status="complete")
+
+    mgr = _RecordingManager()
+    with patch("soc_ai.api.webui.routes_hunts.hunt_console_manager.get_manager", return_value=mgr):
+        resp = client.post(
+            "/api/v1/hunts/rehunt", json={"hunt_ids": [running, done, "does-not-exist"]}
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert [s["old_id"] for s in body["started"]] == [done]
+    reasons = {s["id"]: s["reason"] for s in body["skipped"]}
+    assert reasons == {running: "running", "does-not-exist": "not_found"}
+    # only the eligible one was actually started
+    assert [c["objective"] for c in mgr.calls] == ["done hunt"]
+
+
+def test_bulk_rehunt_dedups_input(client: TestClient) -> None:
+    """A duplicated id is re-hunted ONCE (input deduped, order-preserving)."""
+    h1 = _seed_hunt(client, objective="hunt A", status="complete")
+
+    mgr = _RecordingManager()
+    with patch("soc_ai.api.webui.routes_hunts.hunt_console_manager.get_manager", return_value=mgr):
+        resp = client.post("/api/v1/hunts/rehunt", json={"hunt_ids": [h1, h1, h1]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [s["old_id"] for s in body["started"]] == [h1]
+    assert len(mgr.calls) == 1
+
+
+def test_bulk_rehunt_respects_concurrency_cap(client: TestClient) -> None:
+    """Eligible ids beyond _REHUNT_START_CAP are skipped 'queued' — the endpoint
+    starts at most K hunts so it never fires N concurrent hunts at the one model
+    route (the 7-concurrent-hunts garbage incident)."""
+    from soc_ai.api.webui.routes_hunts import _REHUNT_START_CAP
+
+    n = _REHUNT_START_CAP + 2
+    ids = [_seed_hunt(client, objective=f"hunt {i}", status="complete") for i in range(n)]
+
+    mgr = _RecordingManager()
+    with patch("soc_ai.api.webui.routes_hunts.hunt_console_manager.get_manager", return_value=mgr):
+        resp = client.post("/api/v1/hunts/rehunt", json={"hunt_ids": ids})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # exactly K started; the rest 'queued'
+    assert len(body["started"]) == _REHUNT_START_CAP
+    assert len(mgr.calls) == _REHUNT_START_CAP
+    queued = [s for s in body["skipped"] if s["reason"] == "queued"]
+    assert len(queued) == n - _REHUNT_START_CAP
+    # the started ones are the FIRST K in input order (deferral, not drop)
+    assert [s["old_id"] for s in body["started"]] == ids[:_REHUNT_START_CAP]
+
+
+def test_bulk_rehunt_reports_could_not_start(client: TestClient) -> None:
+    """A start that returns None (manager couldn't launch) is skipped
+    'could_not_start' — surfaced, not silently dropped."""
+    h1 = _seed_hunt(client, objective="doomed", status="error")
+
+    mgr = _RecordingManager(fail_objectives={"doomed"})
+    with patch("soc_ai.api.webui.routes_hunts.hunt_console_manager.get_manager", return_value=mgr):
+        resp = client.post("/api/v1/hunts/rehunt", json={"hunt_ids": [h1]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["started"] == []
+    assert body["skipped"] == [{"id": h1, "reason": "could_not_start"}]
+
+
+def test_bulk_rehunt_input_cap_is_422(client: TestClient) -> None:
+    """An oversized hunt_ids list is rejected by request validation before the
+    handler runs (mirrors the investigations rehunt input cap)."""
+    from soc_ai.api.webui.routes_hunts import _REHUNT_CAP
+
+    too_many = [f"id-{i}" for i in range(_REHUNT_CAP + 1)]
+    resp = client.post("/api/v1/hunts/rehunt", json={"hunt_ids": too_many})
+    assert resp.status_code == 422
+
+
+def test_bulk_delete_removes_rows_and_reports_not_found(client: TestClient) -> None:
+    """POST /hunts/bulk-delete removes each existing terminal hunt and reports an
+    unknown id in not_found; the rows are gone from the list afterwards."""
+    h1 = _seed_complete_hunt(client)
+    h2 = _seed_hunt(client, objective="second hunt", status="complete")
+
+    resp = client.post("/api/v1/hunts/bulk-delete", json={"hunt_ids": [h1, h2, "ghost", h1]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body["deleted"]) == {h1, h2}
+    assert body["not_found"] == ["ghost"]
+
+    remaining = {r["id"] for r in client.get("/api/v1/hunts").json()}
+    assert h1 not in remaining and h2 not in remaining
+    assert client.get(f"/api/v1/hunts/{h1}").status_code == 404
+
+
+def test_bulk_delete_leaves_running_hunt(client: TestClient) -> None:
+    """A still-running hunt is NOT deleted (its drainer could write back) — it's
+    reported in not_found and remains listed."""
+    running = _seed_hunt(client, objective="live hunt", status="running")
+    done = _seed_hunt(client, objective="done hunt", status="complete")
+
+    resp = client.post("/api/v1/hunts/bulk-delete", json={"hunt_ids": [running, done]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == [done]
+    assert body["not_found"] == [running]
+    # the running hunt is still there
+    assert client.get(f"/api/v1/hunts/{running}").status_code == 200

@@ -1098,6 +1098,122 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
         return 1
 
 
+def _audit_verify(args: argparse.Namespace) -> int:
+    """argparse handler for ``soc-ai audit verify``.
+
+    Pulls every record from the audit index (``{audit_index_alias}-*``), sorted
+    ascending by ``seq``, and runs the tamper-evident hash chain over them
+    (:func:`soc_ai.audit.verify.verify_audit_chain`). This is the operator's way
+    to actually exercise the tamper-evidence: an intact chain proves no audit
+    record was edited, reordered, inserted, or deleted since it was written.
+
+    Exit codes:
+      0   chain intact (including an empty index — nothing to tamper with)
+      1   TAMPER DETECTED — the chain broke at some seq
+      2   could not run (ES unreachable / settings didn't load)
+    """
+    from soc_ai.audit.verify import (  # noqa: PLC0415 - lazy
+        ChainVerifyResult,
+        verify_audit_chain,
+    )
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+
+    try:
+        settings = get_settings()
+    except Exception as e:
+        print(
+            f"{_C['red']}audit verify could not run{_C['reset']}: settings did not load "
+            f"({type(e).__name__}: {e}). Run from a directory with a populated .env.",
+            file=sys.stderr,
+        )
+        return 2
+
+    days: int | None = getattr(args, "days", None)
+
+    async def _go() -> ChainVerifyResult:
+        elastic = ElasticClient(settings)
+        try:
+            return await verify_audit_chain(elastic, settings.audit_index_alias, days=days)
+        finally:
+            with contextlib.suppress(Exception):
+                await elastic.aclose()
+
+    try:
+        result = asyncio.run(_go())
+    except Exception as e:
+        # A verification against an unreachable index is "could not run", NOT
+        # "intact" — never let an ES/transport error read as a clean chain.
+        print(
+            f"{_C['red']}audit verify could not run{_C['reset']}: "
+            f"{type(e).__name__}: {e} "
+            f"{_C['dim']}(is the ES/audit index reachable?){_C['reset']}",
+            file=sys.stderr,
+        )
+        return 2
+
+    scope = f" (last {days}d window)" if days is not None else ""
+    if result.capped:
+        print(
+            f"{_C['yellow']}warning: scan hit the record cap — only a prefix of the "
+            f"chain was verified; bound the scan with --days to check a smaller "
+            f"window{_C['reset']}",
+            file=sys.stderr,
+        )
+
+    if not result.ok:
+        broken = result.first_broken_seq
+        print(
+            f"{_C['red']}{_C['bold']}TAMPER DETECTED{_C['reset']}{_C['red']} — "
+            f"chain broke at seq {broken}{_C['reset']}{scope}",
+            file=sys.stderr,
+        )
+        print(
+            f"{_C['dim']}{result.records_verified} record(s) scanned before the break. "
+            f"A record was edited, reordered, inserted, or deleted.{_C['reset']}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if result.records_verified == 0:
+        print(f"{_C['green']}audit chain intact{_C['reset']} — 0 records{scope}")
+        return 0
+
+    span = f"seq {result.first_seq}..{result.last_seq}"
+    print(
+        f"{_C['green']}audit chain intact{_C['reset']} — "
+        f"{result.records_verified} records verified ({span}){scope}"
+    )
+    return 0
+
+
+def _register_audit(sub: Any) -> None:
+    """Register the ``audit`` command group (currently just ``audit verify``)."""
+    p_audit = sub.add_parser(
+        "audit",
+        help="Audit-trail tooling. Subcommand: `verify` checks the tamper-evident "
+        "hash chain over the live audit index",
+    )
+    audit_sub = p_audit.add_subparsers(dest="audit_cmd")
+    p_ver = audit_sub.add_parser(
+        "verify",
+        help="Verify the tamper-evident audit hash chain against the live ES "
+        "audit index. Exit 0 = intact, 1 = tamper detected, 2 = could not run",
+    )
+    p_ver.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Bound the scan to audit records from the last N days (by timestamp). "
+        "Default: the whole index. NOTE: a windowed scan verifies contiguity "
+        "WITHIN the window but cannot verify linkage across the window boundary "
+        "(the record before the window isn't fetched).",
+    )
+    p_ver.set_defaults(func=_audit_verify)
+    # `soc-ai audit` with no subcommand: print the group help instead of serving.
+    p_audit.set_defaults(func=lambda _a: (p_audit.print_help(), 2)[1])
+
+
 def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
     """Data directory for backup/restore: ``--data-dir`` wins, then settings.
 
@@ -1416,6 +1532,7 @@ def main() -> None:
 
     _register_doctor(sub)
     _register_backup(sub)
+    _register_audit(sub)
 
     p_val = sub.add_parser(
         "validate",

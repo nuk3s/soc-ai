@@ -1,0 +1,22 @@
+# soc-ai — daily enrichment (blocklist / GeoIP / cloud-prefix) refresh.
+#
+# The Docker stack ships NO in-app scheduler for enrichment refresh, so without a
+# host cron the URLhaus / Feodo / ThreatFox / Tor / cloud-prefix data goes stale.
+# This runs the refresh inside the running container once a day.
+#
+# Install:
+#   1. Edit the compose-file path below to match your install (default assumes
+#      the stack lives at /opt/soc-ai).
+#   2. Copy this file to the host cron directory (drop the `.example` suffix):
+#        sudo cp scripts/cron.d/soc-ai-blocklists.example /etc/cron.d/soc-ai-blocklists
+#   3. cron.d entries need a trailing newline and must be owned by root, mode 644.
+#
+# abuse.ch feeds (URLhaus/ThreatFox/Feodo) need ABUSE_CH_AUTH_KEY set in .env — a
+# free key from https://auth.abuse.ch/ ; without it those three feeds are skipped.
+#
+# Format: m h dom mon dow  user  command
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Daily at 03:17 (stagger off the top of the hour to avoid feed-server rush).
+17 3 * * *  root  docker compose -f /opt/soc-ai/docker-compose.yml run --rm soc-ai python -m soc_ai blocklists refresh >/var/log/soc-ai-blocklists.log 2>&1

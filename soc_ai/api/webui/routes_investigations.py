@@ -329,6 +329,13 @@ async def delete_investigation(inv_id: str, request: Request) -> dict[str, bool]
 
 
 _REHUNT_CAP = 50
+# How many re-hunts a single bulk call actually STARTS. The rest are returned as
+# skipped/"queued" so the operator re-runs them in a follow-up batch — bounding
+# concurrent load on the single model route. Mirrors the hunts-side cap: a real
+# incident showed 7 simultaneous runs all hitting the wall-clock and producing
+# garbage, so fire-and-forget worker starts must be bounded here (the manager has
+# no internal limit).
+_REHUNT_START_CAP = 3
 
 
 class RehuntIn(BaseModel):
@@ -393,6 +400,14 @@ async def bulk_rehunt(
 
         if not inv.alert_es_id:
             skipped.append({"invId": inv_id, "reason": "no_alert"})
+            continue
+
+        # Concurrency guard: start at most _REHUNT_START_CAP runs this call — the
+        # hunt manager is fire-and-forget with no internal limit, so the cap lives
+        # here. Eligible ids past the cap are deferred ("queued"). Checked BEFORE
+        # the name-resolve below so we also avoid firing ES lookups we won't use.
+        if len(started) >= _REHUNT_START_CAP:
+            skipped.append({"invId": inv_id, "reason": "queued"})
             continue
 
         # Prefer the stored name; if this row was itself created nameless (a pre-fix

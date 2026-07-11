@@ -575,6 +575,20 @@ export interface RehuntResult {
   skipped: { invId: string; reason: string }[];
 }
 
+// Bulk re-hunt on the Hunts page: each re-hunt is a CLEAN re-run of the
+// objective (no prior-narrative seeding), and the batch is throttled — only the
+// first few are STARTED, the rest come back skipped/"queued" (routes_hunts.py
+// ::bulk_rehunt _REHUNT_START_CAP).
+export interface HuntRehuntResult {
+  started: { old_id: string; new_id: string; objective: string }[];
+  skipped: { id: string; reason: string }[];
+}
+
+export interface HuntBulkDeleteResult {
+  deleted: string[];
+  not_found: string[];
+}
+
 // ---- Shell -----------------------------------------------------------------
 
 export interface Workspace {

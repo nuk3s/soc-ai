@@ -4017,6 +4017,60 @@ def test_rehunt_starts_fresh_hunts_for_valid_ids(client: TestClient) -> None:
     assert call_counter["n"] == 2
 
 
+def test_rehunt_respects_concurrency_cap(client: TestClient) -> None:
+    """Eligible ids beyond _REHUNT_START_CAP are skipped 'queued' — the endpoint
+    bounds concurrent load on the single model route (mirrors the hunts side; a
+    real incident showed simultaneous runs all hit the wall-clock and produced
+    garbage)."""
+    import asyncio
+
+    from soc_ai.api.webui.routes_investigations import _REHUNT_START_CAP
+    from soc_ai.store import investigations as inv_svc
+
+    n = _REHUNT_START_CAP + 2
+
+    async def _seed() -> list[str]:
+        maker = client.app.state.db_sessionmaker
+        ids: list[str] = []
+        async with maker() as db:
+            for i in range(n):
+                inv = await inv_svc.create(
+                    db, alert_es_id=f"ev-cap-{i}", started_by="tester", rule_name=f"ET {i}"
+                )
+                await inv_svc.finalize(
+                    db, inv.id, status="complete", verdict="false_positive", confidence=0.9
+                )
+                ids.append(inv.id)
+        return ids
+
+    ids = asyncio.run(_seed())
+
+    call_counter = {"n": 0}
+
+    async def fake_start(
+        _state, *, alert_id: str, started_by: str, rule_name: str | None = None
+    ) -> str:
+        call_counter["n"] += 1
+        return f"NEW-{call_counter['n']}"
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = fake_start
+
+    with patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr):
+        resp = client.post("/api/v1/investigations/rehunt", json={"inv_ids": ids})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Exactly K started; the manager is only invoked K times (no wasted ES
+    # re-resolves for the deferred ids since the cap is checked first).
+    assert len(body["started"]) == _REHUNT_START_CAP
+    assert call_counter["n"] == _REHUNT_START_CAP
+    queued = [s for s in body["skipped"] if s["reason"] == "queued"]
+    assert len(queued) == n - _REHUNT_START_CAP
+    # The first K ids (input order) are the ones started.
+    assert [s["invId"] for s in body["started"]] == ids[:_REHUNT_START_CAP]
+
+
 def test_rehunt_reresolves_rule_name_when_stored_row_is_nameless(client: TestClient) -> None:
     """Re-hunting a NAMELESS row (a pre-fix row, or a selected-id run that died
     early) re-resolves the rule name from ES so the NEW row is named, not NULL."""

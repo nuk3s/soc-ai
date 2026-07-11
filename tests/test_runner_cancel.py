@@ -60,6 +60,37 @@ async def _run_until_cancel(token: CancelToken | None) -> _FakeRecorder:
 
 
 @pytest.mark.asyncio
+async def test_whole_run_timeout_lands_error_and_emits_event() -> None:
+    """The whole-run wall-clock backstop (investigation_run_timeout_s) fires when
+    the stream blocks past the deadline: the run lands 'error' and a terminal
+    'error' event is emitted to the client, without propagating an exception."""
+    rec = _FakeRecorder()
+    state = SimpleNamespace(
+        db_sessionmaker=None,
+        settings=SimpleNamespace(investigation_run_timeout_s=0.05),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    with patch("soc_ai.api.runner.InvestigationRecorder", return_value=rec):
+        async for name, data in recorded_run(
+            state,
+            alert_id="a",
+            started_by="u",
+            event_stream=_blocking_stream(),
+            cancel_token=None,
+        ):
+            events.append((name, data))
+
+    # The run finalized as error (not cancelled — no operator cancel involved).
+    assert rec.finishes == ["error"]
+    # A terminal error event reached the client, tagged as the timeout backstop.
+    kinds = [n for n, _ in events]
+    assert kinds[0] == "investigation_created"
+    assert "error" in kinds
+    err = next(d for n, d in events if n == "error")
+    assert err["type"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
 async def test_unmarked_cancellation_lands_error() -> None:
     """A disconnect / shutdown cancel (no token, or token not requested) → error."""
     rec = await _run_until_cancel(None)

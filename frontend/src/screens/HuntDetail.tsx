@@ -5,6 +5,7 @@ import {
   Crosshair,
   GitBranch,
   Loader2,
+  RotateCw,
   ShieldAlert,
   Trash2,
   Wrench,
@@ -25,6 +26,7 @@ import {
   getHunt,
   getHuntChat,
   postHuntChat,
+  startHuntConsole,
 } from '../lib/api';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
@@ -383,6 +385,8 @@ export function HuntDetail() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [rehunting, setRehunting] = useState(false);
+  const [rehuntError, setRehuntError] = useState<string | null>(null);
 
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // the current status in a ref and let pauseWhen consult it: stop polling once
@@ -419,6 +423,22 @@ export function HuntDetail() {
       .catch((e: unknown) => {
         setDeleteError(e instanceof Error ? e.message : 'Delete failed — please try again.');
         setDeleting(false);
+      });
+  };
+
+  // Re-hunt = a CLEAN re-run of THIS objective as a fresh hunt (no prior-narrative
+  // seeding — that would poison a re-run of a failed hunt). The objective_hash
+  // matches, so the new run automatically gets the "vs last run" diff. Navigate
+  // to the fresh hunt so its live view takes over.
+  const doRehunt = () => {
+    if (rehunting || !data) return;
+    setRehunting(true);
+    setRehuntError(null);
+    startHuntConsole(data.objective)
+      .then((r) => navigate(`/hunts/${r.hunt_id}`))
+      .catch((e: unknown) => {
+        setRehuntError(e instanceof Error ? e.message : 'Could not re-hunt — please try again.');
+        setRehunting(false);
       });
   };
 
@@ -520,9 +540,30 @@ export function HuntDetail() {
               )}
             </div>
 
-            {/* toolbar: cancel (running) / delete (terminal) */}
+            {/* toolbar: re-hunt (terminal) / cancel (running) / delete (terminal) */}
             <div className="mt-4 flex items-center gap-2.5 border-t border-border-faint pt-3.5">
               <div className="flex-1" />
+              {/* Re-hunt: a clean re-run of this objective as a fresh hunt. Prominent
+                  on a failed/interrupted hunt (the ones that need re-running);
+                  a quiet secondary action on a completed one. Never while running. */}
+              {terminal && (
+                <button
+                  onClick={doRehunt}
+                  disabled={rehunting}
+                  title="Re-run this objective as a fresh hunt"
+                  className={
+                    failed
+                      ? 'flex items-center gap-1.5 rounded-control border border-accent bg-[rgba(75,139,245,.14)] px-[11px] py-1.5 text-[12px] font-semibold text-[#cfe0ff] hover:bg-[rgba(75,139,245,.22)] disabled:opacity-60'
+                      : 'flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-accent disabled:opacity-60'
+                  }
+                >
+                  {rehunting ? <Spinner size={13} /> : <RotateCw size={13} />}
+                  {rehunting ? 'Starting…' : 'Re-hunt'}
+                </button>
+              )}
+              {rehuntError && (
+                <span className="font-mono text-[11.5px] text-danger">{rehuntError}</span>
+              )}
               {running && (
                 <button
                   onClick={doCancel}

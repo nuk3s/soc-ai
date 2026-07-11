@@ -1,11 +1,36 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+/**
+ * Explicit URL allow-list for links in agent output. Agent markdown is derived
+ * from attacker-influenced data (payloads, hostnames, rule names), so link hrefs
+ * are untrusted. Only http/https/mailto and scheme-less (relative/anchor) targets
+ * pass; anything with another scheme (javascript:, data:, vbscript:, …) is dropped.
+ * Pinning this in code means link safety no longer depends on react-markdown's
+ * default urlTransform, which a library upgrade could silently change. The
+ * scheme-detection matches react-markdown's own default: a ':' is only a scheme
+ * delimiter when it precedes the first '/', '?', or '#'.
+ */
+export function safeUrl(url: string): string {
+  const colon = url.indexOf(':');
+  if (colon === -1) return url; // no scheme → relative/anchor, safe
+  const firstSpecial = Math.min(
+    ...['/', '?', '#'].map((c) => {
+      const i = url.indexOf(c);
+      return i === -1 ? Infinity : i;
+    }),
+  );
+  if (colon > firstSpecial) return url; // ':' is part of the path, not a scheme
+  const scheme = url.slice(0, colon).toLowerCase();
+  return scheme === 'http' || scheme === 'https' || scheme === 'mailto' ? url : '';
+}
+
 /** Renders assistant Markdown into the dark theme — tight spacing for chat. */
 export function Markdown({ children }: { children: string }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      urlTransform={safeUrl}
       components={{
         p: ({ children }) => <p className="mb-1.5 last:mb-0">{children}</p>,
         ul: ({ children }) => (

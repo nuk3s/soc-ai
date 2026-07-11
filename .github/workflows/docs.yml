@@ -13,10 +13,11 @@ on:
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
+# Workflow-level: least privilege (read only). The Pages deploy scopes
+# (pages: write + id-token: write) are granted ONLY on the deploy job below, so
+# the build job — which runs `pip install` — never holds a deploy/OIDC token.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Allow one concurrent deployment; don't cancel an in-progress production deploy.
 concurrency:
@@ -37,7 +38,9 @@ jobs:
           cache: pip
 
       - name: Install MkDocs Material
-        run: pip install "mkdocs-material>=9.5"
+        # Pin exactly (not `>=`) so a docs build is reproducible and a surprise
+        # upstream release can't change the published site without a repo edit.
+        run: pip install "mkdocs-material==9.7.6"
 
       - name: Build site (strict)
         run: mkdocs build --strict
@@ -51,6 +54,11 @@ jobs:
     name: deploy
     needs: build
     runs-on: ubuntu-latest
+    # The Pages deploy needs these scopes; grant them here (not workflow-level)
+    # so only this job — which runs no untrusted install — holds them.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

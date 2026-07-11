@@ -195,7 +195,19 @@ the refresh skips GeoIP but everything else still works.
 
 ## Updating
 
-One command:
+**Back up first.** Migrations run automatically at startup and schema downgrades
+are unsupported, so a bad upgrade can't be rolled back by re-running an old image
+against a migrated DB — you restore from a snapshot instead. Take one before every
+upgrade (see [Backup and restore](#backup-and-restore) for the full command):
+
+```bash
+docker exec soc-ai python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz
+docker cp soc-ai:/var/lib/soc-ai/data/backup.tar.gz \
+  ./soc-ai-preupgrade-$(date -u +%Y%m%dT%H%M%SZ).tar.gz
+docker exec soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
+```
+
+Then update — one command:
 
 ```bash
 git pull && docker compose up -d --build
@@ -240,6 +252,39 @@ docker exec soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
 The enrichment caches (blocklists, MaxMind, cloud prefixes) are **excluded by
 default** — they are re-downloadable with `soc-ai blocklists refresh`, and they
 dwarf the DB. Add `--full` to include them (worth it on an air-gapped host).
+
+#### Scheduling backups (with retention)
+
+Like the blocklist refresh, the Docker stack ships **no in-app scheduler** for
+backups — add a host cron (or a systemd timer). This one snapshots the store into
+a dated file on the host and prunes anything older than 14 days:
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/soc-ai-backup.sh — nightly backup with N-day retention.
+set -euo pipefail
+DEST=/var/backups/soc-ai            # host dir; must exist and be writable by cron
+RETAIN_DAYS=14
+COMPOSE=/opt/soc-ai/docker-compose.yml
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$DEST"
+docker compose -f "$COMPOSE" exec -T soc-ai \
+  python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz
+docker compose -f "$COMPOSE" cp soc-ai:/var/lib/soc-ai/data/backup.tar.gz \
+  "$DEST/soc-ai-backup-$STAMP.tar.gz"
+docker compose -f "$COMPOSE" exec -T soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
+# Retention: delete backups older than RETAIN_DAYS.
+find "$DEST" -name 'soc-ai-backup-*.tar.gz' -type f -mtime "+$RETAIN_DAYS" -delete
+```
+
+```cron
+# /etc/cron.d/soc-ai-backup — nightly backup, 02:47
+47 2 * * *  root  /usr/local/bin/soc-ai-backup.sh >/var/log/soc-ai-backup.log 2>&1
+```
+
+Store the backups off-box (they contain the decision-record signing key and the
+pinned sensor `known_hosts`). Test a restore periodically — an untested backup is
+a hope, not a recovery plan.
 
 Restore refuses every dangerous step unless you say `--yes`: it won't overwrite
 an existing store (it prints exactly what it would replace), and it won't

@@ -38,7 +38,7 @@ RUN uv sync --frozen --no-install-project --no-dev
 # ── Stage 2: frontend build (React SPA → /fe/dist) ────────────────────────────
 # Built here and copied into the runtime image at /opt/soc-ai/frontend/dist —
 # where main.py's FRONTEND_DIST resolves, so FastAPI serves the SPA at /app.
-FROM node:20-bookworm-slim AS frontend
+FROM node:22-bookworm-slim AS frontend
 
 WORKDIR /fe
 
@@ -128,6 +128,16 @@ ENV PATH="/opt/soc-ai/.venv/bin:$PATH" \
     MAXMIND_DATA_DIR="/var/lib/soc-ai/maxmind" \
     CLOUD_PREFIX_DATA_DIR="/var/lib/soc-ai/cloud_prefixes" \
     HOME="/var/lib/soc-ai"
+
+# Console entry point. Stage 1's `uv sync --no-install-project` installs deps but
+# NOT the project, so pyproject's [project.scripts] `soc-ai` is never generated in
+# the venv — yet the docs and operator muscle-memory expect `soc-ai <cmd>` (backup,
+# restore, blocklists refresh, audit verify, doctor) to work in-container (e.g.
+# `docker exec soc-ai soc-ai backup`). Ship a tiny wrapper on PATH that runs the
+# CLI through the venv python; PYTHONPATH (set above) makes soc_ai importable.
+RUN printf '#!/opt/soc-ai/.venv/bin/python\nimport sys\nfrom soc_ai.cli import main\nsys.exit(main())\n' \
+      > /usr/local/bin/soc-ai \
+    && chmod 0755 /usr/local/bin/soc-ai
 
 USER soc-ai
 

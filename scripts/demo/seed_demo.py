@@ -1454,6 +1454,64 @@ def build_hunt(hunt_id: str) -> tuple[Hunt, list]:
     return hunt, events
 
 
+# Distinct objective from the lateral-movement sweep pair above — a hunt of its
+# own so it never collides with the E3.4 diff hash.
+HUNT_ERROR_OBJECTIVE = (
+    "Hunt for lateral movement from the finance subnet over 24h "
+    "(SMB admin shares, RDP sessions, new service installs)."
+)
+
+
+def build_hunt_error(hunt_id: str) -> tuple[Hunt, list]:
+    """A FAILED hunt (status="error") — the prominent "Re-hunt" affordance target.
+
+    The Hunts list renders an always-visible accent Re-hunt icon on error rows
+    and HuntDetail promotes its Re-hunt button to the accent/"failed" treatment,
+    so the seed needs at least one errored hunt to exercise + screenshot that
+    path. Recent (well inside the default 24h filter), no full report — a hunt
+    cut short before synthesis, exactly like a real budget/time-limit abort.
+    """
+    created = _mins_ago(51)
+    narrative = (
+        "Hunt did not finish — exploration budget/time limit reached before "
+        "synthesis. Two of the planned SMB and Kerberos sweeps completed, but "
+        "the run was aborted before the findings could be assembled into a "
+        "report. Re-run to complete the sweep."
+    )
+    hunt = Hunt(
+        id=hunt_id,
+        objective=HUNT_ERROR_OBJECTIVE,
+        objective_hash=_objective_hash(HUNT_ERROR_OBJECTIVE),
+        kind="chat",
+        status="error",
+        narrative=narrative,
+        report=None,  # cut short before synthesis → no findings/report
+        started_by="admin",
+        created_at=created,
+        finished_at=created + timedelta(minutes=1, seconds=47),
+    )
+    events = [
+        HuntEvent(
+            hunt_id=hunt_id,
+            sequence=1,
+            kind="hunt_started",
+            payload={"objective": HUNT_ERROR_OBJECTIVE},
+        ),
+        HuntEvent(
+            hunt_id=hunt_id,
+            sequence=2,
+            kind="error",
+            payload={
+                "message": (
+                    "exploration budget exhausted (max steps reached) before the "
+                    "hunt could synthesize a report; run aborted"
+                )
+            },
+        ),
+    ]
+    return hunt, events
+
+
 async def seed(data_dir: Path) -> dict:
     # Nuke-to-reseed (ignore_errors: a missing dir is the normal first run).
     shutil.rmtree(data_dir, ignore_errors=True)
@@ -1477,6 +1535,7 @@ async def seed(data_dir: Path) -> dict:
             "interrupted",
             "hunt",
             "hunt_prev",
+            "hunt_error",
         )
     }
 
@@ -1516,6 +1575,7 @@ async def seed(data_dir: Path) -> dict:
     ]
     hunt, hunt_events = build_hunt(ids["hunt"])
     hunt_prev, hunt_prev_events = build_hunt_prev(ids["hunt_prev"])
+    hunt_error, hunt_error_events = build_hunt_error(ids["hunt_error"])
 
     async with sm() as db:
         admin = await create_user(db, dd.DEMO_ADMIN_USER, dd.DEMO_ADMIN_PASSWORD, role="admin")
@@ -1525,13 +1585,14 @@ async def seed(data_dir: Path) -> dict:
             db.add(inv)
         db.add(hunt)
         db.add(hunt_prev)
+        db.add(hunt_error)
         await db.flush()
         for _inv, events, chat in builders:
             for e in events:
                 db.add(e)
             for m in chat:
                 db.add(m)
-        for e in hunt_events + hunt_prev_events:
+        for e in hunt_events + hunt_prev_events + hunt_error_events:
             db.add(e)
         # E2.3 assignment states — one group per chip (curl stays unassigned).
         db.add(
@@ -1643,6 +1704,7 @@ async def seed(data_dir: Path) -> dict:
         "inv_prior_chat": ids["prior1"],
         "hunt": ids["hunt"],
         "hunt_prev": ids["hunt_prev"],
+        "hunt_error": ids["hunt_error"],
         "admin_user": dd.DEMO_ADMIN_USER,
         "admin_password": dd.DEMO_ADMIN_PASSWORD,
     }

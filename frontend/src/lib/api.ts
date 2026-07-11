@@ -17,7 +17,9 @@ import type {
   ConnTestResult,
   DangerSetting,
   EntityDetail,
+  HuntBulkDeleteResult,
   HuntDetailData,
+  HuntRehuntResult,
   HuntRow,
   HuntStat,
   Investigation,
@@ -242,6 +244,21 @@ export function cancelHuntConsole(id: string): Promise<{ cancelled: boolean }> {
 /** Delete a hunt and its events (admin only). 409 if the hunt is still running. */
 export function deleteHunt(id: string): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/hunts/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Re-run a set of hunts as CLEAN fresh hunts of the same objective (no
+ * prior-narrative seeding). The batch is throttled server-side: only the first
+ * few are STARTED, the rest come back skipped/"queued" — re-hunt those in a
+ * smaller follow-up batch. Distinct from ``rehuntInvestigations`` (single-alert).
+ */
+export function rehuntHunts(huntIds: string[]): Promise<HuntRehuntResult> {
+  return post<HuntRehuntResult>('/hunts/rehunt', { hunt_ids: huntIds });
+}
+
+/** Delete a set of hunts (admin only). Running hunts are reported not-removed. */
+export function bulkDeleteHunts(huntIds: string[]): Promise<HuntBulkDeleteResult> {
+  return post<HuntBulkDeleteResult>('/hunts/bulk-delete', { hunt_ids: huntIds });
 }
 
 /** One message in a hunt's read-only follow-up chat thread. */

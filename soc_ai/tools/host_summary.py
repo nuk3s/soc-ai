@@ -16,6 +16,15 @@ What it derives for one IP over a lookback window:
   so ``iPhone`` / ``iPad`` / ``Android`` win over the generic ``Macintosh`` /
   ``Windows`` tokens (the iPhone-vs-Mac fix). The backing UA string is returned
   in ``evidence`` so the call is auditable.
+- ``os_hint`` — an ADDITIVE, telemetry-domain OS inference (see
+  :mod:`soc_ai.tools.os_hint`): the Apple / Windows / Linux / Android vendor
+  domains the host queried / SNI'd, turned into ``{os, confidence, signals,
+  basis}``. This answers the OS question for a modern TLS-only device with no
+  User-Agent (the case where ``device_os_guess`` was ``None`` and a "Linux
+  backdoor" alert on a MacBook went unchallenged). A UA guess stays PRIMARY; the
+  hint corroborates it (or notes a conflict) and only BECOMES ``device_os_guess``
+  when there is no UA. "Linux" is only ever set from POSITIVE distro telemetry,
+  never from the absence of other families.
 - ``role_guess`` — server vs workstation, inferred from whether the host appears
   as a *responder* on well-known service ports (it offers services → server) vs
   only as an *originator* (it consumes services → workstation).
@@ -48,6 +57,7 @@ from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import first_present, get_dotted
 from soc_ai.tools._registry import tool
+from soc_ai.tools.os_hint import OsHint, os_hint_from_domains
 from soc_ai.tools.query_events import _build_time_filter
 
 _LOGGER = logging.getLogger(__name__)
@@ -190,6 +200,7 @@ def _empty_result(ip: str) -> dict[str, Any]:
         "summary": f"no observations for {ip} in the lookback window",
         "hostname": None,
         "device_os_guess": None,
+        "os_hint": None,
         "role_guess": "unknown",
         "first_seen": None,
         "last_seen": None,
@@ -331,12 +342,16 @@ async def host_summary(
             here so it finds evidence for an old alert.
 
     Returns:
-        A dict with ``hostname`` / ``device_os_guess`` / ``role_guess`` /
-        ``first_seen`` / ``last_seen`` / ``top_peers`` / ``top_ports`` /
-        ``top_dns`` and an ``evidence`` sub-dict holding the raw strings backing
-        each guess. On no data: a clean ``observations: False`` result. On an ES
-        error or bad IP: a clean ``{"error": True, "message": ...}`` dict. NEVER
-        raises — the caller is an LLM tool boundary.
+        A dict with ``hostname`` / ``device_os_guess`` / ``os_hint`` /
+        ``role_guess`` / ``first_seen`` / ``last_seen`` / ``top_peers`` /
+        ``top_ports`` / ``top_dns`` and an ``evidence`` sub-dict holding the raw
+        strings backing each guess. ``os_hint`` (additive) is the telemetry-domain
+        OS inference — ``{os, confidence, signals, basis}`` with the matched
+        vendor domains in ``signals`` — or ``None`` when no telemetry named an OS;
+        it backfills ``device_os_guess`` for a TLS-only host with no User-Agent.
+        On no data: a clean ``observations: False`` result. On an ES error or bad
+        IP: a clean ``{"error": True, "message": ...}`` dict. NEVER raises — the
+        caller is an LLM tool boundary.
     """
     try:
         ipaddress.ip_address(ip)
@@ -393,6 +408,7 @@ async def host_summary(
     for candidates in (
         fields.HTTP_USER_AGENT,
         fields.DNS_QUERY,
+        fields.SSL_SNI,  # TLS SNI feeds the telemetry-domain OS hint (TLS-only hosts)
         _DHCP_HOSTNAME,
         _SMB_HOSTNAME,
         _PTR_ANSWER,
@@ -428,9 +444,23 @@ async def host_summary(
         evidence["hostname"] = hostname_evidence
 
     # --- device / OS guess (parse User-Agents — the iPhone-vs-Mac fix) ---
-    device_os_guess, ua_evidence = _resolve_device_os(hits)
+    ua_guess, ua_evidence = _resolve_device_os(hits)
+
+    # Telemetry-domain OS hint: infer OS from the Apple/Windows/Linux/Android
+    # vendor domains the host queried / SNI'd. This is the answer for a modern
+    # TLS-only device (empty UA) whose only OS tell is its own service-discovery
+    # traffic — the BPFDoor-vs-MacBook case that motivated it. The merge keeps a
+    # UA guess PRIMARY and never invents "Linux" from the absence of other
+    # families (os_hint.py enforces that structurally).
+    dns_hint = os_hint_from_domains(_collect_telemetry_domains(hits))
+    device_os_guess, os_hint = _merge_os_evidence(ua_guess, dns_hint)
+
     if ua_evidence:
         evidence["device_os_guess"] = ua_evidence
+    # Surface the matched telemetry domains as evidence too, so the agent SEES the
+    # domains behind a DNS-derived (or corroborating) OS call, not just a label.
+    if os_hint and os_hint["signals"]:
+        evidence["os_hint"] = os_hint["signals"]
 
     # --- role guess (server vs workstation from connection direction) ---
     role_guess, role_evidence = _guess_role(ip, hits)
@@ -456,6 +486,10 @@ async def host_summary(
         "event_count": result.total,
         "hostname": hostname,
         "device_os_guess": device_os_guess,
+        # Additive, evidence-bearing OS hint. Present only when telemetry domains
+        # produced one; None otherwise so existing device_os_guess consumers are
+        # untouched. Shape: {os, confidence, signals, basis[, conflict]}.
+        "os_hint": os_hint,
         "role_guess": role_guess,
         "first_seen": first_seen,
         "last_seen": last_seen,
@@ -516,3 +550,119 @@ def _collect_top_dns(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         counts[qname] += 1
     return [{"value": name, "count": count} for name, count in counts.most_common(_AGG_SIZE)]
+
+
+def _collect_telemetry_domains(hits: list[dict[str, Any]]) -> list[str]:
+    """Every DNS query name + TLS SNI server-name in the sample (forward only).
+
+    Feeds :func:`os_hint_from_domains`. Unlike :func:`_collect_top_dns` this keeps
+    duplicates out (the classifier only needs the SET of domains, not volume) and
+    pulls BOTH the DNS qname and the TLS SNI — the SNI is what a TLS-only Apple
+    device leaves when it resolves via DoH/an upstream resolver and the grid never
+    sees the plaintext DNS query. Reverse-zone (PTR) names are excluded — they
+    describe IPs, not what the host reached for.
+    """
+    seen: dict[str, None] = {}  # ordered-unique
+    for hit in hits:
+        for candidates in (fields.DNS_QUERY, fields.SSL_SNI):
+            name = _first_str(first_present(hit, candidates))
+            if not name:
+                continue
+            low = name.lower().rstrip(".")
+            if low.endswith((".in-addr.arpa", ".ip6.arpa")):
+                continue
+            seen[name] = None
+    return list(seen)
+
+
+# The basis a device_os_guess rests on, surfaced in the os_hint so the agent
+# knows WHICH evidence produced the label (and can weigh a UA against a hint).
+_Basis = str  # "user-agent" | "telemetry-domains" | "both"
+
+
+def _merge_os_evidence(
+    ua_guess: str | None,
+    dns_hint: OsHint | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Combine the UA-based OS guess with the telemetry-domain OS hint.
+
+    Merge policy (evidence-preserving, UA-primary):
+
+    - **UA guess present** → it stays PRIMARY (a User-Agent is a first-party
+      device statement; a telemetry hint never overwrites it). The DNS hint is
+      attached as corroboration or, when the families disagree, a noted conflict —
+      but ``device_os_guess`` remains the UA label. This is the "NEVER overwrite a
+      strong UA signal with a weak DNS one" rule.
+    - **UA guess absent** (the common TLS-only case that motivated this) → the DNS
+      hint BECOMES ``device_os_guess`` (its ``os`` label), carrying its own
+      matched-domain evidence so the guess is auditable.
+    - **Neither** → ``(None, None)`` — nothing to say, and crucially no Linux (or
+      any) label invented from absence.
+
+    Returns ``(device_os_guess, os_hint_dict_or_None)``. The returned hint dict is
+    additive: ``{os, confidence, signals, basis}`` — it never mutates or replaces
+    the existing ``device_os_guess`` consumers' contract.
+    """
+    if dns_hint is None:
+        # No telemetry evidence — device_os_guess is whatever the UA said (may be
+        # None). No os_hint block to add.
+        return ua_guess, None
+
+    # We have a telemetry hint. Compare its family against the UA guess to decide
+    # corroboration vs conflict. UA labels are device/OS strings ("iPhone",
+    # "macOS", "Windows", "Android", "Linux"); map to the coarse family the hint
+    # speaks so "iPhone" corroborates an "apple"/"ios" hint.
+    ua_family = _ua_label_to_family(ua_guess) if ua_guess else None
+    hint_family = _os_label_to_family(dns_hint["os"]) if dns_hint["os"] else None
+
+    hint_block: dict[str, Any] = {
+        "os": dns_hint["os"],
+        "confidence": dns_hint["confidence"],
+        "signals": dns_hint["signals"],
+    }
+
+    if ua_guess is not None:
+        # UA wins primary. Note whether the telemetry agrees or contradicts.
+        if hint_family is not None and ua_family is not None and hint_family != ua_family:
+            hint_block["basis"] = "user-agent"
+            hint_block["conflict"] = (
+                f"user-agent says {ua_guess} ({ua_family}); "
+                f"telemetry domains say {hint_family} — investigate (NAT/multi-device?)"
+            )
+        else:
+            # Agree (or the hint is a mixed/None verdict) → corroboration.
+            hint_block["basis"] = "both" if hint_family is not None else "user-agent"
+        return ua_guess, hint_block
+
+    # No UA — the telemetry hint IS the device_os_guess (when it named a family).
+    hint_block["basis"] = "telemetry-domains"
+    return dns_hint["os"], hint_block
+
+
+# Coarse-family maps so a UA label and a hint label can be compared. Kept local
+# and small — this is only for the corroboration/conflict decision, not a general
+# taxonomy.
+def _ua_label_to_family(label: str) -> str | None:
+    """Map a User-Agent device/OS label to the coarse family os_hint speaks."""
+    mapping = {
+        "iPhone": "apple",
+        "iPad": "apple",
+        "iPod": "apple",
+        "macOS": "apple",
+        "Windows": "windows",
+        "Windows Phone": "windows",
+        "Android": "android",
+        "Linux": "linux",
+        "Chrome OS": "linux",  # ChromeOS is Linux-family telemetry-wise
+    }
+    return mapping.get(label)
+
+
+def _os_label_to_family(label: str) -> str | None:
+    """Collapse an os_hint label (macos/ios/apple/windows/linux/android) to its
+    coarse family for comparison against a UA family."""
+    if label in ("macos", "ios", "apple"):
+        return "apple"
+    if label in ("windows", "linux", "android"):
+        return label
+    return None

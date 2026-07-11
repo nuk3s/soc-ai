@@ -426,6 +426,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         settings.so_host,
     )
 
+    # Loud warning when API auth is disabled — with auth off, require_admin_api is
+    # a no-op, so secret mutation, user creation, and token minting are open to any
+    # caller that can reach the port. Acceptable for loopback-only dev; a real risk
+    # if the bind is non-loopback (the docker default is 0.0.0.0).
+    if not settings.api_auth_required:
+        _loopback = {"127.0.0.1", "::1", "localhost", ""}
+        if str(settings.soc_ai_host) not in _loopback:
+            _LOGGER.warning(
+                "API_AUTH_REQUIRED=false AND bind host is non-loopback (%s) — admin "
+                "endpoints (secret edit, user/token creation) are UNAUTHENTICATED and "
+                "reachable on the network. Set API_AUTH_REQUIRED=true for any shared deploy.",
+                settings.soc_ai_host,
+            )
+        else:
+            _LOGGER.warning(
+                "API_AUTH_REQUIRED=false — running unauthenticated (loopback bind %s). "
+                "Dev/lab only; set API_AUTH_REQUIRED=true before exposing the port.",
+                settings.soc_ai_host,
+            )
+
     auth = make_auth(settings)
     elastic = ElasticClient(settings)
     misp = MispClient(settings) if settings.misp_url is not None else None
