@@ -1,0 +1,26 @@
+[
+  {
+    "target": "investigation",
+    "id": "01DEMOW495Q7GD3D8WTEJ934AY",
+    "messages": [
+      {"role": "user", "content": "Why is this a false positive?"},
+      {"role": "assistant", "content": "Recorded demo answer. The rule 'ET INFO External IP Lookup Domain (ipify.org) in DNS Lookup' is an INFO-tier signature: it fires whenever a host resolves an external IP-lookup service, which plenty of benign software does to learn its own public address. Here the workstation made a single A-record lookup for ipify.org against the internal DNS resolver, it resolved NOERROR, and there was no follow-on connection to a flagged destination. That pattern is a legitimate self-IP check, not command-and-control, so the recorded verdict was false_positive at 0.9 confidence. This is a read-only demo, so I can't run new queries here; in a live deployment I would confirm by pulling the DNS PCAP and checking the resolved answers against reputation data."}
+    ]
+  },
+  {
+    "target": "investigation",
+    "id": "01DEMOP3XD42HDDHRAK52AD0PH",
+    "messages": [
+      {"role": "user", "content": "What made you escalate this one?"},
+      {"role": "assistant", "content": "Recorded demo answer. Three things stacked up into a true_positive at 0.85 confidence. First, the destination is on a public malware-distribution blocklist (the ET DROP / urlhaus feed), so it is a known-bad IP rather than a noisy heuristic. Second, the internal host connected to it by raw IP with no preceding DNS resolution, which is how malware reaches a hard-coded drop server. Third, the request used an outdated IE7 User-Agent that no current browser sends, and the host was first-seen in the last 90 days. Together that reads as a compromised or newly-provisioned host reaching known-malicious infrastructure. This is a read-only demo, so I can't take live action; in a real deployment the recommended next steps would be to isolate the host, pull the full PCAP, and open a case."}
+    ]
+  },
+  {
+    "target": "hunt",
+    "id": "01DEMOHUNT000000000000SSH1",
+    "messages": [
+      {"role": "user", "content": "Did the hunt find any lateral movement?"},
+      {"role": "assistant", "content": "Recorded demo answer. No — the hunt reviewed 41 SSH sessions across HOST_02, HOST_05, and HOST_11 and found no evidence of lateral movement. Every session authenticated to a service account that already existed on that host, no host-to-host pair appeared for the first time, and a search for failed-then-success authentication bursts (the signature of credential spraying) returned zero matches. The disposition was benign at 0.8 confidence. This is a read-only demo, so I can't launch a fresh sweep here; in a live deployment I would widen the window and pivot on any first-seen host pair to confirm."}
+    ]
+  }
+]

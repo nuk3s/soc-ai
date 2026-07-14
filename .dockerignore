@@ -55,7 +55,12 @@ ROADMAP.md
 TODO.md
 
 # ── Scripts not needed inside the image ───────────────────────────────────────
+# Exception: the demo container's bundled mock ES (started by
+# docker/demo-entrypoint.sh). NOTHING else from scripts/ may ship —
+# scripts/build-public-mirror.sh in particular must never leave the dev tree.
 scripts/
+!scripts/demo/mock_es.py
+!scripts/demo/demo_dataset.py
 
 # ── Test suite ────────────────────────────────────────────────────────────────
 tests/

@@ -326,6 +326,14 @@ class Settings(BaseSettings):
 
     # --- Web UI / local store -------------------------------------------
     soc_ai_data_dir: Path = Path("data")
+
+    soc_ai_demo: bool = False
+    """Read-only public demo mode. Seeds the sanitized fixture set at startup,
+    refuses all outbound network clients (Elasticsearch restricted to loopback,
+    for the bundled mock), and turns every mutating endpoint into a structured
+    refusal except the two replay triggers. Env-only (``SOC_AI_DEMO``) — never
+    added to the config-console whitelist, so it cannot be flipped from the UI."""
+
     # Secure default: require a login/token for the API. The admin console and
     # cross-origin API clients both authenticate; only flip this off for an
     # isolated, trusted-network demo where you understand the exposure.

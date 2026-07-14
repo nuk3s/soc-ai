@@ -24,6 +24,7 @@ from typing import Any
 
 import httpx
 
+from soc_ai.demo.guard import assert_egress_allowed
 from soc_ai.tools.online import first_internal_identifier
 
 _LOGGER = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ async def web_search(query: str, *, settings: Any) -> dict[str, Any]:
     max_results = int(getattr(settings, "web_search_max_results", 5))
     verify = bool(getattr(settings, "searxng_verify_ssl", True))
     try:
+        # Demo guard inside the try: blocked egress becomes a normal error
+        # result (this function never raises), before any client exists.
+        assert_egress_allowed(settings, "web search")
         async with httpx.AsyncClient(timeout=timeout, verify=verify) as client:
             resp = await client.get(
                 f"{base}/search",

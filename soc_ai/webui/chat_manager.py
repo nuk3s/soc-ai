@@ -145,6 +145,20 @@ def _build_prompt(prior: list[tuple[str, str]], question: str) -> str:
 async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # noqa: PLR0915
     try:
         settings = state.settings
+        # Demo mode: never build the model/gateway (the egress guard would raise).
+        # Short-circuit BEFORE any agent/ES work with a canned, zero-egress reply
+        # looked up from the seeded fixtures, then finish the pending row exactly
+        # as the live path does. `is True` (not truthy) so a MagicMock settings in
+        # a unit test can't accidentally trip the demo branch (real Settings is a bool).
+        if getattr(settings, "soc_ai_demo", False) is True:
+            from soc_ai.demo.chat import canned_reply  # noqa: PLC0415
+
+            text = canned_reply(getattr(state, "demo_fixtures", None), "investigation", inv_id)
+            async with state.db_sessionmaker() as db:
+                await chat_svc.finish_assistant(
+                    db, assistant_msg_id, content=text, status="done", meta={"demo": True}
+                )
+            return
         ctx = ctx_from_state(state)
         async with state.db_sessionmaker() as db:
             loaded = await inv_svc.get_with_events(db, inv_id)

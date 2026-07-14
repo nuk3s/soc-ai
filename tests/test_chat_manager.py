@@ -156,6 +156,10 @@ def test_extract_tools_ignores_return_parts() -> None:
 def _make_state(*, finish_side_effect: Any = None) -> MagicMock:
     """Build a minimal fake app state for _run_turn tests."""
     settings = MagicMock()
+    # A bare MagicMock auto-returns a truthy attr for soc_ai_demo, which would
+    # fire the demo canned-reply short-circuit in _run_turn and bypass the live
+    # path these tests exercise. Real Settings default soc_ai_demo=False.
+    settings.soc_ai_demo = False
     settings.analyst_model = "test-model"
     settings.chat_turn_timeout_s = 180
 
@@ -208,6 +212,10 @@ def test_run_turn_agent_error_persists_error_row() -> None:
     db_cm.__aexit__ = AsyncMock(return_value=False)
 
     settings = MagicMock()
+    # A bare MagicMock auto-returns a truthy attr for soc_ai_demo, which would
+    # fire the demo canned-reply short-circuit in _run_turn and bypass the live
+    # path these tests exercise. Real Settings default soc_ai_demo=False.
+    settings.soc_ai_demo = False
     settings.analyst_model = "test-model"
     settings.chat_turn_timeout_s = 180
 
@@ -265,6 +273,10 @@ def test_run_turn_error_write_failure_is_logged_not_propagated(caplog: Any) -> N
     db_cm.__aexit__ = AsyncMock(return_value=False)
 
     settings = MagicMock()
+    # A bare MagicMock auto-returns a truthy attr for soc_ai_demo, which would
+    # fire the demo canned-reply short-circuit in _run_turn and bypass the live
+    # path these tests exercise. Real Settings default soc_ai_demo=False.
+    settings.soc_ai_demo = False
     settings.analyst_model = "test-model"
     settings.chat_turn_timeout_s = 180
 
@@ -335,6 +347,10 @@ def test_run_turn_timeout_persists_user_facing_error_row() -> None:
     db_cm.__aexit__ = AsyncMock(return_value=False)
 
     settings = MagicMock()
+    # A bare MagicMock auto-returns a truthy attr for soc_ai_demo, which would
+    # fire the demo canned-reply short-circuit in _run_turn and bypass the live
+    # path these tests exercise. Real Settings default soc_ai_demo=False.
+    settings.soc_ai_demo = False
     settings.analyst_model = "test-model"
     settings.chat_turn_timeout_s = 0.01  # tiny → fires immediately
 
@@ -397,6 +413,10 @@ def test_run_turn_timeout_error_passthrough() -> None:
     db_cm.__aexit__ = AsyncMock(return_value=False)
 
     settings = MagicMock()
+    # A bare MagicMock auto-returns a truthy attr for soc_ai_demo, which would
+    # fire the demo canned-reply short-circuit in _run_turn and bypass the live
+    # path these tests exercise. Real Settings default soc_ai_demo=False.
+    settings.soc_ai_demo = False
     settings.analyst_model = "test-model"
     settings.chat_turn_timeout_s = 42
 
@@ -457,6 +477,10 @@ def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
     db_cm.__aenter__ = AsyncMock(return_value=db)
     db_cm.__aexit__ = AsyncMock(return_value=False)
     settings = MagicMock()
+    # A bare MagicMock auto-returns a truthy attr for soc_ai_demo, which would
+    # fire the demo canned-reply short-circuit in _run_turn and bypass the live
+    # path these tests exercise. Real Settings default soc_ai_demo=False.
+    settings.soc_ai_demo = False
     settings.analyst_model = "test-model"
     settings.chat_turn_timeout_s = 180
     state = MagicMock()

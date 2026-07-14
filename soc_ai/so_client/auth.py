@@ -24,6 +24,7 @@ from typing import Any, Protocol, runtime_checkable
 import httpx
 
 from soc_ai.config import Settings
+from soc_ai.demo.guard import assert_loopback_only
 from soc_ai.errors import SoAuthError
 
 _LOGGER = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ class SoAuthClient(Protocol):
 
 def _make_async_client(settings: Settings) -> httpx.AsyncClient:
     """Construct an :class:`httpx.AsyncClient` with TLS + timeout config."""
+    # Demo mode: only a loopback SO API (the bundled mock) may be reached.
+    assert_loopback_only(settings, str(settings.so_host), "security onion api")
     verify: bool | str = settings.so_verify_ssl
     if settings.so_ca_bundle:
         verify = str(settings.so_ca_bundle)

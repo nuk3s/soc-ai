@@ -1,0 +1,104 @@
+# soc-ai PUBLIC DEMO stack — one container, read-only replay. NOT for real use.
+#
+# This is the local twin of the hosted demo (see render.yaml): the same image
+# as docker-compose.yml, but started through docker/demo-entrypoint.sh, which
+# runs the bundled mock Elasticsearch/LLM endpoint on 127.0.0.1:9200 (inside
+# the container, never published) and then the app with SOC_AI_DEMO=true.
+# The app seeds the sanitized soc_ai/demo/fixtures.json at startup (fail-soft:
+# absent fixtures boot an empty demo), blocks every mutating request except
+# the two replay triggers, and refuses all non-loopback egress.
+#
+# TLS: NONE in this container, deliberately. The hosted demo sits behind the
+# platform edge (which terminates TLS and forwards plain HTTP), so the demo
+# entrypoint starts uvicorn WITHOUT the --ssl-* flags the production compose
+# file relies on. Locally that means plain http://127.0.0.1:8080 — bound to
+# loopback by default, and it must stay that way (auth is pinned off below).
+#
+# Usage:
+#   docker compose -f docker-compose.demo.yml up --build
+#   → http://127.0.0.1:8080/ui/alerts
+#
+# NO .env, NO secrets: every value below is a loopback URL or an inert
+# placeholder that the Settings schema requires to boot. Nothing sensitive
+# exists in the demo environment — by spec.
+
+services:
+
+  soc-ai-demo:
+    image: ghcr.io/nuk3s/soc-ai:${SOC_AI_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: soc-ai-demo
+
+    # The demo entrypoint replaces the image's TLS-serving default CMD.
+    entrypoint: ["/opt/soc-ai/docker/demo-entrypoint.sh"]
+
+    # Loopback publish by default — API_AUTH_REQUIRED=false makes this stack
+    # unauthenticated, so never bind it wider on a box you share. The hosted
+    # demo gets its public exposure through the platform edge, not this port.
+    ports:
+      - "${SOC_AI_DEMO_BIND:-127.0.0.1}:${SOC_AI_DEMO_PORT:-8080}:8080"
+
+    # environment (NOT env_file) on purpose: the demo must boot with no .env.
+    environment:
+      # Master switch — env-only by design (soc_ai/config.py), so it can never
+      # be flipped from the UI.
+      SOC_AI_DEMO: "true"
+      # CARRIED DECISION: the demo read-only middleware blocks POST /login,
+      # and SOC_AI_DEMO does NOT force auth off — pin it off here so visitors
+      # land straight in the (read-only) UI instead of an unusable login form.
+      API_AUTH_REQUIRED: "false"
+      # Public-facing flood backpressure (default is 1200 for real deploys).
+      # The SPA fires ~10-15 API calls per page view, so this must clear a real
+      # visitor's navigation while still catching bots/scrapers — 30 throttled a
+      # human to ~2 clicks/min (dogfood finding). Override for trusted/local use:
+      # SOC_AI_DEMO_RATE_LIMIT=600 podman-compose -f docker-compose.demo.yml up.
+      API_RATE_LIMIT_PER_MIN: "${SOC_AI_DEMO_RATE_LIMIT:-120}"
+      # Everything below either points at the in-container mock (the demo
+      # egress guard refuses any non-loopback client) or is an inert
+      # placeholder Settings requires. No real endpoint, credential, or key.
+      ES_HOSTS: "http://127.0.0.1:9200"
+      SO_HOST: "http://127.0.0.1:9200"
+      SO_USERNAME: "demo"
+      SO_PASSWORD: "demo-placeholder-unused"
+      LITELLM_BASE_URL: "http://127.0.0.1:9200"
+
+    # Plain-HTTP healthcheck — overrides the image's HTTPS one, which matches
+    # the production CMD (TLS on 8443), not the demo entrypoint (HTTP on 8080).
+    # Two-target: probe the bundled mock ES (:9200) as well as the app, because
+    # /healthz is pure app liveness and would stay green with a dead mock behind
+    # it (empty grids). The entrypoint also process-supervises the mock; this
+    # additionally catches an alive-but-wedged mock.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fs http://127.0.0.1:9200/ && curl -fs http://127.0.0.1:8080/healthz"
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    restart: unless-stopped
+
+    # No volumes: the demo is stateless on purpose. The SQLite store lives in
+    # the container filesystem and is re-seeded from the packaged fixtures on
+    # every fresh container — exactly like the hosted free tier (ephemeral FS).
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Same hardening as the production compose file.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Sized to the hosting target (Render free web service = 512 MB).
+    deploy:
+      resources:
+        limits:
+          memory: 512M

@@ -12,6 +12,7 @@ from typing import ClassVar
 import httpx
 import pytest
 import respx
+from soc_ai.demo.guard import DemoEgressBlocked
 from soc_ai.enrichment.blocklist_refresh import (
     BLOCKLIST_FEEDS,
     _atomic_write_bytes,
@@ -354,3 +355,13 @@ def test_cli_refresh_missing_auth_key_still_exits_zero(
     # urlhaus skipped (no key) is not a failure → exit 0.
     assert rc == 0
     assert not (tmp_path / "urlhaus.csv").exists()
+
+
+@pytest.mark.asyncio
+async def test_refresh_blocklists_blocked_in_demo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SOC_AI_DEMO refuses the feed refresh before any HTTP client exists."""
+    monkeypatch.setenv("SOC_AI_DEMO", "true")
+    with pytest.raises(DemoEgressBlocked):
+        await refresh_blocklists(tmp_path, sources=["tor"], abuse_ch_auth_key=None)

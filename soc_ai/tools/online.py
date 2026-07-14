@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from soc_ai.config import Settings
+from soc_ai.demo.guard import assert_egress_allowed
 
 # Host/IP-ish tokens in a free-text query (FQDNs, bare hostnames, IPv4, IPv6).
 # Leading ':' is allowed so IPv6 literals written with a leading '::' (e.g. ``::1``)
@@ -132,6 +133,7 @@ def first_internal_identifier(text: str, settings: Any) -> str | None:
 
 def online_client(settings: Settings) -> httpx.AsyncClient:
     """An ``httpx.AsyncClient`` with the shared online-enrichment timeout + TLS policy."""
+    assert_egress_allowed(settings, "online enrichment")
     return httpx.AsyncClient(
         timeout=settings.online_enrichment_timeout_s,
         verify=settings.online_enrichment_verify_ssl,

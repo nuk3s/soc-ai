@@ -23,6 +23,8 @@ from typing import cast
 
 import httpx
 
+from soc_ai.demo.guard import assert_ambient_egress_allowed
+
 _LOGGER = logging.getLogger(__name__)
 
 # Name of the JSON file written alongside the cloud-prefix data files
@@ -195,6 +197,9 @@ async def refresh_cloud_prefixes(
     to ``cloud_refresh_status.json`` in ``data_dir`` so that
     ``cloud_prefix_staleness_days`` can report how fresh the data is.
     """
+    # No Settings parameter in this signature (the CLI handler owns that), so
+    # the ambient guard resolves the demo flag itself.
+    assert_ambient_egress_allowed("geo/cloud refresh")
     data_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 — httpx uses asyncio, not trio/anyio
     effective_urls = dict(REFRESH_URLS)
     if url_overrides:

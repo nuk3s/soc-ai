@@ -11,6 +11,7 @@ import { INV_STATUS as STATUS } from '../lib/statusMeta';
 import { Checkbox } from '../components/Controls';
 import { ErrorState, LoadingState } from '../components/States';
 import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
+import { useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import { type SortDir, useSort } from '../lib/useSort';
 import type { InvestigationRow, RehuntResult, Verdict } from '../lib/types';
@@ -79,6 +80,11 @@ function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: So
 
 export function Investigations() {
   const navigate = useNavigate();
+  // Demo seeded runs span a couple of hours; widen the default window in demo so
+  // none age out. useDemo() is false outside a DemoProvider — normal deploys keep
+  // 24h. The /demo-status probe resolves async, so the widening happens in an
+  // effect below once `demo` flips (the useState initializer runs before it does).
+  const demo = useDemo();
   const [reloadKey, setReloadKey] = useState(0);
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // whether any run is still live in a ref and let pauseWhen consult it: stop
@@ -107,6 +113,9 @@ export function Investigations() {
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]);
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
   const [range, setRange] = useState('24h');
+  useEffect(() => {
+    if (demo) setRange('30d');
+  }, [demo]);
   const [custom, setCustom] = useState<CustomRange | null>(null);
   // Shared sort mechanics; clicking a new column here starts it ascending.
   const { sort, toggleSort, caret, headerCls } = useSort<SortKey>(

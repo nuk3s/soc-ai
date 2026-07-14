@@ -1,0 +1,55 @@
+# Render Blueprint for the hosted public demo (read-only replay).
+#
+# WHY RENDER, NOT FLY: the demo-site spec targets a free hosting tier, with
+# Render named as the fallback. Fly.io discontinued its free allowances for
+# new organizations (October 2024) — new accounts get a ~2-hour trial, then
+# pay-as-you-go — so there is no Fly free tier to target. Render's free web
+# service tier still exists (2026): 512 MB, 750 instance-hours/month, spins
+# down after 15 min idle (~1 min cold start on the next visit), ephemeral
+# filesystem. All acceptable for this demo: it is stateless by design and
+# re-seeds the packaged fixtures on every boot.
+#
+# TLS: Render's edge terminates TLS and forwards plain HTTP to $PORT (Render
+# sets it; 10000 by default), so docker/demo-entrypoint.sh starts uvicorn
+# WITHOUT the --ssl-* flags the image's default CMD uses.
+#
+# autoDeploy is OFF: deploys go through .github/workflows/demo-deploy.yml
+# (fixture leak gate first, then the Render deploy hook) — never straight
+# from a push.
+#
+# One-time setup (owner): create the Blueprint from this file in the Render
+# dashboard, then copy the service's deploy-hook URL into the GitHub repo
+# secret RENDER_DEPLOY_HOOK_URL.
+
+services:
+  - type: web
+    name: soc-ai-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: /opt/soc-ai/docker/demo-entrypoint.sh
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      # Same block as docker-compose.demo.yml — loopback mock URLs and inert
+      # placeholders only; nothing sensitive exists in the demo environment.
+      - key: SOC_AI_DEMO
+        value: "true"
+      - key: API_AUTH_REQUIRED
+        value: "false"
+      # The SPA fires ~10-15 API calls per page view, so 30/min throttled a real
+      # visitor to ~2 navigations before 429s. 120 clears normal browsing while
+      # still bounding scrapers (production default is 1200).
+      - key: API_RATE_LIMIT_PER_MIN
+        value: "120"
+      - key: ES_HOSTS
+        value: "http://127.0.0.1:9200"
+      - key: SO_HOST
+        value: "http://127.0.0.1:9200"
+      - key: SO_USERNAME
+        value: "demo"
+      - key: SO_PASSWORD
+        value: "demo-placeholder-unused"
+      - key: LITELLM_BASE_URL
+        value: "http://127.0.0.1:9200"

@@ -1,0 +1,80 @@
+name: demo deploy
+
+# Deploys the hosted read-only demo defined in render.yaml (Render free web
+# service; see render.yaml for why not Fly — Fly.io no longer has a free tier
+# for new organizations, and Render is the spec's named fallback).
+#
+# OWNER-TRIGGERED ONLY (workflow_dispatch): the Render service does not exist
+# yet, so a tag-coupled trigger would fail red on every release. Once the
+# Blueprint is created and the RENDER_DEPLOY_HOOK_URL secret is set, flip the
+# trigger to
+#   on:
+#     push:
+#       tags: ["v*"]
+# if release-coupled demo refreshes are wanted.
+#
+# Gate: the demo fixture leak tests run before any deploy — a committed
+# soc_ai/demo/fixtures.json carrying a lab identifier fails the run; an
+# absent fixtures.json passes clean (the image boots fail-soft without it).
+# NOTE: on the public GitHub mirror the gate module self-skips (its pattern
+# source, scripts/build-public-mirror.sh, never ships publicly) — there the
+# effective gate is the mirror build itself, which refuses to publish a
+# leaking tree before anything reaches this repository.
+
+on:
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repo; the deploy credential
+# is the Render deploy-hook secret, not a token with repo scope.
+permissions:
+  contents: read
+
+# Never run two deploys at once; don't cancel a deploy mid-flight either.
+concurrency:
+  group: demo-deploy
+  cancel-in-progress: false
+
+jobs:
+  leak-gate:
+    name: demo fixture leak gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Same SHA pin as ci.yml (setup-uv publishes no floating v8 major tag).
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Demo fixture leak gate
+        run: uv run pytest tests/test_demo_leak_gate.py -v --no-cov
+
+  deploy:
+    name: deploy to Render
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: leak-gate
+    steps:
+      # The deploy-hook URL embeds its auth key, so it lives in a repo secret
+      # (GitHub masks it in logs) and is passed only through env — never
+      # interpolated into the command line. -o /dev/null keeps Render's
+      # response body out of the log too; -f fails the job on a non-2xx.
+      - name: Trigger Render deploy
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL secret is not set — create the Render service from render.yaml first" >&2
+            exit 1
+          fi
+          curl -fsS --max-time 30 -o /dev/null -X POST "$RENDER_DEPLOY_HOOK_URL"
+          echo "Render deploy triggered."

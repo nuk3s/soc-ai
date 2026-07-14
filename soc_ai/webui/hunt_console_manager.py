@@ -249,6 +249,20 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
     """Run one read-only follow-up turn on a COMPLETED hunt and persist the answer."""
     try:
         settings = state.settings
+        # Demo mode: never build the model/gateway (the egress guard would raise).
+        # Short-circuit BEFORE any agent/ES work with a canned, zero-egress reply
+        # looked up from the seeded fixtures, then finish the pending row exactly
+        # as the live path does. `is True` (not truthy) so a MagicMock settings in
+        # a unit test can't accidentally trip the demo branch (real Settings is a bool).
+        if getattr(settings, "soc_ai_demo", False) is True:
+            from soc_ai.demo.chat import canned_reply  # noqa: PLC0415
+
+            text = canned_reply(getattr(state, "demo_fixtures", None), "hunt", hunt_id)
+            async with state.db_sessionmaker() as db:
+                await hunt_svc.finish_chat_assistant(
+                    db, assistant_event_id, content=text, status="done", meta={"demo": True}
+                )
+            return
         ctx = ctx_from_state(state)
         async with state.db_sessionmaker() as db:
             loaded = await hunt_svc.get_with_events(db, hunt_id)

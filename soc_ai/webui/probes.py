@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from soc_ai.demo.guard import assert_egress_allowed
+
 # Default timeout (seconds) for every outbound probe. Kept short so the admin
 # UI stays responsive when an upstream is down or hanging.
 _PROBE_TIMEOUT_S = 10.0
@@ -78,6 +80,9 @@ async def list_gateway_models(settings: Any) -> tuple[list[str], str | None]:
     # self-signed cert with litellm_verify_ssl=false.
     verify = bool(getattr(settings, "litellm_verify_ssl", True))
     try:
+        # Demo guard inside the try: a blocked probe reports a normal ✗ result
+        # (this function never raises), before any client is constructed.
+        assert_egress_allowed(settings, "diagnostics probe")
         async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_S, verify=verify) as client:
             resp = await client.get(f"{base}/v1/models", headers=headers)
         if resp.status_code != 200:
@@ -419,6 +424,10 @@ async def probe_pcap(settings: Any) -> dict[str, Any]:
     args = [*_ssh_base_args(settings), remote]
     timeout = _PROBE_TIMEOUT_S + float(getattr(settings, "so_ssh_timeout_s", 120))
     try:
+        # Demo guard inside the try: a blocked probe reports a normal ✗ result
+        # (this function never raises), before the SSH subprocess is spawned —
+        # process-based egress needs the same refusal as HTTP clients.
+        assert_egress_allowed(settings, "sensor ssh probe")
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,

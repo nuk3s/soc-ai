@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 from soc_ai.config import Settings
+from soc_ai.demo.guard import assert_egress_allowed
 from soc_ai.oracle.redact import Mapping, sanitize_case
 from soc_ai.oracle.sanitize import (
     desanitize,
@@ -317,6 +318,7 @@ async def _call_oracle_raw(
 
     Raises :class:`RuntimeError` on HTTP / transport failure.
     """
+    assert_egress_allowed(settings, "oracle")
     import httpx  # noqa: PLC0415 — lazy; keep hot path light
 
     base_url = str(settings.litellm_base_url).rstrip("/") + "/v1/chat/completions"

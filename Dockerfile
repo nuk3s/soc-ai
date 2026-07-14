@@ -101,6 +101,17 @@ COPY --chown=soc-ai:soc-ai pyproject.toml /opt/soc-ai/pyproject.toml
 # as the frontend bundle below. Without this COPY the endpoint 404s honestly.
 COPY --chown=soc-ai:soc-ai runbooks/     /opt/soc-ai/runbooks/
 
+# Demo packaging (inert in normal deployments — the default CMD below never
+# touches it). mock_es.py + its demo_dataset import are the bundled loopback
+# Elasticsearch/LLM stand-in that docker/demo-entrypoint.sh starts on
+# 127.0.0.1:9200; ONLY these two files are un-ignored in .dockerignore — the
+# rest of scripts/ never ships in the image. The entrypoint itself is selected
+# explicitly by docker-compose.demo.yml / render.yaml.
+COPY --chown=soc-ai:soc-ai scripts/demo/mock_es.py scripts/demo/demo_dataset.py \
+     /opt/soc-ai/scripts/demo/
+COPY --chmod=0755 --chown=soc-ai:soc-ai docker/demo-entrypoint.sh \
+     /opt/soc-ai/docker/demo-entrypoint.sh
+
 # ── Copy the built React SPA ───────────────────────────────────────────────────
 # FastAPI serves this at /app (mounted only when the dir exists). Without it the
 # app still boots and the JSON API works, but /app 404s.

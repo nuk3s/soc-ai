@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import { RecordedRunChip } from '../components/Badges';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { HuntVisuals } from '../components/HuntVisuals';
@@ -28,6 +29,7 @@ import {
   postHuntChat,
   startHuntConsole,
 } from '../lib/api';
+import { useDemo } from '../lib/demo';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
@@ -380,6 +382,7 @@ function CollapsibleSection({
 export function HuntDetail() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
+  const demo = useDemo(); // demo deployment → recorded-run label, no cancel
   const [reloadKey, setReloadKey] = useState(0);
   const [cancelling, setCancelling] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -498,6 +501,7 @@ export function HuntDetail() {
                 <div className="mb-2.5 flex flex-wrap items-center gap-2.5">
                   {disp && <DispositionBadge label={disp.label} color={disp.color} />}
                   <StatusPill status={data.status} />
+                  {demo && <RecordedRunChip />}
                 </div>
                 {/* generated title (from the objective) as the hero headline */}
                 <div
@@ -564,7 +568,9 @@ export function HuntDetail() {
               {rehuntError && (
                 <span className="font-mono text-[11.5px] text-danger">{rehuntError}</span>
               )}
-              {running && (
+              {/* Demo: the cancel POST is demo-blocked (403) — don't offer a
+                  button whose only outcome is a refusal. */}
+              {running && !demo && (
                 <button
                   onClick={doCancel}
                   disabled={cancelling}

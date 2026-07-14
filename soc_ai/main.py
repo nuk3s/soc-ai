@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -362,6 +363,24 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
     except Exception:
         _LOGGER.warning("builtin hunt-template seed failed; continuing", exc_info=True)
 
+    # Demo mode: seed the sanitized recorded-run fixtures so the UI has
+    # investigations/hunts/backtests to browse. Idempotent per row (restart-safe)
+    # and fail-soft — a missing or invalid fixtures.json must never block
+    # serving; the demo just starts with whatever the store already holds.
+    if settings.soc_ai_demo:
+        try:
+            from soc_ai.demo.fixtures import (  # noqa: PLC0415
+                DEFAULT_FIXTURES,
+                load_fixtures,
+                seed_fixtures,
+            )
+
+            added = await seed_fixtures(db_sessionmaker, load_fixtures(DEFAULT_FIXTURES))
+            if added:
+                _LOGGER.info("demo mode: seeded %d fixture row(s)", added)
+        except Exception:
+            _LOGGER.warning("demo fixture seed failed; continuing with empty store", exc_info=True)
+
     # Reap investigations orphaned by the previous process: any row still
     # 'running' at startup can never finish (its background task is gone). Mark
     # them 'interrupted' (NOT 'error') — a clean restart cut them off; they
@@ -473,6 +492,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     app.state.db_engine = db_engine
     app.state.db_sessionmaker = db_sessionmaker
 
+    # Demo mode: cache the parsed fixture document ONCE for the replay runner —
+    # the two allowlisted POSTs (soc_ai/demo/replay.py) look up replays[] per
+    # request without re-reading the file. Fail-soft like the seed hook in
+    # _init_store: a missing/invalid fixtures.json leaves the cache None, and
+    # replays then report unknown alerts the same way the live pipeline does.
+    app.state.demo_fixtures = None
+    if settings.soc_ai_demo:
+        try:
+            from soc_ai.demo.fixtures import DEFAULT_FIXTURES, load_fixtures  # noqa: PLC0415
+
+            app.state.demo_fixtures = load_fixtures(DEFAULT_FIXTURES)
+        except Exception:
+            _LOGGER.warning(
+                "demo replay fixtures unavailable; replay lookups will find nothing",
+                exc_info=True,
+            )
+
     reaper_task = asyncio.create_task(_reaper_loop(db_sessionmaker, settings))
     discovery_task = asyncio.create_task(_discovery_scheduler_loop(app, settings))
     autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
@@ -530,6 +566,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         # else an in-flight Investigate or chat turn can use-after-close on shutdown.
         _worker_tasks.extend(_hm.get_manager(app.state)._tasks.values())
         _worker_tasks.extend(_cm.get_manager(app.state)._tasks.values())
+        # Demo replay drains (soc_ai/demo/replay.py start_background_replay) hold
+        # the DB sessionmaker via the recorder — drain them too, else an in-flight
+        # replay can write after db_engine.dispose(). Empty set outside demo.
+        _worker_tasks.extend(getattr(app.state, "demo_replay_tasks", set()))
         for _t in _worker_tasks:
             if not _t.done():
                 _t.cancel()
@@ -562,6 +602,30 @@ def _resolve_cors_origins(cors_setting: str, so_host: str) -> list[str]:
     return []
 
 
+# Demo mode (SOC_AI_DEMO): the only mutating routes left open — the replay
+# triggers (Task 6 wires them to recorded fixtures). Mounted paths verified
+# against the live route table: the soc_ai.api.routes router is included with
+# NO prefix, so investigate lives at /investigate (not /api/v1/investigate);
+# the webui hunts router is under /api/v1.
+_DEMO_WRITE_ALLOW: set[tuple[str, str]] = {
+    ("POST", "/investigate"),
+    ("POST", "/api/v1/hunt"),
+}
+
+# Chat + hunt-start POSTs carry a variable id in the path, so they can't live in
+# the exact-match set above — match them by pattern. In demo mode these POSTs are
+# turned into canned, ZERO-EGRESS replies by the demo branches in the chat/hunt
+# managers (soc_ai/webui/chat_manager.py, soc_ai/webui/hunt_console_manager.py);
+# ``/api/v1/hunts/chat`` (hunt-start) is wired to a fixture replay in a later task.
+# Anchored ``^...$`` so a pattern can only allow the exact chat routes — never a
+# broader mutating route that merely contains the substring.
+_DEMO_WRITE_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^/api/v1/investigations/[^/]+/chat$"),
+    re.compile(r"^/api/v1/hunts/[^/]+/chat$"),
+    re.compile(r"^/api/v1/hunts/chat$"),  # hunt-start (fixture replay wired later)
+)
+
+
 def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewares + routers
     """Application factory."""
     # Gate the interactive docs + raw schema behind a setting (off in prod) so a
@@ -582,6 +646,42 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         redoc_url="/redoc" if _expose_docs else None,
         openapi_url="/openapi.json" if _expose_docs else None,
     )
+    try:
+        _demo = get_settings().soc_ai_demo
+    except Exception:
+        _demo = False
+    if _demo:
+        # Demo read-only lock: refuse every mutating request with the structured
+        # 403 shape the SPA already renders (detail.reason + detail.hint), except
+        # the replay triggers in _DEMO_WRITE_ALLOW, which replay recorded runs
+        # instead of doing real work (their handlers hit the egress guards if
+        # they try). GET/HEAD/OPTIONS pass untouched — /healthz (docker
+        # healthcheck) and all reads are unaffected. SOC_AI_DEMO is env-only
+        # (not a UI-editable override), so gating registration at create time is
+        # safe and keeps the non-demo request path completely untouched.
+        # Registered FIRST → innermost middleware: on a public demo the refusal
+        # is the most-served mutating response, so it must flow back out through
+        # _security_headers (and CORSMiddleware), which are registered after it
+        # and therefore wrap outside it.
+        @app.middleware("http")
+        async def _demo_readonly(request: Any, call_next: Any) -> Response:
+            _path = request.url.path
+            _allowed = (request.method, _path) in _DEMO_WRITE_ALLOW or (
+                request.method == "POST" and any(p.match(_path) for p in _DEMO_WRITE_ALLOW_PATTERNS)
+            )
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _allowed:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": {
+                            "reason": "demo_mode",
+                            "hint": "Demo — read-only replay; this action is disabled.",
+                        }
+                    },
+                )
+            response: Response = await call_next(request)
+            return response
+
     # Cross-origin API clients (automation / integrations hosted on another
     # origin) fetch soc-ai cross-origin (the React /app is same-origin and needs
     # no CORS). Scope to CORS_ALLOW_ORIGINS if set, else the SO host; "*" only as

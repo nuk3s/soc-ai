@@ -45,6 +45,15 @@ PY = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
 ES_PORT = int(os.environ.get("SMOKE_ES_PORT", "19402"))
 APP_PORT = int(os.environ.get("SMOKE_APP_PORT", "8913"))
 
+# Distinct ports for the read-only demo-mode stack (test_demo_walkthrough), so a
+# demo walkthrough and the capture smoke never collide when run in one session.
+DEMO_ES_PORT = int(os.environ.get("SMOKE_DEMO_ES_PORT", "19404"))
+DEMO_APP_PORT = int(os.environ.get("SMOKE_DEMO_APP_PORT", "8915"))
+
+# The committed, owner-reviewed demo fixture set — the same file the app seeds at
+# startup (soc_ai/main.py demo hook) and the mock ES serves alerts[] from.
+DEMO_FIXTURES = REPO / "soc_ai" / "demo" / "fixtures.json"
+
 _HEALTH_TIMEOUT_S = 45.0  # bounded startup wait (seed migrations + uvicorn boot)
 
 
@@ -158,6 +167,112 @@ def demo_stack() -> Iterator[dict]:
                 raise RuntimeError(f"app did not become healthy in {_HEALTH_TIMEOUT_S}s.\n{log}")
 
             yield {"base_url": base_url, "manifest": manifest}
+        finally:
+            _terminate(app_proc)
+            _terminate(mock_proc)
+
+
+@pytest.fixture(scope="session")
+def demo_mode_stack() -> Iterator[dict]:
+    """The REAL public-demo stack (``SOC_AI_DEMO=true``), in-process for pytest.
+
+    Distinct from :func:`demo_stack` (the docs-screenshot capture path, which
+    pre-seeds a store with ``seed_demo.py``): this fixture exercises the demo
+    *product* path — the app's own startup hook seeds the committed
+    ``soc_ai/demo/fixtures.json``, the read-only middleware blocks mutations,
+    the ``/demo-status`` flag lights the honesty banner, and the mock ES serves
+    that same file's ``alerts[]`` grid. It mirrors ``docker-compose.demo.yml`` /
+    ``docker/demo-entrypoint.sh`` exactly (same env; the app connects to the
+    bundled mock over loopback — the one path the egress guard sanctions):
+
+      * ``mock_es.py --fixtures soc_ai/demo/fixtures.json`` on loopback, and
+      * the real app with ``SOC_AI_DEMO=true`` + ``API_AUTH_REQUIRED=false``, so
+        visitors land straight in the read-only UI (login is demo-blocked).
+
+    No seed step and no manifest: the app seeds itself at startup. Yields
+    ``{base_url, fixtures}`` where ``fixtures`` is the loaded fixture document
+    (investigation/replay/backtest ids for the walkthrough to drive).
+    """
+    fixtures = json.loads(DEMO_FIXTURES.read_text())
+
+    with TemporaryDirectory(prefix="soc-ai-demo-") as workdir:
+        work = Path(workdir)
+        data = work / "data"
+
+        mock_proc: subprocess.Popen[bytes] | None = None
+        app_proc: subprocess.Popen[bytes] | None = None
+        app_log = work / "app.log"
+        try:
+            # --- bundled mock ES + LLM gateway, serving the demo fixtures ------
+            mock_proc = subprocess.Popen(
+                [
+                    PY,
+                    str(REPO / "scripts" / "demo" / "mock_es.py"),
+                    "--port",
+                    str(DEMO_ES_PORT),
+                    "--fixtures",
+                    str(DEMO_FIXTURES),
+                ],
+                cwd=str(REPO),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            # --- the real app in read-only demo mode (docker-compose.demo.yml) -
+            # Scrubbed env cwd'd OUTSIDE the repo so no developer .env leaks in;
+            # every host is the 127.0.0.1 mock (the demo egress guard refuses any
+            # non-loopback client) or an inert placeholder Settings requires.
+            mock_base = f"http://127.0.0.1:{DEMO_ES_PORT}"
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(work),
+                "SOC_AI_DATA_DIR": str(data),
+                "SOC_AI_DEMO": "true",
+                "API_AUTH_REQUIRED": "false",
+                "ES_HOSTS": mock_base,
+                "SO_HOST": mock_base,
+                "SO_USERNAME": "demo",
+                "SO_PASSWORD": "demo-placeholder-unused",
+                "LITELLM_BASE_URL": mock_base,
+            }
+            with app_log.open("wb") as logf:
+                app_proc = subprocess.Popen(
+                    [
+                        PY,
+                        "-m",
+                        "uvicorn",
+                        "soc_ai.main:app",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(DEMO_APP_PORT),
+                    ],
+                    cwd=str(work),  # OUTSIDE the repo — no .env reachable
+                    env=env,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+
+            base_url = f"http://127.0.0.1:{DEMO_APP_PORT}"
+            deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+            while time.monotonic() < deadline:
+                if _healthy(f"{base_url}/healthz"):
+                    break
+                if app_proc.poll() is not None:
+                    log = app_log.read_text(errors="replace") if app_log.exists() else ""
+                    raise RuntimeError(
+                        f"demo app exited during startup (rc={app_proc.returncode}).\n{log}"
+                    )
+                time.sleep(0.5)
+            else:
+                log = app_log.read_text(errors="replace") if app_log.exists() else ""
+                raise RuntimeError(
+                    f"demo app did not become healthy in {_HEALTH_TIMEOUT_S}s.\n{log}"
+                )
+
+            yield {"base_url": base_url, "fixtures": fixtures}
         finally:
             _terminate(app_proc)
             _terminate(mock_proc)

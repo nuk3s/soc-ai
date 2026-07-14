@@ -1,0 +1,118 @@
+[
+  {
+    "id": "01DEMOHUNT000000000000SSH1",
+    "objective": "Sweep the last 24h for SSH lateral movement between internal hosts",
+    "objective_hash": null,
+    "kind": "chat",
+    "status": "complete",
+    "narrative": "Reviewed 41 SSH sessions across HOST_02, HOST_05, and HOST_11 in the window. Every session authenticated to a known service account, no host pair was seen for the first time, and there were no failed-then-success bursts that would signal credential spraying. No lateral movement was found.",
+    "report": {
+      "findings": [
+        {
+          "title": "SSH activity stays within known service accounts",
+          "detail": "All 41 Zeek SSH sessions authenticated to service accounts already established on these hosts. No first-seen host-to-host pair appeared, so there is no evidence of an operator pivoting between machines over SSH.",
+          "severity": "info",
+          "category": "observation",
+          "hosts": ["HOST_02", "HOST_05", "HOST_11"],
+          "citations": ["zeek.ssh"]
+        },
+        {
+          "title": "No failed-then-success authentication bursts",
+          "detail": "A search for failed SSH authentications immediately preceding a success (the signature of credential spraying or brute force) returned zero matches across the window.",
+          "severity": "info",
+          "category": "observation",
+          "hosts": ["HOST_02", "HOST_05", "HOST_11"],
+          "citations": ["zeek.ssh"]
+        }
+      ],
+      "narrative": "Reviewed 41 SSH sessions across HOST_02, HOST_05, and HOST_11 in the window. Every session authenticated to a known service account, no host pair was seen for the first time, and there were no failed-then-success bursts that would signal credential spraying. No lateral movement was found.",
+      "affected_hosts": ["HOST_02", "HOST_05", "HOST_11"],
+      "mitre_techniques": ["T1021.004"],
+      "recommended_actions": [
+        {
+          "title": "No action required",
+          "rationale": "SSH activity in this window is consistent with routine service-account operations; continue baseline monitoring."
+        }
+      ],
+      "confidence": 0.8,
+      "charts": []
+    },
+    "started_by": "demo",
+    "created_at": "2026-07-01T00:00:00Z",
+    "finished_at": "2026-07-01T00:07:00Z",
+    "events": [
+      {"kind": "hunt_started", "sequence": 1, "payload": {"objective": "Sweep the last 24h for SSH lateral movement between internal hosts"}},
+      {"kind": "tool_call", "sequence": 2, "payload": {"tool_name": "t_query_events_oql", "tool_call_id": "call_ssh_1", "args": {"oql": "event.dataset:zeek.ssh"}}},
+      {"kind": "tool_result", "sequence": 3, "payload": {"tool_call_id": "call_ssh_1", "result": {"total": 41, "summary": "41 SSH sessions across HOST_02, HOST_05, and HOST_11"}}},
+      {"kind": "tool_call", "sequence": 4, "payload": {"tool_name": "t_query_events_oql", "tool_call_id": "call_ssh_2", "args": {"oql": "event.dataset:zeek.ssh AND ssh.auth_success:false"}}},
+      {"kind": "tool_result", "sequence": 5, "payload": {"tool_call_id": "call_ssh_2", "result": {"total": 0, "summary": "no failed-then-success authentication bursts"}}},
+      {"kind": "hunt_report", "sequence": 6, "payload": {"findings": [{"title": "SSH activity stays within known service accounts", "detail": "All 41 Zeek SSH sessions authenticated to service accounts already established on these hosts.", "severity": "info", "category": "observation", "hosts": ["HOST_02", "HOST_05", "HOST_11"], "citations": ["zeek.ssh"]}, {"title": "No failed-then-success authentication bursts", "detail": "A search for failed SSH authentications immediately preceding a success returned zero matches.", "severity": "info", "category": "observation", "hosts": ["HOST_02", "HOST_05", "HOST_11"], "citations": ["zeek.ssh"]}], "narrative": "Reviewed 41 SSH sessions across HOST_02, HOST_05, and HOST_11 in the window. No first-seen host pairs and no failed-then-success bursts. No lateral movement was found.", "affected_hosts": ["HOST_02", "HOST_05", "HOST_11"], "mitre_techniques": ["T1021.004"], "recommended_actions": [{"title": "No action required", "rationale": "SSH activity is consistent with routine service-account operations."}], "confidence": 0.8, "charts": []}},
+      {"kind": "done", "sequence": 7, "payload": {"finding_count": 2}}
+    ]
+  },
+  {
+    "id": "01DEMOHUNT000000000000DNS2",
+    "objective": "Hunt for DNS beaconing and algorithmically-generated domains in the last 24h",
+    "objective_hash": null,
+    "kind": "chat",
+    "status": "complete",
+    "narrative": "Aggregated outbound DNS by client. HOST_07 showed periodic queries to updates.example.com at a fixed 300-second cadence, which matched a known software-update poller rather than command-and-control. No high-entropy or algorithmically-generated domain names were observed anywhere in the window.",
+    "report": {
+      "findings": [
+        {
+          "title": "Periodic DNS from HOST_07 is a known update poller",
+          "detail": "HOST_07 queried updates.example.com every 300 seconds. The fixed cadence and the well-known vendor update endpoint match a software-update client, not beaconing to C2. The destination resolves to a public CDN and carries no blocklist hits.",
+          "severity": "info",
+          "category": "observation",
+          "hosts": ["HOST_07"],
+          "citations": ["zeek.dns"]
+        },
+        {
+          "title": "No algorithmically-generated domains observed",
+          "detail": "Screening outbound DNS for high-entropy labels (the signature of DGA malware) returned no candidates across the window.",
+          "severity": "info",
+          "category": "observation",
+          "hosts": [],
+          "citations": ["zeek.dns"]
+        }
+      ],
+      "narrative": "Aggregated outbound DNS by client. HOST_07 showed periodic queries to updates.example.com at a fixed 300-second cadence, which matched a known software-update poller rather than command-and-control. No high-entropy or algorithmically-generated domain names were observed anywhere in the window.",
+      "affected_hosts": ["HOST_07"],
+      "mitre_techniques": ["T1071.004"],
+      "recommended_actions": [
+        {
+          "title": "Baseline the update poller",
+          "rationale": "Add updates.example.com to the known-good periodic-DNS baseline so future runs suppress it automatically."
+        }
+      ],
+      "confidence": 0.75,
+      "charts": [
+        {
+          "kind": "line",
+          "title": "HOST_07 DNS queries to updates.example.com per hour",
+          "x_label": "hour",
+          "y_label": "queries",
+          "series": [
+            {"x": "00:00", "y": 12},
+            {"x": "01:00", "y": 12},
+            {"x": "02:00", "y": 12},
+            {"x": "03:00", "y": 12}
+          ],
+          "source_citations": ["zeek.dns"]
+        }
+      ]
+    },
+    "started_by": "demo",
+    "created_at": "2026-07-01T00:10:00Z",
+    "finished_at": "2026-07-01T00:18:00Z",
+    "events": [
+      {"kind": "hunt_started", "sequence": 1, "payload": {"objective": "Hunt for DNS beaconing and algorithmically-generated domains in the last 24h"}},
+      {"kind": "tool_call", "sequence": 2, "payload": {"tool_name": "t_query_events_oql", "tool_call_id": "call_dns_1", "args": {"oql": "event.dataset:zeek.dns"}}},
+      {"kind": "tool_result", "sequence": 3, "payload": {"tool_call_id": "call_dns_1", "result": {"total": 5120, "summary": "aggregated outbound DNS by client; one periodic pattern stood out"}}},
+      {"kind": "tool_call", "sequence": 4, "payload": {"tool_name": "t_query_events_oql", "tool_call_id": "call_dns_2", "args": {"oql": "event.dataset:zeek.dns AND dns.query:updates.example.com"}}},
+      {"kind": "tool_result", "sequence": 5, "payload": {"tool_call_id": "call_dns_2", "result": {"total": 288, "summary": "HOST_07 queried updates.example.com on a fixed 300s cadence — a known update poller"}}},
+      {"kind": "hunt_report", "sequence": 6, "payload": {"findings": [{"title": "Periodic DNS from HOST_07 is a known update poller", "detail": "HOST_07 queried updates.example.com every 300 seconds; the fixed cadence and well-known endpoint match a software-update client, not C2.", "severity": "info", "category": "observation", "hosts": ["HOST_07"], "citations": ["zeek.dns"]}, {"title": "No algorithmically-generated domains observed", "detail": "Screening outbound DNS for high-entropy labels returned no DGA candidates.", "severity": "info", "category": "observation", "hosts": [], "citations": ["zeek.dns"]}], "narrative": "HOST_07 showed periodic queries to updates.example.com at a fixed 300-second cadence, matching a known update poller rather than C2. No DGA names observed.", "affected_hosts": ["HOST_07"], "mitre_techniques": ["T1071.004"], "recommended_actions": [{"title": "Baseline the update poller", "rationale": "Add updates.example.com to the known-good periodic-DNS baseline."}], "confidence": 0.75, "charts": []}},
+      {"kind": "done", "sequence": 7, "payload": {"finding_count": 2}}
+    ]
+  }
+]

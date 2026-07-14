@@ -32,6 +32,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from soc_ai.config import Settings
+from soc_ai.demo.guard import assert_egress_allowed
 from soc_ai.enrichment.blocklists import BlocklistDB, BlocklistHit
 from soc_ai.enrichment.cloud_tags import CloudPrefixDB
 from soc_ai.enrichment.maxmind import AsnInfo, GeoIpInfo, MaxmindReader
@@ -143,6 +144,7 @@ class MispClient:
     """
 
     def __init__(self, settings: Settings) -> None:
+        assert_egress_allowed(settings, "misp")
         if settings.misp_url is None:
             raise ValueError("MISP_URL is not configured")
         api_key = settings.misp_api_key.get_secret_value() if settings.misp_api_key else ""

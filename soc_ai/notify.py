@@ -36,6 +36,8 @@ from typing import Any
 
 import httpx
 
+from soc_ai.demo.guard import assert_egress_allowed
+
 _LOGGER = logging.getLogger(__name__)
 
 # Valid ``notify_format`` values (kept here so config.py + the route + tests share
@@ -234,6 +236,10 @@ async def fire(event: NotifyEvent, settings: Any, audit: Any = None) -> None:
     status: int | None = None
     error: str | None = None
     try:
+        # The demo guard sits INSIDE the try so a blocked send stays fail-soft
+        # (a webhook must never break the caller) while still refusing before
+        # any HTTP client is constructed.
+        assert_egress_allowed(settings, "webhook notify")
         status = await _post_with_retries(url, payload, verify=verify)
     except Exception as exc:  # a webhook failure must never break the caller
         error = type(exc).__name__
@@ -436,6 +442,9 @@ async def send_test(settings: Any, audit: Any = None) -> tuple[bool, str]:
     status: int | None = None
     error: str | None = None
     try:
+        # Demo guard inside the try: the Test button reports a structured
+        # failure instead of raising, and no HTTP client is ever constructed.
+        assert_egress_allowed(settings, "webhook notify")
         status = await _post_with_retries(url, payload, verify=verify)
     except Exception as exc:  # never raise into the route
         error = type(exc).__name__

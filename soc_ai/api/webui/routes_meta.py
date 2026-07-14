@@ -13,6 +13,7 @@ from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.webui._shared import (
     _ago,
+    open_router,
     require_admin_api,
     router,
 )
@@ -42,6 +43,25 @@ async def get_data_sources(
     """Every enrichment data source — local feeds + opt-in online lookups — with
     freshness and key/enable status, for the config console's Data Sources panel."""
     return DataSourcesOut(sources=collect_data_sources(settings))
+
+
+# ── Demo flag (open) ────────────────────────────────────────────────────────
+
+
+class DemoStatusOut(BaseModel):
+    demo: bool
+
+
+@open_router.get("/demo-status", response_model=DemoStatusOut)
+async def demo_status(settings: Settings = Depends(get_settings_dep)) -> DemoStatusOut:
+    """Whether this deployment is the public demo (``SOC_AI_DEMO``).
+
+    Deliberately on ``open_router`` (pre-auth): the SPA's honesty banner —
+    rendered by both route roots (AppShell and the login screen) — must show on
+    EVERY screen under ANY auth config, including before login. Boolean only;
+    no secrets, no config.
+    """
+    return DemoStatusOut(demo=settings.soc_ai_demo)
 
 
 # ── Shell chrome: workspaces + notifications ───────────────────────────────

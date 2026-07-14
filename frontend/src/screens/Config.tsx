@@ -16,6 +16,7 @@ import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
+import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav } from './ConfigNav';
@@ -202,6 +203,7 @@ function ModelFitnessChip({
 }
 
 export function Config() {
+  const demo = useDemo(); // read-only demo: config writes show a note, never POST
   const [nonce, setNonce] = useState(0);
   // Collapsed config sections (the panel is long — let the operator fold away
   // the groups they aren't tuning). Session-scoped; deep-link auto-expands.
@@ -307,6 +309,10 @@ export function Config() {
   const isDirty = dirtyKeys.length > 0;
 
   const [minted, setMinted] = useState('');
+  // The API-tokens section has no error strip of its own; this carries the demo
+  // note (mint/revoke are blocked in the read-only demo) via the section's own
+  // inline status element rather than a new toast.
+  const [tokenMsg, setTokenMsg] = useState('');
 
   // Auto-dismiss the freshly-minted token banner so the secret doesn't linger
   // on screen until reload. It still carries a manual ✕ for immediate dismissal.
@@ -339,6 +345,8 @@ export function Config() {
   const [reembedResult, setReembedResult] = useState<RagReembedResult | null>(null);
   const [reembedError, setReembedError] = useState('');
   const runReembed = () => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setReembedError(blocked); return; } // demo: no doomed write
     setReembedding(true);
     setReembedResult(null);
     setReembedError('');
@@ -501,14 +509,20 @@ export function Config() {
   }, [loading, data, flatSections]);
 
   // Wrap a mutation so any error surfaces inline and the list refetches on success.
-  const identMutation = (p: Promise<unknown>) => {
+  // Takes a THUNK, not a live promise: in demo we must decide BEFORE the request
+  // is created, so the request is never fired (add/remove/toggle/dismiss).
+  const identMutation = (makeP: () => Promise<unknown>) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setIdentError(blocked); return; } // demo: no doomed write
     setIdentError('');
-    p.then(refetchIdents).catch((e: unknown) =>
+    makeP().then(refetchIdents).catch((e: unknown) =>
       setIdentError(e instanceof Error ? e.message : 'Action failed'),
     );
   };
 
   const runScanNow = async () => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setIdentError(blocked); return; } // demo: no doomed write
     setIdentError('');
     setScanning(true);
     try {
@@ -592,6 +606,8 @@ export function Config() {
   const applyStaged = async () => {
     const entries = Object.entries(staged);
     if (!entries.length) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setApplyResult({ ok: false, msg: blocked }); return; } // demo: no doomed write
     setApplying(true);
     setApplyErrors({});
     setApplyResult(null);
@@ -810,6 +826,8 @@ export function Config() {
 
   const handleDangerSave = async (key: string) => {
     if (dangerConfirm !== key) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setDangerSaveMsg({ key, msg: blocked, ok: false }); return; } // demo: no doomed write
     setDangerSaving(true);
     setDangerSaveMsg(null);
     try {
@@ -832,6 +850,8 @@ export function Config() {
   };
 
   const handleConnTest = async (target: 'es' | 'llm') => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setConnTestResults(prev => ({ ...prev, [target]: { ok: false, detail: blocked, loading: false } })); return; } // demo: no doomed probe
     setConnTestResults(prev => ({ ...prev, [target]: { ok: false, detail: '', loading: true } }));
     try {
       const result = await testConnection(target);
@@ -909,10 +929,10 @@ export function Config() {
                 title={meta[kind].title}
                 addPlaceholder={meta[kind].placeholder}
                 rows={group?.rows ?? []}
-                onAdd={(value) => identMutation(addInternalIdentifier(kind, value))}
-                onSetActive={(id, active) => identMutation(setIdentifierActive(id, active))}
-                onRemove={(id) => identMutation(removeIdentifier(id))}
-                onDismiss={(id) => identMutation(dismissIdentifier(id))}
+                onAdd={(value) => identMutation(() => addInternalIdentifier(kind, value))}
+                onSetActive={(id, active) => identMutation(() => setIdentifierActive(id, active))}
+                onRemove={(id) => identMutation(() => removeIdentifier(id))}
+                onDismiss={(id) => identMutation(() => dismissIdentifier(id))}
               />
             </div>
           );
@@ -1105,6 +1125,8 @@ export function Config() {
                   <select
                     value={u.role}
                     onChange={(e) => {
+                      const blocked = demoBlocked(demo);
+                      if (blocked) { setUserError(blocked); return; } // demo: no doomed write
                       setUserError('');
                       setUserRole(u.id, e.target.value)
                         .then(() => setNonce((n) => n + 1))
@@ -1118,6 +1140,8 @@ export function Config() {
                   <button
                     onClick={() => {
                       if (isLastEnabledAdmin) return;
+                      const blocked = demoBlocked(demo);
+                      if (blocked) { setUserError(blocked); return; } // demo: no doomed write
                       setUserError('');
                       toggleUserDisabled(u.id)
                         .then(() => setNonce((n) => n + 1))
@@ -1129,12 +1153,14 @@ export function Config() {
                     {u.disabled ? 'Enable' : 'Disable'}
                   </button>
                   <button
-                    onClick={() =>
+                    onClick={() => {
+                      const blocked = demoBlocked(demo);
+                      if (blocked) { setUserError(blocked); return; } // demo: no doomed write
                       resetUserPassword(u.id).then((r) => {
                         setResetPw({ id: u.id, password: r.password });
                         setNonce((n) => n + 1);
-                      })
-                    }
+                      });
+                    }}
                     disabled={resetPw?.id === u.id}
                     className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-40 disabled:cursor-not-allowed"
                     style={{ borderColor: 'rgba(240,68,56,.3)' }}
@@ -1172,6 +1198,8 @@ export function Config() {
           </select>
           <button
             onClick={() => {
+              const blocked = demoBlocked(demo);
+              if (blocked) { setUserError(blocked); return; } // demo: no doomed write
               setUserError('');
               createUser(newUser.username, newUser.password, newUser.role)
                 .then(() => {
@@ -1202,7 +1230,11 @@ export function Config() {
         right={
           <span onClick={(e) => e.stopPropagation()}>
             <button
-              onClick={() => mintToken().then((t) => { setMinted(t); setNonce((n) => n + 1); })}
+              onClick={() => {
+                const blocked = demoBlocked(demo);
+                if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
+                mintToken().then((t) => { setMinted(t); setNonce((n) => n + 1); });
+              }}
               className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
             >
               + Mint token
@@ -1210,6 +1242,17 @@ export function Config() {
           </span>
         }
       >
+        {tokenMsg && (
+          <div
+            className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[12.5px] text-text-2"
+            style={{ borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }}
+          >
+            <span className="flex-1">{tokenMsg}</span>
+            <button onClick={() => setTokenMsg('')} className="text-[11.5px] text-faint hover:text-text" aria-label="Dismiss">
+              ✕
+            </button>
+          </div>
+        )}
         {minted && (
           <div className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3" style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}>
             <span className="text-warn"><Key size={15} /></span>
@@ -1237,7 +1280,11 @@ export function Config() {
                 </div>
               </div>
               <button
-                onClick={() => revokeToken(tk.id).then(() => setNonce((n) => n + 1))}
+                onClick={() => {
+                  const blocked = demoBlocked(demo);
+                  if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
+                  revokeToken(tk.id).then(() => setNonce((n) => n + 1));
+                }}
                 className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
                 style={{ borderColor: 'rgba(240,68,56,.3)' }}
               >

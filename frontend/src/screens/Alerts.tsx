@@ -26,6 +26,7 @@ import {
   startHunt,
   stopAutoTriage,
 } from '../lib/api';
+import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
 import { type SortDir, useSort } from '../lib/useSort';
@@ -281,7 +282,17 @@ export function Alerts() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [reloadKey, setReloadKey] = useState(0);
+  // Demo content is rebased to "now" but still spans a couple of hours; widen the
+  // default window so nothing the seed shipped ages out of view. The /demo-status
+  // probe resolves async (demo is false on first render), so widen via an effect
+  // when it flips rather than in the useState initializer, which only runs once —
+  // otherwise a hard-refresh straight to /alerts keeps the 24h default. demo flips
+  // once, early, before any user pick, so this never clobbers a manual choice.
+  const demo = useDemo();
   const [filterTime, setFilterTime] = useState('24h');
+  useEffect(() => {
+    if (demo) setFilterTime('30d');
+  }, [demo]);
   const [customRange, setCustomRange] = useState<CustomRange | null>(null);
   const [filterSevs, setFilterSevs] = useState<string[]>([]); // [] = all
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]); // [] = all
@@ -549,6 +560,8 @@ export function Alerts() {
   // Acknowledge a single group (keyboard `a`) — reuses the same ackGroup write
   // path + ack strip as the bulk bar, scoped to one detection.
   const ackOneGroup = (g: AlertGroup) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
     setAckingCount(1);
     setAckingAlertTotal(g.count || 0);
     setAcking(true);
@@ -566,6 +579,8 @@ export function Alerts() {
   // Escalate a single group to a Security Onion case (keyboard `e`) — reuses
   // the escalateGroup write path; result surfaces in the ack strip.
   const escalateOneGroup = (g: AlertGroup) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
     escalateGroup(g, alertQuery)
       .then((r) => {
         showAckMsg(`Escalated ${r.escalated} of ${r.total} event${r.total !== 1 ? 's' : ''} in ${g.name} to a case`);
@@ -623,12 +638,22 @@ export function Alerts() {
   // Each reuses the one /alerts/assign endpoint (assignAlert), then refreshes
   // the list so the chip/owner update. Assign-to-me and release both change
   // ownership; mark-in-review / mark-done only move the state on an owned rule.
-  const assignToMe = (g: AlertGroup) =>
+  // Demo blocks every /alerts/assign write; the note lands on the shared ack strip.
+  const assignToMe = (g: AlertGroup) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name).then(() => setReloadKey((k) => k + 1));
-  const release = (g: AlertGroup) =>
+  };
+  const release = (g: AlertGroup) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name, true).then(() => setReloadKey((k) => k + 1));
-  const setTriage = (g: AlertGroup, state: TriageState) =>
+  };
+  const setTriage = (g: AlertGroup, state: TriageState) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name, false, state).then(() => setReloadKey((k) => k + 1));
+  };
 
   // The Verdict filter carries a synthetic 'pipeline_error' value (E1.2): a
   // fallback group matches it regardless of its (needs_more_info) verdict, and —
@@ -876,11 +901,16 @@ export function Alerts() {
         </div>
       )}
 
-      {/* ack result strip */}
+      {/* ack result strip — neutral/info tint for the demo note (it's neither a
+          success nor a failure), success-green for a real ack result. */}
       {!acking && ackMsg && (
         <div
           className="mb-3.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
-          style={{ borderColor: 'rgba(34,197,94,.30)', background: 'rgba(34,197,94,.06)' }}
+          style={
+            ackMsg === DEMO_ACTION_NOTE
+              ? { borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }
+              : { borderColor: 'rgba(34,197,94,.30)', background: 'rgba(34,197,94,.06)' }
+          }
         >
           <span className="font-semibold text-text-2">{ackMsg}</span>
           <div className="flex-1" />
@@ -1040,6 +1070,8 @@ export function Alerts() {
             onClick={() => {
               const selectedGroups = (groups ?? []).filter((g) => selected[g.id]);
               if (!selectedGroups.length) return;
+              const blocked = demoBlocked(demo);
+              if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
               const n = selectedGroups.length;
               // allSettled: a single assign failing must not silently drop the rest.
               // Keep failed groups selected so the analyst can retry them.
@@ -1070,6 +1102,8 @@ export function Alerts() {
             onClick={() => {
               const selectedGroups = (groups ?? []).filter((g) => selected[g.id]);
               if (!selectedGroups.length) return;
+              const blocked = demoBlocked(demo);
+              if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write (before setAcking so the strip shows)
               const n = selectedGroups.length;
               const alertTotal = selectedGroups.reduce((s, g) => s + (g.count || 0), 0);
               setAckingCount(n);
@@ -1122,6 +1156,8 @@ export function Alerts() {
             <button
               disabled={ackingEvents}
               onClick={async () => {
+                const blocked = demoBlocked(demo);
+                if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
                 setAckingEvents(true);
                 try {
                   await ackEvents(selectedEventIds);
@@ -1681,6 +1717,7 @@ function AlertDrawer({
 }) {
   const [tick, setTick] = useState(0);
   const [cancelling, setCancelling] = useState(false);
+  const demo = useDemo(); // demo: cancel is demo-blocked — don't offer it
   const { data: inv, loading, error } = useAsync<Inv | null>(
     () => (drawerId ? getInvestigation(drawerId) : Promise.resolve(null)),
     [drawerId, tick]
@@ -1719,7 +1756,7 @@ function AlertDrawer({
             {inv?.kind ?? starting?.kind ?? 'suricata'}
           </span>
           <div className="flex-1 truncate text-[14px] font-semibold">{inv?.name ?? starting?.name ?? 'Investigation'}</div>
-          {inv?.status === 'investigating' && (
+          {inv?.status === 'investigating' && !demo && (
             <button
               disabled={cancelling}
               onClick={() => {

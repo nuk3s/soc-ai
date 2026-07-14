@@ -1478,6 +1478,25 @@ def test_probe_pcap_disabled(settings_kratos: Settings) -> None:
     assert "disabled" in r["detail"]
 
 
+def test_probe_pcap_blocked_in_demo(settings_kratos: Settings) -> None:
+    """Demo mode refuses the sensor SSH probe before the subprocess is spawned."""
+    import asyncio
+
+    from soc_ai.webui import probes
+
+    demo = settings_kratos.model_copy(
+        update={
+            "soc_ai_demo": True,
+            "pcap_enabled": True,
+            "so_ssh_host": "192.0.2.253",
+            "so_ssh_key": Path("/nonexistent/pcap-key"),
+        }
+    )
+    r = asyncio.run(probes.probe_pcap(demo))
+    assert r["ok"] is False
+    assert "demo mode" in r["detail"]
+
+
 def test_security_response_headers_present(client: TestClient) -> None:
     """Every response carries the conservative security headers."""
     resp = client.get("/healthz")

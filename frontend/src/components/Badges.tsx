@@ -1,4 +1,4 @@
-import { Wrench } from 'lucide-react';
+import { Disc, Wrench } from 'lucide-react';
 
 import { KIND, SEVERITY, VERDICT } from '../lib/tokens';
 import type { DetectionKind, Severity, Verdict } from '../lib/types';
@@ -102,6 +102,22 @@ export function PipelineErrorChip({ hint, large }: { hint?: string | null; large
     >
       <Wrench size={large ? 12 : 10} strokeWidth={2.5} />
       Pipeline error
+    </span>
+  );
+}
+
+// ---- recorded-run chip (demo mode) ------------------------------------------
+// Labels a verdict as a RECORDED real run being replayed. Purely presentational
+// — callers gate on useDemo() so it can never leak into a real deployment.
+export function RecordedRunChip() {
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-pill border px-[9px] py-[2.5px] text-[11.5px] font-semibold"
+      style={{ color: '#8fb5f9', background: 'rgba(75,139,245,.09)', borderColor: 'rgba(75,139,245,.35)' }}
+      title="soc-ai ran this investigation for real earlier and recorded it — you are replaying the recording, not running live."
+    >
+      <Disc size={10} strokeWidth={2.5} />
+      recorded run
     </span>
   );
 }

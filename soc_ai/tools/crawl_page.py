@@ -25,6 +25,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from soc_ai.demo.guard import assert_egress_allowed
+
 _LOGGER = logging.getLogger(__name__)
 
 # Cap on redirect hops we will follow + revalidate before giving up. A chain
@@ -221,6 +223,9 @@ async def crawl_page(url: str, *, settings: Any) -> dict[str, Any]:
         if raw:
             headers["Authorization"] = f"Bearer {raw}"
     try:
+        # Demo guard inside the try: blocked egress becomes a normal error
+        # result (this function never raises), before any client exists.
+        assert_egress_allowed(settings, "page crawl")
         async with httpx.AsyncClient(timeout=timeout, verify=verify) as client:
             # Resolve+revalidate the redirect chain BEFORE handing crawl4ai a
             # url, so a 30x to an internal host can't slip past the SSRF guard

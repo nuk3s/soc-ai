@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from sqlalchemy import select
 
+from soc_ai.demo.guard import assert_egress_allowed
 from soc_ai.store.models import Runbook, RunbookEmbedding
 
 if TYPE_CHECKING:
@@ -129,6 +130,7 @@ async def embed_texts(texts: list[str], *, settings: Settings) -> list[list[floa
     field is honoured, not the array order). Raises :class:`RagGatewayError`
     on any HTTP/transport/shape failure — callers pick the fail-soft posture.
     """
+    assert_egress_allowed(settings, "embeddings")
     base, headers, verify = _gateway(settings)
     payload = {"model": settings.rag_embed_model, "input": texts}
     try:
@@ -156,6 +158,7 @@ async def rerank_scores(query: str, documents: list[str], *, settings: Settings)
     endpoint omits scores 0.0). Raises :class:`RagGatewayError` on failure —
     ``search()`` catches it and keeps the pre-rerank merged order (fail-soft).
     """
+    assert_egress_allowed(settings, "embeddings")
     base, headers, verify = _gateway(settings)
     payload = {
         "model": settings.rag_rerank_model,

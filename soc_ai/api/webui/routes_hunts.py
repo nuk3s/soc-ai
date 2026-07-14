@@ -28,6 +28,8 @@ from soc_ai.api.webui._timeline import (
     _tool_step,
 )
 from soc_ai.config import Settings
+from soc_ai.demo.hunt_replay import pick_canned_hunt, start_background_hunt_replay
+from soc_ai.demo.replay import find_replay, start_background_replay
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.so_client.inventory import discover_datasets
@@ -529,7 +531,11 @@ class HuntChatIn(BaseModel):
 
 
 @router.post("/hunts/chat")
-async def start_hunt_chat(request: Request, body: HuntChatIn) -> dict[str, str]:
+async def start_hunt_chat(
+    request: Request,
+    body: HuntChatIn,
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, str]:
     """Start a background chat-driven hunt; returns its id immediately.
 
     The Hunt Console UI opens the new hunt's detail and polls it live (mirrors
@@ -538,6 +544,26 @@ async def start_hunt_chat(request: Request, body: HuntChatIn) -> dict[str, str]:
     persists every event and the detail view polls the timeline.
     """
     started_by = await identify_caller(request)
+    # Demo mode (SOC_AI_DEMO): replay a RECORDED canned hunt instead of building
+    # the egress-blocked hunt agent — returns a real hunt_id the SPA polls exactly
+    # like a live hunt, and the row lands complete WITH its narrative + report.
+    # Zero egress: HuntRecorder writes the store only, no model is built. Mirrors
+    # the investigation replay branch in start_hunt (POST /hunt) above. With no
+    # eventful/reportful canned hunt seeded (rare once fixtures are rebuilt), fall
+    # through to the live path (unchanged): hunt_recorded_run emits hunt_created —
+    # creating the row and returning a real hunt_id with a 200 — BEFORE run_hunt
+    # builds the egress-blocked model, so the row then lands status='error' in the
+    # background drain (not a 503). Same reporting a live hunt-start had in demo
+    # before this branch existed.
+    if settings.soc_ai_demo:
+        hunt = pick_canned_hunt(getattr(request.app.state, "demo_fixtures", None))
+        if hunt is not None:
+            hid = await start_background_hunt_replay(
+                request.app.state, body.objective, started_by, hunt
+            )
+            if hid is None:
+                raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
+            return {"hunt_id": hid}
     prior: str | None = None
     if body.prior_hunt_id:
         async with request.app.state.db_sessionmaker() as db:
@@ -914,7 +940,16 @@ async def start_hunt(
     investigation. We resolve up front and 404 instead.
     """
     started_by = await identify_caller(request)
-    exists, rule_name = await resolve_alert_for_hunt(elastic, settings, body.alert_id)
+    # Demo mode (SOC_AI_DEMO): replay this alert's RECORDED run instead of a live
+    # one — no ES resolve, no LLM. An alert with no recording reports through the
+    # SAME 404 below (a recording-less alert IS an unknown alert to the demo), and
+    # the 409 duplicate-guard / 503 / response contract are shared unchanged.
+    demo_replay = None
+    if settings.soc_ai_demo:
+        demo_replay = find_replay(getattr(request.app.state, "demo_fixtures", None), body.alert_id)
+        exists, rule_name = demo_replay is not None, None
+    else:
+        exists, rule_name = await resolve_alert_for_hunt(elastic, settings, body.alert_id)
     if not exists:
         raise HTTPException(
             status_code=404,
@@ -939,9 +974,14 @@ async def start_hunt(
                 ),
             },
         )
-    inv_id = await hunt_manager.get_manager(request.app.state).start(
-        request.app.state, alert_id=body.alert_id, started_by=started_by, rule_name=rule_name
-    )
+    if demo_replay is not None:
+        inv_id = await start_background_replay(
+            request.app.state, replay=demo_replay, started_by=started_by
+        )
+    else:
+        inv_id = await hunt_manager.get_manager(request.app.state).start(
+            request.app.state, alert_id=body.alert_id, started_by=started_by, rule_name=rule_name
+        )
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
     return {"investigation_id": inv_id}

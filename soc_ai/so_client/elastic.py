@@ -19,6 +19,7 @@ from elasticsearch import AsyncElasticsearch, NotFoundError
 from pydantic import BaseModel, Field, computed_field
 
 from soc_ai.config import Settings
+from soc_ai.demo.guard import assert_loopback_only
 
 
 class EsSearchResult(BaseModel):
@@ -48,6 +49,9 @@ class ElasticClient:
     """Async client for the Security Onion Elasticsearch cluster."""
 
     def __init__(self, settings: Settings) -> None:
+        # Demo mode: only the bundled loopback mock ES may be reached.
+        for host in settings.es_hosts:
+            assert_loopback_only(settings, str(host), "elasticsearch")
         auth: tuple[str, str] | None = None
         if settings.es_username and settings.es_password:
             auth = (

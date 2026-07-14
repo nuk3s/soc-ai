@@ -90,6 +90,9 @@ async def recorded_run(
         async with asyncio.timeout(run_timeout):
             async for ev in event_stream:
                 await recorder.record(ev.kind, ev.sequence, ev.payload)
+                # Frame contract (kind, {session_id, sequence, payload}) is
+                # mirrored by soc_ai/demo/replay.py — change both together
+                # (pinned by tests/test_demo_mode.py's frame-contract test).
                 yield (
                     ev.kind,
                     {

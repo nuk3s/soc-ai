@@ -19,6 +19,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from soc_ai.agent._gateway_retry import RetryingAsyncTransport
 from soc_ai.config import Settings
+from soc_ai.demo.guard import assert_egress_allowed
 
 
 def _build_provider(settings: Settings) -> OpenAIProvider:
@@ -31,6 +32,7 @@ def _build_provider(settings: Settings) -> OpenAIProvider:
     batch load. The harness's per-run wall-clock cap
     (``BatchConfig.per_run_timeout_s``) is what catches genuine hangs.
     """
+    assert_egress_allowed(settings, "llm gateway")
     api_key = settings.litellm_api_key.get_secret_value() if settings.litellm_api_key else "dummy"
     # Resilient transport: retries transient gateway failures (429/502/503/504 +
     # connection/read/timeout errors) with jittered exponential backoff. This is

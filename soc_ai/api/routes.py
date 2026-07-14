@@ -31,6 +31,7 @@ from soc_ai.api.schemas import (
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
 from soc_ai.api.webui_api import resolve_alert_for_hunt
 from soc_ai.config import Settings
+from soc_ai.demo.replay import find_replay, replay_recorded_run
 from soc_ai.so_client.elastic import ElasticClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -100,6 +101,24 @@ async def investigate_endpoint(
     The leading ``investigation_created`` event carries the new row's id.
     """
     started_by = await identify_caller(request)
+
+    # Demo mode (SOC_AI_DEMO): pure playback of this alert's RECORDED run through
+    # the same recorder + SSE encoder — no ES resolve, no LLM. A missing recording
+    # replays the live pipeline's unknown-alert error stream (see demo/replay.py).
+    if ctx.settings.soc_ai_demo:
+        replay = find_replay(getattr(request.app.state, "demo_fixtures", None), req.alert_id)
+
+        async def demo_stream() -> Any:
+            async for name, data in replay_recorded_run(
+                request.app.state,
+                alert_id=req.alert_id,
+                started_by=started_by,
+                replay=replay,
+            ):
+                yield sse_encode(name, data)
+
+        return EventSourceResponse(demo_stream())
+
     # Resolve the rule name up front so the investigation row is named at creation
     # — a run that dies before its first alert_context event (e.g. an ES prefetch
     # error) must not leave a nameless "Alert <id>…" row. Best-effort: a resolution

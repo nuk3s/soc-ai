@@ -17,6 +17,7 @@ import pytest
 import respx
 from elasticsearch import NotFoundError
 from soc_ai.config import Settings
+from soc_ai.demo.guard import DemoEgressBlocked
 from soc_ai.errors import SoAuthError
 from soc_ai.so_client.auth import _SRV_TOKEN_TTL_S, ConnectAuth, KratosAuth, make_auth
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
@@ -720,3 +721,21 @@ async def test_connect_reads_are_concurrent(settings_connect: Settings) -> None:
         f"Expected ConnectAuth reads to run concurrently (max_in_flight>1), got {max_in_flight}"
     )
     await auth.aclose()
+
+
+# =====================================================================
+# Demo-mode egress guard (SO API client is loopback-only)
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_so_auth_loopback_only_in_demo(settings_kratos: Settings) -> None:
+    """Demo mode: the SO API client may only target loopback (the bundled mock)."""
+    with pytest.raises(DemoEgressBlocked):
+        KratosAuth(settings_kratos.model_copy(update={"soc_ai_demo": True}))
+    ok = KratosAuth(
+        settings_kratos.model_copy(
+            update={"soc_ai_demo": True, "so_host": "https://127.0.0.1:8443"}
+        )
+    )
+    await ok.aclose()

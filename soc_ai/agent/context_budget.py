@@ -24,6 +24,8 @@ from typing import Any
 
 import httpx
 
+from soc_ai.demo.guard import assert_egress_allowed
+
 _LOGGER = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 4
@@ -93,6 +95,9 @@ async def _fetch_window(settings: Any, base: str, model: str) -> int | None:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     verify = bool(getattr(settings, "litellm_verify_ssl", True))
     try:
+        # Demo guard inside the try: blocked discovery degrades to "window
+        # unknown" (returns None) without constructing a client.
+        assert_egress_allowed(settings, "model-window discovery")
         async with httpx.AsyncClient(timeout=10.0, verify=verify) as client:
             resp = await client.get(f"{base}/model/info", headers=headers)
         if resp.status_code != 200:

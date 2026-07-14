@@ -28,7 +28,7 @@ import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
-import { KindBadge, SeverityTag, VerdictPill } from '../components/Badges';
+import { KindBadge, RecordedRunChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { Spinner } from '../components/States';
 import {
   type ChatThread,
@@ -44,6 +44,7 @@ import {
   startHunt,
 } from '../lib/api';
 import { clearChatDraft, loadChatDraft, saveChatDraft } from '../lib/chatDraft';
+import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
 import { TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import type {
@@ -111,6 +112,7 @@ function fmt(s: number) {
 
 export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictApplied }: InvestigationProps) {
   const v = VERDICT[inv.verdict];
+  const demo = useDemo(); // demo deployment → label the verdict as a recorded run
   const [actions, setActions] = useState<
     Record<string, 'approved' | 'rejected' | 'executing' | 'failed'>
   >({});
@@ -432,6 +434,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <div className="absolute left-0 top-0 h-full w-[3px]" style={{ background: v.color }} />
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
         <VerdictPill verdict={inv.verdict} large />
+        {demo && <RecordedRunChip />}
         {inv.sev && <SeverityTag sev={inv.sev} />}
         {/* min-w-0 + max-w-full + break-all: the badge may use the whole header
             row and wraps internally when genuinely out of space — the FULL
@@ -615,6 +618,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // path. The card's explicit Approve click IS the human consent — these write
   // to the live Security Onion grid.
   const runAdvisory = (a: RecommendedAction, index: number) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setActionMsg((m) => ({ ...m, [a.id]: blocked })); return; } // demo: no doomed grid write
     setActions((s) => ({ ...s, [a.id]: 'executing' }));
     setActionMsg((m) => ({ ...m, [a.id]: '' }));
     executeAction(inv.id, index)
@@ -840,6 +845,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           <button
             disabled={overriding}
             onClick={() => {
+              const blocked = demoBlocked(demo);
+              if (blocked) { setOverrideError(blocked); return; } // demo: no doomed write
               setOverriding(true);
               setOverrideError(null);
               submitOverride(inv.id, overrideVerdictVal, overrideRationale || undefined)

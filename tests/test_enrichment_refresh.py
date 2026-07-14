@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+from soc_ai.demo.guard import DemoEgressBlocked
 from soc_ai.enrichment.refresh import (
     REFRESH_URLS,
     cloud_prefix_staleness_days,
@@ -230,3 +231,13 @@ async def test_fetch_validated_allows_compressed_body() -> None:
         async with httpx.AsyncClient() as client:
             out = await _fetch_validated(client, url, as_json=True, retries=1)
     assert out == raw  # decompressed body returned, no false truncation error
+
+
+@pytest.mark.asyncio
+async def test_refresh_cloud_prefixes_blocked_in_demo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SOC_AI_DEMO refuses the cloud-prefix refresh before any HTTP client exists."""
+    monkeypatch.setenv("SOC_AI_DEMO", "true")
+    with pytest.raises(DemoEgressBlocked):
+        await refresh_cloud_prefixes(tmp_path, sources=["aws"])

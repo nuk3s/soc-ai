@@ -46,6 +46,8 @@ from pathlib import Path
 
 import httpx
 
+from soc_ai.demo.guard import assert_ambient_egress_allowed
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -165,6 +167,9 @@ async def refresh_blocklists(
         One :class:`RefreshResult` per attempted feed. A single feed failing
         (HTTP error) does not abort the others (fail-open).
     """
+    # No Settings parameter in this signature (the CLI handler owns that), so
+    # the ambient guard resolves the demo flag itself.
+    assert_ambient_egress_allowed("blocklist refresh")
     data_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 — httpx uses asyncio
     results: list[RefreshResult] = []
 
