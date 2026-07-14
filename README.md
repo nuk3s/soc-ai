@@ -7,7 +7,12 @@
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
   <img src="https://img.shields.io/badge/status-1.1.0-3fb950" alt="1.1.0">
+  <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
+
+### [▶ Try the live demo →](https://soc-ai-demo.onrender.com/)
+
+Click through recorded investigations, hunts, and a backtest in the real console — no install, no login, nothing leaves the box.
 
 </div>
 
