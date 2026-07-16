@@ -124,6 +124,12 @@ AuditKind = Literal[
     # MUST be a valid audit kind or every auto-ack fails to record and the badge
     # never shows.
     "auto_ack",
+    # auto-ack ARMED for a confident FP but held back by a guard
+    # (maybe_auto_ack_fp: high_stakes severity/exploit-class cap, or confidence
+    # below the threshold). Recorded so the drawer can explain WHY the pending
+    # ack needs a human (_build_actions ``e.kind == "auto_ack_skipped"`` →
+    # pendingNote). No write happened; the payload carries reason + numbers.
+    "auto_ack_skipped",
     # analyst-egress fail-closed residue sweep (soc_ai/agent/orchestrator.py::
     # _guard_egress). Emitted best-effort when analyst_redaction_fail_closed is on
     # and the INDEPENDENT unsafe_residue detector finds an internal identifier that

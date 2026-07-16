@@ -131,6 +131,7 @@ export function Sidebar() {
       <button
         onClick={toggleNav}
         title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         className="mb-1.5 flex items-center gap-2.5 rounded-control px-[9px] py-[7px] text-faint hover:bg-surface-3 hover:text-text"
         style={{ justifyContent: collapsed ? 'center' : 'flex-start' }}
       >
@@ -183,6 +184,7 @@ export function Sidebar() {
             <button
               onClick={() => signOut(navigate)}
               title="Sign out"
+              aria-label="Sign out"
               className="flex text-faint hover:text-text"
             >
               <LogOut size={15} />

@@ -24,10 +24,34 @@ from dataclasses import dataclass, field
 
 # A trailing caveat appended to the stored answer when the narrative asserts
 # concrete artifacts that are grounded in NEITHER a tool result NOR the seed context.
+# Used for ZERO-TOOL turns, where "not backed by a tool result" is literally true.
 UNVERIFIED_CAVEAT = (
     "\n\n⚠ Unverified: the above was not backed by a tool result or the "
     "investigation's evidence; treat as a hypothesis, not a finding."
 )
+
+# Bound on how many suspect artifacts the scoped caveat names inline.
+_SCOPED_CAVEAT_CAP = 4
+
+
+def scoped_unverified_caveat(ungrounded: list[str]) -> str:
+    """Caveat for a turn that DID run tools but asserted some ungrounded artifacts.
+
+    The blanket :data:`UNVERIFIED_CAVEAT` under a visible tool-call footer reads
+    as a contradiction — "not backed by a tool result" directly beneath five
+    tool calls (dogfood 2026-07-15). Name the specific suspect claims instead,
+    so the analyst knows exactly which parts to double-check and which parts
+    the tool output stands behind.
+    """
+    shown = [f"`{a}`" for a in ungrounded[:_SCOPED_CAVEAT_CAP]]
+    listing = ", ".join(shown) + (" …" if len(ungrounded) > _SCOPED_CAVEAT_CAP else "")
+    return (
+        f"\n\n⚠ Partially unverified: {listing} "
+        "do not appear in this turn's tool results or the investigation's "
+        "evidence — verify before acting on them. The reply's other specifics "
+        "are grounded in the tool output."
+    )
+
 
 # ── Artifact detectors ──────────────────────────────────────────────────────
 # Each pattern pulls *concrete identity claims* out of free text. We deliberately

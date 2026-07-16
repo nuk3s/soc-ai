@@ -525,7 +525,7 @@ export function HuntDetail() {
                   <span className="text-text-2">{data.elapsedLabel}</span>
                   <span className="text-ghost">·</span>
                   <span className="text-faint">kind</span>
-                  <span className="text-text-2">{data.kind}</span>
+                  <span className="text-text-2">{/* 'chat' is the storage kind for any operator-started hunt — 'manual' is what an analyst reads */}{data.kind === 'chat' ? 'manual' : data.kind}</span>
                 </div>
               </div>
               {/* confidence ring — only meaningful once the hunt concludes */}

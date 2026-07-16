@@ -126,3 +126,65 @@ def test_trend_requires_auth_when_enabled(settings_kratos: Settings) -> None:
     for client in _client(secured):
         resp = client.get("/api/v1/quality/trend")
         assert resp.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# Run-now + status (schedulable from the UI, 2026-07-16)
+# ---------------------------------------------------------------------------
+
+
+def test_quality_eval_run_now_single_flight(client: TestClient) -> None:
+    """POST /quality/eval/run starts one background eval; a second POST while
+    it runs joins it (no double batch). Status reflects running → done."""
+    import asyncio as aio
+
+    release = aio.Event()
+
+    async def _slow_eval(*a: Any, **kw: Any) -> Any:
+        from soc_ai.eval.nightly import NightlyRunResult
+
+        await release.wait()
+        return NightlyRunResult(exit_code=0, mode="local")
+
+    with patch("soc_ai.api.webui.routes_quality.run_eval_nightly", _slow_eval):
+        first = client.post("/api/v1/quality/eval/run").json()
+        assert first["running"] is True
+
+        second = client.post("/api/v1/quality/eval/run").json()
+        assert second["running"] is True
+        assert second.get("note") == "already running"
+
+        status = client.get("/api/v1/quality/eval/status").json()
+        assert status["running"] is True
+
+        release.set()
+        # bounded wait for the worker to land
+        for _ in range(40):
+            status = client.get("/api/v1/quality/eval/status").json()
+            if not status["running"]:
+                break
+            import time
+
+            time.sleep(0.05)
+        assert status["running"] is False
+        assert status["last_exit_code"] == 0
+        assert status["last_run"] is not None
+
+
+def test_quality_eval_run_now_records_failure_detail(client: TestClient) -> None:
+    async def _failing_eval(*a: Any, **kw: Any) -> Any:
+        from soc_ai.eval.nightly import NightlyRunResult
+
+        return NightlyRunResult(exit_code=2, mode="local", detail="no eligible alerts")
+
+    with patch("soc_ai.api.webui.routes_quality.run_eval_nightly", _failing_eval):
+        assert client.post("/api/v1/quality/eval/run").json()["running"] is True
+        import time
+
+        for _ in range(40):
+            status = client.get("/api/v1/quality/eval/status").json()
+            if not status["running"]:
+                break
+            time.sleep(0.05)
+    assert status["last_exit_code"] == 2
+    assert "no eligible alerts" in status["last_detail"]

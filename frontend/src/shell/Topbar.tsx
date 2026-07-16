@@ -22,6 +22,9 @@ function useBreadcrumb(): { crumb: string; crumb2?: string } {
   if (pathname.startsWith('/investigation')) return { crumb: 'Investigation', crumb2: params.id };
   if (pathname.startsWith('/hunts') && params.id) return { crumb: 'Hunts', crumb2: params.id };
   if (pathname.startsWith('/hunts')) return { crumb: 'Hunts' };
+  if (pathname.startsWith('/notifications')) return { crumb: 'Notifications' };
+  if (pathname.startsWith('/backtest')) return { crumb: 'Backtest' };
+  if (pathname.startsWith('/runbooks')) return { crumb: 'Runbooks' };
   if (pathname.startsWith('/config')) return { crumb: 'Config' };
   return { crumb: '' };
 }
@@ -201,6 +204,7 @@ export function Topbar() {
           setWsOpen(false);
         }}
         title="Notifications"
+        aria-label="Notifications"
         className="relative flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <Bell size={16} />
@@ -215,6 +219,7 @@ export function Topbar() {
       <button
         onClick={openPalette}
         title="Help & shortcuts"
+        aria-label="Help and shortcuts"
         className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <HelpCircle size={16} />

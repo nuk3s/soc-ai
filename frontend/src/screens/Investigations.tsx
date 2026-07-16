@@ -1,6 +1,6 @@
 import { Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
 import { Fragment, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { MultiSelect } from '../components/MultiSelect';
@@ -11,6 +11,7 @@ import { INV_STATUS as STATUS } from '../lib/statusMeta';
 import { Checkbox } from '../components/Controls';
 import { ErrorState, LoadingState } from '../components/States';
 import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
+import { verdictFilterFromSearch } from '../lib/investigationFilters';
 import { useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import { type SortDir, useSort } from '../lib/useSort';
@@ -80,6 +81,7 @@ function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: So
 
 export function Investigations() {
   const navigate = useNavigate();
+  const location = useLocation();
   // Demo seeded runs span a couple of hours; widen the default window in demo so
   // none age out. useDemo() is false outside a DemoProvider — normal deploys keep
   // 24h. The /demo-status probe resolves async, so the widening happens in an
@@ -110,12 +112,31 @@ export function Investigations() {
     };
   }, []);
 
-  const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]);
+  // Seed the Verdict filter from the URL (?verdict=pipeline_error — the
+  // Dashboard's pipeline-error KPI deep-links here). Initializer-only: once
+  // mounted the MultiSelect owns the state, so clearing the filter works
+  // normally and doesn't fight the URL.
+  const [filterVerdicts, setFilterVerdicts] = useState<string[]>(() =>
+    verdictFilterFromSearch(location.search),
+  );
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
-  const [range, setRange] = useState('24h');
+  // A deep link widens the window to the widest preset: the Dashboard KPI counts
+  // its 100 most recent runs with NO time filter, so landing on the default 24h
+  // could show an empty list for the very rows the link promised.
+  const [range, setRange] = useState(() => (verdictFilterFromSearch(location.search).length ? '30d' : '24h'));
   useEffect(() => {
     if (demo) setRange('30d');
   }, [demo]);
+  // Re-apply on a LATER navigation to this screen with a ?verdict= param (the
+  // mount initializers above won't re-run). Param absent → no-op, so the
+  // operator's manual filter/range changes are never clobbered.
+  useEffect(() => {
+    const fromUrl = verdictFilterFromSearch(location.search);
+    if (fromUrl.length) {
+      setFilterVerdicts(fromUrl);
+      setRange('30d');
+    }
+  }, [location.search]);
   const [custom, setCustom] = useState<CustomRange | null>(null);
   // Shared sort mechanics; clicking a new column here starts it ascending.
   const { sort, toggleSort, caret, headerCls } = useSort<SortKey>(
@@ -185,15 +206,20 @@ export function Investigations() {
   // Cluster retries of the SAME alert: surface the canonical (primary) run and
   // tuck earlier/errored/cancelled re-runs under it, so the one that WORKED is
   // never buried under a pile of failed attempts. Retries reveal inline on demand.
+  // EXCEPT under the pipeline_error filter: a superseded fallback run's primary
+  // usually doesn't match the filter, so tucking would hide the very rows the
+  // filter promised — promote matching fallback retries to top-level instead.
+  const promoteFallback = (r: InvestigationRow): boolean =>
+    filterVerdicts.includes('pipeline_error') && !!r.fallback && r.isPrimary === false;
   const retriesByAlert = new Map<string, InvestigationRow[]>();
   for (const r of visible) {
-    if (r.isPrimary === false && r.alertId) {
+    if (r.isPrimary === false && r.alertId && !promoteFallback(r)) {
       const arr = retriesByAlert.get(r.alertId) ?? [];
       arr.push(r);
       retriesByAlert.set(r.alertId, arr);
     }
   }
-  const primaries = visible.filter((r) => r.isPrimary !== false);
+  const primaries = visible.filter((r) => r.isPrimary !== false || promoteFallback(r));
 
   // When grouping, cluster rows by detection name (keeping the user's sort within
   // each group) and precompute per-group counts for the headers.
@@ -504,7 +530,10 @@ export function Investigations() {
         {!loading && !error && rows.length === 0 && (
           <div className="px-4 py-10 text-center text-[13px] text-faint">No investigations yet.</div>
         )}
-        {!loading && !error && rows.length > 0 && visible.length === 0 && (
+        {/* Keyed on displayRows (what actually renders), not `visible`: a row can
+            match the filter yet be tucked under a filtered-out primary, which
+            used to leave a blank table with no message. */}
+        {!loading && !error && rows.length > 0 && displayRows.length === 0 && (
           <div className="px-4 py-10 text-center text-[13px] text-faint">No investigations match the selected filters.</div>
         )}
         {displayRows.map((r, i) => {

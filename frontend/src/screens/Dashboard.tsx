@@ -1,7 +1,7 @@
 import { Activity, ArrowUpRight, Crosshair, Database, Gauge, ShieldAlert, ShieldCheck, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { KindBadge, StatusTag, VerdictPill } from '../components/Badges';
+import { KindBadge, PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { QualityCard } from '../components/QualityCard';
 import { INV_STATUS } from '../lib/statusMeta';
@@ -18,8 +18,13 @@ import {
   getDataSources,
   getHealth,
   getInvestigations,
+  getDetectionTuningSummary,
+  getQualityEvalStatus,
   getQualityTrend,
+  startQualityEval,
 } from '../lib/api';
+import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFilters';
+import { formatSkipReasons } from '../lib/skipReasons';
 import { VERDICT } from '../lib/tokens';
 import type { AlertGroup, Severity, Verdict } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
@@ -204,6 +209,12 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
           <span className="font-semibold text-text">{s.hunted}</span> investigated
           {s.skipped ? `, ${s.skipped} skipped` : ''}
           {s.failed ? `, ${s.failed} failed` : ''}.
+          {/* WHY were they skipped — the bare count told the analyst nothing. */}
+          {s.skipped > 0 && formatSkipReasons(s.skipped_reasons) && (
+            <div className="mt-1 font-mono text-[11px] text-faint">
+              {formatSkipReasons(s.skipped_reasons)}
+            </div>
+          )}
         </>
       ) : (
         'Idle — no auto-investigate batch has run yet.'
@@ -329,10 +340,41 @@ export function Dashboard() {
   });
   triageActiveRef.current = !!triage.data?.active;
   const sources = useAsync(getDataSources, [], { refetchInterval: 60_000 });
+  // Pending mute recommendations — a slow-moving, ES-aggregation-backed count;
+  // 5 min keeps the nudge fresh without hammering the tuning analysis. Errors
+  // (incl. 403 for non-admin analysts) resolve to no data → panel hidden.
+  const tuning = useAsync(getDetectionTuningSummary, [], { refetchInterval: 300_000 });
   // Quality trend — one point per NIGHTLY run, so a slow cadence is plenty;
   // 60s only exists to catch a manually-triggered eval-nightly without a
   // hard page refresh.
-  const quality = useAsync(getQualityTrend, [], { refetchInterval: 60_000 });
+  const [qualityReload, setQualityReload] = useState(0);
+  const quality = useAsync(getQualityTrend, [qualityReload], { refetchInterval: 60_000 });
+  // "Run eval now" — kicks the same single-flight micro-eval the in-app
+  // scheduler and the CLI use, then polls until the run lands so the new
+  // trend point appears without a reload. Real LLM runs → minutes, so the
+  // button reflects the in-flight state the whole time.
+  const [evalRunning, setEvalRunning] = useState(false);
+  const [evalNote, setEvalNote] = useState<string | null>(null);
+  const runEvalNow = () => {
+    if (evalRunning) return;
+    setEvalRunning(true);
+    setEvalNote(null);
+    startQualityEval()
+      .then(async () => {
+        // n real investigations at concurrency 1 — poll generously (30 min cap).
+        for (let i = 0; i < 360; i++) {
+          await new Promise((r) => setTimeout(r, 5_000));
+          const s = await getQualityEvalStatus().catch(() => null);
+          if (s && !s.running) {
+            if (s.last_exit_code !== 0 && s.last_detail) setEvalNote(s.last_detail);
+            break;
+          }
+        }
+        setQualityReload((k) => k + 1);
+      })
+      .catch((e) => setEvalNote(e instanceof Error ? e.message : 'could not start the eval'))
+      .finally(() => setEvalRunning(false));
+  };
   // Upstream reachability — polled on mount + every 30s so a down dependency
   // (ES / gateway) surfaces as a banner instead of a wall of empty widgets.
   // Errors resolve to null (health data is null) → no banner, so a transient
@@ -373,8 +415,10 @@ export function Dashboard() {
   // Pipeline errors (E1.2): runs whose needs_more_info is a failure fallback
   // (model truncation / gateway 5xx), excluded from the NMI KPI above. Derived
   // from the investigations list the dashboard already fetches — a small
-  // operator signal that infra, not evidence, blocked those verdicts.
-  const pipelineErrors = rows.filter((r) => r.fallback).length;
+  // operator signal that infra, not evidence, blocked those verdicts. Counts
+  // only errors the operator hasn't dismissed (each run's detail page has a
+  // Dismiss button); the KPI links to the pre-filtered Investigations list.
+  const pipelineErrors = livePipelineErrors(rows).length;
 
   const a = (n: number): string => (alerts.data ? n.toLocaleString() : alerts.error ? '—' : '…');
   const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : '…');
@@ -462,7 +506,14 @@ export function Dashboard() {
               {pipelineErrors > 0 && (
                 <>
                   {' · '}
-                  <span style={{ color: '#fca5a5' }}>{i(pipelineErrors)} pipeline error{pipelineErrors === 1 ? '' : 's'}</span>
+                  <button
+                    onClick={() => navigate(PIPELINE_ERRORS_URL)}
+                    title="Show these runs on the Investigations list — open one to see the error and dismiss it"
+                    className="cursor-pointer underline decoration-[rgba(252,165,165,.45)] underline-offset-2 hover:decoration-[#fca5a5]"
+                    style={{ color: '#fca5a5' }}
+                  >
+                    {i(pipelineErrors)} pipeline error{pipelineErrors === 1 ? '' : 's'}
+                  </button>
                 </>
               )}
             </>
@@ -549,8 +600,14 @@ export function Dashboard() {
                       <span className="flex-none">
                         {/* A running/awaiting/errored row has no verdict yet — the
                             status tag carries that. Showing an "untriaged" pill
-                            beside "Investigating" reads as a contradiction. */}
-                        {r.verdict !== 'untriaged' && <VerdictPill verdict={r.verdict} conf={r.conf} />}
+                            beside "Investigating" reads as a contradiction. A
+                            fallback (E1.2) replaces the amber NMI pill with the
+                            pipeline-error chip, matching the Investigations list. */}
+                        {r.fallback ? (
+                          <PipelineErrorChip />
+                        ) : (
+                          r.verdict !== 'untriaged' && <VerdictPill verdict={r.verdict} conf={r.conf} />
+                        )}
                       </span>
                       <span className="hidden w-[120px] flex-none md:block">
                         <StatusTag color={st.color} label={st.label} pulse={st.pulse} />
@@ -574,12 +631,34 @@ export function Dashboard() {
           </Panel>
 
           <Panel>
-            <PanelHeader icon={<Gauge size={15} />} title="Verdict quality" />
+            <PanelHeader
+              icon={<Gauge size={15} />}
+              title="Verdict quality"
+              right={
+                // Hidden when the trend itself failed (non-admin session) —
+                // the run endpoint is admin-gated like the trend.
+                !quality.error ? (
+                  <button
+                    onClick={runEvalNow}
+                    disabled={evalRunning}
+                    title="Run the quality micro-eval now — the same run the nightly schedule performs (real investigations; takes minutes)"
+                    className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
+                  >
+                    {evalRunning ? 'Evaluating…' : 'Run now'}
+                  </button>
+                ) : undefined
+              }
+            />
             <QualityCard
               points={quality.data?.points ?? []}
               error={quality.error}
               loading={quality.loading && !quality.data}
             />
+            {evalNote && (
+              <div className="px-[15px] pb-2.5 text-[12px]" style={{ color: '#f5a623' }}>
+                {evalNote}
+              </div>
+            )}
           </Panel>
 
           <Panel>
@@ -591,6 +670,32 @@ export function Dashboard() {
               onManage={() => navigate('/config#data-sources')}
             />
           </Panel>
+
+          {/* Detection-tuning nudge: pending mute recommendations lived unseen in
+              Config while auto-investigate kept paying for runs on the same
+              benign rules (dogfood 2026-07-15). Admin-gated endpoint — a 403 or
+              zero pending simply hides the panel. */}
+          {(tuning.data?.pending ?? 0) > 0 && (
+            <Panel>
+              <PanelHeader icon={<Gauge size={15} />} title="Detection tuning" />
+              <div className="flex items-center justify-between gap-3 px-[15px] py-3">
+                <div className="text-[13px] text-text-2">
+                  <span className="font-semibold" style={{ color: '#f5a623' }}>
+                    {tuning.data!.pending} mute suggestion{tuning.data!.pending === 1 ? '' : 's'}
+                  </span>{' '}
+                  pending — noisy rules with zero true positives keep consuming
+                  investigations.
+                </div>
+                <button
+                  onClick={() => navigate('/config#detection-tuning')}
+                  className="flex flex-none items-center gap-1 text-[12px] font-semibold text-accent hover:underline"
+                >
+                  Review
+                  <ArrowUpRight size={13} />
+                </button>
+              </div>
+            </Panel>
+          )}
         </div>
       </div>
     </div>

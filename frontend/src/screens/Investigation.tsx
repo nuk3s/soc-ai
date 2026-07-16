@@ -24,8 +24,10 @@ import {
   Zap,
 } from 'lucide-react';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
+import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
 import { KindBadge, RecordedRunChip, SeverityTag, VerdictPill } from '../components/Badges';
@@ -33,12 +35,14 @@ import { Spinner } from '../components/States';
 import {
   type ChatThread,
   ackGroup,
+  dismissInvestigationError,
   escalateGroup,
   executeAction,
   getChatThread,
   downloadInvestigationExport,
   overrideVerdict as submitOverride,
   postChat,
+  getMe,
   requestMoreInfo,
   resolveInvestigation,
   startHunt,
@@ -77,6 +81,9 @@ interface InvestigationProps {
   onReHunt?: (newId: string) => void;
   /** Called after a chat verdict proposal is applied, so the parent refetches inv. */
   onVerdictApplied?: () => void;
+  /** Called with the detection (rule) name after a successful group-scoped ack —
+   * lets the Alerts list hide the group optimistically while ES catches up. */
+  onAcked?: (ruleName: string) => void;
 }
 
 const ACTION_ICON: Record<ActionTag, LucideIcon> = {
@@ -110,8 +117,17 @@ function fmt(s: number) {
   return `${m < 10 ? '0' : ''}${m}:${x < 10 ? '0' : ''}${x}`;
 }
 
-export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictApplied }: InvestigationProps) {
+export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictApplied, onAcked }: InvestigationProps) {
+  const navigate = useNavigate();
   const v = VERDICT[inv.verdict];
+  // Who is clicking — the just-executed action line used to hardcode
+  // "· analyst ·" even for an admin session (dogfood 2026-07-15).
+  const [me, setMe] = useState<string | null>(null);
+  useEffect(() => {
+    getMe()
+      .then((m) => setMe(m.username))
+      .catch(() => {});
+  }, []);
   const demo = useDemo(); // demo deployment → label the verdict as a recorded run
   const [actions, setActions] = useState<
     Record<string, 'approved' | 'rejected' | 'executing' | 'failed'>
@@ -207,6 +223,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     // Restore this investigation's saved draft (the drawer is reused across
     // investigations, so the previous one's draft must not bleed through).
     setDraft(loadChatDraft(inv.id));
+    setErrDismiss('idle');
+    setErrDismissMsg(null);
     // Seed from the REAL elapsed (backend) so opening the same run in the drawer
     // then the permalink doesn't reset the timer to 0:00.
     setElapsed(inv.elapsedSec ?? 0);
@@ -232,16 +250,51 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const [overriding, setOverriding] = useState(false);
   const [overrideError, setOverrideError] = useState<string | null>(null);
 
+  // Dismiss (acknowledge) a pipeline-error run: the Dashboard KPI stops counting
+  // it, while the run itself stays a fallback under the Pipeline-error filter.
+  // `done` locally bridges the gap until a poll returns inv.errorDismissed.
+  const [errDismiss, setErrDismiss] = useState<'idle' | 'busy' | 'done'>('idle');
+  const [errDismissMsg, setErrDismissMsg] = useState<string | null>(null);
+  const errorDismissed = inv.errorDismissed || errDismiss === 'done';
+  const dismissError = () => {
+    if (errDismiss === 'busy') return;
+    const blocked = demoBlocked(demo);
+    if (blocked) {
+      setErrDismissMsg(blocked);
+      return;
+    }
+    setErrDismissMsg(null);
+    setErrDismiss('busy');
+    dismissInvestigationError(inv.id)
+      .then(() => setErrDismiss('done'))
+      .catch((e) => {
+        setErrDismiss('idle');
+        setErrDismissMsg(e instanceof Error ? e.message : 'dismiss failed');
+      });
+  };
+
   // Re-run the investigation: start a fresh hunt on the same alert and hand the
   // new investigation id to the container so it switches to (and polls) it.
-  const reRun = () => {
+  // `deep` forces the full tool-driven loop — offered when THIS run was a
+  // zero-tool heuristic, because re-running a heuristic verdict through the
+  // same fast path just repeats the heuristic (dogfood 2026-07-15).
+  const startReRun = (deep: boolean) => {
     if (reHunting) return;
     setReHunting(true);
-    startHunt(inv.groupId)
+    startHunt(inv.groupId, deep ? { deep: true } : undefined)
       .then((newId) => onReHunt?.(newId))
       .catch(() => {})
       .finally(() => setReHunting(false));
   };
+  const reRun = () => startReRun(false);
+  const reRunDeep = () => startReRun(true);
+  const wasHeuristic = inv.status === 'complete' && inv.meta?.toolCalls === 0;
+
+  // The verdict consulted the rule-tuning tool (the rationale/summary cites
+  // t_suggest_rule_tuning) — offer a direct link to the tuning screen.
+  const tuningCited = /suggest_rule_tuning/.test(
+    `${inv.rationale ?? ''} ${inv.summary.map((s) => ('v' in s ? s.v : '')).join(' ')}`,
+  );
 
   // "Request more info": launch a FOCUSED re-investigation that targets the
   // open questions behind this needs_more_info verdict. Same navigate/poll
@@ -335,6 +388,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
         {reHunting ? 'Re-running…' : 'Re-run investigation'}
       </button>
+      {wasHeuristic && (
+        <button
+          onClick={reRunDeep}
+          disabled={reHunting}
+          title="This verdict came from the zero-tool fast path — re-run with the full tool-driven investigation loop instead"
+          className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
+        >
+          {reHunting ? <Spinner size={13} /> : <Crosshair size={13} />}
+          Deep re-run
+        </button>
+      )}
       <button
         onClick={() => { void downloadInvestigationExport(inv.id); }}
         title="Download the decision record (tools, cited events, verdict — JSON with a sha256 integrity checksum)"
@@ -470,6 +534,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <p className="mt-3.5 text-[13.5px] leading-[1.6] text-[#aeb6c2]" style={{ textWrap: 'pretty' }}>
         <Summary segments={inv.summary} onCite={goToCite} />
       </p>
+      {/* Close the tuning loop: a verdict that cites the rule-tuning tool
+          ("tuning recommends mute") gets a direct path to the Mute button —
+          the recommendation used to dead-end in prose (dogfood 2026-07-15). */}
+      {tuningCited && (
+        <button
+          onClick={() => navigate('/config#detection-tuning')}
+          className="mt-3 flex items-center gap-1.5 text-[12.5px] font-semibold text-accent hover:underline"
+        >
+          <Wrench size={13} />
+          Review the detection-tuning suggestion for this rule
+        </button>
+      )}
     </div>
     {inv.oracle?.escalated && (
       <OracleCard oracle={inv.oracle} />
@@ -492,14 +568,36 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {inv.fallback.hint ? <>: {inv.fallback.hint}</> : '.'}
           {' '}It was recorded as needs_more_info as a placeholder — re-run it to get a real verdict.
         </div>
-        <button
-          onClick={reRun}
-          disabled={reHunting}
-          className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
-        >
-          {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
-          {reHunting ? 'Re-running…' : 'Re-run investigation'}
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={reRun}
+            disabled={reHunting}
+            className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
+          >
+            {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
+            {reHunting ? 'Re-running…' : 'Re-run investigation'}
+          </button>
+          {errorDismissed ? (
+            <span className="flex items-center gap-1.5 text-[12.5px] text-dim">
+              <Check size={13} /> Dismissed — no longer counted on the Dashboard
+            </span>
+          ) : (
+            <button
+              onClick={dismissError}
+              disabled={errDismiss === 'busy'}
+              title="Acknowledge this pipeline error — the Dashboard stops counting it; the run stays under the Investigations 'Pipeline error' filter"
+              className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[12.5px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
+            >
+              {errDismiss === 'busy' ? <Spinner size={13} /> : <X size={13} />}
+              {errDismiss === 'busy' ? 'Dismissing…' : 'Dismiss'}
+            </button>
+          )}
+        </div>
+        {errDismissMsg && (
+          <div className="mt-2 text-[12px]" style={{ color: '#f04438' }}>
+            {errDismissMsg}
+          </div>
+        )}
       </div>
     )}
     {/* Open-questions / follow-up block. Also shown for an `inconclusive`
@@ -627,6 +725,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         if (res.status === 'executed') {
           setActions((s) => ({ ...s, [a.id]: 'approved' }));
           setActionMsg((m) => ({ ...m, [a.id]: res.detail }));
+          // The backend ack is group-scoped — let the Alerts list hide the
+          // whole detection optimistically while the ES agg catches up.
+          if (a.tag === 'ack') onAcked?.(inv.name);
         } else {
           setActions((s) => ({ ...s, [a.id]: 'failed' }));
           setActionMsg((m) => ({ ...m, [a.id]: res.error ?? 'execution failed' }));
@@ -649,6 +750,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             action={a}
             decision={actions[a.id]}
             message={actionMsg[a.id]}
+            executedBy={me ?? 'you'}
             onApprove={() => runAdvisory(a, i)}
             onReject={() => setActions((s) => ({ ...s, [a.id]: 'rejected' }))}
           />
@@ -673,12 +775,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             (r) => `Escalated ${r.escalated} of ${r.total} event${r.total === 1 ? '' : 's'} to a case.`,
           );
     call
-      .then((text) => setSettledMsg({ tone: 'ok', text }))
+      .then((text) => {
+        setSettledMsg({ tone: 'ok', text });
+        if (kind === 'ack') onAcked?.(inv.name);
+      })
       .catch((e) => setSettledMsg({ tone: 'err', text: e instanceof Error ? e.message : 'request failed' }))
       .finally(() => setSettledAction(null));
   };
+  // Suppressed for a pipeline fallback: the run FAILED before reaching a
+  // verdict — offering "verdict settled, acknowledge it" directly under the
+  // "re-run to get a real verdict" panel contradicts the only sane next step.
   const settledActionEl =
-    inv.status === 'complete' && inv.actions.length === 0 ? (
+    inv.status === 'complete' && inv.actions.length === 0 && !inv.fallback ? (
       <div
         className="rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
@@ -765,8 +873,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 <div className="mb-1 font-mono text-[10.5px] uppercase tracking-[.06em] text-faint">
                   turn {i + 1}
                 </div>
-                <div className="whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-dim">
-                  {r}
+                {/* The model writes its reasoning in markdown — render it,
+                    don't dump the raw syntax (dogfood follow-up 2026-07-16). */}
+                <div className="text-[12px] leading-relaxed text-dim">
+                  <Markdown>{r}</Markdown>
                 </div>
               </div>
             ))}
@@ -1439,12 +1549,15 @@ function ActionCard({
   action,
   decision,
   message,
+  executedBy,
   onApprove,
   onReject,
 }: {
   action: RecommendedAction;
   decision?: 'approved' | 'rejected' | 'executing' | 'failed';
   message?: string;
+  /** current username, for the just-executed attribution line. */
+  executedBy?: string;
   onApprove: () => void;
   onReject: () => void;
 }) {
@@ -1497,7 +1610,13 @@ function ActionCard({
       )}
 
       {showButtons ? (
-        <div className="mt-[13px] flex gap-[9px] pl-[31px]">
+        <>
+          {action.pendingNote && (
+            <div className="mt-[10px] pl-[31px] text-[12px] leading-[1.5] text-faint">
+              {action.pendingNote}
+            </div>
+          )}
+          <div className="mt-[13px] flex gap-[9px] pl-[31px]">
           <button
             onClick={onApprove}
             className="flex items-center gap-1.5 rounded-control border border-success-btn-border bg-success-btn px-4 py-2 text-[13px] font-semibold text-[#eafff2] hover:bg-[#22824c]"
@@ -1512,7 +1631,8 @@ function ActionCard({
               <X size={15} /> {action.token ? 'Reject' : 'Dismiss'}
             </button>
           )}
-        </div>
+          </div>
+        </>
       ) : decision === 'executing' ? (
         <div
           className="mt-[11px] flex items-center gap-2 pl-[31px] text-[12.5px] font-semibold"
@@ -1536,7 +1656,7 @@ function ActionCard({
                 system suffix. */}
             {(!applied || !action.appliedNote) && (
               <span className="font-mono text-[11px] font-normal text-faint">
-                {applied ? '· system · automatic' : '· analyst · just now'}
+                {applied ? '· system · automatic' : `· ${executedBy ?? 'you'} · just now`}
               </span>
             )}
           </div>

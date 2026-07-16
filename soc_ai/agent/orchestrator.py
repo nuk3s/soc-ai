@@ -147,6 +147,7 @@ from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools.enrichment import build_local_enrichment_context
 from soc_ai.tools.write_exec import execute_write_tool
+from soc_ai.triage_models import is_pipeline_fallback
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -514,7 +515,11 @@ async def maybe_auto_ack_fp(
     interacts with the auto-triage floor.
 
     Returns the ``auto_ack`` StepEvent (for the caller to yield into the stream)
-    when the write was attempted, or ``None`` when any gate condition is unmet.
+    when the write was attempted; an ``auto_ack_skipped`` StepEvent (with
+    ``reason`` = ``below_threshold`` | ``high_stakes``) when auto-ack was armed
+    for this FP but a guard held it back — recorded so the drawer can explain
+    why the pending ack needs a human; or ``None`` when auto-ack simply doesn't
+    apply (disabled, or a non-FP verdict).
     """
     settings = ctx.settings
     if not settings.auto_ack_fp_enabled:
@@ -522,7 +527,19 @@ async def maybe_auto_ack_fp(
     if report.verdict != "false_positive":
         return None
     if (report.confidence or 0.0) < settings.auto_ack_fp_threshold:
-        return None
+        # Record WHY this FP wasn't auto-acked so the drawer can explain the
+        # pending ack instead of leaving the analyst to guess (two identical-
+        # looking ack cards behaved differently in dogfood 2026-07-15).
+        skipped_ev: StepEvent = emit_ev(
+            "auto_ack_skipped",
+            {
+                "es_id": es_id,
+                "reason": "below_threshold",
+                "confidence": report.confidence,
+                "threshold": settings.auto_ack_fp_threshold,
+            },
+        )
+        return skipped_ev
     if _is_high_stakes_alert(alert):
         # Blast-radius cap: never auto-write an ack on a high-stakes alert, even
         # on a confident FP. The verdict stands; a human must ack it.
@@ -532,7 +549,16 @@ async def maybe_auto_ack_fp(
             es_id,
             report.confidence or 0.0,
         )
-        return None
+        high_stakes_ev: StepEvent = emit_ev(
+            "auto_ack_skipped",
+            {
+                "es_id": es_id,
+                "reason": "high_stakes",
+                "confidence": report.confidence,
+                "threshold": settings.auto_ack_fp_threshold,
+            },
+        )
+        return high_stakes_ev
 
     _LOGGER.info(
         "auto-acking FP alert %s (confidence=%.2f >= threshold=%.2f)",
@@ -587,10 +613,15 @@ async def investigate(
     *,
     ctx: InvestigationContext,
     focus_hint: str | None = None,
+    deep: bool = False,
 ) -> AsyncIterator[StepEvent]:
     """Public entry point for the synth-first triage pipeline.
 
     Async-yields :class:`StepEvent` items throughout the run.
+
+    ``deep`` (optional): force the full tool-driven investigation loop for THIS
+    run regardless of ``fast_triage_enabled`` — the analyst's "deep re-run" of
+    a heuristic verdict must go deeper than the heuristic it double-checks.
 
     ``focus_hint`` (optional): when this run was launched to close a prior
     ``needs_more_info`` verdict (the "request more info" action), the prior
@@ -631,6 +662,7 @@ async def investigate(
         alert_id=alert_id,
         ctx=ctx,
         focus_hint=focus_hint,
+        deep=deep,
     ):
         yield ev
 
@@ -964,6 +996,14 @@ def _should_escalate_to_oracle(
     if not settings.oracle_enabled:
         return False
 
+    # A pipeline-fallback placeholder is a MECHANICAL failure (model truncation,
+    # gateway 5xx), not a model opinion — there is nothing for the Oracle to
+    # adjudicate and its needs_more_info verdict would trip condition 1 below.
+    # Re-running is the fix; escalating just burnt heavy-model tokens on
+    # "Oracle did not return a verdict" (dogfood 2026-07-15).
+    if is_pipeline_fallback({"resolution": report.resolution}):
+        return False
+
     from soc_ai.agent.decision_templates import (  # noqa: PLC0415
         _rule_signals_attack,
         _rule_signals_malware,
@@ -1285,6 +1325,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     alert_id: str,
     ctx: InvestigationContext,
     focus_hint: str | None = None,
+    deep: bool = False,
 ) -> AsyncGenerator[StepEvent, None]:
     """Phase A → B → C → optional D → C round 2 → done.
 
@@ -1737,7 +1778,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     loop_messages: list[Any] | None = None
     # fast_triage_enabled=False forces the tool-driven loop regardless of how
     # confident round-1 was ("agent does agent things"): deeper but slower.
-    force_investigate = not ctx.settings.fast_triage_enabled
+    # `deep` is the same override scoped to THIS run (the analyst's deep re-run).
+    force_investigate = deep or not ctx.settings.fast_triage_enabled
     if force_investigate or (
         ctx.settings.investigate_when_unsure
         and (
@@ -1748,6 +1790,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         ran_investigation_loop = True
         if definitely_investigate:
             loop_reason = "definitely_investigate"
+        elif deep:
+            loop_reason = "deep_rerun"
         elif force_investigate:
             loop_reason = "fast_triage_disabled"
         else:

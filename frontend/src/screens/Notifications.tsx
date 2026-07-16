@@ -16,20 +16,26 @@ const TONE: Record<Notification['tone'], string> = {
 export function Notifications() {
   const navigate = useNavigate();
   const { data, loading, error } = useAsync(getNotifications, [], { refetchInterval: 15000 });
-  const [dismissed, setDismissed] = useState<Set<string>>(() => getDismissed());
+  // Bump to re-read localStorage after a dismissal. The dismissed set is
+  // re-read on every render (not snapshotted at mount) so this screen and the
+  // Topbar bell — which polls the same store — can never disagree about what
+  // is dismissed (the badge/panel mismatch from dogfood 2026-07-15).
+  const [dismissTick, setDismissTick] = useState(0);
+  void dismissTick;
+  const dismissed = getDismissed();
 
   const items = (data ?? []).filter((n) => !dismissed.has(n.id));
 
   const dismiss = (id: string) => {
     dismissNotification(id);
-    setDismissed((s) => new Set(s).add(id));
+    setDismissTick((t) => t + 1);
   };
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
       <div className="text-[20px] font-semibold tracking-[-.015em]">Notifications</div>
       <div className="mb-4 mt-0.5 text-[13px] text-dim">
-        {items.length} active · pending approvals and in-flight investigations
+        {items.length} active · in-flight investigations and last-24h completions
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         {loading && <LoadingState />}

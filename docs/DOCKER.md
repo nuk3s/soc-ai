@@ -461,15 +461,21 @@ cron (or any scheduler) that execs the refresh on a cadence:
 17 3 * * 0  root  docker compose -f /opt/soc-ai/docker-compose.yml exec -T soc-ai python -m soc_ai blocklists refresh
 ```
 
-### The nightly quality micro-eval is also host-scheduled
+### The nightly quality micro-eval — schedule it in-app or from host cron
 
 `soc-ai eval-nightly` investigates a handful of real alerts and lands one row in
 the local quality trend (the dashboard's **Verdict quality** card), alarming
 through the notification webhook when the new point regresses against its own
 history. It converts "the verdicts were validated once" into "the verdicts are
 measured every night" — the tripwire for a silent degradation after an
-inference-engine or analyst-model swap. Like the blocklist refresh, soc-ai
-ships **no in-app scheduler** for it; add a host cron:
+inference-engine or analyst-model swap.
+
+The simplest way to schedule it is **in-app**: Config → Quality → *Nightly
+quality eval* (runs daily at the configured UTC hour; the dashboard card also
+has a **Run now** button sharing the same single-flight run). The in-app
+scheduler skips its slot when a snapshot already landed today (e.g. a host
+cron beat it to it) — the reverse is not true, so pick ONE scheduler: the
+toggle, or this host cron:
 
 ```cron
 # /etc/cron.d/soc-ai-quality — nightly micro-eval, 02:17

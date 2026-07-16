@@ -396,6 +396,52 @@ def test_get_detection_tuning_returns_nominations_and_overrides(client: TestClie
     assert body["overrides"] == []
 
 
+def test_detection_tuning_summary_counts_actionable_mutes(client: TestClient) -> None:
+    """The Dashboard nudge counts pending MUTE recommendations that aren't
+    already muted — the loop was open: 10 recommendations sat unseen in Config
+    while auto-investigate kept paying for runs on the same benign rules
+    (dogfood 2026-07-15)."""
+    noms = [
+        {
+            "rule_name": "ET NOISE",
+            "alert_count": 412,
+            "investigations": 8,
+            "fp": 8,
+            "tp": 0,
+            "nmi": 0,
+            "recommendation": "mute",
+            "reason": "all FP",
+            "already_muted": False,
+        },
+        {
+            "rule_name": "ET MUTED ALREADY",
+            "alert_count": 100,
+            "investigations": 5,
+            "fp": 5,
+            "tp": 0,
+            "nmi": 0,
+            "recommendation": "mute",
+            "reason": "all FP",
+            "already_muted": True,
+        },
+        {
+            "rule_name": "ET WATCH",
+            "alert_count": 50,
+            "investigations": 3,
+            "fp": 2,
+            "tp": 0,
+            "nmi": 1,
+            "recommendation": "monitor",
+            "reason": "mixed",
+            "already_muted": False,
+        },
+    ]
+    with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)):
+        resp = client.get("/api/v1/detection-tuning/summary")
+    assert resp.status_code == 200
+    assert resp.json() == {"pending": 1}
+
+
 def test_post_override_then_remove_roundtrip(client: TestClient) -> None:
     # Create a mute via the endpoint.
     resp = client.post(

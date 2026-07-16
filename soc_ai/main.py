@@ -156,6 +156,89 @@ def _discovery_due(last_scan_iso: str | None, interval_hours: int) -> bool:
     return (datetime.now(UTC) - last) >= timedelta(hours=interval_hours)
 
 
+def _eval_nightly_due(
+    now: datetime,
+    *,
+    hour_utc: int,
+    last_scheduled_date: str | None,
+    latest_snapshot_date: str | None,
+) -> bool:
+    """True iff the in-app nightly quality eval should run at *now*.
+
+    Runs at most once per UTC day, at the first wake at/after ``hour_utc``.
+    Two independent once-per-day guards: the in-memory ``last_scheduled_date``
+    (covers failed runs that wrote no snapshot — no retry storm) and the
+    durable ``latest_snapshot_date`` (covers restarts after a successful run,
+    and a host-cron run that already landed today's point).
+    """
+    today = now.date().isoformat()
+    if last_scheduled_date == today:
+        return False
+    if now.hour < hour_utc:
+        return False
+    return latest_snapshot_date != today
+
+
+async def _eval_nightly_loop(app: FastAPI, settings: Any) -> None:
+    """Run the nightly quality micro-eval in-app when scheduled.
+
+    The nightly used to be host-cron-only; ``eval_nightly_enabled`` makes it
+    schedulable from the UI (Config → Quality). Models the discovery loop:
+    fixed wake cadence, live settings read each wake (console toggles apply
+    without a restart), and the run-now single-flight ``_QualityEvalStatus``
+    shared with POST /quality/eval/run so a scheduled run and a manual run
+    can never overlap. A failed iteration is logged and the loop continues.
+    """
+    # Lazy import: reuse the run-now single-flight + worker (one direction).
+    from soc_ai.api.webui_api import (  # noqa: PLC0415
+        _get_quality_eval_status,
+        _quality_eval_worker,
+    )
+
+    wake_seconds = 300
+    while True:
+        await asyncio.sleep(wake_seconds)
+        try:
+            if not settings.eval_nightly_enabled:
+                continue
+            status = _get_quality_eval_status(app.state)
+            if status.running:
+                continue
+            now = datetime.now(UTC)
+            # Durable freshness check — fail-soft toward "no snapshot today"
+            # (running twice is cheaper than silently never running).
+            latest_snapshot_date: str | None = None
+            try:
+                from soc_ai.store import quality as quality_store  # noqa: PLC0415
+
+                async with app.state.db_sessionmaker() as db:
+                    rows = await quality_store.recent_snapshots(db, limit=1)
+                if rows:
+                    latest_snapshot_date = rows[0].created_at.date().isoformat()
+            except Exception:
+                _LOGGER.warning(
+                    "eval-nightly: snapshot freshness check failed (continuing)", exc_info=True
+                )
+            if not _eval_nightly_due(
+                now,
+                hour_utc=settings.eval_nightly_hour_utc,
+                last_scheduled_date=status.last_scheduled_date,
+                latest_snapshot_date=latest_snapshot_date,
+            ):
+                # A point already landed today (host cron / pre-restart run):
+                # consume the day so later wakes skip the DB check too.
+                if latest_snapshot_date == now.date().isoformat():
+                    status.last_scheduled_date = latest_snapshot_date
+                continue
+            status.last_scheduled_date = now.date().isoformat()
+            status.running = True  # claim the single-flight slot before scheduling
+            status._task = asyncio.create_task(_quality_eval_worker(app.state))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("eval-nightly scheduler iteration failed; continuing")
+
+
 async def _discovery_scheduler_loop(app: FastAPI, settings: Any) -> None:
     """Periodically run the internal-identifier discovery scan when scheduled.
 
@@ -513,6 +596,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     discovery_task = asyncio.create_task(_discovery_scheduler_loop(app, settings))
     autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
     hunt_schedule_task = asyncio.create_task(_hunt_schedule_loop(app))
+    eval_nightly_task = asyncio.create_task(_eval_nightly_loop(app, settings))
 
     try:
         yield
@@ -530,6 +614,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         hunt_schedule_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await hunt_schedule_task
+        eval_nightly_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await eval_nightly_task
+        # An in-flight quality-eval worker (scheduled or run-now) holds its own
+        # engine/ES clients — cancel + drain like the discovery worker below.
+        from soc_ai.api.webui_api import _get_quality_eval_status  # noqa: PLC0415
+
+        _qs = _get_quality_eval_status(app.state)
+        if _qs._task is not None and not _qs._task.done():
+            _qs._task.cancel()
+            with contextlib.suppress(BaseException):
+                await _qs._task
         # A scheduled (or manual "Scan now") discovery worker may be mid-scan,
         # tracked on the shared single-flight status object (the same one the
         # scan-now endpoint uses). Cancel + drain it BEFORE the ES/DB clients it

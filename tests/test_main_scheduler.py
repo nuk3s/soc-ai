@@ -608,3 +608,126 @@ async def test_at_loop_cancels_cleanly_on_shutdown(monkeypatch: pytest.MonkeyPat
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert task.cancelled() or task.done()
+
+
+# --------------------------------------------------------------------------- #
+# eval-nightly in-app scheduler (schedulable from the UI, 2026-07-16)
+# --------------------------------------------------------------------------- #
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from soc_ai.api.webui.routes_quality import _QualityEvalStatus  # noqa: E402
+from soc_ai.main import _eval_nightly_due, _eval_nightly_loop  # noqa: E402
+
+
+def test_eval_nightly_due_helper() -> None:
+    now = datetime(2026, 7, 16, 4, 30, tzinfo=UTC)
+    # hour reached, nothing ran today → due
+    assert _eval_nightly_due(now, hour_utc=3, last_scheduled_date=None, latest_snapshot_date=None)
+    # before the configured hour → not due
+    assert not _eval_nightly_due(
+        now, hour_utc=5, last_scheduled_date=None, latest_snapshot_date=None
+    )
+    # already attempted today (even if it failed) → not due
+    assert not _eval_nightly_due(
+        now, hour_utc=3, last_scheduled_date="2026-07-16", latest_snapshot_date=None
+    )
+    # a snapshot already landed today (cron/other process) → not due
+    assert not _eval_nightly_due(
+        now, hour_utc=3, last_scheduled_date=None, latest_snapshot_date="2026-07-16"
+    )
+    # yesterday's attempt/snapshot never blocks today
+    assert _eval_nightly_due(
+        now, hour_utc=3, last_scheduled_date="2026-07-15", latest_snapshot_date="2026-07-15"
+    )
+
+
+def _eval_settings(*, enabled: bool = True, hour: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(eval_nightly_enabled=enabled, eval_nightly_hour_utc=hour)
+
+
+def _eval_app(status: _QualityEvalStatus) -> SimpleNamespace:
+    class _FakeDb:
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+    return SimpleNamespace(
+        state=SimpleNamespace(_quality_eval_status=status, db_sessionmaker=_FakeDb)
+    )
+
+
+async def _run_eval_iterations(
+    monkeypatch: pytest.MonkeyPatch, app: SimpleNamespace, settings: Any, n: int = 1
+) -> None:
+    real_sleep = asyncio.sleep
+    calls = {"n": 0}
+
+    async def _sleep(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] <= n:
+            return None
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await _eval_nightly_loop(app, settings)
+    finally:
+        monkeypatch.setattr(main_mod.asyncio, "sleep", real_sleep)
+
+
+@pytest.mark.asyncio
+async def test_eval_loop_runs_when_enabled_and_hour_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _QualityEvalStatus()
+    app = _eval_app(status)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+        status.running = False
+
+    monkeypatch.setattr("soc_ai.api.webui_api._quality_eval_worker", _stub_worker)
+    monkeypatch.setattr("soc_ai.store.quality.recent_snapshots", AsyncMock(return_value=[]))
+
+    await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=True, hour=0))
+    if status._task is not None:
+        with contextlib.suppress(Exception):
+            await status._task
+
+    assert invoked == [True]
+    assert status.last_scheduled_date is not None
+
+
+@pytest.mark.asyncio
+async def test_eval_loop_skips_when_disabled_or_early_or_already_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _QualityEvalStatus()
+    app = _eval_app(status)
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+
+    monkeypatch.setattr("soc_ai.api.webui_api._quality_eval_worker", _stub_worker)
+    monkeypatch.setattr("soc_ai.store.quality.recent_snapshots", AsyncMock(return_value=[]))
+
+    # disabled
+    await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=False, hour=0))
+    # hour not reached (25 can never be reached)
+    await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=True, hour=24))
+    # already attempted today
+    status.last_scheduled_date = datetime.now(UTC).date().isoformat()
+    await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=True, hour=0))
+    # already running
+    status.last_scheduled_date = None
+    status.running = True
+    await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=True, hour=0))
+
+    assert invoked == []

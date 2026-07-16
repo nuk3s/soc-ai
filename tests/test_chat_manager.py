@@ -552,3 +552,75 @@ def test_chat_online_tools_gated_by_master_toggle(settings_kratos: Any) -> None:
     settings_on = settings_kratos.model_copy(update={"allow_online_enrichment": True})
     names_on = _tool_names(settings_on)
     assert online <= names_on, sorted(online - names_on)
+
+
+def test_run_turn_scopes_caveat_when_tools_ran() -> None:
+    """A turn that RAN tools but asserted an ungrounded artifact gets the
+    scoped caveat naming the suspect claim — the blanket 'not backed by a tool
+    result' under a real tool-call footer read as a contradiction (dogfood
+    2026-07-15)."""
+    from soc_ai.agent.narrative_grounding import UNVERIFIED_CAVEAT
+
+    captured: dict[str, Any] = {}
+
+    async def _finish(_db: Any, _msg_id: int, *, content: str, status: str, meta: Any) -> None:
+        captured["content"] = content
+        captured["meta"] = meta
+
+    inv = MagicMock()
+    inv.id = "inv-scoped"
+    inv.alert_es_id = "es-scoped"
+    inv.rule_name = "ET TEST"
+    inv.src_ip = "10.0.0.1"
+    inv.dest_ip = "10.0.0.2"
+    inv.verdict = "false_positive"
+    inv.confidence = 0.9
+    inv.rationale = "benign"
+    inv.summary = ""
+
+    db = AsyncMock()
+    db_cm = MagicMock()
+    db_cm.__aenter__ = AsyncMock(return_value=db)
+    db_cm.__aexit__ = AsyncMock(return_value=False)
+    settings = MagicMock()
+    settings.soc_ai_demo = False
+    settings.analyst_model = "test-model"
+    settings.chat_turn_timeout_s = 180
+    state = MagicMock()
+    state.settings = settings
+    state.db_sessionmaker = MagicMock(return_value=db_cm)
+
+    result = MagicMock()
+    result.output = "The host also resolved ad.local repeatedly."
+
+    grounding = MagicMock(grounded=False, ungrounded=["ad.local"], reason="ungrounded")
+    with (
+        patch(
+            "soc_ai.webui.chat_manager.inv_svc.get_with_events", AsyncMock(return_value=(inv, []))
+        ),
+        patch(
+            "soc_ai.webui.chat_manager.chat_svc.history_for_agent",
+            AsyncMock(return_value=[("user", "anything else?")]),
+        ),
+        patch("soc_ai.webui.chat_manager.get_alert_context", AsyncMock(return_value=MagicMock())),
+        patch("soc_ai.webui.chat_manager.check_narrative_grounding", return_value=grounding),
+        patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
+        patch(
+            "soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock(side_effect=_finish)
+        ),
+        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_manager._extract_tools", return_value=["t_query_events_oql"]),
+        patch(
+            "soc_ai.webui.chat_manager._extract_tool_evidence",
+            return_value=[{"tool": "t_query_events_oql", "result": "127 matches"}],
+        ),
+    ):
+        agent_mock = MagicMock()
+        agent_mock.run = AsyncMock(return_value=result)
+        mock_build.return_value = agent_mock
+        asyncio.run(_run_turn(state, "inv-scoped", 9))
+
+    assert captured["meta"]["narrative_grounding"]["grounded"] is False
+    assert "ad.local" in captured["content"]
+    assert "Partially unverified" in captured["content"]
+    assert UNVERIFIED_CAVEAT not in captured["content"]

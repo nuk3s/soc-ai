@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import timedelta
 from typing import Any
 
 from fastapi import Depends, Request
@@ -19,6 +20,7 @@ from soc_ai.api.webui._shared import (
 )
 from soc_ai.config import Settings
 from soc_ai.store import auth as auth_svc
+from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import (
     probes,
@@ -87,11 +89,27 @@ async def list_workspaces(settings: Settings = Depends(get_settings_dep)) -> lis
     return [WorkspaceOut(name=name, env="prod")]
 
 
+# How far back completed runs/hunts stay in the bell. Long enough to survive a
+# shift handover, short enough that the panel is "what happened recently", not
+# a history screen. Items are client-dismissible (stable ids → localStorage).
+_NOTIF_WINDOW = timedelta(hours=24)
+
+
 @router.get("/notifications", response_model=list[NotificationOut])
 async def list_notifications(request: Request) -> list[NotificationOut]:
+    """In-flight runs + last-24h completions (investigations and hunts).
+
+    The bell badge counts exactly this list — it must never advertise an item
+    the panel can't show (the dogfood-2026-07-15 "badge=1, panel empty"
+    phantom). Completions are durable, dismissible entries rather than
+    transient in-flight state that vanishes between polls.
+    """
+    cutoff = auth_svc.utcnow() - _NOTIF_WINDOW
     out: list[NotificationOut] = []
     async with request.app.state.db_sessionmaker() as db:
         running = await inv_svc.list_recent(db, status="running", limit=20)
+        completed = await inv_svc.list_recent(db, status="complete", limit=20)
+        hunts_done = await hunts_svc.list_recent(db, status="complete", limit=10, since=cutoff)
     for inv in running:
         out.append(
             NotificationOut(
@@ -102,7 +120,118 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 href=f"/investigation/{inv.id}",
             )
         )
-    return out[:12]
+    done: list[NotificationOut] = []
+    for inv in completed:
+        fin = inv.finished_at
+        if fin is None or fin < cutoff:
+            continue
+        verdict = inv.verdict or "untriaged"
+        tone = (
+            "danger"
+            if verdict == "true_positive"
+            else "warn"
+            if verdict in ("needs_more_info", "inconclusive")
+            else "accent"
+        )
+        done.append(
+            NotificationOut(
+                id=f"inv-done:{inv.id}",
+                tone=tone,
+                title=f"Verdict {verdict}: {inv.rule_name or inv.id}",
+                when=_ago(fin.isoformat()),
+                href=f"/investigation/{inv.id}",
+            )
+        )
+    for h in hunts_done:
+        findings = (h.report or {}).get("findings") or []
+        n = len(findings)
+        done.append(
+            NotificationOut(
+                id=f"hunt-done:{h.id}",
+                tone="warn" if n else "accent",
+                title=f"Hunt finished — {n} finding{'' if n == 1 else 's'}: {h.objective[:80]}",
+                when=_ago((h.finished_at or h.created_at).isoformat()),
+                href=f"/hunts/{h.id}",
+            )
+        )
+    return (out + done)[:12]
+
+
+# ── Scheduled maintenance (backup + blocklist cron visibility) ─────────────
+
+
+class BackupArchiveOut(BaseModel):
+    name: str
+    size_bytes: int
+    modified: str  # tz-aware ISO
+
+
+class MaintenanceOut(BaseModel):
+    backups: list[BackupArchiveOut]
+    backups_dir: str
+    blocklists_dir: str
+    # Newest blocklist file's mtime — when the feeds were last refreshed.
+    blocklists_refreshed: str | None = None
+    blocklist_files: int = 0
+
+
+_BACKUP_LIST_CAP = 8
+
+
+@router.get(
+    "/maintenance",
+    response_model=MaintenanceOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_maintenance(settings: Settings = Depends(get_settings_dep)) -> MaintenanceOut:
+    """Observed maintenance facts for the Config panel.
+
+    The nightly backup/blocklist crons run OUTSIDE the app (host crontab), so
+    the product can't promise a schedule — it reports what actually happened:
+    the archives sitting in ``<data_dir>/backups`` and the blocklist feeds'
+    freshness. Automation the user can't see in the UI doesn't exist (user
+    requirement, 2026-07-16). Missing dirs are a normal cold state, never a 500.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    def _iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=UTC).isoformat()
+
+    backups_dir = settings.soc_ai_data_dir / "backups"
+    archives: list[BackupArchiveOut] = []
+    try:
+        candidates = sorted(
+            backups_dir.glob("soc-ai-backup-*.tar.gz"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for p in candidates[:_BACKUP_LIST_CAP]:
+            st = p.stat()
+            archives.append(
+                BackupArchiveOut(name=p.name, size_bytes=st.st_size, modified=_iso(st.st_mtime))
+            )
+    except OSError:
+        pass  # no backups yet — cold state, not an error
+
+    newest: float | None = None
+    n_files = 0
+    try:
+        for p in settings.blocklist_data_dir.iterdir():
+            if not p.is_file():
+                continue
+            n_files += 1
+            mt = p.stat().st_mtime
+            newest = mt if newest is None or mt > newest else newest
+    except OSError:
+        pass
+
+    return MaintenanceOut(
+        backups=archives,
+        backups_dir=str(backups_dir),
+        blocklists_dir=str(settings.blocklist_data_dir),
+        blocklists_refreshed=_iso(newest) if newest is not None else None,
+        blocklist_files=n_files,
+    )
 
 
 # ── Current-user endpoints ────────────────────────────────────────────────

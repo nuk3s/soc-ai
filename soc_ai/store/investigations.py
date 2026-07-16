@@ -192,6 +192,24 @@ async def resolve(
     return inv
 
 
+async def dismiss_error(db: AsyncSession, inv_id: str) -> Investigation | None:
+    """Stamp the operator's ack of a pipeline-error run.
+
+    Idempotent: an already-dismissed row keeps its ORIGINAL timestamp (the first
+    ack is the auditable moment). Returns the row, or ``None`` if not found.
+    Whether the run actually IS a pipeline fallback is the caller's check —
+    this helper only records the ack.
+    """
+    inv = await db.get(Investigation, inv_id)
+    if inv is None:
+        return None
+    if inv.error_dismissed_at is None:
+        inv.error_dismissed_at = utcnow()
+        await db.commit()
+        await db.refresh(inv)
+    return inv
+
+
 async def reap_stale_running(
     db: AsyncSession, *, older_than_minutes: int | None, status: str = "error"
 ) -> int:

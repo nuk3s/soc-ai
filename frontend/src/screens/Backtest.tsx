@@ -3,6 +3,7 @@ import { useRef, useState } from 'react';
 import { Panel } from '../components/Panel';
 import { ErrorState } from '../components/States';
 import { getBacktest, startBacktest } from '../lib/api';
+import { absTime } from '../lib/timeRange';
 import { useAsync } from '../lib/useAsync';
 import type {
   Backtest as BacktestData,
@@ -252,6 +253,11 @@ function Results({ data }: { data: BacktestData }) {
 
   return (
     <>
+      {/* When this backtest actually ran — without it the results read as
+          current no matter how stale they are (dogfood 2026-07-15). */}
+      {data.finished_at && (
+        <div className="mb-3 text-[12px] text-faint">Ran {absTime(data.finished_at)}</div>
+      )}
       {/* headline metric cards */}
       <div className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
         <MetricCard

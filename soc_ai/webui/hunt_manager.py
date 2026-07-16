@@ -39,6 +39,7 @@ class HuntManager:
         started_by: str,
         rule_name: str | None = None,
         focus_hint: str | None = None,
+        deep: bool = False,
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -53,6 +54,9 @@ class HuntManager:
         ``needs_more_info`` investigation ("request more info") — threaded into
         the run so the fresh investigation targets those gaps.
 
+        ``deep`` (optional): force the full tool-driven loop for this run
+        (the analyst's "deep re-run" of a heuristic verdict).
+
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
         """
@@ -66,6 +70,7 @@ class HuntManager:
             cancel_token=token,
             rule_name=rule_name,
             focus_hint=focus_hint,
+            deep=deep,
         )
 
         # Consume until the first event — must be "investigation_created".

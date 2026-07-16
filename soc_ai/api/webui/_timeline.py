@@ -512,6 +512,12 @@ class RecommendedActionOut(BaseModel):
     # Short human label for WHY it reads as done ("Already acknowledged",
     # "Executed · analyst"). None keeps the UI's default auto-ack wording.
     appliedNote: str | None = None
+    # Why a PENDING ack is waiting for a human when auto-ack is otherwise armed
+    # (severity/exploit-class guard, or confidence below the threshold) — from
+    # the persisted auto_ack_skipped event. None when auto-ack simply doesn't
+    # apply. Two identical-looking ack cards behaving differently with no
+    # explanation was a dogfood trust finding (2026-07-15).
+    pendingNote: str | None = None
 
 
 class TimelineStepOut(BaseModel):
@@ -627,6 +633,10 @@ class InvestigationOut(BaseModel):
     # button instead of treating it as a genuine needs_more_info. Distinct from
     # `resolution` (manual/chat override) so the two never conflate.
     fallback: FallbackOut | None = None
+    # Operator ack of a fallback run (POST /investigations/{id}/dismiss-error) —
+    # lets the drawer render the Dismiss button as already-done instead of
+    # offering a redundant ack.
+    errorDismissed: bool = False
     # Ordered model reasoning traces (the <think> blocks) captured per model turn.
     # Surfaced so an analyst can see WHY a verdict was reached — the "show your
     # work" explainability the timeline (which skips model_response) drops.
@@ -723,6 +733,27 @@ def _build_actions(
     auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
     executed = _executed_actions(events)
 
+    # Auto-ack armed but held back? Explain the pending ack instead of leaving
+    # the analyst to guess why THIS one needs a click.
+    ack_pending_note: str | None = None
+    for e in events:
+        if e.kind != "auto_ack_skipped":
+            continue
+        p = e.payload or {}
+        if p.get("reason") == "high_stakes":
+            ack_pending_note = (
+                "High/critical-severity and malware/exploit-class alerts "
+                "always require a human acknowledgement."
+            )
+        elif p.get("reason") == "below_threshold":
+            conf, thr = p.get("confidence"), p.get("threshold")
+            if isinstance(conf, int | float) and isinstance(thr, int | float):
+                ack_pending_note = (
+                    f"Auto-ack is on, but confidence {conf:.2f} is below "
+                    f"the {thr:.2f} auto-ack threshold."
+                )
+        break
+
     def _ack_note(tn: str) -> str | None:
         # Only the NEW already-acked case gets a note; auto-ack keeps the UI's
         # default "Auto-acknowledged · system · automatic" wording.
@@ -775,6 +806,7 @@ def _build_actions(
                 rationale=a.get("rationale", ""),
                 applied=applied,
                 appliedNote=note,
+                pendingNote=(ack_pending_note if tn == "ack_alert" and not applied else None),
             )
         )
     return out

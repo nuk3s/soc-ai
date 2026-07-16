@@ -24,6 +24,7 @@ from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.narrative_grounding import (
     UNVERIFIED_CAVEAT,
     check_narrative_grounding,
+    scoped_unverified_caveat,
 )
 from soc_ai.agent.prompts import oql_primer_block
 from soc_ai.agent.proposal_validation import Proposal, validate_proposal
@@ -263,7 +264,15 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
                 len(meta["tools"]),
                 grounding.reason,
             )
-            answer = answer + UNVERIFIED_CAVEAT
+            # A turn that RAN tools gets the scoped caveat naming the suspect
+            # claims — the blanket "not backed by a tool result" under a
+            # footer listing real tool calls read as a contradiction
+            # (dogfood 2026-07-15). Zero-tool turns keep the blanket wording.
+            answer = answer + (
+                scoped_unverified_caveat(grounding.ungrounded)
+                if tool_evidence and grounding.ungrounded
+                else UNVERIFIED_CAVEAT
+            )
             meta["narrative_grounding"] = {
                 "grounded": False,
                 "ungrounded": grounding.ungrounded,

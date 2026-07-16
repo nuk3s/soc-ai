@@ -13,6 +13,7 @@ import { EgressPolicyPanel } from './EgressPolicyPanel';
 import { NotificationsPanel } from './NotificationsPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 import { DetectionTuningPanel } from './DetectionTuningPanel';
+import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
@@ -73,6 +74,7 @@ const PANELS: PanelDef[] = [
   { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment' },
   { id: 'users', label: 'Users', parent: 'System' },
   { id: 'api-tokens', label: 'API tokens', parent: 'System' },
+  { id: 'maintenance', label: 'Scheduled maintenance', parent: 'System' },
   { id: 'diagnostics', label: 'Diagnostics', parent: 'System' },
   { id: 'danger-zone', label: 'Danger Zone', parent: 'System' },
 ];
@@ -1534,6 +1536,12 @@ export function Config() {
     ),
     users: usersSection,
     'api-tokens': apiTokensSection,
+    maintenance: (
+      <MaintenancePanel
+        collapsed={!!collapsed['Scheduled maintenance']}
+        onToggleCollapse={() => toggleSection('Scheduled maintenance')}
+      />
+    ),
     diagnostics: diagnosticsSection,
     'danger-zone': dangerZoneSection,
   };

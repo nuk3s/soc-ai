@@ -2,11 +2,13 @@ import { BookOpen, ChevronsLeft, Crosshair, Search, Settings, Triangle, Zap } fr
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { signOut } from '../lib/api';
+import { getAlerts, getInvestigations, signOut } from '../lib/api';
+import { searchEntities } from '../lib/paletteSearch';
+import type { AlertGroup, InvestigationRow } from '../lib/types';
 import { useShell } from './ShellContext';
 
 interface Command {
-  group: 'Go to' | 'Action' | 'View' | 'Account';
+  group: 'Go to' | 'Action' | 'View' | 'Account' | 'Investigations' | 'Alerts';
   label: string;
   icon: ReactNode;
   run: () => void;
@@ -68,18 +70,36 @@ export function CommandPalette() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collapsed, navigate, closePalette, toggleNav, requestTriage]);
 
+  // Entity corpus for the search half of "Search or jump to": fetched once per
+  // palette open (fail-soft — a fetch error just means command-only results).
+  const [invs, setInvs] = useState<InvestigationRow[]>([]);
+  const [groups, setGroups] = useState<AlertGroup[]>([]);
+
   const filtered = useMemo(() => {
     const query = q.toLowerCase();
-    return query
+    const base = query
       ? commands.filter((c) => c.label.toLowerCase().includes(query) || c.group.toLowerCase().includes(query))
       : commands;
-  }, [q, commands]);
+    const entities = searchEntities(q, invs, groups).map<Command>((h) => ({
+      group: h.group,
+      label: h.label,
+      icon: h.group === 'Investigations' ? <Search size={15} /> : <Triangle size={15} />,
+      run: () => {
+        closePalette();
+        navigate(h.to);
+      },
+    }));
+    return [...base, ...entities];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, commands, invs, groups]);
 
-  // reset query + selection on open; focus the input
+  // reset query + selection on open; focus the input; refresh the entity corpus
   useEffect(() => {
     if (paletteOpen) {
       setQ('');
       setIdx(0);
+      getInvestigations().then(setInvs).catch(() => {});
+      getAlerts({ range: '7d' }).then(setGroups).catch(() => {});
       // focus after paint
       const t = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(t);

@@ -149,6 +149,9 @@ export interface RecommendedAction {
   applied?: boolean;
   /** why it reads as done ("Already acknowledged", "Executed · analyst"); absent = auto-ack default. */
   appliedNote?: string | null;
+  /** why a PENDING ack is waiting for a human while auto-ack is armed
+   * (severity/exploit-class guard, or confidence below threshold). */
+  pendingNote?: string | null;
 }
 
 export interface ResolutionProvenance {
@@ -264,6 +267,8 @@ export interface Investigation {
    * reaching a verdict (model truncation / gateway 5xx). Drives the drawer's
    * "failed before reaching a verdict" panel + Re-run, not the amber NMI block. */
   fallback?: FallbackProvenance | null;
+  /** Operator ack of a fallback run (dismiss-error) — renders the Dismiss button as done. */
+  errorDismissed?: boolean;
   /** Live acked state of this investigation's alert in Security Onion (false on ES error). */
   alertAcked?: boolean;
 }
@@ -333,6 +338,9 @@ export interface InvestigationRow {
   /** true when this run's needs_more_info is a pipeline-failure fallback (E1.2) —
    * rendered as a "pipeline error — retry" chip, filterable, excluded from the NMI KPI. */
   fallback?: boolean;
+  /** operator ack of a fallback run (dismiss-error) — the Dashboard's pipeline-error
+   * KPI counts only `fallback && !errorDismissed`; the row itself stays a fallback. */
+  errorDismissed?: boolean;
 }
 
 // ---- Hunts -----------------------------------------------------------------

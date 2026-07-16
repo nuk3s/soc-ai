@@ -160,11 +160,15 @@ export function QualityCard({
       <LoadingState label="Loading…" />
     ) : (
       <div className="px-[15px] py-3.5 text-[12.5px] leading-[1.6] text-dim">
-        No quality history yet — schedule{' '}
-        <code className="rounded bg-surface-3 px-1 font-mono text-[11.5px]">
-          soc-ai eval-nightly
-        </code>{' '}
-        from host cron. <span className="text-faint">See docs/DOCKER.md.</span>
+        No quality history yet — use <span className="font-semibold text-text-2">Run now</span>{' '}
+        above, or enable the nightly eval in Config → Quality.{' '}
+        <span className="text-faint">
+          (Host cron via{' '}
+          <code className="rounded bg-surface-3 px-1 font-mono text-[11px]">
+            soc-ai eval-nightly
+          </code>{' '}
+          still works — see docs/DOCKER.md.)
+        </span>
       </div>
     );
   }

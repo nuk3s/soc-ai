@@ -8,6 +8,7 @@ import { Drawer } from '../components/Drawer';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
+import { hideOptimisticallyAcked } from '../lib/alertFilters';
 import {
   type AlertQuery,
   type AutoTriageStatus,
@@ -492,6 +493,15 @@ export function Alerts() {
   // Stable so AlertDrawer's poll-timer effect (dep: onComplete) doesn't reset
   // every parent re-render.
   const onDrawerComplete = useCallback(() => setReloadKey((k) => k + 1), []);
+
+  // Session-local record of drawer-initiated group acks (rule → epoch ms).
+  // The ES agg lags a fresh ack by seconds-to-minutes, so hide the group
+  // optimistically; a group whose latest event postdates the ack re-surfaces.
+  const [optimisticAcked, setOptimisticAcked] = useState<Record<string, number>>({});
+  const onDrawerAcked = useCallback((ruleName: string) => {
+    setOptimisticAcked((m) => ({ ...m, [ruleName]: Date.now() }));
+    setReloadKey((k) => k + 1);
+  }, []);
   const closeDrawer = () => {
     setStarting(null);
     searchParams.delete('drawer');
@@ -667,13 +677,13 @@ export function Alerts() {
   };
   const visible = useMemo(
     () =>
-      (groups ?? [])
+      hideOptimisticallyAcked(groups ?? [], optimisticAcked, hideAcked)
         .filter((g) => matchView(g, view, me))
         .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
         .filter(matchesVerdict)
         .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [groups, view, me, filterSevs, filterVerdicts, sort],
+    [groups, view, me, filterSevs, filterVerdicts, sort, optimisticAcked, hideAcked],
   );
 
   const visIds = visible.map((g) => g.id);
@@ -1641,6 +1651,7 @@ export function Alerts() {
         navigateToPermalink={(id) => navigate(`/investigation/${id}`, { state: { from: '/alerts' } })}
         onReHunt={openDrawer}
         onComplete={onDrawerComplete}
+        onAcked={onDrawerAcked}
       />
     </div>
   );
@@ -1707,6 +1718,7 @@ function AlertDrawer({
   navigateToPermalink,
   onReHunt,
   onComplete,
+  onAcked,
 }: {
   drawerId: string | null;
   starting: AlertGroup | null;
@@ -1714,6 +1726,7 @@ function AlertDrawer({
   navigateToPermalink: (id: string) => void;
   onReHunt: (id: string) => void;
   onComplete: () => void;
+  onAcked?: (ruleName: string) => void;
 }) {
   const [tick, setTick] = useState(0);
   const [cancelling, setCancelling] = useState(false);
@@ -1788,7 +1801,7 @@ function AlertDrawer({
       {isStarting && <LoadingState label={`Starting investigation on ${starting?.name}…`} />}
       {drawerId && loading && !inv && <LoadingState label="Loading investigation…" />}
       {error && <div className="p-4"><ErrorState error={error} /></div>}
-      {inv && <Investigation inv={inv} layout="drawer" onReHunt={onReHunt} onVerdictApplied={() => setTick((x) => x + 1)} />}
+      {inv && <Investigation inv={inv} layout="drawer" onReHunt={onReHunt} onVerdictApplied={() => setTick((x) => x + 1)} onAcked={onAcked} />}
     </Drawer>
   );
 }

@@ -87,6 +87,11 @@ class Investigation(Base):
     started_by: Mapped[str] = mapped_column(String(64), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Operator acknowledgement of a pipeline-error run (the fallback marker in
+    # ``report`` — see ``is_pipeline_fallback``). Non-NULL silences the run in
+    # the Dashboard's "N pipeline errors" KPI; the row itself stays a fallback
+    # (the flag is history, the ack is presentation). Migration 0021.
+    error_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
 
 
 class InvestigationEvent(Base):

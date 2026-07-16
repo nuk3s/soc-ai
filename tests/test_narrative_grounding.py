@@ -153,3 +153,26 @@ def test_caveat_text_is_marked() -> None:
     """The appended caveat is clearly marked as unverified."""
     assert "Unverified" in UNVERIFIED_CAVEAT
     assert "hypothesis" in UNVERIFIED_CAVEAT
+
+
+def test_scoped_caveat_names_the_ungrounded_artifacts() -> None:
+    """When the turn RAN tools, the blanket 'not backed by a tool result'
+    caveat contradicts the visible tool-call footer (dogfood 2026-07-15).
+    The scoped variant names the specific suspect claims instead."""
+    from soc_ai.agent.narrative_grounding import scoped_unverified_caveat
+
+    caveat = scoped_unverified_caveat(["ad.local", "DESKTOP-JSM4N2P"])
+    assert "ad.local" in caveat
+    assert "DESKTOP-JSM4N2P" in caveat
+    assert "verify" in caveat.lower()
+    # It must NOT claim the whole reply lacked tool backing.
+    assert "was not backed by a tool result" not in caveat
+
+
+def test_scoped_caveat_caps_the_artifact_list() -> None:
+    from soc_ai.agent.narrative_grounding import scoped_unverified_caveat
+
+    caveat = scoped_unverified_caveat([f"host-{i}.corp" for i in range(10)])
+    assert "host-0.corp" in caveat
+    assert "host-9.corp" not in caveat  # capped, not an unbounded dump
+    assert "…" in caveat

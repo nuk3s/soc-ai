@@ -622,7 +622,7 @@ async def _fire_quality_alarm(
         await notify.fire_safe(event, settings, audit)
 
 
-def _eval_nightly(args: argparse.Namespace) -> int:  # noqa: PLR0915 - one place that wires the whole nightly
+def _eval_nightly(args: argparse.Namespace) -> int:
     """Nightly quality micro-eval: a tiny real-alert batch, trended locally.
 
     Thin orchestration over the existing batch machinery (`validate-batch`'s
@@ -647,8 +647,10 @@ def _eval_nightly(args: argparse.Namespace) -> int:  # noqa: PLR0915 - one place
     NO synth scenarios and NO meta-analysis — the nightly is a cheap smoke-
     trend over real traffic, not a benchmark.
 
-    Scheduling is the HOST's job (cron → ``docker exec``, see
-    docs/DOCKER.md); soc-ai deliberately ships no in-app scheduler for this.
+    Scheduling: either the in-app scheduler (Config → Quality →
+    ``eval_nightly_enabled``, runs daily at ``eval_nightly_hour_utc``) or
+    host cron → ``docker exec`` (see docs/DOCKER.md). Both call the same
+    :func:`soc_ai.eval.nightly.run_eval_nightly` core.
 
     Exit codes:
       0   ok — snapshot written (a fired alarm still exits 0: the run worked)
@@ -657,7 +659,7 @@ def _eval_nightly(args: argparse.Namespace) -> int:  # noqa: PLR0915 - one place
           fully-broken engine is exactly what the trend must record)
       5   unexpected internal error
     """
-    from pathlib import Path  # noqa: PLC0415 - lazy
+    from soc_ai.eval.nightly import run_eval_nightly  # noqa: PLC0415 - lazy
 
     settings = get_settings()
 
@@ -671,159 +673,48 @@ def _eval_nightly(args: argparse.Namespace) -> int:  # noqa: PLR0915 - one place
     else:
         mode = "graded" if settings.oracle_enabled else "local"
 
-    # Clamp to the documented bounds even for env-sourced values: the config
-    # console enforces [1,10] / [0.05,0.5], but a stray .env must not turn the
-    # unattended nightly into an hour-long batch or a hair-trigger pager.
-    n = max(1, min(10, settings.quality_nightly_n))
-    alarm_drop = max(0.05, min(0.5, settings.quality_alarm_drop))
-    oql = args.oql or settings.webui_alerts_query
-
-    print(
-        f"{_C['dim']}eval-nightly · mode={mode} n={n} oql={oql!r}{_C['reset']}",
-        file=sys.stderr,
-        flush=True,
-    )
-
     def _emit(line: str) -> None:
         print(f"{_C['dim']}{line}{_C['reset']}", file=sys.stderr, flush=True)
 
-    async def _go() -> int:
-        import functools  # noqa: PLC0415 - lazy
-
-        from soc_ai.eval.batch import BatchConfig, run_batch  # noqa: PLC0415 - lazy
-        from soc_ai.eval.harness import run as harness_run  # noqa: PLC0415 - lazy
-        from soc_ai.eval.quality import (  # noqa: PLC0415 - lazy
-            TrendPoint,
-            compute_snapshot_metrics,
-            detect_regression,
-        )
-        from soc_ai.eval.report import build_report, load_index  # noqa: PLC0415 - lazy
-        from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
-        from soc_ai.store import quality as quality_store  # noqa: PLC0415 - lazy
-        from soc_ai.store.db import (  # noqa: PLC0415 - lazy
-            make_engine,
-            make_sessionmaker,
-            run_migrations,
-        )
-
-        cfg = BatchConfig(
-            oql=oql,
-            n=n,
-            # Concurrency 1: the nightly runs unattended on possibly-shared
-            # inference infra — it must never contend with live triage.
-            concurrency=1,
-            out_dir=Path(args.out_dir),
+    result = asyncio.run(
+        run_eval_nightly(
+            settings,
+            mode=mode,
+            oql=args.oql,
+            out_dir=args.out_dir,
             per_run_timeout_s=args.per_run_timeout_s,
+            emit=_emit,
+            # Module-global reference resolved here at call time, so tests
+            # patching `cli._fire_quality_alarm` keep intercepting the alarm.
+            fire_alarm=_fire_quality_alarm,
         )
+    )
+    rc = result.exit_code
 
-        elastic = ElasticClient(settings)
-        try:
-            try:
-                summary = await run_batch(
-                    cfg,
-                    settings=settings,
-                    elastic=elastic,
-                    # grade=False keeps the per-alert oracle call OUT of local
-                    # mode — the whole zero-egress contract hangs on this kwarg.
-                    runner=functools.partial(harness_run, grade=(mode == "graded")),
-                    progress=_emit,
-                )
-            except RuntimeError as e:
-                print(f"{_C['red']}eval-nightly failed{_C['reset']}: {e}", file=sys.stderr)
-                return 5
-            except Exception as e:
-                print(
-                    f"{_C['red']}eval-nightly failed (transport){_C['reset']}: "
-                    f"{type(e).__name__}: {e}",
-                    file=sys.stderr,
-                )
-                return 5
+    if rc == 5:
+        print(f"{_C['red']}{result.detail}{_C['reset']}", file=sys.stderr)
+    elif rc == 2:
+        print(f"{_C['yellow']}{result.detail}{_C['reset']}", file=sys.stderr)
+    elif result.metrics is not None:
+        metrics = result.metrics
 
-            if summary.n_planned == 0:
-                print(
-                    f"{_C['yellow']}no eligible alerts for {oql!r} — "
-                    f"no snapshot written{_C['reset']}",
-                    file=sys.stderr,
-                )
-                return 2
-            if summary.aborted_reason:
-                # Still record the point below: a fully-broken engine (every
-                # run failing) is precisely the regression the trend exists
-                # to catch — swallowing it would blind the alarm.
-                print(f"{_C['red']}{summary.aborted_reason}{_C['reset']}", file=sys.stderr)
+        def _pct(v: float | None) -> str:
+            return "—" if v is None else f"{v * 100:.0f}%"
 
-            # Aggregate (pure; no oracle, no meta-analysis) + reduce to a point.
-            _json_path, _md_path, agg = build_report(summary.batch_dir)
-            rows = load_index(summary.batch_dir)
-            metrics = compute_snapshot_metrics(rows, agg, mode=mode)
-
-            # Trend: read same-mode history, detect, insert + prune in one txn.
-            engine = make_engine(settings)
-            try:
-                # The CLI may run before the app ever booted against this
-                # store (fresh install, cron-first) — same idiom as
-                # discover-internal-identifiers.
-                await run_migrations(engine)
-                maker = make_sessionmaker(engine)
-                async with maker() as db:
-                    history = await quality_store.recent_snapshots(db, limit=7, mode=mode)
-                    reasons = detect_regression(
-                        metrics,
-                        [
-                            TrendPoint(
-                                agreement_rate=h.agreement_rate,
-                                fallback_rate=h.fallback_rate,
-                            )
-                            for h in history
-                        ],
-                        alarm_drop=alarm_drop,
-                    )
-                    await quality_store.insert_snapshot(
-                        db,
-                        mode=mode,
-                        n_ok=metrics.n_ok,
-                        n_error=metrics.n_error,
-                        agreement_rate=metrics.agreement_rate,
-                        fallback_rate=metrics.fallback_rate,
-                        error_rate=metrics.error_rate,
-                        verdict_counts=metrics.verdict_counts,
-                        latency_p50_ms=metrics.latency_p50_ms,
-                        batch_dir=str(summary.batch_dir),
-                        alarmed=bool(reasons),
-                        alarm_reasons=reasons or None,
-                    )
-            finally:
-                with contextlib.suppress(Exception):
-                    await engine.dispose()
-
-            def _pct(v: float | None) -> str:
-                return "—" if v is None else f"{v * 100:.0f}%"
-
-            print(
-                f"{_C['bold']}quality snapshot{_C['reset']} ({mode}) — "
-                f"ok={metrics.n_ok} err={metrics.n_error} · "
-                f"agreement={_pct(metrics.agreement_rate)} · "
-                f"fallback={_pct(metrics.fallback_rate)} · "
-                f"error={_pct(metrics.error_rate)} · "
-                f"p50={metrics.latency_p50_ms or '—'}ms\n"
-                f"{_C['dim']}batch: {summary.batch_dir}{_C['reset']}",
-                file=sys.stderr,
-            )
-
-            if reasons:
-                print(f"{_C['bold']}{_C['red']}QUALITY REGRESSION{_C['reset']}", file=sys.stderr)
-                for r in reasons:
-                    print(f"  {_C['yellow']}- {r}{_C['reset']}", file=sys.stderr)
-                await _fire_quality_alarm(
-                    settings, elastic=elastic, mode=mode, reasons=reasons, metrics=metrics
-                )
-
-            return 4 if summary.aborted_reason else 0
-        finally:
-            with contextlib.suppress(Exception):
-                await elastic.aclose()
-
-    rc = asyncio.run(_go())
+        print(
+            f"{_C['bold']}quality snapshot{_C['reset']} ({result.mode}) — "
+            f"ok={metrics.n_ok} err={metrics.n_error} · "
+            f"agreement={_pct(metrics.agreement_rate)} · "
+            f"fallback={_pct(metrics.fallback_rate)} · "
+            f"error={_pct(metrics.error_rate)} · "
+            f"p50={metrics.latency_p50_ms or '—'}ms\n"
+            f"{_C['dim']}batch: {result.batch_dir}{_C['reset']}",
+            file=sys.stderr,
+        )
+        if result.alarm_reasons:
+            print(f"{_C['bold']}{_C['red']}QUALITY REGRESSION{_C['reset']}", file=sys.stderr)
+            for r in result.alarm_reasons:
+                print(f"  {_C['yellow']}- {r}{_C['reset']}", file=sys.stderr)
     if rc == 0:
         # The nightly only trends if something schedules it — hand the operator
         # the exact host-cron line (docs/DOCKER.md carries the same one).

@@ -1158,6 +1158,18 @@ class Settings(BaseSettings):
     real regression until the median itself decays. Bounded [0.05, 0.5] in
     the config console; the CLI clamps the same way."""
 
+    eval_nightly_enabled: bool = False
+    """Master switch for the IN-APP nightly eval scheduler: run the quality
+    micro-eval once a day at ``eval_nightly_hour_utc`` without any host cron
+    (schedulable from the UI — Config → Quality). Off by default (recurring
+    LLM cost is an explicit opt-in, like scheduled hunts); host cron remains
+    a supported alternative — both paths share the same single-flight slot
+    logic through :func:`soc_ai.eval.nightly.run_eval_nightly`."""
+
+    eval_nightly_hour_utc: int = 3
+    """UTC hour (0-23) the in-app scheduler runs the nightly eval at. The run
+    fires the first wake at/after this hour, at most once per UTC day."""
+
     # ---- validators ---------------------------------------------------
 
     @field_validator(

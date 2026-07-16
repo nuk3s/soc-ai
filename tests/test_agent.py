@@ -4642,6 +4642,24 @@ class TestShouldEscalateToOracle:
         report = self._report(verdict="needs_more_info", confidence=0.4)
         assert self._gate(report, enriched, settings) is True
 
+    def test_pipeline_fallback_never_escalates(self) -> None:
+        """A pipeline-fallback placeholder is a MECHANICAL failure, not a model
+        opinion — there is nothing for the Oracle to adjudicate. Its verdict is
+        needs_more_info (which condition 1 would otherwise escalate), so the
+        fallback guard must fire first. Observed: heavy-model tokens burnt on
+        'Oracle did not return a verdict' for a failed run (dogfood 2026-07-15)."""
+        from soc_ai.triage_models import PIPELINE_FALLBACK_PROVENANCE
+
+        settings = _oracle_settings()
+        enriched = _non_malware_benign_enriched()
+        report = self._report(verdict="needs_more_info", confidence=0.3)
+        report.resolution = {
+            "provenance": PIPELINE_FALLBACK_PROVENANCE,
+            "phase": "synth_first_round1",
+            "error_type": "RuntimeError",
+        }
+        assert self._gate(report, enriched, settings) is False
+
     def test_malware_signal_fp_escalates(self) -> None:
         """Malware-signal rule + false_positive (zero-tool path) → escalate (condition 2)."""
         settings = _oracle_settings()

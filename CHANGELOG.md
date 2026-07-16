@@ -6,6 +6,83 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-16
+
+A dogfood-driven release: a full analyst shift on the live deployment produced
+fourteen findings, and this release fixes all of them plus the follow-ups.
+
+### Added
+
+- **Pipeline errors are now clickable and dismissible.** The Dashboard's
+  "N pipeline errors" note deep-links to the pre-filtered Investigations list;
+  each fallback run's detail page has a **Dismiss** button beside Re-run
+  (`POST /investigations/{id}/dismiss-error`, new `error_dismissed_at` column,
+  migration 0021). A fallback run superseded by a successful re-run no longer
+  counts — re-running *is* the fix. The pipeline-error filter also surfaces
+  superseded (non-primary) runs instead of hiding them under their primary.
+- **Deep re-run.** Re-running a "heuristic · no tools" verdict used to repeat
+  the fast path. `POST /hunt` gained a per-run `deep` flag that forces the
+  full tool-driven loop, and the drawer offers **Deep re-run** whenever the
+  completed run made zero tool calls.
+- **⌘K entity search.** The palette now searches investigations (rule name,
+  src/dst IP, id → permalink) and alert groups in addition to screens and
+  actions — typing a rule fragment or an IP finds the thing you're looking at.
+- **Completion notifications.** The bell lists last-24h completed
+  investigations (verdict + tone) and finished hunts (finding count) as
+  durable, dismissible items with permalinks — the badge can no longer
+  advertise something the panel can't show, and a 17-minute hunt now tells
+  you when it lands.
+- **Detection-tuning suggestions are surfaced.** A Dashboard panel shows the
+  count of pending mute recommendations (`GET /detection-tuning/summary`) and
+  links to Config → Detection tuning; a verdict that cites the rule-tuning
+  tool gets a direct "review the suggestion" link. Previously the
+  recommendations sat unseen while auto-investigate kept spending runs on
+  rules already known to be benign noise.
+- **Pending acks explain themselves.** When auto-ack was armed but held back
+  (high/critical severity or exploit-class guard, or below the confidence
+  threshold) the pending action says why (`auto_ack_skipped` event).
+- **Scheduled-maintenance panel.** `GET /maintenance` + Config → System →
+  Scheduled maintenance show the observed facts of the host cron jobs: backup
+  archives in the data volume (name / size / time) and blocklist-feed
+  freshness — with an honest "cron has not run" cold state.
+- **Verdict quality is schedulable from the UI.** The nightly micro-eval core
+  was extracted from the CLI (`soc_ai/eval/nightly.py`) and is now runnable
+  three ways sharing one single-flight slot: the existing `soc-ai
+  eval-nightly` CLI (unchanged flags/exit codes), a **Run now** button on the
+  Dashboard's Verdict-quality card (`POST /quality/eval/run` + status
+  polling), and an in-app scheduler (`eval_nightly_enabled` +
+  `eval_nightly_hour_utc`, Config → Quality) that runs once per UTC day and
+  defers to a snapshot that already landed.
+
+### Fixed
+
+- **The recommended-action ACK is group-scoped.** Executing "Acknowledge
+  alert" acked one event while the settled bar acked the whole group — the
+  queue never shrank after "Executed ✓". It now acknowledges every unacked
+  event of the detection (same contract as `/alerts/ack-group`), reports the
+  count, and the Alerts list hides the group optimistically while the ES
+  aggregation catches up (re-surfacing on newer events).
+- **The Oracle is never consulted on a pipeline-fallback run.** A mechanical
+  failure placeholder carries `needs_more_info`, which tripped the escalation
+  gate and burned heavy-model tokens on "Oracle did not return a verdict".
+- **Chat's unverified caveat is scoped when tools ran.** The blanket "not
+  backed by a tool result" no longer contradicts a visible tool-call footer;
+  it names the specific ungrounded artifacts instead. Zero-tool turns keep
+  the blanket wording.
+- **The settled-action bar is suppressed on fallback runs** — no more
+  "VERDICT SETTLED — TAKE ACTION" directly under "this run failed before
+  reaching a verdict".
+- **Markdown renders where markdown is shown.** Model-reasoning traces render
+  through the Markdown component; runbooks open in rendered preview (Write
+  one click away); runbook list excerpts strip markdown syntax.
+- **Filtered-empty investigation lists say so** instead of rendering a blank
+  table when every match was tucked under a filtered-out primary.
+- Executed-action attribution shows the real username (was hardcoded
+  "analyst"); backtest results show when they ran; console-started hunts read
+  "kind: manual"; auto-triage skip counts explain themselves ("74 verdict
+  inherited · 9 already triaged"); Notifications/Backtest/Runbooks got their
+  missing breadcrumbs; icon-only chrome buttons got aria-labels.
+
 ## [1.1.1] - 2026-07-11
 
 ### Added

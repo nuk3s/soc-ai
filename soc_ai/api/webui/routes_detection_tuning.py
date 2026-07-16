@@ -100,6 +100,29 @@ async def get_detection_tuning(request: Request) -> DetectionTuningOut:
     )
 
 
+class DetectionTuningSummaryOut(BaseModel):
+    # Actionable mute recommendations: recommendation == 'mute' and not already
+    # muted. Feeds the Dashboard nudge so the suggestions stop living unseen in
+    # Config while auto-investigate keeps paying for runs on the same rules.
+    pending: int
+
+
+@router.get(
+    "/detection-tuning/summary",
+    response_model=DetectionTuningSummaryOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_detection_tuning_summary(request: Request) -> DetectionTuningSummaryOut:
+    """Count of pending (not-yet-applied) mute recommendations — the Dashboard nudge."""
+    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
+
+    nominations = await dt.nominate(request.app.state)
+    pending = sum(
+        1 for n in nominations if n.get("recommendation") == "mute" and not n.get("already_muted")
+    )
+    return DetectionTuningSummaryOut(pending=pending)
+
+
 @router.post(
     "/detection-tuning/override",
     response_model=DetectionOverrideOut,

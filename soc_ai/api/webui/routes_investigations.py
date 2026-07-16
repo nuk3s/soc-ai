@@ -100,6 +100,11 @@ class InvestigationRowOut(BaseModel):
     # chip (not the amber Needs-info pill), makes it filterable, and the Dashboard
     # excludes it from the Needs-info KPI.
     fallback: bool = False
+    # Operator ack of a fallback run (POST /investigations/{id}/dismiss-error).
+    # The Dashboard's "N pipeline errors" KPI counts rows where `fallback` is
+    # True AND this is False — the row stays a pipeline error historically; the
+    # ack only silences the dashboard nag.
+    errorDismissed: bool = False
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -138,6 +143,7 @@ def _row(
         # `getattr` guard: list_recent yields ORM rows (report is the JSON column),
         # but tests mock rows with SimpleNamespace and no `report` attr.
         fallback=is_pipeline_fallback(getattr(inv, "report", None)),
+        errorDismissed=getattr(inv, "error_dismissed_at", None) is not None,
     )
 
 
@@ -278,6 +284,7 @@ async def get_investigation(
         # fallback run; drives the drawer's "failed before reaching a verdict"
         # panel instead of the amber Needs-info block.
         fallback=_timeline._fallback_out(report),
+        errorDismissed=inv.error_dismissed_at is not None,
         alertAcked=alert_acked,
     )
 
@@ -300,6 +307,33 @@ async def cancel_hunt(inv_id: str, request: Request) -> dict[str, bool]:
             },
         )
     return {"cancelled": True}
+
+
+@router.post("/investigations/{inv_id}/dismiss-error")
+async def dismiss_pipeline_error(inv_id: str, request: Request) -> dict[str, bool]:
+    """Acknowledge a pipeline-error run so the Dashboard KPI stops counting it.
+
+    The run's fallback marker is untouched — it stays visible under the
+    Investigations "Pipeline error" filter as a historical fact; only the
+    dashboard nag is silenced. Idempotent (a repeat ack is a no-op 200).
+    404 for an unknown id; 409 when the run is not a pipeline fallback (there
+    is no error to dismiss — the button is only shown on fallback runs, but we
+    guard server-side too).
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        inv = await db.get(Investigation, inv_id)
+        if inv is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        if not is_pipeline_fallback(inv.report):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "not_pipeline_error",
+                    "hint": "this run is not a pipeline-failure fallback — nothing to dismiss",
+                },
+            )
+        await inv_svc.dismiss_error(db, inv_id)
+    return {"ok": True}
 
 
 @router.delete("/investigations/{inv_id}", dependencies=[Depends(require_admin_api)])

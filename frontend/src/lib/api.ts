@@ -815,11 +815,14 @@ export function getHealth(): Promise<Health> {
 
 // ---- mutations ------------------------------------------------------------
 
-/** Start a background investigation for an alert; resolves to the new INV id. */
-export function startHunt(alertId: string): Promise<string> {
-  return post<{ investigation_id: string }>('/hunt', { alert_id: alertId }).then(
-    (r) => r.investigation_id,
-  );
+/** Start a background investigation for an alert; resolves to the new INV id.
+ * `deep` forces the full tool-driven loop for this run — the "deep re-run"
+ * of a heuristic (zero-tool) verdict. */
+export function startHunt(alertId: string, opts?: { deep?: boolean }): Promise<string> {
+  return post<{ investigation_id: string }>('/hunt', {
+    alert_id: alertId,
+    ...(opts?.deep ? { deep: true } : {}),
+  }).then((r) => r.investigation_id);
 }
 
 /** Cancel an in-flight hunt (lands the run as `cancelled`). 404 if not running. */
@@ -839,6 +842,16 @@ export function requestMoreInfo(invId: string): Promise<string> {
   return post<{ investigation_id: string }>(
     `/investigations/${encodeURIComponent(invId)}/request-more-info`,
   ).then((r) => r.investigation_id);
+}
+
+/**
+ * Acknowledge a pipeline-error run so the Dashboard KPI stops counting it.
+ * The run stays a fallback historically (Pipeline-error filter still shows it);
+ * only the dashboard nag is silenced. Idempotent; 409 if the run isn't a
+ * pipeline fallback.
+ */
+export function dismissInvestigationError(invId: string): Promise<{ ok: boolean }> {
+  return post<{ ok: boolean }>(`/investigations/${encodeURIComponent(invId)}/dismiss-error`, {});
 }
 
 /** Delete an investigation and its events + chat (admin only). */
@@ -1193,6 +1206,51 @@ export function removeIdentifier(id: number): Promise<{ ok: boolean }> {
  */
 export function dismissIdentifier(id: number): Promise<{ ok: boolean }> {
   return post<{ ok: boolean }>(`/internal-identifiers/${id}/dismiss`, {});
+}
+
+export interface BackupArchive {
+  name: string;
+  size_bytes: number;
+  modified: string;
+}
+
+export interface Maintenance {
+  backups: BackupArchive[];
+  backups_dir: string;
+  blocklists_dir: string;
+  blocklists_refreshed: string | null;
+  blocklist_files: number;
+}
+
+/** Observed maintenance facts (backup archives, blocklist freshness) — admin. */
+export function getMaintenance(): Promise<Maintenance> {
+  return request<Maintenance>('/maintenance');
+}
+
+export interface QualityEvalStatus {
+  running: boolean;
+  last_run: string | null;
+  last_exit_code: number | null;
+  last_detail: string;
+  note?: string | null;
+}
+
+/** Start the quality micro-eval now (single-flight, background) — admin. */
+export function startQualityEval(): Promise<QualityEvalStatus> {
+  return post<QualityEvalStatus>('/quality/eval/run');
+}
+
+/** Poll the quality-eval run state — admin. */
+export function getQualityEvalStatus(): Promise<QualityEvalStatus> {
+  return request<QualityEvalStatus>('/quality/eval/status');
+}
+
+/**
+ * Count of pending detection-tuning mute recommendations (admin-gated).
+ * Feeds the Dashboard nudge; callers treat a 403/error as "hide the nudge".
+ */
+export function getDetectionTuningSummary(): Promise<{ pending: number }> {
+  return request<{ pending: number }>('/detection-tuning/summary');
 }
 
 /** Launch a background discovery scan; returns the (running) status. */

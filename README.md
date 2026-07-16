@@ -10,7 +10,7 @@
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
-### [▶ Try the live demo](https://soc-ai-demo.onrender.com/)
+### [▶ Try the live demo →](https://soc-ai-demo.onrender.com/)
 
 Click through recorded investigations, hunts, and a backtest in the real console — no install, no login, nothing leaves the box.
 

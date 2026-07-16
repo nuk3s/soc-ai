@@ -364,6 +364,71 @@ def test_investigation_detail_exposes_fallback_marker(client: TestClient) -> Non
     assert nmi["fallback"] is None
 
 
+def _seed_finalized_run(client: TestClient, report: dict[str, object]) -> str:
+    """Persist a complete needs_more_info run carrying *report* via the real store."""
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-fb", started_by="tester", rule_name="ET Truncated"
+            )
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.3,
+                rationale="fallback",
+                report=report,
+            )
+            return inv.id
+
+    return asyncio.run(_seed())
+
+
+def test_dismiss_error_acks_pipeline_fallback_run(client: TestClient) -> None:
+    """POST /investigations/{id}/dismiss-error acknowledges a pipeline-error run:
+    200 + idempotent, and the list row / detail flip `errorDismissed` → True so
+    the Dashboard KPI (which counts `fallback and not errorDismissed`) clears."""
+    inv_id = _seed_finalized_run(client, _FALLBACK_REPORT)
+
+    # Pre-dismiss: surfaced as a LIVE pipeline error.
+    row = {r["id"]: r for r in client.get("/api/v1/investigations").json()}[inv_id]
+    assert row["fallback"] is True
+    assert row["errorDismissed"] is False
+
+    resp = client.post(f"/api/v1/investigations/{inv_id}/dismiss-error")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+    row = {r["id"]: r for r in client.get("/api/v1/investigations").json()}[inv_id]
+    assert row["fallback"] is True  # still historically a pipeline error…
+    assert row["errorDismissed"] is True  # …but acknowledged
+    detail = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert detail["errorDismissed"] is True
+
+    # Idempotent: a second dismiss is a no-op 200, not a conflict.
+    resp2 = client.post(f"/api/v1/investigations/{inv_id}/dismiss-error")
+    assert resp2.status_code == 200
+    assert resp2.json() == {"ok": True}
+
+
+def test_dismiss_error_rejects_non_fallback_run(client: TestClient) -> None:
+    """A genuine needs_more_info run has no pipeline error to dismiss → 409."""
+    inv_id = _seed_finalized_run(client, {"verdict": "needs_more_info", "citations": ["ev-1"]})
+    resp = client.post(f"/api/v1/investigations/{inv_id}/dismiss-error")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_pipeline_error"
+
+
+def test_dismiss_error_unknown_id_is_404(client: TestClient) -> None:
+    resp = client.post("/api/v1/investigations/NO-SUCH-RUN/dismiss-error")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["reason"] == "not_found"
+
+
 def test_alerts_badge_marks_pipeline_fallback(client: TestClient) -> None:
     """E1.2: a rule whose STANDING verdict run is a pipeline fallback exposes
     `fallback: true` on its alert-group badge (derived from the representative
@@ -1715,13 +1780,17 @@ def test_auto_triage_explicit_severities_override_config_floor(settings_kratos: 
     assert set(captured["severities"]) == {"critical", "high", "medium"}
 
 
-async def _seed_inv(client: TestClient, *, alert_es_id: str, actions: list[dict]) -> str:
+async def _seed_inv(
+    client: TestClient, *, alert_es_id: str, actions: list[dict], rule_name: str | None = None
+) -> str:
     """Persist a completed investigation carrying report.recommended_actions."""
     from soc_ai.store import investigations as inv_svc
 
     maker = client.app.state.db_sessionmaker
     async with maker() as db:
-        inv = await inv_svc.create(db, alert_es_id=alert_es_id, started_by="tester")
+        inv = await inv_svc.create(
+            db, alert_es_id=alert_es_id, started_by="tester", rule_name=rule_name
+        )
         inv.report = {"recommended_actions": actions}
         await db.commit()
         return inv.id
@@ -1816,6 +1885,118 @@ def test_build_actions_marks_persisted_execution_applied() -> None:
     assert _build_actions([failed], report)[1].applied is False
 
 
+def test_maintenance_reports_backups_and_blocklist_freshness(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """The maintenance panel shows OBSERVED facts: the backup archives sitting
+    in the data volume (newest first) and the blocklist feeds' freshness — the
+    cron jobs must be visible in the product, not only in a crontab (user
+    requirement, 2026-07-16)."""
+    import os
+    import time
+
+    settings = client.app.state.settings
+    backups = tmp_path / "data" / "backups"
+    backups.mkdir(parents=True)
+    old = backups / "soc-ai-backup-20260701-0215.tar.gz"
+    old.write_bytes(b"x" * 10)
+    new = backups / "soc-ai-backup-20260716-0215.tar.gz"
+    new.write_bytes(b"y" * 20)
+    os.utime(old, (time.time() - 86400, time.time() - 86400))
+    blocklists = tmp_path / "blocklists"
+    blocklists.mkdir()
+    (blocklists / "tor_exits.txt").write_text("198.51.100.9\n")
+    settings.soc_ai_data_dir = tmp_path / "data"
+    settings.blocklist_data_dir = blocklists
+
+    body = client.get("/api/v1/maintenance").json()
+    assert [b["name"] for b in body["backups"]] == [new.name, old.name]
+    assert body["backups"][0]["size_bytes"] == 20
+    assert body["backups"][0]["modified"]
+    assert body["blocklist_files"] == 1
+    assert body["blocklists_refreshed"] is not None
+
+
+def test_maintenance_empty_dirs_are_not_an_error(client: TestClient, tmp_path: Path) -> None:
+    settings = client.app.state.settings
+    settings.soc_ai_data_dir = tmp_path / "nope"
+    settings.blocklist_data_dir = tmp_path / "also-nope"
+    body = client.get("/api/v1/maintenance").json()
+    assert body["backups"] == []
+    assert body["blocklists_refreshed"] is None
+    assert body["blocklist_files"] == 0
+
+
+def test_notifications_include_recent_completions(client: TestClient) -> None:
+    """The bell must list what it counts: completed investigations and hunts
+    from the last 24h, not just in-flight runs — a badge over an empty panel
+    was the phantom-notification finding (dogfood 2026-07-15)."""
+    import asyncio
+    from datetime import timedelta
+
+    from soc_ai.store import hunts as hunts_svc
+    from soc_ai.store import investigations as inv_svc
+    from soc_ai.store.auth import utcnow
+
+    async def _seed() -> tuple[str, str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            fresh = await inv_svc.create(db, alert_es_id="ev-n1", started_by="t", rule_name="ET N")
+            await inv_svc.finalize(
+                db, fresh.id, status="complete", verdict="false_positive", confidence=0.9
+            )
+            stale = await inv_svc.create(db, alert_es_id="ev-n2", started_by="t", rule_name="ET O")
+            await inv_svc.finalize(db, stale.id, status="complete", verdict="false_positive")
+            # age the stale one out of the 24h window
+            row = await db.get(type(stale), stale.id)
+            row.finished_at = utcnow() - timedelta(hours=30)
+            await db.commit()
+            hunt = await hunts_svc.create(db, objective="find beacons", started_by="t")
+            await hunts_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                report={"findings": [{"title": "f1"}, {"title": "f2"}]},
+            )
+            return fresh.id, stale.id, hunt.id
+
+    fresh_id, stale_id, hunt_id = asyncio.run(_seed())
+    body = client.get("/api/v1/notifications").json()
+    by_id = {n["id"]: n for n in body}
+    assert f"inv-done:{fresh_id}" in by_id
+    assert by_id[f"inv-done:{fresh_id}"]["href"] == f"/investigation/{fresh_id}"
+    assert "false_positive" in by_id[f"inv-done:{fresh_id}"]["title"]
+    assert f"inv-done:{stale_id}" not in by_id  # aged out of the window
+    assert f"hunt-done:{hunt_id}" in by_id
+    assert "2 findings" in by_id[f"hunt-done:{hunt_id}"]["title"]
+    assert by_id[f"hunt-done:{hunt_id}"]["href"] == f"/hunts/{hunt_id}"
+
+
+def test_build_actions_explains_pending_ack_after_auto_ack_skip() -> None:
+    """When auto-ack was enabled but SKIPPED (severity/class guard or below the
+    confidence threshold), the pending ack card carries the reason — the analyst
+    shouldn't have to guess why THIS one waited for a human (dogfood 2026-07-15)."""
+    from soc_ai.api.webui_api import _build_actions
+
+    report = {"recommended_actions": [{"tool_name": "ack_alert", "rationale": "benign"}]}
+
+    high_stakes = SimpleNamespace(kind="auto_ack_skipped", payload={"reason": "high_stakes"})
+    a = _build_actions([high_stakes], report)[0]
+    assert a.applied is False
+    assert a.pendingNote is not None and "require a human" in a.pendingNote
+
+    below = SimpleNamespace(
+        kind="auto_ack_skipped",
+        payload={"reason": "below_threshold", "confidence": 0.6, "threshold": 0.7},
+    )
+    b = _build_actions([below], report)[0]
+    assert b.pendingNote is not None
+    assert "0.60" in b.pendingNote and "0.70" in b.pendingNote
+
+    # No skip event → no note (auto-ack off, or non-FP verdicts).
+    assert _build_actions([], report)[0].pendingNote is None
+
+
 def test_alert_currently_acked_reads_es_and_swallows_errors(settings_kratos: Settings) -> None:
     """Live acked-state probe: True on event.acknowledged, False on miss/error —
     an ES failure must NEVER break the detail page."""
@@ -1875,6 +2056,95 @@ def test_execute_action_acks_and_defaults_alert_id(client: TestClient) -> None:
     # defaulted alert_id reached the tool; auth was injected (signature declares it)
     assert calls[0]["alert_id"] == "bgCT1Z4B9CEm8iACKAkT"
     assert calls[0]["auth"] is not None
+
+
+def test_execute_ack_action_acks_whole_detection_group(client: TestClient) -> None:
+    """The recommended-action ACK is GROUP-scoped: with a rule_name on the run,
+    every unacked event of that detection is acked (same contract as the settled
+    bar / POST /alerts/ack-group) and the detail reports the count — an analyst
+    who clicked "Execute" must not find the group still in the queue."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-grp-1",
+            rule_name="ET TEST Group Rule",
+            actions=[{"tool_name": "ack_alert", "tool_args": {}}],
+        )
+    )
+    events = [SimpleNamespace(es_id=f"es-grp-{i}") for i in range(1, 4)]
+    calls: list[dict] = []
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_group_events",
+            AsyncMock(return_value=events),
+        ),
+        patch(
+            "soc_ai.tools.write_exec.get_tool",
+            return_value=_fake_write_tool(calls, {"acknowledged": True}),
+        ),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+    assert body["status"] == "executed"
+    assert body["detail"] == "Acknowledged 3 alerts in this detection group."
+    assert {c["alert_id"] for c in calls} == {"es-grp-1", "es-grp-2", "es-grp-3"}
+
+
+def test_execute_ack_action_group_already_clear(client: TestClient) -> None:
+    """No unacked events left in the group → ok-with-note, no writes fired."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-clear-1",
+            rule_name="ET TEST Clear Rule",
+            actions=[{"tool_name": "ack_alert", "tool_args": {}}],
+        )
+    )
+    calls: list[dict] = []
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=[])),
+        patch(
+            "soc_ai.tools.write_exec.get_tool",
+            return_value=_fake_write_tool(calls, {"acknowledged": True}),
+        ),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+    assert body["status"] == "executed"
+    assert "already acknowledged" in body["detail"]
+    assert calls == []
+
+
+def test_execute_ack_action_falls_back_to_single_on_es_error(client: TestClient) -> None:
+    """Group fetch failing (ES down) must not break the action — fall back to
+    the single-alert ack so the analyst's click still does something."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-fb-1",
+            rule_name="ET TEST Fallback Rule",
+            actions=[{"tool_name": "ack_alert", "tool_args": {}}],
+        )
+    )
+    calls: list[dict] = []
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_group_events",
+            AsyncMock(side_effect=RuntimeError("es down")),
+        ),
+        patch(
+            "soc_ai.tools.write_exec.get_tool",
+            return_value=_fake_write_tool(calls, {"acknowledged": True}),
+        ),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+    assert body["status"] == "executed"
+    assert body["detail"] == "Alert acknowledged in Security Onion."
+    assert [c["alert_id"] for c in calls] == ["es-fb-1"]
 
 
 def test_execute_action_surfaces_tool_error(client: TestClient) -> None:
@@ -4372,6 +4642,27 @@ def test_hunt_starts_when_alert_id_resolves(client: TestClient) -> None:
     fake_mgr.start.assert_called_once()
     # the resolved rule name is seeded into the hunt so the row is named at birth
     assert fake_mgr.start.call_args.kwargs["rule_name"] == "ET MALWARE Some Rule Name"
+    # a plain hunt is NOT deep — the fast path stays available
+    assert fake_mgr.start.call_args.kwargs["deep"] is False
+
+
+def test_hunt_deep_flag_threads_to_manager(client: TestClient) -> None:
+    """POST /hunt {deep:true} forces the full tool-driven loop for THIS run —
+    re-running a "heuristic · no tools" verdict must be able to go deeper than
+    the heuristic it is double-checking (dogfood 2026-07-15)."""
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="INV-DEEP")
+    with (
+        patch(
+            "soc_ai.api.webui.routes_hunts.resolve_alert_for_hunt",
+            AsyncMock(return_value=(True, "ET X")),
+        ),
+        patch("soc_ai.api.webui_api.hunt_manager.get_manager", return_value=fake_mgr),
+    ):
+        resp = client.post("/api/v1/hunt", json={"alert_id": "real-es-doc-1", "deep": True})
+
+    assert resp.status_code == 200
+    assert fake_mgr.start.call_args.kwargs["deep"] is True
 
 
 def testresolve_alert_for_hunt_returns_existence_and_rule_name() -> None:

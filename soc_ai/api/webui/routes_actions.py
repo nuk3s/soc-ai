@@ -24,8 +24,14 @@ from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
 from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
+from soc_ai.webui import alerts_query as aq
 
 _LOGGER = logging.getLogger(__name__)
+
+# Window for the group-scoped ack below. The drawer doesn't know which time
+# window the Alerts screen is showing, so use a generous fixed one — wide
+# enough to cover any realistic queue view, still bounded by _ACK_CAP.
+_GROUP_ACK_RANGE = "7d"
 
 
 # ── Advisory action execution ──────────────────────────────────────────────
@@ -56,6 +62,63 @@ def _action_detail(tool_name: str, result: Any) -> str:
         case_id = result.get("case_id") or ""
         return f"Comment added to case {case_id}." if case_id else "Comment added to case."
     return ""
+
+
+async def _group_ack_result(
+    request: Request,
+    *,
+    rule_name: str,
+    settings: Settings,
+    elastic: ElasticClient,
+    user: str,
+) -> tuple[str, int] | None:
+    """Group-scoped ack: acknowledge every unacked event of *rule_name*.
+
+    The recommendation card says "Acknowledge alert", but the analyst's intent
+    is "this detection is handled" — a single-event ack left the rest of the
+    group sitting in the queue after a successful "Executed ✓" (dogfood
+    2026-07-15). Same contract as the settled bar / POST /alerts/ack-group.
+
+    Returns ``(detail, acked)`` on success (``acked`` may be 0 when the group
+    was already clear), or ``None`` when the group fetch failed — the caller
+    falls back to the single-alert ack so the click still does something.
+    """
+    from soc_ai.api.webui.routes_alert_actions import _ACK_CAP, _ack_many  # noqa: PLC0415
+
+    try:
+        events = await aq.fetch_group_events(
+            elastic,
+            settings,
+            rule_name=rule_name,
+            kind="suricata",
+            time_range=_GROUP_ACK_RANGE,
+            size=_ACK_CAP,
+            time_zone=settings.so_timezone,
+            hide_acked=True,
+        )
+    except Exception:
+        _LOGGER.warning(
+            "group ack: event fetch failed for rule %r — falling back to single-alert ack",
+            rule_name,
+            exc_info=True,
+        )
+        return None
+    if not events:
+        return ("All alerts in this detection group were already acknowledged.", 0)
+    acked, failed = await _ack_many(
+        request,
+        [ev.es_id for ev in events],
+        session_id=f"action-ack-group:{rule_name}",
+        caller=user,
+    )
+    if failed:
+        detail = (
+            f"Acknowledged {acked} of {acked + failed} alerts in this "
+            f"detection group ({failed} failed)."
+        )
+    else:
+        detail = f"Acknowledged {acked} alert{'s' if acked != 1 else ''} in this detection group."
+    return (detail, acked)
 
 
 async def _persist_action_executed(
@@ -119,6 +182,7 @@ async def execute_action(
         inv, events = got
         report = inv.report or {}
         alert_es_id = inv.alert_es_id
+        rule_name = inv.rule_name
         inv_real_id = inv.id
         next_seq = max((e.sequence for e in events), default=0) + 1
 
@@ -156,6 +220,33 @@ async def execute_action(
         tool_args["alert_id"] = alert_es_id
 
     user = await identify_caller(request)
+
+    # Group-scoped ack (rule-keyed): the analyst's intent is "this detection is
+    # handled", not "ack one event of it" — a single-event ack left the rest of
+    # the group in the queue after a successful "Executed ✓". Falls back to the
+    # single-alert ack when the run has no rule_name or the group fetch fails.
+    if tool_name == "ack_alert" and rule_name:
+        group = await _group_ack_result(
+            request, rule_name=rule_name, settings=settings, elastic=elastic, user=user
+        )
+        if group is not None:
+            detail, acked = group
+            await _persist_action_executed(
+                request,
+                inv_real_id,
+                next_seq,
+                {
+                    "index": index,
+                    "tool_name": tool_name,
+                    "title": title,
+                    "success": True,
+                    "by": user,
+                    "detail": detail,
+                    "group": True,
+                    "acked": acked,
+                },
+            )
+            return ExecuteActionResult(status="executed", title=title, detail=detail)
 
     # Acking an alert that is ALREADY acked in SO (group-ack, auto-ack of
     # another run, the SO web UI): ok-with-note, and persist the execution so

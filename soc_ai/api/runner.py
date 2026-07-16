@@ -157,6 +157,7 @@ async def run_recorded(
     cancel_token: CancelToken | None = None,
     rule_name: str | None = None,
     focus_hint: str | None = None,
+    deep: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Call investigate() and tee it through the recorder.
 
@@ -167,11 +168,15 @@ async def run_recorded(
     ``focus_hint`` (optional): prior open questions from a re-launched
     ``needs_more_info`` investigation ("request more info") — threaded into
     ``investigate()`` so the fresh run targets those gaps.
+
+    ``deep`` (optional): force the full tool-driven loop for this run
+    (the analyst's "deep re-run" of a heuristic verdict).
     """
     event_gen = investigate(
         alert_id,
         ctx=ctx,
         focus_hint=focus_hint,
+        deep=deep,
     )
 
     async for name, data in recorded_run(

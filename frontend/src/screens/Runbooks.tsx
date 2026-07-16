@@ -14,6 +14,7 @@ import {
   updateRunbook,
 } from '../lib/api';
 import { Markdown } from '../components/Markdown';
+import { mdToPlainExcerpt } from '../lib/mdExcerpt';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
 import { useAsync } from '../lib/useAsync';
 import { dominantVerdictLabel, formatVerdictMix } from '../lib/verdictMix';
@@ -237,7 +238,10 @@ export function Runbooks() {
   const openEdit = (rb: Runbook) => {
     setActionError('');
     setDraft(toDraft(rb));
-    setPreview(false);
+    // An existing runbook opens RENDERED (it's markdown — reading comes before
+    // editing); the Write toggle is one click away. A new runbook starts in
+    // write mode since there is nothing to render yet.
+    setPreview(true);
     setEditingDraft(rb.draft);
     setEditing(rb.id);
   };
@@ -689,7 +693,8 @@ export function Runbooks() {
                       </div>
                       {rb.content && (
                         <div className="mt-0.5 line-clamp-2 text-[11.5px] leading-[1.4] text-faint">
-                          {rb.content}
+                          {/* a 2-line clamp is no place for raw markdown syntax */}
+                          {mdToPlainExcerpt(rb.content)}
                         </div>
                       )}
                       <div className="mt-1.5 flex flex-wrap gap-1.5">

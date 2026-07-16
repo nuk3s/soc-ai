@@ -890,6 +890,9 @@ async def post_hunt_chat(request: Request, hunt_id: str, body: HuntChatIn2) -> H
 class HuntStartIn(BaseModel):
     # Non-blank: an empty id reaches ES as `ids:[""]` and 500s ("Ids can't be empty").
     alert_id: str = Field(min_length=1)
+    # Force the full tool-driven loop for THIS run (the drawer's "deep re-run"
+    # of a heuristic verdict). Ignored by the demo replay path.
+    deep: bool = False
 
 
 async def resolve_alert_for_hunt(
@@ -980,7 +983,11 @@ async def start_hunt(
         )
     else:
         inv_id = await hunt_manager.get_manager(request.app.state).start(
-            request.app.state, alert_id=body.alert_id, started_by=started_by, rule_name=rule_name
+            request.app.state,
+            alert_id=body.alert_id,
+            started_by=started_by,
+            rule_name=rule_name,
+            deep=body.deep,
         )
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})

@@ -188,6 +188,7 @@ async def _fake_investigate_success(
     *,
     ctx: Any,
     focus_hint: str | None = None,
+    deep: bool = False,
 ) -> AsyncIterator[StepEvent]:
     sid = "fake-at-sid"
     yield StepEvent(
@@ -457,6 +458,7 @@ class TestAutoTriageSingleFlight:
             *,
             ctx: Any,
             focus_hint: str | None = None,
+            deep: bool = False,
         ) -> AsyncIterator[StepEvent]:
             sid = "slow-sid"
             yield StepEvent(
@@ -510,6 +512,7 @@ class TestAutoTriageFailedCountsStreamErrors:
             *,
             ctx: Any,
             focus_hint: str | None = None,
+            deep: bool = False,
         ) -> AsyncIterator[StepEvent]:
             sid = "err-sid"
             yield StepEvent(
@@ -551,6 +554,7 @@ class TestAutoTriageFailedCountsStreamErrors:
             *,
             ctx: Any,
             focus_hint: str | None = None,
+            deep: bool = False,
         ) -> AsyncIterator[StepEvent]:
             sid = "hang-sid"
             yield StepEvent(
@@ -883,6 +887,7 @@ class TestAutoTriageLiveProgress:
             *,
             ctx: Any,
             focus_hint: str | None = None,
+            deep: bool = False,
         ) -> AsyncIterator[StepEvent]:
             sid = "tc-sid"
             yield StepEvent(
@@ -955,6 +960,7 @@ class TestAutoTriageLiveProgress:
             *,
             ctx: Any,
             focus_hint: str | None = None,
+            deep: bool = False,
         ) -> AsyncIterator[StepEvent]:
             sid = "gate-sid"
             yield StepEvent(
@@ -1190,7 +1196,11 @@ class TestMaybeAutoAckFp:
             )
 
         mock_write.assert_not_awaited()
-        assert result is None
+        # The skip is RECORDED with its reason so the drawer can explain why
+        # the pending ack needs a human (dogfood 2026-07-15).
+        assert result is not None
+        assert result.kind == "auto_ack_skipped"
+        assert result.payload["reason"] == "high_stakes"
 
     def test_auto_ack_suppressed_for_malware_class_fp(self) -> None:
         """A confident FP on a malware/exploit-class alert is NOT auto-acked."""
@@ -1220,7 +1230,9 @@ class TestMaybeAutoAckFp:
             )
 
         mock_write.assert_not_awaited()
-        assert result is None
+        assert result is not None
+        assert result.kind == "auto_ack_skipped"
+        assert result.payload["reason"] == "high_stakes"
 
     def test_auto_ack_fires_for_low_severity_benign_class_fp(self) -> None:
         """The benign low-severity info-class FP still auto-acks (cap doesn't over-block)."""
@@ -1265,7 +1277,11 @@ class TestMaybeAutoAckFp:
             )
 
         mock_write.assert_not_awaited()
-        assert result is None
+        assert result is not None
+        assert result.kind == "auto_ack_skipped"
+        assert result.payload["reason"] == "below_threshold"
+        assert result.payload["confidence"] == 0.85
+        assert result.payload["threshold"] == 0.9
 
     def test_auto_ack_fires_at_exact_threshold(self) -> None:
         """A confidence exactly equal to the threshold is accepted."""
@@ -1406,6 +1422,7 @@ class TestAutoTriageProgress:
             *,
             ctx: Any,
             focus_hint: str | None = None,
+            deep: bool = False,
         ) -> AsyncIterator[StepEvent]:
             sid = "pend-sid"
             yield StepEvent(

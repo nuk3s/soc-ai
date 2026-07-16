@@ -688,10 +688,40 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
     ),
     # ---- QUALITY: nightly micro-eval trend + alarm tuning (hot) --------------
-    # Both hot=True: `soc-ai eval-nightly` is a fresh CLI process that reads
-    # Settings (with overrides applied) at startup, and the regression detector
-    # reads quality_alarm_drop per run — so a console save applies to the very
+    # All hot=True: the in-app scheduler loop reads settings fresh each wake,
+    # `soc-ai eval-nightly` is a fresh CLI process, and the regression detector
+    # reads quality_alarm_drop per run — a console save applies to the very
     # next nightly without touching the running server.
+    SettingSpec(
+        key="eval_nightly_enabled",
+        attr="eval_nightly_enabled",
+        type="bool",
+        label="Nightly quality eval (run automatically in-app)",
+        section="Quality",
+        hot=True,
+        help=(
+            "Run the quality micro-eval once a day at the hour below — no host "
+            "cron needed. Each run investigates the sample size below (real "
+            "LLM runs), lands one point on the Dashboard's Verdict-quality "
+            "trend, and alarms on regression. Off = run it manually (the "
+            "Dashboard's Run-now button) or from host cron."
+        ),
+    ),
+    SettingSpec(
+        key="eval_nightly_hour_utc",
+        attr="eval_nightly_hour_utc",
+        type="int",
+        label="Nightly eval hour (UTC)",
+        section="Quality",
+        hot=True,
+        help=(
+            "UTC hour of day the scheduled eval runs at (first wake at/after "
+            "this hour, once per UTC day). Pick a quiet hour — the eval runs "
+            "real investigations at concurrency 1."
+        ),
+        min_value=0,
+        max_value=23,
+    ),
     SettingSpec(
         key="quality_nightly_n",
         attr="quality_nightly_n",
