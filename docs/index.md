@@ -13,7 +13,7 @@ confidence number, and the reasoning that got it there.**
 
 The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway.
 Nothing about your network leaves it, and write-backs stay yours: the agent recommends,
-you execute — the one exception is an audited auto-acknowledge for high-confidence,
+you execute. The one exception is an audited auto-acknowledge for high-confidence,
 low-stakes false positives, on by default and one toggle to turn off. There's an optional cloud "Oracle" for a second opinion
 on the hard ones; it's off until you turn it on, and its input is sanitized first.
 
@@ -62,7 +62,7 @@ See [what the agent can do](AGENT_TOOLS.md) for the full tool surface and its gu
 
 Some questions are bigger than a single detection: *"is anything beaconing to a rare
 external IP?"*, *"are the DCs seeing credential-abuse lockouts?"*, *"APT-X uses technique
-Y — is it showing up here?"* The **Hunt Console** takes an objective in plain English and turns
+Y; is it showing up here?"* The **Hunt Console** takes an objective in plain English and turns
 the same read-only agent loose across many hosts and a time window, then hands back
 **findings + a narrative** mapped to MITRE ATT&CK, rather than a single-alert verdict.
 
@@ -83,8 +83,8 @@ The whole point is that you stay in control of anything that changes state.
 
 - **Reads run freely:** pulling events, context, enrichment, and packets is safe, so the
   agent does it without asking.
-- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment —
-  the agent recommends them and you execute them with a click. One pragmatic carve-out
+- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment.
+  The agent recommends them and you execute them with a click. One pragmatic carve-out
   ships on by default: **confident false positives are auto-acknowledged** (confidence-
   gated, never on critical/high-severity or malware/exploit-class alerts, every
   unattended write audited). `auto_ack_fp_enabled=false` turns it off.
@@ -110,7 +110,7 @@ soc-ai exists so you don't have to make that trade:
 - **Readable reasoning:** every verdict cites the events it rests on, and no
   true/false-positive call stands without evidence from a tool call.
 - **You own every change:** the agent recommends writes and you execute them; the one
-  unattended write — the FP auto-ack — is bounded, audited, and yours to switch off.
+  unattended write (the FP auto-ack) is bounded, audited, and yours to switch off.
 
 ---
 
@@ -162,4 +162,5 @@ API, it's opt-in, and it only ever sees sanitized input.
 
 soc-ai is open source under the [Apache-2.0 license](https://github.com/nuk3s/soc-ai/blob/main/LICENSE).
 If you already run Security Onion, it's the self-hosted way to put a local model to work on
-your queue.
+your queue. Curious where the project is going? The [roadmap](ROADMAP.md) keeps the
+story honest, including everything already shipped behind a switch.

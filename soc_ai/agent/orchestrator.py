@@ -50,13 +50,17 @@ from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime
 from typing import Any
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
 from soc_ai import metrics
 from soc_ai.agent import context_budget
+from soc_ai.agent._partial_replay import (
+    repair_dangling_tool_calls,
+    replay_reasoning_context,
+)
 from soc_ai.agent.classifier import AlertClass, classify_alert
 
 # Backward-compat re-exports — _DedupTracker, InvestigationContext, StepEvent now
@@ -117,6 +121,7 @@ from soc_ai.agent.models import (
     build_synthesizer_model,
 )
 from soc_ai.agent.prompts import (
+    BUDGET_PARTIAL_SYNTH_PROMPT,
     INVESTIGATOR_PROMPT,
     SYNTHESIZER_PROMPT,
     _format_investigator_prompt,
@@ -239,6 +244,64 @@ def build_synthesizer(model: Model) -> Agent[None, TriageReport]:
     )
 
 
+def build_partial_triage_synthesizer(model: Model) -> Agent[None, TriageReport]:
+    """No-tools synthesizer that concludes a budget-cut investigation loop.
+
+    Mirrors the hunt runner's partial-report path (:func:`soc_ai.api.
+    hunt_runner._synthesize_partial_hunt`): replays the loop's gathered
+    (repaired) message history and forces a TriageReport from ONLY that
+    evidence. ``retries=3`` for reasoning-model schema-wobble parity with
+    :func:`build_synth_first_agent`.
+    """
+    return Agent(
+        model,
+        output_type=TriageReport,
+        system_prompt=BUDGET_PARTIAL_SYNTH_PROMPT,
+        retries=3,
+    )
+
+
+# Error-shaped on purpose: ``count_successful_tool_calls`` must never count a
+# synthetic closure as gathered evidence (the hunt path's plain-string closure
+# predates that gate and stays as-is for prompt-compat).
+_PARTIAL_CLOSURE_CONTENT: dict[str, Any] = {
+    "error": True,
+    "message": "not executed — tool-call budget exhausted",
+}
+
+
+async def _synthesize_partial_triage(
+    settings: Settings, guard: EgressGuard | None, gathered: list[Any]
+) -> tuple[Any, list[Any]]:
+    """Force a TriageReport from a budget-cut investigation loop's history.
+
+    Returns ``(report, repaired_history)``. The repaired history doubles as
+    ``loop_messages`` for the downstream evidence/citation gates, so the
+    partial verdict earns the loop evidence exemption ONLY from tool results
+    that actually landed. Raises on any failure — the caller lands the honest
+    pipeline-fallback as the last resort.
+    """
+    repaired = repair_dangling_tool_calls(gathered, closure_content=_PARTIAL_CLOSURE_CONTENT)
+    user_msg = replay_reasoning_context(repaired) + (
+        "Write the TriageReport now from the evidence already gathered above."
+    )
+    if guard is not None:
+        # The replayed history is already label space (the loop conversed over
+        # sanitized inputs); this sweep covers the lifted reasoning block.
+        user_msg = guard.sanitize_text(user_msg)
+    user_msg = _guard_egress(guard, user_msg, settings)
+    agent = build_partial_triage_synthesizer(
+        build_synthesizer_model(settings, temperature=settings.synthesizer_temperature)
+    )
+    async with asyncio.timeout(settings.investigation_turn_timeout_s):
+        result = await agent.run(
+            user_msg,
+            message_history=repaired,
+            usage_limits=UsageLimits(request_limit=3, tool_calls_limit=0),
+        )
+    return result.output, repaired
+
+
 def build_synth_first_agent(model: Model) -> Agent[None, TriageReport]:
     """Build the synth Agent for the synth-first pipeline (no tools).
 
@@ -287,7 +350,13 @@ def _guard_egress(guard: EgressGuard | None, text: str, settings: Settings) -> s
     return text
 
 
-def _synth_failure_fallback_report(alert_id: str, phase: str, exc: BaseException) -> Any:
+def _synth_failure_fallback_report(
+    alert_id: str,
+    phase: str,
+    exc: BaseException,
+    *,
+    retry_causes: list[str] | None = None,
+) -> Any:
     """Build a fallback TriageReport when the synth-first model raises.
 
     When the synth fails schema-validation
@@ -335,11 +404,20 @@ def _synth_failure_fallback_report(alert_id: str, phase: str, exc: BaseException
             "phase": phase,
             "error_type": type(exc).__name__,
             "hint": _hint_for(exc),
+            # Only when captured (a schema-retry exhaustion): WHY each attempt
+            # failed, so the pipeline-error drilldown is actionable. Old rows /
+            # other failure classes keep their exact shape.
+            **({"retry_causes": retry_causes} if retry_causes else {}),
         },
     )
 
 
-def _round2_failure_fallback(alert_id: str, round1: Any, exc: BaseException) -> Any:
+def _round2_failure_fallback(
+    alert_id: str,
+    round1: Any,
+    exc: BaseException,
+    retry_causes: list[str] | None = None,
+) -> Any:
     """Fallback verdict when the round-2 investigation loop / synth crashes.
 
     The agent already reached a round-1 verdict before the (expensive, flakier)
@@ -362,7 +440,9 @@ def _round2_failure_fallback(alert_id: str, round1: Any, exc: BaseException) -> 
             )
         except Exception:
             return round1
-    return _synth_failure_fallback_report(alert_id, "investigation_loop_synth", exc)
+    return _synth_failure_fallback_report(
+        alert_id, "investigation_loop_synth", exc, retry_causes=retry_causes
+    )
 
 
 # Backwards-compat shim — pre-split callers used `build_agent(model, ctx)`
@@ -407,6 +487,17 @@ def _hint_for(exc: BaseException) -> str | None:
         return "alert id may be wrong; verify it exists in ES."
     msg = str(exc).lower()
     # Pattern-match on the LiteLLM/PydanticAI error strings.
+    if "exceeded maximum output retries" in msg or (
+        "exceeded maximum retries" in msg and "output validation" in msg
+    ):
+        return (
+            "the model repeatedly produced output that failed TriageReport "
+            "schema validation until the retry budget ran out. The per-attempt "
+            "validation errors are recorded as retry_causes on this run's error "
+            "event and resolution — read those: persistent schema failures "
+            "usually mean the analyst model or its gateway route changed shape "
+            "(reasoning/tool-call format), not a transient fault."
+        )
     if "token limit" in msg and "before any response" in msg:
         return (
             "the model hit its response-token cap while still reasoning, so no "
@@ -431,7 +522,43 @@ def _hint_for(exc: BaseException) -> str | None:
     return None
 
 
-def _error_payload(exc: BaseException, *, phase: str, round_num: int) -> dict[str, Any]:
+def _retry_causes_from_messages(messages: Any) -> list[str]:
+    """Lift the per-attempt validation errors out of a captured message history.
+
+    When a synth run dies with ``UnexpectedModelBehavior: Exceeded maximum
+    output retries``, the actual reasons live in the ``RetryPromptPart``s
+    pydantic-ai fed back to the model — and are otherwise discarded with the
+    run. Called on a ``capture_run_messages()`` capture from the failing run;
+    returns compact, whitespace-normalized strings (most recent last, at most
+    4, each capped at 400 chars) for the error event payload and the fallback
+    report's ``resolution`` marker. Defensive: a surprise message/part shape is
+    skipped, never raised — this runs inside an error handler.
+    """
+    causes: list[str] = []
+    try:
+        for msg in messages or []:
+            for part in getattr(msg, "parts", None) or []:
+                if type(part).__name__ != "RetryPromptPart":
+                    continue
+                try:
+                    rendered = part.model_response()
+                except Exception:
+                    rendered = str(getattr(part, "content", "") or "")
+                compact = " ".join(str(rendered).split())
+                if compact:
+                    causes.append(compact[:400])
+    except Exception:
+        return causes[-4:]
+    return causes[-4:]
+
+
+def _error_payload(
+    exc: BaseException,
+    *,
+    phase: str,
+    round_num: int,
+    retry_causes: list[str] | None = None,
+) -> dict[str, Any]:
     """Typed error event payload with phase/round/type/message + optional hint."""
     payload: dict[str, Any] = {
         "phase": phase,
@@ -442,6 +569,8 @@ def _error_payload(exc: BaseException, *, phase: str, round_num: int) -> dict[st
     hint = _hint_for(exc)
     if hint:
         payload["hint"] = hint
+    if retry_causes:
+        payload["retry_causes"] = retry_causes
     return payload
 
 
@@ -1712,14 +1841,20 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         synth_agent = build_synth_first_agent(
             build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature)
         )
+        # Captures the run's message history even when the run raises — on a
+        # schema-retry exhaustion the RetryPromptParts in here are the only
+        # record of WHY each attempt failed (the prod 2026-07-17/18 fallbacks
+        # recorded just "Exceeded maximum output retries (3)" with hint=null).
+        r1_captured: list[Any] = []
         try:
             # Fail-closed residue sweep on the FINAL composed outbound message
             # (after every sanitize_text above): if fail-closed is on and an
             # internal identifier survived, this raises BEFORE the model call so
             # the payload never egresses. No-op when off / no guard.
             user_msg_round1 = _guard_egress(guard, user_msg_round1, ctx.settings)
-            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                synth_result_round1 = await synth_agent.run(user_msg_round1)
+            with capture_run_messages() as r1_captured:
+                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                    synth_result_round1 = await synth_agent.run(user_msg_round1)
         except EgressResidueError as e:
             # Blocked egress: the model was NOT called. Audit the block (count
             # only) + emit the paired error event, then land the SAME honest
@@ -1734,10 +1869,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # fall through with a fallback NMI TriageReport so the row in
             # index.jsonl is structured (not verdict=None). The post-validators
             # + triage_report emission below run uniformly on the fallback.
-            err_ev = _ev("error", _error_payload(e, phase="synth_first_round1", round_num=1))
+            r1_causes = _retry_causes_from_messages(r1_captured)
+            err_ev = _ev(
+                "error",
+                _error_payload(e, phase="synth_first_round1", round_num=1, retry_causes=r1_causes),
+            )
             await _audit(err_ev)
             yield err_ev
-            triage_round1 = _synth_failure_fallback_report(alert_id, "synth_first_round1", e)
+            triage_round1 = _synth_failure_fallback_report(
+                alert_id, "synth_first_round1", e, retry_causes=r1_causes
+            )
             await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
             triage_round1 = synth_result_round1.output
@@ -1845,6 +1986,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # WHOLE investigator prompt crosses the egress boundary sanitized.
             inv_user_msg = guard.sanitize_text(inv_user_msg)
         inv_result: Any = None
+        # The labeled node messages streamed so far — the budget-partial
+        # synthesis replays these when the loop is cut short (mirrors the hunt
+        # runner's `gathered`).
+        loop_gathered: list[Any] = []
         budget_exc: BaseException | None = None
         # Set when the fail-closed residue sweep blocks the loop's first model
         # call: routes the budget-boundary convergence below to the HONEST
@@ -1886,6 +2031,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     if node_msg is None:
                         node_msg = getattr(node, "request", None)
                     if node_msg is not None:
+                        loop_gathered.append(node_msg)
                         async for ev in _walk_message(
                             node_msg, _ev, phase="investigation_loop", round_num=1
                         ):
@@ -1962,12 +2108,65 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             final_synth_rerun = None  # fallback verdict — never vote on it
             await metrics.get_metrics().record_event("fallback_verdict", {})
         elif budget_exc is not None:
-            # Round-1 verdict stands (evidence gathered pre-budget is preserved in
-            # the streamed timeline). loop_messages stays None — the downstream
-            # evidence/citation checks already handle that.
-            triage_final = _round2_failure_fallback(alert_id, triage_round1, budget_exc)
-            final_synth_rerun = None  # fallback verdict — never vote on it
-            await metrics.get_metrics().record_event("fallback_verdict", {})
+            # A settled round-1 verdict stands (evidence gathered pre-budget is
+            # preserved in the streamed timeline). With NO settled round-1
+            # (definitely_investigate skipped it, or round-1 was itself NMI)
+            # the old path discarded every gathered tool result into a generic
+            # 0.3 fallback — the 2026-07-18 prod BPFDoor run burned 25 tool
+            # calls and landed nothing. Now: synthesize a PARTIAL verdict from
+            # the gathered history (mirrors the hunt runner's budget path);
+            # the honest fallback remains the last resort.
+            partial_report: Any = None
+            repaired_history: list[Any] = []
+            settled_r1 = getattr(triage_round1, "verdict", None) in (
+                "true_positive",
+                "false_positive",
+            )
+            if not settled_r1 and loop_gathered:
+                try:
+                    partial_report, repaired_history = await _synthesize_partial_triage(
+                        ctx.settings, guard, loop_gathered
+                    )
+                except asyncio.CancelledError:
+                    raise  # cooperative cancel — propagate, never swallow
+                except EgressResidueError as e:
+                    async for ev in _emit_egress_blocked("investigation_loop_partial_synth", e):
+                        yield ev
+                except BaseException as e:
+                    err_ev = _ev(
+                        "error",
+                        _error_payload(e, phase="investigation_loop_partial_synth", round_num=1),
+                    )
+                    await _audit(err_ev)
+                    yield err_ev
+            if partial_report is not None:
+                triage_final = partial_report.model_copy(
+                    update={
+                        # A cut-short investigation must not assert high
+                        # confidence (mirrors the hunt humility clamp).
+                        "confidence": min(partial_report.confidence, 0.6),
+                        "summary": (partial_report.summary or "")
+                        + " (Investigation stopped at the tool-call budget; "
+                        "verdict synthesized from the evidence gathered before "
+                        "the cutoff.)",
+                        # Never recurse into Phase D off a budget-cut synthesis.
+                        "gap_for_investigator": None,
+                    }
+                )
+                if guard is not None:
+                    # Assignment-source restore — the gates below compare this
+                    # report's text against RAW enriched/pivot values.
+                    triage_final = _desanitize_report(triage_final, guard)
+                # The repaired history feeds the downstream evidence/citation
+                # gates: the partial verdict earns the loop exemption only from
+                # tool results that actually landed (synthetic closures are
+                # error-shaped and never counted).
+                loop_messages = repaired_history
+                final_synth_rerun = None  # budget-cut verdict — never vote on it
+            else:
+                triage_final = _round2_failure_fallback(alert_id, triage_round1, budget_exc)
+                final_synth_rerun = None  # fallback verdict — never vote on it
+                await metrics.get_metrics().record_event("fallback_verdict", {})
         elif inv_result is None:
             # The agent run ended without a final result (no End node reached, and
             # no exception raised). Emit an honest error instead of crashing with an
@@ -2024,15 +2223,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # sanitized inputs/tool results); this sweep covers the RAW
                 # candidate block woven into the synthesizer message.
                 loop_synth_msg = guard.sanitize_text(loop_synth_msg)
+            # Same capture as round-1: on schema-retry exhaustion the causes
+            # live only in the run's RetryPromptParts.
+            ls_captured: list[Any] = []
             try:
                 # Fail-closed residue sweep on the FINAL composed loop-synth
                 # message before the model call — raises BEFORE egress on residue.
                 loop_synth_msg = _guard_egress(guard, loop_synth_msg, ctx.settings)
-                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                    loop_synth_result = await loop_synth.run(
-                        loop_synth_msg,
-                        usage_limits=loop_usage_limits,
-                    )
+                with capture_run_messages() as ls_captured:
+                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                        loop_synth_result = await loop_synth.run(
+                            loop_synth_msg,
+                            usage_limits=loop_usage_limits,
+                        )
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
             except EgressResidueError as e:
@@ -2049,12 +2252,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # the client retries) previously propagated past the recorder,
                 # landing status=error with NO verdict + no recorded error event.
                 # Catch it, record the error, and DON'T discard the round-1 verdict.
+                ls_causes = _retry_causes_from_messages(ls_captured)
                 err_ev = _ev(
-                    "error", _error_payload(e, phase="investigation_loop_synth", round_num=2)
+                    "error",
+                    _error_payload(
+                        e,
+                        phase="investigation_loop_synth",
+                        round_num=2,
+                        retry_causes=ls_causes,
+                    ),
                 )
                 await _audit(err_ev)
                 yield err_ev
-                triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+                triage_final = _round2_failure_fallback(alert_id, triage_round1, e, ls_causes)
                 final_synth_rerun = None  # fallback verdict — never vote on it
                 await metrics.get_metrics().record_event("fallback_verdict", {})
             else:

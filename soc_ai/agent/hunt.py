@@ -246,6 +246,10 @@ headline is derived from the worst THREAT finding — a mis-tagged gap would tel
 analyst "malicious activity found" when nothing malicious was seen.
 
 ## Correlation patterns (a hunt correlates — it doesn't just list alerts)
+**Triage owns the alert stream.** Do not re-disposition alerts — a finding is \
+never "alert X is a false positive"; the auto-triage pipeline already renders \
+those verdicts one alert at a time. Alerts CORROBORATE telemetry findings you \
+measured; they are not findings.
 - **Kill-chain over time (one host):** recon/scan → lateral movement on the same host \
 in the next ~2h → C2/exfil in the next ~6h is a chain, not three coincidences. Walk \
 the host's activity forward in time and surface the sequence as ONE timeline finding \

@@ -23,9 +23,12 @@ from typing import Any
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.usage import UsageLimits
 
+from soc_ai.agent._partial_replay import (
+    repair_dangling_tool_calls,
+    replay_reasoning_context,
+)
 from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.hunt import (
     HUNT_SYSTEM_PROMPT,
@@ -64,7 +67,7 @@ async def _build_hunt_run(
     # instead of guessing from a hardcoded list.
     system_prompt = (
         HUNT_SYSTEM_PROMPT.format(objective=objective)
-        + oql_primer_block()
+        + oql_primer_block(flavor="hunt")
         + await inventory_prompt_block(ctx.elastic, ctx.settings)
     )
     if guard is not None:
@@ -114,99 +117,11 @@ def _desanitize_hunt_report(report: Any, guard: EgressGuard | None) -> Any:
         return report
 
 
-def _repair_dangling_tool_calls(gathered: list[Any]) -> list[Any]:
-    """Close out unexecuted trailing tool calls so the transcript can be replayed.
-
-    pydantic-ai raises :class:`UsageLimitExceeded` AFTER the ``ModelResponse``
-    carrying the next tool-call batch has landed in the history but BEFORE the
-    calls execute — so a budget-exhausted hunt transcript ALWAYS ends with
-    unprocessed tool calls, and replaying it with a new user prompt is rejected
-    with ``UserError: Cannot provide a new user prompt when the message history
-    contains unprocessed tool calls`` (the 2026-07 prod failure: every
-    budget-capped hunt errored and its evidence was discarded). Repair: append a
-    synthetic ``ModelRequest`` with one ``ToolReturnPart`` per dangling call in
-    the trailing batch (prod batches ran ~3 calls), preserving the model's final
-    reasoning for the synthesizer. Returns a NEW list; ``gathered`` is never
-    mutated.
-
-    Defensive by design — this path must never be able to crash the hunt again:
-    if the trailing ``ModelResponse`` is any shape we can't repair (message-class
-    drift after a pydantic-ai bump, surprise part payloads), fall back to
-    TRIMMING it off — losing the final unexecuted step beats losing the whole
-    report. The caller's error handling remains the LAST resort, not the first.
-    """
-    if not gathered:
-        return gathered
-    last = gathered[-1]
-    if not isinstance(last, ModelResponse):
-        return gathered  # tail already ends on a request — replayable as-is
-    try:
-        dangling = [p for p in last.parts if isinstance(p, ToolCallPart)]
-        if not dangling:
-            return gathered  # plain text/thinking tail — replayable as-is
-        return [
-            *gathered,
-            ModelRequest(
-                parts=[
-                    ToolReturnPart(
-                        tool_name=part.tool_name,
-                        tool_call_id=part.tool_call_id,
-                        content="not executed — hunt budget exhausted",
-                    )
-                    for part in dangling
-                ]
-            ),
-        ]
-    except Exception:
-        # Unexpected tail shape: trim the trailing ModelResponse rather than
-        # replay a history pydantic-ai will reject.
-        _LOGGER.warning(
-            "hunt: could not close out dangling tool calls; trimming the trailing "
-            "model response before partial synthesis",
-            exc_info=True,
-        )
-        return gathered[:-1]
-
-
-def _replay_reasoning_context(gathered: list[Any]) -> str:
-    """Surface the exploration model's own reasoning as explicit synthesizer input.
-
-    The trust-erosion bug (two prod hunts, 2026-07): the exploration model had
-    ALREADY debunked the false positive IN ITS REASONING ("Apple service
-    discovery, not C2"), but that debunking lived in ``ThinkingPart``s the
-    partial synthesizer never saw — pydantic-ai does NOT feed a prior turn's
-    thinking back into a fresh agent's ``message_history`` (thinking is stripped
-    from replayed context), so only the loud alert TITLES survived and the
-    synthesizer reasserted the FP. This lifts the reasoning text back out of the
-    gathered ``ModelResponse`` ``ThinkingPart``s and returns it as a plain-text
-    block to prepend to the synthesizer's user message, so the model's own
-    debunking is in front of it when it writes up a cut-short hunt.
-
-    Returns ``""`` when there is no reasoning to replay (a non-reasoning model, or
-    an empty trace) — the caller then simply omits the block. Defensive: any
-    surprise part shape is skipped, never raised.
-    """
-    traces: list[str] = []
-    for msg in gathered:
-        for part in getattr(msg, "parts", None) or []:
-            if type(part).__name__ != "ThinkingPart":
-                continue
-            content = str(getattr(part, "content", "") or "").strip()
-            if content:
-                traces.append(content)
-    if not traces:
-        return ""
-    joined = "\n\n".join(traces)
-    return (
-        "## Your own reasoning from the exploration above (do NOT ignore it)\n"
-        "While hunting you already reasoned about this evidence — including any "
-        "false positives you debunked. That reasoning is NOT in the replayed "
-        "message history, so it is reproduced here verbatim. Weight it: if you "
-        "concluded an alert was a false positive (e.g. 'solicited echo reply, not "
-        "C2' / 'Apple service discovery, not a Linux backdoor'), do NOT reassert "
-        "it as a threat now just because the alert title is loud.\n\n"
-        f"{joined}\n\n---\n\n"
-    )
+# Shared with the triage loop's budget-partial path — extracted verbatim to
+# soc_ai.agent._partial_replay (2026-07-18). Module aliases keep the names
+# callers and tests use; the hunt closure content is the shared default.
+_repair_dangling_tool_calls = repair_dangling_tool_calls
+_replay_reasoning_context = replay_reasoning_context
 
 
 async def _synthesize_partial_hunt(

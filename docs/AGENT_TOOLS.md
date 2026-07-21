@@ -21,7 +21,7 @@ guardrails.
 | `get_rule_content` / `t_get_rule_content` | Fetch a detection rule's **full text** by SID/`publicId` or exact title — what the signature actually matches (content strings, ports, dsize, PCRE), so a verdict rests on the rule body, not its name. | SO detections index |
 | `decode_payload` / `t_decode_payload` | Decode payload bytes already in evidence (Suricata base64 `payload`, hex, or `payload_printable` text) into printable strings, embedded domains/URLs/IPs, Shannon entropy, and DNS/HTTP/TLS protocol hints. **Local compute, no egress** — works even after the PCAP ring has rotated. | In-process (dpkt decode helpers) |
 | `get_playbooks` | Pull response playbooks, optionally scoped to a given alert. | SO playbooks index |
-| `lookup_runbook` | Search operator-authored runbooks (procedures / "what normal looks like on *this* network") so a verdict can cite the org's own guidance. Ranking is **embedding-free** (rule-link > tag > keyword), fully air-gapped — no external index. | Local store (`soc_ai/store/runbooks`) |
+| `lookup_runbook` | Search operator-authored runbooks (procedures / "what normal looks like on *this* network") so a verdict can cite the org's own guidance. Default ranking is local BM25 with rule-link > tag > keyword boosts; setting `RAG_EMBED_MODEL` adds an opt-in semantic tier via your gateway. Either way there is no external index and nothing leaves your network. | Local store (`soc_ai/store/runbooks`) |
 | `enrich_ip` | Enrich an IP locally: vendored blocklist hits, GeoIP/ASN (MaxMind), cloud-prefix tag, internal-vs-external classification (`INTERNAL_CIDRS`), + optional MISP. Internal IPs short-circuit the external-only lookups. | Vendored blocklists / MaxMind / MISP |
 | `enrich_domain` | Enrich a domain via local blocklist lookup + optional MISP. | Vendored blocklists / MISP |
 | `enrich_hash` | Enrich a file hash via local blocklist lookup + optional MISP. | Vendored blocklists / MISP |
@@ -79,9 +79,5 @@ Known gaps, in rough roadmap order:
   inter-arrival timing, five-tuple stats).
 - **No active host/network actions** beyond the three SO write tools (no isolate,
   no block, no firewall change).
-- **`lookup_runbook`** searches operator-authored runbooks in the local store
-  (FTS5 BM25 with rule-link/tag boosts; gateway embeddings are the opt-in
-  semantic tier). Author them on the console's **Runbooks** page — write,
-  import `.md` files, or load the shipped starter pack (`runbooks/starter-pack/`).
 - Read tools run against whatever indices the deployment's index-pattern settings
   point at; off-pattern data is invisible to the agent.

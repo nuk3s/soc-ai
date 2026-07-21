@@ -58,9 +58,10 @@ _ALERT_ONLY_NOTE = (
 # therefore CANNOT corroborate a threat asserted from those same alerts:
 #   * t_query_events_oql   — the primary lens; returns raw event docs INCLUDING
 #     suricata.alert documents (the loud alert titles that dominated the
-#     truncated prod transcripts). It can also return zeek/host docs, but a
-#     citation resolving into one is indistinguishable from one resolving into an
-#     alert doc, so it is conservatively treated as non-corroborating.
+#     truncated prod transcripts). Its results are partitioned per-document by
+#     ``_oql_telemetry_docs`` BEFORE the membership test below — docs positively
+#     identified as non-alert telemetry corroborate; alert docs and
+#     unidentifiable docs do not (2026-07-20 telemetry-latitude design).
 #   * t_query_detections   — searches detection RULES (the claim source itself).
 #   * t_get_rule_content   — returns the signature's own definition (the claim).
 #   * t_rule_prevalence    — a rule's base-rate/noisiness (rule metadata).
@@ -155,6 +156,53 @@ def _citation_resolves(citation: str, evidence_text: str) -> bool:
     return False
 
 
+def _oql_telemetry_docs(result: Any) -> list[Any]:
+    """The subset of an OQL result's hit docs POSITIVELY identified as telemetry.
+
+    ``t_query_events_oql`` returns ``EsSearchResult.model_dump()`` —
+    ``{total, hits: [<ES hit>], aggregations, ...}`` where each hit carries the
+    doc under ``_source`` (or ``fields`` with list-wrapped values). A doc is
+    telemetry iff its ``event.dataset`` is present and is NOT ``suricata.alert``
+    and its ``event.kind`` is not ``alert``. Everything else — alert docs, docs
+    with no dataset, aggregation-only results, malformed shapes — is excluded,
+    so this helper can only ever ADD corroboration for docs that are provably
+    not the detector's own claim. Never raises on shape surprises.
+    """
+    if not isinstance(result, dict):
+        return []
+    hits = result.get("hits")
+    if not isinstance(hits, list):
+        return []
+
+    def _one(container: dict[str, Any], dotted: str) -> Any:
+        # _source form nests ({"event": {"dataset": ...}}); fields form is flat
+        # dotted keys with list-wrapped values ({"event.dataset": ["zeek.dns"]}).
+        head, _, tail = dotted.partition(".")
+        nested = container.get(head)
+        value = nested.get(tail) if isinstance(nested, dict) else container.get(dotted)
+        if isinstance(value, list):
+            return value[0] if value else None
+        return value
+
+    telemetry: list[Any] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        src = hit.get("_source")
+        if not isinstance(src, dict):
+            src = hit.get("fields")
+        if not isinstance(src, dict):
+            continue
+        dataset = _one(src, "event.dataset")
+        kind = _one(src, "event.kind")
+        if not isinstance(dataset, str) or not dataset:
+            continue  # cannot positively identify → not corroborating
+        if dataset == "suricata.alert" or kind == "alert":
+            continue  # the detector's claim cannot corroborate itself
+        telemetry.append(hit)
+    return telemetry
+
+
 def _corroborating_evidence_text(tool_results: list[Any]) -> str:
     """Lower-cased JSON dump of ONLY the corroborating (non-alert) tool results.
 
@@ -163,6 +211,9 @@ def _corroborating_evidence_text(tool_results: list[Any]) -> str:
     ``tool_name`` is in :data:`_ALERT_QUERY_TOOLS` are the detector's own claim
     (Suricata alert documents, rule text, rule base-rates) and are EXCLUDED, so a
     citation that resolves only into an alert document does NOT resolve here.
+    ``t_query_events_oql`` is special-cased first: its result is partitioned
+    per-document by :func:`_oql_telemetry_docs`, so a zeek/host doc found via
+    the broad lens corroborates while the alert docs in the same result don't.
     Everything else — decoded payloads, enrichment, host/prevalence, zeek flow
     records — is corroboration and its ``result`` is included.
 
@@ -174,7 +225,16 @@ def _corroborating_evidence_text(tool_results: list[Any]) -> str:
     corroborating: list[Any] = []
     for item in tool_results:
         if isinstance(item, dict) and "tool_name" in item and "result" in item:
-            if item.get("tool_name") in _ALERT_QUERY_TOOLS:
+            tool = item.get("tool_name")
+            if tool == "t_query_events_oql":
+                # Partition at the DOC level: zeek/host docs found through the
+                # broad lens are real corroboration; alert docs and anything
+                # not positively identified stay out.
+                docs = _oql_telemetry_docs(item["result"])
+                if docs:
+                    corroborating.append(docs)
+                continue
+            if tool in _ALERT_QUERY_TOOLS:
                 continue  # a detector-claim result cannot corroborate itself
             corroborating.append(item["result"])
         else:

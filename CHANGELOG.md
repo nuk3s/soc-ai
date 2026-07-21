@@ -6,6 +6,50 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-21
+
+A quality patch: the two failure modes behind the dashboard's "pipeline
+errors" KPI are now self-healing or fully diagnosable, hunts regained their
+telemetry-first latitude, and the docs caught up with the code.
+
+### Added
+
+- **Public roadmap.** `docs/ROADMAP.md` tells the release story with a
+  you-are-here graphic and an honest list of what ships dark behind
+  default-off switches. Linked from the README and the docs site nav.
+- **Hunting-flavored OQL examples.** Hunts (and hunt follow-up chat) get
+  telemetry-first worked examples (dataset scoping, first-seen destinations,
+  cadence measurement) in place of the alert-triage primer examples;
+  investigator and alert-chat prompts are unchanged. The examples are also a
+  docs page (`docs/OQL_HUNT_EXAMPLES.md`).
+
+### Fixed
+
+- **Schema-retry pipeline errors self-heal.** The most common pipeline error
+  (the analyst model emitting a nested report field as a JSON-encoded string,
+  burning every retry identically) is now tolerated at the schema layer:
+  stringified containers are decoded in place, and strings that aren't valid
+  JSON still fail loudly. Retry exhaustion, when it does happen, records each
+  attempt's validation cause on the error event and the report, so the KPI
+  drilldown says exactly what went wrong.
+- **Budget-cut investigations land real verdicts.** When the tool budget or
+  wall clock cuts an investigation short with no settled round-1 verdict, the
+  gathered evidence is replayed through a partial synthesizer (the same
+  pattern hunts use) instead of discarding it for a generic fallback.
+- **Hunt corroboration gate credits telemetry found via OQL.** The gate now
+  partitions OQL results per document: a Zeek record found through the broad
+  lens corroborates a high-severity finding, while alert documents still
+  cannot corroborate the claim they raised. Generic hunt sweeps no longer
+  re-disposition alerts; triage owns the alert stream.
+
+### Docs
+
+- Accuracy pass across the whole set: retired every shipped-feature-described-
+  as-future claim (runbook retrieval, API auth, external TI, tuning
+  suggestions, the web console itself), caught the docs changelog up from
+  1.0.6 to current, fixed stale version strings, and rewrote the dev roadmap
+  as a reality ledger.
+
 ## [1.2.0] - 2026-07-16
 
 A dogfood-driven release: a full analyst shift on the live deployment produced

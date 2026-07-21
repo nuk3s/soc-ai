@@ -9,6 +9,27 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.2.1** — Accuracy and honesty patch: pipeline errors now record *why* each
+  model retry failed (and the schema tolerates the stringified-JSON wobble that
+  caused most of them), hunts gained telemetry-first latitude (the corroboration
+  gate credits Zeek evidence found through broad queries, and generic sweeps no
+  longer re-triage the alert stream), plus a documentation refresh and the
+  public roadmap.
+- **1.2.0** — The dogfood release: a full analyst shift on the live deployment
+  produced fourteen findings, and this release fixed all of them — notifications,
+  entity search, a maintenance panel, pipeline-error visibility with one-click
+  dismiss, group acknowledge, deep re-run, and the verdict-quality eval now
+  schedulable straight from the dashboard.
+- **1.1.1** — Re-hunt and multi-select on the Hunts page, plus a delta-review
+  hardening pass.
+- **1.1.0** — The measurement release: nightly quality trend with a regression
+  alarm, highlighted redaction previews, and a real runbooks workspace so the
+  agent grounds verdicts in your own procedures.
+- **1.0.8** — Trust, workflow, and threat-hunting: fallback verdicts are labeled
+  as such, hunt findings must cite evidence, assignment states and keyboard
+  triage speed up the queue, and hunts gain scheduling.
+- **1.0.7** — Fixes from the first week of production triage: SO write-token
+  expiry, export auth, re-hunt caps, and CLI auth.
 - **1.0.6** — Retired the Tampermonkey userscript; soc-ai is now driven entirely from its web console (`/app`) and the Hunt Console.
 - **1.0.5** — Patch: the auto-triage scheduler now fires its first sweep on a
   freshly-booted host (a monotonic-clock sentinel bug), plus Node 24-native CI

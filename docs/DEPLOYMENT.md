@@ -41,7 +41,7 @@ The shape of the install:
                     │ LiteLLM gateway                  │
                     │ https://your-litellm-gateway     │
                     │   - soc-ai-analyst → (operator alias)│
-                    │   - soc-ai-embed   → Qwen3 (v1.1)   │
+                    │   - soc-ai-embed   → (optional)     │
                     └──────────────────────────────────┘
 ```
 
@@ -56,7 +56,8 @@ The shape of the install:
   - The SO manager's port `:9200` (Elasticsearch)
   - The SO manager's port `:443` (web UI / Kratos)
   - The LiteLLM gateway's HTTPS endpoint
-  - (Optional, v1.1) A Qdrant instance for RAG runbooks
+  - (Optional) An embeddings model on the gateway (`RAG_EMBED_MODEL`) if you
+    want semantic runbook search on top of the built-in keyword ranking
 - **Security Onion 3.0.0** with a non-default analyst account whose
   password you know (the SO grid creates this for you).
 - **A LiteLLM gateway** preconfigured with the analyst model alias
@@ -286,7 +287,7 @@ automatically.
 ```bash
 # Health check from any host that can reach the soc-ai VM:
 curl -k https://<soc-ai-host>:8443/healthz
-# → {"status":"ok","version":"1.0.0","so_auth":"kratos",...}
+# → {"status":"ok","version":"1.2.1","so_auth":"kratos",...}
 
 # Or use the CLI:
 uv run soc-ai healthz --url https://<soc-ai-host>:8443

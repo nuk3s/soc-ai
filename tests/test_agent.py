@@ -5809,3 +5809,518 @@ def test_is_strong_grounded_template_logic() -> None:
         rationale="x",
     )
     assert _is_strong_grounded_template(ext, _make_vpn_icmp_enriched()) is False
+
+
+# =====================================================================
+# Pipeline-error diagnosability (retry causes) + budget-graceful partial
+# synthesis — 2026-07-18 prod investigation fixes.
+# =====================================================================
+
+
+def test_hint_for_output_retry_exhaustion() -> None:
+    """Retry-exhaustion messages must produce an actionable hint (prod runs
+    landed hint=null, leaving the KPI drilldown with nothing to act on)."""
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+    from soc_ai.agent.orchestrator import _hint_for
+
+    for msg in (
+        "Exceeded maximum output retries (3)",
+        "Exceeded maximum retries (3) for output validation",
+    ):
+        hint = _hint_for(UnexpectedModelBehavior(msg))
+        assert hint is not None, msg
+        assert "validation" in hint.lower()
+
+
+def test_retry_causes_from_messages_extracts_retry_prompt_parts() -> None:
+    """The helper lifts RetryPromptPart contents (the per-attempt validation
+    errors pydantic-ai fed back to the model) out of a captured message
+    history, most recent last, bounded in count and per-item length."""
+    from pydantic_ai.messages import ModelRequest, RetryPromptPart
+    from soc_ai.agent.orchestrator import _retry_causes_from_messages
+
+    msgs = [
+        ModelRequest(parts=[RetryPromptPart(content="first cause: bad verdict")]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content=[
+                        {
+                            "type": "literal_error",
+                            "loc": ("verdict",),
+                            "msg": "Input should be 'true_positive', ...",
+                            "input": "bogus",
+                        }
+                    ]
+                )
+            ]
+        ),
+    ]
+    causes = _retry_causes_from_messages(msgs)
+    assert len(causes) == 2
+    assert "first cause" in causes[0]
+    assert "verdict" in causes[1]
+    # Bounded: many long causes are capped in count and per-item size.
+    many = [
+        ModelRequest(parts=[RetryPromptPart(content=f"cause-{i}: " + "x" * 2000)])
+        for i in range(10)
+    ]
+    capped = _retry_causes_from_messages(many)
+    assert len(capped) <= 4
+    assert "cause-9" in capped[-1]  # most recent survives
+    assert all(len(c) <= 400 for c in capped)
+    # Defensive: junk messages never raise.
+    assert _retry_causes_from_messages([object(), None]) == []
+    assert _retry_causes_from_messages([]) == []
+
+
+def test_synth_failure_fallback_resolution_carries_retry_causes() -> None:
+    """The fallback report's resolution marker records WHY each retry failed
+    so the KPI drilldown is actionable."""
+    from soc_ai.agent.orchestrator import _synth_failure_fallback_report
+
+    report = _synth_failure_fallback_report(
+        "alert-9",
+        "synth_first_round1",
+        RuntimeError("Exceeded maximum output retries (3)"),
+        retry_causes=["verdict: Input should be 'true_positive' ..."],
+    )
+    assert report.resolution["retry_causes"] == ["verdict: Input should be 'true_positive' ..."]
+    # Absent causes -> key omitted (old rows keep their shape).
+    bare = _synth_failure_fallback_report("alert-9", "synth_first_round1", RuntimeError("boom"))
+    assert "retry_causes" not in bare.resolution
+
+
+def test_round2_failure_fallback_forwards_retry_causes() -> None:
+    """When round-2 lands the NMI fallback (no settled round-1), retry causes
+    captured at the failing synth propagate into the resolution marker."""
+    from soc_ai.agent.orchestrator import _round2_failure_fallback
+
+    report = _round2_failure_fallback(
+        "alert-9",
+        None,
+        RuntimeError("Exceeded maximum output retries (3)"),
+        retry_causes=["summary: Field required"],
+    )
+    assert report.verdict == "needs_more_info"
+    assert report.resolution["retry_causes"] == ["summary: Field required"]
+
+
+@pytest.mark.asyncio
+async def test_round1_retry_exhaustion_records_retry_causes_end_to_end(
+    settings_kratos: Settings,
+) -> None:
+    """Drive the REAL synth-first agent against a model that always emits a
+    schema-invalid TriageReport: pydantic-ai burns its output retries, and the
+    pipeline must surface the per-attempt validation causes on BOTH the error
+    event and the fallback report's resolution (the 2026-07-17/18 prod runs
+    recorded only 'Exceeded maximum output retries (3)' with hint=null)."""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+
+    def _always_invalid(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        output_tool = next(t.name for t in info.output_tools)
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=output_tool, args={"verdict": "bogus_verdict"})]
+        )
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _stub_enriched_alert_context(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=FunctionModel(_always_invalid),
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=None,
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    err_ev = next(
+        e for e in events if e.kind == "error" and e.payload.get("phase") == "synth_first_round1"
+    )
+    causes = err_ev.payload.get("retry_causes")
+    assert causes, "error event must carry the per-retry validation causes"
+    assert any("verdict" in c for c in causes)
+    assert err_ev.payload.get("hint"), "retry exhaustion must carry a hint"
+
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "needs_more_info"
+    resolution = report_ev.payload.get("resolution") or {}
+    assert resolution.get("retry_causes") == causes
+
+
+# ---------------------------------------------------------------------
+# Budget-graceful partial synthesis (the 2026-07-18 BPFDoor run: 25 tool
+# calls of evidence discarded into a generic 0.3 NMI fallback).
+# ---------------------------------------------------------------------
+
+
+def _budget_loop_messages() -> list[Any]:
+    """A realistic cut-short loop history: one successful zeek call+return,
+    then a dangling tool-call batch (budget fired before it executed)."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        ThinkingPart,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+
+    return [
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="t_query_zeek_logs",
+                    args={"community_id": "1:abc"},
+                    tool_call_id="c1",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="t_query_zeek_logs",
+                    content={"ssl": {"server_name": "evil.example.com"}},
+                    tool_call_id="c1",
+                )
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ThinkingPart(content="solicited echo reply - likely a false positive"),
+                ToolCallPart(
+                    tool_name="t_query_events_oql",
+                    args={"query": "x"},
+                    tool_call_id="c2",
+                ),
+            ]
+        ),
+    ]
+
+
+def _budget_investigator(messages: list[Any]) -> Any:
+    """A fake loop investigator whose ``iter()`` streams *messages* then
+    raises UsageLimitExceeded — the shape pydantic-ai produces when the
+    tool_calls_limit fires mid-run."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from pydantic_ai.exceptions import UsageLimitExceeded
+    from pydantic_ai.messages import ModelResponse
+
+    class _BudgetRun:
+        result = None
+
+        def __aiter__(self) -> Any:
+            return self._agen()
+
+        async def _agen(self) -> Any:
+            for msg in messages:
+                if isinstance(msg, ModelResponse):
+                    yield SimpleNamespace(model_response=msg, request=None)
+                else:
+                    yield SimpleNamespace(model_response=None, request=msg)
+            raise UsageLimitExceeded(
+                "The next tool call(s) would exceed the tool_calls_limit of 25 (tool_calls=27)."
+            )
+
+    class _BudgetCM:
+        async def __aenter__(self) -> _BudgetRun:
+            return _BudgetRun()
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    fake = MagicMock()
+    fake.iter = MagicMock(return_value=_BudgetCM())
+    return fake
+
+
+async def _run_budget_loop(
+    settings: Settings, partial_agent: Any, *, loop_messages: list[Any] | None = None
+) -> list[Any]:
+    """Drive investigate() into the loop via definitely_investigate (round-1
+    skipped, exactly the prod BPFDoor shape), hit the tool budget, and return
+    the drained events. ``partial_agent`` doubles the budget-partial synth."""
+    ctx = _make_ctx(settings)
+    fake_investigator = _budget_investigator(
+        _budget_loop_messages() if loop_messages is None else loop_messages
+    )
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _malware_signal_enriched(alert_id)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=TestModel(call_tools=[]),
+        ),
+        patch("soc_ai.agent.orchestrator.build_investigator", return_value=fake_investigator),
+        patch(
+            "soc_ai.agent.orchestrator.build_partial_triage_synthesizer",
+            return_value=partial_agent,
+        ),
+    ):
+        return [ev async for ev in investigate("beacon-001", ctx=ctx)]
+
+
+def _fake_partial_agent(report: TriageReport) -> Any:
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent.run = AsyncMock(return_value=MagicMock(output=report))
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_loop_budget_with_unsettled_round1_synthesizes_partial_verdict(
+    settings_kratos: Settings,
+) -> None:
+    """Budget exhaustion on a definitely-investigate run (round-1 skipped) must
+    synthesize a verdict from the evidence already gathered — not discard 25
+    tool calls into a generic 0.3 NMI pipeline-fallback."""
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    settings_kratos.investigate_when_unsure = True
+    partial_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.55,
+        summary="Solicited echo reply; zeek shows normal TLS to a known host.",
+        citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    partial_agent = _fake_partial_agent(partial_report)
+    events = await _run_budget_loop(settings_kratos, partial_agent)
+
+    kinds = [e.kind for e in events]
+    assert kinds[-1] == "done"
+    budget_err = next(
+        e
+        for e in events
+        if e.kind == "error" and e.payload.get("phase") == "investigation_loop_budget"
+    )
+    assert "tool_calls_limit" in budget_err.payload["message"]
+
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+    assert not is_pipeline_fallback(report_ev.payload)
+    assert "budget" in report_ev.payload["summary"].lower()
+
+    # The partial synth replayed a REPAIRED history: the dangling c2 call is
+    # closed by a synthetic tool-return whose content is error-shaped (so it
+    # can never count as gathered evidence), and the model's own thinking is
+    # lifted into the user prompt.
+    await_args = partial_agent.run.await_args
+    history = await_args.kwargs["message_history"]
+    closing = history[-1].parts[0]
+    assert closing.tool_call_id == "c2"
+    assert closing.content.get("error") is True
+    user_msg = await_args.args[0]
+    assert "solicited echo reply" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_loop_budget_partial_synth_confidence_clamped(
+    settings_kratos: Settings,
+) -> None:
+    """A cut-short investigation must not assert high confidence: the partial
+    verdict is clamped to <= 0.6 (mirrors the hunt path's humility clamp)."""
+    settings_kratos.investigate_when_unsure = True
+    overconfident = TriageReport(
+        verdict="false_positive",
+        confidence=0.9,
+        summary="Confident from partial evidence.",
+        citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    events = await _run_budget_loop(settings_kratos, _fake_partial_agent(overconfident))
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "false_positive"
+    assert report_ev.payload["confidence"] <= 0.6
+
+
+@pytest.mark.asyncio
+async def test_loop_budget_partial_synth_failure_falls_back_to_nmi(
+    settings_kratos: Settings,
+) -> None:
+    """If the partial synthesis itself fails, the run lands today's honest
+    pipeline-fallback (needs_more_info + provenance marker) — never an
+    unhandled error."""
+    from unittest.mock import MagicMock
+
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    settings_kratos.investigate_when_unsure = True
+    partial_agent = MagicMock()
+    partial_agent.run = AsyncMock(side_effect=RuntimeError("partial synth exploded"))
+    events = await _run_budget_loop(settings_kratos, partial_agent)
+
+    kinds = [e.kind for e in events]
+    assert kinds[-1] == "done"
+    assert any(
+        e.kind == "error" and e.payload.get("phase") == "investigation_loop_partial_synth"
+        for e in events
+    )
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "needs_more_info"
+    assert is_pipeline_fallback(report_ev.payload)
+
+
+@pytest.mark.asyncio
+async def test_loop_budget_with_no_gathered_evidence_falls_back_to_nmi(
+    settings_kratos: Settings,
+) -> None:
+    """Budget fired before ANY node landed: nothing to synthesize from, so the
+    partial synth is skipped and the honest fallback stands."""
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    settings_kratos.investigate_when_unsure = True
+    partial_agent = _fake_partial_agent(
+        TriageReport(verdict="false_positive", confidence=0.5, summary="x", citations=[])
+    )
+    events = await _run_budget_loop(settings_kratos, partial_agent, loop_messages=[])
+    partial_agent.run.assert_not_awaited()
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "needs_more_info"
+    assert is_pipeline_fallback(report_ev.payload)
+
+
+def test_triage_report_accepts_stringified_gap_for_investigator() -> None:
+    """deepseek-v4-flash sometimes emits `gap_for_investigator` as a JSON-ENCODED
+    STRING instead of a nested object (prod run 01KY0T3ZDPX5MXD1TYMPVDQ5ZH,
+    2026-07-20: all 3 retries failed identically with model_type/'Input should
+    be an object'). Same wobble class as InvestigationTranscript.rubric_coverage
+    (Nemotron, Phase 2 smoke) — the schema must auto-parse the string."""
+    gap_json = json.dumps(
+        {
+            "question": (
+                "Are there Zeek conn records for traffic between 203.0.113.221 "
+                "and 192.0.2.119 that show the flow state, duration, and byte counts?"
+            ),
+            "tool_name": "t_query_zeek_logs",
+            "tool_args": {"query": "conn where id.orig_h == 203.0.113.221"},
+            "why_this_matters": "Flow state distinguishes a scan from a real exchange.",
+        }
+    )
+    report = TriageReport.model_validate(
+        {
+            "verdict": "needs_more_info",
+            "confidence": 0.5,
+            "summary": "Fragmented UDP from external IP; need conn context.",
+            "gap_for_investigator": gap_json,
+        }
+    )
+    assert report.gap_for_investigator is not None
+    assert report.gap_for_investigator.tool_name == "t_query_zeek_logs"
+    assert report.gap_for_investigator.tool_args == {
+        "query": "conn where id.orig_h == 203.0.113.221"
+    }
+
+
+def test_triage_report_stringified_containers_auto_parse() -> None:
+    """The same stringification wobble on the OTHER container fields —
+    recommended_actions / citations as JSON-array strings, and tool_args as a
+    JSON-object string inside a nested action — must also decode."""
+    report = TriageReport.model_validate(
+        {
+            "verdict": "false_positive",
+            "confidence": 0.9,
+            "summary": "Benign CDN fragment.",
+            "citations": '["es-id-1", "es-id-2"]',
+            "recommended_actions": json.dumps(
+                [
+                    {
+                        "tool_name": "ack_alert",
+                        "tool_args": '{"alert_id": "a-1"}',
+                        "rationale": "Legacy rule, benign traffic.",
+                    }
+                ]
+            ),
+        }
+    )
+    assert report.citations == ["es-id-1", "es-id-2"]
+    assert len(report.recommended_actions) == 1
+    assert report.recommended_actions[0].tool_args == {"alert_id": "a-1"}
+
+
+def test_triage_report_non_json_string_gap_still_rejected() -> None:
+    """A string that is NOT valid JSON must still fail validation normally —
+    the coercion only rescues well-formed stringified containers."""
+    with pytest.raises(Exception) as exc_info:
+        TriageReport.model_validate(
+            {
+                "verdict": "needs_more_info",
+                "confidence": 0.5,
+                "summary": "x",
+                "gap_for_investigator": "please query zeek for the flow",
+            }
+        )
+    assert "gap_for_investigator" in str(exc_info.value)
+
+
+def test_oql_primer_hunt_flavor_swaps_worked_examples() -> None:
+    """Hunts get telemetry-first worked examples; the triage flavor (default)
+    keeps the alert-triage examples byte-for-byte. Both keep the shared syntax
+    core, the behavioral examples, and the pitfalls sections."""
+    from soc_ai.agent.prompts import oql_primer_block
+
+    triage = oql_primer_block()
+    hunt = oql_primer_block(flavor="hunt")
+
+    # Triage flavor unchanged: alert-triage examples present.
+    assert "Find a specific alert by rule name" in triage
+    assert "Hunting worked examples" not in triage
+
+    # Hunt flavor: hunt examples in, triage examples out.
+    assert "Hunting worked examples" in hunt
+    assert "Find a specific alert by rule name" not in hunt
+    # Shared sections survive in BOTH flavors.
+    for block in (triage, hunt):
+        assert "## Filter grammar" in block
+        assert "## Lateral-movement & behavioral examples" in block
+        assert "## Common pitfalls (avoid these)" in block
+
+
+def test_oql_primer_markers_present_on_disk() -> None:
+    """The hunt flavor splices on HTML comment markers in docs/OQL_PRIMER.md.
+    If a docs edit drops them, the splice silently degrades — this test is the
+    loud failure the spec requires."""
+    from soc_ai.agent.prompts import _OQL_PRIMER_PATH
+
+    text = _OQL_PRIMER_PATH.read_text(encoding="utf-8")
+    assert "<!-- triage-examples:start -->" in text
+    assert "<!-- triage-examples:end -->" in text
+    assert text.index("<!-- triage-examples:start -->") < text.index("<!-- triage-examples:end -->")
+
+
+def test_investigator_prompt_keeps_triage_examples() -> None:
+    """The investigator path never sees the hunt flavor."""
+    from soc_ai.agent.prompts import build_investigator_prompt
+
+    assert "Find a specific alert by rule name" in build_investigator_prompt()
+
+
+def test_hunt_prompt_carries_triage_owns_alerts_doctrine() -> None:
+    """The rider from the 2026-07-20 telemetry-latitude design: a hunt never
+    re-dispositions alerts (triage owns that stream); alerts corroborate."""
+    from soc_ai.agent.hunt import HUNT_SYSTEM_PROMPT
+
+    assert "Triage owns the alert stream" in HUNT_SYSTEM_PROMPT
+    assert "re-disposition" in HUNT_SYSTEM_PROMPT

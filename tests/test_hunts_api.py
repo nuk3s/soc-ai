@@ -2478,3 +2478,111 @@ def test_bulk_delete_leaves_running_hunt(client: TestClient) -> None:
     assert body["not_found"] == [running]
     # the running hunt is still there
     assert client.get(f"/api/v1/hunts/{running}").status_code == 200
+
+
+def _oql_hit(doc_id: str, dataset: str | None, kind: str | None = None) -> dict[str, Any]:
+    """A minimal ES hit doc in the EsSearchResult.model_dump() shape the
+    t_query_events_oql tool emits ({hits: [{_id, _source: {...}}]})."""
+    src: dict[str, Any] = {}
+    event: dict[str, Any] = {}
+    if dataset is not None:
+        event["dataset"] = dataset
+    if kind is not None:
+        event["kind"] = kind
+    if event:
+        src["event"] = event
+    return {"_id": doc_id, "_index": "logs-x", "_source": src}
+
+
+def test_oql_telemetry_docs_partitions_by_dataset() -> None:
+    """Only docs POSITIVELY identified as non-alert telemetry survive the
+    partition: zeek docs yes; suricata.alert docs no; docs with no
+    event.dataset no; fields-form docs (list values) yes; non-dict results
+    never raise."""
+    from soc_ai.agent.hunt_gates import _oql_telemetry_docs
+
+    result = {
+        "total": 4,
+        "hits": [
+            _oql_hit("zeekDOC00", "zeek.conn"),
+            _oql_hit("alrtDOC00", "suricata.alert", kind="alert"),
+            _oql_hit("bareDOC00", None),  # no dataset — cannot be identified
+            {  # fields-form doc (ES fields option returns list values)
+                "_id": "fldsDOC00",
+                "fields": {"event.dataset": ["zeek.dns"], "event.kind": ["event"]},
+            },
+        ],
+    }
+    kept = _oql_telemetry_docs(result)
+    kept_ids = [d.get("_id") for d in kept]
+    assert kept_ids == ["zeekDOC00", "fldsDOC00"]
+    # Defensive shapes: never raise, never corroborate.
+    assert _oql_telemetry_docs(None) == []
+    assert _oql_telemetry_docs("boom") == []
+    assert _oql_telemetry_docs({"aggregations": {"a": 1}}) == []
+
+
+def test_validate_hunt_findings_oql_zeek_doc_now_corroborates() -> None:
+    """THE fix the 2026-07-20 telemetry-latitude design exists for: a high
+    THREAT finding whose citation resolves into a ZEEK doc fetched via
+    t_query_events_oql keeps its severity. Before the doc-level partition,
+    OQL was blanket non-corroborating and this capped to medium."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Beacon from 10.0.0.5 to 203.0.113.7",
+            detail="Regular 60s cadence, low jitter, measured over 4h of conn records.",
+            severity="high",
+            category="threat",
+            hosts=["10.0.0.5"],
+            citations=["zeekCONN77abc"],
+        )
+    ]
+    tool_results = [
+        _labeled(
+            "t_query_events_oql",
+            {
+                "total": 2,
+                "hits": [
+                    _oql_hit("zeekCONN77abc", "zeek.conn"),
+                    _oql_hit("alrtNOISE99x", "suricata.alert", kind="alert"),
+                ],
+            },
+        )
+    ]
+    validated, _stats = _validate_hunt_findings(findings, tool_results)
+    assert validated[0].severity == "high"  # NOT capped — zeek doc corroborates
+
+
+def test_validate_hunt_findings_oql_alert_doc_still_capped() -> None:
+    """The trust floor holds: the SAME shape, but the citation resolves only
+    into the suricata.alert doc inside the OQL result → still capped to
+    medium with the corroborate-first note."""
+    from soc_ai.agent.hunt_gates import _ALERT_ONLY_NOTE, _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="BPFDoor on 192.0.2.15",
+            detail="The alert fired.",
+            severity="high",
+            category="threat",
+            hosts=["192.0.2.15"],
+            citations=["alrtDOC55zzz"],
+        )
+    ]
+    tool_results = [
+        _labeled(
+            "t_query_events_oql",
+            {
+                "total": 2,
+                "hits": [
+                    _oql_hit("alrtDOC55zzz", "suricata.alert", kind="alert"),
+                    _oql_hit("zeekOTHER11m", "zeek.conn"),  # present but NOT cited
+                ],
+            },
+        )
+    ]
+    validated, _stats = _validate_hunt_findings(findings, tool_results)
+    assert validated[0].severity == "medium"
+    assert _ALERT_ONLY_NOTE in (validated[0].validator_note or "")

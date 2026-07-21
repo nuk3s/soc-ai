@@ -131,7 +131,7 @@ Health check:
 
 ```bash
 curl -k https://localhost:8443/healthz
-# → {"status":"ok","version":"1.0.0","so_auth":"kratos",...}
+# → {"status":"ok","version":"1.2.1","so_auth":"kratos",...}
 ```
 
 ---
@@ -310,7 +310,7 @@ schema only ever moves forward, so older code reads a newer DB fine for the
 additive changes a patch release makes:
 
 ```bash
-git checkout v1.0.0 && docker compose up -d --build
+git checkout v1.2.0 && docker compose up -d --build
 ```
 
 ### What "no breaking updates" means here

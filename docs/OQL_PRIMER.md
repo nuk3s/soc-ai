@@ -83,6 +83,7 @@ If you reference a field outside the whitelist, the validator rejects the query
 and tells you which field was bad. Try a more conventional name from the list
 above before guessing.
 
+<!-- triage-examples:start -->
 ## Worked examples
 
 These cover the patterns you'll need most often during alert triage.
@@ -163,6 +164,7 @@ event.module:zeek AND zeek.conn.duration:[60 TO *]
 event.kind:alert | count
 ```
 
+<!-- triage-examples:end -->
 ## Lateral-movement & behavioral examples
 
 These target the datasets that reveal east-west movement and RITA-style rollups.

@@ -32,6 +32,28 @@ WriteToolName = Literal["ack_alert", "escalate_to_case", "add_case_comment"]
 Verdict = Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
 
 
+def _decode_stringified_json(v: Any) -> Any:
+    """Decode a JSON-encoded string into its container (dict/list), else pass through.
+
+    Serving models recurrently emit nested container fields as JSON-encoded
+    strings instead of objects/arrays: Nemotron-30B did it to
+    ``InvestigationTranscript.rubric_coverage`` (Phase 2 smoke), and
+    deepseek-v4-flash does it to ``TriageReport.gap_for_investigator`` (prod
+    run 01KY0T3ZDPX5MXD1TYMPVDQ5ZH, 2026-07-20 — all 3 schema retries failed
+    identically, so retry feedback does not recover it). The payload inside the
+    string is well-formed; auto-parsing it is strictly more accepting. Strings
+    that don't parse to a container fall through to Pydantic's normal error.
+    """
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return v
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return v
+
+
 class RecommendedAction(BaseModel):
     """One write-tool invocation the agent recommends for the analyst to execute."""
 
@@ -41,6 +63,8 @@ class RecommendedAction(BaseModel):
         description="Arguments to pass to the tool. Must match the tool's signature.",
     )
     rationale: str = Field(description="One-line justification visible to the analyst.")
+
+    _decode_tool_args = field_validator("tool_args", mode="before")(_decode_stringified_json)
 
 
 class RubricCoverage(BaseModel):
@@ -153,28 +177,10 @@ class InvestigationTranscript(BaseModel):
         ),
     )
 
-    @field_validator("rubric_coverage", mode="before")
-    @classmethod
-    def _parse_rubric_string(cls, v: Any) -> Any:
-        """Accept JSON string for `rubric_coverage` and auto-parse to object.
-
-        Phase 2 smoke against Nemotron-30B showed the model recurrently
-        emits `rubric_coverage` as a JSON-encoded string instead of a
-        nested object (e.g. ``"rubric_coverage": "{\\"enrichment_called\\":
-        true, ...}"``). The shape is otherwise correct — auto-parsing
-        the string saves the model from burning 5+ retries discovering
-        the schema wants an object. Pre-validates the string into a
-        dict; invalid JSON falls through to Pydantic's normal validation
-        path which will reject it.
-        """
-        if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                return v
-            if isinstance(parsed, dict):
-                return parsed
-        return v
+    # Accept a JSON string for `rubric_coverage` and auto-parse to object —
+    # Phase 2 smoke against Nemotron-30B showed the model recurrently emits it
+    # stringified (e.g. ``"rubric_coverage": "{\"enrichment_called\": true}"``).
+    _decode_rubric = field_validator("rubric_coverage", mode="before")(_decode_stringified_json)
 
 
 class TargetedGap(BaseModel):
@@ -214,6 +220,8 @@ class TargetedGap(BaseModel):
         description="Exact args; the targeted-investigator runs them verbatim.",
     )
     why_this_matters: str = Field(..., description="One line: how the answer changes the verdict.")
+
+    _decode_tool_args = field_validator("tool_args", mode="before")(_decode_stringified_json)
 
 
 class TriageReport(BaseModel):
@@ -309,6 +317,10 @@ class TriageReport(BaseModel):
             "``provenance`` and ``resolved_via`` are different keys."
         ),
     )
+
+    _decode_containers = field_validator(
+        "gap_for_investigator", "recommended_actions", "citations", mode="before"
+    )(_decode_stringified_json)
 
 
 # Sentinel written into ``TriageReport.resolution['provenance']`` (and, downstream,

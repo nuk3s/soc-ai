@@ -291,7 +291,7 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
         # query and knows zeek.ssh (or endpoint/windows/etc.) actually exists here.
         sys_prompt = (
             CHAT_SYSTEM_PROMPT.format(context=seed_context)
-            + oql_primer_block()
+            + oql_primer_block(flavor="hunt")
             + await inventory_prompt_block(ctx.elastic, settings)
         )
         if guard is not None:

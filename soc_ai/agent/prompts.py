@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _OQL_PRIMER_PATH = _REPO_ROOT / "docs" / "OQL_PRIMER.md"
+_OQL_HUNT_EXAMPLES_PATH = _REPO_ROOT / "docs" / "OQL_HUNT_EXAMPLES.md"
+_TRIAGE_EXAMPLES_START = "<!-- triage-examples:start -->"
+_TRIAGE_EXAMPLES_END = "<!-- triage-examples:end -->"
 
 
 _INVESTIGATOR_RUBRIC = """\
@@ -394,23 +397,42 @@ Wildcards must be ANCHORED: `foo*` and `f?o` are accepted; a leading wildcard
 """
 
 
-def _load_oql_primer() -> str:
+def _load_oql_primer(flavor: str = "triage") -> str:
     try:
         primer = _OQL_PRIMER_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:  # pragma: no cover - dev-only safeguard
         primer = "# OQL primer\n\n> Primer file missing on disk; OQL is unavailable.\n"
+    if flavor == "hunt":
+        # Splice the alert-triage worked examples out and the hunting examples
+        # in. Splice keys on the HTML comment markers (invisible on the docs
+        # site); test_oql_primer_markers_present_on_disk fails the build if a
+        # docs edit drops them, so a missing marker never silently degrades —
+        # fall back to the full primer in that case (fail-open at runtime).
+        start = primer.find(_TRIAGE_EXAMPLES_START)
+        end = primer.find(_TRIAGE_EXAMPLES_END)
+        if start != -1 and end != -1 and start < end:
+            try:
+                hunt_examples = _OQL_HUNT_EXAMPLES_PATH.read_text(encoding="utf-8")
+            except FileNotFoundError:  # pragma: no cover - dev-only safeguard
+                hunt_examples = ""
+            primer = primer[:start] + hunt_examples + primer[end + len(_TRIAGE_EXAMPLES_END) :]
     return primer + _OQL_PIPE_STAGE_ADDENDUM
 
 
-def oql_primer_block() -> str:
+def oql_primer_block(flavor: str = "triage") -> str:
     """The OQL primer as an appendable block, for any agent that runs OQL.
 
     The investigator gets it via :func:`build_investigator_prompt`; the HUNT and
     follow-up-CHAT agents ALSO run ``t_query_events_oql`` and must get it too, or
     they write invalid OQL (parentheses, leading wildcards) and churn through
     failed queries — the root cause of hunts that 'find nothing'.
+
+    ``flavor="hunt"`` swaps the alert-triage worked examples for the
+    telemetry-first hunting examples (``docs/OQL_HUNT_EXAMPLES.md``) — hunts
+    should slice datasets, not pivot from alerts (2026-07-20 telemetry-latitude
+    design). Triage/investigator/alert-chat callers keep the default.
     """
-    return "\n\n" + _load_oql_primer()
+    return "\n\n" + _load_oql_primer(flavor)
 
 
 def build_investigator_prompt() -> str:
@@ -718,6 +740,29 @@ def build_synth_first_system_prompt() -> str:
 
 
 SYNTH_FIRST_SYSTEM_PROMPT = build_synth_first_system_prompt()
+
+
+BUDGET_PARTIAL_SYNTH_PROMPT = """You are soc-ai's triage synthesizer, concluding an \
+investigation that hit its tool-call budget before the investigator could finish. The \
+FULL trace of the tool calls already made this session — and their results — is in the \
+conversation above.
+
+Write the final `TriageReport` NOW from ONLY the evidence already gathered above. You \
+have NO remaining tool budget — do not ask for more tools. HARD RULE: state a concrete \
+fact (host, domain, IP/port, hash, user) ONLY if it appears in a tool result above; \
+never invent or "example" a value. Because the investigation was cut short, keep the \
+summary honest about what was and was not checked, and set a LOWER confidence than you \
+would for a completed run. A short, honest, grounded PARTIAL verdict is the goal — \
+never a fabricated complete one. If the gathered evidence does not support a verdict, \
+return `needs_more_info` and say what is missing.
+
+A detector claim is not a threat: a rule name / signature title is the DETECTOR'S \
+CLAIM, not an observation. Conclude `true_positive` ONLY when a tool result above \
+corroborates it beyond the alert document itself — a decoded payload, a measured \
+beacon cadence, a blocklist / enrichment hit, host prevalence, or a host artifact. A \
+solicited reply that merely matches a loud signature with no corroborating indicator \
+is an uncorroborated false positive, not C2 — read the direction/target, don't anchor \
+on the rule name."""
 
 
 def _format_investigator_prompt(

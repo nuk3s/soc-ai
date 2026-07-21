@@ -1,7 +1,7 @@
 # Architecture
 
 How soc-ai is put together, going deeper than the high-level diagram in the
-README. This describes `main` as it stands after the v1 delivery.
+README. This describes `main` as of the 1.2 line.
 
 ## Process model
 

@@ -104,6 +104,7 @@ nav:
       - Web console: WEBUI_GUIDE.md
       - Agent tools: AGENT_TOOLS.md
       - OQL primer: OQL_PRIMER.md
+      - OQL hunting examples: OQL_HUNT_EXAMPLES.md
       - Test PCAPs: TEST_PCAPS.md
   - How it works:
       - Architecture: ARCHITECTURE.md
@@ -111,6 +112,7 @@ nav:
   - Blog:
       - Getting an LLM to show its work: blog/2026-07-getting-an-llm-to-show-its-work.md
   - Project:
+      - Roadmap: ROADMAP.md
       - Changelog: project/changelog.md
       - Contributing: project/contributing.md
       - Security policy: project/security.md
