@@ -33,7 +33,7 @@ README. This describes `main` as of the 1.2 line.
 Write actions (ack / escalate / comment) are **not** on this surface: the
 pipeline recommends them in the report, and the analyst executes them through
 the actions API (`POST /api/v1/investigations/{id}/actions/{index}/execute`,
-`soc_ai/api/webui/routes_actions.py`) — the single analyst write path.
+`soc_ai/api/webui/routes_actions.py`), the single analyst write path.
 
 > **Security posture:** the JSON API requires authentication when
 > `API_AUTH_REQUIRED=true`: a session cookie (web login) or a bearer API token
@@ -48,7 +48,7 @@ the actions API (`POST /api/v1/investigations/{id}/actions/{index}/execute`,
 
 Every triage runs through one entry point, `investigate()` in
 `soc_ai/agent/orchestrator.py`, which delegates to
-`_run_synth_first_pipeline()`. One pipeline, staged escalation — each stage
+`_run_synth_first_pipeline()`. One pipeline, staged escalation: each stage
 handles what the previous could not, at roughly 10× the cost.
 
 ```mermaid
@@ -74,18 +74,18 @@ Names in code → what they actually are:
 
 | Code name | Actual role |
 |---|---|
-| `build_synth_first_agent` ("synthesizer") | **The primary verdict writer (settle path)** — tool-less by design; the loop path uses the sibling `build_synthesizer` over the transcript, and failure paths emit deterministic fallbacks |
-| `targeted_investigator` / Phase D | **Deterministic dispatcher** — not an agent, not an LLM; runs the one tool the synth named (`soc_ai/agent/targeted_investigator.py`) |
-| `build_investigator` | **The investigation loop** — full tool-equipped agent, entered for definitely-investigate, `investigate_when_unsure` trigger, or `fast_triage_enabled=false` (forces loop for every alert) |
+| `build_synth_first_agent` ("synthesizer") | **The primary verdict writer (settle path)**: tool-less by design; the loop path uses the sibling `build_synthesizer` over the transcript, and failure paths emit deterministic fallbacks |
+| `targeted_investigator` / Phase D | **Deterministic dispatcher**: not an agent, not an LLM; runs the one tool the synth named (`soc_ai/agent/targeted_investigator.py`) |
+| `build_investigator` | **The investigation loop**: full tool-equipped agent, entered for definitely-investigate, `investigate_when_unsure` trigger, or `fast_triage_enabled=false` (forces loop for every alert) |
 | Chat / Hunt agents | Share the read-tool surface from `soc_ai/agent/toolset.py`; chat adds `propose_verdict` + rule tuning, hunt uses wider windows and writes a `HuntReport` |
-| Oracle | Opt-in second opinion via raw HTTP completion — **not** a pydantic-ai agent |
+| Oracle | Opt-in second opinion via raw HTTP completion, **not** a pydantic-ai agent |
 
 ### Synth-first stage detail
 
-- **Phase A — rich precompute:** `get_enriched_alert_context()` pivots the
+- **Phase A (rich precompute):** `get_enriched_alert_context()` pivots the
   alert across host / user / community-id and runs local enrichment, producing
   an `EnrichedAlertContext`.
-- **Phase B — decision template:** `match_decision_template()`
+- **Phase B (decision template):** `match_decision_template()`
   (`soc_ai/agent/decision_templates.py`) runs ordered, pure-function templates
   over the enriched context and may hand the synth a *candidate verdict* (an
   anchor it can keep, refine, or override).
@@ -95,11 +95,11 @@ Names in code → what they actually are:
   (e.g. a template in `EXTERNAL_REPUTATION_TEMPLATES`). This pre-check only
   runs when `investigate_when_unsure` is enabled. When true a
   `synth_round1_skipped` event is emitted and the pipeline routes straight to
-  the investigation loop — Phase C is never called.
-- **Phase C — synthesis round 1:** the heavy model reads the materialized
+  the investigation loop, and Phase C is never called.
+- **Phase C (synthesis round 1):** the heavy model reads the materialized
   evidence + candidate and emits a `TriageReport`. It has no tools and may
   include a `gap_for_investigator` naming **one** tool + exact args.
-- **Phase D — targeted dispatch (optional):** if a gap was named and the loop
+- **Phase D (targeted dispatch, optional):** if a gap was named and the loop
   was not entered, `soc_ai/agent/targeted_investigator.py` dispatches that
   single tool **deterministically** (no LLM in the loop), then synthesis
   round 2 reads the combined evidence. Phase D runs at most
@@ -129,8 +129,8 @@ report is emitted (see below).
 ## Tools & the read/write split
 
 Every tool function is registered in a global registry (`soc_ai/tools/_registry.py`)
-with a `read_only` flag. The **read-tool surface** — wrapping, dedup,
-result-clamping, and per-role registration — is the sole responsibility of
+with a `read_only` flag. The **read-tool surface** (wrapping, dedup,
+result-clamping, and per-role registration) is the sole responsibility of
 `soc_ai/agent/toolset.py`, which defines all `t_*` tools once and exposes them
 per-role via `register_read_tools(agent, ctx, role)`. Closures over the runtime
 `InvestigationContext` keep the LLM-facing signatures semantic (no `auth` /
@@ -140,7 +140,7 @@ per-role via `register_read_tools(agent, ctx, role)`. Closures over the runtime
   `t_query_zeek_logs`, `t_get_playbooks`, `t_get_event_raw`, the `t_enrich_*`
   family, `t_lookup_runbook`, and more) auto-execute.
 - **Write tools** (`ack_alert`, `escalate_to_case`, `add_case_comment`) are
-  never exposed to the LLM for execution — the report *recommends* them, and
+  never exposed to the LLM for execution; the report *recommends* them, and
   they only run through the audited `execute_write_tool`
   (`soc_ai/tools/write_exec.py`) on an explicit analyst action.
 
@@ -154,19 +154,19 @@ dispatchable surface is the `PHASE_D_TOOLS` tuple exported from `toolset.py`.
 This is the firewall between LLM-generated query strings and Elasticsearch.
 Raw OQL **never** reaches ES. The pipeline is:
 
-1. `parse_oql` — split on top-level `|`, parse the boolean filter with a Lark
+1. `parse_oql`: split on top-level `|`, parse the boolean filter with a Lark
    grammar into a typed AST, parse pipe stages with regex.
-2. `validate_oql` — walk the AST and reject any field not on the whitelist
+2. `validate_oql`: walk the AST and reject any field not on the whitelist
    (`oql_fields.json`), reject repeated/unsafe pipe stages, and cap `head` at a
    hard 10,000-row ceiling.
-3. `ast_to_es_dsl` — translate the validated AST into an ES search body.
+3. `ast_to_es_dsl`: translate the validated AST into an ES search body.
 
 `query_events_oql` also excludes synthetic-eval docs
 (`synth.scenario_id`) by default so fixtures can't leak into real responses.
 
 ## Write-action flow (`soc_ai/tools/write_exec.py` → `execute_write_tool`)
 
-1. The pipeline never executes a write itself — it lists write tools in
+1. The pipeline never executes a write itself; it lists write tools in
    `TriageReport.recommended_actions` (advisory only).
 2. The analyst executes a recommendation from the report via the actions API
    (`POST /api/v1/investigations/{id}/actions/{index}/execute`). Group ack /

@@ -197,7 +197,7 @@ the refresh skips GeoIP but everything else still works.
 
 **Back up first.** Migrations run automatically at startup and schema downgrades
 are unsupported, so a bad upgrade can't be rolled back by re-running an old image
-against a migrated DB — you restore from a snapshot instead. Take one before every
+against a migrated DB; you restore from a snapshot instead. Take one before every
 upgrade (see [Backup and restore](#backup-and-restore) for the full command):
 
 ```bash
@@ -207,7 +207,7 @@ docker cp soc-ai:/var/lib/soc-ai/data/backup.tar.gz \
 docker exec soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
 ```
 
-Then update — one command:
+Then update with one command:
 
 ```bash
 git pull && docker compose up -d --build
@@ -235,7 +235,7 @@ curl -k https://localhost:8443/healthz      # → {"status":"ok","version":"…"
 ### Backup and restore
 
 `soc-ai backup` snapshots the store through the SQLite backup API, so it is
-**safe while the app is running** — don't `docker cp` the bare `.db` out of a
+**safe while the app is running**; don't `docker cp` the bare `.db` out of a
 live container; the store runs WAL journaling and a raw copy of a hot
 database can tear pages. The archive carries the DB snapshot, the app-owned
 sidecar files next to it (the decision-record signing key, the pinned sensor
@@ -250,13 +250,13 @@ docker exec soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
 ```
 
 The enrichment caches (blocklists, MaxMind, cloud prefixes) are **excluded by
-default** — they are re-downloadable with `soc-ai blocklists refresh`, and they
+default**, since they are re-downloadable with `soc-ai blocklists refresh`, and they
 dwarf the DB. Add `--full` to include them (worth it on an air-gapped host).
 
 #### Scheduling backups (with retention)
 
 Like the blocklist refresh, the Docker stack ships **no in-app scheduler** for
-backups — add a host cron (or a systemd timer). This one snapshots the store into
+backups; add a host cron (or a systemd timer). This one snapshots the store into
 a dated file on the host and prunes anything older than 14 days:
 
 ```bash
@@ -283,13 +283,13 @@ find "$DEST" -name 'soc-ai-backup-*.tar.gz' -type f -mtime "+$RETAIN_DAYS" -dele
 ```
 
 Store the backups off-box (they contain the decision-record signing key and the
-pinned sensor `known_hosts`). Test a restore periodically — an untested backup is
+pinned sensor `known_hosts`). Test a restore periodically: an untested backup is
 a hope, not a recovery plan.
 
 Restore refuses every dangerous step unless you say `--yes`: it won't overwrite
 an existing store (it prints exactly what it would replace), and it won't
 restore under a live-looking app (a write-ahead log with recent activity).
-It also refuses — regardless of `--yes` — an archive made by a **newer** soc-ai,
+It also refuses, regardless of `--yes`, an archive made by a **newer** soc-ai,
 because schema downgrades are unsupported. An **older** archive is always fine:
 the app migrates it to head at the next startup.
 
@@ -461,20 +461,20 @@ cron (or any scheduler) that execs the refresh on a cadence:
 17 3 * * 0  root  docker compose -f /opt/soc-ai/docker-compose.yml exec -T soc-ai python -m soc_ai blocklists refresh
 ```
 
-### The nightly quality micro-eval — schedule it in-app or from host cron
+### The nightly quality micro-eval: schedule it in-app or from host cron
 
 `soc-ai eval-nightly` investigates a handful of real alerts and lands one row in
 the local quality trend (the dashboard's **Verdict quality** card), alarming
 through the notification webhook when the new point regresses against its own
 history. It converts "the verdicts were validated once" into "the verdicts are
-measured every night" — the tripwire for a silent degradation after an
+measured every night", the tripwire for a silent degradation after an
 inference-engine or analyst-model swap.
 
 The simplest way to schedule it is **in-app**: Config → Quality → *Nightly
 quality eval* (runs daily at the configured UTC hour; the dashboard card also
 has a **Run now** button sharing the same single-flight run). The in-app
 scheduler skips its slot when a snapshot already landed today (e.g. a host
-cron beat it to it) — the reverse is not true, so pick ONE scheduler: the
+cron beat it to it); the reverse is not true, so pick ONE scheduler: the
 toggle, or this host cron:
 
 ```cron
@@ -484,7 +484,7 @@ toggle, or this host cron:
 
 Mode is automatic and honest about egress: with `oracle_enabled` on, each run
 is **oracle-graded** (one cloud call per alert; agreement rate joins the
-trend); otherwise it runs **zero-egress local** mode (no oracle at all — the
+trend); otherwise it runs **zero-egress local** mode (no oracle at all; the
 trend carries fallback/error rates, verdict distribution, and latency instead,
 and the dashboard card labels which mode measured each point). Force either
 with `--graded` / `--local`. Tune the sample size (`quality_nightly_n`) and the
@@ -505,7 +505,7 @@ container restarting mid-hunt, raise `deploy.resources.limits.memory` in
 
 **First move: run the doctor.** `docker exec soc-ai python -m soc_ai doctor` checks the whole
 dependency surface (config, store + migration head, Security Onion, Elasticsearch, gateway,
-model fitness) and prints a pass/fail table with a fix hint on every failing line — start
+model fitness) and prints a pass/fail table with a fix hint on every failing line. Start
 there before the per-symptom entries below.
 
 **Container exits immediately after start**

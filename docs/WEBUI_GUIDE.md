@@ -1,4 +1,4 @@
-# soc-ai web UI — operator guide
+# soc-ai web UI: operator guide
 
 The soc-ai web UI is a self-hosted triage console for Security Onion alerts. It
 runs on the soc-ai host at **`https://<host>:8443/app`** behind session auth.
@@ -34,7 +34,7 @@ docker compose logs soc-ai | grep -i password
 
 Change it after first login (Config → Users → reset password).
 
-## Triage console — `/app/alerts`
+## Triage console (`/app/alerts`)
 
 ![The alert queue with AI verdicts inline](img/screenshot-alerts.png)
 
@@ -60,7 +60,7 @@ The main pane: Security-Onion-style alert groups (by rule), newest first.
   picked up by the next run. The status chip shows hunted/total/skipped + the
   chosen severities.
 
-## Investigations — `/app/investigations`
+## Investigations (`/app/investigations`)
 
 ![The investigations list with verdicts and confidence](img/screenshot-investigations.png)
 
@@ -73,22 +73,22 @@ marked `error` (its worker died with the previous process), and a periodic sweep
 marks any run still `running` past `investigation_reaper_minutes` (default 30).
 No manual SQL needed to clear orphans.
 
-## Runbooks — `/app/runbooks`
+## Runbooks (`/app/runbooks`)
 
-The authoring space for your team's own triage guidance — the corpus the
+The authoring space for your team's own triage guidance, the corpus the
 investigation agent searches (its `lookup_runbook` tool) and cites in verdicts.
 Reading is open to analysts; creating/editing/deleting is admin-gated.
 
 - **Editor**: title, markdown content (with a write/preview toggle), tags, and
-  **linked rules** — detection rule names/UUIDs this runbook applies to. A
+  **linked rules**: detection rule names/UUIDs this runbook applies to. A
   rule-link is the strongest retrieval signal: when that rule fires, this
   runbook wins.
 - **Import files…**: bulk-import existing `.md` procedures from your wiki or
   repo. Optional YAML front-matter (`title:`, `tags:`, `rules:`) is parsed
-  leniently — malformed metadata is ignored and the body still imports; the
+  leniently: malformed metadata is ignored and the body still imports; the
   title falls back to the first `#` heading, then the filename.
 - **Load starter pack**: seeds ten generic, vendor-neutral SOC runbooks shipped
-  with the repo (`runbooks/starter-pack/`). Idempotent by title — it never
+  with the repo (`runbooks/starter-pack/`). Idempotent by title, so it never
   duplicates or overwrites a runbook you already have, so it's safe to re-run
   after upgrades. Edit the seeded copies freely; your edits stick.
 - When the optional **Retrieval (RAG)** embeddings tier is configured, each row
@@ -98,7 +98,7 @@ Reading is open to analysts; creating/editing/deleting is admin-gated.
 The Config page keeps a compact summary (count + manage link) next to the
 Retrieval settings.
 
-## Config console — `/app/config` (admin only)
+## Config console (`/app/config`, admin only)
 
 In-UI configuration. A non-admin who reaches it gets a clean 403 (no login loop).
 
@@ -147,7 +147,7 @@ access (automation / integrations) once `API_AUTH_REQUIRED` is enabled.
 
 Every **read** tool the agent uses is read-only. Every **write** tool (anything
 that changes Security Onion state: ack, escalate-to-case, comment) is something
-the agent can only *recommend* — you execute it with a click from the report,
+the agent can only *recommend*; you execute it with a click from the report,
 and every execution is audited. The one bounded exception is the
 confidence-gated auto-acknowledge for low-stakes false positives
 (`auto_ack_fp_enabled`), which never touches critical or malware-class alerts. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the

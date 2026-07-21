@@ -1,7 +1,7 @@
 # Contributing
 
-soc-ai welcomes contributions. The full contributor guide — how to set up the dev
-environment, the coding standards, and how to open a pull request — lives in the
+soc-ai welcomes contributions. The full contributor guide, covering dev-environment
+setup, coding standards, and how to open a pull request, lives in the
 repository:
 
 [:octicons-arrow-right-24: **CONTRIBUTING.md on GitHub**](https://github.com/nuk3s/soc-ai/blob/main/CONTRIBUTING.md)

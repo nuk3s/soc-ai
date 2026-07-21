@@ -53,12 +53,12 @@ prints the URL and admin password.
 !!! tip "Something not working?"
     Run the doctor: `docker exec soc-ai python -m soc_ai doctor` (or `uv run soc-ai doctor`
     from a source checkout). It checks config, the local store + migrations, Security Onion,
-    Elasticsearch, the gateway, and the analyst model's fitness — a pass/fail table with a
+    Elasticsearch, the gateway, and the analyst model's fitness, and prints a pass/fail table with a
     fix hint on every failing line.
 
-Full Docker detail — required mounts, SELinux relabeling, upstream TLS trust
-(`*_VERIFY_SSL`), the port-8443-vs-SO-nginx conflict, and the manual + rsync/systemd
-paths — is in [Docker deployment](DOCKER.md).
+Full Docker detail (required mounts, SELinux relabeling, upstream TLS trust
+via `*_VERIFY_SSL`, the port-8443-vs-SO-nginx conflict, and the manual + rsync/systemd
+paths) is in [Docker deployment](DOCKER.md).
 
 ## Work an alert in the browser
 
