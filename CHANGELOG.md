@@ -6,6 +6,64 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-23
+
+A security and correctness patch from a full code review of 1.2.1. Sixty-nine
+findings were fixed across the agent, tools, API, oracle redaction, store, and
+frontend, plus a decision-template fix that spares a high-volume class of benign
+informational alerts from a redundant investigation loop. No new features and no
+schema changes.
+
+### Security
+
+- **The evidence gate requires real evidence.** A data-free tool call (a
+  zero-hit query, a clean-internal enrichment) no longer satisfies the hard
+  evidence gate, and a verdict grounded only in a prefetched IOC hit must agree
+  with that hit. This closes several ways a verdict could settle without a
+  genuine investigation.
+- **Auto-acknowledge is opt-in and bound to the investigation.** The unattended
+  false-positive acknowledge path defaults off, honors the same attack-classtype
+  guard as oracle escalation, and executes only against the alert the analyst
+  approved — never a target chosen by model output.
+- **Oracle redaction gaps closed.** The cloud-egress sanitizer now redacts
+  Windows profile and UNC paths, single-label hostnames written with a trailing
+  root dot, and defanged indicators in web-search queries, and it masks the full
+  length of a multi-word secret. The eval path threads the operator's configured
+  internal hosts and suffixes through its own sanitizer and residue gate, and
+  never re-sends a rehydrated (desanitized) critique to the cloud.
+- **SSRF hardening in the page-fetch tool.** The internal-range guard rejects
+  carrier-grade-NAT (100.64.0.0/10) and every non-global range, and DNS
+  resolution runs off the event loop so a slow or hostile resolver cannot stall
+  the server.
+- **Audit trail.** Windowed chain verification no longer false-positives "tamper
+  detected" on a normal deployment, and the redactor masks the whole multi-word
+  secret value.
+- **Auth and session hygiene.** The CSRF origin allowlist no longer trusts the
+  Security Onion grid origin; an admin password reset revokes previously minted
+  API tokens; unauthenticated login bodies are size-capped; the CLI warns when a
+  bearer token would ride over unverified TLS; and the bootstrap admin password
+  is written to a `0600` file instead of the log.
+- **Denial-of-service caps.** Hunt and investigation chat, alert-action batches,
+  auto-triage batches, OQL group-by and count stages, and the always-on triage
+  time windows are now bounded so a single caller — or the model — cannot
+  overload the app or the Elasticsearch cluster.
+- **Supply chain.** Container base images and the compose quick-start pin by
+  digest or explicit tag, and the GitLab CI `uv` install is version-pinned.
+- **Frontend.** The markdown renderer rejects protocol-relative link and image
+  URLs.
+
+### Fixed
+
+- **Benign informational alerts skip the redundant investigation loop.** The
+  benign decision templates now judge the external endpoint regardless of flow
+  direction, so a server-side observation (a TLS certificate, JA3S, or banner)
+  whose external counterparty is the connection *source* is recognized without a
+  full tool-driven investigation.
+- A batch of correctness fixes across advisory-action idempotency, group-ack
+  semantics, chat-turn isolation, redaction case-folding and word boundaries,
+  runbook full-text search, tool-result clamping, and frontend polling and error
+  handling. The per-commit history has the full list.
+
 ## [1.2.1] - 2026-07-21
 
 A quality patch: the two failure modes behind the dashboard's "pipeline

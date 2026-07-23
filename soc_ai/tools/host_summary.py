@@ -69,6 +69,14 @@ _SAMPLE_SIZE = 200
 # Cap distinct buckets per terms aggregation.
 _AGG_SIZE = 10
 
+# Hard ceiling on the requested window. This is an LLM-callable read tool —
+# alert-embedded text (payload/DNS/HTTP fields) can steer the agent to pass an
+# absurd value (e.g. lookback_hours=876000), turning a "who is this host"
+# lookup into a full-history ES search against the same cluster the live SO
+# grid depends on. 720h (30 days) comfortably covers the widest legitimate
+# window (default is 24h) while bounding worst-case query cost.
+_MAX_LOOKBACK_HOURS = 24 * 30
+
 # Well-known service ports — a host seen RESPONDING on one of these is offering a
 # service (server signal). Originating a connection TO one is consuming it
 # (workstation signal). Kept deliberately small + classic; the role guess is a
@@ -336,7 +344,8 @@ async def host_summary(
             Zeek queries work across RFC1918 too).
         elastic: client for the SO ES cluster.
         settings: app settings (uses ``events_index_pattern``).
-        lookback_hours: window size in hours. Default 24.
+        lookback_hours: window size in hours. Default 24, capped at
+            ``_MAX_LOOKBACK_HOURS`` (30 days).
         time_anchor: when set, center the window on this timestamp instead of the
             now-relative default. The chat/investigator threads ``alert.timestamp``
             here so it finds evidence for an old alert.
@@ -363,6 +372,13 @@ async def host_summary(
             "error": True,
             "type": "ValueError",
             "message": f"lookback_hours must be positive, got {lookback_hours}",
+        }
+
+    if lookback_hours > _MAX_LOOKBACK_HOURS:
+        return {
+            "error": True,
+            "type": "ValueError",
+            "message": (f"lookback_hours must be <= {_MAX_LOOKBACK_HOURS}, got {lookback_hours}"),
         }
 
     index = settings.events_index_pattern

@@ -319,14 +319,34 @@ def _auth_headers(token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def _warn_insecure_auth(token: str | None, verify: bool | str) -> None:
+    """Loud stderr warning when a Bearer token rides over unverified TLS.
+
+    Mirrors the ``API_AUTH_REQUIRED=false`` warning main.py emits at startup:
+    a real risk (on-path attacker captures a fully-privileged API token) gets
+    a visible flag instead of silent acceptance, without changing the default
+    lab self-signed posture.
+    """
+    if token and verify is False:
+        print(
+            f"{_C['yellow']}WARNING{_C['reset']}: sending a Bearer token with TLS "
+            "certificate verification disabled (the default) — an on-path attacker "
+            "could capture it. Pass --verify or --cafile to verify the server's cert.",
+            file=sys.stderr,
+        )
+
+
 def _triage(args: argparse.Namespace) -> int:
     base_url = _resolve_base_url(args.url)
+    token = _resolve_token(args)
+    verify = _resolve_verify(args)
+    _warn_insecure_auth(token, verify)
     return asyncio.run(
         _stream_investigation(
             base_url,
             args.alert_id,
-            token=_resolve_token(args),
-            verify=_resolve_verify(args),
+            token=token,
+            verify=verify,
         )
     )
 
@@ -334,11 +354,14 @@ def _triage(args: argparse.Namespace) -> int:
 def _healthz(args: argparse.Namespace) -> int:
     base_url = _resolve_base_url(args.url)
     url = base_url.rstrip("/") + "/healthz"
+    token = _resolve_token(args)
+    verify = _resolve_verify(args)
+    _warn_insecure_auth(token, verify)
     # verify defaults to False (lab self-signed); --verify/--cafile enable it.
     with httpx.Client(
-        verify=_resolve_verify(args),
+        verify=verify,
         timeout=10.0,
-        headers=_auth_headers(_resolve_token(args)),
+        headers=_auth_headers(token),
     ) as client:
         resp = client.get(url)
     try:

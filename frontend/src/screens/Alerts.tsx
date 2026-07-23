@@ -318,6 +318,11 @@ export function Alerts() {
   };
   const view = (searchParams.get('view') as ViewId) || 'all';
   const drawerId = searchParams.get('drawer');
+  // useAsync captures pauseWhen at setup and can't see `drawerId` there (it's
+  // not in the deps below), so track it in a ref and let pauseWhen consult
+  // that instead — same gotcha/pattern as Investigations.tsx, Hunts.tsx, etc.
+  const drawerOpenRef = useRef(false);
+  drawerOpenRef.current = !!drawerId;
   const { data: groups, loading, error } = useAsync(
     () => getAlerts(alertQuery),
     [filterTime, customRange?.from, customRange?.to, hideAcked, reloadKey],
@@ -325,7 +330,7 @@ export function Alerts() {
       refetchInterval: 10000, // keep the grid + verdict/status badges live without a reload
       // Pause the 10s ES aggregation while an investigation drawer is open, so
       // the grid doesn't churn under the analyst; resumes on close.
-      pauseWhen: () => !!drawerId,
+      pauseWhen: () => drawerOpenRef.current,
     }
   );
 
@@ -652,17 +657,23 @@ export function Alerts() {
   const assignToMe = (g: AlertGroup) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
-    assignAlert(g.name).then(() => setReloadKey((k) => k + 1));
+    assignAlert(g.name)
+      .then(() => setReloadKey((k) => k + 1))
+      .catch(() => showAckMsg(`Failed to assign ${g.name}`));
   };
   const release = (g: AlertGroup) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
-    assignAlert(g.name, true).then(() => setReloadKey((k) => k + 1));
+    assignAlert(g.name, true)
+      .then(() => setReloadKey((k) => k + 1))
+      .catch(() => showAckMsg(`Failed to release ${g.name}`));
   };
   const setTriage = (g: AlertGroup, state: TriageState) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
-    assignAlert(g.name, false, state).then(() => setReloadKey((k) => k + 1));
+    assignAlert(g.name, false, state)
+      .then(() => setReloadKey((k) => k + 1))
+      .catch(() => showAckMsg(`Failed to update ${g.name}`));
   };
 
   // The Verdict filter carries a synthetic 'pipeline_error' value (E1.2): a

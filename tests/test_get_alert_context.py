@@ -528,6 +528,87 @@ async def test_behavioral_summary_pivot_surfaces_beacon_into_pivots(
 
 
 @pytest.mark.asyncio
+async def test_behavioral_summary_malformed_hit_does_not_poison_prefetch(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    """A behavioral-summary doc with a schema-drifted field (a list where a
+    scalar string is expected, plausible on a deployment's custom RITA/DNS-tunnel
+    rollup) must NOT abort the whole prefetch. Per the pivot's best-effort
+    contract it degrades to [] and the rest of the context survives (regression
+    for F47 — the SoAlert.from_es_hit comprehension used to raise OUTSIDE the
+    pivot's try/except and propagate through the un-guarded outer gather)."""
+    malformed_doc = {
+        "_id": "beacon-bad-1",
+        "_source": {
+            "event.dataset": "zeek.conn_summary",
+            "source.ip": "10.0.0.115",
+            # schema drift: user.name arrives as a list, not a scalar string,
+            # so SoAlert.from_es_hit raises pydantic.ValidationError.
+            "user.name": ["svc-a", "svc-b"],
+        },
+    }
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(sample_alert), *([_EMPTY_HITS] * 6)],
+        behavioral_response=_hits_response([malformed_doc]),
+    )
+
+    # Must not raise; the malformed behavioral doc is dropped, not fatal.
+    ctx = await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
+    assert ctx.alert.id == "alert-001"
+    assert all(e.id != "beacon-bad-1" for e in ctx.community_id_events)
+
+
+@pytest.mark.asyncio
+async def test_community_pivot_capped_at_max_after_behavioral_merge(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    """Prepending behavioral-summary docs must not push community_id_events past
+    the documented ``max_per_pivot`` cap (F74). Behavioral docs (high-signal,
+    rare) keep the front slots; the OLDEST community_id events are dropped to fit."""
+    community_hits = [
+        {
+            "_id": f"event-c{i}",
+            "_source": {
+                "@timestamp": f"2026-05-07T10:30:{sec}Z",
+                "network": {"community_id": "1:abc123def456=="},
+            },
+        }
+        for i, sec in ((1, "10"), (2, "20"), (3, "30"))
+    ]
+    beacon_docs = [
+        {
+            "_id": f"beacon-{j}",
+            "_source": {
+                "event.dataset": "zeek.conn_summary",
+                "source.ip": "10.0.0.115",
+                "synth": {"beacon_profile": {"interval_similarity": 0.95}},
+            },
+        }
+        for j in (1, 2)
+    ]
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        [
+            _alert_lookup_response(sample_alert),
+            _hits_response(community_hits),  # community_id pivot: 3 hits
+            *([_EMPTY_HITS] * 4),  # host, user, process, file
+            _EMPTY_HITS,  # host-risk agg
+        ],
+        behavioral_response=_hits_response(beacon_docs),
+    )
+
+    ctx = await get_alert_context(
+        "alert-001", elastic=elastic, settings=settings_kratos, max_per_pivot=3
+    )
+
+    ids = [e.id for e in ctx.community_id_events]
+    assert len(ids) == 3  # capped at max_per_pivot, not 3 + 2
+    assert ids[:2] == ["beacon-1", "beacon-2"]  # behavioral keep the front slots
+    assert ids[2] == "event-c3"  # newest community event kept; c1/c2 (oldest) dropped
+
+
+@pytest.mark.asyncio
 async def test_host_risk_degrades_gracefully_on_agg_failure(
     settings_kratos: Settings, sample_alert: dict[str, Any]
 ) -> None:

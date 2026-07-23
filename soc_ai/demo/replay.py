@@ -19,8 +19,10 @@ NOT a Hunt-Console row):
 
 A missing recording replays the live pipeline's unknown-alert stream —
 ``session_start`` then a prefetch-phase ``error`` event with the same payload
-keys as ``soc_ai.agent.orchestrator._error_payload`` — and the row lands
-``status='error'`` exactly like a live run on an unknown alert.
+keys as ``soc_ai.agent.orchestrator._error_payload``. Unlike a live run, NO
+row is created for it: an unrecorded alert_id has nothing to persist, and
+creating one anyway would let an unauthenticated demo visitor flood the DB
+by looping bogus alert_ids (F37).
 """
 
 from __future__ import annotations
@@ -59,13 +61,14 @@ def step_delay(n_events: int) -> float:
 
 
 def _unknown_alert_replay(alert_es_id: str) -> dict[str, Any]:
-    """A synthetic replay mirroring the live pipeline's unknown-alert stream.
+    """The events for a synthetic replay mirroring the live pipeline's
+    unknown-alert stream — the caller (:func:`replay_recorded_run`) streams
+    ``events`` directly and skips the recorder, so no row is created.
 
     Live, an unknown alert 200s the SSE stream and fails in prefetch:
     ``session_start`` then ``error`` (``_error_payload`` keys — phase/round/
-    type/message/hint). With no ``triage_report`` recorded, the recorder's
-    finish downgrade lands the row ``status='error'`` — the same reporting a
-    live run gives, not an invented shape.
+    type/message/hint). The demo mirrors that same error shape without the
+    row a live run would land, since the alert was never recorded.
     """
     return {
         "alert_es_id": alert_es_id,
@@ -105,9 +108,22 @@ async def replay_recorded_run(
     the recorder is the same tee live runs use, the GET endpoints render the
     replay identically to a real run. Each replay creates a NEW row (live
     parity: re-clicking re-runs the recording).
+
+    *replay* ``None`` (no recording for *alert_id*) is the ONE case that never
+    touches the recorder: there is nothing to persist for an alert the demo
+    never recorded, and ``/investigate`` is an unauthenticated, allow-listed
+    write on a public demo — starting a row per bogus alert_id would let a
+    visitor flood the DB just by looping garbage ids (F37). The unknown-alert
+    error stream is emitted directly, with no leading ``investigation_created``.
     """
     if replay is None:
-        replay = _unknown_alert_replay(alert_id)
+        session_id = uuid.uuid4().hex[:12]
+        for ev in _unknown_alert_replay(alert_id)["events"]:
+            kind = str(ev.get("kind", ""))
+            sequence = int(ev.get("sequence", 0))
+            payload = ev.get("payload") or {}
+            yield kind, {"session_id": session_id, "sequence": sequence, "payload": payload}
+        return
     inv_meta = replay.get("investigation") or {}
     recorder = InvestigationRecorder(
         state.db_sessionmaker,

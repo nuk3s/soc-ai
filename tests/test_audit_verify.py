@@ -140,6 +140,34 @@ async def test_verify_deleted_record_breaks_chain() -> None:
     assert result.first_broken_seq == 3
 
 
+async def test_verify_windowed_slice_is_not_tamper() -> None:
+    """A ``days=`` window that legitimately starts mid-stream (the record before the
+    window was rotated out / filtered) must NOT be reported as tampered. Regression
+    for the windowed false-positive: verify_chain forced the genesis prev_hash onto
+    the first in-window record regardless of its real seq."""
+    full = _build_chain(10)
+    window = full[6:]  # seqs 6..9 — exactly what a days= filter hands back on an old deploy
+    elastic = _elastic_with(window)
+    result = await verify_audit_chain(elastic, "soc-ai-audit", days=7)
+    assert result.ok is True
+    assert result.first_broken_seq is None
+    assert result.records_verified == 4
+    assert result.first_seq == 6
+    assert result.last_seq == 9
+
+
+async def test_verify_full_scan_still_flags_missing_head() -> None:
+    """No-regression guard: a full (non-windowed) scan whose oldest records are gone
+    is still a tamper. With no ``days`` window to excuse it, expect_genesis stays on,
+    so a first record with seq>0 and a non-genesis prev_hash is caught, not accepted."""
+    full = _build_chain(10)
+    missing_head = full[3:]  # head deleted, no days= window
+    elastic = _elastic_with(missing_head)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")  # days=None
+    assert result.ok is False
+    assert result.first_broken_seq == 3
+
+
 async def test_verify_empty_index_is_intact() -> None:
     elastic = _elastic_with([])
     result = await verify_audit_chain(elastic, "soc-ai-audit")

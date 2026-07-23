@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from soc_ai.config import Settings
+from soc_ai.eval import sanitize as san
 from soc_ai.eval.oracle_client import OracleError, OracleResponse, call_oracle
 
 _LOGGER = logging.getLogger(__name__)
@@ -164,9 +165,13 @@ def extract_section(response_md: str, n: int) -> str | None:
 def load_slim_rows(rows: list[dict[str, Any]]) -> list[RunSlim]:
     """Read each successful run's bundle and pull the slim fields.
 
-    Skips errored rows + rows where the bundle / response.md is
-    missing. Disagreements (`agreement="no"`) also load the `## 2. Why`
-    section.
+    Reads the SANITIZED (label-only) critique copy, never the de-sanitized
+    ``response.md``: the meta hop re-sends these sections to the cloud oracle,
+    so it must not rehydrate real internal identifiers back into the payload
+    (F01). Skips errored rows, rows with no bundle, and legacy bundles that
+    predate ``response.sanitized.md`` — falling back to ``response.md`` there
+    would reintroduce the leak. Disagreements (`agreement="no"`) also load the
+    `## 2. Why` section.
     """
     slim: list[RunSlim] = []
     for r in rows:
@@ -176,9 +181,13 @@ def load_slim_rows(rows: list[dict[str, Any]]) -> list[RunSlim]:
         if not bp:
             continue
         bundle = Path(bp)
-        response_path = bundle / "response.md"
+        response_path = bundle / "response.sanitized.md"
         if not response_path.exists():
-            _LOGGER.warning("meta: bundle %s has no response.md; skipping", bundle)
+            _LOGGER.warning(
+                "meta: bundle %s has no response.sanitized.md; skipping "
+                "(will not fall back to the de-sanitized response.md)",
+                bundle,
+            )
             continue
         try:
             md = response_path.read_text(encoding="utf-8")
@@ -416,6 +425,21 @@ async def _call_oracle_async(
     oracle_caller: OracleCallable,
 ) -> OracleResponse:
     """Wrap the sync ``call_oracle`` in to_thread for use in gather()."""
+    # Defense in depth (F01): the map/reduce prompt is built from the label-only
+    # response.sanitized.md, so it should already be clean — but re-run the
+    # residue sweep before egress anyway, mirroring the per-alert harness's
+    # pre-send gate. A sanitizer gap or a hallucinated internal identifier must
+    # not slip to the cloud on this second hop.
+    issues = san.unsafe_residue(
+        user_message,
+        extra_hosts=settings.oracle_extra_hosts,
+        extra_suffixes=settings.oracle_internal_suffixes,
+    )
+    if issues:
+        raise RuntimeError(
+            f"meta-analysis residue check refused to send ({len(issues)} issues): "
+            + "; ".join(issues[:5])
+        )
     api_key = (
         settings.litellm_api_key.get_secret_value() if settings.litellm_api_key is not None else ""
     )

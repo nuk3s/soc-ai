@@ -176,7 +176,12 @@ async def verify_audit_chain(
     records, capped = await _fetch_audit_records(
         elastic, audit_index_alias, days=days, max_records=max_records
     )
-    ok, first_broken = verify_chain(records)
+    # A windowed (days=N) scan may legitimately start mid-stream (the record
+    # before the window was filtered out), so its first prev_hash can't be checked
+    # against a predecessor we didn't fetch — don't force the genesis check there
+    # (it would false-positive a tamper). A full scan is still expected to reach
+    # genesis, so a missing head stays a real tamper.
+    ok, first_broken = verify_chain(records, expect_genesis=days is None)
 
     # Seq span actually covered (over the chained records verify_chain considered).
     seqs = [r["seq"] for r in records if isinstance(r.get("seq"), int)]

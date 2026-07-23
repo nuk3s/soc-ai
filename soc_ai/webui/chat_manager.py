@@ -33,6 +33,7 @@ from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.get_alert_context import get_alert_context
+from soc_ai.webui.probes import _scrub
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -346,10 +347,13 @@ async def _run_turn(state: Any, inv_id: str, assistant_msg_id: int) -> None:  # 
         )
     except Exception as e:
         _LOGGER.exception("chat turn failed for inv=%s", inv_id)
+        # Scrub the exception text before it becomes user-facing content — a
+        # verbose provider/gateway error body could otherwise echo a credential
+        # (same defensive scrub probes.py applies to its error surfaces).
         await _persist_terminal_error(
             state,
             assistant_msg_id,
-            f"Sorry — the chat turn failed ({e}). Try again.",
+            f"Sorry — the chat turn failed ({_scrub(str(e))}). Try again.",
         )
 
 

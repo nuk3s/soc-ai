@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import stat
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +37,7 @@ from soc_ai.main import (
     _discovery_scheduler_loop,
     _init_store,
 )
+from soc_ai.store import auth as auth_svc
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
@@ -426,6 +429,36 @@ async def test_init_store_reaps_orphaned_investigation_to_interrupted(
         assert row.status == "interrupted"
         assert inv_svc.blocks_rehunt(row) is False
     await engine2.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_store_bootstrap_password_written_to_locked_file_not_logged(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one-shot bootstrap admin password must land in a 0600 sidecar file
+    under the data dir, not in cleartext in the log stream — journald/container
+    logs are often readable by the same audience (other analysts, integrations)
+    this credential must stay secret from."""
+    engine = make_engine(settings_kratos)
+    with caplog.at_level(logging.WARNING, logger="soc_ai.main"):
+        maker = await _init_store(engine, settings_kratos)
+
+    cred_path = settings_kratos.soc_ai_data_dir / "bootstrap-admin-password.txt"
+    assert cred_path.is_file()
+    assert stat.S_IMODE(cred_path.stat().st_mode) == 0o600
+    written_pw = cred_path.read_text().strip()
+    assert written_pw
+
+    # The raw password must never appear in the log stream — only a pointer to
+    # the file that holds it.
+    assert written_pw not in caplog.text
+    assert "BOOTSTRAP CREDENTIAL" in caplog.text
+    assert str(cred_path) in caplog.text
+
+    # The file's password is the real, working bootstrap credential.
+    async with maker() as db:
+        assert await auth_svc.authenticate(db, "admin", written_pw) is not None
+    await engine.dispose()
 
 
 # --------------------------------------------------------------------------- #

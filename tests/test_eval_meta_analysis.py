@@ -98,10 +98,21 @@ def _write_bundle(
     md: str = (
         "## 1. Verdict\n\nYes.\n\n## 2. Why\n\nReason A.\n\n## 3. Architecture\n\nSuggestion X.\n"
     ),
+    sanitized_md: str | None = None,
 ) -> Path:
+    """Write a per-alert bundle.
+
+    ``md`` is the de-sanitized human copy (``response.md``). The meta-analysis
+    reads the still-sanitized copy (``response.sanitized.md``); by default it
+    mirrors ``md``, but a test can plant divergent content to prove which file
+    is actually read (F01).
+    """
     bundle = base / alert_id
     bundle.mkdir()
     (bundle / "response.md").write_text(md, encoding="utf-8")
+    (bundle / "response.sanitized.md").write_text(
+        md if sanitized_md is None else sanitized_md, encoding="utf-8"
+    )
     return bundle
 
 
@@ -147,6 +158,42 @@ def test_load_slim_rows_carves_out_why_only_for_disagreements(tmp_path: Path) ->
     assert yes_run.why_section is None
     assert no_run.why_section is not None
     assert "Reason A" in no_run.why_section
+
+
+def test_load_slim_rows_reads_sanitized_copy_not_desanitized(tmp_path: Path) -> None:
+    """F01: the meta hop must read response.sanitized.md (labels), never the
+    de-sanitized response.md (real internals). Plant divergent content in the
+    two files and confirm the sanitized one is what feeds the cloud call."""
+    bundle = _write_bundle(
+        tmp_path,
+        "a1",
+        md=(
+            "## 1. Verdict\n\nYes.\n\n## 2. Why\n\nReason A.\n\n"
+            "## 3. Architecture\n\nHarden 10.20.30.148 and app01.lan.\n"
+        ),
+        sanitized_md=(
+            "## 1. Verdict\n\nYes.\n\n## 2. Why\n\nReason A.\n\n"
+            "## 3. Architecture\n\nHarden IP_01 and HOST_01.\n"
+        ),
+    )
+    slim = load_slim_rows([_row("a1", str(bundle))])
+    assert len(slim) == 1
+    arch = slim[0].architecture_section
+    # Read from the sanitized copy: labels present, real internals absent.
+    assert "IP_01" in arch
+    assert "10.20.30.148" not in arch
+    assert "app01.lan" not in arch
+
+
+def test_load_slim_rows_skips_bundle_without_sanitized_copy(tmp_path: Path) -> None:
+    """F01: a legacy bundle that only has the de-sanitized response.md must be
+    SKIPPED (not fall back to the leaky file)."""
+    bundle = tmp_path / "legacy"
+    bundle.mkdir()
+    (bundle / "response.md").write_text(
+        "## 3. Architecture\n\nHarden 10.20.30.148.\n", encoding="utf-8"
+    )
+    assert load_slim_rows([_row("legacy", str(bundle))]) == []
 
 
 def test_load_slim_rows_skips_errored_and_missing(tmp_path: Path) -> None:
@@ -566,6 +613,36 @@ async def test_run_meta_analysis_propagates_reduce_failure(tmp_path: Path) -> No
             settings=_settings(),
             oracle_caller=_caller,
         )
+
+
+async def test_run_meta_analysis_refuses_residual_leak(tmp_path: Path) -> None:
+    """F01 defense-in-depth: if a bundle's sanitized copy still carries a raw
+    private identifier (a sanitizer gap or an oracle hallucination), the meta
+    hop must refuse to egress it — mirroring the per-alert harness residue gate.
+    """
+    # response.sanitized.md carries a raw RFC1918 IP the residue sweep will flag.
+    bundle = _write_bundle(
+        tmp_path,
+        "a1",
+        sanitized_md="## 3. Architecture\n\nAdd a pivot for 10.9.9.9 traffic.\n",
+    )
+    caller = _stub_oracle_caller(
+        canned_map=[{"theme": "x", "count_in_chunk": 1, "representative_quote": "q"}],
+        canned_reduce={"changes": [{"change": "x", "priority": "low"} for _ in range(5)]},
+    )
+
+    with pytest.raises(RuntimeError, match="residue"):
+        await run_meta_analysis(
+            rows=[_row("a1", str(bundle))],
+            batch_dir=tmp_path,
+            aggregates={"n_total": 1},
+            settings=_settings(),
+            oracle_caller=caller,
+            map_chunk_size=10,
+        )
+
+    # Refused BEFORE any cloud call.
+    assert caller.captured == []  # type: ignore[attr-defined]
 
 
 async def test_run_meta_analysis_refuses_when_no_usable_runs(tmp_path: Path) -> None:

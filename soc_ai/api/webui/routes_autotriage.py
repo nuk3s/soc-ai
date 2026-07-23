@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._shared import (
@@ -56,14 +56,25 @@ def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
     )
 
 
+_ALERT_IDS_CAP = 50
+# plan_targets_for_ids() intentionally applies no max-targets cap to an explicit
+# selection (the operator picked these on purpose) — so without an input-boundary
+# cap here, an uncapped alert_ids list would hold the single-flight slot for one
+# sequential LLM investigation (up to auto_triage_per_target_timeout_s each) per
+# id, starving the scheduled sweep. Cap at the boundary, mirroring the
+# investigations/hunts rehunt endpoints' ``_REHUNT_CAP``.
+
+
 class AutoTriageIn(BaseModel):
     range: str = aq.DEFAULT_RANGE
     q: str | None = None
     severities: list[str] = []
     # Explicit operator selection (alert ES ids). When present, auto-triage
     # honours the selection — bypassing severity/range planning and the
-    # max-targets cap — and only skips ids that already carry a verdict.
-    alert_ids: list[str] = []
+    # max-targets cap — and only skips ids that already carry a verdict. Capped
+    # at the input boundary so an oversized payload is rejected (422) before
+    # the dedup/planning loop iterates it.
+    alert_ids: list[str] = Field(default_factory=list, max_length=_ALERT_IDS_CAP)
 
 
 @router.post("/auto-triage", response_model=AutoTriageStatusOut)

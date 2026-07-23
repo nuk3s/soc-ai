@@ -263,6 +263,42 @@ async def test_response_md_is_desanitized(
     assert "HOST_01" not in saved
 
 
+async def test_run_writes_sanitized_response_copy(
+    tmp_path: Path,
+    patch_investigate: list[StepEvent],
+) -> None:
+    """F01: the bundle also keeps a still-sanitized copy of the oracle text.
+
+    ``response.md`` is de-sanitized for the operator (real internals), but the
+    meta-analysis re-sends critique sections to the cloud — so the bundle must
+    ALSO persist ``response.sanitized.md`` (the raw, label-only oracle text,
+    before ``desanitize``) for that second hop to read instead of the
+    rehydrated file.
+    """
+    response_text = "The oracle says IP_01 is suspicious and HOST_01 should be quarantined."
+    caller = _stub_oracle(response_text)
+
+    result = await harness_run(
+        "KDG7CZ4BVBs3R9hXQbPY",
+        settings=_settings_for_eval(),
+        out_dir=tmp_path,
+        oracle_caller=caller,
+    )
+
+    sanitized_copy = result.bundle_dir / "response.sanitized.md"
+    assert sanitized_copy.exists(), "missing response.sanitized.md"
+    saved = sanitized_copy.read_text(encoding="utf-8")
+    # The labels are preserved (this copy is NOT rehydrated).
+    assert "IP_01" in saved
+    assert "HOST_01" in saved
+    # And the real internals never appear in the sanitized copy.
+    assert "10.20.30.148" not in saved
+    assert "app01.lan" not in saved
+    # The de-sanitized human copy still shows the real values (unchanged behavior).
+    human = (result.bundle_dir / "response.md").read_text(encoding="utf-8")
+    assert "10.20.30.148" in human
+
+
 async def test_what_was_sent_is_sanitized(
     tmp_path: Path,
     patch_investigate: list[StepEvent],
@@ -287,6 +323,141 @@ async def test_what_was_sent_is_sanitized(
     # Public IOCs pass through (they're what the oracle needs to reason about).
     assert "8.8.8.8" in sent
     assert "storyblok.com" in sent
+
+
+async def test_extra_hosts_are_redacted_from_oracle_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F10: an operator's ORACLE_EXTRA_HOSTS bare hostname must be redacted from
+    the sanitized payload the harness ships to the cloud oracle.
+
+    The harness threads ``settings.oracle_extra_hosts`` into every sanitize()
+    call (and the residue gate). Without that plumbing a bare internal hostname
+    like ``spark1`` — shape-indistinguishable from public infra — egresses
+    verbatim, bypassing the exact protection the operator configured.
+    """
+    sid = "sess_hosts"
+    events = [
+        StepEvent(kind="session_start", session_id=sid, sequence=1, payload={"alert_id": "h1"}),
+        StepEvent(
+            kind="alert_context",
+            session_id=sid,
+            sequence=2,
+            payload={"alert": {"host.name": "spark1", "destination.ip": "8.8.8.8"}},
+        ),
+        StepEvent(
+            kind="triage_report",
+            session_id=sid,
+            sequence=3,
+            payload={
+                "verdict": "false_positive",
+                "confidence": 0.8,
+                "summary": "spark1 made a benign query.",
+                "citations": [],
+                "recommended_actions": [],
+            },
+        ),
+    ]
+
+    async def _fake_investigate(_alert_id: str, **_kw: Any) -> AsyncIterator[StepEvent]:
+        for ev in events:
+            yield ev
+
+    class _StubAuth:
+        async def aclose(self) -> None:
+            return None
+
+    class _StubElastic:
+        async def aclose(self) -> None:
+            return None
+
+    def _fake_build_context(_s: Settings, **_kw: Any) -> Any:
+        class _Ctx:
+            elastic = _StubElastic()
+            auth = _StubAuth()
+
+        return _Ctx()
+
+    monkeypatch.setattr(harness_mod, "investigate", _fake_investigate)
+    monkeypatch.setattr(harness_mod, "_build_context", _fake_build_context)
+
+    settings = _settings_for_eval()
+    settings.oracle_extra_hosts = ["spark1"]
+
+    caller = _stub_oracle("ok")
+    await harness_run("h1", settings=settings, out_dir=tmp_path, oracle_caller=caller)
+
+    sent = caller.captured["user_message"]  # type: ignore[attr-defined]
+    assert "spark1" not in sent
+    # A HOST label was minted for it, and the public IOC still passes through.
+    assert "HOST_01" in sent
+    assert "8.8.8.8" in sent
+
+
+async def test_alert_id_is_sanitized_not_bare_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F11: an alert id that embeds an internal hostname must be run through
+    sanitize(), not a bare mapping-lookup fallback.
+
+    Some deployments embed a hostname in the ES ``_id``. The bare
+    ``mapping.forward.get(alert_id, alert_id)`` only redacts it if that exact
+    string coincidentally appeared elsewhere in the payload. Here the id never
+    appears in any event, so the fallback ships it raw — and the residue gate
+    never sees it because it isn't folded into ``bundle_text``.
+    """
+    internal_id = "dc01.internal"
+    sid = "sess_aid"
+    # Deliberately: the alert id string appears in NO event payload.
+    events = [
+        StepEvent(kind="session_start", session_id=sid, sequence=1, payload={"note": "start"}),
+        StepEvent(
+            kind="triage_report",
+            session_id=sid,
+            sequence=2,
+            payload={
+                "verdict": "false_positive",
+                "confidence": 0.8,
+                "summary": "benign outbound to 8.8.8.8",
+                "citations": [],
+                "recommended_actions": [],
+            },
+        ),
+    ]
+
+    async def _fake_investigate(_alert_id: str, **_kw: Any) -> AsyncIterator[StepEvent]:
+        for ev in events:
+            yield ev
+
+    class _StubAuth:
+        async def aclose(self) -> None:
+            return None
+
+    class _StubElastic:
+        async def aclose(self) -> None:
+            return None
+
+    def _fake_build_context(_s: Settings, **_kw: Any) -> Any:
+        class _Ctx:
+            elastic = _StubElastic()
+            auth = _StubAuth()
+
+        return _Ctx()
+
+    monkeypatch.setattr(harness_mod, "investigate", _fake_investigate)
+    monkeypatch.setattr(harness_mod, "_build_context", _fake_build_context)
+
+    caller = _stub_oracle("ok")
+    await harness_run(
+        internal_id, settings=_settings_for_eval(), out_dir=tmp_path, oracle_caller=caller
+    )
+
+    sent = caller.captured["user_message"]  # type: ignore[attr-defined]
+    # The internal id was redacted to a HOST label, not shipped verbatim.
+    assert "dc01.internal" not in sent
+    assert "Alert id: `HOST_01`" in sent
 
 
 async def test_oracle_call_uses_litellm_settings(

@@ -447,15 +447,21 @@ def _is_internal_domain_like(value: str, suffixes: tuple[str, ...]) -> bool:
 
     A dotted FQDN that does NOT end in an internal suffix is treated as public
     and passes through verbatim (the Oracle needs it).
+
+    A trailing DNS root-zone dot (``PRINTSRV.``, ``dc01.lan.``) is stripped
+    before the dot-membership test so the RFC-absolute-name form (also a known
+    Host-header domain-filter evasion) cannot bypass the single-label branch.
     """
-    v = value.strip().lower()
+    v = value.strip().lower().rstrip(".")
     if not v:
         return False
     # Single-label (no dot) → internal by definition.
     if "." not in v:
         return True
-    # Internal suffix match.
-    return any(v.endswith(s.lstrip(".")) for s in suffixes)
+    # Internal suffix match — compare against the FULL dotted suffix so the label
+    # boundary is enforced (``.lan`` must not match ``…milan``).  ``_resolve_suffixes``
+    # supplies each configured suffix with its leading dot.
+    return any(v.endswith(s) for s in suffixes)
 
 
 # ---------------------------------------------------------------------------
@@ -589,12 +595,11 @@ def _try_harvest_scalar(
             mapping.label_for(value, "IP")
         return
 
-    # DOMAIN fields — internal suffix only.
+    # DOMAIN fields — internal suffix only.  Match the FULL dotted suffix so the
+    # label boundary is enforced (``.lan`` must not match ``…milan``).
     if any(s in _DOMAIN_FIELDS for s in suffixes_of_path):
         v_lower = value.lower()
-        if any(v_lower.endswith(s.lstrip(".")) for s in suffixes) or any(
-            v_lower.endswith(s) for s in suffixes
-        ):
+        if any(v_lower.endswith(s) for s in suffixes):
             mapping.label_for(value, "HOST")
         return
 
@@ -660,21 +665,30 @@ def _build_learned_re(
 def _replace_learned(text: str, mapping: Mapping, learned_re: re.Pattern[str] | None) -> str:
     """Substitute learned real values in *text* with their opaque labels.
 
-    Case-insensitive match: looks up the original (case-folded) in
-    ``mapping.forward``.  Falls back to a title-case then lower-case attempt
-    so ``FINANCE-PC`` and ``Finance-PC`` both map to ``HOST_01`` if
-    ``FINANCE-PC`` was the originally-learned key.
+    Case-insensitive: ``learned_re`` matches occurrences regardless of casing,
+    and the label is resolved via a case-folded index of ``mapping.forward``.
+    This covers GENUINELY mixed-case originals (e.g. a ``WebSrv-Prod`` learned
+    from ``host.name`` still redacts a ``websrv-prod`` / ``WEBSRV-PROD``
+    occurrence in free text) — not only all-upper / all-lower forms.  An exact
+    match is preferred first so byte-for-byte rehydration is unchanged when the
+    original casing is present verbatim.
     """
     if learned_re is None or not mapping.forward:
         return text
 
+    # Build the case-folded index once (earliest-learned label wins on a
+    # case-collision, so the lowest-numbered label is preferred deterministically).
+    folded: dict[str, str] = {}
+    for real, label in mapping.forward.items():
+        folded.setdefault(real.lower(), label)
+
     def _sub(m: re.Match[str]) -> str:
         matched = m.group(0)
-        # Try exact match first, then lower-case, to handle case variants.
-        label = mapping.forward.get(matched) or mapping.forward.get(matched.lower())
+        # Exact match first (preserves current byte-for-byte behaviour), then
+        # fall back to the case-folded lookup for differently-cased occurrences.
+        label = mapping.forward.get(matched)
         if label is None:
-            # Try upper-case (e.g. learned "FINANCE-PC" via uppercase key).
-            label = mapping.forward.get(matched.upper())
+            label = folded.get(matched.lower())
         return label if label is not None else matched
 
     return learned_re.sub(_sub, text)

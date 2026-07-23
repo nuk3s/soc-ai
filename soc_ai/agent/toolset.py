@@ -210,6 +210,46 @@ def _clamp_tool_result[T](value: T) -> T:
                     else:
                         hi = mid - 1
                 return cast("T", _candidate(lo))
+        # Aggregation envelope: a `groupby` response carries its big list under
+        # aggregations.<name>.buckets (one terms agg per groupby field, nested).
+        # Bisect the OUTERMOST buckets list — dropping an outer bucket drops its
+        # nested sub-buckets too, so total size shrinks monotonically — until a
+        # multi-field groupby fits the budget. Without this, groupby responses
+        # fall through to the flag-only fallback below, which relabels the same
+        # oversized payload __truncated__ without shrinking it.
+        aggs = value.get("aggregations")
+        if isinstance(aggs, dict):
+            for agg_name, agg_body in aggs.items():
+                if (
+                    isinstance(agg_body, dict)
+                    and isinstance(agg_body.get("buckets"), list)
+                    and agg_body["buckets"]
+                ):
+                    buckets = agg_body["buckets"]
+
+                    def _agg_candidate(
+                        n: int,
+                        name: str = agg_name,
+                        body: dict[str, Any] = agg_body,
+                        bkts: list[Any] = buckets,
+                    ) -> dict[str, Any]:
+                        return {
+                            **value,
+                            "aggregations": {**aggs, name: {**body, "buckets": bkts[:n]}},
+                            "__truncated__": True,
+                            "__total_buckets__": len(bkts),
+                            "__shown_buckets__": n,
+                            "__total_bytes__": len(encoded),
+                        }
+
+                    lo, hi = 0, len(buckets)
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if len(json.dumps(_agg_candidate(mid))) <= _TOOL_RESULT_BUDGET_BYTES:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    return cast("T", _agg_candidate(lo))
         # No recognized list field — fall back to flag-only.
         return cast("T", {**value, "__truncated__": True, "__total_bytes__": len(encoded)})
     # Strings / numbers — stringify + clip.

@@ -78,6 +78,33 @@ _CITATION_STOP_WORDS: frozenset[str] = frozenset(
 )
 
 
+def _semantic_token_resolves(source: str, bundle_text: str) -> bool:
+    """True iff a DISTINCTIVE token of ``source`` appears in ``bundle_text``.
+
+    GATE C: a citation may resolve semantically only on a DISTINCTIVE token —
+    never a stop-word, and never a bare short generic substring. A token
+    qualifies when it is either
+      (a) long (>= 8 chars — JA3 hashes, sha256, full IPs, SPNs, ES ids):
+          a substring match is enough, OR
+      (b) medium (>= 5 chars — a domain label like "c2.xyz", a hyphenated
+          host "evil-server", a short FQDN): it must match on WORD BOUNDARIES,
+          not as a fragment of a longer word.
+    Tokens carry dots/hyphens/slashes (``_FUZZY_TOKEN_RE``), so the (b) path must
+    NOT require ``isalnum`` — that would drop every domain and dotted IP. This
+    kills hollow <=4-char / generic-word "resolutions" while preserving
+    resolution of specific values.
+    """
+    for tok in _FUZZY_TOKEN_RE.findall(source):
+        low = tok.lower()
+        if low in _CITATION_STOP_WORDS:
+            continue
+        if len(tok) >= 8 and low in bundle_text:
+            return True
+        if len(tok) >= 5 and re.search(rf"\b{re.escape(low)}\b", bundle_text):
+            return True
+    return False
+
+
 def _resolve_citations(
     citations: list[str],
     alert_ctx: Any,
@@ -131,8 +158,18 @@ def _resolve_citations(
         resolution_kind = "unresolved"
 
         if kind == "id":
-            resolved = True
-            resolution_kind = "strict_id"
+            # F57: do NOT blind-trust an id-shaped citation. A fabricated id would
+            # otherwise resolve to strict_id without ever touching the bundle,
+            # inflating coverage_ratio (skipping the confidence cap and defeating
+            # the verdict-floor's no-evidence check) — the exact pitfall
+            # hunt_gates documents and avoids. Require the id to actually appear in
+            # the bundle (same distinctive-token check as the semantic fallback):
+            # a real ES id the model was shown is present; a hallucinated one isn't.
+            if bundle_text is None:
+                bundle_text = _bundle_dump_text(alert_ctx)
+            if target and _semantic_token_resolves(target, bundle_text):
+                resolved = True
+                resolution_kind = "strict_id"
         elif kind == "path":
             if target and _path_exists_in_alert(alert_ctx, target):
                 resolved = True
@@ -143,36 +180,14 @@ def _resolve_citations(
                 resolution_kind = "strict_tool"
 
         if not resolved:
-            # Fall back to semantic substring match: any substantive
-            # token from the citation appearing in the bundle dump
-            # counts as a resolution.
+            # Fall back to semantic resolution: any DISTINCTIVE token from the
+            # citation appearing in the bundle dump counts (see
+            # :func:`_semantic_token_resolves` for the stop-word / band rules).
             if bundle_text is None:
                 bundle_text = _bundle_dump_text(alert_ctx)
-            tokens = _FUZZY_TOKEN_RE.findall(c)
-            for tok in tokens:
-                low = tok.lower()
-                # GATE C: a citation may resolve semantically only on a
-                # DISTINCTIVE token — never a stop-word, and never a bare short
-                # generic substring. A token qualifies when it is either
-                #   (a) long (>= 8 chars — JA3 hashes, sha256, full IPs, SPNs):
-                #       a substring match is enough, OR
-                #   (b) medium (>= 5 chars — a domain label like "c2.xyz", a
-                #       hyphenated host "evil-server", a short FQDN): it must match
-                #       on WORD BOUNDARIES, not as a fragment of a longer word.
-                # Tokens carry dots/hyphens/slashes (_FUZZY_TOKEN_RE), so the (b)
-                # path must NOT require ``isalnum`` — that would drop every domain
-                # and dotted IP. This kills hollow <=4-char / generic-word
-                # "resolutions" while preserving resolution of specific values.
-                if low in _CITATION_STOP_WORDS:
-                    continue
-                if len(tok) >= 8 and low in bundle_text:
-                    resolved = True
-                    resolution_kind = "semantic"
-                    break
-                if len(tok) >= 5 and re.search(rf"\b{re.escape(low)}\b", bundle_text):
-                    resolved = True
-                    resolution_kind = "semantic"
-                    break
+            if _semantic_token_resolves(c, bundle_text):
+                resolved = True
+                resolution_kind = "semantic"
 
         if resolved:
             counts["valid"] += 1
@@ -901,51 +916,6 @@ def _verdict_cites_decisive_pivot_value(report: Any, enriched_ctx: Any) -> bool:
     return bool(cited) and any(v in cited for v in values)
 
 
-# Keys on a tool result that are bookkeeping / classification flags, NOT gathered
-# evidence — a result carrying only these did not discriminate anything.
-_NON_EVIDENCE_RESULT_KEYS = frozenset(
-    {
-        "error",
-        "ok",
-        "available",
-        "reason",
-        "hint",
-        "internal",
-        "indicator",
-        "indicator_type",
-        "query",
-        "ip",
-        "domain",
-        "hash",
-        "algo",
-        "note",
-    }
-)
-
-
-def _targeted_result_has_data(result: Any) -> bool:
-    """True iff a Phase-D targeted-tool result carries DISCRIMINATING evidence.
-
-    Mirrors :func:`count_successful_tool_calls`' "non-error DATA" semantics: an
-    empty-but-non-error dict — an OQL/zeek query with zero hits, ``enrich_ip`` on
-    an internal IP with no blocklist/MISP hit — gathered nothing and must NOT
-    exempt the hard evidence gate.
-
-    Rather than enumerate every data-bearing field (fragile — tools return many
-    shapes: hits, sni_servers, dns_queries, asn, prevalence flags…), a result has
-    data iff it carries ANY truthy value under a key that is not a bookkeeping /
-    classification flag. Search-shaped results (``total``/``hits``) are judged on
-    hit count so a zero-hit query is correctly empty.
-    """
-    if not isinstance(result, dict) or result.get("error"):
-        return False
-    # Search-shaped result (OQL / zeek / cases): data iff there are hits.
-    if "total" in result or "hits" in result:
-        return bool(result.get("total")) or bool(result.get("hits"))
-    # Otherwise: any non-bookkeeping key with a truthy value is gathered evidence.
-    return any(v for k, v in result.items() if k not in _NON_EVIDENCE_RESULT_KEYS)
-
-
 def _downgrade_unevidenced_verdict(
     report: Any,  # TriageReport
     enriched_ctx: Any,  # EnrichedAlertContext
@@ -991,10 +961,14 @@ def _downgrade_unevidenced_verdict(
         getattr(candidate, "verdict", None) == report.verdict
     )
     grounded_in_pivot = _verdict_grounded_in_pivot(report, enriched_ctx)
+    # An IOC hit is evidence FOR escalation, never for CLEARING. It only grounds a
+    # true_positive — a zero-tool false_positive that rationalized away a genuinely
+    # known-bad indicator is NOT grounded by that hit and must still be gated.
+    ioc_hit_grounds = report.verdict == "true_positive" and _has_ioc_hit(enriched_ctx)
     if (
         has_tool_evidence
         or strong_template
-        or _has_ioc_hit(enriched_ctx)  # grounded in a concrete blocklist/MISP IOC
+        or ioc_hit_grounds  # a concrete blocklist/MISP IOC grounds a TP only
         or grounded_in_pivot  # grounded in a cited, orchestrator-prefetched pivot record
     ):
         if grounded_in_pivot and not (has_tool_evidence or strong_template):

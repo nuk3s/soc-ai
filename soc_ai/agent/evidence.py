@@ -145,17 +145,66 @@ def _loop_evidence_marker(
     return None
 
 
+# Keys on a tool result that are bookkeeping / classification flags, NOT gathered
+# evidence — a result carrying only these did not discriminate anything.
+_NON_EVIDENCE_RESULT_KEYS = frozenset(
+    {
+        "error",
+        "ok",
+        "available",
+        "reason",
+        "hint",
+        "internal",
+        "indicator",
+        "indicator_type",
+        "query",
+        "ip",
+        "domain",
+        "hash",
+        "algo",
+        "note",
+    }
+)
+
+
+def _targeted_result_has_data(result: Any) -> bool:
+    """True iff a tool result carries DISCRIMINATING evidence.
+
+    Backs both the Phase-D targeted-dispatch check and (via
+    :func:`count_successful_tool_calls`) the investigation-loop hard gate: an
+    empty-but-non-error dict — an OQL/zeek query with zero hits, ``enrich_ip`` on
+    an internal IP with no blocklist/MISP hit — gathered nothing and must NOT
+    exempt the hard evidence gate.
+
+    Rather than enumerate every data-bearing field (fragile — tools return many
+    shapes: hits, sni_servers, dns_queries, asn, prevalence flags…), a result has
+    data iff it carries ANY truthy value under a key that is not a bookkeeping /
+    classification flag. Search-shaped results (``total``/``hits``) are judged on
+    hit count so a zero-hit query is correctly empty.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    # Search-shaped result (OQL / zeek / cases): data iff there are hits.
+    if "total" in result or "hits" in result:
+        return bool(result.get("total")) or bool(result.get("hits"))
+    # Otherwise: any non-bookkeeping key with a truthy value is gathered evidence.
+    return any(v for k, v in result.items() if k not in _NON_EVIDENCE_RESULT_KEYS)
+
+
 def count_successful_tool_calls(messages: list[Any] | None) -> int:
-    """Count tool calls that returned NON-error DATA in a PydanticAI history.
+    """Count tool calls that returned NON-error DISCRIMINATING DATA in a PydanticAI history.
 
     A ``ToolReturnPart`` (duck-typed: has ``content``, lacks ``args``) is counted
     only when its content is usable — an error result (``{"error": True}``), a
     dedup short-circuit (``{"duplicate_call": True}``) or a prefetch short-circuit
     (``{"prefetch_already_has_this": True}``) does NOT count, because none of them
-    gathered new evidence. Counting returns (not call parts) sidesteps the
-    fragile call/return pairing by ``tool_call_id``. Returns 0 for None/empty.
-    This is the signal behind the hard evidence gate: did the agent actually
-    investigate, or just reason over prefetch?
+    gathered new evidence. Nor does an empty-but-non-error result (a zero-hit OQL
+    query, a clean-internal enrich): it made a call but discovered nothing, so it
+    is held to the same discriminating-data standard as the Phase-D path
+    (:func:`_targeted_result_has_data`). Counting returns (not call parts)
+    sidesteps the fragile call/return pairing by ``tool_call_id``. Returns 0 for
+    None/empty. This is the signal behind the hard evidence gate: did the agent
+    actually investigate, or just reason over prefetch?
     """
     if not messages:
         return 0
@@ -175,10 +224,16 @@ def count_successful_tool_calls(messages: list[Any] | None) -> int:
             c = part.content
             if c is None:
                 continue  # a tool that returned nothing is not evidence
-            if isinstance(c, dict) and (
-                c.get("error") or c.get("duplicate_call") or c.get("prefetch_already_has_this")
-            ):
-                continue
+            if isinstance(c, dict):
+                if c.get("error") or c.get("duplicate_call") or c.get("prefetch_already_has_this"):
+                    continue
+                # A NON-error dict is only evidence when it carries DISCRIMINATING
+                # data. A zero-hit OQL loop message or a clean-internal enrich made
+                # a call but discovered nothing; counting it would let one throwaway
+                # call satisfy the hard evidence gate (the QVOD zero-tool defect,
+                # one call away). Same standard as the Phase-D dispatch.
+                if not _targeted_result_has_data(c):
+                    continue
             n += 1
     return n
 

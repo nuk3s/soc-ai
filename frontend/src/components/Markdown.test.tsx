@@ -33,4 +33,16 @@ describe('safeUrl', () => {
     expect(safeUrl('/path:with:colons')).toBe('/path:with:colons');
     expect(safeUrl('foo?x=a:b')).toBe('foo?x=a:b');
   });
+
+  it('drops protocol-relative (scheme-relative) URLs', () => {
+    // No ':' at all, so the no-scheme branch would otherwise pass these through
+    // verbatim — but "//host/path" still navigates off-app on click (a[href])
+    // or beacons on render (img[src]), just without a visible scheme.
+    expect(safeUrl('//evil.example.com/phish')).toBe('');
+    expect(safeUrl('//evil.example.com/track.png')).toBe('');
+    // A browser's URL parser strips leading C0-control/space before parsing —
+    // padding the URL must not be a way to dodge the check above.
+    expect(safeUrl('  //evil.example.com')).toBe('');
+    expect(safeUrl('\t\n//evil.example.com')).toBe('');
+  });
 });

@@ -6,7 +6,7 @@ import logging
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from soc_ai.api.webui._shared import (
     _request_is_https,
@@ -19,8 +19,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class LoginIn(BaseModel):
-    username: str
-    password: str
+    # Bounded so an unauthenticated caller can't force this pre-auth endpoint
+    # to buffer/process an arbitrarily large credential string; mirrors the
+    # admin-create-user bounds (routes_admin.CreateUserIn).
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 @open_router.post("/login")

@@ -58,11 +58,18 @@ class ElasticClient:
                 settings.es_username,
                 settings.es_password.get_secret_value(),
             )
+        # elasticsearch-py's `ca_certs` param is `DefaultType | str` (no `None`
+        # option) -- only pass it when a bundle is actually pinned.
+        ca_kwargs: dict[str, Any] = {}
+        if settings.es_ca_bundle:
+            ca_kwargs["ca_certs"] = str(settings.es_ca_bundle)
+
         self._client = AsyncElasticsearch(
             hosts=[str(h).rstrip("/") for h in settings.es_hosts],
             basic_auth=auth,
             verify_certs=settings.es_verify_ssl,
             request_timeout=settings.es_request_timeout_s,
+            **ca_kwargs,
             # Transport-layer resilience for the contended SO ES on the
             # lab grid. Under batch concurrency=5, prefetch fans out
             # 25-ish simultaneous searches; the cluster sometimes

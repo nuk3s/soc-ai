@@ -19,7 +19,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: dependency build ─────────────────────────────────────────────────
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58 AS builder
+# ^ pinned by digest (supply-chain hardening, mirrors the SHA-pinned GitHub
+#   Actions in release.yml); tag above is for humans only — bump both
+#   together when refreshing. Resolve a new digest with:
+#     docker buildx imagetools inspect ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /build
 
@@ -38,7 +42,8 @@ RUN uv sync --frozen --no-install-project --no-dev
 # ── Stage 2: frontend build (React SPA → /fe/dist) ────────────────────────────
 # Built here and copied into the runtime image at /opt/soc-ai/frontend/dist —
 # where main.py's FRONTEND_DIST resolves, so FastAPI serves the SPA at /app.
-FROM node:22-bookworm-slim AS frontend
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS frontend
+# ^ digest-pinned (see the builder stage's FROM comment above); tag: 22-bookworm-slim.
 
 WORKDIR /fe
 
@@ -52,7 +57,8 @@ RUN npm run build
 
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS runtime
+# ^ digest-pinned (see the builder stage's FROM comment above); tag: 3.12-slim.
 
 # ── OS-level deps ─────────────────────────────────────────────────────────────
 # curl: HEALTHCHECK; ca-certificates: trust chain for outbound HTTPS;

@@ -223,6 +223,57 @@ class TestHomePaths:
         assert m.counters.get("USER", 0) == 2
 
 
+class TestWindowsPaths:
+    """Windows-native paths must not leak usernames/hostnames to the Oracle (F13).
+
+    ``C:\\Users\\<user>\\…`` and ``\\Documents and Settings\\<user>\\`` redact the
+    profile username (mirror of /home); UNC ``\\\\<host>\\<share>`` redacts the
+    share host.  Single-backslash hex-escape shellcode must NOT be touched.
+    """
+
+    def test_users_profile_username_redacted_tail_preserved(self) -> None:
+        m = _clean_mapping()
+        out = sanitize(r"dropped C:\Users\jdoe\Downloads\payload.exe", m)
+        assert "jdoe" not in out
+        assert r"C:\Users\USER_" in out
+        assert r"\Downloads\payload.exe" in out
+
+    def test_documents_and_settings_username_redacted(self) -> None:
+        m = _clean_mapping()
+        out = sanitize(r"legacy \Documents and Settings\asmith\ntuser.dat", m)
+        assert "asmith" not in out
+        assert "USER_" in out
+
+    def test_unc_host_redacted_share_preserved(self) -> None:
+        m = _clean_mapping()
+        out = sanitize(r"copied from \\fileserver01\shared\finance\Q3.xlsx", m)
+        assert "fileserver01" not in out
+        assert r"\\HOST_" in out
+        assert r"\shared\finance\Q3.xlsx" in out
+
+    def test_windows_paths_roundtrip(self) -> None:
+        m = _clean_mapping()
+        original = r"C:\Users\jdoe\x and \\fileserver01\share\y"
+        out = sanitize(original, m)
+        assert desanitize(out, m) == original
+
+    def test_hex_escape_payload_not_touched(self) -> None:
+        """Single-backslash hex-escape shellcode must NOT trip the UNC rule."""
+        m = _clean_mapping()
+        payload = r"\x90\x90\x90\x41\x41 NOP sled"
+        out = sanitize(payload, m)
+        assert out == payload, f"payload bytes corrupted: {out!r}"
+        assert m.counters == {}
+
+    def test_wellknown_profile_folder_not_redacted(self) -> None:
+        """Well-known non-user profile folders (Public, Administrator) pass —
+        the Oracle needs the common C:\\Users\\Public malware path verbatim."""
+        m = _clean_mapping()
+        out = sanitize(r"dropped to C:\Users\Public\Downloads\x.exe", m)
+        assert r"C:\Users\Public\Downloads\x.exe" in out
+        assert m.counters == {}
+
+
 # ---------------------------------------------------------------------------
 # 6. MAC addresses → always tokenized
 # ---------------------------------------------------------------------------
@@ -381,6 +432,33 @@ class TestReversibility:
         sanitized = sanitize("10.0.0.1 8.8.8.8", m)
         assert isinstance(sanitized, str)
         assert desanitize(sanitized, m) == "10.0.0.1 8.8.8.8"
+
+
+class TestDesanitizeWordBoundary:
+    """desanitize() must honour word boundaries like its sibling replacer, so a
+    label-shaped SUBSTRING inside an unrelated token is not rehydrated into a
+    real internal identifier spliced mid-word (F45)."""
+
+    def test_label_substring_inside_word_not_spliced(self) -> None:
+        m = _clean_mapping()
+        m.forward = {"192.0.2.253": "IP_01"}
+        m.reverse = {"IP_01": "192.0.2.253"}
+        # 'SHIP_0142' contains the substring 'IP_01' — it must NOT be replaced.
+        text = "The device SHIP_0142 reported a benign heartbeat."
+        assert desanitize(text, m) == text
+
+    def test_standalone_label_still_restored(self) -> None:
+        m = _clean_mapping()
+        m.forward = {"192.0.2.253": "IP_01"}
+        m.reverse = {"IP_01": "192.0.2.253"}
+        assert desanitize("host IP_01 is down", m) == "host 192.0.2.253 is down"
+
+    def test_label_adjacent_to_punctuation_restored(self) -> None:
+        """Boundary guard must not block a label next to non-word punctuation."""
+        m = _clean_mapping()
+        m.forward = {"dc01.lan": "HOST_02"}
+        m.reverse = {"HOST_02": "dc01.lan"}
+        assert desanitize("(HOST_02) and HOST_02.", m) == "(dc01.lan) and dc01.lan."
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +638,47 @@ class TestResidueNetbiosHosts:
         leaks = unsafe_residue("DESKTOP-AB12 and again DESKTOP-AB12")
         netbios = [leak for leak in leaks if "DESKTOP-AB12" in leak]
         assert len(netbios) == 1, f"expected one dedup'd flag, got {netbios}"
+
+
+class TestResidueWindowsPaths:
+    """Independent fail-closed nets for Windows-native paths (F13).
+
+    A profile username or UNC share host that survived BOTH sanitize passes
+    still trips the refuse-gate.  Runs on ``json.dumps`` output, where every
+    backslash is doubled — a real UNC ``\\\\`` becomes four backslashes, while a
+    single-backslash hex escape (``\\x90``) becomes only two, so the UNC net
+    never false-positives on shellcode.
+    """
+
+    def test_catches_unredacted_profile_user(self) -> None:
+        text = json.dumps({"msg": r"C:\Users\jdoe\Downloads\x.exe"})
+        leaks = unsafe_residue(text)
+        assert any("jdoe" in leak for leak in leaks), leaks
+
+    def test_catches_unredacted_unc_host(self) -> None:
+        text = json.dumps({"msg": r"\\fileserver01\shared\Q3.xlsx"})
+        leaks = unsafe_residue(text)
+        assert any("fileserver01" in leak for leak in leaks), leaks
+
+    def test_no_known_values_needed(self) -> None:
+        """Independence: fires WITHOUT known_values (redacter may have missed it)."""
+        text = json.dumps({"msg": r"\\fileserver01\share"})
+        assert any("fileserver01" in leak for leak in unsafe_residue(text, known_values=()))
+
+    def test_hex_escape_payload_not_flagged(self) -> None:
+        """Single-backslash hex-escape shellcode must not false-positive the UNC net."""
+        text = json.dumps({"payload": r"\x90\x90\x90\x41\x41"})
+        assert unsafe_residue(text) == []
+
+    def test_redacted_paths_not_flagged(self) -> None:
+        """Correctly-redacted paths (opaque labels) are not residue."""
+        text = json.dumps({"msg": r"C:\Users\USER_01\x and \\HOST_02\share"})
+        assert unsafe_residue(text) == []
+
+    def test_allowlisted_unc_host_not_flagged(self) -> None:
+        text = json.dumps({"msg": r"\\fileserver01\share"})
+        leaks = unsafe_residue(text, allowlist=["fileserver01"])
+        assert not any("fileserver01" in leak for leak in leaks)
 
 
 # ---------------------------------------------------------------------------

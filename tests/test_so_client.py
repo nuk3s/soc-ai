@@ -313,6 +313,25 @@ def test_make_auth_picks_connect_when_credentials_set(
 # =====================================================================
 
 
+def test_elastic_client_uses_ca_bundle_when_set(settings_kratos: Settings) -> None:
+    """F70: a pinned CA bundle path is passed through to AsyncElasticsearch,
+    mirroring the SO (so_ca_bundle) and MISP (misp_ca_bundle) clients."""
+    from pathlib import Path
+
+    settings_kratos.es_ca_bundle = Path("/etc/ssl/es-ca.pem")
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch") as mock_es:
+        ElasticClient(settings_kratos)
+    _, kwargs = mock_es.call_args
+    assert kwargs["ca_certs"] == "/etc/ssl/es-ca.pem"
+
+
+def test_elastic_client_no_ca_bundle_by_default(settings_kratos: Settings) -> None:
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch") as mock_es:
+        ElasticClient(settings_kratos)
+    _, kwargs = mock_es.call_args
+    assert kwargs.get("ca_certs") is None
+
+
 @pytest.mark.asyncio
 async def test_elastic_search_unwraps_total_dict(settings_kratos: Settings) -> None:
     fake_es = AsyncMock()

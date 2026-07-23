@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import socket
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -207,6 +209,33 @@ async def test_public_host_resolving_to_internal_ip_refused() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cgnat_range_refused() -> None:
+    """SSRF (F14): CGNAT space (RFC 6598, 100.64.0.0/10 — also Tailscale's default
+    overlay range) is NOT is_private/is_reserved, so the per-flag guard missed it.
+    It is non-global, so it must be refused — as both an IP-literal host and an
+    external name resolving into the range."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    # (a) IP-literal host inside CGNAT space.
+    with _patch_httpx(h):
+        r = await crawl_page("https://100.64.5.5/x", settings=_settings())
+    assert r["ok"] is False
+    assert "internal IP" in r["error"]
+
+    # (b) External NAME whose A record points into CGNAT space (rebinding-style).
+    with _patch_httpx(h), _patch_resolve("100.100.100.100"):
+        r = await crawl_page("https://evil.example.com/x", settings=_settings())
+    assert r["ok"] is False
+    assert "internal IP" in r["error"]
+
+    assert calls["n"] == 0  # never reached the network
+
+
+@pytest.mark.asyncio
 async def test_public_host_resolving_to_public_ip_allowed() -> None:
     """A genuinely external host (resolves to a public IP) is allowed through."""
     payload = {"markdown": "public threat-intel page", "success": True}
@@ -299,6 +328,26 @@ async def test_external_redirect_chain_followed_then_crawled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_success_reports_final_url_not_original() -> None:
+    """Provenance (F52): after a redirect, the result attributes content to the
+    FINAL fetched url (the actual source), and preserves the original argument
+    under ``requested_url`` — never silently substitute the pre-redirect url."""
+
+    def h(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/md"):
+            return httpx.Response(200, json={"markdown": "final page body", "success": True})
+        if req.url.path == "/start":
+            return httpx.Response(301, headers={"location": "https://abuse.example.com/final"})
+        return httpx.Response(200)  # /final is terminal
+
+    with _patch_httpx(h), _patch_resolve("93.184.216.34"):
+        r = await crawl_page("https://abuse.example.com/start", settings=_settings())
+    assert r["ok"] is True
+    assert r["url"] == "https://abuse.example.com/final"  # content source, not original
+    assert r["requested_url"] == "https://abuse.example.com/start"
+
+
+@pytest.mark.asyncio
 async def test_redirect_loop_refused() -> None:
     """An over-long redirect chain (loop / evasion) is refused, not crawled."""
     md_calls = {"n": 0}
@@ -354,6 +403,41 @@ async def test_unresolvable_host_refused() -> None:
     assert r["ok"] is False
     assert "did not resolve" in r["error"]
     assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dns_guard_runs_off_event_loop() -> None:
+    """Regression (F15): the SSRF guard's DNS resolution must run OFF the event
+    loop. A slow/blackholed resolver must not stall the single-worker server for
+    every other request.
+
+    The fake resolver blocks until a concurrent coroutine releases it. That
+    coroutine can only run if the event loop is NOT held by the resolve — so on
+    the old blocking-``socket.getaddrinfo`` code path the resolver never unblocks
+    (it times out) and ``ran_concurrently`` stays False."""
+    unblock = threading.Event()
+    ran_concurrently = {"v": False}
+
+    def blocking_resolve(host: str, *a: Any, **k: Any) -> list[Any]:
+        if not unblock.wait(timeout=1.0):
+            raise OSError("resolver never unblocked — event loop was stalled")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+    async def unblocker() -> None:
+        await asyncio.sleep(0.05)
+        ran_concurrently["v"] = True
+        unblock.set()
+
+    def h(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"markdown": "external page", "success": True})
+
+    with _patch_httpx(h), patch("soc_ai.tools.crawl_page.socket.getaddrinfo", blocking_resolve):
+        results = await asyncio.gather(
+            crawl_page("https://abuse.example.com/x", settings=_settings()),
+            unblocker(),
+        )
+    assert ran_concurrently["v"] is True  # loop stayed responsive during the resolve
+    assert results[0]["ok"] is True
 
 
 def test_wiring_dispatch_and_literal() -> None:

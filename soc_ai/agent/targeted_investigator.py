@@ -19,10 +19,47 @@ import logging
 from collections.abc import Callable
 from typing import Any, NoReturn, cast
 
-from soc_ai.agent.toolset import PHASE_D_TOOLS
+from soc_ai.agent.toolset import PHASE_D_TOOLS, _clamp_tool_result
 from soc_ai.agent.triage import TargetedGap
 
 _LOGGER = logging.getLogger(__name__)
+
+# Per-tool argument ceilings, mirroring the clamps register_read_tools enforces
+# inline in the interactive path (toolset.py). Phase-D dispatch calls the tool
+# functions DIRECTLY, bypassing those wrappers, so we must re-apply the SAME
+# caps here — otherwise an oversized max_results/k (a synth mistake, or a
+# prompt-injected steer from attacker-influenceable alert data) pulls thousands
+# of full docs back and blows the round-2 synth prompt past the model's context.
+# Keep in sync with the min(...) clamps in soc_ai/agent/toolset.py.
+_PHASE_D_ARG_CEILINGS: dict[str, dict[str, int]] = {
+    "t_query_events_oql": {"max_results": 25},
+    "t_query_zeek_logs": {"max_results": 25},
+    "t_query_cases": {"max_results": 10},
+    "t_query_detections": {"max_results": 10},
+    "t_get_playbooks": {"max_results": 10},
+    "t_lookup_runbook": {"k": 5},
+}
+
+
+def _clamp_arg_ceilings(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
+    """Return ``tool_args`` with any capped arg clamped to its per-tool ceiling.
+
+    Returns the SAME dict object untouched when nothing needs clamping (so the
+    common path stays byte-identical); otherwise a shallow copy with the
+    offending ints lowered. Never mutates the caller's ``gap.tool_args``.
+    """
+    ceilings = _PHASE_D_ARG_CEILINGS.get(tool_name)
+    if not ceilings:
+        return tool_args
+    clamped: dict[str, Any] | None = None
+    for arg, cap in ceilings.items():
+        val = tool_args.get(arg)
+        # bool is an int subclass — exclude it so a stray True/False isn't "clamped".
+        if isinstance(val, int) and not isinstance(val, bool) and val > cap:
+            if clamped is None:
+                clamped = dict(tool_args)
+            clamped[arg] = cap
+    return clamped if clamped is not None else tool_args
 
 
 def build_targeted_investigator_prompt(gap: TargetedGap) -> str:
@@ -127,6 +164,11 @@ async def _dispatch_named_tool(
     # cannot miss for a validated name.
     fn = _dispatch_table()[tool_name]
 
+    # Re-apply the interactive path's per-tool arg ceilings (toolset.py). The
+    # tool functions here are called directly, so their wrapper clamps (e.g.
+    # max_results=min(..., 25)) don't run — do it before dispatch.
+    tool_args = _clamp_arg_ceilings(tool_name, tool_args)
+
     base_kwargs: dict[str, Any] = {"settings": ctx.settings}
     if tool_name in {"t_enrich_ip", "t_enrich_domain", "t_enrich_hash"}:
         base_kwargs["misp"] = getattr(ctx, "misp", None)
@@ -207,10 +249,14 @@ async def _dispatch_named_tool(
 
     if hasattr(raw, "model_dump"):
         # `raw` is a pydantic model here; model_dump(mode="json") yields a dict.
-        return cast("dict[str, Any]", raw.model_dump(mode="json"))
-    if isinstance(raw, dict):
-        return raw
-    return {"result": raw}
+        result = cast("dict[str, Any]", raw.model_dump(mode="json"))
+    elif isinstance(raw, dict):
+        result = raw
+    else:
+        result = {"result": raw}
+    # Clamp to the per-tool budget, exactly as the interactive wrappers do,
+    # before this result is embedded verbatim in the round-2 synth prompt.
+    return _clamp_tool_result(result)
 
 
 __all__ = [

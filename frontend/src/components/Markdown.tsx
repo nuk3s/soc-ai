@@ -12,6 +12,14 @@ import remarkGfm from 'remark-gfm';
  * delimiter when it precedes the first '/', '?', or '#'.
  */
 export function safeUrl(url: string): string {
+  // Protocol-relative ("//host/path") has no ':' at all, so it would otherwise
+  // fall into the no-scheme "safe" branch below — but a browser resolves it
+  // against the CURRENT scheme, so it still navigates (or, for an <img>, loads)
+  // off-app to an attacker-controlled host, just without a visible scheme. The
+  // app never needs one — same-origin paths already start with a single '/'.
+  // Strip leading C0 controls/space first (a browser's URL parser does the
+  // same) so a whitespace-padded "  //evil.example" can't dodge the check.
+  if (url.replace(/^[\x00-\x20]+/, '').startsWith('//')) return '';
   const colon = url.indexOf(':');
   if (colon === -1) return url; // no scheme → relative/anchor, safe
   const firstSpecial = Math.min(

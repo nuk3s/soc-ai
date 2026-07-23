@@ -15,6 +15,12 @@ sorted chronologically, capped at ``max_per_pivot`` rows. Pivots whose source
 field is absent from the alert resolve to an empty list. All five pivot
 queries dispatch via :func:`asyncio.gather` for end-to-end latency.
 
+The ``community_id`` pivot is the one exception to strict chronological order:
+rare behavioral-summary docs (beacon / DNS-tunnel profiles) are prepended at its
+head so their decisive bullet surfaces first, so it reads decisive-first, not
+time-ordered. It is still capped at ``max_per_pivot`` (the oldest correlated
+events are dropped to make room for the prepended summaries).
+
 **Resilience.** Transient ``ConnectionTimeout`` / 5xx from a contended ES
 cluster are retried at the transport layer by elasticsearch-py
 (see :class:`ElasticClient`'s ``max_retries`` + ``retry_on_timeout`` +
@@ -215,9 +221,19 @@ async def get_alert_context(
     # They are high-signal and rare, so they win the front slots; dedupe by id
     # against whatever the community_id pivot already returned.
     if behavioral_summaries:
-        seen_ids = {e.id for e in events_by_key.get("community_id", [])}
+        existing = events_by_key.get("community_id", [])
+        seen_ids = {e.id for e in existing}
         fresh = [e for e in behavioral_summaries if e.id not in seen_ids]
-        events_by_key["community_id"] = fresh + events_by_key.get("community_id", [])
+        # Re-cap the merged list to max_per_pivot so the documented "at most
+        # max_per_pivot rows" contract still holds after the prepend (otherwise
+        # the list could reach max_per_pivot + 8 and, in the fail-open path where
+        # context-budget window discovery fails, reach the prompt untrimmed).
+        # The behavioral docs keep the head slots; trim the OLDEST community_id
+        # events (they are sorted ascending) to make room.
+        keep = max(max_per_pivot - len(fresh), 0)
+        events_by_key["community_id"] = (
+            fresh[:max_per_pivot] + existing[max(len(existing) - keep, 0) :]
+        )
 
     return AlertContext(
         alert=alert,
@@ -467,12 +483,17 @@ async def _behavioral_summary_pivot(
             size=min(max_results, 8),
             sort=[{"@timestamp": {"order": "asc"}}],
         )
+        # Materialize inside the try: a single schema-drifted summary doc (a
+        # list/dict where SoAlert expects a scalar) would otherwise raise
+        # pydantic.ValidationError here and, because the outer gather is NOT
+        # return_exceptions=True, abort the ENTIRE prefetch. Best-effort means
+        # a bad hit costs this pivot's evidence, not the whole investigation.
+        return [SoAlert.from_es_hit(h) for h in result.hits]
     except Exception as exc:  # best-effort: never poison the prefetch (BLE001 ok)
         _LOGGER.warning(
             "behavioral-summary pivot for alert %s failed: %s", alert.id, type(exc).__name__
         )
         return []
-    return [SoAlert.from_es_hit(h) for h in result.hits]
 
 
 async def _host_risk(

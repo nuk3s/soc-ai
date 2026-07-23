@@ -9,6 +9,7 @@ import pytest
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+from soc_ai.so_client.oql import _HARD_MAX_RESULTS
 from soc_ai.tools.get_alert_context import get_alert_context
 from soc_ai.tools.query_events import query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
@@ -216,6 +217,9 @@ async def test_query_events_oql_groupby_uses_aggs(settings_kratos: Settings) -> 
 async def test_query_events_oql_count_sets_track_total_hits(
     settings_kratos: Settings,
 ) -> None:
+    """F72: `count` must cap `track_total_hits` at the same hard ceiling as
+    `head` (bounded integer), not `True` — `True` forces an exact count with
+    no cost ceiling across a broad, unbounded time window."""
     response = {"took": 0, "hits": {"total": {"value": 42}, "hits": []}}
     elastic, fake_es = _make_elastic(settings_kratos, response)
 
@@ -226,7 +230,8 @@ async def test_query_events_oql_count_sets_track_total_hits(
     )
 
     body = fake_es.search.call_args.kwargs["body"]
-    assert body["track_total_hits"] is True
+    assert body["track_total_hits"] == _HARD_MAX_RESULTS
+    assert body["track_total_hits"] is not True
     assert body["size"] == 0
     assert result.total == 42
 
@@ -270,6 +275,25 @@ async def test_query_events_oql_invalid_time_range_rejected(
 
 
 @pytest.mark.asyncio
+async def test_query_events_oql_excessive_time_range_rejected(
+    settings_kratos: Settings,
+) -> None:
+    """F53: an unbounded time_range_minutes must be rejected before the ES
+    call — alert-embedded text is prompt-injection surface and could
+    otherwise steer the agent into a full-history scan against the live SO
+    cluster."""
+    elastic, fake_es = _make_elastic(settings_kratos, {"took": 0, "hits": {"total": 0, "hits": []}})
+    with pytest.raises(ValueError, match="time_range_minutes"):
+        await query_events_oql(
+            "*",
+            elastic=elastic,
+            settings=settings_kratos,
+            time_range_minutes=999_999_999,
+        )
+    fake_es.search.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_query_events_oql_caps_size_at_max_results(
     settings_kratos: Settings,
 ) -> None:
@@ -290,6 +314,23 @@ async def test_query_events_oql_caps_size_at_max_results(
 # =====================================================================
 # C6: query_zeek_logs projection includes zeek.conn.history
 # =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_query_zeek_logs_excessive_time_range_rejected(settings_kratos: Settings) -> None:
+    """F53: an unbounded time_range_minutes must be rejected before the ES
+    call — alert-embedded text is prompt-injection surface and could
+    otherwise steer the agent into a full-history scan against the live SO
+    cluster."""
+    elastic, fake_es = _make_elastic(settings_kratos, {"took": 0, "hits": {"total": 0, "hits": []}})
+    with pytest.raises(ValueError, match="time_range_minutes"):
+        await query_zeek_logs(
+            "1:abc123==",
+            elastic=elastic,
+            settings=settings_kratos,
+            time_range_minutes=999_999_999,
+        )
+    fake_es.search.assert_not_called()
 
 
 @pytest.mark.asyncio

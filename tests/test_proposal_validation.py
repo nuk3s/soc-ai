@@ -75,3 +75,51 @@ def test_junk_and_empty_citations_do_not_ground() -> None:
     v = validate_proposal(p, tool_evidence=_tool_evidence())
     assert v.ok is False
     assert v.objection and "evidence" in v.objection.lower()
+
+
+def test_bare_stopword_citation_does_not_ground() -> None:
+    """F20: a bare stop-word citation ('false') must NOT ground a proposal. The old
+    `len(low) >= 4 and low in results_blob` fallback accepted any 4+ char substring,
+    including a generic word that appears incidentally in a tool result — so a
+    proposal that ran one real (but irrelevant) tool call and tacked on 'false'
+    passed the only server-side gate on POST /investigations/{id}/resolve."""
+    tool_evidence = [
+        {
+            "tool": "t_enrich_ip",
+            "result": "{'ip': '8.8.8.8', 'asn': {'org': 'Google'}, "
+            "'internal': False, 'blocklist_hits': []}",
+        }
+    ]
+    p = Proposal(
+        verdict="false_positive",
+        confidence=0.6,
+        rationale="benign google dns",
+        citations=["false"],  # a stop-word that appears (as 'False') in the result
+        recommended_actions=[],
+    )
+    v = validate_proposal(p, tool_evidence=tool_evidence)
+    assert v.ok is False
+    assert v.objection and "evidence" in v.objection.lower()
+
+
+def test_distinctive_value_citation_still_grounds() -> None:
+    """F20 companion: a DISTINCTIVE token that really appears in a tool result
+    (a full IP, a domain label) still grounds the proposal — the tighter resolver
+    kills hollow matches without dropping real citations."""
+    tool_evidence = [
+        {
+            "tool": "t_enrich_ip",
+            "result": "{'ip': '203.0.113.9', 'asn': {'org': 'Evil'}, "
+            "'blocklist_hits': [{'source': 'feodo'}]}",
+        }
+    ]
+    p = Proposal(
+        verdict="true_positive",
+        confidence=0.8,
+        rationale="C2 to a blocklisted IP",
+        citations=["203.0.113.9"],  # a full IP present in the result
+        recommended_actions=[],
+    )
+    v = validate_proposal(p, tool_evidence=tool_evidence)
+    assert v.ok is True
+    assert v.objection is None

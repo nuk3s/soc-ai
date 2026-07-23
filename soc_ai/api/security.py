@@ -49,9 +49,16 @@ def _allowed_origins(request: Request, settings: Settings) -> set[str]:
     """The CSRF allowlist: the app's own origin + CORS + csrf_trusted_origins.
 
     The app origin is derived from the inbound request (scheme+host+port as the
-    browser sees it) and from ``SO_HOST``/``soc_ai_host`` as a fallback so the
-    check works behind a proxy or before the first SPA request. Reuses the same
-    CSV allowlist shape as the CORS config.
+    browser sees it) and from ``soc_ai_host`` as a fallback so the check works
+    behind a proxy or before the first SPA request. Reuses the same CSV
+    allowlist shape as the CORS config.
+
+    Deliberately excludes ``settings.so_host``: that is the address of a
+    separate product (Security Onion's own web console) soc-ai talks OUT to,
+    not an origin the browser should ever legitimately POST to soc-ai's own
+    API from. Trusting it here would let a script-execution bug in SO's UI
+    forge cookie-authenticated writes against soc-ai. An operator who really
+    needs SO's origin trusted can opt in explicitly via ``csrf_trusted_origins``.
     """
     allowed: set[str] = set()
     # The origin the browser actually reached us on (most reliable for a
@@ -60,11 +67,10 @@ def _allowed_origins(request: Request, settings: Settings) -> set[str]:
     norm_base = _normalize_origin(base)
     if norm_base:
         allowed.add(norm_base)
-    # Configured hosts as a fallback (proxy / pre-first-request).
-    for raw in (str(settings.so_host) if settings.so_host else "", settings.soc_ai_host):
-        norm = _normalize_origin(raw)
-        if norm:
-            allowed.add(norm)
+    # Configured host as a fallback (proxy / pre-first-request).
+    norm_host = _normalize_origin(settings.soc_ai_host)
+    if norm_host:
+        allowed.add(norm_host)
     # CORS allowlist (cross-origin callers) + explicit CSRF trusted origins.
     for csv in (settings.cors_allow_origins, settings.csrf_trusted_origins):
         for raw_entry in csv.split(","):

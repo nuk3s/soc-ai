@@ -351,6 +351,7 @@ def desanitize(text: str, mapping: Mapping) -> str:
 def unsafe_residue(
     text: str,
     *,
+    extra_hosts: Iterable[str] | None = None,
     extra_suffixes: Iterable[str] | None = None,
     extra_usernames: Iterable[str] | None = None,
     allowlist: Iterable[str] | None = None,
@@ -360,6 +361,14 @@ def unsafe_residue(
 
     This catches drift between sanitize() and the cloud-bound payload
     (e.g. text added after sanitize ran, or a pattern we missed).
+
+    `extra_hosts`: caller-supplied single-label internal hostnames
+    (typically ``settings.oracle_extra_hosts``). MUST match the tuple
+    threaded into :func:`sanitize`'s ``extra_hosts`` so the detector can
+    verify whatever the replacer redacted — a bare internal name is
+    shape-indistinguishable from public infra, so without this the gate
+    silently passes it. `extra_suffixes`: additional internal DNS suffixes
+    beyond the defaults (must likewise match sanitize()'s).
 
     `allowlist`: tokens that the caller deliberately pinned through
     sanitize() and that the residue check must NOT flag. Without this
@@ -382,7 +391,7 @@ def unsafe_residue(
             issues.append(f"residual MAC: {m.group(0)}")
 
     suffixes = tuple(_DEFAULT_INTERNAL_SUFFIXES) + tuple(extra_suffixes or ())
-    explicit = tuple(_DEFAULT_INTERNAL_HOSTS)
+    explicit = tuple(_DEFAULT_INTERNAL_HOSTS) + tuple(extra_hosts or ())
     host_re = _build_internal_host_re(suffixes, explicit)
     for m in host_re.finditer(text):
         if m.group(0) not in allow:

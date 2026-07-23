@@ -59,7 +59,12 @@ def scoped_unverified_caveat(ungrounded: list[str]) -> str:
 # internal domains, dotted IPs, JA3 hashes) rather than trying to parse prose.
 
 # Windows / NetBIOS-style host labels: DESKTOP-XXXX, WIN11-01, DC01, SRV-FILE2 …
-_HOSTNAME = re.compile(r"\b(?:[A-Z][A-Z0-9]{1,14}-[A-Z0-9]{2,15}|DESKTOP-[A-Z0-9]{3,})\b")
+# Case-insensitive: a fabricated hostname written lowercase (common LLM prose,
+# e.g. "desktop-jsm4n2p") is the same hallucination as its all-caps form and must
+# be caught too — the char classes are ASCII-only, so IGNORECASE stays ASCII.
+_HOSTNAME = re.compile(
+    r"\b(?:[A-Z][A-Z0-9]{1,14}-[A-Z0-9]{2,15}|DESKTOP-[A-Z0-9]{3,})\b", re.IGNORECASE
+)
 # Dotted FQDNs / domains: ad.local, wsus.internal, foo.corp.example.com.
 # Requires at least one dot and an alphabetic TLD-ish final label (>=2 chars) so
 # we don't catch version strings or "e.g".
@@ -88,7 +93,6 @@ _DOMAIN_STOP_SUFFIXES = (
     ".json",
     ".py",
     ".md",
-    ".com.",  # trailing dot artifacts
 )
 _DOMAIN_STOP_EXACT = {"e.g", "i.e", "etc.al"}
 

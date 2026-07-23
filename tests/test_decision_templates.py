@@ -704,3 +704,99 @@ def test_worm_guard_unchanged() -> None:
     )
     cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
     assert cv is None
+
+
+def test_informational_benign_cloud_fires_on_reversed_flow_cert_observation() -> None:
+    """Server-side observations (TLS cert / JA3S / banner) tag the alert with the
+    RESPONSE packet's direction: external SOURCE (the server) -> internal
+    DESTINATION (the client). The benign-informational templates must judge the
+    external endpoint whichever leg it is, or this whole high-volume ET INFO
+    class falls through to a full investigation loop.
+
+    Regression: the templates were hardcoded to destination_ip, so an
+    external-source cert observation matched nothing (candidate=None -> loop).
+    """
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET INFO Observed Let's Encrypt Certificate from Active Intermediate, E1",
+        severity_label="low",
+        source_ip="162.159.207.0",  # external server presenting the cert
+        destination_ip="10.0.0.1",  # internal client
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+    enrich = {
+        "162.159.207.0": IndicatorEnrichment(
+            indicator="162.159.207.0",
+            indicator_type="ip",
+            asn=AsnInfo(number=13335, org="Cloudflare, Inc."),
+            cloud_provider="Cloudflare",
+            internal=False,
+        ),
+        "10.0.0.1": IndicatorEnrichment(indicator="10.0.0.1", indicator_type="ip", internal=True),
+    }
+    typed = TypedZeekFields(conn_states=["SF"])
+    cv = match_decision_template(_ctx(alert, enrichments=enrich, typed_zeek=typed))
+    assert cv is not None
+    assert cv.template_id == "informational_external_clean_benign_cloud"
+    assert cv.verdict == "false_positive"
+
+
+def test_informational_unknown_asn_fires_on_reversed_flow() -> None:
+    """Same reversed-flow shape but the external source has no benign-cloud tag
+    (ASN unresolved) -> the unknown-ASN template still clears it FP so the loop
+    is skipped."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET INFO Observed TLS Handshake to External Host",
+        severity_label="low",
+        source_ip="203.0.113.10",  # external, no benign-cloud tag
+        destination_ip="10.0.0.1",  # internal
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+    enrich = {
+        "203.0.113.10": IndicatorEnrichment(
+            indicator="203.0.113.10", indicator_type="ip", internal=False
+        ),
+        "10.0.0.1": IndicatorEnrichment(indicator="10.0.0.1", indicator_type="ip", internal=True),
+    }
+    cv = match_decision_template(_ctx(alert, enrichments=enrich))
+    assert cv is not None
+    assert cv.template_id == "informational_external_unknown_asn"
+    assert cv.verdict == "false_positive"
+
+
+def test_reversed_flow_blocklist_hit_on_external_source_not_cleared() -> None:
+    """The reversed-flow path still honours the guards: a blocklist hit on the
+    external source blocks the benign templates (no auto-clear of a flagged
+    external server that happens to be on the source leg)."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET INFO Observed TLS Handshake to External Host",
+        severity_label="low",
+        source_ip="203.0.113.66",  # external, flagged
+        destination_ip="10.0.0.1",  # internal
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+    enrich = {
+        "203.0.113.66": IndicatorEnrichment(
+            indicator="203.0.113.66",
+            indicator_type="ip",
+            internal=False,
+            blocklist_hits=[
+                BlocklistHit(
+                    indicator="203.0.113.66",
+                    indicator_type="ip",
+                    source="abuse.ch",
+                    tags=("c2",),
+                )
+            ],
+        ),
+        "10.0.0.1": IndicatorEnrichment(indicator="10.0.0.1", indicator_type="ip", internal=True),
+    }
+    cv = match_decision_template(_ctx(alert, enrichments=enrich))
+    # A flagged external source must NOT be benign-cleared by the reversed-flow
+    # change (it routes to needs_more_info / investigation, never false_positive).
+    assert cv is None or cv.verdict != "false_positive"

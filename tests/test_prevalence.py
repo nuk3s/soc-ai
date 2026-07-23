@@ -349,6 +349,20 @@ async def test_non_positive_lookback_returns_error_not_raise(settings_kratos: Se
 
 
 @pytest.mark.asyncio
+async def test_excessive_lookback_returns_error_not_raise(settings_kratos: Settings) -> None:
+    """F53: an unbounded lookback_days must be rejected before the ES call —
+    alert-embedded text is prompt-injection surface and could otherwise steer
+    the agent into a full-history scan against the live SO cluster."""
+    elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
+    out = await prevalence(
+        "10.0.0.5", elastic=elastic, settings=settings_kratos, lookback_days=999_999_999
+    )
+    assert out["error"] is True
+    assert "lookback_days" in out["message"]
+    fake_es.search.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_registered_as_read_only_tool() -> None:
     """The tool is registered in the global registry as read-only."""
     import soc_ai.tools  # noqa: F401  (force-import registers decorators)

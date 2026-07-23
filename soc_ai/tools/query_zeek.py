@@ -16,7 +16,7 @@ from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import first_present
 from soc_ai.tools._registry import tool
-from soc_ai.tools.query_events import _build_time_filter
+from soc_ai.tools.query_events import _MAX_TIME_RANGE_MINUTES, _build_time_filter
 
 DEFAULT_LOG_TYPES: tuple[str, ...] = ("conn", "dns", "http", "ssl", "files", "ssh")
 
@@ -130,7 +130,8 @@ async def query_zeek_logs(
         settings: app settings (uses ``events_index_pattern``).
         log_types: Zeek dataset suffixes to include (e.g. ``["conn", "dns"]``).
             Defaults to ``conn``, ``dns``, ``http``, ``ssl``, ``files``.
-        time_range_minutes: window size in minutes. Default 60.
+        time_range_minutes: window size in minutes. Default 60, capped at
+            ``_MAX_TIME_RANGE_MINUTES`` (43_200 = 30 days).
         max_results: hard cap on returned records.
         time_anchor: when set, center the window on this timestamp
             (``[anchor - rng/2, anchor + rng/2]``) instead of the
@@ -149,6 +150,10 @@ async def query_zeek_logs(
         raise ValueError(f"max_results must be positive, got {max_results}")
     if time_range_minutes <= 0:
         raise ValueError(f"time_range_minutes must be positive, got {time_range_minutes}")
+    if time_range_minutes > _MAX_TIME_RANGE_MINUTES:
+        raise ValueError(
+            f"time_range_minutes must be <= {_MAX_TIME_RANGE_MINUTES}, got {time_range_minutes}"
+        )
 
     types = tuple(log_types) if log_types else DEFAULT_LOG_TYPES
     datasets = [f"zeek.{t}" for t in types]

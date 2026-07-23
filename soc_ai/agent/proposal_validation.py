@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from soc_ai.agent.gates import _CITATION_STOP_WORDS, _FUZZY_TOKEN_RE
+
 _TERMINAL = {"true_positive", "false_positive"}
 # Tokens worth matching against tool results: ids, community ids, dotted paths,
 # long alphanumerics — strip the (path ...)/(id ...) wrappers first.
@@ -37,6 +39,30 @@ class ProposalValidation:
 def _unwrap(citation: str) -> str:
     m = _WRAP.match(citation.strip())
     return (m.group(1) if m else citation).strip()
+
+
+def _citation_grounded_in_results(citation: str, results_blob: str) -> bool:
+    """True iff a DISTINCTIVE token of ``citation`` appears in ``results_blob``.
+
+    Same discipline as GATE C (:mod:`soc_ai.agent.gates`) and the hunt-finding
+    gate: a stop-word or a short generic fragment never grounds a proposal on its
+    own; a long token (>= 8 chars — an id/hash/full IP) grounds on a substring, a
+    medium token (>= 5 chars — a domain label, a hyphenated host) grounds only on
+    a word boundary. Replaces the old ``len(low) >= 4 and low in results_blob``
+    fallback that let a bare 'false' pass just because the word appeared
+    incidentally in a tool result.
+    """
+    if not results_blob:
+        return False
+    for tok in _FUZZY_TOKEN_RE.findall(citation):
+        low = tok.lower()
+        if low in _CITATION_STOP_WORDS:
+            continue
+        if len(tok) >= 8 and low in results_blob:
+            return True
+        if len(tok) >= 5 and re.search(rf"\b{re.escape(low)}\b", results_blob):
+            return True
+    return False
 
 
 def validate_proposal(
@@ -67,7 +93,7 @@ def validate_proposal(
         # a tool name — that let junk like "in" pass the gate.
         if low in tool_names or any(tn in low for tn in tool_names if tn):
             return ProposalValidation(ok=True)
-        if len(low) >= 4 and low in results_blob:
+        if _citation_grounded_in_results(token, results_blob):
             return ProposalValidation(ok=True)
 
     return ProposalValidation(

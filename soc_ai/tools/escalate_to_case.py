@@ -34,7 +34,11 @@ async def escalate_to_case(
 ) -> dict[str, Any]:
     """POST /connect/case with title/description, linking to ``alert_id``.
 
-    Returns the new case JSON on 2xx, or raises :class:`SoApiError`.
+    Returns the new case JSON on 2xx. On a 2xx with an empty/non-JSON body the
+    case was already created SO-side, so returns a synthetic
+    ``{"alert_id": ..., "escalated": True}`` rather than raising — raising would
+    make the caller retry and create a DUPLICATE case (mirrors
+    ``add_case_comment``). Only 4xx/5xx raises :class:`SoApiError`.
     """
     if not _EVENT_ID_RE.match(alert_id):
         raise ValueError(
@@ -60,5 +64,8 @@ async def escalate_to_case(
         )
     try:
         return dict(resp.json())
-    except ValueError as e:
-        raise SoApiError(f"escalate_to_case response was not JSON: {e}") from e
+    except ValueError:
+        # 2xx but empty/non-JSON body: the SO-side write already happened, so a
+        # hard failure here would risk a duplicate case on retry. Degrade to a
+        # synthetic success (same pattern as add_case_comment).
+        return {"alert_id": alert_id, "escalated": True}

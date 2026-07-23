@@ -25,6 +25,7 @@ re-exports it for backward compatibility.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -195,9 +196,13 @@ def first_present(source: Mapping[str, Any], candidates: Sequence[str]) -> Any:
 
 # Per-(index, candidates) cache of the resolved aggregation field. Once a
 # candidate is confirmed to carry data on this deployment, repeated calls are
-# free. Keyed on (index, tuple(candidates)) so distinct logical fields and
-# index patterns never collide.
-_AGG_FIELD_CACHE: dict[tuple[str, tuple[str, ...]], str] = {}
+# free until the TTL lapses. Keyed on (index, tuple(candidates)) so distinct
+# logical fields and index patterns never collide. Same TTL pattern as
+# inventory.py's dataset-discovery cache, so a live schema migration (e.g. an
+# Elastic-Agent upgrade moving data onto a different field) self-heals within
+# minutes instead of requiring a process restart.
+_AGG_FIELD_CACHE_TTL_SECONDS = 300.0
+_AGG_FIELD_CACHE: dict[tuple[str, tuple[str, ...]], tuple[float, str]] = {}
 
 
 async def _candidate_has_data(es_client: ElasticClient, index: str, field: str) -> bool:
@@ -220,21 +225,25 @@ async def resolve_agg_field(
     es_client: ElasticClient,
     index: str,
     candidates: Sequence[str],
+    *,
+    ttl_seconds: float = _AGG_FIELD_CACHE_TTL_SECONDS,
 ) -> str:
     """Return the first candidate that actually has data on this deployment.
 
     Probes each candidate in order with the cheapest correct ``exists`` count
     and stops at the first with ``count > 0``, caching the result per
-    ``(index, tuple(candidates))`` so repeated calls are free. On any error, or
-    when no candidate has data, returns ``candidates[0]`` — the ECS-first
-    default — so a query path can proceed (it never raises).
+    ``(index, tuple(candidates))`` for ``ttl_seconds`` so repeated calls are
+    free until the deployment's schema might plausibly have changed. On any
+    error, or when no candidate has data, returns ``candidates[0]`` — the
+    ECS-first default — so a query path can proceed (it never raises).
     """
     cand_tuple = tuple(candidates)
     default = cand_tuple[0]
     cache_key = (index, cand_tuple)
+    now = time.monotonic()
     cached = _AGG_FIELD_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    if cached is not None and now < cached[0]:
+        return cached[1]
 
     resolved = default
     try:
@@ -248,7 +257,7 @@ async def resolve_agg_field(
         # right call for a best-effort resolver.)
         return default
 
-    _AGG_FIELD_CACHE[cache_key] = resolved
+    _AGG_FIELD_CACHE[cache_key] = (now + ttl_seconds, resolved)
     return resolved
 
 

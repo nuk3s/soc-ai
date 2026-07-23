@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     es_username: str | None = None
     es_password: SecretStr | None = None
     es_verify_ssl: bool = True
+    # Optional path to a CA bundle for the ES connection specifically — mirrors
+    # so_ca_bundle/misp_ca_bundle. Without this, a self-hosted ES behind a
+    # private CA has no option between cert failures and ES_VERIFY_SSL=false
+    # (which disables validation on the channel carrying the ES basic-auth
+    # credential and every raw alert/event document).
+    es_ca_bundle: Path | None = None
     # Per-request timeout in seconds. 30s balances a typical grid under moderate
     # concurrency (several runs * ~6 pivot queries each = dozens of simultaneous
     # ES queries) against failing fast on a wedged cluster. Lower for fast
@@ -1064,7 +1070,7 @@ class Settings(BaseSettings):
         return v
 
     # --- Auto-acknowledge high-confidence false positives ---------------
-    auto_ack_fp_enabled: bool = True
+    auto_ack_fp_enabled: bool = False
     """When True, alerts the system is confident are false positives are
     automatically acknowledged in Security Onion. Two paths:
 
@@ -1075,11 +1081,13 @@ class Settings(BaseSettings):
       cluster's events too — before this, an inherited verdict never reached
       SO and those alerts lingered unacked forever.
 
-    ON by default: both paths are gated by the confidence threshold AND the
-    high-stakes guard (``_is_high_stakes_alert`` — a critical/high-severity or
-    malware/exploit-class alert is never auto-acked, whatever the verdict),
-    and every unattended write is audited. Set False to require a human click
-    for every acknowledgement.
+    OFF by default: an auto-ack writes state into Security Onion with no
+    analyst in the loop, so it stays opt-in — an operator must set this True
+    to accept that (mirroring ``auto_triage_schedule_enabled``'s default-off
+    posture). Even then both paths are gated by the confidence threshold AND
+    the high-stakes guard (``_is_high_stakes_alert`` — a critical/high-severity
+    or malware/exploit-class alert is never auto-acked, whatever the verdict),
+    and every unattended write is audited.
 
     Note the severity interaction: the high-stakes guard never auto-acks a
     critical/high-severity (or malware/exploit-class) alert, while
@@ -1197,6 +1205,7 @@ class Settings(BaseSettings):
         "misp_url",
         "misp_api_key",
         "misp_ca_bundle",
+        "es_ca_bundle",
         "bootstrap_admin_password",
         "config_secret_key",
         "so_ssh_key",

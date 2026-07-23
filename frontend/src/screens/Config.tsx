@@ -328,6 +328,15 @@ export function Config() {
   const [newUser, setNewUser] = useState({ username: '', password: '', role: 'analyst' });
   const [resetPw, setResetPw] = useState<{ id: number; password: string } | null>(null);
 
+  // Auto-dismiss the plaintext reset-password banner, same as the mint-token
+  // banner above — so the secret doesn't linger on an unattended screen. Still
+  // carries a manual ✕ for immediate dismissal.
+  useEffect(() => {
+    if (!resetPw) return;
+    const t = setTimeout(() => setResetPw(null), 30000);
+    return () => clearTimeout(t);
+  }, [resetPw]);
+
   // Danger-zone state
   const [dangerSettings, setDangerSettings] = useState<DangerSetting[]>([]);
   const [dangerLoading, setDangerLoading] = useState(false);
@@ -1158,10 +1167,12 @@ export function Config() {
                     onClick={() => {
                       const blocked = demoBlocked(demo);
                       if (blocked) { setUserError(blocked); return; } // demo: no doomed write
-                      resetUserPassword(u.id).then((r) => {
-                        setResetPw({ id: u.id, password: r.password });
-                        setNonce((n) => n + 1);
-                      });
+                      resetUserPassword(u.id)
+                        .then((r) => {
+                          setResetPw({ id: u.id, password: r.password });
+                          setNonce((n) => n + 1);
+                        })
+                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Failed to reset password'));
                     }}
                     disabled={resetPw?.id === u.id}
                     className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1235,7 +1246,9 @@ export function Config() {
               onClick={() => {
                 const blocked = demoBlocked(demo);
                 if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
-                mintToken().then((t) => { setMinted(t); setNonce((n) => n + 1); });
+                mintToken()
+                  .then((t) => { setMinted(t); setNonce((n) => n + 1); })
+                  .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Failed to mint token'));
               }}
               className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
             >
@@ -1285,7 +1298,9 @@ export function Config() {
                 onClick={() => {
                   const blocked = demoBlocked(demo);
                   if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
-                  revokeToken(tk.id).then(() => setNonce((n) => n + 1));
+                  revokeToken(tk.id)
+                    .then(() => setNonce((n) => n + 1))
+                    .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Failed to revoke token'));
                 }}
                 className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
                 style={{ borderColor: 'rgba(240,68,56,.3)' }}

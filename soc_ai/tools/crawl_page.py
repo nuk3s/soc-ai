@@ -17,6 +17,7 @@ internal service's content.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import socket
@@ -35,16 +36,17 @@ _MAX_REDIRECT_HOPS = 8
 
 
 def _ip_is_internal(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, settings: Any) -> bool:
-    """True iff *ip* is loopback/link-local/private/reserved/multicast/unspecified
-    or falls inside a configured ``internal_cidrs`` network."""
-    if (
-        ip.is_loopback
-        or ip.is_link_local
-        or ip.is_private
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    ):
+    """True iff *ip* is not globally routable, or falls inside a configured
+    ``internal_cidrs`` network.
+
+    Anything that is not globally routable is treated as internal:
+    ``ipaddress.is_global`` captures loopback, link-local, RFC1918 private,
+    reserved, multicast and unspecified in one check — plus the cases the older
+    per-flag approach missed, notably CGNAT (``100.64.0.0/10``) and benchmarking
+    (``198.18.0.0/15``), neither of which is ``is_private``. Mirrors
+    :func:`soc_ai.tools.online.is_internal_ip`.
+    """
+    if not ip.is_global:
         return True
     for net in getattr(settings, "internal_cidrs", []) or []:
         try:
@@ -55,14 +57,19 @@ def _ip_is_internal(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, settings:
     return False
 
 
-def _resolve_addrs(host: str) -> list[str]:
+async def _resolve_addrs(host: str) -> list[str]:
     """Resolve *host* to every A/AAAA address. Returns [] if resolution fails.
 
     A resolution failure is itself a refusal reason (we cannot prove the host
     is external), handled by the caller.
+
+    ``socket.getaddrinfo`` is blocking and has no timeout, so we run it off the
+    event loop (via a thread): a slow/blackholed resolver must not stall the
+    single-worker server for every other in-flight request, and this keeps the
+    call cancellable at the surrounding ``await`` for the turn-timeout watchdog.
     """
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
     except (OSError, UnicodeError):
         return []
     addrs: list[str] = []
@@ -73,7 +80,7 @@ def _resolve_addrs(host: str) -> list[str]:
     return addrs
 
 
-def _host_is_internal(url: str, settings: Any) -> str | None:
+async def _host_is_internal(url: str, settings: Any) -> str | None:
     """Return a reason string if *url*'s host is internal/unsafe, else None.
 
     The host is DNS-resolved and EVERY resolved address (v4 + v6) is checked
@@ -122,7 +129,7 @@ def _host_is_internal(url: str, settings: Any) -> str | None:
     # 4. Resolve the name and reject if ANY resolved address is internal. This
     #    closes the SSRF hole where ``evil.com`` resolves to 169.254.169.254 /
     #    10.x and the octal/hex-literal bypass (we check canonical resolved IPs).
-    addrs = _resolve_addrs(host)
+    addrs = await _resolve_addrs(host)
     if not addrs:
         return f"host {host!r} did not resolve (cannot verify it is external)"
     for addr in addrs:
@@ -172,7 +179,7 @@ async def _preflight_redirects(
             return current, None  # 30x with no target — let crawl4ai handle it
         # Resolve relative redirects against the current url, then revalidate.
         next_url = urljoin(current, location)
-        bad = _host_is_internal(next_url, settings)
+        bad = await _host_is_internal(next_url, settings)
         if bad is not None:
             return None, f"redirect to internal target ({bad})"
         current = next_url
@@ -209,7 +216,7 @@ async def crawl_page(url: str, *, settings: Any) -> dict[str, Any]:
     base = str(getattr(settings, "crawl4ai_url", "") or "").rstrip("/")
     if not base:
         return {"ok": False, "error": "crawl4ai_url not configured"}
-    bad = _host_is_internal(url, settings)
+    bad = await _host_is_internal(url, settings)
     if bad is not None:
         return {"ok": False, "error": f"refused: {bad}; crawl_page is for EXTERNAL pages only"}
 
@@ -266,7 +273,11 @@ async def crawl_page(url: str, *, settings: Any) -> dict[str, Any]:
     title = str(result.get("title", "")) if isinstance(result, dict) else ""
     return {
         "ok": True,
-        "url": url,
+        # ``url`` is the ACTUAL content source (the post-redirect url crawl4ai
+        # fetched); ``requested_url`` preserves the original argument so a
+        # shortener/lookalike can't be silently credited with the fetched page.
+        "url": fetch_url,
+        "requested_url": url,
         "title": title[:200],
         "content": content[:max_chars],
         "truncated": truncated,

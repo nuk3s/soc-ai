@@ -267,6 +267,25 @@ class TestLearnedValuePropagation:
         text = json.dumps(out)
         assert host_label in text
 
+    def test_mixed_case_host_propagated_across_casing(self) -> None:
+        """A genuinely mixed-case hostname (neither pure-upper nor pure-lower)
+        learned from host.name must also be redacted where it reappears with
+        DIFFERENT casing in free text — the case-fold fallback must cover mixed
+        originals, not only all-upper/all-lower (F43)."""
+        m = _mapping()
+        case = {
+            "host": {"name": "WebSrv-Prod"},
+            "message": "conn from websrv-prod and WEBSRV-PROD flagged",
+        }
+        out = sanitize_case(case, m)
+        text = json.dumps(out)
+        assert "websrv-prod" not in text.lower(), (
+            f"differently-cased occurrence of a mixed-case host leaked: {text}"
+        )
+        assert "HOST_" in text
+        # One host → exactly one label (no duplicate allocation).
+        assert m.counters.get("HOST", 0) == 1
+
 
 # ---------------------------------------------------------------------------
 # 4. IP fields — private tokenised; public passes
@@ -365,6 +384,17 @@ class TestDomainFields:
         out = sanitize_case(case, m)
         text = json.dumps(out)
         assert "evil.com" in text
+        assert m.counters.get("HOST", 0) == 0
+
+    def test_public_domain_colliding_on_suffix_substring_passes(self) -> None:
+        """A public FQDN whose final label merely CONTAINS a suffix substring
+        (``update.milan`` vs ``.lan``) must NOT be over-redacted — the suffix
+        match requires the dot boundary (F44)."""
+        m = _mapping()
+        case = {"domain": "update.milan"}
+        out = sanitize_case(case, m)
+        text = json.dumps(out)
+        assert "update.milan" in text, "public domain over-redacted on suffix substring collision"
         assert m.counters.get("HOST", 0) == 0
 
     def test_internal_domain_field(self) -> None:
@@ -669,6 +699,16 @@ class TestFieldMapGapLeaks:
         assert "dc01.lan" not in text
         assert "HOST_" in text
 
+    def test_domain_like_suffix_substring_collision_passes(self) -> None:
+        """A public SNI whose final label ends in a suffix substring but not the
+        dotted suffix (``conference.milan`` vs ``.lan``) must PASS (F44)."""
+        m = _mapping()
+        case = {"alert": {"zeek_ssl_server_name": "conference.milan"}}
+        out = sanitize_case(case, m)
+        text = json.dumps(out)
+        assert "conference.milan" in text, "public SNI over-redacted on suffix substring collision"
+        assert m.counters.get("HOST", 0) == 0
+
     def test_single_label_sni_tokenised(self) -> None:
         """Single-label zeek_ssl_server_name (PRINTSRV) → tokenised."""
         m = _mapping()
@@ -677,6 +717,28 @@ class TestFieldMapGapLeaks:
         text = json.dumps(out)
         assert "PRINTSRV" not in text
         assert "HOST_" in text
+
+    def test_single_label_trailing_root_dot_tokenised(self) -> None:
+        """A single-label DOMAIN_LIKE value with a trailing DNS root-zone dot
+        (``PRINTSRV.`` / ``DC01.``) must redact identically to the dot-less form
+        — the trailing dot must not bypass the single-label heuristic (F12)."""
+        m = _mapping()
+        case = {
+            "alert_summary": {
+                "alert": {
+                    "zeek_http_host": "PRINTSRV.",
+                    "zeek_dns_query": "DC01.",
+                    "zeek_ssl_server_name": "FILESRV",
+                }
+            }
+        }
+        out = sanitize_case(case, m)
+        text = json.dumps(out)
+        leaks = unsafe_residue(text, known_values=tuple(m.reverse.values()))
+        assert "PRINTSRV" not in text, "trailing-dot Host header leaked to outbound payload"
+        assert "DC01" not in text, "trailing-dot DNS query leaked to outbound payload"
+        assert "FILESRV" not in text, "single-label SNI leaked"
+        assert leaks == [], f"residue gate also missed the trailing-dot names: {leaks}"
 
     def test_typed_zeek_sni_servers_list_single_label(self) -> None:
         """typed_zeek.sni_servers list — single-label elements tokenised."""

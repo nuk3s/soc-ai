@@ -251,10 +251,15 @@ async def dismiss_internal_identifier(request: Request, ident_id: int) -> dict[s
     dependencies=[Depends(require_admin_api)],
 )
 async def delete_internal_identifier(request: Request, ident_id: int) -> dict[str, Any]:
-    """Delete a manual identifier. Refuses a detected row → 409 (dismiss it)."""
+    """Delete a manual identifier. Unknown id → 404; a detected row → 409 (dismiss it)."""
     async with request.app.state.db_sessionmaker() as db:
         deleted = await ids_store.delete_manual(db, ident_id)
         if not deleted:
+            # delete_manual() returns False for BOTH a missing id and a detected
+            # row — disambiguate for the HTTP status, same as dismiss above.
+            existing = await db.get(InternalIdentifier, ident_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail={"reason": "not_found"})
             raise HTTPException(
                 status_code=409,
                 detail={

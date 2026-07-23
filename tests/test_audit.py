@@ -121,6 +121,26 @@ def test_redact_text_key_value_secret() -> None:
         assert modified, line
 
 
+def test_redact_text_multiword_secret_fully_masked() -> None:
+    """A secret value with spaces is redacted in FULL, not just its first token —
+    else the bulk of a passphrase leaks verbatim into the shared ES cluster."""
+    out, modified = redact_text("password = correct horse battery staple")
+    assert modified
+    assert "[REDACTED:secret]" in out
+    assert "horse" not in out
+    assert "battery" not in out
+    assert "staple" not in out
+
+
+def test_redact_text_multiword_secret_stops_at_delimiter() -> None:
+    """The value capture stops at a natural field delimiter so a following,
+    non-secret field isn't swallowed into the redaction."""
+    out, _ = redact_text("password = my long pass, user=bob")
+    assert "[REDACTED:secret]" in out
+    assert "long" not in out
+    assert "user=bob" in out
+
+
 def test_redact_value_dict_recursive() -> None:
     payload = {
         "args": {"comment": "please contact alice@example.com"},
@@ -441,6 +461,30 @@ async def test_chain_head_recovers_across_restart(settings_kratos: Settings) -> 
     ok, broken = verify_chain(es.docs)
     assert ok is True
     assert broken is None
+
+
+@pytest.mark.asyncio
+async def test_windowed_verify_skips_genesis_boundary(settings_kratos: Settings) -> None:
+    """A mid-stream window (what ``days=N`` returns on an old deployment) is not a
+    tamper. ``expect_genesis=False`` leaves the first record's boundary linkage
+    UNVERIFIED instead of forcing the genesis prev_hash; the default full-scan mode
+    still flags a missing head (seq>0 first record with a non-genesis prev_hash)."""
+    es = _CapturingES()
+    logger = _logger_with(es, settings_kratos)
+    for i in range(10):
+        await logger.log_kind("s", "tool_call", {"i": i})
+
+    window = es.docs[6:]  # seqs 6..9 — exactly what a days= filter hands back
+
+    # Default (full-scan) mode forces the genesis check → false 'tamper' at seq 6.
+    ok_full, broken_full = verify_chain(window)
+    assert ok_full is False
+    assert broken_full == 6
+
+    # Windowed mode: boundary is UNVERIFIED, not tampered → intact.
+    ok_win, broken_win = verify_chain(window, expect_genesis=False)
+    assert ok_win is True
+    assert broken_win is None
 
 
 def test_compute_hash_is_order_independent() -> None:

@@ -155,6 +155,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // skip the render where inv.id just changed (draft still holds the PREVIOUS
   // investigation's text then) so it can't clobber the new id's stored draft.
   const draftIdRef = useRef(inv.id);
+  // The investigation id the component is CURRENTLY showing, updated by the
+  // identity-reset effect below. An in-flight postChat/getChatThread request
+  // closes over the id it was fired for; applyThread compares against this ref
+  // so a response that lands after the drawer has switched to another
+  // investigation (re-hunt / request-more-info before the reply arrives) is
+  // dropped instead of clobbering the new investigation's chat.
+  const currentInvIdRef = useRef(inv.id);
   // Entity graph always starts collapsed — for most investigations the blast
   // radius is noise, and the collapsed bar narrative carries the gist.
   const [graphOpen, setGraphOpen] = useState(false);
@@ -212,6 +219,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // reset transient state only when the investigation IDENTITY changes (drawer
   // reuse / re-hunt) — never on a poll refresh of the same investigation.
   useEffect(() => {
+    currentInvIdRef.current = inv.id;
     setActions({});
     setActionMsg({});
     setSettledAction(null);
@@ -315,12 +323,19 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // The pending assistant turn comes back with empty text — drop it and let the
   // typing indicator stand in until the real reply lands.
   const applyThread = (thread: ChatThread) => {
+    // This closure was created for whichever investigation was current when
+    // the request fired (postChat / getChatThread below both close over the
+    // same `inv.id`). If the drawer has since switched to another
+    // investigation (re-hunt / request-more-info before this reply landed),
+    // applying it would clobber the new investigation's chat — drop it.
+    if (currentInvIdRef.current !== inv.id) return;
     setChat(thread.messages.filter((m) => m.text || m.role === 'user'));
     setPending(thread.pending);
     if (chatTimer.current) clearTimeout(chatTimer.current);
     if (thread.pending) {
       chatTimer.current = setTimeout(() => {
         getChatThread(inv.id).then(applyThread).catch(() => {
+          if (currentInvIdRef.current !== inv.id) return;
           setPending(false);
           // Only push the error message if the last message isn't already it
           // (repeated poll failures must not stack duplicate error bubbles).
@@ -343,6 +358,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     clearChatDraft(inv.id); // sent — drop the persisted draft
     setPending(true);
     postChat(inv.id, t).then(applyThread).catch(() => {
+      if (currentInvIdRef.current !== inv.id) return; // drawer moved on — don't clobber the new investigation's chat
       setPending(false);
       setChat((c) => [...c, { role: 'assistant', text: NET_ERR_TEXT }]);
     });

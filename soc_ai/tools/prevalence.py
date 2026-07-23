@@ -64,6 +64,14 @@ _HEAVY_VOLUME_EVENTS = 50
 # lookback can't ask ES for an unbounded histogram.
 _MAX_DAY_BUCKETS = 400
 
+# Hard ceiling on the requested window. This is an LLM-callable read tool —
+# alert-embedded text is in-scope prompt-injection surface, so an unbounded
+# lookback_days lets the agent turn a rarity check into a full-history ES
+# scan against the same cluster the live SO grid depends on. 365d comfortably
+# covers the widest legitimate baseline (default is 90d) while bounding
+# worst-case query cost.
+_MAX_LOOKBACK_DAYS = 365
+
 # Domain-match candidate fields, ECS-first. A host "talks to" a domain when it
 # resolves it (dns.query), negotiates TLS to it (ssl.server_name / SNI), or
 # sends an HTTP request to it (http.host / virtual_host). We OR across all
@@ -227,7 +235,8 @@ async def prevalence(
         settings: app settings (uses ``events_index_pattern``).
         peer_ip: when set, scope to flows between ``ip`` and this peer.
         domain: when set, scope to this host's references to this domain.
-        lookback_days: window size in days. Default 90.
+        lookback_days: window size in days. Default 90, capped at
+            ``_MAX_LOOKBACK_DAYS`` (365).
         time_anchor: when set, anchor the window's upper bound on this timestamp
             (``[anchor - lookback, anchor]``) instead of "now". The orchestrator
             passes ``alert.timestamp`` so the baseline reflects what was known up
@@ -270,6 +279,12 @@ async def prevalence(
         return {
             "error": True,
             "message": f"lookback_days must be positive, got {lookback_days}",
+        }
+
+    if lookback_days > _MAX_LOOKBACK_DAYS:
+        return {
+            "error": True,
+            "message": f"lookback_days must be <= {_MAX_LOOKBACK_DAYS}, got {lookback_days}",
         }
 
     evidence: dict[str, Any] = {

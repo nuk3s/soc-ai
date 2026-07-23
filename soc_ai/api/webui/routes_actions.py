@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
+from weakref import WeakValueDictionary
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -49,6 +51,37 @@ class ExecuteActionResult(BaseModel):
     error: str | None = None
 
 
+def _case_id_from_result(result: Any) -> str:
+    """The SO case id from an ``escalate_to_case`` tool result (id/caseId/case_id)."""
+    if not isinstance(result, dict):
+        return ""
+    return str(result.get("id") or result.get("caseId") or result.get("case_id") or "")
+
+
+def _observed_case_id(events: list[Any]) -> str | None:
+    """The SO case id THIS investigation itself opened, if any.
+
+    Scans persisted successful ``action_executed`` events for an
+    ``escalate_to_case`` execution and returns the case id the system observed
+    from SO's response (persisted as ``case_id``). This is the ONLY case id an
+    ``add_case_comment`` action may target: ``RecommendedAction.tool_args`` is
+    fully model-authored and attacker-influenceable, so the model's free-form
+    ``case_id`` is never trusted as a write target (F07). Returns the most
+    recent one, or ``None`` when this investigation opened no case.
+    """
+    found: str | None = None
+    for e in events:
+        if e.kind != "action_executed":
+            continue
+        p = e.payload or {}
+        if not p.get("success") or p.get("tool_name") != "escalate_to_case":
+            continue
+        cid = p.get("case_id")
+        if isinstance(cid, str) and cid:
+            found = cid
+    return found
+
+
 def _action_detail(tool_name: str, result: Any) -> str:
     """One-line, analyst-facing confirmation of what the write tool did."""
     if not isinstance(result, dict):
@@ -56,7 +89,7 @@ def _action_detail(tool_name: str, result: Any) -> str:
     if tool_name == "ack_alert":
         return "Alert acknowledged in Security Onion."
     if tool_name == "escalate_to_case":
-        case_id = result.get("id") or result.get("caseId") or result.get("case_id") or ""
+        case_id = _case_id_from_result(result)
         return f"Case created: {case_id}" if case_id else "Case created in Security Onion."
     if tool_name == "add_case_comment":
         case_id = result.get("case_id") or ""
@@ -79,9 +112,13 @@ async def _group_ack_result(
     group sitting in the queue after a successful "Executed ✓" (dogfood
     2026-07-15). Same contract as the settled bar / POST /alerts/ack-group.
 
-    Returns ``(detail, acked)`` on success (``acked`` may be 0 when the group
-    was already clear), or ``None`` when the group fetch failed — the caller
-    falls back to the single-alert ack so the click still does something.
+    Returns ``(detail, acked)`` when the group fetch found unacked events and
+    acked them. Returns ``None`` — so the caller falls back to the single-alert
+    ack — both when the group fetch FAILED and when it came back EMPTY: an empty
+    result is ambiguous (an already-clear Suricata group, OR a wrong-field miss on
+    a non-Suricata detection, since ``kind`` is hardcoded ``suricata`` and a Zeek
+    notice's name lives in ``notice.note``, not ``rule.name``). The single-alert
+    path is dataset-agnostic and idempotent, so it is correct for both (F28).
     """
     from soc_ai.api.webui.routes_alert_actions import _ACK_CAP, _ack_many  # noqa: PLC0415
 
@@ -104,7 +141,11 @@ async def _group_ack_result(
         )
         return None
     if not events:
-        return ("All alerts in this detection group were already acknowledged.", 0)
+        # Ambiguous empty result — do NOT claim group success with acked=0 (that
+        # falsely marks a non-Suricata alert handled while it stays unacked in SO,
+        # F28). Fall back to the single-alert ack keyed on this investigation's own
+        # alert_es_id, which is dataset-agnostic and idempotent.
+        return None
     acked, failed = await _ack_many(
         request,
         [ev.es_id for ev in events],
@@ -149,6 +190,35 @@ async def _persist_action_executed(
         )
 
 
+# Per-(inv_id, index) execution locks serialize concurrent execute-action calls
+# for the SAME advisory action (double-click, client retry, flaky-network
+# auto-retry). Without this, two concurrent escalates both pass the "already
+# executed?" idempotency check on the same pre-write snapshot and both POST
+# /connect/case → duplicate SO cases (F029 — the very outcome the persisted
+# ``action_executed`` marker exists to prevent, but the marker alone only covers
+# the reload-replay case, not a concurrent race). Holding the lock across the
+# whole handler makes the second caller read the FRESH event stream (with the
+# first call's persisted marker) and return ok-with-note instead of writing
+# again. A WeakValueDictionary auto-evicts a key's lock once no in-flight call
+# references it, so the map can't grow unbounded.
+_ACTION_LOCKS: WeakValueDictionary[tuple[str, int], asyncio.Lock] = WeakValueDictionary()
+
+
+def _action_lock(inv_id: str, index: int) -> asyncio.Lock:
+    """The shared ``asyncio.Lock`` for one ``(investigation, action index)``.
+
+    Safe under single-threaded asyncio: the get-or-create never awaits, so two
+    coroutines racing for the same key can't interleave and always receive the
+    SAME lock object.
+    """
+    key = (inv_id, index)
+    lock = _ACTION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ACTION_LOCKS[key] = lock
+    return lock
+
+
 @router.post(
     "/investigations/{inv_id}/actions/{index}/execute",
     response_model=ExecuteActionResult,
@@ -168,7 +238,31 @@ async def execute_action(
 
     Idempotent: a previously executed action (persisted ``action_executed``
     event) or an ack of an already-acked alert returns ok-with-note instead of
-    writing again — no duplicate SO cases, no double acks.
+    writing again — no duplicate SO cases, no double acks. Concurrent executes of
+    the same action are serialized (F029) so a double-click can't race the write.
+    """
+    # Serialize per (inv_id, index): a second concurrent caller blocks here, then
+    # re-reads the event stream inside `_execute_action_locked` and sees the first
+    # call's persisted marker — so it never fires a duplicate write.
+    async with _action_lock(inv_id, index):
+        return await _execute_action_locked(
+            request, inv_id=inv_id, index=index, settings=settings, elastic=elastic
+        )
+
+
+async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst write path
+    request: Request,
+    *,
+    inv_id: str,
+    index: int,
+    settings: Settings,
+    elastic: ElasticClient,
+) -> ExecuteActionResult:
+    """Execute the write action. MUST run under ``_action_lock(inv_id, index)``.
+
+    The event stream (carrying the ``action_executed`` idempotency marker) is read
+    AFTER the caller acquired the lock, so a concurrent double-click can't pass the
+    "already executed?" check on a stale pre-write snapshot.
     """
     async with request.app.state.db_sessionmaker() as db:
         got = await inv_svc.get_with_events(db, inv_id)
@@ -209,15 +303,31 @@ async def execute_action(
         )
 
     tool_args = dict(rec.get("tool_args") or {})
-    # The model usually fills alert_id, but default it from the investigation's
-    # own alert when missing so an ack/escalate never silently targets nothing.
-    if tool_name in ("ack_alert", "escalate_to_case") and not tool_args.get("alert_id"):
+    # SECURITY (F07): the write TARGET is bound server-side, never taken from the
+    # model. ``RecommendedAction.tool_args`` is fully model-authored (no
+    # validator) and assembled from attacker-influenceable enriched-alert context,
+    # so a present-but-wrong alert_id/case_id would ack/escalate/comment on a
+    # DIFFERENT SO object than the one the analyst approved in this investigation.
+    if tool_name in ("ack_alert", "escalate_to_case"):
+        # Always OVERWRITE (not default-when-missing): the target is this
+        # investigation's own alert, even when the model supplied an alert_id.
         if not alert_es_id:
             raise HTTPException(
                 status_code=400,
                 detail={"reason": "missing_alert_id", "tool": tool_name},
             )
         tool_args["alert_id"] = alert_es_id
+    elif tool_name == "add_case_comment":
+        # Bind to a case THIS investigation itself opened (a prior escalate the
+        # system executed and observed), never the model's free-form case_id. No
+        # such case → refuse rather than comment on an arbitrary/hostile case id.
+        bound_case_id = _observed_case_id(events)
+        if not bound_case_id:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "no_case_for_comment", "tool": tool_name},
+            )
+        tool_args["case_id"] = bound_case_id
 
     user = await identify_caller(request)
 
@@ -286,19 +396,21 @@ async def execute_action(
     if error is not None:
         return ExecuteActionResult(status="error", title=title, error=error)
     detail = _action_detail(tool_name, result)
-    await _persist_action_executed(
-        request,
-        inv_real_id,
-        next_seq,
-        {
-            "index": index,
-            "tool_name": tool_name,
-            "title": title,
-            "success": True,
-            "by": user,
-            "detail": detail,
-        },
-    )
+    exec_payload: dict[str, Any] = {
+        "index": index,
+        "tool_name": tool_name,
+        "title": title,
+        "success": True,
+        "by": user,
+        "detail": detail,
+    }
+    if tool_name == "escalate_to_case":
+        # Persist the SO-created case id so a later add_case_comment can bind its
+        # write target to a case THIS investigation opened (F07).
+        case_id = _case_id_from_result(result)
+        if case_id:
+            exec_payload["case_id"] = case_id
+    await _persist_action_executed(request, inv_real_id, next_seq, exec_payload)
     return ExecuteActionResult(status="executed", title=title, detail=detail)
 
 

@@ -142,6 +142,25 @@ async def test_api_token_rejected_when_creator_disabled(settings_kratos: Setting
     await engine.dispose()
 
 
+async def test_reset_user_password_revokes_api_tokens(settings_kratos: Settings) -> None:
+    """A password reset must also revoke every API token the account minted —
+    otherwise a compromised admin's rogue bearer token keeps authenticating
+    after the "incident response" password reset."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        user = await auth_svc.create_user(db, "heidi", "pw", role="admin")
+        raw_session = await auth_svc.create_session(db, user, ttl_hours=12)
+        raw_token = await auth_svc.create_api_token(db, "rogue", user.id)
+        assert await auth_svc.check_api_token(db, raw_token) is not None
+
+        await auth_svc.reset_user_password(db, user.id, "new-pw")
+
+        # Session revoked (existing coverage) AND the token is now rejected too.
+        assert await auth_svc.get_session_user(db, raw_session) is None
+        assert await auth_svc.check_api_token(db, raw_token) is None
+    await engine.dispose()
+
+
 async def test_bootstrap_admin(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
@@ -169,6 +188,34 @@ async def test_bootstrap_admin_fixed_password_not_returned(
 
 
 # ---------------------------------------------------------------------------
+# LoginThrottle eviction (no DB — pure in-memory unit)
+# ---------------------------------------------------------------------------
+
+
+def test_login_throttle_protects_near_threshold_entry_from_eviction() -> None:
+    """A key one failure away from lockout must survive eviction pressure from
+    a flood of distinct throwaway usernames.
+
+    Without protecting near-threshold entries, a distributed attacker could
+    interleave a few failures against a targeted username ("admin") with a
+    flood of failures across many throwaway usernames — each of which grows
+    the bounded ``_fails`` dict past ``max_keys`` and forces an eviction of the
+    globally oldest-touched key. Since the targeted key isn't touched again
+    while the flood runs, it becomes "oldest" and gets evicted, silently
+    resetting its failure count to zero before it ever reaches ``max_failures``
+    — defeating the lockout indefinitely.
+    """
+    throttle = auth_svc.LoginThrottle(max_failures=5, max_keys=10)
+    for _ in range(4):  # one shy of lockout
+        assert throttle.record_failure("1.1.1.1", "admin") is False
+    for i in range(50):  # eviction pressure from distinct throwaway usernames
+        throttle.record_failure("1.1.1.1", f"throwaway{i}")
+    # "admin"'s failure history survived: the 5th failure locks it out, proving
+    # it was never reset to zero by the eviction flood.
+    assert throttle.record_failure("1.1.1.1", "admin") is True
+
+
+# ---------------------------------------------------------------------------
 # Carry-over A: SQLite FK enforcement
 # ---------------------------------------------------------------------------
 
@@ -187,4 +234,16 @@ async def test_authenticate_rejects_overlong_password(settings_kratos: Settings)
     async with maker() as db:
         await auth_svc.create_user(db, "gina", "pw")
         assert await auth_svc.authenticate(db, "gina", "x" * 100) is None
+    await engine.dispose()
+
+
+async def test_create_user_overlong_password_raises_clean_error(
+    settings_kratos: Settings,
+) -> None:
+    """A password over bcrypt's 72-byte limit must raise PasswordTooLongError,
+    not an unhandled bcrypt ValueError, from create_user()."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        with pytest.raises(auth_svc.PasswordTooLongError):
+            await auth_svc.create_user(db, "ivan", "x" * 73)
     await engine.dispose()

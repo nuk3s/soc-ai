@@ -42,8 +42,11 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"\1: [REDACTED:session_token]",
     ),
     # Generic key=value / key: value secrets (password, secret, api_key, …).
+    # Capture the whole value up to a natural field delimiter (comma, semicolon,
+    # or newline), NOT just the first \S+ token — a passphrase with spaces
+    # ("correct horse battery staple") must be masked in full, not half-leaked.
     (
-        re.compile(r"(?i)(password|passwd|pwd|secret|api[_-]?key)\s*[=:]\s*\S+"),
+        re.compile(r"(?i)(password|passwd|pwd|secret|api[_-]?key)\s*[=:]\s*[^\n,;]+"),
         r"\1=[REDACTED:secret]",
     ),
     # RFC 5322 email

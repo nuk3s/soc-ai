@@ -68,6 +68,13 @@ def build_mcp(
         max_results: int = 100,
     ) -> dict[str, Any]:
         """Run a validated OQL query against the SO events index."""
+        # An MCP client is an untrusted caller (no prompt-mediated guidance the
+        # way an agent's system prompt gives it), so clamp the same way the
+        # agent's own t_query_events_oql wrapper does (toolset.py) -- without
+        # this, a `head`-less query's max_results goes straight into the ES
+        # request body with no ceiling (oql.py's _HARD_MAX_RESULTS only guards
+        # an explicit `head` stage).
+        max_results = min(max_results, 25)
         result = await query_events_oql(
             query,
             elastic=elastic,
@@ -84,6 +91,12 @@ def build_mcp(
         max_per_pivot: int = 50,
     ) -> dict[str, Any]:
         """Fetch a SOC alert and fan out via 5 typed pivots."""
+        # Clamp: get_alert_context only rejects non-positive values, not
+        # unbounded ones. 14_400s (4h) covers the widest legitimate pivot
+        # window in the synth scenario catalogue; 50 matches this tool's
+        # existing default.
+        window_seconds = min(window_seconds, 14_400)
+        max_per_pivot = min(max_per_pivot, 50)
         result = await get_alert_context(
             alert_id,
             elastic=elastic,
@@ -100,6 +113,9 @@ def build_mcp(
         max_results: int = 25,
     ) -> list[dict[str, Any]]:
         """Search SOC cases by free-text + optional status filter."""
+        # Same clamp as the agent's t_query_cases wrapper (toolset.py):
+        # query_cases only rejects non-positive max_results, not unbounded ones.
+        max_results = min(max_results, 10)
         out = await query_cases(
             query,
             elastic=elastic,
@@ -112,6 +128,8 @@ def build_mcp(
     @mcp.tool()
     async def detections(query: str, max_results: int = 25) -> list[dict[str, Any]]:
         """Search SOC detection rules by free-text."""
+        # Same clamp as the agent's t_query_detections wrapper (toolset.py).
+        max_results = min(max_results, 10)
         out = await query_detections(
             query,
             elastic=elastic,
@@ -128,6 +146,8 @@ def build_mcp(
         max_results: int = 100,
     ) -> list[dict[str, Any]]:
         """Pivot into Zeek logs by network.community_id."""
+        # Same clamp as the agent's t_query_zeek_logs wrapper (toolset.py).
+        max_results = min(max_results, 25)
         return await query_zeek_logs(
             community_id,
             elastic=elastic,
@@ -140,6 +160,8 @@ def build_mcp(
     @mcp.tool()
     async def playbooks(alert_id: str | None = None, max_results: int = 25) -> list[dict[str, Any]]:
         """Pull playbooks; optionally scoped to a given alert's linked rule."""
+        # Same clamp as the agent's t_get_playbooks wrapper (toolset.py).
+        max_results = min(max_results, 10)
         out = await get_playbooks(
             elastic=elastic,
             settings=settings,
@@ -185,6 +207,8 @@ def build_mcp(
         bare embedding with no store — this degrades to ``[]`` exactly like the
         in-app tool does, rather than erroring.
         """
+        # Same clamp as the agent's t_lookup_runbook wrapper (toolset.py).
+        k = min(k, 5)
         return await lookup_runbook(query, k=k, db_sessionmaker=db_sessionmaker)
 
     return mcp

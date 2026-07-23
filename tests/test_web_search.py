@@ -114,6 +114,34 @@ async def test_privacy_guard_refuses_internal_identifiers(query: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "what is 10[.]9[.]8[.]8 doing",  # bracket-defanged internal IPv4
+        "look up 10(.)4(.)4(.)4",  # paren-defanged internal IPv4
+        "host 10[dot]4[dot]4[dot]4 detail",  # [dot]-defanged internal IPv4
+        "route 127{.}0{.}0{.}1 loopback",  # brace-defanged loopback
+        "research vpn[.]internal[.]corp reputation",  # defanged internal FQDN suffix
+        "fetch hxxp://dc01[.]corp[.]local/x",  # hxxp + defanged internal FQDN
+    ],
+)
+async def test_privacy_guard_refuses_defanged_internal_identifiers(query: str) -> None:
+    """Defanged IOC notation (``10[.]9[.]8[.]8``, ``a(dot)b``, ``hxxp``) must NOT
+    let an internal IP/hostname slip past the egress guard to public search."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    with _patch_httpx(h):
+        r = await web_search(query, settings=_settings())
+    assert r["ok"] is False
+    assert "internal" in r["error"].lower()
+    assert calls["n"] == 0  # never reached the network
+
+
+@pytest.mark.asyncio
 async def test_privacy_guard_allows_external_domain_query() -> None:
     """A normal external-indicator query (public domain, no internal tokens) is
     NOT over-refused and reaches the search backend."""

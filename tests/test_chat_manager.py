@@ -248,6 +248,69 @@ def test_run_turn_agent_error_persists_error_row() -> None:
     assert finish_mock.call_args.kwargs.get("status") == "error"
 
 
+def test_run_turn_error_content_is_scrubbed_before_persisting() -> None:
+    """F75: the catch-all handler stringifies the raised exception into the
+    persisted (and later analyst-rendered) error content. If that exception's
+    message happens to embed a credential-shaped substring (e.g. a verbose
+    gateway/provider error body echoing an Authorization header), it must be
+    scrubbed the same way probes.py's ``_scrub`` protects other user-facing
+    error surfaces — not stored/rendered verbatim."""
+
+    inv = MagicMock()
+    inv.id = "inv-secret"
+    inv.alert_es_id = "es-secret"
+    inv.rule_name = "ET FAIL"
+    inv.src_ip = "10.0.0.1"
+    inv.dest_ip = "10.0.0.2"
+    inv.verdict = "false_positive"
+    inv.confidence = 0.8
+    inv.rationale = "benign"
+    inv.summary = ""
+
+    finish_mock = AsyncMock()
+
+    db = AsyncMock()
+    db_cm = MagicMock()
+    db_cm.__aenter__ = AsyncMock(return_value=db)
+    db_cm.__aexit__ = AsyncMock(return_value=False)
+
+    settings = MagicMock()
+    settings.soc_ai_demo = False
+    settings.analyst_model = "test-model"
+    settings.chat_turn_timeout_s = 180
+
+    state = MagicMock()
+    state.settings = settings
+    state.db_sessionmaker = MagicMock(return_value=db_cm)
+
+    _get_with_events = AsyncMock(return_value=(inv, []))
+    _history = AsyncMock(return_value=[("user", "hello")])
+    _alert_ctx = AsyncMock(side_effect=RuntimeError("ES down"))
+
+    secret_token = "sk-live-abc123SECRET"  # pragma: allowlist secret
+
+    with (
+        patch("soc_ai.webui.chat_manager.inv_svc.get_with_events", _get_with_events),
+        patch("soc_ai.webui.chat_manager.chat_svc.history_for_agent", _history),
+        patch("soc_ai.webui.chat_manager.get_alert_context", _alert_ctx),
+        patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
+        patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", finish_mock),
+        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+    ):
+        agent_mock = MagicMock()
+        agent_mock.run = AsyncMock(
+            side_effect=RuntimeError(f"gateway 401: Authorization: Bearer {secret_token}")
+        )
+        mock_build.return_value = agent_mock
+
+        asyncio.run(_run_turn(state, "inv-secret", 42))
+
+    finish_mock.assert_called_once()
+    content = finish_mock.call_args.kwargs.get("content", "")
+    assert secret_token not in content
+    assert finish_mock.call_args.kwargs.get("status") == "error"
+
+
 def test_run_turn_error_write_failure_is_logged_not_propagated(caplog: Any) -> None:
     """BUG #10(b): if finish_assistant raises in the error path, the exception
     is logged (not propagated) so the background task doesn't die silently."""

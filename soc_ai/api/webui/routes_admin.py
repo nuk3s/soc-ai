@@ -145,6 +145,14 @@ async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str
                     "hint": f"Username {username!r} is already taken.",
                 },
             ) from exc
+        except auth_svc.PasswordTooLongError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "password_too_long",
+                    "hint": "Password must be at most 72 bytes (bcrypt's limit).",
+                },
+            ) from exc
     return {"ok": True}
 
 
@@ -153,18 +161,11 @@ async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str
     dependencies=[Depends(require_admin_api)],
 )
 async def toggle_user_disabled(request: Request, user_id: int) -> dict[str, bool | int]:
-    # Resolve caller for self-disable guard: session user OR API-token bearer
+    # require_admin_api already guarantees only a session-authenticated admin
+    # reaches this point (a bearer-token-only caller is rejected before the
+    # handler runs whenever api_auth_required is True), so the self-disable
+    # guard only needs the session user.
     caller = await current_user(request)
-    if caller is None and request.app.state.settings.api_auth_required:
-        # Bearer-token caller: resolve user from token so self-disable is blocked
-        authz = request.headers.get("authorization", "")
-        if authz.lower().startswith("bearer "):
-            raw_token = authz[7:].strip()
-            async with request.app.state.db_sessionmaker() as _db:
-                api_tok = await auth_svc.check_api_token(_db, raw_token)
-            if api_tok is not None:
-                async with request.app.state.db_sessionmaker() as _db:
-                    caller = await auth_svc.get_user_by_id(_db, api_tok.created_by)
     if caller is not None and caller.id == user_id:
         raise HTTPException(
             status_code=400,

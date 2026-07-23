@@ -66,10 +66,15 @@ _ALERT_ONLY_NOTE = (
 #   * t_get_rule_content   — returns the signature's own definition (the claim).
 #   * t_rule_prevalence    — a rule's base-rate/noisiness (rule metadata).
 #   * t_suggest_rule_tuning — rule disposition trend (rule metadata).
+# ``t_get_event_raw`` is NOT a blanket corroborator: it fetches a single event by
+# _id, which may be the underlying flow record OR the very alert doc that raised
+# the claim. It is partitioned by ``event.dataset``/``event.kind`` (same test as
+# ``t_query_events_oql``) — a fetched telemetry doc corroborates, a refetched
+# suricata.alert doc does not.
 # Every OTHER tool is corroborating evidence BEYOND the alert document —
 # t_get_pcap / t_decode_payload (decoded packets), t_enrich_* (blocklist/MISP/
 # ASN), t_prevalence (host novelty), t_host_summary (host artifact/OS),
-# t_query_zeek_logs / t_get_event_raw (the underlying flow records), the online
+# t_query_zeek_logs (the underlying flow records), the online
 # quartet (greynoise/shodan/cve) and the web tools. A finding grounded in ANY of
 # those has looked past the alert title, which is exactly what the gate requires.
 _ALERT_QUERY_TOOLS: frozenset[str] = frozenset(
@@ -214,8 +219,11 @@ def _corroborating_evidence_text(tool_results: list[Any]) -> str:
     ``t_query_events_oql`` is special-cased first: its result is partitioned
     per-document by :func:`_oql_telemetry_docs`, so a zeek/host doc found via
     the broad lens corroborates while the alert docs in the same result don't.
-    Everything else — decoded payloads, enrichment, host/prevalence, zeek flow
-    records — is corroboration and its ``result`` is included.
+    ``t_get_event_raw`` gets the same partition (its single ``_source`` is wrapped
+    as a synthetic hit), so refetching the raw form of the detector alert doc does
+    NOT corroborate. Everything else — decoded payloads, enrichment,
+    host/prevalence, zeek flow records — is corroboration and its ``result`` is
+    included.
 
     Defensive: a bare (un-labeled) item — a legacy shape, or a tool_result that
     somehow arrived without a ``tool_name`` — is treated as corroborating (it is
@@ -233,6 +241,17 @@ def _corroborating_evidence_text(tool_results: list[Any]) -> str:
                 docs = _oql_telemetry_docs(item["result"])
                 if docs:
                     corroborating.append(docs)
+                continue
+            if tool == "t_get_event_raw":
+                # A raw fetch returns a single event's _source. It corroborates
+                # ONLY when that doc is positively identified as non-alert
+                # telemetry — refetching the raw form of the SAME detector alert
+                # (event.dataset=suricata.alert / kind=alert) is the alert
+                # re-stated, not corroboration. Reuse the OQL doc partition by
+                # wrapping the _source as a synthetic hit.
+                src = item["result"]
+                if isinstance(src, dict) and _oql_telemetry_docs({"hits": [{"_source": src}]}):
+                    corroborating.append(src)
                 continue
             if tool in _ALERT_QUERY_TOOLS:
                 continue  # a detector-claim result cannot corroborate itself

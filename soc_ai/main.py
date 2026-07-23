@@ -396,6 +396,36 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
             _LOGGER.exception("hunt scheduler iteration failed; continuing")
 
 
+def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
+    """Write the one-shot bootstrap admin password to a locked-down sidecar
+    file instead of the shared log stream, and log only a pointer to it.
+
+    setup.sh pre-generates BOOTSTRAP_ADMIN_PASSWORD so this path is off the
+    happy path. journald/container logs are often readable by the same
+    audience (other analysts, integrations) this credential must stay secret
+    from. Mirrors the chmod(0o600) treatment backup.py gives the Ed25519
+    signing key sidecar.
+    """
+    cred_path = settings.soc_ai_data_dir / "bootstrap-admin-password.txt"
+    try:
+        cred_path.write_text(created_pw + "\n")
+        cred_path.chmod(0o600)
+    except OSError:
+        # Data dir not writable for some reason — fall back to the log line
+        # rather than leaving the operator with no way to reach the account.
+        _LOGGER.warning(
+            "BOOTSTRAP CREDENTIAL (change at first login, then scrub this log line): "
+            "initial admin user 'admin' password=%s",
+            created_pw,
+        )
+    else:
+        _LOGGER.warning(
+            "BOOTSTRAP CREDENTIAL written to %s (mode 0600) — log in as 'admin', "
+            "change the password, then delete that file.",
+            cred_path,
+        )
+
+
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
     """Migrate the store, bootstrap the admin, apply config overrides, reap orphans.
 
@@ -416,14 +446,7 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
     async with db_sessionmaker() as db:
         created_pw = await bootstrap_admin(db, settings.bootstrap_admin_password)
     if created_pw is not None:
-        # One-shot bootstrap credential. It lands in journald/container logs, so
-        # mark it unmistakably for the operator to change + scrub. setup.sh
-        # pre-generates BOOTSTRAP_ADMIN_PASSWORD so this path is off the happy path.
-        _LOGGER.warning(
-            "BOOTSTRAP CREDENTIAL (change at first login, then scrub this log line): "
-            "initial admin user 'admin' password=%s",
-            created_pw,
-        )
+        _persist_bootstrap_credential(settings, created_pw)
 
     # Re-apply persisted admin config overrides onto the live settings singleton
     # so operator choices (e.g. Oracle on/off) survive a restart.
@@ -842,6 +865,36 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
             response.headers.setdefault(
                 "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
             )
+        return response
+
+    # /api/v1/login is unauthenticated by design ("this IS the gate") and runs
+    # before the login throttle's counters are touched, so it's the one route an
+    # anonymous caller can flood with an arbitrarily large request body — the
+    # deployed stack terminates TLS in uvicorn directly with nothing in front to
+    # impose a size cap. Reject early on a declared Content-Length so the body is
+    # never buffered; LoginIn's own Field(max_length=...) is defense in depth for
+    # callers that omit Content-Length.
+    _LOGIN_MAX_BODY_BYTES = 8 * 1024  # ample for a username+password JSON body
+
+    @app.middleware("http")
+    async def _login_body_size_guard(request: Any, call_next: Any) -> Response:
+        if request.url.path == "/api/v1/login":
+            content_length = request.headers.get("content-length")
+            if (
+                content_length is not None
+                and content_length.isdigit()
+                and int(content_length) > _LOGIN_MAX_BODY_BYTES
+            ):
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": {
+                            "reason": "payload_too_large",
+                            "hint": "Login request body too large.",
+                        }
+                    },
+                )
+        response: Response = await call_next(request)
         return response
 
     try:

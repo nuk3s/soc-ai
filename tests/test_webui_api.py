@@ -1703,6 +1703,18 @@ def test_auto_triage_selected_spawns_for_targets(client: TestClient) -> None:
     assert s["note"] == "triaging 1 selected (1 already triaged)"
 
 
+def test_auto_triage_selected_input_cap_is_422(client: TestClient) -> None:
+    """An oversized alert_ids list is rejected by request validation before
+    planning runs — plan_targets_for_ids applies no max-targets cap of its own,
+    so an unbounded selection would otherwise hold the single-flight slot for
+    one sequential LLM investigation per id (mirrors the rehunt input caps)."""
+    from soc_ai.api.webui.routes_autotriage import _ALERT_IDS_CAP
+
+    too_many = [f"id-{i}" for i in range(_ALERT_IDS_CAP + 1)]
+    resp = client.post("/api/v1/auto-triage", json={"alert_ids": too_many})
+    assert resp.status_code == 422
+
+
 def test_auto_triage_sweep_uses_config_floor_medium(settings_kratos: Settings) -> None:
     """Sweep with auto_triage_min_severity=medium plans critical+high+medium."""
     settings = settings_kratos.model_copy(update={"auto_triage_min_severity": "medium"})
@@ -1805,6 +1817,17 @@ def _fake_write_tool(calls: list[dict], result: dict):
         return result
 
     return ToolSpec(name="ack_alert", read_only=False, description="", func=fn)
+
+
+def _fake_comment_tool(calls: list[dict]):
+    """Patch target for write_exec.get_tool for add_case_comment — records case_id."""
+    from soc_ai.tools._registry import ToolSpec
+
+    async def fn(case_id: str, comment: str, *, auth) -> dict:
+        calls.append({"case_id": case_id, "comment": comment})
+        return {"case_id": case_id, "added": True}
+
+    return ToolSpec(name="add_case_comment", read_only=False, description="", func=fn)
 
 
 def test_build_actions_marks_ack_applied_after_auto_ack() -> None:
@@ -2058,6 +2081,129 @@ def test_execute_action_acks_and_defaults_alert_id(client: TestClient) -> None:
     assert calls[0]["auth"] is not None
 
 
+def test_execute_action_binds_write_target_to_investigation(client: TestClient) -> None:
+    """F07: the write TARGET is bound to the investigation's own alert es-id — a
+    model-authored alert_id (attacker-influenceable tool_args) is OVERWRITTEN, not
+    trusted, so Execute can never ack/escalate a DIFFERENT alert than the analyst
+    approved. Verified for both ack and escalate."""
+    import asyncio
+
+    # ack: model supplies a DIFFERENT (victim) alert_id; endpoint overwrites it.
+    inv_ack = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-ack-real",
+            actions=[{"tool_name": "ack_alert", "tool_args": {"alert_id": "es-OTHER-victim"}}],
+        )
+    )
+    acks: list[dict] = []
+    with patch(
+        "soc_ai.tools.write_exec.get_tool",
+        return_value=_fake_write_tool(acks, {"acknowledged": True}),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_ack}/actions/0/execute").json()
+    assert body["status"] == "executed"
+    assert [c["alert_id"] for c in acks] == ["es-ack-real"]  # never es-OTHER-victim
+
+    # escalate: same server-side target binding.
+    inv_esc = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-esc-real",
+            actions=[
+                {
+                    "tool_name": "escalate_to_case",
+                    "tool_args": {
+                        "alert_id": "es-OTHER-victim",
+                        "case_title": "t",
+                        "case_description": "d",
+                    },
+                }
+            ],
+        )
+    )
+    escs: list[dict] = []
+    with patch(
+        "soc_ai.tools.write_exec.get_tool",
+        return_value=_fake_write_tool(escs, {"id": "CASE-9"}),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_esc}/actions/0/execute").json()
+    assert body["status"] == "executed"
+    assert [c["alert_id"] for c in escs] == ["es-esc-real"]  # never es-OTHER-victim
+
+
+def test_execute_add_case_comment_binds_to_own_case(client: TestClient) -> None:
+    """F07: add_case_comment writes only to a case THIS investigation opened. The
+    model's free-form case_id is IGNORED; the comment binds to the case id the
+    system observed when it executed the escalate action in this run."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-cmt-1",
+            actions=[
+                {
+                    "tool_name": "escalate_to_case",
+                    "tool_args": {"case_title": "t", "case_description": "d"},
+                },
+                {
+                    "tool_name": "add_case_comment",
+                    "tool_args": {"case_id": "CASE-EVIL", "comment": "note"},
+                },
+            ],
+        )
+    )
+    # Step 1: escalate — the system creates + observes the real case id.
+    esc_calls: list[dict] = []
+    with patch(
+        "soc_ai.tools.write_exec.get_tool",
+        return_value=_fake_write_tool(esc_calls, {"id": "CASE-REAL"}),
+    ):
+        assert (
+            client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()["status"]
+            == "executed"
+        )
+    # Step 2: comment — bound to CASE-REAL, NOT the model's CASE-EVIL.
+    cmt_calls: list[dict] = []
+    with patch(
+        "soc_ai.tools.write_exec.get_tool",
+        return_value=_fake_comment_tool(cmt_calls),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/1/execute").json()
+    assert body["status"] == "executed"
+    assert [c["case_id"] for c in cmt_calls] == ["CASE-REAL"]
+
+
+def test_execute_add_case_comment_refuses_without_own_case(client: TestClient) -> None:
+    """F07: with no escalate observed for this investigation there is no trusted
+    case to comment on — the action is refused (400) rather than commenting on the
+    model's free-form case_id, and no write reaches Security Onion."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-cmt-2",
+            actions=[
+                {
+                    "tool_name": "add_case_comment",
+                    "tool_args": {"case_id": "CASE-EVIL", "comment": "x"},
+                }
+            ],
+        )
+    )
+    cmt_calls: list[dict] = []
+    with patch(
+        "soc_ai.tools.write_exec.get_tool",
+        return_value=_fake_comment_tool(cmt_calls),
+    ):
+        resp = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute")
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "no_case_for_comment"
+    assert cmt_calls == []  # no comment written to any case
+
+
 def test_execute_ack_action_acks_whole_detection_group(client: TestClient) -> None:
     """The recommended-action ACK is GROUP-scoped: with a rule_name on the run,
     every unacked event of that detection is acked (same contract as the settled
@@ -2092,7 +2238,10 @@ def test_execute_ack_action_acks_whole_detection_group(client: TestClient) -> No
 
 
 def test_execute_ack_action_group_already_clear(client: TestClient) -> None:
-    """No unacked events left in the group → ok-with-note, no writes fired."""
+    """A genuinely all-acked detection group leaves nothing to write. Because an
+    empty group fetch is ambiguous (F28), the endpoint falls back to the
+    single-alert path, which finds the alert already acked in SO and returns
+    ok-with-note without writing again."""
     import asyncio
 
     inv_id = asyncio.run(
@@ -2107,14 +2256,54 @@ def test_execute_ack_action_group_already_clear(client: TestClient) -> None:
     with (
         patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=[])),
         patch(
+            "soc_ai.api.webui._timeline._alert_currently_acked",
+            AsyncMock(return_value=True),
+        ),
+        patch(
             "soc_ai.tools.write_exec.get_tool",
             return_value=_fake_write_tool(calls, {"acknowledged": True}),
         ),
     ):
         body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
     assert body["status"] == "executed"
-    assert "already acknowledged" in body["detail"]
+    assert "already acknowledged" in body["detail"].lower()
     assert calls == []
+
+
+def test_execute_ack_action_empty_group_falls_back_to_single_ack(client: TestClient) -> None:
+    """F28: an empty group fetch is AMBIGUOUS — the group is genuinely all-acked,
+    OR the hardcoded kind='suricata' name field (rule.name) matched nothing because
+    this investigation is a non-Suricata detection whose name lives elsewhere (a
+    Zeek notice → notice.note). Reporting group success with acked=0 there would
+    falsely mark the real alert handled while it stays unacked in SO. Instead the
+    endpoint falls back to the single-alert ack keyed on the investigation's own
+    alert es-id, so a still-unacked alert actually gets acknowledged."""
+    import asyncio
+
+    inv_id = asyncio.run(
+        _seed_inv(
+            client,
+            alert_es_id="es-notice-1",
+            rule_name="Zeek::Notice SSH::Password_Guessing",
+            actions=[{"tool_name": "ack_alert", "tool_args": {}}],
+        )
+    )
+    calls: list[dict] = []
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=[])),
+        patch(
+            "soc_ai.api.webui._timeline._alert_currently_acked",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "soc_ai.tools.write_exec.get_tool",
+            return_value=_fake_write_tool(calls, {"acknowledged": True}),
+        ),
+    ):
+        body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
+    assert body["status"] == "executed"
+    assert body["detail"] == "Alert acknowledged in Security Onion."
+    assert [c["alert_id"] for c in calls] == ["es-notice-1"]  # the real alert got acked
 
 
 def test_execute_ack_action_falls_back_to_single_on_es_error(client: TestClient) -> None:
@@ -2232,6 +2421,80 @@ def test_execute_action_persists_and_suppresses_reoffer(client: TestClient) -> N
         assert second["status"] == "executed"
         assert "Already executed" in second["detail"]
         assert len(calls) == 1
+
+
+async def test_execute_action_serializes_concurrent_escalate(settings_kratos: Settings) -> None:
+    """F29: two concurrent execute calls for the SAME escalate action (double-click,
+    client retry, flaky-network auto-retry) must create EXACTLY ONE Security Onion
+    case. Without a per-(inv, index) lock both requests pass the idempotency check
+    on the same pre-write snapshot and both POST /connect/case → duplicate cases."""
+    import asyncio
+
+    from soc_ai.api.webui.routes_actions import execute_action
+    from soc_ai.store import investigations as inv_svc
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+    from soc_ai.tools._registry import ToolSpec
+
+    settings = settings_kratos
+    engine = make_engine(settings)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    async with maker() as db:
+        inv = await inv_svc.create(db, alert_es_id="es-race-1", started_by="t", rule_name=None)
+        inv.report = {
+            "recommended_actions": [
+                {
+                    "tool_name": "escalate_to_case",
+                    "tool_args": {"case_title": "t", "case_description": "d"},
+                }
+            ]
+        }
+        await db.commit()
+        inv_id = inv.id
+
+    app_state = SimpleNamespace(
+        db_sessionmaker=maker, auth=AsyncMock(), settings=settings, audit=None
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def escalate(alert_id, case_title="", case_description="", *, auth):
+        calls.append(alert_id)
+        started.set()
+        await release.wait()  # hold the (first) request inside the write
+        return {"id": "CASE-1"}
+
+    spec = ToolSpec(name="escalate_to_case", read_only=False, description="", func=escalate)
+
+    try:
+        with (
+            patch("soc_ai.tools.write_exec.get_tool", return_value=spec),
+            patch(
+                "soc_ai.api.webui.routes_actions.identify_caller",
+                AsyncMock(return_value="tester"),
+            ),
+        ):
+            t1 = asyncio.create_task(
+                execute_action(request, inv_id, 0, settings=settings, elastic=AsyncMock())
+            )
+            await asyncio.wait_for(started.wait(), timeout=2)  # first call is inside the write
+            t2 = asyncio.create_task(
+                execute_action(request, inv_id, 0, settings=settings, elastic=AsyncMock())
+            )
+            await asyncio.sleep(0.15)  # give the racer time to (try to) reach the write
+            release.set()
+            r1 = await asyncio.wait_for(t1, timeout=2)
+            r2 = await asyncio.wait_for(t2, timeout=2)
+    finally:
+        await engine.dispose()
+
+    # Exactly ONE case created despite two concurrent executes; the loser is told.
+    assert len(calls) == 1
+    assert {r1.status, r2.status} == {"executed"}
+    assert any("Already executed" in r.detail for r in (r1, r2))
 
 
 def test_execute_action_ack_already_acked_in_es_is_idempotent(client: TestClient) -> None:
@@ -2670,6 +2933,36 @@ def test_chat_thread_surfaces_verdict_proposal(client: TestClient) -> None:
     assert prop[0]["token"] == "tk"
 
 
+def test_investigation_chat_rejects_second_turn_while_pending(client: TestClient) -> None:
+    """A 2nd POST while a prior turn's assistant is still pending → 409 chat_busy,
+    so we never orphan a duplicate pending assistant row or spawn a duplicate agent
+    run (mirrors the hunt-chat busy guard)."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    from soc_ai.store import chat as chat_svc
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id="ev-busy", started_by="t")
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="needs_more_info", confidence=0.4
+            )
+            await chat_svc.add_user_message(db, inv.id, "first question")
+            await chat_svc.create_pending_assistant(db, inv.id)
+            return inv.id
+
+    inv_id = asyncio.run(_seed())
+    with patch("soc_ai.webui.chat_manager.get_manager", return_value=MagicMock()) as get_mgr:
+        resp = client.post(f"/api/v1/investigations/{inv_id}/chat", json={"message": "second"})
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "chat_busy"
+    # The guard must fire BEFORE any background turn is spawned.
+    get_mgr.return_value.start.assert_not_called()
+
+
 def test_seedchat_surfaces_verdict_proposal(client: TestClient) -> None:
     """A verdict proposal must render as a card on reload (seedChat path), not plain text."""
     import asyncio
@@ -3072,6 +3365,27 @@ def test_ack_events_success(client: TestClient) -> None:
     assert data["acked"] == 3  # dedupe: a, b, c
     assert data["failed"] == 0
     assert data["total"] == 3
+
+
+def test_ack_events_rejects_oversized_es_ids_at_validation(client: TestClient) -> None:
+    """POST /alerts/ack-events 422s a too-large es_ids array before any write path
+    runs — mirrors RehuntIn.inv_ids so an oversized payload can't force a full
+    parse/dedup pass before the _ACK_CAP truncation ever applies."""
+    from soc_ai.api.webui.routes_alert_actions import _ACK_CAP
+
+    write_calls = []
+
+    async def fake_write(tool_name, tool_args, *, auth, settings, **_kwargs):
+        write_calls.append(tool_args)
+        return (None, None)
+
+    with patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write):
+        resp = client.post(
+            "/api/v1/alerts/ack-events",
+            json={"es_ids": [f"e{i}" for i in range(_ACK_CAP + 1)]},
+        )
+    assert resp.status_code == 422
+    assert write_calls == []
 
 
 def test_ack_events_partial_failure(client: TestClient) -> None:
@@ -3714,6 +4028,17 @@ def test_create_user_short_password(client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "password_too_short"
 
 
+def test_create_user_password_over_bcrypt_limit(client: TestClient) -> None:
+    """POST /config/users with a password over bcrypt's 72-byte limit returns a
+    clean 400 (password_too_long), not an unhandled 500 from bcrypt.hashpw()."""
+    resp = client.post(
+        "/api/v1/config/users",
+        json={"username": "ivan", "password": "x" * 73, "role": "analyst"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["reason"] == "password_too_long"
+
+
 def test_set_user_role(client: TestClient) -> None:
     """POST /config/users/{id}/set-role promotes/demotes a user; GET reflects the change."""
     client.post(
@@ -3775,6 +4100,33 @@ def test_last_admin_cannot_be_disabled(client: TestClient) -> None:
     resp = client.post(f"/api/v1/config/users/{uid}/toggle-disabled")
     assert resp.status_code == 400
     assert resp.json()["detail"]["reason"] == "last_admin"
+
+
+def test_toggle_disabled_bearer_token_caller_rejected_by_admin_gate(
+    settings_kratos: Settings,
+) -> None:
+    """F62: with api_auth_required=True, a bearer-token-only caller (no session
+    cookie) — even one minted by an admin — is rejected by the require_admin_api
+    gate before toggle_user_disabled's handler body ever runs. Pins that the
+    in-handler bearer-token self-disable resolution is unreachable dead code."""
+    import asyncio
+
+    from soc_ai.store import auth as auth_svc
+
+    async def _seed_admin_and_token(c: TestClient) -> str:
+        async with c.app.state.db_sessionmaker() as db:
+            admin = await auth_svc.create_user(db, "tokadmin", "longpassword1", role="admin")
+            return await auth_svc.create_api_token(db, "bearer-test", admin.id)
+
+    for client in _auth_client(settings_kratos):
+        raw_token = asyncio.run(_seed_admin_and_token(client))
+        # No session cookie set — authenticate purely via the bearer token.
+        resp = client.post(
+            "/api/v1/config/users/1/toggle-disabled",
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["reason"] == "admin_required"
 
 
 def test_reset_password_returns_password(client: TestClient) -> None:
@@ -3887,6 +4239,20 @@ class TestDangerZoneGet:
                 assert "isSet" in row
                 assert "source" in row
                 assert "hot" in row
+
+    def test_whitespace_only_secret_env_value_reported_unset(
+        self, settings_kratos: Settings
+    ) -> None:
+        """F63: a whitespace-only env-sourced secret (so_password has no
+        blank-to-None coercion) must report isSet=False, source='unset' — the
+        same emptiness test _secret_is_set applies everywhere else."""
+        blank = settings_kratos.model_copy(update={"so_password": SecretStr("   ")})
+        for c in _client(blank):
+            r = c.get("/api/v1/config/danger")
+            assert r.status_code == 200
+            row = next(x for x in r.json() if x["key"] == "so_password")
+            assert row["isSet"] is False
+            assert row["source"] == "unset"
 
 
 class TestDangerZoneSave:
@@ -4019,6 +4385,35 @@ class TestDangerZoneSave:
             assert r.status_code == 200
             assert r.json()["restart_required"] is False
             assert c.app.state.settings.so_ssh_host == "sensor.local"
+
+    def test_hot_setattr_failure_rolls_back_db_override(self, settings: Settings) -> None:
+        """F30/F36: a hot spec whose live setattr fails validation (e.g. clearing
+        so_ssh_host while pcap_enabled=True trips the cross-field validator) must
+        roll back the just-written DB override and return 400 — not ok:true with
+        an override that silently fails to (re-)apply on every future restart."""
+        import asyncio
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        settings.so_ssh_host = "sensor.lab.local"
+        settings.pcap_enabled = True
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "so_ssh_host", "value": "", "confirm": "so_ssh_host"},
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"]["reason"] == "invalid_value"
+
+            # No orphaned override left behind (it would never apply on restart).
+            async def _read(app=c.app) -> str | None:
+                async with app.state.db_sessionmaker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "so_ssh_host")
+                    )
+
+            assert asyncio.run(_read()) is None
 
     def test_secret_save_without_config_secret_key_returns_400_not_500(self) -> None:
         """Saving a SECRET danger setting with no CONFIG_SECRET_KEY → 400 (not 500),
@@ -4177,6 +4572,70 @@ class TestApiKeys:
             assert r.status_code == 400
             assert r.json()["detail"]["reason"] == "no_config_secret_key"
             assert "supersecret" not in r.text
+
+    def test_whitespace_only_env_key_reported_unset(self, settings: Settings) -> None:
+        """F63: a whitespace-only env-sourced key (shodan_api_key has no
+        blank-to-None coercion) must report isSet=False, source='unset' — the
+        same emptiness test _secret_is_set applies everywhere else."""
+        blank = settings.model_copy(update={"shodan_api_key": SecretStr("   ")})
+        for c in _client(blank):
+            r = c.get("/api/v1/config/api-keys")
+            assert r.status_code == 200
+            row = next(x for x in r.json() if x["key"] == "shodan_api_key")
+            assert row["isSet"] is False
+            assert row["source"] == "unset"
+
+
+class TestNotifyWebhookGet:
+    """GET /api/v1/config/notify/webhook — isSet/source derivation."""
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        return Settings(
+            so_host="https://so.example.com",
+            so_username="analyst",
+            so_password=SecretStr("password123"),
+            so_verify_ssl=False,
+            es_hosts=["https://so.example.com:9200"],
+            litellm_base_url="http://localhost:4000",
+            config_secret_key=SecretStr("0Y5eLjMDakyujfxGcb5ijyW_GL4pkxv3gHqWkfanOz0="),
+            api_auth_required=False,
+        )
+
+    def test_unset_reports_unset(self, settings: Settings) -> None:
+        for c in _client(settings):
+            r = c.get("/api/v1/config/notify/webhook")
+            assert r.status_code == 200
+            assert r.json() == {"isSet": False, "source": "unset"}
+
+    def test_env_value_reports_env(self, settings: Settings) -> None:
+        configured = settings.model_copy(
+            update={"notify_webhook_url": SecretStr("https://hooks.example.com/x")}
+        )
+        for c in _client(configured):
+            r = c.get("/api/v1/config/notify/webhook")
+            assert r.status_code == 200
+            assert r.json() == {"isSet": True, "source": "env"}
+
+    def test_whitespace_only_env_value_reported_unset(self, settings: Settings) -> None:
+        """F63: a whitespace-only env-sourced webhook URL (no blank-to-None
+        coercion on notify_webhook_url) must report isSet=False, source='unset'
+        — the same emptiness test _secret_is_set applies everywhere else."""
+        blank = settings.model_copy(update={"notify_webhook_url": SecretStr("   ")})
+        for c in _client(blank):
+            r = c.get("/api/v1/config/notify/webhook")
+            assert r.status_code == 200
+            assert r.json() == {"isSet": False, "source": "unset"}
+
+    def test_db_override_reports_db(self, settings: Settings) -> None:
+        for c in _client(settings):
+            c.post(
+                "/api/v1/config/notify/webhook",
+                json={"value": "https://hooks.example.com/db"},
+            )
+            r = c.get("/api/v1/config/notify/webhook")
+            assert r.status_code == 200
+            assert r.json() == {"isSet": True, "source": "db"}
 
 
 class TestDangerZoneTest:
@@ -4808,6 +5267,23 @@ def test_api_login_reachable_without_prior_auth_when_auth_required(
         assert login_resp.json()["ok"] is True
 
 
+def test_api_login_oversized_body_rejected(client: TestClient) -> None:
+    """A login body over the size cap is rejected 413 before any auth/DB work —
+    /login is unauthenticated and runs before the login throttle engages, so an
+    anonymous caller must not be able to force it to buffer an arbitrarily
+    large request body."""
+    resp = client.post("/api/v1/login", json={"username": "admin", "password": "x" * 9000})
+    assert resp.status_code == 413
+    assert resp.json()["detail"]["reason"] == "payload_too_large"
+
+
+def test_api_login_overlong_password_field_rejected(client: TestClient) -> None:
+    """A password under the body-size cap but over LoginIn's max_length is a
+    clean 422, not buffered/hashed."""
+    resp = client.post("/api/v1/login", json={"username": "admin", "password": "x" * 2000})
+    assert resp.status_code == 422
+
+
 def test_api_logout_clears_session(settings_kratos: Settings) -> None:
     """POST /api/v1/logout invalidates the session so subsequent requests are rejected."""
     for client in _auth_client(settings_kratos):
@@ -4962,6 +5438,15 @@ def test_internal_identifiers_delete_manual_ok(client: TestClient) -> None:
     body = client.get("/api/v1/internal-identifiers").json()
     groups = {g["kind"]: g["rows"] for g in body["groups"]}
     assert all(r["value"] != "kept-then-gone" for r in groups["host"])
+
+
+def test_internal_identifiers_delete_unknown_404(client: TestClient) -> None:
+    """F64: DELETE on a nonexistent id must be 404, not the 409 meant for a
+    detected row (delete_manual() returns False for BOTH cases — the route
+    must disambiguate, mirroring dismiss_internal_identifier's 404/409 split)."""
+    resp = client.delete("/api/v1/internal-identifiers/999999")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["reason"] == "not_found"
 
 
 def test_internal_identifiers_delete_detected_409(client: TestClient) -> None:

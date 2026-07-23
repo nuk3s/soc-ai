@@ -316,6 +316,24 @@ async def test_host_summary_invalid_ip_returns_error(settings_kratos: Settings) 
 
 
 @pytest.mark.asyncio
+async def test_host_summary_excessive_lookback_hours_returns_error(
+    settings_kratos: Settings,
+) -> None:
+    """F53: an unbounded lookback_hours must be rejected before the ES call —
+    alert-embedded text is prompt-injection surface and could otherwise steer
+    the agent into a full-history scan against the live SO cluster."""
+    elastic, _ = _make_elastic(settings_kratos, _result([]))
+
+    out = await host_summary(
+        "10.20.30.50", elastic=elastic, settings=settings_kratos, lookback_hours=876_000
+    )
+
+    assert out["error"] is True
+    assert "lookback_hours" in out["message"]
+    elastic.search.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_host_summary_centers_window_on_time_anchor(settings_kratos: Settings) -> None:
     """When a time_anchor is passed, the @timestamp filter is centered on it
     (so an old alert still finds evidence) — verify the query the tool built."""

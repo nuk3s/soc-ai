@@ -140,12 +140,13 @@ async def test_fts_rule_link_outranks_bm25_even_with_zero_text_overlap(
 
 
 async def test_fts_prefix_matches_partial_last_token(settings_kratos: Settings) -> None:
-    """The LAST query token gets the prefix form, so a partially-typed trailing
-    word ("beaco") still finds "beacon"."""
+    """The token typed LAST gets the prefix form, so a partially-typed trailing
+    word ("beaco") still finds "beacon" — even when an earlier, alphabetically
+    later-sorting token ("zzznotpresent") could otherwise seize the star."""
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        rb = await runbooks_svc.create(db, title="Beacon triage", content="periodicity")
-        results = await runbooks_svc.search(db, "triage beaco", k=5)
+        rb = await runbooks_svc.create(db, title="Beacon monitoring", content="periodicity")
+        results = await runbooks_svc.search(db, "zzznotpresent beaco", k=5)
         assert [r["id"] for r in results] == [rb.id]
     await engine.dispose()
 

@@ -298,10 +298,10 @@ def test_timeout_knobs_overridable_from_env(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_auto_ack_fp_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """auto_ack_fp_enabled defaults ON (threshold + high-stakes gated), threshold 0.7."""
+    """auto_ack_fp_enabled defaults OFF (unattended SO write is opt-in), threshold 0.7."""
     _setenv_required(monkeypatch)
     s = Settings()
-    assert s.auto_ack_fp_enabled is True
+    assert s.auto_ack_fp_enabled is False
     assert s.auto_ack_fp_threshold == 0.7
 
 

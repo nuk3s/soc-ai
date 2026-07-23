@@ -24,11 +24,21 @@ from soc_ai.api.hunt_runner import hunt_recorded_run
 from soc_ai.api.runner import CancelToken
 from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.store import hunts as hunt_svc
+from soc_ai.webui.probes import _scrub
 
 _LOGGER = logging.getLogger(__name__)
 
 _STATE_ATTR = "_hunt_console_manager"
 _CHAT_STATE_ATTR = "_hunt_chat_manager"
+
+# Hard ceiling on simultaneous background hunts this manager will run. Every hunt
+# holds the single model route for up to ``hunt_run_timeout_s`` with a
+# ``hunt_request_limit``-deep budget, so unbounded concurrency melts the gateway —
+# a real incident ran 7 at once, all hit the wall-clock, all produced garbage.
+# This is the SHARED limit across the ad-hoc (POST /hunts/chat), bulk re-hunt, and
+# scheduled paths; the bulk endpoint's ``_REHUNT_START_CAP`` is a smaller
+# per-request cap that sits under this global one.
+_MAX_CONCURRENT_HUNTS = 5
 
 
 class HuntConsoleManager:
@@ -37,6 +47,12 @@ class HuntConsoleManager:
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._tokens: dict[str, CancelToken] = {}
+        # Slots claimed by start() calls that are past the ceiling check but have
+        # not yet registered their task in ``_tasks``. Counted alongside
+        # ``_tasks`` so the ceiling holds across the ``await`` inside start() — a
+        # naive ``len(self._tasks)`` check would let a concurrent burst all slip
+        # through the window before any of them registered.
+        self._reserved = 0
 
     async def start(
         self,
@@ -52,47 +68,68 @@ class HuntConsoleManager:
         Consumes ``hunt_recorded_run`` until the first ``hunt_created`` event to
         capture the hunt id, then hands the remaining generator to a background
         task that runs it to completion. Returns the hunt id, or None if the
-        generator ended/errored before emitting ``hunt_created``.
+        generator ended/errored before emitting ``hunt_created`` — or if the
+        shared concurrency ceiling (``_MAX_CONCURRENT_HUNTS``) is already full.
 
         ``kind`` tags the hunt row (``"chat"`` for an operator-typed hunt,
         ``"scheduled"`` for a recurring hunt fired by the schedule loop) — it is
         threaded straight into ``hunt_recorded_run`` → ``hunt_svc.create``.
         """
-        ctx = ctx_from_state(state)
-        token = CancelToken()
-        gen = hunt_recorded_run(
-            state,
-            ctx=ctx,
-            objective=objective,
-            started_by=started_by,
-            prior=prior,
-            kind=kind,
-            cancel_token=token,
-        )
-
-        hunt_id: str | None = None
+        # Concurrency guard: this manager is fire-and-forget (one unbounded
+        # background asyncio.Task per call), so without a cap a scripted/rapid-fire
+        # burst of starts puts N simultaneous hunts on the single model route.
+        # Reserve a slot ATOMICALLY (no await between the check and the +=1) so the
+        # ceiling holds even under a concurrent burst. A None return is surfaced by
+        # callers as 503/"could_not_start" (ad-hoc + bulk) or a skipped cycle (the
+        # scheduler), i.e. retry in a smaller batch / a moment later.
+        if len(self._tasks) + self._reserved >= _MAX_CONCURRENT_HUNTS:
+            _LOGGER.warning(
+                "hunt_console_manager: at concurrency ceiling (%d in flight) — rejecting start",
+                _MAX_CONCURRENT_HUNTS,
+            )
+            return None
+        self._reserved += 1
         try:
-            async for name, data in gen:
-                if name == "hunt_created":
-                    hunt_id = data.get("hunt_id")
-                    break
-        except Exception:
-            _LOGGER.exception("hunt_console_manager: failed to start hunt")
-            return None
+            ctx = ctx_from_state(state)
+            token = CancelToken()
+            gen = hunt_recorded_run(
+                state,
+                ctx=ctx,
+                objective=objective,
+                started_by=started_by,
+                prior=prior,
+                kind=kind,
+                cancel_token=token,
+            )
 
-        if hunt_id is None:
-            return None
+            hunt_id: str | None = None
+            try:
+                async for name, data in gen:
+                    if name == "hunt_created":
+                        hunt_id = data.get("hunt_id")
+                        break
+            except Exception:
+                _LOGGER.exception("hunt_console_manager: failed to start hunt")
+                return None
 
-        task: asyncio.Task[None] = asyncio.create_task(_drain(gen, hunt_id=hunt_id))
-        self._tasks[hunt_id] = task
-        self._tokens[hunt_id] = token
+            if hunt_id is None:
+                return None
 
-        def _cleanup(_t: asyncio.Task[None]) -> None:
-            self._tasks.pop(hunt_id, None)
-            self._tokens.pop(hunt_id, None)
+            task: asyncio.Task[None] = asyncio.create_task(_drain(gen, hunt_id=hunt_id))
+            self._tasks[hunt_id] = task
+            self._tokens[hunt_id] = token
 
-        task.add_done_callback(_cleanup)
-        return hunt_id
+            def _cleanup(_t: asyncio.Task[None]) -> None:
+                self._tasks.pop(hunt_id, None)
+                self._tokens.pop(hunt_id, None)
+
+            task.add_done_callback(_cleanup)
+            return hunt_id
+        finally:
+            # Release the reservation: once the task is registered in ``_tasks`` it
+            # holds the slot instead (a clean hand-off with no gap); on any early
+            # return the slot is simply freed.
+            self._reserved -= 1
 
     def cancel(self, hunt_id: str) -> bool:
         """Cancel an in-flight hunt — an EXPLICIT operator cancel.
@@ -329,8 +366,13 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
         )
     except Exception as e:
         _LOGGER.exception("hunt-chat turn failed for hunt=%s", hunt_id)
+        # Scrub the exception text before it becomes user-facing content — a
+        # verbose provider/gateway error body could otherwise echo a credential
+        # (same defensive scrub probes.py applies to its error surfaces).
         await _hunt_chat_persist_error(
-            state, assistant_event_id, f"Sorry — the chat turn failed ({e}). Try again."
+            state,
+            assistant_event_id,
+            f"Sorry — the chat turn failed ({_scrub(str(e))}). Try again.",
         )
 
 

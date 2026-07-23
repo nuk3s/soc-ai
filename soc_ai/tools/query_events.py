@@ -26,6 +26,14 @@ from soc_ai.so_client.oql import (
 )
 from soc_ai.tools._registry import tool
 
+# Hard ceiling on the requested window. This is an LLM-callable read tool —
+# alert-embedded text is in-scope prompt-injection surface, so an unbounded
+# time_range_minutes lets the agent turn a scoped query into a full-history ES
+# scan against the same cluster the live SO grid depends on. 43_200m (30 days)
+# comfortably covers the widest legitimate window (the eval sampler's default
+# is 10_080m = 7 days) while bounding worst-case query cost.
+_MAX_TIME_RANGE_MINUTES = 43_200
+
 
 def _build_time_filter(
     time_range_minutes: int,
@@ -81,7 +89,8 @@ async def query_events_oql(
             ``sortby``, ``head``, ``count``).
         elastic: An :class:`ElasticClient` for dispatching to the SO ES cluster.
         settings: The application :class:`Settings` (used for the index pattern).
-        time_range_minutes: Window size in minutes. Default 1440 = 24h.
+        time_range_minutes: Window size in minutes. Default 1440 = 24h, capped
+            at ``_MAX_TIME_RANGE_MINUTES`` (43_200 = 30 days).
         max_results: Hard cap on returned hits (or ``head N`` limit). The
             validator rejects ``head`` stages that exceed this value.
         time_anchor: When set, center the window on this timestamp
@@ -98,6 +107,10 @@ async def query_events_oql(
     """
     if time_range_minutes <= 0:
         raise ValueError(f"time_range_minutes must be positive, got {time_range_minutes}")
+    if time_range_minutes > _MAX_TIME_RANGE_MINUTES:
+        raise ValueError(
+            f"time_range_minutes must be <= {_MAX_TIME_RANGE_MINUTES}, got {time_range_minutes}"
+        )
 
     ast = parse_oql(query)
     validate_oql(ast, max_results=max_results)

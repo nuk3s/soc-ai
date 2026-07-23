@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
@@ -285,8 +285,14 @@ async def escalate_group(
     )
 
 
+_ES_ID = Annotated[str, Field(max_length=512)]  # ES ``_id`` values are <=512 bytes
+
+
 class AckEventsIn(BaseModel):
-    es_ids: list[str]
+    # Cap at the input boundary (mirrors RehuntIn.inv_ids) so an oversized
+    # payload is rejected by validation before the dedup/truncate logic below
+    # ever parses or iterates it.
+    es_ids: list[_ES_ID] = Field(max_length=_ACK_CAP)
 
 
 @router.post("/alerts/ack-events", response_model=AckGroupOut)

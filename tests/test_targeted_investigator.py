@@ -309,6 +309,61 @@ async def test_dispatch_decode_payload_runs_pure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_clamps_max_results_and_truncates_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F05: Phase-D dispatch must apply the SAME safety wrappers the interactive
+    tool path does.
+
+    (a) An oversized ``max_results`` must be clamped to the per-tool ceiling
+        ``register_read_tools`` enforces (25 for ``t_query_events_oql``) BEFORE
+        the tool is called — otherwise a synth (or injected alert data) can ask
+        for 10 000 full docs.
+    (b) The raw tool return must run through ``_clamp_tool_result`` so an
+        oversized result can't be embedded verbatim in the round-2 synth prompt
+        and overflow the model's context window.
+    """
+    import json
+
+    import soc_ai.tools.query_events as qe_mod
+    from soc_ai.agent.targeted_investigator import _dispatch_named_tool
+    from soc_ai.agent.toolset import _TOOL_RESULT_BUDGET_BYTES
+
+    seen: dict[str, Any] = {}
+
+    class _FatResult:
+        def model_dump(self, mode: str = "json") -> dict[str, Any]:
+            return {
+                "total": 99999,
+                "took_ms": 5,
+                "aggregations": None,
+                "hits": [{"_id": f"x{i}", "_source": {"pad": "y" * 400}} for i in range(500)],
+            }
+
+    async def fake_query(query: str, *, max_results: int = 100, **kwargs: Any) -> _FatResult:
+        seen["max_results"] = max_results
+        return _FatResult()
+
+    monkeypatch.setattr(qe_mod, "query_events_oql", fake_query)
+
+    class _StubCtx:
+        settings = object()
+        elastic = object()
+        auth = object()
+
+    out = await _dispatch_named_tool(
+        "t_query_events_oql",
+        {"query": "event.kind:alert", "max_results": 10000},
+        _StubCtx(),
+    )
+    # (a) max_results clamped to the interactive ceiling before dispatch.
+    assert seen["max_results"] == 25
+    # (b) the raw result was clamped under the tool budget.
+    assert isinstance(out, dict)
+    assert len(json.dumps(out)) <= _TOOL_RESULT_BUDGET_BYTES
+
+
+@pytest.mark.asyncio
 async def test_dispatch_es_query_tools_bind_without_auth_typeerror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

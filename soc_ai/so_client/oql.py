@@ -473,6 +473,14 @@ def collect_wildcard_patterns(node: FilterNode) -> list[str]:
 
 _HARD_MAX_RESULTS: int = 10_000
 
+# A groupby fans out one nested `terms` agg PER field: `size` levels compound
+# multiplicatively (25^N buckets in the worst case before a `head` narrows
+# it), and an unbounded field count lets a query force arbitrarily deep
+# per-shard aggregation work regardless of the caller's head/max_results.
+# 4 comfortably covers realistic SOC pivot depth (e.g. host, source.ip,
+# destination.ip, event.module).
+_MAX_GROUPBY_FIELDS: int = 4
+
 
 def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
     """Run safety checks on a parsed AST.
@@ -512,6 +520,12 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
             if seen_groupby:
                 raise OqlValidationError("groupby may not be repeated")
             seen_groupby = True
+            if len(stage.fields) > _MAX_GROUPBY_FIELDS:
+                raise OqlValidationError(
+                    f"groupby supports at most {_MAX_GROUPBY_FIELDS} fields, "
+                    f"got {len(stage.fields)}",
+                    fragment=",".join(stage.fields),
+                )
             for field_name in stage.fields:
                 if not wl.is_allowed(field_name):
                     raise OqlValidationError(
@@ -629,7 +643,13 @@ def ast_to_es_dsl(ast: OqlAst, *, default_size: int = 100) -> dict[str, Any]:
                 body["size"] = stage.limit
         elif isinstance(stage, Count):
             body["size"] = 0
-            body["track_total_hits"] = True
+            # An integer (not `True`) caps ES at an EXACT count up to that many
+            # docs, falling back to a `gte` lower-bound estimate beyond it --
+            # `True` instead forces a full exact count across every matching
+            # doc/shard with no cost ceiling. `_HARD_MAX_RESULTS` is the same
+            # ceiling already enforced on `head`. `EsSearchResult` already
+            # renders a `gte` relation as `total_is_lower_bound`.
+            body["track_total_hits"] = _HARD_MAX_RESULTS
 
     return body
 
@@ -654,10 +674,14 @@ def _attach_bucket_sort(aggs: dict[str, Any], direction: str) -> None:
 
 
 def _attach_bucket_size(aggs: dict[str, Any], limit: int) -> None:
-    """Limit the outermost terms aggregation to the top-N buckets."""
+    """Limit EVERY nesting level of a (possibly nested) terms aggregation to
+    the top-N buckets — not just the outermost, else inner levels stay at the
+    hardcoded default regardless of the caller's `head`."""
     for agg_body in aggs.values():
         if "terms" in agg_body:
             agg_body["terms"]["size"] = limit
+            if "aggs" in agg_body:
+                _attach_bucket_size(agg_body["aggs"], limit)
             return
 
 

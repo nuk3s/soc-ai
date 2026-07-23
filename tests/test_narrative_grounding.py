@@ -108,6 +108,23 @@ def test_real_alert_ip_with_fabricated_host_dns_smb_is_flagged() -> None:
     assert "10.20.30.66" not in g.ungrounded  # the alert's real IP, grounded in the seed
 
 
+def test_lowercase_hostname_is_extracted_and_flagged() -> None:
+    """F21: a fabricated hostname written in lowercase (common LLM prose style)
+    must still be detected — the hostname regex was case-sensitive, so a whole-
+    cloth `desktop-jsm4n2p` claim evaded the grounding check purely by
+    capitalization."""
+    seed = "Alert: ET SCAN (10.0.0.5 → 10.0.0.9)"
+    answer = (
+        "**The traffic originated from workstation desktop-jsm4n2p per our "
+        "inventory, so this is benign.**"
+    )
+    a = extract_artifacts(answer)
+    assert "desktop-jsm4n2p" in a.hostnames
+    g = check_narrative_grounding(answer, seed_context=seed, tool_evidence=[])
+    assert g.grounded is False
+    assert "desktop-jsm4n2p" in g.ungrounded
+
+
 def test_no_concrete_artifacts_is_not_flagged() -> None:
     """A purely qualitative answer with no concrete identifiers is never flagged."""
     answer = (
@@ -147,6 +164,26 @@ def test_domain_regex_ignores_prose_and_filenames() -> None:
     """Avoid false positives: 'e.g.' and dotted filenames are not domains."""
     a = extract_artifacts("e.g. the report.json file and main.py were unchanged.")
     assert a.domains == []
+
+
+def test_com_domain_is_extracted_and_flagged() -> None:
+    """F03: a fabricated *.com domain — the single most common C2/phishing TLD —
+    must be extracted as an artifact and, when ungrounded, flagged. The `.com.`
+    stop-suffix used to swallow every .com domain (its own `.rstrip('.')` collided
+    with the legitimate TLD), so this whole class evaded the grounding check."""
+    from soc_ai.agent.narrative_grounding import _looks_like_domain
+
+    assert _looks_like_domain("evilbeacon.com") is True
+    seed = "Alert: ET SCAN (10.0.0.5 → 10.0.0.9)"
+    answer = (
+        "**This host connected out to evilbeacon.com, a benign CDN endpoint, so "
+        "this is a false positive.**"
+    )
+    a = extract_artifacts(answer)
+    assert "evilbeacon.com" in a.domains
+    g = check_narrative_grounding(answer, seed_context=seed, tool_evidence=[])
+    assert g.grounded is False
+    assert "evilbeacon.com" in g.ungrounded
 
 
 def test_caveat_text_is_marked() -> None:

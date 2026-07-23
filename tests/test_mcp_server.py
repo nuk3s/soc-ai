@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from soc_ai.config import Settings
@@ -103,3 +103,62 @@ async def test_mcp_server_name(settings_kratos: Settings) -> None:
     elastic = _make_elastic(settings_kratos)
     mcp = build_mcp(settings_kratos, elastic)
     assert mcp.name == "soc-ai"
+
+
+def _model_dump_stub() -> MagicMock:
+    obj = MagicMock()
+    obj.model_dump.return_value = {}
+    return obj
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_clamp_absurd_caller_limits(settings_kratos: Settings) -> None:
+    """An MCP client is an untrusted caller: it must not be able to push
+    max_results / window_seconds / max_per_pivot / k straight through to
+    Elasticsearch unclamped (unlike the agent's own tool wrappers in
+    toolset.py, which cap every one of these before dispatch)."""
+    elastic = _make_elastic(settings_kratos)
+    mcp = build_mcp(settings_kratos, elastic)
+
+    with (
+        patch(
+            "soc_ai.mcp_server.server.query_events_oql",
+            AsyncMock(return_value=_model_dump_stub()),
+        ) as fake_query_events,
+        patch(
+            "soc_ai.mcp_server.server.get_alert_context",
+            AsyncMock(return_value=_model_dump_stub()),
+        ) as fake_alert_context,
+        patch("soc_ai.mcp_server.server.query_cases", AsyncMock(return_value=[])) as fake_cases,
+        patch(
+            "soc_ai.mcp_server.server.query_detections", AsyncMock(return_value=[])
+        ) as fake_detections,
+        patch("soc_ai.mcp_server.server.query_zeek_logs", AsyncMock(return_value=[])) as fake_zeek,
+        patch(
+            "soc_ai.mcp_server.server.get_playbooks", AsyncMock(return_value=[])
+        ) as fake_playbooks,
+        patch(
+            "soc_ai.mcp_server.server.lookup_runbook", AsyncMock(return_value=[])
+        ) as fake_runbook,
+    ):
+        await mcp.call_tool(
+            "query_events", {"query": "*", "max_results": 1_000_000, "time_range_minutes": 60}
+        )
+        await mcp.call_tool(
+            "alert_context",
+            {"alert_id": "x", "window_seconds": 100_000_000, "max_per_pivot": 1_000_000},
+        )
+        await mcp.call_tool("cases", {"query": "*", "max_results": 1_000_000})
+        await mcp.call_tool("detections", {"query": "*", "max_results": 1_000_000})
+        await mcp.call_tool("zeek_logs", {"community_id": "c1", "max_results": 1_000_000})
+        await mcp.call_tool("playbooks", {"max_results": 1_000_000})
+        await mcp.call_tool("runbook", {"query": "*", "k": 1_000_000})
+
+    assert fake_query_events.call_args.kwargs["max_results"] <= 25
+    assert fake_alert_context.call_args.kwargs["window_seconds"] <= 14_400
+    assert fake_alert_context.call_args.kwargs["max_per_pivot"] <= 50
+    assert fake_cases.call_args.kwargs["max_results"] <= 10
+    assert fake_detections.call_args.kwargs["max_results"] <= 10
+    assert fake_zeek.call_args.kwargs["max_results"] <= 25
+    assert fake_playbooks.call_args.kwargs["max_results"] <= 10
+    assert fake_runbook.call_args.kwargs["k"] <= 5

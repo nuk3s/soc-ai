@@ -125,6 +125,21 @@ def test_cookie_post_referer_fallback_is_allowed(auth_client: TestClient) -> Non
     assert resp.status_code == 200
 
 
+def test_cookie_post_so_host_origin_is_rejected(auth_client: TestClient) -> None:
+    """SO_HOST (Security Onion's own web console — a separate product soc-ai
+    talks OUT to) must NOT be in the CSRF allowlist: trusting it would let a
+    script-execution bug in SO's UI forge cookie-authenticated writes against
+    soc-ai. so_host is fixed to "https://so.example.com" in settings_kratos."""
+    _login(auth_client)
+    resp = auth_client.post(
+        "/api/v1/me/status",
+        json={"status": "busy"},
+        headers={"Origin": "https://so.example.com"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "bad_origin"
+
+
 # ── bearer-token requests are exempt ────────────────────────────────────────
 
 

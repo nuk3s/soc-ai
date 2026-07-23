@@ -227,6 +227,29 @@ def _is_ip_internal(ctx: EnrichedAlertContext, ip: str | None) -> bool:
         return False
 
 
+def _external_endpoint(ctx: EnrichedAlertContext) -> str | None:
+    """The external counterparty IP, regardless of flow direction.
+
+    Informational alerts fire on either leg: an outbound client->server flow
+    (external = ``destination_ip``) or a server->client observation such as a TLS
+    cert / JA3S / server banner, where Suricata tags the alert with the RESPONSE
+    packet's direction (external = ``source_ip``, internal = ``destination_ip``).
+    The benign-informational templates must judge the EXTERNAL endpoint, not a
+    fixed leg -- otherwise every server-side observation slips past them and burns
+    a full investigation loop.
+
+    Prefers an external destination (preserving the original outbound behaviour),
+    then an external source. Returns ``None`` when neither side is external (a
+    purely-internal alert, handled by ``clean_internal_traffic``).
+    """
+    a = ctx.alert
+    if a.destination_ip and not _is_ip_internal(ctx, a.destination_ip):
+        return a.destination_ip
+    if a.source_ip and not _is_ip_internal(ctx, a.source_ip):
+        return a.source_ip
+    return None
+
+
 def _any_blocklist_hit(ctx: EnrichedAlertContext) -> bool:
     return any(e.blocklist_hits for e in ctx.enrichments.values())
 
@@ -440,14 +463,15 @@ def t_informational_external_clean_benign_cloud(
         return None
     if _any_blocklist_hit(ctx):
         return None
-    if not _ip_is_benign_cloud(ctx, a.destination_ip):
+    ext = _external_endpoint(ctx)
+    if ext is None or not _ip_is_benign_cloud(ctx, ext):
         return None
     # Malware/exploit-signal guard.
     if _rule_signals_malware(ctx):
         return None
     if not _zeek_conn_clean(ctx):
         return None
-    enrich = ctx.enrichments.get(a.destination_ip or "")
+    enrich = ctx.enrichments.get(ext)
     asn_org = enrich.asn.org if enrich and enrich.asn else "?"
     return CandidateVerdict(
         verdict="false_positive",
@@ -455,7 +479,7 @@ def t_informational_external_clean_benign_cloud(
         cited_evidence=[
             "alert.rule_metadata.signature_severity=Informational",
             "alert.alert_action=allowed",
-            f"destination_ip ASN org='{asn_org}'",
+            f"external endpoint {ext} ASN org='{asn_org}'",
             f"connection.state/zeek.conn.conn_state={ctx.typed_zeek.conn_states}",
         ],
         template_id="informational_external_clean_benign_cloud",
@@ -478,9 +502,10 @@ def t_informational_external_unknown_asn(
         return None
     if _any_blocklist_hit(ctx):
         return None
-    if _is_ip_internal(ctx, a.destination_ip):
+    ext = _external_endpoint(ctx)
+    if ext is None:
         return None
-    if _ip_is_benign_cloud(ctx, a.destination_ip):
+    if _ip_is_benign_cloud(ctx, ext):
         return None  # benign-cloud handled by the more specific template above
     # Malware/exploit-signal guard.
     if _rule_signals_malware(ctx):
@@ -491,7 +516,7 @@ def t_informational_external_unknown_asn(
         cited_evidence=[
             "alert.rule_metadata.signature_severity=Informational",
             "alert.alert_action=allowed",
-            "no blocklist hits on destination_ip",
+            f"no blocklist hits on external endpoint {ext}",
         ],
         template_id="informational_external_unknown_asn",
         rationale=(

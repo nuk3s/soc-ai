@@ -85,6 +85,32 @@ async def test_ack_alert_posts_soc_id_to_events_ack() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ack_alert_never_sends_comment_and_signals_not_persisted() -> None:
+    """SO 3.0.0's /api/events/ack has no comment field. ack_alert must (a) never
+    put ``comment`` in the request body, and (b) signal ``comment_persisted=False``
+    so the UI/analyst is not left believing SO now carries that context (F54).
+
+    The body assertion also pins the contract: a future SO version that DOES add
+    a comment field can't silently start relying on it without a test noticing.
+    """
+    auth = _mock_auth(httpx.Response(200, json={"errors": []}))
+    result = await ack_alert(
+        "alert-001", comment="confirmed internal vuln scanner per case #123", auth=auth
+    )
+    body = auth.request.call_args.kwargs["json"]
+    assert "comment" not in body
+    assert result["comment_persisted"] is False
+
+
+@pytest.mark.asyncio
+async def test_ack_alert_omits_persist_signal_when_no_comment() -> None:
+    """With no comment supplied there is nothing to flag — the signal is absent."""
+    auth = _mock_auth(httpx.Response(200, json={}))
+    result = await ack_alert("alert-001", auth=auth)
+    assert "comment_persisted" not in result
+
+
+@pytest.mark.asyncio
 async def test_ack_alert_uses_configured_timezone() -> None:
     """When `settings` is passed, ack uses settings.so_timezone."""
     from soc_ai.config import Settings
@@ -135,6 +161,20 @@ async def test_escalate_to_case_raises_on_5xx() -> None:
     auth = _mock_auth(httpx.Response(503, text="busy"))
     with pytest.raises(SoApiError, match="503"):
         await escalate_to_case("alert-001", case_title="x", case_description="y", auth=auth)
+
+
+@pytest.mark.asyncio
+async def test_escalate_to_case_returns_synthetic_when_response_not_json() -> None:
+    """A 2xx with an empty/non-JSON body (transient proxy, 204 variant) means the
+    case WAS created SO-side. Raising here would make the caller/agent retry and
+    create a DUPLICATE case, so degrade gracefully — mirroring add_case_comment's
+    identical-situation handling (F55). Only 4xx/5xx is a real failure."""
+    for resp in (httpx.Response(201, text=""), httpx.Response(200, text="OK")):
+        auth = _mock_auth(resp)
+        result = await escalate_to_case(
+            "alert-001", case_title="Suspicious", case_description="triage", auth=auth
+        )
+        assert result == {"alert_id": "alert-001", "escalated": True}
 
 
 @pytest.mark.asyncio

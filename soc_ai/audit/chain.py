@@ -47,12 +47,26 @@ def _content_without_hash(record: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in record.items() if k != "hash"}
 
 
-def verify_chain(records: list[dict[str, Any]]) -> tuple[bool, int | None]:
+def verify_chain(
+    records: list[dict[str, Any]], *, expect_genesis: bool = True
+) -> tuple[bool, int | None]:
     """Recompute every record's hash and verify linkage.
 
     ``records`` is a list of audit records (dicts, e.g. ES ``_source`` bodies or
     ``AuditEvent.model_dump(mode="json")`` outputs). They are sorted by ``seq``
     before checking so caller ordering does not matter.
+
+    ``expect_genesis`` controls how the FIRST record's inbound linkage is judged
+    when the set does not begin at :data:`GENESIS_SEQ`:
+    - ``True`` (default — a full-index scan): the fetched set is expected to reach
+      back to genesis, so a first record with ``seq > 0`` (its predecessor is
+      gone) or a first ``prev_hash`` that is not the genesis hash is a real
+      tamper (head deletion) and is reported.
+    - ``False`` (a windowed ``days=N`` scan): the record immediately preceding the
+      window was deliberately NOT fetched, so its hash cannot be confirmed against
+      the first in-window ``prev_hash``. That single boundary linkage is left
+      UNVERIFIED rather than falsely reported as tampered; every record's own hash
+      and every *in-window* link is still fully checked.
 
     Returns ``(ok, first_broken_seq)``:
     - ``(True, None)`` — the chain is intact.
@@ -72,15 +86,24 @@ def verify_chain(records: list[dict[str, Any]]) -> tuple[bool, int | None]:
 
     chained.sort(key=lambda r: r["seq"])
 
-    expected_prev = GENESIS_PREV_HASH
-    expected_seq = chained[0]["seq"]  # chain may start mid-stream (recovered head)
+    # The first record's inbound link can only be checked when we actually hold
+    # its predecessor: either this IS the genesis record, or a full scan is
+    # expected to start at genesis (so a missing head is a real tamper). A
+    # windowed scan that legitimately starts mid-stream has no fetched
+    # predecessor — leave that one boundary UNVERIFIED (``expected_prev = None``)
+    # rather than force the genesis hash and false-positive a tamper.
+    expected_seq = chained[0]["seq"]
+    expected_prev: str | None = (
+        GENESIS_PREV_HASH if expected_seq == GENESIS_SEQ or expect_genesis else None
+    )
     for rec in chained:
         seq = rec["seq"]
         # Detect a gap / duplicate / reorder: seq must advance by exactly 1.
         if seq != expected_seq:
             return False, seq
-        # prev_hash must point at the predecessor's stored hash.
-        if rec.get("prev_hash") != expected_prev:
+        # prev_hash must point at the predecessor's stored hash (skipped only for
+        # an unverified windowed boundary, where expected_prev is None).
+        if expected_prev is not None and rec.get("prev_hash") != expected_prev:
             return False, seq
         # Recompute the hash over the stored content and compare.
         recomputed = compute_hash(_content_without_hash(rec), rec["prev_hash"])

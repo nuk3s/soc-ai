@@ -78,10 +78,12 @@ async def ack_alert(
     """POST /api/events/ack with the alert id; mark the alert acknowledged.
 
     Returns ``{"alert_id": ..., "acknowledged": true, "raw": <api-response>}``
-    on 2xx, or raises :class:`SoApiError` on 4xx/5xx. ``comment`` is
-    accepted for caller convenience but the SO 3.0.0 ack endpoint does
-    not currently surface a comment field; it's silently dropped (a
-    note in the audit trail still records what the agent intended).
+    on 2xx, or raises :class:`SoApiError` on 4xx/5xx. ``comment`` is accepted
+    for caller convenience but the SO 3.0.0 ack endpoint has no comment field,
+    so it never reaches the SO record. When a comment is supplied the result
+    also carries ``"comment_persisted": False`` so the caller is not left
+    believing SO now holds that context — only soc-ai's own audit trail records
+    the intended comment.
     """
     if not _EVENT_ID_RE.match(alert_id):
         raise ValueError(
@@ -123,8 +125,14 @@ async def ack_alert(
         except ValueError:
             parsed = None
 
-    return {
+    result: dict[str, Any] = {
         "alert_id": alert_id,
         "acknowledged": True,
         "raw": parsed,
     }
+    if comment is not None:
+        # SO 3.0.0's ack endpoint has no comment field, so the supplied comment
+        # never lands in the SO record. Flag that explicitly rather than letting
+        # the caller assume it persisted (only the audit trail keeps the intent).
+        result["comment_persisted"] = False
+    return result

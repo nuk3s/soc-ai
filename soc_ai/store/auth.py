@@ -16,7 +16,7 @@ from typing import Any
 
 import bcrypt
 from pydantic import SecretStr
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.models import ApiToken, User, UserSession
@@ -69,11 +69,16 @@ class LoginThrottle:
 
     def _evict_if_full(self) -> None:
         # Cheap bound: when over capacity, drop ~one entry. Locked keys are kept
-        # preferentially (they're the security-relevant ones).
+        # preferentially (they're the security-relevant ones). Keys that are
+        # near the lockout threshold are also protected from eviction: without
+        # this, an attacker could interleave a few failures against a targeted
+        # username with a flood of throwaway usernames to keep evicting (and so
+        # resetting) the targeted key's failure count before it ever reaches
+        # max_failures, defeating the lockout indefinitely.
         while len(self._fails) >= self.max_keys:
-            oldest_key = min(
-                self._fails, key=lambda k: self._fails[k][-1] if self._fails[k] else 0.0
-            )
+            candidates = {k: v for k, v in self._fails.items() if len(v) < self.max_failures - 1}
+            pool = candidates if candidates else self._fails
+            oldest_key = min(pool, key=lambda k: self._fails[k][-1] if self._fails[k] else 0.0)
             self._fails.pop(oldest_key, None)
 
     def is_locked(self, ip: str, username: str) -> bool:
@@ -143,7 +148,19 @@ def csrf_token_for(raw_session_token: str) -> str:
     return _sha256("csrf:" + raw_session_token)
 
 
+class PasswordTooLongError(ValueError):
+    """Raised when a caller-supplied password exceeds bcrypt's 72-byte limit."""
+
+
 async def hash_password(password: str) -> str:
+    # bcrypt.hashpw() raises a bare ValueError above 72 bytes; guard here (the
+    # one place every caller-supplied password funnels through — create_user()
+    # and reset_user_password()) so that surfaces as a clean, catchable error
+    # instead of an unhandled 500. Mirrors the guard authenticate() already
+    # applies before verify_password().
+    if len(password.encode()) > _BCRYPT_MAX_BYTES:
+        raise PasswordTooLongError(f"password exceeds bcrypt's {_BCRYPT_MAX_BYTES}-byte limit")
+
     def _hash() -> str:
         return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -271,16 +288,21 @@ async def set_user_disabled(db: AsyncSession, user_id: int, disabled: bool) -> N
 
 
 async def reset_user_password(db: AsyncSession, user_id: int, new_password: str) -> None:
-    """Set a new password hash and invalidate the user's existing sessions.
+    """Set a new password hash and invalidate the user's existing sessions
+    and API tokens.
 
-    Deleting the sessions forces a fresh login with the new credential, so a
-    reset immediately revokes any active cookie for that account.
+    Deleting the sessions forces a fresh login with the new credential, and
+    revoking every token this account minted closes the gap a password reset
+    alone would leave: ``check_api_token`` only honors ``revoked``/creator-
+    ``disabled``, so a bearer token minted before the reset would otherwise
+    keep authenticating indefinitely after the "incident response" reset.
     """
     user = await db.get(User, user_id)
     if user is None:
         return
     user.password_hash = await hash_password(new_password)
     await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
+    await db.execute(update(ApiToken).where(ApiToken.created_by == user_id).values(revoked=True))
     await db.commit()
 
 

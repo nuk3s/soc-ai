@@ -4,8 +4,40 @@
 // (`demoBlocked`) wired through the real DemoProvider → useDemo chain, so this
 // tests the actual decision the ack/escalate/save handlers make — not a copy.
 import { fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DEMO_ACTION_NOTE, DemoProvider, demoBlocked, useDemo } from '../lib/demo';
+import { ShellProvider } from '../shell/ShellContext';
+
+// F38 — background poll pause while the drawer is open. A single group with an
+// existing investigation (invId) so "Open investigation" is on the row without
+// needing to fake a hunt round-trip.
+const POLL_GROUP = vi.hoisted(() => ({
+  id: 'g1',
+  name: 'ET SCAN Test Detection',
+  kind: 'suricata',
+  sev: 'high',
+  count: 3,
+  verdict: 'true_positive',
+  conf: 0.9,
+  latest: '2m ago',
+  inherited: false,
+  events: [],
+  invId: 'INV-1',
+}));
+
+vi.mock('../lib/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/api')>()),
+  getAlerts: vi.fn().mockResolvedValue([POLL_GROUP]),
+  getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
+  // The drawer's own investigation fetch never needs to resolve for this test —
+  // leaving it pending keeps the (heavy) Investigation report out of the tree.
+  getInvestigation: vi.fn(() => new Promise(() => {})),
+  assignAlert: vi.fn().mockResolvedValue({ ok: true }),
+}));
+
+import { Alerts } from './Alerts';
+import { assignAlert, getAlerts } from '../lib/api';
 
 // Pinned literally (not imported) so a copy edit to the note can't self-approve.
 const NOTE =
@@ -129,5 +161,71 @@ describe('config admin action guard', () => {
     fireEvent.click(screen.getByText('Create user'));
     expect(createUser).toHaveBeenCalledTimes(1);
     expect(setUserError).not.toHaveBeenCalled();
+  });
+});
+
+// F38 — useAsync's background-poll interval calls `pauseWhen` on whatever
+// closure was live when its effect last ran; that effect's deps don't include
+// `drawerId`, so a plain `() => !!drawerId` freezes at the drawer state from
+// mount instead of tracking it live (the exact gotcha every other pauseWhen
+// call site in this codebase routes around with a ref). Drive the real
+// interval callback directly (captured off `setInterval`, called by hand)
+// rather than waiting out the 10s in real time.
+describe('alerts grid background poll (F38)', () => {
+  it('pauses the 10s poll once the investigation drawer is open', async () => {
+    const intervalSpy = vi.spyOn(window, 'setInterval');
+    try {
+      render(
+        <MemoryRouter initialEntries={['/alerts']}>
+          <ShellProvider>
+            <Alerts />
+          </ShellProvider>
+        </MemoryRouter>,
+      );
+
+      // Initial foreground fetch, then the row is on screen.
+      await screen.findByLabelText('Open investigation');
+      expect(getAlerts).toHaveBeenCalledTimes(1);
+
+      const pollCall = intervalSpy.mock.calls.find((c) => c[1] === 10000);
+      expect(pollCall).toBeTruthy();
+      const poll = pollCall![0] as () => void;
+
+      // Drawer closed — a poll tick should still fetch.
+      poll();
+      expect(getAlerts).toHaveBeenCalledTimes(2);
+
+      // Open the drawer (no dep of the outer useAsync effect changes).
+      fireEvent.click(screen.getByLabelText('Open investigation'));
+      await screen.findByLabelText('Close');
+
+      // A poll tick while the drawer is open must be skipped.
+      poll();
+      expect(getAlerts).toHaveBeenCalledTimes(2);
+    } finally {
+      intervalSpy.mockRestore();
+    }
+  });
+});
+
+// F39 — the owner-avatar "+" (assign to me), the owner avatar (release), and
+// Review/Done all reuse assignAlert with no .catch, unlike every sibling write
+// in this file (ackOneGroup, escalateOneGroup, the bulk assign/ack blocks) —
+// a failed request silently left the row unchanged with no analyst feedback.
+describe('assignAlert write paths surface a failure instead of failing silently (F39)', () => {
+  it('shows a failure message on the ack strip when "Assign to me" rejects', async () => {
+    vi.mocked(assignAlert).mockRejectedValueOnce(new Error('network down'));
+    render(
+      <MemoryRouter initialEntries={['/alerts']}>
+        <ShellProvider>
+          <Alerts />
+        </ShellProvider>
+      </MemoryRouter>,
+    );
+
+    const assignBtn = await screen.findByTitle('Assign to me');
+    fireEvent.click(assignBtn);
+
+    await screen.findByText(`Failed to assign ${POLL_GROUP.name}`);
   });
 });

@@ -714,22 +714,8 @@ async def api_get_danger_settings(
         else:
             # Check the live Settings attribute (populated from env / .env at startup).
             attr_val = getattr(settings, spec.attr, None)
-            if attr_val is None:
-                source = "unset"
-                is_set = False
-            else:
-                # SecretStr fields must be unwrapped to check for emptiness.
-                raw = (
-                    attr_val.get_secret_value()
-                    if isinstance(attr_val, SecretStr)
-                    else str(attr_val)
-                )
-                if raw.strip():
-                    source = "env"
-                    is_set = True
-                else:
-                    source = "unset"
-                    is_set = False
+            is_set = _secret_is_set(attr_val)
+            source = "env" if is_set else "unset"
 
         # Map internal SettingType to the frontend type label.
         if spec.secret:
@@ -824,17 +810,29 @@ async def api_save_danger_setting(
 
     # Hot specs are read fresh per tool-call → apply live via setattr on the
     # Settings singleton (validate_assignment coerces str→SecretStr, csv→typed).
-    # restart_required reflects whether it actually applied (a non-hot spec, or a
-    # value that fails live validation, still persists and applies on restart).
-    applied_live = False
+    # A value that fails live validation (a field or cross-field constraint, e.g.
+    # PCAP_ENABLED requiring a non-empty SO_SSH_HOST) would otherwise leave a
+    # poisoned override in the DB that silently re-fails apply_to_settings on
+    # every future restart while the UI reported success. Roll back + report
+    # honestly, same contract as POST /config/setting above.
     if spec.hot:
         try:
             setattr(settings, spec.attr, typed)
-            applied_live = True
-        except (ValueError, TypeError, ValidationError):
-            applied_live = False
+        except (ValueError, TypeError, ValidationError) as exc:
+            async with request.app.state.db_sessionmaker() as db:
+                await cfg_svc.delete_override(db, body.key)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "invalid_value",
+                    "hint": f"{body.key} failed validation on apply and was not saved",
+                },
+            ) from exc
+        restart_required = False
+    else:
+        restart_required = True
 
-    return {"ok": True, "restart_required": not applied_live}
+    return {"ok": True, "restart_required": restart_required}
 
 
 # ── API keys (hot, write-only enrichment provider secrets) ────────────────────
@@ -883,12 +881,8 @@ async def api_get_api_keys(
             source, is_set = "db", True
         else:
             attr_val = getattr(settings, spec.attr, None)
-            raw = (
-                attr_val.get_secret_value()
-                if isinstance(attr_val, SecretStr)
-                else ("" if attr_val is None else str(attr_val))
-            )
-            source, is_set = ("env", True) if raw.strip() else ("unset", False)
+            is_set = _secret_is_set(attr_val)
+            source = "env" if is_set else "unset"
         out.append(
             ApiKeyOut(key=spec.key, label=spec.label, help=spec.help, isSet=is_set, source=source)
         )
@@ -1020,12 +1014,8 @@ async def api_get_notify_webhook(
     if in_db:
         return NotifyWebhookOut(isSet=True, source="db")
     attr_val = getattr(settings, spec.attr, None)
-    raw = (
-        attr_val.get_secret_value()
-        if isinstance(attr_val, SecretStr)
-        else ("" if attr_val is None else str(attr_val))
-    )
-    return NotifyWebhookOut(isSet=bool(raw.strip()), source="env" if raw.strip() else "unset")
+    is_set = _secret_is_set(attr_val)
+    return NotifyWebhookOut(isSet=is_set, source="env" if is_set else "unset")
 
 
 @router.post(

@@ -308,7 +308,8 @@ async def search(
     if k <= 0:
         return []
 
-    query_tokens = set(_tokenize(query or ""))
+    ordered_tokens = list(dict.fromkeys(_tokenize(query or "")))
+    query_tokens = set(ordered_tokens)
     if not query_tokens and not rule_name:
         return []
 
@@ -317,9 +318,7 @@ async def search(
     linked_ids: set[int] = set()
 
     # ── Text tier: FTS5 BM25, falling back to the legacy in-process scorer ────
-    fts_pairs = (
-        await _fts_hits(db, sorted(query_tokens), limit=_FTS_CANDIDATES) if query_tokens else []
-    )
+    fts_pairs = await _fts_hits(db, ordered_tokens, limit=_FTS_CANDIDATES) if query_tokens else []
     if fts_pairs is None:
         # Legacy fallback — identical to the pre-FTS behavior. Cap the working
         # set (matches ``list_all``); scoring is in-process, so an unbounded

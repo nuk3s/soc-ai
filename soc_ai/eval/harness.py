@@ -139,11 +139,35 @@ async def run(
     investigation_elapsed_ms = int((time.monotonic() - started) * 1000)
 
     # ----- Sanitize -----
+    # Thread the operator's ORACLE_EXTRA_HOSTS / ORACLE_INTERNAL_SUFFIXES into
+    # every sanitize() call so bare internal hostnames the operator configured
+    # (shape-indistinguishable from public infra) are redacted before egress —
+    # matching the production Oracle client. The same tuples feed the residue
+    # gate in _grade_with_oracle so the detector can verify the replacer.
+    resolved_hosts = tuple(settings.oracle_extra_hosts)
+    resolved_suffixes = tuple(settings.oracle_internal_suffixes)
     mapping = san.Mapping()
     sanitized_events = [
-        _sanitize_event_payload(ev.kind, ev.sequence, ev.payload, mapping) for ev in events
+        _sanitize_event_payload(
+            ev.kind,
+            ev.sequence,
+            ev.payload,
+            mapping,
+            extra_hosts=resolved_hosts,
+            extra_suffixes=resolved_suffixes,
+        )
+        for ev in events
     ]
-    sanitized_report = _sanitize_dict(final_report, mapping) if final_report else None
+    sanitized_report = (
+        _sanitize_dict(
+            final_report,
+            mapping,
+            extra_hosts=resolved_hosts,
+            extra_suffixes=resolved_suffixes,
+        )
+        if final_report
+        else None
+    )
 
     if grade:
         response, response_md, user_message, arch = _grade_with_oracle(
@@ -219,13 +243,31 @@ def _grade_with_oracle(
     the LiteLLM/oracle call, and the de-sanitization of the critique for local
     display. Returns ``(response, response_md, user_message, arch_context)``.
     """
+    # Sanitize the alert id itself. A bare ``mapping.forward.get(alert_id, ...)``
+    # only redacts the id when that exact string coincidentally appeared (and
+    # matched a pattern) elsewhere in the payload; run it through sanitize() so
+    # an internal identifier embedded in the ES ``_id`` (some deployments do
+    # this) is redacted regardless. Fold the resulting label into ``bundle_text``
+    # so the pre-send residue gate actually covers the id.
+    alert_id_label, _ = san.sanitize(
+        alert_id,
+        mapping=mapping,
+        extra_hosts=tuple(settings.oracle_extra_hosts),
+        extra_suffixes=tuple(settings.oracle_internal_suffixes),
+    )
+
     # Build a single string of everything we'll send for the residue check.
     # Cheaper than walking the dicts again — `unsafe_residue` uses the
     # same regexes as `sanitize` so this catches drift either way.
     bundle_text = json.dumps(sanitized_events, default=str)
     if sanitized_report is not None:
         bundle_text += "\n" + json.dumps(sanitized_report, default=str)
-    issues = san.unsafe_residue(bundle_text)
+    bundle_text += "\n" + alert_id_label
+    issues = san.unsafe_residue(
+        bundle_text,
+        extra_hosts=tuple(settings.oracle_extra_hosts),
+        extra_suffixes=tuple(settings.oracle_internal_suffixes),
+    )
     if issues:
         # Save a debug bundle even on refusal so the operator can see
         # what slipped through and extend the redactor.
@@ -242,7 +284,6 @@ def _grade_with_oracle(
         )
 
     # ----- Build the user message + ask the oracle (via LiteLLM) -----
-    alert_id_label = mapping.forward.get(alert_id, alert_id)
     user_message = build_user_message(
         alert_id_label=alert_id_label,
         sanitized_events=sanitized_events,
@@ -344,16 +385,27 @@ def _sanitize_event_payload(
     sequence: int,
     payload: dict[str, Any],
     mapping: san.Mapping,
+    *,
+    extra_hosts: tuple[str, ...] = (),
+    extra_suffixes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Return a sanitized copy of one SSE event payload."""
     return {
         "kind": kind,
         "sequence": sequence,
-        "payload": _sanitize_dict(payload, mapping),
+        "payload": _sanitize_dict(
+            payload, mapping, extra_hosts=extra_hosts, extra_suffixes=extra_suffixes
+        ),
     }
 
 
-def _sanitize_dict(value: Any, mapping: san.Mapping) -> Any:
+def _sanitize_dict(
+    value: Any,
+    mapping: san.Mapping,
+    *,
+    extra_hosts: tuple[str, ...] = (),
+    extra_suffixes: tuple[str, ...] = (),
+) -> Any:
     """Walk a dict/list/scalar tree, sanitize every string in place.
 
     Non-string scalars (int, bool, None) pass through unchanged.
@@ -362,19 +414,33 @@ def _sanitize_dict(value: Any, mapping: san.Mapping) -> Any:
     synth-first redesign's `enrichments: dict[str, IndicatorEnrichment]`
     keys IPs/domains by raw indicator string, which would otherwise
     leak through.
+
+    ``extra_hosts`` / ``extra_suffixes`` (the operator's ORACLE_EXTRA_HOSTS /
+    ORACLE_INTERNAL_SUFFIXES) are threaded into every sanitize() call so
+    deployment-specific bare hostnames and custom internal suffixes are
+    redacted here too, not just by the defaults.
     """
     if isinstance(value, str):
-        sanitized, _ = san.sanitize(value, mapping=mapping)
+        sanitized, _ = san.sanitize(
+            value, mapping=mapping, extra_hosts=extra_hosts, extra_suffixes=extra_suffixes
+        )
         return sanitized
     if isinstance(value, dict):
         return {
-            (san.sanitize(k, mapping=mapping)[0] if isinstance(k, str) else k): _sanitize_dict(
-                v, mapping
-            )
+            (
+                san.sanitize(
+                    k, mapping=mapping, extra_hosts=extra_hosts, extra_suffixes=extra_suffixes
+                )[0]
+                if isinstance(k, str)
+                else k
+            ): _sanitize_dict(v, mapping, extra_hosts=extra_hosts, extra_suffixes=extra_suffixes)
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [_sanitize_dict(v, mapping) for v in value]
+        return [
+            _sanitize_dict(v, mapping, extra_hosts=extra_hosts, extra_suffixes=extra_suffixes)
+            for v in value
+        ]
     return value
 
 
@@ -405,13 +471,20 @@ def _save_bundle(
 
     Layout:
         bundle_dir/
-            response.md       the oracle's de-sanitized critique
-            request.json      what was sent (sanitized)
-            events.jsonl      one event per line (sanitized)
-            mapping.json      {label: original}
-            meta.json         alert_id, ts, model, tokens, status, elapsed
+            response.md            the oracle's de-sanitized critique
+            response.sanitized.md  the oracle's RAW critique (labels intact)
+            request.json           what was sent (sanitized)
+            events.jsonl           one event per line (sanitized)
+            mapping.json           {label: original}
+            meta.json              alert_id, ts, model, tokens, status, elapsed
+
+    ``response.md`` is de-sanitized for the operator to read; ``response.sanitized.md``
+    keeps the label-only text the oracle actually returned. The meta-analysis
+    re-sends critique sections to the cloud, so it MUST read the sanitized copy
+    (never the rehydrated one) to avoid shipping real internal identifiers twice.
     """
     (bundle_dir / "response.md").write_text(response_md, encoding="utf-8")
+    (bundle_dir / "response.sanitized.md").write_text(response.text, encoding="utf-8")
     (bundle_dir / "events.jsonl").write_text(
         "\n".join(json.dumps(e, default=str) for e in events) + "\n",
         encoding="utf-8",

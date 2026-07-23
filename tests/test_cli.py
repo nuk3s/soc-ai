@@ -286,6 +286,55 @@ def test_verify_defaults_to_false_without_flags(monkeypatch: pytest.MonkeyPatch)
     assert async_kwargs["verify"] is False
 
 
+def test_triage_warns_on_stderr_when_token_sent_without_tls_verify(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Bearer token sent over an unverified TLS connection (the default) must
+    print a loud stderr warning (F35) — silent token-over-untrusted-cert lets an
+    on-path attacker harvest a fully-privileged API credential unnoticed.
+    """
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    _patch_async_client(monkeypatch)
+    rc = cli._triage(_triage_args(token="scai_flagtoken"))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "verify" in err.lower()
+
+
+def test_healthz_warns_on_stderr_when_token_sent_without_tls_verify(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    _patch_sync_client(monkeypatch)
+    rc = cli._healthz(_healthz_args(token="scai_flagtoken"))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+
+
+def test_no_insecure_auth_warning_when_verify_enabled(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    _patch_sync_client(monkeypatch)
+    rc = cli._healthz(_healthz_args(token="scai_flagtoken", verify=True))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" not in err
+
+
+def test_no_insecure_auth_warning_when_no_token(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SOC_AI_API_TOKEN", raising=False)
+    _patch_sync_client(monkeypatch)
+    rc = cli._healthz(_healthz_args())
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" not in err
+
+
 def test_triage_and_healthz_parsers_accept_auth_flags() -> None:
     """The flags are actually registered on both subparsers (wiring check)."""
     # Reuse main()'s parser construction indirectly: build via _add_api_client_args

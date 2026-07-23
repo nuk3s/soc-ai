@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.oql import (
+    _HARD_MAX_RESULTS,
     And,
     BareValue,
     Count,
@@ -360,6 +361,20 @@ def test_validate_duplicate_groupby_rejected() -> None:
         validate_oql(ast)
 
 
+def test_validate_groupby_over_max_fields_rejected() -> None:
+    """F46: unbounded groupby field count lets a query force deeply-nested
+    per-shard terms aggregations — cap the pivot depth."""
+    fields = ",".join(["host.name"] * 30)
+    ast = parse_oql(f"* | groupby {fields} | head 10000")
+    with pytest.raises(OqlValidationError, match="groupby supports at most"):
+        validate_oql(ast, max_results=10000)
+
+
+def test_validate_groupby_at_max_fields_allowed() -> None:
+    ast = parse_oql("* | groupby host.name, source.ip, destination.ip, event.module")
+    validate_oql(ast)
+
+
 def test_validate_duplicate_sortby_rejected() -> None:
     ast = parse_oql("* | sortby @timestamp | sortby host.name")
     with pytest.raises(OqlValidationError, match="sortby may not be repeated"):
@@ -484,6 +499,17 @@ def test_full_translate_head_with_groupby_limits_buckets() -> None:
     assert agg_root["terms"]["size"] == 5
 
 
+def test_full_translate_head_with_nested_groupby_limits_all_levels() -> None:
+    """F46: `head` must cap EVERY nested terms agg, not just the outermost —
+    otherwise inner levels stay at the hardcoded default (25) regardless of
+    what the caller asked for."""
+    body = ast_to_es_dsl(parse_oql("* | groupby host.name, source.ip | head 5"))
+    outer = next(iter(body["aggs"].values()))
+    assert outer["terms"]["size"] == 5
+    inner = next(iter(outer["aggs"].values()))
+    assert inner["terms"]["size"] == 5
+
+
 def test_full_translate_sortby_without_groupby_uses_sort() -> None:
     body = ast_to_es_dsl(parse_oql("* | sortby @timestamp desc"))
     assert body["sort"] == [{"@timestamp": {"order": "desc"}}]
@@ -495,6 +521,12 @@ def test_full_translate_head_without_groupby_uses_size() -> None:
 
 
 def test_full_translate_count_emits_track_total_hits() -> None:
+    """F72: `count` must NOT set `track_total_hits: True` — that forces ES to
+    compute an exact total across every matching doc/shard with no cost
+    ceiling. A bounded integer (the same hard cap `head` uses) still returns
+    an exact count up to that many docs and a `gte` lower-bound beyond it,
+    which EsSearchResult already renders as `total_is_lower_bound`."""
     body = ast_to_es_dsl(parse_oql("event.kind:alert | count"))
     assert body["size"] == 0
-    assert body["track_total_hits"] is True
+    assert body["track_total_hits"] == _HARD_MAX_RESULTS
+    assert body["track_total_hits"] is not True

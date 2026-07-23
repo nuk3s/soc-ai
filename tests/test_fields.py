@@ -163,6 +163,20 @@ async def test_resolve_agg_field_caches_result() -> None:
     assert es.probed == ["client.bytes"]  # unchanged
 
 
+async def test_resolve_agg_field_cache_expires_after_ttl() -> None:
+    """F71: an unbounded cache silently goes stale forever if the deployment's
+    schema migrates mid-process (e.g. an Elastic-Agent upgrade moving data onto
+    a different field). A TTL of 0 means "already expired" -> the second call
+    must re-probe rather than serve the stale cached name."""
+    es = FakeES({"client.bytes": 42})
+    first = await resolve_agg_field(es, "logs-*", CONN_ORIG_BYTES, ttl_seconds=0)
+    assert first == "client.bytes"
+    assert es.probed == ["client.bytes"]
+    second = await resolve_agg_field(es, "logs-*", CONN_ORIG_BYTES, ttl_seconds=0)
+    assert second == "client.bytes"
+    assert es.probed == ["client.bytes", "client.bytes"]  # re-probed, not cached
+
+
 async def test_resolve_agg_field_cache_keyed_on_index() -> None:
     es = FakeES({"client.bytes": 7})
     await resolve_agg_field(es, "logs-a", CONN_ORIG_BYTES)

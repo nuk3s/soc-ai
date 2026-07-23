@@ -25,6 +25,21 @@ from soc_ai.demo.guard import assert_egress_allowed
 # are captured, not just those starting with a hextet.
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9:][A-Za-z0-9_.:-]*")
 
+# Common IOC "defanging" notation analysts (and LLMs) use so identifiers aren't
+# clickable: a bracket/paren/brace-wrapped dot or "dot" word (``10[.]9[.]8[.]8``,
+# ``a(dot)b``, ``dc01{.}corp{.}local``) and the ``hxxp`` scheme. The token regex
+# stops at the first ``[``/``(``, so a defanged internal IP/hostname would
+# otherwise tokenize into harmless fragments and slip past the leak guard — we
+# RE-fang the text first so the real identifier is scanned.
+_DEFANG_DOT_RE = re.compile(r"[\[({]\s*(?:\.|dot)\s*[\])}]", re.IGNORECASE)
+_DEFANG_HXXP_RE = re.compile(r"hxxp(s?)", re.IGNORECASE)
+
+
+def _refang(text: str) -> str:
+    """Undo common IOC defanging so leak detection sees the real identifier."""
+    text = _DEFANG_DOT_RE.sub(".", text)
+    return _DEFANG_HXXP_RE.sub(r"http\1", text)
+
 
 def online_unavailable(
     settings: Settings, *, requires_key: str | None = None
@@ -104,7 +119,7 @@ def first_internal_identifier(text: str, settings: Any) -> str | None:
     """
     suffixes = tuple(s.lower() for s in (getattr(settings, "oracle_internal_suffixes", ()) or ()))
     extra_hosts = {str(h).lower() for h in (getattr(settings, "oracle_extra_hosts", ()) or ())}
-    for raw in _IDENTIFIER_TOKEN_RE.findall(text or ""):
+    for raw in _IDENTIFIER_TOKEN_RE.findall(_refang(text or "")):
         # Strip only dot/hyphen punctuation from the ends — NOT colons, which are
         # part of an IPv6 literal (``::1``) or an IPv4 ``host:port``.
         tok = str(raw).strip(".-")

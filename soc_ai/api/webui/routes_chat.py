@@ -64,6 +64,12 @@ async def post_chat(request: Request, inv_id: str, body: ChatIn) -> ChatThreadOu
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
         if inv.status == "running":
             raise HTTPException(status_code=409, detail={"reason": "still_running"})
+        existing = await chat_svc.list_messages(db, inv_id)
+        if any(m.status == "pending" for m in existing):
+            # A prior turn's assistant is still working — one in-flight turn at a
+            # time, or a second POST orphans a duplicate pending row and spawns a
+            # duplicate agent run (mirrors the hunt-chat guard in routes_hunts.py).
+            raise HTTPException(status_code=409, detail={"reason": "chat_busy"})
         await chat_svc.add_user_message(db, inv_id, text)
         pending = await chat_svc.create_pending_assistant(db, inv_id)
         msgs = await chat_svc.list_messages(db, inv_id)

@@ -22,6 +22,9 @@ WHAT IS REDACTED
   .corp``) or bare hostnames provided via ``extra_hosts``.
 - Internal-domain emails — ``local@internal-suffix-domain``.
 - ``/home/<user>/`` paths — only the ``<user>`` component.
+- Windows user-profile paths (``C:\\Users\\<user>\\``,
+  ``\\Documents and Settings\\<user>\\``) — only the ``<user>`` component.
+- UNC share paths (``\\<host>\\<share>``) — only the ``<host>`` component.
 - MAC addresses (always — they identify physical hardware).
 
 WHAT PASSES THROUGH (load-bearing — do NOT touch)
@@ -74,6 +77,35 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]{1,64}@([\w.-]{1,255}\.[A-Za-z]{2,63})\b")
 
 # /home/<user>/ — redact username only, preserve path tail.
 _HOMEPATH_RE = re.compile(r"(/home/)([A-Za-z_][A-Za-z0-9_-]{0,31})(/|\b)")
+
+# Windows user-profile paths — redact the <user> component only (the Windows
+# analogue of _HOMEPATH_RE).  Covers modern ``C:\Users\<user>\`` and legacy
+# ``\Documents and Settings\<user>\``.  The username runs up to the next path
+# separator (Windows account names may contain spaces).
+_WINPROFILE_RE = re.compile(
+    r"([A-Za-z]:\\Users\\|\\Documents and Settings\\)"
+    r"([^\\/:*?\"<>|\r\n]+)",
+    re.IGNORECASE,
+)
+
+# UNC network share paths (``\\<host>\<share>\…``) — redact the <host> only.
+# Structural: two backslashes at a boundary, a host label, then the share
+# separator.  Independent of the credential ``DOMAIN\user`` rule (redact.py,
+# which deliberately rejects a preceding backslash), so an SMB file-server name
+# that appears only in free text still cannot egress.
+_UNC_HOST_RE = re.compile(r"(?<![\w\\])\\\\([A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?)(?=\\)")
+
+# Opaque-label shape (USER_01, HOST_02, …) — used to avoid re-tokenising an
+# already-redacted value on a second pass over the Windows-path rules.
+_LABEL_FULLMATCH_RE = re.compile(r"(?:USER|HOST|IP|MAC|EMAIL)_\d+")
+
+# Well-known Windows profile folders / universal built-in accounts that are NOT
+# user-identifying — never redact these (mirrors the credential rule's built-in
+# stopset; the Oracle benefits from seeing e.g. the common ``C:\Users\Public``
+# malware drop path verbatim).
+_WINPROFILE_STOPSET: frozenset[str] = frozenset(
+    {"public", "default", "default user", "all users", "administrator", "guest"}
+)
 
 # CGNAT range — Python's IPv4Address.is_private omits this on 3.12.
 _CGNAT_NETWORK = ipaddress.IPv4Network("100.64.0.0/10")
@@ -246,6 +278,24 @@ def _sanitize_str(
 
     text = _HOMEPATH_RE.sub(_home, text)
 
+    # 7. Windows user-profile paths — username component only (mirror of /home).
+    def _winprofile(m: re.Match[str]) -> str:
+        head, user = m.group(1), m.group(2)
+        if _LABEL_FULLMATCH_RE.fullmatch(user) or user.lower() in _WINPROFILE_STOPSET:
+            return m.group(0)
+        return f"{head}{mapping.label_for(user, 'USER')}"
+
+    text = _WINPROFILE_RE.sub(_winprofile, text)
+
+    # 8. UNC share host — \\<host>\<share>; host component only.
+    def _unc(m: re.Match[str]) -> str:
+        host = m.group(1)
+        if _LABEL_FULLMATCH_RE.fullmatch(host):
+            return m.group(0)
+        return f"\\\\{mapping.label_for(host, 'HOST')}"
+
+    text = _UNC_HOST_RE.sub(_unc, text)
+
     # --- Restore allowlisted tokens (replace placeholder with original) --
     for original, ph in orig_to_ph.items():
         text = text.replace(ph, original)
@@ -362,9 +412,15 @@ def desanitize(obj: Any, mapping: Mapping) -> Any:
         return obj
 
     # Build a single pattern that matches all known labels (longest first to
-    # avoid partial matches when one label is a prefix of another).
+    # avoid partial matches when one label is a prefix of another).  Word-boundary
+    # guards (mirroring redact._build_learned_re) stop a label-shaped SUBSTRING
+    # inside a longer token (e.g. ``IP_01`` within ``SHIP_0142``) from being
+    # spliced into a real identifier — every label has the fixed ``CATEGORY_\d+``
+    # shape, so the guards cannot break a legitimate whole-token match.
     pattern = re.compile(
-        "|".join(re.escape(k) for k in sorted(mapping.reverse, key=len, reverse=True))
+        r"(?<!\w)(?:"
+        + "|".join(re.escape(k) for k in sorted(mapping.reverse, key=len, reverse=True))
+        + r")(?!\w)"
     )
 
     def _subst(text: str) -> str:
@@ -532,6 +588,16 @@ def unsafe_residue(
     # it never fires on a value the redacter already tokenised to a label.
     issues.extend(_residue_credentials(text, allow))
 
+    # --- 10. Windows user-profile paths (independent net) -------------------
+    # A profile username (``C:\Users\<user>\``) that survived the redacter's
+    # Windows-path pass.  Anchored on the literal ``Users`` segment (zero FP).
+    issues.extend(_residue_winprofile(text, allow))
+
+    # --- 11. UNC share hosts (independent net) ------------------------------
+    # An SMB file-server host (``\\<host>\<share>``) that survived.  Four-
+    # backslash UNC prefix in JSON output → never trips on hex-escape shellcode.
+    issues.extend(_residue_unc_hosts(text, allow))
+
     return issues
 
 
@@ -694,6 +760,66 @@ def _residue_credentials(text: str, allow: set[str]) -> list[str]:
             if not any(c.isalpha() for c in val):
                 continue
             issues.append(f"residual credential username: {val}")
+    return issues
+
+
+# Independent (do-not-share-with-redact) Windows-native path nets.  Re-declared
+# from scratch so a bug in the redacter cannot blind the safety net.  These run
+# on ``json.dumps`` output where every backslash is doubled: a real UNC ``\\``
+# (two raw backslashes) becomes four, while a single-backslash hex escape
+# (``\x90``) becomes only two — so ``\\{4}`` on the UNC prefix never trips on
+# shellcode, while ``\\{1,2}`` on the profile separators tolerates both the raw
+# dict value and the JSON-escaped form.
+_RESIDUE_WINPROFILE_RE = re.compile(
+    r"(?:[A-Za-z]:\\{1,2}Users|\\{1,2}Documents and Settings)\\{1,2}"
+    r"([^\\/:*?\"<>|\r\n]+)",
+    re.IGNORECASE,
+)
+_RESIDUE_UNC_HOST_RE = re.compile(r"\\{4}([A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?)\\{2}")
+
+
+def _residue_winprofile(text: str, allow: set[str]) -> list[str]:
+    """Flag Windows user-profile paths whose ``<user>`` component survived.
+
+    Anchored on the literal ``Users`` / ``Documents and Settings`` segment, so
+    it never fires on arbitrary text.  Opaque labels and allowlisted tokens are
+    never flagged.
+    """
+    issues: list[str] = []
+    seen: set[str] = set()
+    for mat in _RESIDUE_WINPROFILE_RE.finditer(text):
+        user = mat.group(1)
+        key = user.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _OPAQUE_LABEL_RE.fullmatch(user) or key in _WINPROFILE_STOPSET:
+            continue
+        if user in allow or key in allow:
+            continue
+        issues.append(f"residual Windows profile user: {user}")
+    return issues
+
+
+def _residue_unc_hosts(text: str, allow: set[str]) -> list[str]:
+    """Flag UNC share hosts (``\\\\<host>\\<share>``) that survived.
+
+    Structural and conservative (four-backslash UNC prefix in JSON output).
+    Opaque labels and allowlisted tokens are never flagged.
+    """
+    issues: list[str] = []
+    seen: set[str] = set()
+    for mat in _RESIDUE_UNC_HOST_RE.finditer(text):
+        host = mat.group(1)
+        key = host.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _OPAQUE_LABEL_RE.fullmatch(host):
+            continue
+        if host in allow or key in allow:
+            continue
+        issues.append(f"residual UNC host: {host}")
     return issues
 
 

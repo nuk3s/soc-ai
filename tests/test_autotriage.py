@@ -171,8 +171,16 @@ def at_settings(settings_kratos: Settings) -> Settings:
     # Single-source (Suricata) feed: these tests exercise auto-triage's severity
     # + planning logic against one fetch_groups aggregation. The multi-source
     # merge is covered in test_webui_alerts_query.
+    # auto_ack_fp_enabled ships OFF (unattended SO writes are opt-in). These
+    # auto-triage tests exercise the inherited-FP auto-ack path, so opt in
+    # explicitly; the gate-off case is covered by
+    # test_inherited_ack_gated_by_toggle_and_confidence, which overrides it back.
     return settings_kratos.model_copy(
-        update={"bootstrap_admin_password": SecretStr(ADMIN_PW), "webui_extra_detections": False}
+        update={
+            "bootstrap_admin_password": SecretStr(ADMIN_PW),
+            "webui_extra_detections": False,
+            "auto_ack_fp_enabled": True,
+        }
     )
 
 
@@ -1124,6 +1132,35 @@ class TestMaybeAutoAckFp:
         assert result.payload["es_id"] == "ev-abc"
         assert result.payload["success"] is True
 
+    def test_auto_ack_off_by_default_no_unattended_write(self) -> None:
+        """SHIPPED DEFAULT must not write to SO unattended (regression for F17).
+
+        With no ``auto_ack_fp_enabled`` override, the setting is False, so a
+        confident false-positive verdict — even one grounded only in a
+        prefetched pivot — never reaches ``execute_write_tool``. The unattended
+        ack requires an explicit operator opt-in.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        ctx = self._make_ctx({})  # no override → shipped default
+        assert ctx.settings.auto_ack_fp_enabled is False
+        report = self._make_report(verdict="false_positive", confidence=0.99)
+        _ev, _audit, _ = self._make_emit_audit()
+
+        alert = self._make_alert()
+        mock_write = AsyncMock(return_value=(None, None))
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+            result = asyncio.run(
+                maybe_auto_ack_fp(
+                    report, "ev-default", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                )
+            )
+
+        mock_write.assert_not_awaited()
+        assert result is None
+
     def test_auto_ack_disabled_when_opted_out(self) -> None:
         """No ack write when auto_ack_fp_enabled=False (operator opt-out)."""
         from unittest.mock import AsyncMock, patch
@@ -1233,6 +1270,52 @@ class TestMaybeAutoAckFp:
         assert result is not None
         assert result.kind == "auto_ack_skipped"
         assert result.payload["reason"] == "high_stakes"
+
+    def test_auto_ack_suppressed_for_attack_classtype_fp(self) -> None:
+        """A confident FP on an attack-class alert (denial-of-service /
+        exploit-kit) is NOT auto-acked, even when the rule name carries no
+        malware token and SO's own severity is low.
+
+        These classtypes are in decision_templates._ATTACK_CLASSTYPES (they
+        escalate to the Oracle) but classify_alert()'s _CLASSTYPE_MAP has no
+        entry for them and their rule names don't hit _alert_signals_malware —
+        so the high-stakes guard must consult the same attack-classtype set the
+        escalation guard does, or these would auto-ack unsupervised.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        cases = [
+            ("denial-of-service", "ET DOS Excessive ICMP", "ev-dos"),
+            ("exploit-kit", "ET CURRENT_EVENTS Possible RIG EK Landing", "ev-ek"),
+        ]
+        for classtype, rule_name, es_id in cases:
+            ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+            report = self._make_report(verdict="false_positive", confidence=0.95)
+            # Attack classtype, but a generically-named rule (no malware token)
+            # and low SO severity — only the attack-classtype signal blocks it.
+            alert = self._make_alert(
+                classtype=classtype,
+                severity_label="low",
+                severity_score=1,
+                rule_name=rule_name,
+                signature_severity=None,
+            )
+            _ev, _audit, _ = self._make_emit_audit()
+
+            mock_write = AsyncMock(return_value=({"ok": True}, None))
+            with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+                result = asyncio.run(
+                    maybe_auto_ack_fp(
+                        report, es_id, alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    )
+                )
+
+            mock_write.assert_not_awaited(), f"should not ack for classtype={classtype!r}"
+            assert result is not None, f"classtype={classtype!r}"
+            assert result.kind == "auto_ack_skipped", f"classtype={classtype!r}"
+            assert result.payload["reason"] == "high_stakes", f"classtype={classtype!r}"
 
     def test_auto_ack_fires_for_low_severity_benign_class_fp(self) -> None:
         """The benign low-severity info-class FP still auto-acks (cap doesn't over-block)."""

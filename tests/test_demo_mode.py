@@ -351,20 +351,39 @@ def test_demo_investigate_replays_fixture(monkeypatch, tmp_path):
 def test_demo_investigate_unknown_alert_mirrors_live_error(monkeypatch, tmp_path):
     """No recording for the alert → the stream mirrors the live pipeline's
     unknown-alert reporting: 200 SSE, session_start, then a prefetch-phase
-    error event (same payload keys as orchestrator._error_payload), and the
-    row lands status='error' — NOT a crash, NOT a new error shape."""
+    error event (same payload keys as orchestrator._error_payload) — NOT a
+    crash, NOT a new error shape. Unlike a live unknown-alert run, NO row is
+    created (F37): an unrecorded alert_id has nothing to persist, and an
+    unauthenticated demo visitor must not be able to flood the DB with one
+    permanent row per bogus alert_id."""
     with _replay_app(monkeypatch, tmp_path) as client:
+        before = client.get("/api/v1/investigations").json()
         with client.stream("POST", "/investigate", json={"alert_id": "no-such-alert"}) as resp:
             assert resp.status_code == 200
             body = "".join(resp.iter_text())
 
         kinds = _sse_event_kinds(body)
-        assert kinds[0] == "investigation_created"
+        assert "investigation_created" not in kinds
+        assert kinds[0] == "session_start"
         assert "error" in kinds
         assert '"phase": "prefetch"' in body
 
-        row = _poll_investigation(client, _sse_inv_id(body))
-        assert row["status"] == "error"
+        after = client.get("/api/v1/investigations").json()
+        assert after == before
+
+
+def test_demo_investigate_unknown_alert_flood_creates_no_rows(monkeypatch, tmp_path):
+    """F37: looping POST /investigate with garbage alert_id values (the demo's
+    own allow-listed, unauthenticated write path) must not grow the
+    investigations table at all — each unrecorded alert_id streams its error
+    and lands nothing."""
+    with _replay_app(monkeypatch, tmp_path) as client:
+        for i in range(10):
+            with client.stream("POST", "/investigate", json={"alert_id": f"garbage-{i}"}) as resp:
+                assert resp.status_code == 200
+                "".join(resp.iter_text())
+
+        assert client.get("/api/v1/investigations").json() == []
 
 
 def test_demo_hunt_replays_fixture_in_background(monkeypatch, tmp_path):

@@ -139,6 +139,30 @@ def test_unsafe_residue_skips_label_placeholders() -> None:
     assert san.unsafe_residue(text) == []
 
 
+def test_unsafe_residue_flags_bare_extra_host() -> None:
+    """F10: the residue gate must accept ``extra_hosts`` (the operator's
+    ORACLE_EXTRA_HOSTS) so a bare internal hostname that survived sanitize is
+    caught before egress — mirroring the sanitize() side, which already takes
+    it. Without the host listed the token is shape-indistinguishable from public
+    infra and is (correctly) NOT flagged."""
+    payload = "beacon observed from spark1 to 8.8.8.8"
+    # Listed as an internal host → flagged.
+    issues = san.unsafe_residue(payload, extra_hosts=["spark1"])
+    assert any("spark1" in i for i in issues)
+    # Not listed → not flagged (bare name looks like public infra).
+    assert san.unsafe_residue(payload) == []
+
+
+def test_sanitize_and_unsafe_residue_extra_hosts_agree() -> None:
+    """F10 invariant: threading the SAME extra_hosts into sanitize() and
+    unsafe_residue() means the sanitized output has no residual internal host."""
+    hosts = ["dc01", "gateway"]
+    out, _ = san.sanitize("traffic dc01 -> gateway", extra_hosts=hosts)
+    assert "dc01" not in out
+    assert "gateway" not in out
+    assert san.unsafe_residue(out, extra_hosts=hosts) == []
+
+
 def test_redos_adversarial_inputs_complete_fast() -> None:
     """Bounded quantifiers: a 40k-char adversarial run with no valid match must
     not cause catastrophic backtracking. Both the email rule and the internal-

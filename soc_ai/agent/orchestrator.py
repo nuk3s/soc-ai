@@ -75,6 +75,7 @@ from soc_ai.agent.egress_guard import EgressGuard, EgressResidueError
 # Backward-compat re-exports — evidence helpers now live in soc_ai.agent.evidence;
 # tests and callers reach these via orchestrator.
 from soc_ai.agent.evidence import (  # noqa: F401
+    _NON_EVIDENCE_RESULT_KEYS,
     _beacon_profile_bullet,
     _bundle_dump_text,
     _classify_citation,
@@ -84,6 +85,7 @@ from soc_ai.agent.evidence import (  # noqa: F401
     _num,
     _path_exists_in_alert,
     _pivot_decisive_evidence,
+    _targeted_result_has_data,
     _tool_was_invoked,
     count_successful_tool_calls,
 )
@@ -96,7 +98,6 @@ from soc_ai.agent.gates import (  # noqa: F401
     _ESCALATION_CONF_FLOOR,
     _FUZZY_TOKEN_RE,
     _GROUNDED_EVIDENCE_TOKENS,
-    _NON_EVIDENCE_RESULT_KEYS,
     _PIVOT_ATTRS,
     _PIVOT_DECISIVE_ATTRS,
     _apply_targeted_downgrades,
@@ -110,7 +111,6 @@ from soc_ai.agent.gates import (  # noqa: F401
     _pivot_evidence_tokens,
     _resolve_citations,
     _synth_first_post_validate,
-    _targeted_result_has_data,
     _validate_citations,
     _verdict_cites_decisive_pivot_value,
     _verdict_grounded_in_pivot,
@@ -592,9 +592,18 @@ def _is_high_stakes_alert(alert: SoAlert) -> bool:
     Any one of these makes the alert high-stakes. The verdict still stands —
     we just refuse to *auto-write* an ack on it.
     """
-    from soc_ai.agent.decision_templates import _alert_signals_malware  # noqa: PLC0415 — circular
+    from soc_ai.agent.decision_templates import (  # noqa: PLC0415 — circular
+        _ATTACK_CLASSTYPES,
+        _alert_signals_malware,
+    )
 
     if classify_alert(alert) in (AlertClass.EXPLOIT_ATTEMPT, AlertClass.POST_COMPROMISE):
+        return True
+    # Attack-class Suricata classtypes (denial-of-service / exploit-kit / …) that
+    # the Oracle-escalation guard treats as attack-signalling but classify_alert's
+    # _CLASSTYPE_MAP doesn't map — mirror _rule_signals_attack so the auto-ack cap
+    # and the escalation guard never disagree on what's an attack.
+    if (alert.classtype or "").lower() in _ATTACK_CLASSTYPES:
         return True
     if _alert_signals_malware(alert):
         return True
@@ -995,7 +1004,14 @@ def _synth_reasoning_payload(run_result: Any) -> dict[str, Any] | None:
         for msg in messages or []:
             for part in getattr(msg, "parts", []) or []:
                 ptype = type(part).__name__
-                if ptype == "ThinkingPart":
+                if ptype == "RetryPromptPart":
+                    # pydantic-ai rejected the PRECEDING attempt (a
+                    # schema-validation retry). Everything accumulated so far
+                    # belongs to a superseded attempt — drop it so the panel
+                    # reflects only the attempt that produced the accepted report.
+                    traces.clear()
+                    texts.clear()
+                elif ptype == "ThinkingPart":
                     content = getattr(part, "content", "") or ""
                     if content.strip():
                         traces.append(content.strip())
@@ -2372,12 +2388,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # event above, but it and the gap text must be re-labeled
                 # before this composed message crosses the egress boundary.
                 user_msg_round2 = guard.sanitize_text(user_msg_round2)
+            r2_captured: list[Any] = []
             try:
                 # Fail-closed residue sweep on the FINAL composed round-2 message
                 # before the model call — raises BEFORE egress on residue.
                 user_msg_round2 = _guard_egress(guard, user_msg_round2, ctx.settings)
-                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                    synth_result_round2 = await synth_agent.run(user_msg_round2)
+                with capture_run_messages() as r2_captured:
+                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                        synth_result_round2 = await synth_agent.run(user_msg_round2)
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
             except EgressResidueError as e:
@@ -2394,14 +2412,23 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 break
             except BaseException as e:
                 # Emit a recorded error, then fall back to the round-1 verdict (or a
-                # scoreable NMI) so the row is never a silent status=error.
+                # scoreable NMI) so the row is never a silent status=error. Lift the
+                # per-attempt schema-validation causes off the captured run so a
+                # round-2 retry-exhaustion isn't the hint=null blind spot the
+                # retry_causes feature closed for round-1/loop-synth.
+                r2_causes = _retry_causes_from_messages(r2_captured)
                 err_ev = _ev(
                     "error",
-                    _error_payload(e, phase="synth_first_round2", round_num=dispatch_round + 1),
+                    _error_payload(
+                        e,
+                        phase="synth_first_round2",
+                        round_num=dispatch_round + 1,
+                        retry_causes=r2_causes,
+                    ),
                 )
                 await _audit(err_ev)
                 yield err_ev
-                triage_final = _round2_failure_fallback(alert_id, triage_round1, e)
+                triage_final = _round2_failure_fallback(alert_id, triage_round1, e, r2_causes)
                 final_synth_rerun = None  # fallback verdict — never vote on it
                 await metrics.get_metrics().record_event("fallback_verdict", {})
                 phase_d_synth_ok = False

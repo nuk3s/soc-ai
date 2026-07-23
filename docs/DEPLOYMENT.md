@@ -287,7 +287,7 @@ automatically.
 ```bash
 # Health check from any host that can reach the soc-ai VM:
 curl -k https://<soc-ai-host>:8443/healthz
-# → {"status":"ok","version":"1.2.1","so_auth":"kratos",...}
+# → {"status":"ok","version":"1.2.2","so_auth":"kratos",...}
 
 # Or use the CLI:
 uv run soc-ai healthz --url https://<soc-ai-host>:8443

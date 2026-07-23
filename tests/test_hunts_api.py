@@ -714,6 +714,121 @@ def test_start_hunt_chat_rejects_empty_objective(client: TestClient) -> None:
     assert resp.status_code == 422  # min_length=1 validation
 
 
+def test_hunt_console_manager_caps_concurrent_hunts() -> None:
+    """HuntConsoleManager.start() returns None once its shared concurrency ceiling
+    is reached, so a rapid-fire burst of POST /hunts/chat (or a large bulk re-hunt
+    / schedule storm) can't put unbounded simultaneous hunts on the single model
+    route — the documented 7-concurrent-hunts incident. Slots free up as hunts
+    finish, and every start()-driven path (ad-hoc, bulk, scheduled) shares it."""
+    from unittest.mock import MagicMock
+
+    from soc_ai.webui import hunt_console_manager as hcm
+
+    async def _go() -> None:
+        # An asyncio.Event held OPEN keeps each background drain task in flight so
+        # the manager's in-flight count stays at the ceiling for the test.
+        block = asyncio.Event()
+        counter = {"n": 0}
+
+        def _fake_run(_state: Any, **_kw: Any) -> Any:
+            counter["n"] += 1
+            hid = f"h{counter['n']}"
+
+            async def _gen() -> Any:
+                yield "hunt_created", {"hunt_id": hid}
+                await block.wait()  # hold the drain open until released
+
+            return _gen()
+
+        mgr = hcm.HuntConsoleManager()
+        with (
+            patch.object(hcm, "hunt_recorded_run", _fake_run),
+            patch.object(hcm, "ctx_from_state", lambda _s: MagicMock()),
+        ):
+            n_attempts = 12  # more than any sane ceiling
+            results = [
+                await mgr.start(MagicMock(), objective="o", started_by="t")
+                for _ in range(n_attempts)
+            ]
+            started = [r for r in results if r is not None]
+            # An unguarded manager starts ALL of them; the guard must bound it.
+            assert 0 < len(started) < n_attempts
+            # ...and the bound is exactly the shared ceiling.
+            assert len(started) == hcm._MAX_CONCURRENT_HUNTS
+            # Rejections come AFTER the ceiling (deferral, not a random scramble).
+            assert results[: len(started)] == started
+            assert all(r is None for r in results[len(started) :])
+
+            # Release the in-flight hunts; their tasks finish and free their slots.
+            block.set()
+            await asyncio.gather(*list(mgr._tasks.values()))
+            for _ in range(5):
+                await asyncio.sleep(0)  # flush done-callbacks (slot cleanup)
+            assert not mgr._tasks
+            # A slot is available again → a fresh start succeeds.
+            assert await mgr.start(MagicMock(), objective="o", started_by="t") is not None
+            await asyncio.gather(*list(mgr._tasks.values()))
+
+    asyncio.run(_go())
+
+
+def test_run_hunt_chat_turn_error_content_is_scrubbed_before_persisting() -> None:
+    """F75: identical to the investigation-chat catch-all (chat_manager.py) —
+    the raised exception's message is stringified straight into the persisted
+    error content. A verbose provider/gateway error body echoing a credential
+    must be scrubbed, not stored/rendered verbatim."""
+    from unittest.mock import MagicMock
+
+    from soc_ai.webui import hunt_console_manager as hcm
+
+    hunt = MagicMock()
+    hunt.id = "hunt-secret"
+    hunt.objective = "hunt for beaconing"
+    hunt.narrative = "nothing yet"
+    hunt.report = {}
+
+    finish_mock = AsyncMock()
+
+    db = AsyncMock()
+    db_cm = MagicMock()
+    db_cm.__aenter__ = AsyncMock(return_value=db)
+    db_cm.__aexit__ = AsyncMock(return_value=False)
+
+    settings = MagicMock()
+    settings.soc_ai_demo = False
+    settings.analyst_cloud_redaction = False
+    settings.hunt_chat_turn_timeout_s = 180
+
+    state = MagicMock()
+    state.settings = settings
+    state.db_sessionmaker = MagicMock(return_value=db_cm)
+
+    _get_with_events = AsyncMock(return_value=(hunt, []))
+    _history = AsyncMock(return_value=[("user", "which host?")])
+
+    secret_token = "sk-live-abc123SECRET"  # pragma: allowlist secret
+
+    with (
+        patch.object(hcm.hunt_svc, "get_with_events", _get_with_events),
+        patch.object(hcm.hunt_svc, "chat_history_for_agent", _history),
+        patch.object(hcm.hunt_svc, "finish_chat_assistant", finish_mock),
+        patch.object(hcm, "build_chat_agent") as mock_build,
+        patch.object(hcm, "build_investigator_model", MagicMock()),
+    ):
+        agent_mock = MagicMock()
+        agent_mock.run = AsyncMock(
+            side_effect=RuntimeError(f"gateway 401: Authorization: Bearer {secret_token}")
+        )
+        mock_build.return_value = agent_mock
+
+        asyncio.run(hcm._run_hunt_chat_turn(state, "hunt-secret", 42))
+
+    finish_mock.assert_called_once()
+    content = finish_mock.call_args.kwargs.get("content", "")
+    assert secret_token not in content
+    assert finish_mock.call_args.kwargs.get("status") == "error"
+
+
 def test_delete_hunt_removes_row_and_events(client: TestClient, settings_kratos: Settings) -> None:
     """DELETE /hunts/{id} removes a completed hunt and its events; a re-list is empty."""
     hunt_id = _seed_complete_hunt(client)
@@ -1825,6 +1940,71 @@ def test_validate_hunt_findings_corroboration_only_applies_to_high_threat() -> N
     assert validated[0].validator_note is None
     assert validated[1].severity == "high"  # high OBSERVATION untouched
     assert validated[1].validator_note is None
+    assert counts["findings_capped"] == 0
+
+
+def test_validate_hunt_findings_get_event_raw_refetching_alert_is_not_corroboration() -> None:
+    """F19: t_get_event_raw refetching the raw form of the SAME detector alert
+    (event.dataset=suricata.alert) is the alert re-stated, not corroboration — a
+    high threat citing only that raw alert doc is still capped to medium. Before
+    the fix, t_get_event_raw was not doc-partitioned, so the refetched alert
+    counted as corroboration and the finding stayed high."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    raw_alert_source = {
+        "event": {"dataset": "suricata.alert", "kind": "alert"},
+        "rule": {"name": "ET MALWARE BPFDoor ICMP Heartbeat"},
+        "log": {"id": {"uid": "sRAWALERTUID42Qx"}},
+    }
+    findings = [
+        HuntFinding(
+            title="BPFDoor backdoor on 192.0.2.15",
+            detail="Refetched the raw form of the ICMP heartbeat alert.",
+            severity="high",
+            category="threat",
+            hosts=["192.0.2.15"],
+            citations=["sRAWALERTUID42Qx"],  # the alert doc's own uid, refetched
+        )
+    ]
+    tool_results = [_labeled("t_get_event_raw", raw_alert_source)]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    f = validated[0]
+    assert f.severity == "medium"  # capped — a refetched alert doc is not corroboration
+    assert "only detector alerts cited" in (f.validator_note or "").lower()
+    assert counts["findings_capped"] == 1
+
+
+def test_validate_hunt_findings_get_event_raw_telemetry_doc_corroborates() -> None:
+    """F19 companion: t_get_event_raw fetching a NON-alert telemetry doc
+    (event.dataset=zeek.conn) IS real corroboration — it looked past the alert
+    title — so a high threat citing it stays high. Guards against over-broadly
+    denylisting the tool (which would drop this legitimate corroboration)."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    raw_zeek_source = {
+        "event": {"dataset": "zeek.conn", "kind": "event"},
+        "network": {"community_id": "1:zeekconncorrob"},
+        "log": {"id": {"uid": "sRAWZEEKUID88Zt"}},
+    }
+    findings = [
+        HuntFinding(
+            title="Confirmed exfil on 10.0.0.5",
+            detail="Zeek conn shows a large outbound-dominant transfer.",
+            severity="high",
+            category="threat",
+            hosts=["10.0.0.5"],
+            citations=["sRAWZEEKUID88Zt"],
+        )
+    ]
+    tool_results = [_labeled("t_get_event_raw", raw_zeek_source)]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    f = validated[0]
+    assert f.severity == "high"  # NOT capped — a fetched telemetry doc corroborates
+    assert f.validator_note is None
     assert counts["findings_capped"] == 0
 
 
