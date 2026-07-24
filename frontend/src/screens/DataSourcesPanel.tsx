@@ -42,8 +42,9 @@ export function DataSourcesPanel({
       <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         What the agent draws on for enrichment — local-mirror feeds (zero-egress, refreshed
-        out-of-band) and opt-in online lookups. API keys live in <code>.env</code>; the master
-        switch for online lookups is under "Online enrichment".
+        out-of-band) and opt-in online lookups. Provider API keys are set live in the API keys
+        panel below (encrypted at rest, never shown again); the master switch for online lookups
+        is under "Online enrichment".
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         <div className="grid grid-cols-[1fr_120px_90px_80px_100px] gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">

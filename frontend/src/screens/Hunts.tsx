@@ -37,7 +37,7 @@ import {
   startHuntConsole,
   updateHuntSchedule,
 } from '../lib/api';
-import type { HuntSchedule, HuntTemplate } from '../lib/api';
+import type { HuntSchedule, HuntScheduleList, HuntTemplate } from '../lib/api';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { useAsync } from '../lib/useAsync';
 import type { HuntRehuntResult, HuntRow, HuntStatus } from '../lib/types';
@@ -320,8 +320,13 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
 // above like any other hunt.
 // ---------------------------------------------------------------------------
 function ScheduledHunts() {
+  const navigate = useNavigate();
   const [reloadKey, setReloadKey] = useState(0);
-  const { data, loading, error } = useAsync<HuntSchedule[]>(getHuntSchedules, [reloadKey]);
+  const { data, loading, error } = useAsync<HuntScheduleList>(getHuntSchedules, [reloadKey]);
+  const schedules = data?.schedules;
+  // Defaults to true (no false "paused" flash) until the first response lands —
+  // loading/error states already gate the row list below.
+  const masterSwitchOn = data?.masterSwitchEnabled ?? true;
 
   // The add/edit form state. ``editing`` holds the id being edited (null = the
   // add form). Kept flat (not a modal) — modest inline editor, like ManagedList.
@@ -393,9 +398,27 @@ function ScheduledHunts() {
       <div className="flex items-center gap-1.5 border-b border-border px-4 py-3 text-[13px] font-semibold">
         <CalendarClock size={15} className="text-accent" /> Scheduled hunts
         <span className="ml-2 text-[11.5px] font-normal text-dim">
-          Recurring hunts on an interval — enable the master switch in Config to run them.
+          Recurring hunts on an interval.
         </span>
       </div>
+
+      {data && !masterSwitchOn && (
+        <div className="flex items-center gap-2 border-b border-warn/25 bg-warn/5 px-4 py-2.5 text-[12px] text-warn">
+          <AlertTriangle size={14} className="flex-none" />
+          <span>
+            Scheduled hunts are paused globally —{' '}
+            <button
+              type="button"
+              onClick={() => navigate('/config#triage-automation')}
+              className="font-semibold underline decoration-warn/50 underline-offset-2 hover:decoration-warn"
+            >
+              enable them in Config
+            </button>
+            . Rows below still show their own on/off state, but nothing fires until the
+            switch is on.
+          </span>
+        </div>
+      )}
 
       {loading && !data ? (
         <LoadingState label="Loading schedules…" />
@@ -403,10 +426,10 @@ function ScheduledHunts() {
         <ErrorState error={error} onRetry={reload} />
       ) : (
         <>
-          {!data || data.length === 0 ? (
+          {!schedules || schedules.length === 0 ? (
             <EmptyState>No scheduled hunts yet — add one below.</EmptyState>
           ) : (
-            data.map((s) => (
+            schedules.map((s) => (
               <div
                 key={s.id}
                 className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-0"
@@ -414,14 +437,20 @@ function ScheduledHunts() {
                 <button
                   type="button"
                   onClick={() => { void toggleEnabled(s); }}
-                  title={s.enabled ? 'Enabled — click to pause' : 'Paused — click to enable'}
+                  title={
+                    !s.enabled
+                      ? 'Paused — click to enable'
+                      : masterSwitchOn
+                        ? 'Enabled — click to pause'
+                        : 'Enabled, but paused by the global master switch (Config) — it will not fire'
+                  }
                   className={`flex-none rounded-badge border px-[8px] py-[2px] text-[10.5px] font-semibold uppercase tracking-[.04em] ${
-                    s.enabled
+                    s.enabled && masterSwitchOn
                       ? 'border-accent/40 bg-accent/10 text-accent'
                       : 'border-border-strong bg-surface-2 text-faint'
                   }`}
                 >
-                  {s.enabled ? 'on' : 'paused'}
+                  {!s.enabled ? 'paused' : masterSwitchOn ? 'on' : 'on (paused)'}
                 </button>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[13px] text-text">{s.objective}</div>

@@ -363,7 +363,10 @@ def client(settings_kratos: Settings) -> Iterator[TestClient]:
 
 def test_schedules_crud_roundtrip(client: TestClient) -> None:
     # empty to start
-    assert client.get("/api/v1/hunt-schedules").json() == []
+    assert client.get("/api/v1/hunt-schedules").json() == {
+        "schedules": [],
+        "masterSwitchEnabled": False,
+    }
 
     # create (interval below the floor is clamped up by the store)
     resp = client.post(
@@ -386,7 +389,7 @@ def test_schedules_crud_roundtrip(client: TestClient) -> None:
     sid = created["id"]
 
     # list shows it
-    listing = client.get("/api/v1/hunt-schedules").json()
+    listing = client.get("/api/v1/hunt-schedules").json()["schedules"]
     assert [r["objective"] for r in listing] == ["Nightly beacon sweep"]
 
     # update (pause it + rename)
@@ -403,7 +406,21 @@ def test_schedules_crud_roundtrip(client: TestClient) -> None:
     rm = client.delete(f"/api/v1/hunt-schedules/{sid}")
     assert rm.status_code == 200
     assert rm.json() == {"deleted": True}
-    assert client.get("/api/v1/hunt-schedules").json() == []
+    assert client.get("/api/v1/hunt-schedules").json() == {
+        "schedules": [],
+        "masterSwitchEnabled": False,
+    }
+
+
+def test_list_reports_master_switch_enabled(settings_kratos: Settings) -> None:
+    """GET must surface ``hunt_schedules_enabled`` so the frontend can render an
+    honest banner/pill without a second round trip to /config (dogfood #N:
+    scheduled-hunts-discoverability)."""
+    settings = settings_kratos.model_copy(update={"hunt_schedules_enabled": True})
+    for c in _client(settings):
+        body = c.get("/api/v1/hunt-schedules").json()
+        assert body["masterSwitchEnabled"] is True
+        assert body["schedules"] == []
 
 
 def test_update_missing_schedule_404(client: TestClient) -> None:

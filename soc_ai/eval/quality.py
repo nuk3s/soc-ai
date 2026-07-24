@@ -43,6 +43,11 @@ ERROR_RATE_CEILING = 0.3
 # symptom (verdicts keep flowing, but they're no longer reasoned).
 FALLBACK_JUMP = 0.3
 
+# Binary floats can't represent most n_ok fractions exactly (0.8 - 0.6 is
+# 0.20000000000000007, not 0.2), so an EXACT single-flip drop must not
+# out-round the self-scaling floor below and fire by float dust alone.
+_FLOAT_SLOP = 1e-9
+
 
 @dataclass(frozen=True)
 class SnapshotMetrics:
@@ -168,12 +173,17 @@ def detect_regression(
     reasons: list[str] = []
 
     hist_agreement = [p.agreement_rate for p in history if p.agreement_rate is not None]
-    if new.agreement_rate is not None and hist_agreement:
+    if new.agreement_rate is not None and hist_agreement and new.n_ok > 0:
         med = _median(hist_agreement)
-        if med - new.agreement_rate > alarm_drop:
+        # A single flipped verdict must never page anyone on its own: at
+        # n_ok alerts, one flip moves agreement_rate by exactly 1/n_ok, so
+        # the effective threshold is whichever is looser — the configured
+        # alarm_drop, or one full flip's worth (the floor requires >=2 flips).
+        min_drop = max(alarm_drop, 1.0 / new.n_ok)
+        if med - new.agreement_rate > min_drop + _FLOAT_SLOP:
             reasons.append(
                 f"agreement_rate {new.agreement_rate:.2f} is more than "
-                f"{alarm_drop:.2f} below the trailing median {med:.2f}"
+                f"{min_drop:.2f} below the trailing median {med:.2f}"
             )
 
     if new.error_rate > ERROR_RATE_CEILING:

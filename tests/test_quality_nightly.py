@@ -193,6 +193,22 @@ def test_detector_agreement_drop_fires_and_names_the_numbers() -> None:
     assert "0.80" in reasons[0]  # the trailing median is in the message
 
 
+def test_detector_agreement_drop_single_flip_stays_silent() -> None:
+    """At the default n_ok=5, one flipped verdict moves agreement_rate by
+    exactly 1/5 = 0.2 against a stable 0.8 median — that's a single flip,
+    not a regression, and must never page anyone on its own."""
+    new = _metrics(agreement_rate=0.6, n_ok=5)
+    assert detect_regression(new, _hist(7, agreement=0.8), alarm_drop=0.15) == []
+
+
+def test_detector_agreement_drop_two_flip_still_fires() -> None:
+    """Two flipped verdicts at n_ok=5 is a real 0.4 drop — the self-scaling
+    floor (1/n_ok = 0.2) must not swallow a genuine regression."""
+    new = _metrics(agreement_rate=0.4, n_ok=5)
+    reasons = detect_regression(new, _hist(7, agreement=0.8), alarm_drop=0.15)
+    assert any("agreement_rate" in r for r in reasons)
+
+
 def test_detector_agreement_drop_uses_median_not_mean() -> None:
     """One euphoric outlier night must not drag the baseline: median of
     [0.6, 0.6, 0.6, 1.0] is 0.6 — a new 0.5 is only a 0.1 drop, no alarm."""

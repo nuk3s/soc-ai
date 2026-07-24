@@ -1231,6 +1231,23 @@ def test_config_set_setting_rejects_secret(client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "secret_setting"
 
 
+def test_config_set_misp_url_persists_but_needs_restart(client: TestClient) -> None:
+    """Dogfood #2: misp_url is a plain, non-secret, non-danger setting in
+    'Online enrichment' (co-located with allow_online_enrichment and, one panel
+    down, misp_api_key) — settable via the regular POST /config/setting path
+    like any other setting. It's hot=False: the MispClient is built once at
+    startup (soc_ai.tools.enrichment.MispClient), so a change only takes effect
+    after a restart, unlike its sibling toggle."""
+    resp = client.post(
+        "/api/v1/config/setting", json={"key": "misp_url", "value": "https://misp.example.com"}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "restart_required": True}
+    # hot=False → never setattr'd onto the live Settings singleton; only the DB
+    # override is written (applied on the next restart's load_overrides pass).
+    assert client.app.state.settings.misp_url is None
+
+
 def test_row_status_is_honest() -> None:
     """An investigation row's status never silently claims 'complete'."""
     from types import SimpleNamespace
@@ -4480,7 +4497,9 @@ class TestApiKeys:
             assert r.status_code == 200
             rows = r.json()
             keys = {row["key"] for row in rows}
-            assert {"shodan_api_key", "greynoise_api_key", "misp_api_key"} <= keys
+            # crawl4ai_token (dogfood #2): now a plain hot secret alongside its
+            # enrichment-provider siblings, not a Danger-Zone typed-confirm field.
+            assert {"shodan_api_key", "greynoise_api_key", "misp_api_key", "crawl4ai_token"} <= keys
             for row in rows:
                 assert set(row) == {"key", "label", "help", "isSet", "source"}
 
@@ -4584,6 +4603,53 @@ class TestApiKeys:
             row = next(x for x in r.json() if x["key"] == "shodan_api_key")
             assert row["isSet"] is False
             assert row["source"] == "unset"
+
+    def test_crawl4ai_token_save_hot_applies_and_encrypts(self, settings: Settings) -> None:
+        """Dogfood #2: crawl4ai_token moved from the Danger Zone's typed-confirm
+        flow to the plain hot-secret pattern (mirrors shodan/greynoise above) —
+        same write-only, Fernet-encrypted, hot-apply contract, just reached via
+        POST /config/api-keys instead of POST /config/danger/setting."""
+        import asyncio
+        import json as _json
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/api-keys",
+                json={"key": "crawl4ai_token", "value": "CRAWL4AI-TOKEN-XYZ"},
+            )
+            assert r.status_code == 200
+            assert r.json() == {"ok": True, "isSet": True}
+            assert "CRAWL4AI-TOKEN-XYZ" not in r.text
+            # Hot-applied onto the live Settings singleton (no restart).
+            live = c.app.state.settings.crawl4ai_token
+            assert live is not None and live.get_secret_value() == "CRAWL4AI-TOKEN-XYZ"
+
+            # Stored Fernet-encrypted, never plaintext — same as every other
+            # secret in this panel.
+            async def _read(app: Any = c.app) -> str | None:
+                async with app.state.db_sessionmaker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "crawl4ai_token")
+                    )
+
+            stored = _json.loads(asyncio.run(_read()))
+            assert stored != "CRAWL4AI-TOKEN-XYZ"
+            assert stored.startswith("gAAAA")
+
+    def test_crawl4ai_token_no_longer_a_danger_setting(self, settings: Settings) -> None:
+        """The old Danger-Zone typed-confirm path must reject it now — same 400
+        contract POST /config/danger/setting already enforces for any key that
+        isn't a registered danger spec."""
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "crawl4ai_token", "value": "x", "confirm": "crawl4ai_token"},
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"]["reason"] == "unknown_danger_key"
 
 
 class TestNotifyWebhookGet:

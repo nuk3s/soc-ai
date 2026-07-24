@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-07-24
+
+A dogfood patch: four rough edges found during an analyst shift on the live
+deployment. No schema changes.
+
+### Fixed
+
+- **Scheduled hunts no longer look active while they are paused.** A per-schedule
+  "on" pill in the Hunt Console read as running even when the global
+  scheduled-hunts switch was off, so nothing actually fired. The console now shows
+  a banner that links to the setting and marks each row "on (paused)" while the
+  global switch is off. `GET /api/v1/hunt-schedules` returns the master-switch
+  state alongside the schedules.
+- **The triage pipeline recovers from a transient grid blip.** A momentary
+  Elasticsearch or Security Onion transport error during the prefetch step used to
+  end the investigation in a manual-recovery error state. That step now retries
+  with backoff on transient transport errors only; a genuine "alert not found" or
+  a validation error still fails fast, without a fabricated verdict. Tunable via
+  `prefetch_max_retries` and `prefetch_retry_base_delay_s`.
+- **The nightly quality-regression alarm stops crying wolf on small samples.** At
+  the default sample size of five, a single flipped verdict moved the agreement
+  rate by exactly the alarm threshold, so one disagreement always paged. The alarm
+  now scales its floor to the sample size and needs at least two flips to fire.
+
+### Changed
+
+- **The config console groups each external service with its own settings.**
+  Turning an integration on now sits next to where you enter its key. The MISP URL
+  is editable in the console beside the MISP key, the crawl4ai token moved from the
+  Danger Zone to the ordinary API-keys panel, and help text that pointed at `.env`
+  for settings the console already owns was corrected.
+
 ## [1.2.3] - 2026-07-23
 
 A targeted fix: per-alert verdict inheritance now honors the configured inherit

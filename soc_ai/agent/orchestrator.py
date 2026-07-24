@@ -1480,6 +1480,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     ``needs_more_info`` investigation, woven into the round-1 seed + the
     investigation-loop investigator prompt so this run targets those gaps.
     """
+    from soc_ai.agent._prefetch_retry import retry_prefetch  # noqa: PLC0415
     from soc_ai.agent.decision_templates import match_decision_template  # noqa: PLC0415
     from soc_ai.agent.prompts import (  # noqa: PLC0415
         build_synth_first_round2_user_message,
@@ -1631,19 +1632,24 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         cloud=ctx.cloud,
     )
     try:
-        enriched = await get_enriched_alert_context(
-            alert_id,
-            elastic=ctx.elastic,
-            settings=ctx.settings,
-            enrichment=enrichment_ctx,
-            misp=ctx.misp,
-            include_synth=ctx.include_synth,
-            # Thread the effective CIDR set (settings.internal_cidrs union active
-            # 'cidr' rows minus muted, resolved once above) into Phase-A enrichment
-            # so an activated CIDR marks hosts internal here too — consistent
-            # with the ICMP-downgrade classification path. No active cidr rows /
-            # no DB ⇒ classification_cidrs == settings.internal_cidrs (unchanged).
-            internal_cidrs=classification_cidrs,
+        enriched = await retry_prefetch(
+            lambda: get_enriched_alert_context(
+                alert_id,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                enrichment=enrichment_ctx,
+                misp=ctx.misp,
+                include_synth=ctx.include_synth,
+                # Thread the effective CIDR set (settings.internal_cidrs union
+                # active 'cidr' rows minus muted, resolved once above) into
+                # Phase-A enrichment so an activated CIDR marks hosts internal
+                # here too — consistent with the ICMP-downgrade classification
+                # path. No active cidr rows / no DB ⇒ classification_cidrs ==
+                # settings.internal_cidrs (unchanged).
+                internal_cidrs=classification_cidrs,
+            ),
+            max_retries=ctx.settings.prefetch_max_retries,
+            base_delay_s=ctx.settings.prefetch_retry_base_delay_s,
         )
     except Exception as e:
         err_ev = _ev("error", _error_payload(e, phase="prefetch", round_num=0))

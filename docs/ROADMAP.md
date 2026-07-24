@@ -3,7 +3,7 @@
 soc-ai moves fast, and it moves in public. This page is the honest picture:
 what has shipped, what you can turn on today, and what comes next.
 
-![soc-ai roadmap: 1.0 through 1.2 shipped, 1.2.3 current, 1.3 and later planned](img/roadmap.svg)
+![soc-ai roadmap: 1.0 through 1.2 shipped, 1.2.4 current, 1.3 and later planned](img/roadmap.svg)
 
 ## The story so far
 
@@ -30,11 +30,16 @@ went in; fourteen fixes came out. Notifications, entity search, a maintenance
 panel, pipeline-error visibility with one-click dismiss, group acknowledge,
 deep re-run, and the quality eval now schedulable straight from the dashboard.
 
-**1.2.3 is where we are today.** When the model stumbles, the pipeline now
+**1.2.4 is where we are today.** When the model stumbles, the pipeline now
 records exactly why and recovers from the most common failure on its own. And
 hunts got their latitude back: generic sweeps hunt the telemetry (beacons,
 first-seen destinations, odd cadences) instead of re-triaging the alert queue,
-because triage already owns that.
+because triage already owns that. The latest patch tightened the edges an
+operator actually hits: scheduled hunts say plainly when they are paused instead
+of showing a switched-on pill that never fires, a transient grid blip during
+triage is retried instead of dropped, the nightly regression alarm no longer
+pages on a single flipped verdict at small sample sizes, and the config console
+groups each integration's switch with the key it needs.
 
 ## Already in the box, waiting on a switch
 

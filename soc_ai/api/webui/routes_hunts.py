@@ -1041,12 +1041,27 @@ def _schedule_out(row: HuntSchedule) -> HuntScheduleOut:
     )
 
 
-@router.get("/hunt-schedules", response_model=list[HuntScheduleOut])
-async def list_hunt_schedules(request: Request) -> list[HuntScheduleOut]:
-    """All recurring hunt schedules, most-recently-created first (analyst-readable)."""
+class HuntScheduleListOut(BaseModel):
+    """Schedule rows plus the ``hunt_schedules_enabled`` global master switch, so
+    the frontend can render an honest "paused globally" banner/pill without a
+    second round trip to /config."""
+
+    schedules: list[HuntScheduleOut]
+    masterSwitchEnabled: bool
+
+
+@router.get("/hunt-schedules", response_model=HuntScheduleListOut)
+async def list_hunt_schedules(
+    request: Request, settings: Settings = Depends(get_settings_dep)
+) -> HuntScheduleListOut:
+    """All recurring hunt schedules, most-recently-created first (analyst-readable),
+    plus whether the ``hunt_schedules_enabled`` master switch is currently on."""
     async with request.app.state.db_sessionmaker() as db:
         rows = await hs_svc.list_all(db)
-    return [_schedule_out(r) for r in rows]
+    return HuntScheduleListOut(
+        schedules=[_schedule_out(r) for r in rows],
+        masterSwitchEnabled=bool(getattr(settings, "hunt_schedules_enabled", False)),
+    )
 
 
 @router.post(

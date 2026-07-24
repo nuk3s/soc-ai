@@ -618,7 +618,11 @@ async def test_investigate_stops_with_error_when_prefetch_fails(
     settings_kratos.investigate_when_unsure = False
     ctx = _make_ctx(settings_kratos)
 
+    call_count = 0
+
     async def _fail(_alert_id: str, **_kw: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
         raise SoNotFoundError("alert not found: alert-001")
 
     with patch(
@@ -636,6 +640,127 @@ async def test_investigate_stops_with_error_when_prefetch_fails(
     assert err["type"] == "SoNotFoundError"
     assert "alert not found" in err["message"]
     assert err.get("hint")
+    # SoNotFoundError is not a transient-infra failure — the prefetch retry
+    # wrapper must not burn its budget re-fetching an alert that doesn't exist.
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_prefetch_does_not_retry_alert_not_found(
+    settings_kratos: Settings,
+) -> None:
+    """SoNotFoundError fails fast through the retry wrapper — same assertion
+    as above, phrased as its own test per the fix's test list (a dedicated
+    non-retry regression, independent of the error-shape test)."""
+    from soc_ai.errors import SoNotFoundError
+
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+
+    call_count = 0
+
+    async def _fail(_alert_id: str, **_kw: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        raise SoNotFoundError("alert not found: alert-001")
+
+    with patch(
+        "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+        side_effect=_fail,
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    assert [e.kind for e in events] == ["session_start", "error"]
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_prefetch_retries_on_transient_connection_error_then_succeeds(
+    settings_kratos: Settings,
+) -> None:
+    """A transient `ConnectionError` on the first prefetch attempt is retried
+    by the orchestrator-level wrapper; a second, successful attempt lets the
+    run complete with a REAL triage_report — no error event, no manual
+    re-hunt needed for a momentary ES/SO blip."""
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.prefetch_retry_base_delay_s = 0.0
+    ctx = _make_ctx(settings_kratos)
+
+    call_count = 0
+
+    async def _flaky(alert_id: str, **_kw: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ConnectionError("Cannot connect to host 10.0.0.253:9200")
+        return _stub_enriched_alert_context(alert_id)
+
+    fake_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.85,
+        summary="Internal scanner; expected periodic traffic.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    synth_model = TestModel(call_tools=[], custom_output_args=fake_report)
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_flaky,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=synth_model,
+        ),
+        patch(
+            "soc_ai.agent.decision_templates.match_decision_template",
+            return_value=_strong_benign_candidate(),
+        ),
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert "error" not in kinds
+    assert "triage_report" in kinds
+    assert kinds[-1] == "done"
+    # One failed attempt + one successful retry.
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_prefetch_retries_exhausted_still_errors_honestly(
+    settings_kratos: Settings,
+) -> None:
+    """When every prefetch attempt (initial + all retries) hits a transient
+    `ConnectionError`, the run still ends honestly: `session_start`, `error`
+    — the terminal no-fabricated-verdict path, now reached only AFTER the
+    retry budget (`prefetch_max_retries`, default 2) is exhausted."""
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.prefetch_retry_base_delay_s = 0.0
+    ctx = _make_ctx(settings_kratos)
+
+    call_count = 0
+
+    async def _always_fail(_alert_id: str, **_kw: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        raise ConnectionError("Cannot connect to host 10.0.0.253:9200")
+
+    with patch(
+        "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+        side_effect=_always_fail,
+    ):
+        events = [ev async for ev in investigate("alert-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert kinds == ["session_start", "error"]
+    err = events[1].payload
+    assert err["phase"] == "prefetch"
+    assert err["type"] == "ConnectionError"
+    # Initial attempt + prefetch_max_retries retries, all exhausted.
+    assert call_count == settings_kratos.prefetch_max_retries + 1
 
 
 @pytest.mark.asyncio
@@ -1994,11 +2119,17 @@ async def test_error_event_hint_for_es_unreachable(
 ) -> None:
     """When the prefetch fails because ES is unreachable (host restarting,
     network down), the error event carries a hint pointing the analyst at
-    the SO grid + ES_HOSTS config."""
+    the SO grid + ES_HOSTS config — reached only after the orchestrator-level
+    prefetch retry (ConnectionError is transient-infra) exhausts its budget."""
     settings_kratos.investigate_when_unsure = False
+    settings_kratos.prefetch_retry_base_delay_s = 0.0
     ctx = _make_ctx(settings_kratos)
 
+    call_count = 0
+
     async def _connection_refused(_alert_id: str, **_kw: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
         raise ConnectionError(
             "Cannot connect to host 10.0.0.253:9200 ssl:default [Connect call failed]"
         )
@@ -2014,6 +2145,8 @@ async def test_error_event_hint_for_es_unreachable(
     assert err["round"] == 0
     assert "unreachable" in err["hint"].lower()
     assert "ES_HOSTS" in err["hint"]
+    # Retried through the full budget before giving up honestly.
+    assert call_count == settings_kratos.prefetch_max_retries + 1
 
 
 def test_targeted_gap_round_trips() -> None:

@@ -71,7 +71,7 @@ const PANELS: PanelDef[] = [
   { id: 'redaction-preview', label: 'Redaction preview', parent: 'Privacy & Egress' },
   { id: 'data-sources', label: 'Data sources', parent: 'Data & Enrichment', placement: { at: 'start' } },
   { id: 'detection-tuning', label: 'Detection tuning', parent: 'Data & Enrichment' },
-  { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment' },
+  { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment', placement: { afterGroup: 'Online enrichment' } },
   { id: 'users', label: 'Users', parent: 'System' },
   { id: 'api-tokens', label: 'API tokens', parent: 'System' },
   { id: 'maintenance', label: 'Scheduled maintenance', parent: 'System' },

@@ -80,6 +80,21 @@ class Settings(BaseSettings):
     # fully-unreachable grid can't stall a call for request_timeout x (1+retries):
     # 30s x 3 = 90s worst case (was 60 x 4 = 240s).
     es_max_retries: int = 2
+    # Orchestrator-level retries around the WHOLE Phase-A prefetch call
+    # (`get_enriched_alert_context`), on top of `es_max_retries` above. The ES
+    # client's own retry budget covers a single pivot query hiccup; this covers
+    # a longer blip (a restarting node, a few seconds of network flap) that
+    # exhausts that budget and would otherwise raise straight through the
+    # pipeline's one hard-fail path (no evidence was ever gathered, so unlike
+    # every synthesis-phase failure there is no fallback report — a manual
+    # re-hunt is the only recovery). Only ConnectionError / elasticsearch-py
+    # TransportError (transient-infra) are retried; SoNotFoundError and
+    # validation errors fail through immediately (see `_prefetch_retry.py`).
+    prefetch_max_retries: int = 2
+    # Base seconds for the prefetch retry's exponential backoff (jittered,
+    # same formula as `litellm_max_retries`'s gateway transport). Attempt N
+    # waits random() * min(30s, base * 2**N).
+    prefetch_retry_base_delay_s: float = 2.0
     # Hard wall-clock bound for INTERACTIVE console grid queries (alerts list +
     # group events). Below the worst-case ES retry budget so the UI fails fast
     # with a clean "grid unavailable" error instead of hanging while the client
@@ -855,8 +870,9 @@ class Settings(BaseSettings):
     Empty disables page reads. Editable in the config console."""
 
     crawl4ai_token: SecretStr | None = None
-    """Optional Bearer token for the crawl4ai service (.env only — never the
-    config console, never rendered)."""
+    """Optional Bearer token for the crawl4ai service. Stored Fernet-encrypted,
+    write-only, editable live in the config console's API keys panel (never
+    rendered back once set)."""
 
     crawl4ai_verify_ssl: bool = True
     """Verify the crawl4ai TLS cert. Set False for a self-signed homelab cert."""

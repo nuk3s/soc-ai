@@ -11,12 +11,15 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('./AgentToolsPanel', () => ({ AgentToolsPanel: () => null }));
-vi.mock('./ApiKeysPanel', () => ({ ApiKeysPanel: () => null }));
+// ApiKeysPanel and DetectionTuningPanel render a marker div (instead of null,
+// like their sibling stubs) so the placement test below can assert their DOM
+// position relative to the server-driven settings groups around them.
+vi.mock('./ApiKeysPanel', () => ({ ApiKeysPanel: () => <div data-testid="panel-api-keys" /> }));
 vi.mock('./DataSourcesPanel', () => ({ DataSourcesPanel: () => null }));
 vi.mock('./EgressPolicyPanel', () => ({ EgressPolicyPanel: () => null }));
 vi.mock('./NotificationsPanel', () => ({ NotificationsPanel: () => null }));
 vi.mock('./RedactionPreviewPanel', () => ({ RedactionPreviewPanel: () => null }));
-vi.mock('./DetectionTuningPanel', () => ({ DetectionTuningPanel: () => null }));
+vi.mock('./DetectionTuningPanel', () => ({ DetectionTuningPanel: () => <div data-testid="panel-detection-tuning" /> }));
 vi.mock('./MaintenancePanel', () => ({ MaintenancePanel: () => null }));
 vi.mock('./RunbooksPanel', () => ({ RunbooksPanel: () => null }));
 
@@ -49,7 +52,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { Config } from './Config';
-import { mintToken, resetUserPassword, revokeToken } from '../lib/api';
+import { getConfig, mintToken, resetUserPassword, revokeToken } from '../lib/api';
 
 describe('Config admin write paths surface a failure instead of failing silently (F39)', () => {
   it('shows an error on the users strip when resetUserPassword rejects', async () => {
@@ -96,5 +99,50 @@ describe('reset-password banner auto-dismiss (F69)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Dogfood #2 — the Config page grouped controls by "kind of control" (settings
+// group vs. standalone panel) instead of "feature the control belongs to": the
+// API-keys panel (write-only provider secrets) rendered two sections after the
+// "Online enrichment" toggle that gates them, with an unrelated "Detection
+// tuning" panel sandwiched in between. Config.tsx's PANELS layout builder now
+// gives the api-keys entry `placement: { afterGroup: 'Online enrichment' }` so
+// it splices in immediately under that toggle — same fix already used for the
+// Notifications webhook panel. Detection tuning falls out to last in the
+// parent as a side effect (it has no placement, so it's appended after
+// whatever's already there once api-keys stops taking that slot).
+describe('Data & Enrichment panel placement (dogfood #2)', () => {
+  it('renders the API-keys panel directly under Online enrichment, ahead of Detection tuning', async () => {
+    vi.mocked(getConfig).mockResolvedValueOnce({
+      groups: [
+        { title: 'Web research', parent: 'Data & Enrichment', items: [] },
+        { title: 'Online enrichment', parent: 'Data & Enrichment', items: [] },
+      ],
+      tokens: [TOKEN],
+      users: [],
+      dangerHost: '',
+    });
+    render(<Config />);
+
+    // Group titles also appear in the left-nav sidebar (an <a> per section) —
+    // only the main-content heading is relevant to DOM/render order here.
+    const mainOnly = async (label: string) => {
+      const matches = await screen.findAllByText(label);
+      const match = matches.find((el) => !el.closest('nav'));
+      if (!match) throw new Error(`no main-content match for "${label}"`);
+      return match;
+    };
+    const webResearch = await mainOnly('Web research');
+    const onlineEnrichment = await mainOnly('Online enrichment');
+    const apiKeys = await screen.findByTestId('panel-api-keys');
+    const detectionTuning = await screen.findByTestId('panel-detection-tuning');
+
+    const isBefore = (a: Element, b: Element) =>
+      !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+    expect(isBefore(webResearch, onlineEnrichment)).toBe(true);
+    expect(isBefore(onlineEnrichment, apiKeys)).toBe(true);
+    expect(isBefore(apiKeys, detectionTuning)).toBe(true);
   });
 });

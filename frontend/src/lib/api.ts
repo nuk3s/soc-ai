@@ -306,9 +306,16 @@ export interface HuntScheduleInput {
   enabled: boolean;
 }
 
-/** All recurring hunt schedules, most-recently-created first. */
-export function getHuntSchedules(): Promise<HuntSchedule[]> {
-  return request<HuntSchedule[]>('/hunt-schedules');
+/** Schedule rows plus the ``hunt_schedules_enabled`` global master switch — off
+ * means no schedule fires no matter what its own per-row `enabled` says. */
+export interface HuntScheduleList {
+  schedules: HuntSchedule[];
+  masterSwitchEnabled: boolean;
+}
+
+/** All recurring hunt schedules, most-recently-created first, plus master-switch state. */
+export function getHuntSchedules(): Promise<HuntScheduleList> {
+  return request<HuntScheduleList>('/hunt-schedules');
 }
 
 /** Create a recurring hunt schedule (admin). */

@@ -557,8 +557,28 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "Off by default — the rest of soc-ai is zero-egress (local feeds). "
             "Turning this on lets the agent reach third-party reputation/asset "
-            "APIs over the internet. Provider keys (e.g. GREYNOISE_API_KEY) are "
-            "set in .env; Shodan InternetDB needs no key."
+            "APIs over the internet. Provider keys are set live, below, in the "
+            "API keys panel; Shodan InternetDB needs no key."
+        ),
+    ),
+    SettingSpec(
+        key="misp_url",
+        attr="misp_url",
+        type="str",
+        label="MISP base URL (e.g. https://misp.example.com)",
+        section="Online enrichment",
+        # Unlike the rest of this hot group: MISP_URL feeds the MispClient built
+        # once at startup (soc_ai.tools.enrichment.MispClient, held on
+        # app.state.misp) rather than re-read per call, so a change needs a
+        # restart to take effect — same reasoning as so_host/es_hosts/
+        # litellm_base_url in the Danger Zone. It stays out of the Danger Zone
+        # itself (not a secret, no typed confirm needed) so it can render next to
+        # misp_api_key instead of being split across two very different sections.
+        hot=False,
+        help=(
+            "Restart required to take effect (feeds the MISP client built at "
+            "startup). Also set the MISP API key, below in the API keys panel, "
+            "to enable MISP threat-intel lookups."
         ),
     ),
     SettingSpec(
@@ -855,7 +875,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         secret=True,
         label="MISP API key",
-        help="Threat-intel matches. Also set the MISP URL (Danger Zone) to enable MISP enrichment.",
+        help=(
+            "Threat-intel matches. Also set the MISP URL, above under Online "
+            "enrichment, to enable MISP enrichment."
+        ),
     ),
     SettingSpec(
         key="maxmind_license_key",
@@ -876,6 +899,19 @@ WHITELIST: tuple[SettingSpec, ...] = (
         secret=True,
         label="abuse.ch auth key",
         help="Refreshes the URLhaus / Feodo blocklists (used by the next `blocklists refresh`).",
+    ),
+    SettingSpec(
+        key="crawl4ai_token",
+        attr="crawl4ai_token",
+        type="str",
+        section="API keys",
+        hot=True,  # read per crawl_page call, never baked into a startup client
+        secret=True,
+        label="crawl4ai API token",
+        help=(
+            "Bearer token for the crawl4ai instance configured under Web research "
+            "above (if it requires auth). Stored Fernet-encrypted."
+        ),
     ),
     # ---- NOTIFICATIONS: opt-in outbound webhook (the only new egress path) ----
     # All hot=True (read fresh per send by soc_ai.notify.fire, so a save applies
@@ -984,10 +1020,11 @@ WHITELIST: tuple[SettingSpec, ...] = (
     # ---- DANGER ZONE: connection identity + secrets (typed-confirm) ----------
     # The SO/ES/LiteLLM connection settings are hot=False: they feed clients
     # built at startup, so a change needs a restart (the lifespan applies
-    # overrides BEFORE building those clients). The PCAP-SSH settings, the
-    # crawl4ai token and internal_cidrs are hot=True — they're read fresh per
-    # tool-call, so a save applies live. Every danger setting still requires a
-    # typed confirm at the route.
+    # overrides BEFORE building those clients). The PCAP-SSH settings and
+    # internal_cidrs are hot=True — they're read fresh per tool-call, so a save
+    # applies live. Every danger setting still requires a typed confirm at the
+    # route. (crawl4ai_token used to live here too — it moved to the plain
+    # hot-secret "API keys" pattern above; see that section's SettingSpec.)
     SettingSpec(
         key="so_host",
         attr="so_host",
@@ -1127,17 +1164,6 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="PCAP sensor SSH key path",
         help="Path on the soc-ai host to the private key used for PCAP fetch.",
     ),
-    SettingSpec(
-        key="crawl4ai_token",
-        attr="crawl4ai_token",
-        type="str",
-        section="Danger Zone",
-        hot=True,  # read per crawl_page call
-        danger=True,
-        secret=True,
-        label="crawl4ai API token",
-        help="Stored Fernet-encrypted. Leave blank to keep the current value.",
-    ),
 )
 
 WHITELIST_BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in WHITELIST}
@@ -1227,7 +1253,7 @@ def _check_bounds(spec: SettingSpec, value: float) -> None:
 # intentional and NOT restricted — only the scheme is, to block file://, gopher://
 # and similar SSRF vectors. Empty (unset) is always allowed.
 _URL_SETTING_KEYS = frozenset(
-    {"searxng_url", "crawl4ai_url", "so_host", "es_hosts", "litellm_base_url"}
+    {"searxng_url", "crawl4ai_url", "so_host", "es_hosts", "litellm_base_url", "misp_url"}
 )
 
 

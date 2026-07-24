@@ -566,6 +566,53 @@ def test_url_setting_rejects_non_http_scheme() -> None:
     assert coerce("searxng_url", "") == ""  # unset is fine
 
 
+def test_misp_url_is_whitelisted_non_secret_online_enrichment() -> None:
+    """Dogfood #2 (config-page regroup): misp_api_key's help text pointed at a
+    'MISP URL' setting that never existed in WHITELIST — misp_url was env-only
+    despite already being a Settings field (config.py). It's now a real,
+    UI-editable SettingSpec, co-located with the allow_online_enrichment toggle
+    by living in 'Online enrichment'. It's a plain URL, not a secret: MISP_URL
+    carries no confidentiality requirement the way an API key does."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    spec = WHITELIST_BY_KEY["misp_url"]
+    assert spec.type == "str"
+    assert spec.section == "Online enrichment"
+    assert spec.secret is False
+    assert spec.danger is False
+    # MISP_URL feeds the MispClient built once at startup (app.state.misp), not
+    # re-read per call — a change needs a restart, unlike its sibling toggle.
+    assert spec.hot is False
+
+
+def test_misp_url_rejects_non_http_scheme() -> None:
+    """misp_url is a URL setting like searxng_url/crawl4ai_url — same SSRF guard."""
+    from soc_ai.store.config_overrides import coerce
+
+    with pytest.raises(ValueError):
+        coerce("misp_url", "file:///etc/passwd")
+    assert coerce("misp_url", "https://misp.example.com") == "https://misp.example.com"
+    assert coerce("misp_url", "") == ""  # unset is fine
+
+
+def test_crawl4ai_token_is_a_plain_hot_secret_not_danger_zone() -> None:
+    """Dogfood #2: crawl4ai_token required the Danger-Zone typed-confirm ceremony
+    despite being read fresh per crawl_page call (soc_ai.tools.crawl_page), never
+    baked into a startup-built client — the same shape as shodan_api_key /
+    greynoise_api_key. It's now specced the same way: danger=False, secret=True,
+    hot=True, rendered in the API-keys panel (section='API keys') instead of the
+    Danger Zone, so it sits next to its sibling crawl4ai_enabled/crawl4ai_url
+    settings' neighborhood instead of two top-level sections away."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY, api_key_specs
+
+    spec = WHITELIST_BY_KEY["crawl4ai_token"]
+    assert spec.danger is False
+    assert spec.secret is True
+    assert spec.hot is True
+    assert spec.section == "API keys"
+    assert spec.key in {s.key for s in api_key_specs()}
+
+
 def test_fast_triage_toggle_default_and_whitelisted(monkeypatch: pytest.MonkeyPatch) -> None:
     """F2: the fast-triage toggle defaults on (current behavior) and is exposed
     in the admin config console with the speed/depth tradeoff note."""
