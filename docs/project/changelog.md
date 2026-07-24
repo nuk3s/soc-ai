@@ -9,6 +9,7 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.2.3** — Per-alert verdict inheritance now respects the configured inherit window (webui_inherit_window_days): the alerts feed no longer inherits a rule's stale standing verdict onto fresh alerts.
 - **1.2.2** — Security and correctness patch from a full code review of 1.2.1: evidence-gate integrity, oracle-redaction leak fixes, opt-in/bound auto-acknowledge, SSRF and denial-of-service caps, audit and auth hygiene, and supply-chain pinning.
 - **1.2.1** — Accuracy and honesty patch: pipeline errors now record *why* each
   model retry failed (and the schema tolerates the stringified-JSON wobble that

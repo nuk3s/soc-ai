@@ -293,26 +293,35 @@ async def latest_for_rules(db: AsyncSession, rule_names: list[str]) -> dict[str,
 
 
 async def latest_complete_for_rules(
-    db: AsyncSession, rule_names: list[str]
+    db: AsyncSession, rule_names: list[str], *, window_days: int | None = None
 ) -> dict[str, Investigation]:
     """Most recent COMPLETE, verdict-bearing investigation per rule name.
 
-    This is the rule's STANDING VERDICT for the alerts feed. Unlike
-    :func:`latest_for_rules`, it skips running/error/cancelled and verdictless
-    rows, so a later interrupted run (a re-hunt cancelled by a deploy, an errored
-    run) never erases the verdict the rule already earned — the source of the
-    "group says untriaged but its events are investigated/inherited" mismatch.
+    This is the rule's STANDING VERDICT. Unlike :func:`latest_for_rules`, it skips
+    running/error/cancelled and verdictless rows, so a later interrupted run (a
+    re-hunt cancelled by a deploy, an errored run) never erases the verdict the
+    rule already earned — the source of the "group says untriaged but its events
+    are investigated/inherited" mismatch.
+
+    ``window_days`` bounds the verdict's age. The PER-ALERT inheritance fallback
+    passes ``webui_inherit_window_days`` so a stale standing verdict isn't
+    inherited onto fresh alerts (mirroring the pair tier in
+    :func:`latest_for_pairs`); the rule-GROUP standing badge omits it to reflect
+    the rule's last disposition regardless of age. ``None`` = unbounded.
     """
     if not rule_names:
         return {}
+    conds = [
+        Investigation.rule_name.in_(rule_names),
+        Investigation.status == "complete",
+        Investigation.verdict.is_not(None),
+    ]
+    if window_days is not None:
+        conds.append(Investigation.created_at >= utcnow() - timedelta(days=window_days))
     rows = (
         await db.scalars(
             select(Investigation)
-            .where(
-                Investigation.rule_name.in_(rule_names),
-                Investigation.status == "complete",
-                Investigation.verdict.is_not(None),
-            )
+            .where(*conds)
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
             # Bounded like _latest_by: only the newest complete row per rule is
             # kept, so a small multiple of len(rule_names) suffices.

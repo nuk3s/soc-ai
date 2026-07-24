@@ -2,7 +2,7 @@
 #
 # Usage:
 #   docker compose up -d                              # build from source + start
-#   SOC_AI_IMAGE_TAG=1.2.2 docker compose pull soc-ai && docker compose up -d
+#   SOC_AI_IMAGE_TAG=1.2.3 docker compose pull soc-ai && docker compose up -d
 #     # run a pinned published GHCR image — never pull bare :latest
 #
 # soc-ai talks to a LiteLLM gateway you run separately (most setups put it on a
@@ -27,7 +27,7 @@ services:
     # flow is unchanged. To run the prebuilt release image instead, pull it
     # explicitly first, PINNED to a release (never bare :latest — an
     # unaudited moving target):
-    #     SOC_AI_IMAGE_TAG=1.2.2 docker compose pull soc-ai && docker compose up -d
+    #     SOC_AI_IMAGE_TAG=1.2.3 docker compose pull soc-ai && docker compose up -d
     # (or `./setup.sh --prebuilt`, which pins it for you).
     image: ghcr.io/nuk3s/soc-ai:${SOC_AI_IMAGE_TAG:-latest}
     build:

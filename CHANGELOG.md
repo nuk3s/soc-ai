@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-23
+
+A targeted fix: per-alert verdict inheritance now honors the configured inherit
+window.
+
+### Fixed
+
+- **Per-alert verdict inheritance respects `webui_inherit_window_days`.** The
+  alerts feed's rule-level inheritance fallback had no age bound, so an alert
+  could display a verdict inherited from an investigation far older than the
+  configured window — and never be re-triaged. The per-alert fallback is now
+  bounded by the same window as the pair tier; the rule-group standing badge
+  still reflects the rule's last disposition regardless of age.
+
 ## [1.2.2] - 2026-07-23
 
 A security and correctness patch from a full code review of 1.2.1. Sixty-nine

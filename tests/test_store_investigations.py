@@ -170,6 +170,39 @@ async def test_latest_for_pairs(settings_kratos: Settings) -> None:
     await engine.dispose()
 
 
+async def test_latest_complete_for_rules_window_bounds_inheritance(
+    settings_kratos: Settings,
+) -> None:
+    """The rule-level fallback honours ``window_days`` for PER-ALERT inheritance:
+    a standing verdict older than the window is not inherited (so the alert is
+    re-triaged, not stuck on a stale verdict), while the unbounded call (the
+    rule-group badge) still returns it. Regression for "inherited a verdict from
+    18d ago, past the configured window"."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        a = await inv_svc.create(db, alert_es_id="e1", started_by="t", rule_name="RULE A")
+        await inv_svc.finalize(
+            db, a.id, status="complete", verdict="false_positive", confidence=0.9
+        )
+        row = await db.get(Investigation, a.id)
+        assert row is not None
+        row.created_at = utcnow() - timedelta(days=18)
+        await db.commit()
+
+        # Unbounded (group-badge use): the 18d-old standing verdict is returned.
+        unbounded = await inv_svc.latest_complete_for_rules(db, ["RULE A"])
+        assert unbounded["RULE A"].id == a.id
+        # Bounded to a 7-day inherit window (per-alert use): the 18d verdict is excluded.
+        assert await inv_svc.latest_complete_for_rules(db, ["RULE A"], window_days=7) == {}
+
+        # A fresh verdict for the same rule IS inherited within the window.
+        b = await inv_svc.create(db, alert_es_id="e2", started_by="t", rule_name="RULE A")
+        await inv_svc.finalize(db, b.id, status="complete", verdict="true_positive", confidence=0.9)
+        bounded = await inv_svc.latest_complete_for_rules(db, ["RULE A"], window_days=7)
+        assert bounded["RULE A"].id == b.id
+    await engine.dispose()
+
+
 async def _age(db, inv_id: str, minutes: int) -> None:  # type: ignore[no-untyped-def]
     """Backdate a row's created_at so the periodic reaper sees it as stale."""
     row = await db.get(Investigation, inv_id)

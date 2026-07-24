@@ -394,7 +394,13 @@ async def list_group_events(
         # triaged group inherits consistently. (Using the most-recent run of ANY
         # status would skip the fallback whenever a later run errored/was
         # cancelled, leaving some events mislabelled "untriaged".)
-        rule_map = await inv_svc.latest_complete_for_rules(db, [rule_name])
+        # Per-alert inheritance fallback: bound by the SAME window as the pair
+        # tier so a rule's stale standing verdict isn't inherited onto fresh
+        # alerts (the "inherited a verdict from 18d ago, past my window" bug).
+        # The rule-GROUP standing badge deliberately stays unbounded.
+        rule_map = await inv_svc.latest_complete_for_rules(
+            db, [rule_name], window_days=settings.webui_inherit_window_days
+        )
     rule_inv = rule_map.get(rule_name)
 
     out: list[AlertEventOut] = []
