@@ -17,9 +17,12 @@
 # (fixture leak gate first, then the Render deploy hook) — never straight
 # from a push.
 #
-# One-time setup (owner): create the Blueprint from this file in the Render
-# dashboard, then copy the service's deploy-hook URL into the GitHub repo
-# secret RENDER_DEPLOY_HOOK_URL.
+# Setup already done (owner): the Blueprint from this file is live as
+# soc-ai-demo on Render, with its deploy-hook URL in the GitHub repo secret
+# RENDER_DEPLOY_HOOK_URL. autoDeploy stays off by design — refreshes are
+# triggered manually, either via .github/workflows/demo-deploy.yml
+# (workflow_dispatch → the deploy hook) or the Render dashboard's Manual
+# Deploy button.
 
 services:
   - type: web

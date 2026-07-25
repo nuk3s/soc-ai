@@ -20,7 +20,14 @@ from soc_ai.config import Settings
 from soc_ai.demo.fixtures import load_fixtures, seed_fixtures
 from soc_ai.store.auth import utcnow
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from soc_ai.store.models import Backtest, Hunt, HuntEvent, Investigation, InvestigationEvent
+from soc_ai.store.models import (
+    Backtest,
+    Hunt,
+    HuntEvent,
+    HuntSchedule,
+    Investigation,
+    InvestigationEvent,
+)
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -195,6 +202,65 @@ async def test_seed_hunts_with_events(settings_kratos: Settings) -> None:
         assert utcnow() - hunt.finished_at < timedelta(minutes=5)
         n_ev = await db.scalar(select(func.count()).select_from(HuntEvent))
     assert n_ev == 1
+    await engine.dispose()
+
+
+HUNT_SCHEDULE_FIXTURE = {
+    "version": 1,
+    "investigations": [],
+    "hunts": [],
+    "backtests": [],
+    "hunt_schedules": [
+        {
+            "id": 9001,
+            "objective": "beacon sweep",
+            "interval_minutes": 120,
+            "enabled": True,
+            "last_run_at": "2026-07-01T03:00:00Z",
+            "created_by": "demo",
+            "created_at": "2026-07-01T02:30:00Z",
+        }
+    ],
+    "alerts": [],
+    "replays": [],
+    "chats": [],
+}
+
+
+async def test_seed_hunt_schedules_optional_section(settings_kratos: Settings) -> None:
+    """``hunt_schedules[]`` is an OPTIONAL fixture section — absent from the
+    shipped fixtures.json today, but when present, seed_fixtures inserts a
+    HuntSchedule row the same idempotent-per-id way as the other sections."""
+    engine, maker = await _db(settings_kratos)
+    data = copy.deepcopy(HUNT_SCHEDULE_FIXTURE)
+    assert await seed_fixtures(maker, data) == 1
+    assert await seed_fixtures(maker, data) == 0  # idempotent re-seed
+    async with maker() as db:
+        sched = await db.get(HuntSchedule, 9001)
+        assert sched is not None
+        assert sched.objective == "beacon sweep"
+        assert sched.interval_minutes == 120
+        assert sched.enabled is True
+        assert sched.created_by == "demo"
+        assert sched.last_run_at is not None
+        assert sched.last_run_at.tzinfo is None
+        assert sched.created_at.tzinfo is None
+        n = await db.scalar(select(func.count()).select_from(HuntSchedule))
+    assert n == 1
+    await engine.dispose()
+
+
+async def test_seed_without_hunt_schedules_key_is_a_noop(settings_kratos: Settings) -> None:
+    """A fixture dict without ``hunt_schedules`` (the shipped fixtures.json shape
+    today) must still seed cleanly — no KeyError, no row inserted."""
+    engine, maker = await _db(settings_kratos)
+    data = copy.deepcopy(FIXTURE)
+    assert "hunt_schedules" not in data
+    added = await seed_fixtures(maker, data)
+    assert added == 2  # unaffected: the investigation + the backtest
+    async with maker() as db:
+        n = await db.scalar(select(func.count()).select_from(HuntSchedule))
+    assert n == 0
     await engine.dispose()
 
 

@@ -8,6 +8,7 @@ import { INV_STATUS } from '../lib/statusMeta';
 import { Panel, PanelHeader } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
+import { demoBlocked, useDemo } from '../lib/demo';
 import {
   type AlertQuery,
   type AutoTriageStatus,
@@ -303,6 +304,7 @@ function downDeps(h: Health | null): DownDep[] {
 
 export function Dashboard() {
   const navigate = useNavigate();
+  const demo = useDemo(); // read-only demo: eval-run shows a note, never POST
   const [range, setRange] = useState('24h');
   const [custom, setCustom] = useState<CustomRange | null>(null);
   const rangeLabel = range === 'custom' ? 'custom range' : `last ${range}`;
@@ -357,6 +359,8 @@ export function Dashboard() {
   const [evalNote, setEvalNote] = useState<string | null>(null);
   const runEvalNow = () => {
     if (evalRunning) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setEvalNote(blocked); return; } // demo: no doomed write
     setEvalRunning(true);
     setEvalNote(null);
     startQualityEval()

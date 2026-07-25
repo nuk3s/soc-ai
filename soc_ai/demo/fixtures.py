@@ -1,14 +1,17 @@
 """Load the sanitized demo fixture set and seed it into the store.
 
 Schema (version 1): ``{version, investigations[], hunts[], backtests[],
-alerts[] (mock-ES documents, consumed by scripts/demo/mock_es.py),
-replays[] ({alert_es_id, investigation{...}, events[]} — replayed live by
-soc_ai/demo/replay.py, NOT seeded at startup), chats[] ({target
-("investigation"|"hunt"), id, messages[]} — canned assistant replies looked
-up by soc_ai/demo/chat.py at request time, NOT seeded at startup)}``. Each
-investigation/hunt carries its ordered ``events[]`` (``{kind, sequence,
-payload}``) — the same rows :class:`~soc_ai.store.models.InvestigationEvent` /
-:class:`~soc_ai.store.models.HuntEvent` store.
+hunt_schedules[] (OPTIONAL — the shipped fixtures.json carries none today;
+see :class:`~soc_ai.store.models.HuntSchedule`), alerts[] (mock-ES documents,
+consumed by scripts/demo/mock_es.py), replays[] ({alert_es_id,
+investigation{...}, events[]} — replayed live by soc_ai/demo/replay.py, NOT
+seeded at startup), chats[] ({target ("investigation"|"hunt"), id,
+messages[]} — canned assistant replies looked up by soc_ai/demo/chat.py at
+request time, NOT seeded at startup)}``. Each investigation/hunt carries its
+ordered ``events[]`` (``{kind, sequence, payload}``) — the same rows
+:class:`~soc_ai.store.models.InvestigationEvent` /
+:class:`~soc_ai.store.models.HuntEvent` store. ``hunt_schedules[]`` rows carry
+no events.
 
 Seeding is idempotent PER ROW (skip any primary key already present), so a
 restart — or a store that was only partially seeded — completes without
@@ -26,13 +29,24 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from soc_ai.store.models import Backtest, Hunt, HuntEvent, Investigation, InvestigationEvent
+from soc_ai.store.models import (
+    Backtest,
+    Hunt,
+    HuntEvent,
+    HuntSchedule,
+    Investigation,
+    InvestigationEvent,
+)
 
 DEFAULT_FIXTURES = Path(__file__).parent / "fixtures.json"
 
 # Row keys holding ISO-8601 strings in the fixture file; the store's DateTime
 # columns want naive-UTC datetime objects (see soc_ai/store/models.py docstring).
 _TIME_KEYS = ("created_at", "finished_at")
+
+# Same idea for a hunt_schedules[] row (HuntSchedule has no finished_at, but
+# does have last_run_at — NULL until the schedule has fired once).
+_SCHEDULE_TIME_KEYS = ("created_at", "last_run_at")
 
 
 def load_fixtures(path: Path = DEFAULT_FIXTURES) -> dict[str, Any]:
@@ -87,14 +101,14 @@ def _parse_naive_utc(value: str) -> datetime:
     return parsed
 
 
-def _rebase_rows_to_now(rows: list[dict[str, Any]]) -> None:
-    """Shift one section's created_at+finished_at forward so its newest row lands
-    at 'now', preserving ordering and gaps within the section. Mutates in place;
-    a no-op when the section carries no parseable timestamp.
+def _rebase_rows_to_now(rows: list[dict[str, Any]], keys: tuple[str, ...] = _TIME_KEYS) -> None:
+    """Shift one section's timestamp fields (*keys*) forward so its newest row
+    lands at 'now', preserving ordering and gaps within the section. Mutates in
+    place; a no-op when the section carries no parseable timestamp.
     """
     times: list[datetime] = []
     for row in rows:
-        for key in _TIME_KEYS:
+        for key in keys:
             value = row.get(key)
             if isinstance(value, str):
                 times.append(_parse_naive_utc(value))
@@ -102,16 +116,16 @@ def _rebase_rows_to_now(rows: list[dict[str, Any]]) -> None:
         return
     delta = datetime.now(UTC).replace(tzinfo=None) - max(times)
     for row in rows:
-        for key in _TIME_KEYS:
+        for key in keys:
             value = row.get(key)
             if isinstance(value, str):
                 row[key] = (_parse_naive_utc(value) + delta).isoformat()
 
 
 def _rebase_to_now(data: dict[str, Any]) -> None:
-    """Rebase each section (investigations/hunts/backtests) independently so its
-    OWN newest row lands at 'now', preserving ordering and gaps within the
-    section.
+    """Rebase each section (investigations/hunts/backtests/hunt_schedules)
+    independently so its OWN newest row lands at 'now', preserving ordering and
+    gaps within the section.
 
     Per-section, not one global delta: in the committed fixtures the backtest is
     ~2 days newer than the newest investigation, so a single global anchor would
@@ -123,11 +137,17 @@ def _rebase_to_now(data: dict[str, Any]) -> None:
     """
     for section in ("investigations", "hunts", "backtests"):
         _rebase_rows_to_now(data.get(section, []))
+    _rebase_rows_to_now(data.get("hunt_schedules", []), keys=_SCHEDULE_TIME_KEYS)
 
 
-def _coerce_times(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert ISO-8601 timestamp strings to the store's naive-UTC datetimes."""
-    for key in _TIME_KEYS:
+def _coerce_times(row: dict[str, Any], keys: tuple[str, ...] = _TIME_KEYS) -> dict[str, Any]:
+    """Convert ISO-8601 timestamp strings to the store's naive-UTC datetimes.
+
+    *keys* defaults to the investigation/hunt/backtest pair
+    (``created_at``/``finished_at``); a hunt_schedules[] row passes
+    :data:`_SCHEDULE_TIME_KEYS` instead (``created_at``/``last_run_at``).
+    """
+    for key in keys:
         value = row.get(key)
         if isinstance(value, str):
             parsed = datetime.fromisoformat(value)
@@ -146,8 +166,8 @@ async def seed_fixtures(
     :func:`_rebase_to_now`) so seeded content always reads as recent. Each row
     is then copied before the ``events`` pop / time coercion, so seeding never
     drops events and one loaded document can be seeded repeatedly.
-    Returns the number of parent rows (investigations + hunts + backtests)
-    added; their child events ride along uncounted.
+    Returns the number of parent rows (investigations + hunts + backtests +
+    hunt_schedules) added; their child events ride along uncounted.
     """
     _rebase_to_now(data)
     added = 0
@@ -179,6 +199,13 @@ async def seed_fixtures(
             bt = _coerce_times(dict(raw))
             if await db.get(Backtest, bt["id"]) is None:
                 db.add(Backtest(**bt))
+                added += 1
+        # OPTIONAL section — absent from the shipped fixtures.json today, so
+        # ``.get(..., [])`` makes this whole block a no-op for that file.
+        for raw in data.get("hunt_schedules", []):
+            sched = _coerce_times(dict(raw), keys=_SCHEDULE_TIME_KEYS)
+            if await db.get(HuntSchedule, sched["id"]) is None:
+                db.add(HuntSchedule(**sched))
                 added += 1
         await db.commit()
     return added

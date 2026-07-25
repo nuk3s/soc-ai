@@ -21,6 +21,7 @@ import { Checkbox } from '../components/Controls';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
+import { demoBlocked, useDemo } from '../lib/demo';
 import { rangeToSinceUntil } from '../lib/timeRange';
 import {
   bulkDeleteHunts,
@@ -321,6 +322,7 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
 // ---------------------------------------------------------------------------
 function ScheduledHunts() {
   const navigate = useNavigate();
+  const demo = useDemo(); // read-only demo: schedule writes show a note, never POST/PATCH/DELETE
   const [reloadKey, setReloadKey] = useState(0);
   const { data, loading, error } = useAsync<HuntScheduleList>(getHuntSchedules, [reloadKey]);
   const schedules = data?.schedules;
@@ -355,6 +357,8 @@ function ScheduledHunts() {
   const save = async () => {
     const obj = objective.trim();
     if (!obj || busy) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setFormErr(blocked); return; } // demo: no doomed write
     const mins = Math.max(MIN_INTERVAL_MINUTES, Math.round(interval) || MIN_INTERVAL_MINUTES);
     setBusy(true);
     setFormErr(null);
@@ -374,6 +378,8 @@ function ScheduledHunts() {
   };
 
   const toggleEnabled = async (s: HuntSchedule) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setFormErr(blocked); return; } // demo: no doomed write
     try {
       await updateHuntSchedule(s.id, { enabled: !s.enabled });
       reload();
@@ -383,6 +389,8 @@ function ScheduledHunts() {
   };
 
   const removeOne = async (id: number) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setFormErr(blocked); setPendingDelete(null); return; } // demo: no doomed write
     try {
       await deleteHuntSchedule(id);
     } catch {

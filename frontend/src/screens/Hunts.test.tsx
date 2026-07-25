@@ -5,9 +5,10 @@
 // `masterSwitchEnabled` alongside the rows so the panel can render an honest
 // state: a persistent banner with a real deep-link into Config, and a muted
 // "on (paused)" pill instead of the plain accent "on".
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
+import { DemoProvider } from '../lib/demo';
 
 const SCHEDULE = vi.hoisted(() => ({
   id: 1,
@@ -20,6 +21,9 @@ const SCHEDULE = vi.hoisted(() => ({
 }));
 
 const getHuntSchedulesMock = vi.hoisted(() => vi.fn());
+const createHuntScheduleMock = vi.hoisted(() => vi.fn());
+const updateHuntScheduleMock = vi.hoisted(() => vi.fn());
+const deleteHuntScheduleMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -27,17 +31,22 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHuntStats: vi.fn().mockResolvedValue([]),
   getHuntTemplates: vi.fn().mockResolvedValue([]),
   getHuntSchedules: getHuntSchedulesMock,
+  createHuntSchedule: createHuntScheduleMock,
+  updateHuntSchedule: updateHuntScheduleMock,
+  deleteHuntSchedule: deleteHuntScheduleMock,
 }));
 
 import { Hunts } from './Hunts';
 
-function renderHunts() {
+function renderHunts(demo = false) {
   return render(
     <MemoryRouter initialEntries={['/hunts']}>
-      <Routes>
-        <Route path="/hunts" element={<Hunts />} />
-        <Route path="/config" element={<div>CONFIG SCREEN</div>} />
-      </Routes>
+      <DemoProvider demo={demo}>
+        <Routes>
+          <Route path="/hunts" element={<Hunts />} />
+          <Route path="/config" element={<div>CONFIG SCREEN</div>} />
+        </Routes>
+      </DemoProvider>
     </MemoryRouter>,
   );
 }
@@ -65,5 +74,50 @@ describe('ScheduledHunts master-switch discoverability', () => {
     const row = screen.getByText('Nightly beacon sweep').closest('div')!.parentElement!.parentElement!;
     expect(within(row).getByText('on')).toBeTruthy();
     expect(within(row).queryByText('on (paused)')).toBeNull();
+  });
+});
+
+// Two new 1.2.x write buttons (create/edit, toggle, delete) never fired a
+// doomed write in demo mode — Hunts.tsx had zero useDemo/demoBlocked wiring
+// until this fix. Each assertion below drives the real ScheduledHunts panel
+// (not a miniature) through DemoProvider so it exercises the actual handler.
+describe('ScheduledHunts demo guard', () => {
+  it('shows the demo note and does not POST when creating a schedule', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [], masterSwitchEnabled: true });
+    renderHunts(true);
+
+    await screen.findByText('No scheduled hunts yet — add one below.');
+    fireEvent.change(screen.getByPlaceholderText('New recurring hunt objective…'), {
+      target: { value: 'find beacons' },
+    });
+    fireEvent.click(screen.getByText('Add'));
+
+    await screen.findByText(/Not available in the read-only demo/);
+    expect(createHuntScheduleMock).not.toHaveBeenCalled();
+  });
+
+  it('shows the demo note and does not PATCH when toggling a schedule', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: true });
+    renderHunts(true);
+
+    const row = (await screen.findByText('Nightly beacon sweep')).closest('div')!.parentElement!
+      .parentElement!;
+    fireEvent.click(within(row).getByText('on'));
+
+    await screen.findByText(/Not available in the read-only demo/);
+    expect(updateHuntScheduleMock).not.toHaveBeenCalled();
+  });
+
+  it('shows the demo note and does not DELETE when removing a schedule', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: true });
+    renderHunts(true);
+
+    const row = (await screen.findByText('Nightly beacon sweep')).closest('div')!.parentElement!
+      .parentElement!;
+    fireEvent.click(within(row).getByTitle('Delete schedule'));
+    fireEvent.click(within(row).getByTitle('Confirm delete'));
+
+    await screen.findByText(/Not available in the read-only demo/);
+    expect(deleteHuntScheduleMock).not.toHaveBeenCalled();
   });
 });
