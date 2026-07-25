@@ -26,6 +26,16 @@ def _demo_on(settings: Any) -> bool:
     return getattr(settings, "soc_ai_demo", False) is True
 
 
+def is_demo(settings: Any) -> bool:
+    """Public predicate: whether *settings* carries a genuine demo flag.
+
+    Same strict ``is True`` semantics as the internal guard, exported so
+    non-egress callers (e.g. the health-status probes) can branch on demo mode
+    without importing a private helper or re-deriving the flag.
+    """
+    return _demo_on(settings)
+
+
 class DemoEgressBlocked(RuntimeError):
     """Demo mode refused to construct an outbound network client."""
 

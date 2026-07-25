@@ -135,6 +135,23 @@ async def test_probe_llm_non_200() -> None:
     assert "401" in result["detail"]
 
 
+async def test_probe_llm_demo_mode_reports_healthy_without_egress() -> None:
+    """In demo mode the gateway is replayed, so /health must show it OK — and the
+    probe must NOT attempt any outbound call (which the demo guard would refuse
+    and surface as a false 'AI gateway not reachable' degraded banner)."""
+    settings = _llm_settings(api_key="some-key")
+    settings.soc_ai_demo = True
+
+    async def _boom(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("probe_llm must not attempt egress in demo mode")
+
+    with _patch_httpx(_boom):
+        result = await probes.probe_llm(settings)
+
+    assert result["ok"] is True
+    assert "demo" in result["detail"].lower()
+
+
 # ---------------------------------------------------------------------------
 # probe_es
 # ---------------------------------------------------------------------------

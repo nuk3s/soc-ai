@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from soc_ai.demo.guard import assert_egress_allowed
+from soc_ai.demo.guard import assert_egress_allowed, is_demo
 
 # Default timeout (seconds) for every outbound probe. Kept short so the admin
 # UI stays responsive when an upstream is down or hanging.
@@ -110,6 +110,13 @@ async def probe_llm(settings: Any) -> dict[str, Any]:
     Never raises; returns ``ok``/``detail``. The API key is never placed into
     ``detail``.
     """
+    # In demo mode the agent's answers are replayed from packaged fixtures and
+    # there is no live gateway to reach. An egress probe would be (correctly)
+    # refused by the demo guard, but reporting that refusal as a degraded
+    # upstream lights up a false "AI gateway not reachable" banner on a demo
+    # that is working exactly as designed. Report healthy-by-replay instead.
+    if is_demo(settings):
+        return {"ok": True, "detail": "demo mode — replayed responses (no live gateway)"}
     ids, err = await list_gateway_models(settings)
     if err is not None:
         return {"ok": False, "detail": err}
