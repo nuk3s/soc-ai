@@ -27,7 +27,9 @@ from soc_ai.store.models import (
     HuntSchedule,
     Investigation,
     InvestigationEvent,
+    QualitySnapshot,
 )
+from soc_ai.triage_models import is_pipeline_fallback
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -261,6 +263,93 @@ async def test_seed_without_hunt_schedules_key_is_a_noop(settings_kratos: Settin
     async with maker() as db:
         n = await db.scalar(select(func.count()).select_from(HuntSchedule))
     assert n == 0
+    await engine.dispose()
+
+
+QUALITY_SNAPSHOT_FIXTURE = {
+    "version": 1,
+    "investigations": [],
+    "hunts": [],
+    "backtests": [],
+    "quality_snapshots": [
+        {
+            "id": 9001,
+            "created_at": "2026-07-01T03:00:00Z",
+            "mode": "graded",
+            "n_ok": 8,
+            "n_error": 0,
+            "agreement_rate": 0.85,
+            "fallback_rate": 0.0,
+            "error_rate": 0.0,
+            "verdict_counts": {"true_positive": 3, "false_positive": 4, "needs_more_info": 1},
+            "latency_p50_ms": 52000,
+            "batch_dir": None,
+            "alarmed": False,
+            "alarm_reasons": None,
+        }
+    ],
+    "alerts": [],
+    "replays": [],
+    "chats": [],
+}
+
+
+async def test_seed_quality_snapshots_optional_section(settings_kratos: Settings) -> None:
+    """``quality_snapshots[]`` is an OPTIONAL fixture section — when present,
+    seed_fixtures inserts a QualitySnapshot row the same idempotent-per-id way as
+    the other sections, so the demo Dashboard Quality card has a trend to draw."""
+    engine, maker = await _db(settings_kratos)
+    data = copy.deepcopy(QUALITY_SNAPSHOT_FIXTURE)
+    assert await seed_fixtures(maker, data) == 1
+    assert await seed_fixtures(maker, data) == 0  # idempotent re-seed
+    async with maker() as db:
+        snap = await db.get(QualitySnapshot, 9001)
+        assert snap is not None
+        assert snap.mode == "graded"
+        assert snap.agreement_rate == 0.85
+        assert snap.verdict_counts == {
+            "true_positive": 3,
+            "false_positive": 4,
+            "needs_more_info": 1,
+        }
+        assert snap.alarmed is False
+        # created_at is the only time key; it lands as the store's naive-UTC value.
+        assert snap.created_at.tzinfo is None
+        n = await db.scalar(select(func.count()).select_from(QualitySnapshot))
+    assert n == 1
+    await engine.dispose()
+
+
+async def test_seed_without_quality_snapshots_key_is_a_noop(settings_kratos: Settings) -> None:
+    """A fixture dict without ``quality_snapshots`` must still seed cleanly — no
+    KeyError, no row inserted (mirrors the hunt_schedules no-op guard)."""
+    engine, maker = await _db(settings_kratos)
+    data = copy.deepcopy(FIXTURE)
+    assert "quality_snapshots" not in data
+    added = await seed_fixtures(maker, data)
+    assert added == 2  # unaffected: the investigation + the backtest
+    async with maker() as db:
+        n = await db.scalar(select(func.count()).select_from(QualitySnapshot))
+    assert n == 0
+    await engine.dispose()
+
+
+async def test_committed_fixtures_seed_the_1_2_x_showcase(settings_kratos: Settings) -> None:
+    """The shipped soc_ai/demo/fixtures.json carries the 1.2.x showcase content:
+    hunt schedules (Hunts screen), a quality-trend series (Dashboard Quality
+    card), and exactly one pipeline-fallback investigation (Dashboard pipeline-
+    errors KPI) — so those screens render content in the read-only demo."""
+    data = load_fixtures()  # the real committed fixture file (DEFAULT_FIXTURES)
+    engine, maker = await _db(settings_kratos)
+    await seed_fixtures(maker, data)
+    async with maker() as db:
+        n_sched = await db.scalar(select(func.count()).select_from(HuntSchedule))
+        n_snap = await db.scalar(select(func.count()).select_from(QualitySnapshot))
+        rows = (await db.execute(select(Investigation))).scalars().all()
+    assert n_sched >= 2
+    assert n_snap >= 5
+    fallbacks = [r for r in rows if is_pipeline_fallback(r.report)]
+    assert len(fallbacks) == 1
     await engine.dispose()
 
 

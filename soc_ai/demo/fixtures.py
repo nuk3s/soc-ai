@@ -1,8 +1,9 @@
 """Load the sanitized demo fixture set and seed it into the store.
 
 Schema (version 1): ``{version, investigations[], hunts[], backtests[],
-hunt_schedules[] (OPTIONAL — the shipped fixtures.json carries none today;
-see :class:`~soc_ai.store.models.HuntSchedule`), alerts[] (mock-ES documents,
+hunt_schedules[] (OPTIONAL — see :class:`~soc_ai.store.models.HuntSchedule`),
+quality_snapshots[] (OPTIONAL — the nightly quality-trend series, see
+:class:`~soc_ai.store.models.QualitySnapshot`), alerts[] (mock-ES documents,
 consumed by scripts/demo/mock_es.py), replays[] ({alert_es_id,
 investigation{...}, events[]} — replayed live by soc_ai/demo/replay.py, NOT
 seeded at startup), chats[] ({target ("investigation"|"hunt"), id,
@@ -36,6 +37,7 @@ from soc_ai.store.models import (
     HuntSchedule,
     Investigation,
     InvestigationEvent,
+    QualitySnapshot,
 )
 
 DEFAULT_FIXTURES = Path(__file__).parent / "fixtures.json"
@@ -135,7 +137,7 @@ def _rebase_to_now(data: dict[str, Any]) -> None:
     fields only); the committed fixtures mix tz-aware and naive rows, so
     everything is normalized to naive-UTC first.
     """
-    for section in ("investigations", "hunts", "backtests"):
+    for section in ("investigations", "hunts", "backtests", "quality_snapshots"):
         _rebase_rows_to_now(data.get(section, []))
     _rebase_rows_to_now(data.get("hunt_schedules", []), keys=_SCHEDULE_TIME_KEYS)
 
@@ -167,7 +169,8 @@ async def seed_fixtures(
     is then copied before the ``events`` pop / time coercion, so seeding never
     drops events and one loaded document can be seeded repeatedly.
     Returns the number of parent rows (investigations + hunts + backtests +
-    hunt_schedules) added; their child events ride along uncounted.
+    hunt_schedules + quality_snapshots) added; their child events ride along
+    uncounted.
     """
     _rebase_to_now(data)
     added = 0
@@ -200,12 +203,18 @@ async def seed_fixtures(
             if await db.get(Backtest, bt["id"]) is None:
                 db.add(Backtest(**bt))
                 added += 1
-        # OPTIONAL section — absent from the shipped fixtures.json today, so
-        # ``.get(..., [])`` makes this whole block a no-op for that file.
+        # OPTIONAL section — ``.get(..., [])`` makes this a no-op when absent.
         for raw in data.get("hunt_schedules", []):
             sched = _coerce_times(dict(raw), keys=_SCHEDULE_TIME_KEYS)
             if await db.get(HuntSchedule, sched["id"]) is None:
                 db.add(HuntSchedule(**sched))
+                added += 1
+        # OPTIONAL section — the nightly quality-trend series (created_at is the
+        # only time key). ``.get(..., [])`` makes this a no-op when absent.
+        for raw in data.get("quality_snapshots", []):
+            snap = _coerce_times(dict(raw))
+            if await db.get(QualitySnapshot, snap["id"]) is None:
+                db.add(QualitySnapshot(**snap))
                 added += 1
         await db.commit()
     return added

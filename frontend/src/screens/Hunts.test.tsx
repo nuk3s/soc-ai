@@ -77,6 +77,32 @@ describe('ScheduledHunts master-switch discoverability', () => {
   });
 });
 
+// The "paused globally" banner CTA deep-links to a Config toggle that is itself
+// demo-guarded (a dead-end in the read-only demo), so the banner is suppressed
+// in demo mode ONLY. The "on (paused)" pills still render (that IS the 1.2.4
+// feature); only the banner is hidden. Live (non-demo) behavior is unchanged.
+describe('ScheduledHunts banner demo-suppression', () => {
+  it('does NOT render the paused-globally banner in demo mode', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: false });
+    renderHunts(true);
+
+    await screen.findByText('Nightly beacon sweep');
+    expect(screen.queryByText(/paused globally/i)).toBeNull();
+    // The "on (paused)" pill still renders — the banner is the only thing hidden.
+    const row = screen.getByText('Nightly beacon sweep').closest('div')!.parentElement!
+      .parentElement!;
+    expect(within(row).getByText('on (paused)')).toBeTruthy();
+  });
+
+  it('DOES render the paused-globally banner outside demo mode', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: false });
+    renderHunts(false);
+
+    await screen.findByText('Nightly beacon sweep');
+    expect(screen.getByText(/paused globally/i)).toBeTruthy();
+  });
+});
+
 // Two new 1.2.x write buttons (create/edit, toggle, delete) never fired a
 // doomed write in demo mode — Hunts.tsx had zero useDemo/demoBlocked wiring
 // until this fix. Each assertion below drives the real ScheduledHunts panel

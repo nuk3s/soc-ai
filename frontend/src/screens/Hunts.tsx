@@ -410,7 +410,11 @@ function ScheduledHunts() {
         </span>
       </div>
 
-      {data && !masterSwitchOn && (
+      {/* The banner's CTA deep-links to a Config toggle that is itself demo-
+          guarded — a dead-end in the read-only demo — so suppress it in demo mode
+          ONLY. The "on (paused)" pills below still render (that IS the 1.2.4
+          feature); only this banner is hidden. Live behavior is unchanged. */}
+      {data && !masterSwitchOn && !demo && (
         <div className="flex items-center gap-2 border-b border-warn/25 bg-warn/5 px-4 py-2.5 text-[12px] text-warn">
           <AlertTriangle size={14} className="flex-none" />
           <span>
