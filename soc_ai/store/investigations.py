@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from ulid import ULID
 
 from soc_ai.store import chat_memory
@@ -267,17 +268,25 @@ async def get_with_events(
 async def _latest_by(db: AsyncSession, column: Any, keys: list[str]) -> dict[str, Investigation]:
     if not keys:
         return {}
-    rows = (
-        await db.scalars(
-            select(Investigation)
-            .where(column.in_(keys))
-            .order_by(Investigation.created_at.desc(), Investigation.id.desc())
-            # Bound the scan: we only keep the newest row per key, so at most a
-            # small multiple of len(keys) is ever needed. Without this the query
-            # returns every historical re-investigation for the keys.
-            .limit(len(keys) * 10)
+    # Newest row PER KEY via a window function. A global ORDER BY … LIMIT is
+    # wrong here: one noisy key with many recent rows can push every other key's
+    # newest row past the limit and drop it from the map entirely. ROW_NUMBER()
+    # partitions per key so each key's newest row is selected independently.
+    ranked = (
+        select(
+            Investigation,
+            func.row_number()
+            .over(
+                partition_by=column,
+                order_by=(Investigation.created_at.desc(), Investigation.id.desc()),
+            )
+            .label("rn"),
         )
-    ).all()
+        .where(column.in_(keys))
+        .subquery()
+    )
+    latest = aliased(Investigation, ranked)
+    rows = (await db.scalars(select(latest).where(ranked.c.rn == 1))).all()
     out: dict[str, Investigation] = {}
     for inv in rows:
         key = getattr(inv, column.key)
@@ -318,16 +327,24 @@ async def latest_complete_for_rules(
     ]
     if window_days is not None:
         conds.append(Investigation.created_at >= utcnow() - timedelta(days=window_days))
-    rows = (
-        await db.scalars(
-            select(Investigation)
-            .where(*conds)
-            .order_by(Investigation.created_at.desc(), Investigation.id.desc())
-            # Bounded like _latest_by: only the newest complete row per rule is
-            # kept, so a small multiple of len(rule_names) suffices.
-            .limit(len(rule_names) * 10)
+    # Newest complete row PER RULE via a window function (see :func:`_latest_by`):
+    # a global ORDER BY … LIMIT lets one noisy rule's recent rows evict every
+    # other rule's standing verdict, so partition per rule and take rn == 1.
+    ranked = (
+        select(
+            Investigation,
+            func.row_number()
+            .over(
+                partition_by=Investigation.rule_name,
+                order_by=(Investigation.created_at.desc(), Investigation.id.desc()),
+            )
+            .label("rn"),
         )
-    ).all()
+        .where(*conds)
+        .subquery()
+    )
+    latest = aliased(Investigation, ranked)
+    rows = (await db.scalars(select(latest).where(ranked.c.rn == 1))).all()
     out: dict[str, Investigation] = {}
     for inv in rows:
         if inv.rule_name and inv.rule_name not in out:
@@ -415,21 +432,30 @@ async def override_counts_by_rule(
     out: dict[str, dict[str, int]] = {}
     if not rule_names:
         return out
-    rows = (
-        await db.scalars(
-            select(Investigation)
-            .where(
-                Investigation.rule_name.in_(rule_names),
-                Investigation.status == "complete",
-                Investigation.verdict.is_not(None),
+    # Bound PER RULE, not with a global LIMIT: a window function keeps each
+    # rule's 25 most-recent completions so one noisy rule can't evict another
+    # rule's overrides from the scan. Analyst overrides are rare relative to raw
+    # completions, so 25 recent rows per rule covers the history that drives a
+    # nomination.
+    ranked = (
+        select(
+            Investigation,
+            func.row_number()
+            .over(
+                partition_by=Investigation.rule_name,
+                order_by=(Investigation.created_at.desc(), Investigation.id.desc()),
             )
-            .order_by(Investigation.created_at.desc(), Investigation.id.desc())
-            # Bound the scan like verdict_counts_by_rule. Analyst overrides are
-            # rare relative to raw completions; a small multiple per rule covers
-            # the recent history that drives a nomination.
-            .limit(len(rule_names) * 25)
+            .label("rn"),
         )
-    ).all()
+        .where(
+            Investigation.rule_name.in_(rule_names),
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+        )
+        .subquery()
+    )
+    recent = aliased(Investigation, ranked)
+    rows = (await db.scalars(select(recent).where(ranked.c.rn <= 25))).all()
     for inv in rows:
         if inv.rule_name is None:
             continue

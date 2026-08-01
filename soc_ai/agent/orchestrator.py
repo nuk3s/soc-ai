@@ -1660,6 +1660,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     await _audit(enriched_ev)
     yield enriched_ev
 
+    # Anchor every time-windowed tool on THIS alert's @timestamp immediately
+    # after prefetch. The fast / Phase-D path dispatches the query tools and
+    # t_get_pcap WITHOUT entering the investigation-loop branch below (which is
+    # where the anchor used to be set), so without this a round-1 gap dispatch
+    # (or a t_get_pcap capture) fell back to a now-relative window; and on a ctx
+    # reused across an auto-triage / backtest sweep it could inherit a PREVIOUS
+    # alert's timestamp. Set unconditionally here for every run so both the
+    # Phase-D and loop paths center on this alert (matches the documented
+    # InvestigationContext.default_time_anchor contract). The loop branch below
+    # re-sets it (with dedup / prefetched_community_ids) harmlessly.
+    ctx.default_time_anchor = enriched.alert.timestamp
+
     # ----- Phase B: decision template -----
     candidate = match_decision_template(enriched)
     template_ev = _ev(

@@ -70,6 +70,13 @@ _OCCASIONAL_PER_DAY = 1.0
 # a single host pair is focused, not background nuisance.
 _NOISY_MIN_HOSTS = 5
 
+# Cap the caller-supplied lookback window. Alert-embedded text is in-scope
+# prompt-injection surface, so an unbounded lookback_days lets the agent turn a
+# rarity check into a full-history ES scan (track_total_hits + two cardinality
+# aggs) against the same live SO grid production hunting depends on. 365d is
+# ample for a base-rate signal and mirrors the sibling read tools' ceilings.
+_MAX_LOOKBACK_DAYS = 365
+
 
 def _rule_match_query(rule_name: str, lookback_days: int) -> dict[str, Any]:
     """Match ``suricata.alert`` docs whose rule name equals ``rule_name``.
@@ -223,6 +230,13 @@ async def rule_prevalence(
             "error": True,
             "type": "ValueError",
             "message": f"lookback_days must be positive, got {lookback_days}",
+        }
+
+    if lookback_days > _MAX_LOOKBACK_DAYS:
+        return {
+            "error": True,
+            "type": "ValueError",
+            "message": (f"lookback_days must be <= {_MAX_LOOKBACK_DAYS}, got {lookback_days}"),
         }
 
     index = settings.events_index_pattern

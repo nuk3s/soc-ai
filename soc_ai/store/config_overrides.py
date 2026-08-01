@@ -839,14 +839,17 @@ WHITELIST: tuple[SettingSpec, ...] = (
         min_value=1,
         max_value=168,
     ),
-    # ---- API KEYS: enrichment provider secrets (hot, write-only) -------------
-    # Distinct from the Danger-Zone secrets: these feed per-call enrichment
-    # clients (read fresh from settings on each tool call / refresh), so they are
-    # hot=True — a saved key applies live, no restart. secret=True ⇒ Fernet-
-    # encrypted at rest, never rendered back (write-only). NOT danger (no typed
-    # confirm). Section "API keys" is intentionally NOT in SECTION_ORDER: these
-    # render in the dedicated API-keys panel next to Data sources, never in the
-    # normal settings groups. Requires CONFIG_SECRET_KEY to persist.
+    # ---- API KEYS: enrichment provider secrets (write-only) ------------------
+    # Distinct from the Danger-Zone secrets: MOST of these feed per-call
+    # enrichment clients (read fresh from settings on each tool call / refresh),
+    # so they are hot=True — a saved key applies live, no restart. The ONE
+    # exception is misp_api_key (hot=False): it is baked into the MispClient built
+    # once at startup, so it needs a restart to take effect (see its spec below).
+    # secret=True ⇒ Fernet-encrypted at rest, never rendered back (write-only).
+    # NOT danger (no typed confirm). Section "API keys" is intentionally NOT in
+    # SECTION_ORDER: these render in the dedicated API-keys panel next to Data
+    # sources, never in the normal settings groups. Requires CONFIG_SECRET_KEY to
+    # persist.
     SettingSpec(
         key="shodan_api_key",
         attr="shodan_api_key",
@@ -872,12 +875,18 @@ WHITELIST: tuple[SettingSpec, ...] = (
         attr="misp_api_key",
         type="str",
         section="API keys",
-        hot=True,
+        # Exception to the hot API-keys group: misp_api_key is baked into the
+        # MispClient's Authorization header when that client is built once at
+        # startup (soc_ai.tools.enrichment.MispClient, held on app.state.misp) and
+        # is NOT re-read per call — so a saved key needs a restart to take effect,
+        # exactly like misp_url above. The other enrichment keys ARE read per call.
+        hot=False,
         secret=True,
         label="MISP API key",
         help=(
-            "Threat-intel matches. Also set the MISP URL, above under Online "
-            "enrichment, to enable MISP enrichment."
+            "Restart required to take effect (baked into the MISP client built at "
+            "startup). Also set the MISP URL, above under Online enrichment, to "
+            "enable MISP enrichment."
         ),
     ),
     SettingSpec(
@@ -1286,13 +1295,17 @@ def coerce(key: str, raw_str: str) -> Any:
         v_int = int(raw_str)  # ValueError on junk/"1.5" → caller rejects
         _check_bounds(spec, v_int)
         return v_int
+    # URL-scheme guard for BOTH csv (es_hosts) and plain-str URL settings. Runs
+    # BEFORE the csv early-return below — otherwise it is dead for es_hosts, the
+    # only csv-typed URL setting, and a bare host:port ("es1:9200") is stored then
+    # rejected by AnyHttpUrl on every restart. _require_http_scheme splits on
+    # commas, so the raw csv string is checked host-by-host.
+    if key in _URL_SETTING_KEYS:
+        _require_http_scheme(key, raw_str)
     if spec.type == "csv":
         # Comma-separated list → list[str]; whitespace trimmed, empties dropped.
         return [part.strip() for part in raw_str.split(",") if part.strip()]
-    result = str(raw_str)
-    if key in _URL_SETTING_KEYS:
-        _require_http_scheme(key, result)
-    return result
+    return str(raw_str)
 
 
 def _validate_typed(spec: SettingSpec, value: Any) -> Any:
@@ -1320,7 +1333,12 @@ def _validate_typed(spec: SettingSpec, value: Any) -> Any:
     if spec.type == "csv":
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
             raise ValueError(f"{spec.key} expects a list of strings")
-        return [x.strip() for x in value if x.strip()]
+        cleaned = [x.strip() for x in value if x.strip()]
+        # es_hosts is a csv of URLs — enforce the http(s) scheme here too, not
+        # just the plain-str branch below (which the csv return would skip).
+        if spec.key in _URL_SETTING_KEYS:
+            _require_http_scheme(spec.key, ",".join(cleaned))
+        return cleaned
     if not isinstance(value, str):
         raise ValueError(f"{spec.key} expects a string")
     if spec.key in _URL_SETTING_KEYS:

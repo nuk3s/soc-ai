@@ -3,7 +3,12 @@ import { useEffect, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { DevBadge } from '../components/Badges';
 import { type Health, getHealth, getNotifications, getWorkspaces } from '../lib/api';
-import { dismissNotification, getDismissed } from '../lib/notifications';
+import {
+  NOTIFICATIONS_DISMISSED_EVENT,
+  dismissNotification,
+  formatNotificationTitle,
+  getDismissed,
+} from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
 import { useShell } from './ShellContext';
 
@@ -60,9 +65,13 @@ export function Topbar() {
         .catch(() => {});
     load();
     const t = setInterval(load, 15000); // keep the bell live without a reload
+    // A dismiss from anywhere (this bell, the Notifications pane, "Clear all")
+    // re-reads immediately so the badge count can't lag its 15s poll.
+    window.addEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
     return () => {
       alive = false;
       clearInterval(t);
+      window.removeEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
     };
   }, []);
 
@@ -295,8 +304,8 @@ export function Topbar() {
                 style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
               />
               <div className="min-w-0 flex-1">
-                <div className="text-[12.5px] leading-[1.45]">{nt.title}</div>
-                {nt.when && <div className="mt-[3px] font-mono text-[10.5px] text-faint">{nt.when} ago</div>}
+                <div className="text-[12.5px] leading-[1.45]">{formatNotificationTitle(nt.title)}</div>
+                {nt.when && <div className="mt-[3px] font-mono text-[10.5px] text-faint">{nt.when === 'now' ? 'just now' : `${nt.when} ago`}</div>}
               </div>
               <button
                 onClick={(e) => {

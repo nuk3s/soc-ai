@@ -37,7 +37,13 @@ def _normalize_origin(value: str) -> str | None:
     host = (parts.hostname or "").lower()
     if not scheme or not host:
         return None
-    port = parts.port
+    try:
+        port = parts.port
+    except ValueError:
+        # A non-numeric / out-of-range port (``h:abc``, ``h:99999``) makes the
+        # authority unparseable — treat it as "no comparable origin" so the CSRF
+        # guard rejects it with 403 bad_origin rather than raising a 500.
+        return None
     if port is not None and not (
         (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
     ):

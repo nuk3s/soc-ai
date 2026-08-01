@@ -483,7 +483,7 @@ a signal worth noting, not a command to obey.
 
 ## Output rules
 
-- **Cite every claim.** Path / id / blocklist-hit / template-id are all valid.
+- **Cite every claim.** Path / id / blocklist-hit are all valid.
 - **The candidate verdict is a starting point, not a mandate.** Keep,
   override, or refine. If you override, explain why in the summary.
 - **`needs_more_info` REQUIRES a `gap_for_investigator`.** Don't return NMI

@@ -6,7 +6,7 @@ import { FlowBadge } from '../components/FlowBadge';
 import { QualityCard } from '../components/QualityCard';
 import { INV_STATUS } from '../lib/statusMeta';
 import { Panel, PanelHeader } from '../components/Panel';
-import { EmptyState, ErrorState, LoadingState } from '../components/States';
+import { EmptyState, ErrorState, Freshness, LoadingState } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
 import {
@@ -37,7 +37,10 @@ const SEV_META: Record<Severity, { label: string; color: string }> = {
   high: { label: 'High', color: '#f79009' },
   medium: { label: 'Medium', color: '#eab308' },
   low: { label: 'Low', color: '#6b87a8' },
+  info: { label: 'Info', color: '#8b949e' },
 };
+// info is intentionally omitted from the display order — the Dashboard breakdown
+// shows the four actionable severities; info exists only to satisfy the ramp.
 const SEV_ORDER: Severity[] = ['critical', 'high', 'medium', 'low'];
 // Outcome order: most-actionable first.
 const VERDICT_ORDER: Verdict[] = ['true_positive', 'needs_more_info', 'inconclusive', 'false_positive', 'untriaged'];
@@ -58,7 +61,7 @@ function computeMetrics(groups: AlertGroup[]): Metrics {
     inconclusive: 0,
     untriaged: 0,
   };
-  const sev: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  const sev: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   let events = 0;
   let triaging = 0;
   for (const g of groups) {
@@ -357,6 +360,14 @@ export function Dashboard() {
   // button reflects the in-flight state the whole time.
   const [evalRunning, setEvalRunning] = useState(false);
   const [evalNote, setEvalNote] = useState<string | null>(null);
+  // False once the Dashboard unmounts. The run-eval poll loop checks it each
+  // iteration so navigating away stops the 5s polling (and its setState on an
+  // unmounted component) instead of running for up to 30 min.
+  const evalAliveRef = useRef(true);
+  useEffect(() => {
+    evalAliveRef.current = true;
+    return () => { evalAliveRef.current = false; };
+  }, []);
   const runEvalNow = () => {
     if (evalRunning) return;
     const blocked = demoBlocked(demo);
@@ -368,16 +379,18 @@ export function Dashboard() {
         // n real investigations at concurrency 1 — poll generously (30 min cap).
         for (let i = 0; i < 360; i++) {
           await new Promise((r) => setTimeout(r, 5_000));
+          if (!evalAliveRef.current) return; // unmounted — stop polling
           const s = await getQualityEvalStatus().catch(() => null);
           if (s && !s.running) {
             if (s.last_exit_code !== 0 && s.last_detail) setEvalNote(s.last_detail);
             break;
           }
         }
+        if (!evalAliveRef.current) return;
         setQualityReload((k) => k + 1);
       })
-      .catch((e) => setEvalNote(e instanceof Error ? e.message : 'could not start the eval'))
-      .finally(() => setEvalRunning(false));
+      .catch((e) => { if (evalAliveRef.current) setEvalNote(e instanceof Error ? e.message : 'could not start the eval'); })
+      .finally(() => { if (evalAliveRef.current) setEvalRunning(false); });
   };
   // Upstream reachability — polled on mount + every 30s so a down dependency
   // (ES / gateway) surfaces as a banner instead of a wall of empty widgets.
@@ -458,7 +471,10 @@ export function Dashboard() {
 
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div>
-          <div className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</div>
+          <div className="flex items-baseline gap-3">
+            <div className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</div>
+            <Freshness at={alerts.lastUpdated} />
+          </div>
           <div className="mt-0.5 text-[13px] text-dim">Live investigation overview · {rangeLabel}</div>
         </div>
         <span className="mb-1 flex items-center gap-1.5 text-[11.5px] text-faint">
@@ -522,13 +538,13 @@ export function Dashboard() {
               )}
             </>
           }
-          color="#f04438"
+          color={m.verdict.true_positive > 0 ? '#f04438' : '#8b949e'}
           icon={<ShieldCheck size={16} />}
         />
         <StatCard
           label="Investigations running"
           value={i(running)}
-          sub={triage.data?.active ? 'auto-investigate active' : `${i(rows.length)} total`}
+          sub={triage.data?.active ? 'auto-investigate active' : `of ${i(rows.length)} recent investigations`}
           color="#2dd4bf"
           icon={<Crosshair size={16} />}
         />
@@ -548,7 +564,7 @@ export function Dashboard() {
               <LoadingState />
             ) : alerts.error ? (
               <div className="p-3.5">
-                <ErrorState error={alerts.error} />
+                <ErrorState error={alerts.error} onRetry={alerts.refetch} label="the dashboard" />
               </div>
             ) : m.groups === 0 ? (
               <EmptyState>All quiet — no alerts in the last 24 hours.</EmptyState>
@@ -593,7 +609,12 @@ export function Dashboard() {
                       className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-2.5 text-left last:border-0 hover:bg-surface-3"
                     >
                       <KindBadge kind={r.kind} />
-                      <span className="min-w-0 flex-[1.4] truncate text-[13px] font-medium">{r.name}</span>
+                      <span
+                        title={r.name}
+                        className="min-w-0 flex-[1.4] truncate text-[13px] font-medium"
+                      >
+                        {r.name}
+                      </span>
                       {/* Flow mirrors the Investigations column fix: a real minimum
                           so two full IPv4s + the arrow fit, growing with spare width
                           while the rule name shrinks — the old fixed 150px clipped

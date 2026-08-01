@@ -6,6 +6,53 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-08-01
+
+A visual refresh of the alert workspace, a code-review remediation across the
+1.2.x line, and a batch of dogfood fixes from the live deployment. No schema
+changes.
+
+### Added
+
+- **Toast notifications.** Transient events (a triage finishing, a bulk action
+  landing, a background poll failing) surface as dismissable toasts instead of
+  inline banners that pushed the page around as they appeared. The Notifications
+  page gained a "Clear all" that dismisses every entry at once.
+- **Freshness indicators on live surfaces.** The Alerts, Notifications, and
+  Entity screens show when their data last refreshed and raise a stale notice
+  when a background poll stops landing, so a wedged poll is visible instead of
+  passing for quiet.
+
+### Changed
+
+- **Alert workspace redesign.** Colors, spacing, and radii come from CSS
+  custom-property design tokens rather than scattered literals. The filter bar
+  and the bulk-action bar now share one row that morphs on selection instead of
+  stacking a second bar and shifting the table below it. Activity indicators are
+  consolidated and per-row feedback moved to toasts.
+- **Consistent error and retry states.** A failed load shows an explicit retry
+  control instead of an empty panel, and open modals hold focus and block
+  background scroll while they are up.
+- **Review remediation across the 1.2.x line.** A full code review produced 58
+  findings; the fixes tightened request-auth scoping, the scheduler's
+  storm-protection window, and reverse-proxy header parsing, among others,
+  without changing a public contract.
+
+### Fixed
+
+- **DNS-SD / SRV service records no longer pollute the internal-domain
+  inventory.** The internal-domain-suffix auto-detector ingested mDNS service
+  types (`_dns-sd._udp.local`, `_printer._tcp.local`) and a doubled suffix as if
+  each were a host's own domain. Underscore-prefixed service labels (RFC 6763 /
+  RFC 2782) are now filtered before any suffix or bare host is recorded.
+- **The alerts table stops shifting when a row is selected.** The morphing
+  filter/bulk row is pinned to a fixed height, so selecting an alert no longer
+  nudges the table below it.
+- **The notification bell opens immediately.** Opening the bell used to hang for
+  seconds while it fetched; it now renders from cached state and refreshes in the
+  background. Further dogfood fixes landed for the config console, chart
+  accessibility, and the command palette.
+
 ## [1.2.4] - 2026-07-24
 
 A dogfood patch: four rough edges found during an analyst shift on the live

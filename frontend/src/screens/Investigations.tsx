@@ -9,10 +9,10 @@ import { inRange } from '../lib/timeRange';
 // Shared with the Dashboard — single source of truth for status colour/label/pulse.
 import { INV_STATUS as STATUS } from '../lib/statusMeta';
 import { Checkbox } from '../components/Controls';
-import { ErrorState, LoadingState } from '../components/States';
+import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
 import { verdictFilterFromSearch } from '../lib/investigationFilters';
-import { useDemo } from '../lib/demo';
+import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import { type SortDir, useSort } from '../lib/useSort';
 import type { InvestigationRow, RehuntResult, Verdict } from '../lib/types';
@@ -87,12 +87,11 @@ export function Investigations() {
   // 24h. The /demo-status probe resolves async, so the widening happens in an
   // effect below once `demo` flips (the useState initializer runs before it does).
   const demo = useDemo();
-  const [reloadKey, setReloadKey] = useState(0);
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // whether any run is still live in a ref and let pauseWhen consult it: stop
   // polling once every row has reached a terminal state.
   const activeRef = useRef(false);
-  const { data, loading, error } = useAsync(getInvestigations, [reloadKey], {
+  const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(getInvestigations, [], {
     refetchInterval: 10000, // live status (running → complete) without a reload
     pauseWhen: () => !activeRef.current,
   });
@@ -100,9 +99,9 @@ export function Investigations() {
   // A run started elsewhere (another tab, auto-triage) won't be reflected while
   // this list is idle — so force one refetch when the tab regains focus.
   useEffect(() => {
-    const onFocus = () => setReloadKey((k) => k + 1);
+    const onFocus = () => refetch();
     const onVisible = () => {
-      if (document.visibilityState === 'visible') setReloadKey((k) => k + 1);
+      if (document.visibilityState === 'visible') refetch();
     };
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisible);
@@ -175,9 +174,9 @@ export function Investigations() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   const rows = data ?? [];
+  // pauseWhen consults the RAW set — keep polling while ANY run is still live,
+  // even one that's filtered out of the current view.
   activeRef.current = rows.some((r) => r.status === 'running');
-  const running = rows.filter((r) => r.status === 'running').length;
-  const tps = rows.filter((r) => r.verdict === 'true_positive').length;
 
   // invId → detection/rule name, for labelling the rehunt result panel (E2.2).
   // The rehunt targets the SOURCE investigation, whose row is still in the list.
@@ -202,6 +201,13 @@ export function Investigations() {
     .filter(matchesVerdict)
     .filter((r) => !filterStatuses.length || filterStatuses.includes(r.status))
     .sort((a, b) => cmpRows(a, b, sort.key, sort.dir));
+
+  // Header figures track the ACTIVE filters (time range + verdict/status) — the
+  // same `visible` set the table derives from — not the raw fetched page (up to
+  // 100), which ignored the time filter and overcounted (e.g. "100" over a 57-row
+  // 24h view).
+  const running = visible.filter((r) => r.status === 'running').length;
+  const tps = visible.filter((r) => r.verdict === 'true_positive').length;
 
   // Cluster retries of the SAME alert: surface the canonical (primary) run and
   // tuck earlier/errored/cancelled re-runs under it, so the one that WORKED is
@@ -265,6 +271,8 @@ export function Investigations() {
   const handleRehunt = async () => {
     const ids = Object.keys(selected).filter((k) => selected[k]);
     if (!ids.length) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setRehuntMsg(blocked); return; } // demo: no doomed write
     setRehunting(true);
     setRehuntMsg(null);
     setRehuntResult(null);
@@ -274,7 +282,7 @@ export function Investigations() {
       // "Started N · M skipped" alone hides which ids skipped and why (E2.2).
       setRehuntResult(await rehuntInvestigations(ids));
       setSelected({});
-      setReloadKey((k) => k + 1);
+      refetch();
     } catch (err) {
       setRehuntMsg(`Re-investigate failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -286,6 +294,8 @@ export function Investigations() {
   // confirm in the row, then deletes just that investigation.
   const deleteOne = async (id: string) => {
     setRehuntMsg(null);
+    const blocked = demoBlocked(demo);
+    if (blocked) { setRehuntMsg(blocked); setPendingDelete(null); return; } // demo: no doomed write
     try {
       await deleteInvestigation(id);
       setRehuntMsg('Investigation deleted');
@@ -293,12 +303,14 @@ export function Investigations() {
       setRehuntMsg('Delete failed — cancel a running investigation first, or admin only');
     }
     setPendingDelete(null);
-    setReloadKey((k) => k + 1);
+    refetch();
   };
 
   const handleDelete = async () => {
     const ids = Object.keys(selected).filter((k) => selected[k]);
     if (!ids.length) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setRehuntMsg(blocked); setConfirmDelete(false); return; } // demo: no doomed write
     setDeleting(true);
     setRehuntMsg(null);
     let ok = 0;
@@ -318,15 +330,19 @@ export function Investigations() {
     setSelected({});
     setConfirmDelete(false);
     setDeleting(false);
-    setReloadKey((k) => k + 1);
+    refetch();
   };
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
-      <div className="text-[20px] font-semibold tracking-[-.015em]">Investigations</div>
-      <div className="mb-4 mt-0.5 text-[13px] text-dim">
-        {rows.length} investigations · {running} in progress · {tps} true positive
+      <div className="flex items-baseline gap-3">
+        <div className="text-title">Investigations</div>
+        <Freshness at={lastUpdated} />
       </div>
+      <div className="mb-4 mt-0.5 text-[13px] text-dim">
+        {visible.length} investigations · {running} in progress · {tps} true positive
+      </div>
+      {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
 
       {/* filter bar + bulk action */}
       <div className="mb-3.5 flex flex-wrap items-center gap-2">
@@ -526,7 +542,7 @@ export function Investigations() {
         </div>
 
         {loading && <LoadingState />}
-        {error && <div className="p-3"><ErrorState error={error} /></div>}
+        {error && <div className="p-3"><ErrorState error={error} onRetry={refetch} label="investigations" /></div>}
         {!loading && !error && rows.length === 0 && (
           <div className="px-4 py-10 text-center text-[13px] text-faint">No investigations yet.</div>
         )}

@@ -234,6 +234,13 @@ def count_successful_tool_calls(messages: list[Any] | None) -> int:
                 # one call away). Same standard as the Phase-D dispatch.
                 if not _targeted_result_has_data(c):
                     continue
+            elif isinstance(c, list) and not c:
+                # An empty list (zero hits / no matches) from a list-returning
+                # tool — t_query_zeek_logs, t_query_cases, t_query_detections,
+                # t_get_playbooks, t_lookup_runbook — gathered nothing. Hold it to
+                # the same standard as an empty dict so one throwaway call cannot
+                # exempt the hard evidence gate (the QVOD zero-tool defect).
+                continue
             n += 1
     return n
 

@@ -33,6 +33,7 @@ from soc_ai.api.webui_api import resolve_alert_for_hunt
 from soc_ai.config import Settings
 from soc_ai.demo.replay import find_replay, replay_recorded_run
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.store import investigations as inv_svc
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,6 +108,27 @@ async def investigate_endpoint(
     # replays the live pipeline's unknown-alert error stream (see demo/replay.py).
     if ctx.settings.soc_ai_demo:
         replay = find_replay(getattr(request.app.state, "demo_fixtures", None), req.alert_id)
+
+        # Demo is unauthenticated (API_AUTH_REQUIRED=false). Mirror POST
+        # /api/v1/hunt's in-flight guard so a visitor can't spawn a second
+        # concurrent replay row while one for this alert is still ``running`` —
+        # bounding duplicate demo rows to one per recorded alert. (An unrecorded
+        # alert creates no row at all; replay.py already hardens that, F37.)
+        if replay is not None:
+            async with request.app.state.db_sessionmaker() as db:
+                existing = (await inv_svc.latest_for_alerts(db, [req.alert_id])).get(req.alert_id)
+            if existing is not None and existing.status == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "reason": "investigation_in_progress",
+                        "running_inv_id": existing.id,
+                        "hint": (
+                            "an investigation is already running for this alert — "
+                            "open it or wait for it to finish before starting another"
+                        ),
+                    },
+                )
 
         async def demo_stream() -> Any:
             async for name, data in replay_recorded_run(

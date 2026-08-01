@@ -187,6 +187,15 @@ async def _dispatch_named_tool(
     }:
         base_kwargs["elastic"] = ctx.elastic
         base_kwargs["auth"] = getattr(ctx, "auth", None)
+        # Center the windowed query tools (query_events_oql / query_zeek_logs) on
+        # the alert's @timestamp, exactly as the interactive wrappers do
+        # (toolset.py). Without it these fall to their now-relative branch
+        # (_build_time_filter with time_anchor=None -> [now-Nm, now]) and return
+        # zero hits for any batch/older alert. Family members that don't accept
+        # `time_anchor` (query_cases / query_detections / get_rule_content /
+        # get_event_raw / get_playbooks) drop it via the signature filter below —
+        # the same mechanism that already drops the injected `auth`.
+        base_kwargs["time_anchor"] = getattr(ctx, "default_time_anchor", None)
     elif tool_name == "t_lookup_runbook":
         # Operator-runbook search hits the local store, not ES — inject the
         # session factory instead of elastic/auth. ``settings`` is unused by

@@ -64,6 +64,30 @@ function del<T>(path: string): Promise<T> {
 // ---------------------------------------------------------------------------
 const API_BASE = '/api/v1';
 
+/** Where the analyst was when their session expired — login reads this to
+ *  return them to their deep link instead of always landing on the dashboard.
+ *  A ?next= param carries the same value as a fallback when sessionStorage is
+ *  unavailable. */
+export const POST_LOGIN_REDIRECT_KEY = 'soc-ai:post-login-redirect';
+
+/**
+ * Hand a mid-session 401 off to the login page without throwing the analyst's
+ * place away. The Topbar polls every 15s, so expiry on a long-lived tab trips
+ * this from a background request — capture the current deep link (sessionStorage
+ * + a ?next= param) so login can restore it, and don't re-navigate when we're
+ * already on the login screen (a stray poll must not clobber a sign-in attempt).
+ */
+function redirectToLogin(): void {
+  if (window.location.pathname.replace(/\/+$/, '') === '/app/login') return;
+  const next = window.location.pathname + window.location.search + window.location.hash;
+  try {
+    sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, next);
+  } catch {
+    /* storage blocked — the ?next= param still carries the destination */
+  }
+  window.location.href = '/app/login?next=' + encodeURIComponent(next);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = import.meta.env.VITE_API_TOKEN as string | undefined;
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -78,8 +102,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   if (res.status === 401) {
-    // Not authenticated / session expired — hand off to the React login page.
-    window.location.href = '/app/login';
+    // Not authenticated / session expired — hand off to the login page,
+    // preserving the analyst's current deep link (see redirectToLogin).
+    redirectToLogin();
     throw new Error('Unauthorized');
   }
   if (!res.ok) {

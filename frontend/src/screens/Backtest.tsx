@@ -91,7 +91,13 @@ export function Backtest() {
     setStarting(true);
     setStartError(null);
     startBacktest({ windowDays, sampleSize, minSeverity: minSeverity || undefined })
-      .then(() => setReloadKey((k) => k + 1))
+      .then((s) => {
+        // A non-active status means the run never started (no dispositioned
+        // alerts in the window, planning failed, already running, …). The POST
+        // carries the reason; a follow-up GET drops it, so surface it here.
+        if (!s.active) setStartError(s.note ?? 'Backtest did not start.');
+        else setReloadKey((k) => k + 1);
+      })
       .catch((e: unknown) =>
         setStartError(e instanceof Error ? e.message : 'Could not start the backtest.'),
       )
@@ -410,7 +416,7 @@ function ConfusionTable({ confusion }: { confusion: BacktestConfusion }) {
                     key={v}
                     className="px-2 py-1.5 text-right tabular-nums"
                     style={{
-                      color: n === 0 ? '#5b6473' : agree ? '#3fb950' : '#cdd5e0',
+                      color: n === 0 ? '#7d8896' : agree ? '#3fb950' : '#cdd5e0',
                       fontWeight: agree && n > 0 ? 600 : 400,
                     }}
                   >

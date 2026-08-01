@@ -376,6 +376,21 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
     """
     model_id = str(getattr(settings, "analyst_model", "") or "")
 
+    # In demo mode the analyst answers are replayed from packaged fixtures and
+    # there is no live gateway. Every fitness leg builds the synthesizer model,
+    # which hits the demo egress guard (build_synthesizer_model →
+    # assert_egress_allowed → DemoEgressBlocked) and grades FAIL — lighting up a
+    # false "analyst model unfit" chip on a demo working exactly as designed
+    # (the same false-alarm class hotfixed for probe_llm). Report a non-alarming
+    # PASS before any model is built.
+    if is_demo(settings):
+        return {
+            "grade": "pass",
+            "model": model_id,
+            "legs": [],
+            "detail": "demo mode — replayed responses (no live gateway)",
+        }
+
     async def _run_all() -> list[dict[str, Any]]:
         # Sequential (not concurrent): the legs share the single gateway and a
         # burst of 3 structured-output calls at once can trip the very

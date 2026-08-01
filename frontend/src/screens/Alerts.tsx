@@ -1,13 +1,13 @@
 import { ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { Checkbox } from '../components/Controls';
 import { Drawer } from '../components/Drawer';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
-import { ErrorState, LoadingState, Spinner } from '../components/States';
+import { ErrorState, Freshness, LoadingState, Spinner } from '../components/States';
 import { hideOptimisticallyAcked } from '../lib/alertFilters';
 import {
   type AlertQuery,
@@ -28,6 +28,7 @@ import {
   stopAutoTriage,
 } from '../lib/api';
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
+import { useToast } from '../lib/toast';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
 import { type SortDir, useSort } from '../lib/useSort';
@@ -97,6 +98,15 @@ const VERDICT_RANK: Record<string, number> = { true_positive: 6, false_positive:
 // by verdict — rank it just above untriaged so triaging rows cluster together.
 const TRIAGING_RANK = 2;
 const verdictRank = (g: AlertGroup): number => (g.triaging ? TRIAGING_RANK : VERDICT_RANK[g.verdict] ?? 0);
+
+/** Stable per-detection identity for client-side row state (expansion,
+ * selection, keyboard focus, refs). The backend sets `g.id` to the NEWEST
+ * event's ES `_id`, which changes on every 10s poll as new events land —
+ * keying row state on it orphans that state each refresh (an expanded group
+ * collapses, a ticked checkbox drops). kind+name is the identity every write
+ * path already addresses a group by (ackGroup / assignAlert take `g.name`).
+ * `g.id` is kept only as the representative-event payload for a new hunt. */
+const groupKey = (g: AlertGroup): string => `${g.kind}:${g.name}`;
 
 /** Derive 1-2 char avatar initials from a username or token:<name> string. */
 function toInitials(owner: string): string {
@@ -279,8 +289,9 @@ function matchView(g: AlertGroup, view: ViewId, me: string): boolean {
 }
 
 export function Alerts() {
-  const { triageNonce, paletteOpen } = useShell();
+  const { paletteOpen, modalOpen } = useShell();
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [reloadKey, setReloadKey] = useState(0);
   // Demo content is rebased to "now" but still spans a couple of hours; widen the
@@ -323,7 +334,7 @@ export function Alerts() {
   // that instead — same gotcha/pattern as Investigations.tsx, Hunts.tsx, etc.
   const drawerOpenRef = useRef(false);
   drawerOpenRef.current = !!drawerId;
-  const { data: groups, loading, error } = useAsync(
+  const { data: groups, loading, error, lastUpdated } = useAsync(
     () => getAlerts(alertQuery),
     [filterTime, customRange?.from, customRange?.to, hideAcked, reloadKey],
     {
@@ -351,7 +362,12 @@ export function Alerts() {
   // ---- keyboard-first triage (E2.5) --------------------------------------
   // Index of the keyboard-focused group row within the visible list; -1 = none.
   // Vim-style j/k (+ arrows) move it, o/Enter open, a/e/i act, x selects.
-  const [focusedIndex, setFocusedIndex] = useState(-1);
+  // Keyboard focus is tracked by STABLE group key, not list index: the 10s poll
+  // re-sorts `visible` and can insert new groups above the focused row, so an
+  // index would silently re-point at a DIFFERENT detection between polls (`a`/`e`
+  // would then ack/escalate the wrong group). The index is derived from the key
+  // each render below; focus drops when the focused row leaves the list.
+  const [focusedKey, setFocusedKey] = useState<string | null>(null);
   const [keyHelpOpen, setKeyHelpOpen] = useState(false);
   // Per-row element refs so the focused row can be scrolled into view as focus
   // moves. Keyed by group id; stale keys are harmless (a WeakMap-ish plain map).
@@ -362,17 +378,16 @@ export function Alerts() {
     'desc',
   );
 
+  // Results (ack / triage batch summaries) go to the app-wide toaster instead of
+  // stacking dismissible strips in this header.
+  const { toast } = useToast();
+
   // ---- group-ack strip ---------------------------------------------------
-  const [ackMsg, setAckMsg] = useState<string | null>(null);
-  const ackMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [acking, setAcking] = useState(false);
   const [ackingCount, setAckingCount] = useState(0);
   const [ackingAlertTotal, setAckingAlertTotal] = useState(0);
-  const showAckMsg = (m: string) => {
-    setAckMsg(m);
-    if (ackMsgTimer.current) clearTimeout(ackMsgTimer.current);
-    ackMsgTimer.current = setTimeout(() => setAckMsg(null), 7000);
-  };
+  const showAckMsg = (m: string) =>
+    toast({ message: m, tone: m === DEMO_ACTION_NOTE ? 'info' : 'success' });
 
   // ---- group-hunt reason strip -------------------------------------------
   const [huntReason, setHuntReason] = useState<string | null>(null);
@@ -389,17 +404,11 @@ export function Alerts() {
   const [triaging, setTriaging] = useState(false);
   const [pct, setPct] = useState(0);
   const [triageStatus, setTriageStatus] = useState<AutoTriageStatus | null>(null);
-  const [triageMsg, setTriageMsg] = useState<string | null>(null);
   const triageTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const triageMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Severity floor for the global sweep button ("High and up" by default).
   const [triageFloor, setTriageFloor] = useState<string>('high');
 
-  const showTriageMsg = (m: string) => {
-    setTriageMsg(m);
-    if (triageMsgTimer.current) clearTimeout(triageMsgTimer.current);
-    triageMsgTimer.current = setTimeout(() => setTriageMsg(null), 7000);
-  };
+  const showTriageMsg = (m: string) => toast({ message: m, tone: 'info' });
 
   // A one-line summary of how a batch landed — never let it finish silently.
   // When the backend carries a per-reason skip breakdown (E2.2), spell it out
@@ -417,7 +426,6 @@ export function Alerts() {
   const startTriage = (alertIds?: string[], minSeverity?: string) => {
     setTriaging(true);
     setPct(0);
-    setTriageMsg(null);
     if (triageTimer.current) clearInterval(triageTimer.current);
     const finish = (msg: string | null) => {
       if (triageTimer.current) clearInterval(triageTimer.current);
@@ -458,19 +466,23 @@ export function Alerts() {
       });
   };
 
-  // kick off triage when the shell requests it (command palette / bulk bar)
-  const lastNonce = useRef(triageNonce);
+  // Kick off triage when the command palette requests it. The palette carries
+  // the intent in the navigation STATE (not a shell nonce): Alerts is code-split
+  // and the palette navigates here before this screen mounts, so a nonce bumped
+  // pre-mount is seeded away and never observed. A location.state flag arrives on
+  // the mount navigation (and on a repeat request while already here, which gets
+  // a fresh location.key), and is cleared immediately so a refresh or Back can't
+  // re-fire it.
   useEffect(() => {
-    if (triageNonce !== lastNonce.current) {
-      lastNonce.current = triageNonce;
+    if ((location.state as { autoTriage?: boolean } | null)?.autoTriage) {
       startTriage(undefined, triageFloor);
+      navigate(location.pathname + location.search, { replace: true, state: {} });
     }
-  }, [triageNonce]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key]);
 
   useEffect(() => () => {
     if (triageTimer.current) clearInterval(triageTimer.current);
-    if (triageMsgTimer.current) clearTimeout(triageMsgTimer.current);
-    if (ackMsgTimer.current) clearTimeout(ackMsgTimer.current);
     if (huntReasonTimer.current) clearTimeout(huntReasonTimer.current);
   }, []);
 
@@ -484,6 +496,11 @@ export function Alerts() {
     setEventsLoading({});
     setEventsMore({});
     setEventsLoadingMore({});
+    // The cached event pages these ids came from were just discarded, so any
+    // per-event selection now points at rows that are off-screen and may fall
+    // outside the new window — clear it too, else the bulk bar keeps offering
+    // "Ack N events" against ES ids the analyst can no longer see (F59).
+    setSelEvents({});
   }, [filterTime, customRange?.from, customRange?.to, hideAcked]);
 
   const setView = (v: ViewId) => {
@@ -560,7 +577,8 @@ export function Alerts() {
   // Shows the selection rationale in a dismissible strip so the operator knows
   // which event was chosen and why.
   const huntGroup = (g: AlertGroup) => {
-    setHuntGroupPending((s) => ({ ...s, [g.id]: true }));
+    const gk = groupKey(g);
+    setHuntGroupPending((s) => ({ ...s, [gk]: true }));
     getRepresentative(g, alertQuery)
       .then((rep) => {
         showHuntReason(`Investigating representative: ${rep.reason}`);
@@ -569,7 +587,7 @@ export function Alerts() {
       })
       .then((invId) => openDrawer(invId))
       .catch(() => setStarting(null))
-      .finally(() => setHuntGroupPending((s) => ({ ...s, [g.id]: false })));
+      .finally(() => setHuntGroupPending((s) => ({ ...s, [gk]: false })));
   };
 
   // Acknowledge a single group (keyboard `a`) — reuses the same ackGroup write
@@ -607,44 +625,47 @@ export function Alerts() {
   // Toggle a single group's selection (keyboard `x`) into the same `selected`
   // map the checkboxes + bulk bar use.
   const toggleSelectGroup = (g: AlertGroup) => {
+    const gk = groupKey(g);
     setSelected((s) => {
       const next = { ...s };
-      if (next[g.id]) delete next[g.id];
-      else next[g.id] = true;
+      if (next[gk]) delete next[gk];
+      else next[gk] = true;
       return next;
     });
   };
 
   const toggleExpand = (g: AlertGroup) => {
-    const opening = !expanded[g.id];
-    setExpanded((s) => ({ ...s, [g.id]: !s[g.id] }));
+    const gk = groupKey(g);
+    const opening = !expanded[gk];
+    setExpanded((s) => ({ ...s, [gk]: !s[gk] }));
     // Fetch this group's first page of events the first time it's opened.
-    if (opening && groupEvents[g.id] === undefined && !eventsLoading[g.id]) {
-      setEventsLoading((s) => ({ ...s, [g.id]: true }));
+    if (opening && groupEvents[gk] === undefined && !eventsLoading[gk]) {
+      setEventsLoading((s) => ({ ...s, [gk]: true }));
       getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset: 0 })
         .then((evs) => {
-          setGroupEvents((s) => ({ ...s, [g.id]: evs }));
+          setGroupEvents((s) => ({ ...s, [gk]: evs }));
           // A full page implies there may be more — show "Load more".
-          setEventsMore((s) => ({ ...s, [g.id]: evs.length >= EVENTS_PAGE_SIZE }));
+          setEventsMore((s) => ({ ...s, [gk]: evs.length >= EVENTS_PAGE_SIZE }));
         })
-        .catch(() => setGroupEvents((s) => ({ ...s, [g.id]: [] })))
-        .finally(() => setEventsLoading((s) => ({ ...s, [g.id]: false })));
+        .catch(() => setGroupEvents((s) => ({ ...s, [gk]: [] })))
+        .finally(() => setEventsLoading((s) => ({ ...s, [gk]: false })));
     }
   };
 
   // Fetch the next page of a group's events and append it. Hides "Load more"
   // once a returned page is short (no further pages).
   const loadMoreEvents = (g: AlertGroup) => {
-    if (eventsLoadingMore[g.id]) return;
-    const offset = groupEvents[g.id]?.length ?? 0;
-    setEventsLoadingMore((s) => ({ ...s, [g.id]: true }));
+    const gk = groupKey(g);
+    if (eventsLoadingMore[gk]) return;
+    const offset = groupEvents[gk]?.length ?? 0;
+    setEventsLoadingMore((s) => ({ ...s, [gk]: true }));
     getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset })
       .then((evs) => {
-        setGroupEvents((s) => ({ ...s, [g.id]: [...(s[g.id] ?? []), ...evs] }));
-        setEventsMore((s) => ({ ...s, [g.id]: evs.length >= EVENTS_PAGE_SIZE }));
+        setGroupEvents((s) => ({ ...s, [gk]: [...(s[gk] ?? []), ...evs] }));
+        setEventsMore((s) => ({ ...s, [gk]: evs.length >= EVENTS_PAGE_SIZE }));
       })
-      .catch(() => setEventsMore((s) => ({ ...s, [g.id]: false })))
-      .finally(() => setEventsLoadingMore((s) => ({ ...s, [g.id]: false })));
+      .catch(() => setEventsMore((s) => ({ ...s, [gk]: false })))
+      .finally(() => setEventsLoadingMore((s) => ({ ...s, [gk]: false })));
   };
 
   const ownerOf = (g: AlertGroup) => g.owner ?? '';
@@ -697,27 +718,23 @@ export function Alerts() {
     [groups, view, me, filterSevs, filterVerdicts, sort, optimisticAcked, hideAcked],
   );
 
-  const visIds = visible.map((g) => g.id);
+  const visIds = visible.map(groupKey);
   const allSelected = visIds.length > 0 && visIds.every((id) => selected[id]);
+  // Resolve the focused row from its stable key (see focusedKey). -1 when the
+  // key is null or the row is no longer visible — the keyboard layer then no-ops
+  // its row actions gracefully.
+  const focusedIndex = focusedKey ? visible.findIndex((g) => groupKey(g) === focusedKey) : -1;
 
-  // ---- keyboard-first triage (E2.5): clamp + global handler ---------------
-  // Keep focusedIndex inside the (possibly changed) visible range: none when the
-  // list is empty, else clamp into bounds. Runs whenever the visible set changes.
-  useEffect(() => {
-    setFocusedIndex((i) => {
-      if (visible.length === 0) return -1;
-      if (i < 0) return -1; // stay "unfocused" until the user presses j/k
-      return Math.min(i, visible.length - 1);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible.length]);
+  // ---- keyboard-first triage (E2.5): global handler -----------------------
+  // (No clamp effect needed: focusedIndex is derived from focusedKey each render,
+  // so a vanished or re-sorted focused row is reconciled automatically.)
 
   // Scroll the keyboard-focused row into view as focus moves.
   useEffect(() => {
     if (focusedIndex < 0) return;
     const g = visible[focusedIndex];
     if (!g) return;
-    rowRefs.current[g.id]?.scrollIntoView({ block: 'nearest' });
+    rowRefs.current[groupKey(g)]?.scrollIntoView({ block: 'nearest' });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusedIndex]);
 
@@ -734,9 +751,15 @@ export function Alerts() {
   // dispatch to the local handlers.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // An open investigation drawer is a modal surface — its own Esc handler
+      // closes it. Row shortcuts (a/e/x/o/i/j/k) must not act on the list behind
+      // it, so short-circuit the whole layer while the drawer is open (the same
+      // precondition the palette establishes for these keys).
+      if (drawerId) return;
       const g = focusedIndex >= 0 ? visible[focusedIndex] : undefined;
       const action = resolveTriageKey(e, {
         paletteOpen,
+        modalOpen,
         keyHelpOpen,
         targetIsEditable: isEditableTarget(e.target as HTMLElement | null),
         rowCount: visible.length,
@@ -751,9 +774,11 @@ export function Alerts() {
         case 'open-help':
           setKeyHelpOpen(true);
           return;
-        case 'move':
-          setFocusedIndex((i) => nextFocusIndex(i, action.delta, visible.length));
+        case 'move': {
+          const nextIdx = nextFocusIndex(focusedIndex, action.delta, visible.length);
+          setFocusedKey(visible[nextIdx] ? groupKey(visible[nextIdx]) : null);
           return;
+        }
       }
       // Row actions: resolveTriageKey only emits these with hasFocusedRow, so
       // `g` is defined here — the check is for TypeScript narrowing.
@@ -780,9 +805,10 @@ export function Alerts() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paletteOpen, keyHelpOpen, visible, focusedIndex]);
+  }, [paletteOpen, modalOpen, keyHelpOpen, visible, focusedIndex, drawerId]);
   const selCount = Object.keys(selected).filter((k) => selected[k]).length;
   const selectedEventIds = Object.entries(selEvents).filter(([, v]) => v).map(([k]) => k);
+  const hasSelection = selCount > 0 || selectedEventIds.length > 0;
   const rowPad = density === 'compact' ? '7px 14px' : '11px 14px';
 
   const toggleSelectAll = () => {
@@ -827,7 +853,10 @@ export function Alerts() {
       {/* header */}
       <div className="mb-4 flex items-end gap-3.5">
         <div>
-          <div className="text-[20px] font-semibold tracking-[-.015em]">Alerts</div>
+          <div className="flex items-baseline gap-3">
+            <div className="text-title">Alerts</div>
+            <Freshness at={lastUpdated} />
+          </div>
           <div className="mt-0.5 text-[13px] text-dim">
             {untriaged} untriaged · {counts.all} detections · {totalEvents} events in window
           </div>
@@ -856,103 +885,58 @@ export function Alerts() {
         </div>
       </div>
 
-      {/* live triage strip */}
-      {triaging && (
+      {/* Activity slot — capacity 1. Only IN-PROGRESS screen work renders here;
+          results go to the toaster. Both jobs at once show as two lines in ONE
+          bordered strip, never two stacked strips (the header height is bounded
+          by construction). */}
+      {(triaging || acking) && (
         <div
-          className="relative mb-3.5 flex items-center gap-[13px] overflow-hidden rounded-card border px-3.5 py-[11px]"
+          className="relative mb-3.5 flex flex-col gap-2 overflow-hidden rounded-card border px-3.5 py-[11px]"
           style={{ borderColor: 'rgba(75,139,245,.35)', background: 'linear-gradient(90deg,rgba(75,139,245,.10),rgba(75,139,245,.02))' }}
         >
-          <div className="absolute left-0 top-0 h-0.5 w-[40%] animate-scanline" style={{ background: 'linear-gradient(90deg,transparent,#4b8bf5,transparent)' }} />
-          <Spinner size={15} />
-          <div className="text-[13px] font-semibold">
-            Bulk investigating
-            {triageStatus?.severities?.length ? ` ${triageStatus.severities.join(', ')}` : ''}
-            …
-          </div>
-          <div className="font-mono text-[12px] text-dim">
-            {(() => {
-              const s = triageStatus;
-              const done = s ? s.hunted + s.skipped + s.failed : 0;
-              const total = s ? s.total : 0;
-              const parts: string[] = [`${done}/${total} investigated`];
-              if (s && s.skipped) parts.push(`${s.skipped} skipped`);
-              if (s && s.failed) parts.push(`${s.failed} failed`);
-              if (s && s.tool_calls) parts.push(`${s.tool_calls} tool calls`);
-              if (s && s.current) parts.push(s.current);
-              return parts.join(' · ');
-            })()}
-          </div>
-          <div className="flex-1" />
-          <button
-            onClick={() => {
-              void stopAutoTriage().catch(() => {});
-            }}
-            title="Stop after the current investigation finishes"
-            className="flex items-center gap-1 rounded-[6px] border border-border-strong px-2 py-1 text-[11.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-          >
-            <X size={12} /> Stop
-          </button>
-          <div className="font-mono text-[12px] font-semibold text-accent">{pct}%</div>
-        </div>
-      )}
-
-      {/* triage result — so a batch never finishes silently */}
-      {!triaging && triageMsg && (
-        <div
-          className="mb-3.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
-          style={{ borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }}
-        >
-          <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span>
-          <span className="font-semibold text-text-2">{triageMsg}</span>
-          <div className="flex-1" />
-          <button onClick={() => setTriageMsg(null)} className="flex text-dim hover:text-text" aria-label="Dismiss">
-            <X size={14} />
-          </button>
-        </div>
-      )}
-
-      {/* ack in-progress banner */}
-      {acking && (
-        <div
-          className="mb-3.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
-          style={{ borderColor: 'rgba(34,197,94,.30)', background: 'rgba(34,197,94,.06)' }}
-        >
-          <Spinner size={14} />
-          <span className="font-semibold text-text-2">Acknowledging {ackingCount} group{ackingCount !== 1 ? 's' : ''} ({ackingAlertTotal} alert{ackingAlertTotal !== 1 ? 's' : ''}) in Security Onion…</span>
-        </div>
-      )}
-
-      {/* ack result strip — neutral/info tint for the demo note (it's neither a
-          success nor a failure), success-green for a real ack result. */}
-      {!acking && ackMsg && (
-        <div
-          className="mb-3.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
-          style={
-            ackMsg === DEMO_ACTION_NOTE
-              ? { borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }
-              : { borderColor: 'rgba(34,197,94,.30)', background: 'rgba(34,197,94,.06)' }
-          }
-        >
-          <span className="font-semibold text-text-2">{ackMsg}</span>
-          <div className="flex-1" />
-          <button onClick={() => setAckMsg(null)} className="flex text-dim hover:text-text" aria-label="Dismiss">
-            <X size={14} />
-          </button>
-        </div>
-      )}
-
-      {/* group-hunt representative reason strip */}
-      {huntReason && (
-        <div
-          className="mb-3.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
-          style={{ borderColor: 'rgba(139,92,246,.35)', background: 'rgba(139,92,246,.07)' }}
-        >
-          <span className="flex flex-shrink-0" style={{ color: '#a78bfa' }}><Sparkles size={13} /></span>
-          <span className="font-semibold text-text-2">{huntReason}</span>
-          <div className="flex-1" />
-          <button onClick={() => setHuntReason(null)} className="flex text-dim hover:text-text" aria-label="Dismiss">
-            <X size={14} />
-          </button>
+          {triaging && (
+            <div className="absolute left-0 top-0 h-0.5 w-[40%] animate-scanline" style={{ background: 'linear-gradient(90deg,transparent,#4b8bf5,transparent)' }} />
+          )}
+          {triaging && (
+            <div className="flex items-center gap-[13px]">
+              <Spinner size={15} />
+              <div className="text-[13px] font-semibold">
+                Bulk investigating
+                {triageStatus?.severities?.length ? ` ${triageStatus.severities.join(', ')}` : ''}
+                …
+              </div>
+              <div className="font-mono text-[12px] text-dim">
+                {(() => {
+                  const s = triageStatus;
+                  const done = s ? s.hunted + s.skipped + s.failed : 0;
+                  const total = s ? s.total : 0;
+                  const parts: string[] = [`${done}/${total} investigated`];
+                  if (s && s.skipped) parts.push(`${s.skipped} skipped`);
+                  if (s && s.failed) parts.push(`${s.failed} failed`);
+                  if (s && s.tool_calls) parts.push(`${s.tool_calls} tool calls`);
+                  if (s && s.current) parts.push(s.current);
+                  return parts.join(' · ');
+                })()}
+              </div>
+              <div className="flex-1" />
+              <button
+                onClick={() => {
+                  void stopAutoTriage().catch(() => {});
+                }}
+                title="Stop after the current investigation finishes"
+                className="flex items-center gap-1 rounded-[6px] border border-border-strong px-2 py-1 text-[11.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+              >
+                <X size={12} /> Stop
+              </button>
+              <div className="font-mono text-[12px] font-semibold text-accent">{pct}%</div>
+            </div>
+          )}
+          {acking && (
+            <div className="flex items-center gap-2.5 text-[13px]">
+              <Spinner size={14} />
+              <span className="font-semibold text-text-2">Acknowledging {ackingCount} group{ackingCount !== 1 ? 's' : ''} ({ackingAlertTotal} alert{ackingAlertTotal !== 1 ? 's' : ''}) in Security Onion…</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -983,8 +967,11 @@ export function Alerts() {
         })}
       </div>
 
-      {/* filter bar */}
-      <div className="mb-3.5 flex flex-wrap items-center gap-2">
+      {/* Context row: the filter bar. Hidden while rows are selected — the
+          bulk-action bar takes this same slot (below) so the table never shifts
+          down as you multi-select. */}
+      {!hasSelection && (
+      <div className="mb-3 flex min-h-[51px] flex-wrap items-center gap-2">
         <TimeRangeFilter
           value={filterTime}
           custom={customRange}
@@ -1025,7 +1012,7 @@ export function Alerts() {
           style={
             hideAcked
               ? { borderColor: 'rgba(34,197,94,.5)', background: 'rgba(34,197,94,.10)', color: '#4ade80' }
-              : { borderColor: 'var(--color-border-2, #23314a)', background: 'var(--color-surface-1, #111827)', color: 'var(--color-dim, #8b94a3)' }
+              : { borderColor: '#1c232e', background: '#0b0e13', color: '#8b94a3' } // border-2 / surface-1 / dim
           }
         >
           <Check size={12} />
@@ -1037,16 +1024,20 @@ export function Alerts() {
           <button
             onClick={() => setDensity('comfortable')}
             title="Comfortable"
+            aria-label="Comfortable density"
+            aria-pressed={density !== 'compact'}
             className="flex items-center px-2 py-1.5"
-            style={{ color: density !== 'compact' ? '#e6e9ef' : '#5b6473', background: density !== 'compact' ? '#141b25' : 'transparent' }}
+            style={{ color: density !== 'compact' ? '#e6e9ef' : '#7d8896', background: density !== 'compact' ? '#141b25' : 'transparent' }}
           >
             <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
           </button>
           <button
             onClick={() => setDensity('compact')}
             title="Compact"
+            aria-label="Compact density"
+            aria-pressed={density === 'compact'}
             className="flex items-center border-l border-border-2 px-2 py-1.5"
-            style={{ color: density === 'compact' ? '#e6e9ef' : '#5b6473', background: density === 'compact' ? '#141b25' : 'transparent' }}
+            style={{ color: density === 'compact' ? '#e6e9ef' : '#7d8896', background: density === 'compact' ? '#141b25' : 'transparent' }}
           >
             <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 5h16M4 9h16M4 13h16M4 17h16M4 21h16" /></svg>
           </button>
@@ -1055,17 +1046,19 @@ export function Alerts() {
           Sort <span className="font-mono font-semibold text-text">{sort.key} {sort.dir === 'asc' ? '↑' : '↓'}</span>
         </div>
       </div>
+      )}
 
-      {/* bulk action bar */}
-      {(selCount > 0 || selectedEventIds.length > 0) && (
-        <div className="mb-3 flex animate-fadeUp items-center gap-[9px] rounded-card border border-accent-deep bg-[#0d1726] px-[13px] py-2">
+      {/* Bulk-action bar — occupies the SAME slot as the filter bar, replacing it
+          during selection so the table's top edge stays put. */}
+      {hasSelection && (
+        <div className="mb-3 flex min-h-[51px] animate-fadeUp items-center gap-[9px] rounded-card border border-accent-deep bg-[#0d1726] px-[13px] py-2">
           <span className="text-[12.5px] font-semibold text-text-2">
             {selCount > 0 && (
               <>
                 <span className="font-mono text-accent">{selCount}</span> group{selCount !== 1 ? 's' : ''}
                 {' · '}
                 <span className="font-mono text-accent">
-                  {(groups ?? []).filter((g) => selected[g.id]).reduce((s, g) => s + (g.count || 0), 0)}
+                  {(groups ?? []).filter((g) => selected[groupKey(g)]).reduce((s, g) => s + (g.count || 0), 0)}
                 </span> alerts
               </>
             )}
@@ -1075,7 +1068,10 @@ export function Alerts() {
           <div className="h-4 w-px bg-[#23314a]" />
           <button
             onClick={() => {
-              const groupIds = Object.keys(selected).filter((k) => selected[k]);
+              // Map the selected STABLE group keys back to each group's CURRENT
+              // representative event id (fresh from the latest poll) — that id is
+              // what the triage backend resolves, not the kind:name key.
+              const groupIds = (groups ?? []).filter((g) => selected[groupKey(g)]).map((g) => g.id);
               const allIds = [...groupIds, ...selectedEventIds];
               if (!allIds.length) return;
               startTriage(allIds);
@@ -1089,7 +1085,7 @@ export function Alerts() {
           </button>
           <button
             onClick={() => {
-              const selectedGroups = (groups ?? []).filter((g) => selected[g.id]);
+              const selectedGroups = (groups ?? []).filter((g) => selected[groupKey(g)]);
               if (!selectedGroups.length) return;
               const blocked = demoBlocked(demo);
               if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
@@ -1099,7 +1095,7 @@ export function Alerts() {
               Promise.allSettled(selectedGroups.map((g) => assignAlert(g.name)))
                 .then((outcomes) => {
                   const failedIds = outcomes
-                    .map((o, i) => (o.status === 'rejected' ? selectedGroups[i].id : null))
+                    .map((o, i) => (o.status === 'rejected' ? groupKey(selectedGroups[i]) : null))
                     .filter((id): id is string => id !== null);
                   const ok = n - failedIds.length;
                   setSelected((s) => {
@@ -1121,7 +1117,7 @@ export function Alerts() {
           </button>
           <button
             onClick={() => {
-              const selectedGroups = (groups ?? []).filter((g) => selected[g.id]);
+              const selectedGroups = (groups ?? []).filter((g) => selected[groupKey(g)]);
               if (!selectedGroups.length) return;
               const blocked = demoBlocked(demo);
               if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write (before setAcking so the strip shows)
@@ -1146,7 +1142,7 @@ export function Alerts() {
                       totalFailed += o.value.failed;
                       if (o.value.capped) anyCapped = true;
                     } else {
-                      failedIds.push(selectedGroups[i].id);
+                      failedIds.push(groupKey(selectedGroups[i]));
                     }
                   });
                   const failedGroups = failedIds.length;
@@ -1167,7 +1163,7 @@ export function Alerts() {
             className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success"
           >
             {(() => {
-              const sg = (groups ?? []).filter((g) => selected[g.id]);
+              const sg = (groups ?? []).filter((g) => selected[groupKey(g)]);
               const n = sg.length;
               const a = sg.reduce((s, g) => s + (g.count || 0), 0);
               return n > 0 ? `Acknowledge ${n} group${n !== 1 ? 's' : ''} · ${a} alert${a !== 1 ? 's' : ''}` : 'Acknowledge';
@@ -1193,11 +1189,23 @@ export function Alerts() {
               {ackingEvents ? 'Acking…' : `Ack ${selectedEventIds.length} event${selectedEventIds.length !== 1 ? 's' : ''}`}
             </button>
           )}
-          <button onClick={() => { setSelected({}); setSelEvents({}); }} className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger">
-            Dismiss
-          </button>
           <div className="flex-1" />
-          <button onClick={() => { setSelected({}); setSelEvents({}); }} className="text-[12px] text-dim hover:text-text">Clear</button>
+          <button onClick={() => { setSelected({}); setSelEvents({}); }} className="text-[12px] text-dim hover:text-text">Clear selection</button>
+        </div>
+      )}
+
+      {/* Group-hunt (pivot) representative reason — a subtle 12px annotation
+          attached beneath the context row, not a standalone strip (DESIGN Q4). */}
+      {huntReason && (
+        <div className="-mt-2 mb-3.5 flex items-center gap-1.5 text-[12px] text-dim">
+          <span className="flex flex-shrink-0" style={{ color: '#a78bfa' }}><Sparkles size={12} /></span>
+          <span className="min-w-0 truncate">{huntReason}</span>
+          <button
+            onClick={() => setHuntReason(null)}
+            className="flex-shrink-0 text-faint hover:text-text"
+          >
+            Clear
+          </button>
         </div>
       )}
 
@@ -1209,7 +1217,7 @@ export function Alerts() {
           style={{ gridTemplateColumns: GRID, minWidth: 720 }}
         >
           <div className="flex items-center">
-            <Checkbox checked={allSelected} onClick={toggleSelectAll} title="Select all" />
+            <Checkbox checked={allSelected} onClick={toggleSelectAll} title="Select all" aria-label="Select all detections" />
           </div>
           <div className={hdrCls('detection')} onClick={() => toggleSort('detection')}>
             Detection{caret('detection')}
@@ -1237,12 +1245,13 @@ export function Alerts() {
         )}
 
         {visible.map((g, rowIdx) => {
-          const isExp = !!expanded[g.id];
+          const gk = groupKey(g);
+          const isExp = !!expanded[gk];
           const owner = ownerOf(g);
-          const seld = !!selected[g.id];
+          const seld = !!selected[gk];
           const kbFocused = rowIdx === focusedIndex;
           return (
-            <div key={g.id} ref={(el) => { rowRefs.current[g.id] = el; }}>
+            <div key={gk} ref={(el) => { rowRefs.current[gk] = el; }}>
               <div
                 onClick={() => toggleExpand(g)}
                 className={`relative grid cursor-pointer items-center gap-2.5 border-b border-border-faint hover:bg-surface-hover${
@@ -1255,7 +1264,7 @@ export function Alerts() {
                   <span className="pointer-events-none absolute inset-y-0 left-0 w-[3px] bg-accent" aria-hidden="true" />
                 )}
                 {(() => {
-                  const loadedEvs = groupEvents[g.id] ?? [];
+                  const loadedEvs = groupEvents[gk] ?? [];
                   const loadedIds = loadedEvs.map((ev) => ev.id).filter(Boolean) as string[];
                   const evSelCount = loadedIds.filter((id) => selEvents[id]).length;
                   const evIndeterminate = evSelCount > 0 && evSelCount < loadedIds.length;
@@ -1264,21 +1273,22 @@ export function Alerts() {
                       <Checkbox
                         checked={seld}
                         indeterminate={evIndeterminate}
+                        aria-label={`Select ${g.name}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           const turning = !seld;
                           setSelected((s) => {
                             const next = { ...s };
-                            if (next[g.id]) delete next[g.id];
-                            else next[g.id] = true;
+                            if (next[gk]) delete next[gk];
+                            else next[gk] = true;
                             return next;
                           });
                           setSelEvents((prev) => {
                             const next = { ...prev };
                             if (turning) {
-                              (groupEvents[g.id] ?? []).forEach((ev) => { if (ev.id) next[ev.id] = true; });
+                              (groupEvents[gk] ?? []).forEach((ev) => { if (ev.id) next[ev.id] = true; });
                             } else {
-                              (groupEvents[g.id] ?? []).forEach((ev) => { if (ev.id) delete next[ev.id]; });
+                              (groupEvents[gk] ?? []).forEach((ev) => { if (ev.id) delete next[ev.id]; });
                             }
                             return next;
                           });
@@ -1484,13 +1494,13 @@ export function Alerts() {
                         e.stopPropagation();
                         huntGroup(g);
                       }}
-                      disabled={!!huntGroupPending[g.id]}
+                      disabled={!!huntGroupPending[gk]}
                       aria-label="Retry investigation"
                       title="Last re-run failed — re-investigate the representative event"
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                       style={{ borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)', color: '#f87171' }}
                     >
-                      {huntGroupPending[g.id] ? <Spinner size={11} color="#f87171" /> : <Zap size={11} />}
+                      {huntGroupPending[gk] ? <Spinner size={11} color="#f87171" /> : <Zap size={11} />}
                       Retry
                     </button>
                   )}
@@ -1515,13 +1525,13 @@ export function Alerts() {
                         e.stopPropagation();
                         huntGroup(g);
                       }}
-                      disabled={!!huntGroupPending[g.id]}
+                      disabled={!!huntGroupPending[gk]}
                       title="Investigate the most-representative event in this group"
                       aria-label="Investigate"
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                       style={{ borderColor: 'rgba(139,92,246,.35)', background: 'rgba(139,92,246,.07)', color: '#a78bfa' }}
                     >
-                      {huntGroupPending[g.id] ? <Spinner size={11} color="#a78bfa" /> : <Sparkles size={11} />}
+                      {huntGroupPending[gk] ? <Spinner size={11} color="#a78bfa" /> : <Sparkles size={11} />}
                       Investigate
                     </button>
                   )}
@@ -1531,13 +1541,13 @@ export function Alerts() {
               {/* expanded events (lazy-loaded on first open) */}
               {isExp && (
                 <div className="animate-fadeUp-slow border-b border-border-faint bg-bg pb-1.5 pt-1">
-                  {eventsLoading[g.id] && (
+                  {eventsLoading[gk] && (
                     <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">Loading events…</div>
                   )}
-                  {!eventsLoading[g.id] && (groupEvents[g.id]?.length ?? 0) === 0 && (
+                  {!eventsLoading[gk] && (groupEvents[gk]?.length ?? 0) === 0 && (
                     <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">No events in window.</div>
                   )}
-                  {(groupEvents[g.id] ?? []).map((ev, i) => (
+                  {(groupEvents[gk] ?? []).map((ev, i) => (
                     <div
                       key={ev.id ?? i}
                       className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
@@ -1624,19 +1634,19 @@ export function Alerts() {
                       </div>
                     </div>
                   ))}
-                  {!eventsLoading[g.id] && eventsMore[g.id] && (
+                  {!eventsLoading[gk] && eventsMore[gk] && (
                     <div className="py-1.5 pl-[36px] pr-3.5">
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           loadMoreEvents(g);
                         }}
-                        disabled={eventsLoadingMore[g.id]}
+                        disabled={eventsLoadingMore[gk]}
                         className="inline-flex items-center gap-1.5 rounded-badge border border-border-input px-[9px] py-[3px] font-mono text-[11px] font-semibold text-dim hover:text-text disabled:opacity-60"
                         style={{ background: 'rgba(148,163,184,.06)' }}
                       >
-                        {eventsLoadingMore[g.id] ? <Spinner size={11} /> : <ChevronRight size={12} className="rotate-90" />}
-                        {eventsLoadingMore[g.id] ? 'Loading…' : 'Load more'}
+                        {eventsLoadingMore[gk] ? <Spinner size={11} /> : <ChevronRight size={12} className="rotate-90" />}
+                        {eventsLoadingMore[gk] ? 'Loading…' : 'Load more'}
                       </button>
                     </div>
                   )}

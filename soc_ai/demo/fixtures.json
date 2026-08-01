@@ -15541,6 +15541,231 @@
  ],
  "replays": [
   {
+   "alert_es_id": "9F4kTp8BwxVkvmc70zZ9",
+   "investigation": {
+    "id": "01DEMOFA11BACKSYNTHRERUN01",
+    "alert_es_id": "9F4kTp8BwxVkvmc70zZ9",
+    "rule_name": "ET MALWARE Possible Cobalt Strike Beacon (GET)",
+    "verdict": "true_positive",
+    "confidence": 0.94,
+    "rationale": null,
+    "summary": "Workstation IP_41 issued a periodic HTTP GET beacon to external host 193.29.13.44:80 with URI /submit.php?id=... and a hardcoded Mozilla/4.0 user-agent — the default Cobalt Strike malleable-C2 GET profile. The connections repeat on a fixed ~60s cadence with near-identical request sizes (tool t_prevalence: 214 events across 3h, jitter<5%), and the destination IP is on the Feodo Tracker C2 blocklist with no DNS resolution behind it (tool t_enrich_ip: blocklist_hits=[feodo]). No business application on IP_41 has ever contacted this host before today (tool t_host_summary: first-seen peer). This is an active Cobalt Strike beacon check-in from a compromised workstation and warrants immediate containment.",
+    "report": {
+     "verdict": "true_positive",
+     "confidence": 0.94,
+     "summary": "Workstation IP_41 issued a periodic HTTP GET beacon to external host 193.29.13.44:80 with URI /submit.php?id=... and a hardcoded Mozilla/4.0 user-agent — the default Cobalt Strike malleable-C2 GET profile. The connections repeat on a fixed ~60s cadence with near-identical request sizes (tool t_prevalence: 214 events across 3h, jitter<5%), and the destination IP is on the Feodo Tracker C2 blocklist with no DNS resolution behind it (tool t_enrich_ip: blocklist_hits=[feodo]). No business application on IP_41 has ever contacted this host before today (tool t_host_summary: first-seen peer). This is an active Cobalt Strike beacon check-in from a compromised workstation and warrants immediate containment.",
+     "citations": [
+      "alert.rule_name",
+      "alert.source_ip",
+      "alert.destination_ip",
+      "zeek.http.uri",
+      "zeek.http.user_agent",
+      "tool t_get_rule_content:rule_id=2027000",
+      "tool t_enrich_ip:ip=193.29.13.44",
+      "tool t_prevalence:ip=IP_41,peer_ip=193.29.13.44",
+      "tool t_host_summary:ip=IP_41"
+     ],
+     "recommended_actions": [
+      {
+       "tool_name": "escalate_to_case",
+       "tool_args": {
+        "alert_id": "9F4kTp8BwxVkvmc70zZ9",
+        "case_title": "Cobalt Strike beacon from IP_41",
+        "case_description": "Workstation IP_41 is beaconing to Cobalt Strike C2 at 193.29.13.44 over HTTP GET (/submit.php, default malleable-C2 profile, ~60s cadence). The destination is on the Feodo Tracker C2 blocklist and is a first-seen peer for this host. Isolate IP_41 and begin host-forensics to identify the initial access vector and scope of compromise."
+       },
+       "rationale": "The GET profile matches Cobalt Strike's default malleable-C2 template, the cadence is machine-regular, and the C2 IP is blocklisted (tool t_enrich_ip:ip=193.29.13.44) — a confirmed beacon requiring incident response."
+      }
+     ],
+     "field_reconciliation": null,
+     "validator_note": null,
+     "local_verdict": null
+    },
+    "src_ip": "IP_41",
+    "dest_ip": "193.29.13.44",
+    "status": "complete",
+    "started_by": "demo",
+    "created_at": "2026-07-11T13:50:00.000000+00:00",
+    "finished_at": "2026-07-11T13:54:12.000000+00:00"
+   },
+   "events": [
+    {
+     "kind": "session_start",
+     "sequence": 1,
+     "payload": {
+      "alert_id": "9F4kTp8BwxVkvmc70zZ9",
+      "pipeline": "synth_first"
+     }
+    },
+    {
+     "kind": "enriched_alert_context",
+     "sequence": 2,
+     "payload": {
+      "alert": {
+       "id": "9F4kTp8BwxVkvmc70zZ9",
+       "timestamp": "2026-07-11T13:49:41.512000Z",
+       "rule_name": "ET MALWARE Possible Cobalt Strike Beacon (GET)",
+       "rule_uuid": "2027000",
+       "severity_label": null,
+       "severity_score": 1,
+       "source_ip": "IP_41",
+       "source_port": 51544,
+       "destination_ip": "193.29.13.44",
+       "destination_port": 80,
+       "host_name": "so-sensor-1",
+       "event_action": "allowed",
+       "alert_action": null,
+       "classtype": "trojan-activity",
+       "event_module": "suricata",
+       "event_dataset": "suricata.alert",
+       "event_category": "network",
+       "zeek_http_method": "GET",
+       "zeek_http_host": "193.29.13.44",
+       "zeek_http_uri": "/submit.php?id=1289471632",
+       "zeek_http_user_agent": "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1)"
+      },
+      "enrichments": {
+       "193.29.13.44": {
+        "indicator": "193.29.13.44",
+        "internal": false,
+        "blocklist_hits": [
+         {
+          "source": "feodo",
+          "malware": "CobaltStrike"
+         }
+        ],
+        "misp_hits": []
+       }
+      },
+      "host_alert_profile": {
+       "ET MALWARE Possible Cobalt Strike Beacon (GET)": 3
+      }
+     }
+    },
+    {
+     "kind": "tool_call",
+     "sequence": 3,
+     "payload": {
+      "tool_name": "t_get_rule_content",
+      "args": {
+       "rule_id": "2027000"
+      },
+      "tool_call_id": "call-csrule",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "tool_result",
+     "sequence": 4,
+     "payload": {
+      "tool_call_id": "call-csrule",
+      "result": {
+       "summary": "Rule matches the default Cobalt Strike malleable-C2 GET profile (content:\"/submit.php?id=\"; http.user_agent match).",
+       "rule_id": "2027000"
+      }
+     }
+    },
+    {
+     "kind": "tool_call",
+     "sequence": 5,
+     "payload": {
+      "tool_name": "t_enrich_ip",
+      "args": {
+       "ip": "193.29.13.44"
+      },
+      "tool_call_id": "call-enrip",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "tool_result",
+     "sequence": 6,
+     "payload": {
+      "tool_call_id": "call-enrip",
+      "result": {
+       "indicator": "193.29.13.44",
+       "internal": false,
+       "blocklist_hits": [
+        {
+         "source": "feodo",
+         "malware": "CobaltStrike"
+        }
+       ],
+       "misp_hits": []
+      }
+     }
+    },
+    {
+     "kind": "tool_call",
+     "sequence": 7,
+     "payload": {
+      "tool_name": "t_prevalence",
+      "args": {
+       "ip": "IP_41",
+       "peer_ip": "193.29.13.44"
+      },
+      "tool_call_id": "call-prev",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "tool_result",
+     "sequence": 8,
+     "payload": {
+      "tool_call_id": "call-prev",
+      "result": {
+       "summary": "IP_41 <-> 193.29.13.44: 214 events across 3h, first-seen peer, fixed ~60s cadence (jitter<5%).",
+       "observed": true,
+       "rarity": "first-seen"
+      }
+     }
+    },
+    {
+     "kind": "triage_report",
+     "sequence": 9,
+     "payload": {
+      "verdict": "true_positive",
+      "confidence": 0.94,
+      "summary": "Workstation IP_41 issued a periodic HTTP GET beacon to external host 193.29.13.44:80 with URI /submit.php?id=... and a hardcoded Mozilla/4.0 user-agent — the default Cobalt Strike malleable-C2 GET profile. The connections repeat on a fixed ~60s cadence with near-identical request sizes (tool t_prevalence: 214 events across 3h, jitter<5%), and the destination IP is on the Feodo Tracker C2 blocklist with no DNS resolution behind it (tool t_enrich_ip: blocklist_hits=[feodo]). No business application on IP_41 has ever contacted this host before today (tool t_host_summary: first-seen peer). This is an active Cobalt Strike beacon check-in from a compromised workstation and warrants immediate containment.",
+      "citations": [
+       "alert.rule_name",
+       "alert.source_ip",
+       "alert.destination_ip",
+       "zeek.http.uri",
+       "zeek.http.user_agent",
+       "tool t_get_rule_content:rule_id=2027000",
+       "tool t_enrich_ip:ip=193.29.13.44",
+       "tool t_prevalence:ip=IP_41,peer_ip=193.29.13.44",
+       "tool t_host_summary:ip=IP_41"
+      ],
+      "recommended_actions": [
+       {
+        "tool_name": "escalate_to_case",
+        "tool_args": {
+         "alert_id": "9F4kTp8BwxVkvmc70zZ9",
+         "case_title": "Cobalt Strike beacon from IP_41",
+         "case_description": "Workstation IP_41 is beaconing to Cobalt Strike C2 at 193.29.13.44 over HTTP GET (/submit.php, default malleable-C2 profile, ~60s cadence). The destination is on the Feodo Tracker C2 blocklist and is a first-seen peer for this host. Isolate IP_41 and begin host-forensics to identify the initial access vector and scope of compromise."
+        },
+        "rationale": "The GET profile matches Cobalt Strike's default malleable-C2 template, the cadence is machine-regular, and the C2 IP is blocklisted (tool t_enrich_ip:ip=193.29.13.44) — a confirmed beacon requiring incident response."
+       }
+      ],
+      "field_reconciliation": null,
+      "validator_note": null,
+      "local_verdict": null
+     }
+    },
+    {
+     "kind": "done",
+     "sequence": 10,
+     "payload": {
+      "recommended_count": 1
+     }
+    }
+   ]
+  },
+  {
    "alert_es_id": "9N6cTp8BwxVkvmc70vrs",
    "investigation": {
     "id": "01DEMO5VB9PVCHXZDWKBKVBS14",

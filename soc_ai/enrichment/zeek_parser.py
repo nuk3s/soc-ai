@@ -111,9 +111,17 @@ def parse_typed_zeek_fields(pivots: Iterable[SoAlert]) -> TypedZeekFields:
         )
         _maybe_append_str(typed.file_sha256s, _pick(pivot.zeek_files_sha256, data, "sha256"))
         _maybe_append_str(typed.file_md5s, _pick(pivot.zeek_files_md5, data, "md5"))
-        _maybe_append_str(typed.kerberos_ciphers, _pick(pivot.zeek_kerberos_cipher, data, "cipher"))
+        # Kerberos `cipher`/`service` share raw-message key names with TLS
+        # (ssl.log's `cipher`) and conn/other logs (`service`), so the message
+        # fallback is gated to zeek.kerberos records only — otherwise a benign
+        # legacy-TLS RC4 session or a conn `service` would be rolled up as a
+        # Kerberoasting signal. The typed attribute is already dataset-correct.
+        krb_data = data if ds == "zeek.kerberos" else {}
         _maybe_append_str(
-            typed.kerberos_services, _pick(pivot.zeek_kerberos_service, data, "service")
+            typed.kerberos_ciphers, _pick(pivot.zeek_kerberos_cipher, krb_data, "cipher")
+        )
+        _maybe_append_str(
+            typed.kerberos_services, _pick(pivot.zeek_kerberos_service, krb_data, "service")
         )
         _maybe_append_str(typed.smb_actions, _pick(pivot.zeek_smb_action, data, "action"))
         _maybe_append_str(typed.smb_file_names, _pick(pivot.zeek_smb_name, data, "name"))

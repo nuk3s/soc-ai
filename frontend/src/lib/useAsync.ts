@@ -1,9 +1,23 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 export interface AsyncState<T> {
   data: T | null;
   loading: boolean;
   error: Error | null;
+  /** Wall-clock ms of the last SUCCESSFUL load, or null if never. Powers "updated Xs ago". */
+  lastUpdated: number | null;
+  /**
+   * Consecutive BACKGROUND-poll failures, reset to 0 on any success. A surface
+   * is "stale" at >= 2 (show the last-good data with a degraded marker). A
+   * FOREGROUND failure sets `error` instead — that's a hard load failure, not a
+   * silently-stale poll.
+   */
+  failCount: number;
+}
+
+export interface UseAsyncResult<T> extends AsyncState<T> {
+  /** Re-run the loader now (foreground semantics; keeps prior data on failure). */
+  refetch: () => void;
 }
 
 export interface UseAsyncOptions {
@@ -20,14 +34,30 @@ export interface UseAsyncOptions {
  * `{ refetchInterval }` to make a screen poll itself live; background refetches
  * keep the last-good data on screen (no loading flash, no flap on a transient
  * grid blip) and pause while the tab is hidden.
+ *
+ * The result also carries `lastUpdated` (for an "updated Xs ago" marker),
+ * `failCount` (consecutive background-poll failures; >= 2 means the surface is
+ * showing stale data), and `refetch()` (a manual re-run — screens should use
+ * this instead of a hand-rolled `reloadKey` counter, and pass it to
+ * `<ErrorState onRetry>`).
  */
 export function useAsync<T>(
   loader: () => Promise<T>,
   deps: unknown[] = [],
   options: UseAsyncOptions = {},
-): AsyncState<T> {
+): UseAsyncResult<T> {
   const { refetchInterval, pauseWhen } = options;
-  const [state, setState] = useState<AsyncState<T>>({ data: null, loading: true, error: null });
+  const [state, setState] = useState<AsyncState<T>>({
+    data: null,
+    loading: true,
+    error: null,
+    lastUpdated: null,
+    failCount: 0,
+  });
+  // Bumping this re-runs the effect (foreground). Replaces the per-screen
+  // hand-rolled reloadKey pattern; `refetch` is stable across renders.
+  const [reloadTick, setReloadTick] = useState(0);
+  const refetch = useCallback(() => setReloadTick((t) => t + 1), []);
 
   useEffect(() => {
     let alive = true;
@@ -39,25 +69,38 @@ export function useAsync<T>(
     const run = (foreground: boolean) => {
       const id = ++seq;
       const fresh = () => alive && id === seq;
-      // Foreground (initial / dep change): show loading but keep prior data so
-      // the screen doesn't flash. Background (poll): silent.
-      if (foreground) setState((s) => ({ data: s.data, loading: true, error: null }));
+      // Foreground (initial / dep change / refetch): show loading but keep prior
+      // data so the screen doesn't flash. Background (poll): silent.
+      if (foreground) setState((s) => ({ ...s, loading: true, error: null }));
       loader()
         .then((data) => {
-          if (fresh()) setState({ data, loading: false, error: null });
+          if (fresh())
+            setState((s) => ({
+              ...s,
+              data,
+              loading: false,
+              error: null,
+              lastUpdated: Date.now(),
+              failCount: 0,
+            }));
         })
         .catch((error: unknown) => {
           if (!fresh()) return;
           if (!foreground) {
-            // A background poll failed — keep the last good data, don't flap.
-            setState((s) => ({ ...s, loading: false }));
+            // A background poll failed — keep the last good data, don't flap,
+            // and count toward staleness.
+            setState((s) => ({ ...s, loading: false, failCount: s.failCount + 1 }));
             return;
           }
-          setState({
-            data: null,
+          // Foreground failure — surface the error. Keep prior data (null on the
+          // first load, so the screen still blanks to the ErrorState there; a
+          // populated screen keeps its data so a failed manual refresh doesn't
+          // wipe it).
+          setState((s) => ({
+            ...s,
             loading: false,
             error: error instanceof Error ? error : new Error(String(error)),
-          });
+          }));
         });
     };
 
@@ -78,7 +121,7 @@ export function useAsync<T>(
       if (timer) clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [...deps, reloadTick]);
 
-  return state;
+  return { ...state, refetch };
 }

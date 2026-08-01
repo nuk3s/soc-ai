@@ -19,7 +19,7 @@ interface NavItem {
 const NAV: NavItem[] = [
   { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
   { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
-  { to: '/investigations', label: 'Investigations', icon: <Search size={16} /> },
+  { to: '/investigations', label: 'Investigations', icon: <Search size={16} />, match: ['/investigations', '/investigation', '/entity'] },
   { to: '/notifications', label: 'Notifications', icon: <Bell size={16} /> },
   { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, match: ['/hunts'] },
   { to: '/backtest', label: 'Backtest', icon: <History size={16} /> },
@@ -104,7 +104,7 @@ export function Sidebar() {
                 background: active ? '#11161e' : 'transparent',
               }}
             >
-              <span className="flex w-[17px] flex-none" style={{ color: active ? '#4b8bf5' : '#5b6473' }}>
+              <span className="flex w-[17px] flex-none" style={{ color: active ? '#4b8bf5' : '#7d8896' }}>
                 {n.icon}
               </span>
               {!collapsed && (

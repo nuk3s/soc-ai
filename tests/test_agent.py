@@ -5757,6 +5757,22 @@ def test_count_successful_tool_calls_ignores_text_thinking_retry_parts() -> None
     assert count_successful_tool_calls([mixed]) == 1
 
 
+def test_count_successful_tool_calls_ignores_empty_list_returns() -> None:
+    """Regression: several investigator tools (t_query_zeek_logs, t_query_cases,
+    t_query_detections, t_get_playbooks, t_lookup_runbook) return a BARE list and
+    yield [] when nothing matched. An empty list gathered no data and must NOT
+    exempt the hard evidence gate — the same standard the dict path already holds.
+    A non-empty list is real hits and still counts."""
+    from soc_ai.agent.orchestrator import count_successful_tool_calls
+
+    # empty list = zero hits = not evidence
+    assert count_successful_tool_calls([_ret([])]) == 0
+    # non-empty list = real hits = evidence
+    assert (
+        count_successful_tool_calls([_ret([{"community_id": "1:abc", "src_ip": "10.0.0.1"}])]) == 1
+    )
+
+
 def test_targeted_result_has_data() -> None:
     """The Phase-D evidence check requires DISCRIMINATING data — an empty-but-
     non-error result (zero OQL hits, internal IP with no hits) is not evidence."""

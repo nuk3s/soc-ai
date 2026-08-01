@@ -113,20 +113,23 @@ interface CheckboxProps {
   onChange?: (checked: boolean) => void;
   title?: string;
   indeterminate?: boolean;
+  'aria-label'?: string;
 }
-export function Checkbox({ checked, onClick, onChange, title, indeterminate }: CheckboxProps) {
+export function Checkbox({ checked, onClick, onChange, title, indeterminate, 'aria-label': ariaLabel }: CheckboxProps) {
   const active = checked || !!indeterminate;
   const handleClick = (e: React.MouseEvent) => {
     onClick?.(e);
     if (onChange) onChange(!checked);
   };
   return (
-    <div
+    <button
+      type="button"
       role="checkbox"
       aria-checked={indeterminate ? 'mixed' : checked}
+      aria-label={ariaLabel}
       title={title}
       onClick={handleClick}
-      className="flex h-4 w-4 cursor-pointer items-center justify-center rounded-[4px] border-[1.5px]"
+      className="flex h-4 w-4 flex-none cursor-pointer items-center justify-center rounded-[4px] border-[1.5px] p-0"
       style={{
         borderColor: active ? '#4b8bf5' : '#2a3645',
         background: active ? '#4b8bf5' : 'transparent',
@@ -141,6 +144,6 @@ export function Checkbox({ checked, onClick, onChange, title, indeterminate }: C
           <path d="M20 6L9 17l-5-5" />
         </svg>
       ) : null}
-    </div>
+    </button>
   );
 }

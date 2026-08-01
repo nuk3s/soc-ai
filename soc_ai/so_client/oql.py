@@ -623,33 +623,44 @@ def ast_to_es_dsl(ast: OqlAst, *, default_size: int = 100) -> dict[str, Any]:
         "size": default_size,
     }
 
-    has_groupby = False
+    # Pipe stages bind by TYPE in a canonical order, NOT source order: an explicit
+    # `head`/`sortby` that syntactically precedes `groupby` must still attach to the
+    # aggregation instead of setting a top-level `size` that the later `groupby`
+    # silently overwrites with 0 (which stranded the bucket size at its default 25).
+    # validate_oql already forbids repeating groupby/sortby/head, so there is at
+    # most one of each.
+    groupby = next((s for s in ast.pipes if isinstance(s, GroupBy)), None)
+    sortby = next((s for s in ast.pipes if isinstance(s, SortBy)), None)
+    head = next((s for s in ast.pipes if isinstance(s, Head)), None)
+    has_count = any(isinstance(s, Count) for s in ast.pipes)
+    has_groupby = groupby is not None
 
-    for stage in ast.pipes:
-        if isinstance(stage, GroupBy):
-            body["aggs"] = _build_terms_aggs(stage.fields)
-            body["size"] = 0  # groupby returns aggs, not hits
-            has_groupby = True
-        elif isinstance(stage, SortBy):
-            if stage.field == "count" and has_groupby:
-                # Sorting buckets by doc_count
-                _attach_bucket_sort(body["aggs"], stage.direction)
-            else:
-                body["sort"] = [{stage.field: {"order": stage.direction}}]
-        elif isinstance(stage, Head):
-            if has_groupby:
-                _attach_bucket_size(body["aggs"], stage.limit)
-            else:
-                body["size"] = stage.limit
-        elif isinstance(stage, Count):
-            body["size"] = 0
-            # An integer (not `True`) caps ES at an EXACT count up to that many
-            # docs, falling back to a `gte` lower-bound estimate beyond it --
-            # `True` instead forces a full exact count across every matching
-            # doc/shard with no cost ceiling. `_HARD_MAX_RESULTS` is the same
-            # ceiling already enforced on `head`. `EsSearchResult` already
-            # renders a `gte` relation as `total_is_lower_bound`.
-            body["track_total_hits"] = _HARD_MAX_RESULTS
+    if groupby is not None:
+        body["aggs"] = _build_terms_aggs(groupby.fields)
+        body["size"] = 0  # groupby returns aggs, not hits
+
+    if sortby is not None:
+        if sortby.field == "count" and has_groupby:
+            # Sorting buckets by doc_count
+            _attach_bucket_sort(body["aggs"], sortby.direction)
+        else:
+            body["sort"] = [{sortby.field: {"order": sortby.direction}}]
+
+    if head is not None:
+        if has_groupby:
+            _attach_bucket_size(body["aggs"], head.limit)
+        else:
+            body["size"] = head.limit
+
+    if has_count:
+        body["size"] = 0
+        # An integer (not `True`) caps ES at an EXACT count up to that many
+        # docs, falling back to a `gte` lower-bound estimate beyond it --
+        # `True` instead forces a full exact count across every matching
+        # doc/shard with no cost ceiling. `_HARD_MAX_RESULTS` is the same
+        # ceiling already enforced on `head`. `EsSearchResult` already
+        # renders a `gte` relation as `total_is_lower_bound`.
+        body["track_total_hits"] = _HARD_MAX_RESULTS
 
     return body
 

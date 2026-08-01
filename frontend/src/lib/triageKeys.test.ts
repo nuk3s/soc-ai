@@ -46,6 +46,8 @@ describe('resolveTriageKey', () => {
 
   it('hard guards swallow everything: palette open, typing in a field, Cmd/Ctrl/Alt held', () => {
     expect(resolveTriageKey(key('j'), ctx({ paletteOpen: true }))).toBeNull();
+    // Any open modal (drawer OR palette) disarms triage via the shared signal.
+    expect(resolveTriageKey(key('a'), ctx({ modalOpen: true }))).toBeNull();
     expect(resolveTriageKey(key('j'), ctx({ targetIsEditable: true }))).toBeNull();
     // Editable target outranks even the help overlay's Escape (guard order).
     expect(

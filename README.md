@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.2.4-3fb950" alt="1.2.4">
+  <img src="https://img.shields.io/badge/status-1.2.5-3fb950" alt="1.2.5">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
@@ -18,7 +18,7 @@ Click through recorded investigations, hunts, and a backtest in the real console
 
 soc-ai reads the alerts on your [Security Onion](https://securityonionsolutions.com/) grid and triages them with an LLM you host yourself. For each alert it pulls the related events, checks what else the host has been doing, runs the indicators against local threat intel, and decodes the packets off the sensor when that's what it takes. Then it hands you a verdict, a confidence number, and the reasoning that got it there.
 
-The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway. Nothing about your network leaves it, and write-backs stay yours: the agent recommends, you execute. The one exception is an audited auto-acknowledge for high-confidence, low-stakes false positives, on by default and one toggle to turn off. There's an optional cloud "Oracle" for a second opinion on the hard ones; it's off until you turn it on, and its input is sanitized first.
+The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway. Nothing about your network leaves it, and write-backs stay yours: the agent recommends, you execute. The one exception is an audited auto-acknowledge for high-confidence, low-stakes false positives — off by default, one toggle to turn on. There's an optional cloud "Oracle" for a second opinion on the hard ones; it's off until you turn it on, and its input is sanitized first.
 
 <div align="center">
   <img src="docs/img/screenshot-investigation.png" alt="An investigation: verdict, confidence, the reasoning, recommended actions, and the timeline of how the agent got there" width="900">
@@ -63,7 +63,7 @@ The **Runbooks** page in the console is the authoring space: write them in markd
 The whole point is that you stay in control of anything that changes state.
 
 - **Reads run freely:** pulling events, context, enrichment, and packets is safe, so the agent does it without asking.
-- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment. The agent recommends them and you execute them with a click. One pragmatic carve-out ships on by default: **confident false positives are auto-acknowledged** (confidence-gated, never on critical/high-severity or malware/exploit-class alerts, every unattended write audited). `auto_ack_fp_enabled=false` turns it off.
+- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment. The agent recommends them and you execute them with a click. One pragmatic carve-out is available but ships off by default: **confident false positives can be auto-acknowledged** (confidence-gated, never on critical/high-severity or malware/exploit-class alerts, every unattended write audited). Set `auto_ack_fp_enabled=true` (Config → Triage automation) to enable it.
 - **Nothing leaves your network without your consent.** The reasoning runs on your own model, on your own hardware. The Oracle (an optional cloud second opinion) is **off by default**, and even when you turn it on, internal hostnames, usernames, and IPs are redacted before anything is sent. Leave it off and the whole pipeline stays on your network.
 
 More detail in [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md).
@@ -80,7 +80,9 @@ else's cloud. soc-ai exists so you don't have to make that trade:
   Oracle off (the default), nothing about your network leaves it; the whole
   pipeline works with no internet at all.
 - **Readable reasoning:** every verdict cites the events it rests on, and no
-  true/false-positive call stands without evidence from a tool call. The logic is
+  true/false-positive call stands without evidence — a successful tool call, a
+  rule-grounded benign template, a concrete IOC hit, or a cited correlated-pivot
+  record; anything less is coerced to `needs_more_info`. The logic is
   in the open. Read exactly how a verdict was reached, and change it.
 - **You own every change:** the agent recommends writes and you execute them; the
   one unattended write (the FP auto-ack) is bounded, audited, and yours to
@@ -168,7 +170,7 @@ cd frontend && npm ci && npm run build   # the React console
 ## Where it's headed
 
 <div align="center">
-  <img src="docs/img/roadmap.svg" alt="soc-ai roadmap: 1.0 triage engine, 1.0.x hunt console, 1.1 measurement, and 1.2 operations all shipped; 1.2.4 quality is current; 1.3 and later milestones are planned" width="900">
+  <img src="docs/img/roadmap.svg" alt="soc-ai roadmap: 1.0 triage engine, 1.0.x hunt console, 1.1 measurement, and 1.2 operations all shipped; 1.2.5 is current; 1.3 and later milestones are planned" width="900">
 </div>
 
 The project moved quickly and it moved in public. 1.0 shipped the triage engine and the always-on console in June 2026. The 1.0.x line added the Hunt Console, backtests, runbooks, and grid discovery. 1.1 made quality continuously measured, and 1.2 was built from fourteen findings out of a full analyst shift on a live deployment.

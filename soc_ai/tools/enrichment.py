@@ -170,7 +170,7 @@ class MispClient:
     async def search_ioc(
         self,
         value: str,
-        ioc_type: str | None = None,
+        ioc_type: str | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """POST /attributes/restSearch and return the ``Attribute`` array.
 
@@ -295,7 +295,12 @@ async def enrich_ip(
 
     if misp is not None and not enrichment.internal:
         try:
-            misp_results = await misp.search_ioc(ip, ioc_type="ip-src")
+            # MISP stores IP IOCs under any of these attribute types. A malicious
+            # C2 *destination* is conventionally ip-dst, so querying ip-src alone
+            # silently misses the destination IOCs that matter most for triage.
+            misp_results = await misp.search_ioc(
+                ip, ioc_type=["ip-src", "ip-dst", "ip-src|port", "ip-dst|port"]
+            )
             enrichment.misp_hits = [_finding_from_misp(m) for m in misp_results]
         except Exception as e:  # fail-open
             enrichment.errors.append(f"misp lookup failed: {e}")
@@ -320,7 +325,7 @@ async def enrich_domain(
             enrichment.errors.append(f"blocklist lookup failed: {e}")
     if misp is not None:
         try:
-            misp_results = await misp.search_ioc(domain, ioc_type="domain")
+            misp_results = await misp.search_ioc(domain, ioc_type=["domain", "hostname"])
             enrichment.misp_hits = [_finding_from_misp(m) for m in misp_results]
         except Exception as e:  # fail-open
             enrichment.errors.append(f"misp lookup failed: {e}")

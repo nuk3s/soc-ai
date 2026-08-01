@@ -110,6 +110,21 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
     if interval_min <= 0 or age_min <= 0:
         return
     chat_age = timedelta(seconds=max(int(getattr(settings, "chat_turn_timeout_s", 180)), 1))
+    # Backtests and hunts legitimately run FAR longer than a single investigation,
+    # so reaping them at the investigation age (default 30 min) flips an in-flight
+    # job to 'error' mid-run. Derive each its own reap age from its real ceiling:
+    #   * a backtest replays up to ``backtest_max_sample`` full investigations
+    #     back-to-back, each bounded by ``investigation_run_timeout_s`` — worst-case
+    #     budget is the product. Every backtest is clamped to that sample cap, so
+    #     this age never reaps a legitimately-running one regardless of sample size.
+    #   * a hunt runs to its ``hunt_run_timeout_s`` wall-clock backstop and then
+    #     does partial synthesis — budget that plus a synthesis margin (one age_min).
+    # ``max(age_min, …)`` keeps each at least as generous as the investigation knob.
+    inv_run_min = max(int(getattr(settings, "investigation_run_timeout_s", 900)) // 60, 1)
+    hunt_age_min = max(age_min, int(getattr(settings, "hunt_run_timeout_s", 1800)) // 60 + age_min)
+    bt_age_min = max(
+        age_min, int(getattr(settings, "backtest_max_sample", 50)) * inv_run_min + age_min
+    )
     while True:
         await asyncio.sleep(interval_min * 60)
         try:
@@ -118,11 +133,11 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
             if n:
                 _LOGGER.info("reaper: marked %d stale 'running' investigation(s) as error", n)
             async with db_sessionmaker() as db:
-                nh = await hunt_svc.reap_stale_running(db, older_than_minutes=age_min)
+                nh = await hunt_svc.reap_stale_running(db, older_than_minutes=hunt_age_min)
             if nh:
                 _LOGGER.info("reaper: marked %d stale 'running' hunt(s) as error", nh)
             async with db_sessionmaker() as db:
-                nb = await bt_svc.reap_stale_running(db, older_than_minutes=age_min)
+                nb = await bt_svc.reap_stale_running(db, older_than_minutes=bt_age_min)
             if nb:
                 _LOGGER.info("reaper: marked %d stale 'running' backtest(s) as error", nb)
         except asyncio.CancelledError:
@@ -336,12 +351,14 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
     unless ``hunt_schedules_enabled``. Each wake fetches the DUE schedules
     (:func:`soc_ai.store.hunt_schedules.due_schedules`) and spawns a normal hunt
     per schedule via the shared ``HuntConsoleManager`` (tagged ``kind="scheduled"``),
-    then stamps ``last_run_at`` immediately.
+    then stamps ``last_run_at`` — but only after the spawn actually succeeds. A
+    spawn rejected at the shared concurrency ceiling stays unstamped so the
+    schedule remains due and retries on the next wake (no lost cycle).
 
     **Single-flight** is per-SCHEDULE, not global: distinct schedules run
     concurrently (the manager keys tasks by hunt_id, so they never collide), but a
     schedule can't re-fire while its own hunt is still running because
-    :func:`mark_ran` resets its interval clock the instant it spawns — so the same
+    :func:`mark_ran` resets its interval clock the instant a spawn succeeds — so the same
     schedule is no longer "due" next wake until the interval elapses again. This
     relies on the interval being ≥ the hunt runtime (enforced as a 60-min floor at
     the store). A per-schedule failure is logged and skipped so one bad schedule
@@ -369,25 +386,51 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
             launched = 0
             for sched in due:
                 try:
-                    # Reset the interval clock BEFORE spawning: this is the
-                    # single-flight guard — even if the spawn is slow or the hunt
-                    # runs long, the schedule is no longer "due" next wake.
-                    async with app.state.db_sessionmaker() as db:
-                        await hs_svc.mark_ran(db, sched.id, now)
                     hunt_id = await manager.start(
                         app.state,
                         objective=sched.objective,
                         started_by="scheduler",
                         kind="scheduled",
                     )
-                    if hunt_id is not None:
-                        launched += 1
+                    if hunt_id is None:
+                        # Rejected: the shared concurrency ceiling is full (or the
+                        # generator died before hunt_created). Leave last_run_at
+                        # UNSTAMPED so the schedule stays "due" and the next wake
+                        # retries it — stamping here would silently drop a whole
+                        # interval and show a "last ran" for a run that never began.
+                        _LOGGER.warning(
+                            "hunt scheduler: schedule id=%s could not start "
+                            "(at capacity?) — left due to retry next wake",
+                            sched.id,
+                        )
+                        continue
+                    # Stamp the interval clock only AFTER a real spawn: this is the
+                    # per-schedule single-flight guard and records the run that
+                    # actually started. The loop is sequential, so the next wake
+                    # can't fire mid-pass — a slow start() can't double-fire it.
+                    async with app.state.db_sessionmaker() as db:
+                        await hs_svc.mark_ran(db, sched.id, now)
+                    launched += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     _LOGGER.exception(
                         "hunt scheduler: schedule id=%s failed to fire; skipping", sched.id
                     )
+                    # A schedule whose spawn RAISED (a broken objective, a bug in
+                    # start()) is stamped so it can't retry-storm every wake — a
+                    # permanently-bad schedule fires at most once per interval, not
+                    # once per wake. This is distinct from the capacity rejection
+                    # above (hunt_id is None), which is transient and SHOULD retry.
+                    try:
+                        async with app.state.db_sessionmaker() as db:
+                            await hs_svc.mark_ran(db, sched.id, now)
+                    except Exception:
+                        _LOGGER.exception(
+                            "hunt scheduler: schedule id=%s could not be stamped after "
+                            "a failed spawn",
+                            sched.id,
+                        )
             if launched:
                 _LOGGER.info("hunt scheduler: launched %d scheduled hunt(s)", launched)
         except asyncio.CancelledError:
@@ -685,6 +728,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         # else an in-flight Investigate or chat turn can use-after-close on shutdown.
         _worker_tasks.extend(_hm.get_manager(app.state)._tasks.values())
         _worker_tasks.extend(_cm.get_manager(app.state)._tasks.values())
+        # The "Chat about this hunt" follow-up turns (HuntChatManager, stored as
+        # hunt_events) are a THIRD chat drainer. Without this, a pending hunt-chat
+        # turn is abandoned mid-flight at shutdown — never cancelled, so its
+        # done-callback backstop never fires and the row stays 'pending' forever
+        # (the hunt's chat then spins and every later POST .../chat 409s).
+        _worker_tasks.extend(_hcm.get_chat_manager(app.state)._tasks.values())
         # Demo replay drains (soc_ai/demo/replay.py start_background_replay) hold
         # the DB sessionmaker via the recorder — drain them too, else an in-flight
         # replay can write after db_engine.dispose(). Empty set outside demo.

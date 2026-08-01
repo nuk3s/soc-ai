@@ -7,6 +7,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DEMO_ACTION_NOTE, DemoProvider, demoBlocked, useDemo } from '../lib/demo';
+import { ToastProvider } from '../lib/toast';
 import { ShellProvider } from '../shell/ShellContext';
 
 // F38 — background poll pause while the drawer is open. A single group with an
@@ -216,11 +217,13 @@ describe('assignAlert write paths surface a failure instead of failing silently 
   it('shows a failure message on the ack strip when "Assign to me" rejects', async () => {
     vi.mocked(assignAlert).mockRejectedValueOnce(new Error('network down'));
     render(
-      <MemoryRouter initialEntries={['/alerts']}>
-        <ShellProvider>
-          <Alerts />
-        </ShellProvider>
-      </MemoryRouter>,
+      <ToastProvider>
+        <MemoryRouter initialEntries={['/alerts']}>
+          <ShellProvider>
+            <Alerts />
+          </ShellProvider>
+        </MemoryRouter>
+      </ToastProvider>,
     );
 
     const assignBtn = await screen.findByTitle('Assign to me');

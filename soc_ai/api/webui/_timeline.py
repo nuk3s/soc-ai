@@ -695,23 +695,54 @@ async def _alert_currently_acked(
         return False
 
 
-def _executed_actions(events: list[Any]) -> dict[int, dict[str, Any]]:
-    """index -> payload of persisted successful advisory-action executions.
+def _action_identity(action: dict[str, Any]) -> str:
+    """Stable key for a recommended action, independent of its POSITION in
+    ``report.recommended_actions``.
+
+    Chat-resolve can REPLACE the whole recommended_actions list, re-indexing every
+    action; a position-keyed idempotency marker would then bind to whatever action
+    now occupies that slot (F04). Keying on the model-authored content (tool + args
+    + rationale) keeps an "executed" marker bound to the action it actually ran, and
+    lets a genuinely new recommendation stay actionable.
+    """
+    return json.dumps(
+        {
+            "tool_name": action.get("tool_name", ""),
+            "tool_args": action.get("tool_args") or {},
+            "rationale": action.get("rationale", ""),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _executed_actions(events: list[Any]) -> dict[str, dict[str, Any]]:
+    """action-identity -> payload of persisted successful advisory-action executions.
 
     ``POST .../actions/{index}/execute`` writes an ``action_executed`` event on
     success (FR-030); reading it back here means a reload never re-offers an
     already-executed escalate (duplicate SO cases) or ack.
+
+    Keyed by the action's stable identity (``action_key``, see
+    :func:`_action_identity`) so the marker survives a chat-resolve that REPLACES
+    (and thus re-indexes) recommended_actions (F04). Legacy markers written before
+    ``action_key`` existed are keyed by position as ``#idx:<n>`` so a reload still
+    reads them as applied.
     """
-    out: dict[int, dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for e in events:
         if e.kind != "action_executed":
             continue
         p = e.payload or {}
         if not p.get("success"):
             continue
-        idx = p.get("index")
-        if isinstance(idx, int):
-            out[idx] = p
+        key = p.get("action_key")
+        if not isinstance(key, str) or not key:
+            idx = p.get("index")
+            if not isinstance(idx, int):
+                continue
+            key = f"#idx:{idx}"
+        out[key] = p
     return out
 
 
@@ -786,7 +817,9 @@ def _build_actions(
         return out
     for i, a in enumerate(report.get("recommended_actions", []) or []):
         tn = a.get("tool_name", "")
-        exec_p = executed.get(i)
+        # Match by stable identity first (survives a chat-resolve re-index, F04),
+        # falling back to the legacy position key for pre-action_key markers.
+        exec_p = executed.get(_action_identity(a)) or executed.get(f"#idx:{i}")
         applied = exec_p is not None or ((auto_acked or alert_acked) and tn == "ack_alert")
         note: str | None = None
         if exec_p is not None:
@@ -871,6 +904,15 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
         if e.kind.startswith("oracle"):
             has_oracle = True
         group = _tl_group(e.kind)
+        # Phase-D targeted dispatches run REAL tools (run_targeted_investigation)
+        # but are recorded as `targeted_dispatch`, not `tool_call` — count them so a
+        # synth-first run that grounded its verdict on t_get_event_raw/t_query_events
+        # isn't mis-badged "heuristic · no tools" with toolCalls 0 (F06).
+        if e.kind == "targeted_dispatch":
+            td_tool = str(p.get("tool_name", ""))
+            tool_calls += 1
+            if "query" in td_tool or "zeek" in td_tool or "pcap" in td_tool:
+                pivots += 1
         if e.kind == "tool_call":
             tn = str(p.get("tool_name", ""))
             # `final_result` is pydantic-ai's structured-output pseudo-tool, not an

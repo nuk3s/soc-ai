@@ -4,6 +4,7 @@ import { Outlet, useLocation } from 'react-router-dom';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { RouteFallback } from '../components/States';
 import { DEMO_BANNER_H, DemoBanner, DemoProvider, useDemoStatus } from '../lib/demo';
+import { ToastProvider } from '../lib/toast';
 import { useUpdateCheck } from '../lib/useUpdateCheck';
 import { CommandPalette } from './CommandPalette';
 import { Sidebar } from './Sidebar';
@@ -16,6 +17,7 @@ export function AppShell() {
   const location = useLocation();
   return (
     <DemoProvider demo={demo}>
+      <ToastProvider>
       {/* Demo honesty banner: pinned above the shell on EVERY screen, never
           dismissible. Absent (and the DOM untouched) outside demo mode. */}
       {demo && <DemoBanner />}
@@ -74,6 +76,7 @@ export function AppShell() {
           </div>
         )}
       </div>
+      </ToastProvider>
     </DemoProvider>
   );
 }

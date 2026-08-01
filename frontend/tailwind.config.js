@@ -5,64 +5,69 @@ export default {
     extend: {
       colors: {
         // surfaces & text (dark, cool-neutral)
-        bg: '#080a0e',
-        'surface-1': '#0b0e13',
-        'surface-2': '#0c1016',
-        'surface-3': '#11161e',
-        'surface-hover': '#0e131a',
-        'surface-card': '#0e1117', // login card / dropdowns / palette
-        border: '#161c25',
-        'border-2': '#1c232e',
-        'border-strong': '#2a3645',
-        'border-faint': '#11151c',
-        'border-input': '#232b37',
-        text: '#e6e9ef',
-        'text-2': '#cdd5e0',
-        dim: '#8b94a3',
-        faint: '#5b6473',
-        ghost: '#3a424f',
-
+        bg: 'rgb(var(--bg) / <alpha-value>)',
+        'surface-1': 'rgb(var(--surface-1) / <alpha-value>)',
+        'surface-2': 'rgb(var(--surface-2) / <alpha-value>)',
+        'surface-3': 'rgb(var(--surface-3) / <alpha-value>)',
+        'surface-hover': 'rgb(var(--surface-hover) / <alpha-value>)',
+        'surface-card': 'rgb(var(--surface-card) / <alpha-value>)',
+        border: 'rgb(var(--border) / <alpha-value>)',
+        'border-2': 'rgb(var(--border-2) / <alpha-value>)',
+        'border-strong': 'rgb(var(--border-strong) / <alpha-value>)',
+        'border-faint': 'rgb(var(--border-faint) / <alpha-value>)',
+        'border-input': 'rgb(var(--border-input) / <alpha-value>)',
+        text: 'rgb(var(--text) / <alpha-value>)',
+        'text-2': 'rgb(var(--text-2) / <alpha-value>)',
+        dim: 'rgb(var(--dim) / <alpha-value>)',
+        faint: 'rgb(var(--faint) / <alpha-value>)',
+        ghost: 'rgb(var(--ghost) / <alpha-value>)',
         // accent & status
-        accent: '#4b8bf5',
-        'accent-deep': '#2c5fd0',
-        success: '#3fb950',
-        'success-btn': '#1d6b3f',
-        'success-btn-border': '#2a8a52',
-        warn: '#f5a623',
-        danger: '#f04438',
-
+        accent: 'rgb(var(--accent) / <alpha-value>)',
+        'accent-deep': 'rgb(var(--accent-deep) / <alpha-value>)',
+        focus: 'rgb(var(--focus) / <alpha-value>)',
+        success: 'rgb(var(--success) / <alpha-value>)',
+        'success-btn': 'rgb(var(--success-btn) / <alpha-value>)',
+        'success-btn-border': 'rgb(var(--success-btn-border) / <alpha-value>)',
+        warn: 'rgb(var(--warn) / <alpha-value>)',
+        danger: 'rgb(var(--danger) / <alpha-value>)',
         // verdict
-        'verdict-tp': '#f04438',
-        'verdict-fp': '#7ba893',
-        'verdict-nmi': '#f5a623',
-        'verdict-untriaged': '#6b7484',
-
-        // severity
-        'sev-critical': '#f04438',
-        'sev-high': '#f79009',
-        'sev-medium': '#eab308',
-        'sev-low': '#6b87a8',
-
+        'verdict-tp': 'rgb(var(--verdict-tp) / <alpha-value>)',
+        'verdict-fp': 'rgb(var(--verdict-fp) / <alpha-value>)',
+        'verdict-nmi': 'rgb(var(--verdict-nmi) / <alpha-value>)',
+        'verdict-untriaged': 'rgb(var(--verdict-untriaged) / <alpha-value>)',
+        // severity — ONE canonical ramp (green is never a severity)
+        'sev-critical': 'rgb(var(--sev-critical) / <alpha-value>)',
+        'sev-high': 'rgb(var(--sev-high) / <alpha-value>)',
+        'sev-medium': 'rgb(var(--sev-medium) / <alpha-value>)',
+        'sev-low': 'rgb(var(--sev-low) / <alpha-value>)',
+        'sev-info': 'rgb(var(--sev-info) / <alpha-value>)',
         // detection kind
-        'kind-suricata': '#4b8bf5',
-        'kind-sigma': '#a472f0',
-        'kind-notice': '#2dd4bf',
-
-        // misc mono accents from prototype
-        'mono-amber': '#e0a83a',
-        'mono-green': '#7ba893',
-        'node-host': '#4b8bf5',
-        'node-c2': '#e0a83a',
-        'node-dc': '#7ba893',
+        'kind-suricata': 'rgb(var(--kind-suricata) / <alpha-value>)',
+        'kind-sigma': 'rgb(var(--kind-sigma) / <alpha-value>)',
+        'kind-notice': 'rgb(var(--kind-notice) / <alpha-value>)',
+        // misc mono accents / graph nodes
+        'mono-amber': 'rgb(var(--mono-amber) / <alpha-value>)',
+        'mono-green': 'rgb(var(--mono-green) / <alpha-value>)',
+        'node-host': 'rgb(var(--node-host) / <alpha-value>)',
+        'node-c2': 'rgb(var(--node-c2) / <alpha-value>)',
+        'node-dc': 'rgb(var(--node-dc) / <alpha-value>)',
       },
       fontFamily: {
         sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
         mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
       },
       fontSize: {
-        // semantic sizes used across the spec
-        'screen-title': ['20px', { lineHeight: '1.2', letterSpacing: '-0.015em', fontWeight: '600' }],
+        // Named type roles (hard floor 11px). Adopt incrementally in place of the
+        // ad-hoc text-[Npx] values; 11px is only for uppercase-tracked labels and
+        // mono captions — anything read rather than glanced at is >=12px.
+        micro: ['11px', { lineHeight: '1.3', letterSpacing: '0.06em' }],
+        meta: ['12px', { lineHeight: '1.4' }],
+        ui: ['13px', { lineHeight: '1.45' }],
+        body: ['13px', { lineHeight: '1.55' }],
+        section: ['15px', { lineHeight: '1.35', fontWeight: '600' }],
+        title: ['20px', { lineHeight: '1.2', letterSpacing: '-0.015em', fontWeight: '600' }],
         headline: ['21px', { lineHeight: '1.32', letterSpacing: '-0.015em', fontWeight: '600' }],
+        kpi: ['24px', { lineHeight: '1.1', fontWeight: '600' }],
       },
       borderRadius: {
         chip: '5px',

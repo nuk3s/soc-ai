@@ -7,7 +7,7 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
@@ -254,16 +254,28 @@ _DEV_ME = MeOut(username="analyst", role="admin", status="")
 async def get_me(request: Request) -> MeOut:
     """Return the current user's username, role, and status.
 
-    When ``api_auth_required`` is False (dev / lab default) and there is no
-    active session, return a sensible dev fallback so the SPA always has a
-    user to render.  When auth IS required and there is no session, the
-    ``require_api_auth`` dependency already rejected the request with 401
-    before this handler runs.
+    A session-cookie user reports their own identity. With no session:
+
+    - ``api_auth_required`` False (dev / lab default): a stable dev fallback so
+      the SPA always has a user to render.
+    - ``api_auth_required`` True: the caller reached here on a valid bearer token
+      (``require_api_auth`` 401s otherwise, and it does NOT resolve a session),
+      so report the TOKEN's identity — never the dev admin fallback, which would
+      advertise an ``admin`` role the token cannot exercise.
     """
     user = await current_user(request)
-    if user is None:
+    if user is not None:
+        return MeOut(username=user.username, role=user.role, status=user.status)
+    settings = request.app.state.settings
+    if not settings.api_auth_required:
         return _DEV_ME
-    return MeOut(username=user.username, role=user.role, status=user.status)
+    authz = request.headers.get("authorization", "")
+    if authz.lower().startswith("bearer "):
+        async with request.app.state.db_sessionmaker() as db:
+            token = await auth_svc.check_api_token(db, authz[7:].strip())
+        if token is not None:
+            return MeOut(username=f"token:{token.name}", role="token", status="")
+    raise HTTPException(status_code=401, detail={"reason": "no_session"})
 
 
 @router.post("/me/status")
@@ -276,7 +288,10 @@ async def set_my_status(request: Request, body: SetStatusIn) -> dict[str, str | 
     trimmed = body.status.strip()[:64]
     user = await current_user(request)
     if user is None:
-        # Dev / no-auth mode: nothing to persist, just echo back.
+        # No session (dev / no-auth mode, or a bearer-token caller with no user
+        # row): nothing to persist, echo back. The CSRF layer already governs
+        # who may POST here; this endpoint is also the suite's canonical
+        # authenticated-POST probe, so it must stay a 200 for bearer callers.
         return {"ok": True, "status": trimmed}
     async with request.app.state.db_sessionmaker() as db:
         await auth_svc.set_user_status(db, user.id, trimmed)

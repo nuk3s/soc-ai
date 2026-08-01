@@ -20,7 +20,7 @@ import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResul
 import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
-import { ConfigNav } from './ConfigNav';
+import { ConfigNav, ConfigNavSelect } from './ConfigNav';
 
 /** Slugify a section title into a stable DOM id / anchor fragment. */
 function slug(s: string): string {
@@ -578,7 +578,7 @@ export function Config() {
     return stagedBool('auto_ack_fp_enabled', s.value as boolean);
   };
 
-  if (loading) return <div className="p-6"><LoadingState label="Loading settings…" /></div>;
+  if (loading && !data) return <div className="p-6"><LoadingState label="Loading settings…" /></div>;
   if (error) return <div className="p-6"><ErrorState error={error} /></div>;
   if (!data) return null;
 
@@ -1567,6 +1567,7 @@ export function Config() {
         <ConfigNav groups={layout} activeId={activeId} onNavigate={navigateToSection} />
       </aside>
       <div className="min-w-0 max-w-permalink flex-1">
+      <ConfigNavSelect groups={layout} activeId={activeId} onNavigate={navigateToSection} />
       <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
       <div className="mb-[18px] mt-0.5 text-[13px] text-dim">
         Runtime settings · users · API tokens. Source badges show whether a value is set in the database or pinned by an

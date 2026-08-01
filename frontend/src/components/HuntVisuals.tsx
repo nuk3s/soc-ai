@@ -11,6 +11,7 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  LabelList,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -20,19 +21,19 @@ import {
   YAxis,
 } from 'recharts';
 import { useNavigate } from 'react-router-dom';
-import type { HuntChart, HuntFinding } from '../lib/types';
+import type { ReactNode } from 'react';
+import type { HuntChart, HuntFinding, Severity } from '../lib/types';
+import { SEVERITY } from '../lib/tokens';
 import { Panel, PanelHeader } from './Panel';
 
-// Hunt severity palette — mirrors HuntDetail's SEV_COLOR. Ordered worst-first
-// so rank 0 = critical (chart rows + "worst severity" both read top-down).
+// Hunt severity colors derive from the single app-wide ramp (lib/tokens) — no
+// second palette, so "low" is the same dim blue as everywhere else, never green.
+// SEV_ORDER stays worst-first: rank 0 = critical (chart rows + "worst severity"
+// both read top-down).
 const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
-const SEV_COLOR: Record<string, string> = {
-  critical: '#f85149',
-  high: '#f0883e',
-  medium: '#d29922',
-  low: '#3fb950',
-  info: '#8b949e',
-};
+const SEV_COLOR: Record<string, string> = Object.fromEntries(
+  (Object.keys(SEVERITY) as Severity[]).map((k) => [k, SEVERITY[k].color]),
+);
 
 // Category colors for the stacked breakdown: only 'threat' segments carry the
 // severity color — gaps and observations stay deliberately muted so a wall of
@@ -53,6 +54,9 @@ const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) +
 // explicitly against the dark surface tokens.
 const TICK = { fill: '#8b94a3', fontSize: 11 };
 const MONO_TICK = { fill: '#8b94a3', fontSize: 10.5, fontFamily: 'JetBrains Mono, monospace' };
+// Always-visible value labels (the non-hover path): mono, a touch brighter than
+// the ticks so a number reads off the bar without a pointer.
+const VALUE_LABEL = { fill: '#c9d1d9', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' };
 const AXIS_LINE = { stroke: '#1c232e' };
 const CURSOR = { fill: 'rgba(255,255,255,.04)' };
 const TIP_BOX =
@@ -72,6 +76,56 @@ function LegendRow({ items }: { items: { swatch: string; round?: boolean; label:
         </span>
       ))}
     </div>
+  );
+}
+
+// The non-hover path: every chart panel carries a collapsed <details> that
+// re-renders the same series as a real <table>. It is the screen-reader and
+// touch fallback for the hover tooltips, and stays in the DOM even when closed.
+function TableDisclosure({
+  caption,
+  columns,
+  rows,
+}: {
+  caption: string;
+  columns: string[];
+  rows: ReactNode[][];
+}) {
+  return (
+    <details className="border-t border-border">
+      <summary className="cursor-pointer select-none px-3.5 py-[9px] font-mono text-[11px] text-dim hover:text-text-2">
+        View as table
+      </summary>
+      <div className="overflow-x-auto px-3.5 pb-3 pt-1">
+        <table className="w-full border-collapse text-left text-[12px]">
+          <caption className="sr-only">{caption}</caption>
+          <thead>
+            <tr>
+              {columns.map((c) => (
+                <th
+                  key={c}
+                  scope="col"
+                  className="border-b border-border px-2 py-1 font-mono text-[10.5px] font-semibold uppercase tracking-[.04em] text-dim"
+                >
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i}>
+                {r.map((cell, j) => (
+                  <td key={j} className="border-b border-border px-2 py-1 font-mono text-[11.5px] text-text-2">
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
   );
 }
 
@@ -129,7 +183,7 @@ function BreakdownTip({ active, payload }: TooltipProps<number, string>) {
 function BreakdownChart({ rows }: { rows: BreakdownRow[] }) {
   return (
     <ResponsiveContainer width="100%" height={Math.max(rows.length * 38 + 26, 100)}>
-      <BarChart data={rows} layout="vertical" margin={{ top: 4, right: 18, bottom: 0, left: 4 }}>
+      <BarChart accessibilityLayer aria-label="Findings by severity and category" data={rows} layout="vertical" margin={{ top: 4, right: 26, bottom: 0, left: 4 }}>
         <XAxis type="number" allowDecimals={false} tick={TICK} axisLine={AXIS_LINE} tickLine={false} />
         <YAxis
           type="category"
@@ -148,7 +202,16 @@ function BreakdownChart({ rows }: { rows: BreakdownRow[] }) {
           ))}
         </Bar>
         <Bar dataKey="visibility_gap" stackId="cat" fill={GAP_COLOR} isAnimationActive={false} />
-        <Bar dataKey="observation" stackId="cat" fill={OBS_COLOR} isAnimationActive={false} />
+        <Bar dataKey="observation" stackId="cat" fill={OBS_COLOR} isAnimationActive={false}>
+          {/* one total-per-severity label at the end of the stack — no hover needed */}
+          <LabelList
+            position="right"
+            valueAccessor={(e: { payload?: BreakdownRow }) =>
+              e.payload ? e.payload.threat + e.payload.visibility_gap + e.payload.observation : ''
+            }
+            style={VALUE_LABEL}
+          />
+        </Bar>
       </BarChart>
     </ResponsiveContainer>
   );
@@ -206,7 +269,7 @@ function HostTip({ active, payload }: TooltipProps<number, string>) {
 function HostChart({ rows }: { rows: HostRow[] }) {
   return (
     <ResponsiveContainer width="100%" height={Math.max(rows.length * 32 + 26, 90)}>
-      <BarChart data={rows} layout="vertical" margin={{ top: 4, right: 18, bottom: 0, left: 4 }}>
+      <BarChart accessibilityLayer aria-label="Host involvement — findings per host (top 8 hosts)" data={rows} layout="vertical" margin={{ top: 4, right: 30, bottom: 0, left: 4 }}>
         <XAxis type="number" allowDecimals={false} tick={TICK} axisLine={AXIS_LINE} tickLine={false} />
         <YAxis
           type="category"
@@ -222,6 +285,8 @@ function HostChart({ rows }: { rows: HostRow[] }) {
           {rows.map((r) => (
             <Cell key={r.host} fill={SEV_COLOR[r.worst] ?? SEV_COLOR.info} />
           ))}
+          {/* top-8 cut means the axis never crowds — label every bar end */}
+          <LabelList dataKey="count" position="right" style={VALUE_LABEL} />
         </Bar>
       </BarChart>
     </ResponsiveContainer>
@@ -403,13 +468,16 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
       <div className="px-2 pb-1 pt-3">
         <ResponsiveContainer width="100%" height={height}>
           {isBar ? (
-            <BarChart data={data} margin={{ top: 4, right: 14, bottom: 2, left: 0 }}>
+            <BarChart accessibilityLayer aria-label={chart.title || 'Chart'} data={data} margin={{ top: 4, right: 14, bottom: 2, left: 0 }}>
               {common}
-              <Bar dataKey="y" fill={color} radius={[3, 3, 0, 0]} isAnimationActive={false} />
+              <Bar dataKey="y" fill={color} radius={[3, 3, 0, 0]} isAnimationActive={false}>
+                {/* label each bar end only for short series that won't collide */}
+                {data.length <= 8 && <LabelList dataKey="y" position="top" style={VALUE_LABEL} />}
+              </Bar>
             </BarChart>
           ) : (
             // line + timeline both render as a value-over-x line
-            <LineChart data={data} margin={{ top: 4, right: 14, bottom: 2, left: 0 }}>
+            <LineChart accessibilityLayer aria-label={chart.title || 'Chart'} data={data} margin={{ top: 4, right: 14, bottom: 2, left: 0 }}>
               {common}
               <Line
                 type="monotone"
@@ -424,6 +492,11 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
           )}
         </ResponsiveContainer>
       </div>
+      <TableDisclosure
+        caption={`${chart.title || 'Chart'} — data table`}
+        columns={[chart.xLabel ? clip(chart.xLabel, 24) : 'x', chart.yLabel ? clip(chart.yLabel, 24) : 'value']}
+        rows={data.map((p) => [String(p.x), typeof p.y === 'number' ? p.y : String(p.y ?? '')])}
+      />
       {chart.xLabel && (
         <div className="border-t border-border px-3.5 py-[7px] font-mono text-[10.5px] text-dim">
           {clip(chart.xLabel, 60)}
@@ -447,6 +520,10 @@ interface HuntVisualsProps {
 export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntVisualsProps) {
   const sevRows = breakdownRows(findings);
   const hostR = hostRows(findings);
+  // Distinct hosts NAMED by findings. hostRows caps at the top 8 by involvement,
+  // so when more exist the Host-involvement panel is truncating — its header
+  // says "top 8 of N" instead of a bare (capped) count.
+  const hostsNamed = new Set(findings.flatMap((f) => f.hosts)).size;
 
   // the map's right column: the chart's top-8 hosts, backfilled (under the
   // same cap) with affected hosts no finding names
@@ -486,20 +563,50 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
             <BreakdownChart rows={sevRows} />
           </div>
           <LegendRow items={breakdownLegend} />
+          <TableDisclosure
+            caption="Findings breakdown by severity and category"
+            columns={['Severity', 'Threat', 'Visibility gap', 'Observation', 'Total']}
+            rows={sevRows.map((r) => [
+              r.severity,
+              r.threat,
+              r.visibility_gap,
+              r.observation,
+              r.threat + r.visibility_gap + r.observation,
+            ])}
+          />
         </Panel>
 
         <Panel>
           <PanelHeader
             icon={<Server size={15} />}
             title="Host involvement"
-            right={<span className="font-mono text-[11px] text-accent">{hostR.length}</span>}
+            right={
+              <span className="font-mono text-[11px] text-accent">
+                {hostsNamed > hostR.length ? `top ${hostR.length} of ${hostsNamed}` : hostR.length}
+              </span>
+            }
           />
           {hostR.length === 0 ? (
             <div className="px-4 py-3.5 text-[12.5px] text-dim">No findings name a host.</div>
           ) : (
-            <div className="px-2 py-3">
-              <HostChart rows={hostR} />
-            </div>
+            <>
+              <div className="px-2 py-3">
+                <HostChart rows={hostR} />
+              </div>
+              <LegendRow
+                items={[
+                  {
+                    swatch: `linear-gradient(90deg,${SEV_COLOR.critical},${SEV_COLOR.medium},${SEV_COLOR.low})`,
+                    label: 'bar color = worst severity',
+                  },
+                ]}
+              />
+              <TableDisclosure
+                caption="Host involvement — findings per host"
+                columns={['Host', 'Findings', 'Worst severity']}
+                rows={hostR.map((r) => [r.host, r.count, r.worst])}
+              />
+            </>
           )}
         </Panel>
 
@@ -525,6 +632,16 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
                   { swatch: SEV_COLOR.high, label: 'finding (severity color)' },
                   { swatch: '#4b8bf5', round: true, label: 'host' },
                 ]}
+              />
+              <TableDisclosure
+                caption="Host–finding map — each finding and the hosts it names"
+                columns={['Finding', 'Severity', 'Category', 'Hosts']}
+                rows={findings.map((f, i) => [
+                  `F${i + 1} — ${f.title}`,
+                  sevKey(f.severity),
+                  f.category ?? 'threat',
+                  f.hosts.length ? f.hosts.join(', ') : '—',
+                ])}
               />
             </>
           )}

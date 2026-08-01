@@ -11,6 +11,59 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Design tokens as CSS custom properties (rgb triplets so Tailwind's
+   rgb(var(--x) / <alpha-value>) opacity modifiers work). A high-contrast
+   variant later is one :root[data-theme] override; nothing else changes. */
+  :root {
+    /* surfaces & text (dark, cool-neutral) */
+    --bg: 8 10 14; /* #080a0e */
+    --surface-1: 11 14 19; /* #0b0e13 */
+    --surface-2: 12 16 22; /* #0c1016 */
+    --surface-3: 17 22 30; /* #11161e */
+    --surface-hover: 14 19 26; /* #0e131a */
+    --surface-card: 14 17 23; /* #0e1117 */
+    --border: 22 28 37; /* #161c25 */
+    --border-2: 28 35 46; /* #1c232e */
+    --border-strong: 42 54 69; /* #2a3645 */
+    --border-faint: 17 21 28; /* #11151c */
+    --border-input: 35 43 55; /* #232b37 */
+    --text: 230 233 239; /* #e6e9ef */
+    --text-2: 205 213 224; /* #cdd5e0 */
+    --dim: 139 148 163; /* #8b94a3 */
+    --faint: 125 136 150; /* #7d8896 */
+    --ghost: 58 66 79; /* #3a424f */
+    /* accent & status */
+    --accent: 75 139 245; /* #4b8bf5 */
+    --accent-deep: 44 95 208; /* #2c5fd0 */
+    --focus: 127 176 255; /* #7fb0ff */
+    --success: 63 185 80; /* #3fb950 */
+    --success-btn: 29 107 63; /* #1d6b3f */
+    --success-btn-border: 42 138 82; /* #2a8a52 */
+    --warn: 245 166 35; /* #f5a623 */
+    --danger: 240 68 56; /* #f04438 */
+    /* verdict */
+    --verdict-tp: 240 68 56; /* #f04438 */
+    --verdict-fp: 123 168 147; /* #7ba893 */
+    --verdict-nmi: 245 166 35; /* #f5a623 */
+    --verdict-untriaged: 107 116 132; /* #6b7484 */
+    /* severity — ONE canonical ramp (green is never a severity) */
+    --sev-critical: 240 68 56; /* #f04438 */
+    --sev-high: 247 144 9; /* #f79009 */
+    --sev-medium: 234 179 8; /* #eab308 */
+    --sev-low: 107 135 168; /* #6b87a8 */
+    --sev-info: 139 148 158; /* #8b949e */
+    /* detection kind */
+    --kind-suricata: 75 139 245; /* #4b8bf5 */
+    --kind-sigma: 164 114 240; /* #a472f0 */
+    --kind-notice: 45 212 191; /* #2dd4bf */
+    /* misc mono accents / graph nodes */
+    --mono-amber: 224 168 58; /* #e0a83a */
+    --mono-green: 123 168 147; /* #7ba893 */
+    --node-host: 75 139 245; /* #4b8bf5 */
+    --node-c2: 224 168 58; /* #e0a83a */
+    --node-dc: 123 168 147; /* #7ba893 */
+  }
+
 @layer base {
   * {
     box-sizing: border-box;
@@ -23,8 +76,8 @@
     height: 100%;
   }
   body {
-    background: #080a0e;
-    color: #e6e9ef;
+    background: rgb(var(--bg));
+    color: rgb(var(--text));
     font-family: 'IBM Plex Sans', system-ui, sans-serif;
     font-size: 14px;
     line-height: 1.45;
@@ -37,24 +90,26 @@
   ::-webkit-scrollbar-thumb {
     background: #262e3a;
     border-radius: 6px;
-    border: 2px solid #080a0e;
+    border: 2px solid rgb(var(--bg));
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::selection {
-    background: rgba(75, 139, 245, 0.32);
+    background: rgb(var(--accent) / 0.32);
   }
   /* Accessible focus ring for keyboard users */
   :focus-visible {
-    outline: 2px solid #4b8bf5;
-    outline-offset: 1px;
+    outline: 2px solid rgb(var(--focus));
+    outline-offset: 2px;
   }
-  /* Honor reduced-motion: neutralize the app's looping/infinite animations */
+  /* Honor reduced-motion: neutralize the app's looping/infinite animations —
+     but EXEMPT [role="status"] (the loading Spinner). A frozen ring reads as a
+     rendering defect and leaves reduced-motion users with no loading signal. */
   @media (prefers-reduced-motion: reduce) {
-    *,
-    *::before,
-    *::after {
+    *:not([role='status']):not([role='status'] *),
+    *:not([role='status']):not([role='status'] *)::before,
+    *:not([role='status']):not([role='status'] *)::after {
       animation-duration: 0.01ms !important;
       animation-iteration-count: 1 !important;
       transition-duration: 0.01ms !important;

@@ -25,7 +25,7 @@ export function MultiSelect({ label, icon, options, value, onChange }: MultiSele
 
   const triggerStyle = active
     ? { borderColor: 'rgba(75,139,245,.5)', background: 'rgba(75,139,245,.08)', color: '#cfe0ff' }
-    : { borderColor: 'var(--color-border-2, #23314a)', background: 'var(--color-surface-1, #111827)', color: 'var(--color-dim, #8b94a3)' };
+    : { borderColor: '#1c232e', background: '#0b0e13', color: '#8b94a3' }; // border-2 / surface-1 / dim
 
   return (
     <div className="relative" onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false); }}>

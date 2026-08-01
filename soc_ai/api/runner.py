@@ -135,8 +135,16 @@ async def recorded_run(
         # any other cancellation (SSE client disconnect, app/container shutdown)
         # is an interrupted run that never reached a verdict → 'error'. finish()
         # is idempotent, so the finally below is a no-op.
-        await recorder.finish(
-            "cancelled" if (cancel_token is not None and cancel_token.requested) else "error"
+        # Shield the terminal write: Starlette/sse-starlette run this generator
+        # inside an anyio cancel scope that RE-DELIVERS the cancellation on every
+        # await until the scope exits, so a bare ``await recorder.finish(...)`` is
+        # itself cancelled mid-commit and the row is orphaned in ``running`` until
+        # the reaper. asyncio.shield runs the finalize where the cancellation can't
+        # reach it (same fix as soc_ai/demo/replay.py's replay_recorded_run).
+        await asyncio.shield(
+            recorder.finish(
+                "cancelled" if (cancel_token is not None and cancel_token.requested) else "error"
+            )
         )
         raise
     except Exception as exc:
@@ -144,8 +152,11 @@ async def recorded_run(
         await recorder.finish("error")
         yield "error", {"message": str(exc), "type": type(exc).__name__}
     finally:
-        # no-op if already finished; lands rows abandoned by client disconnect
-        await recorder.finish("error")
+        # no-op if already finished; lands rows abandoned by client disconnect.
+        # Shielded for the same reason as the cancel branch above: the finally runs
+        # during the cancellation unwind, where a bare await would be cancelled
+        # before the finalize commits.
+        await asyncio.shield(recorder.finish("error"))
 
 
 async def run_recorded(

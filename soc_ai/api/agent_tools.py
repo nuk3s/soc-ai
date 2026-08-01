@@ -168,6 +168,22 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "Look up the analyst runbook for a detection or technique.",
         (),
     ),
+    _ToolDef(
+        "describe_dataset",
+        "Query",
+        True,
+        "Discover which fields populate a dataset by sampling its recent docs — "
+        "learn a schema before querying it.",
+        (_ES,),
+    ),
+    _ToolDef(
+        "field_values",
+        "Query",
+        True,
+        "List the top values a field takes (a terms aggregation) — what actually "
+        "populates a field.",
+        (_ES,),
+    ),
     # ── Enrichment (local-mirror feeds; online opt-in) ───────────────────────
     _ToolDef(
         "enrich_ip",

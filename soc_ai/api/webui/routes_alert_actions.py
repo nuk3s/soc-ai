@@ -23,7 +23,11 @@ from soc_ai.webui import alerts_query as aq
 
 _LOGGER = logging.getLogger(__name__)
 
-_ACK_CAP = 200  # maximum events acknowledged per ack-group call
+# One BELOW ``aq.MAX_EVENTS`` so ``ack_group`` can fetch ``_ACK_CAP + 1`` and
+# actually observe the overflow: ``fetch_group_events`` clamps ``size`` to
+# ``MAX_EVENTS``, so a cap EQUAL to the clamp made ``capped`` unreachable (a
+# >200-event group was silently part-acked with ``capped=false``, F21).
+_ACK_CAP = 199  # maximum events acknowledged per ack-group call
 _ACK_CONCURRENCY = 8  # bounded fan-out for bulk ack to keep ES/SO round-trips parallel-but-capped
 
 
@@ -118,7 +122,10 @@ async def ack_group(
             time_range=body.range,
             severity=body.severity,
             oql=body.q,
-            size=_ACK_CAP + 1,  # fetch one extra to detect capping
+            # Fetch one past the cap to detect overflow, but never above the
+            # fetch clamp (aq.MAX_EVENTS) — else the extra hit is dropped and
+            # ``capped`` can never trip (F21).
+            size=min(_ACK_CAP + 1, aq.MAX_EVENTS),
             abs_from=body.from_,
             abs_to=body.to,
             time_zone=settings.so_timezone,

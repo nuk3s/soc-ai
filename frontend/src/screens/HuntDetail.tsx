@@ -19,7 +19,7 @@ import { ConfidenceRing } from '../components/ConfidenceRing';
 import { HuntVisuals } from '../components/HuntVisuals';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
-import { ErrorState, LoadingState, Spinner } from '../components/States';
+import { ErrorState, Freshness, LoadingState, Spinner, StaleNotice } from '../components/States';
 import {
   type HuntChatMessage,
   cancelHuntConsole,
@@ -31,17 +31,21 @@ import {
 } from '../lib/api';
 import { useDemo } from '../lib/demo';
 import { HUNT_STATUS } from '../lib/statusMeta';
-import { TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
+import { SEVERITY, TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
-import type { HuntDetailData, HuntDiff, HuntFinding, HuntStatus, TimelineStep } from '../lib/types';
+import type {
+  HuntDetailData,
+  HuntDiff,
+  HuntFinding,
+  HuntStatus,
+  Severity,
+  TimelineStep,
+} from '../lib/types';
 
-const SEV_COLOR: Record<string, string> = {
-  critical: '#f85149',
-  high: '#f0883e',
-  medium: '#d29922',
-  low: '#3fb950',
-  info: '#8b949e',
-};
+// Derived from the single app-wide severity ramp (lib/tokens) — no second palette.
+const SEV_COLOR: Record<string, string> = Object.fromEntries(
+  (Object.keys(SEVERITY) as Severity[]).map((k) => [k, SEVERITY[k].color]),
+);
 
 function StatusPill({ status }: { status: HuntStatus }) {
   const m = HUNT_STATUS[status] ?? HUNT_STATUS.error;
@@ -395,7 +399,7 @@ export function HuntDetail() {
   // the current status in a ref and let pauseWhen consult it: stop polling once
   // the hunt reaches a terminal state.
   const statusRef = useRef<HuntStatus | undefined>(undefined);
-  const { data, loading, error } = useAsync<HuntDetailData>(() => getHunt(id), [id, reloadKey], {
+  const { data, loading, error, lastUpdated, failCount } = useAsync<HuntDetailData>(() => getHunt(id), [id, reloadKey], {
     refetchInterval: 3000,
     pauseWhen: () => {
       // Pause once the hunt reaches ANY terminal state. Only 'running' is live;
@@ -478,6 +482,13 @@ export function HuntDetail() {
         <ErrorState error={new Error('Hunt not found')} />
       ) : (
         <div className="mx-auto max-w-workstation">
+          {failCount >= 2 && (
+            <StaleNotice
+              since={lastUpdated}
+              onRefresh={() => setReloadKey((k) => k + 1)}
+              className="mb-3"
+            />
+          )}
           {/* ── hero: objective headline, meta strip, confidence ring ────── */}
           <div
             className="relative overflow-hidden rounded-panel-lg border p-5"
@@ -502,6 +513,7 @@ export function HuntDetail() {
                   {disp && <DispositionBadge label={disp.label} color={disp.color} />}
                   <StatusPill status={data.status} />
                   {demo && <RecordedRunChip />}
+                  <Freshness at={lastUpdated} className="ml-auto" />
                 </div>
                 {/* generated title (from the objective) as the hero headline */}
                 <div
@@ -739,12 +751,15 @@ export function HuntDetail() {
                   />
                   <div className="flex flex-wrap gap-1.5 p-4">
                     {data.affectedHosts.map((h) => (
-                      <span
+                      // Host chip → the entity pivot page ("what do we know about this box").
+                      <Link
                         key={h}
-                        className="rounded-chip bg-surface-3 px-2 py-0.5 font-mono text-[11.5px] text-mono-amber"
+                        to={`/entity/${encodeURIComponent(h)}`}
+                        title={`Pivot to ${h}`}
+                        className="rounded-chip bg-surface-3 px-2 py-0.5 font-mono text-[11.5px] text-mono-amber hover:brightness-125"
                       >
                         {h}
-                      </span>
+                      </Link>
                     ))}
                   </div>
                 </Panel>

@@ -18,6 +18,7 @@ from soc_ai.api.webui._shared import (
 )
 from soc_ai.api.webui._timeline import (
     _ACTION_TITLE,
+    _action_identity,
     _executed_actions,
 )
 from soc_ai.config import Settings
@@ -285,6 +286,9 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         raise HTTPException(status_code=404, detail={"reason": "no_such_action"})
 
     rec = recs[index]
+    # Idempotency identity is the action's CONTENT, not its list position: a
+    # chat-resolve can replace recommended_actions and shift indexes (F04).
+    action_key = _action_identity(rec)
     tool_name = rec.get("tool_name", "")
     title = _ACTION_TITLE.get(tool_name, tool_name or "Action")
     if tool_name not in WRITE_TOOLS:
@@ -295,7 +299,8 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
 
     # Already executed through this endpoint? Never write twice (the escalate
     # case would open a duplicate SO case) — confirm instead.
-    if index in _executed_actions(events):
+    executed = _executed_actions(events)
+    if action_key in executed or f"#idx:{index}" in executed:
         return ExecuteActionResult(
             status="executed",
             title=title,
@@ -347,6 +352,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
                 next_seq,
                 {
                     "index": index,
+                    "action_key": action_key,
                     "tool_name": tool_name,
                     "title": title,
                     "success": True,
@@ -371,6 +377,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             next_seq,
             {
                 "index": index,
+                "action_key": action_key,
                 "tool_name": tool_name,
                 "title": title,
                 "success": True,
@@ -398,6 +405,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     detail = _action_detail(tool_name, result)
     exec_payload: dict[str, Any] = {
         "index": index,
+        "action_key": action_key,
         "tool_name": tool_name,
         "title": title,
         "success": True,

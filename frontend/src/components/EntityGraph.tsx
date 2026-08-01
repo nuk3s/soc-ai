@@ -135,7 +135,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
                   <text
                     x={cx}
                     y={cy - 5}
-                    fill={e.kind === 'flow' ? '#5b6473' : es.c}
+                    fill={e.kind === 'flow' ? '#7d8896' : es.c}
                     fontSize={9}
                     fontFamily="JetBrains Mono, monospace"
                     textAnchor="middle"
@@ -169,7 +169,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
               // hunt findings). SVG <g> takes an onClick; cursor signals it.
               <g
                 key={'n' + i}
-                onClick={() => navigate(`/entity/${encodeURIComponent(n.label)}`)}
+                onClick={() => navigate(`/entity/${encodeURIComponent(n.id)}`)}
                 style={{ cursor: 'pointer' }}
               >
                 <title>{tip}</title>
@@ -211,7 +211,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
                       {clip(n.label, 20)}
                     </text>
                     {n.sub && (
-                      <text x={x + ns.r + 9} y={y + 10} fill="#5b6473" fontSize={8.5} fontFamily="JetBrains Mono, monospace">
+                      <text x={x + ns.r + 9} y={y + 10} fill="#7d8896" fontSize={8.5} fontFamily="JetBrains Mono, monospace">
                         {clip(n.sub, 24)}
                       </text>
                     )}
@@ -222,7 +222,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
                       {clip(n.label, 22)}
                     </text>
                     {n.sub && (
-                      <text x={x} y={y + ns.r + 24} fill="#5b6473" fontSize={8.5} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
+                      <text x={x} y={y + ns.r + 24} fill="#7d8896" fontSize={8.5} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
                         {clip(n.sub, 26)}
                       </text>
                     )}

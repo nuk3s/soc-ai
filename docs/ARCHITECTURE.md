@@ -122,9 +122,11 @@ report is emitted (see below).
   surface (`_build_provider` / `build_*_model` in `soc_ai/agent/models.py`). A
   Nemotron-specific model profile (`_nemotron_profile`) adjusts tool-call
   behavior for the served models.
-- Two aliases: a **fast** model (the bounded investigation loop, hunts, chat)
-  and a **heavy** model (synthesizer). On the common triage path only the
-  heavy model is called per alert.
+- A single **analyst model** (`ANALYST_MODEL`, legacy alias `HEAVY_MODEL`) is
+  what the investigator, synthesizer, hunt, and chat agents all build from
+  (`settings.analyst_model` in `soc_ai/agent/models.py`) — the pre-1.0 fast/heavy
+  two-model split is gone. The opt-in Oracle is the only second model, and it is
+  reached over raw HTTP rather than the pydantic-ai path.
 
 ## Tools & the read/write split
 
@@ -170,8 +172,8 @@ Raw OQL **never** reaches ES. The pipeline is:
    `TriageReport.recommended_actions` (advisory only).
 2. The analyst executes a recommendation from the report via the actions API
    (`POST /api/v1/investigations/{id}/actions/{index}/execute`). Group ack /
-   escalate and the auto-ack (on by default, confidence- and severity-gated,
-   `auto_ack_fp_enabled=false` to disable) use the same path.
+   escalate and the auto-ack (off by default, confidence- and severity-gated,
+   `auto_ack_fp_enabled=true` to enable) use the same path.
 3. Every execution runs through `execute_write_tool`: restricted to the three
    write tools, audited fail-closed (the audit *intent* record is written
    before Security Onion is touched), and idempotent for already-executed

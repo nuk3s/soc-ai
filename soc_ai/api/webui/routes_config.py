@@ -101,6 +101,23 @@ def _setting_value(spec: cfg_svc.SettingSpec, settings: Settings) -> bool | floa
     return "" if val is None else str(val)
 
 
+def _override_display(spec: cfg_svc.SettingSpec, raw: Any) -> bool | float | str:
+    """Format a stored (non-secret) override value the same way _setting_value
+    formats a live one. Used for a hot=False setting whose DB override is not
+    applied to the live Settings until restart — rendering the live attribute
+    there would show the OLD value while the source badge already reads "db", so
+    a just-saved value appears to vanish. Rendering the staged override keeps the
+    field consistent with its source badge.
+    """
+    if spec.type == "csv":
+        return ", ".join(str(x) for x in (raw or []))
+    if spec.type == "bool":
+        return bool(raw)
+    if spec.type in ("int", "float"):
+        return raw if raw is not None else 0
+    return "" if raw is None else str(raw)
+
+
 def _bounds(spec: cfg_svc.SettingSpec) -> str | None:
     lo, hi = spec.min_value, spec.max_value
     if lo is None and hi is None:
@@ -137,7 +154,15 @@ async def get_config(
                 source="db" if spec.key in overrides else "env",
                 apply="hot-apply" if spec.hot else "restart",
                 type=_SETTING_TYPE.get(spec.type, "text"),
-                value=_setting_value(spec, settings),
+                # For a hot=False setting the DB override is not applied to the
+                # live Settings until restart, so the live attribute still holds
+                # the OLD value. Render the staged override instead so the field
+                # matches its "db" source badge rather than silently reverting.
+                value=(
+                    _override_display(spec, overrides[spec.key])
+                    if not spec.hot and spec.key in overrides
+                    else _setting_value(spec, settings)
+                ),
                 bounds=_bounds(spec),
             )
             for spec in cfg_svc.WHITELIST
@@ -653,28 +678,32 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
             status_code=400, detail={"reason": "invalid_value", "hint": str(exc)}
         ) from exc
     user = await current_user(request)
+    # Validate the live assignment BEFORE persisting: coerce() accepts a
+    # type-correct value that a Settings field validator / cross-field constraint
+    # can still reject at assignment time. Dry-run it against a COPY of the live
+    # settings so a rejected value is refused up front — rather than being
+    # committed over the operator's previously-saved override and then "rolled
+    # back" by DELETING the row, which would discard that prior value and silently
+    # revert the setting to its env/default on the next restart.
+    if spec.hot:
+        try:
+            setattr(settings.model_copy(), spec.attr, typed)
+        except (ValueError, TypeError, ValidationError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "invalid_value",
+                    "hint": f"{body.key} failed validation on apply and was not saved",
+                },
+            ) from exc
     async with request.app.state.db_sessionmaker() as db:
         await cfg_svc.set_override(
             db, body.key, typed, updated_by=user.id if user else None, secret_box=None
         )
-        restart_required = not spec.hot
         if spec.hot:
-            applied = cfg_svc.apply_to_settings(settings, {body.key: typed}, secret_box=None)
-            if body.key not in applied:
-                # coerce() accepted the value but the live Settings model rejected
-                # the assignment (a field validator / cross-field constraint).
-                # apply_to_settings skips it silently, so without this the DB would
-                # keep a poisoned override that never applies and re-skips every
-                # restart while the UI reported success. Roll back + report honestly.
-                await cfg_svc.delete_override(db, body.key)
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "reason": "invalid_value",
-                        "hint": f"{body.key} failed validation on apply and was not saved",
-                    },
-                )
-    return {"ok": True, "restart_required": restart_required}
+            # The dry-run above proved this assignment succeeds, so it applies now.
+            cfg_svc.apply_to_settings(settings, {body.key: typed}, secret_box=None)
+    return {"ok": True, "restart_required": not spec.hot}
 
 
 @router.get(
@@ -790,6 +819,26 @@ async def api_save_danger_setting(
     #    ValueError; surface that as a 400 (operator must set the key) rather than
     #    an uncaught 500. No plaintext is written on this path.
     secret_box = request.app.state.secret_box
+
+    # Validate the live assignment BEFORE persisting for hot specs: a value that
+    # fails live validation (a field or cross-field constraint, e.g. PCAP_ENABLED
+    # requiring a non-empty SO_SSH_HOST, or a malformed internal_cidrs entry) must
+    # be refused up front rather than committed over the operator's prior override
+    # and then "rolled back" by DELETING the row — which would discard that prior
+    # value and revert to the env value on the next restart. Dry-run against a
+    # COPY of the live settings (the hot danger specs are all non-secret plaintext).
+    if spec.hot:
+        try:
+            setattr(settings.model_copy(), spec.attr, typed)
+        except (ValueError, TypeError, ValidationError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "invalid_value",
+                    "hint": f"{body.key} failed validation on apply and was not saved",
+                },
+            ) from exc
+
     try:
         async with request.app.state.db_sessionmaker() as db:
             await cfg_svc.set_override(
@@ -810,24 +859,9 @@ async def api_save_danger_setting(
 
     # Hot specs are read fresh per tool-call → apply live via setattr on the
     # Settings singleton (validate_assignment coerces str→SecretStr, csv→typed).
-    # A value that fails live validation (a field or cross-field constraint, e.g.
-    # PCAP_ENABLED requiring a non-empty SO_SSH_HOST) would otherwise leave a
-    # poisoned override in the DB that silently re-fails apply_to_settings on
-    # every future restart while the UI reported success. Roll back + report
-    # honestly, same contract as POST /config/setting above.
+    # The dry-run above proved this assignment succeeds, so it applies now.
     if spec.hot:
-        try:
-            setattr(settings, spec.attr, typed)
-        except (ValueError, TypeError, ValidationError) as exc:
-            async with request.app.state.db_sessionmaker() as db:
-                await cfg_svc.delete_override(db, body.key)
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "reason": "invalid_value",
-                    "hint": f"{body.key} failed validation on apply and was not saved",
-                },
-            ) from exc
+        setattr(settings, spec.attr, typed)
         restart_required = False
     else:
         restart_required = True
@@ -928,9 +962,12 @@ async def api_save_api_key(
                 "hint": "Set CONFIG_SECRET_KEY to store API keys via the UI.",
             },
         ) from exc
-    # Hot-apply: enrichment keys are read fresh per tool-call. setattr the
-    # plaintext onto the live Settings singleton (validate_assignment coerces
-    # str → SecretStr). NOT apply_to_settings — that decrypts a stored token.
+    # Persist the plaintext onto the live Settings singleton (validate_assignment
+    # coerces str → SecretStr). NOT apply_to_settings — that decrypts a stored
+    # token. Most enrichment keys are read fresh per tool-call so this applies
+    # live; the one exception is misp_api_key (hot=False), which is baked into the
+    # MISP client built at startup and only takes effect on restart — the field's
+    # help text (surfaced by GET /config/api-keys) carries that restart warning.
     setattr(settings, spec.attr, value)
     return {"ok": True, "isSet": True}
 

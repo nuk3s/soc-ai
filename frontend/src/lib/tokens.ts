@@ -11,11 +11,17 @@ export interface SevMeta {
   color: string;
   glow: string;
 }
+// The single canonical severity ramp for the whole app — bars, chips, status
+// dots, and SVG node fills. Green is deliberately absent: it means success /
+// clean everywhere else, so a green severity is a color-scan hazard. Hunt
+// charts derive their colors from this map (see HuntVisuals / HuntDetail)
+// instead of the old second ramp whose "low" was green.
 export const SEVERITY: Record<Severity, SevMeta> = {
   critical: { label: 'Critical', color: '#f04438', glow: 'rgba(240,68,56,.6)' },
   high: { label: 'High', color: '#f79009', glow: 'rgba(247,144,9,.55)' },
   medium: { label: 'Medium', color: '#eab308', glow: 'rgba(234,179,8,.45)' },
   low: { label: 'Low', color: '#6b87a8', glow: 'rgba(107,135,168,.4)' },
+  info: { label: 'Info', color: '#8b949e', glow: 'rgba(139,148,158,.35)' },
 };
 
 export interface VerdictMeta {

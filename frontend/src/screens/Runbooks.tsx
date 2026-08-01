@@ -186,6 +186,21 @@ function EmbedChip({ rb }: { rb: Runbook }) {
   );
 }
 
+/**
+ * List-row preview text. Most runbooks open with a `# Title` heading that
+ * matches the row's own title, so the plain-text excerpt would just repeat the
+ * title verbatim on the line right beneath it. Drop that leading duplicate so
+ * the preview shows the actual body.
+ */
+function previewExcerpt(content: string, title: string): string {
+  const excerpt = mdToPlainExcerpt(content);
+  const t = title.trim();
+  if (t && excerpt.toLowerCase().startsWith(t.toLowerCase())) {
+    return excerpt.slice(t.length).replace(/^[\s:·–—-]+/, '');
+  }
+  return excerpt;
+}
+
 export function Runbooks() {
   const [nonce, setNonce] = useState(0);
   const { data, loading, error } = useAsync(getRunbooks, [nonce]);
@@ -196,6 +211,9 @@ export function Runbooks() {
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState('');
+  // Arms an inline two-step confirm for a row's Delete (matches every other
+  // destructive action in the app) — a runbook has no undo / soft-delete.
+  const [pendingDelete, setPendingDelete] = useState<number | null>(null);
   // One-line outcome summaries for the two bulk actions (import / pack).
   const [bulkSummary, setBulkSummary] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -282,6 +300,7 @@ export function Runbooks() {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     } finally {
       setBusy(false);
+      setPendingDelete(null);
     }
   };
 
@@ -674,13 +693,22 @@ export function Runbooks() {
             )}
             {!loading &&
               !error &&
-              visible.map((rb) => (
+              visible.map((rb) => {
+                const preview = rb.content ? previewExcerpt(rb.content, rb.title) : '';
+                return (
                 <div
                   key={rb.id}
                   className={`border-b border-border-faint px-3.5 py-3 last:border-b-0 ${editing === rb.id ? 'bg-[#11161e]' : ''}`}
                 >
                   <div className="flex items-start gap-3">
-                    <div className="min-w-0 flex-1">
+                    {/* The whole title/body area opens the runbook — the Edit
+                        button is no longer the only way in (dogfood). */}
+                    <button
+                      type="button"
+                      onClick={() => openEdit(rb)}
+                      disabled={busy || editing !== null}
+                      className="min-w-0 flex-1 text-left disabled:cursor-default"
+                    >
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="truncate text-[13px] font-medium" title={rb.title}>
                           {rb.title}
@@ -691,10 +719,10 @@ export function Runbooks() {
                           updated {new Date(rb.updated_at).toLocaleString()}
                         </span>
                       </div>
-                      {rb.content && (
+                      {preview && (
                         <div className="mt-0.5 line-clamp-2 text-[11.5px] leading-[1.4] text-faint">
                           {/* a 2-line clamp is no place for raw markdown syntax */}
-                          {mdToPlainExcerpt(rb.content)}
+                          {preview}
                         </div>
                       )}
                       <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -716,7 +744,7 @@ export function Runbooks() {
                           </span>
                         ))}
                       </div>
-                    </div>
+                    </button>
                     <div className="flex flex-none items-center gap-1.5">
                       <button
                         onClick={() => openEdit(rb)}
@@ -725,18 +753,38 @@ export function Runbooks() {
                       >
                         Edit
                       </button>
-                      <button
-                        onClick={() => void remove(rb.id)}
-                        disabled={busy || editing !== null}
-                        className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:cursor-not-allowed disabled:opacity-40"
-                        style={{ borderColor: 'rgba(240,68,56,.3)' }}
-                      >
-                        Delete
-                      </button>
+                      {pendingDelete === rb.id ? (
+                        <>
+                          <button
+                            onClick={() => void remove(rb.id)}
+                            disabled={busy}
+                            className="rounded-[7px] border border-danger px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            Confirm delete
+                          </button>
+                          <button
+                            onClick={() => setPendingDelete(null)}
+                            disabled={busy}
+                            className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:text-text disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => setPendingDelete(rb.id)}
+                          disabled={busy || editing !== null}
+                          className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:cursor-not-allowed disabled:opacity-40"
+                          style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                        >
+                          Delete
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
           </div>
         </div>
       </div>

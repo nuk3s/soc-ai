@@ -398,7 +398,14 @@ def build_hunt_synthesizer(model: Model, *, objective: str) -> Agent[None, HuntR
     return Agent(
         model,
         output_type=HuntReport,
-        system_prompt=HUNT_SYNTH_PROMPT.format(objective=objective),
+        # `instructions=` (NOT `system_prompt=`): the synthesizer is ALWAYS run with a
+        # NON-EMPTY replayed `message_history` (the gathered exploration transcript),
+        # and pydantic-ai only emits an agent's `system_prompt` when the history is
+        # empty -- so a `system_prompt` would be silently dropped and the partial
+        # write-up would run under the replayed EXPLORATION prompt, missing every
+        # anti-over-claim rule. `instructions` are re-applied on every request
+        # regardless of history, so the synth framing actually reaches the model.
+        instructions=HUNT_SYNTH_PROMPT.format(objective=objective),
         retries=3,
     )
 

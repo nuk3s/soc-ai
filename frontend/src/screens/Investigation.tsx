@@ -50,7 +50,7 @@ import {
 import { clearChatDraft, loadChatDraft, saveChatDraft } from '../lib/chatDraft';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
-import { TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
+import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import type {
   ActionTag,
   AlertMeta,
@@ -66,12 +66,10 @@ import type {
   TimelineStep,
 } from '../lib/types';
 
-const SEV_COLOR: Record<Severity, string> = {
-  critical: '#f04438',
-  high: '#f79009',
-  medium: '#eab308',
-  low: '#6b87a8',
-};
+// Derived from the single app-wide severity ramp (lib/tokens) — no duplicate hexes.
+const SEV_COLOR: Record<string, string> = Object.fromEntries(
+  (Object.keys(SEVERITY) as Severity[]).map((k) => [k, SEVERITY[k].color]),
+);
 
 
 interface InvestigationProps {
@@ -151,6 +149,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // reaper hasn't yet marked it 'error'.
   const [stuck, setStuck] = useState(false);
   const chatTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // False once the component has unmounted. Guards the chat poll continuations:
+  // an in-flight postChat/getChatThread that resolves after unmount must not
+  // re-arm chatTimer (a detached loop nothing would ever clear) or setState.
+  const aliveRef = useRef(true);
   // The investigation id the current `draft` belongs to. Lets the persist effect
   // skip the render where inv.id just changed (draft still holds the PREVIOUS
   // investigation's text then) so it can't clobber the new id's stored draft.
@@ -247,8 +249,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   }, [inv.id]);
 
   // stop any chat poll when the component unmounts
-  useEffect(() => () => {
-    if (chatTimer.current) clearTimeout(chatTimer.current);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      if (chatTimer.current) clearTimeout(chatTimer.current);
+    };
   }, []);
 
   const [reHunting, setReHunting] = useState(false);
@@ -328,6 +334,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     // same `inv.id`). If the drawer has since switched to another
     // investigation (re-hunt / request-more-info before this reply landed),
     // applying it would clobber the new investigation's chat — drop it.
+    if (!aliveRef.current) return; // unmounted mid-flight — don't re-arm the poll
     if (currentInvIdRef.current !== inv.id) return;
     setChat(thread.messages.filter((m) => m.text || m.role === 'user'));
     setPending(thread.pending);
@@ -335,7 +342,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     if (thread.pending) {
       chatTimer.current = setTimeout(() => {
         getChatThread(inv.id).then(applyThread).catch(() => {
-          if (currentInvIdRef.current !== inv.id) return;
+          if (!aliveRef.current || currentInvIdRef.current !== inv.id) return;
           setPending(false);
           // Only push the error message if the last message isn't already it
           // (repeated poll failures must not stack duplicate error bubbles).
@@ -378,7 +385,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     window.setTimeout(() => setFlashStep((cur) => (cur === step.id ? null : cur)), 1600);
   };
 
-  const pendingCount = inv.actions.filter((a) => !actions[a.id]).length;
+  // Genuinely-pending = no local decision AND not already carried out by the
+  // system (auto-ack). An applied action renders as a terminal "✓ done" card, so
+  // counting it as pending contradicted the card (dogfood FP-run finding).
+  const pendingCount = inv.actions.filter((a) => !actions[a.id] && a.applied !== true).length;
   const graphInteresting =
     inv.edges.some((e) => e.kind === 'lateral') || inv.nodes.some((n) => n.kind === 'compromised');
 
@@ -1126,6 +1136,30 @@ function ChatPanel({
         title="Chat about this investigation"
         scopeLabel="scoped to this investigation"
         placeholder="Ask a follow-up… e.g. why not a false positive?"
+        emptyHint={
+          <div className="flex flex-col gap-2.5 py-2 text-[12.5px]">
+            <div className="flex items-center gap-1.5 text-faint">
+              <MessageSquare size={13} />
+              Ask a follow-up about this investigation.
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                'Why not a false positive?',
+                'What evidence supports this verdict?',
+                'What should I check next?',
+              ].map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => onDraft(q)}
+                  className="rounded-pill border border-border-input bg-surface-3 px-2.5 py-1 text-[12px] text-text-2 hover:border-accent hover:text-text"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        }
         listSizeClass={fill ? 'min-h-0 flex-1' : 'max-h-[460px] min-h-[260px]'}
         messages={messages}
         pending={pending}

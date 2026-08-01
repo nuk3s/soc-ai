@@ -10,6 +10,13 @@ interface ShellState {
   openPalette: () => void;
   closePalette: () => void;
   togglePalette: () => void;
+  /** True when ANY modal surface is open (drawer(s) or the palette). Generalizes
+   * `paletteOpen` so keyboard layers can disarm on any modal. */
+  modalOpen: boolean;
+  /** Increment/decrement the open-modal count. Drawers + palette call these on
+   * open/close so `modalOpen` reflects the whole modal stack. */
+  pushModal: () => void;
+  popModal: () => void;
   ws: string;
   setWs: (w: string) => void;
   /** triggered by command palette / bulk bar to kick the alerts auto-triage strip */
@@ -22,6 +29,7 @@ const Ctx = createContext<ShellState | null>(null);
 export function ShellProvider({ children }: { children: ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [modalCount, setModalCount] = useState(0);
   const [ws, setWs] = useState('');
   const [triageNonce, setTriageNonce] = useState(0);
 
@@ -50,6 +58,11 @@ export function ShellProvider({ children }: { children: ReactNode }) {
   const closePalette = useCallback(() => setPaletteOpen(false), []);
   const togglePalette = useCallback(() => setPaletteOpen((o) => !o), []);
   const requestTriage = useCallback(() => setTriageNonce((n) => n + 1), []);
+  const pushModal = useCallback(() => setModalCount((n) => n + 1), []);
+  const popModal = useCallback(() => setModalCount((n) => Math.max(0, n - 1)), []);
+  // Palette is tracked by its own flag; OR it in so an empty modal count with the
+  // palette open still reads as "a modal is open".
+  const modalOpen = modalCount > 0 || paletteOpen;
 
   const value = useMemo<ShellState>(
     () => ({
@@ -59,12 +72,28 @@ export function ShellProvider({ children }: { children: ReactNode }) {
       openPalette,
       closePalette,
       togglePalette,
+      modalOpen,
+      pushModal,
+      popModal,
       ws,
       setWs,
       triageNonce,
       requestTriage,
     }),
-    [collapsed, toggleNav, paletteOpen, openPalette, closePalette, togglePalette, ws, triageNonce, requestTriage]
+    [
+      collapsed,
+      toggleNav,
+      paletteOpen,
+      openPalette,
+      closePalette,
+      togglePalette,
+      modalOpen,
+      pushModal,
+      popModal,
+      ws,
+      triageNonce,
+      requestTriage,
+    ]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

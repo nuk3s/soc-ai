@@ -58,7 +58,7 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
  *  every host chip. Read-only. */
 export function Entity() {
   const { value = '' } = useParams();
-  const { data, loading, error } = useAsync(() => getEntity(value), [value]);
+  const { data, loading, error, refetch } = useAsync(() => getEntity(value), [value]);
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
@@ -77,7 +77,7 @@ export function Entity() {
         {loading && !data ? (
           <LoadingState label="Loading entity…" />
         ) : error ? (
-          <ErrorState error={error} />
+          <ErrorState error={error} onRetry={refetch} label="this entity" />
         ) : !data ? (
           <ErrorState error={new Error('Entity not found')} />
         ) : (

@@ -33,7 +33,6 @@ Guard rails baked in:
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 from typing import Any
 
@@ -41,7 +40,7 @@ import httpx
 
 from soc_ai.config import Settings
 from soc_ai.tools._registry import tool
-from soc_ai.tools.online import online_client, online_unavailable
+from soc_ai.tools.online import is_internal_ip, online_client, online_unavailable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,21 +49,6 @@ _BASE_URL = "https://internetdb.shodan.io"
 # Fields InternetDB returns; we surface them with stable defaults so the agent
 # always sees the same shape whether the host is richly described or sparse.
 _LIST_FIELDS: tuple[str, ...] = ("ports", "cpes", "hostnames", "tags", "vulns")
-
-
-def _is_routable_public_ip(ip: str) -> bool:
-    """True iff ``ip`` is a valid GLOBAL (internet-routable) address.
-
-    Everything else — RFC1918 private space, loopback, link-local, CGNAT
-    (100.64/10), multicast, reserved, unspecified — is *not* something a public
-    asset DB can describe, and must never be sent to a third party. ``is_global``
-    captures all of those exclusions in one check; an unparseable string is
-    likewise rejected.
-    """
-    try:
-        return ipaddress.ip_address(ip).is_global
-    except ValueError:
-        return False
 
 
 def _as_str_list(value: Any) -> list[Any]:
@@ -111,8 +95,11 @@ async def shodan_internetdb(ip: str, *, settings: Settings) -> dict[str, Any]:
     if gate is not None:
         return gate
 
-    # Never send an internal / reserved address to a third-party asset DB.
-    if not _is_routable_public_ip(ip):
+    # Never send an internal / reserved address to a third-party asset DB. Use the
+    # shared predicate so this tool cannot drift from shodan_host / greynoise — it
+    # rejects non-globally-routable IPs AND operator-configured internal_cidrs
+    # (an internal-but-routable host would otherwise leak).
+    if is_internal_ip(ip, settings):
         return {
             "ip": ip,
             "available": False,

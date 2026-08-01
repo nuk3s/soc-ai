@@ -561,15 +561,26 @@ async def test_replay_client_disconnect_lands_terminal_state(monkeypatch, tmp_pa
         tg.start_soon(consume, tg.cancel_scope)
 
     inv_id = holder["id"]
-    async with maker() as db:
-        got = await inv_svc.get_with_events(db, inv_id)
+    # The shielded terminal write lands on a detached task under the anyio scope's
+    # re-delivered cancellation (see docstring), so the row goes terminal a beat
+    # AFTER the task group unwinds. Wait for it rather than racing it — fast enough
+    # to win locally, not under CI load. A genuine orphan (the row never leaving
+    # 'running') still fails, at the timeout.
+    inv = None
+    for _ in range(300):  # up to ~3s
+        async with maker() as db:
+            got = await inv_svc.get_with_events(db, inv_id)
+        assert got is not None
+        inv, _events = got
+        if inv.status != "running":
+            break
+        await anyio.sleep(0.01)
     await engine.dispose()
 
     # We really did disconnect partway — the stream never reached its terminal event.
     assert "done" not in seen
-    assert got is not None
-    inv, _events = got
-    # Terminal immediately, no reaper: the disconnect must not orphan the row.
+    assert inv is not None
+    # Terminal, no reaper: the disconnect must not orphan the row.
     assert inv.status == "error"
 
 

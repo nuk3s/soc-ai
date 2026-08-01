@@ -28,17 +28,33 @@ interface ConfigNavProps {
   onNavigate?: (id: string) => void;
 }
 
+/**
+ * Expand a collapsed target (via onNavigate), then instant-snap to its anchor.
+ * Instant snap ('auto', not 'smooth') — smooth-scrolling this long page is
+ * slow/choppy; the freshly-shown body changes layout, so scroll next frame.
+ * Shared by the sidebar nav (ConfigNav) and the sub-lg "Jump to section" select.
+ */
+function goToSection(id: string, onNavigate?: (id: string) => void) {
+  onNavigate?.(id);
+  requestAnimationFrame(() => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // The sub-lg sticky "Jump to section" bar (ConfigNavSelect) sits at top-0 and
+    // overlaps a top-aligned heading, hiding it. Reserve its height as
+    // scroll-margin so the landed heading clears it. The bar is display:none at
+    // lg+, so its measured height is 0 on desktop — the anchors' own scroll-mt-6
+    // is left untouched there (container-agnostic: scrollIntoView honors
+    // scroll-margin whatever the scroll parent is, unlike a window-based offset).
+    const bar = document.getElementById('config-jump-bar');
+    const offset = bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+    if (offset > 0) el.style.scrollMarginTop = `${offset}px`;
+    el.scrollIntoView({ behavior: 'auto', block: 'start' });
+  });
+  history.replaceState(null, '', `#${id}`);
+}
+
 export function ConfigNav({ groups, activeId, onNavigate }: ConfigNavProps) {
-  const go = (id: string) => {
-    // Expand a collapsed target first, then scroll (the freshly-shown body
-    // changes layout, so scroll on the next frame). Instant snap ('auto', not
-    // 'smooth') — smooth-scrolling this long page is slow/choppy.
-    onNavigate?.(id);
-    requestAnimationFrame(() => {
-      document.getElementById(id)?.scrollIntoView({ behavior: 'auto', block: 'start' });
-    });
-    history.replaceState(null, '', `#${id}`);
-  };
+  const go = (id: string) => goToSection(id, onNavigate);
 
   return (
     <nav className="sticky top-5 flex max-h-[calc(100vh-40px)] flex-col gap-0.5 overflow-y-auto pr-1">
@@ -86,5 +102,49 @@ export function ConfigNav({ groups, activeId, onNavigate }: ConfigNavProps) {
         );
       })}
     </nav>
+  );
+}
+
+/**
+ * Sub-lg (< 1024px) replacement for the sidebar ConfigNav, which is
+ * `hidden ... lg:block` and so vanishes on narrow viewports with no substitute.
+ * A sticky "Jump to section" <select> mirroring the same grouped section list
+ * (parents as <optgroup>, sub-sections as <option>); picking one expands the
+ * target and instant-snaps to it via the shared goToSection mechanism. Shown
+ * only below lg (`block lg:hidden`) so it never doubles the sidebar.
+ */
+export function ConfigNavSelect({ groups, activeId, onNavigate }: ConfigNavProps) {
+  // Reflect the scroll-spy's active section, but only when it's actually one of
+  // our options — otherwise fall back to the disabled placeholder.
+  const selected = groups.some((g) => g.children.some((c) => c.id === activeId))
+    ? activeId
+    : '';
+  return (
+    <label
+      id="config-jump-bar"
+      className="sticky top-0 z-10 mb-4 flex items-center gap-2 bg-bg/95 py-2 text-[11px] font-semibold uppercase tracking-[.06em] text-faint backdrop-blur lg:hidden"
+    >
+      Jump to section
+      <select
+        value={selected}
+        onChange={(e) => {
+          if (e.target.value) goToSection(e.target.value, onNavigate);
+        }}
+        className="min-w-0 flex-1 rounded-control border border-border-input bg-bg px-2.5 py-1.5 text-[12.5px] font-normal normal-case tracking-normal text-text outline-none focus:border-accent"
+      >
+        <option value="" disabled>
+          Choose a section…
+        </option>
+        {groups.map((g) => (
+          <optgroup key={g.label} label={g.label}>
+            {g.children.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.label}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    </label>
   );
 }

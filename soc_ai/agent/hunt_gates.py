@@ -87,6 +87,13 @@ _ALERT_QUERY_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# Canonical non-threat finding categories. The gate must treat ANY other category
+# value the way the read path does (routes_hunts._finding_category maps anything
+# outside the canonical triple back to "threat" for display): a non-canonical
+# spelling ("suspicious activity") must NOT dodge the corroboration cap while still
+# rendering the red threat badge. Only these two are genuinely non-threat.
+_NON_THREAT_CATEGORIES: frozenset[str] = frozenset({"visibility_gap", "observation"})
+
 # Chart budget — a model that emits plausible-but-uncited charts freely is the whole
 # risk, so beyond this ceiling extras are dropped even if they'd otherwise resolve.
 _MAX_CHARTS = 4
@@ -208,6 +215,30 @@ def _oql_telemetry_docs(result: Any) -> list[Any]:
     return telemetry
 
 
+def _oql_aggregations(result: Any) -> Any:
+    """The aggregation rollup of an AGGREGATION-ONLY OQL response, else ``None``.
+
+    A ``groupby``/``count`` OQL query runs with ``size=0`` -- its ``hits`` list is
+    empty and every measured value lives in ``aggregations`` (top talkers, rare
+    destinations, NXDOMAIN churn per host -- most of the primer's worked hunts).
+    :func:`_oql_telemetry_docs` only walks ``hits``, so such a response would
+    contribute NOTHING to corroboration even though a computed rollup over
+    telemetry is exactly the measured evidence that looks past a single detector
+    alert. Returns the ``aggregations`` payload when the response carries
+    aggregations and NO hits (aggregation-only); ``None`` otherwise. Never raises
+    on shape surprises.
+    """
+    if not isinstance(result, dict):
+        return None
+    hits = result.get("hits")
+    if isinstance(hits, list) and hits:
+        return None  # not aggregation-only -- the per-doc partition governs
+    aggs = result.get("aggregations")
+    if isinstance(aggs, dict) and aggs:
+        return aggs
+    return None
+
+
 def _corroborating_evidence_text(tool_results: list[Any]) -> str:
     """Lower-cased JSON dump of ONLY the corroborating (non-alert) tool results.
 
@@ -241,6 +272,15 @@ def _corroborating_evidence_text(tool_results: list[Any]) -> str:
                 docs = _oql_telemetry_docs(item["result"])
                 if docs:
                     corroborating.append(docs)
+                else:
+                    # An aggregation-only response (groupby/count -- the primer's
+                    # top-talkers / rare-destination / NXDOMAIN-churn hunts) returns
+                    # size=0: `hits` is empty and the measured data lives entirely in
+                    # `aggregations`. Those are computed rollups over telemetry, not a
+                    # detector's claim, so they corroborate -- include them.
+                    aggs = _oql_aggregations(item["result"])
+                    if aggs is not None:
+                        corroborating.append(aggs)
                 continue
             if tool == "t_get_event_raw":
                 # A raw fetch returns a single event's _source. It corroborates
@@ -426,7 +466,7 @@ def _apply_corroboration_cap(
     """
     category = str(getattr(finding, "category", None) or "").strip().lower()
     severity = str(getattr(finding, "severity", None) or "info")
-    if category != "threat" or _SEV_RANK.get(severity.lower(), 0) < _SEV_RANK["high"]:
+    if category in _NON_THREAT_CATEGORIES or _SEV_RANK.get(severity.lower(), 0) < _SEV_RANK["high"]:
         return finding
     if _has_corroborating_citation(resolved_citations, corroborating_text):
         return finding  # grounded in evidence beyond the detector alert

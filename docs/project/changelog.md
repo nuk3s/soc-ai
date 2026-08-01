@@ -9,6 +9,7 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.2.5** — Visual refresh of the alert workspace (design-token theming, a filter bar that morphs into bulk actions instead of shifting the table, toast notifications with a one-click clear, and freshness markers that flag a stalled poll), a code-review remediation across the 1.2.x line, and a batch of dogfood fixes. Also stops DNS-SD/SRV service records from polluting the auto-detected internal-domain inventory.
 - **1.2.4** — Dogfood patch: the Hunt Console says plainly when scheduled hunts are paused, the triage pipeline retries a transient grid blip instead of dropping the investigation, the nightly regression alarm no longer pages on one flipped verdict at small sample sizes, and the config console groups each integration's switch with its key.
 - **1.2.3** — Per-alert verdict inheritance now respects the configured inherit window (webui_inherit_window_days): the alerts feed no longer inherits a rule's stale standing verdict onto fresh alerts.
 - **1.2.2** — Security and correctness patch from a full code review of 1.2.1: evidence-gate integrity, oracle-redaction leak fixes, opt-in/bound auto-acknowledge, SSRF and denial-of-service caps, audit and auth hygiene, and supply-chain pinning.

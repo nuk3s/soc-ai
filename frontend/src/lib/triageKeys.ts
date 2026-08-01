@@ -27,6 +27,9 @@ export interface TriageKeyEvent {
 export interface TriageKeyContext {
   /** Command palette open (shared shell signal — no DOM sniffing). */
   paletteOpen: boolean;
+  /** ANY modal surface open (drawer OR palette), from ShellContext.modalOpen.
+   * Optional so callers that only pass `paletteOpen` keep working. */
+  modalOpen?: boolean;
   /** The `?` shortcut cheatsheet overlay open. */
   keyHelpOpen: boolean;
   /** Event target is an input/textarea/select/[contenteditable]. */
@@ -62,7 +65,10 @@ export function resolveTriageKey(
   e: TriageKeyEvent,
   ctx: TriageKeyContext,
 ): TriageAction | null {
-  if (ctx.paletteOpen) return null;
+  // Any open modal (drawer or palette) disarms triage — a single shared signal
+  // (ShellContext.modalOpen) rather than palette-only. `paletteOpen` stays for
+  // callers that pass just that.
+  if (ctx.paletteOpen || ctx.modalOpen) return null;
   if (ctx.targetIsEditable) return null;
 
   // The cheatsheet overlay owns Esc while it's open (any modifier state).

@@ -1,5 +1,5 @@
 import { ChevronLeft, Trash2 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { deleteInvestigation, getInvestigation } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -14,8 +14,22 @@ export function InvestigationPage() {
   const from = (location.state as { from?: string } | null)?.from;
   const backTo = from === '/investigations' ? '/investigations' : '/alerts';
   const backLabel = from === '/investigations' ? 'Investigations' : 'Alerts';
-  const [tick, setTick] = useState(0);
-  const { data: inv, loading, error } = useAsync(() => getInvestigation(id), [id, tick]);
+  const [reloadKey, setReloadKey] = useState(0);
+  // useAsync captures pauseWhen at setup and can't see `inv` there, so track the
+  // status in a ref and let pauseWhen consult it. Driving the live refresh
+  // through refetchInterval (background polls) instead of a foreground `tick`
+  // dep means a single failed poll keeps the last-good report on screen and
+  // never wedges the view — a foreground fetch nulls data on error, which used
+  // to discard the report and stop the poll loop permanently.
+  const statusRef = useRef<string | undefined>(undefined);
+  const { data: inv, loading, error } = useAsync(() => getInvestigation(id), [id, reloadKey], {
+    refetchInterval: 2500,
+    pauseWhen: () => {
+      const s = statusRef.current;
+      return s !== undefined && s !== 'investigating';
+    },
+  });
+  statusRef.current = inv?.status;
   const [confirmDel, setConfirmDel] = useState(false);
   const [delErr, setDelErr] = useState('');
 
@@ -29,13 +43,6 @@ export function InvestigationPage() {
       setConfirmDel(false);
     }
   };
-
-  // Poll a running investigation until it lands a verdict.
-  useEffect(() => {
-    if (inv?.status !== 'investigating') return;
-    const t = setTimeout(() => setTick((x) => x + 1), 2500);
-    return () => clearTimeout(t);
-  }, [inv, tick]);
 
   // Guard: no id means this route was reached without a valid investigation id.
   if (!id) {
@@ -128,7 +135,7 @@ export function InvestigationPage() {
         </div>
       )}
       {inv && (
-        <Investigation inv={inv} layout="page" onReHunt={(newId) => navigate(`/investigation/${newId}`)} onVerdictApplied={() => setTick((x) => x + 1)} />
+        <Investigation inv={inv} layout="page" onReHunt={(newId) => navigate(`/investigation/${newId}`)} onVerdictApplied={() => setReloadKey((x) => x + 1)} />
       )}
     </div>
   );

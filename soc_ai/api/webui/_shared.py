@@ -45,7 +45,12 @@ def _request_is_https(request: Request, settings: Any = None) -> bool:
     if peer not in trusted:
         return False
     forwarded = request.headers.get("x-forwarded-proto", "")
-    # May be a comma-separated list (proxy chain); the left-most is the client.
+    # Take the LEFT-most entry. Unlike X-Forwarded-For — where the left-most hop is
+    # the forgeable client IP and we must walk in from the right — X-Forwarded-Proto's
+    # left-most value is the protocol the client used at the trust boundary (the edge
+    # proxy), which is exactly what decides whether the end-user connection is secure.
+    # Forgery is already prevented by the trusted-peer guard above: an untrusted
+    # client's header never reaches this line.
     return forwarded.split(",")[0].strip().lower() == "https"
 
 
@@ -53,17 +58,24 @@ def client_ip(request: Request, settings: Any) -> str:
     """The caller's IP for per-IP throttling / rate-limiting.
 
     Normally the socket peer. When the app runs behind a reverse proxy whose IP is
-    listed in ``proxy_trusted_ips``, trust the left-most ``X-Forwarded-For`` entry
+    listed in ``proxy_trusted_ips``, trust the right-most untrusted ``X-Forwarded-For`` entry
     so per-IP controls attribute to the real client, not the shared proxy IP.
     ``X-Forwarded-For`` is NEVER trusted from a peer that is not allowlisted — any
     client could otherwise forge it and evade (or poison) the throttles.
     """
     peer = request.client.host if request.client else "?"
-    trusted = getattr(settings, "proxy_trusted_ips", None) or ()
-    if peer in set(trusted):
-        first = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        if first:
-            return first
+    trusted = set(getattr(settings, "proxy_trusted_ips", None) or ())
+    if peer in trusted:
+        # Append-style reverse proxies (nginx ``$proxy_add_x_forwarded_for``,
+        # Caddy, Traefik, HAProxy) put the REAL peer at the RIGHT and leave the
+        # left-most entries fully client-forgeable. Walk right-to-left, skipping
+        # hops that are themselves trusted proxies, and return the first remaining
+        # value — the closest address we did not add. Taking ``[0]`` (the
+        # left-most) would let a client forge its own throttling key.
+        for hop in reversed(request.headers.get("x-forwarded-for", "").split(",")):
+            candidate = hop.strip()
+            if candidate and candidate not in trusted:
+                return candidate
     return peer
 
 

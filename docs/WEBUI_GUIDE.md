@@ -23,16 +23,25 @@ This guide is a practical reference for the analyst/operator surfaces.
 - **admin**: everything an analyst can do **plus** the config console (`/app/config`).
 
 The first admin (`admin`) is bootstrapped on first start; its generated password
-is printed once to the service log. Recover it from the log for your deploy path:
+is written **once** to a locked-down sidecar file,
+`<soc_ai_data_dir>/bootstrap-admin-password.txt` (mode `0600`) — not to the
+service log, which is often readable by the same audience the credential must
+stay secret from. Read it for your deploy path:
 
 ```bash
+# Docker deploy (default data dir /var/lib/soc-ai/data)
+docker exec soc-ai cat /var/lib/soc-ai/data/bootstrap-admin-password.txt
 # systemd / host-venv deploy
-journalctl -u soc-ai | grep -i password
-# Docker deploy
-docker compose logs soc-ai | grep -i password
+cat "$SOC_AI_DATA_DIR/bootstrap-admin-password.txt"
 ```
 
-Change it after first login (Config → Users → reset password).
+Only if the data dir was not writable at startup does soc-ai fall back to
+logging the plaintext (`journalctl -u soc-ai | grep -i password` /
+`docker compose logs soc-ai | grep -i password`); on the normal path the log
+holds only a pointer line, not the password.
+
+Change it after first login (Config → Users → reset password), then **delete the
+sidecar file** — it is no longer needed and should not linger on the volume.
 
 ## Triage console (`/app/alerts`)
 
@@ -121,15 +130,35 @@ overrides are re-applied at startup, so they survive restarts. Editable keys:
 - **PCAP**: `pcap_enabled` (fetch + decode raw packets on demand via the SO
   sensor's Suricata pcap ring).
 
-### Connection (env-managed, read-only)
+### Connection (Danger Zone)
 
-LLM gateway, Security Onion, and Elasticsearch connection details are shown
-read-only with **secrets masked** (`••••••`); they are managed in `.env` on the
-host and never editable or echoed through the UI.
+LLM gateway, Security Onion, and Elasticsearch connection details default to the
+values in `.env` on the host, with **secrets masked** (`••••••`) and never
+echoed back. They are **not** read-only, though: the **Danger Zone** panel lets
+an admin override the connection identity and credentials — `so_host`,
+`so_username`, `so_password`, `so_verify_ssl`, the SSH-pivot fields
+(`so_ssh_host` / `so_ssh_user` / `so_ssh_key`), `es_hosts`, `es_username`,
+`es_password`, `es_verify_ssl`, `litellm_base_url`, `litellm_api_key`, and
+`internal_cidrs`. Each write requires a **typed confirmation** (retype the key
+name) and is **Fernet-encrypted at rest** (needs `CONFIG_SECRET_KEY`). Because
+these repoint startup-built clients they are **not** hot: an override takes
+effect on the **next restart**. Since an admin session can repoint the gateway
+or grid from here — sending every alert's enriched context to a different
+endpoint — treat the admin role and `/app/config` as trust-sensitive, not just
+"agent knobs".
 
 - **Test connection** buttons probe the **LiteLLM gateway** (`GET /v1/models`,
   reports model count) and **Elasticsearch** (`ping`, reports cluster + version).
   Results are inline ✓/✗ and never contain a secret.
+
+### API keys
+
+A separate **API keys** panel (rendered next to Data sources, not in the normal
+settings groups) holds the enrichment-provider secrets: `shodan_api_key`,
+`greynoise_api_key`, `misp_api_key`, `maxmind_license_key`, `abuse_ch_auth_key`,
+and `crawl4ai_token`. These are **write-only** (Fernet-encrypted at rest, never
+rendered back), **hot-applied** (read fresh on each enrichment call — no restart
+and no typed confirm), and also need `CONFIG_SECRET_KEY` to persist.
 
 ### Users
 

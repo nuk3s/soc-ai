@@ -19,7 +19,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Checkbox } from '../components/Controls';
 import { Panel } from '../components/Panel';
-import { EmptyState, ErrorState, LoadingState } from '../components/States';
+import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { rangeToSinceUntil } from '../lib/timeRange';
@@ -600,7 +600,7 @@ export function Hunts() {
   // whether any hunt is still running in a ref and let pauseWhen (on both polls)
   // consult it: stop polling once every hunt has reached a terminal state.
   const activeRef = useRef(false);
-  const { data, loading, error } = useAsync<HuntRow[]>(
+  const { data, loading, error, lastUpdated, failCount } = useAsync<HuntRow[]>(
     () => getHunts(rangeToSinceUntil(range, custom)),
     [reloadKey, range, custom],
     {
@@ -765,8 +765,9 @@ export function Hunts() {
       {/* page header */}
       <div className="mb-5 flex items-end gap-3">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-baseline gap-3">
             <div className="text-[20px] font-semibold tracking-[-.015em]">Hunt Console</div>
+            <Freshness at={lastUpdated} />
           </div>
           <div className="mt-0.5 text-[13px] text-dim">
             Describe a hunt in plain language — the agent correlates across hosts &amp; time and
@@ -960,6 +961,13 @@ export function Hunts() {
       })()}
 
       {/* hunts list */}
+      {failCount >= 2 && (
+        <StaleNotice
+          since={lastUpdated}
+          onRefresh={() => setReloadKey((k) => k + 1)}
+          className="mb-3"
+        />
+      )}
       <Panel>
         <div
           className="grid items-center gap-3 border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-[.04em] text-dim"
@@ -1031,7 +1039,7 @@ export function Hunts() {
               <div>
                 <StatusDot status={h.status} />
               </div>
-              <div className="text-[12px] text-dim">{h.when}</div>
+              <div className="text-[12px] text-dim" title={h.ts}>{h.when}</div>
               <div className="flex items-center justify-end gap-2" onClick={(e) => e.stopPropagation()}>
                 {/* Re-hunt: a clean re-run of this objective as a fresh hunt.
                     Nothing to re-run while still running. Prominent (always

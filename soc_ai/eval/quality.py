@@ -66,6 +66,13 @@ class SnapshotMetrics:
     error_rate: float
     verdict_counts: dict[str, int]
     latency_p50_ms: int | None
+    # agreement_rate's actual denominator: REAL (non-synth) OK rows whose oracle
+    # critique parsed to yes/no/partial. `unknown` critiques count toward n_ok but
+    # not here, so one flipped verdict moves agreement_rate by 1/n_classified —
+    # which exceeds 1/n_ok whenever any critique is unknown. The single-flip alarm
+    # floor scales to THIS. Defaults to 0 for older snapshots / callers that don't
+    # carry it (the detector then falls back to n_ok, the pre-fix behavior).
+    n_classified: int = 0
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,11 @@ def compute_snapshot_metrics(
     if hist is not None and hist.p50 is not None:
         latency_p50_ms = int(hist.p50)
 
+    # agreement_rate's true denominator: REAL OK rows the oracle actually
+    # classified (yes/no/partial). `unknown` critiques count toward n_ok but not
+    # here, so this — not n_ok — is what the single-flip alarm floor must use.
+    n_classified = sum(agg.agreement_counts.get(k, 0) for k in ("yes", "no", "partial"))
+
     return SnapshotMetrics(
         mode=mode,
         n_ok=agg.n_ok,
@@ -128,6 +140,7 @@ def compute_snapshot_metrics(
         error_rate=error_rate,
         verdict_counts=dict(agg.verdict_counts),
         latency_p50_ms=latency_p50_ms,
+        n_classified=n_classified,
     )
 
 
@@ -175,11 +188,15 @@ def detect_regression(
     hist_agreement = [p.agreement_rate for p in history if p.agreement_rate is not None]
     if new.agreement_rate is not None and hist_agreement and new.n_ok > 0:
         med = _median(hist_agreement)
-        # A single flipped verdict must never page anyone on its own: at
-        # n_ok alerts, one flip moves agreement_rate by exactly 1/n_ok, so
-        # the effective threshold is whichever is looser — the configured
-        # alarm_drop, or one full flip's worth (the floor requires >=2 flips).
-        min_drop = max(alarm_drop, 1.0 / new.n_ok)
+        # A single flipped verdict must never page anyone on its own. One flip
+        # moves agreement_rate by 1/CLASSIFIED, where classified counts only the
+        # critiques that parsed to yes/no/partial — NOT n_ok, which also includes
+        # `unknown` critiques that never enter the rate. Scaling the floor to n_ok
+        # under-sizes it whenever a critique is unknown (classified < n_ok), so a
+        # single flip still fires; scale to the true denominator instead. Fall
+        # back to n_ok for older points that don't carry the classified count.
+        denom = new.n_classified if new.n_classified > 0 else new.n_ok
+        min_drop = max(alarm_drop, 1.0 / denom)
         if med - new.agreement_rate > min_drop + _FLOAT_SLOP:
             reasons.append(
                 f"agreement_rate {new.agreement_rate:.2f} is more than "

@@ -1,4 +1,4 @@
-import { BookOpen, ChevronsLeft, Crosshair, Search, Settings, Triangle, Zap } from 'lucide-react';
+import { Bell, BookOpen, ChevronsLeft, Crosshair, History, LayoutDashboard, Search, Settings, Triangle, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -14,13 +14,18 @@ interface Command {
   run: () => void;
 }
 
+// Focusable descendants for the Tab focus-trap while the palette is open.
+const FOCUSABLE =
+  'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
 export function CommandPalette() {
-  const { paletteOpen, openPalette, closePalette, togglePalette, collapsed, toggleNav, requestTriage } =
+  const { paletteOpen, openPalette, closePalette, togglePalette, collapsed, toggleNav, pushModal, popModal } =
     useShell();
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const commands = useMemo<Command[]>(() => {
     const go = (to: string) => () => {
@@ -28,19 +33,26 @@ export function CommandPalette() {
       navigate(to);
     };
     return [
+      { group: 'Go to', label: 'Dashboard', icon: <LayoutDashboard size={15} />, run: go('/dashboard') },
       { group: 'Go to', label: 'Alerts', icon: <Triangle size={15} />, run: go('/alerts') },
       { group: 'Go to', label: 'Investigations', icon: <Search size={15} />, run: go('/investigations') },
+      { group: 'Go to', label: 'Notifications', icon: <Bell size={15} />, run: go('/notifications') },
       { group: 'Go to', label: 'Hunts', icon: <Crosshair size={15} />, run: go('/hunts') },
+      { group: 'Go to', label: 'Backtest', icon: <History size={15} />, run: go('/backtest') },
       { group: 'Go to', label: 'Runbooks', icon: <BookOpen size={15} />, run: go('/runbooks') },
       { group: 'Go to', label: 'Config', icon: <Settings size={15} />, run: go('/config') },
       {
         group: 'Action',
         label: 'Bulk investigate all untriaged',
         icon: <Zap size={15} />,
+        // Carry the intent in the navigation STATE, not a shell nonce: Alerts is
+        // code-split, so from another screen it mounts AFTER this click commits —
+        // a nonce bumped pre-mount is seeded away and never seen, and the batch
+        // silently never starts. Alerts consumes-and-clears location.state on the
+        // arriving navigation (and on a repeat while already there).
         run: () => {
           closePalette();
-          navigate('/alerts');
-          requestTriage();
+          navigate('/alerts', { state: { autoTriage: true } });
         },
       },
       {
@@ -68,7 +80,7 @@ export function CommandPalette() {
       },
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collapsed, navigate, closePalette, toggleNav, requestTriage]);
+  }, [collapsed, navigate, closePalette, toggleNav]);
 
   // Entity corpus for the search half of "Search or jump to": fetched once per
   // palette open (fail-soft — a fetch error just means command-only results).
@@ -93,18 +105,24 @@ export function CommandPalette() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q, commands, invs, groups]);
 
-  // reset query + selection on open; focus the input; refresh the entity corpus
+  // reset query + selection on open; focus the input; refresh the entity corpus;
+  // count into the shared modal stack and restore focus to the opener on close.
   useEffect(() => {
-    if (paletteOpen) {
-      setQ('');
-      setIdx(0);
-      getInvestigations().then(setInvs).catch(() => {});
-      getAlerts({ range: '7d' }).then(setGroups).catch(() => {});
-      // focus after paint
-      const t = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => clearTimeout(t);
-    }
-  }, [paletteOpen]);
+    if (!paletteOpen) return;
+    setQ('');
+    setIdx(0);
+    getInvestigations().then(setInvs).catch(() => {});
+    getAlerts({ range: '7d' }).then(setGroups).catch(() => {});
+    pushModal();
+    const opener = document.activeElement as HTMLElement | null;
+    // focus after paint
+    const t = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => {
+      clearTimeout(t);
+      popModal();
+      opener?.focus?.();
+    };
+  }, [paletteOpen, pushModal, popModal]);
 
   // global keyboard: ⌘K/Ctrl-K toggle, `/` open, arrows + enter when open
   useEffect(() => {
@@ -117,7 +135,22 @@ export function CommandPalette() {
       }
       if (paletteOpen) {
         if (e.key === 'Escape') closePalette();
-        else if (e.key === 'ArrowDown') {
+        else if (e.key === 'Tab') {
+          const node = panelRef.current;
+          if (!node) return;
+          const items = Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE));
+          if (items.length === 0) return;
+          const first = items[0];
+          const last = items[items.length - 1];
+          const active = document.activeElement;
+          if (e.shiftKey && (active === first || !node.contains(active))) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && (active === last || !node.contains(active))) {
+            e.preventDefault();
+            first.focus();
+          }
+        } else if (e.key === 'ArrowDown') {
           e.preventDefault();
           setIdx((i) => {
             const n = filtered.length;
@@ -152,6 +185,7 @@ export function CommandPalette() {
     <>
       <div onClick={closePalette} className="fixed inset-0 z-[60] bg-[rgba(4,6,9,.55)] backdrop-blur-[2px]" />
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
@@ -171,13 +205,21 @@ export function CommandPalette() {
             }}
             placeholder="Search commands, screens, hosts…"
             className="flex-1 border-none bg-transparent text-[15px] text-text outline-none"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-controls="palette-listbox"
+            aria-expanded={filtered.length > 0}
+            aria-activedescendant={filtered[idx] ? `palette-opt-${idx}` : undefined}
           />
           <kbd className="rounded-[4px] border border-border-input px-1.5 py-px font-mono text-[10px] text-faint">esc</kbd>
         </div>
-        <div className="max-h-[344px] overflow-y-auto p-1.5">
+        <div className="max-h-[344px] overflow-y-auto p-1.5" role="listbox" id="palette-listbox" aria-label="Results">
           {filtered.map((c, i) => (
             <button
               key={c.group + c.label}
+              id={`palette-opt-${i}`}
+              role="option"
+              aria-selected={i === idx}
               onClick={c.run}
               onMouseMove={() => setIdx(i)}
               className="flex w-full items-center gap-[11px] rounded-control px-[11px] py-[9px] text-left"

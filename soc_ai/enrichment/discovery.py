@@ -878,6 +878,18 @@ def _is_reverse_zone_name(name: str) -> bool:
     )
 
 
+def _is_service_record_name(name: str) -> bool:
+    """True iff *name* is a DNS-SD / SRV service record, not a host FQDN.
+
+    DNS service discovery (RFC 6763) and SRV (RFC 2782) records use
+    underscore-prefixed labels — ``_dns-sd._udp.local``, ``_printer._tcp.local``,
+    ``_https.host.corp.lan``. These are SERVICE enumeration names, never a host's
+    own domain; deriving a suffix from them polluted the internal-suffix list with
+    mDNS service types (and produced doubled suffixes like ``_https.h.lan.lan``).
+    """
+    return any(label.startswith("_") for label in name.strip(".").lower().split(".") if label)
+
+
 def _ingest_buckets(
     buckets: list[dict[str, Any]],
     cidrs: list[IpNetwork],
@@ -913,6 +925,10 @@ def _ingest_buckets(
             continue
         # Drop reverse-zone (PTR) names — a pointer record, never a host FQDN.
         if _is_reverse_zone_name(key):
+            continue
+        # Drop DNS-SD / SRV service records (underscore-prefixed labels) — mDNS
+        # service types are not host FQDNs and must never become an identifier.
+        if _is_service_record_name(key):
             continue
         suffix = derive_suffix(key)
         if suffix is None:
@@ -969,7 +985,12 @@ def _ingest_resolved_internal_buckets(
         reg = bucket.get("registered_domain") or {}
         reg_buckets = reg.get("buckets") or []
         reg_domain = str(reg_buckets[0].get("key", "")).strip() if reg_buckets else ""
-        if reg_domain and not _is_reverse_zone_name(reg_domain) and "." in reg_domain:
+        if (
+            reg_domain
+            and not _is_reverse_zone_name(reg_domain)
+            and not _is_service_record_name(reg_domain)
+            and "." in reg_domain
+        ):
             distinct = bucket.get("distinct_hosts") or {}
             host_count = int(distinct.get("value", 0)) or 0
             cand = suffixes.setdefault(reg_domain.lower(), _Candidate(value=reg_domain.lower()))

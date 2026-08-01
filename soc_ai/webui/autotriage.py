@@ -230,6 +230,11 @@ async def plan_targets(
                 elastic,
                 settings,
                 rule_name=group.rule_name,
+                # A Zeek notice's name lives in notice.note, not rule.name; without
+                # the group's own kind this defaults to "suricata" and a notice
+                # group fetches ZERO events, so it is never queued nor counted as
+                # skipped — it silently vanishes from the sweep.
+                kind=group.kind,
                 time_range=time_range,
                 oql=oql,
                 size=20,
@@ -555,6 +560,14 @@ async def run_auto_triage(
                 break
             label = target.rule_name if target.rule_name else target.alert_es_id
             status.current = label
+            # Fresh per-target context. InvestigationContext carries per-run tool
+            # state (default_time_anchor, dedup, prefetched community ids) that the
+            # orchestrator only resets on the investigation-loop path — a target
+            # that finalizes on round 1 and takes the Phase-D path would otherwise
+            # inherit the PREVIOUS target's default_time_anchor and fetch PCAP
+            # centred on the wrong alert's timestamp. ctx_from_state only rebinds
+            # the shared app.state clients, so this is cheap.
+            ctx = ctx_from_state(state)
             try:
                 stream_errored = False
                 # Hold the generator so we can guarantee it is closed if the
