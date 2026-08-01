@@ -1,6 +1,6 @@
 [project]
 name = "soc-ai"
-version = "1.2.5"
+version = "1.2.6"
 description = "Self-hosted, privacy-respecting LLM-powered triage assistant for Security Onion"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -54,6 +54,10 @@ dependencies = [
     "dpkt>=1.9.8",
     # Fernet encryption for secret config overrides at rest (Danger Zone).
     "cryptography>=43",
+    # Semver comparison for the About page's opt-in GitHub update check
+    # (soc_ai.webui.updates). Ubiquitous + already resolved transitively; declared
+    # here because updates.py imports it directly.
+    "packaging>=24.0",
 ]
 
 [project.urls]

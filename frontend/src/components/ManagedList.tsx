@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { IdentifierRow } from '../lib/api';
 import { Toggle } from './Controls';
 import { EmptyState } from './States';
@@ -11,6 +11,10 @@ import { EmptyState } from './States';
 // row (always-on env/reserved rows render the toggle ON + disabled/locked),
 // plus Remove for manual rows. An inline "+ add" input appends a manual
 // identifier.
+//
+// Long lists (a real sensor grid detects hundreds of hostnames) opt into three
+// extra affordances — `searchable`, `pageSize` and `bulk`. All three are off by
+// default so a call site that passes none renders exactly what it always did.
 // ---------------------------------------------------------------------------
 
 interface ManagedListProps {
@@ -26,6 +30,22 @@ interface ManagedListProps {
    */
   onDismiss?: (id: number) => void;
   addPlaceholder?: string;
+  /** Render a filter box above the list (case-insensitive substring on value). */
+  searchable?: boolean;
+  /**
+   * Render at most this many (filtered) rows, with a "Show all N" row-button to
+   * expand. Collapses again whenever the filter text changes.
+   */
+  pageSize?: number;
+  /**
+   * Enable per-row selection + a bulk action bar. The component owns the
+   * selection only; every action delegates to these callbacks (no API calls
+   * here) and the selection is cleared once one fires.
+   */
+  bulk?: {
+    onSetActiveMany: (ids: number[], active: boolean) => void;
+    onDismissMany?: (ids: number[]) => void;
+  };
 }
 
 /** Compact a large count: 9200 → "9.2k", 1_300_000 → "1.3M". */
@@ -91,6 +111,12 @@ function Tag({ tone }: { tone: TagTone }) {
 const ctrlBtn =
   'rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed';
 
+const bulkBtn =
+  'rounded-[7px] border border-border-strong bg-surface-3 px-[9px] py-[3px] text-[11px] font-semibold text-dim hover:border-accent hover:text-text';
+
+const dangerBtn =
+  'rounded-[7px] border px-[9px] py-[3px] text-[11px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]';
+
 export function ManagedList({
   title,
   rows,
@@ -99,12 +125,75 @@ export function ManagedList({
   onRemove,
   onDismiss,
   addPlaceholder,
+  searchable,
+  pageSize,
+  bulk,
 }: ManagedListProps) {
   const [value, setValue] = useState('');
   // Inline "click twice to confirm" for a dismiss — keyed by row id so a mis-click
   // never nukes a suggestion on the first press. Cleared on the next render cycle
   // that removes the row (the list refetches after the mutation resolves).
   const [pendingDismiss, setPendingDismiss] = useState<number | null>(null);
+  const [filter, setFilter] = useState('');
+  const [expanded, setExpanded] = useState(false);
+  const [selected, setSelected] = useState<ReadonlySet<number>>(() => new Set());
+  const [pendingBulkDismiss, setPendingBulkDismiss] = useState(false);
+
+  // Filter first, then page: "show all" expands the matches, not the whole list.
+  const query = filter.trim().toLowerCase();
+  const filtered = useMemo(
+    () => (query ? rows.filter((r) => r.value.toLowerCase().includes(query)) : rows),
+    [rows, query],
+  );
+  const pageable = pageSize != null && filtered.length > pageSize;
+  const visible = pageable && !expanded ? filtered.slice(0, pageSize) : filtered;
+
+  // The effective selection is re-derived from the CURRENT rows every render, so
+  // ids that vanish on a refetch (dismissed elsewhere, removed) drop out instead
+  // of being handed back to the API by the next bulk action. Row order in, row
+  // order out.
+  const selectedIds = useMemo(
+    () =>
+      rows
+        .filter((r) => r.mutable && r.id != null && selected.has(r.id))
+        .map((r) => r.id as number),
+    [rows, selected],
+  );
+  const selectedCount = selectedIds.length;
+
+  const shownIds = visible
+    .filter((r) => r.mutable && r.id != null)
+    .map((r) => r.id as number);
+  const allShownSelected = shownIds.length > 0 && shownIds.every((id) => selected.has(id));
+
+  const clearSelection = () => {
+    setSelected(new Set());
+    setPendingBulkDismiss(false);
+  };
+
+  const toggleRow = (id: number) => {
+    setPendingBulkDismiss(false);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // "Select all shown" reaches exactly the visible (filtered + paged) mutable
+  // rows — never a row the operator cannot currently see.
+  const toggleAllShown = () => {
+    setPendingBulkDismiss(false);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const id of shownIds) {
+        if (allShownSelected) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+  };
 
   const submit = () => {
     const v = value.trim();
@@ -116,11 +205,104 @@ export function ManagedList({
   return (
     <div className="mb-3">
       <div className="mb-1.5 text-[12.5px] font-semibold text-text-2">{title}</div>
+
+      {searchable && (
+        <div className="mb-1.5 flex items-center gap-2.5">
+          <input
+            placeholder="Filter…"
+            value={filter}
+            onChange={(e) => {
+              setFilter(e.target.value);
+              // A new filter means a new result set — re-collapse to pageSize.
+              setExpanded(false);
+            }}
+            className="w-[240px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
+          />
+          {query !== '' && (
+            <span className="text-[11.5px] text-faint">
+              {`${filtered.length} of ${rows.length} shown`}
+            </span>
+          )}
+        </div>
+      )}
+
+      {bulk && (shownIds.length > 0 || selectedCount > 0) && (
+        <div className="mb-1.5 flex flex-wrap items-center gap-2.5 rounded-card border border-border bg-surface-2 px-[15px] py-[7px]">
+          <label className="flex cursor-pointer items-center gap-2 text-[11.5px] text-dim">
+            <input
+              type="checkbox"
+              aria-label="Select all shown"
+              checked={allShownSelected}
+              onChange={toggleAllShown}
+              className="h-3.5 w-3.5 flex-none accent-accent"
+            />
+            Select all shown
+          </label>
+          {selectedCount > 0 && (
+            <>
+              <span className="text-[11.5px] font-semibold text-text-2">
+                {selectedCount} selected
+              </span>
+              <div className="ml-auto flex items-center gap-1.5">
+                <button
+                  className={bulkBtn}
+                  onClick={() => {
+                    bulk.onSetActiveMany(selectedIds, true);
+                    clearSelection();
+                  }}
+                >
+                  Enable
+                </button>
+                <button
+                  className={bulkBtn}
+                  onClick={() => {
+                    bulk.onSetActiveMany(selectedIds, false);
+                    clearSelection();
+                  }}
+                >
+                  Disable
+                </button>
+                {bulk.onDismissMany &&
+                  (pendingBulkDismiss ? (
+                    <>
+                      <button
+                        className={dangerBtn}
+                        style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                        onClick={() => {
+                          bulk.onDismissMany?.(selectedIds);
+                          clearSelection();
+                        }}
+                      >
+                        Confirm dismiss ({selectedCount})
+                      </button>
+                      <button className={bulkBtn} onClick={() => setPendingBulkDismiss(false)}>
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className={bulkBtn}
+                      title="Dismiss — remove these suggestions for good (re-add manually to restore)"
+                      onClick={() => setPendingBulkDismiss(true)}
+                    >
+                      Dismiss ({selectedCount})
+                    </button>
+                  ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         {rows.length === 0 ? (
           <EmptyState>No {title.toLowerCase()} yet.</EmptyState>
+        ) : filtered.length === 0 ? (
+          <EmptyState>Nothing matches “{filter.trim()}”.</EmptyState>
         ) : (
-          rows.map((row) => {
+          <>
+          {visible.map((row) => {
+            const rowId = row.id;
             const tone = rowTag(row);
             const prov = provenanceLine(row);
             const active = row.state === 'active';
@@ -129,6 +311,20 @@ export function ManagedList({
                 key={row.id ?? `static:${row.value}`}
                 className="flex items-center gap-3 border-b border-border-faint px-[15px] py-[11px] last:border-0"
               >
+                {/* Only a mutable row with a real id can be acted on in bulk;
+                    the rest keep a spacer so every value stays in one column. */}
+                {bulk &&
+                  (row.mutable && rowId != null ? (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${row.value}`}
+                      checked={selected.has(rowId)}
+                      onChange={() => toggleRow(rowId)}
+                      className="h-3.5 w-3.5 flex-none accent-accent"
+                    />
+                  ) : (
+                    <span aria-hidden="true" className="h-3.5 w-3.5 flex-none" />
+                  ))}
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span
@@ -197,7 +393,18 @@ export function ManagedList({
                 </div>
               </div>
             );
-          })
+          })}
+          {/* Full-width last row: the truncated tail is one press away. The row
+              above keeps its own border-b, so this reads as one more row. */}
+          {pageable && (
+            <button
+              onClick={() => setExpanded((prev) => !prev)}
+              className="w-full px-[15px] py-[9px] text-center text-[11.5px] font-semibold text-dim hover:bg-surface-2 hover:text-text"
+            >
+              {expanded ? `Show first ${pageSize}` : `Show all ${filtered.length}`}
+            </button>
+          )}
+          </>
         )}
       </div>
 

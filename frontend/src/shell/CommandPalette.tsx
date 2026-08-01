@@ -1,17 +1,76 @@
-import { Bell, BookOpen, ChevronsLeft, Crosshair, History, LayoutDashboard, Search, Settings, Triangle, Zap } from 'lucide-react';
+import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard, Search, Settings, SlidersHorizontal, Triangle, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAlerts, getInvestigations, signOut } from '../lib/api';
+import { getAlerts, getConfig, getInvestigations, signOut } from '../lib/api';
+import { buildConfigLayout, keyToSectionId } from '../lib/configLayout';
+import type { ConfigParent } from '../lib/configLayout';
 import { searchEntities } from '../lib/paletteSearch';
 import type { AlertGroup, InvestigationRow } from '../lib/types';
 import { useShell } from './ShellContext';
 
 interface Command {
-  group: 'Go to' | 'Action' | 'View' | 'Account' | 'Investigations' | 'Alerts';
+  group: 'Go to' | 'Action' | 'View' | 'Account' | 'Investigations' | 'Alerts' | 'Settings';
   label: string;
   icon: ReactNode;
   run: () => void;
+}
+
+/** One Config-page hit: a single setting (carries `key`, so the Config page can
+ * flash the exact row) or a whole section (no key — just the anchor). */
+interface SettingHit {
+  label: string;
+  to: string;
+  key?: string;
+}
+
+const SETTINGS_CAP = 10;
+// Below this the settings corpus (~275 rows) would swamp the command list, and
+// an empty query must still show the plain command menu.
+const SETTINGS_MIN_QUERY = 2;
+
+/**
+ * Case-insensitive search over every setting the Config page renders, plus the
+ * sections themselves. The palette indexed only screens and entities, so any
+ * settings concept ("inherit", "egress") returned "No matches" while the Config
+ * page held the answer behind 31 collapsed sections (dogfood 2026-08-01).
+ *
+ * Ranked: setting labels, then sections, then key matches, then help-text-only
+ * matches — the analyst's words are usually the label, and a help-text match is
+ * the weakest signal. Section ids come from buildConfigLayout/keyToSectionId, so
+ * `/config#<id>` always agrees with the id the page actually renders.
+ */
+function searchSettings(q: string, layout: ConfigParent[] | null): SettingHit[] {
+  const query = q.trim().toLowerCase();
+  if (!layout || query.length < SETTINGS_MIN_QUERY) return [];
+  const sectionOf = keyToSectionId(layout);
+  // 0 = setting label, 1 = section, 2 = setting key, 3 = help text only.
+  const tiers: SettingHit[][] = [[], [], [], []];
+  for (const parent of layout) {
+    for (const child of parent.children) {
+      if (child.label.toLowerCase().includes(query)) {
+        tiers[1].push({ label: `${child.label} · section`, to: `/config#${child.id}` });
+      }
+      if (child.kind !== 'group') continue;
+      for (const item of child.group.items) {
+        const label = item.label || item.key;
+        const tier = label.toLowerCase().includes(query)
+          ? 0
+          : item.key.toLowerCase().includes(query)
+            ? 2
+            : (item.help || '').toLowerCase().includes(query)
+              ? 3
+              : -1;
+        if (tier < 0) continue;
+        tiers[tier].push({
+          label: `${label} · ${child.label}`,
+          to: `/config#${sectionOf[item.key] ?? child.id}`,
+          key: item.key,
+        });
+      }
+    }
+  }
+  return tiers.flat().slice(0, SETTINGS_CAP);
 }
 
 // Focusable descendants for the Tab focus-trap while the palette is open.
@@ -41,6 +100,7 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Backtest', icon: <History size={15} />, run: go('/backtest') },
       { group: 'Go to', label: 'Runbooks', icon: <BookOpen size={15} />, run: go('/runbooks') },
       { group: 'Go to', label: 'Config', icon: <Settings size={15} />, run: go('/config') },
+      { group: 'Go to', label: 'About soc-ai', icon: <Info size={15} />, run: go('/config#about') },
       {
         group: 'Action',
         label: 'Bulk investigate all untriaged',
@@ -87,6 +147,14 @@ export function CommandPalette() {
   const [invs, setInvs] = useState<InvestigationRow[]>([]);
   const [groups, setGroups] = useState<AlertGroup[]>([]);
 
+  // Config corpus for the Settings group. Unlike the entity corpus this is
+  // fetched ONCE per mount, not per open: it's large, near-static, and
+  // admin-only — an analyst's 403 (or any failure) is cached as "no settings
+  // results" so the palette behaves exactly as it did before, with no error UI
+  // and no retry on every ⌘K.
+  const [layout, setLayout] = useState<ConfigParent[] | null>(null);
+  const configRequested = useRef(false);
+
   const filtered = useMemo(() => {
     const query = q.toLowerCase();
     const base = query
@@ -101,9 +169,23 @@ export function CommandPalette() {
         navigate(h.to);
       },
     }));
-    return [...base, ...entities];
+    // Pre-filtered against the query (like the entity hits), so the generic
+    // label/group filter above must not run over them a second time.
+    const settings = searchSettings(q, layout).map<Command>((h) => ({
+      group: 'Settings',
+      label: h.label,
+      icon: <SlidersHorizontal size={15} />,
+      run: () => {
+        closePalette();
+        // `state.highlightKey` is the contract the Config page reads to flash
+        // the exact row; section hits carry no key, so they navigate bare.
+        if (h.key) navigate(h.to, { state: { highlightKey: h.key } });
+        else navigate(h.to);
+      },
+    }));
+    return [...base, ...entities, ...settings];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, commands, invs, groups]);
+  }, [q, commands, invs, groups, layout]);
 
   // reset query + selection on open; focus the input; refresh the entity corpus;
   // count into the shared modal stack and restore focus to the opener on close.
@@ -113,6 +195,12 @@ export function CommandPalette() {
     setIdx(0);
     getInvestigations().then(setInvs).catch(() => {});
     getAlerts({ range: '7d' }).then(setGroups).catch(() => {});
+    if (!configRequested.current) {
+      configRequested.current = true;
+      getConfig()
+        .then((c) => setLayout(buildConfigLayout(c.groups)))
+        .catch(() => {});
+    }
     pushModal();
     const opener = document.activeElement as HTMLElement | null;
     // focus after paint

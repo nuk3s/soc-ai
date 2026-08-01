@@ -2629,7 +2629,7 @@ wheels = [
 
 [[package]]
 name = "soc-ai"
-version = "1.2.5"
+version = "1.2.6"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -2644,6 +2644,7 @@ dependencies = [
     { name = "jinja2" },
     { name = "lark" },
     { name = "mcp" },
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "pydantic-ai" },
     { name = "pydantic-settings" },
@@ -2687,6 +2688,7 @@ requires-dist = [
     { name = "jinja2", specifier = ">=3.1" },
     { name = "lark", specifier = ">=1.2.0" },
     { name = "mcp", specifier = ">=1.1.0" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "pydantic-ai", specifier = ">=1.0,<2" },
     { name = "pydantic-settings", specifier = ">=2.6.0" },

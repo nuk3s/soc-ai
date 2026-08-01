@@ -131,7 +131,7 @@ Health check:
 
 ```bash
 curl -k https://localhost:8443/healthz
-# → {"status":"ok","version":"1.2.5","so_auth":"kratos",...}
+# → {"status":"ok","version":"1.2.6","so_auth":"kratos",...}
 ```
 
 ---

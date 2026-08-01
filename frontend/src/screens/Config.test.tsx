@@ -8,6 +8,7 @@
 // owns, and each stub keeps the test hermetic (no api mocking needed for panels
 // this bug doesn't touch).
 import { fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('./AgentToolsPanel', () => ({ AgentToolsPanel: () => null }));
@@ -57,7 +58,11 @@ import { getConfig, mintToken, resetUserPassword, revokeToken } from '../lib/api
 describe('Config admin write paths surface a failure instead of failing silently (F39)', () => {
   it('shows an error on the users strip when resetUserPassword rejects', async () => {
     vi.mocked(resetUserPassword).mockRejectedValueOnce(new Error('reset failed'));
-    render(<Config />);
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/config', hash: '#users' }]}>
+        <Config />
+      </MemoryRouter>,
+    );
     const resetBtn = await screen.findByText('Reset pw');
     fireEvent.click(resetBtn);
     await screen.findByText('reset failed');
@@ -65,7 +70,11 @@ describe('Config admin write paths surface a failure instead of failing silently
 
   it('shows an error on the API tokens banner when mintToken rejects', async () => {
     vi.mocked(mintToken).mockRejectedValueOnce(new Error('mint failed'));
-    render(<Config />);
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/config', hash: '#api-tokens' }]}>
+        <Config />
+      </MemoryRouter>,
+    );
     const mintBtn = await screen.findByText('+ Mint token');
     fireEvent.click(mintBtn);
     await screen.findByText('mint failed');
@@ -73,7 +82,11 @@ describe('Config admin write paths surface a failure instead of failing silently
 
   it('shows an error on the API tokens banner when revokeToken rejects', async () => {
     vi.mocked(revokeToken).mockRejectedValueOnce(new Error('revoke failed'));
-    render(<Config />);
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/config', hash: '#api-tokens' }]}>
+        <Config />
+      </MemoryRouter>,
+    );
     const revokeBtn = await screen.findByText('Revoke');
     fireEvent.click(revokeBtn);
     await screen.findByText('revoke failed');
@@ -88,7 +101,11 @@ describe('reset-password banner auto-dismiss (F69)', () => {
   it('clears the plaintext password banner after 30s, like the mint-token banner', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      render(<Config />);
+      render(
+      <MemoryRouter initialEntries={[{ pathname: '/config', hash: '#users' }]}>
+        <Config />
+      </MemoryRouter>,
+    );
       const resetBtn = await screen.findByText('Reset pw');
       fireEvent.click(resetBtn);
       await screen.findByText('temp-pw');
@@ -113,7 +130,7 @@ describe('reset-password banner auto-dismiss (F69)', () => {
 // parent as a side effect (it has no placement, so it's appended after
 // whatever's already there once api-keys stops taking that slot).
 describe('Data & Enrichment panel placement (dogfood #2)', () => {
-  it('renders the API-keys panel directly under Online enrichment, ahead of Detection tuning', async () => {
+  it('lists API keys directly under Online enrichment, ahead of Detection tuning, in the nav', async () => {
     vi.mocked(getConfig).mockResolvedValueOnce({
       groups: [
         { title: 'Web research', parent: 'Data & Enrichment', items: [] },
@@ -123,26 +140,22 @@ describe('Data & Enrichment panel placement (dogfood #2)', () => {
       users: [],
       dangerHost: '',
     });
-    render(<Config />);
+    render(
+      <MemoryRouter>
+        <Config />
+      </MemoryRouter>,
+    );
 
-    // Group titles also appear in the left-nav sidebar (an <a> per section) —
-    // only the main-content heading is relevant to DOM/render order here.
-    const mainOnly = async (label: string) => {
-      const matches = await screen.findAllByText(label);
-      const match = matches.find((el) => !el.closest('nav'));
-      if (!match) throw new Error(`no main-content match for "${label}"`);
-      return match;
-    };
-    const webResearch = await mainOnly('Web research');
-    const onlineEnrichment = await mainOnly('Online enrichment');
-    const apiKeys = await screen.findByTestId('panel-api-keys');
-    const detectionTuning = await screen.findByTestId('panel-detection-tuning');
-
-    const isBefore = (a: Element, b: Element) =>
-      !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
-
-    expect(isBefore(webResearch, onlineEnrichment)).toBe(true);
-    expect(isBefore(onlineEnrichment, apiKeys)).toBe(true);
-    expect(isBefore(apiKeys, detectionTuning)).toBe(true);
+    // Master-detail: sections render one at a time, so placement ORDER now
+    // lives in the nav (the master). Assert the nav lists the sections in the
+    // placed order — same regression, new home.
+    const nav = (await screen.findAllByRole('navigation'))[0];
+    await screen.findAllByText('Online enrichment');
+    const labels = [...nav.querySelectorAll('a')].map((a) => a.textContent?.trim());
+    const at = (label: string) => labels.indexOf(label);
+    expect(at('Web research')).toBeGreaterThan(-1);
+    expect(at('Online enrichment')).toBeGreaterThan(at('Web research'));
+    expect(at('API keys')).toBe(at('Online enrichment') + 1);
+    expect(at('Detection tuning')).toBeGreaterThan(at('API keys'));
   });
 });

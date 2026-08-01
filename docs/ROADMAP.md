@@ -3,7 +3,7 @@
 soc-ai moves fast, and it moves in public. This page is the honest picture:
 what has shipped, what you can turn on today, and what comes next.
 
-![soc-ai roadmap: 1.0 through 1.2 shipped, 1.2.5 current, 1.3 and later planned](img/roadmap.svg)
+![soc-ai roadmap: 1.0 through 1.2 shipped, 1.2.6 current, 1.3 and later planned](img/roadmap.svg)
 
 ## The story so far
 
@@ -30,7 +30,13 @@ went in; fourteen fixes came out. Notifications, entity search, a maintenance
 panel, pipeline-error visibility with one-click dismiss, group acknowledge,
 deep re-run, and the quality eval now schedulable straight from the dashboard.
 
-**1.2.5 is where we are today.** When the model stumbles, the pipeline now
+**1.2.6 is where we are today.** The Config page was rebuilt master-detail —
+a section nav driving a single-section pane instead of a ~36-screen scroll —
+with settings search everywhere (the page, the command palette), an Apply bar
+that names each staged change, and identifier lists that page, filter, and bulk-
+edit. An About page finally surfaces the running version, with an opt-in,
+zero-egress-by-default GitHub update check. Before that: when the model
+stumbles, the pipeline now
 records exactly why and recovers from the most common failure on its own. And
 hunts got their latitude back: generic sweeps hunt the telemetry (beacons,
 first-seen destinations, odd cadences) instead of re-triaging the alert queue,

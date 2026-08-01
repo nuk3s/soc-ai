@@ -1,5 +1,6 @@
 import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { ApplyBadge, SourceBadge } from '../components/Badges';
 import { NumberField, Select, Toggle } from '../components/Controls';
@@ -13,6 +14,7 @@ import { EgressPolicyPanel } from './EgressPolicyPanel';
 import { NotificationsPanel } from './NotificationsPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 import { DetectionTuningPanel } from './DetectionTuningPanel';
+import { AboutPanel } from './AboutPanel';
 import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
@@ -21,11 +23,12 @@ import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav, ConfigNavSelect } from './ConfigNav';
-
-/** Slugify a section title into a stable DOM id / anchor fragment. */
-function slug(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-}
+import {
+  type ConfigParent,
+  SUB_ANCHOR_HOSTS,
+  buildConfigLayout,
+  keyToSectionId,
+} from '../lib/configLayout';
 
 /** Nearest scrollable ancestor (the AppShell's overflow-y-auto content pane). */
 function scrollContainerOf(el: HTMLElement): HTMLElement | null {
@@ -36,61 +39,9 @@ function scrollContainerOf(el: HTMLElement): HTMLElement | null {
   return null;
 }
 
-// ── Config-page information architecture ─────────────────────────────────────
-// Top-level parent headers, in display order. The server-driven settings groups
-// carry their parent in GET /config (SECTION_PARENTS in
-// soc_ai/store/config_overrides.py — the single source of truth for THEIR
-// grouping); the frontend-owned standalone panels declare theirs in PANELS
-// below. A parent the frontend doesn't know yet is appended after these.
-const PARENT_ORDER = [
-  'Models & Reasoning',
-  'Triage & Workflow',
-  'Retrieval & Memory',
-  'Privacy & Egress',
-  'Data & Enrichment',
-  'System',
-];
-
-// Standalone (frontend-owned) sections: stable DOM id (deep-link anchor — these
-// ids predate the grouped nav and MUST NOT change), label (doubles as the
-// `collapsed`-map key), parent header, and placement relative to the parent's
-// server-driven groups: after a specific group title, at the start, or
-// (default) appended at the end of the parent.
-interface PanelDef {
-  id: string;
-  label: string;
-  parent: string;
-  placement?: { afterGroup?: string; at?: 'start' };
-}
-const PANELS: PanelDef[] = [
-  { id: 'agent-tools', label: 'Agent tools', parent: 'Models & Reasoning' },
-  { id: 'notifications-webhook', label: 'Notification webhook', parent: 'Triage & Workflow', placement: { afterGroup: 'Notifications' } },
-  { id: 'runbooks', label: 'Runbooks', parent: 'Retrieval & Memory' },
-  { id: 'egress-policy', label: 'Egress policy', parent: 'Privacy & Egress', placement: { at: 'start' } },
-  { id: 'internal-identifiers', label: 'Internal identifiers', parent: 'Privacy & Egress', placement: { afterGroup: 'Discovery' } },
-  { id: 'redaction-preview', label: 'Redaction preview', parent: 'Privacy & Egress' },
-  { id: 'data-sources', label: 'Data sources', parent: 'Data & Enrichment', placement: { at: 'start' } },
-  { id: 'detection-tuning', label: 'Detection tuning', parent: 'Data & Enrichment' },
-  { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment', placement: { afterGroup: 'Online enrichment' } },
-  { id: 'users', label: 'Users', parent: 'System' },
-  { id: 'api-tokens', label: 'API tokens', parent: 'System' },
-  { id: 'maintenance', label: 'Scheduled maintenance', parent: 'System' },
-  { id: 'diagnostics', label: 'Diagnostics', parent: 'System' },
-  { id: 'danger-zone', label: 'Danger Zone', parent: 'System' },
-];
-
-// Ids the group-id generator must never produce: every standalone panel id plus
-// in-page anchors that aren't nav sections.
-const RESERVED_IDS: ReadonlySet<string> = new Set([...PANELS.map((p) => p.id), 'rag-reembed']);
-
-type ConfigChild =
-  | { kind: 'group'; id: string; label: string; group: SettingGroup }
-  | { kind: 'panel'; id: string; label: string };
-
-interface ConfigParent {
-  label: string;
-  children: ConfigChild[];
-}
+// The Config-page information architecture (PARENT_ORDER, PANELS, the layout
+// builder) lives in lib/configLayout so the command palette derives the SAME
+// section ids this page renders.
 
 // The Retrieval (RAG) model settings — rendered as gateway-fed dropdowns (same
 // list as the analyst model) instead of free text. Empty string = tier off.
@@ -207,9 +158,27 @@ function ModelFitnessChip({
 export function Config() {
   const demo = useDemo(); // read-only demo: config writes show a note, never POST
   const [nonce, setNonce] = useState(0);
-  // Collapsed config sections (the panel is long — let the operator fold away
-  // the groups they aren't tuning). Session-scoped; deep-link auto-expands.
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const location = useLocation();
+  // Collapsed config sections — persisted so a fold survives leaving the page
+  // (the dogfood walkthrough found collapse state silently reset every visit).
+  // Deep-links and nav clicks auto-expand their target.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('soc-ai:config:collapsed') || '{}') as Record<
+        string,
+        boolean
+      >;
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem('soc-ai:config:collapsed', JSON.stringify(collapsed));
+    } catch {
+      /* private mode — folds just won't persist */
+    }
+  }, [collapsed]);
   const toggleSection = (title: string) =>
     setCollapsed((c) => ({ ...c, [title]: !c[title] }));
   const { data, loading, error } = useAsync(getConfig, [nonce]);
@@ -385,139 +354,178 @@ export function Config() {
 
   const refetchIdents = () => setIdentNonce((n) => n + 1);
 
-  // ── Left-nav / page section model ──────────────────────────────────────────
-  // Two-level: PARENT_ORDER headers, each holding the server-driven settings
-  // groups whose `parent` (from GET /config) matches, with the frontend-owned
-  // standalone panels spliced in per their PANELS placement. Nav order ==
-  // render order == DOM order by construction (both come from this structure).
-  const layout = useMemo<ConfigParent[]>(() => {
-    // Collision-proof group ids: slugs are deduped against the reserved panel
-    // ids AND each other, so a future server section titled e.g. "Users" can
-    // never produce a duplicate DOM id (which would make anchor clicks resolve
-    // to the wrong section). Current titles slug cleanly, so the historical
-    // anchors (#agent, #retrieval-rag, …) are unchanged.
-    const used = new Set(RESERVED_IDS);
-    const idFor = (title: string) => {
-      const base = slug(title) || 'section';
-      let id = base;
-      for (let n = 2; used.has(id); n++) id = `${base}-${n}`;
-      used.add(id);
-      return id;
-    };
-    const parentOrder = [...PARENT_ORDER];
-    const byParent = new Map<string, ConfigChild[]>();
-    const bucket = (parent: string) => {
-      let children = byParent.get(parent);
-      if (!children) {
-        children = [];
-        byParent.set(parent, children);
-        if (!parentOrder.includes(parent)) parentOrder.push(parent);
-      }
-      return children;
-    };
-    for (const g of data?.groups ?? []) {
-      bucket(g.parent ?? g.title).push({ kind: 'group', id: idFor(g.title), label: g.title, group: g });
-    }
-    for (const p of PANELS) {
-      const children = bucket(p.parent);
-      const child: ConfigChild = { kind: 'panel', id: p.id, label: p.label };
-      const after = p.placement?.afterGroup;
-      if (p.placement?.at === 'start') {
-        children.unshift(child);
-      } else if (after) {
-        const i = children.findIndex((c) => c.kind === 'group' && c.label === after);
-        children.splice(i === -1 ? children.length : i + 1, 0, child);
-      } else {
-        children.push(child);
-      }
-    }
-    return parentOrder
-      .filter((label) => byParent.has(label))
-      .map((label) => ({ label, children: byParent.get(label) ?? [] }));
-  }, [data?.groups]);
-
-  // Flat section list in DOM order — drives the scroll-spy and collapse lookup.
+  // ── Master-detail section model ────────────────────────────────────────────
+  // The two-level nav (lib/configLayout) is the master; the content pane renders
+  // ONLY the selected section. Replaces the single 32,000px scroll of all 31
+  // sections the dogfood walkthrough measured (2026-08-01) — and with it the
+  // scroll-spy, which has no long page left to track.
+  const layout = useMemo<ConfigParent[]>(() => buildConfigLayout(data?.groups), [data?.groups]);
   const flatSections = useMemo(() => layout.flatMap((p) => p.children), [layout]);
+  const keyToSection = useMemo(() => keyToSectionId(layout), [layout]);
 
-  // ── Active-section highlight (deterministic scroll-spy) ────────────────────
-  // The previous IntersectionObserver version misattributed nav clicks: it
-  // derived the active id from only the threshold-crossing entries and took the
-  // topmost intersecting one, while scrollIntoView's landing position leaves the
-  // PREVIOUS section's tail 2px inside the scrollport (24px scroll-margin vs the
-  // 22px inter-section gap) — so clicking "Retrieval (RAG)" highlighted "Online
-  // enrichment". Instead: the active section is the LAST one whose top edge has
-  // crossed an activation line just under the scrollport top. Exactly one
-  // winner, immune to the previous section's sliver, correct for short sections.
-  const [activeId, setActiveId] = useState('');
-  // Nav clicks / deep-links pin the highlight to the user's intent and hold the
-  // spy off until the programmatic jump's scroll events have flushed.
-  const spyHoldUntil = useRef(0);
+  // Selection: explicit choice (hash / nav click) > last-visited (localStorage)
+  // > the first section. Stored so "come back to where I was tuning" survives.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [storedSection] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('soc-ai:config:section');
+    } catch {
+      return null;
+    }
+  });
+  const validId = (id: string | null): id is string =>
+    !!id && flatSections.some((s) => s.id === id);
+  const effectiveId = validId(selectedId)
+    ? selectedId
+    : validId(storedSection)
+      ? storedSection
+      : (flatSections[0]?.id ?? '');
   useEffect(() => {
-    if (!flatSections.length) return;
-    let raf = 0;
-    const compute = () => {
-      raf = 0;
-      if (performance.now() < spyHoldUntil.current) return;
-      const els = flatSections
-        .map((s) => document.getElementById(s.id))
-        .filter((el): el is HTMLElement => el != null);
-      if (!els.length) return;
-      const sc = scrollContainerOf(els[0]);
-      // 30px = the 24px scroll-margin anchors land at, plus slack.
-      const line = (sc ? sc.getBoundingClientRect().top : 0) + 30;
-      let current = els[0].id;
-      for (const el of els) {
-        if (el.getBoundingClientRect().top <= line) current = el.id;
-      }
-      // Pinned to the bottom → the last section is the destination even though
-      // it may be too short to ever reach the activation line.
-      if (sc && Math.ceil(sc.scrollTop + sc.clientHeight) >= sc.scrollHeight - 2) {
-        current = els[els.length - 1].id;
-      }
-      setActiveId(current);
-    };
-    const schedule = () => {
-      if (!raf) raf = requestAnimationFrame(compute);
-    };
-    // Capture-phase listener: the page scrolls inside the AppShell's
-    // overflow-y-auto pane, whose scroll events don't bubble to window.
-    document.addEventListener('scroll', schedule, true);
-    window.addEventListener('resize', schedule);
-    schedule();
-    return () => {
-      document.removeEventListener('scroll', schedule, true);
-      window.removeEventListener('resize', schedule);
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [flatSections, nonce, identNonce]);
+    if (!effectiveId) return;
+    try {
+      localStorage.setItem('soc-ai:config:section', effectiveId);
+    } catch {
+      /* private mode — selection just won't persist */
+    }
+  }, [effectiveId]);
 
-  // Nav click / deep-link entry: force-expand a collapsed target so the anchor
-  // is never hidden behind a folded header (the `collapsed` map is keyed by the
-  // section label — for groups that's the group title), pin the highlight, and
-  // hold the scroll-spy briefly (see above).
+  // The setting row to flash after a jump (search hit, apply-bar chip, or the
+  // palette's navigate('/config#…', { state: { highlightKey } }) hand-off).
+  const [highlightKey, setHighlightKey] = useState<string | null>(null);
+  useEffect(() => {
+    if (!highlightKey) return;
+    const el = document.querySelector(`[data-setting-key="${highlightKey}"]`);
+    (el as HTMLElement | null)?.scrollIntoView?.({ behavior: 'auto', block: 'center' });
+    const t = setTimeout(() => setHighlightKey(null), 2500);
+    return () => clearTimeout(t);
+  }, [highlightKey, effectiveId]);
+
+  // ── Settings search (spans every section) ──────────────────────────────────
+  const [query, setQuery] = useState('');
+  const trimmedQuery = query.trim().toLowerCase();
+  const searching = trimmedQuery.length >= 2;
+
+  // Nav click / chip click / search hit: select the section, expand it if its
+  // header was folded, sync the hash (deep-linkable), and start the fresh
+  // section at the top of the content pane.
   const navigateToSection = (id: string) => {
     const label = flatSections.find((s) => s.id === id)?.label;
     if (label) setCollapsed((c) => ({ ...c, [label]: false }));
-    setActiveId(id);
-    spyHoldUntil.current = performance.now() + 400;
+    setSelectedId(id);
+    setQuery('');
+    history.replaceState(null, '', `#${id}`);
+    requestAnimationFrame(() => {
+      const el = document.getElementById(id);
+      const sc = el ? scrollContainerOf(el) : null;
+      if (sc) sc.scrollTop = 0;
+    });
   };
 
-  // Deep-link support: when arriving at /config#<section> (e.g. the dashboard's
-  // "Manage data sources" link → #data-sources), scroll that section into view
-  // once its DOM has mounted. Runs after the settings + standalone panels render.
+  // Deep-link entry: /config#<section> selects that section (dashboard links,
+  // the sidebar version line, the palette). A sub-anchor that lives INSIDE a
+  // section (#rag-reembed) selects its host section, then scrolls to the card.
+  // Router state may carry a highlightKey (palette jump-to-setting).
   useEffect(() => {
-    if (loading || !data) return;
-    const id = window.location.hash.replace('#', '');
-    if (!id) return;
-    navigateToSection(id);
-    const t = setTimeout(() => {
-      // Instant snap ('auto', not 'smooth') — smooth-scrolling this long page
-      // is slow/choppy; same treatment as the ConfigNav click handler.
-      document.getElementById(id)?.scrollIntoView({ behavior: 'auto', block: 'start' });
-    }, 60);
-    return () => clearTimeout(t);
+    if (!flatSections.length) return;
+    const raw = location.hash.replace('#', '');
+    const state = (location.state ?? null) as { highlightKey?: string } | null;
+    let target = raw;
+    let subAnchor: string | null = null;
+    if (raw && !flatSections.some((s) => s.id === raw)) {
+      const hostLabel = SUB_ANCHOR_HOSTS[raw];
+      const host = hostLabel ? flatSections.find((s) => s.label === hostLabel) : undefined;
+      if (host) {
+        target = host.id;
+        subAnchor = raw;
+      } else {
+        target = '';
+      }
+    }
+    if (target) {
+      const label = flatSections.find((s) => s.id === target)?.label;
+      if (label) setCollapsed((c) => ({ ...c, [label]: false }));
+      setSelectedId(target);
+    }
+    if (state?.highlightKey) setHighlightKey(state.highlightKey);
+    if (subAnchor) {
+      const t = setTimeout(
+        () => document.getElementById(subAnchor)?.scrollIntoView?.({ behavior: 'auto', block: 'start' }),
+        60,
+      );
+      return () => clearTimeout(t);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, data, flatSections]);
+  }, [flatSections, location.hash, location.key]);
+
+  // Search corpus: every setting (label + key + help) in every section, every
+  // section name, and the Danger Zone settings. All already client-side — the
+  // page had 275 controls and no way to find one (dogfood 2026-08-01).
+  interface SearchHit {
+    kind: 'setting' | 'section';
+    settingKey?: string;
+    label: string;
+    haystack: string;
+    sectionId: string;
+    sectionLabel: string;
+    parent: string;
+  }
+  const searchIndex = useMemo<SearchHit[]>(() => {
+    const out: SearchHit[] = [];
+    for (const p of layout) {
+      for (const c of p.children) {
+        out.push({
+          kind: 'section',
+          label: c.label,
+          haystack: `${c.label} ${p.label}`.toLowerCase(),
+          sectionId: c.id,
+          sectionLabel: c.label,
+          parent: p.label,
+        });
+        if (c.kind === 'group') {
+          for (const it of c.group.items) {
+            out.push({
+              kind: 'setting',
+              settingKey: it.key,
+              label: it.label || it.key,
+              haystack: `${it.label} ${it.key} ${it.help}`.toLowerCase(),
+              sectionId: c.id,
+              sectionLabel: c.label,
+              parent: p.label,
+            });
+          }
+        }
+      }
+    }
+    for (const ds of dangerSettings) {
+      out.push({
+        kind: 'setting',
+        settingKey: ds.key,
+        label: ds.label,
+        haystack: `${ds.label} ${ds.key}`.toLowerCase(),
+        sectionId: 'danger-zone',
+        sectionLabel: 'Danger Zone',
+        parent: 'System',
+      });
+    }
+    return out;
+  }, [layout, dangerSettings]);
+
+  // Every whitespace-separated term must match; ranked label-match, then
+  // key/help match, sections after settings within a tier.
+  const searchHits = useMemo<SearchHit[]>(() => {
+    if (!searching) return [];
+    const terms = trimmedQuery.split(/\s+/);
+    const scored: { h: SearchHit; score: number }[] = [];
+    for (const h of searchIndex) {
+      if (!terms.every((t) => h.haystack.includes(t))) continue;
+      const labelHit = terms.every((t) => h.label.toLowerCase().includes(t));
+      scored.push({ h, score: (labelHit ? 0 : 2) + (h.kind === 'section' ? 1 : 0) });
+    }
+    return scored
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 50)
+      .map((s) => s.h);
+  }, [searchIndex, searching, trimmedQuery]);
 
   // Wrap a mutation so any error surfaces inline and the list refetches on success.
   // Takes a THUNK, not a live promise: in demo we must decide BEFORE the request
@@ -529,6 +537,22 @@ export function Config() {
     makeP().then(refetchIdents).catch((e: unknown) =>
       setIdentError(e instanceof Error ? e.message : 'Action failed'),
     );
+  };
+
+  // Bulk identifier mutation: fire every per-row call, report failures honestly,
+  // refetch ONCE at the end (not per row). Same demo gate as identMutation.
+  const identBulk = (makeAll: () => Promise<unknown>[]) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) {
+      setIdentError(blocked);
+      return;
+    }
+    setIdentError('');
+    void Promise.allSettled(makeAll()).then((results) => {
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed) setIdentError(`${failed} of ${results.length} bulk actions failed`);
+      refetchIdents();
+    });
   };
 
   const runScanNow = async () => {
@@ -609,6 +633,21 @@ export function Config() {
     setApplyResult(null);
     setRagCustomModel({}); // drop "Other…" modes so the selects re-show server values
     setFormNonce((n) => n + 1); // remount uncontrolled inputs so they reset
+  };
+
+  // Drop ONE staged edit (the apply-bar chip's ✕) — the rest stay staged.
+  const discardOne = (key: string) => {
+    setStaged((s) => {
+      const next = { ...s };
+      delete next[key];
+      return next;
+    });
+    setApplyErrors((e) => {
+      const next = { ...e };
+      delete next[key];
+      return next;
+    });
+    setFormNonce((n) => n + 1); // remount uncontrolled inputs so the field resets
   };
 
   // Persist every staged edit. Each failure is surfaced inline on its control and
@@ -944,6 +983,13 @@ export function Config() {
                 onSetActive={(id, active) => identMutation(() => setIdentifierActive(id, active))}
                 onRemove={(id) => identMutation(() => removeIdentifier(id))}
                 onDismiss={(id) => identMutation(() => dismissIdentifier(id))}
+                searchable
+                pageSize={25}
+                bulk={{
+                  onSetActiveMany: (ids, active) =>
+                    identBulk(() => ids.map((id) => setIdentifierActive(id, active))),
+                  onDismissMany: (ids) => identBulk(() => ids.map((id) => dismissIdentifier(id))),
+                }}
               />
             </div>
           );
@@ -1024,7 +1070,17 @@ export function Config() {
         {!collapsed[g.title] && (
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
           {g.items.map((s) => (
-            <div key={s.key} className="border-b border-border-faint px-[15px] py-[13px]">
+            <div
+              key={s.key}
+              data-setting-key={s.key}
+              data-highlighted={highlightKey === s.key ? 'true' : undefined}
+              className="border-b border-border-faint px-[15px] py-[13px] transition-shadow"
+              style={
+                highlightKey === s.key
+                  ? { boxShadow: 'inset 0 0 0 2px rgb(var(--accent) / 0.7)' }
+                  : undefined
+              }
+            >
               <div className="flex items-center gap-3.5">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
@@ -1500,6 +1556,13 @@ export function Config() {
   // Renderable node per standalone-panel id; PANELS placement decides where
   // each lands in the two-level layout.
   const panelNodes: Record<string, ReactNode> = {
+    about: (
+      <AboutPanel
+        collapsed={!!collapsed['About']}
+        onToggleCollapse={() => toggleSection('About')}
+        refreshKey={nonce}
+      />
+    ),
     'agent-tools': (
       <AgentToolsPanel
         collapsed={!!collapsed['Agent tools']}
@@ -1561,36 +1624,87 @@ export function Config() {
     'danger-zone': dangerZoneSection,
   };
 
-  return (
-    <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
-      <aside className="hidden w-[190px] flex-none lg:block">
-        <ConfigNav groups={layout} activeId={activeId} onNavigate={navigateToSection} />
-      </aside>
-      <div className="min-w-0 max-w-permalink flex-1">
-      <ConfigNavSelect groups={layout} activeId={activeId} onNavigate={navigateToSection} />
-      <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
-      <div className="mb-[18px] mt-0.5 text-[13px] text-dim">
-        Runtime settings · users · API tokens. Source badges show whether a value is set in the database or pinned by an
-        environment variable.
-      </div>
+  const searchInput = (className: string) => (
+    <input
+      value={query}
+      onChange={(e) => setQuery(e.target.value)}
+      placeholder="Search settings"
+      aria-label="Search settings"
+      className={`rounded-control border border-border-input bg-bg px-3 py-1.5 text-[12.5px] text-text outline-none placeholder:text-faint focus:border-accent ${className}`}
+    />
+  );
 
-      {/* Two-level body: parent header, then its sub-sections (server-driven
-          settings groups + standalone panels), in exactly the nav's order. */}
-      {layout.map((p) => (
-        <Fragment key={p.label}>
-          <div className="mb-[14px] mt-[36px] flex items-center gap-2.5">
+  // The section chosen by the master nav — the ONLY section in the DOM.
+  const selectedPane = (() => {
+    for (const p of layout) {
+      const c = p.children.find((child) => child.id === effectiveId);
+      if (!c) continue;
+      return (
+        <Fragment key={c.id}>
+          <div className="mb-[14px] flex items-center gap-2.5">
             <div className="text-[11.5px] font-bold uppercase tracking-[.09em] text-accent">
               {p.label}
             </div>
             <div className="h-px flex-1 bg-border" />
           </div>
-          {p.children.map((c) => (
-            <Fragment key={c.id}>
-              {c.kind === 'group' ? renderGroup(c.id, c.group) : (panelNodes[c.id] ?? null)}
-            </Fragment>
-          ))}
+          {c.kind === 'group' ? renderGroup(c.id, c.group) : (panelNodes[c.id] ?? null)}
         </Fragment>
-      ))}
+      );
+    }
+    return null;
+  })();
+
+  // Search results replace the pane while a query is live; a hit jumps to the
+  // owning section and flashes the exact row.
+  const resultsPane = (
+    <div className="overflow-hidden rounded-card border border-border bg-surface-1">
+      {searchHits.length === 0 ? (
+        <div className="px-4 py-6 text-[12.5px] text-faint">
+          No settings match “{query.trim()}”.
+        </div>
+      ) : (
+        searchHits.map((h) => (
+          <button
+            key={h.kind === 'setting' ? h.settingKey : `section-${h.sectionId}`}
+            type="button"
+            data-testid={`search-result-${h.kind === 'setting' ? h.settingKey : `section-${h.sectionId}`}`}
+            onClick={() => {
+              navigateToSection(h.sectionId);
+              if (h.kind === 'setting') setHighlightKey(h.settingKey ?? null);
+            }}
+            className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-[11px] text-left last:border-0 hover:bg-surface-2"
+          >
+            <div className="min-w-0 flex-1">
+              <span className="text-[13px] font-semibold text-text">{h.label}</span>
+              {h.kind === 'setting' && (
+                <span className="ml-2 font-mono text-[11px] text-faint">{h.settingKey}</span>
+              )}
+            </div>
+            <span className="flex-none text-[11.5px] text-faint">
+              {h.parent} / {h.sectionLabel}
+            </span>
+          </button>
+        ))
+      )}
+    </div>
+  );
+
+  return (
+    <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
+      <aside className="hidden w-[190px] flex-none lg:block">
+        {searchInput('mb-3 w-full')}
+        <ConfigNav groups={layout} activeId={effectiveId} onNavigate={navigateToSection} />
+      </aside>
+      <div className="min-w-0 max-w-permalink flex-1">
+      <ConfigNavSelect groups={layout} activeId={effectiveId} onNavigate={navigateToSection} />
+      <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
+      <div className="mb-[14px] mt-0.5 text-[13px] text-dim">
+        Runtime settings · users · API tokens. Source badges show whether a value is set in the database or pinned by an
+        environment variable.
+      </div>
+      {searchInput('mb-[14px] w-full lg:hidden')}
+
+      {searching ? resultsPane : selectedPane}
 
       {/* Sticky save/apply bar (FIX #8) — settings above stage locally; nothing
           persists until Apply. The bar is only shown when there are staged edits
@@ -1598,12 +1712,54 @@ export function Config() {
           ambiguity of the old per-field auto-save. */}
       {(isDirty || applyResult) && (
         <div className="sticky bottom-4 z-20 mt-4 flex items-center gap-3 rounded-card border border-border-strong bg-surface-2/95 px-4 py-3 shadow-lg backdrop-blur">
-          <div className="min-w-0 flex-1 text-[12.5px]">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 text-[12.5px]">
             {isDirty ? (
-              <span className="text-text">
-                <span className="font-semibold">{dirtyKeys.length}</span> unsaved change{dirtyKeys.length === 1 ? '' : 's'}
-                <span className="ml-1 text-dim">— not applied yet</span>
-              </span>
+              <>
+                {/* Every staged edit is NAMED: a chip per dirty setting. Click →
+                    jump to the owning section with the row flashed (an edit
+                    staged screens ago is findable, not a blind commit); ✕ →
+                    discard just that one. Tooltip carries old → new. */}
+                <span className="mr-1 text-text">
+                  <span className="font-semibold">{dirtyKeys.length}</span> unsaved
+                </span>
+                {dirtyKeys.map((key) => {
+                  const s = findSetting(key);
+                  const label = s?.label || key;
+                  return (
+                    <span
+                      key={key}
+                      data-testid={`chip-${key}`}
+                      role="button"
+                      tabIndex={0}
+                      title={`${String(s?.value ?? '')} → ${staged[key]}`}
+                      onClick={() => {
+                        navigateToSection(keyToSection[key] ?? effectiveId);
+                        setHighlightKey(key);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          navigateToSection(keyToSection[key] ?? effectiveId);
+                          setHighlightKey(key);
+                        }
+                      }}
+                      className="inline-flex cursor-pointer items-center gap-1.5 rounded-chip border border-border-strong bg-surface-3 px-2 py-0.5 text-[11.5px] font-medium text-text hover:border-accent"
+                    >
+                      {label}
+                      <button
+                        type="button"
+                        aria-label={`Discard ${label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          discardOne(key);
+                        }}
+                        className="text-faint hover:text-danger"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+              </>
             ) : applyResult ? (
               <span style={{ color: applyResult.ok ? '#12b76a' : '#f04438' }}>
                 {applyResult.ok ? '✓ ' : '✗ '}{applyResult.msg}

@@ -6,6 +6,46 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-08-01
+
+An About page and a ground-up restructure of the Config page. No schema changes.
+
+### Added
+
+- **An About section.** Config → System → About shows the running version, the
+  license, and links to the GitHub repo and releases; a quiet version line in
+  the sidebar footer deep-links to it, and the command palette gains an "About
+  soc-ai" entry. The running version was never visible in the UI before.
+- **An opt-in update check.** `GET /api/v1/about` serves the build metadata, and
+  `POST /api/v1/updates/check` (admin) compares the running version against the
+  latest GitHub release. Off by default and faithful to the zero-egress posture:
+  no outbound call of any kind until an admin enables `update_check_enabled`
+  (under Privacy & Egress), manual-only with no polling, the version compared
+  locally so nothing about the deployment is sent, and a clean inconclusive
+  result — never a crash, never a leaked host — when GitHub is unreachable or
+  returns something unparseable.
+- **Settings search.** A filter box over every setting's label, key, and help
+  text plus the section names and Danger Zone entries; a hit jumps to the owning
+  section with the exact row flashed. The command palette gets the same corpus:
+  typing a settings concept ("inherit", "egress") now lands on the setting
+  instead of "No matches".
+
+### Changed
+
+- **The Config page is master-detail.** It was one ~36-screen scroll of all 31
+  sections; the section nav now drives a pane that renders only the selected
+  section (~2 screens). Every existing deep link still works, the last-visited
+  section and collapse state persist per operator, and every section is
+  reachable from the nav at laptop viewport heights.
+- **The Apply bar names its changes.** Each staged edit is a chip (tooltip shows
+  old → new); clicking a chip returns to the owning section with the row
+  flashed, and each chip can be discarded individually — no more committing
+  "Apply changes (3)" blind.
+- **Internal identifiers are a real table.** The auto-detected identifier lists
+  gained a per-kind filter, first-25 paging with "Show all", and bulk
+  select-and-act (enable / disable / dismiss, confirm-gated) — replacing an
+  unpaginated wall of hundreds of rows.
+
 ## [1.2.5] - 2026-08-01
 
 A visual refresh of the alert workspace, a code-review remediation across the

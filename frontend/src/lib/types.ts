@@ -576,6 +576,24 @@ export interface ConnTestResult {
   detail: string;
 }
 
+// ---- About + update check --------------------------------------------------
+
+export interface AboutInfo {
+  version: string;
+  repo_url: string;
+  license: string;
+  update_check_enabled: boolean;
+}
+
+export interface UpdateCheckResult {
+  enabled: boolean;
+  ok: boolean;
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  detail: string;
+}
+
 // ---- Bulk re-hunt ----------------------------------------------------------
 
 export interface RehuntResult {

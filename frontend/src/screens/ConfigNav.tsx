@@ -1,14 +1,10 @@
 // ---------------------------------------------------------------------------
-// ConfigNav — sticky two-level in-page nav for the config page: bold top-level
-// section headers (Models & Reasoning, Triage & Workflow, …) with their
-// sub-sections indented beneath. Snaps instantly to each sub-section anchor
-// (honoring `scroll-mt-*` on the targets — smooth-scroll was slow/choppy on
-// this long page) and highlights the active sub-section + its parent. Styled
-// to match the app Sidebar nav items. Pure anchors: the click handler is
-// progressive enhancement — the `href="#id"` jump still works if JS is
-// unavailable. `onNavigate` fires BEFORE the scroll so the page can expand a
-// collapsed target and pin the active highlight to the clicked id (the
-// scroll-spy is suppressed briefly so it can't misattribute the jump).
+// ConfigNav — the MASTER of the config page's master-detail layout: bold
+// top-level section headers (Models & Reasoning, Triage & Workflow, …) with
+// their sub-sections indented beneath. Clicking selects a section (the page
+// renders only the selected one) and highlights it + its parent. Styled to
+// match the app Sidebar nav items. `href="#id"` keeps every entry a real,
+// copyable deep-link.
 // ---------------------------------------------------------------------------
 
 interface ConfigNavChild {
@@ -28,29 +24,11 @@ interface ConfigNavProps {
   onNavigate?: (id: string) => void;
 }
 
-/**
- * Expand a collapsed target (via onNavigate), then instant-snap to its anchor.
- * Instant snap ('auto', not 'smooth') — smooth-scrolling this long page is
- * slow/choppy; the freshly-shown body changes layout, so scroll next frame.
- * Shared by the sidebar nav (ConfigNav) and the sub-lg "Jump to section" select.
- */
 function goToSection(id: string, onNavigate?: (id: string) => void) {
+  // Master-detail: a nav click SELECTS the section (the page renders only that
+  // one), so there is nothing here to scroll to — Config's onNavigate owns
+  // selection, hash sync, and resetting the pane to its top.
   onNavigate?.(id);
-  requestAnimationFrame(() => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    // The sub-lg sticky "Jump to section" bar (ConfigNavSelect) sits at top-0 and
-    // overlaps a top-aligned heading, hiding it. Reserve its height as
-    // scroll-margin so the landed heading clears it. The bar is display:none at
-    // lg+, so its measured height is 0 on desktop — the anchors' own scroll-mt-6
-    // is left untouched there (container-agnostic: scrollIntoView honors
-    // scroll-margin whatever the scroll parent is, unlike a window-based offset).
-    const bar = document.getElementById('config-jump-bar');
-    const offset = bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
-    if (offset > 0) el.style.scrollMarginTop = `${offset}px`;
-    el.scrollIntoView({ behavior: 'auto', block: 'start' });
-  });
-  history.replaceState(null, '', `#${id}`);
 }
 
 export function ConfigNav({ groups, activeId, onNavigate }: ConfigNavProps) {

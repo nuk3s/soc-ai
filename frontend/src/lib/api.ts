@@ -8,6 +8,7 @@
 // ---------------------------------------------------------------------------
 
 import type {
+  AboutInfo,
   AdminUser,
   AlertEvent,
   AlertGroup,
@@ -30,6 +31,7 @@ import type {
   RepresentativeOut,
   StartBacktestOpts,
   TriageState,
+  UpdateCheckResult,
   Workspace,
 } from './types';
 
@@ -843,6 +845,18 @@ export interface Health {
 /** Live upstream status (ES / LLM / PCAP) for the header indicator. */
 export function getHealth(): Promise<Health> {
   return request<Health>('/health');
+}
+
+/** Build metadata (version, repo, license) for the About panel + sidebar. */
+export function getAbout(): Promise<AboutInfo> {
+  return request<AboutInfo>('/about');
+}
+
+/** Manually compare the running version to the latest GitHub release (admin,
+ * opt-in). Never rejects on an unreachable GitHub — the result carries the
+ * failure in `ok`/`detail`. */
+export function checkForUpdates(): Promise<UpdateCheckResult> {
+  return post<UpdateCheckResult>('/updates/check');
 }
 
 // ---- mutations ------------------------------------------------------------

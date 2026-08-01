@@ -58,36 +58,24 @@ describe('ConfigNavSelect (sub-lg jump nav)', () => {
     expect((screen.getByRole('combobox') as HTMLSelectElement).value).toBe('');
   });
 
-  // Regression: the sticky "Jump to section" bar (sticky top-0) used to overlap
-  // the landed heading, hiding it. goToSection must reserve the bar's height as
-  // scroll-margin on the target so it clears the bar.
-  it('offsets the scrolled-to heading by the sticky jump bar height so it is not hidden', () => {
-    // A landing target heading in the document (getElementById(id) resolves it).
+  // Master-detail: choosing a section SELECTS it (the page renders only that
+  // one) — goToSection no longer scrolls at all, so the old sticky-bar
+  // scroll-margin regression is structurally impossible. Pin that: no scroll
+  // side effects on the target, selection is the only outcome.
+  it('selects without scrolling — no scroll side effects on the target', () => {
     const target = document.createElement('div');
     target.id = 'users';
     target.scrollIntoView = vi.fn();
     document.body.appendChild(target);
 
-    // Run the rAF callback synchronously so the scroll runs within the test.
-    const raf = vi
-      .spyOn(window, 'requestAnimationFrame')
-      .mockImplementation((cb: FrameRequestCallback) => {
-        cb(0);
-        return 0;
-      });
-
-    render(<ConfigNavSelect groups={GROUPS} activeId="" />);
-    // The sticky bar reports a real height (jsdom returns 0 from layout by default).
-    const bar = document.getElementById('config-jump-bar');
-    expect(bar).not.toBeNull();
-    bar!.getBoundingClientRect = () => ({ height: 46 }) as DOMRect;
-
+    const onNavigate = vi.fn();
+    render(<ConfigNavSelect groups={GROUPS} activeId="" onNavigate={onNavigate} />);
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'users' } });
 
-    expect(target.style.scrollMarginTop).toBe('46px');
-    expect(target.scrollIntoView).toHaveBeenCalled();
+    expect(onNavigate).toHaveBeenCalledWith('users');
+    expect(target.scrollIntoView).not.toHaveBeenCalled();
+    expect(target.style.scrollMarginTop).toBe('');
 
-    raf.mockRestore();
     document.body.removeChild(target);
   });
 });

@@ -770,6 +770,15 @@ class Settings(BaseSettings):
     """Verify TLS for online-enrichment HTTP calls (these reach the public
     internet, so leave True; only a transparent-proxy setup would need False)."""
 
+    update_check_enabled: bool = False
+    """Opt-in switch for the About page's 'check for updates' button. OFF by
+    default to preserve the zero-egress posture. When on, an admin can manually
+    compare the running version against the latest GitHub release; the check is
+    manual only (no polling), reuses the online-enrichment timeout/TLS policy,
+    and sends nothing about the environment — the version is compared locally.
+    When off, the check makes no network call at all. Editable live in the
+    config console."""
+
     greynoise_api_key: SecretStr | None = None
     """GreyNoise API key (free Community tier available). Set in .env. Without it,
     t_greynoise reports 'not configured' and performs no network I/O."""

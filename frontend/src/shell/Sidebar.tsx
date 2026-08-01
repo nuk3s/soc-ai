@@ -1,8 +1,8 @@
-import { Bell, BookOpen, ChevronsLeft, ChevronsRight, Crosshair, History, LayoutDashboard, LogOut, Search, Settings, Triangle } from 'lucide-react';
+import { Bell, BookOpen, ChevronsLeft, ChevronsRight, Crosshair, History, Info, LayoutDashboard, LogOut, Search, Settings, Triangle } from 'lucide-react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
-import { getMe, setMyStatus, signOut } from '../lib/api';
-import type { Me } from '../lib/types';
+import { getAbout, getMe, setMyStatus, signOut } from '../lib/api';
+import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { useShell } from './ShellContext';
 
@@ -39,12 +39,14 @@ export function Sidebar() {
   const location = useLocation();
 
   const [me, setMe] = useState<Me>({ username: 'analyst', role: 'analyst', status: '' });
+  const [about, setAbout] = useState<AboutInfo | null>(null);
   const [editingStatus, setEditingStatus] = useState(false);
   const [statusDraft, setStatusDraft] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getMe().then(setMe).catch(() => {/* keep placeholder */});
+    getAbout().then(setAbout).catch(() => {/* version line just stays hidden */});
   }, []);
 
   function startEdit() {
@@ -140,6 +142,26 @@ export function Sidebar() {
         </span>
         {!collapsed && <span className="flex-1 whitespace-nowrap text-[12.5px] font-medium">Collapse</span>}
       </button>
+
+      {/* version line — quiet, always-visible, deep-links to the About panel */}
+      {about && (
+        <NavLink
+          to="/config#about"
+          title={`soc-ai v${about.version} — About`}
+          aria-label={`About soc-ai, version ${about.version}`}
+          className="mb-1.5 flex items-center gap-2.5 rounded-control px-[9px] py-[6px] text-faint hover:bg-surface-3 hover:text-text"
+          style={{ justifyContent: collapsed ? 'center' : 'flex-start' }}
+        >
+          <span className="flex w-[17px] flex-none justify-center">
+            <Info size={15} />
+          </span>
+          {!collapsed && (
+            <span className="flex-1 whitespace-nowrap text-[12px]">
+              soc-ai <span className="font-mono text-faint">v{about.version}</span>
+            </span>
+          )}
+        </NavLink>
+      )}
 
       {/* user row */}
       <div

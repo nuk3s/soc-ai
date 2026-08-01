@@ -562,6 +562,21 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key="update_check_enabled",
+        attr="update_check_enabled",
+        type="bool",
+        label="Check GitHub for updates",
+        section="Updates",
+        hot=True,
+        help=(
+            "Off by default — soc-ai makes no outbound call to check for updates. "
+            "When on, the About page's 'Check for updates' button compares the "
+            "running version against the latest GitHub release. Manual only (no "
+            "polling); nothing about your environment or alerts is sent, and the "
+            "version is compared locally."
+        ),
+    ),
+    SettingSpec(
         key="misp_url",
         attr="misp_url",
         type="str",
@@ -1192,6 +1207,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "Memory",
     # Privacy & Egress
     "Discovery",
+    "Updates",
     # Data & Enrichment
     "Queries",
     "PCAP",
@@ -1217,6 +1233,7 @@ SECTION_PARENTS: dict[str, str] = {
     "Retrieval (RAG)": "Retrieval & Memory",
     "Memory": "Retrieval & Memory",
     "Discovery": "Privacy & Egress",
+    "Updates": "Privacy & Egress",
     "Queries": "Data & Enrichment",
     "PCAP": "Data & Enrichment",
     "Web research": "Data & Enrichment",

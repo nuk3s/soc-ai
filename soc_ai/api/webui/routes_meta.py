@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from soc_ai import __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.webui._shared import (
@@ -24,6 +25,9 @@ from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import (
     probes,
+)
+from soc_ai.webui import (
+    updates as updates_svc,
 )
 from soc_ai.webui.deps import current_user
 
@@ -362,3 +366,50 @@ async def health(
     if settings.pcap_enabled:
         out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))
     return out
+
+
+class AboutOut(BaseModel):
+    version: str
+    repo_url: str
+    license: str
+    update_check_enabled: bool
+
+
+class UpdateCheckOut(BaseModel):
+    enabled: bool
+    ok: bool = False
+    current_version: str
+    latest_version: str | None = None
+    update_available: bool = False
+    detail: str
+
+
+@router.get("/about", response_model=AboutOut)
+async def about(settings: Settings = Depends(get_settings_dep)) -> AboutOut:
+    """Static build metadata for the About panel and the sidebar version line.
+
+    Readable by any authenticated user; reaches no upstream and carries no
+    secret. Whether the update check is available is reported so the UI can show
+    the button only when an admin has opted in.
+    """
+    return AboutOut(
+        version=__version__,
+        repo_url=updates_svc.REPO_URL,
+        license=updates_svc.LICENSE,
+        update_check_enabled=settings.update_check_enabled,
+    )
+
+
+@router.post(
+    "/updates/check",
+    response_model=UpdateCheckOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def check_updates(settings: Settings = Depends(get_settings_dep)) -> UpdateCheckOut:
+    """Manually compare the running version against the latest GitHub release.
+
+    Admin-only and opt-in: off by default (no network I/O), never raises, and
+    sends nothing about the deployment. See :func:`soc_ai.webui.updates.check_for_update`.
+    """
+    result = await updates_svc.check_for_update(settings)
+    return UpdateCheckOut(**result)
