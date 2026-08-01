@@ -78,14 +78,25 @@ def test_walkthrough_smoke(page: Page, demo_stack: dict) -> None:
     page.goto(f"{base}/app/hunts/{manifest['hunt_error']}", wait_until="networkidle")
     expect(page.get_by_role("button", name="Re-hunt").first).to_be_visible(timeout=_WAIT_MS)
 
-    # ---- config: analyst-model control + at least one section chevron -------
+    # ---- config (master-detail): the default pane, nav switching, search ----
     page.goto(f"{base}/app/config", wait_until="networkidle")
-    # The analyst-model row is the only one carrying a "Check fitness" button.
+    # Default pane is the first section (Agent) — its analyst-model row is the
+    # only one carrying a "Check fitness" button.
     expect(page.get_by_role("button", name="Check fitness").first).to_be_visible(timeout=_WAIT_MS)
-    # Collapsible sections render a chevron toggle labelled "Expand/Collapse section".
+    # The master nav switches the pane: click a standalone section and assert
+    # its collapsible chevron ("Expand/Collapse section" aria-label) — the same
+    # chevron regression the old single-scroll assertion pinned, now behind a
+    # real nav switch.
+    page.locator("aside").get_by_text("Diagnostics", exact=True).first.click()
     chevrons = page.locator('button[aria-label$="section"]')
     expect(chevrons.first).to_be_visible(timeout=_WAIT_MS)
-    assert chevrons.count() >= 1, "expected at least one collapsible config section chevron"
+    # Settings search spans sections: a concept query surfaces a hit, and
+    # clicking it lands on the owning section with the exact row flashed.
+    page.get_by_placeholder("Search settings").first.fill("inherit")
+    hit = page.locator('[data-testid^="search-result-"]').first
+    expect(hit).to_be_visible(timeout=_WAIT_MS)
+    hit.click()
+    expect(page.locator('[data-highlighted="true"]').first).to_be_visible(timeout=_WAIT_MS)
 
     # ---- final: ZERO console errors across the whole run --------------------
     assert not console_errors, "console errors during smoke:\n" + "\n".join(console_errors)
