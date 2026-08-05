@@ -20,6 +20,7 @@ orchestrator, which created an oracle↔agent import cycle.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -30,6 +31,90 @@ WriteToolName = Literal["ack_alert", "escalate_to_case", "add_case_comment"]
 # The model must never emit it directly (the field description says so); it is
 # in the Literal so voted reports validate/persist/read back like any verdict.
 Verdict = Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
+
+
+# Null sentinels a serving model writes into an Optional container field instead
+# of emitting JSON `null`. Matched case-insensitively after stripping. Kept
+# DELIBERATELY SHORT: only tokens that unambiguously mean "nothing here". A real
+# sentence must still fail validation, or a genuine model error would be silently
+# swallowed as None (see test_meaningful_strings_are_not_swallowed).
+_NULL_SENTINELS = frozenset({"", "none", "null", "nil", "n/a", "na", "nothing", "undefined"})
+
+
+def _normalize_verdict(v: Any) -> Any:
+    """Fold formatting variants of the canonical verdicts to canonical form.
+
+    Serving models pick the right verdict and fumble the FORMAT — "False
+    Positive", "false-positive", " true_positive ". Rejecting those burns a
+    schema retry the model may not recover from (it chose correctly; the error
+    message tells it nothing new). Only case / whitespace / hyphen variants of
+    the four canonical values fold; anything else — including synonyms like
+    "benign" or "malicious" — passes through UNCHANGED to fail the ``Verdict``
+    Literal, because mapping meaning (rather than formatting) would put a
+    verdict in the model's mouth.
+    """
+    if isinstance(v, str):
+        folded = re.sub(r"[\s\-]+", "_", v.strip().lower())
+        if folded in ("true_positive", "false_positive", "needs_more_info", "inconclusive"):
+            return folded
+    return v
+
+
+def _decode_string_list(v: Any) -> Any:
+    """Rescue ``list[str]`` fields from the shapes weak models actually emit.
+
+    - null sentinel string ("None", "null", "") → ``[]``
+    - stringified JSON array → the decoded list (pre-existing behavior)
+    - any other bare string → wrapped as a one-element list. For citations this
+      is trust-free lenience: every entry is validated by the downstream
+      citation resolver anyway, so a wrapped bad string fails THERE with a
+      per-citation reason instead of failing schema validation wholesale.
+    """
+    if isinstance(v, str):
+        decoded = _decode_stringified_json(v)
+        if decoded is None:
+            return []
+        if isinstance(decoded, list):
+            return decoded
+        if isinstance(decoded, str):
+            return [decoded]
+        return v  # a dict for a list[str] field: fall through to the normal error
+    return v
+
+
+def _decode_object_list(v: Any) -> Any:
+    """Rescue ``list[Model]`` fields: bare object → one-element list.
+
+    A model recommending ONE action often emits the object without the array
+    wrapper (both bare and stringified). Sentinels mean "no actions" → ``[]``.
+    Prose stays a string and fails validation normally — item-level contracts
+    (e.g. the WriteToolName Literal) are untouched, so this widens accepted
+    PACKAGING only, never accepted content.
+    """
+    if isinstance(v, dict):
+        return [v]
+    if isinstance(v, str):
+        decoded = _decode_stringified_json(v)
+        if decoded is None:
+            return []
+        if isinstance(decoded, list):
+            return decoded
+        if isinstance(decoded, dict):
+            return [decoded]
+        return v
+    return v
+
+
+def _null_sentinel_to_none(v: Any) -> Any:
+    """Map a null-sentinel STRING to None; pass everything else through.
+
+    The conservative half of :func:`_decode_stringified_json` — used on fields
+    where accepting a model-supplied container would be unsafe, so only the
+    "the model meant null" case is rescued.
+    """
+    if isinstance(v, str) and v.strip().lower() in _NULL_SENTINELS:
+        return None
+    return v
 
 
 def _decode_stringified_json(v: Any) -> Any:
@@ -43,14 +128,28 @@ def _decode_stringified_json(v: Any) -> Any:
     identically, so retry feedback does not recover it). The payload inside the
     string is well-formed; auto-parsing it is strictly more accepting. Strings
     that don't parse to a container fall through to Pydantic's normal error.
+
+    Lower-tier models (the Qwen / Laguna fallback tier) add a second shape: the
+    STRING ``"None"`` (or ``"null"``, ``"N/A"``) where the schema wants
+    ``null``. Observed live from qwen3.6-35b-instruct on ``TriageReport.
+    resolution``, 2026-08-03. That never parsed here — ``json.loads("None")``
+    raises, and even valid ``"null"`` decodes to ``None``, which failed the
+    container check and fell through as the original *string*. Both now map to
+    None so the field's own ``| None`` accepts it instead of burning a schema
+    retry that the model has no idea how to satisfy.
     """
     if isinstance(v, str):
+        if v.strip().lower() in _NULL_SENTINELS:
+            return None
         try:
             parsed = json.loads(v)
         except (json.JSONDecodeError, TypeError, ValueError):
             return v
         if isinstance(parsed, (dict, list)):
             return parsed
+        # `json.loads("null")` -> None: a real JSON null arriving as a string.
+        if parsed is None:
+            return None
     return v
 
 
@@ -318,9 +417,32 @@ class TriageReport(BaseModel):
         ),
     )
 
-    _decode_containers = field_validator(
-        "gap_for_investigator", "recommended_actions", "citations", mode="before"
-    )(_decode_stringified_json)
+    _decode_gap = field_validator("gap_for_investigator", mode="before")(_decode_stringified_json)
+    # List fields get list-aware rescue: sentinel → [], bare item → [item].
+    _decode_citations = field_validator("citations", mode="before")(_decode_string_list)
+    _decode_actions = field_validator("recommended_actions", mode="before")(_decode_object_list)
+    # Formatting-only fold of the canonical verdicts (never synonym mapping).
+    _normalize_verdict_fmt = field_validator("verdict", mode="before")(_normalize_verdict)
+
+    # ``resolution`` gets the null-sentinel rescue ONLY — deliberately NOT the
+    # full stringified-JSON decode the fields above receive.
+    #
+    # The bug this fixes is narrow and observed: a model emitted the STRING
+    # "None" for this nullable dict, which failed ``dict_type`` and burned the
+    # run's whole schema-retry budget (2026-08-03, deepseek-v4-flash serving the
+    # qwen3.6-35b-instruct route).
+    #
+    # Decoding stringified JSON here would be strictly WORSE, because this field
+    # is privileged: ``resolution['provenance'] == 'pipeline_fallback'`` is the
+    # marker that tells the rest of the system "the pipeline failed, this is not
+    # a model opinion". It suppresses Oracle escalation
+    # (``orchestrator._should_escalate_to_oracle``), excludes the run from the
+    # Needs-info KPI, and renders the row as an infrastructure error. Only the
+    # orchestrator's own ``_synth_failure_fallback_report`` may set it. Nothing
+    # downstream strips a model-supplied value, so widening what the MODEL can
+    # get accepted into this field widens a spoofing surface for zero observed
+    # benefit — no model has been seen emitting a stringified resolution object.
+    _decode_resolution = field_validator("resolution", mode="before")(_null_sentinel_to_none)
 
 
 # Sentinel written into ``TriageReport.resolution['provenance']`` (and, downstream,

@@ -17,7 +17,8 @@ import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { AboutPanel } from './AboutPanel';
 import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
-import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import type { BatteryRecommendation, ModelBatteryStatus } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
@@ -143,6 +144,11 @@ function ModelFitnessChip({
           {fitness.detail}
         </span>
       )}
+      {!loading && fitness?.cached && fitness.checked_at && (
+        <span className="text-[11px] text-faint" title="Served from the daily cache — Check fitness re-measures">
+          {_batteryAge(fitness.checked_at)}
+        </span>
+      )}
       <button
         type="button"
         className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
@@ -151,6 +157,128 @@ function ModelFitnessChip({
       >
         Check fitness
       </button>
+    </div>
+  );
+}
+
+/** Age string for a stored battery result ("2h ago"); empty when unknown. */
+function _batteryAge(iso: string | null): string {
+  if (!iso) return '';
+  const ms = Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const h = ms / 3_600_000;
+  if (h < 1) return `${Math.max(1, Math.round(ms / 60_000))}m ago`;
+  if (h < 48) return `${Math.round(h)}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/** The on-demand second tier of the fitness feature: probe the model under
+ * every structured-output configuration, show per-config results, and offer
+ * the deterministic recommendation as a one-click stage (never auto-apply). */
+function ModelBatteryPanel({
+  battery,
+  running,
+  demo,
+  onRun,
+  onRunAll,
+  onApply,
+  recApplied,
+}: {
+  battery: ModelBatteryStatus | null;
+  running: boolean;
+  demo: boolean;
+  onRun: () => void;
+  onRunAll: () => void;
+  onApply: (rec: BatteryRecommendation) => void;
+  /** true = the live knob values already match the recommendation. */
+  recApplied: boolean;
+}) {
+  const result = battery?.result ?? null;
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <div className="flex items-center gap-2">
+        {running && (
+          <span className="text-[11px] text-faint">
+            Battery: {battery?.current_config ?? '…'} ({(battery?.completed ?? 0) + 1}/
+            {battery?.total ?? 4})…
+          </span>
+        )}
+        {!running && result && battery?.stored_at && (
+          <span className="text-[11px] text-faint">{_batteryAge(battery.stored_at)}</span>
+        )}
+        <button
+          type="button"
+          className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
+          onClick={onRun}
+          disabled={running || demo}
+          title={
+            demo
+              ? 'Unavailable in the demo (no model egress)'
+              : 'Probe this model under every structured-output configuration (tool / native / prompted / tool+required). Minutes on a slow backend.'
+          }
+        >
+          Run full battery
+        </button>
+        <button
+          type="button"
+          className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
+          onClick={onRunAll}
+          disabled={running || demo}
+          title={
+            demo
+              ? 'Unavailable in the demo (no model egress)'
+              : 'Re-measure fitness AND run the full battery in one go'
+          }
+        >
+          Run all checks
+        </button>
+      </div>
+      {!running && result && (
+        <table className="text-[11px] text-dim">
+          <tbody>
+            {result.configs.map((c) => {
+              const label = c.tool_choice_required ? `${c.output_mode}+required` : c.output_mode;
+              return (
+                <tr key={label}>
+                  <td className="pr-3 font-mono">{label}</td>
+                  <td className="pr-3 text-right">
+                    {c.ok}/{c.n}
+                  </td>
+                  <td className="text-right">{c.elapsed_s.toFixed(1)}s</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {!running && result?.recommendation && recApplied && (
+        <span
+          className="text-[11px] text-success"
+          title={result.recommendation.reason}
+        >
+          ✓ Already on the recommended settings ({result.recommendation.config})
+        </span>
+      )}
+      {!running && result?.recommendation && !recApplied && (
+        <div className="flex items-center gap-2 rounded border border-border bg-surface-2 px-2 py-1">
+          <span className="max-w-[260px] text-[11px] text-text" title={result.recommendation.reason}>
+            {result.recommendation.reason}
+          </span>
+          <button
+            type="button"
+            className="rounded border border-accent px-2 py-0.5 text-[11px] font-semibold text-accent hover:bg-accent/10 transition-colors"
+            onClick={() => onApply(result.recommendation!)}
+            title="Stage these knob values into the pending config edits (Apply below saves them)"
+          >
+            Apply
+          </button>
+        </div>
+      )}
+      {!running && battery?.error && (
+        <span className="max-w-[280px] truncate text-[11px] text-danger" title={battery.error}>
+          battery failed: {battery.error}
+        </span>
+      )}
     </div>
   );
 }
@@ -246,14 +374,87 @@ export function Config() {
     data?.groups.flatMap((g) => g.items).find((i) => i.key === 'analyst_model')?.value ??
     '';
 
-  const runFitness = () => {
+  const runFitness = (force = false) => {
     setFitnessLoading(true);
-    getModelFitness()
+    getModelFitness(force)
       .then((r) => setFitness(r))
       // Fail-soft: a probe/gateway/permission error must not surface as an error
       // chip — clear the stale grade and stay neutral.
       .catch(() => setFitness(null))
       .finally(() => setFitnessLoading(false));
+  };
+
+  // ── Fitness battery (design spec 2026-08-05) ────────────────────────────
+  const [battery, setBattery] = useState<ModelBatteryStatus | null>(null);
+  const batteryModel = String(currentAnalystModel);
+
+  // Load the stored result for the selected model; keep polling while running.
+  useEffect(() => {
+    if (!batteryModel) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = () => {
+      getModelBattery(batteryModel)
+        .then((r) => {
+          if (cancelled) return;
+          setBattery(r);
+          if (r.running) timer = setTimeout(poll, 2000);
+        })
+        .catch(() => {
+          if (!cancelled) setBattery(null);
+        });
+    };
+    setBattery(null); // model changed — a stale battery result would mislead
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [batteryModel]);
+
+  const runBattery = () => {
+    startModelBattery(batteryModel)
+      .then(() => getModelBattery(batteryModel))
+      .then((r) => setBattery(r))
+      // 409 (already running) also lands here: the poll below re-syncs.
+      .catch(() => getModelBattery(batteryModel).then(setBattery).catch(() => undefined))
+      .finally(() => {
+        // Kick the polling effect even if the effect's timer already fired.
+        setBattery((b) => (b ? { ...b, running: true } : b));
+      });
+  };
+
+  // Does the CURRENT state (staged edit wins over server value) already match
+  // the battery's recommendation? Then the banner reads "already on the
+  // recommended settings" instead of nagging Apply (dogfood 2026-08-05).
+  const currentKnob = (key: string) => {
+    const server = data?.groups.flatMap((g) => g.items).find((i) => i.key === key)?.value;
+    return staged[key] ?? String(server ?? '');
+  };
+  const rec = battery?.result?.recommendation ?? null;
+  const recApplied =
+    !!rec &&
+    currentKnob('synthesizer_output_mode') === rec.synthesizer_output_mode &&
+    currentKnob('analyst_tool_choice_required') === String(rec.analyst_tool_choice_required);
+
+  // One click, both measurements: force a fresh fitness check and start the
+  // battery together (dogfood 2026-08-05).
+  const runAllChecks = () => {
+    runFitness(true);
+    runBattery();
+  };
+
+  // Stage (never save) the recommendation's two knob values — they ride the
+  // normal Apply/Discard flow, audit trail included.
+  const applyBatteryRec = (rec: BatteryRecommendation) => {
+    const serverOf = (key: string) =>
+      String(data?.groups.flatMap((g) => g.items).find((i) => i.key === key)?.value ?? '');
+    stage('synthesizer_output_mode', rec.synthesizer_output_mode, serverOf('synthesizer_output_mode'));
+    stage(
+      'analyst_tool_choice_required',
+      String(rec.analyst_tool_choice_required),
+      serverOf('analyst_tool_choice_required'),
+    );
   };
 
   // Auto-run (debounced) whenever the selected analyst model changes. The grade
@@ -773,7 +974,16 @@ export function Config() {
           <ModelFitnessChip
             fitness={fitness}
             loading={fitnessLoading}
-            onCheck={runFitness}
+            onCheck={() => runFitness(true)}
+          />
+          <ModelBatteryPanel
+            battery={battery}
+            running={!!battery?.running}
+            demo={demo}
+            onRun={runBattery}
+            onRunAll={runAllChecks}
+            onApply={applyBatteryRec}
+            recApplied={recApplied}
           />
         </div>
       );
@@ -832,7 +1042,16 @@ export function Config() {
           <ModelFitnessChip
             fitness={fitness}
             loading={fitnessLoading}
-            onCheck={runFitness}
+            onCheck={() => runFitness(true)}
+          />
+          <ModelBatteryPanel
+            battery={battery}
+            running={!!battery?.running}
+            demo={demo}
+            onRun={runBattery}
+            onRunAll={runAllChecks}
+            onApply={applyBatteryRec}
+            recApplied={recApplied}
           />
         </div>
       );
@@ -1081,7 +1300,10 @@ export function Config() {
                   : undefined
               }
             >
-              <div className="flex items-center gap-3.5">
+              {/* items-start (not center): tall controls like the analyst-model
+                  cell (select + fitness + battery) otherwise float the title to
+                  the middle of the cell (dogfood 2026-08-05). */}
+              <div className="flex items-start gap-3.5">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>

@@ -86,9 +86,35 @@ async def recorded_run(
         "investigation_run_timeout_s",
         _DEFAULT_INVESTIGATION_RUN_TIMEOUT_S,
     )
+    # Highest sequence seen, so a terminal error event appends after the run's
+    # own events instead of colliding with sequence 0 in the timeline.
+    last_seq = 0
+
+    async def _record_terminal_error(payload: dict[str, Any]) -> None:
+        """Persist a terminal-failure event so the row is never silently 'error'.
+
+        ``recorder.record`` is otherwise only reached from inside the streaming
+        loop, so a run that dies at a TIMEOUT, a CANCEL or an escaped exception
+        finalized as ``status='error'`` with NO error event at all — nothing for
+        the pipeline-error drilldown to show and no hint about the cause. In the
+        14 days to 2026-08-03 that produced 49 of 64 error rows, every one of them
+        undiagnosable; 41 landed on a single day when the model backend was down.
+
+        Fail-soft: a persistence problem here must not mask the original failure,
+        and this runs on the cancellation unwind where the DB write may itself be
+        cancelled.
+        """
+        nonlocal last_seq
+        try:
+            last_seq += 1
+            await recorder.record("error", last_seq, payload)
+        except Exception:
+            _LOGGER.exception("failed to record terminal error event")
+
     try:
         async with asyncio.timeout(run_timeout):
             async for ev in event_stream:
+                last_seq = max(last_seq, ev.sequence)
                 await recorder.record(ev.kind, ev.sequence, ev.payload)
                 # Frame contract (kind, {session_id, sequence, payload}) is
                 # mirrored by soc_ai/demo/replay.py — change both together
@@ -121,14 +147,20 @@ async def recorded_run(
             inv_id,
             alert_id,
         )
+        timeout_payload = {
+            "message": f"investigation exceeded {run_timeout}s wall-clock limit",
+            "type": "TimeoutError",
+            "phase": "whole_run_backstop",
+            "hint": (
+                "the run was still streaming when the whole-run wall clock "
+                "expired — usually a hung or very slow model backend. Check the "
+                "LLM gateway and its serving engine before raising "
+                "investigation_run_timeout_s."
+            ),
+        }
+        await _record_terminal_error(timeout_payload)
         await recorder.finish("error")
-        yield (
-            "error",
-            {
-                "message": f"investigation exceeded {run_timeout}s wall-clock limit",
-                "type": "TimeoutError",
-            },
-        )
+        yield ("error", timeout_payload)
     except asyncio.CancelledError:
         # Land a clean terminal state, then let the cancellation propagate so the
         # task actually stops. Only an EXPLICIT operator cancel is 'cancelled';
@@ -141,14 +173,42 @@ async def recorded_run(
         # itself cancelled mid-commit and the row is orphaned in ``running`` until
         # the reaper. asyncio.shield runs the finalize where the cancellation can't
         # reach it (same fix as soc_ai/demo/replay.py's replay_recorded_run).
-        await asyncio.shield(
-            recorder.finish(
-                "cancelled" if (cancel_token is not None and cancel_token.requested) else "error"
+        operator_cancel = cancel_token is not None and cancel_token.requested
+        if not operator_cancel:
+            # NOT an operator cancel, so this lands as 'error' — record why, or the
+            # row is another silent failure. This is the branch the auto-triage
+            # per-target cap trips (it cancels the consumer, which closes this
+            # generator), so it is exactly where the prod silent rows came from.
+            # Shielded like the finalize below: the cancellation is re-delivered on
+            # every await during the unwind.
+            await asyncio.shield(
+                _record_terminal_error(
+                    {
+                        "message": (
+                            "investigation cancelled before reaching a verdict "
+                            "(client disconnect, shutdown, or an outer wall-clock cap)"
+                        ),
+                        "type": "CancelledError",
+                        "phase": "run_cancelled",
+                        "hint": (
+                            "if this was an auto-triage sweep, the per-target cap "
+                            "fired; it is floored above investigation_run_timeout_s "
+                            "so the whole-run backstop reports the real cause first."
+                        ),
+                    }
+                )
             )
-        )
+        await asyncio.shield(recorder.finish("cancelled" if operator_cancel else "error"))
         raise
     except Exception as exc:
         _LOGGER.exception("investigation stream crashed")
+        await _record_terminal_error(
+            {
+                "message": str(exc),
+                "type": type(exc).__name__,
+                "phase": "stream_crashed",
+            }
+        )
         await recorder.finish("error")
         yield "error", {"message": str(exc), "type": type(exc).__name__}
     finally:

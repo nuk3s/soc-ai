@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
@@ -28,7 +31,14 @@ _LOGGER = logging.getLogger(__name__)
 
 # ── Config (admin) ─────────────────────────────────────────────────────────
 
-_SETTING_TYPE = {"bool": "toggle", "int": "number", "float": "number", "str": "text", "csv": "text"}
+_SETTING_TYPE = {
+    "bool": "toggle",
+    "int": "number",
+    "float": "number",
+    "str": "text",
+    "csv": "text",
+    "select": "select",
+}
 
 
 class SettingOut(BaseModel):
@@ -154,6 +164,10 @@ async def get_config(
                 source="db" if spec.key in overrides else "env",
                 apply="hot-apply" if spec.hot else "restart",
                 type=_SETTING_TYPE.get(spec.type, "text"),
+                # Fixed-choice settings: the frontend's select branch keys on
+                # type=='select' + options (that branch predates any server
+                # emitting it — notify_format was special-cased by key instead).
+                options=list(spec.options) if spec.options else None,
                 # For a hot=False setting the DB override is not applied to the
                 # live Settings until restart, so the live attribute still holds
                 # the OLD value. Render the staged override instead so the field
@@ -230,6 +244,16 @@ class ModelFitnessOut(BaseModel):
     model: str
     legs: list[ModelFitnessLegOut] = []
     detail: str
+    # Cache metadata (migration 0023): the Config page auto-runs this check on
+    # every load, and a fitness verdict only changes when the backend behind the
+    # route does — so within the TTL the route answers from the stored result.
+    cached: bool = False
+    checked_at: str | None = None
+
+
+# One day: the operator's "maybe once a day" (dogfood 2026-08-05). The manual
+# "Check fitness" button always bypasses via ?force=true.
+_FITNESS_CACHE_TTL_S = 24 * 3600
 
 
 @router.get(
@@ -239,6 +263,7 @@ class ModelFitnessOut(BaseModel):
 )
 async def api_model_fitness(
     request: Request,
+    force: bool = False,
     settings: Settings = Depends(get_settings_dep),
 ) -> ModelFitnessOut:
     """Grade whether ``analyst_model`` can actually do the pipeline's job.
@@ -256,7 +281,32 @@ async def api_model_fitness(
     audit index must never turn a read-only diagnostic into a 500 — so it is
     wrapped and logged, never raised.
     """
+    from soc_ai.store import model_battery as mb_svc  # noqa: PLC0415
+
+    model_id = str(settings.analyst_model or "")
+    if not force:
+        # Serve the cached verdict inside the TTL — page loads must not cost a
+        # gateway probe (dogfood 2026-08-05: "Checking fitness…" every visit).
+        async with request.app.state.db_sessionmaker() as db:
+            cached = await mb_svc.get_fitness(db, model=model_id)
+        if cached is not None:
+            try:
+                checked = datetime.fromisoformat(cached["checked_at"])
+                age_s = (datetime.now(UTC).replace(tzinfo=None) - checked).total_seconds()
+            except ValueError:
+                age_s = _FITNESS_CACHE_TTL_S + 1
+            if age_s < _FITNESS_CACHE_TTL_S:
+                return ModelFitnessOut(
+                    **cached["result"], cached=True, checked_at=cached["checked_at"]
+                )
+
     result = await probes.probe_model_fitness(settings)
+    checked_at_now = datetime.now(UTC).replace(tzinfo=None).isoformat()
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            await mb_svc.upsert_fitness(db, model=model_id, result=result)
+    except Exception:  # cache write is best-effort — never fail the diagnostic
+        _LOGGER.warning("model_fitness cache write failed (continuing)", exc_info=True)
 
     # Best-effort audit. request.app.state.audit is the shared AuditLogger; its
     # own log() swallows ES write errors for non-mutating events, but we still
@@ -299,6 +349,8 @@ async def api_model_fitness(
         model=result["model"],
         legs=[ModelFitnessLegOut(**leg) for leg in result.get("legs", [])],
         detail=result["detail"],
+        cached=False,
+        checked_at=checked_at_now,
     )
 
 
@@ -1187,3 +1239,162 @@ async def api_danger_test_connection(
         result = await probes.probe_llm(settings)
 
     return ConnTestOut(ok=result["ok"], detail=result["detail"])
+
+
+# ── Model fitness battery (design spec 2026-08-05) ───────────────────────────
+#
+# The on-demand second tier of the fitness feature: probe the analyst model
+# under every structured-output configuration and recommend the winner. Slow
+# (minutes on a CPU tier), so it runs as a background task with a polling GET —
+# the auto-triage status pattern — never as a long HTTP request.
+
+
+@dataclass
+class _BatteryStatus:
+    """Single-flight battery state on ``app.state`` (mirrors AutoTriageStatus)."""
+
+    running: bool = False
+    model: str = ""
+    current_config: str | None = None
+    completed: int = 0
+    total: int = 4
+    error: str | None = None
+    _task: Any = None
+
+
+def _battery_status(state: Any) -> _BatteryStatus:
+    status = getattr(state, "model_battery_status", None)
+    if status is None:
+        status = _BatteryStatus()
+        state.model_battery_status = status
+    return status
+
+
+class BatteryStartIn(BaseModel):
+    # The LiteLLM route to probe; empty/absent = the configured analyst model.
+    # Probing the STAGED dropdown selection before save is the point.
+    model: str = ""
+
+
+async def _run_battery_task(
+    state: Any, settings: Settings, model: str, status: _BatteryStatus
+) -> None:
+    """Background battery run: probe → persist → audit. Never raises."""
+    from soc_ai import model_probe  # noqa: PLC0415 - patch point for tests
+    from soc_ai.store import model_battery as mb_svc  # noqa: PLC0415
+
+    def _progress(label: str, i: int, total: int) -> None:
+        status.current_config = label
+        status.completed = i - 1
+        status.total = total
+
+    try:
+        result = await model_probe.run_battery(settings, model=model or None, on_progress=_progress)
+        async with state.db_sessionmaker() as db:
+            await mb_svc.upsert(db, model=result["model"], result=result)
+        status.completed = status.total
+        # Audit the measurement like model_fitness does — best-effort: a failed
+        # audit index must never fail the battery that already completed.
+        try:
+            audit = getattr(state, "audit", None)
+            if audit is not None:
+                rec = result.get("recommendation")
+                await audit.log_kind(
+                    session_id=f"model-battery:{result['model']}",
+                    kind="model_battery",
+                    payload={
+                        "model": result["model"],
+                        "recommendation": rec,
+                        "configs": [
+                            {
+                                "output_mode": c.get("output_mode"),
+                                "tool_choice_required": c.get("tool_choice_required"),
+                                "ok": c.get("ok"),
+                                "n": c.get("n"),
+                                "elapsed_s": c.get("elapsed_s"),
+                            }
+                            for c in result.get("configs", [])
+                        ],
+                    },
+                )
+        except Exception:
+            _LOGGER.exception("model-battery audit write failed (result persisted)")
+    except Exception as exc:
+        _LOGGER.exception("model battery failed for model=%s", model)
+        status.error = " ".join(str(exc).split())[:300]
+    finally:
+        status.running = False
+        status.current_config = None
+
+
+@router.post(
+    "/config/model-battery",
+    status_code=202,
+    dependencies=[Depends(require_admin_api)],
+)
+async def api_start_model_battery(
+    body: BatteryStartIn,
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, Any]:
+    """Start a fitness battery in the background (409 if one is running).
+
+    Single-flight across models on purpose: probes run sequentially so timing
+    stays attributable, and two concurrent batteries against one gateway would
+    queue against each other and corrupt both measurements.
+    """
+    status = _battery_status(request.app.state)
+    if status.running:
+        raise HTTPException(status_code=409, detail="a model battery is already running")
+    status.running = True
+    status.model = body.model or settings.analyst_model
+    status.completed = 0
+    status.error = None
+    status._task = asyncio.create_task(
+        _run_battery_task(request.app.state, settings, body.model, status)
+    )
+    return {"started": True, "model": status.model}
+
+
+@router.get(
+    "/config/model-battery",
+    dependencies=[Depends(require_admin_api)],
+)
+async def api_model_battery_status(
+    request: Request,
+    model: str = "",
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, Any]:
+    """Live battery progress, or the persisted last result for *model*.
+
+    While a battery runs, every poll returns its progress (regardless of the
+    ``model`` param — single-flight means there is exactly one to report).
+    Idle, the stored result for the requested model is served with its
+    timestamp so the UI can render measurement age.
+    """
+    status = _battery_status(request.app.state)
+    if status.running:
+        return {
+            "running": True,
+            "model": status.model,
+            "current_config": status.current_config,
+            "completed": status.completed,
+            "total": status.total,
+            "result": None,
+            "stored_at": None,
+        }
+    from soc_ai.store import model_battery as mb_svc  # noqa: PLC0415
+
+    target = model or settings.analyst_model
+    async with request.app.state.db_sessionmaker() as db:
+        stored = await mb_svc.get(db, model=target)
+    return {
+        "running": False,
+        "model": target,
+        "current_config": None,
+        "completed": 0,
+        "total": 4,
+        "error": status.error,
+        "result": stored["result"] if stored else None,
+        "stored_at": stored["created_at"] if stored else None,
+    }

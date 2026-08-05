@@ -58,11 +58,12 @@ async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     # migration lands (0010 hunts → 0011 backtests → 0012 runbooks → 0013
     # hunt_objective_hash → 0014 hunt_schedules → 0015 assignment_state → 0016
     # hunt_templates → 0017 runbook_fts → 0018 chat_fts → 0019 quality_snapshots
-    # → 0020 runbook_draft → 0021 investigation_error_dismissed → …).
+    # → 0020 runbook_draft → 0021 investigation_error_dismissed → 0022
+    # model_battery_results → 0023 model_fitness_cache → …).
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0021"
+        assert row.scalar_one() == "0023"
     await engine.dispose()
 
 

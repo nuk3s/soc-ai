@@ -57,25 +57,25 @@ def _build_provider(settings: Settings) -> OpenAIProvider:
     return OpenAIProvider(openai_client=openai_client)
 
 
-def _nemotron_profile() -> OpenAIModelProfile:
-    """Profile for Nemotron 3 served via vLLM with the qwen3_coder tool parser.
+def _analyst_profile(settings: Settings) -> OpenAIModelProfile:
+    """Model profile for the analyst routes (config-adaptive since 2026-08-04).
 
-    Two non-default knobs:
+    Historically ``_nemotron_profile`` — a hardcoded profile for Nemotron 3
+    served via vLLM with the qwen3_coder tool parser, silently applied to EVERY
+    analyst backend that came after it. The knobs:
 
     1. ``supports_thinking=True`` + ``openai_chat_thinking_field="reasoning_content"``
-       so PydanticAI binds Nemotron 3's reasoning trace (which arrives in
-       ``choices[0].message.reasoning_content`` rather than inline
-       ``<think>`` tags) to ``ThinkingPart`` events for the SSE stream.
+       so PydanticAI binds a reasoning trace arriving in
+       ``choices[0].message.reasoning_content`` (rather than inline ``<think>``
+       tags) to ``ThinkingPart`` events for the SSE stream. Harmless when the
+       field is absent.
 
-    2. ``openai_supports_tool_choice_required=False`` so PydanticAI falls
-       through to ``tool_choice='auto'`` for structured-output runs instead
-       of ``tool_choice='required'``. On the Nemotron-3-Super-120B vLLM
-       endpoint (vLLM 0.19.2rc1.dev), ``required`` mode
-       returns zero tool calls — pydantic_ai then exhausts retries and
-       raises ``UnexpectedModelBehavior``. ``auto`` runs through the
-       qwen3_coder parser correctly and emits a valid TriageReport. This
-       bypass is upstream-bug-tracking; remove once vLLM's ``required``
-       mode is fixed for this parser.
+    2. ``openai_supports_tool_choice_required`` — now
+       :attr:`Settings.analyst_tool_choice_required`. The historical False
+       (still the default) forces ``tool_choice='auto'``, the workaround for
+       the vLLM 0.19.2rc1.dev qwen3_coder parser returning zero tool calls
+       under ``required``. Whether ``required`` helps or hurts is per-backend;
+       measure with ``soc-ai model-probe`` before flipping the setting.
     """
     return OpenAIModelProfile(
         supports_thinking=True,
@@ -83,9 +83,15 @@ def _nemotron_profile() -> OpenAIModelProfile:
         # Don't echo the trace back on the next request — bloats context and
         # repeats per locked architecture decision.
         openai_chat_send_back_thinking_parts=False,
-        # Workaround for vLLM 0.19.2rc1.dev qwen3_coder parser bug — see
-        # docstring above.
-        openai_supports_tool_choice_required=False,
+        openai_supports_tool_choice_required=settings.analyst_tool_choice_required,
+        # Capability declaration, not a behavior change: pydantic-ai refuses
+        # output_mode='native' client-side unless the profile declares json_schema
+        # support (models/__init__.py: "Native structured output is not supported
+        # by this model"). The stock openai profile declares it; this custom
+        # profile must too or the synthesizer_output_mode='native' knob is dead
+        # on arrival. Whether the backend HONORS response_format is per-backend —
+        # measured over the wire by `soc-ai model-probe --output-mode native`.
+        supports_json_schema_output=True,
     )
 
 
@@ -114,7 +120,7 @@ def build_investigator_model(settings: Settings) -> Model:
     return OpenAIChatModel(
         settings.analyst_model,
         provider=_build_provider(settings),
-        profile=_nemotron_profile(),
+        profile=_analyst_profile(settings),
         settings=OpenAIChatModelSettings(
             max_tokens=settings.investigator_max_response_tokens,
         ),
@@ -148,7 +154,7 @@ def build_synthesizer_model(settings: Settings, *, temperature: float | None = N
     return OpenAIChatModel(
         settings.analyst_model,
         provider=_build_provider(settings),
-        profile=_nemotron_profile(),
+        profile=_analyst_profile(settings),
         settings=model_settings,
     )
 

@@ -1773,6 +1773,89 @@ def test_classify_citation_plain_form_fallback() -> None:
     assert _classify_citation("a short note") == ("unknown", None)
 
 
+def test_classify_citation_bare_tool_name_is_a_tool_not_an_id() -> None:
+    """The model frequently cites a tool by bare name, dropping the
+    `tool ` prefix. Those must classify as `tool` so the resolver checks
+    the transcript. Before the fix `t_web_search` (>=12 chars) matched
+    `_PLAIN_ID_RE` and classified as `id` — which can only resolve by
+    appearing in the alert bundle, where tool names never appear — and
+    `t_enrich_ip` (11 chars) fell through to `unknown`. Either way a
+    tool that demonstrably ran was scored unresolved, halving confidence.
+
+    Strings below are real citations taken from production
+    investigations that were coerced to needs_more_info.
+    """
+    from soc_ai.agent.orchestrator import _classify_citation
+
+    assert _classify_citation("t_web_search") == ("tool", "t_web_search")
+    assert _classify_citation("t_enrich_ip") == ("tool", "t_enrich_ip")
+    assert _classify_citation("t_enrich_domain") == ("tool", "t_enrich_domain")
+    assert _classify_citation("t_host_summary") == ("tool", "t_host_summary")
+    assert _classify_citation("t_prevalence") == ("tool", "t_prevalence")
+    # A real Elasticsearch _id is mixed-case and must still classify as id.
+    assert _classify_citation("FDG7CZ4BVBs3R9hXQbPW") == ("id", "FDG7CZ4BVBs3R9hXQbPW")
+    # The prefixed form already tolerates a `:key` qualifier
+    # (`tool t_enrich_ip:result.internal=true`); the bare form must too.
+    assert _classify_citation("t_suggest_rule_tuning:rule_tuning_recommendation") == (
+        "tool",
+        "t_suggest_rule_tuning",
+    )
+    assert _classify_citation("t_decode_payload:payload_decoding") == (
+        "tool",
+        "t_decode_payload",
+    )
+
+
+def test_classify_citation_plain_path_tolerates_value_assertion() -> None:
+    """The model often appends the observed value to a plain path
+    (`community_id_events.0.zeek_conn_state=SF`). `_PLAIN_PATH_RE` is
+    `$`-anchored, so the `=value` suffix made the whole citation
+    `unknown`. The prefixed form (`path x=null`) already tolerated this
+    because `_CITE_PATH_RE` stops at the `=`, so the model's preferred
+    plain form was the only one that broke.
+
+    Strings below are real production citations.
+    """
+    from soc_ai.agent.orchestrator import _classify_citation
+
+    assert _classify_citation("community_id_events.0.zeek_conn_state=SF") == (
+        "path",
+        "community_id_events.0.zeek_conn_state",
+    )
+    assert _classify_citation("community_id_events.1.zeek_http_status=200") == (
+        "path",
+        "community_id_events.1.zeek_http_status",
+    )
+    assert _classify_citation("alert.network_community_id=null") == (
+        "path",
+        "alert.network_community_id",
+    )
+    # Prose containing an equals sign must not become a path.
+    assert _classify_citation("the host = a workstation") == ("unknown", None)
+
+
+def test_path_exists_in_alert_descends_into_json_string_fields() -> None:
+    """Zeek/Suricata `message` fields arrive as JSON *strings*, not
+    dicts. A citation into one (`alert.message.app_proto`) could never
+    resolve, because the walk hit a `str` and gave up. This was the
+    single largest class of unresolved path citations in production.
+    """
+    from soc_ai.agent.orchestrator import _path_exists_in_alert
+    from soc_ai.so_client.models import SoAlert
+    from soc_ai.tools.get_alert_context import AlertContext
+
+    alert = SoAlert(
+        id="a1",
+        message='{"app_proto":"tls","flow_id":123,"metadata":{"flowbits":["ssl.established"]}}',
+    )
+    ctx = AlertContext(alert=alert)
+
+    assert _path_exists_in_alert(ctx, "alert.message.app_proto") is True
+    assert _path_exists_in_alert(ctx, "alert.message.metadata.flowbits") is True
+    # A key that isn't in the embedded JSON still rejects.
+    assert _path_exists_in_alert(ctx, "alert.message.not_a_real_key") is False
+
+
 def test_path_exists_in_alert_walks_typed_fields() -> None:
     """The path validator walks against the AlertContext dump.
     `alert.rule_metadata.signature_severity` IS legal when populated;

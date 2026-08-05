@@ -1390,6 +1390,79 @@ def _register_doctor(sub: Any) -> None:
         help="Emit the check results as JSON instead of the table (for automation)",
     )
     p_doc.set_defaults(func=_doctor)
+    # Registered here rather than in main(): model-probe is doctor's sibling
+    # diagnostic, and main() is at its statement budget.
+    _add_model_probe_parser(sub)
+
+
+def _model_probe(args: argparse.Namespace) -> int:
+    """argparse handler for ``soc-ai model-probe``.
+
+    Probes a candidate analyst backend with the REAL synthesizer contract —
+    run this before pointing prod at a new model, once per candidate setting
+    (``--output-mode``, ``--tool-choice``). ``--min-ok`` makes it CI-gateable:
+    exit 1 when fewer than that many attempts produced a valid TriageReport.
+    """
+    import asyncio as _asyncio  # noqa: PLC0415
+
+    from soc_ai.model_probe import format_probe_report, probe_model  # noqa: PLC0415
+
+    settings = get_settings()
+    overrides: dict[str, Any] = {}
+    if args.model:
+        overrides["analyst_model"] = args.model
+    if args.tool_choice == "required":
+        overrides["analyst_tool_choice_required"] = True
+    if overrides:
+        settings = settings.model_copy(update=overrides)
+
+    rep = _asyncio.run(probe_model(settings, n=args.n, output_mode=args.output_mode))
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    else:
+        print(format_probe_report(rep))
+    if args.min_ok and rep["ok"] < args.min_ok:
+        print(f"FAIL: {rep['ok']} usable < --min-ok {args.min_ok}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _add_model_probe_parser(sub: Any) -> None:
+    p_probe = sub.add_parser(
+        "model-probe",
+        help="Probe a candidate analyst model against the real triage contract",
+        description=(
+            "Run the synthesizer agent (same builders and prompt prod uses) N times "
+            "against a canned scenario and tally the outcomes into failure classes. "
+            "The first command to run when evaluating a new/lesser analyst backend."
+        ),
+    )
+    p_probe.add_argument(
+        "--model",
+        default=None,
+        help="LiteLLM route to probe (default: the configured analyst model)",
+    )
+    p_probe.add_argument("-n", type=int, default=6, help="Number of attempts (default 6)")
+    p_probe.add_argument(
+        "--output-mode",
+        choices=["tool", "native", "prompted"],
+        default="tool",
+        help="Structured-output mode to probe (see synthesizer_output_mode)",
+    )
+    p_probe.add_argument(
+        "--tool-choice",
+        choices=["auto", "required"],
+        default="auto",
+        help="Probe with tool_choice forced (see analyst_tool_choice_required)",
+    )
+    p_probe.add_argument(
+        "--min-ok",
+        type=int,
+        default=0,
+        help="Exit 1 if fewer than this many attempts were usable (CI gate)",
+    )
+    p_probe.add_argument("--json", action="store_true", help="Emit the report as JSON")
+    p_probe.set_defaults(func=_model_probe)
 
 
 def _add_api_client_args(p: argparse.ArgumentParser) -> None:

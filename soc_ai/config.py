@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AliasChoices,
@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     backoff) on a slow stack — cutting such a turn mid-retry would throw away work
     that was about to succeed. Raise further for very slow GPUs."""
 
-    auto_triage_per_target_timeout_s: int = 600
+    auto_triage_per_target_timeout_s: int = 1200
     """Wall-clock backstop for a single auto-triage investigation (seconds).
 
     An investigation is heavier than a chat turn — several tool calls plus the
@@ -184,7 +184,30 @@ class Settings(BaseSettings):
     limit and stalls the entire sequential sweep behind it (the exact failure
     that wedged a batch mid-run). On expiry the per-target ``asyncio.timeout``
     raises ``TimeoutError`` — caught by the loop's per-target handler, counted as
-    a failure — and the sweep proceeds to the next target."""
+    a failure — and the sweep proceeds to the next target.
+
+    MUST stay strictly greater than ``investigation_run_timeout_s`` — enforced at
+    use by ``_effective_per_target_timeout``. This is the OUTER of two nested
+    whole-run guards, and they do not report equally well. The inner one
+    (``recorded_run``'s ``investigation_run_timeout_s``) knows WHY the run died:
+    it records a ``whole_run_backstop`` error naming the wall clock and pointing
+    at the model backend, and it lets the orchestrator's own per-turn timeout
+    (``investigation_turn_timeout_s``) conclude gracefully with the round-1
+    verdict first. The outer cap can only cancel the generator from the consumer
+    side, which records the far less useful ``run_cancelled``. Whichever fires
+    first decides what the operator gets to see, so the useful one must win.
+
+    Raised 600 -> 1200 (2026-08-03). At 600 the outer cap was TIGHTER than the
+    inner 900s backstop, so it pre-empted both graceful paths on every slow run.
+    In the preceding 14 days that produced 49 of 64 error rows with no error
+    event at all, every one ``auto-triage:scheduler``, 47 finishing at exactly
+    10.0 minutes. Completed runs in the same window ran p50 2.1min / p95 5.7min /
+    p99 8.6min, so 600s was already clipping the live tail; anything that slows
+    runs down (a degraded backend, a slower model) pushes more of the
+    distribution into it. NOTE: the silent-row half of that failure is fixed
+    independently in ``recorded_run``, which now persists a terminal error event
+    on the timeout, cancel and crash paths — this setting governs which cause
+    gets reported, not whether one is reported at all."""
 
     litellm_max_retries: int = 5
     """How many times the OpenAI client retries a gateway request on a transient
@@ -559,6 +582,43 @@ class Settings(BaseSettings):
     needs_more_info verdict). 32000 covers the worst observed reasoning trace
     with ample headroom; lower it for latency, raise it for very verbose
     reasoning models."""
+
+    analyst_tool_choice_required: bool = False
+    """Allow ``tool_choice='required'`` for the analyst model's structured output.
+
+    False (the default) keeps today's behavior: pydantic-ai falls through to
+    ``tool_choice='auto'``, the workaround for the vLLM qwen3_coder-parser bug
+    on the original Nemotron endpoint (see ``_analyst_profile``). Under
+    ``auto`` a weaker model is free to answer in prose instead of calling the
+    output tool — burning schema retries or exhausting them outright — while
+    ``required`` forces the tool call at the serving layer.
+
+    Whether flipping this helps is a PER-BACKEND fact, not a per-size fact:
+    the llama.cpp CPU tier handles ``auto`` fine, while the short-lived
+    laguna-s21 backend appeared to need ``required`` (small-N evidence only,
+    backend since decommissioned). When a new analyst backend lands, measure
+    with ``soc-ai model-probe --tool-choice required`` before flipping."""
+
+    synthesizer_output_mode: Literal["tool", "native", "prompted"] = "tool"
+    """How the no-tools synthesizer agents obtain the structured TriageReport.
+
+    - ``tool`` (default, today's behavior): pydantic-ai's synthetic
+      ``final_result`` tool call. Depends on the backend's tool-call parser
+      working — the component that produced the DSML-markup-leak failure class
+      (tool-call markup surfacing as prose content).
+    - ``native``: OpenAI ``response_format`` json_schema — server-side guided
+      decoding. The strongest fix for schema wobble on lesser models: the
+      server constrains generation to the schema, and the tool-call parser
+      leaves the path entirely. Requires backend support (vLLM guided
+      decoding, llama.cpp json_schema).
+    - ``prompted``: schema goes in the prompt, JSON parsed from plain text.
+      Weakest guarantees; the escape hatch for backends where BOTH the tool
+      parser and response_format are broken.
+
+    Applies only to the synthesizer agents (synth-first, loop-synth, partial) —
+    the investigator keeps tool mode because it interleaves real tool calls.
+    Validate a candidate mode with ``soc-ai model-probe --output-mode`` before
+    flipping in prod."""
 
     model_context_window_tokens: int = 0
     """The analyst model's input window in tokens, for proactive context

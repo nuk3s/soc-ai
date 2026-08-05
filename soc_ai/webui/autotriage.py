@@ -530,6 +530,38 @@ async def _ack_inherited_fps(
             )
 
 
+# Headroom the outer per-target cap keeps over the inner whole-run backstop, so
+# the inner one always wins the race and lands a diagnosable error. Proportional
+# rather than a fixed number of seconds so the invariant holds at any scale — a
+# test (or a fast-model deployment) can dial BOTH bounds down together and still
+# get a tight sweep, which a fixed additive floor would make impossible.
+_PER_TARGET_HEADROOM_RATIO = 1.25
+
+
+def _effective_per_target_timeout(settings: Any) -> float:
+    """Per-target wall-clock cap, floored above the inner whole-run backstop.
+
+    Two nested guards bound an auto-triage investigation, and they are NOT
+    equivalent on expiry:
+
+    - INNER, ``recorded_run``'s ``investigation_run_timeout_s``: finalizes the
+      row *and* records an ``error`` event with type/phase/hint, so the run shows
+      up in the pipeline-error drilldown with a reason.
+    - OUTER, this cap: cancels the event generator from the consumer side. The
+      recorder's ``CancelledError`` branch lands ``status='error'`` but the
+      generator never gets to emit an error event — a silent, undiagnosable row.
+
+    So the outer cap must only ever fire for a stream the inner backstop could
+    not stop at all. Clamping here (rather than trusting the setting) keeps that
+    invariant even when an operator lowers the knob or an old config_overrides
+    row carries the pre-2026-08-03 default of 600, which was TIGHTER than the
+    inner 900s backstop and silently ate 49 of 64 error rows in 14 days.
+    """
+    configured = float(getattr(settings, "auto_triage_per_target_timeout_s", 1200))
+    inner = float(getattr(settings, "investigation_run_timeout_s", 900))
+    return max(configured, inner * _PER_TARGET_HEADROOM_RATIO)
+
+
 async def run_auto_triage(
     state: Any,
     *,
@@ -547,7 +579,7 @@ async def run_auto_triage(
     status = get_status(state)
     try:
         ctx = ctx_from_state(state)
-        per_target_timeout = getattr(state.settings, "auto_triage_per_target_timeout_s", 600)
+        per_target_timeout = _effective_per_target_timeout(state.settings)
 
         try:
             await _ack_inherited_fps(state, ctx, inherited_acks or [], status)

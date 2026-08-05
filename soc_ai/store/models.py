@@ -502,3 +502,26 @@ class QualitySnapshot(Base):
     alarmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     # Human-readable detector reasons (JSON list of strings); NULL when clean.
     alarm_reasons: Mapped[list[str] | None] = mapped_column(JSON, default=None)
+
+
+class ModelBatteryResult(Base):
+    """Last fitness-battery run per analyst model (design spec 2026-08-05).
+
+    One row per model route name, replaced on every completed battery — the
+    battery measures CONTRACT behavior, which only changes when the backend
+    behind the route changes, so history has no value the audit trail doesn't
+    already provide (a ``model_battery`` audit event is written per run).
+    ``result`` holds the whole ``run_battery`` report: per-config probe
+    outcomes, the recommendation, timings.
+    """
+
+    __tablename__ = "model_battery_results"
+
+    model: Mapped[str] = mapped_column(String(256), primary_key=True)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    # Quick 3-leg fitness cache (migration 0023): separate columns because the
+    # two measurements have independent cadences — a battery run must not clobber
+    # the fitness timestamp and vice versa. Nullable: rows created by either path.
+    fitness_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    fitness_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)

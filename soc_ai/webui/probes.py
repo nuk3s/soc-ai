@@ -172,11 +172,18 @@ _PCAP_BROKEN_HINT = (
 # ruins a shift's triage.
 
 # Hard ceiling on the whole probe so a wedged gateway can't hang the admin UI.
-# Each leg also has its own bound (below); this is the belt to their suspenders.
-_FITNESS_TOTAL_TIMEOUT_S = 30.0
+# Each leg also has its own bound (below); this is the belt to their suspenders —
+# which means it MUST exceed the worst-case sum of the legs (pinned by test).
+# The original 30s total vs 3x12s legs was internally inconsistent: three
+# slow-but-passing legs could not fit, and the overflow produced a hard "fail".
+_FITNESS_TOTAL_TIMEOUT_S = 100.0
 # Per-leg wall-clock bound. A leg that blows this is graded (never raises) so one
 # slow leg degrades to a clear result instead of eating the whole budget.
-_FITNESS_LEG_TIMEOUT_S = 12.0
+# Raised 12 -> 30 (2026-08-05): V4 in tool mode under high reasoning effort
+# measures 10-16s per structured call (battery data), so 12s sat on the knife's
+# edge and the chip flickered UNFIT on the primary analyst model purely with
+# load variance — while the battery proved the same model 2/2 on every config.
+_FITNESS_LEG_TIMEOUT_S = 30.0
 
 # The canned structured-output fixture. A one-line benign-DNS prompt with an
 # unambiguous expected shape (false_positive / 0.9 / one citation) — trivial for a
@@ -391,27 +398,44 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
             "detail": "demo mode — replayed responses (no live gateway)",
         }
 
+    # Mutable accumulators so the total-timeout handler can report the legs
+    # that DID complete and name the one in flight — legs=[] on a timeout is
+    # the same undiagnosable-terminal-state class as a silent pipeline error.
+    completed: list[dict[str, Any]] = []
+    in_flight: list[str] = ["structured_output"]
+
     async def _run_all() -> list[dict[str, Any]]:
         # Sequential (not concurrent): the legs share the single gateway and a
         # burst of 3 structured-output calls at once can trip the very
         # concurrency limits we're trying to characterise. Order is cheapest-
         # signal-first: structured output is the load-bearing gate.
-        return [
-            await _leg_structured_output(settings),
-            await _leg_tool_loop(settings),
-            await _leg_reasoning_budget(settings),
-        ]
+        for name, leg_fn in (
+            ("structured_output", _leg_structured_output),
+            ("tool_loop", _leg_tool_loop),
+            ("reasoning_budget", _leg_reasoning_budget),
+        ):
+            in_flight[0] = name
+            completed.append(await leg_fn(settings))
+        return completed
 
     try:
         legs = await asyncio.wait_for(_run_all(), timeout=_FITNESS_TOTAL_TIMEOUT_S)
     except TimeoutError:
-        # The overall cap tripped — treat as a hard FAIL with a clear reason
-        # rather than leaving the operator with a spinner.
+        # The overall cap tripped — hard FAIL, but keep every finished leg and
+        # mark WHERE the probe stopped so the chip's tooltip is a diagnosis.
+        marker = _fitness_leg(
+            "probe_timeout",
+            "fail",
+            f"probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)}s during the {in_flight[0]} leg",
+        )
         return {
             "grade": "fail",
             "model": model_id,
-            "legs": [],
-            "detail": _scrub(f"model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)}s"),
+            "legs": [*completed, marker],
+            "detail": _scrub(
+                f"model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)}s "
+                f"(stopped during {in_flight[0]})"
+            ),
         }
 
     grade = _reduce_fitness(legs)

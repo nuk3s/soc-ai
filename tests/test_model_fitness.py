@@ -357,3 +357,50 @@ def test_endpoint_admin_gated() -> None:
             ok = c.get("/api/v1/config/model-fitness")
         assert ok.status_code == 200
         assert ok.json()["grade"] == "pass"
+
+
+# ── Dogfood 2026-08-05: budgets + diagnosable total timeout ────────────────
+
+
+def test_total_budget_exceeds_sum_of_leg_budgets() -> None:
+    """The overall cap must be the BELT to the per-leg suspenders — strictly
+    larger than three worst-case legs, or slow-but-passing legs get their run
+    cut mid-probe. The shipped 30s total vs 3x12s legs was internally
+    inconsistent, and on a reasoning model whose structured call runs 10-16s it
+    produced a false UNFIT on the primary analyst model (legs pass individually
+    at 10.9s + 2.5s, but the sum plus variance tripped one budget or the
+    other)."""
+    assert probes._FITNESS_TOTAL_TIMEOUT_S > 3 * probes._FITNESS_LEG_TIMEOUT_S
+
+
+def test_leg_budget_covers_observed_reasoning_latency() -> None:
+    """V4 in tool mode with high reasoning effort measures 10-16s per
+    structured call (battery data, 2026-08-05). The per-leg cap needs real
+    headroom over that, or the chip flickers unfit with load variance."""
+    assert probes._FITNESS_LEG_TIMEOUT_S >= 30.0
+
+
+async def test_total_timeout_reports_completed_legs(monkeypatch) -> None:
+    """When the overall cap fires, the operator gets the legs that DID finish
+    plus a marker naming where it stopped — not legs=[] (the same undiagnosable
+    terminal-state class as the silent pipeline errors of 2026-08-03)."""
+    import asyncio as _asyncio
+
+    async def instant_pass(settings):
+        return probes._fitness_leg("structured_output", "pass", "ok")
+
+    async def hangs(settings):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(probes, "_leg_structured_output", instant_pass)
+    monkeypatch.setattr(probes, "_leg_tool_loop", hangs)
+    monkeypatch.setattr(probes, "_leg_reasoning_budget", hangs)
+    monkeypatch.setattr(probes, "_FITNESS_TOTAL_TIMEOUT_S", 0.3)
+
+    result = await probes.probe_model_fitness(_settings())
+    assert result["grade"] == "fail"
+    names = [leg["name"] for leg in result["legs"]]
+    assert "structured_output" in names  # the completed leg survives
+    assert "probe_timeout" in names  # the marker names where it stopped
+    marker = next(leg for leg in result["legs"] if leg["name"] == "probe_timeout")
+    assert "tool_loop" in marker["detail"]  # which leg was in flight

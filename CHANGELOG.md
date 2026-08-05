@@ -6,6 +6,81 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.7] - 2026-08-05
+
+The lesser-model release: soc-ai now adapts to whatever analyst backend is
+behind the gateway by configuration and measurement instead of code changes,
+and failed pipeline runs explain themselves. No breaking changes; two
+migrations (0022, 0023).
+
+### Added
+
+- **A model fitness battery.** The Config console's fitness check gains an
+  on-demand second tier: "Run full battery" probes the selected analyst model
+  under every structured-output configuration (tool, native, prompted,
+  tool+required) through the real synthesizer contract, shows per-config
+  usable rates and timings, and — when a configuration strictly beats the
+  baseline — offers a deterministic, explained recommendation ("native: 4/4,
+  7.0x faster than tool mode") that one click stages into the normal config
+  Apply flow. Runs as a background task with live progress (minutes on a CPU
+  tier); the last result persists per model with its age (migration 0022);
+  every run lands a `model_battery` audit event. Never auto-applies.
+
+- **`soc-ai model-probe`.** A contract probe for candidate analyst backends: it
+  runs the real synthesizer agent N times against a canned scenario and tallies
+  outcomes into failure classes (`schema_retry_exhausted`, `http_5xx`,
+  `timeout`), reporting which backend actually served via the gateway's own
+  attribution headers. `--min-ok` makes it CI-gateable. The first command to
+  run before pointing prod at a new or lesser model.
+- **Per-backend adaptation knobs.** `synthesizer_output_mode`
+  (`tool`/`native`/`prompted`) selects how the no-tools synthesizers obtain the
+  TriageReport — `native` uses server-side guided decoding (`response_format`
+  json_schema), which removes both schema wobble and the tool-call parser from
+  the path. `analyst_tool_choice_required` lifts the historical forced-`auto`
+  workaround per backend. Both default to today's exact behavior.
+- **Backend attribution on success.** Usage events now carry `served_backend`
+  (api_base, deployment, attempted fallbacks) like error events already did, so
+  verdict quality can be sliced by backend after a fallback window.
+- **A lesser-model runbook.** `docs/LESSER_MODELS.md`: the recorded failure
+  taxonomy, the knob for each failure shape, the timeout ladder, and the probe
+  workflow.
+- **Select-type settings in the Config console.** Fixed-choice settings render
+  as dropdowns with server-supplied options and save-time membership
+  validation; the two new knobs are registered in the Agent section, both
+  hot-apply.
+- **A daily fitness cache.** The quick fitness check is cached per model with
+  a 24h TTL, so opening the Config page renders the stored grade instantly
+  with its age; "Check fitness" forces a fresh measurement, and "Run all
+  checks" runs fitness plus the full battery in one click.
+
+### Fixed
+
+- **Failed pipeline runs are diagnosable instead of silently terminal.** Every
+  terminal failure path (timeout, cancel, crash) now persists an error event
+  with a hint; the auto-triage per-target cap can no longer pre-empt the more
+  informative whole-run backstop (and is floored against misconfiguration);
+  gateway/backend failures are no longer misattributed to Elasticsearch in
+  operator hints, and bare gateway 5xx responses now carry a hint at all; the
+  round-2 loop synthesizer gets a real schema-retry budget; error and usage
+  events record which backend actually served the call (`served_backend`), so
+  an aliased or fallback-routed model can no longer misattribute a failure.
+- **Citations the model actually writes now resolve.** The citation validator
+  recognizes the reference shapes the analyst model emits, ending a class of
+  spurious needs-more-info coercions.
+- **The model-fitness check no longer cries wolf.** Its per-leg and total
+  budgets were internally inconsistent and sized below a reasoning model's
+  real latency, producing intermittent false "unfit" grades on a healthy
+  model; budgets are now consistent (pinned by test) and a probe timeout
+  reports the legs that completed plus where it stopped, instead of nothing.
+- **The battery recommendation is honest about applied settings.** When the
+  current knob values already match the recommendation, the panel says so
+  instead of offering a no-op Apply.
+- **Weak-model output-shape wobble no longer burns schema retries.** Verdict
+  formatting variants ("False Positive", "false-positive") fold to canonical;
+  a bare string citation wraps into a list; a bare recommended-action object
+  wraps into a one-element list; null sentinels on those fields become empty.
+  Packaging only — synonyms, prose, and unknown action tools still fail.
+
 ## [1.2.6] - 2026-08-01
 
 An About page and a ground-up restructure of the Config page. No schema changes.

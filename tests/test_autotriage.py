@@ -572,7 +572,18 @@ class TestAutoTriageFailedCountsStreamErrors:
             yield StepEvent(kind="done", session_id=sid, sequence=2, payload={})
 
         # Tiny per-target backstop (model_copy skips int-field revalidation).
-        tight = at_settings.model_copy(update={"auto_triage_per_target_timeout_s": 0.1})
+        # BOTH bounds must come down together: the per-target cap is floored at
+        # `_PER_TARGET_HEADROOM_RATIO x investigation_run_timeout_s` so it can
+        # never be the tighter of the two (a tighter outer cap cancels the
+        # generator and lands a silent, event-less error — the 2026-08-03 prod
+        # failure this floor exists to prevent). Leaving the inner backstop at its
+        # 900s default would floor the effective cap at 1125s and hang this test.
+        tight = at_settings.model_copy(
+            update={
+                "auto_triage_per_target_timeout_s": 0.1,
+                "investigation_run_timeout_s": 0.08,
+            }
+        )
 
         from soc_ai.webui import autotriage as at
         from soc_ai.webui.autotriage import Target

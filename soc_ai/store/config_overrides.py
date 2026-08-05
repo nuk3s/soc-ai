@@ -29,7 +29,7 @@ from soc_ai.store.secret_box import SecretBox
 
 _LOGGER = logging.getLogger(__name__)
 
-SettingType = Literal["bool", "str", "float", "int", "csv"]
+SettingType = Literal["bool", "str", "float", "int", "csv", "select"]
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,12 @@ class SettingSpec:
     # Secret value: persisted Fernet-encrypted, never rendered back, write-only
     # (an empty submission leaves it unchanged). Requires a config_secret_key.
     secret: bool = False
+    # Fixed-choice string setting (type="select"): the exact allowed values, in
+    # display order. Membership is enforced in coerce()/_validate_typed(), so a
+    # typo'd override fails the SAVE instead of crashing agent construction on
+    # the next investigation (Settings.validate_assignment would reject it at
+    # apply time — after it was already persisted).
+    options: tuple[str, ...] | None = None
 
 
 # The whitelist of admin-editable settings. Order is display order within a
@@ -256,6 +262,34 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help="Lower = more deterministic verdicts. 0.2 is the tuned default.",
         min_value=0.0,
         max_value=2.0,
+    ),
+    SettingSpec(
+        key="synthesizer_output_mode",
+        attr="synthesizer_output_mode",
+        type="select",
+        label="Synthesizer structured-output mode",
+        section="Agent",
+        hot=True,
+        help=(
+            "How the no-tools synthesizers obtain the TriageReport. native = "
+            "server-side guided decoding (strongest fix for schema wobble on "
+            "lesser models); prompted = JSON-in-text escape hatch. Validate a "
+            "candidate with `soc-ai model-probe --output-mode` first."
+        ),
+        options=("tool", "native", "prompted"),
+    ),
+    SettingSpec(
+        key="analyst_tool_choice_required",
+        attr="analyst_tool_choice_required",
+        type="bool",
+        label="Force tool_choice=required",
+        section="Agent",
+        hot=True,
+        help=(
+            "Allow tool_choice='required' for structured output instead of the "
+            "historical forced-auto (a vLLM parser workaround). Per-backend: "
+            "measure with `soc-ai model-probe --tool-choice required` first."
+        ),
     ),
     SettingSpec(
         key="investigator_temperature",
@@ -1322,6 +1356,11 @@ def coerce(key: str, raw_str: str) -> Any:
     if spec.type == "csv":
         # Comma-separated list → list[str]; whitespace trimmed, empties dropped.
         return [part.strip() for part in raw_str.split(",") if part.strip()]
+    if spec.type == "select":
+        v_sel = str(raw_str).strip()
+        if not spec.options or v_sel not in spec.options:
+            raise ValueError(f"{spec.key} must be one of {list(spec.options or ())}")
+        return v_sel
     return str(raw_str)
 
 
@@ -1358,6 +1397,8 @@ def _validate_typed(spec: SettingSpec, value: Any) -> Any:
         return cleaned
     if not isinstance(value, str):
         raise ValueError(f"{spec.key} expects a string")
+    if spec.type == "select" and (not spec.options or value not in spec.options):
+        raise ValueError(f"{spec.key} must be one of {list(spec.options or ())}")
     if spec.key in _URL_SETTING_KEYS:
         _require_http_scheme(spec.key, value)
     return value

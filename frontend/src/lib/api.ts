@@ -385,14 +385,73 @@ export interface ModelFitness {
   model: string;
   legs: ModelFitnessLeg[];
   detail: string;
+  /** true = served from the 24h server-side cache (checked_at = when measured). */
+  cached?: boolean;
+  checked_at?: string | null;
 }
 
 /** Grade whether the configured analyst_model can actually do the pipeline's job
  * (structured output, a tool loop, a budgetable reasoning phase). A model that
  * merely LISTS on the gateway (getGatewayModels) can still be unfit — this runs
  * the real fitness probe and returns the grade for the "Check fitness" chip. */
-export function getModelFitness(): Promise<ModelFitness> {
-  return request<ModelFitness>('/config/model-fitness');
+export function getModelFitness(force = false): Promise<ModelFitness> {
+  return request<ModelFitness>(`/config/model-fitness${force ? '?force=true' : ''}`);
+}
+
+// ── Model fitness battery (design spec 2026-08-05) ──────────────────────────
+
+export interface BatteryConfigResult {
+  output_mode: 'tool' | 'native' | 'prompted';
+  tool_choice_required: boolean;
+  ok: number;
+  n: number;
+  usable_rate: number;
+  tally: Record<string, number>;
+  failures: string[];
+  elapsed_s: number;
+}
+
+export interface BatteryRecommendation {
+  synthesizer_output_mode: 'tool' | 'native' | 'prompted';
+  analyst_tool_choice_required: boolean;
+  config: string;
+  reason: string;
+}
+
+export interface BatteryResult {
+  model: string;
+  n_per_config: number;
+  configs: BatteryConfigResult[];
+  recommendation: BatteryRecommendation | null;
+  elapsed_s: number;
+}
+
+export interface ModelBatteryStatus {
+  running: boolean;
+  model: string;
+  current_config: string | null;
+  completed: number;
+  total: number;
+  error?: string | null;
+  result: BatteryResult | null;
+  stored_at: string | null;
+}
+
+/** Live battery progress while one runs; otherwise the persisted last result
+ * (with its timestamp) for the requested model. */
+export function getModelBattery(model: string): Promise<ModelBatteryStatus> {
+  return request<ModelBatteryStatus>(
+    `/config/model-battery?model=${encodeURIComponent(model)}`,
+  );
+}
+
+/** Start the full fitness battery for a model in the background (409 while one
+ * is already running — single-flight so timings stay attributable). */
+export function startModelBattery(model: string): Promise<{ started: boolean; model: string }> {
+  return request<{ started: boolean; model: string }>('/config/model-battery', {
+    method: 'POST',
+    body: JSON.stringify({ model }),
+  });
 }
 
 // ── Egress policy (E5.3) — one inspectable page of every egress destination ──

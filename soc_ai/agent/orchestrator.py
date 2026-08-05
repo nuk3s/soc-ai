@@ -57,6 +57,7 @@ from pydantic_ai.usage import UsageLimits
 
 from soc_ai import metrics
 from soc_ai.agent import context_budget
+from soc_ai.agent._gateway_retry import capture_backend_attribution
 from soc_ai.agent._partial_replay import (
     repair_dangling_tool_calls,
     replay_reasoning_context,
@@ -230,21 +231,56 @@ def build_investigator(
     return agent
 
 
-def build_synthesizer(model: Model) -> Agent[None, TriageReport]:
+def _synth_output_type(output_mode: str) -> Any:
+    """Map :attr:`Settings.synthesizer_output_mode` to a pydantic-ai output spec.
+
+    ``tool`` returns the bare TriageReport (today's synthetic final_result tool
+    call). ``native`` wraps it in :class:`~pydantic_ai.output.NativeOutput`
+    (response_format json_schema — server-side guided decoding, no tool-call
+    parser in the path). ``prompted`` wraps it in
+    :class:`~pydantic_ai.output.PromptedOutput` (schema in prompt, JSON parsed
+    from text). See the Settings docstring for when each applies; validate a
+    candidate mode with ``soc-ai model-probe`` before flipping in prod.
+    """
+    if output_mode == "tool":
+        return TriageReport
+    if output_mode == "native":
+        from pydantic_ai.output import NativeOutput  # noqa: PLC0415
+
+        return NativeOutput(TriageReport)
+    if output_mode == "prompted":
+        from pydantic_ai.output import PromptedOutput  # noqa: PLC0415
+
+        return PromptedOutput(TriageReport)
+    raise ValueError(f"unknown synthesizer output_mode: {output_mode!r}")
+
+
+def build_synthesizer(model: Model, *, output_mode: str = "tool") -> Agent[None, TriageReport]:
     """Synthesizer agent: heavy model, no tools, TriageReport output.
 
     The synthesizer reads the investigator's transcript (passed as the user
     message) and emits a TriageReport. It has no tools — synthesis happens
     entirely from the gathered evidence.
+
+    ``retries=3`` matches :func:`build_synth_first_agent` and
+    :func:`build_partial_triage_synthesizer`. This builder previously took no
+    ``retries`` at all, inheriting pydantic-ai's default of **1** — a single
+    schema wobble ended the run. It is live on the round-2 loop-synthesis path
+    (the ``investigation_loop_synth`` phase), which accounted for 7 of 11
+    pipeline fallbacks in the 14-day prod window ending 2026-08-03. Schema
+    wobble is stochastic on lower-tier models, so one attempt is not enough.
     """
     return Agent(
         model,
-        output_type=TriageReport,
+        output_type=_synth_output_type(output_mode),
         system_prompt=SYNTHESIZER_PROMPT,
+        retries=3,
     )
 
 
-def build_partial_triage_synthesizer(model: Model) -> Agent[None, TriageReport]:
+def build_partial_triage_synthesizer(
+    model: Model, *, output_mode: str = "tool"
+) -> Agent[None, TriageReport]:
     """No-tools synthesizer that concludes a budget-cut investigation loop.
 
     Mirrors the hunt runner's partial-report path (:func:`soc_ai.api.
@@ -255,7 +291,7 @@ def build_partial_triage_synthesizer(model: Model) -> Agent[None, TriageReport]:
     """
     return Agent(
         model,
-        output_type=TriageReport,
+        output_type=_synth_output_type(output_mode),
         system_prompt=BUDGET_PARTIAL_SYNTH_PROMPT,
         retries=3,
     )
@@ -291,7 +327,8 @@ async def _synthesize_partial_triage(
         user_msg = guard.sanitize_text(user_msg)
     user_msg = _guard_egress(guard, user_msg, settings)
     agent = build_partial_triage_synthesizer(
-        build_synthesizer_model(settings, temperature=settings.synthesizer_temperature)
+        build_synthesizer_model(settings, temperature=settings.synthesizer_temperature),
+        output_mode=settings.synthesizer_output_mode,
     )
     async with asyncio.timeout(settings.investigation_turn_timeout_s):
         result = await agent.run(
@@ -302,7 +339,9 @@ async def _synthesize_partial_triage(
     return result.output, repaired
 
 
-def build_synth_first_agent(model: Model) -> Agent[None, TriageReport]:
+def build_synth_first_agent(
+    model: Model, *, output_mode: str = "tool"
+) -> Agent[None, TriageReport]:
     """Build the synth Agent for the synth-first pipeline (no tools).
 
     Identical to build_synthesizer except it uses the synth-first system
@@ -322,7 +361,7 @@ def build_synth_first_agent(model: Model) -> Agent[None, TriageReport]:
     return Agent(
         model=model,
         system_prompt=SYNTH_FIRST_SYSTEM_PROMPT,
-        output_type=TriageReport,
+        output_type=_synth_output_type(output_mode),
         retries=3,
     )
 
@@ -356,6 +395,7 @@ def _synth_failure_fallback_report(
     exc: BaseException,
     *,
     retry_causes: list[str] | None = None,
+    served_backend: dict[str, Any] | None = None,
 ) -> Any:
     """Build a fallback TriageReport when the synth-first model raises.
 
@@ -408,6 +448,11 @@ def _synth_failure_fallback_report(
             # failed, so the pipeline-error drilldown is actionable. Old rows /
             # other failure classes keep their exact shape.
             **({"retry_causes": retry_causes} if retry_causes else {}),
+            # WHICH deployment produced the failure, from LiteLLM's own response
+            # headers. The alias soc-ai asks for hides both aliasing and fallback
+            # routing, so without this a failure can't be attributed to a backend.
+            # Absent when it couldn't be determined.
+            **({"served_backend": served_backend} if served_backend else {}),
         },
     )
 
@@ -417,6 +462,7 @@ def _round2_failure_fallback(
     round1: Any,
     exc: BaseException,
     retry_causes: list[str] | None = None,
+    served_backend: dict[str, Any] | None = None,
 ) -> Any:
     """Fallback verdict when the round-2 investigation loop / synth crashes.
 
@@ -441,7 +487,11 @@ def _round2_failure_fallback(
         except Exception:
             return round1
     return _synth_failure_fallback_report(
-        alert_id, "investigation_loop_synth", exc, retry_causes=retry_causes
+        alert_id,
+        "investigation_loop_synth",
+        exc,
+        retry_causes=retry_causes,
+        served_backend=served_backend,
     )
 
 
@@ -460,6 +510,14 @@ def build_agent(  # pragma: no cover - thin alias
 # =====================================================================
 # Investigation runner
 # =====================================================================
+
+
+_GATEWAY_BACKEND_HINT = (
+    "the LLM gateway could not reach its model backend (the engine behind the "
+    "LiteLLM route is down, restarting, or returning 5xx) — this is NOT an "
+    "Elasticsearch problem. Verify the serving engine is up and the route's "
+    "api_base points at it, then retry."
+)
 
 
 def _hint_for(exc: BaseException) -> str | None:
@@ -512,13 +570,29 @@ def _hint_for(exc: BaseException) -> str | None:
         )
     if "timed out" in msg or "timeout" in msg:
         return "LiteLLM gateway slow or unreachable; retry."
-    # Generic transport-layer "can't reach the host" — fires when SO/ES is
-    # restarting, the network is down, etc.
+    # Markers LiteLLM stamps into its OWN error strings. Their presence means the
+    # failure was raised by the gateway about a model call, never by the ES client.
+    is_gateway = any(
+        m in msg for m in ("litellm", "model_name:", "vllmexception", "openaiexception")
+    )
+    # Transport-layer "can't reach the host" is ambiguous: it fires for BOTH a
+    # dead Elasticsearch/SO grid and a dead model backend behind LiteLLM. Getting
+    # this backwards sent operators to debug Security Onion for a dead vLLM engine
+    # on 8 of 15 recorded prod error events (2026-08-03).
     if "cannot connect to host" in msg or "connection error" in msg or "connection refused" in msg:
+        if is_gateway:
+            return _GATEWAY_BACKEND_HINT
         return (
             "elasticsearch / Security Onion unreachable. Verify the SO grid is "
             "online and ES_HOSTS in soc-ai's .env points at the right node."
         )
+    # A bare gateway 5xx with no connection text ("status_code: 502, model_name:
+    # …, body:" — LiteLLM truncates the body on a proxy-level failure). These
+    # previously produced NO hint at all, leaving 5 of 15 prod error events with
+    # zero guidance during an outage. The status code alone is enough: a 5xx from
+    # the gateway is always a serving-side failure, never an analyst mistake.
+    if is_gateway and any(code in msg for code in ("status_code: 5", "status code: 5")):
+        return _GATEWAY_BACKEND_HINT
     return None
 
 
@@ -552,12 +626,61 @@ def _retry_causes_from_messages(messages: Any) -> list[str]:
     return causes[-4:]
 
 
+def _served_backend(attribution: Any) -> dict[str, Any] | None:
+    """Normalize a gateway attribution sink for an error payload, or None.
+
+    Takes the dict filled by
+    :func:`soc_ai.agent._gateway_retry.capture_backend_attribution` — LiteLLM's
+    own response headers naming the deployment that actually served the call.
+
+    Deliberately NOT derived from ``ModelResponse.model_name``: that echoes the
+    ALIAS soc-ai requested, so on a route like ``qwen3.6-35b-instruct`` (aliased
+    to the deepseek-v4-flash engine) it reports the wrong model with total
+    confidence. ``api_base`` identifies the engine; ``attempted_fallbacks``
+    reports whether the gateway demoted the request to another deployment.
+
+    Defensive: runs inside error handlers, so a surprise shape yields None.
+    """
+    try:
+        if not isinstance(attribution, dict) or not attribution:
+            return None
+        return {k: v for k, v in attribution.items() if v not in (None, "")}
+    except Exception:
+        return None
+
+
+def _usage_event_payload(
+    round_num: int, u: Any, served_backend: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Usage-event payload; ``served_backend`` when gateway attribution landed.
+
+    Error events have carried ``served_backend`` since the diagnosability fix;
+    without it on SUCCESS too, the one question an operator asks after a
+    fallback window — "which verdicts did the fallback backend produce?" — is
+    unanswerable. Key absent (not null) when attribution is unknown, so old
+    rows and no-attribution runs keep their exact shape.
+    """
+    payload: dict[str, Any] = {
+        "phase": "synthesizer",
+        "round": round_num,
+        "tool_calls": u.tool_calls,
+        "requests": u.requests,
+        "input_tokens": u.input_tokens,
+        "output_tokens": u.output_tokens,
+        "total_tokens": u.total_tokens,
+    }
+    if served_backend:
+        payload["served_backend"] = served_backend
+    return payload
+
+
 def _error_payload(
     exc: BaseException,
     *,
     phase: str,
     round_num: int,
     retry_causes: list[str] | None = None,
+    served_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Typed error event payload with phase/round/type/message + optional hint."""
     payload: dict[str, Any] = {
@@ -571,6 +694,8 @@ def _error_payload(
         payload["hint"] = hint
     if retry_causes:
         payload["retry_causes"] = retry_causes
+    if served_backend:
+        payload["served_backend"] = served_backend
     return payload
 
 
@@ -1520,30 +1645,23 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         except Exception as e:  # audit must never crash the investigation
             _LOGGER.warning("audit log_kind failed: %s", e)
 
-    def _usage_ev(round_num: int, run_result: Any) -> StepEvent | None:
+    def _usage_ev(
+        round_num: int, run_result: Any, served_backend: dict[str, Any] | None = None
+    ) -> StepEvent | None:
         """Build a ``usage`` event from a pydantic_ai result.
 
         The synth-first pipeline previously emitted NO usage events (only
         the legacy investigate() path did), so the UI's token KPI /
         sparkline / context meter stayed dead at 0. Mirror the legacy
         `_build_usage_event` shape so the panel populates.
+        ``served_backend``: gateway attribution for the calls that produced
+        this usage — see :func:`_usage_event_payload`.
         """
         try:
             u = run_result.usage()
         except Exception:
             return None
-        return _ev(
-            "usage",
-            {
-                "phase": "synthesizer",
-                "round": round_num,
-                "tool_calls": u.tool_calls,
-                "requests": u.requests,
-                "input_tokens": u.input_tokens,
-                "output_tokens": u.output_tokens,
-                "total_tokens": u.total_tokens,
-            },
-        )
+        return _ev("usage", _usage_event_payload(round_num, u, served_backend))
 
     def _reasoning_ev(round_num: int, run_result: Any) -> StepEvent | None:
         """``model_response`` event carrying the synthesizer's reasoning trace.
@@ -1873,20 +1991,25 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # match any redaction pattern).
             user_msg_round1 = guard.sanitize_text(user_msg_round1)
         synth_agent = build_synth_first_agent(
-            build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature)
+            build_synthesizer_model(ctx.settings, temperature=ctx.settings.synthesizer_temperature),
+            output_mode=ctx.settings.synthesizer_output_mode,
         )
         # Captures the run's message history even when the run raises — on a
         # schema-retry exhaustion the RetryPromptParts in here are the only
         # record of WHY each attempt failed (the prod 2026-07-17/18 fallbacks
         # recorded just "Exceeded maximum output retries (3)" with hint=null).
         r1_captured: list[Any] = []
+        r1_attr: dict[str, Any] = {}
         try:
             # Fail-closed residue sweep on the FINAL composed outbound message
             # (after every sanitize_text above): if fail-closed is on and an
             # internal identifier survived, this raises BEFORE the model call so
             # the payload never egresses. No-op when off / no guard.
             user_msg_round1 = _guard_egress(guard, user_msg_round1, ctx.settings)
-            with capture_run_messages() as r1_captured:
+            with (
+                capture_run_messages() as r1_captured,
+                capture_backend_attribution() as r1_attr,
+            ):
                 async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                     synth_result_round1 = await synth_agent.run(user_msg_round1)
         except EgressResidueError as e:
@@ -1904,14 +2027,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # index.jsonl is structured (not verdict=None). The post-validators
             # + triage_report emission below run uniformly on the fallback.
             r1_causes = _retry_causes_from_messages(r1_captured)
+            r1_served = _served_backend(r1_attr)
             err_ev = _ev(
                 "error",
-                _error_payload(e, phase="synth_first_round1", round_num=1, retry_causes=r1_causes),
+                _error_payload(
+                    e,
+                    phase="synth_first_round1",
+                    round_num=1,
+                    retry_causes=r1_causes,
+                    served_backend=r1_served,
+                ),
             )
             await _audit(err_ev)
             yield err_ev
             triage_round1 = _synth_failure_fallback_report(
-                alert_id, "synth_first_round1", e, retry_causes=r1_causes
+                alert_id, "synth_first_round1", e, retry_causes=r1_causes, served_backend=r1_served
             )
             await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
@@ -1933,7 +2063,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             if r1_reasoning_ev is not None:
                 await _audit(r1_reasoning_ev)
                 yield r1_reasoning_ev
-            usage_ev = _usage_ev(1, synth_result_round1)
+            usage_ev = _usage_ev(1, synth_result_round1, _served_backend(r1_attr))
             if usage_ev is not None:
                 await _audit(usage_ev)
                 yield usage_ev
@@ -2030,6 +2160,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # pipeline-fallback (E1.2) instead of preserving a round-1 verdict, so a
         # blocked egress renders as a pipeline error.
         egress_blocked_exc: EgressResidueError | None = None
+        # Gateway attribution for the multi-turn loop's model calls. Mutable-dict
+        # sink (see capture_backend_attribution): filled per response, read after
+        # the loop for the usage event, valid even if a later turn raised.
+        loop_attr: dict[str, Any] = {}
         try:
             # Fail-closed residue sweep on the FINAL composed investigator prompt
             # BEFORE the loop's first model call — if an internal identifier
@@ -2042,46 +2176,49 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # CallToolsNode carries the model's response (text + tool requests);
             # the following ModelRequestNode carries that step's tool results.
             node_msg: Any = None
-            async with investigator.iter(inv_user_msg, usage_limits=loop_usage_limits) as inv_run:
-                # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
-                # iterator step (the model-run await that produces the next node),
-                # NOT one timeout spanning the whole multi-turn loop. Event
-                # projection + yielding stays outside the timeout so streaming is
-                # unchanged. A per-turn TimeoutError propagates to the same
-                # except-handlers below (error event + honest stop) as any other
-                # investigator failure.
-                node_iter = inv_run.__aiter__()
-                while True:
-                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                        try:
-                            node = await node_iter.__anext__()
-                        except StopAsyncIteration:
-                            break
-                    # CallToolsNode carries the model's response (text + tool
-                    # requests); the following ModelRequestNode carries that
-                    # step's tool results. Detect by attribute so the message is
-                    # projected the moment its node arrives.
-                    node_msg = getattr(node, "model_response", None)
-                    if node_msg is None:
-                        node_msg = getattr(node, "request", None)
-                    if node_msg is not None:
-                        loop_gathered.append(node_msg)
-                        async for ev in _walk_message(
-                            node_msg, _ev, phase="investigation_loop", round_num=1
-                        ):
-                            # The loop converses in label space; restore real
-                            # values in the streamed timeline events (tool
-                            # calls/results, reasoning traces) — they are
-                            # local storage/display, never egress.
-                            out_ev = (
-                                ev
-                                if guard is None
-                                else ev.model_copy(
-                                    update={"payload": guard.desanitize_obj(ev.payload)}
+            with capture_backend_attribution() as loop_attr:
+                async with investigator.iter(
+                    inv_user_msg, usage_limits=loop_usage_limits
+                ) as inv_run:
+                    # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
+                    # iterator step (the model-run await that produces the next node),
+                    # NOT one timeout spanning the whole multi-turn loop. Event
+                    # projection + yielding stays outside the timeout so streaming is
+                    # unchanged. A per-turn TimeoutError propagates to the same
+                    # except-handlers below (error event + honest stop) as any other
+                    # investigator failure.
+                    node_iter = inv_run.__aiter__()
+                    while True:
+                        async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                            try:
+                                node = await node_iter.__anext__()
+                            except StopAsyncIteration:
+                                break
+                        # CallToolsNode carries the model's response (text + tool
+                        # requests); the following ModelRequestNode carries that
+                        # step's tool results. Detect by attribute so the message is
+                        # projected the moment its node arrives.
+                        node_msg = getattr(node, "model_response", None)
+                        if node_msg is None:
+                            node_msg = getattr(node, "request", None)
+                        if node_msg is not None:
+                            loop_gathered.append(node_msg)
+                            async for ev in _walk_message(
+                                node_msg, _ev, phase="investigation_loop", round_num=1
+                            ):
+                                # The loop converses in label space; restore real
+                                # values in the streamed timeline events (tool
+                                # calls/results, reasoning traces) — they are
+                                # local storage/display, never egress.
+                                out_ev = (
+                                    ev
+                                    if guard is None
+                                    else ev.model_copy(
+                                        update={"payload": guard.desanitize_obj(ev.payload)}
+                                    )
                                 )
-                            )
-                            await _audit(out_ev)
-                            yield out_ev
+                                await _audit(out_ev)
+                                yield out_ev
             inv_result = inv_run.result
         except asyncio.CancelledError:
             raise  # cooperative cancel — propagate, never swallow
@@ -2222,7 +2359,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # check (loop_messages feeds _is_evidence_backed / targeted-cite check).
             loop_transcript = inv_result.output
             loop_messages = inv_result.all_messages()
-            inv_usage_ev = _usage_ev(1, inv_result)
+            inv_usage_ev = _usage_ev(1, inv_result, _served_backend(loop_attr))
             if inv_usage_ev is not None:
                 await _audit(inv_usage_ev)
                 yield inv_usage_ev
@@ -2247,7 +2384,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             loop_synth = build_synthesizer(
                 build_synthesizer_model(
                     ctx.settings, temperature=ctx.settings.synthesizer_temperature
-                )
+                ),
+                output_mode=ctx.settings.synthesizer_output_mode,
             )
             loop_synth_msg = _format_transcript_for_synthesizer(
                 alert_id, [loop_transcript], candidate=candidate
@@ -2260,11 +2398,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # Same capture as round-1: on schema-retry exhaustion the causes
             # live only in the run's RetryPromptParts.
             ls_captured: list[Any] = []
+            ls_attr: dict[str, Any] = {}
             try:
                 # Fail-closed residue sweep on the FINAL composed loop-synth
                 # message before the model call — raises BEFORE egress on residue.
                 loop_synth_msg = _guard_egress(guard, loop_synth_msg, ctx.settings)
-                with capture_run_messages() as ls_captured:
+                with (
+                    capture_run_messages() as ls_captured,
+                    capture_backend_attribution() as ls_attr,
+                ):
                     async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                         loop_synth_result = await loop_synth.run(
                             loop_synth_msg,
@@ -2287,6 +2429,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # landing status=error with NO verdict + no recorded error event.
                 # Catch it, record the error, and DON'T discard the round-1 verdict.
                 ls_causes = _retry_causes_from_messages(ls_captured)
+                ls_served = _served_backend(ls_attr)
                 err_ev = _ev(
                     "error",
                     _error_payload(
@@ -2294,11 +2437,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                         phase="investigation_loop_synth",
                         round_num=2,
                         retry_causes=ls_causes,
+                        served_backend=ls_served,
                     ),
                 )
                 await _audit(err_ev)
                 yield err_ev
-                triage_final = _round2_failure_fallback(alert_id, triage_round1, e, ls_causes)
+                triage_final = _round2_failure_fallback(
+                    alert_id, triage_round1, e, ls_causes, ls_served
+                )
                 final_synth_rerun = None  # fallback verdict — never vote on it
                 await metrics.get_metrics().record_event("fallback_verdict", {})
             else:
@@ -2315,7 +2461,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 if loop_reasoning_ev is not None:
                     await _audit(loop_reasoning_ev)
                     yield loop_reasoning_ev
-                loop_synth_usage_ev = _usage_ev(2, loop_synth_result)
+                loop_synth_usage_ev = _usage_ev(2, loop_synth_result, _served_backend(ls_attr))
                 if loop_synth_usage_ev is not None:
                     await _audit(loop_synth_usage_ev)
                     yield loop_synth_usage_ev
@@ -2407,11 +2553,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # before this composed message crosses the egress boundary.
                 user_msg_round2 = guard.sanitize_text(user_msg_round2)
             r2_captured: list[Any] = []
+            r2_attr: dict[str, Any] = {}
             try:
                 # Fail-closed residue sweep on the FINAL composed round-2 message
                 # before the model call — raises BEFORE egress on residue.
                 user_msg_round2 = _guard_egress(guard, user_msg_round2, ctx.settings)
-                with capture_run_messages() as r2_captured:
+                with (
+                    capture_run_messages() as r2_captured,
+                    capture_backend_attribution() as r2_attr,
+                ):
                     async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                         synth_result_round2 = await synth_agent.run(user_msg_round2)
             except asyncio.CancelledError:
@@ -2435,6 +2585,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # round-2 retry-exhaustion isn't the hint=null blind spot the
                 # retry_causes feature closed for round-1/loop-synth.
                 r2_causes = _retry_causes_from_messages(r2_captured)
+                r2_served = _served_backend(r2_attr)
                 err_ev = _ev(
                     "error",
                     _error_payload(
@@ -2442,11 +2593,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                         phase="synth_first_round2",
                         round_num=dispatch_round + 1,
                         retry_causes=r2_causes,
+                        served_backend=r2_served,
                     ),
                 )
                 await _audit(err_ev)
                 yield err_ev
-                triage_final = _round2_failure_fallback(alert_id, triage_round1, e, r2_causes)
+                triage_final = _round2_failure_fallback(
+                    alert_id, triage_round1, e, r2_causes, r2_served
+                )
                 final_synth_rerun = None  # fallback verdict — never vote on it
                 await metrics.get_metrics().record_event("fallback_verdict", {})
                 phase_d_synth_ok = False
@@ -2465,7 +2619,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 if r2_reasoning_ev is not None:
                     await _audit(r2_reasoning_ev)
                     yield r2_reasoning_ev
-                usage2_ev = _usage_ev(dispatch_round + 1, synth_result_round2)
+                usage2_ev = _usage_ev(
+                    dispatch_round + 1, synth_result_round2, _served_backend(r2_attr)
+                )
                 if usage2_ev is not None:
                     await _audit(usage2_ev)
                     yield usage2_ev

@@ -18,10 +18,82 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any
 
 import httpx
 
 _LOGGER = logging.getLogger(__name__)
+
+# Which BACKEND actually served the most recent gateway call on this run.
+#
+# soc-ai asks LiteLLM for one alias (``analyst_model``) and the gateway may route
+# that to a different deployment, or fall back to another one entirely, without
+# changing anything the client can see: the response body's ``model`` field and
+# pydantic-ai's ``ModelResponse.model_name`` both echo back the ALIAS. So a
+# failure recorded against "the model" names what we asked for, not what ran —
+# which is exactly why "the lower-tier fallback models fail more" was
+# unfalsifiable from the error log.
+#
+# LiteLLM does report the truth, but only in response HEADERS, which pydantic-ai
+# does not surface (``ModelResponse.provider_details`` carries just finish_reason
+# and a timestamp). This transport is the one place soc-ai owns that sees them.
+#
+# The ContextVar holds a MUTABLE dict rather than a value: a ContextVar set
+# inside a child task is invisible to its parent, but mutating a shared dict is
+# visible everywhere the reference reached. That keeps attribution working
+# regardless of how pydantic-ai schedules the request.
+_ATTRIBUTION: ContextVar[dict[str, Any] | None] = ContextVar(
+    "soc_ai_gateway_attribution", default=None
+)
+
+# LiteLLM response headers -> the key we record. `api_base` is the load-bearing
+# one (it identifies the serving engine); `attempted_fallbacks` answers "did this
+# request get demoted to another deployment?" directly.
+_ATTRIBUTION_HEADERS = {
+    "x-litellm-model-api-base": "api_base",
+    "x-litellm-model-group": "model_group",
+    "x-litellm-model-id": "deployment_id",
+    "x-litellm-attempted-fallbacks": "attempted_fallbacks",
+    "x-litellm-attempted-retries": "attempted_retries",
+}
+
+
+@contextmanager
+def capture_backend_attribution() -> Iterator[dict[str, Any]]:
+    """Collect which backend served the gateway calls made inside this block.
+
+    Yields the sink dict; it is populated as calls complete, so read it AFTER the
+    block's work (including from an exception handler — the last attempt's
+    headers are already in there).
+    """
+    sink: dict[str, Any] = {}
+    token = _ATTRIBUTION.set(sink)
+    try:
+        yield sink
+    finally:
+        _ATTRIBUTION.reset(token)
+
+
+def _record_attribution(response: httpx.Response) -> None:
+    """Stash the gateway's backend headers into the active sink (no-op if none).
+
+    Fail-soft on purpose: attribution is diagnostics, and must never be able to
+    break a model call that otherwise succeeded.
+    """
+    try:
+        sink = _ATTRIBUTION.get()
+        if sink is None:
+            return
+        for header, key in _ATTRIBUTION_HEADERS.items():
+            value = response.headers.get(header)
+            if value:
+                sink[key] = value
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        _LOGGER.debug("failed to record gateway attribution", exc_info=True)
+
 
 # Transient gateway statuses worth retrying (mirrors the Oracle client's
 # "5xx/transport = retryable, 4xx = terminal" split, plus 429 rate-limit).
@@ -86,6 +158,10 @@ class RetryingAsyncTransport(httpx.AsyncBaseTransport):
                     delay,
                 )
             else:
+                # Record on EVERY response, including the ones we go on to retry:
+                # if the final attempt raises a transport error, the last headers
+                # we saw are still the best attribution available.
+                _record_attribution(response)
                 if response.status_code not in _RETRYABLE_STATUS or attempt >= self._max_retries:
                     return response
                 # Must release the connection before retrying the request.

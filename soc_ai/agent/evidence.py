@@ -6,6 +6,7 @@ points at.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -25,6 +26,12 @@ _CITE_ID_RE = re.compile(r"\(?\s*id\s+([A-Za-z0-9_-]{6,})\s*\)?")
 
 _PLAIN_PATH_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
 _PLAIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,}$")
+# Bare tool name, prefix dropped (`t_enrich_ip`), with the same optional
+# `:key` qualifier the prefixed form already accepts. All-lowercase with
+# the `t_` prefix, so it can't collide with a mixed-case Elasticsearch _id.
+_PLAIN_TOOL_RE = re.compile(r"^(t_[a-z0-9_]+)(?:\s*:.*)?$")
+# Plain path with the observed value appended (`alert.dns_query=example.com`).
+_PLAIN_PATH_EQ_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)\s*=")
 
 
 def _classify_citation(citation: str) -> tuple[str, str | None]:
@@ -55,9 +62,16 @@ def _classify_citation(citation: str) -> tuple[str, str | None]:
         return "tool", m.group(1)
     if m := _CITE_ID_RE.search(s):
         return "id", m.group(1)
-    # Plain forms.
+    # Plain forms. Tool names are checked before the id fallback: a bare
+    # `t_web_search` is 12+ chars and would otherwise match _PLAIN_ID_RE,
+    # then fail to resolve because tool names never appear in the alert
+    # bundle the id branch searches.
+    if m := _PLAIN_TOOL_RE.match(s):
+        return "tool", m.group(1)
     if _PLAIN_PATH_RE.match(s):
         return "path", s
+    if m := _PLAIN_PATH_EQ_RE.match(s):
+        return "path", m.group(1)
     if _PLAIN_ID_RE.match(s):
         return "id", s
     return "unknown", None
@@ -69,6 +83,11 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
     ``dotted`` may begin with ``alert.`` (the typed fields on the
     pre-loaded alert) or with a top-level pivot key like
     ``community_id_events`` (less common but legal).
+
+    Zeek/Suricata ``message`` fields arrive as embedded JSON *strings*
+    rather than dicts, so the walk parses a string that holds a JSON
+    object and keeps descending. Without that, every citation into a
+    message body (``alert.message.app_proto``) read as unresolved.
     """
     try:
         dump = alert_ctx.model_dump(mode="json")
@@ -76,6 +95,15 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
         return False
     cur: Any = dump
     for part in dotted.split("."):
+        if isinstance(cur, str):
+            # Embedded JSON object — parse once and keep walking.
+            try:
+                parsed = json.loads(cur)
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(parsed, dict | list):
+                return False
+            cur = parsed
         if isinstance(cur, dict):
             if part not in cur:
                 return False
