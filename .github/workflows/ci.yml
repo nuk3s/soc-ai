@@ -18,7 +18,14 @@ jobs:
   ci:
     name: lint + typecheck + test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised 10 -> 30 (2026-08-16): the backend suite crossed the old cap as it
+    # grew past ~4300 tests — the degraded-grid publish was killed at exactly
+    # 10m0s with everything passing, the same failure shape the internal CI
+    # config has recorded at 10m, 20m and 35m. GitHub-hosted runners give this job its own
+    # machine (no contention with the frontend job), so 30m is ~2x projected
+    # wall time. The real fix is parallelising the suite (per-worker DBs, then
+    # pytest-xdist) — tracked internally; when that lands, drop this back.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v7
