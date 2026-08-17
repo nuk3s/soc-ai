@@ -1,4 +1,4 @@
-import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard, Search, Settings, SlidersHorizontal, Triangle, Zap } from 'lucide-react';
+import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard, Search, Server, Settings, SlidersHorizontal, Triangle, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -95,6 +95,9 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Dashboard', icon: <LayoutDashboard size={15} />, run: go('/dashboard') },
       { group: 'Go to', label: 'Alerts', icon: <Triangle size={15} />, run: go('/alerts') },
       { group: 'Go to', label: 'Investigations', icon: <Search size={15} />, run: go('/investigations') },
+      // Screens do not self-register here; the Go-to list is hand-kept in the
+      // sidebar's order, so a new nav entry has to be added in both places.
+      { group: 'Go to', label: 'Hosts', icon: <Server size={15} />, run: go('/hosts') },
       { group: 'Go to', label: 'Notifications', icon: <Bell size={15} />, run: go('/notifications') },
       { group: 'Go to', label: 'Hunts', icon: <Crosshair size={15} />, run: go('/hunts') },
       { group: 'Go to', label: 'Backtest', icon: <History size={15} />, run: go('/backtest') },

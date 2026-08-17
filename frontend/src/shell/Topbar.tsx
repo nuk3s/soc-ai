@@ -7,6 +7,7 @@ import {
   NOTIFICATIONS_DISMISSED_EVENT,
   dismissNotification,
   formatNotificationTitle,
+  formatNotificationWhen,
   getDismissed,
 } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
@@ -27,6 +28,8 @@ function useBreadcrumb(): { crumb: string; crumb2?: string } {
   if (pathname.startsWith('/investigation')) return { crumb: 'Investigation', crumb2: params.id };
   if (pathname.startsWith('/hunts') && params.id) return { crumb: 'Hunts', crumb2: params.id };
   if (pathname.startsWith('/hunts')) return { crumb: 'Hunts' };
+  if (pathname.startsWith('/hosts') && params.ip) return { crumb: 'Hosts', crumb2: params.ip };
+  if (pathname.startsWith('/hosts')) return { crumb: 'Hosts' };
   if (pathname.startsWith('/notifications')) return { crumb: 'Notifications' };
   if (pathname.startsWith('/backtest')) return { crumb: 'Backtest' };
   if (pathname.startsWith('/runbooks')) return { crumb: 'Runbooks' };
@@ -64,13 +67,26 @@ export function Topbar() {
         })
         .catch(() => {});
     load();
-    const t = setInterval(load, 15000); // keep the bell live without a reload
+    // Topbar mounts on every in-shell route, so this poll runs for the whole
+    // session. Skip a backgrounded tab (the house guard, lib/useAsync.ts:118) —
+    // /notifications is the app's hottest endpoint and nobody is watching the
+    // bell in a parked tab — and re-read once on return to visible so the badge
+    // is current the moment the analyst looks again.
+    const t = setInterval(() => {
+      if (document.hidden) return;
+      load();
+    }, 15000); // keep the bell live without a reload
+    const onVisible = () => {
+      if (!document.hidden) load();
+    };
+    document.addEventListener('visibilitychange', onVisible);
     // A dismiss from anywhere (this bell, the Notifications pane, "Clear all")
     // re-reads immediately so the badge count can't lag its 15s poll.
     window.addEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
     return () => {
       alive = false;
       clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
     };
   }, []);
@@ -102,10 +118,20 @@ export function Topbar() {
           setHealthFailed(true);
         });
     tick();
-    const t = setInterval(tick, 60_000);
+    // Same hidden-tab guard as the notifications poll above: don't probe
+    // upstream health for a parked tab, and refresh once on return to visible.
+    const t = setInterval(() => {
+      if (document.hidden) return;
+      tick();
+    }, 60_000);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       alive = false;
       clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
 
@@ -305,7 +331,11 @@ export function Topbar() {
               />
               <div className="min-w-0 flex-1">
                 <div className="text-[12.5px] leading-[1.45]">{formatNotificationTitle(nt.title)}</div>
-                {nt.when && <div className="mt-[3px] font-mono text-[10.5px] text-faint">{nt.when === 'now' ? 'just now' : `${nt.when} ago`}</div>}
+                {formatNotificationWhen(nt.when) && (
+                  <div className="mt-[3px] font-mono text-[10.5px] text-faint">
+                    {formatNotificationWhen(nt.when)}
+                  </div>
+                )}
               </div>
               <button
                 onClick={(e) => {

@@ -47,6 +47,23 @@ async def test_query_events_oql_happy_path(settings_kratos: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_events_oql_rejects_overlong_query_before_parse(
+    settings_kratos: Settings,
+) -> None:
+    """An agent steered into a 30k-term OQL would otherwise burn ~1s of event
+    loop in the synchronous lark parse. The length guard rejects it first — the
+    same 2048 ceiling the HTTP q params enforce."""
+    elastic, fake_es = _make_elastic(settings_kratos, {"took": 0, "hits": {"total": 0, "hits": []}})
+    with pytest.raises(ValueError, match="query must be <="):
+        await query_events_oql(
+            "a" * 3000,
+            elastic=elastic,
+            settings=settings_kratos,
+        )
+    fake_es.search.assert_not_called()  # rejected before any ES call or parse
+
+
+@pytest.mark.asyncio
 async def test_query_events_oql_excludes_synth_docs_by_default(
     settings_kratos: Settings,
 ) -> None:

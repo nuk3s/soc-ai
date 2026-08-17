@@ -1,14 +1,21 @@
 import type { InvestigationRow } from './types';
 
-/** Every value the Investigations Verdict filter accepts — the real verdicts
+/** Every value the Investigations Verdict filter accepts — the settled verdicts
  * plus the synthetic 'pipeline_error' (E1.2 fallback rows). Single source for
- * the deep-link parser below; the MultiSelect labels live with the screen. */
+ * the deep-link parser below; the MultiSelect labels live with the screen.
+ *
+ * 'untriaged' is deliberately absent. This list holds investigation ROWS, and a
+ * detection group nobody has investigated has no row — nor can it get one while
+ * it stays untriaged — so the filter was empty by construction and the table
+ * renders an untriaged verdict as a bare em-dash, never a pill. Untriaged work
+ * belongs on /alerts, which counts the same unit (groups) off the same
+ * endpoint. A run that ENDED without a verdict is reached through the Status
+ * filter's Error/Interrupted options. */
 export const VERDICT_FILTER_VALUES: readonly string[] = [
   'true_positive',
   'false_positive',
   'needs_more_info',
   'inconclusive',
-  'untriaged',
   'pipeline_error',
 ];
 

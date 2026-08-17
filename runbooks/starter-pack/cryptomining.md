@@ -45,7 +45,7 @@ This is the real triage. Check, in order:
    install competitors'-miner killers and re-infection cron jobs — cleanup
    that misses persistence lasts hours.
 4. **Fleet scope**: pivot the pool domain/IP and any dropper hash across the
-   estate. Server-side mining campaigns hit every host with the same exposed
+   network. Server-side mining campaigns hit every host with the same exposed
    service.
 
 ## Verdict guidance

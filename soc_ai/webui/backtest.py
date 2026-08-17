@@ -30,6 +30,9 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
+
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
 from soc_ai.so_client.fields import get_dotted
@@ -69,17 +72,31 @@ def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ``None``/``"no_verdict"`` when the replay produced none). Extra keys
     (``alert_id``, ``rule_name`` …) are passed through untouched. Pure: no I/O.
 
+    DECIDED vs TOTAL. A row whose replay produced no verdict at all (an errored
+    run, or every tool failing because the grid went away mid-backtest) is a row
+    soc-ai never judged. Scoring it as a disagreement turns an infrastructure
+    outage into a model regression: the 2026-08-13 sweep measured a run that lost
+    the grid after 2 of 20 samples reporting "agrees with analysts 10% of the
+    time". Quality is therefore measured over the rows soc-ai actually decided,
+    and COVERAGE is reported separately as ``completion_rate`` — an eval must
+    record an outage as an outage.
+
     Returns:
       - ``agreement_rate``: fraction where soc-ai's verdict matches the human
-        disposition (TP↔escalated, FP↔acked-not-escalated), over ALL rows.
-      - ``fp_reduction``: of the human-FP (acked) rows, the fraction soc-ai also
-        called ``false_positive`` — the toil soc-ai would have auto-cleared.
+        disposition (TP↔escalated, FP↔acked-not-escalated), over the DECIDED rows.
+      - ``completion_rate``: decided rows / all rows — how much of the sample was
+        actually replayed. Read the two together or neither means anything.
+      - ``fp_reduction``: of the DECIDED human-FP (acked) rows, the fraction
+        soc-ai also called ``false_positive`` — the toil soc-ai would auto-clear.
       - ``missed_tp``: of the human-TP (escalated) rows, the COUNT soc-ai called
         ``false_positive`` — the CRITICAL safety number (a missed real incident).
+        Deliberately NOT rebased: it is a count of real events, not a rate.
       - ``missed_tp_rows``: those rows, so the report can list them.
       - ``confusion``: counts by ``human_disposition`` x ``soc_ai_verdict``.
-      - ``n_needs_more_info``: rows where soc-ai hedged.
-      - ``counts``: totals (``total``, ``human_tp``, ``human_fp``, ``agreements``).
+      - ``n_needs_more_info``: rows where soc-ai hedged (a decision, not a gap).
+      - ``n_no_verdict``: rows soc-ai never judged.
+      - ``counts``: totals (``total``, ``decided``, ``no_verdict``, ``human_tp``,
+        ``human_fp``, ``human_fp_decided``, ``agreements``, ``fp_cleared``).
     """
     total = len(rows)
     human_tp = [r for r in rows if r.get("human_disposition") == HUMAN_TP]
@@ -95,16 +112,23 @@ def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
             return "needs_more_info"
         return v if v in SOC_VERDICTS else NO_VERDICT
 
-    agreements = sum(1 for r in rows if _verdict(r) == r.get("human_disposition"))
+    # Rows soc-ai actually judged. `needs_more_info` IS a decision (soc-ai looked
+    # and hedged); `no_verdict` is the absence of one (errored / unreadable).
+    decided = [r for r in rows if _verdict(r) != NO_VERDICT]
+    agreements = sum(1 for r in decided if _verdict(r) == r.get("human_disposition"))
 
-    # fp_reduction: of human-FP alerts, share soc-ai ALSO called false_positive.
-    fp_cleared = sum(1 for r in human_fp if _verdict(r) == HUMAN_FP)
-    fp_reduction = (fp_cleared / len(human_fp)) if human_fp else 0.0
+    # fp_reduction: of the DECIDED human-FP alerts, share soc-ai ALSO called
+    # false_positive. Rebasing matters here for the same reason as agreement —
+    # an unreadable row is not toil soc-ai failed to clear.
+    human_fp_decided = [r for r in human_fp if _verdict(r) != NO_VERDICT]
+    fp_cleared = sum(1 for r in human_fp_decided if _verdict(r) == HUMAN_FP)
+    fp_reduction = (fp_cleared / len(human_fp_decided)) if human_fp_decided else 0.0
 
     # missed_tp: human-TP alerts soc-ai called false_positive (the dangerous miss).
     missed_tp_rows = [r for r in human_tp if _verdict(r) == HUMAN_FP]
 
     n_needs_more_info = sum(1 for r in rows if _verdict(r) == "needs_more_info")
+    n_no_verdict = total - len(decided)
 
     # Confusion matrix: human disposition → {soc verdict: count}.
     confusion: dict[str, dict[str, int]] = {
@@ -117,19 +141,59 @@ def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
             confusion[disp][_verdict(r)] += 1
 
     return {
-        "agreement_rate": (agreements / total) if total else 0.0,
+        "agreement_rate": (agreements / len(decided)) if decided else 0.0,
+        "completion_rate": (len(decided) / total) if total else 0.0,
         "fp_reduction": fp_reduction,
         "missed_tp": len(missed_tp_rows),
         "missed_tp_rows": missed_tp_rows,
         "n_needs_more_info": n_needs_more_info,
+        "n_no_verdict": n_no_verdict,
         "confusion": confusion,
         "counts": {
             "total": total,
+            "decided": len(decided),
+            "no_verdict": n_no_verdict,
             "human_tp": len(human_tp),
             "human_fp": len(human_fp),
+            "human_fp_decided": len(human_fp_decided),
             "agreements": agreements,
             "fp_cleared": fp_cleared,
         },
+    }
+
+
+# A run is DEGRADED when at least this share of its samples produced no verdict.
+# Below the line the run still stands (a couple of unlucky replays are normal and
+# the completion block records them); at or above it, the sample is dominated by
+# rows nobody judged, so the metrics describe an outage rather than the model.
+_DEGRADED_NO_VERDICT_SHARE = 0.5
+
+
+def _completion(metrics: dict[str, Any]) -> dict[str, Any]:
+    """The coverage block persisted beside the metrics.
+
+    Answers "how much of this backtest actually ran" — the question a completed
+    report used to be unable to answer at all. The in-memory ``failed`` counter
+    existed but is transient (reset on the next run, lost on restart) and the SPA
+    only ever showed it in the live-progress panel, so a reader loading the
+    finished report months later saw a clean score over a blind window.
+    """
+    counts = metrics["counts"]
+    total = int(counts["total"])
+    no_verdict = int(counts["no_verdict"])
+    degraded = bool(total and no_verdict >= total * _DEGRADED_NO_VERDICT_SHARE)
+    return {
+        "total": total,
+        "decided": int(counts["decided"]),
+        "no_verdict": no_verdict,
+        "completion_rate": metrics["completion_rate"],
+        "degraded": degraded,
+        "reason": (
+            f"{no_verdict} of {total} replays produced no verdict — the metrics below "
+            "describe only the replays that completed, not the model."
+            if degraded
+            else None
+        ),
     }
 
 
@@ -217,8 +281,11 @@ async def plan_samples(
     distinct disposed rule gets a representative, escalated alerts preferred
     (they carry the safety-critical TP label). Newest-first within a key.
 
-    Never raises — an ES failure logs and returns an empty list so the caller
-    lands a clean, empty backtest rather than crashing.
+    RAISES on an ES failure. This used to swallow it and return ``[]`` "so the
+    caller lands a clean, empty backtest rather than crashing" — which made the
+    console report an outage as a fact about the operator's own triage history:
+    "no dispositioned alerts in the window to replay". A window we could not read
+    is not a window we found empty; the caller turns the error into a 503.
     """
     settings = state.settings
     elastic = state.elastic
@@ -258,16 +325,12 @@ async def plan_samples(
     if severity_floor:
         query["bool"]["filter"].append({"terms": {"event.severity_label": list(severity_floor)}})
 
-    try:
-        result = await elastic.search(
-            settings.events_index_pattern,
-            query,
-            size=500,
-            sort=[{"@timestamp": {"order": "desc"}}],
-        )
-    except Exception:
-        _LOGGER.exception("backtest: dispositioned-alert sampling query failed")
-        return []
+    result = await elastic.search(
+        settings.events_index_pattern,
+        query,
+        size=500,
+        sort=[{"@timestamp": {"order": "desc"}}],
+    )
 
     seen: set[tuple[str, str]] = set()
     samples: list[BacktestSample] = []
@@ -413,14 +476,21 @@ async def run_backtest(
             status.current = None
 
         metrics = score(rows)
+        completion = _completion(metrics)
         results = {
             "metrics": {
                 "agreement_rate": metrics["agreement_rate"],
+                "completion_rate": metrics["completion_rate"],
                 "fp_reduction": metrics["fp_reduction"],
                 "missed_tp": metrics["missed_tp"],
                 "n_needs_more_info": metrics["n_needs_more_info"],
+                "n_no_verdict": metrics["n_no_verdict"],
                 "counts": metrics["counts"],
             },
+            # How much of the sample was actually replayed, and whether the run
+            # was cut short. A report that claims coverage it does not have is
+            # the whole G5 defect — the record must say it was interrupted.
+            "completion": completion,
             "confusion": metrics["confusion"],
             "missed_tp_rows": metrics["missed_tp_rows"],
             "rows": rows,
@@ -433,10 +503,22 @@ async def run_backtest(
                 "some 'human FP' rows were not strictly confirmed benign."
             ),
         }
+        # A run most of whose replays produced nothing did not measure the model,
+        # it measured an outage. Land it as an error so no reader mistakes it for
+        # a verdict on quality — the results ride along so the partial coverage
+        # is still inspectable.
+        final_status = "error" if completion["degraded"] else "complete"
+        if completion["degraded"]:
+            _LOGGER.warning(
+                "backtest: %s finalized DEGRADED — only %d of %d replays produced a verdict",
+                backtest_id,
+                completion["decided"],
+                completion["total"],
+            )
         try:
             async with state.db_sessionmaker() as db:
                 await bt_svc.finalize(
-                    db, backtest_id, status="complete", sampled=len(rows), results=results
+                    db, backtest_id, status=final_status, sampled=len(rows), results=results
                 )
         except Exception:
             _LOGGER.exception("backtest: finalize failed for id=%s", backtest_id)
@@ -460,7 +542,15 @@ async def start_backtest(
     min_severity: str | None,
     started_by: str,
 ) -> BacktestStatus:
-    """Plan + launch a background backtest (single-flight). Never raises.
+    """Plan + launch a background backtest (single-flight).
+
+    Raises ``(TimeoutError, TransportError, ApiError)`` when the SAMPLING query
+    could not read the grid, for the route to answer as a 503 / 400 — including
+    the case where it did not fail so much as never answer, which the
+    ``webui_grid_timeout_s`` bound below turns into that same TimeoutError. Every
+    other failure still degrades to a non-active status carrying a note — but "the
+    grid is unreachable" must not be reported as "your window holds no
+    dispositioned alerts". The single-flight slot is released on every exit path.
 
     Clamps ``sample_size`` to ``settings.backtest_max_sample`` (each sample is a
     full LLM investigation — expensive) and logs the clamp. Samples dispositioned
@@ -492,14 +582,51 @@ async def start_backtest(
         "min_severity": min_severity,
     }
 
-    status.active = True  # claim the single-flight slot before any await
+    # Claim the single-flight slot before any await, and clear the last run's
+    # counters with it. Setting ``active`` alone left the PREVIOUS run's
+    # backtest_id/total/replayed on a status now flagged live, so a page that
+    # mounted while this sampling read was in flight rendered a finished run as
+    # in-progress. Nothing has been sampled yet, so the honest live status is
+    # empty: no id, no total, nothing replayed.
+    status.reset(active=True, total=0, backtest_id=None)
     try:
-        samples = await plan_samples(
-            state,
-            window_days=int(window_days),
-            sample_size=capped,
-            min_severity=min_severity,
+        # Bound the SAMPLING READ, never the replay. plan_samples is exactly one
+        # ES search; the replay behind it is N full LLM investigations and a
+        # 30-day window is legitimately long-running, so the console budget must
+        # not go anywhere near it — it is applied here, to the one grid read the
+        # caller is actually waiting on. Without it a grid that accepts the
+        # connection and never answers held this POST for the client's whole 20 s
+        # and then, on the disconnect, left ``active`` claimed forever: every
+        # later backtest answered "already running" until a restart.
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            samples = await plan_samples(
+                state,
+                window_days=int(window_days),
+                sample_size=capped,
+                min_severity=min_severity,
+            )
+    except (TimeoutError, TransportError, ApiError):
+        # Release the single-flight slot BEFORE propagating, or one outage wedges
+        # every later backtest behind "already running".
+        status.active = False
+        # This note is what SURVIVES: the inline error the POST raises is gone on
+        # the next page load, and the console then renders this string on its own.
+        # It used to be a lowercase fragment with no remedy on it, so the durable
+        # half of the failure was the half that did not say what to do next.
+        status.note = (
+            "Grid unavailable — the window could not be read, so no alerts were "
+            "sampled. Security Onion (Elasticsearch) is slow or unreachable; retry shortly."
         )
+        _LOGGER.warning("backtest: sampling could not read the grid")
+        raise
+    except asyncio.CancelledError:
+        # The caller went away mid-sample — a browser that gave up on this POST,
+        # or a shutdown. CancelledError is a BaseException, so it sails past the
+        # arms above and used to leave the claim outliving the request that made
+        # it: every later backtest then answered "already running" until a
+        # restart, and the console rendered a live run that no longer existed.
+        status.active = False
+        raise
     except Exception:
         status.active = False
         _LOGGER.exception("backtest: planning failed")

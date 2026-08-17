@@ -442,6 +442,40 @@ def test_detection_tuning_summary_counts_actionable_mutes(client: TestClient) ->
     assert resp.json() == {"pending": 1}
 
 
+def test_summary_answers_a_down_grid_with_503_not_an_unhandled_500(client: TestClient) -> None:
+    """Nominating reads the grid, so a down grid must answer like the alert routes.
+
+    Found by the 2026-08-13 verification pass: with ES unreachable this endpoint
+    raised straight out of the handler, so the Dashboard's nudge call produced a
+    500 with an ASGI traceback in the log while its sibling alert routes return a
+    clean 503. Degraded-grid behaviour is exactly what a SOC console must get
+    right, and it is the state the public demo runs in.
+    """
+    from elastic_transport import ConnectionError as EsConnectionError
+
+    with patch(
+        "soc_ai.webui.detection_tuning.nominate",
+        AsyncMock(side_effect=EsConnectionError("grid down")),
+    ):
+        resp = client.get("/api/v1/detection-tuning/summary")
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["reason"] == "grid_unavailable"
+
+
+def test_summary_maps_an_es_client_error_to_400(client: TestClient) -> None:
+    """An ES 4xx is a bad query, not a grid outage — the same split the alerts use."""
+    from elastic_transport import ApiResponseMeta, HttpHeaders
+    from elasticsearch import BadRequestError
+
+    meta = ApiResponseMeta(400, "HTTP/1.1", HttpHeaders(), 0.0, None)
+    with patch(
+        "soc_ai.webui.detection_tuning.nominate",
+        AsyncMock(side_effect=BadRequestError("bad", meta=meta, body={})),
+    ):
+        resp = client.get("/api/v1/detection-tuning/summary")
+    assert resp.status_code == 400
+
+
 def test_post_override_then_remove_roundtrip(client: TestClient) -> None:
     # Create a mute via the endpoint.
     resp = client.post(

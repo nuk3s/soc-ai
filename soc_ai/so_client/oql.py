@@ -24,6 +24,7 @@ Raw OQL never reaches Elasticsearch.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass
@@ -83,6 +84,23 @@ def get_whitelist() -> FieldWhitelist:
     return _WHITELIST
 
 
+def _field_suggestion(name: str) -> str:
+    """A ``; did you mean: …?`` tail naming the closest allowed fields, or ``""``.
+
+    Field rejects are returned verbatim to the LLM agent — the only channel it
+    has to self-correct — and prod logs show groupby/filter field rejects still
+    recurring, so naming the two or three nearest whitelisted names/prefixes
+    (via :func:`difflib.get_close_matches`) converges it faster than the generic
+    "use full ECS field names" line. Empty when nothing is close enough.
+    """
+    wl = get_whitelist()
+    candidates = sorted(wl.exact | wl.prefixes)
+    matches = difflib.get_close_matches(name, candidates, n=3, cutoff=0.6)
+    if not matches:
+        return ""
+    return f"; did you mean: {', '.join(matches)}?"
+
+
 # =====================================================================
 # AST
 # =====================================================================
@@ -116,7 +134,23 @@ class RangeValue:
     hi: str
 
 
-Value = BareValue | QuotedValue | WildcardValue | RangeValue
+@dataclass(frozen=True)
+class ContainsValue:
+    """A full-text *contains* value from the explicit ``field:~value`` form.
+
+    OQL otherwise emits only ``term``/``wildcard``/``range``, so substring intent
+    had no expressible form and the leading-wildcard reject taught ``foo*`` — which
+    on a keyword-mapped field only matches value-initial text. ``:~`` compiles to
+    an ES ``match`` (or ``match_phrase`` when the value was quoted), giving
+    analyzed contains-intent a bounded outlet without a per-field mapping-type
+    table.
+    """
+
+    text: str
+    phrase: bool  # True → match_phrase (value was quoted); False → match (bare)
+
+
+Value = BareValue | QuotedValue | WildcardValue | RangeValue | ContainsValue
 
 
 @dataclass(frozen=True)
@@ -194,11 +228,20 @@ _GRAMMAR = r"""
      | term
 
 term: FIELD ":" field_value
+    | FIELD _CONTAINS contains_value
+
+_CONTAINS: ":~"
+
+contains_value: quoted_value | bare_value
 
 ?field_value: range_value
             | quoted_value
             | wildcard_value
             | bare_value
+            | value_group
+
+value_group: "(" group_member (_OR group_member)* ")"
+?group_member: quoted_value | wildcard_value | bare_value
 
 range_value: "[" range_term _TO range_term "]"
 ?range_term: quoted_value | bare_value | star_value
@@ -225,6 +268,13 @@ ESCAPED_STRING: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/
 """
 
 _PARSER = Lark(_GRAMMAR, parser="lalr", maybe_placeholders=False)
+
+
+@dataclass(frozen=True)
+class _ValueGroup:
+    """Parse-time marker for a field-scoped value group; never leaves term()."""
+
+    members: tuple[Value, ...]
 
 
 class _AstTransformer(Transformer):  # type: ignore[type-arg]
@@ -254,6 +304,13 @@ class _AstTransformer(Transformer):  # type: ignore[type-arg]
         return BareValue(text=str(s))
 
     @v_args(inline=True)
+    def contains_value(self, v: QuotedValue | BareValue) -> ContainsValue:
+        # ``v`` is an already-transformed value from ``contains_value: quoted_value
+        # | bare_value``. A quoted value is a phrase (words must be adjacent →
+        # match_phrase); a bare value is a single analyzed token (→ match).
+        return ContainsValue(text=v.text, phrase=isinstance(v, QuotedValue))
+
+    @v_args(inline=True)
     def star_value(self) -> BareValue:
         return BareValue(text="*")
 
@@ -261,9 +318,22 @@ class _AstTransformer(Transformer):  # type: ignore[type-arg]
     def range_value(self, lo: Value, hi: Value) -> RangeValue:
         return RangeValue(lo=_value_text_for_range(lo), hi=_value_text_for_range(hi))
 
+    def value_group(self, members: list[Value]) -> _ValueGroup:
+        return _ValueGroup(members=tuple(members))
+
     @v_args(inline=True)
-    def term(self, field_token: Token, value: Value) -> Term:
-        return Term(field=str(field_token), value=value)
+    def term(self, field_token: Token, value: Value | _ValueGroup) -> FilterNode:
+        field = str(field_token)
+        if isinstance(value, _ValueGroup):
+            # Lucene-style field-scoped group — `event.dataset:(a OR b)` — the
+            # single most common shape live models write that the grammar used
+            # to reject (23 of 47 parse failures in a 4000-event prod window,
+            # each becoming a zero-coverage query and, downstream, a confident
+            # false-negative hunt finding). Expand to per-value terms under OR.
+            if len(value.members) == 1:
+                return Term(field=field, value=value.members[0])
+            return Or(children=tuple(Term(field=field, value=v) for v in value.members))
+        return Term(field=field, value=value)
 
     def or_expr(self, children: list[FilterNode]) -> Or:
         return Or(children=tuple(children))
@@ -285,10 +355,27 @@ def _value_text_for_range(v: Value) -> str:
     )
 
 
+# A syntactically valid ECS-style field name: an ``@``/letter/underscore start
+# then dotted/dashed word chars, and — crucially — NO internal whitespace.
+# ``groupby`` is the one stage whose regex tolerates whitespace in its capture
+# (``[...\s...]``, so ``groupby a b`` splits on commas to the single token
+# ``"a b"``), and ``FieldWhitelist.is_allowed`` accepts a space-bearing token
+# like ``"source.ip evil"`` because it still ``startswith`` the ``source.``
+# prefix. This gate runs before the whitelist check so such a token is rejected
+# with the self-correcting stage hint instead of reaching ES verbatim.
+_FIELD_NAME_RE = re.compile(r"^[@A-Za-z_][@A-Za-z0-9_.\-]*$")
+
 # Pipe-stage regexes.
-_GROUPBY_RE = re.compile(r"^groupby\s+([@\w.,\s\-]+)$")
+_GROUPBY_RE = re.compile(r"^groupby\s+([@\w.,\s\-]+)$", re.IGNORECASE)
 _SORTBY_RE = re.compile(r"^sortby\s+([@\w.\-]+)\s*(asc|desc)?$", re.IGNORECASE)
 _HEAD_RE = re.compile(r"^(?:head|limit)\s+(\d+)$", re.IGNORECASE)
+
+# ``_HEAD_RE`` captures an unbounded digit run; ``int()`` on a >4300-digit string
+# raises CPython's int-conversion ValueError (not our OqlValidationError). Ten
+# digits (≤ ~10 billion) is already far past ``_HARD_MAX_RESULTS``, so anything
+# longer is rejected up front with a clean hint; ``validate_oql`` applies the
+# real per-call cap to what remains.
+_MAX_HEAD_DIGITS = 10
 _COUNT_RE = re.compile(r"^count$", re.IGNORECASE)
 
 # The authoritative pipe-stage surface, spelled out in the unknown-stage error
@@ -314,7 +401,13 @@ def _parse_pipe_stage(text: str) -> PipeStage:
         direction = (m.group(2) or "asc").lower()
         return SortBy(field=m.group(1), direction=direction)
     if m := _HEAD_RE.match(text):
-        return Head(limit=int(m.group(1)))
+        digits = m.group(1)
+        if len(digits) > _MAX_HEAD_DIGITS:
+            raise OqlValidationError(
+                f"head N is too large; the maximum is {_HARD_MAX_RESULTS}",
+                fragment=text,
+            )
+        return Head(limit=int(digits))
     if _COUNT_RE.match(text):
         return Count()
     raise OqlValidationError(
@@ -366,7 +459,12 @@ def _parse_filter_with_fallback(filter_text: str) -> FilterNode:
             except LarkError:
                 pass
         raise OqlValidationError(
-            f"failed to parse filter: {primary_err}",
+            f"failed to parse filter: {primary_err}. "
+            "OQL syntax: every clause is field:value, joined with AND/OR/NOT; "
+            "parentheses group clauses ((a:1 OR b:2) AND c:3) or values "
+            "(field:(v1 OR v2)); bare terms are not supported — for full-text "
+            "matching write message:term* (anchored wildcard) or "
+            "message:~term (contains, compiles to a full-text match).",
             fragment=filter_text,
         ) from primary_err
     except RecursionError as rec_err:
@@ -494,7 +592,7 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
     for field_name in collect_filter_fields(ast.filter_):
         if not wl.is_allowed(field_name):
             raise OqlValidationError(
-                f"unknown or forbidden field: {field_name!r}",
+                f"unknown or forbidden field: {field_name!r}{_field_suggestion(field_name)}",
                 fragment=field_name,
             )
 
@@ -506,7 +604,9 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
         if pattern[:1] in ("*", "?"):
             raise OqlValidationError(
                 f"leading-wildcard patterns are too expensive; anchor the "
-                f"wildcard (write foo*, not *foo): {pattern!r}",
+                f"wildcard (write foo*, not *foo) — or, for a substring/contains "
+                f"match on analyzed text, use field:~value (compiles to a "
+                f"full-text match): {pattern!r}",
                 fragment=pattern,
             )
 
@@ -527,9 +627,10 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
                     fragment=",".join(stage.fields),
                 )
             for field_name in stage.fields:
-                if not wl.is_allowed(field_name):
+                if not _FIELD_NAME_RE.match(field_name) or not wl.is_allowed(field_name):
                     raise OqlValidationError(
-                        f"unknown or forbidden field in groupby: {field_name!r}",
+                        f"unknown or forbidden field in groupby: "
+                        f"{field_name!r}{_field_suggestion(field_name)}",
                         fragment=field_name,
                     )
         elif isinstance(stage, SortBy):
@@ -546,7 +647,8 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
                     )
             elif not wl.is_allowed(stage.field):
                 raise OqlValidationError(
-                    f"unknown or forbidden field in sortby: {stage.field!r}",
+                    f"unknown or forbidden field in sortby: "
+                    f"{stage.field!r}{_field_suggestion(stage.field)}",
                     fragment=stage.field,
                 )
             if stage.direction not in {"asc", "desc"}:
@@ -604,6 +706,9 @@ def _term_to_dsl(field_name: str, value: Value) -> dict[str, Any]:
         return {"range": {field_name: body}}
     if isinstance(value, WildcardValue):
         return {"wildcard": {field_name: {"value": value.pattern}}}
+    if isinstance(value, ContainsValue):
+        op = "match_phrase" if value.phrase else "match"
+        return {op: {field_name: value.text}}
     if isinstance(value, QuotedValue | BareValue):
         text = value.text
         if "*" in text or "?" in text:

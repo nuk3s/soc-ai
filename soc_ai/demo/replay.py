@@ -93,12 +93,35 @@ def _unknown_alert_replay(alert_es_id: str) -> dict[str, Any]:
     }
 
 
+async def _replay_events_storeless(
+    events: list[dict[str, Any]], inv_id: str
+) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
+    """Stream recorded events with NO recorder — a leading ``investigation_created``
+    carrying *inv_id*, then each event, paced like the live path. Persists nothing.
+    """
+    session_id = uuid.uuid4().hex[:12]
+    delay = step_delay(len(events))
+    yield "investigation_created", {"investigation_id": inv_id}
+    for i, ev in enumerate(events):
+        if i:  # pace BETWEEN steps — no dead air after the terminal event
+            await asyncio.sleep(delay)
+        yield (
+            str(ev.get("kind", "")),
+            {
+                "session_id": session_id,
+                "sequence": int(ev.get("sequence", 0)),
+                "payload": ev.get("payload") or {},
+            },
+        )
+
+
 async def replay_recorded_run(
     state: Any,
     *,
     alert_id: str,
     started_by: str,
     replay: dict[str, Any] | None,
+    reuse_inv_id: str | None = None,
 ) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
     """Feed a recorded event stream through a live :class:`InvestigationRecorder`.
 
@@ -106,8 +129,15 @@ async def replay_recorded_run(
     contract: a leading ``investigation_created`` carrying the new row's id,
     then each recorded event as ``{session_id, sequence, payload}``. Because
     the recorder is the same tee live runs use, the GET endpoints render the
-    replay identically to a real run. Each replay creates a NEW row (live
-    parity: re-clicking re-runs the recording).
+    replay identically to a real run.
+
+    *reuse_inv_id* set (this alert already has a COMPLETED replay row) re-streams
+    the recorded events STORELESS against that id — no new row. That bounds demo
+    replay rows to the recorded-alert set: an anonymous visitor looping
+    ``/investigate`` can't grow the table, because the first replay per alert
+    persists the row and every repeat reuses it (the hunt-start ephemeral
+    treatment, one route over). The FIRST replay for an alert (``reuse_inv_id``
+    None) creates the row through the recorder below.
 
     *replay* ``None`` (no recording for *alert_id*) is the ONE case that never
     touches the recorder: there is nothing to persist for an alert the demo
@@ -123,6 +153,10 @@ async def replay_recorded_run(
             sequence = int(ev.get("sequence", 0))
             payload = ev.get("payload") or {}
             yield kind, {"session_id": session_id, "sequence": sequence, "payload": payload}
+        return
+    if reuse_inv_id is not None:
+        async for frame in _replay_events_storeless(replay.get("events") or [], reuse_inv_id):
+            yield frame
         return
     inv_meta = replay.get("investigation") or {}
     recorder = InvestigationRecorder(

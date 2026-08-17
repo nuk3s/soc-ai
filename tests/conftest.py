@@ -4,6 +4,14 @@ The ``clean_env`` autouse fixture strips soc-ai-related env vars before each
 test so leakage from the host shell or CI runner can't bleed into config-loading
 tests. Tests that need specific env values use ``monkeypatch.setenv`` themselves
 or construct :class:`Settings` directly.
+
+:class:`Settings` has no ``env_prefix``, so every field is readable from a
+bare, case-insensitive env var — ``GENERAL_CHAT_ENABLED=false`` in a dev shell
+silently flips a default under every test that constructs ``Settings()``, and
+the failure surfaces as an unrelated assertion in an unrelated file. The scrub
+set is therefore *derived* from ``Settings.model_fields`` rather than
+hand-listed: a knob added to config.py is isolated the moment it is declared,
+with nothing here to keep in step.
 """
 
 from __future__ import annotations
@@ -20,6 +28,11 @@ from soc_ai.config import Settings, get_settings
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+# Family sweeps, for env vars that are NOT :class:`Settings` fields but still
+# steer soc-ai: ``SOC_AI_API_TOKEN`` (cli.py reads it straight from os.environ),
+# and whatever else an operator's .env carries in one of these families. Exact
+# field names are covered by ``_SETTINGS_ENV_NAMES`` below, so this tuple no
+# longer has to track config.py. tests/test_config.py imports it.
 _PREFIXES = (
     "SO_",
     "ES_",
@@ -35,6 +48,7 @@ _PREFIXES = (
     "MEMORY_",
     "EMBED_",
     "LOG_",
+    "DOSSIER_",
     "API_AUTH_REQUIRED",
     "SESSION_TTL_HOURS",
     "BOOTSTRAP_ADMIN_PASSWORD",
@@ -42,23 +56,47 @@ _PREFIXES = (
 )
 
 
+def _settings_env_names() -> frozenset[str]:
+    """Every env var name pydantic-settings would read into :class:`Settings`.
+
+    Field names and their validation aliases (``ANALYST_MODEL`` / ``HEAVY_MODEL``),
+    upper-cased for comparison because ``case_sensitive=False`` means the shell
+    can spell them either way. No soc-ai field is a single bare word, so this
+    never collides with PATH/HOME-style host variables.
+    """
+    names: set[str] = set()
+    for name, field in Settings.model_fields.items():
+        names.add(name.upper())
+        alias = field.validation_alias
+        if isinstance(alias, str):
+            names.add(alias.upper())
+        else:
+            names.update(c.upper() for c in getattr(alias, "choices", ()) if isinstance(c, str))
+    return frozenset(names)
+
+
+_SETTINGS_ENV_NAMES = _settings_env_names()
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     """Strip soc-ai env vars and isolate tests from any .env in the project root."""
     for key in list(os.environ):
-        if key.startswith(_PREFIXES):
+        upper = key.upper()  # Settings reads env case-insensitively; so do we.
+        if upper.startswith(_PREFIXES) or upper in _SETTINGS_ENV_NAMES:
             monkeypatch.delenv(key, raising=False)
     # pydantic-settings reads `.env` from cwd; chdir to a clean tmp dir so the
     # repo's runtime .env doesn't bleed into tests.
     monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
-    # Reset the in-process login throttles so failed-login tests don't leak
-    # lockout state into later tests (the per-IP spray throttle aggregates all
-    # failures from the shared "testclient" IP).
+    # Reset the in-process credential throttles so failed-attempt tests don't
+    # leak lockout state into later tests (the per-IP spray throttle aggregates
+    # all failures from the shared "testclient" IP).
     from soc_ai.store import auth as _auth
 
     _auth.login_throttle.reset()
     _auth.login_ip_throttle.reset()
+    _auth.password_change_throttle.reset()
     yield
     get_settings.cache_clear()
 

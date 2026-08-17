@@ -362,6 +362,37 @@ def test_battery_api_serves_stored_result_when_idle(tmp_path):
             assert none_data["result"] is None
 
 
+def test_battery_api_serves_null_when_only_fitness_ran(tmp_path):
+    """A quick fitness check writes a row whose battery ``result`` is an empty
+    dict marker (no full battery has run yet). The status endpoint must serve
+    that as ``result: null``, NOT as a truthy ``{}`` — the UI reads
+    ``result.configs`` and a ``{}`` has no configs array to map, which took down
+    the whole Config page (P0)."""
+    settings = _settings(db_path=str(tmp_path / "fitonly.db"))
+    p1, p2, p3, TestClient, create_app = _client(settings)
+
+    with p1, p2, p3:
+        app = create_app()
+        with TestClient(app) as client:
+            from soc_ai.store import model_battery as mb_svc
+
+            async def seed_fitness_only():
+                # upsert_fitness on a fresh model creates the row with result={}
+                # — exactly the state the auto-fitness check leaves on Config mount.
+                async with app.state.db_sessionmaker() as db:
+                    await mb_svc.upsert_fitness(
+                        db,
+                        model="fit-only",
+                        result={"grade": "pass", "model": "fit-only", "legs": [], "detail": "ok"},
+                    )
+
+            asyncio.run(seed_fitness_only())
+            data = client.get("/api/v1/config/model-battery?model=fit-only").json()
+            assert data["running"] is False
+            assert data["result"] is None  # honest wire shape: null, never {}
+            assert data["stored_at"] is None  # no measurement → no age to report
+
+
 # --------------------------------------------------------------------------
 # Fitness cache (dogfood 2026-08-05: "Checking fitness…" on every page load)
 # --------------------------------------------------------------------------

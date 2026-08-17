@@ -7,6 +7,7 @@ by patching :class:`elasticsearch.AsyncElasticsearch`. No live grid is touched.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,12 +16,13 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import respx
+from elastic_transport import TransportError
 from elasticsearch import NotFoundError
 from soc_ai.config import Settings
 from soc_ai.demo.guard import DemoEgressBlocked
 from soc_ai.errors import SoAuthError
 from soc_ai.so_client.auth import _SRV_TOKEN_TTL_S, ConnectAuth, KratosAuth, make_auth
-from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+from soc_ai.so_client.elastic import ElasticClient, EsSearchResult, GridPartialResultsError
 
 # =====================================================================
 # KratosAuth
@@ -474,6 +476,190 @@ async def test_elastic_search_eq_relation_is_exact(settings_kratos: Settings) ->
     assert result.total == 42
     assert result.total_is_lower_bound is False
     assert result.total_display == "42"
+
+
+# =====================================================================
+# G1: a partially-failed search must not read as a quiet grid
+#
+# ES defaults `allow_partial_search_results=true`: shards that failed or
+# timed out come back as HTTP 200 with partial (often zero) hits. The HEALTHY
+# shapes below must stay silent — `ignore_unavailable` / `allow_no_indices`
+# exist so a single-node grid and a fresh index return empty rather than 500.
+# =====================================================================
+
+
+def _es_returning(response: dict[str, Any]) -> AsyncMock:
+    fake_es = AsyncMock()
+    fake_es.search.return_value = response
+    return fake_es
+
+
+_HEALTHY_SHAPES: dict[str, dict[str, Any]] = {
+    # A normal single-node grid: one shard, all successful.
+    "single_node_success": {
+        "took": 4,
+        "timed_out": False,
+        "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+        "hits": {"total": {"value": 3, "relation": "eq"}, "hits": [{"_id": "a"}]},
+    },
+    # A both-shapes pattern whose `*:logs-*` half matches no index on a grid
+    # with no remote clusters — resolves to zero shards, which is not a failure.
+    "no_index_matched": {
+        "took": 0,
+        "timed_out": False,
+        "_shards": {"total": 0, "successful": 0, "skipped": 0, "failed": 0},
+        "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+    },
+    # can_match / frozen-tier shards legitimately skipped: still a complete read.
+    "shards_skipped": {
+        "took": 9,
+        "timed_out": False,
+        "_shards": {"total": 5, "successful": 5, "skipped": 3, "failed": 0},
+        "hits": {"total": {"value": 1, "relation": "eq"}, "hits": [{"_id": "b"}]},
+    },
+    # Test stubs and the demo replay fixtures carry no `_shards` key at all.
+    "no_shards_key": {
+        "took": 1,
+        "hits": {"total": {"value": 2, "relation": "eq"}, "hits": [{"_id": "c"}]},
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_HEALTHY_SHAPES))
+@pytest.mark.asyncio
+async def test_elastic_search_healthy_shapes_never_raise(
+    settings_kratos: Settings, shape: str
+) -> None:
+    """The single-node / empty-pattern / no-metadata responses stay untouched.
+
+    This is the regression guard on the fix, not on the bug: the owner runs a
+    single-node grid, and partial-result detection must not turn an ordinary
+    empty answer into an outage.
+    """
+    response = _HEALTHY_SHAPES[shape]
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=_es_returning(response)):
+        client = ElasticClient(settings_kratos)
+        result = await client.search("logs-*,*:logs-*", {"match_all": {}})
+
+    assert isinstance(result, EsSearchResult)
+    assert result.total == response["hits"]["total"]["value"]
+    assert len(result.hits) == len(response["hits"]["hits"])
+
+
+@pytest.mark.asyncio
+async def test_elastic_search_raises_when_shards_failed(settings_kratos: Settings) -> None:
+    """2 of 5 shards failed → GridPartialResultsError, not an empty result.
+
+    Asserted on the RAISE. A test that only checked a `shards_failed` field
+    would still pass if a refactor kept the field and dropped the raise — which
+    is exactly the false-green shape this defect already shipped once.
+    """
+    response = {
+        "took": 12,
+        "timed_out": False,
+        "_shards": {
+            "total": 5,
+            "successful": 3,
+            "skipped": 0,
+            "failed": 2,
+            "failures": [
+                {
+                    "shard": 1,
+                    "index": "logs-2026.08.13",
+                    "reason": {
+                        "type": "no_shard_available_action_exception",
+                        "reason": "no shard available for [logs-2026.08.13]",
+                    },
+                }
+            ],
+        },
+        "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+    }
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=_es_returning(response)):
+        client = ElasticClient(settings_kratos)
+        with pytest.raises(GridPartialResultsError) as excinfo:
+            await client.search("logs-*", {"match_all": {}})
+
+    exc = excinfo.value
+    assert exc.shards_failed == 2
+    assert exc.shards_total == 5
+    assert "no_shard_available_action_exception" in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_elastic_search_raises_when_timed_out(settings_kratos: Settings) -> None:
+    """`timed_out: true` with zero failed shards is still an incomplete read."""
+    response = {
+        "took": 30_000,
+        "timed_out": True,
+        "_shards": {"total": 5, "successful": 5, "skipped": 0, "failed": 0},
+        "hits": {"total": {"value": 7, "relation": "eq"}, "hits": [{"_id": "a"}]},
+    }
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=_es_returning(response)):
+        client = ElasticClient(settings_kratos)
+        with pytest.raises(GridPartialResultsError) as excinfo:
+            await client.search("logs-*", {"match_all": {}})
+
+    assert excinfo.value.timed_out is True
+    assert "timed out" in str(excinfo.value)
+
+
+def test_grid_partial_results_is_a_transport_error() -> None:
+    """The subclassing IS the fix: every existing `(TimeoutError, TransportError)`
+    arm maps a partial read to the house 503 `grid_unavailable` with no edits,
+    and the agent tool boundary renders it as a structured error dict."""
+    assert issubclass(GridPartialResultsError, TransportError)
+    exc = GridPartialResultsError("partial", shards_failed=1, shards_total=2)
+    caught = False
+    try:
+        raise exc
+    except (TimeoutError, TransportError):
+        caught = True
+    assert caught
+
+
+@pytest.mark.asyncio
+async def test_elastic_search_partial_opt_out_keeps_results_and_warns(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """es_fail_on_partial_results=False → the operator knowingly reads partial
+    data; results come back and the degradation is logged at WARNING."""
+    settings_kratos.es_fail_on_partial_results = False
+    response = {
+        "took": 12,
+        "timed_out": True,
+        "_shards": {
+            "total": 5,
+            "successful": 3,
+            "skipped": 0,
+            "failed": 2,
+            "failures": [{"reason": {"type": "shard_not_available", "reason": "recovering"}}],
+        },
+        "hits": {"total": {"value": 4, "relation": "eq"}, "hits": [{"_id": "a"}]},
+    }
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=_es_returning(response)),
+        caplog.at_level(logging.WARNING, logger="soc_ai.so_client.elastic"),
+    ):
+        client = ElasticClient(settings_kratos)
+        result = await client.search("logs-*", {"match_all": {}})
+
+    assert result.total == 4
+    assert len(result.hits) == 1
+    assert any(
+        record.levelno == logging.WARNING and "partial" in record.getMessage().lower()
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_partial_results_opt_out_is_config_console_visible() -> None:
+    """The opt-out is an admin-editable setting, not an env-only escape hatch."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    spec = WHITELIST_BY_KEY["es_fail_on_partial_results"]
+    assert spec.type == "bool"
+    assert spec.hot is True  # read per search off the live Settings object
+    assert Settings.model_fields["es_fail_on_partial_results"].default is True
 
 
 # =====================================================================

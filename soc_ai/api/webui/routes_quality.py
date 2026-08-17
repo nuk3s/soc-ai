@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from soc_ai.api.webui._shared import _iso_utc, require_admin_api, router
 from soc_ai.eval.nightly import run_eval_nightly
+from soc_ai.eval.quality import alarm_codes_from_key
 from soc_ai.store import quality as quality_svc
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,12 +42,39 @@ class QualityPointOut(BaseModel):
     n_ok: int
     n_error: int
     agreement_rate: float | None
+    # The grade counts behind agreement_rate. NULL on rows written before
+    # migration 0026 — "we never recorded this" and "nothing agreed" are
+    # different facts, and the card must not render the first as the second.
+    # ``n_partial`` is the one worth showing: a partial critique ("right
+    # verdict, thin reasoning") lands in the rate's denominator but not its
+    # numerator, so 3 yes + 2 partial reads as the same 0.60 as 3 yes + 2 no.
+    n_yes: int | None
+    n_partial: int | None
+    n_no: int | None
+    n_classified: int | None
     fallback_rate: float | None
     error_rate: float
     latency_p50_ms: int | None
     verdict_counts: dict[str, int]
     alarmed: bool
     alarm_reasons: list[str]
+    # WHICH condition alarmed, and since when (migration 0027). The reasons
+    # above are prose with the run's live numbers baked in, so they can neither
+    # be compared across nights nor sorted into headlines: "5 of 5 eval runs
+    # errored" is pipeline health, not verdict quality, and the card has to be
+    # able to tell them apart. Empty/null on a clean point AND on a pre-0027
+    # row, where the condition was never recorded — the card renders the prose
+    # in that case rather than inventing a code.
+    alarm_codes: list[str]
+    alarm_key: str | None
+    # When the CURRENT condition started. Older than ``ts`` means the alarm has
+    # been ongoing rather than newly raised — the difference between "this keeps
+    # firing" and "this is still true".
+    alarm_since: str | None
+    # Where this run's artifacts (index.jsonl, bundles with the oracle
+    # critiques, report.md) were written. The only way to adjudicate an alarm
+    # is to read the critiques behind it, so the card links this.
+    batch_dir: str | None
 
 
 class QualityTrendOut(BaseModel):
@@ -81,12 +109,23 @@ async def get_quality_trend(request: Request) -> QualityTrendOut:
                 n_ok=r.n_ok,
                 n_error=r.n_error,
                 agreement_rate=r.agreement_rate,
+                n_yes=r.n_yes,
+                n_partial=r.n_partial,
+                n_no=r.n_no,
+                n_classified=r.n_classified,
                 fallback_rate=r.fallback_rate,
                 error_rate=r.error_rate,
                 latency_p50_ms=r.latency_p50_ms,
                 verdict_counts={str(k): int(v) for k, v in (r.verdict_counts or {}).items()},
                 alarmed=r.alarmed,
                 alarm_reasons=list(r.alarm_reasons or []),
+                alarm_codes=alarm_codes_from_key(r.alarm_key),
+                alarm_key=r.alarm_key,
+                # _iso_utc renders None as "", which a "since when" field must
+                # not become — an empty string is a value the card would try to
+                # parse. Null is the honest answer for a point with no alarm.
+                alarm_since=_iso_utc(r.alarm_since) if r.alarm_since else None,
+                batch_dir=r.batch_dir,
             )
             for r in reversed(rows)
         ]

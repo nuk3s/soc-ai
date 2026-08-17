@@ -20,6 +20,10 @@ Counters / gauges exposed:
   emitted. Watch this stays under 5% of investigations.
 - ``socai_investigation_zero_tool_verdicts_total`` — zero-tool TP/FP
   verdicts blocked/coerced by the evidence gate (QVOD early-warning).
+- ``socai_oracle_refusals_total`` — Oracle adjudications refused because
+  the independent residue gate flagged the sanitized payload. A nonzero
+  and climbing value means the cloud second opinion is effectively off
+  (the sanitizer and the gate disagree on some recurring shape).
 - ``socai_tool_calls_total`` (labeled by ``tool``) — per-tool call
   counts, for spotting which read tools are hot or broken.
 - ``socai_llm_tokens_total`` (labeled by ``phase``, ``direction``) —
@@ -50,6 +54,7 @@ class _Metrics:
         self.investigation_retasks_total = 0
         self.investigation_fallback_verdicts_total = 0
         self.investigation_zero_tool_verdicts_total = 0
+        self.oracle_refusals_total = 0
         self.tool_calls_total: dict[str, int] = defaultdict(int)
         # (phase, direction) -> tokens
         self.llm_tokens_total: dict[tuple[str, str], int] = defaultdict(int)
@@ -75,6 +80,18 @@ class _Metrics:
                 self.investigation_errors_total += 1
             elif kind == "done":
                 self.investigations_total += 1
+
+    async def record_oracle_refusal(self) -> None:
+        """Increment on an Oracle residue-gate refusal.
+
+        Called from :func:`soc_ai.oracle.client.adjudicate` when the independent
+        residue sweep flags the sanitized outbound payload and egress is refused
+        (the local verdict is kept). Surfaces a silently-disabled Oracle — a log
+        line already exists, but nothing was counted, so a gate refusing every
+        transcript was invisible until now.
+        """
+        async with self.lock:
+            self.oracle_refusals_total += 1
 
 
 _GLOBAL = _Metrics()
@@ -136,6 +153,13 @@ def render(version: str) -> str:
     lines.append(
         f"socai_investigation_zero_tool_verdicts_total {m.investigation_zero_tool_verdicts_total}"
     )
+
+    lines.append(
+        "# HELP socai_oracle_refusals_total "
+        "Oracle adjudications refused because the residue gate flagged the sanitized payload."
+    )
+    lines.append("# TYPE socai_oracle_refusals_total counter")
+    lines.append(f"socai_oracle_refusals_total {m.oracle_refusals_total}")
 
     lines.append("# HELP socai_tool_calls_total Per-tool call counts.")
     lines.append("# TYPE socai_tool_calls_total counter")

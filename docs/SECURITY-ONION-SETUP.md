@@ -70,13 +70,16 @@ soc-ai reads alerts and enrichment context straight from Elasticsearch using the
 `ES_USERNAME` / `ES_PASSWORD` basic-auth credentials in `.env` (these are normally the
 same as your SO analyst login). The account needs:
 
-- `read` + `view_index_metadata` on the **events pattern**. SO 3.0 stores Suricata/Zeek
-  events + alerts in `logs-*` data streams, so the pattern is `logs-*` on a single-node
-  grid, or `*:logs-*` (cross-cluster search) on a multi-node / distributed deployment. Set
-  this with `EVENTS_INDEX_PATTERN` in `.env`; `setup.sh` auto-detects the cluster prefix
-  and writes the concrete value. (The old `*:so-*` form is wrong: it matches the
-  old-style `so-*` admin indices, not the `logs-*` data streams, so the alerts console
-  comes up empty.)
+- `read` + `view_index_metadata` on the **events pattern**. SO 3.x stores Suricata/Zeek
+  events + alerts in `logs-*` data streams, so the pattern is `EVENTS_INDEX_PATTERN=logs-*`
+  on a single-node grid, or `*:logs-*` (cross-cluster search) on a multi-node / distributed
+  deployment. Set it in `.env`; `setup.sh` auto-detects the cluster prefix and writes the
+  concrete value. (The old `*:so-*` form is wrong: it matches the old-style `so-*` admin
+  indices, not the `logs-*` data streams, so the alerts console comes up empty.)
+
+  **Leave it as `logs-*`.** The grant has to cover every data stream soc-ai reads, and so
+  does the pattern — including the ones Security Onion doesn't own. See the namespace note
+  under Troubleshooting before you narrow it.
 - `read` + `view_index_metadata` on the cases/detections/playbooks patterns:
   `so-case*` / `so-detection*` / `so-playbook*` on a single-node grid (prefix each with
   `*:` on a multi-node grid, e.g. `*:so-case*`).
@@ -214,6 +217,52 @@ To let soc-ai ack/escalate/comment *and* keep a forensic trail:
 ---
 
 ## Troubleshooting
+
+> **soc-ai can't see logs that clearly exist in SO (auth/syslog "not found", a hunt
+> contradicting an investigation)**
+>
+> Check `EVENTS_INDEX_PATTERN`. If it names `.ds-` backing indices, it is almost certainly
+> too narrow.
+>
+> SO 3.x keeps events in Elasticsearch **data streams**. The documents live in hidden
+> backing indices called `.ds-<stream>-<date>-<generation>` — for example
+> `.ds-logs-system.auth-default-2026.07.17-000004`. A search pattern never has to name
+> those: `logs-*` matches the *data-stream* name and Elasticsearch expands it to every
+> backing index underneath. (The leading dot matters — dot-prefixed indices are hidden, so
+> a plain `logs-*` never matches a `.ds-…` name directly; it doesn't need to.)
+>
+> Write the pattern against the backing indices instead and you have to spell out the
+> Elastic Agent **namespace** segment yourself:
+>
+> | fragment | covers |
+> |---|---|
+> | `.ds-logs-*-so-*` | Security Onion's own integrations — suricata, zeek, soc, kratos, strelka, import |
+> | `.ds-logs-*-default-*` | Elastic's stock integrations — **system.auth, system.syslog**, endpoint, winlog |
+> | `logs-synth-*` | soc-ai's synthetic / eval data |
+>
+> Whatever you leave off is invisible, and **nothing tells you**. On 2026-08-05 a
+> production install running `.ds-logs-*-so-*,logs-synth-*` had no access to ~117K
+> `system.auth` records and ~48M `system.syslog` records. Every query succeeded, the
+> pattern still matched 139M documents so `soc-ai doctor` stayed green, and an
+> investigation reached the wrong conclusion because the login evidence wasn't there.
+>
+> **If you are upgrading and previously narrowed this value, widen it now** — in `.env`
+> (`EVENTS_INDEX_PATTERN=logs-*`, then restart) or live from **Config → Queries → Events
+> index pattern**, which hot-applies to the next query. Confirm with a count that includes
+> the `default` namespace:
+>
+> ```bash
+> curl -sk -u "$ES_USERNAME:$ES_PASSWORD" -XPOST \
+>   "$ES_HOSTS/logs-*/_search?ignore_unavailable=true" \
+>   -H 'Content-Type: application/json' \
+>   -d '{"size":0,"track_total_hits":true,"query":{"term":{"event.dataset":"system.auth"}}}'
+> ```
+>
+> A non-zero `hits.total.value` means the auth stream is in scope. Zero on a grid that is
+> shipping auth logs means it isn't.
+>
+> Pin namespaces only if you have a reason to exclude data. If you do, keep
+> `.ds-logs-*-default-*` in the list.
 
 > **`action [indices:admin/auto_create] is unauthorized for user [...] with roles [analyst] on indices [soc-ai-audit-…]`**
 >

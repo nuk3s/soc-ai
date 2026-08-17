@@ -143,7 +143,7 @@ ANALYST_MODEL=soc-ai-analyst
 # off by default; enable it with ORACLE_ENABLED=true.
 
 # --- Index patterns ----------------------------------------------------
-# SO 3.0 stores Suricata/Zeek events + alerts in Elastic data streams named
+# SO 3.x stores Suricata/Zeek events + alerts in Elastic data streams named
 # `logs-*` (e.g. `.ds-logs-suricata.alerts-so-...`). The events pattern is:
 #   - single-node grid:           logs-*
 #   - multi-node / distributed:   *:logs-*   (cross-cluster search)
@@ -152,6 +152,17 @@ ANALYST_MODEL=soc-ai-analyst
 # both shapes — it matches the old-style `so-*` admin indices (so-case,
 # so-detection), not the `logs-*` data streams where alerts live, so the alerts
 # console comes up empty on a healthy grid.
+#
+# Keep the data-stream form. `logs-*` matches data-stream NAMES; Elasticsearch
+# expands each to its hidden backing indices (`.ds-<stream>-<date>-<gen>`).
+# Writing `.ds-…` instead pins the Elastic Agent namespace segment by hand:
+#   .ds-logs-*-so-*       SO's own integrations (suricata, zeek, soc, kratos)
+#   .ds-logs-*-default-*  Elastic's stock ones — system.auth, system.syslog,
+#                         endpoint, winlog. The login/syslog evidence.
+#   logs-synth-*          soc-ai's synthetic / eval data.
+# Anything you leave off that list is invisible and nothing warns you. See
+# SECURITY-ONION-SETUP.md → Troubleshooting, "soc-ai can't see logs that
+# clearly exist in SO".
 EVENTS_INDEX_PATTERN=logs-*
 # Cases / detections / playbooks live in the old-style `so-*` admin indices.
 # Single-node: so-case* / so-detection* / so-playbook*. Multi-node: prefix each

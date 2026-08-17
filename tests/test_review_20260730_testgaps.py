@@ -139,6 +139,13 @@ _ADMIN_SURFACE = {
     ("POST", "/api/v1/config/users"),
     ("GET", "/api/v1/config"),
     ("GET", "/api/v1/internal-identifiers"),
+    # Host dossier: reads are the analyst default, but declaring what a host IS
+    # (or silencing the system's disagreement with that) is an admin act — an
+    # analyst who could relabel a host's criticality could bury it.
+    ("POST", "/api/v1/dossiers/{ip}/override"),
+    ("DELETE", "/api/v1/dossiers/{ip}/override/{field}"),
+    ("POST", "/api/v1/dossiers/{ip}/conflicts/{field}/snooze"),
+    ("POST", "/api/v1/dossiers/refresh"),
 }
 
 

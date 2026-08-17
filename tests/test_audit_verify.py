@@ -24,7 +24,7 @@ from soc_ai.audit.chain import GENESIS_PREV_HASH, GENESIS_SEQ, compute_hash
 from soc_ai.audit.verify import ChainVerifyResult, verify_audit_chain
 from soc_ai.config import Settings
 from soc_ai.main import create_app
-from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 
 # ── chain builder (mirrors AuditLogger.log's hash stamping) ────────────────────
 
@@ -87,7 +87,45 @@ class _FakeES:
         return {"hits": {"hits": hits}}
 
 
-def _elastic_with(records: list[dict[str, Any]]) -> ElasticClient:
+class _HalfReadES(_FakeES):
+    """The grid that answers 200 having read only half its shards.
+
+    Serves whatever records the surviving shards held (possibly none) exactly as
+    :class:`_FakeES` would, plus the ``_shards``/``timed_out`` metadata that says
+    the read was partial — which is all ES itself says under its default
+    ``allow_partial_search_results=true``. Nothing raises; the evidence is in
+    the envelope, and a reader that only looks at ``hits`` cannot see it.
+    """
+
+    def __init__(self, records: list[dict[str, Any]], *, timed_out: bool = True) -> None:
+        super().__init__(records)
+        self._timed_out = timed_out
+
+    async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+        resp = await super().search(index=index, body=body, **kw)
+        resp["timed_out"] = self._timed_out
+        resp["_shards"] = {
+            "total": 4,
+            "successful": 2,
+            "skipped": 0,
+            "failed": 2,
+            "failures": [
+                {
+                    "shard": 0,
+                    "index": "soc-ai-audit-000001",
+                    "reason": {"type": "no_shard_available_action_exception"},
+                }
+            ],
+        }
+        return resp
+
+
+def _elastic_with(
+    records: list[dict[str, Any]],
+    *,
+    fake: Any | None = None,
+    settings_overrides: dict[str, Any] | None = None,
+) -> ElasticClient:
     """An ElasticClient whose ``_client`` is a :class:`_FakeES` (no real transport)."""
     settings = Settings(
         so_host="https://so.example.com",
@@ -97,8 +135,10 @@ def _elastic_with(records: list[dict[str, Any]]) -> ElasticClient:
         es_hosts=["https://so.example.com:9200"],
         litellm_base_url="http://localhost:4000",
         api_auth_required=False,
+        **(settings_overrides or {}),
     )
-    fake = _FakeES(records)
+    if fake is None:
+        fake = _FakeES(records)
     with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake):
         return ElasticClient(settings)
 
@@ -197,6 +237,99 @@ async def test_verify_respects_max_records_cap() -> None:
     result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=10)
     assert result.capped is True
     assert result.records_verified == 10
+
+
+async def test_verify_half_read_index_raises_not_intact() -> None:
+    """A half-read index is 'could not run', never 'intact — 0 records'.
+
+    ES answers 200 with only the surviving shards' records (here: none), and the
+    partiality is visible only in ``_shards``/``timed_out``. Before the per-page
+    check this paged to zero records and 'an empty chain is intact by definition'
+    turned a blind read into a clean bill of health on the one surface whose
+    whole job is to be believed about integrity.
+    """
+    elastic = _elastic_with([], fake=_HalfReadES([]))
+    with pytest.raises(GridPartialResultsError) as excinfo:
+        await verify_audit_chain(elastic, "soc-ai-audit")
+    err = excinfo.value
+    assert err.shards_failed == 2
+    assert err.shards_total == 4
+    message = str(err)
+    assert "2 of 4 shards failed" in message
+    assert "cannot be verified" in message
+
+
+async def test_verify_half_read_mid_chain_is_unverifiable_not_tamper() -> None:
+    """The bucket-separation control: a partial read must not be scored as tamper.
+
+    The dead shards held seq 2, so the surviving shards serve 0,1,3,4 — to
+    ``verify_chain`` that seq gap is indistinguishable from a deleted record, and
+    without the per-page raise this exact input reports ``ok=False,
+    first_broken_seq=3``: an outage published as the most expensive false alarm
+    the product can raise, telling the operator their audit trail was tampered
+    with because a node restarted. The raise has to happen before a single hit
+    is hashed, so neither verdict bucket can be reached from a partial read.
+    """
+    records = _build_chain(5)
+    del records[2]  # the record the dead shards held
+    elastic = _elastic_with([], fake=_HalfReadES(records))
+    with pytest.raises(GridPartialResultsError):
+        await verify_audit_chain(elastic, "soc-ai-audit")
+
+
+async def test_verify_partial_read_ignores_the_partial_results_opt_out() -> None:
+    """``es_fail_on_partial_results=false`` must not reach the tamper-evidence check.
+
+    The opt-out exists so a console with a chronically red shard stays usable:
+    a degraded panel is better than no panel. Verification is not a panel — a
+    partial read here fakes either an intact chain or a tampered one — so the
+    audit scan raises regardless of the opt-out.
+    """
+    elastic = _elastic_with(
+        [],
+        fake=_HalfReadES(_build_chain(3)),
+        settings_overrides={"es_fail_on_partial_results": False},
+    )
+    with pytest.raises(GridPartialResultsError):
+        await verify_audit_chain(elastic, "soc-ai-audit")
+
+
+async def test_verify_search_timeout_with_no_failed_shards_still_raises() -> None:
+    """``timed_out: true`` with zero failed shards is still a read that never finished."""
+
+    class _TimedOutES(_FakeES):
+        async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+            resp = await super().search(index=index, body=body, **kw)
+            resp["timed_out"] = True
+            resp["_shards"] = {"total": 4, "successful": 4, "skipped": 0, "failed": 0}
+            return resp
+
+    elastic = _elastic_with([], fake=_TimedOutES(_build_chain(3)))
+    with pytest.raises(GridPartialResultsError, match="timed out"):
+        await verify_audit_chain(elastic, "soc-ai-audit")
+
+
+async def test_verify_clean_shard_metadata_still_verifies() -> None:
+    """The over-correction control: the guard keys on failure, not on ``_shards``.
+
+    A response that says all shards answered — and one that says nothing at all,
+    which every other test in this file exercises via the bare :class:`_FakeES` —
+    must verify exactly as before, or the fix is 'always unverifiable' and the
+    operator stops running the check.
+    """
+
+    class _CleanShardsES(_FakeES):
+        async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+            resp = await super().search(index=index, body=body, **kw)
+            resp["timed_out"] = False
+            resp["_shards"] = {"total": 4, "successful": 4, "skipped": 0, "failed": 0}
+            return resp
+
+    records = _build_chain(5)
+    elastic = _elastic_with([], fake=_CleanShardsES(records))
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+    assert result.ok is True
+    assert result.records_verified == 5
 
 
 async def test_verify_es_error_propagates() -> None:

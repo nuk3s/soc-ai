@@ -43,7 +43,7 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import utcnow
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import Backtest, Hunt, Investigation
-from soc_ai.webui.hunt_console_manager import HuntChatManager
+from soc_ai.webui.hunt_console_manager import HuntChatManager, _hunt_chat_resolve_if_pending
 
 # ==================================================================== #
 # F44 — regression floor scales to n_classified, not n_ok
@@ -305,10 +305,16 @@ async def test_f10_shutdown_drain_resolves_pending_hunt_chat(
         await asyncio.Event().wait()  # parks until cancelled
 
     # Register the task exactly as HuntChatManager.start() does (we can't call
-    # start() directly — it would kick off a real model turn).
+    # start() directly — it would kick off a real model turn). The manager is now
+    # a ChatTaskManager subclass, so the done-callback carries the backstop
+    # (resolve-if-pending) rather than the state.
     task: asyncio.Task[None] = asyncio.create_task(_parked())
     mgr._tasks[event_id] = task
-    task.add_done_callback(lambda t: mgr._on_task_done(state, event_id, t))
+
+    def _backstop() -> Any:
+        return _hunt_chat_resolve_if_pending(state, event_id)
+
+    task.add_done_callback(lambda t: mgr._on_task_done(event_id, _backstop, t))
     await asyncio.wait_for(started.wait(), timeout=1.0)
 
     # The lifespan shutdown drain: collect the manager's tasks, cancel, await.

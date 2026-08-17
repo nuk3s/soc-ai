@@ -4,12 +4,11 @@ import { Markdown } from './Markdown';
 import { Panel, PanelHeader } from './Panel';
 
 // ---------------------------------------------------------------------------
-// Shared follow-up-chat rendering, used by both the investigation chat
-// (Investigation.tsx) and the hunt chat (HuntDetail.tsx) so the two surfaces
-// can't drift visually. The THREAD state (loading, polling while the assistant
-// works, posting a turn) intentionally stays in each screen — the investigation
-// chat is seeded from the investigation payload, persists drafts and can apply
-// verdict proposals, while the hunt chat is self-contained and read-only.
+// Shared chat rendering, used by the investigation chat (Investigation.tsx),
+// the hunt chat (HuntDetail.tsx) and the Dashboard assistant
+// (GeneralChatPanel.tsx) so the surfaces can't drift visually. The THREAD state
+// (loading, polling while the assistant works, posting a turn) lives in
+// useChatThread or, for the hunt chat, still in the screen.
 // ---------------------------------------------------------------------------
 
 /** The message shape the shared renderer needs; screens may carry richer types. */
@@ -26,6 +25,8 @@ interface ChatPanelShellProps<M extends ChatDockMessage> {
   placeholder: string;
   messages: M[];
   pending: boolean;
+  /** Tools the in-flight turn has called so far (oldest first). */
+  progressTools?: string[];
   draft: string;
   onDraft: (v: string) => void;
   onSend: () => void;
@@ -36,10 +37,19 @@ interface ChatPanelShellProps<M extends ChatDockMessage> {
   listSizeClass: string;
   /** Optional hint rendered when the thread is empty and idle. */
   emptyHint?: ReactNode;
+  /** Screen-specific header action (e.g. "Clear conversation"), placed with the
+   *  msg count and scope label rather than orphaned below the panel. */
+  headerRight?: ReactNode;
   /**
    * Screen-specific message kinds (e.g. the investigation chat's verdict
    * proposals): return a node (carrying its own key) to replace the default
    * bubble for that message, or null to fall through to it.
+   *
+   * It replaces the WHOLE row, so a card that should appear ALONGSIDE the
+   * agent's prose composes {@link AssistantBubble} itself rather than
+   * re-implementing it — the Dashboard chat's hunt proposal rides on the same
+   * row as the answer, and dropping that prose would throw away the half of the
+   * reply the analyst judges the proposal by.
    */
   renderSpecial?: (m: M, i: number) => ReactNode | null;
 }
@@ -48,12 +58,79 @@ interface ChatPanelShellProps<M extends ChatDockMessage> {
  * Chat panel chrome: header, scrolling bubble list (with autoscroll and a
  * fade-in on messages that arrive after mount), typing indicator, input row.
  */
+// Tool name -> what the analyst would call it. Unknown tools fall back to a
+// de-prefixed, de-underscored form so a new tool still reads sensibly.
+const TOOL_LABELS: Record<string, string> = {
+  t_query_events_oql: 'Querying events',
+  t_query_zeek_logs: 'Reading Zeek logs',
+  t_enrich_ip: 'Enriching IP',
+  t_enrich_domain: 'Enriching domain',
+  t_enrich_hash: 'Enriching hash',
+  t_host_summary: 'Profiling host',
+  t_origin_chain: 'Checking who was driving the host',
+  t_prevalence: 'Checking prevalence',
+  t_rule_prevalence: 'Checking rule prevalence',
+  t_get_pcap: 'Fetching PCAP',
+  t_decode_payload: 'Decoding payload',
+  t_get_rule_content: 'Reading the rule',
+  t_query_cases: 'Searching cases',
+  t_query_detections: 'Searching detections',
+  t_lookup_runbook: 'Consulting runbooks',
+  t_get_playbooks: 'Reading the playbook',
+  t_web_search: 'Searching the web',
+  t_crawl_page: 'Reading a page',
+  propose_verdict: 'Drafting a verdict',
+};
+
+export function toolLabel(name: string): string {
+  return (
+    TOOL_LABELS[name] ??
+    name.replace(/^t_/, '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())
+  );
+}
+
+/**
+ * What the agent said: the markdown bubble plus the tools footer under it.
+ *
+ * Exported because a caller that decorates a row (a proposal card) still has to
+ * render the prose, and a private copy is exactly how this project's chat
+ * surfaces drift — the hunt chat forked its manager and missed every feature
+ * shipped after. Emits a fragment, so the CALLER owns the row wrapper (width,
+ * self-alignment, fade-in) and supplies the vertical rhythm as `gap-1.5`.
+ *
+ * Renders nothing for an empty turn rather than an empty bubble: a proposal row
+ * whose agent proposed without prose should show the card alone.
+ */
+export function AssistantBubble({ text, tools }: { text?: string | null; tools?: string | null }) {
+  return (
+    <>
+      {text ? (
+        <div
+          className="overflow-hidden break-words rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2 [&_pre]:max-w-full [&_pre]:overflow-x-auto"
+          style={{ textWrap: 'pretty' }}
+        >
+          <Markdown>{text}</Markdown>
+        </div>
+      ) : null}
+      {tools ? (
+        <div className="flex items-center gap-1.5 font-mono text-[10.5px] text-faint">
+          <span className="text-accent">
+            <Wrench size={11} />
+          </span>
+          tools · {tools}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 export function ChatPanelShell<M extends ChatDockMessage>({
   title,
   scopeLabel,
   placeholder,
   messages,
   pending,
+  progressTools,
   draft,
   onDraft,
   onSend,
@@ -61,6 +138,7 @@ export function ChatPanelShell<M extends ChatDockMessage>({
   onClose,
   listSizeClass,
   emptyHint,
+  headerRight,
   renderSpecial,
 }: ChatPanelShellProps<M>) {
   const listRef = useRef<HTMLDivElement>(null);
@@ -103,6 +181,7 @@ export function ChatPanelShell<M extends ChatDockMessage>({
               </span>
             )}
             <div className="font-mono text-[11px] text-faint">{scopeLabel}</div>
+            {headerRight}
             {onClose && (
               <button
                 onClick={onClose}
@@ -134,29 +213,29 @@ export function ChatPanelShell<M extends ChatDockMessage>({
               {m.text}
             </div>
           ) : (
-            <div key={i} className={`max-w-[88%] min-w-0 self-start${isNew ? ' animate-fadeUp' : ''}`}>
-              <div
-                className="overflow-hidden break-words rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2 [&_pre]:max-w-full [&_pre]:overflow-x-auto"
-                style={{ textWrap: 'pretty' }}
-              >
-                <Markdown>{m.text ?? ''}</Markdown>
-              </div>
-              {m.tools && (
-                <div className="mt-1.5 flex items-center gap-1.5 font-mono text-[10.5px] text-faint">
-                  <span className="text-accent">
-                    <Wrench size={11} />
-                  </span>
-                  tools · {m.tools}
-                </div>
-              )}
+            <div
+              key={i}
+              className={`flex min-w-0 max-w-[88%] flex-col gap-1.5 self-start${isNew ? ' animate-fadeUp' : ''}`}
+            >
+              <AssistantBubble text={m.text} tools={m.tools} />
             </div>
           );
         })}
         {pending && (
-          <div className="flex items-center gap-1 self-start rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-3.5 py-[11px]">
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" />
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.2s' }} />
-            <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.4s' }} />
+          <div className="flex flex-col items-start gap-1 self-start">
+            <div className="flex items-center gap-1 rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-3.5 py-[11px]">
+              <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" />
+              <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.2s' }} />
+              <span className="h-1.5 w-1.5 animate-blink rounded-full bg-faint" style={{ animationDelay: '.4s' }} />
+            </div>
+            {/* What the agent is actually DOING. A long multi-tool turn used to
+                look identical to a hung one (dogfood 2026-08-06). */}
+            {progressTools != null && progressTools.length > 0 && (
+              <span className="pl-1 text-[11px] text-faint">
+                {toolLabel(progressTools[progressTools.length - 1])}
+                {progressTools.length > 1 && ` · ${progressTools.length} steps`}
+              </span>
+            )}
           </div>
         )}
       </div>

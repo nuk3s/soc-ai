@@ -9,17 +9,89 @@ Thin façade over :class:`elasticsearch.AsyncElasticsearch` that:
   ``count`` pipe stages can reach ES aggregations.
 - Maps a missing document to ``None`` instead of raising
   :class:`elasticsearch.NotFoundError`.
+- Refuses to hand back a PARTIAL search as if it were a complete one (see
+  :class:`GridPartialResultsError`).
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from elastic_transport import TransportError
 from elasticsearch import AsyncElasticsearch, NotFoundError
 from pydantic import BaseModel, Field, computed_field
 
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_loopback_only
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class GridPartialResultsError(TransportError):
+    """Elasticsearch answered 200, but the search did not read the whole grid.
+
+    ES defaults ``allow_partial_search_results=true``: when shards are failed or
+    unassigned (a dead data node, an index still recovering after a restart) or
+    the search timed out, it returns HTTP 200 carrying PARTIAL — frequently
+    zero — hits and no error at all. Taken at face value that renders as "no
+    detections match this view", "all quiet", "no corroborating traffic": an
+    outage silently rewritten as a fact about the network, which is the one
+    answer a SOC console must never invent.
+
+    Subclassing :class:`elastic_transport.TransportError` is deliberate. Every
+    ``except (TimeoutError, TransportError)`` arm in the API already maps it to
+    the house 503 ``grid_unavailable``, and the agent's tool boundary already
+    renders it as a structured error the model can read — so a partial read
+    tells the same story as a refused connection, everywhere, with no edits.
+
+    We detect this locally rather than passing ``allow_partial_search_results=
+    False`` to ES: that makes ES answer with a search-phase error whose status
+    maps to a 400 "bad query", telling the analyst their query is broken when
+    their grid is.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        shards_failed: int = 0,
+        shards_total: int = 0,
+        timed_out: bool = False,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.shards_failed = shards_failed
+        self.shards_total = shards_total
+        self.timed_out = timed_out
+        self.reason = reason
+
+
+def _as_int(value: Any) -> int:
+    """Coerce a shard counter, defaulting to 0 — absent metadata is not failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _first_failure_reason(shards: dict[str, Any]) -> str | None:
+    """The first ``_shards.failures[].reason`` rendered as ``type: reason``."""
+    failures = shards.get("failures")
+    if not isinstance(failures, list) or not failures:
+        return None
+    first = failures[0]
+    if not isinstance(first, dict):
+        return str(first)
+    reason = first.get("reason")
+    if isinstance(reason, dict):
+        kind = str(reason.get("type") or "").strip()
+        detail = str(reason.get("reason") or "").strip()
+        rendered = ": ".join(part for part in (kind, detail) if part)
+        return rendered or None
+    if reason:
+        return str(reason)
+    return None
 
 
 class EsSearchResult(BaseModel):
@@ -49,6 +121,9 @@ class ElasticClient:
     """Async client for the Security Onion Elasticsearch cluster."""
 
     def __init__(self, settings: Settings) -> None:
+        # Held (not copied) so a hot config change — e.g. the partial-results
+        # opt-out — applies to the next search without a restart.
+        self._settings = settings
         # Demo mode: only the bundled loopback mock ES may be reached.
         for host in settings.es_hosts:
             assert_loopback_only(settings, str(host), "elasticsearch")
@@ -122,6 +197,8 @@ class ElasticClient:
             allow_no_indices=True,
         )
 
+        self._check_complete(index, response)
+
         hits_data: dict[str, Any] = response.get("hits", {})
         total_raw = hits_data.get("total", 0)
         if isinstance(total_raw, dict):
@@ -138,6 +215,49 @@ class ElasticClient:
             hits=list(hits_data.get("hits", [])),
             aggregations=dict(aggregations_raw) if aggregations_raw else None,
             total_is_lower_bound=total_is_lower_bound,
+        )
+
+    def _check_complete(self, index: str, response: Any) -> None:
+        """Raise :class:`GridPartialResultsError` unless the search read everything.
+
+        Parsing defaults to ZERO failures: a response with no ``_shards`` key
+        (test stubs, demo replay fixtures) is treated exactly as it was before.
+        Absent metadata must never be made to look like failure. Skipped shards
+        are not failures either — ``can_match`` and frozen tiers skip shards on
+        a perfectly healthy grid.
+        """
+        shards_raw = response.get("_shards")
+        shards: dict[str, Any] = shards_raw if isinstance(shards_raw, dict) else {}
+        shards_failed = _as_int(shards.get("failed"))
+        shards_total = _as_int(shards.get("total"))
+        timed_out = bool(response.get("timed_out") or False)
+        if not shards_failed and not timed_out:
+            return
+
+        reason = _first_failure_reason(shards)
+        parts: list[str] = []
+        if shards_failed:
+            parts.append(f"{shards_failed} of {shards_total} shards failed")
+        if timed_out:
+            parts.append("the search timed out before all shards answered")
+        detail = f" ({reason})" if reason else ""
+        message = (
+            f"partial search results from {index}: {' and '.join(parts)}{detail} — "
+            f"the returned hits are incomplete, so an empty or short answer here "
+            f"means 'unknown', not 'nothing happened'"
+        )
+
+        if not self._settings.es_fail_on_partial_results:
+            # Knowingly opted in to partial reads (e.g. a chronically red shard).
+            _LOGGER.warning("%s; returning them anyway (es_fail_on_partial_results=false)", message)
+            return
+
+        raise GridPartialResultsError(
+            message,
+            shards_failed=shards_failed,
+            shards_total=shards_total,
+            timed_out=timed_out,
+            reason=reason,
         )
 
     async def ping(self) -> dict[str, Any]:

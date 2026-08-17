@@ -553,6 +553,113 @@ async def test_adjudicate_bare_hostname_without_extra_hosts_passes_through() -> 
     assert "appserver" in captured[0]
 
 
+@pytest.mark.asyncio
+async def test_adjudicate_refusal_increments_metric() -> None:
+    """A residue-gate refusal bumps socai_oracle_refusals_total so a silently-
+    disabled Oracle (refusing every transcript) becomes visible."""
+    from soc_ai import metrics
+
+    fresh = metrics._Metrics()
+    metrics._GLOBAL = fresh
+
+    ctx = _make_ctx(_make_settings())
+    # sanitize_case is stubbed to MISS a private IP, so the residue gate fires.
+    raw_case = {
+        "alert_summary": {"source_ip": "192.168.1.100"},
+        "loop_evidence": "",
+        "local_verdict": "false_positive",
+        "local_confidence": 0.85,
+        "local_summary": "Some summary",
+        "local_citations": [],
+    }
+    raw_call = AsyncMock()
+
+    with (
+        patch("soc_ai.oracle.client.sanitize_case", return_value=raw_case),
+        patch("soc_ai.oracle.client._call_oracle_raw", raw_call),
+    ):
+        result = await adjudicate(
+            ctx,
+            enriched=_stub_enriched(),
+            local_report=_stub_report(),
+            transcript_text="",
+        )
+
+    assert result is None
+    raw_call.assert_not_awaited()
+    assert fresh.oracle_refusals_total == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix: oracle-refuse-by-design — the gate must not refuse a payload the
+# sanitizer intentionally left partly un-propagated
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_does_not_refuse_two_occurrence_credential() -> None:
+    """Class 1: a credential value learned in Pass 2 (in-place-only) that re-occurs
+    bare in another case field must egress FULLY LABELLED — adjudicate returns a
+    result rather than refusing by construction, and the username is off the wire."""
+    ctx = _make_ctx(_make_settings())
+    local = TriageReport(
+        verdict="false_positive",
+        confidence=0.6,
+        summary="jdoe touched the share",  # bare re-occurrence of the credential value
+        citations=[],
+        recommended_actions=[],
+    )
+    captured: list[str] = []
+
+    async def _capture(payload: str, *, settings: Any) -> str:
+        captured.append(payload)
+        return _valid_verdict_json(verdict="false_positive", confidence=0.7)
+
+    with patch("soc_ai.oracle.client._call_oracle_raw", _capture):
+        result = await adjudicate(
+            ctx,
+            enriched=_stub_enriched(),
+            local_report=local,
+            transcript_text="Failed logon for user=jdoe from gateway",
+        )
+
+    assert result is not None  # NOT refused
+    assert len(captured) == 1
+    assert "jdoe" not in captured[0]  # fully labelled on the wire
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_does_not_refuse_short_domain_like_label() -> None:
+    """Class 2: a short (<=3 char) DOMAIN_LIKE value the sanitizer intentionally did
+    not propagate (to protect public FQDNs) must be excluded from known_values, so
+    the gate does not refuse when the same substring appears in a public FQDN."""
+    from soc_ai.so_client.models import SoAlert
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext
+
+    enriched = EnrichedAlertContext(
+        alert=SoAlert(id="alert-dc", severity_label="low", zeek_dns_query="dc"),
+        pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
+    )
+    captured: list[str] = []
+
+    async def _capture(payload: str, *, settings: Any) -> str:
+        captured.append(payload)
+        return _valid_verdict_json(verdict="false_positive", confidence=0.7)
+
+    with patch("soc_ai.oracle.client._call_oracle_raw", _capture):
+        result = await adjudicate(
+            ctx=_make_ctx(_make_settings()),
+            enriched=enriched,
+            local_report=_stub_report(),
+            transcript_text="lookup dc.example.com in passive dns",
+        )
+
+    assert result is not None  # NOT refused
+    assert len(captured) == 1
+    # The public FQDN survived verbatim (short-token propagation would corrupt it).
+    assert "dc.example.com" in captured[0]
+
+
 # ---------------------------------------------------------------------------
 # Test: _call_oracle_raw — HTTP egress, response extraction, error mapping
 # (exercises the REAL coroutine with a mocked httpx.AsyncClient; the other

@@ -36,7 +36,11 @@ _INPUT_BUDGET_FRACTION = 0.75
 # signal, and the reactive guard still backstops a pathological single event.
 _MIN_EVENTS_PER_PIVOT = 2
 
-_PIVOT_FIELDS = (
+# The five pivot lists on an AlertContext. PUBLIC because the dossier's host
+# widening reads the same five (orchestrator.dossier_hosts_for_alert): a sixth
+# pivot added here and not there would be trimmed for budget but never read for
+# identity, and nothing would fail.
+PIVOT_FIELDS = (
     "community_id_events",
     "host_events",
     "user_events",
@@ -137,11 +141,11 @@ def trim_enriched_for_budget(
         return js, None
 
     work = enriched.model_copy(deep=True)
-    original_counts = {f: len(getattr(work, f, []) or []) for f in _PIVOT_FIELDS}
+    original_counts = {f: len(getattr(work, f, []) or []) for f in PIVOT_FIELDS}
     while estimate_tokens(js := work.model_dump_json()) > budget_tokens:
         # Longest pivot list still above the floor loses its last (oldest) event.
         longest = max(
-            _PIVOT_FIELDS,
+            PIVOT_FIELDS,
             key=lambda f: len(getattr(work, f, []) or []),
         )
         events = list(getattr(work, longest, []) or [])
@@ -151,7 +155,7 @@ def trim_enriched_for_budget(
 
     dropped = {
         f: original_counts[f] - len(getattr(work, f, []) or [])
-        for f in _PIVOT_FIELDS
+        for f in PIVOT_FIELDS
         if original_counts[f] - len(getattr(work, f, []) or []) > 0
     }
     if not dropped:

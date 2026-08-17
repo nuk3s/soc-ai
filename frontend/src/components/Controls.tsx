@@ -60,8 +60,12 @@ interface SelectProps {
   value: string;
   options?: SelectOption[];
   onChange?: (v: string) => void;
+  /** Accessible name, for a select with no visible `<label>` beside it — the
+   *  compact controls in a selection strip, where a caption costs more room
+   *  than it earns. */
+  label?: string;
 }
-export function Select({ value, options, onChange }: SelectProps) {
+export function Select({ value, options, onChange, label }: SelectProps) {
   const opts = (options ?? []).map((o) => (typeof o === 'string' ? { value: o, label: o } : o));
   if (opts.length <= 1) {
     return (
@@ -77,6 +81,7 @@ export function Select({ value, options, onChange }: SelectProps) {
     <div className="relative flex items-center rounded-control border border-border-input bg-bg pr-2">
       <select
         value={value}
+        aria-label={label}
         onChange={(e) => onChange?.(e.target.value)}
         className="cursor-pointer appearance-none bg-transparent py-[7px] pl-[11px] pr-5 font-mono text-[12.5px] text-text outline-none"
       >

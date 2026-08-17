@@ -68,7 +68,20 @@ facts and surface gaps.
    malicious payload, a clear lateral-movement pattern) actually ties THIS
    alert to it. Decide THIS alert on the evidence you actually gather — do NOT
    escalate it solely because the host has other alerts.
-5. **Research external indicators on the web.** For any EXTERNAL domain / public
+5. **Attribute an INTERNAL source before you blame it.** When an internal host
+   appears to be the SOURCE of hostile or unexpected behavior (scanning, auth
+   probing, lateral connections), you MUST call `t_origin_chain` on that host
+   before naming it as the actor. Ask what an entry-level analyst asks on
+   reflex: *who is on this box?* A host with an inbound SSH/RDP/WinRM session
+   just before the activity is a WAYPOINT, not the origin — name the upstream
+   source and pivot again on it. An empty result is equally decisive: the host
+   acted autonomously, which is usually the more serious finding. Never
+   conclude "internal host X is scanning" while an unexamined session into X
+   sits in the data — that is how a real actor one hop away goes unnamed.
+   Consider what the host IS, too: a hypervisor, domain controller or security
+   appliance initiating outbound remote access is inherently alarming in a way
+   a workstation doing the same is not.
+6. **Research external indicators on the web.** For any EXTERNAL domain / public
    IP / file hash of unknown or "commonly-abused" reputation (ET INFO /
    abused-hosting rules, unknown ASN, newly-seen domains), call `web_search` to
    learn what the service is and whether it is flagged for malware/phishing. Do
@@ -87,7 +100,7 @@ facts and surface gaps.
    (beacon periodicity, POST cadence, encoded commands), and the host's
    concurrent activity. Do not downgrade a payload-backed threat to false-positive
    merely because you couldn't find a public writeup for it.
-6. **Consult the playbook if one is linked.** `get_playbooks(alert_id=...)`
+7. **Consult the playbook if one is linked.** `get_playbooks(alert_id=...)`
    returns checklist questions associated with the alert's rule. Note which
    ones you could answer and which remain open.
 
@@ -208,6 +221,27 @@ audit log but strips them before feeding the next turn. Don't reference your
 own thinking in the user-facing summary.
 
 ---
+"""
+
+
+# The output half of the host-dossier feature, shared by every writer that
+# names a host: both synthesizers and both chats (see
+# :mod:`soc_ai.agent.chat_agent`, which imports it rather than restating it —
+# the chat prompt forked once already and drifted).
+#
+# The block gives the model a hostname and a role; without this it still writes
+# "the host at 192.168.10.202", which is the address the analyst already had.
+# The second half is load-bearing in the other direction: a rule that says "use
+# the name" must not read as licence to produce one, so the absence case is
+# spelled out here too and the HARD RULE against inventing per-event facts is
+# left exactly as it was.
+HOST_NAMING_RULE = """
+**Name a host by what it is.** When a host in scope has a dossier name and role,
+refer to it as `name (role, ip)` on FIRST mention — the host dossier block gives
+you all three — and by name alone after that; "the host at that address" tells
+the analyst nothing they did not already have. A host with no dossier name is
+referred to by its address alone: never invent a name, a role or an OS for a
+host that has none, and never restate an `inferred` role as a settled fact.
 """
 
 
@@ -441,8 +475,8 @@ def build_investigator_prompt() -> str:
 
 
 def build_synthesizer_prompt() -> str:
-    """Synthesizer prompt = verdict policy + citation rule. No OQL primer."""
-    return _SYNTHESIZER_RUBRIC
+    """Synthesizer prompt = verdict policy + citation rule + host naming. No OQL primer."""
+    return _SYNTHESIZER_RUBRIC + HOST_NAMING_RULE
 
 
 INVESTIGATOR_PROMPT = build_investigator_prompt()
@@ -736,7 +770,7 @@ def build_synth_first_round2_user_message(
 
 def build_synth_first_system_prompt() -> str:
     """Synth-first synthesizer system prompt (no tools, hard 200-token visible cap)."""
-    return _SYNTH_FIRST_SYSTEM_RUBRIC
+    return _SYNTH_FIRST_SYSTEM_RUBRIC + HOST_NAMING_RULE
 
 
 SYNTH_FIRST_SYSTEM_PROMPT = build_synth_first_system_prompt()

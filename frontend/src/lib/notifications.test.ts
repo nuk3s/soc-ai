@@ -5,10 +5,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   NOTIFICATIONS_DISMISSED_EVENT,
+  NOTIFICATION_KINDS,
   dismissMany,
   dismissNotification,
   formatNotificationTitle,
+  formatNotificationWhen,
   getDismissed,
+  notificationKind,
 } from './notifications';
 
 describe('notification dismissal', () => {
@@ -67,5 +70,57 @@ describe('formatNotificationTitle', () => {
 
   it('leaves an unknown verdict token untouched', () => {
     expect(formatNotificationTitle('Verdict mystery_state: INV-1')).toBe('Verdict mystery_state: INV-1');
+  });
+});
+
+describe('notificationKind', () => {
+  it('reads the source off the id prefix the backend mints', () => {
+    expect(notificationKind({ id: 'inv:01ABC' })).toBe('investigation');
+    expect(notificationKind({ id: 'inv-done:01ABC' })).toBe('investigation');
+    expect(notificationKind({ id: 'hunt-done:01ABC' })).toBe('hunt');
+    expect(notificationKind({ id: 'dossier-conflict:10.0.0.14:hostname:2' })).toBe('host');
+    expect(notificationKind({ id: 'dep-down:es:20260812234343' })).toBe('system');
+  });
+
+  it('does not confuse the two investigation prefixes', () => {
+    // `inv-done:` must not be swallowed by a naive startsWith('inv') — both are
+    // investigations here, but a substring match would also claim `invite:`.
+    expect(notificationKind({ id: 'invite:99' })).toBe('system');
+  });
+
+  it('files an unrecognised source under system rather than dropping it', () => {
+    // Kind is a lens, never a gate: a source this build has not heard of must
+    // still appear somewhere, or the bell badge would out-count the pane.
+    expect(notificationKind({ id: 'approval:tok-1' })).toBe('system');
+    expect(notificationKind({ id: 'no-colon-at-all' })).toBe('system');
+  });
+
+  it('lists every kind the derivation can return', () => {
+    const kinds = NOTIFICATION_KINDS.map((k) => k.id);
+    expect(kinds).toEqual(['system', 'host', 'investigation', 'hunt']);
+  });
+});
+
+describe('formatNotificationWhen', () => {
+  // The API's relative label is a bare magnitude ('3m', '2h'), so the surface
+  // appends "ago" — except under a minute, where the backend already returns
+  // the word "now" and the append produced "now ago" (F61, fixed on the Topbar
+  // bell and missed on the pane, which shows the SAME rows).
+  it('reads "just now" under a minute, never "now ago"', () => {
+    expect(formatNotificationWhen('now')).toBe('just now');
+  });
+
+  it('appends "ago" to a magnitude', () => {
+    expect(formatNotificationWhen('3m')).toBe('3m ago');
+    expect(formatNotificationWhen('2h')).toBe('2h ago');
+    expect(formatNotificationWhen('5d')).toBe('5d ago');
+  });
+
+  it('has nothing to say when the backend sent no timestamp', () => {
+    // _ago() returns '' for a missing @timestamp; the caller renders nothing
+    // rather than a lone "ago".
+    expect(formatNotificationWhen('')).toBeNull();
+    expect(formatNotificationWhen(null)).toBeNull();
+    expect(formatNotificationWhen(undefined)).toBeNull();
   });
 });

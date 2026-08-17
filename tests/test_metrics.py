@@ -31,6 +31,7 @@ def test_render_emits_required_help_and_type_lines(clean_metrics: metrics._Metri
         "socai_investigation_retasks_total",
         "socai_investigation_fallback_verdicts_total",
         "socai_investigation_zero_tool_verdicts_total",
+        "socai_oracle_refusals_total",
         "socai_tool_calls_total",
         "socai_llm_tokens_total",
     ]:
@@ -108,6 +109,16 @@ async def test_record_event_ignores_unknown_kinds(
     # No counters bumped.
     assert "socai_investigations_total 0" in body
     assert "socai_investigation_errors_total 0" in body
+
+
+@pytest.mark.asyncio
+async def test_record_oracle_refusal_increments(clean_metrics: metrics._Metrics) -> None:
+    """An Oracle residue-gate refusal bumps its own counter, so a silently-disabled
+    Oracle (refusing every transcript) is visible on the next scrape."""
+    await clean_metrics.record_oracle_refusal()
+    await clean_metrics.record_oracle_refusal()
+    body = metrics.render(version="0.1.0")
+    assert "socai_oracle_refusals_total 2" in body
 
 
 def test_render_escapes_label_values(clean_metrics: metrics._Metrics) -> None:

@@ -1,21 +1,25 @@
-import { Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
 import { Fragment, useEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
+import { ListToolbar } from '../components/ListToolbar';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
-import { inRange } from '../lib/timeRange';
+import { rangeToSinceUntil } from '../lib/timeRange';
 // Shared with the Dashboard — single source of truth for status colour/label/pulse.
 import { INV_STATUS as STATUS } from '../lib/statusMeta';
 import { Checkbox } from '../components/Controls';
-import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
-import { deleteInvestigation, getInvestigations, rehuntInvestigations } from '../lib/api';
+import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
+import { deleteInvestigation, listInvestigations, rehuntInvestigations } from '../lib/api';
 import { verdictFilterFromSearch } from '../lib/investigationFilters';
+import { plural } from '../lib/plural';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
+import { useListSelection } from '../lib/useListSelection';
+import { useSavedViews } from '../lib/useSavedViews';
 import { type SortDir, useSort } from '../lib/useSort';
-import type { InvestigationRow, RehuntResult, Verdict } from '../lib/types';
+import type { InvestigationRow, RehuntResult, SavedViewQuery, Verdict } from '../lib/types';
 
 // Raw rehunt skip-reason codes (routes_investigations.py::bulk_rehunt) → friendly
 // text. Unknown codes fall through to the raw code so a new backend reason is
@@ -27,11 +31,65 @@ const REHUNT_SKIP_REASONS: Record<string, string> = {
 };
 const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
+/**
+ * The per-alert latest-run fields the list endpoint carries (`latestRunId`,
+ * `latestRunStatus`, `latestRunWhen` — routes_investigations.py). Declared here
+ * because `InvestigationRow` lives in lib/types.ts, which this change does not
+ * own; fold them onto the shared interface and drop this widening.
+ */
+type WithLatestRun = InvestigationRow & {
+  latestRunId?: string;
+  latestRunStatus?: string;
+  latestRunWhen?: string;
+};
+
+// How a run that reached no verdict is described when it is somebody ELSE's
+// newest run — the phrasing on the row that outlived it.
+const LATEST_RUN_FAILURE: Record<string, string> = {
+  error: 'newest run failed',
+  cancelled: 'newest run cancelled',
+  interrupted: 'newest run interrupted',
+};
+
+/**
+ * What happened to this row's alert AFTER this row, when that is worth saying.
+ *
+ * A re-investigation that dies leaves the older complete run as the alert's
+ * representative one — the right rule, it stops failed retries burying the run
+ * that landed a verdict, but it meant a re-run started against a down grid
+ * vanished into a bare "N earlier" chip while the row went on showing the old
+ * healthy verdict (dogfood D8, 2026-08-14). Three re-runs died and the list
+ * read calm.
+ *
+ * Null in the ordinary case — this run IS its alert's newest — and null on a
+ * server that predates the fields, which is not the same as "nothing failed"
+ * but is the only honest thing an older payload supports. The newest run can
+ * only be a run that reached no verdict here: a running or complete one would
+ * have taken primacy and be this row.
+ */
+function latestRunFailure(
+  row: InvestigationRow,
+): { id: string; label: string; when: string } | null {
+  const r = row as WithLatestRun;
+  if (!r.latestRunId || r.latestRunId === row.id) return null;
+  const label = LATEST_RUN_FAILURE[r.latestRunStatus ?? ''];
+  if (!label) return null;
+  return { id: r.latestRunId, label, when: r.latestRunWhen ?? '' };
+}
+
 // select | detection | verdict | conf | source→dest | status | when | delete.
 // Source→Dest gets a real minimum (two full IPv4s + arrow ≈ 220px at 12px mono)
 // and grows with spare width — the old fixed 120px clipped the destination to a
 // fragment while the verdict/conf/when gutters sat unused (register FR).
 const GRID = '28px minmax(0,1.4fr) 132px 64px minmax(230px,1fr) 110px 96px 44px';
+
+// One SQL page. The server clamps to its own cap and echoes what it used; this
+// is only the size the screen ASKS for.
+const PAGE_SIZE = 50;
+
+// A typed query is a new result set, so a keystroke can't fire a request.
+// Matches the Hosts screen's cadence.
+const SEARCH_DEBOUNCE_MS = 250;
 
 
 type SortKey = 'name' | 'verdict' | 'conf' | 'host' | 'status' | 'when';
@@ -87,14 +145,82 @@ export function Investigations() {
   // 24h. The /demo-status probe resolves async, so the widening happens in an
   // effect below once `demo` flips (the useState initializer runs before it does).
   const demo = useDemo();
+
+  // Seed the Verdict filter from the URL (?verdict=pipeline_error — the
+  // Dashboard's pipeline-error KPI deep-links here). Initializer-only: once
+  // mounted the MultiSelect owns the state, so clearing the filter works
+  // normally and doesn't fight the URL.
+  const [filterVerdicts, setFilterVerdicts] = useState<string[]>(() =>
+    verdictFilterFromSearch(location.search),
+  );
+  const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
+  // Free text, matched SERVER-side against rule name, source and destination.
+  // Alerts had a search box and this screen did not, which is half of why the
+  // two never read as the same product (dogfood A3). Client-side filtering was
+  // never an option here: it is the exact defect the server-side query
+  // replaced.
+  const [q, setQ] = useState('');
+  const [debouncedQ, setDebouncedQ] = useState('');
+  // A deep link widens the window to the widest preset: the Dashboard KPI counts
+  // its 100 most recent runs with NO time filter, so landing on the default 24h
+  // could show an empty list for the very rows the link promised.
+  const [range, setRange] = useState(() => (verdictFilterFromSearch(location.search).length ? '30d' : '24h'));
+  useEffect(() => {
+    if (demo) setRange('30d');
+  }, [demo]);
+  const [custom, setCustom] = useState<CustomRange | null>(null);
+  // SQL paging offset. Every filter change resets it: page 3 of the old query
+  // is a meaningless position in the new one.
+  const [offset, setOffset] = useState(0);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQ(q.trim()), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [q]);
+  // A new query is a new result set — page 3 of the old one means nothing under
+  // it. Reset with the DEBOUNCED value so offset and query change in one
+  // refetch instead of two.
+  useEffect(() => {
+    setOffset(0);
+  }, [debouncedQ]);
+  // Re-apply on a LATER navigation to this screen with a ?verdict= param (the
+  // mount initializers above won't re-run). Param absent → no-op, so the
+  // operator's manual filter/range changes are never clobbered.
+  useEffect(() => {
+    const fromUrl = verdictFilterFromSearch(location.search);
+    if (fromUrl.length) {
+      setFilterVerdicts(fromUrl);
+      setRange('30d');
+      setOffset(0);
+    }
+  }, [location.search]);
+
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // whether any run is still live in a ref and let pauseWhen consult it: stop
-  // polling once every row has reached a terminal state.
+  // polling once every run has reached a terminal state. The ref is fed by the
+  // server's `active` flag (any running run in the WHOLE store), not by the
+  // page: a run outside the current filter can complete INTO it.
   const activeRef = useRef(false);
-  const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(getInvestigations, [], {
-    refetchInterval: 10000, // live status (running → complete) without a reload
-    pauseWhen: () => !activeRef.current,
-  });
+  // The filters travel to the server and come back as SQL WHERE clauses — the
+  // whole point. Filtering the fetched page client-side is how 108 of 109
+  // failed runs became unreachable under every filter the operator could set
+  // (the newest-100 page was saturated by completed FPs). Array deps are joined
+  // so a re-render with equal filters doesn't refetch.
+  const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(
+    () =>
+      listInvestigations({
+        ...rangeToSinceUntil(range, custom),
+        verdict: filterVerdicts,
+        status: filterStatuses,
+        q: debouncedQ || undefined,
+        limit: PAGE_SIZE,
+        offset,
+      }),
+    [range, custom, filterVerdicts.join(','), filterStatuses.join(','), debouncedQ, offset],
+    {
+      refetchInterval: 10000, // live status (running → complete) without a reload
+      pauseWhen: () => !activeRef.current,
+    },
+  );
 
   // A run started elsewhere (another tab, auto-triage) won't be reflected while
   // this list is idle — so force one refetch when the tab regains focus.
@@ -110,33 +236,6 @@ export function Investigations() {
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
-
-  // Seed the Verdict filter from the URL (?verdict=pipeline_error — the
-  // Dashboard's pipeline-error KPI deep-links here). Initializer-only: once
-  // mounted the MultiSelect owns the state, so clearing the filter works
-  // normally and doesn't fight the URL.
-  const [filterVerdicts, setFilterVerdicts] = useState<string[]>(() =>
-    verdictFilterFromSearch(location.search),
-  );
-  const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
-  // A deep link widens the window to the widest preset: the Dashboard KPI counts
-  // its 100 most recent runs with NO time filter, so landing on the default 24h
-  // could show an empty list for the very rows the link promised.
-  const [range, setRange] = useState(() => (verdictFilterFromSearch(location.search).length ? '30d' : '24h'));
-  useEffect(() => {
-    if (demo) setRange('30d');
-  }, [demo]);
-  // Re-apply on a LATER navigation to this screen with a ?verdict= param (the
-  // mount initializers above won't re-run). Param absent → no-op, so the
-  // operator's manual filter/range changes are never clobbered.
-  useEffect(() => {
-    const fromUrl = verdictFilterFromSearch(location.search);
-    if (fromUrl.length) {
-      setFilterVerdicts(fromUrl);
-      setRange('30d');
-    }
-  }, [location.search]);
-  const [custom, setCustom] = useState<CustomRange | null>(null);
   // Shared sort mechanics; clicking a new column here starts it ascending.
   const { sort, toggleSort, caret, headerCls } = useSort<SortKey>(
     { key: 'when', dir: 'desc' },
@@ -146,7 +245,6 @@ export function Investigations() {
   // Alert ids whose earlier (non-primary) runs are expanded inline.
   const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>({});
 
-  const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [rehunting, setRehunting] = useState(false);
   const [rehuntMsg, setRehuntMsg] = useState<string | null>(null);
   // The re-investigate / delete status line is a transient toast, not a
@@ -173,10 +271,10 @@ export function Investigations() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
-  const rows = data ?? [];
-  // pauseWhen consults the RAW set — keep polling while ANY run is still live,
-  // even one that's filtered out of the current view.
-  activeRef.current = rows.some((r) => r.status === 'running');
+  const rows = data?.rows ?? [];
+  // Server truth, whole store: keep polling while ANY run is live, even one the
+  // current filter (or page) excludes — it can complete into the filter set.
+  activeRef.current = data?.active ?? false;
 
   // invId → detection/rule name, for labelling the rehunt result panel (E2.2).
   // The rehunt targets the SOURCE investigation, whose row is still in the list.
@@ -186,46 +284,43 @@ export function Investigations() {
     return name && name.trim() ? name : invId;
   };
 
-  // Apply filters then sort. The Verdict filter carries a synthetic
-  // 'pipeline_error' value (E1.2): a fallback row matches it regardless of its
-  // (needs_more_info) verdict, and — since the chip REPLACES the NMI pill — a
-  // fallback row is NOT matched by selecting 'needs_more_info' alone.
-  const matchesVerdict = (r: InvestigationRow): boolean => {
-    if (!filterVerdicts.length) return true;
-    if (filterVerdicts.includes('pipeline_error') && r.fallback) return true;
-    if (r.fallback) return false; // a fallback shows only under 'pipeline_error'
-    return filterVerdicts.includes(r.verdict);
-  };
-  const visible = rows
-    .filter((r) => inRange(r.ts, range, custom))
-    .filter(matchesVerdict)
-    .filter((r) => !filterStatuses.length || filterStatuses.includes(r.status))
-    .sort((a, b) => cmpRows(a, b, sort.key, sort.dir));
+  // Filtering happens in SQL — `rows` IS the filter set's page. Only the sort
+  // is applied here, and it orders the current page (the server pages by
+  // recency; re-sorting a page by name orders that page, not the query).
+  const visible = [...rows].sort((a, b) => cmpRows(a, b, sort.key, sort.dir));
 
-  // Header figures track the ACTIVE filters (time range + verdict/status) — the
-  // same `visible` set the table derives from — not the raw fetched page (up to
-  // 100), which ignored the time filter and overcounted (e.g. "100" over a 57-row
-  // 24h view).
-  const running = visible.filter((r) => r.status === 'running').length;
-  const tps = visible.filter((r) => r.verdict === 'true_positive').length;
+  // Header figures come from the server's counts over the SAME filter set as
+  // the rows. Tallying the page instead would describe up to PAGE_SIZE rows
+  // while reading as the query's — the phantom-untriaged defect, again.
+  const total = data?.total ?? 0;
+  const totalAll = data?.totalAll ?? 0;
+  const running = data?.running ?? 0;
+  const tps = data?.truePositives ?? 0;
 
   // Cluster retries of the SAME alert: surface the canonical (primary) run and
   // tuck earlier/errored/cancelled re-runs under it, so the one that WORKED is
-  // never buried under a pile of failed attempts. Retries reveal inline on demand.
-  // EXCEPT under the pipeline_error filter: a superseded fallback run's primary
-  // usually doesn't match the filter, so tucking would hide the very rows the
-  // filter promised — promote matching fallback retries to top-level instead.
-  const promoteFallback = (r: InvestigationRow): boolean =>
-    filterVerdicts.includes('pipeline_error') && !!r.fallback && r.isPrimary === false;
+  // never buried under a pile of failed attempts. Retries reveal inline on
+  // demand. `isPrimary` is decided by the SERVER over the alert's WHOLE run
+  // group (filters change which rows come back, never what primary means) — so
+  // a filtered page can hold a retry whose primary is absent. Such a retry is
+  // shown TOP-LEVEL: tucking it under a parent that is not here to expand
+  // rendered a blank table for the very rows the filter promised (dogfood
+  // 2026-07-15 pipeline_error; 2026-08-05 needs_more_info — this rule is those
+  // two special cases generalized).
+  const primaryAlertsOnPage = new Set(
+    visible.filter((r) => r.isPrimary !== false).map((r) => r.alertId ?? ''),
+  );
+  const promoted = (r: InvestigationRow): boolean =>
+    r.isPrimary === false && !primaryAlertsOnPage.has(r.alertId ?? '');
   const retriesByAlert = new Map<string, InvestigationRow[]>();
   for (const r of visible) {
-    if (r.isPrimary === false && r.alertId && !promoteFallback(r)) {
+    if (r.isPrimary === false && r.alertId && !promoted(r)) {
       const arr = retriesByAlert.get(r.alertId) ?? [];
       arr.push(r);
       retriesByAlert.set(r.alertId, arr);
     }
   }
-  const primaries = visible.filter((r) => r.isPrimary !== false || promoteFallback(r));
+  const primaries = visible.filter((r) => r.isPrimary !== false || promoted(r));
 
   // When grouping, cluster rows by detection name (keeping the user's sort within
   // each group) and precompute per-group counts for the headers.
@@ -244,32 +339,40 @@ export function Investigations() {
     }
   }
 
-  // Selection helpers
-  const visibleIds = visible.map((r) => r.id);
-  const selCount = Object.values(selected).filter(Boolean).length;
-  const allVisibleSelected =
-    visibleIds.length > 0 && visibleIds.every((id) => selected[id]);
-  const someVisibleSelected = visibleIds.some((id) => selected[id]);
+  // Selection: the shared hook, which IS this screen's logic — the other lists
+  // now borrow it from here rather than each keeping their own copy.
+  const sel = useListSelection(visible.map((r) => r.id));
+  const selCount = sel.count;
 
-  const toggleSelectAll = () => {
-    if (allVisibleSelected) {
-      // Deselect all visible
-      setSelected((prev) => {
-        const next = { ...prev };
-        visibleIds.forEach((id) => delete next[id]);
-        return next;
-      });
-    } else {
-      setSelected((prev) => {
-        const next = { ...prev };
-        visibleIds.forEach((id) => (next[id] = true));
-        return next;
-      });
-    }
+  // Saved views. The filter state travels as one object, so a chip restores the
+  // whole set at once — half-applying a view is how a "saved" view stops being
+  // the thing that was saved.
+  const currentQuery: SavedViewQuery = {
+    verdict: filterVerdicts,
+    status: filterStatuses,
+    range,
+    custom,
+    q,
+    groupBy,
   };
+  // A TOTAL apply: a facet the view does not name goes back to THIS screen's
+  // default, never to whatever happened to be on screen a moment ago. That is
+  // also what makes the chip a real toggle — clicking an active chip applies
+  // the EMPTY query, which is this screen unfiltered.
+  const views = useSavedViews('investigations', currentQuery, (saved) => {
+    setFilterVerdicts(Array.isArray(saved.verdict) ? (saved.verdict as string[]) : []);
+    setFilterStatuses(Array.isArray(saved.status) ? (saved.status as string[]) : []);
+    // Same widening the demo gets at mount: the seeded runs span a couple of
+    // hours, so resetting the demo to a flat 24h would empty the list.
+    setRange(typeof saved.range === 'string' ? saved.range : demo ? '30d' : '24h');
+    setCustom((saved.custom as CustomRange | null) ?? null);
+    setQ(typeof saved.q === 'string' ? saved.q : '');
+    setGroupBy(saved.groupBy === 'detection' ? 'detection' : 'none');
+    setOffset(0);
+  });
 
   const handleRehunt = async () => {
-    const ids = Object.keys(selected).filter((k) => selected[k]);
+    const ids = sel.ids;
     if (!ids.length) return;
     const blocked = demoBlocked(demo);
     if (blocked) { setRehuntMsg(blocked); return; } // demo: no doomed write
@@ -281,7 +384,7 @@ export function Investigations() {
       // Surface the per-id started/skipped detail the API already returns —
       // "Started N · M skipped" alone hides which ids skipped and why (E2.2).
       setRehuntResult(await rehuntInvestigations(ids));
-      setSelected({});
+      sel.clear();
       refetch();
     } catch (err) {
       setRehuntMsg(`Re-investigate failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -307,7 +410,7 @@ export function Investigations() {
   };
 
   const handleDelete = async () => {
-    const ids = Object.keys(selected).filter((k) => selected[k]);
+    const ids = sel.ids;
     if (!ids.length) return;
     const blocked = demoBlocked(demo);
     if (blocked) { setRehuntMsg(blocked); setConfirmDelete(false); return; } // demo: no doomed write
@@ -327,7 +430,7 @@ export function Investigations() {
       `Deleted ${ok} investigation${ok !== 1 ? 's' : ''}` +
         (failed ? ` · ${failed} failed (cancel a running one first, or admin only)` : '')
     );
-    setSelected({});
+    sel.clear();
     setConfirmDelete(false);
     setDeleting(false);
     refetch();
@@ -339,19 +442,87 @@ export function Investigations() {
         <div className="text-title">Investigations</div>
         <Freshness at={lastUpdated} />
       </div>
+      {/* Server-side counts over the active filter set — never the page's. */}
       <div className="mb-4 mt-0.5 text-[13px] text-dim">
-        {visible.length} investigations · {running} in progress · {tps} true positive
+        {plural(total, 'investigation')} · {running.toLocaleString()} in progress ·{' '}
+        {plural(tps, 'true positive')}
       </div>
       {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
 
-      {/* filter bar + bulk action */}
-      <div className="mb-3.5 flex flex-wrap items-center gap-2">
+      {/* The shared list toolbar: saved-view chips, the search box, this
+          screen's own facets, and the selection strip that takes the facet
+          row's slot so the table's top edge stays put. */}
+      <ListToolbar
+        views={views.views}
+        activeViewId={views.activeViewId}
+        onApplyView={views.onApplyView}
+        onDeleteView={views.onDeleteView}
+        onSaveView={views.onSaveView}
+        viewError={views.error}
+        search={{
+          value: q,
+          onChange: (v) => {
+            setQ(v);
+            views.clearActive();
+          },
+          placeholder: 'Search detection, host or IP…',
+          label: 'Search investigations',
+        }}
+        note={rehuntMsg}
+        selection={{
+          count: selCount,
+          offPageCount: sel.offPageCount,
+          onClearOffPage: sel.clearOffPage,
+          onClear: sel.clear,
+          actions: (
+            <>
+              <button
+                disabled={rehunting}
+                onClick={() => { void handleRehunt(); }}
+                className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
+                style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+              >
+                <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
+                {rehunting ? 'Starting…' : `Re-investigate (${selCount})`}
+              </button>
+              {confirmDelete ? (
+                <>
+                  <button
+                    disabled={deleting}
+                    onClick={() => { void handleDelete(); }}
+                    className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
+                  >
+                    <Trash2 size={12} />
+                    {deleting ? 'Deleting…' : `Confirm delete (${selCount})`}
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(false)}
+                    className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text"
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  title="Delete the selected investigations (admin)"
+                  className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+                >
+                  <Trash2 size={12} /> Delete
+                </button>
+              )}
+            </>
+          ),
+        }}
+      >
         <TimeRangeFilter
           value={range}
           custom={custom}
           onChange={(v, r) => {
             setRange(v);
             if (r) setCustom(r);
+            setOffset(0);
+            views.clearActive();
           }}
         />
         <MultiSelect
@@ -361,25 +532,38 @@ export function Investigations() {
             { value: 'false_positive', label: 'False positive' },
             { value: 'needs_more_info', label: 'Needs more info' },
             { value: 'inconclusive', label: 'Inconclusive' },
-            { value: 'untriaged', label: 'Untriaged' },
+            // No 'Untriaged' option — see VERDICT_FILTER_VALUES: an
+            // uninvestigated group has no row on this list at all.
             { value: 'pipeline_error', label: 'Pipeline error' },
           ]}
           value={filterVerdicts}
-          onChange={setFilterVerdicts}
+          onChange={(v) => {
+            setFilterVerdicts(v);
+            setOffset(0);
+            views.clearActive();
+          }}
         />
         <MultiSelect
           label="Status"
           options={[
             { value: 'complete', label: 'Complete' },
-            { value: 'running', label: 'Investigating' },            { value: 'error', label: 'Error' },
+            { value: 'running', label: 'Investigating' },
+            { value: 'error', label: 'Error' },
             { value: 'interrupted', label: 'Interrupted' },
             { value: 'cancelled', label: 'Cancelled' },
           ]}
           value={filterStatuses}
-          onChange={setFilterStatuses}
+          onChange={(v) => {
+            setFilterStatuses(v);
+            setOffset(0);
+            views.clearActive();
+          }}
         />
         <button
-          onClick={() => setGroupBy((g) => (g === 'detection' ? 'none' : 'detection'))}
+          onClick={() => {
+            setGroupBy((g) => (g === 'detection' ? 'none' : 'detection'));
+            views.clearActive();
+          }}
           title="Group investigations by detection rule"
           className={
             'rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold ' +
@@ -390,61 +574,7 @@ export function Investigations() {
         >
           Group by detection{groupBy === 'detection' ? ' ✓' : ''}
         </button>
-
-        {selCount > 0 && (
-          <>
-            <div className="h-4 w-px bg-border-strong" />
-            <span className="text-[12.5px] text-dim">
-              <span className="font-mono text-accent">{selCount}</span> selected
-            </span>
-            <button
-              disabled={rehunting}
-              onClick={() => { void handleRehunt(); }}
-              className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
-              style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
-            >
-              <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
-              {rehunting ? 'Starting…' : `Re-investigate (${selCount})`}
-            </button>
-            {confirmDelete ? (
-              <>
-                <button
-                  disabled={deleting}
-                  onClick={() => { void handleDelete(); }}
-                  className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
-                >
-                  <Trash2 size={12} />
-                  {deleting ? 'Deleting…' : `Confirm delete (${selCount})`}
-                </button>
-                <button
-                  onClick={() => setConfirmDelete(false)}
-                  className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text"
-                >
-                  Cancel
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={() => setConfirmDelete(true)}
-                title="Delete the selected investigations (admin)"
-                className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-              >
-                <Trash2 size={12} /> Delete
-              </button>
-            )}
-            <button
-              onClick={() => setSelected({})}
-              className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-            >
-              Clear
-            </button>
-          </>
-        )}
-
-        {rehuntMsg && (
-          <span className="text-[12.5px] text-text-2">{rehuntMsg}</span>
-        )}
-      </div>
+      </ListToolbar>
 
       {/* Bulk re-investigate result (E2.2): a collapsed "Started N · M skipped"
           header expands to the per-id detail the API already returns — WHICH
@@ -514,9 +644,9 @@ export function Investigations() {
         >
           <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
             <Checkbox
-              checked={allVisibleSelected}
-              indeterminate={!allVisibleSelected && someVisibleSelected}
-              onChange={toggleSelectAll}
+              checked={sel.allVisibleSelected}
+              indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
+              onChange={sel.toggleAll}
               title="Select all visible"
             />
           </div>
@@ -543,17 +673,31 @@ export function Investigations() {
 
         {loading && <LoadingState />}
         {error && <div className="p-3"><ErrorState error={error} onRetry={refetch} label="investigations" /></div>}
-        {!loading && !error && rows.length === 0 && (
-          <div className="px-4 py-10 text-center text-[13px] text-faint">No investigations yet.</div>
+        {/* `totalAll` (whole store) tells an empty STORE apart from a filter
+            that matched nothing — the filtered page alone cannot. */}
+        {!loading && !error && displayRows.length === 0 && totalAll === 0 && (
+          <EmptyState
+            title="No investigations yet"
+            action={
+              <Link
+                to="/alerts"
+                className="flex items-center gap-1.5 rounded-control border border-accent bg-accent/10 px-3.5 py-1.5 text-[12.5px] font-semibold text-accent hover:bg-accent/20"
+              >
+                Start from Alerts
+              </Link>
+            }
+          >
+            An investigation is what soc-ai does to a detection — it pulls the evidence,
+            reasons over it and lands a verdict. Pick a detection on the Alerts screen, or
+            let auto-triage work the backlog for you.
+          </EmptyState>
         )}
-        {/* Keyed on displayRows (what actually renders), not `visible`: a row can
-            match the filter yet be tucked under a filtered-out primary, which
-            used to leave a blank table with no message. */}
-        {!loading && !error && rows.length > 0 && displayRows.length === 0 && (
-          <div className="px-4 py-10 text-center text-[13px] text-faint">No investigations match the selected filters.</div>
+        {!loading && !error && displayRows.length === 0 && totalAll > 0 && (
+          <EmptyState>No investigations match the selected filters.</EmptyState>
         )}
         {displayRows.map((r, i) => {
           const st = STATUS[r.status] ?? STATUS.error;
+          const failedNewer = latestRunFailure(r);
           const retries = retriesByAlert.get(r.alertId ?? '') ?? [];
           const expanded = !!expandedAlerts[r.alertId ?? ''];
           const groupName = r.name || '(unnamed detection)';
@@ -577,17 +721,44 @@ export function Investigations() {
                 className="flex items-center"
                 onClick={(e) => {
                   e.stopPropagation();
-                  setSelected((prev) => ({ ...prev, [r.id]: !prev[r.id] }));
+                  sel.toggle(r.id);
                 }}
               >
                 <Checkbox
-                  checked={!!selected[r.id]}
+                  checked={sel.isSelected(r.id)}
                   title="Select"
                 />
               </div>
               <div className="flex min-w-0 items-center gap-[9px]">
                 <KindBadge kind={r.kind} />
                 <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{r.name}</span>
+                {/* The row is representative but not current. Says so on the
+                    row itself, because the "N earlier" chip beside it does not
+                    — and on a filtered page the failed run may not be here to
+                    expand to at all. Clicking opens the run that failed. */}
+                {failedNewer && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigate(`/investigation/${failedNewer.id}`, {
+                        state: { from: '/investigations' },
+                      });
+                    }}
+                    title="A newer run of this alert reached no verdict — open it"
+                    className="flex flex-none items-center gap-[4px] rounded-badge border px-[6px] py-[2px] text-[10.5px] font-semibold"
+                    style={{
+                      borderColor: 'rgba(240,68,56,.45)',
+                      background: 'rgba(240,68,56,.1)',
+                      color: '#fca5a5',
+                    }}
+                  >
+                    <AlertTriangle size={10} />
+                    {failedNewer.label}
+                    {failedNewer.when && (
+                      <span className="font-mono text-faint">{failedNewer.when}</span>
+                    )}
+                  </button>
+                )}
                 {retries.length > 0 && (
                   <button
                     onClick={(e) => {
@@ -699,6 +870,32 @@ export function Investigations() {
             </Fragment>
           );
         })}
+
+        {/* Real pagination over the SQL page (the /hosts pattern): `total` is
+            the whole match set, so the range shown is exact, not inferred. */}
+        {!loading && !error && total > PAGE_SIZE && (
+          <div className="flex items-center justify-between border-t border-border px-3.5 py-2.5">
+            <span className="font-mono text-[11.5px] text-faint">
+              {`${total === 0 ? 0 : offset + 1}–${Math.min(offset + PAGE_SIZE, total)} of ${total.toLocaleString()}`}
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                disabled={offset === 0}
+                className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
+              >
+                Previous
+              </button>
+              <button
+                onClick={() => setOffset(offset + PAGE_SIZE)}
+                disabled={Math.min(offset + PAGE_SIZE, total) >= total}
+                className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -2,7 +2,8 @@
 
 One Target per uncovered (rule, src_ip, dst_ip) cluster among groups at or
 above the configured severity floor is queued for a sequential investigation
-run.  Progress is tracked in ``AutoTriageStatus`` on ``app.state``.
+run — endpoint-shaped detections cluster under an empty src/dst rather than
+being dropped.  Progress is tracked in ``AutoTriageStatus`` on ``app.state``.
 
 The severity floor is read from ``settings.auto_triage_min_severity`` (default
 "high") and derived into a band by the API layer before being passed in.
@@ -16,8 +17,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from elasticsearch import ApiError
+
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
+from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import alerts_query as aq
@@ -81,10 +85,29 @@ class AutoTriageStatus:
     # The values always sum to ``skipped``. reset() leaves this alone — the
     # planner is its sole writer and runs before every reset in production.
     skipped_reasons: dict[str, int] = field(default_factory=dict)
+    # What this run could NOT read off the grid — one short label per failed
+    # query ("severity critical", "rule ET SCAN thing"). Written by the planner
+    # on the same contract as ``skipped_reasons`` (sole writer, survives
+    # reset()). Labels name the QUERY, never the exception text: a raw
+    # elastic_transport error carries the grid's host:port and this field is
+    # rendered in the console.
+    #
+    # A sweep that could not look must not report a drained queue: while this is
+    # non-empty the dashboard tile says "degraded", not "0 investigated".
+    grid_errors: list[str] = field(default_factory=list)
     # set by the stop endpoint; the worker checks it between targets and aborts.
     cancelled: bool = False
     # internal: keep a reference to the running task to prevent GC
     _task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def degraded(self) -> bool:
+        """True when part (or all) of this run's planning could not read the grid.
+
+        The counters alone cannot express this: a sweep that read nothing and a
+        sweep that found nothing both land total=0, failed=0.
+        """
+        return bool(self.grid_errors)
 
     def reset(
         self,
@@ -139,6 +162,20 @@ def _stash_skipped_reasons(state: Any, reasons: dict[str, int]) -> None:
     get_status(state).skipped_reasons = dict(reasons)
 
 
+def _stash_grid_errors(state: Any, labels: list[str]) -> None:
+    """Record which grid queries this run could not read (same contract as
+    :func:`_stash_skipped_reasons`: the planner is the sole writer, so a run that
+    read the grid overwrites a previous run's marks with an empty list).
+
+    One asymmetry with ``skipped_reasons``, and it is the whole point of this
+    field: an empty list is a CLAIM about the grid, not a bookkeeping default.
+    Only a planner that got an answer out of the grid may make it —
+    :func:`plan_targets_for_ids` calls this with ``[]`` only when its one lookup
+    came back, because a path that asked nothing has learned nothing.
+    """
+    get_status(state).grid_errors = list(labels)
+
+
 def _bump(counts: dict[str, int], reason: str) -> None:
     """Increment a per-reason skip tally in place."""
     counts[reason] = counts.get(reason, 0) + 1
@@ -146,25 +183,182 @@ def _bump(counts: dict[str, int], reason: str) -> None:
 
 def _cluster_events(
     rule_events: dict[str, list[aq.AlertEvent]],
-) -> tuple[dict[tuple[str, str, str], aq.AlertEvent], dict[str, int]]:
+) -> dict[tuple[str, str, str], aq.AlertEvent]:
     """Cluster events by (rule, src_ip, dst_ip), keeping the newest per cluster.
 
-    Events missing either IP can't be keyed/deduped, so they are dropped and
-    tallied under ``"no_ip"``. Returns ``(clusters, skipped_reasons)`` where
-    ``skipped_reasons`` seeds the run's per-reason skip breakdown.
+    A missing endpoint DEGRADES the key to ``""`` rather than dropping the
+    event. Dropping is what this used to do — tallying the event under a
+    ``"no_ip"`` skip — and it made the scheduled sweep network-flow-only: every
+    endpoint/process-shaped detection (Sigma host rules carry no ``source.*`` /
+    ``destination.*`` at all) was seen and discarded on every 5-minute sweep,
+    forever. Prod bore that out — every no-IP investigation on record was
+    started by a human, none by the scheduler.
+
+    Degrading rather than abandoning the key preserves the dedupe the clustering
+    exists for: all no-IP events of ONE rule collapse into ONE cluster, so a
+    chatty host rule yields one investigation per sweep, not one per event. A
+    per-event fallback key would have destroyed exactly that.
+
+    The host is deliberately NOT part of the key: on a multi-sensor grid one
+    flow is seen by two sensors under two ``host.name`` values, so keying on it
+    would split that one flow into two investigations of the same thing.
+
+    That sensor collision is now the ONLY argument for leaving it out.
+    ``AlertEvent.host`` falls back to the nested ``event_data.host.name``, so on
+    the no-IP class it names the real endpoint rather than the "—" placeholder
+    it used to — a host dimension applied ONLY when both IPs are empty is
+    therefore worth revisiting now that host logs are landing, since two
+    machines tripping one Sigma rule currently collapse into one investigation.
+    It is not a docstring-sized change: the key widens, so the store's pair
+    lookups below have to move with it.
+
+    The 3-tuple shape is load-bearing beyond the dict: the keys are handed
+    straight to the store's pair lookups (:func:`inv_svc.running_for_pairs`,
+    :func:`inv_svc.latest_for_pairs`), which key on
+    ``(rule_name, src_ip, dest_ip)``.
     """
     clusters: dict[tuple[str, str, str], aq.AlertEvent] = {}
-    skipped_reasons: dict[str, int] = {}
     for rule_name, events in rule_events.items():
         for ev in events:
-            if ev.src_ip is None or ev.dst_ip is None:
-                _bump(skipped_reasons, "no_ip")
-                continue
-            key = (rule_name, ev.src_ip, ev.dst_ip)
+            key = (rule_name, ev.src_ip or "", ev.dst_ip or "")
             if key not in clusters:
                 # events are newest-first from fetch_group_events
                 clusters[key] = ev
-    return clusters, skipped_reasons
+    return clusters
+
+
+class _BlindSweep(Exception):
+    """Internal: planning read NOTHING off the grid.
+
+    Carries the real ES exception so the caller can re-raise it (the route needs
+    it to tell a transport failure from an ES 4xx) plus the per-query labels for
+    the degraded marker.
+    """
+
+    def __init__(self, cause: Exception, labels: list[str]) -> None:
+        super().__init__("auto-triage planning could not read the grid")
+        self.cause = cause
+        self.labels = labels
+
+
+def _is_query_class(exc: BaseException) -> bool:
+    """True when the failure is about the QUERY, not about the grid's health.
+
+    A filter the OQL parser refuses never reaches the grid, and one the grid
+    itself answers 4xx to (a parsing_exception, a mapping conflict) was read and
+    rejected — the grid is up either way. Both are deterministic: they fail
+    identically for every severity and retrying will not help. Neither may be
+    labelled into ``grid_errors``, or a bad filter on a perfectly healthy grid
+    leaves the dashboard claiming an outage until the next sweep. A degraded
+    mark that fires on operator error is a mark analysts learn to ignore — the
+    same defect as the false all-clear, aimed the other way. These are re-raised
+    unlabelled for the route to map to a 400.
+
+    429 is the one 4xx that fails both halves of that test, and it is carved out
+    here for the same reason ``routes_alerts._es_api_error_http`` carves it out:
+    a saturated grid — search queue full, or an aggregation tripping the parent
+    circuit breaker — answers 429 to a query that is perfectly well formed and
+    that succeeds unchanged once the cluster recovers. Nothing about it is the
+    operator's doing, so filing it by HTTP number accuses the analyst of a typo
+    and, worse here than on the routes, keeps it out of ``grid_errors``: the
+    sweep never ran, yet the tile records a finished batch that found nothing.
+
+    Nor is it deterministic-and-unretryable the way its 4xx siblings are.
+    ``ElasticClient`` sets ``retry_on_status=(429, 502, 503, 504)``, so a 429
+    that reaches application code has ALREADY been retried ``es_max_retries``
+    times and lost every time. That is sustained saturation rather than a blip,
+    and it is what makes "the grid is degraded" the honest reading of this
+    status rather than a guess.
+
+    408 is carved out beside it, and more plainly still: a request-timeout status
+    is a statement about the GRID, never about the query text. Nothing an analyst
+    can type makes a search finish inside a proxy's patience, and RFC 9110 says
+    outright that the client may repeat the request — the definition of
+    retryable, and the opposite of the deterministic 4xx this function exists to
+    let through. In practice it is a load balancer in front of Elasticsearch
+    giving up under load: 429's story with a different number on it, and the harm
+    of misfiling it is 429's harm too — the sweep read nothing, and the tile
+    records a finished batch that found nothing.
+    """
+    if isinstance(exc, OqlValidationError):
+        return True
+    if isinstance(exc, ApiError):
+        status = getattr(getattr(exc, "meta", None), "status", None)
+        return status is not None and 400 <= status < 500 and status not in (408, 429)
+    return False
+
+
+async def _read_backlog(
+    state: Any,
+    *,
+    time_range: str,
+    oql: str | None,
+    severities: tuple[str, ...],
+) -> tuple[dict[str, list[aq.AlertEvent]], list[str]]:
+    """Read the alert backlog: groups per severity, then events per group.
+
+    Returns ``(rule_name -> events, labels of the queries that failed)``. A
+    partial failure is survivable and returns what WAS readable; a total failure
+    raises :class:`_BlindSweep`, because "we read nothing" and "there is nothing"
+    are the same empty dict and must not be the same answer.
+    """
+    settings = state.settings
+    elastic = state.elastic
+    # Labels for the queries this run could not read (see AutoTriageStatus.grid_errors).
+    grid_errors: list[str] = []
+    last_error: Exception | None = None
+
+    all_groups: list[aq.AlertGroup] = []
+    severities_read = 0
+    for severity in severities:
+        try:
+            groups, _ = await aq.fetch_groups(
+                elastic, settings, time_range=time_range, severity=severity, oql=oql
+            )
+            all_groups.extend(groups)
+            severities_read += 1
+        except Exception as exc:
+            if _is_query_class(exc):
+                raise
+            _LOGGER.exception("auto-triage: fetch_groups failed for severity=%s", severity)
+            grid_errors.append(f"severity {severity}")
+            last_error = exc
+
+    if severities and severities_read == 0 and last_error is not None:
+        raise _BlindSweep(last_error, grid_errors)
+    if not all_groups:
+        return {}, grid_errors
+
+    # For each group, fetch up to 20 recent events.
+    rule_events: dict[str, list[aq.AlertEvent]] = {}
+    for group in all_groups:
+        try:
+            rule_events[group.rule_name] = await aq.fetch_group_events(
+                elastic,
+                settings,
+                rule_name=group.rule_name,
+                # A Zeek notice's name lives in notice.note, not rule.name; without
+                # the group's own kind this defaults to "suricata" and a notice
+                # group fetches ZERO events, so it is never queued nor counted as
+                # skipped — it silently vanishes from the sweep.
+                kind=group.kind,
+                time_range=time_range,
+                oql=oql,
+                size=20,
+            )
+        except Exception as exc:
+            if _is_query_class(exc):
+                raise
+            _LOGGER.exception("auto-triage: fetch_group_events failed for rule=%s", group.rule_name)
+            grid_errors.append(f"rule {group.rule_name}")
+            last_error = exc
+
+    # Groups read fine but not one of their event fetches did: the cluster map
+    # would come out empty and the sweep would report a clean zero for a backlog
+    # it never saw. Same rule as the all-severities case above.
+    if not rule_events and last_error is not None:
+        raise _BlindSweep(last_error, grid_errors)
+    return rule_events, grid_errors
 
 
 async def plan_targets(
@@ -178,8 +372,8 @@ async def plan_targets(
 
     For each severity in *severities*, fetch the grouped-by-rule view,
     then flat-fetch up to 20 recent events per group.  Cluster events by
-    (src_ip, dst_ip); events missing either IP are skipped (counted but not
-    queued) because unkeyable clusters cannot dedupe future events.
+    (src_ip, dst_ip); a missing endpoint degrades to ``""`` so endpoint-shaped
+    detections are triageable at all (see :func:`_cluster_events`).
 
     Drop clusters whose (rule, src_ip, dst_ip) already has:
     - a direct verdict on any clustered event id (latest_for_alerts) — this
@@ -195,62 +389,44 @@ async def plan_targets(
       (inheritance used to leave them unacked forever).
 
     Returns (targets, skipped_count, inherited_acks). A per-reason breakdown of
-    the skip count (``{"no_ip"|"already_triaged"|"running"|"inherited": n}``) is
+    the skip count (``{"already_triaged"|"running"|"inherited": n}``) is
     additionally stashed on the run's :class:`AutoTriageStatus` so the polling
     status can explain the skips without widening this tuple's signature.
+
+    RAISES when NOTHING could be read — every severity's group query failed, or
+    every group's event query did. A sweep that could not look must not return
+    the empty tuple a genuinely quiet backlog returns: that is how a blind
+    sensor was reported to the analyst as a drained queue, run after run, for
+    the whole outage. A PARTIAL failure is different and does not raise: the
+    readable severities are swept and the failures are stashed as
+    ``status.grid_errors`` so the surface can say "degraded" while still doing
+    the work a flaky grid still allows.
     """
     settings = state.settings
-    elastic = state.elastic
 
-    # Collect all groups across the chosen severities
-    all_groups: list[aq.AlertGroup] = []
-    for severity in severities:
-        try:
-            groups, _ = await aq.fetch_groups(
-                elastic,
-                settings,
-                time_range=time_range,
-                severity=severity,
-                oql=oql,
-            )
-            all_groups.extend(groups)
-        except Exception:
-            _LOGGER.exception("auto-triage: fetch_groups failed for severity=%s", severity)
-
-    if not all_groups:
+    try:
+        rule_events, grid_errors = await _read_backlog(
+            state, time_range=time_range, oql=oql, severities=severities
+        )
+    except _BlindSweep as blind:
+        # Nothing readable at all. Stash the marks, then re-raise the REAL
+        # exception so the route can tell a transport failure (503) from an ES
+        # 4xx (400) — and so the scheduler's own catch lands a degraded status.
         _stash_skipped_reasons(state, {})
-        return [], 0, []
-
-    # For each group, fetch up to 20 recent events
-    # Build: rule_name -> list[AlertEvent]
-    rule_events: dict[str, list[aq.AlertEvent]] = {}
-    for group in all_groups:
-        try:
-            events = await aq.fetch_group_events(
-                elastic,
-                settings,
-                rule_name=group.rule_name,
-                # A Zeek notice's name lives in notice.note, not rule.name; without
-                # the group's own kind this defaults to "suricata" and a notice
-                # group fetches ZERO events, so it is never queued nor counted as
-                # skipped — it silently vanishes from the sweep.
-                kind=group.kind,
-                time_range=time_range,
-                oql=oql,
-                size=20,
-            )
-            rule_events[group.rule_name] = events
-        except Exception:
-            _LOGGER.exception("auto-triage: fetch_group_events failed for rule=%s", group.rule_name)
+        _stash_grid_errors(state, blind.labels)
+        raise blind.cause from None
 
     # Per-reason tally of ``skipped`` — surfaced on the status so the completion
-    # note can say WHICH class of skip happened, not just a bare count. Events
-    # missing an IP can't be clustered/deduped, so they are skipped up front.
-    clusters, skipped_reasons = _cluster_events(rule_events)
+    # note can say WHICH class of skip happened, not just a bare count.
+    # Clustering itself no longer skips anything: every fetched event lands in a
+    # cluster, so only the coverage checks below can add to this.
+    skipped_reasons: dict[str, int] = {}
+    clusters = _cluster_events(rule_events)
 
     if not clusters:
         _stash_skipped_reasons(state, skipped_reasons)
-        return [], sum(skipped_reasons.values()), []
+        _stash_grid_errors(state, grid_errors)
+        return [], 0, []
 
     direct_hits, running_pairs, pair_hits = await _coverage_maps(state, clusters)
 
@@ -301,6 +477,7 @@ async def plan_targets(
         targets = targets[:max_targets]
 
     _stash_skipped_reasons(state, skipped_reasons)
+    _stash_grid_errors(state, grid_errors)
     return targets, sum(skipped_reasons.values()), inherited_acks
 
 
@@ -353,7 +530,13 @@ def _inherited_ack_candidates(
     dst_ip: str,
 ) -> list[InheritedAck]:
     """The cluster's events as ack candidates, when the inherited verdict
-    qualifies (empty list otherwise)."""
+    qualifies (empty list otherwise).
+
+    *src_ip*/*dst_ip* are cluster-key components, so a missing endpoint arrives
+    as ``""`` while the event still carries ``None``; both sides are normalised
+    the same way as the key or an empty-endpoint cluster would match none of its
+    own events.
+    """
     if not _qualifies_for_inherited_ack(settings, inherited):
         return []
     return [
@@ -364,7 +547,7 @@ def _inherited_ack_candidates(
             confidence=inherited.confidence or 0.0,
         )
         for e in events
-        if e.src_ip == src_ip and e.dst_ip == dst_ip
+        if (e.src_ip or "") == src_ip and (e.dst_ip or "") == dst_ip
     ]
 
 
@@ -391,6 +574,9 @@ async def plan_targets_for_ids(
             seen.add(aid)
             ids.append(aid)
     if not ids:
+        # No query goes out, so this run learned nothing about the grid. See the
+        # _stash_grid_errors call at the end for why silence is not written down
+        # as health.
         _stash_skipped_reasons(state, {})
         return [], 0
 
@@ -401,8 +587,9 @@ async def plan_targets_for_ids(
     # named at creation — a selected-id run that dies before its first
     # alert_context event must not leave a nameless "Alert <id>…" row. Best-effort:
     # an ES failure here just leaves names blank and the recorder backfills from
-    # the stream (the prior behaviour).
-    id_to_rule = await _resolve_rule_names(state, ids)
+    # the stream (the prior behaviour). It is also the only thing this path asks
+    # the grid, hence the second return value — see below.
+    id_to_rule, grid_answered = await _resolve_rule_names(state, ids)
 
     targets: list[Target] = []
     skipped = 0
@@ -419,19 +606,41 @@ async def plan_targets_for_ids(
         targets.append(
             Target(alert_es_id=aid, rule_name=id_to_rule.get(aid, ""), src_ip="", dst_ip="")
         )
+    # An explicit selection reads no group/event queries, so it can never be
+    # blind in the plan_targets sense. That is NOT a reason to clear a standing
+    # mark: an empty grid_errors does not say "this run was not blind", it says
+    # "the grid is readable", and clearing it unconditionally asserted that on a
+    # path that never asked. Mid-outage the two clicks are adjacent — a refused
+    # sweep lands the mark, the analyst ticks rows on the (stale) alerts list and
+    # hits Bulk Investigate, and the tile drops the degraded note and reports a
+    # tidy "Last batch · N investigated" while every search is still answering
+    # 429. Same false all-clear as D4, laundered through a second click.
+    #
+    # The rule-name lookup above is the one real question this path puts to the
+    # grid, so it is the only thing that can answer it. A reply clears the mark
+    # (recovery must be able to clear it, or a note nothing retires is a note
+    # analysts stop reading); a refusal or an unasked question leaves the last
+    # run's finding standing, because neither is evidence of health.
     _stash_skipped_reasons(state, skipped_reasons)
+    if grid_answered:
+        _stash_grid_errors(state, [])
     return targets, skipped
 
 
-async def _resolve_rule_names(state: Any, ids: list[str]) -> dict[str, str]:
+async def _resolve_rule_names(state: Any, ids: list[str]) -> tuple[dict[str, str], bool]:
     """Batch-resolve ``alert_es_id -> rule.name`` for a selection in one ES query.
 
     Falls back to ``event.dataset`` / ``event.category`` for non-Suricata
     detections (no ``rule.name``). Never raises — on any ES error returns an empty
     map so callers degrade to stream-backfill rather than failing the sweep.
+
+    Returns ``(names, the grid answered)``. The flag is not about the names: an
+    empty map is the same value whether the grid replied with no matching docs or
+    refused the query outright, and :func:`plan_targets_for_ids` has to tell those
+    apart to know whether it may retire a standing degraded mark.
     """
     if not ids:
-        return {}
+        return {}, False
     try:
         lookup = await state.elastic.search(
             state.settings.events_index_pattern,
@@ -440,7 +649,7 @@ async def _resolve_rule_names(state: Any, ids: list[str]) -> dict[str, str]:
         )
     except Exception:
         _LOGGER.exception("auto-triage: rule-name resolution lookup failed")
-        return {}
+        return {}, False
     resolved: dict[str, str] = {}
     for hit in lookup.hits:
         aid = hit.get("_id", "")
@@ -452,7 +661,7 @@ async def _resolve_rule_names(state: Any, ids: list[str]) -> dict[str, str]:
         )
         if aid and name:
             resolved[aid] = str(name)
-    return resolved
+    return resolved, True
 
 
 async def _ack_inherited_fps(
@@ -681,8 +890,27 @@ async def start_config_sweep(state: Any, *, started_by: str) -> int:
             state, time_range=aq.DEFAULT_RANGE, oql=None, severities=band
         )
     except Exception:
-        status.active = False
         _LOGGER.exception("auto-triage: scheduled planning failed")
+        # The scheduler must not die, so the exception stops here — which makes
+        # the persisted status the ONLY place a blind cycle can show up.
+        #
+        # A failed GRID READ lands as a finished, DEGRADED run (plan_targets
+        # stashed the grid_errors before raising): the tile says "could not read
+        # the grid" for the whole outage instead of the previous cycle's clean
+        # numbers. Any OTHER failure (an app-side crash after the backlog was
+        # read, say) has no such mark, so writing a finished zero here would
+        # print a brand-new, freshly-timestamped "Last batch · 0 investigated"
+        # over a cycle that crashed — trading one false all-clear for another.
+        # For that class, only the single-flight slot is released; the last real
+        # batch stands as the last thing that actually happened. (A mark left by
+        # an earlier blind cycle also lands in the first branch — erring toward
+        # "degraded" is the safe direction here; erring toward "clean" is the
+        # entire defect this batch exists to fix.)
+        if status.grid_errors:
+            status.reset(active=False, total=0, skipped=0, severities=band)
+            status.finished_at = datetime.now(UTC).isoformat()
+        else:
+            status.active = False
         return 0
     if not targets and not inherited_acks:
         status.reset(active=False, total=0, skipped=skipped, severities=band)

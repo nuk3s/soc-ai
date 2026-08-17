@@ -92,6 +92,13 @@ export function Entity() {
                 <span className="rounded-chip border border-border-input bg-surface-3 px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em] text-dim">
                   {data.kind}
                 </span>
+                {/* No "host dossier →" chip: the only IPs that still reach this
+                    screen are EXTERNAL ones (App's EntityRoute redirects internal
+                    addresses to /hosts/:ip), and the dossier census is
+                    internal-CIDR-only — so the link would dead-end on "the network
+                    sweep has never seen this address" for essentially every host
+                    that could click it. An operator who has declared a public
+                    CIDR internal still reaches those hosts from the Hosts screen. */}
               </div>
               <div className="mt-2.5 flex flex-wrap items-center gap-4 text-[12px] text-dim">
                 <span>

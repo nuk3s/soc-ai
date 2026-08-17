@@ -437,7 +437,7 @@ def build_emotet(inv_id: str, prior_ids: tuple[str, str]) -> tuple[Investigation
             content=(
                 "Unlikely. Updaters resolve vendor CDNs and transfer variable-size "
                 "payloads; this host POSTs fixed ~2.1 KB bodies to a bare IP on port "
-                "8080 every ~7 minutes, and no other host in the estate talks to it. "
+                "8080 every ~7 minutes, and no other host in the network talks to it. "
                 "That profile matches C2 beaconing, and the destination is on the "
                 "Feodo Emotet blocklist."
             ),

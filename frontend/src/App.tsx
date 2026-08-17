@@ -1,7 +1,8 @@
 import { Suspense } from 'react';
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RouteFallback } from './components/States';
+import { isIpKey, isPrivateIp } from './lib/ip';
 import { lazyWithReload } from './lib/lazyWithReload';
 import { AppShell } from './shell/AppShell';
 
@@ -19,6 +20,8 @@ const Backtest = lazyWithReload(() => import('./screens/Backtest').then((m) => (
 const Config = lazyWithReload(() => import('./screens/Config').then((m) => ({ default: m.Config })));
 const Dashboard = lazyWithReload(() => import('./screens/Dashboard').then((m) => ({ default: m.Dashboard })));
 const Entity = lazyWithReload(() => import('./screens/Entity').then((m) => ({ default: m.Entity })));
+const HostDetail = lazyWithReload(() => import('./screens/HostDetail').then((m) => ({ default: m.HostDetail })));
+const Hosts = lazyWithReload(() => import('./screens/Hosts').then((m) => ({ default: m.Hosts })));
 const HuntDetail = lazyWithReload(() => import('./screens/HuntDetail').then((m) => ({ default: m.HuntDetail })));
 const Hunts = lazyWithReload(() => import('./screens/Hunts').then((m) => ({ default: m.Hunts })));
 const Investigations = lazyWithReload(() => import('./screens/Investigations').then((m) => ({ default: m.Investigations })));
@@ -26,6 +29,38 @@ const InvestigationPage = lazyWithReload(() => import('./screens/InvestigationPa
 const Login = lazyWithReload(() => import('./screens/Login').then((m) => ({ default: m.Login })));
 const Notifications = lazyWithReload(() => import('./screens/Notifications').then((m) => ({ default: m.Notifications })));
 const Runbooks = lazyWithReload(() => import('./screens/Runbooks').then((m) => ({ default: m.Runbooks })));
+
+/**
+ * The /entity/:value route.
+ *
+ * The host page absorbed the entity view for addresses the dossier can actually
+ * describe — and that is INTERNAL addresses only. The census gates on
+ * `_is_internal_ip` (soc_ai/enrichment/host_dossier.py), so a public address is
+ * guaranteed `found:false`, which renders "the network sweep has never seen this
+ * address, so there is nothing to report about it". That sentence is false the
+ * moment the entity timeline holds an investigation or a hunt finding naming
+ * that IP — exactly the case for a C2 or a suspicious destination — and the
+ * timeline would simultaneously be unreachable, since Entity is the only merged
+ * investigations + hunt-findings view an address has.
+ *
+ * Every pivot in the app hands this a raw IP and many of them are public: the
+ * blast-radius graph's `c2` nodes, the alert source/destination pivots, the hunt
+ * finding host chips, and the host page's own external peers. So the gate is
+ * internal-shaped, not merely address-shaped.
+ *
+ * The check happens HERE, above the lazy boundary, so a redirect does not first
+ * download the screen it is redirecting away from. `replace` keeps the entity
+ * URL out of history: Back should return where the analyst came from, not
+ * bounce them through the redirect again.
+ */
+function EntityRoute() {
+  const { value = '' } = useParams();
+  const key = value.trim();
+  if (isIpKey(key) && isPrivateIp(key)) {
+    return <Navigate to={`/hosts/${encodeURIComponent(key)}`} replace />;
+  }
+  return <Entity />;
+}
 
 export function App() {
   return (
@@ -45,7 +80,9 @@ export function App() {
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/hunts" element={<Hunts />} />
             <Route path="/hunts/:id" element={<HuntDetail />} />
-            <Route path="/entity/:value" element={<Entity />} />
+            <Route path="/entity/:value" element={<EntityRoute />} />
+            <Route path="/hosts" element={<Hosts />} />
+            <Route path="/hosts/:ip" element={<HostDetail />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/runbooks" element={<Runbooks />} />
             <Route path="/config" element={<Config />} />

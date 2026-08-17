@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._shared import (
     require_admin_api,
     router,
 )
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
+from soc_ai.config import Settings
 from soc_ai.store import detection_overrides as override_svc
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,12 +82,55 @@ def _override_out(row: Any) -> DetectionOverrideOut:
     )
 
 
+async def _nominate(request: Request, settings: Settings) -> list[dict[str, Any]]:
+    """Nominate noisy rules, answering a degraded grid instead of crashing on it.
+
+    Nominating reads the grid, so it carries the alert routes' failure modes and
+    owes their answers: a slow or unreachable Security Onion is a 503, an ES 4xx
+    is a 400. Without that the Config panel and the Dashboard's nudge returned an
+    unhandled 500 with an ASGI traceback whenever the grid was down — the moment a
+    SOC console most needs to stay composed, and the state the public demo runs in.
+
+    Both callers go through here for one reason: MR !70 fixed the summary route by
+    hand and left the identical call in the list route bare, so the deep-link the
+    nudge points AT still 500'd. A shared helper makes that divergence impossible
+    rather than merely unlikely.
+
+    ``ApiError`` gets its own arm because it is not an ``elastic_transport``
+    ``TransportError`` — separate hierarchies, so the two-tuple alone still lets
+    every ES 4xx through as a 500.
+
+    The ``asyncio.timeout`` bounds the wait at the console's budget instead of the
+    ES client's retry budget (~90 s at shipped defaults). A grid that accepts the
+    connection and never answers raises nothing for the arms below to catch; it
+    just hangs the panel until the SPA gives up first.
+
+    ``_grid_unavailable(exc)`` rather than the flat constant because THIS panel is
+    where the mismatch showed: the muted-rules header learned to print "(—)" for a
+    count it never read, while the error card directly above it kept advising
+    "retry shortly" — one screen giving an honest unknown and a remedy that cannot
+    produce it. The hint now follows the failure class the header follows.
+    """
+    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
+
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            return await dt.nominate(request.app.state)
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
+
+
 @router.get(
     "/detection-tuning",
     response_model=DetectionTuningOut,
     dependencies=[Depends(require_admin_api)],
 )
-async def get_detection_tuning(request: Request) -> DetectionTuningOut:
+async def get_detection_tuning(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> DetectionTuningOut:
     """Nominated noisy rules + the active soft-mute overrides (detection tuning).
 
     Nominations join the live alert volume with each rule's completed-investigation
@@ -89,9 +138,7 @@ async def get_detection_tuning(request: Request) -> DetectionTuningOut:
     operator's active soft mutes. A mute hides a rule from the default alerts feed
     — it never touches Security Onion.
     """
-    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
-
-    nominations = await dt.nominate(request.app.state)
+    nominations = await _nominate(request, settings)
     async with request.app.state.db_sessionmaker() as db:
         overrides = await override_svc.list_active(db)
     return DetectionTuningOut(
@@ -112,11 +159,15 @@ class DetectionTuningSummaryOut(BaseModel):
     response_model=DetectionTuningSummaryOut,
     dependencies=[Depends(require_admin_api)],
 )
-async def get_detection_tuning_summary(request: Request) -> DetectionTuningSummaryOut:
-    """Count of pending (not-yet-applied) mute recommendations — the Dashboard nudge."""
-    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
+async def get_detection_tuning_summary(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+) -> DetectionTuningSummaryOut:
+    """Count of pending (not-yet-applied) mute recommendations — the Dashboard nudge.
 
-    nominations = await dt.nominate(request.app.state)
+    Degraded-grid behaviour lives in :func:`_nominate`, shared with the list route.
+    """
+    nominations = await _nominate(request, settings)
     pending = sum(
         1 for n in nominations if n.get("recommendation") == "mute" and not n.get("already_muted")
     )

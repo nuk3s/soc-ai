@@ -57,6 +57,42 @@ async def test_create_seeds_rule_name_at_birth(settings_kratos: Settings) -> Non
     await engine.dispose()
 
 
+async def test_list_recent_notifications_is_column_scoped_and_bounds_finished_since(
+    settings_kratos: Settings,
+) -> None:
+    """The bell's investigation query selects scalar columns only (never the
+    report blob) and bounds the completed half in SQL by ``finished_since`` —
+    where the endpoint used to take the newest-N page and drop out-of-window
+    rows in Python."""
+    engine, maker = await _db(settings_kratos)
+    now = utcnow()
+    async with maker() as db:
+        fresh = await inv_svc.create(db, alert_es_id="ev-a", started_by="t", rule_name="ET Fresh")
+        await inv_svc.finalize(
+            db, fresh.id, status="complete", verdict="false_positive", report=REPORT
+        )
+        stale = await inv_svc.create(db, alert_es_id="ev-b", started_by="t", rule_name="ET Stale")
+        await inv_svc.finalize(db, stale.id, status="complete", verdict="false_positive")
+        stale_row = await db.get(Investigation, stale.id)
+        assert stale_row is not None
+        stale_row.finished_at = now - timedelta(hours=30)
+        await db.commit()
+
+        rows = await inv_svc.list_recent_notifications(
+            db, status="complete", limit=20, finished_since=now - timedelta(hours=24)
+        )
+        ids = {r.id for r in rows}
+        assert fresh.id in ids
+        assert stale.id not in ids  # finished 30h ago → excluded IN SQL
+
+        # The returned rows are the scalar NotifRow — no report attribute exists,
+        # so the report column is provably never on this query's select list.
+        assert all(isinstance(r, inv_svc.NotifRow) for r in rows)
+        assert not hasattr(rows[0], "report")
+        assert rows[0].rule_name == "ET Fresh"
+    await engine.dispose()
+
+
 async def test_lifecycle_create_append_finalize(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
@@ -167,6 +203,163 @@ async def test_latest_for_pairs(settings_kratos: Settings) -> None:
             await inv_svc.latest_for_pairs(db, [("RULE B", "10.0.0.3", "10.0.0.4")], window_days=7)
             == {}
         )
+    await engine.dispose()
+
+
+async def test_latest_for_pairs_finds_no_ip_investigations(settings_kratos: Settings) -> None:
+    """A NULL-endpoint investigation must be reachable under the ('rule','','') key.
+
+    Endpoint/process-shaped detections (Sigma host rules, Zeek notices) carry no
+    ``source.ip``/``destination.ip``, so the recorder leaves BOTH columns NULL.
+    The sweep planner clusters them under ``(rule, "", "")`` and asks this
+    function about that key. While the query filtered ``src_ip IS NOT NULL AND
+    dest_ip IS NOT NULL`` those rows were dropped BEFORE the ``or ""`` coalescing
+    below it ran, so a no-IP cluster could never inherit its own prior verdict —
+    it was re-investigated on every sweep that saw a newer event id.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # Exactly what the recorder writes for an alert with no endpoints: a rule
+        # name and NULL for both IPs.
+        a = await inv_svc.create(db, alert_es_id="ev-host", started_by="x", rule_name="SIGMA HOST")
+        assert a.src_ip is None and a.dest_ip is None
+        await inv_svc.finalize(db, a.id, status="complete", verdict="false_positive")
+
+        hits = await inv_svc.latest_for_pairs(db, [("SIGMA HOST", "", "")], window_days=7)
+        assert hits[("SIGMA HOST", "", "")].id == a.id
+
+        # A half-endpoint row is keyed on the endpoint it DOES have, so it can
+        # only be inherited by a cluster of the same shape.
+        b = await inv_svc.create(
+            db, alert_es_id="ev-half", started_by="x", rule_name="HALF RULE", dest_ip="1.2.3.4"
+        )
+        await inv_svc.finalize(db, b.id, status="complete", verdict="true_positive")
+        half = await inv_svc.latest_for_pairs(
+            db, [("HALF RULE", "", "1.2.3.4"), ("HALF RULE", "", "")], window_days=7
+        )
+        assert half[("HALF RULE", "", "1.2.3.4")].id == b.id
+        assert ("HALF RULE", "", "") not in half
+    await engine.dispose()
+
+
+async def test_latest_for_pairs_ip_keyed_rows_unchanged(settings_kratos: Settings) -> None:
+    """Regression guard for the ~99.99% path.
+
+    Admitting NULL-endpoint rows must not disturb a both-endpoints lookup: a
+    NULL row's coalesced key always carries an empty component, so it can never
+    equal — nor outrank, since the map keeps the newest row per key — the key of
+    a flow the caller asked about.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        flow = await inv_svc.create(
+            db,
+            alert_es_id="ev-flow",
+            started_by="x",
+            rule_name="ET FLOW",
+            src_ip="10.0.0.1",
+            dest_ip="1.2.3.4",
+        )
+        await inv_svc.finalize(db, flow.id, status="complete", verdict="true_positive")
+        # Same rule, no endpoints, NEWER — the row that would hijack the flow's
+        # key if coalescing collapsed the two shapes together.
+        noip = await inv_svc.create(db, alert_es_id="ev-noip", started_by="x", rule_name="ET FLOW")
+        await inv_svc.finalize(db, noip.id, status="complete", verdict="false_positive")
+
+        hits = await inv_svc.latest_for_pairs(
+            db, [("ET FLOW", "10.0.0.1", "1.2.3.4"), ("ET FLOW", "", "")], window_days=7
+        )
+        assert hits[("ET FLOW", "10.0.0.1", "1.2.3.4")].id == flow.id
+        assert hits[("ET FLOW", "", "")].id == noip.id
+    await engine.dispose()
+
+
+async def test_running_for_pairs_blocks_a_no_ip_duplicate(settings_kratos: Settings) -> None:
+    """The in-flight guard has to cover no-IP clusters too.
+
+    Without it a manual (or previous sweep's) investigation of a host-shaped rule
+    is invisible to the planner: a newer event id defeats the direct id check and
+    the pair check sees nothing, so the same rule is investigated concurrently —
+    duplicate work and duplicate model spend at every 5-minute sweep.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        running = await inv_svc.create(
+            db, alert_es_id="ev-host", started_by="x", rule_name="SIGMA HOST"
+        )
+        assert running.status == "running"
+        # A completed run of the same shape must NOT be reported as in-flight.
+        done = await inv_svc.create(
+            db, alert_es_id="ev-host-old", started_by="x", rule_name="SIGMA DONE"
+        )
+        await inv_svc.finalize(db, done.id, status="complete", verdict="false_positive")
+        # IP-bearing rows keep their own key, unaffected by the no-IP admission.
+        flow = await inv_svc.create(
+            db,
+            alert_es_id="ev-flow",
+            started_by="x",
+            rule_name="ET FLOW",
+            src_ip="10.0.0.1",
+            dest_ip="1.2.3.4",
+        )
+        assert flow.status == "running"
+
+        assert await inv_svc.running_for_pairs(
+            db,
+            [
+                ("SIGMA HOST", "", ""),
+                ("SIGMA DONE", "", ""),
+                ("ET FLOW", "10.0.0.1", "1.2.3.4"),
+                ("ET FLOW", "", ""),
+            ],
+        ) == {("SIGMA HOST", "", ""), ("ET FLOW", "10.0.0.1", "1.2.3.4")}
+    await engine.dispose()
+
+
+async def test_verdict_counts_since_tallies_the_window_in_sql(
+    settings_kratos: Settings,
+) -> None:
+    """Verdicts landed since a cutoff, counted in SQL over the WHOLE table.
+
+    Aggregated rather than tallied from :func:`list_recent`: a capped scan
+    reports a floor as a total the moment a backlog drain completes more
+    investigations than the cap, and the dashboard chat states this number to the
+    model as fact. Only settled, verdict-bearing rows count — a running or
+    errored run has decided nothing.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        assert await inv_svc.verdict_counts_since(db, utcnow() - timedelta(hours=24)) == {}
+
+        for n in range(2):
+            fp = await inv_svc.create(db, alert_es_id=f"ev-fp{n}", started_by="t")
+            await inv_svc.finalize(db, fp.id, status="complete", verdict="false_positive")
+        tp = await inv_svc.create(db, alert_es_id="ev-tp", started_by="t")
+        await inv_svc.finalize(db, tp.id, status="complete", verdict="true_positive")
+
+        # Settled but verdictless, still running, and errored: none is a decision.
+        no_verdict = await inv_svc.create(db, alert_es_id="ev-none", started_by="t")
+        await inv_svc.finalize(db, no_verdict.id, status="complete")
+        await inv_svc.create(db, alert_es_id="ev-running", started_by="t")
+        errored = await inv_svc.create(db, alert_es_id="ev-err", started_by="t")
+        await inv_svc.finalize(db, errored.id, status="error", verdict="true_positive")
+
+        # Older than the cutoff — last quarter's story is not last night's.
+        stale = await inv_svc.create(db, alert_es_id="ev-stale", started_by="t")
+        await inv_svc.finalize(db, stale.id, status="complete", verdict="needs_more_info")
+        stale_row = await db.get(Investigation, stale.id)
+        assert stale_row is not None
+        stale_row.created_at = utcnow() - timedelta(days=9)
+        await db.commit()
+
+        assert await inv_svc.verdict_counts_since(db, utcnow() - timedelta(hours=24)) == {
+            "false_positive": 2,
+            "true_positive": 1,
+        }
+        # Widening the cutoff picks the old row back up.
+        assert (await inv_svc.verdict_counts_since(db, utcnow() - timedelta(days=30))).get(
+            "needs_more_info"
+        ) == 1
     await engine.dispose()
 
 

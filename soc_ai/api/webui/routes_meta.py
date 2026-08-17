@@ -2,27 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import timedelta
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 from soc_ai import __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.webui._shared import (
     _ago,
+    client_ip,
     open_router,
     require_admin_api,
     router,
 )
+from soc_ai.bootstrap_credential import clear_bootstrap_credential
 from soc_ai.config import Settings
 from soc_ai.store import auth as auth_svc
+from soc_ai.store import host_dossier as dossier_svc
 from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store import saved_views as views_svc
 from soc_ai.webui import (
     probes,
 )
@@ -98,6 +103,86 @@ async def list_workspaces(settings: Settings = Depends(get_settings_dep)) -> lis
 # a history screen. Items are client-dismissible (stable ids → localStorage).
 _NOTIF_WINDOW = timedelta(hours=24)
 
+# Host-dossier conflicts shown at once. A standing disagreement is a slow,
+# durable thing — the whole list is on the dossier conflicts screen, and the
+# bell holds 12 items total, so a network-wide re-address must not push every
+# investigation and hunt off it.
+_DOSSIER_NOTIF_CAP = 3
+
+# What to call the trouble, per probe classification (soc_ai.webui.probes). The
+# bell said "unreachable" for every one of them, including a grid answering 429
+# in the same second (dogfood 2026-08-14, D9). An unclassified failure keeps
+# "unreachable" — it is the honest fallback when nothing more is known.
+_DEP_TROUBLE = {
+    "partial": "reading only part of the grid",
+    "overloaded": "overloaded and shedding load",
+    "timeout": "not answering",
+}
+
+
+def _conflict_line(host: Any, field: Any) -> str:
+    """One line naming the disagreement, in the operator's terms."""
+    if field.conflict_kind == "rebound":
+        detail = "a different machine may now hold this address"
+    elif field.conflict_kind == "retracted":
+        detail = "the evidence behind your value is gone"
+    else:
+        inferred = (field.inferred_value or "?")[:40]
+        operator = (field.operator_value or "?")[:40]
+        detail = f'telemetry says "{inferred}", yours says "{operator}"'
+    return f"Dossier conflict on {host.ip} — {field.field}: {detail}"
+
+
+async def _dossier_conflict_notifications(request: Request) -> list[NotificationOut]:
+    """Bell entries for host-dossier prods the sweep has actually fired.
+
+    This is the delivery half of the conflict state machine. Firing writes
+    ``conflict_last_prompted_at`` / ``conflict_prompt_count`` inside the build's
+    transaction, which burns the 14-day rate limit and escalates the "keep mine"
+    backoff — so a prod with no surface is worse than no prod at all: the
+    operator meets the question for the first time already snoozed toward the
+    90-day cap.
+
+    Gated on ``conflict_prompt_count`` rather than on the conflict being open,
+    so the bell mirrors the rate-limited machine and not every disagreement (the
+    full list lives on the dossier conflicts screen). The id carries the cycle
+    counter: a client-side dismissal then holds for THIS prod and does not
+    swallow the next one.
+
+    DB-only and fail-soft, like everything else on this endpoint — it is polled
+    every 15s and has to keep working when a part of the system is broken.
+    """
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None or not getattr(settings, "dossier_enabled", False):
+        return []
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            rows, _total = await dossier_svc.conflicts_due(
+                db,
+                min_observations=int(settings.dossier_conflict_min_observations),
+                limit=_DOSSIER_NOTIF_CAP,
+            )
+    except Exception:
+        _LOGGER.warning("notifications: dossier conflict read failed (continuing)", exc_info=True)
+        return []
+
+    out: list[NotificationOut] = []
+    for host, field in rows:
+        cycle = field.conflict_prompt_count or 0
+        if not cycle:
+            continue  # the machine has not raised this one yet
+        raised = field.conflict_last_prompted_at or field.conflict_first_seen_at
+        out.append(
+            NotificationOut(
+                id=f"dossier-conflict:{host.ip}:{field.field}:{cycle}",
+                tone="warn",
+                title=_conflict_line(host, field),
+                when=_ago(raised.isoformat()) if raised is not None else "",
+                href=f"/entity/{host.ip}",
+            )
+        )
+    return out
+
 
 @router.get("/notifications", response_model=list[NotificationOut])
 async def list_notifications(request: Request) -> list[NotificationOut]:
@@ -110,10 +195,41 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
     """
     cutoff = auth_svc.utcnow() - _NOTIF_WINDOW
     out: list[NotificationOut] = []
+    # Status notifications (dogfood 2026-08-05): a currently-down dependency is
+    # a standing bell entry. Derived ONLY from the warm health cache + the
+    # transition map _cached_health_probes maintains — this endpoint must stay
+    # DB-fast and never probe ES itself (it is polled every 15s and must keep
+    # working precisely when ES is down). Id is stable per outage (keyed on the
+    # flip time) so a client-side dismissal holds for the outage's duration.
+    _DEP_LABEL = {"es": "Security Onion / Elasticsearch", "llm": "LLM gateway"}
+    down_since = getattr(request.app.state, "_dep_down_since", None) or {}
+    down_kind = getattr(request.app.state, "_dep_down_kind", None) or {}
+    for dep, since in down_since.items():
+        trouble = _DEP_TROUBLE.get(str(down_kind.get(dep) or ""), "unreachable")
+        out.append(
+            NotificationOut(
+                id=f"dep-down:{dep}:{since.strftime('%Y%m%d%H%M%S')}",
+                tone="danger",
+                title=f"{_DEP_LABEL.get(dep, dep)} {trouble} — investigations degraded",
+                when=_ago(since.isoformat()),
+                href=None,
+            )
+        )
+    out.extend(await _dossier_conflict_notifications(request))
+    # Column-scoped reads (never the report JSON blob): the bell reads ~5 scalar
+    # fields from investigations and a denormalized findings_count from hunts, and
+    # this endpoint is polled every 15s by every open tab. Both completed-runs
+    # queries share ONE window definition — `finished_since` bounds and orders on
+    # finished_at, the clock the bell renders — so a run created before the window
+    # but finished inside it appears for investigations AND hunts alike.
     async with request.app.state.db_sessionmaker() as db:
-        running = await inv_svc.list_recent(db, status="running", limit=20)
-        completed = await inv_svc.list_recent(db, status="complete", limit=20)
-        hunts_done = await hunts_svc.list_recent(db, status="complete", limit=10, since=cutoff)
+        running = await inv_svc.list_recent_notifications(db, status="running", limit=20)
+        completed = await inv_svc.list_recent_notifications(
+            db, status="complete", limit=20, finished_since=cutoff
+        )
+        hunts_done = await hunts_svc.list_recent_notifications(
+            db, status="complete", limit=10, finished_since=cutoff
+        )
     for inv in running:
         out.append(
             NotificationOut(
@@ -147,8 +263,8 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             )
         )
     for h in hunts_done:
-        findings = (h.report or {}).get("findings") or []
-        n = len(findings)
+        # Denormalized count (migration 0028) — no report blob deserialized here.
+        n = h.findings_count or 0
         done.append(
             NotificationOut(
                 id=f"hunt-done:{h.id}",
@@ -182,19 +298,16 @@ class MaintenanceOut(BaseModel):
 _BACKUP_LIST_CAP = 8
 
 
-@router.get(
-    "/maintenance",
-    response_model=MaintenanceOut,
-    dependencies=[Depends(require_admin_api)],
-)
-async def get_maintenance(settings: Settings = Depends(get_settings_dep)) -> MaintenanceOut:
-    """Observed maintenance facts for the Config panel.
+def _scan_maintenance_dirs(settings: Settings) -> MaintenanceOut:
+    """Stat the backup + blocklist dirs. **Blocking** — call via ``to_thread``.
 
-    The nightly backup/blocklist crons run OUTSIDE the app (host crontab), so
-    the product can't promise a schedule — it reports what actually happened:
-    the archives sitting in ``<data_dir>/backups`` and the blocklist feeds'
-    freshness. Automation the user can't see in the UI doesn't exist (user
-    requirement, 2026-07-16). Missing dirs are a normal cold state, never a 500.
+    A glob with a per-entry ``stat()`` sort key, a second ``stat()`` per listed
+    archive, and an ``iterdir()`` with ``is_file()``/``stat()`` per blocklist
+    file are all synchronous pathlib syscalls. On slow or contended storage, or
+    once the blocklist dir has grown to thousands of feed files, running them in
+    the coroutine would block the loop — so the whole scan lives here and the
+    handler offloads it, matching the repo's pcap-SSH and maxmind pattern.
+    Missing dirs are a normal cold state, never a 500.
     """
     from datetime import UTC, datetime  # noqa: PLC0415
 
@@ -236,6 +349,24 @@ async def get_maintenance(settings: Settings = Depends(get_settings_dep)) -> Mai
         blocklists_refreshed=_iso(newest) if newest is not None else None,
         blocklist_files=n_files,
     )
+
+
+@router.get(
+    "/maintenance",
+    response_model=MaintenanceOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_maintenance(settings: Settings = Depends(get_settings_dep)) -> MaintenanceOut:
+    """Observed maintenance facts for the Config panel.
+
+    The nightly backup/blocklist crons run OUTSIDE the app (host crontab), so
+    the product can't promise a schedule — it reports what actually happened:
+    the archives sitting in ``<data_dir>/backups`` and the blocklist feeds'
+    freshness. Automation the user can't see in the UI doesn't exist (user
+    requirement, 2026-07-16). The filesystem scan is blocking, so it runs in a
+    worker thread (:func:`_scan_maintenance_dirs`).
+    """
+    return await asyncio.to_thread(_scan_maintenance_dirs, settings)
 
 
 # ── Current-user endpoints ────────────────────────────────────────────────
@@ -302,6 +433,228 @@ async def set_my_status(request: Request, body: SetStatusIn) -> dict[str, str | 
     return {"ok": True, "status": trimmed}
 
 
+class ChangePasswordIn(BaseModel):
+    # Bounded like every other credential field (routes_auth.LoginIn,
+    # routes_admin.CreateUserIn) so an unbounded string can't be buffered. The
+    # real rules live in the handler: MIN_PASSWORD_LENGTH below, bcrypt's 72-byte
+    # ceiling above (PasswordTooLongError → a clean 400), so everything inside
+    # this bound gets the house error shape rather than a 422.
+    #
+    # Anything OUTSIDE the bound is a 422 from FastAPI's validation layer, whose
+    # default body echoes the offending `input` — i.e. the plaintext password.
+    # That is scrubbed app-wide in main.py's RequestValidationError handler.
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=1, max_length=1024)
+
+
+@router.post("/me/password")
+async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[str, bool]:
+    """Change the calling user's own password. Session auth, any role.
+
+    Requires a real session user: this endpoint asks "prove you know the
+    CURRENT password", which only means something for an account with a stored
+    hash. A bearer-token caller (or the no-auth dev fallback) has no such
+    account, so it gets a 401 rather than a confusing no-op — the deliberate
+    contrast with ``/me/status``, which echoes for those callers.
+
+    The current password is verified BEFORE the new one is validated: proving
+    the credential is the authentication step, so a caller riding a borrowed
+    cookie learns nothing about the password policy.
+
+    Wrong guesses are throttled exactly as login's are. "Prove you know this
+    password" is an online guessing oracle wherever it is offered, and this one
+    sits behind a cookie an attacker may already have stolen — leaving it
+    unthrottled would hand them the plaintext (and let them lock the analyst
+    out) at thousands of attempts a minute. The lockout is checked BEFORE the
+    bcrypt verify so a flood also can't pin the shared thread pool.
+    """
+    user = await current_user(request)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "reason": "no_session",
+                "hint": "Changing your password requires a signed-in session.",
+            },
+        )
+    settings = request.app.state.settings
+    caller_ip = client_ip(request, settings)
+    throttle = auth_svc.password_change_throttle  # NOT login's — see store.auth
+    if throttle.is_locked(caller_ip, user.username):
+        _LOGGER.warning(
+            "password change locked out for user=%r from ip=%s (too many wrong "
+            "current-password attempts)",
+            user.username,
+            caller_ip,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "reason": "too_many_attempts",
+                "hint": "Too many incorrect attempts; try again later.",
+            },
+        )
+    if not await auth_svc.verify_password(body.current_password, user.password_hash):
+        if throttle.record_failure(caller_ip, user.username):
+            _LOGGER.warning(
+                "password-change throttle engaged for user=%r from ip=%s",
+                user.username,
+                caller_ip,
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "bad_credentials", "hint": "Current password is incorrect."},
+        )
+    throttle.clear(caller_ip, user.username)
+    if len(body.new_password) < auth_svc.MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "password_too_short",
+                "hint": (f"Password must be at least {auth_svc.MIN_PASSWORD_LENGTH} characters."),
+            },
+        )
+    async with request.app.state.db_sessionmaker() as db:
+        try:
+            await auth_svc.change_own_password(
+                db,
+                user.id,
+                body.new_password,
+                # Keep the tab the analyst is typing in signed in; drop the rest.
+                keep_raw_token=request.cookies.get(auth_svc.SESSION_COOKIE),
+            )
+        except auth_svc.PasswordTooLongError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "password_too_long",
+                    "hint": "Password must be at most 72 bytes (bcrypt's limit).",
+                },
+            ) from exc
+    # Only after the change actually landed: the startup log tells the operator
+    # to change this password and delete the sidecar, so doing the second half
+    # for them is what closes the loop. A no-op for every other account.
+    clear_bootstrap_credential(settings, user.username)
+    return {"ok": True}
+
+
+# ── Saved list views ──────────────────────────────────────────────────────────
+
+
+class SavedViewOut(BaseModel):
+    id: int
+    screen: str
+    name: str
+    query: dict[str, Any]
+    created_at: str | None = None
+
+
+class SavedViewListOut(BaseModel):
+    rows: list[SavedViewOut]
+
+
+class SaveViewIn(BaseModel):
+    screen: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=views_svc.NAME_MAX)
+    # The screen's own filter state, opaque here on purpose — see the model.
+    query: dict[str, Any] = Field(default_factory=dict)
+
+
+def _view_out(row: Any) -> SavedViewOut:
+    return SavedViewOut(
+        id=int(row.id),
+        screen=str(row.screen),
+        name=str(row.name),
+        query=dict(row.query_json or {}),
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+async def _require_user(request: Request) -> Any:
+    """The signed-in user, or a 401 in the house shape.
+
+    A saved view belongs to a person, so there is no dev fallback here: a
+    bearer-token caller and a no-auth dev session have no user row to own one.
+    """
+    user = await current_user(request)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "reason": "no_session",
+                "hint": "Saved views belong to a signed-in user.",
+            },
+        )
+    return user
+
+
+@router.get("/me/views", response_model=SavedViewListOut)
+async def list_my_views(request: Request, screen: str | None = None) -> SavedViewListOut:
+    """This user's saved views, oldest first, optionally for one screen."""
+    user = await _require_user(request)
+    async with request.app.state.db_sessionmaker() as db:
+        rows = await views_svc.list_views(db, user.id, screen=screen or None)
+    return SavedViewListOut(rows=[_view_out(r) for r in rows])
+
+
+@router.post("/me/views", response_model=SavedViewOut)
+async def save_my_view(request: Request, body: SaveViewIn) -> SavedViewOut:
+    """Save the current filter set under a name. Re-saving a name replaces it."""
+    user = await _require_user(request)
+    if body.screen not in views_svc.SAVED_VIEW_SCREENS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "unknown_screen",
+                "hint": f"expected one of: {', '.join(views_svc.SAVED_VIEW_SCREENS)}",
+            },
+        )
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "empty_name", "hint": "A view needs a name to be a chip."},
+        )
+    try:
+        views_svc.validate_query(body.query)
+    except views_svc.QueryTooLargeError as exc:
+        raise HTTPException(
+            status_code=400, detail={"reason": exc.reason, "hint": exc.hint}
+        ) from exc
+    async with request.app.state.db_sessionmaker() as db:
+        try:
+            row = await views_svc.upsert_view(
+                db, user.id, screen=body.screen, name=name, query=body.query
+            )
+        except views_svc.TooManyViewsError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "too_many_views",
+                    "hint": (
+                        f"You can keep {views_svc.MAX_VIEWS_PER_USER} saved views; "
+                        "delete one first."
+                    ),
+                },
+            ) from exc
+    return _view_out(row)
+
+
+@router.delete("/me/views/{view_id}")
+async def delete_my_view(request: Request, view_id: int) -> dict[str, bool]:
+    """Delete one of this user's views.
+
+    Someone else's id is a 404, not a 403: the row is scoped out of existence
+    for this caller, so probing ids reveals nothing about another analyst.
+    """
+    user = await _require_user(request)
+    async with request.app.state.db_sessionmaker() as db:
+        gone = await views_svc.delete_view(db, user.id, view_id)
+    if not gone:
+        raise HTTPException(status_code=404, detail={"reason": "not_found"})
+    return {"ok": True}
+
+
 # ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────
 
 _PCAP_PROBE_TTL_S = 300.0  # SSH is heavy; cache the PCAP probe between polls.
@@ -314,6 +667,25 @@ _HEALTH_PROBE_TTL_S = 15.0
 class HealthComponentOut(BaseModel):
     ok: bool
     detail: str
+    # WHICH failure, when ok is False: "partial", "overloaded", "timeout",
+    # "refused" (see soc_ai.webui.probes). Every surface used to hardcode
+    # "<dep> not reachable", so a grid answering 429 — up, replying, shedding
+    # load — sent the analyst off to check firewalls (dogfood 2026-08-14, D9).
+    kind: str = ""
+
+    @model_serializer
+    def _serialize(self) -> dict[str, Any]:
+        """Carry ``kind`` only when the probe actually classified something.
+
+        Presence then MEANS "this failure was identified", which is the contract
+        the banner reads: a healthy component, an unclassified failure and a
+        probe too old to classify are all indistinguishable on the wire, and all
+        three correctly get the generic phrasing.
+        """
+        out: dict[str, Any] = {"ok": self.ok, "detail": self.detail}
+        if self.kind:
+            out["kind"] = self.kind
+        return out
 
 
 class HealthOut(BaseModel):
@@ -332,23 +704,85 @@ async def _cached_pcap_probe(state: Any, settings: Settings) -> dict[str, Any]:
     return result
 
 
-async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dict[str, Any]]:
-    """The ES + LLM probe results, TTL-cached on app state.
+# Hard bound on ONE health probe leg. Without it, probe_es rides the ES
+# client's own timeout+retry stack (~90s worst case with a down grid) — which
+# made /health, the very endpoint the UI's degraded-mode banner keys off, the
+# slowest thing on the page during an outage (dogfood 2026-08-05).
+_HEALTH_PROBE_LEG_TIMEOUT_S = 5.0
 
-    Both are cheap, but a 30s dashboard poll across several tabs would otherwise
-    hit ES + the gateway every time; the short TTL collapses those into one
-    probe per window. Returns ``{"es": {...}, "llm": {...}}``.
+
+async def _bounded_probe(coro: Any, dep: str) -> dict[str, Any]:
+    """One probe leg under the hard bound; a timeout IS the down verdict."""
+    try:
+        async with asyncio.timeout(_HEALTH_PROBE_LEG_TIMEOUT_S):
+            return await coro  # type: ignore[no-any-return]
+    except TimeoutError:
+        return {
+            "ok": False,
+            "kind": "timeout",
+            "detail": f"{dep} probe exceeded {_HEALTH_PROBE_LEG_TIMEOUT_S:.0f}s — treating as down",
+        }
+
+
+async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dict[str, Any]]:
+    """The ES + LLM probe results, TTL-cached on app state (single-flight).
+
+    Both are cheap when healthy, but a 30s dashboard poll across several tabs
+    would otherwise hit ES + the gateway every time; the short TTL collapses
+    those into one probe per window. The LOCK matters as much as the TTL: with
+    a down grid, N concurrent polls against a cold cache used to launch N
+    parallel hanging probes (result-only caching has no single-flight), which
+    ate the browser's connection budget exactly when the UI most needed
+    /health to answer. Returns ``{"es": {...}, "llm": {...}}``.
     """
-    now = time.monotonic()
-    cached = getattr(state, "_health_probe_cache", None)
-    if cached is not None and now - cached[0] < _HEALTH_PROBE_TTL_S:
-        return cached[1]  # type: ignore[no-any-return]
-    result = {
-        "es": await probes.probe_es(state.elastic),
-        "llm": await probes.probe_llm(settings),
-    }
-    state._health_probe_cache = (now, result)
-    return result
+    lock = getattr(state, "_health_probe_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        state._health_probe_lock = lock
+    async with lock:
+        now = time.monotonic()
+        cached = getattr(state, "_health_probe_cache", None)
+        if cached is not None and now - cached[0] < _HEALTH_PROBE_TTL_S:
+            return cached[1]  # type: ignore[no-any-return]
+        result = {
+            "es": await _bounded_probe(probes.probe_es(state.elastic, settings), "elasticsearch"),
+            "llm": await _bounded_probe(probes.probe_llm(settings), "llm gateway"),
+        }
+        state._health_probe_cache = (now, result)
+        _note_dep_transitions(state, result)
+        return result
+
+
+def _note_dep_transitions(state: Any, probed: dict[str, dict[str, Any]]) -> None:
+    """Track when each dependency last flipped down, for status notifications.
+
+    ``state._dep_down_since`` maps dep name -> naive-UTC datetime of the flip.
+    Kept in process memory on purpose: a restart re-probes within one TTL and
+    re-detects a still-down dep, and notification ids stay stable across polls
+    within an outage (client-side dismissal keys on the id).
+
+    ``state._dep_down_kind`` carries the CURRENT failure class beside it, so the
+    bell can say which trouble this is. It is refreshed on every probe rather
+    than pinned at the flip: a grid that starts refusing connections and comes
+    back shedding load is one outage (same id, same dismissal) whose entry
+    should stop saying "unreachable" the moment it is answering again.
+    """
+    down_since = getattr(state, "_dep_down_since", None)
+    if down_since is None:
+        down_since = {}
+        state._dep_down_since = down_since
+    down_kind = getattr(state, "_dep_down_kind", None)
+    if down_kind is None:
+        down_kind = {}
+        state._dep_down_kind = down_kind
+    for dep, res in probed.items():
+        if res.get("ok"):
+            down_since.pop(dep, None)
+            down_kind.pop(dep, None)
+            continue
+        down_kind[dep] = str(res.get("kind") or "")
+        if dep not in down_since:
+            down_since[dep] = auth_svc.utcnow()
 
 
 @router.get("/health", response_model=HealthOut)
@@ -373,6 +807,7 @@ class AboutOut(BaseModel):
     repo_url: str
     license: str
     update_check_enabled: bool
+    general_chat_enabled: bool
 
 
 class UpdateCheckOut(BaseModel):
@@ -391,12 +826,19 @@ async def about(settings: Settings = Depends(get_settings_dep)) -> AboutOut:
     Readable by any authenticated user; reaches no upstream and carries no
     secret. Whether the update check is available is reported so the UI can show
     the button only when an admin has opted in.
+
+    ``general_chat_enabled`` rides along for the same reason, one screen earlier:
+    the Dashboard mounts before it has any other way to learn the feature is off,
+    so without this flag a disabled deployment would render the Ask box and then
+    fail the first request an analyst made — an error on the landing screen of a
+    deployment that turned the feature off deliberately.
     """
     return AboutOut(
         version=__version__,
         repo_url=updates_svc.REPO_URL,
         license=updates_svc.LICENSE,
         update_check_enabled=settings.update_check_enabled,
+        general_chat_enabled=settings.general_chat_enabled,
     )
 
 

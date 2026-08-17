@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -33,6 +37,7 @@ from soc_ai.api.webui._timeline import (
     _entity_graph,
     _host_signals,
 )
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
@@ -47,16 +52,23 @@ _LOGGER = logging.getLogger(__name__)
 
 # ── Investigations ─────────────────────────────────────────────────────────
 
-# Statuses actually written by the backend: running | complete | error |
+# The statuses the backend actually writes: running | complete | error |
 # cancelled | interrupted. (The frontend union also lists a legacy "awaiting"
-# that is never produced.)
-_STATUS = {
-    "running": "running",
-    "complete": "complete",
-    "error": "error",
-    "cancelled": "cancelled",
-    "interrupted": "interrupted",
-}
+# that is never produced.) DERIVED from the store's tuple, not a second copy of
+# it — the same tuple drives the SQL display-status CASE and this route's filter
+# validation, so a status added there reaches the renderer and the filter
+# together instead of leaving them to disagree about a value only one knows.
+_STATUS = frozenset(inv_svc.DISPLAY_STATUSES)
+
+# A search term longer than this is not a search, it is a payload. The columns
+# it matches are a 512-char rule name and two address strings.
+#
+# REFUSED, not truncated. Truncating turns a substring match into a match on a
+# PREFIX of what was typed, so the answer is a superset of the question — the
+# screen renders rows that do not contain the search term and the header count
+# agrees with them. A list quietly answering a different question is the exact
+# failure this endpoint exists to have stopped doing.
+_SEARCH_MAX = 200
 
 
 def _row_status(inv: Investigation) -> str:
@@ -67,8 +79,12 @@ def _row_status(inv: Investigation) -> str:
     reached a triage decision, so labelling it 'complete' would be a lie (the
     verdict shows 'untriaged'). A real verdict — including needs_more_info — keeps
     the stored status.
+
+    The SQL twin is :func:`~soc_ai.store.investigations._display_status_sql`,
+    which the Status filter runs on so the filter and the badge cannot part
+    company; a differential test asserts the two agree row for row.
     """
-    status = _STATUS.get(inv.status, "error")
+    status = inv.status if inv.status in _STATUS else "error"
     if status == "complete" and not (inv.verdict or "").strip():
         return "error"
     return status
@@ -105,6 +121,16 @@ class InvestigationRowOut(BaseModel):
     # True AND this is False — the row stays a pipeline error historically; the
     # ack only silences the dashboard nag.
     errorDismissed: bool = False
+    # What happened LAST to this row's alert, decided over the alert's WHOLE run
+    # group exactly as `isPrimary` is. When it names a different run than this
+    # one, the row is representative but not current — the case the list used to
+    # hide entirely: a re-run that died against a down grid, folded into a bare
+    # "1 earlier" chip while the row went on showing the older healthy verdict
+    # (dogfood D8, 2026-08-14). Equal to this row's own id/status/when when this
+    # run IS the newest, which is the ordinary case and renders nothing extra.
+    latestRunId: str = ""
+    latestRunStatus: str = ""
+    latestRunWhen: str = ""
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -123,34 +149,85 @@ def _elapsed(inv: Investigation) -> str:
 
 
 def _row(
-    inv: Investigation, chat_count: int = 0, *, is_primary: bool = True
+    inv: Investigation,
+    chat_count: int = 0,
+    *,
+    is_primary: bool = True,
+    latest_run: inv_svc.RunRef | None = None,
 ) -> InvestigationRowOut:
+    """Map one persisted run to its list row.
+
+    Every field is read straight off the ORM row: the sole caller is
+    :func:`list_investigations`, which passes ``query_page`` results, so each
+    attribute below is a mapped column that always exists. (It used to carry
+    ``getattr`` guards for tests that mocked ``list_recent`` with
+    ``SimpleNamespace``; the list is a real SQL query now and those tests seed
+    real rows, so the guards were defending against nothing.)
+
+    ``latest_run`` is the newest run of THIS row's alert (see
+    :func:`_latest_runs`); omitting it says this run is its own alert's newest,
+    which is what a caller with no group to consult can honestly claim.
+    """
+    # A RunRef carries no verdict, so the verdict half of `_row_status` (a
+    # 'complete' run that reached no verdict displays as an error) cannot be
+    # applied to a SIBLING run. It does not need to be: `_primary_run_ids`
+    # counts 'complete' as live, so a newest run in that state is always this
+    # very row, and its own Status cell already carries the mapping. Only the
+    # unknown-status guard is reachable from here, and it is kept identical.
+    latest_status = (
+        _row_status(inv)
+        if latest_run is None
+        else (latest_run.status if latest_run.status in _STATUS else "error")
+    )
     return InvestigationRowOut(
         id=inv.id,
-        name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
+        name=inv.rule_name or f"Alert {(inv.alert_es_id or inv.id)[:12]}…",
         kind="suricata",
         verdict=_verdict(inv.verdict),
         conf=inv.confidence,
         host=inv.src_ip or "—",
-        dst=getattr(inv, "dest_ip", None),
+        dst=inv.dest_ip,
         status=_row_status(inv),
         when=_ago(_iso_utc(inv.created_at)),
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(inv.created_at),
         chatCount=chat_count,
-        alertId=getattr(inv, "alert_es_id", None) or inv.id,
+        alertId=inv.alert_es_id or inv.id,
         isPrimary=is_primary,
-        # `getattr` guard: list_recent yields ORM rows (report is the JSON column),
-        # but tests mock rows with SimpleNamespace and no `report` attr.
-        fallback=is_pipeline_fallback(getattr(inv, "report", None)),
-        errorDismissed=getattr(inv, "error_dismissed_at", None) is not None,
+        fallback=is_pipeline_fallback(inv.report),
+        errorDismissed=inv.error_dismissed_at is not None,
+        latestRunId=inv.id if latest_run is None else latest_run.id,
+        latestRunStatus=latest_status,
+        latestRunWhen=_ago(
+            _iso_utc(inv.created_at if latest_run is None else latest_run.created_at)
+        ),
     )
 
 
-def _primary_run_ids(rows: list[Investigation]) -> set[str]:
+class _RunLike(Protocol):
+    """The three scalars primacy is decided from, however they arrive.
+
+    :func:`_primary_run_ids` is a pure function over (id, alert_es_id, status).
+    In the route it is handed :class:`~soc_ai.store.investigations.RunRef`
+    tuples; its unit tests drive it with ``SimpleNamespace`` stand-ins, which is
+    legitimate precisely because the algorithm touches nothing else. Annotating
+    the parameter as ``Sequence[RunRef]`` would state a requirement the function
+    does not have and its own callers already break.
+    """
+
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def alert_es_id(self) -> str | None: ...
+
+    @property
+    def status(self) -> str: ...
+
+
+def _primary_run_ids(rows: Sequence[_RunLike]) -> set[str]:
     """The canonical run id per alert: the most recent run that is RUNNING or
-    COMPLETE, else the most recent run of any status. ``rows`` are newest-first
-    (``list_recent`` order).
+    COMPLETE, else the most recent run of any status. ``rows`` are newest-first.
 
     A running run that is newer than the last complete one wins — clicking
     "re-investigate" must surface the in-flight run as the alert's current
@@ -160,26 +237,169 @@ def _primary_run_ids(rows: list[Investigation]) -> set[str]:
     best_live: dict[str, str] = {}
     best_any: dict[str, str] = {}
     for inv in rows:  # newest-first, so first-seen per key is the most recent
-        key = getattr(inv, "alert_es_id", None) or inv.id
+        key = inv.alert_es_id or inv.id
         best_any.setdefault(key, inv.id)
         if inv.status in ("running", "complete"):
             best_live.setdefault(key, inv.id)
     return {best_live.get(key, run_id) for key, run_id in best_any.items()}
 
 
-@router.get("/investigations", response_model=list[InvestigationRowOut])
+def _latest_runs(rows: Sequence[inv_svc.RunRef]) -> dict[str, inv_svc.RunRef]:
+    """The newest run per alert, whatever its status. ``rows`` are newest-first.
+
+    The twin of :func:`_primary_run_ids`, kept separate on purpose. That
+    function answers which run REPRESENTS an alert, and its rule — prefer the
+    newest running-or-complete run — is right: it stops a pile of failed retries
+    burying the run that actually landed a verdict. This one answers a different
+    question, what happened to the alert LAST, and the two disagreeing is
+    precisely the state the list had no way to show. Three re-investigations
+    started against a down grid came back as two unchanged rows carrying their
+    old healthy verdicts and a bare "1 earlier" chip, so a batch that mostly
+    died read as a mostly-calm list (dogfood D8, 2026-08-14).
+
+    Takes :class:`~soc_ai.store.investigations.RunRef` rather than the looser
+    ``_RunLike`` because it reads ``created_at``, which only RunRef carries —
+    stating a requirement it genuinely has.
+    """
+    latest: dict[str, inv_svc.RunRef] = {}
+    for run in rows:  # newest-first, so first-seen per key is the most recent
+        latest.setdefault(run.alert_es_id or run.id, run)
+    return latest
+
+
+# The verdict-filter vocabulary, mirroring the screen's VERDICT_FILTER_VALUES:
+# the stored verdicts plus the synthetic pipeline_error (fallback-marked rows).
+_VERDICT_FILTERS = (
+    "true_positive",
+    "false_positive",
+    "needs_more_info",
+    "inconclusive",
+    inv_svc.PIPELINE_ERROR_VERDICT,
+)
+
+
+def _csv_filter(raw: str | None, allowed: tuple[str, ...]) -> list[str]:
+    """Parse a comma-separated multi-value filter param, dropping unknowns.
+
+    Unknown members are dropped rather than 422'd (matching the screen's
+    verdictFilterFromSearch): a mangled deep link must degrade to a broader
+    query, not wedge the whole list behind an error. All-unknown → unfiltered.
+    """
+    if not raw:
+        return []
+    return [v for v in (p.strip() for p in raw.split(",")) if v in allowed]
+
+
+class InvestigationListOut(BaseModel):
+    """One SQL page of the list, with figures counted over the right sets.
+
+    ``total`` / ``running`` / ``truePositives`` are counted in SQL over the SAME
+    filter set as ``rows`` — never tallied from the page, which is how a header
+    figure ends up describing 100 rows while reading as the query's (the
+    phantom-untriaged defect, twice shipped). ``totalAll`` / ``active`` describe
+    the WHOLE table: "empty store vs. filter matched nothing" and "poll while
+    anything is running anywhere" cannot be answered from a filtered page.
+    """
+
+    rows: list[InvestigationRowOut]
+    total: int
+    running: int
+    truePositives: int
+    totalAll: int
+    active: bool
+    # The clamped values the server actually used — the client pages by these.
+    limit: int
+    offset: int
+
+
+@router.get("/investigations", response_model=InvestigationListOut)
 async def list_investigations(
     request: Request,
     status: str | None = None,
+    verdict: str | None = None,
+    q: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
     limit: int = 100,
-) -> list[InvestigationRowOut]:
-    if status not in (None, "running", "complete", "error", "cancelled", "interrupted"):
-        status = None
+    offset: int = 0,
+) -> InvestigationListOut:
+    """Investigation rows, newest first — filtered, counted and paged in SQL.
+
+    ``status`` / ``verdict`` are comma-separated multi-selects (single values —
+    the old contract — parse identically). ``since``/``until`` bound
+    ``created_at`` inclusively, like ``GET /hunts``. ``q`` is free text matched
+    against the rule name, source and destination — the columns the table shows.
+    Filtering in SQL is the point: the old newest-100 page made every older
+    errored run unreachable under ANY filter once one outcome saturated the
+    page, and a client-side search box would have rebuilt exactly that.
+
+    ``isPrimary`` is decided over each alert's WHOLE run group (one extra query
+    over the page's alert ids), never over the filtered page — a filter changes
+    which rows come back, not what "primary" means. So a filtered page can
+    contain non-primary rows whose primary sibling is absent; the client tucks a
+    retry under its primary only when that primary is present, and shows it
+    top-level otherwise.
+    """
+    statuses = _csv_filter(status, inv_svc.DISPLAY_STATUSES)
+    verdicts = _csv_filter(verdict, _VERDICT_FILTERS)
+    needle = (q or "").strip()
+    if len(needle) > _SEARCH_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "search_too_long",
+                "hint": f"A search term may be at most {_SEARCH_MAX} characters.",
+            },
+        )
+    limit = min(max(limit, 1), inv_svc.MAX_PAGE_LIMIT)
+    offset = max(0, offset)
     async with request.app.state.db_sessionmaker() as db:
-        rows = await inv_svc.list_recent(db, status=status, limit=min(max(limit, 1), 500))
-        chat_counts = await chat_svc.counts_for(db, [inv.id for inv in rows])
-    primary = _primary_run_ids(rows)
-    return [_row(inv, chat_counts.get(inv.id, 0), is_primary=inv.id in primary) for inv in rows]
+        page = await inv_svc.query_page(
+            db,
+            since=routes_hunts._naive_utc(since),
+            until=routes_hunts._naive_utc(until),
+            verdicts=verdicts,
+            statuses=statuses,
+            q=needle or None,
+            limit=limit,
+            offset=offset,
+        )
+        chat_counts = await chat_svc.counts_for(db, [inv.id for inv in page.rows])
+        alert_ids = sorted({inv.alert_es_id for inv in page.rows if inv.alert_es_id})
+        group_rows = await inv_svc.runs_for_alerts(db, alert_ids)
+    # Primacy over the FULL groups. A page row with a blank alert_es_id
+    # contributes no group to fan out on, so it is merged in as its own
+    # one-run group — otherwise it would carry the default isPrimary and the
+    # decision would be made for it rather than about it. Newest-first order is
+    # what _primary_run_ids assumes.
+    seen = {r.id for r in group_rows}
+    combined = group_rows + [
+        inv_svc.RunRef(inv.id, inv.alert_es_id, inv.status, inv.created_at)
+        for inv in page.rows
+        if inv.id not in seen
+    ]
+    combined.sort(key=lambda r: (r.created_at, r.id), reverse=True)
+    primary = _primary_run_ids(combined)
+    # Same groups, same pass, second question: what happened to each alert LAST.
+    latest = _latest_runs(combined)
+    return InvestigationListOut(
+        rows=[
+            _row(
+                inv,
+                chat_counts.get(inv.id, 0),
+                is_primary=inv.id in primary,
+                latest_run=latest.get(inv.alert_es_id or inv.id),
+            )
+            for inv in page.rows
+        ],
+        total=page.total,
+        running=page.running,
+        truePositives=page.true_positives,
+        totalAll=page.total_all,
+        active=page.active,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/investigations/{inv_id}", response_model=InvestigationOut)
@@ -383,6 +603,20 @@ class RehuntResultOut(BaseModel):
     skipped: list[dict[str, str]]  # [{invId, reason}]
 
 
+def _grid_skip_reason(exc: BaseException) -> str:
+    """Label a mid-batch grid failure the way the raised guard would label it.
+
+    Read off ``_es_api_error_http``'s own 4xx/5xx split instead of restating it,
+    so one exception cannot get two diagnoses: the SAME ES rejection that answers
+    400 ``bad_query`` when nothing has started yet is reported as ``bad_query``
+    in the partial result too, rather than as an outage that never happened. It
+    also means this label tracks that split for free if it is ever corrected.
+    """
+    if isinstance(exc, ApiError) and _es_api_error_http(exc).status_code == 400:
+        return "bad_query"
+    return "grid_unavailable"
+
+
 @router.post("/investigations/rehunt", response_model=RehuntResultOut)
 async def bulk_rehunt(
     request: Request,
@@ -410,6 +644,20 @@ async def bulk_rehunt(
 
     started: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
+    # One grid budget for the WHOLE batch, not one per row. Every nameless id
+    # runs the SAME resolver query, so once that has failed the rest will fail
+    # the same way — and re-probing an accepting-but-silent grid costs a full
+    # webui_grid_timeout_s every time. Nameless rows are exactly the runs that
+    # died early, i.e. the ones an analyst bulk re-hunts to clean up AFTER an
+    # outage, plausibly while the grid is still sick: at the 50-id cap that was
+    # 49 consecutive timeouts, minutes past the SPA's own client timeout, with
+    # the server still starting runs nobody is left watching for.
+    #
+    # The cost if the failure really was transient is bounded and small:
+    # _REHUNT_START_CAP already limits this call to 3 starts and we only get here
+    # with at least one, so at most two re-hunts are deferred — and they are
+    # deferred into the skipped list, which the analyst re-runs, not dropped.
+    grid_skip_reason: str | None = None
 
     # The cap is already guaranteed by RehuntIn's max_length validation;
     # all rows are fetched in a SINGLE query (was one session-open + one
@@ -449,9 +697,36 @@ async def bulk_rehunt(
         # row is named rather than inheriting the NULL.
         rehunt_name = inv.rule_name
         if not rehunt_name:
-            _, rehunt_name = await routes_hunts.resolve_alert_for_hunt(
-                elastic, settings, inv.alert_es_id
-            )
+            if grid_skip_reason is not None:
+                # The grid already answered for this batch. Skip — reported, never
+                # started and never silently dropped — without paying to ask again.
+                skipped.append({"invId": inv_id, "reason": grid_skip_reason})
+                continue
+            try:
+                async with asyncio.timeout(settings.webui_grid_timeout_s):
+                    _, rehunt_name = await routes_hunts.resolve_alert_for_hunt(
+                        elastic, settings, inv.alert_es_id
+                    )
+            except (TimeoutError, TransportError, ApiError) as exc:
+                # A down grid must not discard re-hunts this call ALREADY started:
+                # raising here would report failure for live background runs and
+                # invite a retry that starts each of them a second time. With
+                # nothing started yet there is no write to protect, so answer with
+                # the house error; otherwise degrade this id to a skip and return
+                # the honest partial result.
+                if started:
+                    _LOGGER.warning(
+                        "rehunt: name resolve failed for %s (grid) — skipping it and "
+                        "every remaining nameless row this call",
+                        inv_id,
+                        exc_info=True,
+                    )
+                    grid_skip_reason = _grid_skip_reason(exc)
+                    skipped.append({"invId": inv_id, "reason": grid_skip_reason})
+                    continue
+                if isinstance(exc, ApiError):
+                    raise _es_api_error_http(exc) from exc
+                raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
         new_inv_id = await hunt_manager.get_manager(request.app.state).start(
             request.app.state,
             alert_id=inv.alert_es_id,
@@ -536,7 +811,15 @@ async def request_more_info(
     # Re-resolve the display name if the source row was created nameless.
     rmi_name = inv.rule_name
     if not rmi_name:
-        _, rmi_name = await routes_hunts.resolve_alert_for_hunt(elastic, settings, inv.alert_es_id)
+        try:
+            async with asyncio.timeout(settings.webui_grid_timeout_s):
+                _, rmi_name = await routes_hunts.resolve_alert_for_hunt(
+                    elastic, settings, inv.alert_es_id
+                )
+        except (TimeoutError, TransportError) as exc:
+            raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        except ApiError as exc:
+            raise _es_api_error_http(exc) from exc
 
     new_inv_id = await hunt_manager.get_manager(request.app.state).start(
         request.app.state,

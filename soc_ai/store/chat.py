@@ -71,6 +71,22 @@ async def finish_assistant(
     await db.commit()
 
 
+async def set_progress(db: AsyncSession, msg_id: int, tools: list[str]) -> None:
+    """Record the tools a still-pending turn has called so far.
+
+    Written from the agent's per-tool callback so the poll endpoint can render
+    live progress instead of a bare typing indicator — the "nothing, then
+    everything" complaint (dogfood 2026-08-06). Best-effort by contract: the
+    caller swallows failures, because a progress write must never break the
+    turn that is producing the real answer.
+    """
+    msg = await db.get(ChatMessage, msg_id)
+    if msg is None or msg.status != "pending":
+        return  # finished (or vanished) between the tool call and this write
+    msg.meta = {**(msg.meta or {}), "progress_tools": tools[-12:]}
+    await db.commit()
+
+
 async def reap_stale_pending(db: AsyncSession, *, older_than: timedelta | None = None) -> int:
     """Mark orphaned ``pending`` assistant chat rows as ``error``. Returns the count.
 

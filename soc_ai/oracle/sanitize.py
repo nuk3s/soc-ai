@@ -45,6 +45,7 @@ from re import Pattern
 from typing import Any
 
 from soc_ai.config import get_settings
+from soc_ai.oracle._cred_data import CRED_KEYS, CRED_VALUE_STOPSET
 
 # ---------------------------------------------------------------------------
 # Compiled patterns  (module-level — compiled once, reused everywhere)
@@ -447,6 +448,7 @@ def unsafe_residue(
     extra_suffixes: Iterable[str] = (),
     extra_hosts: Iterable[str] = (),
     known_values: Iterable[str] = (),
+    wire_escaped: bool = False,
 ) -> list[str]:
     """Independent sweep for internal identifiers that survived sanitization.
 
@@ -468,6 +470,16 @@ def unsafe_residue(
             pass (i.e. ``mapping.reverse.values()``).  Any of these that
             still appear verbatim in *text* are flagged as residue — this
             catches bare hostnames / usernames that survived both passes.
+        wire_escaped: Whether *text* is a ``json.dumps``-escaped blob (the
+            cloud Oracle client, ``True``) versus a RAW un-serialized string
+            (the demo publish leak gate and the analyst egress guard, the
+            default ``False``).  It selects the NetBIOS ``DOMAIN\\user``
+            separator: on the WIRE every real backslash is doubled, so a lone
+            single backslash is a JSON escape (``\\n``) and must NOT be read as
+            a separator (fixes the multi-line-transcript false positive); on RAW
+            input a genuine down-level logon carries a single backslash, so a
+            single backslash MUST stay a separator (catches ``DOMAIN\\nancy``).
+            See :func:`_residue_credentials`.
 
     Returns:
         A list of human-readable leak descriptions.  Empty list means clean.
@@ -585,8 +597,9 @@ def unsafe_residue(
     # A bare username in an explicit credential context (user=jdoe, DOMAIN\jdoe)
     # that survived the redacter's free-text credential pass.  Independent regex
     # so a redacter bug cannot blind this; a subset of the redacter's key set so
-    # it never fires on a value the redacter already tokenised to a label.
-    issues.extend(_residue_credentials(text, allow))
+    # it never fires on a value the redacter already tokenised to a label.  The
+    # NetBIOS separator is raw/wire mode-aware (see ``wire_escaped``).
+    issues.extend(_residue_credentials(text, allow, wire_escaped=wire_escaped))
 
     # --- 10. Windows user-profile paths (independent net) -------------------
     # A profile username (``C:\Users\<user>\``) that survived the redacter's
@@ -654,112 +667,150 @@ def _residue_netbios_hosts(text: str, allow: set[str]) -> list[str]:
 # fires on a genuine redacter MISS.  Re-declared independently so the two paths
 # cannot fail together.
 _RESIDUE_CRED_VALUE = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?"
+# The credential key alternation is SHARED with the redacter via
+# :mod:`soc_ai.oracle._cred_data` (``CRED_KEYS``) so a redacter MISS on any of
+# those shapes is still caught by this independent net (detector ⊆ replacer) and
+# the two key lists cannot silently diverge (finding oracle-cred-twin-nets).  The
+# ENGINE stays independent: this net adds ``\\?`` before each optional quote so
+# the json.dumps'd wire form ``\"key\": \"val\"`` is tolerated too.
 _RESIDUE_CRED_KV_RE = re.compile(
-    r"(?<![\w.])(?:samaccountname|username|user[_ -]?name|account|acct|logon|user|usr)"
-    r"\s*[:=]\s*\"?"
+    r"(?<![\w.])(?:" + CRED_KEYS + r")"
+    r"\s*\\?\"?\s*[:=]\s*\\?\"?"
     r"(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@-])",
     re.IGNORECASE,
 )
-# Separator is ``\\{1,2}``: the redacter operates on the single-backslash dict
-# value, but this net runs on ``json.dumps`` output where the backslash is
-# escaped to ``\\`` — match either so a missed logon name is still caught.
-# Domain requires ≥2 chars (``[A-Za-z0-9]`` + ``{1,62}``) so a single-letter
-# token (drive letter ``C\…``) is not mis-read as a NetBIOS domain — matches the
-# redacter's _CRED_NETBIOS_RE so this net never fires on what the redacter skips.
-_RESIDUE_CRED_NETBIOS_RE = re.compile(
-    r"(?<![\w.\\])[A-Za-z0-9][A-Za-z0-9._-]{1,62}\\{1,2}"
+# The 4624/4625 ``Account Name:`` (a username) / ``Account Domain:`` (a NetBIOS
+# domain) message rendering — the space-joined label matches no key alternation,
+# so these are separate nets (mirror redact.py:_CRED_ACCOUNT_NAME_RE /
+# _CRED_ACCOUNT_DOMAIN_RE).
+_RESIDUE_CRED_ACCOUNT_NAME_RE = re.compile(
+    r"Account Name\s*:\s+(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@-])",
+    re.IGNORECASE,
+)
+_RESIDUE_CRED_ACCOUNT_DOMAIN_RE = re.compile(
+    r"Account Domain\s*:\s+(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@-])",
+    re.IGNORECASE,
+)
+# NetBIOS ``DOMAIN\user`` down-level logon — mode-aware separator, because this net
+# runs on BOTH raw and json.dumps'd input and a backslash means different things in
+# each (finding residue-gate-json-newline-fp; raw-regression remediation).
+#
+# RAW (the default, ``wire_escaped=False``): un-serialized string values — the demo
+# publish leak gate and the analyst egress guard.  A genuine down-level logon here
+# carries a SINGLE literal backslash, so the separator is ``\\{1,4}`` (the batch-1
+# safe-broad behavior): ``DOMAIN\nancy`` / ``DOMAIN\frank`` are caught.  A real
+# newline in raw input is a real newline byte, never ``\`` + ``n``, so there is no
+# escaped-newline artifact to false-positive on.
+#
+# WIRE (``wire_escaped=True``): ``json.dumps`` output — the cloud Oracle client.
+# Every real backslash is DOUBLED here, so a genuine separator is ALWAYS ≥2 and the
+# separator is ``\\{2,4}``.  A real newline/tab/quote is a JSON escape carrying a
+# LONE single backslash (``\n`` = ``\`` + ``n``); dropping the single-backslash arm
+# entirely rejects that ``…a CDN\nVerdict…`` false positive while still catching a
+# genuine ``DOMAIN\user`` (2 wire backslashes) and a doubled winlog ``DOMAIN\\user``
+# (4).  This is cleaner than a per-escape-letter lookahead — which also swallowed a
+# raw ``DOMAIN\nancy`` — and needs no such carve-out.
+#
+# Both: domain requires ≥2 chars (``[A-Za-z0-9]`` + ``{1,62}``) so a single-letter
+# drive letter (``C\…``) is not mis-read as a NetBIOS domain, and the caller applies
+# the hive-prefix skip (``HKLM\…``) in both modes.
+_RESIDUE_CRED_NETBIOS_RE_RAW = re.compile(
+    r"(?<![\w.\\])(?P<dom>[A-Za-z0-9][A-Za-z0-9._-]{1,62})\\{1,4}"
     r"(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w.\\@-])"
 )
-# Tokens that are not internal-identifying usernames (re-declared independently).
-_RESIDUE_CRED_STOPSET: frozenset[str] = frozenset(
-    {
-        "true",
-        "false",
-        "null",
-        "none",
-        "nil",
-        "yes",
-        "no",
-        "unknown",
-        "na",
-        "success",
-        "successful",
-        "failure",
-        "failed",
-        "fail",
-        "denied",
-        "allowed",
-        "enabled",
-        "disabled",
-        "active",
-        "inactive",
-        "valid",
-        "invalid",
-        "error",
-        "ok",
-        "expired",
-        "locked",
-        "unlocked",
-        "root",
-        "system",
-        "localsystem",
-        "administrator",
-        "admin",
-        "guest",
-        "nobody",
-        "daemon",
-        "bin",
-        "sys",
-        "sync",
-        "lp",
-        "mail",
-        "news",
-        "uucp",
-        "proxy",
-        "backup",
-        "list",
-        "irc",
-        "gnats",
-        "www-data",
-        "sshd",
-        "postfix",
-        "anonymous",
-        "ftp",
-        "operator",
-        "service",
-        "localservice",
-        "networkservice",
-        "everyone",
-        "self",
-    }
+_RESIDUE_CRED_NETBIOS_RE_WIRE = re.compile(
+    r"(?<![\w.\\])(?P<dom>[A-Za-z0-9][A-Za-z0-9._-]{1,62})\\{2,4}"
+    r"(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w.\\@-])"
 )
+# NetBIOS authorities / registry hives that are NOT internal-identifying: the bare
+# ``nt`` (the ``Account Domain:  NT AUTHORITY`` capture stops at the first space),
+# and the ``HIVE\Subkey`` path prefixes that share the ``TOKEN\TOKEN`` shape of a
+# down-level logon.  Re-declared independently of redact.py.
+_RESIDUE_NT_DOMAIN_STOPSET: frozenset[str] = frozenset({"nt", "authority", "builtin", "service"})
+_RESIDUE_NONDOMAIN_PREFIXES: frozenset[str] = frozenset({"hklm", "hkcu", "hkcr", "hku", "hkcc"})
 
 
-def _residue_credentials(text: str, allow: set[str]) -> list[str]:
-    """Flag credential-context usernames that survived the redacter.
+def _residue_is_nondomain_prefix(tok: str) -> bool:
+    """True iff *tok* is a registry hive / non-domain technical prefix, so a
+    ``tok\\segment`` residue match is a PATH, not a logon name."""
+    low = tok.lower()
+    return low in _RESIDUE_NONDOMAIN_PREFIXES or low.startswith("hkey")
+
+
+# Tokens that are not internal-identifying usernames — SHARED with the redacter
+# via :mod:`soc_ai.oracle._cred_data` so a stopword added to the redacter cannot
+# diverge from this net and cause a permanent refusal (finding
+# oracle-cred-twin-nets).  The regex engine above stays independent.
+_RESIDUE_CRED_STOPSET: frozenset[str] = CRED_VALUE_STOPSET
+
+
+def _residue_credentials(text: str, allow: set[str], *, wire_escaped: bool = False) -> list[str]:
+    """Flag credential-context usernames/domains that survived the redacter.
 
     Independent of :mod:`redact` (own regex, own stopset).  Opaque labels,
     allowlisted tokens, built-in accounts, booleans/status words, and numeric
-    ids are never flagged.
+    ids are never flagged.  The username-context nets (KV / Account Name /
+    NetBIOS) use the username stopset; the domain-context net (``Account
+    Domain:``) uses the NT-authority stopset — mirroring how the redacter stops
+    ``NT``/``BUILTIN`` for domains but tokenises the same word as a username.
+
+    ``wire_escaped`` picks the NetBIOS ``DOMAIN\\user`` separator: ``\\{2,4}``
+    for a ``json.dumps`` blob (every real backslash doubled — a lone one is a
+    JSON escape, not a separator) versus ``\\{1,4}`` for a RAW string (a genuine
+    single-backslash logon must still be caught).  The hive-prefix skip applies
+    in BOTH modes.
     """
     issues: list[str] = []
     seen: set[str] = set()
-    for rx in (_RESIDUE_CRED_KV_RE, _RESIDUE_CRED_NETBIOS_RE):
+
+    def _emit_username(val: str) -> None:
+        key = val.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        if _OPAQUE_LABEL_RE.fullmatch(val):
+            return
+        if val in allow or key in allow:
+            return
+        if key in _RESIDUE_CRED_STOPSET or val.isdigit():
+            return
+        if not any(c.isalpha() for c in val):
+            return
+        issues.append(f"residual credential username: {val}")
+
+    # KV + Account Name → username context.
+    for rx in (_RESIDUE_CRED_KV_RE, _RESIDUE_CRED_ACCOUNT_NAME_RE):
         for mat in rx.finditer(text):
-            val = mat.group("val")
-            key = val.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            if _OPAQUE_LABEL_RE.fullmatch(val):
-                continue
-            if val in allow or key in allow:
-                continue
-            if key in _RESIDUE_CRED_STOPSET or val.isdigit():
-                continue
-            if not any(c.isalpha() for c in val):
-                continue
-            issues.append(f"residual credential username: {val}")
+            _emit_username(mat.group("val"))
+
+    # NetBIOS ``DOMAIN\user`` → username, UNLESS the left token is a registry
+    # hive / non-domain prefix (``HKLM\Software`` is a path, not a logon) — the
+    # hive skip applies in BOTH modes.  RAW input uses the single-backslash-safe
+    # separator; a json.dumps blob uses the doubled-backslash one.
+    netbios_re = _RESIDUE_CRED_NETBIOS_RE_WIRE if wire_escaped else _RESIDUE_CRED_NETBIOS_RE_RAW
+    for mat in netbios_re.finditer(text):
+        if _residue_is_nondomain_prefix(mat.group("dom")):
+            continue
+        _emit_username(mat.group("val"))
+
+    # Account Domain → domain context: the NT-authority stopset, not the username
+    # one (``NT`` / ``BUILTIN`` / ``AUTHORITY`` pass; a real NetBIOS domain flags).
+    for mat in _RESIDUE_CRED_ACCOUNT_DOMAIN_RE.finditer(text):
+        val = mat.group("val")
+        key = val.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _OPAQUE_LABEL_RE.fullmatch(val):
+            continue
+        if val in allow or key in allow:
+            continue
+        if key in _RESIDUE_NT_DOMAIN_STOPSET:
+            continue
+        if not any(c.isalpha() for c in val):
+            continue
+        issues.append(f"residual credential domain: {val}")
+
     return issues
 
 

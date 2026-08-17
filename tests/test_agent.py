@@ -6888,3 +6888,52 @@ def test_hunt_prompt_frames_data_as_untrusted() -> None:
     assert "not a command to obey" in HUNT_SYSTEM_PROMPT
     # Template still renders (no stray braces introduced).
     HUNT_SYSTEM_PROMPT.format(objective="probe")
+
+
+# ── Host naming: the dossier's answer, in the verdict's own words ────────────
+
+
+def test_verdict_writers_are_told_how_to_name_a_host() -> None:
+    """The dossier block puts a hostname and a role in front of the model; the
+    output rule is what turns that into "pve01 (hypervisor, 192.168.10.202)"
+    rather than a bare address the analyst has to go look up.
+
+    One rule, four prompts. The chat prompt forked once already and drifted, so
+    HOST_NAMING_RULE is the shared text and every writer composes it.
+    """
+    from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT, GENERAL_CHAT_SYSTEM_PROMPT
+    from soc_ai.agent.hunt import HUNT_SYNTH_PROMPT, HUNT_SYSTEM_PROMPT
+    from soc_ai.agent.prompts import (
+        HOST_NAMING_RULE,
+        SYNTH_FIRST_SYSTEM_PROMPT,
+        SYNTHESIZER_PROMPT,
+    )
+
+    assert "`name (role, ip)`" in HOST_NAMING_RULE
+    # …and it forbids the adjacent failure: naming a host that has no name.
+    assert "never invent a name" in HOST_NAMING_RULE
+
+    # Every writer that puts a host in front of an analyst. The hunt is one of
+    # them — a HuntReport carries `affected_hosts` and per-finding `hosts` — and
+    # it had the INPUT half (t_host_dossier, and identity in its planner prompt)
+    # without the output half.
+    for prompt in (
+        SYNTHESIZER_PROMPT,
+        SYNTH_FIRST_SYSTEM_PROMPT,
+        CHAT_SYSTEM_PROMPT,
+        GENERAL_CHAT_SYSTEM_PROMPT,
+        HUNT_SYSTEM_PROMPT,
+        HUNT_SYNTH_PROMPT,
+    ):
+        assert HOST_NAMING_RULE.strip() in prompt
+
+
+def test_the_never_invent_hard_rule_survives_the_naming_rule() -> None:
+    """The naming rule tells the model to USE a name it was given. That must not
+    read as licence to produce one — the hard rule is what stops a zero-tool turn
+    asserting a hostname, and it stays absolute."""
+    from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT, GENERAL_CHAT_SYSTEM_PROMPT
+
+    for prompt in (CHAT_SYSTEM_PROMPT, GENERAL_CHAT_SYSTEM_PROMPT):
+        assert "HARD RULE — never invent per-event facts (this is non-negotiable)" in prompt
+        assert "are HALLUCINATIONS, not answers" in prompt

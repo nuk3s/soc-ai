@@ -94,6 +94,36 @@ _BUILTINS: tuple[_Builtin, ...] = (
 )
 
 
+# ── Environment fit (the SECOND annotation axis) ─────────────────────────────
+#
+# `required_datasets` says whether the GRID can see the telemetry; these say
+# whether the NETWORK has the machinery the hunt is about. A grid can carry
+# zeek.kerberos while the network has two intermittent workgroup laptops and no
+# domain — dataset presence ≠ relevance. Requirements live in CODE, not the DB
+# (no migration, no operator bookkeeping): keyed by builtin NAME, the same key
+# `seed_builtins` upserts on. Only builtins appear here — a custom operator
+# template is ALWAYS applicable (the operator knows their network) — and
+# absence means "network-generic". Consumers must DEMOTE, never hide: an
+# attacker's first domain join must not be invisible because the catalogue
+# decided this network "doesn't do domains".
+ENV_WINDOWS = "windows"
+ENV_DOMAIN = "domain"
+
+BUILTIN_ENV_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "Credential abuse / lockouts": (ENV_DOMAIN,),
+    "Lateral movement": (ENV_WINDOWS,),
+    "Suspicious PowerShell / LOLBins": (ENV_WINDOWS,),
+    # The three network-generic builtins (Beaconing, DNS/C2, New external
+    # services) are deliberately absent: every network qualifies.
+}
+
+# requirement -> the human phrase the API reports in `missingEnvironment`.
+ENV_REQUIREMENT_PHRASES: dict[str, str] = {
+    ENV_DOMAIN: "a domain-joined host",
+    ENV_WINDOWS: "a Windows host",
+}
+
+
 def _norm_datasets(values: object) -> list[str]:
     """Coerce ``required_datasets`` into a clean list of non-empty, de-duplicated
     strings (order-preserving). Anything non-list-like becomes ``[]``."""

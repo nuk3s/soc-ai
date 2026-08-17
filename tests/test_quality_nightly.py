@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from argparse import Namespace
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,9 +34,13 @@ from pydantic import SecretStr
 from soc_ai import cli, notify
 from soc_ai.config import Settings
 from soc_ai.eval.batch import BatchSummary
+from soc_ai.eval.nightly import resolve_out_dir, run_eval_nightly
 from soc_ai.eval.quality import (
+    AlarmReason,
     SnapshotMetrics,
     TrendPoint,
+    alarm_codes_from_key,
+    alarm_key_for,
     compute_snapshot_metrics,
     detect_regression,
 )
@@ -111,7 +117,71 @@ def _metrics(**overrides: Any) -> SnapshotMetrics:
 def _hist(
     n: int, *, agreement: float | None = 0.8, fallback: float | None = 0.0
 ) -> list[TrendPoint]:
+    """LEGACY trailing points: a rate and nothing else.
+
+    Rows written before migration 0026 carry no yes/classified counts, which is
+    exactly what these stand for — every test built on ``_hist`` documents the
+    median fallback the detector keeps for pre-0026 history.
+    """
     return [TrendPoint(agreement_rate=agreement, fallback_rate=fallback) for _ in range(n)]
+
+
+def _graded(rate: float, *, n: int = 5, fallback: float | None = 0.0) -> TrendPoint:
+    """One POST-0026 trailing point: the rate plus the counts behind it."""
+    return TrendPoint(
+        agreement_rate=rate,
+        fallback_rate=fallback,
+        n_yes=round(rate * n),
+        n_classified=n,
+    )
+
+
+def _point(rate: float, *, n: int = 5, **overrides: Any) -> SnapshotMetrics:
+    """A new graded point that carries its counts (the post-0026 write path)."""
+    return _metrics(
+        agreement_rate=rate,
+        n_ok=n,
+        n_yes=round(rate * n),
+        n_classified=n,
+        **overrides,
+    )
+
+
+# The real prod graded series (25 rows, 24 graded) that produced the false
+# alarm this fixture exists to kill: 14× 1.00, 8× 0.80, one 0.40 (row id 15)
+# and one 0.60 (row id 27, the newest — the alarm on the dashboard). Pooled,
+# that is 107 agreements of 120 classified critiques = 0.892.
+#
+# The interleaving of the 0.80 nights is NOT recoverable from prod (the batch
+# bundles were deleted by a container recreate — see F3), so this ordering
+# pins what the stored rows DO prove: the multiset above, the 0.40 mid-series,
+# the 0.60 last, and a trailing-7 median of 1.00 at that last point (the stored
+# alarm text names it). Under the old rule it reproduces the stored `alarmed`
+# column exactly — 2 alarms — which is what makes it a regression fixture.
+PROD_GRADED_SERIES: tuple[float, ...] = (
+    1.00, 1.00, 1.00, 0.80, 1.00, 0.80, 1.00, 0.80,
+    1.00, 1.00, 0.80, 1.00, 0.40, 1.00, 0.80, 1.00,
+    1.00, 0.80, 1.00, 0.80, 1.00, 1.00, 0.80, 0.60,
+)  # fmt: skip
+
+
+def _replay(series: tuple[float, ...], *, counts: bool) -> list[int]:
+    """Replay the detector over *series* oldest→newest; return firing indexes.
+
+    ``counts=False`` builds pre-0026 history (rates only) — the shape that
+    reproduces what prod actually stored.
+    """
+    fired: list[int] = []
+    for i, rate in enumerate(series):
+        # Newest-first, the order the store's recent_snapshots returns.
+        history = [
+            (_graded(r) if counts else TrendPoint(agreement_rate=r, fallback_rate=0.0))
+            for r in reversed(series[:i])
+        ]
+        new = _point(rate) if counts else _metrics(agreement_rate=rate, n_ok=5)
+        if any("agreement_rate" in r for r in detect_regression(new, history, alarm_drop=0.15)):
+            fired.append(i)
+    return fired
 
 
 # --------------------------------------------------------------------
@@ -133,6 +203,36 @@ def test_metrics_graded_carries_agreement_and_p50() -> None:
     assert m.error_rate == 0.0
     assert m.latency_p50_ms == 60_000  # median of 60k/120k/60k
     assert m.verdict_counts == {"false_positive": 3}
+
+
+def test_metrics_carry_the_grade_counts_behind_the_rate() -> None:
+    """The rate alone can't be tested for significance and can't be explained.
+    ``partial`` is the sharp edge: it sits in agreement_rate's DENOMINATOR but
+    not its numerator, so "right verdict, thin reasoning" costs a full 0.2 on
+    an n=5 batch exactly like a flat disagreement — the counts are what let the
+    card say "3 agree, 1 partial, 1 no" instead of a bare 0.60."""
+    rows = [
+        _row("a", agreement="yes"),
+        _row("b", agreement="yes"),
+        _row("c", agreement="yes"),
+        _row("d", agreement="partial"),
+        _row("e", agreement="no"),
+        _row("f", agreement="unknown"),  # never enters the rate at all
+    ]
+    m = compute_snapshot_metrics(rows, aggregate(rows), mode="graded")
+    assert (m.n_yes, m.n_partial, m.n_no) == (3, 1, 1)
+    assert m.n_classified == 5  # unknown excluded
+    assert m.agreement_rate == pytest.approx(0.6)
+    # The counts must reconcile with the headline the frontend already reads.
+    assert m.n_yes / m.n_classified == pytest.approx(m.agreement_rate)
+
+
+def test_metrics_local_mode_reports_no_grade_counts() -> None:
+    """No oracle ⇒ no critiques ⇒ zero classified, matching the NULL rate."""
+    rows = [_row("a", agreement="yes")]
+    m = compute_snapshot_metrics(rows, aggregate(rows), mode="local")
+    assert m.n_classified == 0
+    assert (m.n_yes, m.n_partial, m.n_no) == (0, 0, 0)
 
 
 def test_metrics_local_forces_agreement_to_none() -> None:
@@ -256,10 +356,223 @@ def test_detector_history_without_agreement_skips_agreement_rule() -> None:
     assert detect_regression(new, _hist(5, agreement=None), alarm_drop=0.15) == []
 
 
+# --------------------------------------------------------------------
+# detect_regression — the counts-driven agreement test (F1, 2026-08-07)
+# --------------------------------------------------------------------
+
+
+def _prod_history() -> list[TrendPoint]:
+    """The 24 graded prod points as post-0026 trailing history (107/120)."""
+    return [_graded(r) for r in reversed(PROD_GRADED_SERIES)]
+
+
+def test_pooled_baseline_is_the_prod_series_rate() -> None:
+    """Guard the fixture itself: it must pool to the 0.892 the diagnosis used."""
+    hist = _prod_history()
+    n_yes = sum(p.n_yes or 0 for p in hist)
+    n_cls = sum(p.n_classified or 0 for p in hist)
+    assert (n_yes, n_cls) == (107, 120)
+    assert n_yes / n_cls == pytest.approx(0.892, abs=0.001)
+
+
+def test_counts_rule_does_not_fire_on_todays_false_alarm() -> None:
+    """3 of 5 grades agreed against a 0.892 baseline is P≈0.09 — one night in
+    eleven, i.e. INSIDE the detector's own sampling noise. This is the exact
+    point (prod row id 27) that lit the dashboard's regression alarm under the
+    median-of-rates rule, and it must stay silent."""
+    new = _point(0.60)
+    reasons = detect_regression(new, _prod_history(), alarm_drop=0.15)
+    assert [r for r in reasons if "agreement_rate" in r] == []
+
+
+def test_counts_rule_still_fires_on_a_real_drop() -> None:
+    """2 of 5 against the same baseline is P≈0.011 — outside the noise, and the
+    one graded night in prod's history (row id 15) that deserved a look."""
+    new = _point(0.40)
+    reasons = detect_regression(new, _prod_history(), alarm_drop=0.15)
+    agreement = [r for r in reasons if "agreement_rate" in r]
+    assert len(agreement) == 1
+    # The message must carry the counts and the baseline, not just two rates —
+    # an operator adjudicating an alarm needs the denominator.
+    assert "agreement_rate 0.40" in agreement[0]
+    assert "2/5" in agreement[0]
+    assert "107/120" in agreement[0]
+
+
+def test_counts_rule_ignores_a_single_flipped_grade() -> None:
+    """4 of 5 vs a 0.892 baseline: P≈0.46. Nowhere near a regression."""
+    assert detect_regression(_point(0.80), _prod_history(), alarm_drop=0.15) == []
+
+
+def test_counts_rule_replays_the_prod_series_with_one_alarm() -> None:
+    """The whole point, on the real data: the old rule fired twice over prod's
+    24 graded nights (index 12 = the 0.40, index 23 = the 0.60 false alarm);
+    the counts rule keeps the first and drops the second."""
+    assert _replay(PROD_GRADED_SERIES, counts=False) == [12, 23]
+    assert _replay(PROD_GRADED_SERIES, counts=True) == [12]
+
+
+def test_counts_rule_survives_a_flawless_month() -> None:
+    """The degenerate case the pooled baseline must not break on: 30 perfect
+    nights pool to p=1.0, under which ANY miss is impossible and the very next
+    flipped grade would page. Smoothing is what keeps the single-flip
+    invariant (2026-07-24 dogfood fix) alive without the old floor."""
+    perfect = [_graded(1.0) for _ in range(30)]
+    assert detect_regression(_point(0.80), perfect, alarm_drop=0.15) == []
+    # Two flips out of five against a flawless month IS a signal.
+    assert any(
+        "agreement_rate" in r for r in detect_regression(_point(0.60), perfect, alarm_drop=0.15)
+    )
+
+
+def test_counts_rule_pools_beyond_the_median_window() -> None:
+    """The baseline pools up to 30 points, not 7, on purpose: 7 lucky nights
+    (35/35) make a p≈1 baseline out of a rate that is really 0.89, and the next
+    ordinary night pages. With the wider window prod's 0.60 stays silent —
+    with only the 7 it would not."""
+    lucky_week = [_graded(1.0) for _ in range(7)]
+    assert any(
+        "agreement_rate" in r for r in detect_regression(_point(0.60), lucky_week, alarm_drop=0.15)
+    )
+    assert detect_regression(_point(0.60), _prod_history(), alarm_drop=0.15) == []
+
+
+def test_counts_rule_keeps_the_alarm_drop_knob_live() -> None:
+    """The removed 1/denom floor pinned quality_alarm_drop at 0.20 for every
+    n=5 night, so every setting <= 0.20 did nothing. With counts driving
+    significance, the knob is what decides whether a statistically-real but
+    small drop is worth waking someone for."""
+    history = [_graded(0.95, n=100) for _ in range(10)]  # 950/1000, very tight
+    # Statistically overwhelming (P ~ 0) but only a 7-point drop: under the
+    # default 0.15 knob that is not worth an alarm.
+    assert detect_regression(_point(0.88, n=100), history, alarm_drop=0.15) == []
+    # Same shape, a 20-point drop: fires at 0.15…
+    assert any(
+        "agreement_rate" in r
+        for r in detect_regression(_point(0.75, n=100), history, alarm_drop=0.15)
+    )
+    # …and an operator who only cares about 25-point drops gets silence.
+    assert detect_regression(_point(0.75, n=100), history, alarm_drop=0.25) == []
+
+
+def test_legacy_history_without_counts_falls_back_to_the_median_rule() -> None:
+    """Pre-0026 rows carry no counts. The detector must NOT go quiet for the
+    days it takes new history to accumulate — it falls back to the exact
+    median rule (self-scaling floor included) those rows were written under."""
+    legacy = _hist(7, agreement=1.0)
+    # Two flips at n=5 — the old rule's alarm — still fires.
+    assert any(
+        "agreement_rate" in r for r in detect_regression(_point(0.60), legacy, alarm_drop=0.15)
+    )
+    # One flip still doesn't: the floor is intact on this path.
+    assert detect_regression(_point(0.80), legacy, alarm_drop=0.15) == []
+
+
+def test_new_point_without_counts_falls_back_to_the_median_rule() -> None:
+    """The mirror case: counted history but a caller that passes no counts
+    (an older SnapshotMetrics). Rate-vs-rate is all that's available."""
+    new = _metrics(agreement_rate=0.60, n_ok=5)  # no n_classified
+    assert any(
+        "agreement_rate" in r
+        for r in detect_regression(new, [_graded(1.0) for _ in range(7)], alarm_drop=0.15)
+    )
+
+
+def test_counts_rule_needs_min_history_counted_points() -> None:
+    """Two counted rows do not make a baseline: below MIN_HISTORY counted
+    points the detector uses the median rule over everything it has, rather
+    than pooling 10 grades into a confident-looking p."""
+    history = [_graded(1.0), _graded(1.0), *_hist(5, agreement=1.0)]
+    # Pooled, 10/10 would leave a 3-of-5 night unremarkable; the median rule
+    # (which is what must run here) fires on it.
+    assert any(
+        "agreement_rate" in r for r in detect_regression(_point(0.60), history, alarm_drop=0.15)
+    )
+
+
+def test_counts_rule_skips_history_rows_with_no_classified_critiques() -> None:
+    """A graded night where the oracle classified nothing (0/0) carries no
+    evidence: it must not count toward the pooled baseline's history quorum,
+    or three empty nights plus two real ones would look like a baseline."""
+    empty = [
+        TrendPoint(agreement_rate=None, fallback_rate=0.0, n_yes=0, n_classified=0)
+        for _ in range(5)
+    ]
+    history = [_graded(1.0), _graded(1.0), *empty]
+    # Only 2 informative points → median fallback, which fires on a 3-of-5
+    # night. Had the empty rows armed the pooled rule (10/10), it would not.
+    assert any(
+        "agreement_rate" in r for r in detect_regression(_point(0.60), history, alarm_drop=0.15)
+    )
+
+
+def test_median_crossover_self_resolves_once_counted_rows_exist() -> None:
+    """Pins the promise in :func:`detect_regression`'s docstring, so nobody
+    "fixes" the crossover with a special case: while an install still has only
+    pre-0026 history the median rule is the only rule available and CAN fire on
+    consecutive nights, but three counted rows — three nightlies — arm the
+    pooled test, which knows what this install actually looks like."""
+    legacy = _hist(7, agreement=1.0)
+    assert any(
+        r.code == "agreement_drop" for r in detect_regression(_point(0.60), legacy, alarm_drop=0.15)
+    )
+    counted = [_graded(0.6) for _ in range(3)]
+    assert detect_regression(_point(0.60), [*counted, *legacy], alarm_drop=0.15) == []
+
+
 def test_detector_can_stack_multiple_reasons() -> None:
     new = _metrics(agreement_rate=0.2, error_rate=0.5, fallback_rate=0.8)
     reasons = detect_regression(new, _hist(7, agreement=0.9, fallback=0.0), alarm_drop=0.15)
     assert len(reasons) == 3
+
+
+# --------------------------------------------------------------------
+# Alarm IDENTITY: codes + key (F1 follow-up, 2026-08-07)
+# --------------------------------------------------------------------
+
+
+def test_reasons_carry_a_stable_code_beside_the_message() -> None:
+    """A reason string cannot identify a CONDITION: every one of them embeds
+    live numbers ("0.80 vs median 1.00"), so the same condition re-observed
+    tomorrow is a different string and no amount of string comparison can tell
+    "still bad" from "newly bad". The code is the identity the transition gate
+    keys on; the message stays byte-identical because it is what the row, the
+    audit payload and the webhook body already carry."""
+    new = _metrics(agreement_rate=0.2, error_rate=0.5, fallback_rate=0.8)
+    reasons = detect_regression(new, _hist(7, agreement=0.9, fallback=0.0), alarm_drop=0.15)
+    assert {r.code for r in reasons} == {"agreement_drop", "error_ceiling", "fallback_jump"}
+    by_code = {r.code: r for r in reasons}
+    # Byte-compatible with what the pre-0027 detector returned: these ARE
+    # strings, so every existing consumer keeps working unchanged.
+    assert by_code["error_ceiling"] == "error_rate 0.50 exceeds the 0.30 ceiling"
+    assert isinstance(by_code["agreement_drop"], str)
+    assert by_code["fallback_jump"].message.startswith("fallback_rate 0.80 jumped")
+
+
+def test_agreement_code_is_the_same_on_both_agreement_paths() -> None:
+    """The counts test and the pre-0026 median fallback are two ways to observe
+    ONE condition. If they carried different codes, an install crossing over
+    from legacy history would fire a fresh alarm for nothing."""
+    counted = detect_regression(_point(0.40), _prod_history(), alarm_drop=0.15)
+    legacy = detect_regression(_point(0.40), _hist(7, agreement=1.0), alarm_drop=0.15)
+    assert [r.code for r in counted] == ["agreement_drop"]
+    assert [r.code for r in legacy] == ["agreement_drop"]
+
+
+def test_alarm_key_is_sorted_codes_and_none_when_clean() -> None:
+    """The key must not depend on the order the detector happened to append its
+    reasons in — an error+agreement night and an agreement+error night are the
+    same condition and must not alarm twice."""
+    assert alarm_key_for([]) is None
+    a = AlarmReason("error_ceiling", "x")
+    b = AlarmReason("agreement_drop", "y")
+    assert alarm_key_for([a, b]) == alarm_key_for([b, a]) == "agreement_drop+error_ceiling"
+    assert alarm_codes_from_key("agreement_drop+error_ceiling") == [
+        "agreement_drop",
+        "error_ceiling",
+    ]
+    # A pre-0027 row has no key at all — "unknown", which is not "clean".
+    assert alarm_codes_from_key(None) == []
 
 
 # --------------------------------------------------------------------
@@ -451,6 +764,58 @@ def _seed_history(settings: Settings, *, mode: str, fallback_rates: list[float])
     asyncio.run(_go())
 
 
+def _seed_snapshots(settings: Settings, rows: list[dict[str, Any]]) -> None:
+    """Write history rows straight to the store (one engine, one migration)."""
+
+    async def _go() -> None:
+        engine = make_engine(settings)
+        try:
+            await run_migrations(engine)
+            async with make_sessionmaker(engine)() as db:
+                for kw in rows:
+                    await quality_svc.insert_snapshot(db, **kw)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_go())
+
+
+def _graded_row(
+    rate: float, *, n: int = 5, counts: bool = True, **overrides: Any
+) -> dict[str, Any]:
+    """One graded history row. ``counts=False`` writes the pre-0026 shape."""
+    row: dict[str, Any] = {
+        "mode": "graded",
+        "n_ok": n,
+        "n_error": 0,
+        "agreement_rate": rate,
+        "fallback_rate": 0.0,
+        "error_rate": 0.0,
+        "verdict_counts": {},
+        "latency_p50_ms": 1000,
+        "batch_dir": None,
+        "alarmed": False,
+        "alarm_reasons": None,
+    }
+    if counts:
+        yes = round(rate * n)
+        row.update(n_yes=yes, n_partial=0, n_no=n - yes, n_classified=n)
+    row.update(overrides)
+    return row
+
+
+def _local_row(**overrides: Any) -> dict[str, Any]:
+    """One local-mode history row: no oracle, so no agreement and no counts."""
+    return _graded_row(1.0, counts=False, **{"mode": "local", "agreement_rate": None, **overrides})
+
+
+def _seed_graded_history(
+    settings: Settings, *, rates: list[float], n: int = 5, counts: bool = True
+) -> None:
+    """Seed graded history rows that CARRY their counts (post-0026 writes)."""
+    _seed_snapshots(settings, [_graded_row(r, n=n, counts=counts) for r in rates])
+
+
 def test_cli_local_run_writes_snapshot_and_suggests_cron(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -599,3 +964,382 @@ def test_cli_aborted_batch_still_records_the_point(
     assert s.n_error == 3 and s.n_ok == 0
     assert s.error_rate == 1.0
     assert s.fallback_rate is None  # no OK runs → no denominator, honest NULL
+
+
+def test_cli_graded_run_persists_the_grade_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The counts the detector will test against must reach the row, not just
+    the rate — a rate with no denominator cannot be re-tested later, which is
+    how the trend ended up unable to tell noise from a regression."""
+    settings = _settings(oracle_enabled=True)
+    rows = [
+        _row("a", agreement="yes"),
+        _row("b", agreement="yes"),
+        _row("c", agreement="partial"),
+        _row("d", agreement="no"),
+    ]
+    _wire(monkeypatch, settings, rows)
+
+    assert cli._eval_nightly(_args(tmp_path)) == 0
+
+    s = _read_snapshots(settings)[0]
+    assert (s.n_yes, s.n_partial, s.n_no, s.n_classified) == (2, 1, 1, 4)
+    assert s.agreement_rate == pytest.approx(0.5)
+
+
+def test_cli_alarm_uses_the_counts_of_the_seeded_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end on the shape that produced the false alarm: three perfect
+    graded nights on record (with counts), then a 3-of-5 night. The pooled
+    test says that is noise, so no row is flagged and nobody is paged."""
+    settings = _settings(oracle_enabled=True)
+    _seed_graded_history(settings, rates=[1.0, 1.0, 1.0])
+    rows = [_row(a, agreement="yes") for a in ("a", "b", "c")] + [
+        _row(a, agreement="no") for a in ("d", "e")
+    ]
+    captured = _wire(monkeypatch, settings, rows)
+
+    assert cli._eval_nightly(_args(tmp_path)) == 0
+
+    latest = _read_snapshots(settings)[0]
+    assert latest.agreement_rate == pytest.approx(0.6)
+    assert latest.alarmed is False
+    assert captured["alarm"] is None
+
+
+# --------------------------------------------------------------------
+# The transition gate: alarm on entering a condition, not on re-observing it
+# (prod rows 9/10/11, 2026-08-07)
+# --------------------------------------------------------------------
+
+
+class _Clock:
+    """A frozen, test-advanced stand-in for ``store.auth.utcnow``.
+
+    ``alarm_since`` is asserted exactly, and two nightlies inside one test would
+    otherwise land microseconds apart — "carried forward" and "re-stamped" would
+    then be indistinguishable from a timestamp alone.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+# Prod rows 9/10/11 verbatim: agreement 0.80 against a trailing median of 1.00.
+# Ten alerts, not the default five, because that is what the stored alarms imply
+# — the median rule's 1/denom floor absorbs a 0.20 drop at n=5, so a night that
+# DID alarm at 0.80 had more than five classified critiques (quality_nightly_n
+# is capped at 10).
+#
+# Legacy (uncounted) history is the regime those rows were decided in, and the
+# only one where a single condition can alarm on consecutive nights: three
+# counted rows arm the pooled test, which then knows 0.80 is this install's
+# normal. That is the crossover the detector's docstring refuses to special-case.
+def _drop_night() -> list[dict[str, Any]]:
+    return [_row(a, agreement="yes") for a in "abcdefgh"] + [_row(a, agreement="no") for a in "ij"]
+
+
+def _clean_night() -> list[dict[str, Any]]:
+    return [_row(a, agreement="yes") for a in "abcdefghij"]
+
+
+def _error_night() -> list[dict[str, Any]]:
+    """Prod row 26: pipeline health, not verdict quality — every run errored."""
+    return [_row(a, error="EngineDead: 503") for a in "abcde"]
+
+
+def _run_nights(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    tmp_path: Path,
+    nights: list[list[dict[str, Any]]],
+    *,
+    clock: _Clock,
+) -> list[dict[str, Any]]:
+    """Run consecutive nightlies end-to-end against ONE real store.
+
+    Returns the alarm HAND-OFFS that actually fired (audit + webhook), which is
+    the thing the operator experiences — distinct from the alarmed rows, which
+    are what was measured. A shared store is the only way to test a rule about
+    what the previous row said.
+    """
+    handoffs: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr("soc_ai.so_client.elastic.ElasticClient", _FakeElastic)
+    monkeypatch.setattr("soc_ai.store.auth.utcnow", clock)
+
+    async def _fake_alarm(_settings: Settings, **kw: Any) -> None:
+        handoffs.append(kw)
+
+    monkeypatch.setattr(cli, "_fire_quality_alarm", _fake_alarm)
+    for rows in nights:
+        monkeypatch.setattr("soc_ai.eval.batch.run_batch", _stub_run_batch(rows))
+        assert cli._eval_nightly(_args(tmp_path)) == 0
+        clock.now += timedelta(days=1)
+    return handoffs
+
+
+def test_a_persisting_condition_fires_one_side_effect_not_one_per_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Prod rows 9, 10 and 11: ONE condition ("agreement 0.80 against a
+    trailing median of 1.00"), three alarms in 27 hours.
+
+    The detector has no memory and the caller fired on a bare ``if reasons``, so
+    every run that re-observed the same condition paged again — and the
+    operator's only exit was running another eval, which could re-alarm. Each
+    row must still RECORD the alarm (the measurement is honest; the trend must
+    not show a clean night that wasn't), but only the transition is news.
+    """
+    settings = _settings(oracle_enabled=True)
+    _seed_graded_history(settings, rates=[1.0] * 7, counts=False)
+    clock = _Clock(datetime(2026, 8, 6, 2, 17))
+
+    handoffs = _run_nights(monkeypatch, settings, tmp_path, [_drop_night()] * 3, clock=clock)
+
+    rows = _read_snapshots(settings)[:3]
+    assert [r.alarmed for r in rows] == [True, True, True]
+    assert {r.alarm_key for r in rows} == {"agreement_drop"}
+    # One condition, one start date — the card renders "ongoing since 08-06".
+    assert {r.alarm_since for r in rows} == {datetime(2026, 8, 6, 2, 17)}
+    assert len(handoffs) == 1
+    # Plain strings, not AlarmReason: the audit payload and the webhook body are
+    # JSON wire surfaces and must not depend on the detector's return type.
+    assert {type(r) for r in handoffs[0]["reasons"]} == {str}
+    assert "agreement_rate 0.80" in handoffs[0]["reasons"][0]
+
+
+def test_a_changed_condition_is_news_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """2026-08-07's rows 26 then 27: the pipeline erroring out, then a verdict
+    drop. Different conditions, so both fire — the gate suppresses repetition,
+    never a new failure mode. (This is also why the card needs the codes: "the
+    eval runs are failing" is not a statement about verdict quality.)"""
+    settings = _settings(oracle_enabled=True)
+    _seed_graded_history(settings, rates=[1.0] * 7, counts=False)
+    clock = _Clock(datetime(2026, 8, 6, 2, 17))
+
+    handoffs = _run_nights(
+        monkeypatch, settings, tmp_path, [_error_night(), _drop_night()], clock=clock
+    )
+
+    newest, previous = _read_snapshots(settings)[:2]
+    assert [previous.alarm_key, newest.alarm_key] == ["error_ceiling", "agreement_drop"]
+    assert len(handoffs) == 2
+    # Re-stamped on the transition, never inherited from a different condition.
+    assert previous.alarm_since == datetime(2026, 8, 6, 2, 17)
+    assert newest.alarm_since == datetime(2026, 8, 7, 2, 17)
+
+
+def test_a_clean_night_clears_the_condition_so_the_next_one_is_news(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recovery must reset the gate: a clean row carries NULL key and NULL
+    since, so the same condition returning a night later pages again instead of
+    being mistaken for the one that already resolved."""
+    settings = _settings(oracle_enabled=True)
+    _seed_graded_history(settings, rates=[1.0] * 7, counts=False)
+    clock = _Clock(datetime(2026, 8, 6, 2, 17))
+
+    handoffs = _run_nights(
+        monkeypatch,
+        settings,
+        tmp_path,
+        [_drop_night(), _clean_night(), _drop_night()],
+        clock=clock,
+    )
+
+    third, second, first = _read_snapshots(settings)[:3]
+    assert second.alarmed is False
+    assert (second.alarm_key, second.alarm_since) == (None, None)
+    assert first.alarm_since == datetime(2026, 8, 6, 2, 17)
+    assert third.alarm_since == datetime(2026, 8, 8, 2, 17)  # fresh, not the first's
+    assert len(handoffs) == 2
+
+
+def test_pre_0027_history_is_unknown_not_equal_and_still_fires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The upgrade case: the newest row was written before 0027, so it is
+    ``alarmed`` with a NULL key even though its condition looks like today's.
+    NULL is UNKNOWN, not "same" — the gate must fire (a missed first page is
+    the unrecoverable direction) and start the duration clock fresh, and it
+    must not trip over the NULL on the way."""
+    settings = _settings(oracle_enabled=True)
+    _seed_graded_history(settings, rates=[1.0] * 6, counts=False)
+    _seed_snapshots(
+        settings,
+        [
+            _graded_row(
+                0.8,
+                counts=False,
+                alarmed=True,
+                alarm_reasons=["agreement_rate 0.80 is more than 0.15 below the median 1.00"],
+            )
+        ],
+    )
+    clock = _Clock(datetime(2026, 8, 6, 2, 17))
+
+    handoffs = _run_nights(monkeypatch, settings, tmp_path, [_drop_night()], clock=clock)
+
+    newest = _read_snapshots(settings)[0]
+    assert newest.alarm_key == "agreement_drop"
+    assert newest.alarm_since == datetime(2026, 8, 6, 2, 17)
+    assert len(handoffs) == 1
+
+
+def test_other_mode_history_cannot_suppress_an_alarm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gate compares against the previous SAME-MODE row. A local night's
+    alarm must not be silenced by a graded row carrying the same key — the two
+    modes are different instruments, which is already how the detector reads
+    history."""
+    settings = _settings()  # local mode
+    _seed_snapshots(
+        settings,
+        # The graded alarm is seeded LAST so it is the newest row in the table:
+        # a gate that read "the previous snapshot" without the mode filter would
+        # match its key and swallow tonight's local alarm.
+        [_local_row(fallback_rate=0.0) for _ in range(3)]
+        + [
+            _graded_row(
+                0.6,
+                counts=False,
+                alarmed=True,
+                alarm_reasons=["fallback_rate 0.90 jumped more than 0.30 above the median 0.00"],
+                alarm_key="fallback_jump",
+                alarm_since=datetime(2026, 8, 1, 2, 17),
+            )
+        ],
+    )
+    clock = _Clock(datetime(2026, 8, 6, 2, 17))
+    night = [_row(a, is_fallback=True, verdict="needs_more_info") for a in "abc"]
+
+    handoffs = _run_nights(monkeypatch, settings, tmp_path, [night], clock=clock)
+
+    newest = _read_snapshots(settings)[0]
+    assert newest.mode == "local"
+    assert newest.alarm_key == "fallback_jump"
+    assert newest.alarm_since == datetime(2026, 8, 6, 2, 17)
+    assert len(handoffs) == 1
+
+
+# --------------------------------------------------------------------
+# Bundle directory default (F3) — the artifacts an alarm is adjudicated from
+# --------------------------------------------------------------------
+
+
+def test_bundle_dir_defaults_beside_the_persisted_data_dir(tmp_path: Path) -> None:
+    """A container install's data dir is an absolute path inside a mounted
+    volume (/var/lib/soc-ai/data); the bundles belong on the same root, or a
+    container recreate deletes the oracle critiques behind every alarm on the
+    trend. Rooted at tmp_path here — the resolver CREATES the directory, and a
+    test must not write outside its sandbox to prove that.
+    """
+    settings = _settings(soc_ai_data_dir=tmp_path / "var" / "lib" / "soc-ai" / "data")
+    out_dir, note = resolve_out_dir(settings, None)
+    assert out_dir == tmp_path / "var" / "lib" / "soc-ai" / "evals"
+    assert out_dir.is_dir()  # created eagerly, so an unwritable mount is caught here
+    assert note is None
+
+
+def test_bundle_dir_stays_relative_for_a_plain_host_install() -> None:
+    """A host/dev install keeps the historical ./evals — a relative data dir
+    means there is no /var/lib root to be inside of."""
+    settings = _settings(soc_ai_data_dir=Path("data"))
+    out_dir, _note = resolve_out_dir(settings, None)
+    assert out_dir == Path("evals")
+
+
+def test_bundle_dir_explicit_argument_always_wins(tmp_path: Path) -> None:
+    """--out-dir is the operator's override and is never second-guessed."""
+    settings = _settings(soc_ai_data_dir=tmp_path / "var" / "data")
+    out_dir, note = resolve_out_dir(settings, tmp_path / "custom")
+    assert out_dir == tmp_path / "custom"
+    assert not (tmp_path / "var" / "evals").exists()  # no dir created behind it
+    assert note is None
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root bypasses the permission bits this simulates; CI runs as root, "
+    "so the uid-independent twin below is what covers the fallback there",
+)
+def test_bundle_dir_falls_back_loudly_when_the_volume_is_unwritable(
+    tmp_path: Path,
+) -> None:
+    """A volume mounted root-owned (old image, new compose file) must not kill
+    the unattended run — but the operator has to be told the bundles are
+    landing somewhere a recreate will delete.
+
+    Simulates the real shape: the directory exists and is not writable by this
+    user, which is the ``os.access`` branch."""
+    unwritable = tmp_path / "ro"
+    unwritable.mkdir(mode=0o500)
+    settings = _settings(soc_ai_data_dir=unwritable / "data")
+    out_dir, note = resolve_out_dir(settings, None)
+    assert out_dir == Path("evals")
+    assert note is not None
+    assert str(unwritable / "evals") in note
+
+
+def test_bundle_dir_falls_back_loudly_when_the_path_cannot_be_created(
+    tmp_path: Path,
+) -> None:
+    """The same fallback via the ``OSError`` branch, provoked in a way no uid
+    can bypass: the parent is a regular file, so ``mkdir`` raises
+    ``NotADirectoryError`` for root and non-root alike.
+
+    This twin exists because CI runs as root, where a chmod-based test silently
+    stops testing anything — it passes locally and fails in CI, which is how it
+    was found (2026-08-07)."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    settings = _settings(soc_ai_data_dir=blocker / "data")
+    out_dir, note = resolve_out_dir(settings, None)
+    assert out_dir == Path("evals")
+    assert note is not None
+    assert str(blocker / "evals") in note
+
+
+async def test_nightly_writes_bundles_under_the_resolved_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The in-app scheduler and Run-now pass no out_dir at all — that path is
+    the one that wrote into the container's ephemeral WORKDIR."""
+    root = tmp_path / "var" / "lib" / "soc-ai"
+    settings = _settings(soc_ai_data_dir=root / "data")
+    monkeypatch.setattr("soc_ai.so_client.elastic.ElasticClient", _FakeElastic)
+    monkeypatch.setattr("soc_ai.eval.batch.run_batch", _stub_run_batch([_row("a")]))
+
+    result = await run_eval_nightly(settings, mode="local")
+
+    assert result.batch_dir is not None
+    assert result.batch_dir.startswith(str(root / "evals"))
+
+
+def test_cli_eval_nightly_leaves_the_bundle_dir_to_the_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented cron line (docs/DOCKER.md) runs ``eval-nightly`` inside
+    the container with no --out-dir, so this flag's DEFAULT is what decided
+    that prod's oracle critiques lived in an ephemeral WORKDIR. It must defer
+    to resolve_out_dir instead of pinning a relative path."""
+    import sys
+
+    captured: dict[str, Any] = {}
+
+    def _capture(args: Namespace) -> int:
+        captured["out_dir"] = args.out_dir
+        return 0
+
+    monkeypatch.setattr(cli, "_eval_nightly", _capture)
+    monkeypatch.setattr(sys, "argv", ["soc-ai", "eval-nightly"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["out_dir"] is None

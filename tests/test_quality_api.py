@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -117,6 +118,85 @@ def test_trend_caps_at_30_points_newest_kept(client: TestClient) -> None:
     # and the oldest five (p50 0..4) fell off the front.
     assert points[-1]["latency_p50_ms"] == 34
     assert points[0]["latency_p50_ms"] == 5
+
+
+def test_trend_exposes_the_counts_and_the_bundle_behind_a_point(client: TestClient) -> None:
+    """Two things an operator needs to adjudicate an alarm and the card needs
+    to be honest: the grade counts behind the rate (a bare 0.60 hides whether
+    the two non-agreements were flat disagreements or thin-reasoning
+    ``partial`` calls) and the bundle path the critiques live in."""
+    _seed(
+        client,
+        [
+            _snap(
+                agreement_rate=0.6,
+                n_yes=3,
+                n_partial=1,
+                n_no=1,
+                n_classified=5,
+                batch_dir="/var/lib/soc-ai/evals/batch-20260807",
+            )
+        ],
+    )
+    point = client.get("/api/v1/quality/trend").json()["points"][0]
+    assert (point["n_yes"], point["n_partial"], point["n_no"]) == (3, 1, 1)
+    assert point["n_classified"] == 5
+    assert point["batch_dir"] == "/var/lib/soc-ai/evals/batch-20260807"
+
+
+def test_trend_exposes_the_alarm_identity_and_its_duration(client: TestClient) -> None:
+    """The card cannot render "still the same problem" from prose: every reason
+    string embeds the run's live numbers, so one unchanged condition reads as a
+    new sentence every night. The codes are what let it say "ongoing since
+    08-06" and give the pipeline-health alarm (``error_ceiling`` — the eval runs
+    themselves failing) a different headline from a verdict-quality one."""
+    _seed(
+        client,
+        [
+            _snap(
+                agreement_rate=0.4,
+                error_rate=0.6,
+                alarmed=True,
+                alarm_reasons=["agreement_rate 0.40 ...", "error_rate 0.60 ..."],
+                alarm_key="agreement_drop+error_ceiling",
+                alarm_since=datetime(2026, 8, 6, 2, 17),
+            )
+        ],
+    )
+    point = client.get("/api/v1/quality/trend").json()["points"][0]
+    assert point["alarm_codes"] == ["agreement_drop", "error_ceiling"]
+    assert point["alarm_key"] == "agreement_drop+error_ceiling"
+    # Timezone-aware like every other timestamp on the wire, or the browser
+    # renders "ongoing since" off by the client's UTC offset.
+    assert point["alarm_since"] == "2026-08-06T02:17:00+00:00"
+
+
+def test_trend_serves_no_codes_for_a_clean_or_pre_0027_point(client: TestClient) -> None:
+    """A clean row has no condition, and a pre-0027 row's condition was never
+    recorded — both must serve empty/null rather than an invented code, so the
+    card falls back to the prose reasons it has always shown."""
+    _seed(
+        client,
+        [
+            _snap(),
+            _snap(alarmed=True, alarm_reasons=["agreement_rate 0.40 ..."]),  # pre-0027
+        ],
+    )
+    clean, legacy = client.get("/api/v1/quality/trend").json()["points"]
+    assert (clean["alarm_codes"], clean["alarm_key"], clean["alarm_since"]) == ([], None, None)
+    assert legacy["alarmed"] is True
+    assert legacy["alarm_codes"] == []
+    assert legacy["alarm_since"] is None
+    assert legacy["alarm_reasons"] == ["agreement_rate 0.40 ..."]
+
+
+def test_trend_serves_null_counts_for_pre_0026_rows(client: TestClient) -> None:
+    """Rows written before the counts existed must read back as null, not 0 —
+    "we never recorded this" and "nothing agreed" are different facts."""
+    _seed(client, [_snap()])
+    point = client.get("/api/v1/quality/trend").json()["points"][0]
+    assert point["n_yes"] is None
+    assert point["n_classified"] is None
 
 
 def test_trend_requires_auth_when_enabled(settings_kratos: Settings) -> None:

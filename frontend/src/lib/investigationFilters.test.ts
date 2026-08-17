@@ -3,7 +3,11 @@
 // (fallback runs the operator has NOT dismissed) and the Investigations screen's
 // deep-link filter parsing (unknown values dropped, never wedging the filter).
 import { describe, expect, it } from 'vitest';
-import { livePipelineErrors, verdictFilterFromSearch } from './investigationFilters';
+import {
+  VERDICT_FILTER_VALUES,
+  livePipelineErrors,
+  verdictFilterFromSearch,
+} from './investigationFilters';
 import type { InvestigationRow } from './types';
 
 const row = (over: Partial<InvestigationRow>): InvestigationRow => ({
@@ -58,7 +62,21 @@ describe('verdictFilterFromSearch', () => {
 
   it('drops unknown values so a mangled URL cannot wedge the filter', () => {
     expect(verdictFilterFromSearch('?verdict=bogus')).toEqual([]);
-    expect(verdictFilterFromSearch('?verdict=bogus,untriaged')).toEqual(['untriaged']);
+    expect(verdictFilterFromSearch('?verdict=bogus,true_positive')).toEqual(['true_positive']);
+  });
+
+  // 'untriaged' names a unit this list cannot hold: an alert group nobody has
+  // investigated has no investigation ROW, and cannot get one while it stays
+  // untriaged. The filter was therefore empty by construction — and the table
+  // renders an untriaged verdict as a bare em-dash, never a pill, so it never
+  // even matched something an operator could point at. Untriaged work lives on
+  // /alerts (same endpoint, same unit); stale bookmarks degrade to "no filter".
+  it('no longer accepts untriaged — that unit lives on the Alerts screen', () => {
+    expect(VERDICT_FILTER_VALUES).not.toContain('untriaged');
+    expect(verdictFilterFromSearch('?verdict=untriaged')).toEqual([]);
+    expect(verdictFilterFromSearch('?verdict=untriaged,pipeline_error')).toEqual([
+      'pipeline_error',
+    ]);
   });
 
   it('returns no filter without the param', () => {

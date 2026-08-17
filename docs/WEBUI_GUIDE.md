@@ -7,8 +7,8 @@ This guide is a practical reference for the analyst/operator surfaces.
 ![An investigation in the console](img/screenshot-investigation.png)
 
 > **Front door is `/app`**, the React console. It is the only web surface;
-> bare `/` redirects to `/app/alerts` and login lands there. (The legacy
-> server-rendered `/ui` console has been removed.)
+> bare `/` redirects into it and signing in lands you on the Dashboard. (The
+> legacy server-rendered `/ui` console has been removed.)
 
 > **First run / self-signed cert:** the UI serves over HTTPS with a self-signed
 > cert. Visit the base URL once and accept the cert warning before signing in;
@@ -42,6 +42,62 @@ holds only a pointer line, not the password.
 
 Change it after first login (Config → Users → reset password), then **delete the
 sidecar file** — it is no longer needed and should not linger on the volume.
+
+## Dashboard (`/app/dashboard`)
+
+Where signing in lands you. What the grid is doing right now and what soc-ai
+has made of it, with a box to ask about either.
+
+### Ask soc-ai
+
+A chat that answers on the spot, using the same read tools as the investigation
+chat and taking about as long. Ask it what datasets you have, which rule was
+noisiest overnight, or what a host has been up to.
+
+- **One rolling thread per analyst**, kept across navigation and restarts. Two
+  analysts don't see each other's questions. **Clear** discards yours.
+- **It proposes hunts, it never starts one.** When answering would take a sweep
+  across many hosts or a long window, the turn comes back with a **Start hunt**
+  card holding an objective the agent wrote from what it just looked at, and a
+  line on what the sweep would settle. Both are on the card before you decide;
+  pressing **Start hunt** launches that objective and opens the running hunt.
+- **What it can't do:** no write actions, no verdict changes, no ack or
+  escalate. Read tools only.
+- **Turning it off:** Config → Models & Reasoning → Agent → *Dashboard chat*.
+  Hot, so it takes effect without a restart; the box disappears from the
+  Dashboard rather than failing when someone types. Do that if a shared analyst
+  model is already saturated by the triage backlog — the assistant sits on the
+  screen everyone lands on, which makes it the easiest place in the product to
+  spend inference capacity without meaning to. Nothing runs while nobody types,
+  and switching it off keeps stored threads.
+
+### Outcome and severity tiles
+
+The verdict tiles count alert **groups** over the range you picked. The four
+settled verdicts open the Investigations list filtered to that verdict.
+**Untriaged** goes to `/app/alerts` instead, because a group nobody has
+investigated has no investigation row to show; the link carries your range and
+un-hides acked groups, so the destination holds exactly what the tile counted.
+
+The severity bars go to the same list, filtered to that severity.
+
+### Verdict quality
+
+The trend from the nightly micro-eval (see
+[DOCKER.md](DOCKER.md#the-nightly-quality-micro-eval-schedule-it-in-app-or-from-host-cron)
+for scheduling it). The badge says which instrument measured each point:
+**oracle graded** points carry an agreement rate, **locally measured** points
+carry fallback and error rates instead. The two are never blended on one line.
+
+Under the headline rate sits the grade composition, "3 agree · 2 partial". A
+partial critique ("right verdict, thin reasoning") costs the rate exactly as
+much as a flat disagreement, and a bare 60% can't tell you which you got — one
+is a prompt to tighten, the other a regression to chase.
+
+When a point alarms, the card prints the path to that run's eval bundle. That
+directory holds the oracle critiques, which are the only evidence for or against
+the alarm. It is a path on the soc-ai host, not a link: read it with
+`docker exec soc-ai cat <path>/report.md`.
 
 ## Triage console (`/app/alerts`)
 
@@ -81,6 +137,103 @@ drop are cleaned up automatically. On startup every orphaned `running` row is
 marked `error` (its worker died with the previous process), and a periodic sweep
 marks any run still `running` past `investigation_reaper_minutes` (default 30).
 No manual SQL needed to clear orphans.
+
+## Hosts (`/app/hosts`)
+
+What soc-ai has concluded about each machine on your network, and what you have
+declared instead. Two screens.
+
+**The list** (`/app/hosts`) is one row per host: address, role, hostname,
+criticality, how many fields each lane holds, event count, last seen. Search
+matches an address or a hostname; the **Role** and **Lane** selects narrow to a
+role, or to hosts a human has touched ("declared") versus hosts nobody has
+("inferred only"). Sort by last seen, first seen, stalest, busiest or address.
+Click a row to open the host.
+
+Above the table sit four counts of the whole network. The panel header below
+counts what your filters match; these four never do. **All hosts** carries how
+many have no clean build, meaning never swept or errored on the last attempt.
+**Named** is hosts whose name the resolver will assert, so it agrees with the
+Hostname column rather than with whatever is stored. **Reporting** is hosts
+where an agent on the machine reports about itself, and it is the only place
+the console shows how far host-log shipping has got. **Needs review** is the
+open disagreements, the same number the queue carries. Under the four sits the
+age of the numbers — "Last swept 4h ago", and a note while automatic sweeps are
+off, since nothing else refreshes them. A count that could not be read shows a
+dash, never a zero.
+
+**The host page** (`/app/hosts/<ip>`), top to bottom:
+
+- **The banner** names the machine — hostname if anything knows one, otherwise
+  the address — with its role, where that role came from, OS, criticality, and
+  whether the machine reports on itself. "no agent data" means every field below
+  was observed from the network rather than told to us by the host.
+- **Four counters**: services it answers on, accounts seen authenticating,
+  connection volume, and alerts over seven days. Under the alert count sits an
+  **all alerts · 7d** link, and it means what it says: the alerts console
+  filters by time, severity and verdict, never by host, so it opens on the whole
+  network's detections over those days with this host's among them.
+- **Peers, volume and users** over the window you pick — 24h or 7d.
+- **Twelve field cards**, one per dossier field.
+
+An internal address opened from anywhere in the console lands here: alert rows,
+the peer graph, and old `/entity/<ip>` links all redirect. External addresses
+still open the Entity screen, because the sweep only builds hosts inside your
+`internal_cidrs`.
+
+### The two lanes
+
+Every field holds up to two answers and they never overwrite each other:
+
+- **inferred** — what the sweep concluded, with a provenance rung (what kind of
+  signal it came from), a confidence, and the evidence behind it under **Why?**.
+- **operator** — what you declared. Stored in its own columns, so no rebuild can
+  clobber it.
+
+Nothing is a stored "current value". The page resolves each field on read,
+operator lane first, then the inferred value if it clears the confidence floor
+(`dossier_min_confidence`) and has been re-confirmed inside the freshness window
+(`dossier_staleness_hours`). A field that resolves to nothing says which of
+those it failed, because "no signal yet" and "observed but too weak to assert"
+are different answers.
+
+### Declaring, accepting, keeping yours (admin)
+
+On any field card:
+
+- **Declare a value** (**Edit declaration** once one exists) writes your value
+  and an optional note, recorded with your name and shown back on the card.
+  Three fields — services offered, activity profile, management plane — hold
+  structured values and take JSON.
+- **Hand back to the builder** deletes your override and lets the sweep's answer
+  stand again.
+- When the sweep disagrees with something you declared, the card says so and
+  names the kind: the evidence points elsewhere, the evidence it rested on is
+  gone, or the address appears to have rebound to a different machine. Then:
+  - **Accept inference** (confirm with **Discard my value**) drops your override
+    and takes the sweep's answer.
+  - **Keep mine** keeps yours and stops the question for a while. The interval
+    doubles each time you press it, capped at 90 days.
+
+Analysts see all of this read-only. Declaring, accepting, keeping and running a
+sweep are admin-only.
+
+A disagreement has to earn its way onto the screen: three consecutive builds
+that disagree (`dossier_conflict_min_observations`) before you are prompted, and
+at most one prompt per field per 14 days
+(`dossier_conflict_prompt_interval_hours`). One build agreeing resets the count.
+
+### Running the sweep
+
+**The scheduled sweep is off by default** (`dossier_schedule_enabled`). A sweep
+is hundreds of hosts across several Elasticsearch queries each, so you decide
+when it runs. Until it has run at least once the Hosts screen is empty — that is
+a sweep that has not happened, not a network with no hosts on it.
+
+- **Rebuild now** on the Hosts screen (admin) runs one in the background and
+  reports what it built.
+- Config → Host dossier turns on the schedule and sets its interval. Every
+  setting there is hot: no restart, and the next sweep picks it up.
 
 ## Runbooks (`/app/runbooks`)
 
@@ -126,7 +279,8 @@ overrides are re-applied at startup, so they survive restarts. Editable keys:
   everything sent to it is sanitized first), `oracle_model`, and the escalation
   thresholds (`oracle_escalate_*`). This is the home for the Oracle toggle.
 - **Agent**: `investigate_when_unsure` (run the bounded investigation loop when
-  the fast round-1 verdict isn't evidence-backed).
+  the fast round-1 verdict isn't evidence-backed) and `general_chat_enabled`
+  (the Dashboard's Ask soc-ai box; on by default).
 - **PCAP**: `pcap_enabled` (fetch + decode raw packets on demand via the SO
   sensor's Suricata pcap ring).
 

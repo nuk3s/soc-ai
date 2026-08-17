@@ -11,21 +11,29 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { type ReactNode, Suspense, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { RecordedRunChip } from '../components/Badges';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
-import { HuntVisuals } from '../components/HuntVisuals';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
-import { ErrorState, Freshness, LoadingState, Spinner, StaleNotice } from '../components/States';
 import {
-  type HuntChatMessage,
+  ErrorState,
+  Freshness,
+  LoadingState,
+  NotFoundState,
+  Spinner,
+  StaleNotice,
+} from '../components/States';
+import {
+  type ChatThread,
+  type HuntChatThread,
   cancelHuntConsole,
   deleteHunt,
   getHunt,
   getHuntChat,
+  isNotFound,
   postHuntChat,
   startHuntConsole,
 } from '../lib/api';
@@ -33,6 +41,8 @@ import { useDemo } from '../lib/demo';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { SEVERITY, TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
+import { lazyWithReload } from '../lib/lazyWithReload';
+import { useChatThread } from '../lib/useChatThread';
 import type {
   HuntDetailData,
   HuntDiff,
@@ -46,6 +56,30 @@ import type {
 const SEV_COLOR: Record<string, string> = Object.fromEntries(
   (Object.keys(SEVERITY) as Severity[]).map((k) => [k, SEVERITY[k].color]),
 );
+
+// HuntVisuals statically imports recharts (~370 KB of the old 417 KB HuntDetail
+// route chunk). It renders only when a hunt is complete AND has findings — a
+// notification click on a finished-but-empty hunt fetched all of recharts to
+// render nothing. Lazy-import it so the recharts chunk loads only when the
+// "Visual summary" section actually mounts; the route chunk drops to ~40 KB.
+// lazyWithReload (not bare lazy) so a first mount after a deploy self-heals the
+// dead-hash chunk 404 with one reload instead of throwing to the error boundary.
+const HuntVisuals = lazyWithReload(() =>
+  import('../components/HuntVisuals').then((m) => ({ default: m.HuntVisuals })),
+);
+
+// Placeholder while the recharts chunk loads — one Panel-shaped shimmer, so the
+// section reserves its space instead of jumping when the charts arrive.
+function VisualsSkeleton() {
+  return (
+    <Panel className="animate-pulse">
+      <div className="h-[220px] p-4">
+        <div className="mb-3 h-3 w-40 rounded bg-surface-3" />
+        <div className="h-[168px] rounded bg-surface-2" />
+      </div>
+    </Panel>
+  );
+}
 
 function StatusPill({ status }: { status: HuntStatus }) {
   const m = HUNT_STATUS[status] ?? HUNT_STATUS.error;
@@ -476,19 +510,49 @@ export function HuntDetail() {
 
       {loading && !data ? (
         <LoadingState label="Loading hunt…" />
-      ) : error ? (
+      ) : /* A 404 is an answer, not an incident — and retrying one just fails
+             again. Only a real failure keeps the alarm card and its Retry.
+
+             Both branches are gated on `!data`, the same way HostDetail is: an
+             error that arrives once the report is already on screen must not
+             take it away. A hunt deleted in another tab while the analyst is
+             reading it would otherwise replace the report they are mid-sentence
+             in with a not-found card. These states answer "the first load
+             failed", and only that. */
+      error && !data && isNotFound(error) ? (
+        <NotFoundState what="hunt" id={id} backTo="/hunts" backLabel="Back to Hunt Console" />
+      ) : error && !data ? (
         <ErrorState error={error} onRetry={() => setReloadKey((k) => k + 1)} />
       ) : !data ? (
-        <ErrorState error={new Error('Hunt not found')} />
+        <NotFoundState what="hunt" id={id} backTo="/hunts" backLabel="Back to Hunt Console" />
       ) : (
         <div className="mx-auto max-w-workstation">
-          {failCount >= 2 && (
+          {/* Two ways this report can be older than it looks, and until now
+              only one of them said so. StaleNotice counted BACKGROUND poll
+              failures; a FOREGROUND refresh that failed left `error` set and
+              the content untouched — correct, but completely silent, so the
+              analyst went on reading stale findings with nothing on screen
+              disagreeing. The foreground case is the louder of the two (they
+              asked) so it wins the slot — but only the CLICK stopped: a hunt
+              that is still running is still being polled every 3s underneath,
+              and the next tick heals the page on its own. `retrying` says which
+              of those the analyst is looking at, rather than the strip quietly
+              flipping back later with no explanation. */}
+          {error ? (
+            <StaleNotice
+              since={lastUpdated}
+              onRefresh={() => setReloadKey((k) => k + 1)}
+              reason="refresh-failed"
+              retrying={running}
+              className="mb-3"
+            />
+          ) : failCount >= 2 ? (
             <StaleNotice
               since={lastUpdated}
               onRefresh={() => setReloadKey((k) => k + 1)}
               className="mb-3"
             />
-          )}
+          ) : null}
           {/* ── hero: objective headline, meta strip, confidence ring ────── */}
           <div
             className="relative overflow-hidden rounded-panel-lg border p-5"
@@ -683,11 +747,13 @@ export function HuntDetail() {
                   to plot, and a chart must never render from nothing). */}
               {complete && data.findings.length > 0 && (
                 <CollapsibleSection title="Visual summary">
-                  <HuntVisuals
-                    findings={data.findings}
-                    affectedHosts={data.affectedHosts}
-                    charts={data.charts}
-                  />
+                  <Suspense fallback={<VisualsSkeleton />}>
+                    <HuntVisuals
+                      findings={data.findings}
+                      affectedHosts={data.affectedHosts}
+                      charts={data.charts}
+                    />
+                  </Suspense>
                 </CollapsibleSection>
               )}
 
@@ -820,10 +886,25 @@ export function HuntDetail() {
 }
 
 // ── Read-only follow-up chat about a completed hunt ─────────────────────────
-// Same rendering as the investigation chat (the shared ChatPanelShell) but
-// strictly read-only: a hunt chat owns its own thread state and can only
-// answer questions — it can't ack, escalate, or change a verdict.
-function HuntChatPanel({
+// Same rendering as the investigation chat (the shared ChatPanelShell) and now
+// the same TRANSPORT (useChatThread) as every other chat surface. Strictly
+// read-only: it can only answer questions — it can't ack, escalate, or change a
+// verdict.
+
+// Normalise the hunt thread's wire shape to the shared hook's ChatThread. The
+// only difference is HuntChatMessage.tools is `string | null` where
+// ChatMessage.tools is `string | undefined`, so drop the null. progress_tools
+// carries straight through — the hunt chat now runs on the shared turn engine,
+// so its thread exposes live tool progress like every other chat surface.
+function toChatThread(t: HuntChatThread): ChatThread {
+  return {
+    messages: t.messages.map((m) => ({ role: m.role, text: m.text, tools: m.tools ?? undefined })),
+    pending: t.pending,
+    progress_tools: t.progress_tools,
+  };
+}
+
+export function HuntChatPanel({
   huntId,
   fill,
   onClose,
@@ -832,57 +913,20 @@ function HuntChatPanel({
   fill?: boolean;
   onClose?: () => void;
 }) {
-  const [messages, setMessages] = useState<HuntChatMessage[]>([]);
-  const [pending, setPending] = useState(false);
-  const [draft, setDraft] = useState('');
-  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const NET_ERR_TEXT = 'Could not reach the server — please try again.';
-
-  // Apply a thread from the API; keep polling while the assistant works. The
-  // backend runs the turn in the background and appends the reply to the thread.
-  const applyThread = (thread: { messages: HuntChatMessage[]; pending: boolean }) => {
-    setMessages(thread.messages.filter((m) => m.text || m.role === 'user'));
-    setPending(thread.pending);
-    if (pollTimer.current) clearTimeout(pollTimer.current);
-    if (thread.pending) {
-      pollTimer.current = setTimeout(() => {
-        getHuntChat(huntId)
-          .then(applyThread)
-          .catch(() => {
-            setPending(false);
-            setMessages((c) => {
-              const last = c[c.length - 1];
-              if (last?.role === 'assistant' && last.text === NET_ERR_TEXT) return c;
-              return [...c, { role: 'assistant', text: NET_ERR_TEXT }];
-            });
-          });
-      }, 1500);
-    }
-  };
-
-  // Load the existing thread once, and resume polling if a turn is still running.
-  useEffect(() => {
-    getHuntChat(huntId).then(applyThread).catch(() => undefined);
-    return () => {
-      if (pollTimer.current) clearTimeout(pollTimer.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [huntId]);
-
-  const send = () => {
-    const t = draft.trim();
-    if (!t || pending) return;
-    setMessages((c) => [...c, { role: 'user', text: t }]);
-    setDraft('');
-    setPending(true);
-    postHuntChat(huntId, t)
-      .then(applyThread)
-      .catch(() => {
-        setPending(false);
-        setMessages((c) => [...c, { role: 'assistant', text: NET_ERR_TEXT }]);
-      });
-  };
+  // The shared transport slice — mount fetch, a poll that re-arms ONLY while a
+  // turn is pending, send, and per-subject drafts. This panel used to keep its
+  // own copy, and that copy re-armed the 1.5s poll from applyThread with no
+  // alive guard: a response resolving after unmount re-armed a loop nothing
+  // would ever clear, polling the endpoint (and setState-ing an unmounted
+  // panel) forever. useChatThread's aliveRef closes that (lib/useChatThread.ts).
+  // Live tool progress now flows: the hunt chat runs on the shared turn engine,
+  // so its thread carries progress_tools (toChatThread passes it through) and the
+  // ChatPanelShell footer renders what the agent is DOING during a long turn.
+  const chat = useChatThread({
+    subject: huntId,
+    fetchThread: (id) => getHuntChat(id).then(toChatThread),
+    sendMessage: (id, text) => postHuntChat(id, text).then(toChatThread),
+  });
 
   return (
     <ChatPanelShell
@@ -896,11 +940,12 @@ function HuntChatPanel({
           host X”. The assistant answers from the hunt's evidence; it can't change the result.
         </div>
       }
-      messages={messages}
-      pending={pending}
-      draft={draft}
-      onDraft={setDraft}
-      onSend={send}
+      messages={chat.messages}
+      pending={chat.pending}
+      progressTools={chat.progressTools}
+      draft={chat.draft}
+      onDraft={chat.setDraft}
+      onSend={chat.send}
       fill={fill}
       onClose={onClose}
     />

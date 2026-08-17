@@ -10,6 +10,7 @@ rows.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -38,6 +39,12 @@ async def insert_snapshot(
     batch_dir: str | None,
     alarmed: bool,
     alarm_reasons: list[str] | None,
+    alarm_key: str | None = None,
+    alarm_since: datetime | None = None,
+    n_yes: int | None = None,
+    n_partial: int | None = None,
+    n_no: int | None = None,
+    n_classified: int | None = None,
     keep_last: int = KEEP_LAST,
 ) -> QualitySnapshot:
     """Insert one nightly snapshot and prune history in the SAME transaction.
@@ -49,6 +56,18 @@ async def insert_snapshot(
     ``created_at`` has only second precision — two same-second inserts would
     tie). ``keep_last`` is parameterized so tests can exercise the prune
     without inserting 90+ rows.
+
+    The grade counts default to None so a caller that has none — and every row
+    written before migration 0026 — leaves NULLs rather than zeros. The
+    detector reads NULL as "no counts recorded, use the median rule" and 0 as
+    "the oracle classified nothing", which are opposite facts.
+
+    ``alarm_key``/``alarm_since`` (0027) default to None for the same reason:
+    they describe a CONDITION, and a clean point has none. The caller owns the
+    carry-forward rule (see
+    :func:`soc_ai.eval.nightly._record_trend_point`) — this module only moves
+    rows, and deriving the previous row's key here would hide the one decision
+    that governs whether an operator gets paged.
     """
     row = QualitySnapshot(
         mode=mode,
@@ -56,12 +75,18 @@ async def insert_snapshot(
         n_error=n_error,
         agreement_rate=agreement_rate,
         fallback_rate=fallback_rate,
+        n_yes=n_yes,
+        n_partial=n_partial,
+        n_no=n_no,
+        n_classified=n_classified,
         error_rate=error_rate,
         verdict_counts=verdict_counts,
         latency_p50_ms=latency_p50_ms,
         batch_dir=batch_dir,
         alarmed=alarmed,
         alarm_reasons=alarm_reasons,
+        alarm_key=alarm_key,
+        alarm_since=alarm_since,
     )
     db.add(row)
     # Flush so the new row has its id and is visible to the prune subquery —

@@ -8,6 +8,7 @@ subcommand is the only intended caller.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -170,7 +171,7 @@ async def run(
     )
 
     if grade:
-        response, response_md, user_message, arch = _grade_with_oracle(
+        response, response_md, user_message, arch = await _grade_with_oracle(
             alert_id=alert_id,
             settings=settings,
             out_dir=out_dir,
@@ -225,7 +226,7 @@ async def run(
 # --------------------------------------------------------------------
 
 
-def _grade_with_oracle(
+async def _grade_with_oracle(
     *,
     alert_id: str,
     settings: Settings,
@@ -242,6 +243,12 @@ def _grade_with_oracle(
     the residue check that must pass before anything leaves, the prompt build,
     the LiteLLM/oracle call, and the de-sanitization of the critique for local
     display. Returns ``(response, response_md, user_message, arch_context)``.
+
+    ``async`` because ``oracle_caller`` is a blocking ``httpx.Client`` POST with
+    a timeout up to 300s: run inline it would freeze the single-worker event loop
+    for the whole critique (the notifications poll, /health, SSE streams and every
+    scheduler wake stall). It is offloaded with :func:`asyncio.to_thread`, the
+    same precedent :mod:`soc_ai.eval.meta_analysis` uses for the identical call.
     """
     # Sanitize the alert id itself. A bare ``mapping.forward.get(alert_id, ...)``
     # only redacts the id when that exact string coincidentally appeared (and
@@ -300,7 +307,8 @@ def _grade_with_oracle(
         raise RuntimeError("LITELLM_API_KEY not set")
 
     try:
-        response = oracle_caller(
+        response = await asyncio.to_thread(
+            oracle_caller,
             base_url=str(settings.litellm_base_url),
             api_key=api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else api_key,
             verify_ssl=settings.litellm_verify_ssl,

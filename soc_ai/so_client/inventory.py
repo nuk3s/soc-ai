@@ -72,8 +72,17 @@ async def discover_datasets(
     """Aggregate ``event.dataset`` (+ count, newest event, ``event.category``) over
     the events index for the last ``window_minutes``. TTL-cached.
 
-    Best-effort: any ES error returns an EMPTY inventory rather than raising — the
-    ambient block is additive, and a discovery failure must never break triage.
+    RAISES on an ES failure — it does not return an empty inventory. An empty
+    ``GridInventory`` is a claim about the estate ("this grid carries no DNS,
+    endpoint or network telemetry"); an outage is a claim about the read. They
+    are not the same sentence, and swallowing the error made the console tell
+    analysts the first one whenever the second was true.
+
+    Every caller fails soft on its own terms and needs the error to do it: the
+    hunt-template route returns ``None`` so every template reports available,
+    the dossier reads an empty frozenset as "unknown, not nothing", and
+    :func:`inventory_prompt_block` drops the ambient block rather than telling
+    the model the grid is empty.
     """
     index = settings.events_index_pattern
     key = (index, window_minutes)
@@ -97,8 +106,11 @@ async def discover_datasets(
     try:
         result = await elastic.search(index, query, size=0, aggs=aggs, track_total_hits=True)
     except Exception as exc:
+        # Logged here (the index pattern is only known here), then re-raised so
+        # the caller can tell an outage from an empty grid. Nothing is cached:
+        # the next call re-reads rather than serving a phantom empty inventory.
         _LOGGER.warning("dataset discovery failed on %s: %s", index, exc)
-        return GridInventory(datasets=(), window_minutes=window_minutes, total_events=0)
+        raise
 
     buckets = ((result.aggregations or {}).get("datasets") or {}).get("buckets") or []
     infos: list[DatasetInfo] = []

@@ -238,39 +238,42 @@ def test_primary_run_ids_surfaces_inflight_reinvestigation() -> None:
 
 
 def test_investigations_list(client: TestClient) -> None:
-    invs = [
-        SimpleNamespace(
-            id="INV-1",
-            rule_name="ET X",
-            verdict="false_positive",
-            confidence=0.85,
-            status="complete",
-            src_ip="10.0.0.5",
-            created_at=datetime(2026, 6, 17, 12, 0, tzinfo=UTC),
-        ),
-        SimpleNamespace(
-            id="INV-2",
-            rule_name=None,
-            verdict=None,
-            confidence=None,
-            status="running",
-            src_ip=None,
-            created_at=datetime(2026, 6, 17, 12, 5, tzinfo=UTC),
-        ),
-    ]
-    with patch("soc_ai.api.webui_api.inv_svc.list_recent", AsyncMock(return_value=invs)):
-        body = client.get("/api/v1/investigations").json()
-    assert body[0]["id"] == "INV-1"
-    assert body[0]["verdict"] == "false_positive"
-    assert body[0]["host"] == "10.0.0.5"
-    assert body[0]["status"] == "complete"
-    # None rule_name -> identify by alert id (here the inv id, no alert_es_id on the mock)
-    assert body[1]["name"] == "Alert INV-2…"
-    assert body[1]["verdict"] == "untriaged"  # None verdict -> untriaged
-    assert body[1]["status"] == "running"
+    """The list is a real query now (rows + counts, filtered in SQL), so this
+    seeds the store instead of mocking list_recent — the row mapping under test
+    has to ride the same SQL path production does."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            done = await inv_svc.create(
+                db, alert_es_id="ev-done", started_by="t", rule_name="ET X", src_ip="10.0.0.5"
+            )
+            await inv_svc.finalize(
+                db, done.id, status="complete", verdict="false_positive", confidence=0.85
+            )
+            # A second, still-running row with no rule name.
+            await inv_svc.create(db, alert_es_id="ev-run-abcdef", started_by="t")
+
+    asyncio.run(_seed())
+    body = client.get("/api/v1/investigations").json()
+    rows = {r["name"]: r for r in body["rows"]}
+    assert rows["ET X"]["verdict"] == "false_positive"
+    assert rows["ET X"]["host"] == "10.0.0.5"
+    assert rows["ET X"]["status"] == "complete"
+    # None rule_name -> identify by (the first 12 chars of) the alert id.
+    running = rows["Alert ev-run-abcde…"]
+    assert running["verdict"] == "untriaged"  # None verdict -> untriaged
+    assert running["status"] == "running"
     # Neither row is a pipeline fallback (no marker on either report).
-    assert body[0]["fallback"] is False
-    assert body[1]["fallback"] is False
+    assert all(r["fallback"] is False for r in body["rows"])
+    # The envelope counts describe the (unfiltered) set — and the whole store.
+    assert body["total"] == body["totalAll"] == 2
+    assert body["running"] == 1
+    assert body["truePositives"] == 0
+    assert body["active"] is True
 
 
 # The persisted report dict shape a synth-failure fallback lands (E1.2). Mirrors
@@ -294,35 +297,44 @@ def test_investigations_list_marks_pipeline_fallback_row(client: TestClient) -> 
     """E1.2: a run whose report carries the pipeline_fallback marker → its row
     `fallback` is True; a normal needs_more_info run → False. The verdict is
     needs_more_info in BOTH — only the row flag distinguishes them."""
-    invs = [
-        SimpleNamespace(
-            id="INV-FB",
-            rule_name="ET Truncated",
-            verdict="needs_more_info",
-            confidence=0.3,
-            status="complete",
-            src_ip="10.0.0.9",
-            created_at=datetime(2026, 7, 7, 12, 0, tzinfo=UTC),
-            report=_FALLBACK_REPORT,
-        ),
-        SimpleNamespace(
-            id="INV-NMI",
-            rule_name="ET Genuine",
-            verdict="needs_more_info",
-            confidence=0.55,
-            status="complete",
-            src_ip="10.0.0.10",
-            created_at=datetime(2026, 7, 7, 12, 5, tzinfo=UTC),
-            report={"verdict": "needs_more_info", "citations": ["ev-1"]},
-        ),
-    ]
-    with patch("soc_ai.api.webui_api.inv_svc.list_recent", AsyncMock(return_value=invs)):
-        body = client.get("/api/v1/investigations").json()
-    by_id = {r["id"]: r for r in body}
-    assert by_id["INV-FB"]["verdict"] == "needs_more_info"
-    assert by_id["INV-FB"]["fallback"] is True
-    assert by_id["INV-NMI"]["verdict"] == "needs_more_info"
-    assert by_id["INV-NMI"]["fallback"] is False
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            fb = await inv_svc.create(
+                db, alert_es_id="ev-fb", started_by="t", rule_name="ET Truncated"
+            )
+            await inv_svc.finalize(
+                db,
+                fb.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.3,
+                report=_FALLBACK_REPORT,
+            )
+            nmi = await inv_svc.create(
+                db, alert_es_id="ev-nmi", started_by="t", rule_name="ET Genuine"
+            )
+            await inv_svc.finalize(
+                db,
+                nmi.id,
+                status="complete",
+                verdict="needs_more_info",
+                confidence=0.55,
+                report={"verdict": "needs_more_info", "citations": ["ev-1"]},
+            )
+            return fb.id, nmi.id
+
+    fb_id, nmi_id = asyncio.run(_seed())
+    body = client.get("/api/v1/investigations").json()
+    by_id = {r["id"]: r for r in body["rows"]}
+    assert by_id[fb_id]["verdict"] == "needs_more_info"
+    assert by_id[fb_id]["fallback"] is True
+    assert by_id[nmi_id]["verdict"] == "needs_more_info"
+    assert by_id[nmi_id]["fallback"] is False
 
 
 def test_investigation_detail_exposes_fallback_marker(client: TestClient) -> None:
@@ -395,7 +407,7 @@ def test_dismiss_error_acks_pipeline_fallback_run(client: TestClient) -> None:
     inv_id = _seed_finalized_run(client, _FALLBACK_REPORT)
 
     # Pre-dismiss: surfaced as a LIVE pipeline error.
-    row = {r["id"]: r for r in client.get("/api/v1/investigations").json()}[inv_id]
+    row = {r["id"]: r for r in client.get("/api/v1/investigations").json()["rows"]}[inv_id]
     assert row["fallback"] is True
     assert row["errorDismissed"] is False
 
@@ -403,7 +415,7 @@ def test_dismiss_error_acks_pipeline_fallback_run(client: TestClient) -> None:
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
 
-    row = {r["id"]: r for r in client.get("/api/v1/investigations").json()}[inv_id]
+    row = {r["id"]: r for r in client.get("/api/v1/investigations").json()["rows"]}[inv_id]
     assert row["fallback"] is True  # still historically a pipeline error…
     assert row["errorDismissed"] is True  # …but acknowledged
     detail = client.get(f"/api/v1/investigations/{inv_id}").json()
@@ -931,6 +943,146 @@ def test_group_events_rerun_clears_inherited_pill(client: TestClient) -> None:
     assert "Inherited" in ev["ev-sibling"]["inheritedReason"]
 
 
+def _seed_pair_and_rule_verdicts(
+    client: TestClient,
+    *,
+    rule: str,
+    pair_alert_id: str,
+    pair_src: str | None,
+    pair_dest: str | None,
+) -> tuple[str, str]:
+    """Seed two complete verdicts for *rule*: an OLDER one on (pair_src, pair_dest)
+    and a NEWER one on an unrelated flow.
+
+    The two tiers must be distinguishable: whichever id the event reports tells us
+    whether it resolved through the PAIR tier (the older, endpoint-matched run) or
+    fell through to the rule-level standing verdict (the newer, unrelated one).
+    ``created_at`` is set explicitly because SQLite's ``CURRENT_TIMESTAMP`` has
+    second resolution and both rows would otherwise be written in the same tick.
+    """
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> tuple[str, str]:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            pair_inv = await inv_svc.create(db, alert_es_id=pair_alert_id, started_by="t")
+            await inv_svc.finalize(
+                db,
+                pair_inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.9,
+                rationale="benign on this endpoint",
+            )
+            pair_inv.rule_name = rule
+            pair_inv.src_ip = pair_src
+            pair_inv.dest_ip = pair_dest
+            pair_inv.created_at = now - timedelta(minutes=30)
+            await db.commit()
+
+            rule_inv = await inv_svc.create(db, alert_es_id="ev-unrelated-flow", started_by="t")
+            await inv_svc.finalize(
+                db,
+                rule_inv.id,
+                status="complete",
+                verdict="true_positive",
+                confidence=0.8,
+                rationale="malicious on a different flow",
+            )
+            rule_inv.rule_name = rule
+            rule_inv.src_ip = "10.0.0.9"
+            rule_inv.dest_ip = "9.9.9.9"
+            rule_inv.created_at = now
+            await db.commit()
+            return pair_inv.id, rule_inv.id
+
+    return asyncio.run(_seed())
+
+
+def test_group_events_no_ip_event_resolves_through_the_pair_tier(
+    client: TestClient,
+) -> None:
+    """A host-shaped (no-IP) event must inherit from its OWN cluster's verdict.
+
+    The pair lookup used to be built only from events with BOTH endpoints, so a
+    host/process detection could never match the pair tier and fell through to the
+    rule-level standing verdict — which, on a rule that also fires on network
+    flows, attributed the host detection's verdict to an unrelated flow. Coalescing
+    a missing endpoint to "" is the same degrade the sweep planner applies, and it
+    keeps the store's 3-tuple pair key intact.
+    """
+    RULE = "Potential Exploitation of CVE-2024-3094"
+    # The no-flow run carries NULL endpoints — what the recorder actually writes
+    # for a host-shaped alert, since the alert has no source.ip/destination.ip to
+    # extract at all.
+    pair_id, rule_id = _seed_pair_and_rule_verdicts(
+        client, rule=RULE, pair_alert_id="ev-host-old", pair_src=None, pair_dest=None
+    )
+
+    events = [
+        AlertEvent(
+            es_id="ev-host-new",
+            timestamp="2026-08-07T01:10:37Z",
+            src="—",
+            dst="—",
+            severity="high",
+            host="test-ubuntu24",
+            host_ip="192.168.10.150",
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        body = client.get(
+            "/api/v1/alerts/events", params={"rule_name": RULE, "kind": "sigma"}
+        ).json()
+
+    ev = body[0]
+    # The machine and its agent address survive to the row — a host detection with
+    # neither is not investigable.
+    assert ev["host"] == "test-ubuntu24"
+    assert ev["hostIp"] == "192.168.10.150"
+    assert ev["invId"] == pair_id, "no-IP event must inherit its own cluster's verdict"
+    assert ev["invId"] != rule_id
+    assert ev["investigated"] is False
+    assert ev["inheritedReason"] is not None
+    # The source run observed no flow, so the reason must not manufacture one.
+    assert "? → ?" not in ev["inheritedReason"]
+    assert "10.0.0.9" not in ev["inheritedReason"]
+
+
+def test_group_events_ip_pair_tier_unchanged(client: TestClient) -> None:
+    """Regression guard for the ~99.99% path: an event with both endpoints still
+    resolves through the pair tier, not the newer rule-level standing verdict."""
+    RULE = "ET FLOW PAIR TIER"
+    pair_id, rule_id = _seed_pair_and_rule_verdicts(
+        client, rule=RULE, pair_alert_id="ev-flow-old", pair_src="10.0.0.1", pair_dest="1.2.3.4"
+    )
+
+    events = [
+        AlertEvent(
+            es_id="ev-flow-new",
+            timestamp="2026-06-22T10:00:00Z",
+            src="10.0.0.1",
+            dst="1.2.3.4",
+            severity="high",
+            host="wks-1",
+            src_ip="10.0.0.1",
+            dst_ip="1.2.3.4",
+            dst_port=443,
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        body = client.get(
+            "/api/v1/alerts/events", params={"rule_name": RULE, "kind": "suricata"}
+        ).json()
+
+    ev = body[0]
+    assert ev["invId"] == pair_id
+    assert ev["invId"] != rule_id
+    assert ev["inheritedReason"] is not None
+    assert "10.0.0.1 → 1.2.3.4" in ev["inheritedReason"]
+
+
 def test_group_events_errored_direct_run_falls_through_to_inherited(
     client: TestClient,
 ) -> None:
@@ -1037,7 +1189,7 @@ def test_investigations_list_ts_is_offset_aware(client: TestClient) -> None:
             await db.commit()
 
     asyncio.run(_seed())
-    rows = client.get("/api/v1/investigations").json()
+    rows = client.get("/api/v1/investigations").json()["rows"]
     assert rows, "expected at least one investigation row"
     row = next(r for r in rows if r["name"] == "ET TS TEST")
     assert row["ts"].endswith("+00:00") or row["ts"].endswith("Z")
@@ -1967,6 +2119,27 @@ def test_maintenance_empty_dirs_are_not_an_error(client: TestClient, tmp_path: P
     assert body["blocklist_files"] == 0
 
 
+def test_scan_maintenance_dirs_is_a_pure_sync_helper(tmp_path: Path) -> None:
+    """The blocking filesystem scan is extracted so the handler can ``to_thread``
+    it. It is a plain sync function returning the MaintenanceOut shape — same
+    contract as the endpoint, just off the event loop."""
+    from soc_ai.api.webui.routes_meta import _scan_maintenance_dirs
+
+    backups = tmp_path / "data" / "backups"
+    backups.mkdir(parents=True)
+    (backups / "soc-ai-backup-20260716-0215.tar.gz").write_bytes(b"z" * 5)
+    blocklists = tmp_path / "blocklists"
+    blocklists.mkdir()
+    (blocklists / "feodo.txt").write_text("198.51.100.9\n")
+    settings = SimpleNamespace(soc_ai_data_dir=tmp_path / "data", blocklist_data_dir=blocklists)
+
+    out = _scan_maintenance_dirs(settings)  # type: ignore[arg-type]
+    assert [b.name for b in out.backups] == ["soc-ai-backup-20260716-0215.tar.gz"]
+    assert out.backups[0].size_bytes == 5
+    assert out.blocklist_files == 1
+    assert out.blocklists_refreshed is not None
+
+
 def test_notifications_include_recent_completions(client: TestClient) -> None:
     """The bell must list what it counts: completed investigations and hunts
     from the last 24h, not just in-flight runs — a badge over an empty panel
@@ -2010,6 +2183,49 @@ def test_notifications_include_recent_completions(client: TestClient) -> None:
     assert f"hunt-done:{hunt_id}" in by_id
     assert "2 findings" in by_id[f"hunt-done:{hunt_id}"]["title"]
     assert by_id[f"hunt-done:{hunt_id}"]["href"] == f"/hunts/{hunt_id}"
+
+
+def test_notifications_window_uses_finished_at_for_both_halves(client: TestClient) -> None:
+    """The bell's 24h completions window is defined by finished_at for BOTH
+    investigations AND hunts (notifications-window-two-clocks).
+
+    A long-queued run CREATED >24h ago (backlog, long budget) that COMPLETED
+    inside the window must still appear — the rendered stamp is finished_at, so
+    the window must be too. The hunts half previously bounded created_at, which
+    silently dropped exactly this row.
+    """
+    import asyncio
+    from datetime import timedelta
+
+    from soc_ai.store import hunts as hunts_svc
+    from soc_ai.store import investigations as inv_svc
+    from soc_ai.store.auth import utcnow
+
+    async def _seed() -> tuple[str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-late", started_by="t", rule_name="ET LATE"
+            )
+            await inv_svc.finalize(db, inv.id, status="complete", verdict="false_positive")
+            hunt = await hunts_svc.create(db, objective="late beacon sweep", started_by="t")
+            await hunts_svc.finalize(
+                db, hunt.id, status="complete", report={"findings": [{"title": "f1"}]}
+            )
+            # Created long before the 24h window; finished just inside it.
+            old = utcnow() - timedelta(hours=30)
+            recent = utcnow() - timedelta(minutes=20)
+            irow = await db.get(type(inv), inv.id)
+            irow.created_at, irow.finished_at = old, recent
+            hrow = await db.get(type(hunt), hunt.id)
+            hrow.created_at, hrow.finished_at = old, recent
+            await db.commit()
+            return inv.id, hunt.id
+
+    inv_id, hunt_id = asyncio.run(_seed())
+    by_id = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    assert f"inv-done:{inv_id}" in by_id  # created outside, finished inside → shown
+    assert f"hunt-done:{hunt_id}" in by_id
 
 
 def test_build_actions_explains_pending_ack_after_auto_ack_skip() -> None:
@@ -2950,6 +3166,68 @@ def test_chat_thread_surfaces_verdict_proposal(client: TestClient) -> None:
     assert prop[0]["token"] == "tk"
 
 
+def test_chat_msg_out_carries_every_proposal_kind() -> None:
+    """One serializer, one registry of proposal kinds.
+
+    ``_chat_msg_out`` used to hard-code ``verdict_proposal``, so the Dashboard's
+    hunt proposal serialized with ``kind``, ``messageId`` and ``proposal`` all
+    None — a proposal card the analyst never saw — and the general-chat routes
+    grew a second serializer to fill them back in. Gating on the shared set
+    makes the next proposal kind a one-line registration instead of a third copy.
+    """
+    from soc_ai.api.webui._timeline import PROPOSAL_KINDS, _chat_msg_out
+
+    assert {"verdict_proposal", "hunt_proposal"} <= PROPOSAL_KINDS
+    for kind in PROPOSAL_KINDS:
+        out = _chat_msg_out(
+            SimpleNamespace(
+                id=41,
+                role="assistant",
+                content="text",
+                meta={"kind": kind, "proposal": {"objective": "sweep"}},
+            )
+        )
+        assert out.kind == kind, kind
+        assert out.messageId == 41, kind
+        assert out.proposal == {"objective": "sweep"}, kind
+
+
+def test_chat_msg_out_leaves_a_plain_answer_uncarded() -> None:
+    """An ordinary reply must offer no Apply/Start control: no kind, no row id."""
+    from soc_ai.api.webui._timeline import _chat_msg_out
+
+    out = _chat_msg_out(
+        SimpleNamespace(
+            id=42, role="assistant", content="3 datasets", meta={"tools": ["t_field_values"]}
+        )
+    )
+    assert out.kind is None
+    assert out.messageId is None
+    assert out.proposal is None
+    assert out.tools == "t_field_values"
+
+
+def test_general_chat_names_are_on_the_legacy_patch_surface() -> None:
+    """Every route function and helper is re-exported from the package and from
+    the ``webui_api`` shim. A name missing from that surface still ROUTES (the
+    module is imported for its decorator side effects), so the omission is
+    invisible until a test patches it — and that patch silently no-ops against
+    the real handler."""
+    from soc_ai.api import webui, webui_api
+
+    for name in (
+        "get_general_chat",
+        "post_general_chat",
+        "clear_general_chat",
+        "_thread_key_for",
+        "PROPOSAL_KINDS",
+    ):
+        assert hasattr(webui, name), f"soc_ai.api.webui.{name}"
+        assert name in webui.__all__, f"soc_ai.api.webui.__all__: {name}"
+        assert hasattr(webui_api, name), f"soc_ai.api.webui_api.{name}"
+        assert name in webui_api.__all__, f"soc_ai.api.webui_api.__all__: {name}"
+
+
 def test_investigation_chat_rejects_second_turn_while_pending(client: TestClient) -> None:
     """A 2nd POST while a prior turn's assistant is still pending → 409 chat_busy,
     so we never orphan a duplicate pending assistant row or spawn a duplicate agent
@@ -3852,8 +4130,11 @@ def test_representative_no_events_returns_404(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
-def test_representative_no_ip_falls_back_to_newest(client: TestClient) -> None:
-    """When no events have IPs, the fallback is the globally newest event."""
+def test_representative_no_ip_picks_newest_and_counts_the_whole_group(
+    client: TestClient,
+) -> None:
+    """A group with no flow at all still picks the newest event — and now reports
+    how many events that shape covers instead of a hardcoded 1."""
     from soc_ai.webui.alerts_query import AlertEvent
 
     ev1 = AlertEvent(
@@ -3885,7 +4166,62 @@ def test_representative_no_ip_falls_back_to_newest(client: TestClient) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["alert_id"] == "ev-no-ip-new"
-    assert "newest overall" in body["reason"]
+    assert body["matched"] == 2
+    assert body["total"] == 2
+    # The rationale must not invent a flow for a detection that observed none.
+    assert "no network flow" in body["reason"].lower()
+    assert "→" not in body["reason"]
+
+
+def test_representative_prefers_the_dominant_no_ip_shape(client: TestClient) -> None:
+    """A host-shaped group with ONE stray flow event must not elect that stray.
+
+    Excluding no-IP events from the modal count made a single flow-bearing event
+    the "most representative" of a 5-to-1 host-shaped cluster, so the hunt the
+    operator launched from the group investigated the outlier.
+    """
+    from soc_ai.webui.alerts_query import AlertEvent
+
+    host_events = [
+        AlertEvent(
+            es_id=f"ev-host-{i}",
+            timestamp=f"2026-08-07T01:0{i}:00Z",
+            src="—",
+            dst="—",
+            severity="high",
+            host="test-ubuntu24",
+            host_ip="192.168.10.150",
+        )
+        for i in range(5)
+    ]
+    stray_flow = AlertEvent(
+        es_id="ev-stray-flow",
+        timestamp="2026-08-07T01:09:00Z",  # newest overall, but a minority shape
+        src="10.0.0.1",
+        dst="10.0.0.2",
+        severity="high",
+        host="wks-1",
+        src_ip="10.0.0.1",
+        dst_ip="10.0.0.2",
+        dst_port=443,
+    )
+
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_group_events",
+        AsyncMock(return_value=[*host_events, stray_flow]),
+    ):
+        resp = client.get(
+            "/api/v1/alerts/representative",
+            params={"rule_name": "Potential Exploitation of CVE-2024-3094", "range": "24h"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["alert_id"] == "ev-host-4"  # newest of the dominant no-flow shape
+    assert body["matched"] == 5
+    assert body["total"] == 6
+    assert body["src_ip"] is None
+    assert body["dst_ip"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -3913,7 +4249,7 @@ def test_investigations_list_chat_count(client: TestClient) -> None:
 
     inv_id = asyncio.run(_seed())
     body = client.get("/api/v1/investigations").json()
-    row = next((r for r in body if r["id"] == inv_id), None)
+    row = next((r for r in body["rows"] if r["id"] == inv_id), None)
     assert row is not None, "seeded investigation not found in list"
     # 1 user + 1 assistant = 2 done messages
     assert row["chatCount"] == 2
@@ -6072,3 +6408,131 @@ def test_spa_hashed_assets_keep_default_caching(spa_client: TestClient) -> None:
     assert resp.status_code == 200
     assert "cache-control" not in resp.headers
     assert "etag" in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/dossiers/sweep-health — the non-admin sweep-health projection
+# ---------------------------------------------------------------------------
+#
+# The full status (GET /dossiers/refresh) is admin-gated because last_summary
+# carries the sweep's raw failure strings. Before this route existed a
+# non-admin had NO sweep record at all, and the Hosts / host-page empty states
+# fell back to "the sweep hasn't run yet" over a sweep that ran and died — the
+# false all-clear, served to the role least able to check. These tests pin the
+# projection's two contracts: it says enough (running / degraded / last_run /
+# error count), and it says NOTHING else.
+
+
+def _dossier_sweep_status(client: TestClient) -> Any:
+    from soc_ai.api.webui.routes_dossier import _get_dossier_status
+
+    return _get_dossier_status(client.app.state)
+
+
+def test_sweep_health_is_a_closed_projection_with_no_error_strings(client: TestClient) -> None:
+    """THE security assertion, whole-body and exhaustive rather than spot-checked.
+
+    The route exists to disclose a degraded sweep to a non-privileged caller
+    WITHOUT the failure strings the admin gate protects (index names, query
+    text, whatever an exception said about the estate). Asserting the entire
+    response equal to a four-key literal means a fifth field added later fails
+    here and forces the boundary decision to be made out loud."""
+    status = _dossier_sweep_status(client)
+    status.running = False
+    status.last_run = "2026-08-14T02:00:00+00:00"
+    status.last_summary = {
+        "hosts_built": 0,
+        "fields_written": 0,
+        "errors": [
+            "census pass: ConnectionError querying logs-*",
+            "host 192.0.2.10: search_phase_execution_exception on logs-*",
+        ],
+        "notes": ["census truncated at the 500-host cap"],
+    }
+    resp = client.get("/api/v1/dossiers/sweep-health")
+    assert resp.status_code == 200
+    # The whole body, field by field — not `"errors" not in body`.
+    assert resp.json() == {
+        "running": False,
+        "degraded": True,
+        "last_run": "2026-08-14T02:00:00+00:00",
+        "error_count": 2,
+    }
+    # Byte-level: no failure string, index pattern, counter or note leaks in
+    # any spelling or nesting.
+    for fragment in ("ConnectionError", "logs-", "census", "hosts_built", "notes", "truncated"):
+        assert fragment not in resp.text, fragment
+
+
+def test_sweep_health_fresh_install_reads_as_not_run(client: TestClient) -> None:
+    """The control: no record is not a record of failure. A healthy fresh
+    install must keep the genuine first-run empty state, so the projection must
+    not degrade an estate nothing has ever swept."""
+    resp = client.get("/api/v1/dossiers/sweep-health")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "running": False,
+        "degraded": False,
+        "last_run": None,
+        "error_count": 0,
+    }
+
+
+def test_sweep_health_reports_a_running_sweep(client: TestClient) -> None:
+    """A sweep in flight supersedes the last one's verdict client-side, so the
+    projection has to carry `running` — it is the one state where waiting is
+    the right thing for the reader to do."""
+    status = _dossier_sweep_status(client)
+    status.running = True
+    try:
+        body = client.get("/api/v1/dossiers/sweep-health").json()
+        assert body["running"] is True
+        assert body["degraded"] is False
+    finally:
+        status.running = False
+
+
+def test_sweep_health_degraded_keys_off_error_strings_only(client: TestClient) -> None:
+    """`degraded` mirrors the client's own guard (lib/sweepErrors.ts): the
+    `errors` list and nothing else. Zero counts are a settled estate, `notes`
+    are what a HEALTHY run reports, a non-list is an unrecognised shape and not
+    evidence of trouble, and only string entries count."""
+    status = _dossier_sweep_status(client)
+    status.last_run = "2026-08-14T02:00:00+00:00"
+    cases: list[tuple[dict[str, Any] | None, int]] = [
+        ({"hosts_built": 0, "fields_written": 0, "errors": []}, 0),
+        ({"errors": "refresh failed; see server logs"}, 0),
+        ({"errors": [7, "one real error"]}, 1),
+        ({"notes": ["census truncated at the 500-host cap"]}, 0),
+        (None, 0),
+    ]
+    for summary, expected in cases:
+        status.last_summary = summary
+        body = client.get("/api/v1/dossiers/sweep-health").json()
+        assert body["error_count"] == expected, summary
+        assert body["degraded"] is (expected > 0), summary
+
+
+def test_sweep_health_readable_by_an_analyst_while_the_full_status_stays_admin(
+    settings_kratos: Settings,
+) -> None:
+    """The access decision this route IS: an analyst may read the projection,
+    an anonymous caller may not, and the FULL status keeps its admin gate — the
+    projection must never become the argument for loosening it."""
+    from soc_ai.store.auth import SESSION_COOKIE
+
+    for client in _auth_client(settings_kratos):
+        # Not an open endpoint: unauthenticated is refused.
+        assert client.get("/api/v1/dossiers/sweep-health").status_code in (401, 403)
+
+        token = asyncio.run(_seed_user_session(client, username="ana", role="analyst"))
+        client.cookies.set(SESSION_COOKIE, token)
+        headers = {"Origin": "http://testserver"}
+
+        resp = client.get("/api/v1/dossiers/sweep-health", headers=headers)
+        assert resp.status_code == 200
+        assert set(resp.json()) == {"running", "degraded", "last_run", "error_count"}
+
+        full = client.get("/api/v1/dossiers/refresh", headers=headers)
+        assert full.status_code == 403
+        assert full.json()["detail"]["reason"] == "admin_required"

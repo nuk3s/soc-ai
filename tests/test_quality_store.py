@@ -8,6 +8,8 @@ migrated to head. Uses the ``settings_kratos`` fixture, which the autouse
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from soc_ai.config import Settings
 from soc_ai.store import quality as quality_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
@@ -59,6 +61,17 @@ async def test_migration_creates_quality_snapshots_table(settings_kratos: Settin
             "batch_dir",
             "alarmed",
             "alarm_reasons",
+            # 0026: the counts behind agreement_rate. NULL on pre-0026 rows —
+            # "never recorded" is not "nothing agreed".
+            "n_yes",
+            "n_partial",
+            "n_no",
+            "n_classified",
+            # 0027: the alarm's IDENTITY and how long it has held. Without
+            # these the alarm has no memory and re-fires every run a condition
+            # persists (prod rows 9/10/11 — one condition, three pages).
+            "alarm_key",
+            "alarm_since",
         } <= cols
     await engine.dispose()
 
@@ -90,6 +103,58 @@ async def test_nullable_metrics_round_trip_as_null(settings_kratos: Settings) ->
         got = (await quality_svc.recent_snapshots(db))[0]
         assert got.agreement_rate is None
         assert got.fallback_rate is None
+    await engine.dispose()
+
+
+async def test_grade_counts_round_trip_and_default_to_null(settings_kratos: Settings) -> None:
+    """The detector tests counts, not rates, so they have to survive the write.
+    A caller that passes none leaves NULLs, which is the sentinel the detector
+    reads as "pre-0026 row, fall back to the median rule"."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await quality_svc.insert_snapshot(
+            db,
+            **_snapshot_kwargs(  # type: ignore[arg-type]
+                agreement_rate=0.6, n_yes=3, n_partial=1, n_no=1, n_classified=5
+            ),
+        )
+        counted = (await quality_svc.recent_snapshots(db))[0]
+        assert (counted.n_yes, counted.n_partial, counted.n_no) == (3, 1, 1)
+        assert counted.n_classified == 5
+
+        await quality_svc.insert_snapshot(db, **_snapshot_kwargs())  # type: ignore[arg-type]
+        legacy = (await quality_svc.recent_snapshots(db))[0]
+        assert legacy.n_yes is None
+        assert legacy.n_classified is None
+    await engine.dispose()
+
+
+async def test_alarm_identity_round_trips_and_defaults_to_null(settings_kratos: Settings) -> None:
+    """The key is what the next run compares against to decide whether anyone is
+    told, and ``alarm_since`` is what the card reads to say "ongoing since" —
+    both have to survive the write. A caller that passes neither (every pre-0027
+    row, and every clean point) leaves NULLs: "no condition recorded" is not
+    "the condition started at epoch"."""
+    engine, maker = await _db(settings_kratos)
+    since = datetime(2026, 8, 6, 2, 17, 0)
+    async with maker() as db:
+        await quality_svc.insert_snapshot(
+            db,
+            **_snapshot_kwargs(  # type: ignore[arg-type]
+                alarmed=True,
+                alarm_reasons=["agreement_rate 0.80 is more than 0.15 below the median 1.00"],
+                alarm_key="agreement_drop",
+                alarm_since=since,
+            ),
+        )
+        alarmed = (await quality_svc.recent_snapshots(db))[0]
+        assert alarmed.alarm_key == "agreement_drop"
+        assert alarmed.alarm_since == since
+
+        await quality_svc.insert_snapshot(db, **_snapshot_kwargs())  # type: ignore[arg-type]
+        clean = (await quality_svc.recent_snapshots(db))[0]
+        assert clean.alarm_key is None
+        assert clean.alarm_since is None
     await engine.dispose()
 
 

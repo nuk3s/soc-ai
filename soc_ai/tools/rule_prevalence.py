@@ -1,7 +1,7 @@
 """``rule_prevalence`` tool — base-rate / noisiness oracle for a detection rule.
 
 The investigator (and analyst) constantly need one piece of context the alert
-itself never carries: *how often does THIS rule fire across the estate?* A rule
+itself never carries: *how often does THIS rule fire across the network?* A rule
 that fires thousands of times a day on this network is almost certainly tuned
 poorly or matching benign-here traffic — its next hit is weak evidence. A rule
 that has NEVER fired before is the opposite: the very first firing is notable and
@@ -14,7 +14,7 @@ What it derives for one rule name over a lookback window:
 
 - ``total_fires`` — how many ``suricata.alert`` docs matched the rule name.
 - ``distinct_src_hosts`` / ``distinct_dest_hosts`` — cardinality of the source /
-  destination IPs the rule fired on (a rule firing across the whole estate is
+  destination IPs the rule fired on (a rule firing across the whole network is
   noise; one firing on a single host pair is focused).
 - ``first_seen`` / ``last_seen`` — the span the rule has been active in the window.
 - ``fires_per_day`` — ``total_fires`` normalised over the lookback window.
@@ -61,7 +61,7 @@ _DATASET = "suricata.alert"
 
 # noisiness thresholds, in fires-per-day over the lookback window. Deliberately
 # coarse — this is a hint to weight the evidence, not a verdict. A rule firing
-# tens of times a day across the estate is background noise here; a rule firing
+# tens of times a day across the network is background noise here; a rule firing
 # a handful of times is occasional; less than ~once a day is rare; zero is the
 # special "first-seen" bucket (its very next firing is the notable one).
 _NOISY_PER_DAY = 10.0
@@ -134,7 +134,7 @@ def _agg_time(agg: dict[str, Any] | None) -> str | None:
 
 
 def _classify_noisiness(total_fires: int, fires_per_day: float, distinct_hosts: int) -> str:
-    """Bucket a rule by how often AND how broadly it fires across the estate.
+    """Bucket a rule by how often AND how broadly it fires across the network.
 
     ``first-seen`` is reserved for a rule that has NOT fired in the window — its
     next firing is the notable one. ``noisy`` (background nuisance — a firing is
@@ -178,7 +178,7 @@ def _empty_result(rule_name: str, lookback_days: int) -> dict[str, Any]:
 @tool(
     read_only=True,
     description=(
-        "Base-rate / noisiness of a Suricata detection rule across the estate:"
+        "Base-rate / noisiness of a Suricata detection rule across the network:"
         " is it noisy (fires constantly -> a firing is weak evidence here) or"
         " rare/first-seen (a firing is notable)? Returns total_fires,"
         " distinct src/dest hosts, first/last seen, fires_per_day, noisiness."
@@ -191,7 +191,7 @@ async def rule_prevalence(
     settings: Settings,
     lookback_days: int = 30,
 ) -> dict[str, Any]:
-    """How prevalent is a detection rule across the estate over a lookback window?
+    """How prevalent is a detection rule across the network over a lookback window?
 
     Answers: is this rule *noisy* (fires constantly across many hosts → its next
     firing is likely benign HERE and weak evidence) or *rare / first-seen* (a
@@ -275,7 +275,7 @@ async def rule_prevalence(
     last_seen = _agg_time(aggregations.get("last_seen"))
 
     # Normalise volume over the FULL lookback window (not the observed span): the
-    # question is "how often does this fire on this estate", and a rule that fired
+    # question is "how often does this fire on this network", and a rule that fired
     # 100 times in one hour 20 days ago is still rare across a 30-day window.
     fires_per_day = round(total_fires / lookback_days, 3)
     noisiness = _classify_noisiness(total_fires, fires_per_day, max(distinct_src, distinct_dest))

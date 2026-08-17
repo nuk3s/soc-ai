@@ -41,6 +41,82 @@ def test_build_filter_rejects_non_whitelisted_field(settings_kratos: Settings) -
         aq.build_filter(settings_kratos, time_range="24h", severity=None, oql="_internal_nope:1")
 
 
+def test_build_filter_rejects_non_iso_abs_range(settings_kratos: Settings) -> None:
+    """A non-ISO absolute range (raw junk, or ES date-math like ``now-100y``) is
+    rejected in build_filter as an OqlValidationError.
+
+    abs_from/abs_to went verbatim into an ES ``range`` with no format check, so a
+    bad value made ES 400 — and a ``BadRequestError`` is an ApiError, not a
+    TransportError, so it escaped the route handler as a 500. Rejecting here maps
+    it to a clean 400 via the routes' existing OqlValidationError handler.
+    """
+    with pytest.raises(OqlValidationError):
+        aq.build_filter(
+            settings_kratos,
+            time_range="24h",
+            severity=None,
+            oql=None,
+            abs_from="lol",
+            abs_to="lol",
+        )
+    with pytest.raises(OqlValidationError):
+        aq.build_filter(
+            settings_kratos,
+            time_range="24h",
+            severity=None,
+            oql=None,
+            abs_from="now-100y",
+            abs_to="now",
+        )
+
+
+def _abs_ts_range(q: dict[str, Any]) -> dict[str, Any]:
+    for f in q["bool"]["filter"]:
+        rng = f.get("range", {})
+        if "@timestamp" in rng:
+            return rng["@timestamp"]  # type: ignore[no-any-return]
+    raise AssertionError("no @timestamp range in filter")
+
+
+def test_build_filter_abs_range_within_window_passes_through(settings_kratos: Settings) -> None:
+    """An in-window absolute range is passed through verbatim (with time_zone)."""
+    q = aq.build_filter(
+        settings_kratos,
+        time_range="24h",
+        severity=None,
+        oql=None,
+        abs_from="2026-08-01T00:00:00Z",
+        abs_to="2026-08-05T00:00:00Z",
+        time_zone="UTC",
+    )
+    assert _abs_ts_range(q) == {
+        "gte": "2026-08-01T00:00:00Z",
+        "lte": "2026-08-05T00:00:00Z",
+        "time_zone": "UTC",
+    }
+
+
+def test_build_filter_clamps_oversized_abs_span(settings_kratos: Settings) -> None:
+    """A century-wide absolute range is clamped to the max window so a stale
+    bookmark can't issue an unbounded aggregation across the shared grid."""
+    from datetime import datetime
+
+    q = aq.build_filter(
+        settings_kratos,
+        time_range="24h",
+        severity=None,
+        oql=None,
+        abs_from="1926-01-01T00:00:00Z",
+        abs_to="2026-01-01T00:00:00Z",
+    )
+    ts = _abs_ts_range(q)
+    assert ts["lte"] == "2026-01-01T00:00:00Z"  # upper bound preserved
+    assert ts["gte"] != "1926-01-01T00:00:00Z"  # lower bound pulled up
+    lo = datetime.fromisoformat(ts["gte"].replace("Z", "+00:00"))
+    hi = datetime.fromisoformat(ts["lte"].replace("Z", "+00:00"))
+    assert (hi - lo).days <= 366  # retained span is at most the max window
+
+
 def _fake_elastic(payload: dict[str, Any]) -> AsyncMock:
     elastic = AsyncMock()
     elastic.search.return_value = EsSearchResult(
@@ -255,6 +331,105 @@ async def test_fetch_group_events(settings_kratos: Settings) -> None:
     # rule.name term filter was added
     query = elastic.search.call_args.args[1]
     assert {"term": {"rule.name": "ET SCAN thing"}} in query["bool"]["filter"]
+
+
+# ── host-shaped detections: the machine lives under event_data ──────────────
+#
+# Shape taken from a live Security Onion 3.x doc (logs-detections.alerts-so,
+# rule "Potential Exploitation of CVE-2024-3094 - Suspicious SSH Child
+# Process"): the whole originating endpoint document is nested under
+# `event_data`, so there is NO top-level host.* and NO source/destination at
+# all. All 27 sigma.alert docs in the prod window matched this shape.
+HOST_SHAPED_HITS = {
+    "total": 1,
+    "hits": [
+        {
+            "_id": "sigma-host-1",
+            "_source": {
+                "@timestamp": "2026-08-07T01:10:37.000Z",
+                "sigma_level": "high",
+                "rule": {"name": "Potential Exploitation of CVE-2024-3094"},
+                "event": {"dataset": "sigma.alert", "severity_label": "high"},
+                "event_data": {
+                    "host": {"name": "test-ubuntu24", "os": {"type": "linux"}},
+                    "metadata": {"input": {"beats": {"host": {"ip": "192.168.10.150"}}}},
+                },
+            },
+        }
+    ],
+}
+
+
+async def test_fetch_group_events_host_falls_back_to_nested_event_data(
+    settings_kratos: Settings,
+) -> None:
+    """A host-shaped Sigma detection must name its machine, not show "—".
+
+    Reading only top-level ``host.name`` left AlertEvent.host as the em-dash
+    placeholder for every endpoint/process detection — the Host column was blank
+    for exactly the class SO's host-log shipping is growing.
+    """
+    elastic = _fake_elastic(HOST_SHAPED_HITS)
+    events = await aq.fetch_group_events(
+        elastic, settings_kratos, rule_name="Potential Exploitation of CVE-2024-3094"
+    )
+    assert events[0].host == "test-ubuntu24"
+
+
+async def test_fetch_group_events_top_level_host_name_still_wins(
+    settings_kratos: Settings,
+) -> None:
+    """Top-level ``host.name`` keeps precedence over the nested fallback.
+
+    On a Suricata alert host.name is the SENSOR name and the grid is read that
+    way; the nested endpoint document is only consulted when there is no
+    top-level host at all.
+    """
+    hit = {
+        "_id": "both-1",
+        "_source": {
+            "@timestamp": "2026-08-07T01:10:37.000Z",
+            "host": {"name": "so-sensor-1"},
+            "event_data": {"host": {"name": "test-ubuntu24"}},
+            "event": {"dataset": "suricata.alert", "severity_label": "high"},
+        },
+    }
+    elastic = _fake_elastic({"total": 1, "hits": [hit]})
+    events = await aq.fetch_group_events(elastic, settings_kratos, rule_name="ET SENSOR")
+    assert events[0].host == "so-sensor-1"
+
+
+async def test_fetch_group_events_host_ip_is_not_a_flow_endpoint(
+    settings_kratos: Settings,
+) -> None:
+    """The endpoint agent's address rides ``host_ip`` — NEVER src_ip/dst_ip.
+
+    src_ip/dst_ip mean FLOW endpoints and are the cluster key the sweep planner
+    and the pair-inheritance lookups key on. Feeding an agent address into them
+    would invent a flow that was never observed and desync that key from the
+    investigation the recorder writes for these alerts (which carries no flow at
+    all), so every sweep would miss its own prior verdict.
+    """
+    elastic = _fake_elastic(HOST_SHAPED_HITS)
+    events = await aq.fetch_group_events(
+        elastic, settings_kratos, rule_name="Potential Exploitation of CVE-2024-3094"
+    )
+    ev = events[0]
+    assert ev.host_ip == "192.168.10.150"
+    assert ev.src_ip is None
+    assert ev.dst_ip is None
+    assert ev.src == "—"
+    assert ev.dst == "—"
+
+
+async def test_fetch_group_events_host_ip_none_without_an_agent_address(
+    settings_kratos: Settings,
+) -> None:
+    """A flow-shaped alert has no endpoint agent — host_ip stays None rather than
+    borrowing one of the flow endpoints."""
+    elastic = _fake_elastic(FLAT_HITS)
+    events = await aq.fetch_group_events(elastic, settings_kratos, rule_name="ET SCAN thing")
+    assert events[0].host_ip is None
 
 
 def test_build_filter_star_base_skips_base_query(settings_kratos: Settings) -> None:

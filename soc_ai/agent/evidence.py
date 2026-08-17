@@ -173,6 +173,23 @@ def _loop_evidence_marker(
     return None
 
 
+# Tools whose result is soc-ai's own INFERENCE, not an observation — available to
+# the agent as context, never as the thing that unlocks a settled verdict.
+#
+# `t_host_dossier` returns conclusions ("hypervisor, 0.9, from behavioural
+# signals") drawn by an earlier build job from telemetry the host itself can
+# influence: the name it announces over DHCP, the banner it serves. Its payload is
+# dense with truthy, non-bookkeeping keys, so :func:`_targeted_result_has_data`
+# reads it as discriminating data and one dossier call was enough to satisfy the
+# hard evidence gate — a one-call route to a confident true_positive /
+# false_positive having observed nothing this run. That is the failure this
+# project has fought repeatedly (the QVOD zero-tool verdict; the fabricated
+# `auth.success` of 2026-08-05): inference presented as observation. Excluded here
+# rather than by sniffing the payload shape, because the shape is the dossier's
+# API and would drift; the tool name is the contract.
+NON_EVIDENTIAL_TOOLS = frozenset({"t_host_dossier"})
+
+
 # Keys on a tool result that are bookkeeping / classification flags, NOT gathered
 # evidence — a result carrying only these did not discriminate anything.
 _NON_EVIDENCE_RESULT_KEYS = frozenset(
@@ -209,6 +226,10 @@ def _targeted_result_has_data(result: Any) -> bool:
     data iff it carries ANY truthy value under a key that is not a bookkeeping /
     classification flag. Search-shaped results (``total``/``hits``) are judged on
     hit count so a zero-hit query is correctly empty.
+
+    Content-only, deliberately: it cannot tell an OBSERVATION from an INFERENCE
+    that happens to be richly populated. Whether the tool observes anything at all
+    is decided by name, ahead of this call — see :data:`NON_EVIDENTIAL_TOOLS`.
     """
     if not isinstance(result, dict) or result.get("error"):
         return False
@@ -229,10 +250,12 @@ def count_successful_tool_calls(messages: list[Any] | None) -> int:
     gathered new evidence. Nor does an empty-but-non-error result (a zero-hit OQL
     query, a clean-internal enrich): it made a call but discovered nothing, so it
     is held to the same discriminating-data standard as the Phase-D path
-    (:func:`_targeted_result_has_data`). Counting returns (not call parts)
-    sidesteps the fragile call/return pairing by ``tool_call_id``. Returns 0 for
-    None/empty. This is the signal behind the hard evidence gate: did the agent
-    actually investigate, or just reason over prefetch?
+    (:func:`_targeted_result_has_data`). Nor does a return from a tool in
+    :data:`NON_EVIDENTIAL_TOOLS`, whose content is soc-ai's own inference rather
+    than an observation. Counting returns (not call parts) sidesteps the fragile
+    call/return pairing by ``tool_call_id``. Returns 0 for None/empty. This is the
+    signal behind the hard evidence gate: did the agent actually investigate, or
+    just reason over prefetch?
     """
     if not messages:
         return 0
@@ -248,6 +271,11 @@ def count_successful_tool_calls(messages: list[Any] | None) -> int:
             # verdict would score >=1 and skip the downgrade). Only an actual tool
             # RESULT is evidence.
             if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
+                continue
+            # A result that is soc-ai's own inference is context, not evidence —
+            # see NON_EVIDENTIAL_TOOLS. Dropped before the content tests because
+            # a found dossier passes them all: it is data, just not OBSERVED data.
+            if getattr(part, "tool_name", None) in NON_EVIDENTIAL_TOOLS:
                 continue
             c = part.content
             if c is None:

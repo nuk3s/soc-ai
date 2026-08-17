@@ -6,6 +6,8 @@ import asyncio
 import logging
 from typing import Annotated, Any
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -14,6 +16,7 @@ from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._shared import (
     router,
 )
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
@@ -80,11 +83,19 @@ async def _ack_many(
     return acked, failed
 
 
+# The OQL filter box parses synchronously (lark) on the event loop, and neither
+# parse_oql nor validate_oql caps length or clause count — a 30k-term OR body
+# (~630 KB) is ~1 s of uninterruptible CPU that the sibling asyncio.timeout
+# guards cannot preempt. Cap the field so an oversized body is rejected at
+# validation before the parse runs. Mirrors the sibling ``_ES_ID`` annotation.
+_OQL_Q = Annotated[str, Field(max_length=2048)]
+
+
 class AckGroupIn(BaseModel):
     rule_name: str
     kind: str = "suricata"
     range: str = aq.DEFAULT_RANGE
-    q: str | None = None
+    q: _OQL_Q | None = None
     severity: str | None = None
     from_: str | None = None
     to: str | None = None
@@ -111,30 +122,41 @@ async def ack_group(
     Fetches up to ``_ACK_CAP`` events matching the rule+filters and calls
     ``ack_alert`` for each via the write-tool path.  Returns counts of
     successes, failures, and whether the cap was hit.
+
+    The grid read is guarded and bounded like its sibling ``GET /alerts/events``,
+    and it runs BEFORE any write: a failed fetch acknowledges nothing, so the
+    503 can never arrive on top of a partial ack that a retry would double.
     """
     caller = await identify_caller(request)
     try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=body.rule_name,
-            kind=body.kind,
-            time_range=body.range,
-            severity=body.severity,
-            oql=body.q,
-            # Fetch one past the cap to detect overflow, but never above the
-            # fetch clamp (aq.MAX_EVENTS) — else the extra hit is dropped and
-            # ``capped`` can never trip (F21).
-            size=min(_ACK_CAP + 1, aq.MAX_EVENTS),
-            abs_from=body.from_,
-            abs_to=body.to,
-            time_zone=settings.so_timezone,
-            hide_acked=True,
-        )
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            events = await aq.fetch_group_events(
+                elastic,
+                settings,
+                rule_name=body.rule_name,
+                kind=body.kind,
+                time_range=body.range,
+                severity=body.severity,
+                oql=body.q,
+                # Fetch one past the cap to detect overflow, but never above the
+                # fetch clamp (aq.MAX_EVENTS) — else the extra hit is dropped and
+                # ``capped`` can never trip (F21).
+                size=min(_ACK_CAP + 1, aq.MAX_EVENTS),
+                abs_from=body.from_,
+                abs_to=body.to,
+                time_zone=settings.so_timezone,
+                hide_acked=True,
+            )
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
         ) from exc
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        # An ES ApiError is NOT a TransportError — without this arm an ES 4xx
+        # still escapes the tuple above as an unhandled 500.
+        raise _es_api_error_http(exc) from exc
 
     capped = len(events) > _ACK_CAP
     events = events[:_ACK_CAP]
@@ -243,27 +265,35 @@ async def escalate_group(
     ``fetch_group_events`` filters. Each matching event opens a case via the
     ``escalate_to_case`` write tool; ``_ESCALATE_CAP`` bounds the number of
     cases so a group escalate can never spray hundreds.
+
+    Same guarded, bounded, read-before-write shape as :func:`ack_group`: a failed
+    fetch opens no cases, so the 503 is never a report on a half-done escalate.
     """
     caller = await identify_caller(request)
     try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=body.rule_name,
-            kind=body.kind,
-            time_range=body.range,
-            severity=body.severity,
-            oql=body.q,
-            size=_ESCALATE_CAP + 1,  # fetch one extra to detect capping
-            abs_from=body.from_,
-            abs_to=body.to,
-            time_zone=settings.so_timezone,
-            hide_acked=True,
-        )
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            events = await aq.fetch_group_events(
+                elastic,
+                settings,
+                rule_name=body.rule_name,
+                kind=body.kind,
+                time_range=body.range,
+                severity=body.severity,
+                oql=body.q,
+                size=_ESCALATE_CAP + 1,  # fetch one extra to detect capping
+                abs_from=body.from_,
+                abs_to=body.to,
+                time_zone=settings.so_timezone,
+                hide_acked=True,
+            )
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
         ) from exc
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
 
     capped = len(events) > _ESCALATE_CAP
     events = events[:_ESCALATE_CAP]

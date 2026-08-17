@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from elastic_transport import ConnectionError as EsConnectionError
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.so_client.inventory import (
     _clear_cache,
@@ -27,7 +28,7 @@ class _FakeES:
     async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
         self.calls.append({"index": index, "query": query, **kwargs})
         if self._raise:
-            raise RuntimeError("es down")
+            raise EsConnectionError("connection refused")
         return EsSearchResult(
             total=self._total,
             took_ms=1,
@@ -98,11 +99,32 @@ async def test_discover_datasets_caches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discover_datasets_best_effort_on_error() -> None:
+async def test_discover_datasets_propagates_grid_errors() -> None:
+    """G7: an outage must NOT return an empty-looking inventory.
+
+    A returned empty `GridInventory` is indistinguishable from a grid that
+    genuinely carries no datasets, which is how a hiccup told analysts their
+    network has no DNS or endpoint telemetry. Callers fail soft on their own
+    terms (the hunt-template route reports every template available, the
+    dossier reads an empty set as "unknown"); they can only do that if the
+    error reaches them.
+    """
     _clear_cache()
     es = _FakeES(None, raise_exc=True)
+    with pytest.raises(EsConnectionError):
+        await discover_datasets(es, _settings())
+
+
+@pytest.mark.asyncio
+async def test_discover_datasets_does_not_cache_a_failure() -> None:
+    """A failed discovery leaves the cache empty, so the next call re-reads."""
+    _clear_cache()
+    es = _FakeES(_AGG, total=1, raise_exc=True)
+    with pytest.raises(EsConnectionError):
+        await discover_datasets(es, _settings())
+    es._raise = False
     inv = await discover_datasets(es, _settings())
-    assert inv.datasets == ()  # never raises; empty inventory
+    assert "zeek.ssh" in inv.dataset_names()
 
 
 def test_format_inventory_block_lists_all_datasets() -> None:

@@ -1,5 +1,6 @@
-import { AlertTriangle, RotateCw } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, RotateCw, SearchX } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
+import { Link } from 'react-router-dom';
 
 /** Spinner — the 2px ring with a transparent top, as used throughout. */
 export function Spinner({ size = 15, color = '#4b8bf5' }: { size?: number; color?: string }) {
@@ -69,9 +70,81 @@ export function ErrorState({
   );
 }
 
-export function EmptyState({ children }: { children: ReactNode }) {
+/**
+ * The id asked for isn't there — a calm answer, not an incident.
+ *
+ * Deliberately NOT the ErrorState: an unknown investigation/hunt/host id used
+ * to render the same alarm-red "Couldn't load this view" card as a real outage,
+ * so the analyst could not tell "this run doesn't exist" from "the grid is
+ * down" (dogfood B3, 2026-08-11). Neutral chrome, and no Retry — retrying a
+ * 404 just fails again. The way out is the list it came from.
+ */
+export function NotFoundState({
+  what,
+  id,
+  backTo,
+  backLabel,
+}: {
+  what: string;
+  id?: string;
+  backTo: string;
+  backLabel: string;
+}) {
   return (
-    <div className="px-4 py-10 text-center text-[13px] text-faint">{children}</div>
+    <div className="flex flex-col items-center gap-2 rounded-card border border-border bg-surface-1 px-4 py-8 text-center">
+      <span className="text-faint">
+        <SearchX size={20} />
+      </span>
+      <div className="text-[13.5px] font-semibold text-text-2">No such {what}</div>
+      <div className="max-w-[460px] text-[12.5px] leading-[1.6] text-faint">
+        {id ? (
+          <>
+            Nothing here answers to <span className="font-mono text-dim">{id}</span>. It may have
+            been deleted, or the link may be mistyped.
+          </>
+        ) : (
+          <>It may have been deleted, or the link may be mistyped.</>
+        )}
+      </div>
+      <Link
+        to={backTo}
+        className="mt-1 flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-text-2 hover:border-accent hover:text-text"
+      >
+        <ArrowLeft size={12} /> {backLabel}
+      </Link>
+    </div>
+  );
+}
+
+/**
+ * Nothing to show — said in the shape that gets the operator somewhere.
+ *
+ * `title` is the headline, the children are the explainer, `action` is the one
+ * thing to do next. Hosts and Hunts had built that shape by hand; Investigations
+ * had a bare "No investigations yet." and no way forward, which is the same
+ * screen telling a new operator nothing (dogfood B1). All three now pass the
+ * parts and get one look. A caller that passes only children still renders
+ * exactly the plain centred line it always did.
+ */
+export function EmptyState({
+  title,
+  action,
+  children,
+}: {
+  title?: ReactNode;
+  action?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="px-4 py-10 text-center text-[13px] text-faint">
+      <div className="mx-auto max-w-[520px]">
+        {title && <div className="text-[13.5px] font-semibold text-text-2">{title}</div>}
+        {children && (
+          <div className={'leading-[1.6]' + (title ? ' mt-1.5 text-dim' : '')}>{children}</div>
+        )}
+        {action && <div className="mt-3 flex justify-center">{action}</div>}
+      </div>
+    </div>
   );
 }
 
@@ -110,18 +183,46 @@ export function Freshness({ at, className = '' }: { at: number | null; className
 }
 
 /**
- * Degraded marker shown when a surface's background polls have failed enough to
- * be stale (failCount >= 2). The last-good data stays on screen; this says so,
- * with the time it's from and a manual retry.
+ * Degraded marker for a surface still showing its last-good data, in the two
+ * ways that happens.
+ *
+ * `reason="stale"` (the default) is the background case: polls have failed
+ * enough times to count (failCount >= 2) and the next one is already coming, so
+ * the copy says "retrying".
+ *
+ * `reason="refresh-failed"` is the FOREGROUND case — the analyst asked for
+ * fresh data, or a route param changed, and the request failed. The detail
+ * screens keep their content through that (deliberately: an error arriving
+ * after the report is on screen must not take it away), which left nothing at
+ * all on screen to say the refresh had failed, so the analyst read stale data
+ * believing it current.
+ *
+ * `retrying` is a fact about the surface, not about which of the two cases this
+ * is: a screen that polls on an interval goes on polling right through a failed
+ * click, and the next tick will heal the page with nobody doing anything. Copy
+ * that dropped the retry promise there would send the analyst off to fix
+ * something that is already fixing itself; copy that kept it on a screen with
+ * no poll (a finished investigation, a host page) would promise a retry that is
+ * never coming. The callers know which they are, so they say.
+ *
+ * One component for all of it because they are one message to the reader ("what
+ * you are looking at is from earlier") and a second banner shape would just be
+ * a second thing to learn.
  */
 export function StaleNotice({
   since,
   onRefresh,
   className = '',
+  reason = 'stale',
+  retrying = false,
 }: {
   since: number | null;
   onRefresh: () => void;
   className?: string;
+  reason?: 'stale' | 'refresh-failed';
+  /** Is something still polling underneath? Only read for `refresh-failed`;
+   *  the background case is a failing poll loop, which by definition is. */
+  retrying?: boolean;
 }) {
   const t = since ? new Date(since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
   return (
@@ -130,7 +231,11 @@ export function StaleNotice({
       className={`flex items-center gap-2 rounded-control border-l-2 border-warn bg-[rgba(245,166,35,.08)] px-3 py-1.5 text-[12px] text-warn ${className}`}
     >
       <AlertTriangle size={13} className="flex-none" />
-      <span>Showing data from {t} — retrying</span>
+      <span>
+        {reason === 'refresh-failed'
+          ? `Refresh failed — still showing data from ${t}${retrying ? ' — retrying' : ''}`
+          : `Showing data from ${t} — retrying`}
+      </span>
       <button
         onClick={onRefresh}
         className="ml-auto flex items-center gap-1 rounded-control border border-[rgba(245,166,35,.4)] px-2 py-0.5 text-[11px] font-semibold hover:bg-[rgba(245,166,35,.15)]"

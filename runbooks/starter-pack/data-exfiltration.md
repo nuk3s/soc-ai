@@ -34,7 +34,7 @@ prior 7 days:
   instances of the same product — the domain often differs only in the
   tenant path or subdomain. "It went to a well-known cloud service" is not
   a dismissal; consumer file-sharing services are a top exfil channel.
-- Rare destinations: first-seen-for-the-estate upload endpoints, direct-to-
+- Rare destinations: first-seen-for-the-network upload endpoints, direct-to-
   IP uploads, and residential/VPS ASNs deserve escalation weight.
 - Protocol mismatch: FTP/SCP/rsync from hosts that never used them, or
   HTTPS POSTs to a host that isn't a web app the org uses.

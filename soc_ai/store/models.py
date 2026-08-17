@@ -68,10 +68,16 @@ class ApiToken(Base):
 
 class Investigation(Base):
     __tablename__ = "investigations"
-    # Composite similarity index created by migration 0003. Declared here so the
-    # ORM metadata matches the DB — otherwise `alembic revision --autogenerate`
-    # would propose DROPPING the index it can't see in the model.
-    __table_args__ = (Index("ix_investigations_similarity", "rule_name", "src_ip", "dest_ip"),)
+    # Composite similarity index created by migration 0003; the (status,
+    # created_at) index by migration 0028 (it serves the /notifications
+    # status-filtered created_at scan, query_page's ORDER BY, and
+    # reap_stale_running). Declared here so the ORM metadata matches the DB —
+    # otherwise `alembic revision --autogenerate` would propose DROPPING an index
+    # it can't see in the model.
+    __table_args__ = (
+        Index("ix_investigations_similarity", "rule_name", "src_ip", "dest_ip"),
+        Index("ix_investigations_status_created", "status", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
     alert_es_id: Mapped[str] = mapped_column(String(128), index=True)
@@ -92,6 +98,13 @@ class Investigation(Base):
     # the Dashboard's "N pipeline errors" KPI; the row itself stays a fallback
     # (the flag is history, the ack is presentation). Migration 0021.
     error_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Persisted twin of ``is_pipeline_fallback(report)`` — stamped at
+    # finalize/resolve (this module writes the report in both places) and
+    # backfilled by migration 0028. Lets ``query_page`` aggregate the fallback /
+    # true-positive counts over the whole filter set on each 10s poll WITHOUT a
+    # per-row ``json_extract`` over every report blob. NULL only on legacy /
+    # not-yet-finalized rows, which ``.isnot(True)`` treats as not-a-fallback.
+    is_fallback: Mapped[bool | None] = mapped_column(Boolean, default=None)
 
 
 class InvestigationEvent(Base):
@@ -117,6 +130,10 @@ class Hunt(Base):
     """
 
     __tablename__ = "hunts"
+    # (status, created_at) composite from migration 0028 — serves the
+    # /notifications completed-hunt scan and previous_completed_run. Declared so
+    # the ORM metadata matches the DB (see the Investigation note).
+    __table_args__ = (Index("ix_hunts_status_created", "status", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
     objective: Mapped[str] = mapped_column(Text)
@@ -130,6 +147,11 @@ class Hunt(Base):
     status: Mapped[str] = mapped_column(String(16), default="running")
     narrative: Mapped[str | None] = mapped_column(Text, default=None)
     report: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)  # HuntReport
+    # Persisted ``len(report["findings"])`` — stamped at finalize, backfilled by
+    # migration 0028. Lets the /notifications bell show a hunt's finding count
+    # without deserializing its report blob. NULL only on legacy / unfinished
+    # rows (rendered as 0).
+    findings_count: Mapped[int | None] = mapped_column(Integer, default=None)
     started_by: Mapped[str] = mapped_column(String(64), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
@@ -470,9 +492,12 @@ class QualitySnapshot(Base):
       latency) that need no oracle.
 
     ``alarmed``/``alarm_reasons`` persist the regression-detector outcome for
-    THIS point (vs the trailing same-mode median — see
+    THIS point (vs the trailing same-mode history — see
     :func:`soc_ai.eval.quality.detect_regression`) so the Quality card can
-    flag the latest run without re-deriving the rule client-side. The table is
+    flag the latest run without re-deriving the rule client-side, and
+    ``alarm_key``/``alarm_since`` say WHICH condition it is and how long it has
+    held, which is what lets the writer alarm on the transition into a
+    condition instead of on every run that re-observes it. The table is
     pruned to the newest 90 rows on every insert (~3 months of nightlies) —
     a trend, not an archive; the full batch artifacts live on disk at
     ``batch_dir``.
@@ -492,6 +517,23 @@ class QualitySnapshot(Base):
     # (is_pipeline_fallback) — infra noise, not model reasoning. NULL when no
     # run succeeded (no denominator).
     fallback_rate: Mapped[float | None] = mapped_column(Float, default=None)
+    # The grade counts BEHIND agreement_rate (migration 0026). A rate with no
+    # denominator can't be significance-tested and can't be explained: at the
+    # default n=5 an agreement_rate is quantised to 0.2 steps, so comparing one
+    # to a median of other rates fires on ordinary sampling noise (the false
+    # alarm of 2026-08-07). The detector pools THESE across the trailing
+    # history instead. They also carry the honesty the rate can't: ``partial``
+    # ("right verdict, thin reasoning") sits in the rate's denominator but not
+    # its numerator, so 3 yes + 2 partial and 3 yes + 2 no are both 0.60.
+    # NULL on pre-0026 rows — "never recorded" is not "nothing agreed", and
+    # the detector keys its median fallback on exactly that NULL.
+    n_yes: Mapped[int | None] = mapped_column(Integer, default=None)
+    n_partial: Mapped[int | None] = mapped_column(Integer, default=None)
+    n_no: Mapped[int | None] = mapped_column(Integer, default=None)
+    # yes + partial + no. Persisted rather than derived because it is the
+    # denominator the detector reads, and `unknown` critiques (counted in n_ok,
+    # never in the rate) must not be able to creep into it later.
+    n_classified: Mapped[int | None] = mapped_column(Integer, default=None)
     error_rate: Mapped[float] = mapped_column(Float, default=0.0)
     # {"true_positive": 2, "false_positive": 3, ...} over the OK runs — the
     # verdict-distribution-drift signal for local mode.
@@ -502,6 +544,19 @@ class QualitySnapshot(Base):
     alarmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     # Human-readable detector reasons (JSON list of strings); NULL when clean.
     alarm_reasons: Mapped[list[str] | None] = mapped_column(JSON, default=None)
+    # The alarm's IDENTITY (migration 0027): the rule codes that fired, sorted
+    # and joined ("agreement_drop", "agreement_drop+error_ceiling"). NULL when
+    # clean, and NULL on pre-0027 rows. The reasons above cannot serve as an
+    # identity — each embeds the run's live numbers, so one unchanged condition
+    # reads as a different string every night, which is why every re-observation
+    # of it paged (rows 9/10/11 of prod's own trend: one condition, three
+    # alarms, 27 hours). The writer fires side effects only when this changes.
+    alarm_key: Mapped[str | None] = mapped_column(Text, default=None)
+    # When the CURRENT condition started: carried forward from the previous
+    # same-mode snapshot while the key is unchanged, re-stamped when it changes.
+    # Stored rather than derived because the history it would be derived from is
+    # pruned to 90 rows. NULL whenever alarm_key is.
+    alarm_since: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
 
 
 class ModelBatteryResult(Base):
@@ -525,3 +580,260 @@ class ModelBatteryResult(Base):
     # the fitness timestamp and vice versa. Nullable: rows created by either path.
     fitness_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
     fitness_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+
+class HostDossier(Base):
+    """One internal host the network sweep knows about (migration 0024).
+
+    The dossier answers "what IS this host?" durably, so an investigation can
+    weigh *what the host is* alongside what it did. This row is the per-host
+    header — identity lifetime, build bookkeeping — while the beliefs themselves
+    live one per field in :class:`HostDossierField`.
+
+    Keyed on the **IP**, not on a MAC or a hostname. On a network-only grid
+    (which is what most deployments are) the majority of hosts never emit DHCP
+    or NTLM, so a MAC/hostname key would leave half the network unkeyed — and it
+    is the IP that the alert joins on, and the IP whose egress-guard label the
+    prompt block has to collapse onto. ``host_key`` is stored separately from
+    ``ip`` so re-keying on a stable per-machine identifier later is a data
+    backfill rather than a schema rewrite.
+
+    The cost of an IP key is that an address outlives the machine behind it.
+    That is mitigated rather than designed away: ``identity_fingerprint`` hashes
+    the hostname+MAC seen at the last build, and ``identity_rebound_at`` is
+    stamped when it changes from one non-null value to a *different* non-null
+    value — the tripwire that tells an operator "the machine behind this address
+    appears to have changed; your override may no longer apply".
+
+    ``first_seen`` is MONOTONE: a build over a narrower window must widen it, never
+    reset it. ``last_built_at`` is the staleness sort key the sweep orders by, so
+    a network larger than one run's budget is drained across runs from durable
+    state instead of a cursor that a restart would lose.
+    """
+
+    __tablename__ = "host_dossier"
+    __table_args__ = (
+        # Unique INDEX rather than a bare constraint: this is both the identity
+        # guarantee and the lookup path (`GET /dossiers/{ip}` and the per-alert
+        # prompt block both fetch by key).
+        Index("uq_host_dossier_host_key", "host_key", unique=True),
+        Index("ix_host_dossier_ip", "ip"),
+        Index("ix_host_dossier_last_built_at", "last_built_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # v1: the normalized IP string. Named for what it IS (the key) so a future
+    # MAC/hostname key needs no rename.
+    host_key: Mapped[str] = mapped_column(String(64))
+    ip: Mapped[str] = mapped_column(String(64))
+    # Lifetime across ALL builds: min(stored, observed) / max(stored, observed).
+    first_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # When a build last COMPLETED for this host (NULL = never built, and
+    # therefore first in the staleness queue).
+    last_built_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Newest event @timestamp inside the last build window — distinct from
+    # last_built_at, which is about the builder rather than the host.
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    event_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # sha256(hostname + "|" + mac)[:32] as of the last build.
+    identity_fingerprint: Mapped[str | None] = mapped_column(String(64), default=None)
+    identity_rebound_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Last per-host failure, NULL on success. A host that fails to build keeps
+    # its previous beliefs and reports why the refresh didn't happen.
+    build_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class HostDossierField(Base):
+    """One belief about one host, in two physically separate lanes.
+
+    **There is no ``value`` column, and that is the design.** The inference lane
+    (``inferred_*``) is written only by the builder; the operator lane
+    (``operator_*``) only by an explicit override. The effective value is
+    computed at read time by ``soc_ai.dossier.resolve``, so an operator's
+    override cannot be clobbered by a rebuild — there is nothing for a rebuild
+    to clobber.
+
+    The alternative — store the effective value and have the builder skip
+    overridden fields — is the ``InternalIdentifier.dismissed`` trap: skipping
+    stops the system recording what it currently believes, which makes "prod the
+    operator when the evidence keeps disagreeing" impossible to implement. Here
+    an override suppresses **effect**, never **observation**. The builder keeps
+    writing what it sees into the inference lane forever, and the disagreement
+    that accumulates in the ``conflict_*`` columns is what eventually earns a
+    single, rate-limited prod.
+
+    ``inferred_evidence`` is keyed BY SOURCE (``{"banner": {...},
+    "telemetry": {...}}``) so a stronger signal arriving later refines the value
+    without erasing the weaker belief that supported it — the same reason
+    ``host_summary`` keeps both sides of an OS disagreement.
+
+    ``inferred_last_run_at`` records the last build that *evaluated* this field
+    even when it concluded nothing, which is what lets the resolver distinguish
+    "still true" from "nobody has looked in three days". ``inferred_retracted_at``
+    marks the opposite case: a build that found no evidence for a value it used
+    to hold, which nulls ``inferred_value`` in the same write rather than leaving
+    a fact standing on evidence that has gone.
+
+    Conflict state is persisted rather than held in memory because the prod
+    interval is measured in weeks and a restart must not reset the clock (or
+    re-fire the prod).
+    """
+
+    __tablename__ = "host_dossier_field"
+    __table_args__ = (
+        UniqueConstraint("dossier_id", "field", name="uq_host_dossier_field"),
+        Index("ix_host_dossier_field_dossier_id", "dossier_id"),
+        # GET /dossiers/conflicts scans for open disagreements across the network.
+        Index("ix_host_dossier_field_conflict", "conflict_first_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dossier_id: Mapped[int] = mapped_column(
+        ForeignKey("host_dossier.id", ondelete="CASCADE"),
+    )
+    # One of soc_ai.dossier.types.DOSSIER_FIELDS.
+    field: Mapped[str] = mapped_column(String(32))
+
+    # --- inference lane: written ONLY by upsert_inferred() ---
+    inferred_value: Mapped[str | None] = mapped_column(Text, default=None)
+    # Structured payload for services_offered / activity_profile /
+    # management_plane, which a scalar cannot carry.
+    inferred_value_json: Mapped[Any | None] = mapped_column(JSON, default=None)
+    inferred_confidence: Mapped[float | None] = mapped_column(Float, default=None)
+    # Provenance ladder rung — see soc_ai.dossier.types.PROVENANCE_LADDER.
+    inferred_source: Mapped[str | None] = mapped_column(String(16), default=None)
+    inferred_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    inferred_first_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    inferred_last_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    inferred_last_run_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    inferred_retracted_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+    # --- operator lane: written ONLY by set_override() / clear_override() ---
+    operator_value: Mapped[str | None] = mapped_column(Text, default=None)
+    operator_value_json: Mapped[Any | None] = mapped_column(JSON, default=None)
+    operator_set_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    operator_actor: Mapped[str | None] = mapped_column(String(64), default=None)
+    operator_note: Mapped[str | None] = mapped_column(Text, default=None)
+
+    # --- conflict / prod state ---
+    # 'mismatch' | 'retracted' | 'rebound'
+    conflict_kind: Mapped[str | None] = mapped_column(String(16), default=None)
+    # NULL whenever the two lanes agree; set on the build that first disagrees.
+    conflict_first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Consecutive DISAGREEING builds — the "continued evidence" gate that stops
+    # one anomalous sweep from nagging an operator.
+    conflict_observations: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    conflict_last_prompted_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Never reset — history, and the notification cycle id, so dismissing one
+    # prod does not hide the next.
+    conflict_prompt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    conflict_snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+
+class DossierRun(Base):
+    """One network sweep: the durable last-run stamp plus its counters.
+
+    Durable because the discovery job's equivalent (``_DiscoveryStatus.last_scan``)
+    lives on ``app.state`` and its due-check treats ``None`` as due — so a restart
+    loop re-sweeps the whole network every boot. The row is written on **every**
+    sweep, including one that found nothing: gating the stamp on "did some work"
+    is what made auto-triage re-run full ES planning every 60 seconds, and a
+    stable network finds nothing new almost every time.
+
+    Pruned to the newest 50 rows at the end of each run — an operations trail,
+    not an archive.
+    """
+
+    __tablename__ = "dossier_run"
+    __table_args__ = (Index("ix_dossier_run_started_at", "started_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime())
+    # NULL while the sweep is in flight, or if the process died mid-run.
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    trigger: Mapped[str] = mapped_column(String(16))  # 'schedule' | 'manual' | 'inline'
+    hosts_seen: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    hosts_built: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    fields_written: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    conflicts_detected: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    conflicts_prompted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Per-host failures collected during the sweep; NULL on a clean run.
+    errors: Mapped[list[str] | None] = mapped_column(JSON, default=None)
+    # Advisory notes from a healthy sweep — a truncated cap, a cadence ceiling.
+    # Kept in their own column so a run that hit zero failures still reads as
+    # clean (errors NULL) while the caps it ran into stay visible: folding these
+    # into `errors` made every nightly sweep report a nonzero error count.
+    notes: Mapped[list[str] | None] = mapped_column(JSON, default=None)
+
+
+class GeneralChatMessage(Base):
+    """One message in the dashboard's general chat — a rolling thread per analyst.
+
+    Column-for-column :class:`ChatMessage` with ``investigation_id`` swapped for
+    ``thread_key``, and that is the point: the API serializes both through the
+    same ``ChatThreadOut`` shape, so the SPA's chat transport does not have to
+    learn a second wire format. A merge of the two stores later should be a
+    rename.
+
+    ``thread_key`` is the caller string ``identify_caller`` produces (the same
+    actor value ``started_by`` records) — one durable thread per analyst, no
+    thread list, no naming. There is no FK: the thread outlives any row it could
+    point at, including the user account being renamed.
+
+    ``status`` runs pending → done|error exactly as investigation chat does, and
+    for the same reason: the answer is written by a background task the UI polls.
+    Unlike investigation chat, completed turns are NOT projected into
+    ``chat_memory`` — see :mod:`soc_ai.store.general_chat`.
+    """
+
+    __tablename__ = "general_chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_key: Mapped[str] = mapped_column(String(64), index=True)
+    role: Mapped[str] = mapped_column(String(16))  # "user" | "assistant"
+    content: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="done")  # pending|done|error
+    meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+
+
+class SavedView(Base):
+    """One analyst's named filter set for one list screen.
+
+    Server-side rather than ``localStorage`` by the owner's explicit choice, so
+    a view an analyst builds at one workstation is there at the next one. That
+    is also what makes ``user_id`` load-bearing: every read and every delete is
+    scoped by it, so a view belongs to exactly one person and is invisible —
+    not merely forbidden — to everyone else.
+
+    ``query_json`` is the screen's own filter state, opaque to the backend. The
+    four list screens disagree about what a filter IS (a verdict multi-select, a
+    role string, an OQL clause), and a column per facet would have to be
+    migrated every time one of them grew a control. The screen that wrote a view
+    is the screen that reads it, and it is the only thing that has to understand
+    the shape.
+
+    ``(user_id, screen, name)`` is unique: saving "Beacons" twice updates the
+    filters instead of growing a second identical chip.
+    """
+
+    __tablename__ = "saved_view"
+    __table_args__ = (
+        UniqueConstraint("user_id", "screen", "name", name="uq_saved_view_name"),
+        Index("ix_saved_view_user_screen", "user_id", "screen"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The view dies with the account — a filter set has no meaning without the
+    # analyst it belongs to, and an orphan row would be unreachable anyway.
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # One of soc_ai.store.saved_views.SAVED_VIEW_SCREENS.
+    screen: Mapped[str] = mapped_column(String(32))
+    name: Mapped[str] = mapped_column(String(64))
+    query_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())

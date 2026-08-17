@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from typing import get_args
+from datetime import datetime, timedelta
+from typing import Any, get_args
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,14 +14,17 @@ from soc_ai.agent.orchestrator import InvestigationContext
 from soc_ai.agent.targeted_investigator import _dispatch_table
 from soc_ai.agent.toolset import PHASE_D_TOOLS, register_read_tools
 from soc_ai.config import Settings
+from soc_ai.store.models import HostDossier, HostDossierField
 from soc_ai.triage_models import TargetedGap
 
 from tests.test_tool_surface import INVESTIGATOR_EXPECTED, _all_flags_on
 
 
-def _agent_with(role: str, settings: Settings) -> Agent:
+def _agent_with(role: str, settings: Settings, **ctx_kwargs: Any) -> Agent:
     agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
-    ctx = InvestigationContext(settings=settings, auth=AsyncMock(), elastic=AsyncMock())
+    ctx = InvestigationContext(
+        settings=settings, auth=AsyncMock(), elastic=AsyncMock(), **ctx_kwargs
+    )
     register_read_tools(agent, ctx, role=role)  # type: ignore[arg-type]
     return agent
 
@@ -108,3 +112,217 @@ async def test_dedup_wrapping_runs_through_registered_tool(settings_kratos: Sett
     assert second["duplicate_call"] is True
     assert second["tool_name"] == "t_query_cases"
     assert "hint" in second
+
+
+# ---------------------------------------------------------------------------
+# t_host_dossier — the durable asset record, read from the local store
+# ---------------------------------------------------------------------------
+
+
+class _FakeSession:
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+def _sessionmaker() -> Any:
+    return _FakeSession
+
+
+def _dossier_settings(settings: Settings, *, enabled: bool = True) -> Settings:
+    return settings.model_copy(update={"dossier_enabled": enabled})
+
+
+def _stored() -> tuple[HostDossier, list[HostDossierField]]:
+    """A host the sweep called a hypervisor and an operator called critical."""
+    now = datetime.now().replace(microsecond=0)
+    host = HostDossier(
+        host_key="192.168.10.202",
+        ip="192.168.10.202",
+        first_seen=now - timedelta(days=65),
+        last_seen=now - timedelta(minutes=3),
+        event_count=3412,
+    )
+    rows = [
+        HostDossierField(
+            field="role",
+            inferred_value="hypervisor",
+            inferred_confidence=0.9,
+            inferred_source="behaviour",
+            inferred_last_run_at=now - timedelta(hours=1),
+            inferred_evidence={"behaviour": {"strings": ["responds on tcp/8006 (from behaviour)"]}},
+        ),
+        HostDossierField(
+            field="criticality",
+            operator_value="high",
+            operator_actor="analyst",
+            operator_set_at=now - timedelta(days=5),
+            # The builder keeps observing an overridden field; the tool must
+            # report both lanes so the model can see what is being suppressed.
+            inferred_value="medium",
+            inferred_confidence=0.9,
+            inferred_source="behaviour",
+            inferred_last_run_at=now - timedelta(hours=1),
+        ),
+    ]
+    return host, rows
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_reports_operator_and_inferred_lanes(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from soc_ai.store import host_dossier as store
+
+    async def _get(db: object, ip: str) -> tuple[HostDossier, list[HostDossierField]] | None:
+        return _stored() if ip == "192.168.10.202" else None
+
+    monkeypatch.setattr(store, "get_dossier", _get)
+    agent = _agent_with(
+        "investigator", _dossier_settings(settings_kratos), db_sessionmaker=_sessionmaker()
+    )
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip="192.168.10.202")
+
+    assert result["found"] is True
+    role = result["fields"]["role"]
+    assert role["value"] == "hypervisor"
+    assert role["source"] == "behaviour"
+    assert role["strength"] == "strong"
+    crit = result["fields"]["criticality"]
+    assert crit["value"] == "high"
+    assert crit["source"] == "operator"
+    assert crit["operator_actor"] == "analyst"
+    # An override suppresses effect, never observation.
+    assert crit["inferred_value"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_absence_is_an_answer(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "No dossier" must not read as "nothing notable about this host"."""
+    from soc_ai.store import host_dossier as store
+
+    async def _none(db: object, ip: str) -> None:
+        return None
+
+    monkeypatch.setattr(store, "get_dossier", _none)
+    agent = _agent_with("chat", _dossier_settings(settings_kratos), db_sessionmaker=_sessionmaker())
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip="8.8.8.8")
+
+    assert result["found"] is False
+    assert "not evidence" in result["note"].lower()
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_disabled_answers_instead_of_vanishing(
+    settings_kratos: Settings,
+) -> None:
+    """Registered even when off: an unregistered tool leaves the model guessing,
+    and a local-DB read is not worth a registration gate."""
+    agent = _agent_with(
+        "hunt",
+        _dossier_settings(settings_kratos, enabled=False),
+        db_sessionmaker=_sessionmaker(),
+    )
+    assert "t_host_dossier" in _names(agent)
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip="192.168.10.202")
+    assert result == {"available": False, "reason": "host dossier disabled"}
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_without_a_database_says_so(settings_kratos: Settings) -> None:
+    agent = _agent_with("investigator", _dossier_settings(settings_kratos))
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip="192.168.10.202")
+    assert result["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_dedups_and_survives_a_store_failure(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from soc_ai.store import host_dossier as store
+
+    async def _get(db: object, ip: str) -> tuple[HostDossier, list[HostDossierField]] | None:
+        return _stored()
+
+    monkeypatch.setattr(store, "get_dossier", _get)
+    agent = _agent_with(
+        "investigator", _dossier_settings(settings_kratos), db_sessionmaker=_sessionmaker()
+    )
+    tool = agent._function_toolset.tools["t_host_dossier"].function
+    assert (await tool(ip="192.168.10.202"))["found"] is True
+    assert (await tool(ip="192.168.10.202"))["duplicate_call"] is True
+
+    async def _boom(db: object, ip: str) -> None:
+        raise RuntimeError("no such table: host_dossier")
+
+    monkeypatch.setattr(store, "get_dossier", _boom)
+    failed = await tool(ip="192.168.10.7")
+    assert failed["error"] is True
+    assert failed["type"] == "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Egress-tool identifier threading (finding search-guard-ignores-db-identifiers)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_egress_tool_idents_prefers_preseeded(settings_kratos: Settings) -> None:
+    """The orchestrator pre-seeds the set it already resolved for EgressGuard; the
+    helper returns it without a second DB round-trip."""
+    from soc_ai.agent.toolset import _egress_tool_idents
+
+    ctx = InvestigationContext(settings=settings_kratos, auth=AsyncMock(), elastic=AsyncMock())
+    ctx.effective_internal_suffixes = (".discovered.example",)
+    ctx.effective_internal_hosts = ("jumpbox",)
+    ctx._egress_idents_resolved = True
+    sfx, hosts = await _egress_tool_idents(ctx)
+    assert sfx == (".discovered.example",)
+    assert hosts == ("jumpbox",)
+
+
+@pytest.mark.asyncio
+async def test_egress_tool_idents_none_without_db(settings_kratos: Settings) -> None:
+    """No DB session ⇒ (None, None): the tool guard falls back to raw settings."""
+    from soc_ai.agent.toolset import _egress_tool_idents
+
+    ctx = InvestigationContext(
+        settings=settings_kratos, auth=AsyncMock(), elastic=AsyncMock(), db_sessionmaker=None
+    )
+    sfx, hosts = await _egress_tool_idents(ctx)
+    assert sfx is None and hosts is None
+    assert ctx._egress_idents_resolved is True
+
+
+@pytest.mark.asyncio
+async def test_web_search_closure_threads_effective_idents(
+    settings_kratos: Settings, monkeypatch: Any
+) -> None:
+    """The t_web_search closure passes the ctx's effective identifier sets through
+    to web_search (the actual egress guard input)."""
+    captured: dict[str, Any] = {}
+
+    async def _fake_web_search(
+        query: str, *, settings: Any, suffixes: Any = None, extra_hosts: Any = None
+    ) -> dict[str, Any]:
+        captured["suffixes"] = suffixes
+        captured["extra_hosts"] = extra_hosts
+        return {"ok": True}
+
+    monkeypatch.setattr("soc_ai.agent.toolset.web_search", _fake_web_search)
+    agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+    ctx = InvestigationContext(
+        settings=_all_flags_on(settings_kratos), auth=AsyncMock(), elastic=AsyncMock()
+    )
+    ctx.effective_internal_suffixes = (".disc.example",)
+    ctx.effective_internal_hosts = ("jumpbox",)
+    ctx._egress_idents_resolved = True
+    register_read_tools(agent, ctx, role="investigator")
+    fn = agent._function_toolset.tools["t_web_search"].function
+    await fn("some query")
+    assert captured["suffixes"] == (".disc.example",)
+    assert captured["extra_hosts"] == ("jumpbox",)

@@ -3,7 +3,26 @@
 // skew can never exclude a just-created hunt), while a custom range sends both
 // edges. Bounds are inclusive [from, to], matching inRange.
 import { describe, expect, it } from 'vitest';
-import { rangeToSinceUntil } from './timeRange';
+import { ago, rangeToSinceUntil } from './timeRange';
+
+describe('ago', () => {
+  const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+
+  it('answers in the unit a reader is scanning for', () => {
+    expect(ago(at(5_000))).toBe('now');
+    expect(ago(at(8 * 60_000))).toBe('8m ago');
+    expect(ago(at(4 * 3_600_000))).toBe('4h ago');
+    expect(ago(at(3 * 86_400_000))).toBe('3d ago');
+  });
+
+  it('says never for a stamp that is absent, and does not fake one for junk', () => {
+    // Null means the thing has not happened — a host list's "last seen", a KPI
+    // strip's "last swept". Rendering it as a date would invent an event.
+    expect(ago(null)).toBe('never');
+    expect(ago('')).toBe('never');
+    expect(ago('not-a-date')).toBe('—');
+  });
+});
 
 describe('rangeToSinceUntil', () => {
   const now = Date.UTC(2026, 6, 7, 12, 0, 0); // 2026-07-07T12:00:00Z

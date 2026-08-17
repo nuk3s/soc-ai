@@ -68,12 +68,20 @@ def test_residue_gate_ignores_real_newlines_in_values():
     assert not residue_scan(record)
 
 
-def test_residue_gate_still_catches_domain_logon_forms():
-    """A genuine DOMAIN\\user credential form in a value must trip the gate."""
-    record = {"summary": "logon as CORP\\jdoe failed twice"}
+@pytest.mark.parametrize("user", ["jdoe", "nancy", "frank", "bob", "tom", "rick"])
+def test_residue_gate_still_catches_domain_logon_forms(user):
+    """A genuine DOMAIN\\user credential form in a RAW value must trip the gate.
+
+    ``residue_scan`` scans un-serialized values (default RAW mode), where a real
+    down-level logon carries a SINGLE backslash.  The usernames beginning with a
+    JSON escape letter (nancy, frank, bob, tom, rick) are the regression an
+    escape-letter lookahead silently dropped — a real internal credential could
+    then ship to the public demo/GitHub.  All must be caught.
+    """
+    record = {"summary": f"logon as CORP\\{user} failed twice"}
     findings = residue_scan(record)
-    assert findings
-    assert any("jdoe" in f for f in findings)
+    assert findings, user
+    assert any(user in f for f in findings), user
 
 
 def _write_bundle(d: Path, alert_label: str, summary: str, *, with_alert: bool = False) -> Path:

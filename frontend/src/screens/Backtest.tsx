@@ -86,6 +86,26 @@ export function Backtest() {
   const running = !!data?.active;
   activeRef.current = running;
 
+  // A run is `active` from the moment the sampling query goes out — before a
+  // backtest row exists and before there is anything to replay. Rendering that
+  // as "Replaying 0 dispositioned alerts… / 0 / 0 replayed" states a finished
+  // replay of nothing, which is the shape of a clean empty result; against a
+  // grid that answered nothing it read as "there was nothing to compare" rather
+  // than "we were blind". Nothing here can tell those apart, so it claims
+  // neither: it names the phase the run is actually in, and the sampling read's
+  // own outcome (a 503, or the note below) is what says whether the grid
+  // answered.
+  const sampling = running && !data?.backtest_id;
+
+  // What the screen renders below: a stored run (a score, or one that was cut
+  // short), or the empty panel. It matters here because the empty panel is where
+  // the status note used to be shown — and it is the one branch that does NOT
+  // render once the console has history, which is every console after its first
+  // backtest. A run that failed in its sampling read has no results of its own,
+  // so without this its note landed under a completed run's score and was never
+  // drawn: the failure was invisible behind last week's number.
+  const storedRun = !!data && ((!!data.results && data.status === 'complete') || data.status === 'error');
+
   const launch = () => {
     if (starting || running) return;
     setStarting(true);
@@ -189,24 +209,48 @@ export function Backtest() {
       {/* live progress */}
       {running && data && (
         <Panel className="mb-5 p-4">
-          <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-accent">
-            <Loader2 size={15} className="animate-spin" />
-            Replaying {data.total} dispositioned alert{data.total === 1 ? '' : 's'}…
-          </div>
-          <ProgressBar done={data.replayed + data.failed} total={data.total} />
-          <div className="mt-2 text-[12px] text-dim">
-            {data.replayed + data.failed} / {data.total} replayed
-            {data.current && (
-              <span className="text-faint">
-                {' '}
-                · investigating <span className="text-text-2">{data.current}</span>
-              </span>
-            )}
-            {data.failed > 0 && (
-              <span className="text-warn"> · {data.failed} failed</span>
-            )}
-          </div>
+          {sampling ? (
+            <div data-testid="backtest-sampling">
+              <div className="mb-1 flex items-center gap-2 text-[13px] font-semibold text-accent">
+                <Loader2 size={15} className="animate-spin" />
+                Reading Security Onion for alerts your analysts dispositioned…
+              </div>
+              <div className="text-[12px] text-dim">
+                Nothing has been replayed yet — the window is still being sampled.
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-accent">
+                <Loader2 size={15} className="animate-spin" />
+                Replaying {data.total} dispositioned alert{data.total === 1 ? '' : 's'}…
+              </div>
+              <ProgressBar done={data.replayed + data.failed} total={data.total} />
+              <div className="mt-2 text-[12px] text-dim">
+                {data.replayed + data.failed} / {data.total} replayed
+                {data.current && (
+                  <span className="text-faint">
+                    {' '}
+                    · investigating <span className="text-text-2">{data.current}</span>
+                  </span>
+                )}
+                {data.failed > 0 && (
+                  <span className="text-warn"> · {data.failed} failed</span>
+                )}
+              </div>
+            </>
+          )}
         </Panel>
+      )}
+
+      {/* The newest attempt's outcome, when what follows is an OLDER run. */}
+      {!running && storedRun && data?.note && (
+        <div
+          data-testid="backtest-note"
+          className="mb-3 rounded-card border border-border bg-surface-2 px-4 py-2.5 text-[12px] text-warn"
+        >
+          {data.note}
+        </div>
       )}
 
       {/* results / errors / empty */}
@@ -215,15 +259,15 @@ export function Backtest() {
       ) : data?.results && data.status === 'complete' ? (
         <Results data={data} />
       ) : data?.status === 'error' ? (
-        <Panel className="p-6 text-center text-[13px] text-danger">
-          The last backtest failed to complete. Check the service logs and try again.
-        </Panel>
+        <InterruptedRun data={data} />
       ) : !running && !loading ? (
-        <Panel className="p-8 text-center text-[13px] text-faint">
-          {data?.note
-            ? data.note
-            : 'No backtest yet. Configure a window above and run one to see how soc-ai’s verdicts compare to your analysts’ real dispositions.'}
-        </Panel>
+        <div data-testid="backtest-empty">
+          <Panel className="p-8 text-center text-[13px] text-faint">
+            {data?.note
+              ? data.note
+              : 'No backtest yet. Configure a window above and run one to see how soc-ai’s verdicts compare to your analysts’ real dispositions.'}
+          </Panel>
+        </div>
       ) : null}
     </div>
   );
@@ -237,6 +281,34 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="text-[11px] uppercase tracking-[.05em] text-dim">{label}</span>
       {children}
     </label>
+  );
+}
+
+/** A backtest that did not finish measuring.
+ *
+ * The report an owner uses to decide whether to adopt the product must never
+ * price an outage as a model regression. A run that lost the grid mid-replay
+ * used to finalize `complete` with every unreadable replay counted as a
+ * disagreement — "soc-ai disagrees with human analysts 90% of the time" when the
+ * truth was the sensor was blind for 18 of 20 replays. Those runs now land as
+ * `error` and stop here: the coverage is stated, the score is not. */
+function InterruptedRun({ data }: { data: BacktestData }) {
+  const c = data.results?.completion;
+  return (
+    <div data-testid="backtest-interrupted">
+      <Panel className="p-6 text-center text-[13px] text-danger">
+        {c
+          ? `This backtest was cut short — only ${c.decided} of ${c.total} replays produced a verdict.`
+          : 'The last backtest failed to complete. Check the service logs and try again.'}
+        {c && (
+          <div className="mt-1.5 text-[12px] text-faint">
+            The remaining {c.no_verdict} could not be replayed, so there is no score to report.
+            That is an infrastructure result, not a measurement of soc-ai — check the grid and run
+            it again.
+          </div>
+        )}
+      </Panel>
+    </div>
   );
 }
 
@@ -264,18 +336,31 @@ function Results({ data }: { data: BacktestData }) {
       {data.finished_at && (
         <div className="mb-3 text-[12px] text-faint">Ran {absTime(data.finished_at)}</div>
       )}
+      {/* Coverage before score. A rate over rows soc-ai never judged is not a
+          statement about soc-ai, so say how many it judged first. */}
+      {r.completion && r.completion.no_verdict > 0 && (
+        <div
+          data-testid="backtest-partial-coverage"
+          className="mb-3 rounded-card border border-border bg-surface-2 px-4 py-2.5 text-[12px] text-warn"
+        >
+          {r.completion.decided} of {r.completion.total} sampled alerts were replayed. The other{' '}
+          {r.completion.no_verdict} produced no verdict and are excluded from the rates below —
+          they are missing coverage, not disagreement.
+        </div>
+      )}
+
       {/* headline metric cards */}
       <div className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
         <MetricCard
           label="Agreement with analysts"
           value={pct(m.agreement_rate)}
-          sub={`${m.counts.agreements} of ${m.counts.total} verdicts matched the human call`}
+          sub={`${m.counts.agreements} of ${m.counts.decided ?? m.counts.total} replayed verdicts matched the human call`}
           color="#4b8bf5"
         />
         <MetricCard
           label="False-positive toil cleared"
           value={pct(m.fp_reduction)}
-          sub={`${m.counts.fp_cleared} of ${m.counts.human_fp} acknowledged alerts soc-ai would auto-clear`}
+          sub={`${m.counts.fp_cleared} of ${m.counts.human_fp_decided ?? m.counts.human_fp} acknowledged alerts soc-ai would auto-clear`}
           color="#3fb950"
         />
         <MissedTpCard missed={missed} humanTp={m.counts.human_tp} rows={r.missed_tp_rows} />

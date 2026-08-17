@@ -166,6 +166,57 @@ def test_domain_regex_ignores_prose_and_filenames() -> None:
     assert a.domains == []
 
 
+def test_domain_regex_scales_linearly_on_dot_dense_text() -> None:
+    """``_DOMAIN`` must not backtrack super-linearly on dot-dense text.
+
+    A model answer can echo a payload_printable / DNS-heavy blob into the
+    narrative; ``extract_artifacts`` runs on the event loop inside the bounded
+    regrounding retry loop, so quadratic cost multiplies per attempt.
+
+    Asserts SCALING, not wall-clock — a stopwatch bound measures the machine and
+    flakes under CPU contention (the class this repo has been burned by).
+    Doubling the input is the load-invariant discriminator: backtracking is
+    super-linear (quadratic gives ~4x) while a bounded pattern is linear (~2x),
+    and both measurements slow together under load so their ratio holds.
+    """
+    import time
+
+    from soc_ai.agent.narrative_grounding import _DOMAIN
+
+    def build(n: int) -> str:
+        return "a." * n + "a" * 100  # dot-dense label run with no valid TLD tail
+
+    def elapsed(payload: str) -> float:
+        start = time.perf_counter()
+        list(_DOMAIN.finditer(payload))
+        return time.perf_counter() - start
+
+    elapsed("ab" * 100)  # warm the compiled pattern before anything is timed
+    single = elapsed(build(10_000))
+    double = elapsed(build(20_000))
+    scaling = double / max(single, 1e-6)
+    assert scaling < 3.0, f"ReDoS: _DOMAIN scaled {scaling:.2f}x on 2x input (linear is 2.0)"
+
+
+def test_domain_regex_matching_semantics_preserved() -> None:
+    """The linear rewrite matches exactly what the old pattern did: the same
+    domains still surface as artifacts, the same non-domains still don't."""
+
+    def domains(text: str) -> list[str]:
+        return extract_artifacts(text).domains
+
+    # Real domains still match (single/multi-label, hyphens, mixed case, wildcard).
+    assert domains("resolved ad.local and wsus.internal") == ["ad.local", "wsus.internal"]
+    assert domains("beacon to foo.corp.example.com now") == ["foo.corp.example.com"]
+    assert domains("hyphen-name.example.co.uk here") == ["hyphen-name.example.co.uk"]
+    assert domains("MixedCase.Example.COM domain") == ["MixedCase.Example.COM"]
+    assert domains("wildcard *.example.com cert") == ["example.com"]
+    # Non-domains still don't (prose fragments, dotted filenames, field paths, IPs).
+    assert domains("e.g. the report.json and main.py were unchanged") == []
+    assert domains("queried zeek.dns and event.dataset fields") == []
+    assert domains("connected to 192.168.1.1 only") == []
+
+
 def test_com_domain_is_extracted_and_flagged() -> None:
     """F03: a fabricated *.com domain — the single most common C2/phishing TLD —
     must be extracted as an artifact and, when ungrounded, flagged. The `.com.`

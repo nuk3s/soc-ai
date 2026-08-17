@@ -90,6 +90,21 @@ never swept (an operator may have activated a legit corp domain) and
 ``manual`` rows are never touched. Counted in ``summary.retired``; fail-soft
 like the rest of the scan. See :func:`_retire_vestigial_rows`.
 
+The third rule is additionally gated on the scan having been able to READ —
+judged PER-SIGNAL, not per-scan: only the four name sub-queries can produce a
+suffix, so the gate asks whether THEY all succeeded and collectively observed
+events (see :class:`_SignalHealth` for the sub-query → identifier-class map).
+When a name sub-query errored (a grid outage, a mapping failure, a failed
+field-resolution probe — the probes CHOOSE the DNS fields for three of the
+four, so a probe that blew up chose them blind) or the name signals scanned
+zero events (an index pattern matching nothing still answers
+200 with nothing), the scan produced no suffixes for reasons that say nothing
+about the estate, so it must not tombstone a pending suggestion — absence of
+evidence is not evidence of absence. A failure confined to the CIDR-discovery
+IP aggregations does NOT suppress retirement: those sub-queries can never
+produce a suffix, so their failure is not missing suffix evidence. The first
+two rules inspect only the stored value and stay unconditional.
+
 Graceful degradation: a missing field / mapping or an ES error on one sub-query
 is caught, recorded in ``summary.errors``, and the scan continues with whatever
 other signal is available. Zero yield is a valid result — never crash the scan.
@@ -105,6 +120,7 @@ import functools
 import ipaddress
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -123,6 +139,28 @@ if TYPE_CHECKING:
     from soc_ai.so_client.elastic import ElasticClient
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _scan_error(what: str, exc: BaseException) -> str:
+    """One operator-facing line for a scan sub-query that failed.
+
+    Deliberately not ``f"{type(exc).__name__}: {exc}"``. These strings are the
+    detail line under the banner on Config → Internal identifiers, and that
+    prefix put a raw exception chain in front of the analyst — doubled, when the
+    message already named its own class ("ApiError: ApiError(429, …)") — while
+    the Hosts sweep banner rendered the same fact as prose (dogfood 2026-08-14,
+    D11). A grid error's message already says what happened; the class name is
+    kept only where the message alone would be meaningless, as a bare KeyError's
+    ``'host.name'`` is.
+    """
+    message = str(exc).strip()
+    name = type(exc).__name__
+    if not message:
+        return f"{what}: {name}"
+    if name.lower() in message.lower() or " " in message:
+        return f"{what}: {message}"
+    return f"{what}: {name}: {message}"
+
 
 # Reserved / special-use TLDs that are never public. A suffix whose right-most
 # label is one of these is "clearly internal" and may auto-activate.
@@ -254,6 +292,54 @@ class _Candidate:
     def merge_sample(self, fqdn: str) -> None:
         if fqdn and fqdn not in self.samples and len(self.samples) < 5:
             self.samples.append(fqdn)
+
+
+@dataclass
+class _SignalHealth:
+    """Read-health of the sub-queries that feed ONE identifier class's evidence.
+
+    THE SUB-QUERY → IDENTIFIER-CLASS MAP (the shape of the per-signal
+    retirement gate):
+
+    * ``suffix`` and ``host`` rows are produced ONLY by the four name signals
+      in :func:`_discover_name_signals` — (a) ``host.name``, (b) PTR answers,
+      (c) forward-resolved records, (d) raw DNS query names. All four ingest
+      into the same suffix/host candidate maps, so if ANY of them failed, a
+      suffix this scan "did not produce" may simply not have been read. The
+      two field-resolution probes that choose the DNS fields for (b)/(c)/(d)
+      belong to this class too: a probe that errored fell back to the ECS
+      default BLIND, and on a legacy ``zeek.*`` grid the aggregations then
+      "succeed" against unmapped fields with zero buckets — a blind read
+      wearing a clean 200 (see :func:`_resolve_scan_field`).
+    * ``cidr`` rows are produced only by the IP-field aggregations in
+      :func:`_discover_cidrs` (``source.ip``/``destination.ip`` volume plus
+      the ``connection.local.*`` corroboration). Those sub-queries can never
+      produce a suffix, so their failures say nothing about a suffix's
+      absence — and no retirement rule exists for CIDR rows at all.
+    * The machine-GUID and junk-host retirement rules read the stored value
+      only; they map to NO sub-queries and run even during a full outage.
+
+    Only the lookup-only-public suffix rule reasons from what the scan
+    produced, so only the NAME class carries a health object today; the CIDR
+    aggregations deliberately do not touch it. Errors still land in
+    ``DiscoverySummary.errors`` for the operator regardless — this object
+    only decides what a failure is allowed to SUPPRESS, never what it reports.
+    """
+
+    errors: int = 0
+    scanned_events: int = 0
+
+    @property
+    def observed_estate(self) -> bool:
+        """True iff this class's sub-queries all succeeded AND saw ≥1 event.
+
+        Both halves are load-bearing: an errored sub-query may be the very one
+        that would have produced the row (half-blind counts as blind), and a
+        clean zero-event read (the ES wrapper's ``ignore_unavailable`` /
+        ``allow_no_indices`` turns an index pattern matching nothing into
+        200-with-nothing) observed nothing at all.
+        """
+        return self.errors == 0 and self.scanned_events > 0
 
 
 _AGG_SIZE = 500  # cap distinct FQDN buckets per query
@@ -651,11 +737,14 @@ async def _aggregate_field(
     query: dict[str, Any],
     field_name: str,
     summary: DiscoverySummary,
+    health: _SignalHealth,
 ) -> list[dict[str, Any]]:
     """Run one terms+cardinality aggregation; return its buckets (or []).
 
     On any ES error / missing-field, records the error in *summary* and returns
-    an empty list so the caller continues with other signal.
+    an empty list so the caller continues with other signal. The outcome is
+    also folded into *health* — the read-health of the identifier class this
+    sub-query feeds (see :class:`_SignalHealth`) — which gates retirement.
     """
     try:
         res = await es_client.search(
@@ -666,10 +755,12 @@ async def _aggregate_field(
             track_total_hits=True,
         )
     except Exception as exc:
-        summary.errors.append(f"{field_name}: {type(exc).__name__}: {exc}")
+        summary.errors.append(_scan_error(field_name, exc))
+        health.errors += 1
         _LOGGER.warning("discovery: aggregation on %s failed: %s", field_name, exc)
         return []
     summary.scanned_events += int(res.total)
+    health.scanned_events += int(res.total)
     aggs = res.aggregations or {}
     cand = aggs.get("candidates") or {}
     buckets = cand.get("buckets") or []
@@ -683,13 +774,15 @@ async def _aggregate_resolved_internal(
     query_field: str,
     resolved_field: str,
     summary: DiscoverySummary,
+    health: _SignalHealth,
 ) -> list[dict[str, Any]]:
     """Run the forward-record aggregation (query name + resolved-IP sub-terms).
 
     Each returned bucket is a DNS query name carrying a ``resolved_ips`` sub-agg
     (and SO's ``registered_domain`` when present). On any ES error / missing
     field, records the error in *summary* and returns ``[]`` so the scan
-    continues (zero yield is valid).
+    continues (zero yield is valid). The outcome also folds into *health*
+    (see :class:`_SignalHealth`), which gates retirement.
     """
     try:
         res = await es_client.search(
@@ -700,10 +793,12 @@ async def _aggregate_resolved_internal(
             track_total_hits=True,
         )
     except Exception as exc:
-        summary.errors.append(f"{query_field}+resolved: {type(exc).__name__}: {exc}")
+        summary.errors.append(_scan_error(f"{query_field}+resolved", exc))
+        health.errors += 1
         _LOGGER.warning("discovery: resolved-internal aggregation failed: %s", exc)
         return []
     summary.scanned_events += int(res.total)
+    health.scanned_events += int(res.total)
     candidates = (res.aggregations or {}).get("candidates") or {}
     return list(candidates.get("buckets") or [])
 
@@ -722,6 +817,11 @@ async def _aggregate_ip_field(
     cluster the keys ourselves). On any ES error / missing field, records the
     error in *summary* and returns ``[]`` so the scan continues (zero yield is
     valid).
+
+    Deliberately takes NO :class:`_SignalHealth`: these sub-queries feed only
+    the ``cidr`` class, which has no grid-gated retirement rule, so their
+    failure must not suppress the (name-signal-gated) public-suffix
+    retirement. It stays loud in ``summary.errors`` either way.
     """
     try:
         res = await es_client.search(
@@ -732,7 +832,7 @@ async def _aggregate_ip_field(
             track_total_hits=True,
         )
     except Exception as exc:
-        summary.errors.append(f"{field_name}: {type(exc).__name__}: {exc}")
+        summary.errors.append(_scan_error(field_name, exc))
         _LOGGER.warning("discovery: IP aggregation on %s failed: %s", field_name, exc)
         return []
     aggs = res.aggregations or {}
@@ -741,14 +841,55 @@ async def _aggregate_ip_field(
     return list(buckets)
 
 
+async def _resolve_scan_field(
+    es_client: ElasticClient,
+    index: str,
+    candidates: Sequence[str],
+    summary: DiscoverySummary,
+    health: _SignalHealth | None,
+) -> str:
+    """Resolve an aggregation field for the scan, keeping a probe failure LOUD.
+
+    :func:`resolve_agg_field` swallows its exists-probe errors and falls back
+    to the ECS-first default — correct for a query path that must not crash,
+    but silent: on a legacy ``zeek.*`` grid a transient blip confined to the
+    probe window makes the dependent aggregations run against unmapped ECS
+    fields, "succeed" with zero buckets, and leave ``summary.errors`` empty.
+    So the failure is re-surfaced here: recorded in ``summary.errors`` always,
+    and — when the field feeds a class with a grid-gated retirement rule —
+    counted against that class's :class:`_SignalHealth` so the blind choice
+    closes the retirement gate (the gate deliberately ignores
+    ``summary.errors``, so recording alone would not protect it). Pass
+    ``health=None`` for fields feeding only the CIDR class, which has no such
+    rule: loud, but suppresses nothing.
+    """
+    errors: list[Exception] = []
+    resolved = await resolve_agg_field(es_client, index, candidates, on_probe_error=errors.append)
+    if errors:
+        summary.errors.append(_scan_error(f"{candidates[0]} field probe", errors[0]))
+        if health is not None:
+            health.errors += 1
+        _LOGGER.warning(
+            "discovery: field probe for %s failed (%s) — aggregating the ECS default blind",
+            candidates[0],
+            errors[0],
+        )
+    return resolved
+
+
 async def _discover_name_signals(
     es_client: ElasticClient,
     index: str,
     cidrs: list[IpNetwork],
     lookback: int,
     summary: DiscoverySummary,
-) -> tuple[dict[str, _Candidate], dict[str, _Candidate]]:
+) -> tuple[dict[str, _Candidate], dict[str, _Candidate], _SignalHealth]:
     """Aggregate the four name signals into ``(suffixes, hosts)`` candidate maps.
+
+    Also returns the NAME-class :class:`_SignalHealth` covering exactly these
+    four sub-queries — the only ones that can produce a suffix/host row — plus
+    the two field-resolution probes that choose the DNS fields for (b)/(c)/(d),
+    as the per-signal input to the public-suffix retirement gate.
 
     DNS field names are resolved ECS-first against THIS deployment (modern grid →
     ``dns.query.name`` / ``dns.resolved_ip``; older SO / synth → ``zeek.dns.*``).
@@ -768,13 +909,23 @@ async def _discover_name_signals(
     """
     suffixes: dict[str, _Candidate] = {}
     hosts: dict[str, _Candidate] = {}
+    health = _SignalHealth()
 
-    dns_query_field = await resolve_agg_field(es_client, index, fields.DNS_QUERY)
-    dns_resolved_field = await resolve_agg_field(es_client, index, fields.DNS_RESOLVED_IP)
+    # The two exists-probes below CHOOSE the fields for name sub-queries (b),
+    # (c) and (d). A probe that errored chose blind — the aggregations may then
+    # run against fields this grid never populates and "succeed" with zero
+    # buckets — so a probe failure counts against the name class's health
+    # exactly like a failed sub-query (and is recorded in summary.errors).
+    dns_query_field = await _resolve_scan_field(es_client, index, fields.DNS_QUERY, summary, health)
+    dns_resolved_field = await _resolve_scan_field(
+        es_client, index, fields.DNS_RESOLVED_IP, summary, health
+    )
 
     # (a) host.name.
     host_query = _base_query(cidrs, lookback)
-    host_buckets = await _aggregate_field(es_client, index, host_query, "host.name", summary)
+    host_buckets = await _aggregate_field(
+        es_client, index, host_query, "host.name", summary, health
+    )
     _ingest_buckets(host_buckets, cidrs, suffixes, hosts, associated=True)
 
     # (b) PTR answers for internal IPs (reverse zone).
@@ -791,24 +942,28 @@ async def _discover_name_signals(
             }
         }
     )
-    ptr_buckets = await _aggregate_field(es_client, index, ptr_query, dns_resolved_field, summary)
+    ptr_buckets = await _aggregate_field(
+        es_client, index, ptr_query, dns_resolved_field, summary, health
+    )
     _ingest_buckets(ptr_buckets, cidrs, suffixes, hosts, associated=True)
 
     # (c) forward records that resolve INTERNAL (strongest signal).
     resolved_query = _base_query(cidrs, lookback)
     resolved_query["bool"]["filter"].append({"term": {"event.dataset": "zeek.dns"}})
     resolved_buckets = await _aggregate_resolved_internal(
-        es_client, index, resolved_query, dns_query_field, dns_resolved_field, summary
+        es_client, index, resolved_query, dns_query_field, dns_resolved_field, summary, health
     )
     _ingest_resolved_internal_buckets(resolved_buckets, cidrs, suffixes, hosts)
 
     # (d) raw outbound DNS query names (weak, not associated).
     dns_query = _base_query(cidrs, lookback)
     dns_query["bool"]["filter"].append({"term": {"event.dataset": "zeek.dns"}})
-    dns_buckets = await _aggregate_field(es_client, index, dns_query, dns_query_field, summary)
+    dns_buckets = await _aggregate_field(
+        es_client, index, dns_query, dns_query_field, summary, health
+    )
     _ingest_buckets(dns_buckets, cidrs, suffixes, hosts, associated=False)
 
-    return suffixes, hosts
+    return suffixes, hosts, health
 
 
 async def _discover_cidrs(
@@ -841,8 +996,16 @@ async def _discover_cidrs(
         ip_buckets = await _aggregate_ip_field(es_client, index, window_query, ip_field, summary)
         _ingest_ip_buckets(ip_buckets, cidrs, candidates)
 
-    local_orig_field = await resolve_agg_field(es_client, index, fields.CONN_LOCAL_ORIG)
-    local_resp_field = await resolve_agg_field(es_client, index, fields.CONN_LOCAL_RESP)
+    # health=None: these fields feed only the CIDR class, which has no
+    # grid-gated retirement rule — a blind probe here is recorded in
+    # summary.errors (weaker corroboration must stay loud) but must not
+    # suppress the name-signal-gated public-suffix retirement.
+    local_orig_field = await _resolve_scan_field(
+        es_client, index, fields.CONN_LOCAL_ORIG, summary, None
+    )
+    local_resp_field = await _resolve_scan_field(
+        es_client, index, fields.CONN_LOCAL_RESP, summary, None
+    )
     for flag_field, ip_field in (
         (local_orig_field, "source.ip"),
         (local_resp_field, "destination.ip"),
@@ -1024,6 +1187,8 @@ async def _retire_vestigial_rows(
     db: AsyncSession,
     scan_suffix_values: set[str],
     summary: DiscoverySummary,
+    *,
+    retire_public: bool,
 ) -> None:
     """Auto-dismiss existing detected rows the CURRENT rules can no longer produce.
 
@@ -1044,7 +1209,14 @@ async def _retire_vestigial_rows(
       the lookup-only-public drop means the current rules produce nothing for
       them, so the muted suggestion is unsupported noise. ACTIVE public
       suffixes are NEVER touched here: an operator may have activated a
-      legitimate corp domain.
+      legitimate corp domain. Skipped entirely when *retire_public* is False:
+      that rule is the only one that reasons from what THIS scan produced, so
+      it is only sound when the sub-queries that could have produced a suffix
+      — the four name signals, and only those (see :class:`_SignalHealth`) —
+      all succeeded AND saw events. The caller passes the name-signal
+      health's ``observed_estate``; an unrelated CIDR-discovery failure does
+      not suppress this rule. *retire_public* has no default on purpose: the
+      unsafe direction must never be reachable by omitting a keyword.
 
     ``source=='manual'`` rows are never touched anywhere in the sweep — an
     operator's explicit entry outranks any rule. Already-dismissed rows are
@@ -1065,7 +1237,8 @@ async def _retire_vestigial_rows(
             if junk is not None:
                 reason = f"junk host ({junk}) — rule added after this row was detected"
         elif (
-            row.kind == "suffix"
+            retire_public
+            and row.kind == "suffix"
             and row.state == "muted"
             and is_public_registrable(row.value)
             and row.value not in scan_suffix_values
@@ -1130,7 +1303,11 @@ async def run_discovery(
     min_hosts = settings.discovery_min_hosts
 
     # 2. Name signals: host.name + PTR + internal-resolution + raw DNS query.
-    suffixes, hosts = await _discover_name_signals(es_client, index, cidrs, lookback, summary)
+    #    name_health tracks the read-health of exactly these four sub-queries —
+    #    the per-signal input to the retirement gate in step 5.
+    suffixes, hosts, name_health = await _discover_name_signals(
+        es_client, index, cidrs, lookback, summary
+    )
 
     # Distinct internal hosts seen across both signals (best-effort: the max
     # per-candidate cardinality we observed — a floor on the deployment's size).
@@ -1183,10 +1360,38 @@ async def run_discovery(
 
         # 5. Vestigial retirement sweep (fail-soft, same session): auto-dismiss
         #    detected rows the current rules can no longer produce.
+        #    ABSENCE OF EVIDENCE IS NOT EVIDENCE OF ABSENCE — judged PER-SIGNAL:
+        #    the lookup-only-public rule reasons from what THIS scan produced,
+        #    and only the four NAME sub-queries can produce a suffix (the
+        #    sub-query → identifier-class map lives on _SignalHealth). So the
+        #    gate asks whether THOSE sub-queries succeeded and saw the estate.
+        #    A failing CIDR-discovery IP aggregation stays loud in
+        #    summary.errors but is not missing suffix evidence — under the old
+        #    whole-scan gate one persistently erroring IP aggregation
+        #    suppressed public retirement on every scan, forever. Dismissal is
+        #    a TERMINAL tombstone no later scan resurrects, so a scan blind ON
+        #    THIS SIGNAL must never write one: an errored name sub-query may
+        #    be the very one that would have produced the row, and a clean
+        #    zero-event read (ignore_unavailable/allow_no_indices turns an
+        #    index pattern matching nothing into 200-with-nothing) observed
+        #    nothing at all. The two other rules read the stored value only
+        #    and stay unconditional.
+        retire_public = name_health.observed_estate
+        if not retire_public:
+            _LOGGER.warning(
+                "discovery: name signals blind (%d name-signal error(s), %d events "
+                "scanned by them) — skipping the lookup-only-public retirement rule; "
+                "a read that failed or saw nothing is not evidence a suggestion is "
+                "unreal",
+                name_health.errors,
+                name_health.scanned_events,
+            )
         try:
-            await _retire_vestigial_rows(db, scan_suffix_values, summary)
+            await _retire_vestigial_rows(
+                db, scan_suffix_values, summary, retire_public=retire_public
+            )
         except Exception as exc:
-            summary.errors.append(f"retirement sweep: {type(exc).__name__}: {exc}")
+            summary.errors.append(_scan_error("retirement sweep", exc))
             _LOGGER.warning("discovery: retirement sweep failed: %s", exc)
 
     summary.finished_at = datetime.now(UTC).isoformat()

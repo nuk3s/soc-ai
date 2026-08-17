@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -27,12 +30,15 @@ from soc_ai.api.webui._timeline import (
     _compact,
     _tool_step,
 )
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
-from soc_ai.demo.hunt_replay import pick_canned_hunt, start_background_hunt_replay
+from soc_ai.demo.guard import is_demo
+from soc_ai.demo.hunt_replay import pick_canned_hunt
 from soc_ai.demo.replay import find_replay, start_background_replay
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.so_client.inventory import discover_datasets
+from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import hunt_schedules as hs_svc
 from soc_ai.store import hunt_templates as ht_svc
 from soc_ai.store import hunts as hunt_svc
@@ -521,10 +527,19 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
     )
 
 
+# Objective length cap, shared by the console, schedules and templates (the same
+# analyst-written text lands in all three). Raised 2000 -> 12000 (dogfood
+# 2026-08-06): 2000 chars is about one paragraph, and a real hunt brief — scope,
+# exclusions, the specific behaviors to look for — routinely runs longer. It was
+# rejected with a bare 422. Still bounded: the objective is prepended to the
+# agent's prompt, so an unbounded paste would eat the context budget.
+MAX_OBJECTIVE_CHARS = 12000
+
+
 class HuntChatIn(BaseModel):
     # Non-blank objective — an empty hunt objective is a no-op that would burn a
     # model call for nothing.
-    objective: str = Field(min_length=1, max_length=2000)
+    objective: str = Field(min_length=1, max_length=MAX_OBJECTIVE_CHARS)
     # Optional prior hunt id for a follow-up turn: its narrative seeds the new
     # hunt so the agent can pivot within the thread.
     prior_hunt_id: str | None = None
@@ -544,26 +559,20 @@ async def start_hunt_chat(
     persists every event and the detail view polls the timeline.
     """
     started_by = await identify_caller(request)
-    # Demo mode (SOC_AI_DEMO): replay a RECORDED canned hunt instead of building
-    # the egress-blocked hunt agent — returns a real hunt_id the SPA polls exactly
-    # like a live hunt, and the row lands complete WITH its narrative + report.
-    # Zero egress: HuntRecorder writes the store only, no model is built. Mirrors
-    # the investigation replay branch in start_hunt (POST /hunt) above. With no
-    # eventful/reportful canned hunt seeded (rare once fixtures are rebuilt), fall
-    # through to the live path (unchanged): hunt_recorded_run emits hunt_created —
-    # creating the row and returning a real hunt_id with a 200 — BEFORE run_hunt
-    # builds the egress-blocked model, so the row then lands status='error' in the
-    # background drain (not a 503). Same reporting a live hunt-start had in demo
-    # before this branch existed.
+    # Demo mode (SOC_AI_DEMO): return the SEEDED canned hunt's own id — a read, not
+    # a write. That hunt is already a complete store row (seed_fixtures at startup)
+    # carrying the narrative + timeline + report a run would produce, so the SPA
+    # polls GET /hunts/{id} and renders a finished hunt. No new Hunt row and no
+    # background task per POST: the hunt-side mirror of routes_chat._demo_thread,
+    # which is what keeps an unauthenticated visitor from growing the Hunt table
+    # (and the replay-task set) without bound. Finding:
+    # demo-readonly-contract-violated-by-hunt-start. With no reportful canned hunt
+    # seeded (not the shipped demo shape) fall through to the live path unchanged.
     if settings.soc_ai_demo:
         hunt = pick_canned_hunt(getattr(request.app.state, "demo_fixtures", None))
-        if hunt is not None:
-            hid = await start_background_hunt_replay(
-                request.app.state, body.objective, started_by, hunt
-            )
-            if hid is None:
-                raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
-            return {"hunt_id": hid}
+        hid = hunt.get("id") if hunt else None
+        if hid is not None:
+            return {"hunt_id": str(hid)}
     prior: str | None = None
     if body.prior_hunt_id:
         async with request.app.state.db_sessionmaker() as db:
@@ -817,6 +826,11 @@ class HuntChatMessageOut(BaseModel):
 class HuntChatThreadOut(BaseModel):
     messages: list[HuntChatMessageOut]
     pending: bool
+    # Tools the in-flight turn has called so far, oldest first — the hunt-chat
+    # mirror of ``ChatThreadOut.progress_tools`` (routes_chat.py). The SPA's
+    # HuntChatPanel renders it as a live progress footer during a long follow-up
+    # instead of a bare typing indicator. Empty unless a turn is pending.
+    progress_tools: list[str] = []
 
 
 def _hunt_chat_msg_out(ev: HuntEvent) -> HuntChatMessageOut:
@@ -829,19 +843,75 @@ def _hunt_chat_msg_out(ev: HuntEvent) -> HuntChatMessageOut:
 
 
 def _hunt_chat_thread(events: list[HuntEvent]) -> HuntChatThreadOut:
+    # Read live progress off the pending assistant row's meta, the same shape
+    # the general/host chat expose (routes_chat.py:_thread). The shared turn
+    # engine writes it there via ``hunt_svc.set_progress``.
+    pending_evs = [e for e in events if (e.payload or {}).get("status") == "pending"]
+    progress: list[str] = []
+    if pending_evs:
+        meta = (pending_evs[-1].payload or {}).get("meta")
+        if isinstance(meta, dict):
+            raw = meta.get("progress_tools")
+            if isinstance(raw, list):
+                progress = [str(t) for t in raw]
     return HuntChatThreadOut(
         messages=[_hunt_chat_msg_out(e) for e in events],
-        pending=any((e.payload or {}).get("status") == "pending" for e in events),
+        pending=bool(pending_evs),
+        progress_tools=progress,
+    )
+
+
+def _demo_hunt_chat_thread(text: str, reply: str) -> HuntChatThreadOut:
+    """One ephemeral turn — the visitor's question and the canned *reply*.
+
+    The hunt chat's twin of :func:`soc_ai.api.webui.routes_chat._demo_thread`,
+    and it exists for the same reason: on the public demo ``api_auth_required``
+    is false, so every visitor is the same caller, and this thread is keyed on a
+    hunt they ALL share. Persisted, that means visitor two reads visitor one's
+    typed question and can be handed a 409 ``chat_busy`` from a turn they did not
+    start. There is no per-browser identity to key on instead (no cookie is
+    issued without a login, and anything client-supplied would be
+    attacker-chosen), so the demo stores nothing at all: no rows, nothing to
+    collide over, and the property holds under concurrency by construction.
+
+    The visitor still sees a working conversation — the SPA renders the thread
+    this POST returns. Only persistence across a reload is lost, which a canned
+    reply should arguably not have.
+
+    Not shared with ``routes_chat._demo_thread`` because the wire types differ:
+    this surface serializes ``HuntChatMessageOut`` (which carries ``tools``) off
+    ``hunt_events``, not ``ChatMessageOut`` off ``chat_messages``.
+    """
+    return HuntChatThreadOut(
+        messages=[
+            HuntChatMessageOut(role="user", text=text),
+            # Sourced from the manager so the demo has ONE answer for this
+            # surface, not two that can drift; the manager keeps its own
+            # short-circuit as the backstop for any future path that does spawn a
+            # turn (it must never build a model — the demo egress guard raises).
+            HuntChatMessageOut(role="assistant", text=reply),
+        ],
+        pending=False,
     )
 
 
 @router.get("/hunts/{hunt_id}/chat", response_model=HuntChatThreadOut)
 async def get_hunt_chat(request: Request, hunt_id: str) -> HuntChatThreadOut:
     """Poll target — the hunt's follow-up chat thread, with a pending flag while
-    the assistant works."""
+    the assistant works.
+
+    On the public demo it is always empty — see :func:`_demo_hunt_chat_thread`.
+    """
     async with request.app.state.db_sessionmaker() as db:
         if await db.get(Hunt, hunt_id) is None:
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        if is_demo(request.app.state.settings):
+            # Empty rather than a read of the shared thread — kept AFTER the 404
+            # so a bogus hunt id still 404s as it does live. Returning empty
+            # unconditionally makes "no visitor sees another's messages" a
+            # property of this route instead of a bet on the table having stayed
+            # empty.
+            return _hunt_chat_thread([])
         msgs = await hunt_svc.list_chat_messages(db, hunt_id)
     return _hunt_chat_thread(msgs)
 
@@ -856,7 +926,11 @@ class HuntChatIn2(BaseModel):
 async def post_hunt_chat(request: Request, hunt_id: str, body: HuntChatIn2) -> HuntChatThreadOut:
     """Ask a follow-up about a COMPLETED hunt. Writes the user turn + a pending
     assistant turn, spawns the background chat task, and returns the thread (poll
-    GET .../chat until !pending). Read-only — a hunt chat never acks/escalates."""
+    GET .../chat until !pending). Read-only — a hunt chat never acks/escalates.
+
+    On the public demo it neither writes nor spawns anything — see
+    :func:`_demo_hunt_chat_thread`.
+    """
     text = body.message.strip()
     if not text:
         raise HTTPException(status_code=400, detail={"reason": "empty_message"})
@@ -867,6 +941,14 @@ async def post_hunt_chat(request: Request, hunt_id: str, body: HuntChatIn2) -> H
         if hunt.status == "running":
             # Can't chat about a hunt that hasn't landed its report yet.
             raise HTTPException(status_code=409, detail={"reason": "still_running"})
+        if is_demo(request.app.state.settings):
+            # AFTER the 404/still-running checks, so the demo rejects the same
+            # requests a real deployment does — it answers differently, it does
+            # not validate differently. Before the busy check and the writes,
+            # which are the two that cross demo visitors.
+            return _demo_hunt_chat_thread(
+                text, hunt_console_manager.demo_chat_reply(request.app.state, hunt_id)
+            )
         existing = await hunt_svc.list_chat_messages(db, hunt_id)
         if any((e.payload or {}).get("status") == "pending" for e in existing):
             # A prior turn's assistant is still working — one in-flight turn at a
@@ -910,6 +992,14 @@ async def resolve_alert_for_hunt(
     ``event.category`` for non-Suricata detections) so the caller can seed the
     investigation's display name at creation — the row is then never anonymous,
     even if the run dies before its first alert_context event.
+
+    Grid errors PROPAGATE, and every caller both BOUNDS this call in
+    ``asyncio.timeout(webui_grid_timeout_s)`` and maps the error onto the house
+    503/400. Neither belongs in here. The outage must never leave as the 404
+    "alert not found" this returns for a genuinely absent alert — "I could not
+    look" is not "not there" — and an unbounded caller holds Investigate, the
+    most-clicked button in the product, for the ES client's whole retry budget
+    (~90 s at shipped defaults) against an accepting-but-silent grid.
     """
     lookup = await elastic.search(
         settings.events_index_pattern,
@@ -952,7 +1042,18 @@ async def start_hunt(
         demo_replay = find_replay(getattr(request.app.state, "demo_fixtures", None), body.alert_id)
         exists, rule_name = demo_replay is not None, None
     else:
-        exists, rule_name = await resolve_alert_for_hunt(elastic, settings, body.alert_id)
+        try:
+            async with asyncio.timeout(settings.webui_grid_timeout_s):
+                exists, rule_name = await resolve_alert_for_hunt(elastic, settings, body.alert_id)
+        except (TimeoutError, TransportError) as exc:
+            # A down grid is a retryable 503, never the 404 below: telling the
+            # analyst "alert not found — it may have aged out" when the sensor is
+            # simply unreadable is a statement about their estate we cannot make.
+            raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        except ApiError as exc:
+            # An ES ApiError is NOT a TransportError — without this arm an ES 4xx
+            # still escapes the tuple above as an unhandled 500.
+            raise _es_api_error_http(exc) from exc
     if not exists:
         raise HTTPException(
             status_code=404,
@@ -965,6 +1066,11 @@ async def start_hunt(
     # caller to it instead of spawning a second investigation for the same alert.
     async with request.app.state.db_sessionmaker() as db:
         existing = (await inv_svc.latest_for_alerts(db, [body.alert_id])).get(body.alert_id)
+        # Reuse decision keys off ANY completed replay row for this alert, not the
+        # newest row of any status — otherwise an `error` row left by a mid-stream
+        # /investigate abort becomes "latest" and defeats reuse (same guard the
+        # /investigate path uses).
+        completed = await inv_svc.complete_for_alert(db, body.alert_id)
     if existing is not None and existing.status == "running":
         raise HTTPException(
             status_code=409,
@@ -977,6 +1083,14 @@ async def start_hunt(
                 ),
             },
         )
+    # Demo replay: reuse this alert's already-completed replay row instead of
+    # persisting a fresh one per POST. The SPA polls GET /investigations/{id}, so
+    # the row must exist — returning the completed one (no new row, no background
+    # task) bounds demo replay rows to the recorded-alert set, the read-only
+    # mirror the hunt-start path already uses. The first replay per alert (no
+    # existing complete row) still creates it below.
+    if demo_replay is not None and completed is not None:
+        return {"investigation_id": completed.id}
     if demo_replay is not None:
         inv_id = await start_background_replay(
             request.app.state, replay=demo_replay, started_by=started_by
@@ -1004,7 +1118,7 @@ async def start_hunt(
 
 
 class HuntScheduleIn(BaseModel):
-    objective: str = Field(min_length=1, max_length=2000)
+    objective: str = Field(min_length=1, max_length=MAX_OBJECTIVE_CHARS)
     interval_minutes: int = Field(
         default=hs_svc.MIN_INTERVAL_MINUTES, ge=hs_svc.MIN_INTERVAL_MINUTES, le=43200
     )
@@ -1014,7 +1128,7 @@ class HuntScheduleIn(BaseModel):
 class HuntSchedulePatch(BaseModel):
     """All fields optional — only the provided ones are updated."""
 
-    objective: str | None = Field(default=None, min_length=1, max_length=2000)
+    objective: str | None = Field(default=None, min_length=1, max_length=MAX_OBJECTIVE_CHARS)
     interval_minutes: int | None = Field(default=None, ge=hs_svc.MIN_INTERVAL_MINUTES, le=43200)
     enabled: bool | None = None
 
@@ -1138,7 +1252,7 @@ async def delete_hunt_schedule(request: Request, schedule_id: int) -> dict[str, 
 
 class HuntTemplateIn(BaseModel):
     name: str = Field(min_length=1, max_length=256)
-    objective_template: str = Field(min_length=1, max_length=2000)
+    objective_template: str = Field(min_length=1, max_length=MAX_OBJECTIVE_CHARS)
     # The `event.dataset` names this hunt correlates over — a grid missing one
     # flags the template. Bounded so a custom template can't carry a runaway list.
     required_datasets: list[str] = Field(default_factory=list, max_length=32)
@@ -1149,7 +1263,9 @@ class HuntTemplatePatch(BaseModel):
     """All fields optional — only the provided ones are updated."""
 
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    objective_template: str | None = Field(default=None, min_length=1, max_length=2000)
+    objective_template: str | None = Field(
+        default=None, min_length=1, max_length=MAX_OBJECTIVE_CHARS
+    )
     required_datasets: list[str] | None = Field(default=None, max_length=32)
     default_window_minutes: int | None = Field(default=None, ge=1, le=43200)
 
@@ -1170,20 +1286,86 @@ class HuntTemplateOut(BaseModel):
     # flag) a template on an inventory error.
     available: bool = True
     missingDatasets: list[str] = []
+    # Was the availability axis actually EVALUATED? False when inventory
+    # discovery failed, which is exactly when ``available`` fails open to True
+    # for every template. Fail-open is right — an unreadable inventory must not
+    # hide or falsely flag a hunt — but on its own it is indistinguishable from
+    # "checked, and the telemetry is there", and the picker was drawing the
+    # confident version: six highlighted chips on a grid whose datasets nobody
+    # could read, and a hunt launched against telemetry the grid cannot see.
+    # Unknown is not available. The client renders a third, neutral state off
+    # this flag; the annotation stays absent rather than invented.
+    availabilityKnown: bool = True
+    # Environment-fit annotation — a SECOND, independent axis (hunt-fit).
+    # ``available`` says the grid can SEE the telemetry; ``applicable`` says the
+    # network HAS the machinery the hunt is about (a Windows host, a domain).
+    # False iff a requirement in ht_svc.BUILTIN_ENV_REQUIREMENTS is met by NO
+    # resolved dossier. ``missingEnvironment`` carries the human phrases
+    # ("a domain-joined host"). A not-applicable template is DEMOTED in the
+    # picker, never hidden, and stays fully runnable. Fail-open: custom
+    # templates, profile errors and a never-built dossier table are all True.
+    applicable: bool = True
+    missingEnvironment: list[str] = []
 
 
-def _template_out(row: HuntTemplate, present: set[str] | None) -> HuntTemplateOut:
-    """Serialize a template, annotating availability against ``present`` dataset names.
+def _environment_fit(
+    row: HuntTemplate, profile: dossier_store.EnvironmentProfile | None
+) -> tuple[bool, list[str]]:
+    """``(applicable, missing-environment phrases)`` for one template.
+
+    FAIL-OPEN, all three rules mandatory:
+
+    * a custom (non-builtin) template is always applicable — the operator knows
+      their network better than the dossier table does;
+    * ``profile is None`` (the query raised) → applicable: a broken profile
+      must never demote a hunt;
+    * ``built_hosts == 0`` → applicable: a table nothing ever built describes
+      an UNKNOWN network, not an empty one.
+
+    A requirement is met by EVEN ONE resolved host. An unknown requirement
+    token (a future map entry this build doesn't understand) counts as met, in
+    the same fail-open spirit.
+    """
+    if not row.builtin:
+        return True, []
+    requirements = ht_svc.BUILTIN_ENV_REQUIREMENTS.get(row.name, ())
+    if not requirements:
+        return True, []
+    if profile is None or profile.built_hosts == 0:
+        return True, []
+    met = {
+        ht_svc.ENV_WINDOWS: profile.windows_hosts > 0,
+        ht_svc.ENV_DOMAIN: profile.domain_joined_hosts > 0,
+    }
+    missing = [
+        ht_svc.ENV_REQUIREMENT_PHRASES.get(req, req)
+        for req in requirements
+        if not met.get(req, True)
+    ]
+    return not missing, missing
+
+
+def _template_out(
+    row: HuntTemplate,
+    present: set[str] | None,
+    profile: dossier_store.EnvironmentProfile | None = None,
+) -> HuntTemplateOut:
+    """Serialize a template, annotating availability against ``present`` dataset names
+    and environment fit against ``profile``.
 
     ``present is None`` means the inventory couldn't be discovered — the template
     is reported ``available=True, missingDatasets=[]`` (best-effort: an inventory
-    error must never hide or falsely flag a template).
+    error must never hide or falsely flag a template) and, crucially,
+    ``availabilityKnown=False``, so the fail-open value is never mistaken for a
+    measured one. ``profile is None`` fails open the same way on the environment
+    axis (see :func:`_environment_fit`).
     """
     required = [str(d) for d in (row.required_datasets or [])]
     if present is None:
         missing: list[str] = []
     else:
         missing = [d for d in required if d not in present]
+    applicable, missing_environment = _environment_fit(row, profile)
     return HuntTemplateOut(
         id=row.id,
         name=row.name,
@@ -1195,6 +1377,9 @@ def _template_out(row: HuntTemplate, present: set[str] | None) -> HuntTemplateOu
         createdAt=_iso_utc(row.created_at),
         available=not missing,
         missingDatasets=missing,
+        availabilityKnown=present is not None,
+        applicable=applicable,
+        missingEnvironment=missing_environment,
     )
 
 
@@ -1205,29 +1390,78 @@ async def _present_dataset_names(request: Request) -> set[str] | None:
     template list is ONE inventory read, not one per template. Best-effort: any
     discovery failure returns ``None`` so the caller reports every template
     available rather than hiding them on an inventory error.
+
+    Bounded by ``webui_grid_timeout_s``: on a cache miss this is a live grid read
+    on a console route, and against a grid that accepts but never answers the ES
+    client's retry budget would hold the Hunt Console for ~90 s. The timeout lands
+    in the same fail-open branch as any other discovery failure.
     """
     try:
         elastic = request.app.state.elastic
         settings = request.app.state.settings
-        inv = await discover_datasets(elastic, settings)
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            inv = await discover_datasets(elastic, settings)
     except Exception:
         _LOGGER.warning("hunt-template availability: inventory discovery failed", exc_info=True)
         return None
     return set(inv.dataset_names())
 
 
+async def _environment_profile(request: Request) -> dossier_store.EnvironmentProfile | None:
+    """The network's resolved-dossier environment counts, or ``None`` on failure.
+
+    One small two-query read per request, under the resolver's own gates
+    (``dossier_min_confidence`` / ``dossier_staleness_hours``, read hot).
+    Best-effort like :func:`_present_dataset_names`: any failure returns
+    ``None`` and the caller reports every template applicable — a broken
+    profile must never demote a hunt.
+    """
+    try:
+        settings = request.app.state.settings
+        async with request.app.state.db_sessionmaker() as db:
+            return await dossier_store.environment_profile(
+                db,
+                min_confidence=float(
+                    getattr(
+                        settings, "dossier_min_confidence", dossier_store.DEFAULT_MIN_CONFIDENCE
+                    )
+                ),
+                staleness_hours=int(
+                    getattr(
+                        settings, "dossier_staleness_hours", dossier_store.DEFAULT_STALENESS_HOURS
+                    )
+                ),
+            )
+    except Exception:
+        _LOGGER.warning("hunt-template environment fit: profile query failed", exc_info=True)
+        return None
+
+
 @router.get("/hunt-templates", response_model=list[HuntTemplateOut])
 async def list_hunt_templates(request: Request) -> list[HuntTemplateOut]:
-    """All hunt templates, builtins first, ANNOTATED with grid availability.
+    """All hunt templates, builtins first, ANNOTATED on two independent axes.
 
-    Each template is flagged ``available``/``missingDatasets`` against the live
-    (TTL-cached) grid inventory: a template needing telemetry this grid doesn't
-    have is FLAGGED, never hidden. The inventory is read ONCE for the whole list.
+    * ``available``/``missingDatasets`` — can the GRID see the telemetry? Flagged
+      against the live (TTL-cached) inventory, read ONCE for the whole list.
+      ``availabilityKnown=False`` when that read failed: the values below it are
+      fail-open defaults, not measurements, and the picker must say so instead of
+      presenting an unchecked template as one that matches live telemetry.
+    * ``applicable``/``missingEnvironment`` — does the NETWORK have the machinery
+      the hunt targets (a Windows host, a domain)? Computed per request from the
+      resolved dossier store, so it re-evaluates automatically after every
+      dossier sweep — the moment the first domain join appears, the hunt
+      reopens, with no cache to wait out.
+
+    Neither axis ever hides a template: missing telemetry is flagged, a
+    non-applicable hunt is demoted — and both stay fully runnable. An
+    attacker's first domain join must not be invisible because the catalogue
+    decided this network "doesn't do domains".
     """
     present = await _present_dataset_names(request)
+    profile = await _environment_profile(request)
     async with request.app.state.db_sessionmaker() as db:
         rows = await ht_svc.list_all(db)
-    return [_template_out(r, present) for r in rows]
+    return [_template_out(r, present, profile) for r in rows]
 
 
 @router.post(
@@ -1248,9 +1482,11 @@ async def create_hunt_template(request: Request, body: HuntTemplateIn) -> HuntTe
             builtin=False,
             created_by=created_by,
         )
-    # Annotate the freshly-created row too (cheap — the inventory is TTL-cached).
+    # Annotate the freshly-created row too (cheap — the inventory is TTL-cached,
+    # the profile two small queries; a custom row is always applicable anyway).
     present = await _present_dataset_names(request)
-    return _template_out(row, present)
+    profile = await _environment_profile(request)
+    return _template_out(row, present, profile)
 
 
 @router.put(
@@ -1290,8 +1526,9 @@ async def update_hunt_template(
             default_window_minutes=body.default_window_minutes,
         )
     present = await _present_dataset_names(request)
+    profile = await _environment_profile(request)
     assert row is not None  # existed above + same session; narrow for mypy
-    return _template_out(row, present)
+    return _template_out(row, present, profile)
 
 
 @router.delete(

@@ -1,7 +1,7 @@
 """Tests for the ``rule_prevalence`` read tool.
 
 Core guarantee under test: the tool tells a noisy rule (fires constantly across
-the estate → a firing is weak evidence HERE) apart from a rare / first-seen rule
+the network → a firing is weak evidence HERE) apart from a rare / first-seen rule
 (a firing is notable). Plus the robustness contract shared by the read tools:
 empty data → a clean ``observed: False`` / ``first-seen`` result (NOT an
 exception); an ES error or bad input → a clean error dict (NOT a raised

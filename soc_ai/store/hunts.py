@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
@@ -123,6 +123,10 @@ async def finalize(
         hunt.narrative = narrative
     if report is not None:
         hunt.report = report
+        # Denormalize the finding count so the /notifications bell never
+        # deserializes the report blob to answer "N findings" (migration 0028).
+        findings = report.get("findings")
+        hunt.findings_count = len(findings) if isinstance(findings, list) else 0
     hunt.finished_at = utcnow()
     await db.commit()
 
@@ -167,6 +171,58 @@ async def list_recent(
         q = q.where(Hunt.created_at <= until)
     q = q.limit(limit)
     return list((await db.scalars(q)).all())
+
+
+class HuntNotifRow(NamedTuple):
+    """The scalar columns the /notifications bell reads from a hunt — never the
+    report blob. ``findings_count`` is the denormalized column (migration 0028),
+    so the bell shows "N findings" without deserializing ``report``."""
+
+    id: str
+    objective: str
+    status: str
+    created_at: datetime
+    finished_at: datetime | None
+    findings_count: int | None
+
+
+async def list_recent_notifications(
+    db: AsyncSession,
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    finished_since: datetime | None = None,
+) -> list[HuntNotifRow]:
+    """Lightweight hunt rows for the notifications bell — scalar columns only.
+
+    A column-scoped SELECT (not ``list_recent``, which loads full ORM entities
+    including the ``report`` JSON) so the app's hottest poll never drags a
+    report blob it only wants a finding count from. ``finished_since`` bounds AND
+    orders the query on ``finished_at`` — the SAME clock the bell RENDERS ("N
+    ago" is finished_at) and the one window definition the investigations sibling
+    uses. This half previously bounded ``created_at``, so a hunt CREATED before
+    the window but FINISHED inside it (a long-queued backlog hunt) was silently
+    dropped. NULL ``finished_at`` (a running row) is excluded by the ``>=`` bound,
+    which is correct: this query is only ever the completed half.
+    """
+    q = select(
+        Hunt.id,
+        Hunt.objective,
+        Hunt.status,
+        Hunt.created_at,
+        Hunt.finished_at,
+        Hunt.findings_count,
+    )
+    if status is not None:
+        q = q.where(Hunt.status == status)
+    if finished_since is not None:
+        q = q.where(Hunt.finished_at >= finished_since).order_by(
+            Hunt.finished_at.desc(), Hunt.id.desc()
+        )
+    else:
+        q = q.order_by(Hunt.created_at.desc(), Hunt.id.desc())
+    q = q.limit(limit)
+    return [HuntNotifRow(*row) for row in (await db.execute(q)).all()]
 
 
 async def findings_for_entity(
@@ -348,6 +404,29 @@ async def finish_chat_assistant(
             role="assistant",
             content=content,
         )
+    await db.commit()
+
+
+async def set_progress(db: AsyncSession, event_id: int, tools: list[str]) -> None:
+    """Record the tools a still-``pending`` hunt-chat turn has called so far.
+
+    The hunt-events twin of :func:`soc_ai.store.general_chat.set_progress`:
+    written from the shared engine's per-tool callback so the poll endpoint can
+    render live progress instead of a bare typing indicator. Best-effort by
+    contract — the caller swallows failures, because a progress write must never
+    break the turn producing the real answer. The meta lives INSIDE the event
+    payload here (``payload["meta"]["progress_tools"]``), not on a column.
+    """
+    ev = await db.get(HuntEvent, event_id)
+    if ev is None:
+        return
+    payload = dict(ev.payload or {})
+    if payload.get("status") != "pending":
+        return  # finished (or resolved) between the tool call and this write
+    meta = dict(payload.get("meta") or {})
+    meta["progress_tools"] = tools[-12:]
+    payload["meta"] = meta
+    ev.payload = payload
     await db.commit()
 
 

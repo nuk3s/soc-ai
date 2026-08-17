@@ -12,7 +12,7 @@ import logging
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import bcrypt
 from pydantic import SecretStr
@@ -21,12 +21,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.models import ApiToken, User, UserSession
 
+if TYPE_CHECKING:
+    from sqlalchemy import CursorResult
+
 _LOGGER = logging.getLogger(__name__)
 
 SESSION_COOKIE = "soc_ai_session"
 _BCRYPT_MAX_BYTES = 72
 TOKEN_PREFIX = "scai_"  # noqa: S105
 VALID_ROLES = ("admin", "analyst")
+
+#: Floor for every caller-chosen password — admin create-user AND the
+#: self-service change (``POST /api/v1/me/password``). ONE constant on purpose:
+#: two independently-worded rules is how a UI ends up promising a minimum the
+#: server doesn't hold (or refusing one it would have accepted).
+MIN_PASSWORD_LENGTH = 8
 
 
 # ---------------------------------------------------------------------------
@@ -39,9 +48,10 @@ class LoginThrottle:
 
     After ``max_failures`` failures inside ``window_s``, the key is locked for
     ``cooldown_s``. A successful login clears the key. State is in-memory and
-    bounded (``max_keys``); oldest-touched entries are evicted when full, so a
-    flood of distinct keys cannot grow the dict without limit. Per-process only
-    — adequate for the single-process deployment; not shared across workers.
+    bounded (``max_keys``): BOTH the failure map (``_fails``) and the lockout map
+    (``_locked``) evict when full, so a flood of distinct keys cannot grow either
+    dict without limit. Per-process only — adequate for the single-process
+    deployment; not shared across workers.
     """
 
     __slots__ = ("_fails", "_locked", "cooldown_s", "max_failures", "max_keys", "window_s")
@@ -81,6 +91,20 @@ class LoginThrottle:
             oldest_key = min(pool, key=lambda k: self._fails[k][-1] if self._fails[k] else 0.0)
             self._fails.pop(oldest_key, None)
 
+    def _evict_locked_if_full(self, now: float) -> None:
+        # Mirror _evict_if_full for the lockout map. is_locked() only reclaims a
+        # locked key LAZILY (when that exact key is re-probed after cooldown), so
+        # a spray of distinct keys that never come back would grow _locked without
+        # bound. When at capacity, first drop locks whose cooldown already elapsed
+        # (dead weight), then evict the entries nearest to expiry until under cap.
+        if len(self._locked) < self.max_keys:
+            return
+        for k in [k for k, until in self._locked.items() if until <= now]:
+            self._locked.pop(k, None)
+        while len(self._locked) >= self.max_keys:
+            soonest_key = min(self._locked, key=lambda k: self._locked[k])
+            self._locked.pop(soonest_key, None)
+
     def is_locked(self, ip: str, username: str) -> bool:
         """True iff this (ip, username) is currently in cooldown."""
         key = self._key(ip, username)
@@ -104,6 +128,7 @@ class LoginThrottle:
         self._evict_if_full()
         self._fails[key] = hits
         if len(hits) >= self.max_failures:
+            self._evict_locked_if_full(now)
             self._locked[key] = now + self.cooldown_s
             return True
         return False
@@ -128,6 +153,19 @@ login_throttle = LoginThrottle()
 # so a password-spray that rotates usernames to stay under the per-(IP,username)
 # limit still trips a coarser per-IP lockout. Higher threshold for shared/NAT IPs.
 login_ip_throttle = LoginThrottle(max_failures=20, window_s=15 * 60, cooldown_s=15 * 60)
+
+# THIRD, SEPARATE instance, for the self-service password change. That endpoint
+# also asks "prove you know this password", so it is the same online guessing
+# oracle login is — and a worse one to leave open: an attacker holding a stolen
+# session cookie already has app access but NOT the plaintext credential, and the
+# plaintext is what also opens the analyst's other systems (and what would let
+# the attacker lock them out). Same limits as login.
+#
+# Deliberately NOT the shared ``login_throttle``. Both key on (ip, username), so
+# reusing it would mean five fat-fingered attempts in the change-password modal
+# ALSO lock the analyst out of the login page — punishing the legitimate user, on
+# a screen they only reached by being logged in, for a typo.
+password_change_throttle = LoginThrottle()
 
 # Precomputed bcrypt hash for authenticate()'s constant-time path: verified
 # against when the account is missing/disabled so login timing is uniform.
@@ -226,6 +264,24 @@ async def get_session_user(db: AsyncSession, raw_token: str) -> User | None:
     return user
 
 
+async def purge_expired_sessions(db: AsyncSession) -> int:
+    """Delete every ``UserSession`` whose TTL has elapsed; returns the row count.
+
+    :func:`get_session_user` rejects an expired session but leaves the row, and
+    the only other deletes are the explicit-logout path and the per-user wipe in
+    :func:`reset_user_password`. So a cookie that is simply abandoned leaves a
+    permanent row (a token hash + user id) — thousands accumulate over a year of
+    analysts across tabs. This is the maintenance sweep the startup reap runs,
+    matching how ``_reap_orphans_at_startup`` resolves the other tables the prior
+    process left behind.
+    """
+    result = await db.execute(delete(UserSession).where(UserSession.expires_at < utcnow()))
+    await db.commit()
+    # cast: AsyncSession.execute is typed Result, but a DELETE returns a
+    # CursorResult, whose rowcount is the number of rows removed.
+    return int(cast("CursorResult[Any]", result).rowcount or 0)
+
+
 async def delete_session(db: AsyncSession, raw_token: str) -> None:
     session = await db.scalar(
         select(UserSession).where(UserSession.token_hash == _sha256(raw_token))
@@ -303,6 +359,35 @@ async def reset_user_password(db: AsyncSession, user_id: int, new_password: str)
     user.password_hash = await hash_password(new_password)
     await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
     await db.execute(update(ApiToken).where(ApiToken.created_by == user_id).values(revoked=True))
+    await db.commit()
+
+
+async def change_own_password(
+    db: AsyncSession, user_id: int, new_password: str, *, keep_raw_token: str | None
+) -> None:
+    """Re-hash a user's password on their own request, sparing the calling session.
+
+    Deliberately narrower than :func:`reset_user_password`. That one is an
+    *admin* action against *someone else's* account — an offboarding/incident
+    lever — so it revokes every session and every API token the account minted.
+    This one is the analyst rotating their own credential from the account menu:
+    signing them out of the very tab they typed it in would be a bug, not a
+    security win. So the session identified by ``keep_raw_token`` survives and
+    every OTHER session for the user is deleted (a shared-workstation tab, or a
+    stolen cookie, loses access the moment the password changes).
+
+    API tokens are left alone for the same reason: they are named, separately
+    revocable integration credentials, not a side effect of the login the
+    analyst is rotating.
+    """
+    user = await db.get(User, user_id)
+    if user is None:
+        return
+    user.password_hash = await hash_password(new_password)
+    stmt = delete(UserSession).where(UserSession.user_id == user_id)
+    if keep_raw_token is not None:
+        stmt = stmt.where(UserSession.token_hash != _sha256(keep_raw_token))
+    await db.execute(stmt)
     await db.commit()
 
 

@@ -52,6 +52,18 @@ export function DetectionTuningPanel({
 
   const nominations = data?.nominations ?? [];
   const overrides = data?.overrides ?? [];
+  // Both halves of this panel are fed by the one call, so when it fails the
+  // muted-rules COUNT is unknown — and `?? []` renders unknown as zero. On a
+  // grid outage that printed "MUTED RULES (0)" over a bare table: a team that
+  // relies on mutes reads "nothing is suppressed" at exactly the moment nobody
+  // can check. Zero is a finding; this is the absence of one, and the header
+  // has to be able to say so. A genuinely empty list on a healthy grid keeps
+  // its 0 and its explanatory caption.
+  //
+  // The predicate is "did a load ever land", not "is there an error right now":
+  // useAsync keeps the last good data through a failed REFETCH, and a count of
+  // "—" over rows the panel is still showing would be its own small lie.
+  const overridesKnown = !!data;
 
   // Wrap a mutation so any error surfaces inline and the lists refetch on success.
   const mutate = (p: Promise<unknown>) => {
@@ -161,7 +173,7 @@ export function DetectionTuningPanel({
 
       {/* ── Active overrides ─────────────────────────────────────────────── */}
       <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[.06em] text-faint">
-        Muted rules ({overrides.length})
+        Muted rules ({overridesKnown ? overrides.length : '—'})
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         <div className="grid grid-cols-[1fr_140px_90px] gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
@@ -172,6 +184,16 @@ export function DetectionTuningPanel({
         {!loading && !error && overrides.length === 0 && (
           <div className="px-3.5 py-4 text-[12.5px] text-faint">
             No muted rules. Mute a nominated rule above to suppress it from the default feed.
+          </div>
+        )}
+        {/* Without this the failed load leaves a bare column header — the same
+            shape as an empty table, which is the reading to avoid. The card
+            above already carries the error and the retry; this one only has to
+            refuse to claim the list is empty. Not shown when a previous load
+            left rows on screen: they are stale, not absent. */}
+        {error && !data && (
+          <div className="px-3.5 py-4 text-[12.5px] text-faint">
+            Muted rules couldn&apos;t be loaded — this is not a claim that none are muted.
           </div>
         )}
         {overrides.map((o: DetectionOverride) => (

@@ -17,18 +17,33 @@ import type {
   Config,
   ConnTestResult,
   DangerSetting,
+  Dossier,
+  DossierConflicts,
+  DossierFieldName,
+  DossierHealthFilter,
+  DossierLane,
+  DossierList,
+  DossierRefreshStatus,
+  DossierSortKey,
+  DossierSummary,
   EntityDetail,
+  HostActivity,
+  HostActivityRange,
   HuntBulkDeleteResult,
   HuntDetailData,
   HuntRehuntResult,
   HuntRow,
   HuntStat,
   Investigation,
+  InvestigationList,
   InvestigationRow,
   Me,
   Notification,
   RehuntResult,
   RepresentativeOut,
+  SavedView,
+  SavedViewQuery,
+  SavedViewScreen,
   StartBacktestOpts,
   TriageState,
   UpdateCheckResult,
@@ -36,11 +51,12 @@ import type {
 } from './types';
 
 /** JSON-body POST helper. */
-function post<T>(path: string, body?: unknown): Promise<T> {
+function post<T>(path: string, body?: unknown, opts?: RequestOpts): Promise<T> {
   return request<T>(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
+    ...opts,
   });
 }
 
@@ -54,8 +70,8 @@ function put<T>(path: string, body?: unknown): Promise<T> {
 }
 
 /** DELETE helper. */
-function del<T>(path: string): Promise<T> {
-  return request<T>(path, { method: 'DELETE' });
+function del<T>(path: string, opts?: RequestOpts): Promise<T> {
+  return request<T>(path, { method: 'DELETE', ...opts });
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +87,97 @@ const API_BASE = '/api/v1';
  *  A ?next= param carries the same value as a fallback when sessionStorage is
  *  unavailable. */
 export const POST_LOGIN_REDIRECT_KEY = 'soc-ai:post-login-redirect';
+
+/** The SPA's own path prefix ('/app'), i.e. the router basename main.tsx uses. */
+const APP_BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
+
+/**
+ * A stored destination, reduced to a router path — or null if it is not one.
+ *
+ * The value comes back from sessionStorage or a ?next= query param, and both
+ * are writable by whoever can hand the analyst a link. So this is an
+ * allow-list, not a deny-list: the ONLY thing accepted is a path that already
+ * begins with the SPA's own prefix. That single rule refuses every open-redirect
+ * shape at once — `https://evil.example/x` and `javascript:…` don't start with
+ * a slash at all, and `//evil.example/x` (protocol-relative, the one that looks
+ * like a path) is refused by the explicit check below because a bare
+ * `startsWith('/')` would wave it through if BASE_URL were ever '/'.
+ *
+ * `/app/login` is refused too: honouring it would return the analyst to the
+ * screen they just left, which reads as a failed sign-in. That check compares
+ * the way the ROUTER matches — case-folded and without the query or fragment —
+ * because `/app/LOGIN` and `/app/login#x` reach the Login screen just as surely
+ * as the lower-case spelling does, and a check that only knew one of them would
+ * be a rule the other two walk around.
+ *
+ * The return value drops the prefix, because react-router's navigate() works
+ * inside the basename — passing the browser path would land on /app/app/hosts.
+ */
+function inAppPath(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  // Protocol-relative and backslash-smuggled authorities, before anything else.
+  if (raw.startsWith('//') || raw.startsWith('/\\')) return null;
+  if (!raw.startsWith(APP_BASE + '/')) return null;
+  const path = raw.slice(APP_BASE.length);
+  const route = path.toLowerCase().split(/[?#]/)[0];
+  if (route === '/login' || route.startsWith('/login/')) return null;
+  return path;
+}
+
+/**
+ * Consume the deep link a 401 stashed, if there is a usable one.
+ *
+ * Reading it CLEARS it, whether or not it survived {@link inAppPath}: a
+ * destination is good for exactly one sign-in, and a rejected one must not sit
+ * in storage waiting for the next. Returns a router-relative path, or null for
+ * "no destination" — the caller decides the default.
+ */
+export function takePostLoginRedirect(search?: string): string | null {
+  let stored: string | null = null;
+  try {
+    stored = sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY);
+    sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+  } catch {
+    /* storage blocked — the ?next= param below is exactly this fallback */
+  }
+  const fromStorage = inAppPath(stored);
+  if (fromStorage) return fromStorage;
+  const qs = search ?? (typeof window === 'undefined' ? '' : window.location.search);
+  return inAppPath(new URLSearchParams(qs).get('next'));
+}
+
+/**
+ * A non-OK API response, carrying the HTTP status the screens branch on.
+ *
+ * "This run doesn't exist" and "the grid is down" are different answers, and
+ * with only a message string to go on every detail screen rendered them as the
+ * same alarm-red card (dogfood B3, 2026-08-11). Transport failures — network
+ * error, client timeout — stay plain `Error`s: they carry no status because
+ * there was no response, and "not found" is exactly what they cannot claim.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  /**
+   * House error code (e.g. `bad_credentials`), when the body carried one. The
+   * wire shape is {reason, hint}: `hint` is the sentence shown to the analyst,
+   * `reason` the machine-readable code. Callers key off `reason` — matching the
+   * prose instead breaks the moment the wording is edited, and can't separate
+   * two rejections that read alike.
+   */
+  readonly reason?: string;
+
+  constructor(message: string, status: number, reason?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.reason = reason;
+  }
+}
+
+/** True when a request failed because the thing it asked for isn't there. */
+export function isNotFound(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
 
 /**
  * Hand a mid-session 401 off to the login page without throwing the analyst's
@@ -90,7 +197,30 @@ function redirectToLogin(): void {
   window.location.href = '/app/login?next=' + encodeURIComponent(next);
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Client-side budget for every JSON request. Without it, fetch inherits the
+// browser default (effectively indefinite) — and when the backend hangs on a
+// down Elasticsearch (~90s worst case), stacked polls exhaust the browser's
+// ~6-connections-per-origin pool, so even DB-backed widgets and lazy route
+// chunks queue behind hung requests and the whole UI appears frozen (dogfood
+// 2026-08-05). 20s sits above the backend's 12s grid bound; callers with a
+// known-slow endpoint can pass their own timeoutMs. Streaming (SSE) paths do
+// NOT go through this helper — a total-duration signal would kill them.
+const REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * Per-call overrides the fetch helpers forward to `request()`.
+ *
+ * `skipLoginRedirect` is for the handful of endpoints where a 401 is an
+ * ANSWER rather than an expiry — see the saved-view calls at the bottom of this
+ * file. Everything else keeps the global handoff, so a session that really did
+ * expire still lands on login with its deep link intact.
+ */
+interface RequestOpts {
+  timeoutMs?: number;
+  skipLoginRedirect?: boolean;
+}
+
+async function request<T>(path: string, init?: RequestInit & RequestOpts): Promise<T> {
   const token = import.meta.env.VITE_API_TOKEN as string | undefined;
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (init?.headers) Object.assign(headers, init.headers as Record<string, string>);
@@ -98,27 +228,45 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(API_BASE + path, { credentials: 'include', ...init, headers });
-  } catch {
+    res = await fetch(API_BASE + path, {
+      credentials: 'include',
+      signal: AbortSignal.timeout(init?.timeoutMs ?? REQUEST_TIMEOUT_MS),
+      ...init,
+      headers,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      throw new Error('Request timed out — the soc-ai API (or Security Onion behind it) is slow or down.');
+    }
     throw new Error('Network error — is the soc-ai API reachable?');
   }
 
-  if (res.status === 401) {
+  if (res.status === 401 && !init?.skipLoginRedirect) {
     // Not authenticated / session expired — hand off to the login page,
     // preserving the analyst's current deep link (see redirectToLogin).
+    // Opted-out callers fall through to the ApiError below instead, so they
+    // can read the refusal rather than have the page navigated out from under
+    // them (RequestOpts.skipLoginRedirect).
     redirectToLogin();
     throw new Error('Unauthorized');
   }
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
+    let reason: string | undefined;
     try {
       const body = await res.json();
       const hint = body?.detail?.hint ?? (typeof body?.detail === 'string' ? body.detail : null);
       if (hint) detail = hint;
+      // The house error shape is {reason, hint}: `hint` is the sentence shown to
+      // the analyst, `reason` the machine-readable code. Dropping `reason` forced
+      // callers to regex the prose to work out WHAT failed — which breaks the
+      // moment the wording is edited, and can't separate two rejections that read
+      // alike. Carry it on the Error instead.
+      if (typeof body?.detail?.reason === 'string') reason = body.detail.reason;
     } catch {
       /* non-JSON error body — keep the status line */
     }
-    throw new Error(detail);
+    throw new ApiError(detail, res.status, reason);
   }
   return (await res.json()) as T;
 }
@@ -129,6 +277,11 @@ export interface AlertQuery {
   to?: string;
   severity?: string; // '' = all, else critical|high|medium|low
   hideAcked?: boolean; // when true, exclude acknowledged/escalated groups
+  /** An OQL filter clause, validated server-side (parse + field whitelist).
+   *  Carried by deep links — the host page's Alerts KPI narrows this screen to
+   *  one host with it. Part of AlertQuery so the event pages and group actions
+   *  fetched under an active filter stay scoped to the same set. */
+  q?: string;
 }
 
 function alertQueryParams(query: AlertQuery, base: Record<string, string> = {}): string {
@@ -141,6 +294,7 @@ function alertQueryParams(query: AlertQuery, base: Record<string, string> = {}):
   }
   if (query.severity) p.set('severity', query.severity);
   if (query.hideAcked) p.set('hide_acked', 'true');
+  if (query.q) p.set('q', query.q);
   return p.toString();
 }
 
@@ -179,8 +333,44 @@ export function getRepresentative(
   return request<RepresentativeOut>(`/alerts/representative?${qs}`);
 }
 
+/** Filters for the investigations list — applied by the SERVER, in SQL.
+ * `verdict` accepts the stored verdicts plus the synthetic 'pipeline_error'
+ * (fallback-marked runs); `status` accepts the display statuses. Both are
+ * multi-value (joined as comma-separated params). */
+export interface InvestigationListQuery {
+  since?: string;
+  until?: string;
+  verdict?: string[];
+  status?: string[];
+  /** Free text, matched SERVER-side against rule name, source and destination.
+   *  Client-side filtering is what made older runs unreachable in the first
+   *  place — see the note above. */
+  q?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** One filtered, counted, paged slice of the investigations list. */
+export function listInvestigations(q: InvestigationListQuery = {}): Promise<InvestigationList> {
+  const p = new URLSearchParams();
+  if (q.since) p.set('since', q.since);
+  if (q.until) p.set('until', q.until);
+  if (q.verdict?.length) p.set('verdict', q.verdict.join(','));
+  if (q.status?.length) p.set('status', q.status.join(','));
+  if (q.q?.trim()) p.set('q', q.q.trim());
+  if (q.limit != null) p.set('limit', String(q.limit));
+  if (q.offset != null) p.set('offset', String(q.offset));
+  const qs = p.toString();
+  return request<InvestigationList>(`/investigations${qs ? `?${qs}` : ''}`);
+}
+
+/** The newest rows, unfiltered (first page) — for the two consumers that want a
+ * recent sample rather than a query: the command palette's jump list and the
+ * redaction-preview picker. Anything that reports a FIGURE wants
+ * `listInvestigations` and its server-side counts; a sample counted as if it
+ * were a query is how the pipeline-error KPI came to read zero. */
 export function getInvestigations(): Promise<InvestigationRow[]> {
-  return request<InvestigationRow[]>('/investigations');
+  return listInvestigations({ limit: 100 }).then((r) => r.rows);
 }
 
 /**
@@ -196,6 +386,7 @@ export function getInvestigation(idOrGroupId: string): Promise<Investigation> {
 export async function downloadInvestigationExport(invId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/investigations/${encodeURIComponent(invId)}/export`, {
     credentials: 'include',
+    signal: AbortSignal.timeout(60_000),
     headers: { Accept: 'application/json' },
   });
   if (!res.ok) throw new Error(`Export failed (${res.status})`);
@@ -249,6 +440,15 @@ export function getEntity(value: string): Promise<EntityDetail> {
 }
 
 /**
+ * The longest objective the hunt endpoints accept (MAX_OBJECTIVE_CHARS in
+ * routes_hunts.py). Lives at the API boundary because the two callers are on
+ * opposite sides of the app: the Hunt Console's textarea hard-stops here, and
+ * the Dashboard chat clamps an agent-written objective here — a proposal card
+ * that 422s on click is worse than one that was trimmed.
+ */
+export const MAX_OBJECTIVE_CHARS = 12000;
+
+/**
  * Start a chat-driven Hunt Console hunt; resolves with the new hunt's id (poll
  * it live). Distinct from ``startHunt``, which starts a single-alert
  * INVESTIGATION — a Hunt Console hunt is broad (findings + narrative).
@@ -298,6 +498,8 @@ export interface HuntChatMessage {
 export interface HuntChatThread {
   messages: HuntChatMessage[];
   pending: boolean;
+  /** Tools the in-flight turn has called so far, oldest first (empty when idle). */
+  progress_tools?: string[];
 }
 
 /** The hunt's follow-up "Chat about this" thread (poll while pending). */
@@ -378,16 +580,39 @@ export interface ModelFitnessLeg {
   ok: boolean;
   grade: 'pass' | 'degraded' | 'fail';
   detail: string;
+  /** How slow, and on which backend. Null on a leg that never ran far enough to
+   * measure, and on verdicts cached before the 2026-08-07 probe rebuild. */
+  elapsed_s?: number | null;
+  backend?: string | null;
 }
 
 export interface ModelFitness {
-  grade: 'pass' | 'degraded' | 'fail';
+  /** 'unknown' = no probe ran and there was no cached verdict to carry over. */
+  grade: 'pass' | 'degraded' | 'fail' | 'unknown';
   model: string;
   legs: ModelFitnessLeg[];
   detail: string;
   /** true = served from the 24h server-side cache (checked_at = when measured). */
   cached?: boolean;
   checked_at?: string | null;
+  /** Which gateway backend actually served the probe. soc-ai asks for an ALIAS
+   * and the gateway may route it anywhere, so without this "model X is unfit"
+   * names what we asked for rather than what ran. */
+  served_backend?: { api_base: string } | null;
+  /** false = the self-load guard declined to probe (soc-ai's own eval /
+   * auto-triage / battery was saturating the same gateway); `note` says why and
+   * any verdict shown alongside is the previous, cached one. */
+  measured?: boolean;
+  note?: string | null;
+  /** THE red-state boolean: two consecutive failed checks. A single fail is a
+   * measurement, not a verdict — the chip's colour keys on this, never on
+   * `grade === 'fail'`. All the history fields below are null when the audit
+   * store could not be read, where `alarm` degrades to the single sample. */
+  alarm?: boolean;
+  recent_checks?: number | null;
+  recent_fails?: number | null;
+  consecutive_fails?: number | null;
+  last_pass_at?: string | null;
 }
 
 /** Grade whether the configured analyst_model can actually do the pipeline's job
@@ -494,12 +719,47 @@ export interface QualityPoint {
   n_ok: number;
   n_error: number;
   agreement_rate: number | null;
+  /** The grade counts behind `agreement_rate` (= `n_yes / n_classified`). All
+   * four are null on rows written before migration 0026 and stay that way
+   * forever — nothing can recover them — so every reader must treat null as
+   * "never recorded", not as 0. A `partial` critique ("right verdict, thin
+   * reasoning") lands in `n_classified` but not `n_yes`, which is why the rate
+   * alone can't tell 3 agree + 2 partial from 3 agree + 2 wrong. */
+  n_yes: number | null;
+  n_partial: number | null;
+  n_no: number | null;
+  n_classified: number | null;
   fallback_rate: number | null;
   error_rate: number;
   latency_p50_ms: number | null;
   verdict_counts: Record<string, number>;
   alarmed: boolean;
   alarm_reasons: string[];
+  /** WHICH condition alarmed (migration 0027): `agreement_drop`,
+   * `error_ceiling`, `fallback_jump`. `alarm_reasons` above can't answer that —
+   * each message bakes in the run's live numbers, so the same condition reads
+   * differently every night. Empty on a clean point AND on a pre-0027 row,
+   * where the condition was never recorded; readers must render the prose in
+   * that case rather than infer a code.
+   *
+   * All three are OPTIONAL, not merely nullable, because a server older than
+   * this release omits them from the JSON entirely — an SPA build outliving its
+   * backend (or a cached bundle) must parse that response, not crash on it. */
+  alarm_codes?: string[];
+  /** The codes sorted and joined with "+" — the identity of one alarm
+   * CONDITION, so `agreement_drop+error_ceiling` on two nights is one problem
+   * and not two. Null when clean or pre-0027. */
+  alarm_key?: string | null;
+  /** ISO-8601 (tz-aware) start of the CURRENT condition. Earlier than the
+   * point's own `ts` means the alarm is ongoing, not newly raised — the
+   * difference between "this keeps firing" and "this is still true". Null when
+   * clean or pre-0027. */
+  alarm_since?: string | null;
+  /** Server-side directory holding this run's eval bundle — the oracle
+   * critiques that are the only evidence for or against an alarm. A filesystem
+   * path on the soc-ai host, NOT a URL: no endpoint serves it. Null on rows
+   * written before migration 0026. */
+  batch_dir: string | null;
 }
 
 export interface QualityTrend {
@@ -641,6 +901,7 @@ export async function getAnalystRedactionPreview(
   const res = await fetch(`${API_BASE}/analyst/redaction-preview/${encodeURIComponent(invId)}`, {
     credentials: 'include',
     headers,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`Preview failed (${res.status} ${res.statusText})`);
   const body = (await res.json()) as AnalystRedactionPreview | AnalystRedactionPreviewUnavailable;
@@ -793,6 +1054,22 @@ export interface HuntTemplate {
   createdAt: string;
   available: boolean; // false iff any requiredDataset is absent from the grid
   missingDatasets: string[]; // exactly which telemetry the grid lacks (for the flag)
+  // Was `available` MEASURED? When the grid inventory could not be read the
+  // server still reports available=true — fail-open, so an unreadable inventory
+  // never hides or falsely flags a hunt — and this says so, because on the wire
+  // a fail-open default and a measured yes are otherwise identical. The picker
+  // renders a third, neutral state off it rather than the confident chip.
+  // Optional so a payload from a server predating the flag reads as "known",
+  // which is what it was.
+  availabilityKnown?: boolean;
+  // Environment fit — a SECOND, independent axis. `available` says the grid can
+  // SEE the telemetry; `applicable` says the network HAS the machinery the hunt
+  // targets (a Windows host, a domain), from the resolved dossiers. false → the
+  // picker DEMOTES the chip into a collapsed cluster, never hides it, and it
+  // stays fully runnable. Fail-open server-side: custom templates, profile
+  // errors and a never-built dossier table all report true.
+  applicable: boolean;
+  missingEnvironment: string[]; // human phrases, e.g. "a domain-joined host"
 }
 
 /** Create payload for a custom template (always saved builtin=false). */
@@ -906,7 +1183,8 @@ export function getHealth(): Promise<Health> {
   return request<Health>('/health');
 }
 
-/** Build metadata (version, repo, license) for the About panel + sidebar. */
+/** Build metadata (version, repo, license) plus the feature flags a screen needs
+ *  before it renders — see `AboutInfo`, which is the whole contract. */
 export function getAbout(): Promise<AboutInfo> {
   return request<AboutInfo>('/about');
 }
@@ -972,6 +1250,8 @@ export function rehuntInvestigations(invIds: string[]): Promise<RehuntResult> {
 export interface ChatThread {
   messages: ChatMessage[];
   pending: boolean;
+  /** Tools the in-flight turn has called so far, oldest first (empty when idle). */
+  progress_tools?: string[];
 }
 
 export function getChatThread(invId: string): Promise<ChatThread> {
@@ -980,6 +1260,50 @@ export function getChatThread(invId: string): Promise<ChatThread> {
 
 export function postChat(invId: string, message: string): Promise<ChatThread> {
   return post<ChatThread>(`/investigations/${encodeURIComponent(invId)}/chat`, { message });
+}
+
+// ── The Dashboard's general chat ────────────────────────────────────────────
+// One rolling thread per analyst, keyed server-side on the caller's identity —
+// which is why these three take no id. They return the SAME `ChatThread` shape
+// as the investigation chat (the backend serializes every chat surface through
+// one serializer), so `useChatThread` drives this surface unchanged.
+
+/** This analyst's dashboard thread; also the poll target while a turn runs. */
+export function getGeneralChat(): Promise<ChatThread> {
+  return request<ChatThread>('/chat');
+}
+
+/** Ask the dashboard assistant. 409 while a turn is already in flight. */
+export function postGeneralChat(message: string): Promise<ChatThread> {
+  return post<ChatThread>('/chat', { message });
+}
+
+/** Discard this analyst's thread. Resolves with it empty, so the caller can
+ *  reuse the same response handler it uses for a GET. */
+export function clearGeneralChat(): Promise<ChatThread> {
+  return del<ChatThread>('/chat');
+}
+
+// ── The host page chat ──────────────────────────────────────────────────────
+// One SHARED thread per host, keyed server-side on the address ("host:<ip>") —
+// the investigation-chat precedent for object-scoped chats, so every analyst on
+// this host's page reads the same conversation. Same `ChatThread` wire shape as
+// every other chat surface (one backend serializer), so `useChatThread` drives
+// it unchanged.
+
+/** This host's shared thread; also the poll target while a turn runs. */
+export function getHostChat(ip: string): Promise<ChatThread> {
+  return request<ChatThread>(`/dossiers/${encodeURIComponent(ip)}/chat`);
+}
+
+/** Ask about this host. 409 while a turn is already in flight on its thread. */
+export function postHostChat(ip: string, message: string): Promise<ChatThread> {
+  return post<ChatThread>(`/dossiers/${encodeURIComponent(ip)}/chat`, { message });
+}
+
+/** Discard this host's thread (this host's only). Resolves with it empty. */
+export function clearHostChat(ip: string): Promise<ChatThread> {
+  return del<ChatThread>(`/dossiers/${encodeURIComponent(ip)}/chat`);
 }
 
 /** Apply a validated chat verdict proposal. */
@@ -1061,6 +1385,22 @@ export function setMyStatus(status: string): Promise<{ ok: boolean; status: stri
   return post<{ ok: boolean; status: string }>('/me/status', { status });
 }
 
+/**
+ * Change your own password. Rejections (wrong current password, below the
+ * server's minimum length) arrive as a thrown Error carrying the backend's
+ * hint, which the modal renders inline. On success the caller stays signed in —
+ * the backend keeps THIS session and drops the account's others.
+ */
+export function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<{ ok: boolean }> {
+  return post<{ ok: boolean }>('/me/password', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  });
+}
+
 // ── Danger-zone API ───────────────────────────────────────────────────────────
 
 export function listDangerSettings(): Promise<DangerSetting[]> {
@@ -1096,6 +1436,16 @@ export interface AutoTriageStatus {
   tool_calls: number;
   // Per-reason breakdown of `skipped` (reason code → count); sums to `skipped`.
   skipped_reasons?: Record<string, number>;
+  /**
+   * True when the sweep could not read part (or all) of the grid. The counters
+   * cannot express this on their own: a sweep that read NOTHING and a sweep that
+   * FOUND nothing both land total=0, hunted=0, failed=0 — so an outage rendered
+   * as a fully-drained queue for the whole blind window. Key off this, never off
+   * `total === 0`.
+   */
+  degraded?: boolean;
+  /** Which queries failed ("severity critical", "rule ET SCAN thing"). */
+  grid_errors?: string[];
 }
 
 const _SEV_LADDER = ['critical', 'high', 'medium', 'low'] as const;
@@ -1368,6 +1718,196 @@ export function getDiscoveryScan(): Promise<DiscoveryScanStatus> {
   return request<DiscoveryScanStatus>('/discovery/scan');
 }
 
+// ── Host dossier ──────────────────────────────────────────────────────────────
+// The dossier keeps two physically separate lanes per field — what the network
+// sweep inferred and what an operator declared — and stores no "current value"
+// at all; every response here is the resolver's read-time answer.
+//
+// The four mutating helpers are ADMIN-gated server-side and each answers with
+// the WHOLE re-resolved dossier. Callers must re-render from that response
+// rather than patching the field they touched: setting `role` can clear a
+// conflict, and a partial update would leave a disagreement on screen that no
+// longer exists.
+
+export interface DossierQuery {
+  /** Substring match over the host key and its resolved identity fields. */
+  q?: string;
+  /** Coarse prefilter over the stored lanes. The resolver still applies the
+   *  confidence floor and staleness window, so a host listed under a role can
+   *  resolve to unknown on its own page — the honest answer, not a mismatch. */
+  role?: string;
+  /** Hosts carrying an operator declaration, or hosts running on pure inference. */
+  source?: DossierLane;
+  /** `broken`: hosts with no clean build on record — never built, or the last
+   *  build errored. The same predicate `DossierSummary.never_built` counts, so
+   *  the count and the filtered view describe one set. */
+  health?: DossierHealthFilter;
+  limit?: number;
+  offset?: number;
+  sort?: DossierSortKey;
+}
+
+/** A page of the network, every field resolved. Paged in SQL: `total` is the
+ *  whole match set, not the length of the page. */
+export function listDossiers(query: DossierQuery = {}): Promise<DossierList> {
+  const p = new URLSearchParams();
+  if (query.q) p.set('q', query.q);
+  if (query.role) p.set('role', query.role);
+  if (query.source) p.set('source', query.source);
+  if (query.health) p.set('health', query.health);
+  // `!= null` rather than truthiness: offset 0 is a real page (the first one),
+  // and dropping it as falsy is how a pager that pages forward can never page
+  // back to the top.
+  if (query.limit != null) p.set('limit', String(query.limit));
+  if (query.offset != null) p.set('offset', String(query.offset));
+  if (query.sort) p.set('sort', query.sort);
+  const qs = p.toString();
+  return request<DossierList>('/dossiers' + (qs ? `?${qs}` : ''));
+}
+
+/**
+ * Open disagreements the builder has kept seeing, oldest first. A row stays here
+ * after it has prodded — the interval throttles the NOTIFICATION, not the
+ * disagreement — and snoozed rows are excluded, which is what "keep mine" bought.
+ */
+export function getDossierConflicts(limit?: number): Promise<DossierConflicts> {
+  return request<DossierConflicts>(
+    '/dossiers/conflicts' + (limit != null ? `?limit=${limit}` : ''),
+  );
+}
+
+/**
+ * Network-wide dossier counts, for the host list's KPI strip.
+ *
+ * A separate request from `listDossiers` on purpose. That one is a SQL page of
+ * up to 5,000 hosts; these numbers are aggregates over the whole table, and
+ * deriving any of them from a page would state a figure about fifty rows as if
+ * it described the network. It carries its own freshness (`last_built_at`,
+ * `schedule_enabled`) because the sweep schedule is off by default.
+ */
+export function getDossierSummary(): Promise<DossierSummary> {
+  return request<DossierSummary>('/dossiers/summary');
+}
+
+/**
+ * One host's dossier: every field resolved, both lanes, all evidence.
+ * An address the sweep has never seen answers 200 with `found: false` and twelve
+ * `no_signal` fields — render that as "no dossier for this host", because it is
+ * a real answer and an error state there would read as "nothing notable". Only a
+ * path segment that is not an address at all is a 404.
+ */
+export function getDossier(ip: string): Promise<Dossier> {
+  return request<Dossier>(`/dossiers/${encodeURIComponent(ip)}`);
+}
+
+export interface DossierOverrideInput {
+  field: DossierFieldName;
+  /** The scalar declaration. Blank/whitespace is refused server-side (400
+   *  `empty_override`) — omit it entirely when declaring a structured field
+   *  rather than sending an empty string beside `value_json`. */
+  value?: string;
+  /** The structured declaration, for services_offered / activity_profile /
+   *  management_plane — the three fields a scalar cannot carry. */
+  value_json?: unknown;
+  note?: string;
+}
+
+/**
+ * Declare a field's value — admin. Not a hint the next build can outvote: it
+ * lands in a separate column family the resolver reads first, so no inference
+ * run can clobber it. The builder keeps observing underneath, which is how a
+ * persistent disagreement accumulates into one rate-limited "reconsider?" prod.
+ */
+/** What a bulk declaration did, host by host — a three-way partition. */
+export interface DossierBulkOverrideResult {
+  /** Took the declaration. */
+  updated: string[];
+  /** The sweep has never built a row for these. */
+  not_found: string[];
+  /** Hit an error of their own; the rest of the batch still went through. */
+  failed: Array<{ ip: string; reason: string }>;
+}
+
+/**
+ * Declare one field across a selection of hosts — admin.
+ *
+ * The server reuses the SAME store path as the single-host declare, host by
+ * host, so the operator lane keeps exactly one writer and a bulk tag cannot
+ * drift from a single one. Returns a partition rather than a count: a selection
+ * can outlive a sweep, and "3 of 5" with no names leaves the operator
+ * re-checking all five.
+ */
+export function bulkSetDossierOverride(
+  ips: string[],
+  body: DossierOverrideInput,
+): Promise<DossierBulkOverrideResult> {
+  return post<DossierBulkOverrideResult>('/dossiers/bulk-override', { ips, ...body });
+}
+
+export function setDossierOverride(ip: string, body: DossierOverrideInput): Promise<Dossier> {
+  return post<Dossier>(`/dossiers/${encodeURIComponent(ip)}/override`, body);
+}
+
+/**
+ * Accept the inference: drop the operator value and close the disagreement —
+ * admin. Throws 409 (`no_operator_override`) on a field carrying no override;
+ * an inferred value cannot be deleted, the next build writes it straight back.
+ */
+export function clearDossierOverride(ip: string, field: DossierFieldName): Promise<Dossier> {
+  return del<Dossier>(`/dossiers/${encodeURIComponent(ip)}/override/${encodeURIComponent(field)}`);
+}
+
+/**
+ * "Keep mine": postpone this disagreement, with an interval that doubles per
+ * prod already fired and caps at 90 days — admin. Nothing is resolved; the
+ * override stands and the builder keeps observing, so the conflict re-surfaces
+ * later unless the evidence comes back into agreement. Throws 409
+ * (`no_open_conflict`) when nothing currently disagrees with the override.
+ */
+export function snoozeDossierConflict(ip: string, field: DossierFieldName): Promise<Dossier> {
+  return post<Dossier>(
+    `/dossiers/${encodeURIComponent(ip)}/conflicts/${encodeURIComponent(field)}/snooze`,
+  );
+}
+
+/**
+ * Rebuild the network dossier now, in the background — admin, single-flight.
+ * A second start while a sweep is in flight reports the running one instead of
+ * launching a second (a sweep is hundreds of hosts x several grid round trips,
+ * and two at once is the connection-pool pressure that has frozen this app
+ * before). `note` reads 'dossier disabled' when the master switch is off.
+ */
+export function startDossierRefresh(): Promise<DossierRefreshStatus> {
+  return post<DossierRefreshStatus>('/dossiers/refresh');
+}
+
+/** Poll the network sweep — admin. */
+export function getDossierRefreshStatus(): Promise<DossierRefreshStatus> {
+  return request<DossierRefreshStatus>('/dossiers/refresh');
+}
+
+/**
+ * One host's LIVE activity: peers, connection volume, users, alert count.
+ *
+ * Deliberately a second call rather than more fields on `getDossier`. The
+ * dossier is swept and cached and answers while Security Onion is down; this
+ * reads the grid on every request and cannot. Fetching them separately is what
+ * lets the host page keep its identity half on screen and degrade only this one
+ * when the grid is unreachable (503 `grid_unavailable`).
+ *
+ * `range` is always sent even though the server defaults to 24h: the volume
+ * histogram's bucket width is derived from it, so the request and the chart must
+ * name the same window.
+ */
+export function getHostActivity(
+  ip: string,
+  range: HostActivityRange = '24h',
+): Promise<HostActivity> {
+  return request<HostActivity>(
+    `/dossiers/${encodeURIComponent(ip)}/activity?range=${encodeURIComponent(range)}`,
+  );
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 export interface LoginResult {
@@ -1387,6 +1927,7 @@ export async function login(username: string, password: string): Promise<LoginRe
   let res: Response;
   try {
     res = await fetch(API_BASE + '/login', {
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       credentials: 'include',
@@ -1435,4 +1976,36 @@ export async function logout(): Promise<void> {
  */
 export function signOut(navigate: (to: string) => void): Promise<void> {
   return logout().finally(() => navigate('/login'));
+}
+
+// ── Saved list views (per user, server-held) ────────────────────────────────
+//
+// These three opt out of the global 401 handoff, because here a 401 is an
+// ANSWER, not an expiry: a saved view belongs to a person, and a deployment
+// running with API_AUTH_REQUIRED=false has nobody to own one. That is the
+// steady state of the demo and of every hermetic instance, so the redirect sent
+// Alerts, Investigations, Hunts and Hosts — the four screens that fetch views on
+// mount — to a login page nobody could sign in to, while Notifications (which
+// fetches none) stayed usable. Refused now surfaces as an ApiError carrying
+// {status, reason}; useSavedViews reads it and simply drops the controls.
+
+/** This user's saved views, oldest first — optionally for one screen. */
+export function listSavedViews(screen?: SavedViewScreen): Promise<SavedView[]> {
+  const qs = screen ? `?screen=${encodeURIComponent(screen)}` : '';
+  return request<{ rows: SavedView[] }>(`/me/views${qs}`, { skipLoginRedirect: true }).then(
+    (r) => r.rows,
+  );
+}
+
+/** Save the current filter set under a name. Re-saving a name replaces it. */
+export function saveView(
+  screen: SavedViewScreen,
+  name: string,
+  query: SavedViewQuery,
+): Promise<SavedView> {
+  return post<SavedView>('/me/views', { screen, name, query }, { skipLoginRedirect: true });
+}
+
+export function deleteSavedView(id: number): Promise<{ ok: boolean }> {
+  return del<{ ok: boolean }>(`/me/views/${id}`, { skipLoginRedirect: true });
 }

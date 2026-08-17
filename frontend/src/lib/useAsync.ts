@@ -66,13 +66,18 @@ export function useAsync<T>(
     // captures its id and bails unless it's still the latest (and still alive).
     let seq = 0;
 
+    let inFlight = false;
     const run = (foreground: boolean) => {
+      inFlight = true;
       const id = ++seq;
       const fresh = () => alive && id === seq;
       // Foreground (initial / dep change / refetch): show loading but keep prior
       // data so the screen doesn't flash. Background (poll): silent.
       if (foreground) setState((s) => ({ ...s, loading: true, error: null }));
       loader()
+        .finally(() => {
+          if (id === seq) inFlight = false;
+        })
         .then((data) => {
           if (fresh())
             setState((s) => ({
@@ -112,6 +117,11 @@ export function useAsync<T>(
         if (!alive) return;
         if (typeof document !== 'undefined' && document.hidden) return; // don't poll a backgrounded tab
         if (pauseWhen && pauseWhen()) return;
+        // In-flight guard: when the API is slow/down, a bare interval stacks a
+        // new request on top of the unresolved previous one — with several
+        // pollers that exhausts the browser's per-origin connection pool and
+        // freezes UNRELATED widgets (dogfood 2026-08-05). Skip the tick instead.
+        if (inFlight) return;
         run(false);
       }, refetchInterval);
     }

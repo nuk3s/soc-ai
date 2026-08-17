@@ -14,7 +14,7 @@ write without your click, and nothing leaving your network. The always-on web
 console shipped on day one.
 
 **The 1.0.x line made it a place you could work all day.** The Hunt Console
-took plain-English objectives across the whole estate. Backtests let you replay
+took plain-English objectives across the whole network. Backtests let you replay
 the agent against alerts you had already dispositioned, so trust could be
 measured instead of assumed. Runbooks gave the agent your team's own
 procedures to cite, and grid discovery taught it to learn what data your

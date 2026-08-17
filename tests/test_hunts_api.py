@@ -15,11 +15,12 @@ import asyncio
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic_ai.models.test import TestModel
+from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT
 from soc_ai.agent.hunt import (
     HUNT_SYSTEM_PROMPT,
     HuntFinding,
@@ -33,6 +34,7 @@ from soc_ai.config import Settings
 from soc_ai.main import create_app
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store.models import Hunt
+from soc_ai.webui import hunt_console_manager as hcm
 
 # A valid HuntReport the TestModel emits as the agent's structured output.
 FAKE_REPORT = HuntReport(
@@ -145,12 +147,25 @@ def test_hunt_online_tools_gated_by_master_toggle(settings_kratos: Settings) -> 
 
 
 def test_run_hunt_streams_report(settings_kratos: Settings) -> None:
+    """The stream contract, on a hunt that made one successful grid read — the
+    evidence-count gate requires >=1 for a clean report, so the stub model runs
+    one real (patched-ES) OQL query before emitting its report."""
+    from soc_ai.so_client.elastic import EsSearchResult
+
     async def _go() -> list[Any]:
         events = []
         # Patch the model builder the runner uses so no live gateway is touched.
-        with patch(
-            "soc_ai.api.hunt_runner.build_investigator_model",
-            return_value=TestModel(call_tools=[], custom_output_args=FAKE_REPORT),
+        with (
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(
+                    call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+                ),
+            ),
+            patch(
+                "soc_ai.agent.toolset.query_events_oql",
+                AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+            ),
         ):
             async for ev in run_hunt(_ctx(settings_kratos), objective="hunt for beaconing"):
                 events.append(ev)
@@ -159,6 +174,7 @@ def test_run_hunt_streams_report(settings_kratos: Settings) -> None:
     events = asyncio.run(_go())
     kinds = [e.kind for e in events]
     assert kinds[0] == "hunt_started"
+    assert "tool_result" in kinds  # the grid read really streamed
     assert "hunt_report" in kinds
     assert kinds[-1] == "done"
     report_ev = next(e for e in events if e.kind == "hunt_report")
@@ -217,7 +233,13 @@ def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: 
     from types import SimpleNamespace
 
     from pydantic_ai.exceptions import UsageLimitExceeded
-    from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
 
     class _BudgetRun:
         result = None
@@ -228,6 +250,35 @@ def test_run_hunt_budget_exhaustion_synthesizes_partial_report(settings_kratos: 
                     SimpleNamespace(
                         model_response=None,
                         request=ModelRequest(parts=[UserPromptPart(content="hunt for beaconing")]),
+                    ),
+                    # One EXECUTED grid read before the budget ran out — a real
+                    # budget-exhausted hunt burned its budget on queries, and the
+                    # evidence-count gate requires >=1 successful read for the
+                    # partial report to stand clean (a zero-read partial is a
+                    # blind hunt and is that gate's subject, not this test's).
+                    SimpleNamespace(
+                        model_response=ModelResponse(
+                            parts=[
+                                ToolCallPart(
+                                    tool_name="t_query_events_oql",
+                                    args={"q": "wide"},
+                                    tool_call_id="c0",
+                                )
+                            ]
+                        ),
+                        request=None,
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=ModelRequest(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_query_events_oql",
+                                    content={"total": 0, "hits": []},
+                                    tool_call_id="c0",
+                                )
+                            ]
+                        ),
                     ),
                     SimpleNamespace(model_response=_dangling_batch_response(), request=None),
                 ]
@@ -367,13 +418,45 @@ def test_run_hunt_wall_clock_timeout_synthesizes_partial_report(
     as budget exhaustion (a grounded PARTIAL report, not an empty error)."""
     from types import SimpleNamespace
 
-    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 
     class _HangingRun:
         result = None
 
         def __init__(self) -> None:
-            self._yielded = False
+            # A few live steps — including one SUCCESSFUL grid read, so the
+            # partial report stands clean under the evidence-count gate (the
+            # "ran some queries, then the LLM hung" failure mode really did run
+            # a query) — then the stream wedges.
+            self._nodes = iter(
+                [
+                    SimpleNamespace(
+                        model_response=ModelResponse(
+                            parts=[
+                                TextPart(content="ran a query"),
+                                ToolCallPart(
+                                    tool_name="t_query_events_oql",
+                                    args={"q": "wide"},
+                                    tool_call_id="c1",
+                                ),
+                            ]
+                        ),
+                        request=None,
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=SimpleNamespace(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_query_events_oql",
+                                    content={"total": 0, "hits": []},
+                                    tool_call_id="c1",
+                                )
+                            ]
+                        ),
+                    ),
+                ]
+            )
 
         async def __aenter__(self) -> _HangingRun:
             return self
@@ -385,14 +468,10 @@ def test_run_hunt_wall_clock_timeout_synthesizes_partial_report(
             return self
 
         async def __anext__(self) -> Any:
-            if not self._yielded:
-                # One live step lands in `gathered`, then the stream wedges — the
-                # exact "ran some queries, then the LLM hung" failure mode.
-                self._yielded = True
-                return SimpleNamespace(
-                    model_response=ModelResponse(parts=[TextPart(content="ran a query")]),
-                    request=None,
-                )
+            try:
+                return next(self._nodes)
+            except StopIteration:
+                pass
             await asyncio.sleep(3600)  # hang until the wall-clock backstop cancels
             raise AssertionError("unreachable")  # pragma: no cover
 
@@ -526,7 +605,9 @@ def test_finding_category_legacy_inference() -> None:
         )
         == "visibility_gap"
     )
-    assert _finding_category({"title": "No host process logging on the estate"}) == "visibility_gap"
+    assert (
+        _finding_category({"title": "No host process logging on the network"}) == "visibility_gap"
+    )
     # … everything else stays a threat finding (old behavior).
     assert _finding_category({"title": "Beaconing to rare external IP"}) == "threat"
 
@@ -680,15 +761,27 @@ def test_start_hunt_chat_persists_via_manager(
 ) -> None:
     """POST /hunts/chat starts a background hunt that lands a complete row.
 
-    Patches the model builder the hunt runner uses so the whole background flow
-    runs offline; then polls the persisted row (via an independent engine) until
-    the background drainer finalizes it.
+    Patches the model builder the hunt runner uses (and the ES call under the
+    query tool — a COMPLETE hunt requires at least one successful grid read
+    under the evidence-count gate) so the whole background flow runs offline;
+    then polls the persisted row (via an independent engine) until the
+    background drainer finalizes it.
     """
     import time
 
-    with patch(
-        "soc_ai.api.hunt_runner.build_investigator_model",
-        return_value=TestModel(call_tools=[], custom_output_args=FAKE_REPORT),
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    with (
+        patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            return_value=TestModel(
+                call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+            ),
+        ),
+        patch(
+            "soc_ai.agent.toolset.query_events_oql",
+            AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+        ),
     ):
         resp = client.post("/api/v1/hunts/chat", json={"objective": "hunt for beaconing"})
         assert resp.status_code == 200
@@ -812,8 +905,11 @@ def test_run_hunt_chat_turn_error_content_is_scrubbed_before_persisting() -> Non
         patch.object(hcm.hunt_svc, "get_with_events", _get_with_events),
         patch.object(hcm.hunt_svc, "chat_history_for_agent", _history),
         patch.object(hcm.hunt_svc, "finish_chat_assistant", finish_mock),
-        patch.object(hcm, "build_chat_agent") as mock_build,
-        patch.object(hcm, "build_investigator_model", MagicMock()),
+        # The turn now runs through the shared engine, so the agent/model builders
+        # live in chat_turn — patch them there, not on the (un-forked) manager.
+        patch("soc_ai.webui.chat_turn.build_chat_agent") as mock_build,
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn.inventory_prompt_block", AsyncMock(return_value="")),
     ):
         agent_mock = MagicMock()
         agent_mock.run = AsyncMock(
@@ -821,7 +917,7 @@ def test_run_hunt_chat_turn_error_content_is_scrubbed_before_persisting() -> Non
         )
         mock_build.return_value = agent_mock
 
-        asyncio.run(hcm._run_hunt_chat_turn(state, "hunt-secret", 42))
+        asyncio.run(hcm._run_turn(state, "hunt-secret", 42))
 
     finish_mock.assert_called_once()
     content = finish_mock.call_args.kwargs.get("content", "")
@@ -869,9 +965,9 @@ def test_delete_running_hunt_conflicts(client: TestClient) -> None:
 
 def test_hunt_chat_thread_empty_and_404(client: TestClient) -> None:
     hunt_id = _seed_complete_hunt(client)
-    # a completed hunt with no chat yet → empty, not pending
+    # a completed hunt with no chat yet → empty, not pending, no live progress
     body = client.get(f"/api/v1/hunts/{hunt_id}/chat").json()
-    assert body == {"messages": [], "pending": False}
+    assert body == {"messages": [], "pending": False, "progress_tools": []}
     # unknown hunt → 404
     assert client.get("/api/v1/hunts/nope/chat").status_code == 404
 
@@ -937,7 +1033,10 @@ def test_hunt_chat_message_runs_a_turn_and_round_trips(
     hunt_id = _seed_complete_hunt(client)
 
     with patch(
-        "soc_ai.webui.hunt_console_manager.build_investigator_model",
+        # The turn runs through the shared engine now — the model builder lives
+        # in chat_turn. The answer's IP (203.0.113.9) is in the seeded report, so
+        # the newly-inherited grounding check leaves it uncaveated.
+        "soc_ai.webui.chat_turn.build_investigator_model",
         return_value=TestModel(
             call_tools=[], custom_output_text="The rare beacon was to 203.0.113.9."
         ),
@@ -980,6 +1079,130 @@ def test_hunt_chat_message_runs_a_turn_and_round_trips(
     assert all("chat" not in (s.get("group", "").lower()) for s in detail["timeline"])
     tl_titles = " ".join(s["title"] for s in detail["timeline"])
     assert "which host was beaconing" not in tl_titles
+
+
+# ── the hunt follow-up chat runs on the SHARED turn engine (un-fork) ─────────
+#
+# hunt-chat-fork-persists: the hunt chat used to COPY the turn body out of
+# chat_manager, so it silently missed the live tool progress, grounding check,
+# regrounding loop and fabricated-citation gate the other chats got. It is now a
+# client of soc_ai.webui.chat_turn like every other chat shape. These pin that.
+
+
+def test_hunt_chat_spec_builds_the_hunt_shape(client: TestClient) -> None:
+    """The manager's whole job: a ``ChatTurnSpec`` the shared engine can run —
+    the hunt-shaped half and nothing more. If this ever needs turn logic copied
+    back in, the engine is missing a seam and the fork is creeping back."""
+    from tests.test_general_chat_api import _state
+
+    hunt_id = _seed_complete_hunt(client)
+    state = _state(client)
+
+    async def _go() -> Any:
+        async with state.db_sessionmaker() as db:
+            await hunt_svc.add_chat_user_message(db, hunt_id, "older question")
+            older = await hunt_svc.create_pending_chat_assistant(db, hunt_id)
+            await hunt_svc.finish_chat_assistant(db, older.id, content="older answer")
+            await hunt_svc.add_chat_user_message(db, hunt_id, "which host was worst?")
+            row = await hunt_svc.create_pending_chat_assistant(db, hunt_id)
+        spec = hcm._hunt_chat_spec(state, hunt_id, row.id)
+        return spec, await spec.prepare()
+
+    spec, inputs = asyncio.run(_go())
+    assert spec.label == f"hunt={hunt_id}"
+    # A hunt follow-up gets its OWN (minutes-long) budget, not the chat's seconds.
+    assert spec.timeout_s == state.settings.hunt_chat_turn_timeout_s
+    assert spec.set_progress is not None  # live tool progress is wired
+    assert inputs is not None
+    assert inputs.system_prompt is CHAT_SYSTEM_PROMPT
+    # A hunt follow-up slices telemetry, it does not pivot from an alert.
+    assert inputs.oql_flavor == "hunt"
+    assert inputs.question == "which host was worst?"
+    assert inputs.prior == [("user", "older question"), ("assistant", "older answer")]
+    # There is no proposal on a hunt follow-up (no verdict, no nested sweep):
+    # the engine's default read-only agent is exactly right.
+    assert inputs.build_agent is None
+    assert inputs.finalize_meta is None
+    # The seed anchors on what the hunt concluded.
+    assert "hunt for beaconing" in inputs.seed_context
+
+
+def test_hunt_chat_ungrounded_answer_now_gets_the_caveat(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """The payoff of the un-fork: an answer asserting a host/domain absent from
+    the hunt's evidence comes back wearing the Unverified caveat — the guardrail
+    the fork lacked, now inherited from the shared engine (matches
+    test_chat_turn's cross-shape grounding test)."""
+    import time
+
+    hunt_id = _seed_complete_hunt(client)
+
+    with patch(
+        "soc_ai.webui.chat_turn.build_investigator_model",
+        return_value=TestModel(
+            call_tools=[],
+            custom_output_text="The host resolved evil.example.com repeatedly.",
+        ),
+    ):
+        resp = client.post(f"/api/v1/hunts/{hunt_id}/chat", json={"message": "any bad DNS?"})
+        assert resp.status_code == 200
+
+        done: dict[str, Any] | None = None
+        for _ in range(50):  # up to ~5s
+            rows = _read_hunt_chat(settings_kratos, hunt_id)
+            assistant = [r for r in rows if r["kind"] == "chat_assistant"]
+            if assistant and assistant[-1]["payload"].get("status") == "done":
+                done = assistant[-1]
+                break
+            time.sleep(0.1)
+
+    assert done is not None
+    assert "Unverified" in done["payload"]["content"]
+    grounding = done["payload"]["meta"]["narrative_grounding"]
+    assert grounding["grounded"] is False
+    assert "evil.example.com" in grounding["ungrounded"]
+
+
+def test_hunt_chat_thread_surfaces_live_tool_progress(client: TestClient) -> None:
+    """``set_progress`` writes the tools a pending turn has run into the assistant
+    row's meta; the thread route surfaces them as ``progress_tools`` so the
+    panel's footer populates during a long follow-up (the wire half of the
+    un-fork). Empty before any turn is pending."""
+    hunt_id = _seed_complete_hunt(client)
+
+    async def _seed_pending() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await hunt_svc.add_chat_user_message(db, hunt_id, "which host?")
+            row = await hunt_svc.create_pending_chat_assistant(db, hunt_id)
+            await hunt_svc.set_progress(db, row.id, ["t_query_events_oql", "t_host_dossier"])
+
+    asyncio.run(_seed_pending())
+    body = client.get(f"/api/v1/hunts/{hunt_id}/chat").json()
+    assert body["pending"] is True
+    assert body["progress_tools"] == ["t_query_events_oql", "t_host_dossier"]
+
+
+def test_hunt_chat_delegates_to_the_shared_engine_not_a_fork() -> None:
+    """The un-fork, pinned in source: the manager is a CLIENT of chat_turn, and
+    the byte-identical helpers the fork carried are gone. A re-derived turn body
+    here is exactly the drift the extraction exists to stop."""
+    import inspect
+
+    src = inspect.getsource(hcm)
+    assert "run_chat_turn" in src
+    # The turn body — wall clock and grounding gate — lives in the engine now.
+    assert "asyncio.timeout" not in src
+    assert "check_narrative_grounding" not in src
+    # The three duplicated helpers plus the system-prompt fork are deleted.
+    for gone in (
+        "_hunt_chat_build_prompt",
+        "_hunt_chat_extract_tools",
+        "_hunt_chat_system_prompt",
+        "_MAX_HISTORY",
+    ):
+        assert not hasattr(hcm, gone), f"{gone} survived the un-fork"
+        assert gone not in src, f"{gone} still spelled in the module"
 
 
 # ── E1.3: post-hunt citation gate ────────────────────────────────────────────
@@ -1784,11 +2007,14 @@ def test_get_hunt_diff_fuzzy_title_and_hosts_identity(
 
 def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) -> None:
     """The recorded run emits hunt_created (with the row id) first, then tees the
-    agent stream, and finalizes a complete row."""
+    agent stream, and finalizes a complete row. The stub model makes one real
+    (patched-ES) grid read — a COMPLETE row requires >=1 successful read under
+    the evidence-count gate."""
     engine = None
 
     async def _go() -> tuple[list[str], str]:
         nonlocal engine
+        from soc_ai.so_client.elastic import EsSearchResult
         from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 
         engine = make_engine(settings_kratos)
@@ -1797,9 +2023,17 @@ def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) ->
         state = type("S", (), {"db_sessionmaker": maker})()
         names: list[str] = []
         hunt_id = ""
-        with patch(
-            "soc_ai.api.hunt_runner.build_investigator_model",
-            return_value=TestModel(call_tools=[], custom_output_args=FAKE_REPORT),
+        with (
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(
+                    call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+                ),
+            ),
+            patch(
+                "soc_ai.agent.toolset.query_events_oql",
+                AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+            ),
         ):
             async for name, data in hunt_recorded_run(
                 state, ctx=_ctx(settings_kratos), objective="beaconing", started_by="admin"
@@ -2226,7 +2460,7 @@ def test_run_hunt_partial_path_applies_humility(settings_kratos: Settings) -> No
     from types import SimpleNamespace
 
     from pydantic_ai.exceptions import UsageLimitExceeded
-    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 
     over_confident = HuntReport(
         findings=[
@@ -2246,12 +2480,36 @@ def test_run_hunt_partial_path_applies_humility(settings_kratos: Settings) -> No
         result = None
 
         def __init__(self) -> None:
+            # "Ran one query" for real: one successful grid read, so the partial
+            # report stands under the evidence-count gate and what this test
+            # observes is the HUMILITY clamp, not the blind-hunt marker.
             self._nodes = iter(
                 [
                     SimpleNamespace(
-                        model_response=ModelResponse(parts=[TextPart(content="ran one query")]),
+                        model_response=ModelResponse(
+                            parts=[
+                                TextPart(content="ran one query"),
+                                ToolCallPart(
+                                    tool_name="t_query_events_oql",
+                                    args={"q": "wide"},
+                                    tool_call_id="c1",
+                                ),
+                            ]
+                        ),
                         request=None,
-                    )
+                    ),
+                    SimpleNamespace(
+                        model_response=None,
+                        request=SimpleNamespace(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="t_query_events_oql",
+                                    content={"total": 2, "hits": [{"_id": "e1"}]},
+                                    tool_call_id="c1",
+                                )
+                            ]
+                        ),
+                    ),
                 ]
             )
 
@@ -2766,3 +3024,226 @@ def test_validate_hunt_findings_oql_alert_doc_still_capped() -> None:
     validated, _stats = _validate_hunt_findings(findings, tool_results)
     assert validated[0].severity == "medium"
     assert _ALERT_ONLY_NOTE in (validated[0].validator_note or "")
+
+
+# ── Host dossier: identity in the planner prompt and the console seed ────────
+#
+# A hunt objective names hosts the same way an alert does — "did anything probe
+# 192.168.10.202?" — and until now the hunt agent learned only what those
+# addresses DID. The block that fixes that for investigations is the same block
+# here: one renderer, composed BEFORE the egress sweep, bounded at
+# MAX_PROMPT_HOSTS.
+
+DOSSIER_HOST = "192.168.10.202"
+
+
+async def _ctx_with_dossier(settings: Settings, ip: str = DOSSIER_HOST) -> tuple[Any, Any]:
+    """(engine, ctx) on a scratch DB holding one built host — the hypervisor case."""
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+    from tests.test_dossier_orchestrator import _seed_dossier
+
+    engine = make_engine(settings)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    await _seed_dossier(maker, ip)
+    ctx = InvestigationContext(
+        settings=settings,
+        auth=AsyncMock(),
+        elastic=AsyncMock(),
+        db_sessionmaker=maker,
+    )
+    return engine, ctx
+
+
+async def _planner_system_prompt(ctx: Any, objective: str) -> str:
+    """The system prompt ``_build_hunt_run`` actually hands the hunt agent."""
+    from soc_ai.api import hunt_runner
+
+    seen: list[str] = []
+
+    def _capture(_model: Any, _ctx: Any, *, system_prompt: str) -> Any:
+        seen.append(system_prompt)
+        return MagicMock()
+
+    with (
+        patch.object(hunt_runner, "build_investigator_model", MagicMock()),
+        patch.object(hunt_runner, "build_hunt_agent", _capture),
+    ):
+        await hunt_runner._build_hunt_run(ctx, objective=objective, prior=None)
+    return seen[0]
+
+
+def test_hunt_planner_prompt_carries_the_objectives_host_identity(
+    settings_kratos: Settings,
+) -> None:
+    """The hunt is told what the host IS before it plans what to look for."""
+    from soc_ai.dossier.prompt import HEADING
+
+    async def _go() -> str:
+        engine, ctx = await _ctx_with_dossier(settings_kratos)
+        try:
+            return await _planner_system_prompt(ctx, f"did anything probe {DOSSIER_HOST}?")
+        finally:
+            await engine.dispose()
+
+    prompt = asyncio.run(_go())
+    assert HEADING in prompt
+    assert "role: hypervisor" in prompt
+    assert "no interactive SSH" in prompt
+
+
+def test_hunt_planner_prompt_has_no_block_when_the_context_switch_is_off(
+    settings_kratos: Settings,
+) -> None:
+    """``dossier_context_enabled`` is a live toggle; the hunt must obey it too."""
+    from soc_ai.dossier.prompt import HEADING
+
+    settings_kratos.dossier_context_enabled = False
+
+    async def _go() -> str:
+        engine, ctx = await _ctx_with_dossier(settings_kratos)
+        try:
+            return await _planner_system_prompt(ctx, f"did anything probe {DOSSIER_HOST}?")
+        finally:
+            await engine.dispose()
+
+    assert HEADING not in asyncio.run(_go())
+
+
+def test_hunt_planner_block_is_composed_before_the_egress_sanitize(
+    settings_kratos: Settings,
+) -> None:
+    """Patch the guard and read what it was HANDED.
+
+    Appending the dossier after the sweep leaks internal hostnames and addresses
+    to a cloud analyst model; the only correct position is before it.
+    """
+    from soc_ai.agent.egress_guard import EgressGuard
+    from soc_ai.dossier.prompt import HEADING
+
+    settings_kratos.analyst_cloud_redaction = True
+    handed: list[str] = []
+    real_sanitize = EgressGuard.sanitize_text
+
+    def _spy(self: Any, text: str) -> str:
+        handed.append(text)
+        return real_sanitize(self, text)  # type: ignore[arg-type]
+
+    async def _go() -> str:
+        engine, ctx = await _ctx_with_dossier(settings_kratos)
+        try:
+            with patch.object(EgressGuard, "sanitize_text", _spy):
+                return await _planner_system_prompt(ctx, f"did anything probe {DOSSIER_HOST}?")
+        finally:
+            await engine.dispose()
+
+    prompt = asyncio.run(_go())
+    assert any(HEADING in text and DOSSIER_HOST in text for text in handed), (
+        "the dossier block never reached sanitize_text — it is being composed "
+        "after the egress sweep"
+    )
+    # …and what would egress carries the block's prose but not the address.
+    assert HEADING in prompt
+    assert "role: hypervisor" in prompt
+    assert DOSSIER_HOST not in prompt
+
+
+def test_hunt_chat_seed_carries_the_reports_host_identity(settings_kratos: Settings) -> None:
+    """The follow-up chat on a finished hunt seeds the identity of the hosts the
+    report named, so "was that host allowed to do that?" is answerable without
+    re-deriving what the host is."""
+    from soc_ai.dossier.prompt import HEADING
+    from soc_ai.webui import hunt_console_manager as hcm
+
+    hunt = MagicMock()
+    hunt.id = "hunt-1"
+    hunt.objective = "sweep for interactive SSH"
+    hunt.narrative = "one host answered"
+    hunt.report = {"affected_hosts": [DOSSIER_HOST], "findings": []}
+
+    async def _go() -> str:
+        engine, ctx = await _ctx_with_dossier(settings_kratos)
+        try:
+            return await hcm._hunt_chat_seed_block(ctx, hunt)
+        finally:
+            await engine.dispose()
+
+    seed = asyncio.run(_go())
+    assert HEADING in seed
+    assert "role: hypervisor" in seed
+
+
+def test_hunt_chat_seed_block_is_composed_before_the_egress_sanitize(
+    settings_kratos: Settings,
+) -> None:
+    """The hunt chat now runs on the shared engine, which composes the seed +
+    dossier into the system prompt and sanitizes the WHOLE string at the egress
+    boundary. This proves the seed's addresses reach that sweep — sanitizing the
+    seed and THEN appending the dossier would leak the block in the clear while
+    every assertion about the seed helper's own output still passed.
+
+    It drives ``_run_turn`` (the manager's entry to ``run_chat_turn``) and reads
+    the system prompt the agent was actually constructed with.
+    """
+    from soc_ai.agent.egress_guard import EgressGuard
+    from soc_ai.dossier.prompt import HEADING
+    from soc_ai.webui import hunt_console_manager as hcm
+
+    settings_kratos.analyst_cloud_redaction = True
+    settings_kratos.hunt_chat_turn_timeout_s = 180
+
+    hunt = MagicMock()
+    hunt.id = "hunt-1"
+    hunt.objective = f"did {DOSSIER_HOST} answer SSH?"
+    hunt.narrative = "one host answered"
+    hunt.report = {"findings": []}
+
+    handed: list[str] = []
+    real_sanitize = EgressGuard.sanitize_text
+
+    def _spy(self: Any, text: str) -> str:
+        handed.append(text)
+        return real_sanitize(self, text)  # type: ignore[arg-type]
+
+    async def _go() -> str:
+        engine, ctx = await _ctx_with_dossier(settings_kratos)
+        try:
+            state = MagicMock()
+            state.settings = settings_kratos
+            state.db_sessionmaker = ctx.db_sessionmaker
+            agent_mock = MagicMock()
+            agent_mock.run = AsyncMock(return_value=MagicMock(output="ok", all_messages=list))
+            with (
+                patch.object(hcm, "ctx_from_state", lambda _s: ctx),
+                patch.object(hcm.hunt_svc, "get_with_events", AsyncMock(return_value=(hunt, []))),
+                patch.object(
+                    hcm.hunt_svc,
+                    "chat_history_for_agent",
+                    AsyncMock(return_value=[("user", "was it allowed to?")]),
+                ),
+                patch.object(hcm.hunt_svc, "finish_chat_assistant", AsyncMock()),
+                # The turn body lives in the shared engine now — patch the model
+                # and agent builders there. Inventory stubbed so the composition
+                # under test is just seed + dossier + primer.
+                patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
+                patch("soc_ai.webui.chat_turn.inventory_prompt_block", AsyncMock(return_value="")),
+                patch("soc_ai.webui.chat_turn.build_chat_agent") as mock_build,
+                patch.object(EgressGuard, "sanitize_text", _spy),
+            ):
+                mock_build.return_value = agent_mock
+                await hcm._run_turn(state, "hunt-1", 7)
+            return str(mock_build.call_args.kwargs["system_prompt"])
+        finally:
+            await engine.dispose()
+
+    built_with = asyncio.run(_go())
+
+    assert any(HEADING in text and DOSSIER_HOST in text for text in handed), (
+        "the dossier block never reached sanitize_text — it is being composed "
+        "after the egress sweep"
+    )
+    # What the agent was actually built with carries the block's prose, labelled.
+    assert HEADING in built_with
+    assert "role: hypervisor" in built_with
+    assert DOSSIER_HOST not in built_with

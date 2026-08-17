@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from soc_ai.agent.proposal_validation import Proposal, validate_proposal
-from soc_ai.webui.chat_manager import _extract_tool_evidence, _extract_tools, _run_turn
+from soc_ai.webui.chat_manager import _run_turn
+from soc_ai.webui.chat_turn import _extract_tool_evidence, _extract_tools
 
 
 def test_verdict_proposal_meta_contract() -> None:
@@ -233,7 +235,7 @@ def test_run_turn_agent_error_persists_error_row() -> None:
         patch("soc_ai.webui.chat_manager.get_alert_context", _alert_ctx),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", finish_mock),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
     ):
         # Agent.run raises → should trigger the error path
         agent_mock = MagicMock()
@@ -295,7 +297,7 @@ def test_run_turn_error_content_is_scrubbed_before_persisting() -> None:
         patch("soc_ai.webui.chat_manager.get_alert_context", _alert_ctx),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", finish_mock),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
     ):
         agent_mock = MagicMock()
         agent_mock.run = AsyncMock(
@@ -358,7 +360,7 @@ def test_run_turn_error_write_failure_is_logged_not_propagated(caplog: Any) -> N
         patch("soc_ai.webui.chat_manager.get_alert_context", _alert_ctx2),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", finish_mock),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
     ):
         agent_mock = MagicMock()
         agent_mock.run = AsyncMock(side_effect=RuntimeError("LLM gateway exploded"))
@@ -434,7 +436,7 @@ def test_run_turn_timeout_persists_user_facing_error_row() -> None:
         patch("soc_ai.webui.chat_manager.get_alert_context", _alert_ctx),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", finish_mock),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
     ):
         agent_mock = MagicMock()
         agent_mock.run = AsyncMock(side_effect=_slow_run)
@@ -497,7 +499,7 @@ def test_run_turn_timeout_error_passthrough() -> None:
         patch("soc_ai.webui.chat_manager.get_alert_context", _alert_ctx),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", finish_mock),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
     ):
         agent_mock = MagicMock()
         agent_mock.run = AsyncMock(side_effect=TimeoutError())
@@ -565,16 +567,16 @@ def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
         ),
         patch("soc_ai.webui.chat_manager.get_alert_context", AsyncMock(return_value=MagicMock())),
         patch(
-            "soc_ai.webui.chat_manager.check_narrative_grounding",
+            "soc_ai.webui.chat_turn.check_narrative_grounding",
             return_value=MagicMock(grounded=True),
         ),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch(
             "soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock(side_effect=_finish)
         ),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
-        patch("soc_ai.webui.chat_manager._extract_tools", return_value=[]),
-        patch("soc_ai.webui.chat_manager._extract_tool_evidence", return_value=[]),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn._extract_tools", return_value=[]),
+        patch("soc_ai.webui.chat_turn._extract_tool_evidence", return_value=[]),
     ):
         agent_mock = MagicMock()
         agent_mock.run = AsyncMock(return_value=result)
@@ -666,15 +668,15 @@ def test_run_turn_scopes_caveat_when_tools_ran() -> None:
             AsyncMock(return_value=[("user", "anything else?")]),
         ),
         patch("soc_ai.webui.chat_manager.get_alert_context", AsyncMock(return_value=MagicMock())),
-        patch("soc_ai.webui.chat_manager.check_narrative_grounding", return_value=grounding),
+        patch("soc_ai.webui.chat_turn.check_narrative_grounding", return_value=grounding),
         patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
         patch(
             "soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock(side_effect=_finish)
         ),
-        patch("soc_ai.webui.chat_manager.build_investigator_model", MagicMock()),
-        patch("soc_ai.webui.chat_manager._extract_tools", return_value=["t_query_events_oql"]),
+        patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
+        patch("soc_ai.webui.chat_turn._extract_tools", return_value=["t_query_events_oql"]),
         patch(
-            "soc_ai.webui.chat_manager._extract_tool_evidence",
+            "soc_ai.webui.chat_turn._extract_tool_evidence",
             return_value=[{"tool": "t_query_events_oql", "result": "127 matches"}],
         ),
     ):
@@ -687,3 +689,228 @@ def test_run_turn_scopes_caveat_when_tools_ran() -> None:
     assert "ad.local" in captured["content"]
     assert "Partially unverified" in captured["content"]
     assert UNVERIFIED_CAVEAT not in captured["content"]
+
+
+# ── The alert's hosts, seeded as identity — and therefore as grounding ───────
+#
+# ``seed_context`` is not just the prompt's anchor: it is the corpus
+# ``check_narrative_grounding`` grades the answer against. Putting the dossier
+# there is what makes "pve01 is the hypervisor" a GROUNDED sentence instead of
+# one that ships under an ⚠ Unverified caveat — the same reason the general
+# chat seeds the grid's identifiers.
+
+CHAT_SRC = "192.168.10.202"
+CHAT_PEER = "192.168.10.30"
+CHAT_DST = "8.8.8.8"
+CHAT_HOSTNAME = "pve-01"
+
+
+async def _seeded_state(settings: Any) -> tuple[Any, Any]:
+    """(engine, state) on a scratch DB holding one built host."""
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+    from tests.test_dossier_orchestrator import _seed_dossier
+
+    engine = make_engine(settings)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    # A hyphenated name on purpose: the grounding checker's hostname pattern
+    # wants one, so seeding `pve01` would make the grounded assertion vacuous.
+    await _seed_dossier(maker, CHAT_SRC, hostname=CHAT_HOSTNAME)
+
+    state = SimpleNamespace(
+        settings=settings,
+        db_sessionmaker=maker,
+        auth=AsyncMock(),
+        elastic=AsyncMock(),
+        misp=None,
+        audit=None,
+        enrichment=SimpleNamespace(blocklist=None, maxmind=None, cloud=None),
+    )
+    return engine, state
+
+
+def _chat_investigation() -> Any:
+    inv = MagicMock()
+    inv.id = "inv-dossier"
+    inv.alert_es_id = "es-1"
+    inv.rule_name = "ET INFO Session Traffic"
+    inv.src_ip = CHAT_SRC
+    inv.dest_ip = CHAT_DST
+    inv.verdict = "false_positive"
+    inv.confidence = 0.8
+    inv.rationale = "routine management traffic"
+    inv.summary = ""
+    return inv
+
+
+async def _chat_seed_context(state: Any) -> str:
+    """The seed ``_investigation_spec`` composes for one investigation."""
+    from soc_ai.so_client.models import SoAlert
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext
+    from soc_ai.webui.chat_manager import _investigation_spec
+
+    alert_context = EnrichedAlertContext(
+        alert=SoAlert(id="es-1", rule_name="ET INFO", source_ip=CHAT_SRC, destination_ip=CHAT_DST),
+        community_id_events=[SoAlert(id="e1", source_ip=CHAT_PEER, destination_ip=CHAT_SRC)],
+    )
+    with (
+        patch(
+            "soc_ai.webui.chat_manager.inv_svc.get_with_events",
+            AsyncMock(return_value=(_chat_investigation(), [])),
+        ),
+        patch(
+            "soc_ai.webui.chat_manager.chat_svc.history_for_agent",
+            AsyncMock(return_value=[("user", "is that host allowed to answer SSH?")]),
+        ),
+        patch(
+            "soc_ai.webui.chat_manager.get_alert_context",
+            AsyncMock(return_value=alert_context),
+        ),
+    ):
+        inputs = await _investigation_spec(state, "inv-dossier", 1).prepare()
+    assert inputs is not None
+    return inputs.seed_context
+
+
+def test_chat_seed_carries_the_alerts_host_identities(settings_kratos: Any) -> None:
+    from soc_ai.dossier.prompt import HEADING
+
+    async def _go() -> str:
+        engine, state = await _seeded_state(settings_kratos)
+        try:
+            return await _chat_seed_context(state)
+        finally:
+            await engine.dispose()
+
+    seed = asyncio.run(_go())
+    assert HEADING in seed
+    assert "role: hypervisor" in seed
+    assert CHAT_HOSTNAME in seed
+    # The alert's own verdict is still the head of the block, not displaced.
+    assert seed.startswith("Alert: ")
+    # …and the widening reaches the group's peer, not just the two endpoints.
+    assert CHAT_PEER in seed
+
+
+def test_chat_seed_grounds_an_answer_that_names_the_host(settings_kratos: Any) -> None:
+    """The payoff, and the reason the block goes in seed_context rather than
+    straight into the system prompt: ``check_narrative_grounding`` grades the
+    answer against seed_context, so naming the host correctly becomes a GROUNDED
+    sentence instead of one that ships wearing an ⚠ Unverified caveat."""
+    from soc_ai.agent.narrative_grounding import check_narrative_grounding
+    from soc_ai.dossier.prompt import HEADING
+
+    answer = f"**No.** {CHAT_HOSTNAME} (hypervisor, {CHAT_SRC}) has a policy of no interactive SSH."
+
+    async def _go() -> str:
+        engine, state = await _seeded_state(settings_kratos)
+        try:
+            return await _chat_seed_context(state)
+        finally:
+            await engine.dispose()
+
+    seed = asyncio.run(_go())
+    probe = check_narrative_grounding(answer, seed_context=seed, tool_evidence=[])
+    assert probe.grounded, probe.ungrounded
+    assert probe.ungrounded == [], "the host's own name must not read as a fabrication"
+
+    # Proof the block is what did it: graded against the seed WITHOUT it, the
+    # same true sentence is flagged as an invented hostname.
+    without_block = seed.split(HEADING)[0]
+    assert (
+        CHAT_HOSTNAME
+        in check_narrative_grounding(
+            answer, seed_context=without_block, tool_evidence=[]
+        ).ungrounded
+    )
+
+
+def test_chat_seed_has_no_block_when_the_context_switch_is_off(settings_kratos: Any) -> None:
+    from soc_ai.dossier.prompt import HEADING
+
+    settings_kratos.dossier_context_enabled = False
+
+    async def _go() -> str:
+        engine, state = await _seeded_state(settings_kratos)
+        try:
+            return await _chat_seed_context(state)
+        finally:
+            await engine.dispose()
+
+    assert HEADING not in asyncio.run(_go())
+
+
+def test_chat_seed_block_reaches_the_engines_egress_sweep(settings_kratos: Any) -> None:
+    """The chat sites rely on a STRUCTURAL argument — ``run_chat_turn`` is the
+    only consumer of ``seed_context`` and it sweeps the composed prompt — so
+    lock it by driving the real engine, not by re-doing its composition here.
+
+    Sanitizing inside ``_prepare`` instead would hand the guard a pre-labelled
+    string and the block's real addresses would never reach it.
+    """
+    from soc_ai.agent.egress_guard import EgressGuard
+    from soc_ai.dossier.prompt import HEADING
+    from soc_ai.so_client.models import SoAlert
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext
+    from soc_ai.webui.chat_manager import _investigation_spec
+    from soc_ai.webui.chat_turn import run_chat_turn
+
+    settings_kratos.analyst_cloud_redaction = True
+    handed: list[str] = []
+    real_sanitize = EgressGuard.sanitize_text
+
+    def _spy(self: Any, text: str) -> str:
+        handed.append(text)
+        return real_sanitize(self, text)  # type: ignore[arg-type]
+
+    alert_context = EnrichedAlertContext(
+        alert=SoAlert(id="es-1", rule_name="ET INFO", source_ip=CHAT_SRC, destination_ip=CHAT_DST),
+        community_id_events=[SoAlert(id="e1", source_ip=CHAT_PEER, destination_ip=CHAT_SRC)],
+    )
+
+    async def _go() -> str:
+        engine, state = await _seeded_state(settings_kratos)
+        try:
+            agent_mock = MagicMock()
+            agent_mock.run = AsyncMock(return_value=MagicMock(output="ok", all_messages=list))
+            with (
+                patch(
+                    "soc_ai.webui.chat_manager.inv_svc.get_with_events",
+                    AsyncMock(return_value=(_chat_investigation(), [])),
+                ),
+                patch(
+                    "soc_ai.webui.chat_manager.chat_svc.history_for_agent",
+                    AsyncMock(return_value=[("user", "is that host allowed to answer SSH?")]),
+                ),
+                patch(
+                    "soc_ai.webui.chat_manager.get_alert_context",
+                    AsyncMock(return_value=alert_context),
+                ),
+                patch("soc_ai.webui.chat_manager.chat_svc.finish_assistant", AsyncMock()),
+                patch("soc_ai.webui.chat_manager.chat_svc.set_progress", AsyncMock()),
+                patch("soc_ai.webui.chat_turn.build_investigator_model", MagicMock()),
+                patch("soc_ai.webui.chat_turn.inventory_prompt_block", AsyncMock(return_value="")),
+                patch("soc_ai.webui.chat_manager.build_chat_agent") as mock_build,
+                patch.object(EgressGuard, "sanitize_text", _spy),
+            ):
+                mock_build.return_value = agent_mock
+                await run_chat_turn(state, _investigation_spec(state, "inv-dossier", 1))
+                return str(mock_build.call_args.kwargs["system_prompt"])
+        finally:
+            await engine.dispose()
+
+    built_with = asyncio.run(_go())
+
+    # The guard was handed ONE string carrying the system prompt's own header,
+    # the dossier block AND the raw address — i.e. the engine composed first and
+    # swept the whole thing. Asserting only "the block reached the guard" would
+    # also pass if the block were swept on its own before composition.
+    assert any(
+        "investigation assistant" in text and HEADING in text and CHAT_SRC in text
+        for text in handed
+    ), "the dossier block was not swept as part of the composed system prompt"
+    # The agent was built with the labelled prompt: block prose in, address out.
+    assert HEADING in built_with
+    assert "role: hypervisor" in built_with
+    assert CHAT_SRC not in built_with

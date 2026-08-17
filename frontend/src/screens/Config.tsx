@@ -1,8 +1,8 @@
 import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { ReactNode } from 'react';
-import { ApplyBadge, SourceBadge } from '../components/Badges';
+import { ApplyBadge, RoleChip, SourceBadge, StatusTag } from '../components/Badges';
 import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
@@ -21,6 +21,8 @@ import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDis
 import type { BatteryRecommendation, ModelBatteryStatus } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { demoBlocked, useDemo } from '../lib/demo';
+import { plural } from '../lib/plural';
+import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { useAsync } from '../lib/useAsync';
 import type { AdminUser, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav, ConfigNavSelect } from './ConfigNav';
@@ -108,14 +110,119 @@ function CollapsibleConfigSection({
 }
 
 // Grade chip + "Check fitness" button shown beside the analyst-model control.
-// green=pass / amber=degraded / red=fail. Fail-soft: with no grade yet (or after a
-// probe error) it shows only the button, never an error — the check is advisory
-// and NEVER blocks Apply.
+// green=pass / amber=degraded or a lone fail / red=alarm. Fail-soft: with no
+// grade yet (or after a probe error) it shows only the button, never an error —
+// the check is advisory and NEVER blocks Apply.
 const _FITNESS_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
   pass: { bg: '#12b76a22', fg: '#12b76a', label: 'fit' },
   degraded: { bg: '#f79f0022', fg: '#f79009', label: 'degraded' },
   fail: { bg: '#f0443822', fg: '#f04438', label: 'unfit' },
 };
+
+/** Host out of a served_backend api_base ("https://gw.lan:4000/v1" → "gw.lan:4000").
+ * The operator needs to know WHICH backend was measured; the scheme and path are
+ * spam in a line this narrow. */
+function _backendHost(base: string | null | undefined): string {
+  if (!base) return '';
+  try {
+    return new URL(base).host;
+  } catch {
+    // Not an absolute URL (a bare host:port, say) — strip any scheme and path by
+    // hand rather than falling back to printing the whole string.
+    return base.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0];
+  }
+}
+
+/** `_batteryAge` for a timestamp that may carry its own zone.
+ *
+ * It assumes the naive UTC the fitness/battery cache writes and appends the Z
+ * itself — but `last_pass_at` is a passthrough of the AUDIT index timestamp,
+ * which is whatever the indexing writer wrote ("…+00:00" as readily as "…Z").
+ * Appending Z to that yields an unparseable date and a blank age, which the
+ * sentence below would report as "no pass in window" over a window that had one. */
+function _isoAge(iso: string | null | undefined): string {
+  if (!iso) return '';
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(iso)) return _batteryAge(iso);
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) ? _batteryAge(new Date(t).toISOString()) : '';
+}
+
+/** The n-of-m sentence under the grade ("2 of last 5 checks failed, last pass 3h
+ * ago"), or '' when the server sent no history — an older build, or an audit
+ * index this one could not read, in which case the chip keeps its single-sample
+ * wording rather than claiming a record it never saw. */
+function _fitnessHistory(f: ModelFitness): string {
+  const checks = f.recent_checks;
+  const fails = f.recent_fails;
+  if (typeof checks !== 'number' || typeof fails !== 'number' || checks <= 0) return '';
+  const noun = checks === 1 ? 'check' : 'checks';
+  if (fails <= 0) return `last ${checks} ${noun} passed`;
+  const age = _isoAge(f.last_pass_at);
+  return `${fails} of last ${checks} ${noun} failed${age ? `, last pass ${age}` : ', no pass in window'}`;
+}
+
+type FitnessView = {
+  label: string;
+  /** Undefined = the quiet, colourless state (nothing was measured). */
+  colors?: { background: string; color: string };
+  detail: string;
+  /** "unfit — last verdict, 3h ago" when a not-measured response still carries
+   * the previous cached verdict; '' otherwise. */
+  stale: string;
+  /** Cache age on its own; '' unless this IS a measured-then-cached verdict. */
+  age: string;
+  title: string;
+};
+
+/** Fold a fitness response into what the chip shows. Null = show nothing (an
+ * unknown grade with nothing to say), which is what this chip did before any of
+ * the history fields existed. */
+function _fitnessView(f: ModelFitness): FitnessView | null {
+  const graded = _FITNESS_STYLE[f.grade];
+  // Each leg's detail carries its own elapsed-vs-budget line ("timed out after
+  // 27.4s (budget 30s)"). Keep them in the tooltip: the visible line is one
+  // truncated sentence, and a bare "timed out" is the unfalsifiable verdict that
+  // made this chip untrustworthy in the first place.
+  const title = [f.detail, ...(f.legs ?? []).map((l) => `${l.name}: ${l.detail}`)]
+    .filter(Boolean)
+    .join('\n');
+
+  if (f.measured === false) {
+    // The self-load guard declined to probe. This is neither a verdict nor an
+    // error: soc-ai's own eval saturating the gateway once graded the live model
+    // UNFIT while that same eval scored it 5/5. Say so quietly, and if a cached
+    // verdict rides along, label it as the OLD one instead of dressing it fresh.
+    const reason = (f.note ?? f.detail ?? '').replace(/^not measured:\s*/i, '');
+    const age = _isoAge(f.checked_at);
+    return {
+      label: 'not measured',
+      detail: reason,
+      stale: graded ? `${graded.label} — last verdict${age ? `, ${age}` : ''}` : '',
+      age: '',
+      title: f.note || title,
+    };
+  }
+  if (!graded) return null;
+
+  // RED KEYS ON `alarm`, not on the grade: the backend now decides the red state
+  // from the last N checks (two consecutive fails), because one adverse sample
+  // beside four good ones is a measurement, not a verdict. A lone fail still
+  // says "unfit" — it just wears the caution colours.
+  const alarm = f.alarm ?? f.grade === 'fail';
+  const colors = f.grade === 'fail' && !alarm ? _FITNESS_STYLE.degraded : graded;
+  const host = _backendHost(f.served_backend?.api_base);
+  const detail = [_fitnessHistory(f) || f.detail, host ? `via ${host}` : '']
+    .filter(Boolean)
+    .join(' · ');
+  return {
+    label: graded.label,
+    colors: { background: colors.bg, color: colors.fg },
+    detail,
+    stale: '',
+    age: f.cached ? _isoAge(f.checked_at) : '',
+    title,
+  };
+}
 
 function ModelFitnessChip({
   fitness,
@@ -126,27 +233,43 @@ function ModelFitnessChip({
   loading: boolean;
   onCheck: () => void;
 }) {
-  const style = fitness ? _FITNESS_STYLE[fitness.grade] : undefined;
+  const view = fitness ? _fitnessView(fitness) : null;
   return (
     <div className="flex items-center gap-2">
       {loading && <span className="text-[11px] text-faint">Checking fitness…</span>}
-      {!loading && fitness && style && (
+      {!loading && view && (
         <span
-          className="rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide"
-          style={{ background: style.bg, color: style.fg }}
-          title={fitness.detail}
+          data-testid="fitness-chip"
+          className={`rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide${
+            view.colors ? '' : ' bg-surface-3 text-dim'
+          }`}
+          style={view.colors}
+          title={view.title}
         >
-          {style.label}
+          {view.label}
         </span>
       )}
-      {!loading && fitness && style && (
-        <span className="max-w-[190px] truncate text-[11px] text-dim" title={fitness.detail}>
-          {fitness.detail}
+      {!loading && view && view.detail && (
+        <span
+          data-testid="fitness-detail"
+          className="max-w-[190px] truncate text-[11px] text-dim"
+          title={view.title}
+        >
+          {view.detail}
         </span>
       )}
-      {!loading && fitness?.cached && fitness.checked_at && (
+      {!loading && view && view.stale && (
+        <span
+          data-testid="fitness-stale"
+          className="text-[11px] text-faint"
+          title="The last measured verdict — no probe ran this time"
+        >
+          {view.stale}
+        </span>
+      )}
+      {!loading && view && view.age && (
         <span className="text-[11px] text-faint" title="Served from the daily cache — Check fitness re-measures">
-          {_batteryAge(fitness.checked_at)}
+          {view.age}
         </span>
       )}
       <button
@@ -203,7 +326,7 @@ function ModelBatteryPanel({
             {battery?.total ?? 4})…
           </span>
         )}
-        {!running && result && battery?.stored_at && (
+        {!running && result?.configs && battery?.stored_at && (
           <span className="text-[11px] text-faint">{_batteryAge(battery.stored_at)}</span>
         )}
         <button
@@ -233,7 +356,7 @@ function ModelBatteryPanel({
           Run all checks
         </button>
       </div>
-      {!running && result && (
+      {!running && result?.configs && (
         <table className="text-[11px] text-dim">
           <tbody>
             {result.configs.map((c) => {
@@ -287,6 +410,7 @@ export function Config() {
   const demo = useDemo(); // read-only demo: config writes show a note, never POST
   const [nonce, setNonce] = useState(0);
   const location = useLocation();
+  const navigate = useNavigate();
   // Collapsed config sections — persisted so a fold survives leaving the page
   // (the dogfood walkthrough found collapse state silently reset every visit).
   // Deep-links and nav clicks auto-expand their target.
@@ -555,6 +679,27 @@ export function Config() {
 
   const refetchIdents = () => setIdentNonce((n) => n + 1);
 
+  // A scan the SERVER is still running, which this screen used to have no way
+  // of knowing about: `scanning` was set by the click handler and died with the
+  // navigation, so coming back to a page whose scan was still grinding drew an
+  // idle "Scan now" over it — indistinguishable from a scan that finished and
+  // found nothing, and the analyst's next move is to click it again.
+  // `last_scan` IS the object GET /discovery/scan answers with (the identifiers
+  // route returns the same status), so the running flag is already on the wire.
+  const scanAdopted = !!idents?.last_scan?.running;
+  const scanInFlight = scanning || scanAdopted;
+
+  // Follow an adopted scan to its end, so its outcome — including the "Scan
+  // degraded" note below — lands without a reload. Keyed on `idents` rather
+  // than on the nonce, so a slow answer delays the next poll instead of
+  // stacking requests on it; a failed refetch stops the loop and shows its
+  // error, rather than hammering a server that is already unwell.
+  useEffect(() => {
+    if (!scanAdopted || scanning) return;
+    const t = setTimeout(() => setIdentNonce((n) => n + 1), 4000);
+    return () => clearTimeout(t);
+  }, [scanAdopted, scanning, idents]);
+
   // ── Master-detail section model ────────────────────────────────────────────
   // The two-level nav (lib/configLayout) is the master; the content pane renders
   // ONLY the selected section. Replaces the single 32,000px scroll of all 31
@@ -564,8 +709,13 @@ export function Config() {
   const flatSections = useMemo(() => layout.flatMap((p) => p.children), [layout]);
   const keyToSection = useMemo(() => keyToSectionId(layout), [layout]);
 
-  // Selection: explicit choice (hash / nav click) > last-visited (localStorage)
-  // > the first section. Stored so "come back to where I was tuning" survives.
+  // Selection: nav click > the URL's hash > last-visited (localStorage) > the
+  // first section. Stored so "come back to where I was tuning" survives.
+  //
+  // The hash is read HERE — as derived state, on the first render that has a
+  // layout to resolve it against — not only in the effect below. Waiting for
+  // the effect means one committed frame showing the fallback section, and
+  // that frame is what writes the fallback into localStorage (A6).
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [storedSection] = useState<string | null>(() => {
     try {
@@ -574,13 +724,16 @@ export function Config() {
       return null;
     }
   });
+  const hashId = location.hash.replace('#', '');
   const validId = (id: string | null): id is string =>
     !!id && flatSections.some((s) => s.id === id);
   const effectiveId = validId(selectedId)
     ? selectedId
-    : validId(storedSection)
-      ? storedSection
-      : (flatSections[0]?.id ?? '');
+    : validId(hashId)
+      ? hashId
+      : validId(storedSection)
+        ? storedSection
+        : (flatSections[0]?.id ?? '');
   useEffect(() => {
     if (!effectiveId) return;
     try {
@@ -614,7 +767,18 @@ export function Config() {
     if (label) setCollapsed((c) => ({ ...c, [label]: false }));
     setSelectedId(id);
     setQuery('');
-    history.replaceState(null, '', `#${id}`);
+    // Through the ROUTER, not a raw history.replaceState: the effect below
+    // reads `location.hash`, and a URL moved behind the router's back left that
+    // pinned to whatever the page was ENTERED with. Any later layout rebuild —
+    // applying a setting refetches the config — then re-ran the effect and
+    // re-applied the stale entry hash, throwing the analyst out of the section
+    // they were editing while the address bar still read the right one (A6).
+    // `replace` keeps the historic behaviour: switching sections is not a
+    // history entry, so Back leaves the Config page. `search` is carried over
+    // explicitly because a partial Path defaults it to '' — the replaceState
+    // this replaced preserved the query string, and silently dropping it would
+    // make any future ?tab= / ?highlight= vanish on the first nav click.
+    navigate({ search: location.search, hash: id }, { replace: true });
     requestAnimationFrame(() => {
       const el = document.getElementById(id);
       const sc = el ? scrollContainerOf(el) : null;
@@ -626,9 +790,16 @@ export function Config() {
   // the sidebar version line, the palette). A sub-anchor that lives INSIDE a
   // section (#rag-reembed) selects its host section, then scrolls to the card.
   // Router state may carry a highlightKey (palette jump-to-setting).
+  //
+  // A plain section hash is already honoured by `effectiveId` above, on the
+  // first render that can resolve it; this effect is what SETTLES it (and what
+  // resolves the two cases derived state cannot: sub-anchors and highlightKey).
+  // It is safe to re-run on a layout rebuild only because `navigateToSection`
+  // goes through the router, so `location.hash` names the section the analyst
+  // is actually on rather than the one they arrived on.
   useEffect(() => {
     if (!flatSections.length) return;
-    const raw = location.hash.replace('#', '');
+    const raw = hashId;
     const state = (location.state ?? null) as { highlightKey?: string } | null;
     let target = raw;
     let subAnchor: string | null = null;
@@ -656,7 +827,7 @@ export function Config() {
       return () => clearTimeout(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flatSections, location.hash, location.key]);
+  }, [flatSections, hashId, location.key]);
 
   // Search corpus: every setting (label + key + help) in every section, every
   // section name, and the Danger Zone settings. All already client-side — the
@@ -769,8 +940,10 @@ export function Config() {
         return;
       }
       // Poll until the scan is no longer running, then refetch the list. A bounded
-      // number of polls (≈2 min at 1.5s each) keeps a wedged scan from spinning the
-      // button forever — we surface a timeout instead of staying disabled.
+      // number of polls (≈2 min at 1.5s each) hands a long scan back to the
+      // slower adoption poll above rather than holding this handler open — the
+      // button keeps saying "Scanning…" either way, because the server is still
+      // scanning, and this note says so out loud instead of going quiet.
       let running = start.running;
       for (let i = 0; running && i < 80; i++) {
         await new Promise((r) => setTimeout(r, 1500));
@@ -1131,6 +1304,17 @@ export function Config() {
     }
   };
 
+  // What the last scan could not read. The lists below are the scan's OUTPUT,
+  // so a scan that failed half its queries renders as a shorter list rather
+  // than as a failure — indistinguishable, with only the timestamp on screen,
+  // from a scan that read everything and found nothing new.
+  const scanErrors = sweepErrorList(idents?.last_scan?.last_summary);
+  // Hidden while a scan is in flight, like the timestamp beside it: the run on
+  // screen is about to replace this verdict. In flight means the SERVER's scan,
+  // not this tab's click — the two differ after a navigation, and the server is
+  // the one that knows.
+  const scanDegraded = scanErrors.length > 0 && !scanInFlight;
+
   // Internal-identifiers section, defined here so it can be interleaved into the
   // settings-group map (rendered immediately after the Discovery group).
   const internalIdentifiersSection = (
@@ -1141,18 +1325,26 @@ export function Config() {
       onToggle={() => toggleSection('Internal identifiers')}
       right={
         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-          {idents?.last_scan?.last_scan && !scanning && (
+          {/* The tag rides in the header, not only in the body note, because the
+              section folds — and a folded section that still says "last scan:
+              <time>" would be the same false all-clear in one line. */}
+          {scanDegraded && (
+            <span data-testid="identifier-scan-degraded-tag">
+              <StatusTag color="#d29922" label="Scan degraded" />
+            </span>
+          )}
+          {idents?.last_scan?.last_scan && !scanInFlight && (
             <span className="text-[11px] text-faint">
               last scan: {new Date(idents.last_scan.last_scan).toLocaleString()}
             </span>
           )}
           <button
             onClick={runScanNow}
-            disabled={scanning}
+            disabled={scanInFlight}
             className="inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            {scanning && <Spinner size={11} />}
-            {scanning ? 'Scanning…' : 'Scan now'}
+            {scanInFlight && <Spinner size={11} />}
+            {scanInFlight ? 'Scanning…' : 'Scan now'}
           </button>
         </div>
       }
@@ -1165,6 +1357,37 @@ export function Config() {
         one off, which keeps it in the list but unused. Dismissed suggestions are hidden; re-add one
         manually to restore it.
       </div>
+
+      {scanDegraded && (
+        <div
+          data-testid="identifier-scan-degraded"
+          className="mb-2.5 rounded-card border border-warn/30 bg-warn/[0.06] px-3.5 py-2.5"
+        >
+          <StatusTag color="#d29922" label="Scan degraded" />
+          <div className="mt-1 text-[12px] leading-[1.5] text-text-2">
+            The last scan hit {plural(scanErrors.length, 'error')} and could not read all of your
+            data, so the lists below are incomplete. A suffix, hostname or subnet missing here may
+            be one the scan never got to see rather than one your network does not have. Scanning
+            again runs the same queries, so start with what failed:
+          </div>
+          {/* The strings, not just how many. This channel carries local faults
+              as well as grid ones ("no internal CIDRs configured; cannot scope
+              internal source"), and a bare count sends the operator off to wait
+              on Security Onion for something Security Onion will never fix. */}
+          <ul className="mt-1.5 space-y-0.5 text-[11.5px] text-dim">
+            {scanErrors.slice(0, SHOWN_ERRORS).map((e, i) => (
+              <li key={i} className="truncate font-mono" title={e}>
+                {e}
+              </li>
+            ))}
+            {scanErrors.length > SHOWN_ERRORS && (
+              <li className="text-faint">
+                and {(scanErrors.length - SHOWN_ERRORS).toLocaleString()} more
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
 
       {identError && <div className="mb-2 text-[12px] text-danger">{identError}</div>}
 
@@ -1386,14 +1609,7 @@ export function Config() {
                 <div className="flex-1 min-w-0">
                   <div className="text-[13px] font-semibold">{u.username}</div>
                   <div className="mt-0.5 flex items-center gap-2 text-[11.5px] text-faint">
-                    <span
-                      className="rounded px-1.5 py-0.5 text-[10.5px] font-semibold"
-                      style={u.role === 'admin'
-                        ? { background: 'rgba(99,180,255,.15)', color: '#63b4ff' }
-                        : { background: 'rgba(148,163,184,.1)', color: '#94a3b8' }}
-                    >
-                      {u.role}
-                    </span>
+                    <RoleChip role={u.role} />
                     <span
                       className="rounded px-1.5 py-0.5 text-[10.5px] font-semibold"
                       style={u.disabled

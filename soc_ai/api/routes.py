@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
 from typing import Any
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from sse_starlette.sse import EventSourceResponse
@@ -29,6 +32,7 @@ from soc_ai.api.schemas import (
     InvestigateRequest,
 )
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.api.webui_api import resolve_alert_for_hunt
 from soc_ai.config import Settings
 from soc_ai.demo.replay import find_replay, replay_recorded_run
@@ -114,9 +118,18 @@ async def investigate_endpoint(
         # concurrent replay row while one for this alert is still ``running`` —
         # bounding duplicate demo rows to one per recorded alert. (An unrecorded
         # alert creates no row at all; replay.py already hardens that, F37.)
+        reuse_inv_id: str | None = None
         if replay is not None:
             async with request.app.state.db_sessionmaker() as db:
                 existing = (await inv_svc.latest_for_alerts(db, [req.alert_id])).get(req.alert_id)
+                # Reuse ANY completed replay row for this alert — not only when the
+                # LATEST row is complete. A client that aborts this inline SSE
+                # mid-stream lands an 'error' row that becomes the latest; a
+                # latest-based check would then miss the earlier complete row, so
+                # each abort would add a row AND force the next post to persist a
+                # fresh one (~1 row/request under abort-looping). Querying the
+                # completed set directly closes that residual.
+                complete = await inv_svc.complete_for_alert(db, req.alert_id)
             if existing is not None and existing.status == "running":
                 raise HTTPException(
                     status_code=409,
@@ -129,6 +142,13 @@ async def investigate_endpoint(
                         ),
                     },
                 )
+            # A completed replay row exists for this alert — re-stream the recorded
+            # events STORELESS against it rather than persisting a fresh row. Bounds
+            # demo replay rows to the recorded-alert set, so an anonymous visitor
+            # looping /investigate can't grow the table (the hunt-start ephemeral
+            # treatment, one route over).
+            if complete is not None:
+                reuse_inv_id = complete.id
 
         async def demo_stream() -> Any:
             async for name, data in replay_recorded_run(
@@ -136,6 +156,7 @@ async def investigate_endpoint(
                 alert_id=req.alert_id,
                 started_by=started_by,
                 replay=replay,
+                reuse_inv_id=reuse_inv_id,
             ):
                 yield sse_encode(name, data)
 
@@ -145,9 +166,12 @@ async def investigate_endpoint(
     # — a run that dies before its first alert_context event (e.g. an ES prefetch
     # error) must not leave a nameless "Alert <id>…" row. Best-effort: a resolution
     # failure must never block the actual investigation, so fall back to None and
-    # let the recorder backfill from the stream.
+    # let the recorder backfill from the stream. Bounded because "best-effort" and
+    # "unbounded" together mean a silent grid delays the stream by the ES client's
+    # whole retry budget for a name we are willing to do without.
     try:
-        _, seed_rule_name = await resolve_alert_for_hunt(elastic, ctx.settings, req.alert_id)
+        async with asyncio.timeout(ctx.settings.webui_grid_timeout_s):
+            _, seed_rule_name = await resolve_alert_for_hunt(elastic, ctx.settings, req.alert_id)
     except Exception:
         seed_rule_name = None
 
@@ -164,6 +188,39 @@ async def investigate_endpoint(
             yield sse_encode(name, data)
 
     return EventSourceResponse(stream())
+
+
+async def _find_alert_search(
+    elastic: ElasticClient,
+    settings: Settings,
+    must: list[dict[str, Any]],
+    time_filter: dict[str, Any],
+) -> tuple[Any, int]:
+    """One bounded, guarded ``must`` + time-window lookup for :func:`find_alert_endpoint`.
+
+    Bounded like the console reads: this endpoint answers an interactive client
+    waiting on a row, so it fails fast instead of riding the ES client's full
+    retry budget (~90 s at shipped defaults). Grid errors become the house
+    503/400 rather than escaping the handler as an unhandled 500 — and, just as
+    importantly, rather than being swallowed into the ``no_match`` body, which
+    would report an outage as a fact about the caller's telemetry.
+    """
+    q: dict[str, Any] = {"bool": {"must": must, "filter": [time_filter]}}
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            result = await elastic.search(
+                settings.events_index_pattern,
+                q,
+                size=1,
+                sort=[{"@timestamp": {"order": "desc"}}],
+            )
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        # An ES ApiError is NOT a TransportError — without this arm an ES 4xx
+        # still escapes the tuple above as an unhandled 500.
+        raise _es_api_error_http(exc) from exc
+    return (result.hits[0] if result.hits else None, result.total)
 
 
 @router.post(
@@ -183,6 +240,10 @@ async def find_alert_endpoint(
     timestamp, etc.). A cross-origin API client posts whatever row-level
     context it has here, and we run an ES search to resolve back to a
     concrete alert.
+
+    A grid failure is reported as a grid failure: 503 ``grid_unavailable`` (or
+    400 on an ES-rejected query), never the ``found_via="no_match"`` body that
+    means "I looked and this row is not in your telemetry".
     """
     must: list[dict[str, Any]] = []
     if req.rule_uuid:
@@ -219,14 +280,7 @@ async def find_alert_endpoint(
             _LOGGER.info("find_alert: could not parse timestamp %r: %s", req.timestamp, e)
 
     async def _search_with_filter(time_filter: dict[str, Any]) -> tuple[Any, int]:
-        q: dict[str, Any] = {"bool": {"must": must, "filter": [time_filter]}}
-        result = await elastic.search(
-            settings.events_index_pattern,
-            q,
-            size=1,
-            sort=[{"@timestamp": {"order": "desc"}}],
-        )
-        return (result.hits[0] if result.hits else None, result.total)
+        return await _find_alert_search(elastic, settings, must, time_filter)
 
     hit = None
     total = 0

@@ -206,6 +206,63 @@ async def test_connect_error_graceful() -> None:
     assert r["ok"] is False
 
 
+@pytest.mark.asyncio
+async def test_db_discovered_suffix_caught_when_env_empty() -> None:
+    """A deployment whose internal suffix came from the DB / identifiers UI with an
+    empty .env: the tool guard must use the threaded EFFECTIVE set, not env-only
+    settings, or a discovered internal FQDN fans out to public search."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"results": [], "answers": []})
+
+    s = _settings(oracle_internal_suffixes=(), oracle_extra_hosts=[])
+    with _patch_httpx(h):
+        # env-only guard (no threaded set) MISSES it — the reported bug …
+        env_only = await web_search("lookup host.acme-corp.example", settings=s)
+        # … but the threaded effective suffix set catches it.
+        threaded = await web_search(
+            "lookup host.acme-corp.example",
+            settings=s,
+            suffixes=(".acme-corp.example",),
+            extra_hosts=(),
+        )
+    assert env_only["ok"] is True  # regression witness
+    assert threaded["ok"] is False
+    assert "internal" in threaded["error"].lower()
+    assert calls["n"] == 1  # only the env-only path reached the network
+
+
+@pytest.mark.asyncio
+async def test_db_discovered_bare_host_caught_when_env_empty() -> None:
+    """A DB-discovered bare hostname (not on any suffix) is caught via the threaded
+    effective host set."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    s = _settings(oracle_internal_suffixes=(), oracle_extra_hosts=[])
+    with _patch_httpx(h):
+        r = await web_search(
+            "who is jumpbox today", settings=s, suffixes=(), extra_hosts=("jumpbox",)
+        )
+    assert r["ok"] is False
+    assert "internal" in r["error"].lower()
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_settings_when_effective_none() -> None:
+    """When no effective set is threaded (None ⇒ no DB), the guard falls back to the
+    raw settings tuples — behaviour unchanged."""
+    r = await web_search("research dc01.corp.local", settings=_settings())
+    assert r["ok"] is False
+    assert "internal" in r["error"].lower()
+
+
 def test_wiring_dispatch_and_literal() -> None:
     # dispatch table includes t_web_search → web_search
     from soc_ai.agent import targeted_investigator as ti

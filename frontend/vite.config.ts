@@ -42,5 +42,26 @@ export default defineConfig({
     },
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
+    // MUST stay above setup.ts's asyncUtilTimeout (5000). Both were 5000, so
+    // RTL's findBy wait and vitest's own deadline expired on the same tick:
+    // under CI contention the runner killed the test at the instant the wait
+    // would have resolved, surfacing as a bare "Test timed out in 5000ms" with
+    // no assertion — the Dashboard.generalChat "flake" that blocked three
+    // pipelines. A test may now use its full wait and still have room to fail
+    // with a real message.
+    testTimeout: 15_000,
+    // Run test FILES one at a time. Several suites are timing-sensitive by
+    // nature (real intervals + polls: the Alerts keyboard-focus-after-a-re-sort
+    // guard, the Dashboard chat's send→reply hop). Under parallel workers those
+    // starve and fail while passing alone — measured on this branch: 2 failures
+    // in parallel, 668/668 sequential, every failing test green in isolation.
+    // Contention, not a leak: main sits just under the threshold at 72 files
+    // and this branch's 76 tipped it over, so the next few files would have
+    // done it anyway.
+    //
+    // Costs ~75s (37s → 111s) and buys a deterministic suite. Worth it: the
+    // alternative is retry-until-green, which hides real regressions behind an
+    // expected-flake reflex.
+    fileParallelism: false,
   },
 })

@@ -7,8 +7,10 @@ most recent investigation per rule / per alert.
 
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import Any
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, NamedTuple
 
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy import delete as sa_delete
@@ -128,6 +130,11 @@ async def finalize(
         inv.summary = summary
     if report is not None:
         inv.report = report
+        # Denormalize the pipeline-fallback marker so query_page's aggregate reads
+        # a column instead of json_extract'ing every row's report on each poll
+        # (migration 0028). Recomputed from the report just written, so it always
+        # agrees with is_pipeline_fallback(report).
+        inv.is_fallback = is_pipeline_fallback(report)
     inv.finished_at = utcnow()
     await db.commit()
 
@@ -181,6 +188,11 @@ async def resolve(
     if rationale is not None:
         inv.rationale = rationale
     inv.report = report  # reassign so the JSON column persists the mutation
+    # The override replaced report["resolution"] with a manual/chat resolution
+    # (no `provenance`), so the row is no longer a pipeline fallback — recompute
+    # the denormalized flag from the report just written, keeping it in step with
+    # is_pipeline_fallback(report) exactly as the pre-column json_extract did.
+    inv.is_fallback = is_pipeline_fallback(report)
     if source_message_id:
         # Mark the source proposal applied in the SAME transaction as the verdict
         # change, so a concurrent or retried apply can't slip past the idempotency
@@ -401,6 +413,33 @@ async def verdict_counts_by_rule(
     return out
 
 
+async def verdict_counts_since(db: AsyncSession, cutoff: datetime) -> dict[str, int]:
+    """Verdicts landed since *cutoff*, tallied by verdict across the whole table.
+
+    The dashboard chat's posture line. Deliberately NOT ``list_recent(limit=N)``
+    plus an in-Python tally: a capped scan reports a FLOOR as a total the moment
+    a backlog drain completes more investigations than the cap, and the seed
+    block states this number to the model as fact — a wrong-but-confident number
+    in the anchor is the failure this project keeps paying for.
+
+    Only ``complete``, verdict-bearing rows count: a running or errored run has
+    decided nothing. Verdict strings are returned as stored (no bucketing —
+    unlike :func:`verdict_counts_by_rule`, whose three buckets have to sum to a
+    total), so a new verdict value shows up here rather than vanishing.
+    ``cutoff`` is naive UTC, matching ``created_at`` and :func:`utcnow`.
+    """
+    rows = await db.execute(
+        select(Investigation.verdict, func.count())
+        .where(
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+            Investigation.created_at >= cutoff,
+        )
+        .group_by(Investigation.verdict)
+    )
+    return {str(verdict): int(count) for verdict, count in rows.all()}
+
+
 async def override_counts_by_rule(
     db: AsyncSession, rule_names: list[str]
 ) -> dict[str, dict[str, int]]:
@@ -493,6 +532,26 @@ async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str,
     return await _latest_by(db, Investigation.alert_es_id, alert_ids)
 
 
+async def complete_for_alert(db: AsyncSession, alert_id: str) -> Investigation | None:
+    """The most recent COMPLETED investigation for *alert_id*, or None.
+
+    Distinct from :func:`latest_for_alerts`, which returns the newest row of ANY
+    status. The demo replay reuse guard needs "does a completed replay row exist
+    for this alert" independent of a newer non-complete row: a client that aborts
+    the inline ``/investigate`` SSE mid-stream lands an ``error`` row that would
+    otherwise become the latest and defeat a latest-based reuse check, so each
+    abort would both add a row and force the next post to persist a fresh one.
+    Querying the completed set directly closes that.
+    """
+    q = (
+        select(Investigation)
+        .where(Investigation.alert_es_id == alert_id, Investigation.status == "complete")
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .limit(1)
+    )
+    return (await db.scalars(q)).first()
+
+
 def blocks_rehunt(inv: Investigation) -> bool:
     """Whether a prior investigation should suppress starting a NEW hunt for its
     alert. Only an in-flight (``running``) or genuinely finished (``complete``)
@@ -538,6 +597,315 @@ async def list_recent(
     return list((await db.scalars(q)).all())
 
 
+class NotifRow(NamedTuple):
+    """The scalar columns the /notifications bell reads from an investigation.
+
+    The bell renders id / rule_name / verdict / status / the two timestamps and
+    nothing else — never the ``report`` JSON blob. Selecting exactly these keeps
+    the app's hottest poll from materializing a report column it discards, the
+    way :class:`RunRef` does for primacy.
+    """
+
+    id: str
+    rule_name: str | None
+    verdict: str | None
+    status: str
+    created_at: datetime
+    finished_at: datetime | None
+
+
+async def list_recent_notifications(
+    db: AsyncSession,
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    finished_since: datetime | None = None,
+) -> list[NotifRow]:
+    """Lightweight investigation rows for the notifications bell — scalar columns only.
+
+    Column-scoped (not :func:`list_recent`, which loads full ORM entities with
+    the ``report`` blob). ``finished_since`` bounds AND orders the query on
+    ``finished_at`` IN SQL — the completed-runs half of the bell previously took
+    the newest-N page by ``created_at`` and dropped out-of-window rows in Python
+    afterwards, so a run created before the window but finished inside it fell
+    off the created_at page and never appeared. finished_at is the clock the
+    bell renders, so it is the one window definition for both halves. NULL
+    ``finished_at`` (a running row) is excluded by the ``>=`` bound, which is
+    correct: the bound is only ever passed for the completed query, and the
+    running query keeps its ``created_at`` order (the stamp it renders).
+    """
+    q = select(
+        Investigation.id,
+        Investigation.rule_name,
+        Investigation.verdict,
+        Investigation.status,
+        Investigation.created_at,
+        Investigation.finished_at,
+    )
+    if status is not None:
+        q = q.where(Investigation.status == status)
+    if finished_since is not None:
+        q = q.where(Investigation.finished_at >= finished_since).order_by(
+            Investigation.finished_at.desc(), Investigation.id.desc()
+        )
+    else:
+        q = q.order_by(Investigation.created_at.desc(), Investigation.id.desc())
+    q = q.limit(limit)
+    return [NotifRow(*row) for row in (await db.execute(q)).all()]
+
+
+# The stored statuses the backend actually writes (anything else renders as
+# 'error'). The ONE list: the display-status CASE below, the route's filter
+# validation, and the route's renderer (``_row_status``'s ``_STATUS`` is
+# ``frozenset(DISPLAY_STATUSES)``) all read it, so a status added here cannot
+# reach one of the three and leave the other two disagreeing about it.
+DISPLAY_STATUSES = ("running", "complete", "error", "cancelled", "interrupted")
+
+# The synthetic verdict-filter member: not a stored verdict string but "the
+# report carries the E1.2 pipeline-fallback marker". Spelled here because the
+# SQL translation of that marker lives in this module.
+PIPELINE_ERROR_VERDICT = "pipeline_error"
+
+# Cap shared with the route (mirrors list_recent's historical clamp).
+MAX_PAGE_LIMIT = 500
+
+
+def _display_status_sql() -> Any:
+    """The status a row will RENDER with, as a SQL expression.
+
+    Mirrors ``routes_investigations._row_status``: an unknown stored status is
+    'error', and a 'complete' run with no (or blank) verdict is 'error'. The
+    filter must use THIS, not the raw column — filtering on the raw column would
+    let status=complete return rows the table then displays as errors, and
+    status=error miss them: a filter promising a set the screen contradicts.
+
+    The trim charset is spelled out because the renderer's blank test is
+    ``str.strip()``, which strips ALL whitespace, while SQL ``trim(x)`` with no
+    charset strips SPACES ONLY — a tab-only verdict rendered as 'error' and
+    filtered as 'complete'. The charset is Python's ``string.whitespace``, so
+    the two agree over ASCII whitespace and the differential test pins that.
+    They still part company on the Unicode whitespace ``str.strip()`` strips and
+    ``string.whitespace`` omits (NEL, NBSP, U+2028…); closing that would mean
+    enumerating Unicode space codepoints into a SQL charset for a column the
+    backend only ever writes from a fixed verdict enum, so the ASCII half is
+    where this stops. The two-argument ``trim`` this emits is SQLite's spelling,
+    not portable SQL.
+    """
+    blank = " \t\n\r\x0b\x0c"
+    no_verdict = or_(Investigation.verdict.is_(None), func.trim(Investigation.verdict, blank) == "")
+    return case(
+        (and_(Investigation.status == "complete", no_verdict), "error"),
+        (Investigation.status.not_in(DISPLAY_STATUSES), "error"),
+        else_=Investigation.status,
+    )
+
+
+@dataclass(frozen=True)
+class InvestigationPage:
+    """One SQL page of the investigations list, with counts that stay honest.
+
+    ``total``/``running``/``true_positives`` describe the whole FILTER SET, not
+    the page — a figure tallied from the rows on screen describes one page while
+    reading as the query's (the phantom-untriaged defect). ``total_all`` and
+    ``active`` describe the whole table: the client needs "is the store empty or
+    did my filter match nothing" and "is anything running anywhere" (poll
+    gating), and neither can be derived from a filtered page.
+    """
+
+    rows: list[Investigation]
+    total: int
+    running: int
+    true_positives: int
+    total_all: int
+    active: bool
+
+
+async def query_page(
+    db: AsyncSession,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    verdicts: Sequence[str] | None = None,
+    statuses: Sequence[str] | None = None,
+    q: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> InvestigationPage:
+    """The investigations list as a real query: filters, counts and paging in SQL.
+
+    This exists because the screen used to filter a newest-100
+    :func:`list_recent` page client-side — on a deployment whose newest 100 runs
+    were one saturated outcome, every older errored run was unreachable under
+    ANY filter the operator could set. :func:`list_recent` is left untouched for
+    its other callers (the bell's bounded running/completed lists).
+
+    ``since``/``until`` bound ``created_at`` inclusively (naive UTC, matching
+    the column). ``statuses`` filters on the DISPLAY status
+    (:func:`_display_status_sql`) so the filter agrees with what the table
+    renders. ``verdicts`` matches stored verdict strings, plus the synthetic
+    :data:`PIPELINE_ERROR_VERDICT`: a fallback-marked row matches ONLY that
+    member — its stored needs_more_info must not leak into the NMI filter — and
+    a row matches a real verdict only when it is NOT fallback-marked, mirroring
+    the screen's matchesVerdict semantics (the ``true_positives`` figure applies
+    that same guard, so it never counts a row the verdict filter would exclude).
+    Unknown members simply match nothing (the route drops them before calling).
+
+    ``q`` is the operator's free text, matched case-insensitively as a substring
+    of the rule name, the source address or the destination address — the three
+    things the table actually renders, so a row that matches is a row whose
+    match is visible. It joins ``conds``, which means it narrows the header
+    counts alongside the rows: a search that shrank the table while the counts
+    described the whole store is the phantom-count defect this query exists to
+    prevent. ``autoescape`` keeps a typed ``%`` a percent sign rather than
+    "match everything".
+
+    Three queries: the page, one aggregate over the filter set (total / running
+    / true-positive), one over the whole table (total_all / active). The
+    ``(status, created_at)`` index (migration 0028) serves the ORDER BY.
+    Fallback membership reads the persisted ``is_fallback`` column — stamped at
+    finalize/resolve — rather than ``json_extract``'ing every row's report blob
+    on each poll (the growth defect this query used to carry). Reordering the
+    conjunction to test the cheap verdict first would NOT be sound: SQLite does
+    not guarantee left-to-right evaluation of AND terms.
+    """
+    # ``is_fallback`` is a nullable Boolean: True only on rows finalize/resolve
+    # stamped as pipeline fallbacks. ``.isnot(True)`` folds both False AND NULL
+    # (legacy / not-yet-finalized rows) to not-a-fallback — the same treatment
+    # the old `or_(provenance.is_(None), provenance != ...)` gave a NULL path.
+    is_fallback = Investigation.is_fallback.is_(True)
+    not_fallback = Investigation.is_fallback.isnot(True)
+
+    conds: list[Any] = []
+    if since is not None:
+        conds.append(Investigation.created_at >= since)
+    if until is not None:
+        conds.append(Investigation.created_at <= until)
+    if statuses:
+        conds.append(_display_status_sql().in_(list(statuses)))
+    if verdicts:
+        stored = [v for v in verdicts if v != PIPELINE_ERROR_VERDICT]
+        terms: list[Any] = []
+        if PIPELINE_ERROR_VERDICT in verdicts:
+            terms.append(is_fallback)
+        if stored:
+            terms.append(and_(not_fallback, Investigation.verdict.in_(stored)))
+        conds.append(or_(*terms))
+    needle = (q or "").strip()
+    if needle:
+        conds.append(
+            or_(
+                Investigation.rule_name.icontains(needle, autoescape=True),
+                Investigation.src_ip.icontains(needle, autoescape=True),
+                Investigation.dest_ip.icontains(needle, autoescape=True),
+            )
+        )
+
+    limit = max(1, min(limit, MAX_PAGE_LIMIT))
+    offset = max(0, offset)
+
+    rows = list(
+        (
+            await db.scalars(
+                select(Investigation)
+                .where(*conds)
+                .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        ).all()
+    )
+    total, running, true_positives = (
+        await db.execute(
+            select(
+                func.count(Investigation.id),
+                func.coalesce(
+                    func.sum(case((_display_status_sql() == VERDICTS_RUNNING, 1), else_=0)), 0
+                ),
+                # Same not-a-fallback guard the ROW filter applies to
+                # verdict=true_positive. Without it a fallback-marked row that
+                # still carries a true_positive verdict counts here while
+                # rendering a pipeline-error chip below — a header figure
+                # describing a set its own rows are not in.
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (and_(not_fallback, Investigation.verdict == "true_positive"), 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+            ).where(*conds)
+        )
+    ).one()
+    total_all, running_all = (
+        await db.execute(
+            select(
+                func.count(Investigation.id),
+                func.coalesce(
+                    func.sum(case((Investigation.status == VERDICTS_RUNNING, 1), else_=0)), 0
+                ),
+            )
+        )
+    ).one()
+    return InvestigationPage(
+        rows=rows,
+        total=int(total),
+        running=int(running),
+        true_positives=int(true_positives),
+        total_all=int(total_all),
+        active=int(running_all) > 0,
+    )
+
+
+class RunRef(NamedTuple):
+    """The columns primacy is decided from — and nothing else.
+
+    :func:`runs_for_alerts` fans out over a page's alert ids (up to the 500-row
+    page cap), and each alert contributes its WHOLE retry group. Fetching full
+    ORM rows there would drag every retry's ``report`` JSON blob through the
+    session to answer a question that reads four scalar columns.
+    """
+
+    id: str
+    alert_es_id: str | None
+    status: str
+    created_at: datetime
+
+
+async def runs_for_alerts(db: AsyncSession, alert_ids: Sequence[str]) -> list[RunRef]:
+    """EVERY run for the given alerts, newest first — the primacy input.
+
+    The canonical ("primary") run per alert is decided over the alert's WHOLE
+    group. Deciding it over a filtered page instead would crown whichever
+    sibling happened to match the filter — under status=error an errored retry
+    would arrive labelled primary while its complete sibling (the run that
+    actually holds the verdict) sat excluded.
+
+    One indexed query (``alert_es_id`` carries an index), no LIMIT. The row
+    count is the sum of the page's group sizes: deliberately unbounded PER
+    ALERT, because a bound would make primacy depend on which runs fit it —
+    the accident this function exists to prevent. In practice groups stay
+    small (``blocks_rehunt`` refuses re-runs of running/complete alerts and
+    bulk rehunt starts at most 3), and the theoretical worst case — every row
+    in the table retries an alert on the page — is a scan of :class:`RunRef`
+    tuples, not of report blobs.
+    """
+    if not alert_ids:
+        return []
+    rows = await db.execute(
+        select(
+            Investigation.id,
+            Investigation.alert_es_id,
+            Investigation.status,
+            Investigation.created_at,
+        )
+        .where(Investigation.alert_es_id.in_(list(alert_ids)))
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+    )
+    return [RunRef(*row) for row in rows.all()]
+
+
 async def for_entity(db: AsyncSession, value: str, *, limit: int = 50) -> list[Investigation]:
     """Investigations touching an entity — where ``src_ip == value OR dest_ip == value``.
 
@@ -566,7 +934,19 @@ async def latest_for_pairs(
     window_days: int,
 ) -> dict[tuple[str, str, str], Investigation]:
     """Most recent COMPLETE investigation per (rule_name, src_ip, dest_ip),
-    no older than the window. Running/error rows never propagate."""
+    no older than the window. Running/error rows never propagate.
+
+    A NULL endpoint is a KEY VALUE, not a reason to skip the row: it coalesces to
+    ``""``, the same degrade the sweep planner and the alert grid apply when they
+    build the pairs they ask about. Filtering NULLs out in SQL made every
+    endpoint/process-shaped detection (Sigma host rules carry no ``source.*`` /
+    ``destination.*``, so the recorder leaves both columns NULL) invisible here —
+    the rows were discarded before the coalescing below could key them, so a
+    no-IP cluster never inherited its own prior verdict and was re-investigated
+    on every sweep that saw a newer event id. Both-endpoint rows are unaffected:
+    a coalesced key always carries an empty component where the row had a NULL,
+    so it can never collide with a flow's key.
+    """
     if not pairs:
         return {}
     cutoff = utcnow() - timedelta(days=window_days)
@@ -578,8 +958,6 @@ async def latest_for_pairs(
                 Investigation.rule_name.in_(rules),
                 Investigation.status == "complete",
                 Investigation.created_at >= cutoff,
-                Investigation.src_ip.is_not(None),
-                Investigation.dest_ip.is_not(None),
             )
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         )
@@ -740,6 +1118,11 @@ async def running_for_pairs(
     investigated twice minutes apart. The planner subtracts these pairs.
     No window: wedged ``running`` rows are reaped to ``error``, so a crashed
     run can't suppress its pair for long.
+
+    NULL endpoints coalesce to ``""`` rather than excluding the row, exactly as
+    in :func:`latest_for_pairs` — otherwise the guard covers only network flows
+    and a host-shaped rule can be investigated twice concurrently (a manual run
+    in flight would not block the scheduled one).
     """
     if not pairs:
         return set()
@@ -749,8 +1132,6 @@ async def running_for_pairs(
             select(Investigation).where(
                 Investigation.rule_name.in_(rules),
                 Investigation.status == "running",
-                Investigation.src_ip.is_not(None),
-                Investigation.dest_ip.is_not(None),
             )
         )
     ).all()

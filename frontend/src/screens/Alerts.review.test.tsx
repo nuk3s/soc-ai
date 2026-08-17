@@ -13,8 +13,9 @@
 //         changes.
 //   F61 — sub-minute notification time renders "just now", not "now ago".
 //   F62 — the sidebar lights "Investigations" on /investigation/:id and /entity.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
+import { ToastProvider } from '../lib/toast';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AlertEvent, AlertGroup } from '../lib/types';
 
@@ -39,14 +40,19 @@ vi.mock('../lib/api', async (importOriginal) => {
     getWorkspaces: vi.fn(),
     getNotifications: vi.fn(),
     getHealth: vi.fn(),
+    listSavedViews: vi.fn(),
     signOut: vi.fn(),
   };
 });
-vi.mock('../lib/notifications', () => ({
+// Spread the real module and override only what these tests need held still: a
+// hand-listed mock silently drops any export the module later grows, and the
+// break then lands on whichever screen imports it next rather than here. F61
+// below asserts the real relative-time formatter, so it must NOT be stubbed.
+vi.mock('../lib/notifications', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/notifications')>()),
   getDismissed: () => new Set<string>(),
   dismissNotification: vi.fn(),
   dismissMany: vi.fn(),
-  NOTIFICATIONS_DISMISSED_EVENT: 'soc-ai:notifications-dismissed',
   formatNotificationTitle: (t: string) => t,
 }));
 
@@ -56,6 +62,7 @@ import {
   getAlerts,
   getAutoTriageStatus,
   getHealth,
+  listSavedViews,
   getInvestigations,
   getMe,
   getNotifications,
@@ -101,16 +108,20 @@ beforeEach(() => {
   vi.mocked(getWorkspaces).mockResolvedValue([]);
   vi.mocked(getNotifications).mockResolvedValue([]);
   vi.mocked(getHealth).mockResolvedValue({ es: { ok: true, detail: '' }, llm: { ok: true, detail: '' } } as never);
+  vi.mocked(listSavedViews).mockResolvedValue([]);
 });
 
-function renderAlerts() {
-  return render(
+function renderAlerts({ toasts = false }: { toasts?: boolean } = {}) {
+  // The toaster is opt-in: most tests assert on in-table DOM and useToast is a
+  // no-op outside a provider, so only the tests that read a notice pay for it.
+  const tree = (
     <MemoryRouter initialEntries={['/alerts']}>
       <ShellProvider>
         <Alerts />
       </ShellProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(toasts ? <ToastProvider>{tree}</ToastProvider> : tree);
 }
 
 // Grab the alerts screen's 10s background-poll callback (the one useAsync
@@ -173,14 +184,22 @@ describe('F12 — keyboard focus follows the group, not the row index', () => {
       // Highlight the first row (AAA) with `j`.
       fireEvent.keyDown(window, { key: 'j' });
 
-      // Poll re-sorts: CCC appears above, AAA is now index 1.
-      capturePoll(intervalSpy)();
-      await screen.findByText('CCC');
+      // Poll re-sorts: CCC appears above, AAA is now index 1. `act` flushes the
+      // poll's already-resolved fetch and the re-render it schedules, so the
+      // list below is settled rather than raced — this test failed ONLY on a
+      // contended runner, where a bare findByText/waitFor can miss a hop the
+      // mock has in fact already completed.
+      await act(async () => {
+        capturePoll(intervalSpy)();
+      });
+      expect(screen.getByText('CCC')).toBeTruthy();
 
       // `a` must acknowledge AAA (the row the analyst highlighted), never the
       // Cobalt-Strike-shaped CCC that slid into index 0.
-      fireEvent.keyDown(window, { key: 'a' });
-      await waitFor(() => expect(ackGroup).toHaveBeenCalled());
+      await act(async () => {
+        fireEvent.keyDown(window, { key: 'a' });
+      });
+      expect(ackGroup).toHaveBeenCalled();
       expect(vi.mocked(ackGroup).mock.calls[0][0].name).toBe('AAA');
     } finally {
       intervalSpy.mockRestore();
@@ -189,28 +208,155 @@ describe('F12 — keyboard focus follows the group, not the row index', () => {
 });
 
 describe('F59 / context-row morph — a selection cannot be stranded by a filter change', () => {
-  it('replaces the filter bar with bulk actions while events are selected', async () => {
+  it('keeps the filters usable during a selection, and drops the selection out loud if one changes', async () => {
+    // This used to assert the opposite: the filter row was REPLACED by the bulk
+    // bar, which prevented a stranded selection structurally — by removing the
+    // controls. Generalised to the shared toolbar that rule deleted the only
+    // filter Hunts has and blanked a live search term on Investigations, so the
+    // same guarantee is made a different way: the filters stay, and changing one
+    // clears the selection and says so.
     const g = mkGroup({ id: 'es-1', name: 'ET SCAN Noisy', count: 3 });
     vi.mocked(getAlerts).mockResolvedValue([g]);
     vi.mocked(getAlertGroupEvents).mockResolvedValue([mkEvent({ id: 'ev-1', ts: '2026-07-30T00:00:00Z' })]);
-    renderAlerts();
+    renderAlerts({ toasts: true });
     await screen.findByText('ET SCAN Noisy');
 
-    // Filters (incl. "Hide acknowledged") are present before any selection.
     expect(screen.getByRole('button', { name: /Hide acknowledged/ })).toBeTruthy();
 
     // Expand the group (row click) → its events load, then tick one event.
+    const beforeExpand = screen.getAllByRole('checkbox').length;
     fireEvent.click(screen.getByText('ET SCAN Noisy'));
     await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
-    const boxes = await screen.findAllByRole('checkbox');
+    // CALLED is not RENDERED. Without this wait the last checkbox is still the
+    // GROUP's, so the click selects all 3 events and the bar reads "Ack 3
+    // events" — which `findByText('Ack 1 event')` then waits out and fails on,
+    // with a message that blames the label rather than the selection. Passed on
+    // an idle box, failed the loaded CI runner.
+    await waitFor(() =>
+      expect(screen.getAllByRole('checkbox').length).toBeGreaterThan(beforeExpand),
+    );
+    const boxes = screen.getAllByRole('checkbox');
     fireEvent.click(boxes[boxes.length - 1]);
     await screen.findByText('Ack 1 event');
 
-    // The context row now morphs to bulk actions: "Hide acknowledged" is gone, so
-    // a filter toggle can't discard the selected rows out from under the
-    // selection (the phantom-selection bug is prevented structurally), and the
-    // table's top edge doesn't shift as the analyst multi-selects.
-    expect(screen.queryByRole('button', { name: /Hide acknowledged/ })).toBeNull();
+    // The filter is STILL there and still operable while the selection stands.
+    const hideAcked = screen.getByRole('button', { name: /Hide acknowledged/ });
+    expect(hideAcked).toBeTruthy();
+
+    // Using it discards the selection rather than stranding it — and says so.
+    fireEvent.click(hideAcked);
+    await waitFor(() => expect(screen.queryByText('Ack 1 event')).toBeNull());
+    expect(await screen.findByText(/selection cleared/i)).toBeTruthy();
+  });
+});
+
+describe('selection counts are a true partition, not a double count', () => {
+  // Ticking a group's checkbox also ticks every LOADED event under it, so the
+  // expanded rows agree with the header box. Counting those events AGAIN beside
+  // the group — and submitting them again — is the counts-that-lie disease:
+  // "1 group · 3 events" for one group of three loaded events, and four ids
+  // sent for one group's worth of work.
+  const groupWithEvents = () => {
+    vi.mocked(getAlerts).mockResolvedValue([
+      mkGroup({ id: 'es-1', name: 'ET SCAN Noisy', count: 2000 }),
+    ]);
+    vi.mocked(getAlertGroupEvents).mockResolvedValue([
+      mkEvent({ id: 'ev-1', ts: '2026-07-30T00:00:00Z' }),
+      mkEvent({ id: 'ev-2', ts: '2026-07-30T00:01:00Z' }),
+      mkEvent({ id: 'ev-3', ts: '2026-07-30T00:02:00Z' }),
+    ]);
+  };
+
+  it('does not count a selected group\'s own events a second time', async () => {
+    groupWithEvents();
+    renderAlerts();
+    await screen.findByText('ET SCAN Noisy');
+    fireEvent.click(screen.getByText('ET SCAN Noisy')); // expand → events load
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+
+    // Tick the GROUP box, which also ticks its three loaded events.
+    fireEvent.click(screen.getAllByRole('checkbox')[1]);
+    const strip = await screen.findByTestId('list-toolbar-selection');
+
+    expect(within(strip).getByText(/1 group/)).toBeTruthy();
+    // The three covered events are NOT announced as separate work…
+    expect(within(strip).queryByText(/event/)).toBeNull();
+    // …and the whole-window fire count is labelled as such, not as a selection.
+    expect(within(strip).getByText(/2,000 alerts in window/)).toBeTruthy();
+  });
+
+  it('submits one id per selected group, not one per covered event', async () => {
+    groupWithEvents();
+    renderAlerts();
+    await screen.findByText('ET SCAN Noisy');
+    fireEvent.click(screen.getByText('ET SCAN Noisy'));
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+    fireEvent.click(screen.getAllByRole('checkbox')[1]);
+
+    const strip = await screen.findByTestId('list-toolbar-selection');
+    fireEvent.click(within(strip).getByText('Bulk Investigate'));
+    await waitFor(() => expect(vi.mocked(startAutoTriage)).toHaveBeenCalled());
+    const arg = vi.mocked(startAutoTriage).mock.calls[0][0] as { alertIds?: string[] };
+    expect(arg.alertIds).toEqual(['es-1']);
+  });
+
+  it('still counts an event the operator picked OUTSIDE any selected group', async () => {
+    groupWithEvents();
+    renderAlerts();
+    await screen.findByText('ET SCAN Noisy');
+    fireEvent.click(screen.getByText('ET SCAN Noisy'));
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+
+    // Only one event, no group.
+    const boxes = screen.getAllByRole('checkbox');
+    fireEvent.click(boxes[boxes.length - 1]);
+    const strip = await screen.findByTestId('list-toolbar-selection');
+    expect(within(strip).getByText(/Ack 1 event/)).toBeTruthy();
+    // No group is selected, so nothing claims one.
+    expect(within(strip).queryByText(/group/)).toBeNull();
+  });
+});
+
+describe('saved views on Alerts', () => {
+  const VIEW = {
+    id: 3,
+    screen: 'alerts' as const,
+    name: 'Critical, unacked',
+    // Deliberately PARTIAL — saved before `hideAcked` existed as a key. The
+    // range is here so applying the view provably reaches the server query.
+    query: { view: 'critical', sevs: ['critical'], range: '7d' },
+    created_at: null,
+  };
+
+  it('applying a partial view does not flip hide-acknowledged off', async () => {
+    // `!!saved.hideAcked` forced the ON-by-default filter OFF for any view that
+    // omitted the key. A saved view that silently unhides acknowledged alerts
+    // is worse than no saved views at all.
+    vi.mocked(listSavedViews).mockResolvedValue([VIEW]);
+    vi.mocked(getAlerts).mockResolvedValue([mkGroup({ id: 'es-1', name: 'ET SCAN Noisy' })]);
+    renderAlerts();
+    await screen.findByText('ET SCAN Noisy');
+
+    const before = vi.mocked(getAlerts).mock.calls.length;
+    fireEvent.click(await screen.findByTitle(/Apply the saved view "Critical, unacked"/));
+    await waitFor(() => expect(vi.mocked(getAlerts).mock.calls.length).toBeGreaterThan(before));
+    const q = vi.mocked(getAlerts).mock.calls.slice(-1)[0][0] as { hideAcked?: boolean };
+    expect(q.hideAcked).toBe(true);
+  });
+
+  it('un-lights the chip once a facet moves on from what it described', async () => {
+    vi.mocked(listSavedViews).mockResolvedValue([VIEW]);
+    vi.mocked(getAlerts).mockResolvedValue([mkGroup({ id: 'es-1', name: 'ET SCAN Noisy' })]);
+    renderAlerts();
+    await screen.findByText('ET SCAN Noisy');
+
+    const chip = await screen.findByTitle(/Apply the saved view "Critical, unacked"/);
+    fireEvent.click(chip);
+    await waitFor(() => expect(chip).toHaveAttribute('aria-pressed', 'true'));
+
+    // Edit a facet by hand: the chip no longer describes what is applied.
+    fireEvent.click(screen.getByRole('button', { name: /Hide acknowledged/ }));
+    await waitFor(() => expect(chip).toHaveAttribute('aria-pressed', 'false'));
   });
 });
 

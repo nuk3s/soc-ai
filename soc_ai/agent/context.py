@@ -6,6 +6,7 @@ Shared by the pipeline, the toolset, and the API layer.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -67,6 +68,12 @@ class InvestigationContext:
     # callers (CLI / WebUI / tests) leave this ``None`` for live-monitor
     # behavior. Tools fall back to now-relative when this is absent.
     default_time_anchor: datetime | None = None
+    # Optional per-tool-call progress callback, set by a caller that renders
+    # live progress (the chat manager). Invoked with the tool name as each tool
+    # STARTS, so a long turn is legible instead of "nothing, then everything"
+    # (dogfood 2026-08-06). Fire-and-forget: never awaited for a result, and any
+    # exception it raises is swallowed — progress must never break a tool call.
+    on_tool_call: Callable[[str], None] | None = None
     # Dedup tracker. Per-investigation set of seen tool-call
     # signatures. The orchestrator builds a fresh one per `investigate()`
     # call so dedup state never leaks across runs.
@@ -106,6 +113,20 @@ class InvestigationContext:
     # only sees sanitized results, and the entrypoints sanitize prompts /
     # desanitize outputs against the same per-run label mapping.
     egress_guard: EgressGuard | None = None
+    # Effective internal-identifier sets (env-config union active DB rows, minus
+    # muted) for the ONLINE egress tool guards (web_search / crawl_page). These
+    # tools previously read env-only settings, so a deployment that configured its
+    # internal names through discovery with an empty .env leaked a discovered
+    # FQDN/host to public search. The orchestrator pre-seeds these from the set it
+    # already resolves for EgressGuard; other entrypoints leave them None and the
+    # tool closures resolve them lazily once from ``db_sessionmaker`` (see
+    # ``soc_ai.agent.toolset._egress_tool_idents``). None ⇒ the tool guard falls
+    # back to the raw settings tuples (db-less path: behaviour unchanged).
+    effective_internal_suffixes: tuple[str, ...] | None = None
+    effective_internal_hosts: tuple[str, ...] | None = None
+    # Set once the effective sets above have been resolved (so a legitimate
+    # (None, None) — no DB — is not re-resolved on every tool call).
+    _egress_idents_resolved: bool = False
 
 
 class StepEvent(BaseModel):

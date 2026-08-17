@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { login } from '../lib/api';
+import { login, takePostLoginRedirect } from '../lib/api';
 import { DEMO_BANNER_H, DemoBanner, useDemoStatus } from '../lib/demo';
 import { ScopeMark, Wordmark } from '../components/Logo';
 
@@ -21,7 +21,12 @@ export function Login() {
     setPending(true);
     try {
       await login(username, password);
-      navigate('/dashboard');
+      // Where they were headed when the session expired, not where we'd like
+      // them to start. A 401 on /app/hosts/198.51.100.5 bounced through here
+      // and landed on the dashboard, throwing away the link the analyst had
+      // actually followed — usually one someone else had sent them. `replace`
+      // because the login screen is not a place to go Back to.
+      navigate(takePostLoginRedirect() ?? '/dashboard', { replace: true });
     } catch (e) {
       // login() already returns a generic message on a real 401 and surfaces
       // the server's hint (e.g. rate-limit) or a network/cert error otherwise.

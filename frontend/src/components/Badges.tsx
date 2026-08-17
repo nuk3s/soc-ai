@@ -15,6 +15,25 @@ export function DevBadge({ label = 'In development' }: { label?: string }) {
   );
 }
 
+// ---- Account role chip -----------------------------------------------------
+// One definition for "what this account may do", shared by the admin Users
+// table and the sidebar account menu — the two places a role is stated. Blue
+// for admin (it is the privileged one), slate for everything else.
+export function RoleChip({ role }: { role: string }) {
+  return (
+    <span
+      className="inline-flex flex-none items-center rounded px-1.5 py-0.5 text-[10.5px] font-semibold"
+      style={
+        role === 'admin'
+          ? { background: 'rgba(99,180,255,.15)', color: '#63b4ff' }
+          : { background: 'rgba(148,163,184,.1)', color: '#94a3b8' }
+      }
+    >
+      {role}
+    </span>
+  );
+}
+
 // ---- Detection kind badge (mono uppercase pill) ----------------------------
 export function KindBadge({ kind }: { kind: DetectionKind }) {
   const k = KIND[kind];

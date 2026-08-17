@@ -36,12 +36,14 @@ from soc_ai.main import (
     _discovery_due,
     _discovery_scheduler_loop,
     _init_store,
+    _reaper_loop,
 )
 from soc_ai.store import auth as auth_svc
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import general_chat as gc_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from soc_ai.store.models import ChatMessage
+from soc_ai.store.models import ChatMessage, GeneralChatMessage
 
 
 def _make_app(status: _DiscoveryStatus) -> SimpleNamespace:
@@ -764,3 +766,476 @@ async def test_eval_loop_skips_when_disabled_or_early_or_already_ran(
     await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=True, hour=0))
 
     assert invoked == []
+
+
+# --------------------------------------------------------------------------- #
+# Host-dossier scheduler loop — the network sweep that keeps asset context fresh.
+# Same harness as the discovery loop, plus the one thing that makes this loop
+# different: its due-check reads the DURABLE ``dossier_run`` stamp, so a restart
+# loop cannot re-sweep the whole network on every boot.
+# --------------------------------------------------------------------------- #
+
+from soc_ai.api.webui import _DossierStatus, _get_dossier_status  # noqa: E402
+from soc_ai.main import _dossier_due, _dossier_scheduler_loop  # noqa: E402
+
+
+def _dossier_app(status: _DossierStatus) -> SimpleNamespace:
+    """A stub app carrying the shared single-flight status the loop reads.
+
+    ``_dossier_status`` is the attr the real ``_get_dossier_status`` uses; the
+    clients are the ones ``_run_dossier_task`` would reach (unused — the worker
+    is stubbed), and ``db_sessionmaker`` is what the durable-stamp read takes."""
+    state = SimpleNamespace(
+        _dossier_status=status,
+        elastic=object(),
+        db_sessionmaker=object(),
+        settings=None,
+    )
+    return SimpleNamespace(state=state)
+
+
+def _dossier_settings(
+    *,
+    enabled: bool = True,
+    schedule_enabled: bool = True,
+    interval_hours: int = 24,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        dossier_enabled=enabled,
+        dossier_schedule_enabled=schedule_enabled,
+        dossier_schedule_interval_hours=interval_hours,
+    )
+
+
+def _patch_durable_stamp(
+    monkeypatch: pytest.MonkeyPatch, stamp: datetime | None, reads: list[Any]
+) -> None:
+    """Stub the durable ``dossier_run`` read, recording every call.
+
+    Patched at its source module so the loop's lazy import picks it up; ``reads``
+    lets a test prove the loop caches the stamp instead of hitting the DB on
+    every wake."""
+
+    async def _latest(_maker: Any) -> datetime | None:
+        reads.append(_maker)
+        return stamp
+
+    monkeypatch.setattr("soc_ai.enrichment.host_dossier.latest_run_started_at", _latest)
+
+
+async def _run_dossier_iterations(
+    monkeypatch: pytest.MonkeyPatch,
+    app: SimpleNamespace,
+    settings: Any,
+    n: int = 1,
+) -> None:
+    """Run ``_dossier_scheduler_loop`` for exactly ``n`` body iterations."""
+    real_sleep = asyncio.sleep
+    calls = {"n": 0}
+
+    async def _sleep(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] <= n:
+            return None
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await _dossier_scheduler_loop(app, settings)
+    finally:
+        monkeypatch.setattr(main_mod.asyncio, "sleep", real_sleep)
+
+
+async def _drain_dossier_worker(status: _DossierStatus) -> None:
+    task = status._task
+    if task is not None:
+        with contextlib.suppress(Exception):
+            await task
+
+
+def test_dossier_due_helper() -> None:
+    # no sweep has EVER completed (the durable table is empty) → due
+    assert _dossier_due(None, 24) is True
+    # last sweep well past the interval → due
+    past = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    assert _dossier_due(past, 24) is True
+    # last sweep a minute ago → not due
+    recent = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    assert _dossier_due(recent, 24) is False
+    # unparseable timestamp → fail toward running the sweep
+    assert _dossier_due("not-a-timestamp", 24) is True
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_runs_when_enabled_and_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh install (no dossier_run row) + both switches on → one sweep starts."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+    reads: list[Any] = []
+    _patch_durable_stamp(monkeypatch, None, reads)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+        # mirror the real worker's finally: release the slot + stamp last_run
+        status.running = False
+        status.last_run = datetime.now(UTC).isoformat()
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings())
+    await _drain_dossier_worker(status)
+
+    # the loop found the slot through the same accessor the endpoint uses
+    assert _get_dossier_status(app.state) is status
+    assert invoked == [True]
+    assert reads == [app.state.db_sessionmaker]
+    assert status.last_run is not None
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_skips_when_durable_stamp_is_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE restart-loop regression: a fresh process must not re-sweep the network.
+
+    ``status.last_run`` is None on every boot, and None reads as due — so a loop
+    fed only by the in-memory stamp would re-sweep hundreds of hosts on each
+    restart. Fed by the durable ``dossier_run`` stamp instead, a process that
+    boots an hour after the last sweep waits out the interval. The stamp is read
+    once and cached, so later wakes stay a timestamp compare."""
+    status = _DossierStatus()  # in-memory stamp is None, as after any restart
+    app = _dossier_app(status)
+    reads: list[Any] = []
+    recent = datetime.now(UTC) - timedelta(hours=1)
+    _patch_durable_stamp(monkeypatch, recent, reads)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings(interval_hours=24), n=2)
+    await _drain_dossier_worker(status)
+
+    assert invoked == []
+    assert status.running is False
+    assert status.last_run == recent.isoformat()  # cached from the durable row
+    assert len(reads) == 1  # …and not re-read on the second wake
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_runs_when_durable_stamp_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable stamp older than the interval is due, restart or not."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+    reads: list[Any] = []
+    _patch_durable_stamp(monkeypatch, datetime.now(UTC) - timedelta(hours=25), reads)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+        status.running = False
+        status.last_run = datetime.now(UTC).isoformat()
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings(interval_hours=24))
+    await _drain_dossier_worker(status)
+
+    assert invoked == [True]
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_runs_when_durable_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken durable read degrades to 'due' rather than never sweeping again.
+
+    There is no retry storm behind this: the worker stamps ``status.last_run`` in
+    its ``finally`` whatever happened, so the next wake compares timestamps."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+
+    async def _boom(_maker: Any) -> datetime | None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("soc_ai.enrichment.host_dossier.latest_run_started_at", _boom)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+        status.running = False
+        status.last_run = datetime.now(UTC).isoformat()
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings())
+    await _drain_dossier_worker(status)
+
+    assert invoked == [True]
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_skips_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Either switch off → the loop wakes, reads settings, and does nothing.
+
+    The durable read must not fire either: a disabled feature has no business
+    touching the database on a five-minute timer."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+    reads: list[Any] = []
+    _patch_durable_stamp(monkeypatch, None, reads)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    # schedule off (master switch on)
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings(schedule_enabled=False))
+    await _drain_dossier_worker(status)
+    assert invoked == []
+    assert status.running is False
+
+    # master switch off (schedule on)
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings(enabled=False))
+    await _drain_dossier_worker(status)
+    assert invoked == []
+    assert status.running is False
+    assert reads == []
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_respects_single_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A manual 'Rebuild now' in flight blocks the scheduled sweep.
+
+    Two network sweeps at once is the connection-pool pressure that has frozen
+    this app before, so the scheduler shares the endpoint's single-flight slot."""
+    status = _DossierStatus()  # never swept → would be due...
+    status.running = True  # ...but a manual rebuild owns the slot
+    app = _dossier_app(status)
+    reads: list[Any] = []
+    _patch_durable_stamp(monkeypatch, None, reads)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings())
+    await _drain_dossier_worker(status)
+
+    assert invoked == []
+    assert status.running is True  # the in-flight sweep still owns the slot
+    assert reads == []  # not even a DB read while one is running
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_yields_the_slot_to_a_rebuild_that_lands_mid_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-flight check has to survive the await it straddles.
+
+    ``status.running`` was read BEFORE the durable last-run query and never
+    re-read after it, so a "Rebuild now" POST landing inside that await window
+    claimed the slot and the loop then started a SECOND network sweep on top of
+    it — two sweeps, hundreds of hosts each, several ES round trips per host.
+    """
+    status = _DossierStatus()  # never swept → due
+    app = _dossier_app(status)
+
+    async def _latest(_maker: Any) -> datetime | None:
+        # The manual POST claims the slot while this read is in flight.
+        status.running = True
+        return None
+
+    monkeypatch.setattr("soc_ai.enrichment.host_dossier.latest_run_started_at", _latest)
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings())
+    await _drain_dossier_worker(status)
+
+    assert invoked == [], "a scheduled sweep started alongside the manual one"
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_cancels_cleanly_on_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation at shutdown unwinds the loop without error (lifespan teardown)."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+
+    started = asyncio.Event()
+    park = asyncio.Event()  # never set → parks until cancelled
+
+    async def _sleep(_seconds: float) -> None:
+        started.set()
+        await park.wait()
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
+
+    task = asyncio.create_task(_dossier_scheduler_loop(app, _dossier_settings()))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled() or task.done()
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_survives_iteration_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raising iteration is logged and swallowed; the next wake sweeps."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+    reads: list[Any] = []
+    _patch_durable_stamp(monkeypatch, None, reads)
+
+    calls = {"n": 0}
+
+    class _Boom:
+        dossier_schedule_enabled = True
+        dossier_schedule_interval_hours = 24
+
+        @property
+        def dossier_enabled(self) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return True
+
+    invoked: list[bool] = []
+
+    async def _stub_worker(state: Any) -> None:
+        invoked.append(True)
+        status.running = False
+        status.last_run = datetime.now(UTC).isoformat()
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+
+    # iteration #1 raises (swallowed), #2 sweeps → proves broad-except resilience.
+    await _run_dossier_iterations(monkeypatch, app, _Boom(), n=2)
+    await _drain_dossier_worker(status)
+
+    assert calls["n"] >= 2
+    assert invoked == [True]
+
+
+# --------------------------------------------------------------------------- #
+# General-chat reaper — BOTH call sites.
+#
+# soc_ai.store.general_chat.reap_stale_pending only scans general_chat_messages,
+# and soc_ai.store.chat.reap_stale_pending only scans chat_messages, so the
+# dashboard chat is reaped exactly as often as main.py remembers to call it. Both
+# call sites are covered here because they have DIFFERENT age semantics (periodic
+# = older than the turn timeout, startup = every pending row regardless of age),
+# and getting the startup one wrong is invisible until a restart lands mid-turn
+# and leaves an empty bubble on the landing screen forever.
+# --------------------------------------------------------------------------- #
+
+
+async def _run_reaper_once(monkeypatch: pytest.MonkeyPatch, maker: Any, settings: Any) -> None:
+    """Run exactly one ``_reaper_loop`` body iteration, then unwind.
+
+    Same bounding recipe as ``_run_iterations``: patch ``soc_ai.main.asyncio.sleep``
+    so the first wake returns and the second raises ``CancelledError``.
+    """
+    real_sleep = asyncio.sleep
+    calls = {"n": 0}
+
+    async def _sleep(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return None
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await _reaper_loop(maker, settings)
+    finally:
+        monkeypatch.setattr(main_mod.asyncio, "sleep", real_sleep)
+
+
+@pytest.mark.asyncio
+async def test_reaper_loop_sweeps_stale_general_chat_turns(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The periodic sweep reaps a general-chat turn older than the turn timeout
+    and SPARES a fresh one (still legitimately in flight) — the same age rule the
+    investigation-chat sweep uses, proven side by side in one iteration so a
+    future edit can't silently drop one table's sweep."""
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+
+    stale = auth_svc.utcnow() - timedelta(minutes=30)  # >> chat_turn_timeout_s (300s)
+    async with maker() as db:
+        old = await gc_svc.create_pending_assistant(db, "analyst:alice")
+        fresh = await gc_svc.create_pending_assistant(db, "analyst:alice")
+        inv = await inv_svc.create(db, alert_es_id="ev-reap", started_by="t")
+        inv_chat = await chat_svc.create_pending_assistant(db, inv.id)
+        old.created_at = stale
+        inv_chat.created_at = stale
+        await db.commit()
+        old_id, fresh_id, inv_chat_id = old.id, fresh.id, inv_chat.id
+
+    await _run_reaper_once(monkeypatch, maker, settings_kratos)
+
+    async with maker() as db:
+        reaped = await db.get(GeneralChatMessage, old_id)
+        assert reaped is not None
+        assert reaped.status == "error"
+        assert "interrupted" in reaped.content
+        spared = await db.get(GeneralChatMessage, fresh_id)
+        assert spared is not None and spared.status == "pending"
+        # the investigation-chat sweep still runs in the same iteration
+        inv_row = await db.get(ChatMessage, inv_chat_id)
+        assert inv_row is not None and inv_row.status == "error"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_init_store_reaps_pending_general_chat_turns(settings_kratos: Settings) -> None:
+    """A 'pending' general-chat row that survives a restart is resolved at
+    startup regardless of age — its background task died with the previous
+    process, so waiting out the turn timeout would only extend how long the
+    dashboard shows an empty answer bubble. A completed turn is untouched."""
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    async with maker() as db:
+        pend = await gc_svc.create_pending_assistant(db, "analyst:bob")
+        done = await gc_svc.create_pending_assistant(db, "analyst:bob")
+        await gc_svc.finish_assistant(db, done.id, content="kept", status="done")
+        pend_id, done_id = pend.id, done.id
+    await engine.dispose()
+
+    # Fresh engine on the SAME on-disk DB simulates a process restart.
+    engine2 = make_engine(settings_kratos)
+    maker2 = await _init_store(engine2, settings_kratos)
+    async with maker2() as db:
+        reaped = await db.get(GeneralChatMessage, pend_id)
+        assert reaped is not None
+        assert reaped.status == "error"
+        assert "interrupted" in reaped.content
+        kept = await db.get(GeneralChatMessage, done_id)
+        assert kept is not None and kept.status == "done" and kept.content == "kept"
+    await engine2.dispose()

@@ -21,10 +21,12 @@ Coverage:
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from elastic_transport import ConnectionError as EsConnectionError
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from soc_ai.config import Settings
@@ -48,7 +50,7 @@ from soc_ai.enrichment.discovery import (
     run_discovery,
 )
 from soc_ai.main import create_app
-from soc_ai.so_client.elastic import EsSearchResult
+from soc_ai.so_client.elastic import EsSearchResult, GridPartialResultsError
 from soc_ai.store import internal_identifiers as ids
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -147,6 +149,7 @@ class FakeES:
         local_orig_ip_buckets: list[dict[str, Any]] | None = None,
         local_resp_ip_buckets: list[dict[str, Any]] | None = None,
         raise_on: str | None = None,
+        raise_exc: BaseException | None = None,
         ecs: bool = False,
     ) -> None:
         self._host = host_buckets or []
@@ -158,6 +161,9 @@ class FakeES:
         self._local_orig_ip = local_orig_ip_buckets or []
         self._local_resp_ip = local_resp_ip_buckets or []
         self._raise_on = raise_on
+        # What `raise_on` raises. Defaults to the generic mapping error; a test
+        # about how a failure READS supplies the real exception instead.
+        self._raise_exc = raise_exc
         self._ecs = ecs
         self.calls: list[str] = []
         # The fields that "have data" for exists-probes. Legacy grid → zeek.*;
@@ -202,7 +208,7 @@ class FakeES:
             field_name = aggs["candidates"]["terms"]["field"]
         self.calls.append(field_name)
         if self._raise_on is not None and field_name == self._raise_on:
-            raise RuntimeError(f"mapping missing for {field_name}")
+            raise self._raise_exc or RuntimeError(f"mapping missing for {field_name}")
         # The resolved-internal (forward-record) aggregation carries a
         # resolved_ips sub-agg — route it by that shape.
         sub = aggs["candidates"].get("aggs", {}) if aggs else {}
@@ -583,6 +589,49 @@ async def test_run_discovery_graceful_degradation_on_subquery_error() -> None:
     assert ("suffix", ".corp.acme.local") in rows
 
 
+# ── The scan banner's detail line is prose (dogfood 2026-08-14, D11) ────────
+#
+# These strings are what the operator reads under the banner on Config →
+# Internal identifiers. On the half-read grid the line was
+# "host.name: GridPartialResultsError: partial search results from logs-*: …" —
+# a raw exception chain, where the Hosts sweep banner in the same state showed
+# the same fact as a sentence.
+
+
+async def test_run_discovery_error_line_carries_no_exception_class() -> None:
+    settings = _settings()
+    maker = await _sessionmaker(settings)
+    fake = FakeES(
+        dns_buckets=[_bucket("printer.corp.acme.local", 3, 3)],
+        raise_on="host.name",
+        raise_exc=GridPartialResultsError(
+            "partial search results from logs-*: 2 of 4 shards failed",
+            shards_failed=2,
+            shards_total=4,
+        ),
+    )
+
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    line = next(e for e in summary.errors if e.startswith("host.name:"))
+    assert "GridPartialResultsError" not in line
+    # …and the fact itself survives — this is about how it reads, not about
+    # quietly dropping what the operator needs.
+    assert "2 of 4 shards failed" in line
+
+
+async def test_run_discovery_keeps_the_class_when_the_message_says_nothing() -> None:
+    """The negative control: a bare KeyError renders as ``'host.name'``, which
+    on its own tells the operator nothing, so the class name stays."""
+    settings = _settings()
+    maker = await _sessionmaker(settings)
+    fake = FakeES(raise_on="host.name", raise_exc=KeyError("host.name"))
+
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    assert any("KeyError" in e for e in summary.errors)
+
+
 async def test_run_discovery_preserves_operator_mute_on_rerun() -> None:
     """A muted detected row stays muted across a re-scan (tombstone)."""
     settings = _settings()
@@ -715,6 +764,364 @@ async def test_retirement_sweep_is_terminal_across_rescans() -> None:
             (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
         }
     assert full[("suffix", ".cdn.netflix.com")].state == "dismissed"
+
+
+# ---------------------------------------------------------------------------
+# Retirement sweep vs a degraded grid — absence of evidence is not evidence of
+# absence. A scan whose aggregations FAILED never produced the suffix, so it
+# must not conclude the suffix is gone (the dismissal is a terminal tombstone —
+# the only irreversible write in the scan).
+# ---------------------------------------------------------------------------
+
+
+def _isolated_settings(tmp_path: Path) -> Settings:
+    """Settings whose SQLite file lives in this test's own tmp dir.
+
+    These tests assert on ``summary.retired`` — a whole-scan count — so they
+    must not share the default ``data/soc-ai.db`` with the rest of the suite,
+    where a leftover row from another test would be swept into the count.
+    """
+    settings = _settings()
+    settings.soc_ai_data_dir = tmp_path  # type: ignore[assignment]
+    return settings
+
+
+class UnreachableES:
+    """A grid that is down: every search raises a transport-level error.
+
+    Models the real outage shape — ``resolve_agg_field`` swallows its probe
+    failures and falls back to the ECS default, then every aggregation raises
+    and lands in ``summary.errors``, leaving ``scan_suffix_values`` empty.
+    """
+
+    def __init__(self) -> None:
+        self.searches = 0
+
+    async def search(self, index: str, query: dict[str, Any], **_: Any) -> EsSearchResult:
+        self.searches += 1
+        raise EsConnectionError("connection refused")
+
+    async def aclose(self) -> None:  # pragma: no cover - cleanup no-op
+        return None
+
+
+async def test_retirement_sweep_keeps_pending_suggestion_when_grid_is_down(tmp_path: Path) -> None:
+    """A scan against a RAISING grid leaves a pending suggestion pending.
+
+    The scan could not look, so "this scan did not produce it" is not evidence
+    the identifier is unreal. The row must be byte-for-byte unchanged — state
+    still ``muted``, no ``retired`` tombstone in its evidence — and nothing may
+    be counted as retired.
+    """
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        seeded = await ids.upsert_detected(
+            db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted"
+        )
+        seeded_evidence = dict(seeded.evidence or {})
+
+    down = UnreachableES()
+    summary = await run_discovery(down, maker, settings)  # type: ignore[arg-type]
+
+    assert summary.errors, "an unreachable grid must record its failures"
+    assert down.searches > 0, "the scan must actually have tried to read the grid"
+    assert summary.retired == 0
+
+    async with maker() as db:
+        visible = {(r.kind, r.value): r for r in await ids.list_identifiers(db)}
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    key = ("suffix", ".corp.bigco.com")
+    assert key in visible, "an outage must not hide a pending suggestion from the operator"
+    row = full[key]
+    assert row.state == "muted"  # THE assertion: still pending, not tombstoned
+    assert "retired" not in (row.evidence or {})
+    assert row.evidence == seeded_evidence  # untouched, not rewritten
+
+
+class EmptyES:
+    """A grid that answers cleanly and says nothing: 200-with-zero-hits.
+
+    The real shape behind this is the ES wrapper's hard-coded
+    ``ignore_unavailable=True, allow_no_indices=True``: when
+    ``EVENTS_INDEX_PATTERN`` stops matching any index (SO upgrade renames
+    indices, ILM wipes the window, snapshot-restore in progress) every search
+    succeeds with nothing. ``summary.errors`` stays EMPTY, so an errors-only
+    gate lets the terminal tombstone through the front door.
+    """
+
+    def __init__(self) -> None:
+        self.searches = 0
+
+    async def search(self, index: str, query: dict[str, Any], **_: Any) -> EsSearchResult:
+        self.searches += 1
+        return EsSearchResult(
+            total=0,
+            took_ms=1,
+            hits=[],
+            aggregations={"candidates": {"buckets": []}},
+        )
+
+    async def aclose(self) -> None:  # pragma: no cover - cleanup no-op
+        return None
+
+
+async def test_retirement_sweep_keeps_pending_suggestion_when_grid_reads_empty(
+    tmp_path: Path,
+) -> None:
+    """A scan that read ZERO events must not retire either.
+
+    An index pattern matching nothing is indistinguishable, from the errors
+    list alone, from a healthy quiet estate — the scan succeeds with
+    ``errors == []``. But a scan that observed no events observed nothing at
+    all, so it cannot support "this scan did not produce it".
+    """
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        seeded = await ids.upsert_detected(
+            db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted"
+        )
+        seeded_evidence = dict(seeded.evidence or {})
+
+    empty = EmptyES()
+    summary = await run_discovery(empty, maker, settings)  # type: ignore[arg-type]
+
+    assert empty.searches > 0, "the scan must actually have queried the grid"
+    assert summary.errors == [], "a reachable-but-empty grid reports no errors"
+    assert summary.scanned_events == 0, "this scan saw no events at all"
+    assert summary.retired == 0
+
+    async with maker() as db:
+        visible = {(r.kind, r.value): r for r in await ids.list_identifiers(db)}
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    key = ("suffix", ".corp.bigco.com")
+    assert key in visible, "an empty read must not hide a pending suggestion"
+    row = full[key]
+    assert row.state == "muted"  # THE assertion: still pending, not tombstoned
+    assert "retired" not in (row.evidence or {})
+    assert row.evidence == seeded_evidence
+
+
+async def test_retirement_sweep_defers_when_one_name_signal_failed(tmp_path: Path) -> None:
+    """Half-blind counts as blind for the tombstone.
+
+    The scan read plenty of events from the signals that worked, so an
+    events-only gate would let it retire — but the signal that raised is
+    exactly the one that might have produced this suffix. Keeps the
+    ``not summary.errors`` half of the gate load-bearing.
+    """
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        await ids.upsert_detected(db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted")
+
+    fake = FakeES(host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)], raise_on="zeek.dns.query")
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    assert summary.errors, "the failed sub-query must be recorded"
+    assert summary.scanned_events > 0, "the surviving signals still read events"
+    assert summary.retired == 0
+
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("suffix", ".corp.bigco.com")].state == "muted"
+
+
+async def test_retirement_gate_ignores_unrelated_ip_agg_failure(tmp_path: Path) -> None:
+    """The public-retirement gate is PER-SIGNAL, not per-scan.
+
+    Here CIDR discovery's ``source.ip`` aggregations persistently fail (a
+    deployment whose IP-field mapping rejects the terms agg) while every
+    sub-query that could have produced a suffix — the four name signals —
+    succeeded and saw the estate. "This scan did not produce it" is therefore
+    real evidence about the suffix, and the stale muted public suggestion must
+    still retire. Under the old whole-scan gate the unrelated failure
+    suppressed retirement on EVERY scan, forever, with only a warning log.
+    """
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        await ids.upsert_detected(db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted")
+
+    fake = FakeES(host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)], raise_on="source.ip")
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    # The unrelated failure is still loud — recorded, not swallowed.
+    assert any("source.ip" in e for e in summary.errors)
+    assert summary.scanned_events > 0, "the name signals read the estate"
+    assert summary.retired == 1
+
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("suffix", ".corp.bigco.com")].state == "dismissed"
+
+
+class ProbeFlakyES(FakeES):
+    """A legacy ``zeek.*`` grid whose field-resolution exists-probes fail.
+
+    The silent shape behind a blind field choice: a transient blip confined to
+    the probe window. ``resolve_agg_field`` swallows the error and falls back
+    to the ECS-first default, and every AGGREGATION then succeeds — 200,
+    events matched — but the DNS name sub-queries run against fields this grid
+    never populates and return zero buckets, so nothing lands in
+    ``summary.errors`` on its own. ``probe_fields`` narrows the flake to
+    specific candidates (default: every probe fails).
+    """
+
+    def __init__(self, *args: Any, probe_fields: tuple[str, ...] | None = None, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self._probe_fields = probe_fields
+
+    async def search(
+        self,
+        index: str,
+        query: dict[str, Any],
+        *,
+        size: int = 100,
+        aggs: dict[str, Any] | None = None,
+        track_total_hits: bool | None = None,
+        **kw: Any,
+    ) -> EsSearchResult:
+        probe_field = _exists_probe_field(query)
+        if (
+            aggs is None
+            and probe_field is not None
+            and (self._probe_fields is None or probe_field in self._probe_fields)
+        ):
+            raise EsConnectionError("connection reset during field probe")
+        return await super().search(
+            index, query, size=size, aggs=aggs, track_total_hits=track_total_hits, **kw
+        )
+
+
+async def test_retirement_defers_when_field_probe_fails(tmp_path: Path) -> None:
+    """A failed field-resolution probe closes the retirement gate.
+
+    The two exists-probes CHOOSE the DNS fields for name signals (b)/(c)/(d);
+    ``resolve_agg_field`` swallows their failure and falls back to the ECS
+    default, so on this legacy ``zeek.*`` grid every aggregation "succeeds" —
+    200, events matched, zero buckets — and the suffix normally sustained by
+    the raw-lookup signal is not re-produced. Before the probe failure was
+    folded into the name-class health, this scan tombstoned the pending
+    suggestion with ``summary.errors == []``: a silent false terminal write
+    no degraded-scan surface could ever disclose.
+    """
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        seeded = await ids.upsert_detected(
+            db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted"
+        )
+        seeded_evidence = dict(seeded.evidence or {})
+
+    fake = ProbeFlakyES(
+        host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)],
+        # Keyed at zeek.dns.query — would re-produce the suffix on a grounded
+        # read, invisible to an aggregation against the blind ECS default.
+        dns_buckets=[_bucket("app.corp.bigco.com", 20, 2)],
+    )
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    assert any("dns.query.name field probe" in e for e in summary.errors), (
+        "the blind field choice must be loud, not a clean summary"
+    )
+    assert summary.scanned_events > 0, "the aggregations themselves still read events"
+    assert summary.retired == 0
+
+    async with maker() as db:
+        visible = {(r.kind, r.value): r for r in await ids.list_identifiers(db)}
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    row = full[("suffix", ".corp.bigco.com")]
+    assert row.state == "muted"  # THE assertion: still pending, not tombstoned
+    assert "retired" not in (row.evidence or {})
+    assert row.evidence == seeded_evidence
+    # Over-correction guard: the flake degrades the DNS signals, it does not
+    # abort the scan — host.name (no probe involved) still landed its suffix.
+    assert ("suffix", ".corp.acme.local") in visible
+
+
+async def test_retirement_gate_ignores_conn_local_probe_failure(tmp_path: Path) -> None:
+    """A blind probe on the CIDR-corroboration fields suppresses nothing.
+
+    Mirror of ``test_retirement_gate_ignores_unrelated_ip_agg_failure`` for
+    the probe seam: ``connection.local.*`` feeds only the CIDR class, which
+    has no grid-gated retirement rule, so the stale muted public suffix still
+    retires — while the failed probes stay loud in ``summary.errors``.
+    """
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        await ids.upsert_detected(db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted")
+
+    fake = ProbeFlakyES(
+        host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)],
+        probe_fields=("connection.local.originator", "connection.local.responder"),
+    )
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    assert any("connection.local.originator field probe" in e for e in summary.errors)
+    assert any("connection.local.responder field probe" in e for e in summary.errors)
+    assert summary.retired == 1
+
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("suffix", ".corp.bigco.com")].state == "dismissed"
+
+
+async def test_retirement_sweep_still_retires_public_row_on_healthy_scan(tmp_path: Path) -> None:
+    """Negative control: a scan that genuinely looked and did not produce the
+    suffix still dismisses it. Without this the fix could be "never retire"."""
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        await ids.upsert_detected(db, "suffix", ".corp.bigco.com", {"host_count": 2}, "muted")
+
+    fake = FakeES(host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)])
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    assert summary.errors == []
+    assert summary.scanned_events > 0, "the discriminator: this scan really saw the estate"
+    assert summary.retired == 1
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("suffix", ".corp.bigco.com")].state == "dismissed"
+
+
+async def test_grid_independent_retirement_rules_still_run_when_down(tmp_path: Path) -> None:
+    """The machine-GUID and junk-host rules read the stored VALUE, not the grid,
+    so an outage does not suspend them — only the scan-derived public rule."""
+    settings = _isolated_settings(tmp_path)
+    maker = await _sessionmaker(settings)
+    guid = ".05bc0f86-f13e-4904-a92b-11dee17856a1.local"
+    async with maker() as db:
+        await ids.upsert_detected(db, "suffix", guid, {"host_count": 1}, "active")
+        await ids.upsert_detected(db, "host", "WORKGROUP", {"host_count": 9}, "active")
+
+    summary = await run_discovery(UnreachableES(), maker, settings)  # type: ignore[arg-type]
+
+    assert summary.errors
+    assert summary.retired == 2
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("suffix", guid)].state == "dismissed"
+    assert full[("host", "WORKGROUP")].state == "dismissed"
 
 
 async def test_run_discovery_no_cidrs_returns_error_summary() -> None:

@@ -1,7 +1,7 @@
 """Docs-vs-code accuracy gate (review Tier-0 rec #2).
 
 The 2026-07-03 full review found user-facing doc claims that had silently gone
-stale. This module is a lightweight regression gate that fails when the two
+stale. This module is a lightweight regression gate that fails when the
 highest-drift surfaces diverge from the code:
 
 1. ``docs/AGENT_TOOLS.md`` "Read tools" table  ==  the read tools actually
@@ -12,6 +12,13 @@ highest-drift surfaces diverge from the code:
    declared fails ``AuditEvent`` validation at runtime and is *silently
    dropped* from the audit trail (the exact ``auto_ack`` bug class this
    review found; see the comment above ``"auto_ack"`` in schemas.py).
+3. ``docs/AGENT_TOOLS.md`` "Proposal tools" table  ==  the ``propose_*`` tools
+   registered on the chat agents. These are the third capability class, and
+   the one a reader is most likely to mis-model: they are neither read tools
+   (they change what the UI offers) nor write tools (they touch nothing
+   upstream). A proposal tool that ships undocumented leaves the doc claiming
+   a "complete capability surface" that omits the only way the agent can put a
+   verdict or a hunt in front of an analyst.
 
 Hermetic by design: parses the doc + source files with regex relative to the
 repo root and imports only ``soc_ai`` modules already imported elsewhere in
@@ -172,6 +179,88 @@ def test_not_callable_note_still_documents_skip_set() -> None:
             f"{name!r} is skipped by REGISTERED_BUT_NOT_AGENT_CALLABLE but no "
             f"longer mentioned in the read-tools section of {AGENT_TOOLS_DOC}."
         )
+
+
+# ---------------------------------------------------------------------------
+# Gate 3 — AGENT_TOOLS.md "Proposal tools" table == registered propose_* tools
+# ---------------------------------------------------------------------------
+#
+# Proposal tools are registered inline in soc_ai/agent/chat_agent.py rather
+# than in the shared toolset, because each one closes over the sink its caller
+# passes; they carry no `t_` prefix, so Gate 1's scan cannot see them at all.
+# They are also opt-in per surface (no sink -> tool absent from the schema),
+# which is exactly why the doc has to name them: whether the agent in front of
+# you can propose a verdict, a hunt, or neither is a product fact, not an
+# implementation detail.
+
+PROPOSAL_TOOL_SOURCE = REPO_ROOT / "soc_ai" / "agent" / "chat_agent.py"
+PROPOSAL_SECTION_HEADING = "## Proposal tools"
+
+
+def _proposal_section() -> str:
+    text = AGENT_TOOLS_DOC.read_text(encoding="utf-8")
+    assert PROPOSAL_SECTION_HEADING in text, (
+        f"{PROPOSAL_SECTION_HEADING!r} heading missing from {AGENT_TOOLS_DOC} — "
+        "the doc must carry a section for the propose_* tools registered in "
+        f"{PROPOSAL_TOOL_SOURCE.name}."
+    )
+    section = text.split(PROPOSAL_SECTION_HEADING, 1)[1]
+    return re.split(r"\n## ", section, maxsplit=1)[0]
+
+
+def _documented_proposal_tools() -> set[str]:
+    """Tool names from the first column of the proposal-tools markdown table."""
+    names: set[str] = set()
+    for line in _proposal_section().splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = line.split("|")
+        if len(cells) < 2:
+            continue
+        first_cell = cells[1]
+        if set(first_cell.strip()) <= {"-", ":", " "} or first_cell.strip() == "Tool":
+            continue  # header / separator row
+        names |= {
+            span for span in re.findall(r"`([^`]+)`", first_cell) if span.startswith("propose_")
+        }
+    return names
+
+
+def _registered_proposal_tools() -> set[str]:
+    """Every ``propose_*`` tool the chat agent builder can register."""
+    src = PROPOSAL_TOOL_SOURCE.read_text(encoding="utf-8")
+    return set(re.findall(r"async def (propose_[a-z0-9_]+)\(", src))
+
+
+def test_proposal_tool_scan_parses() -> None:
+    """Parsing sanity: a rename or a move out of chat_agent.py must fail loudly
+    here, not silently empty the comparison on both sides."""
+    registered = _registered_proposal_tools()
+    assert registered, (
+        f"no `async def propose_*` found in {PROPOSAL_TOOL_SOURCE} — did proposal "
+        "tools move to another module? Update PROPOSAL_TOOL_SOURCE in "
+        "tests/test_docs_accuracy.py."
+    )
+
+
+def test_every_proposal_tool_is_documented() -> None:
+    """A new propose_* tool MUST get a row in the doc's proposal-tools table."""
+    undocumented = _registered_proposal_tools() - _documented_proposal_tools()
+    assert not undocumented, (
+        f"proposal tools registered in {PROPOSAL_TOOL_SOURCE.name} but MISSING "
+        f"from the {PROPOSAL_SECTION_HEADING!r} table in {AGENT_TOOLS_DOC}: "
+        f"{sorted(undocumented)}. Add a row saying which surface offers it and "
+        "what the analyst has to confirm."
+    )
+
+
+def test_every_documented_proposal_tool_exists() -> None:
+    """A documented proposal tool that no longer exists is stale-doc drift."""
+    ghosts = _documented_proposal_tools() - _registered_proposal_tools()
+    assert not ghosts, (
+        f"proposal tools documented in {AGENT_TOOLS_DOC} but NOT registered in "
+        f"{PROPOSAL_TOOL_SOURCE.name}: {sorted(ghosts)}. Remove the stale row(s)."
+    )
 
 
 # ---------------------------------------------------------------------------

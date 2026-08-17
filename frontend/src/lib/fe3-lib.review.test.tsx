@@ -9,7 +9,7 @@
 import { fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getNotifications, POST_LOGIN_REDIRECT_KEY } from './api';
+import { getNotifications, POST_LOGIN_REDIRECT_KEY, takePostLoginRedirect } from './api';
 import { dismissNotification, getDismissed } from './notifications';
 
 // EntityGraph calls useNavigate() — stub it so we can assert the pivot target.
@@ -78,6 +78,21 @@ describe('mid-session 401 redirect (F43)', () => {
     await expect(getNotifications()).rejects.toThrow('Unauthorized');
     expect(window.location.href).toBe('');
     expect(sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
+  });
+
+  it('falls back to ?next= when sessionStorage held nothing (#84)', () => {
+    // The two sources exist because storage can be blocked; the param is what
+    // survives that, and it goes through the same allow-list.
+    sessionStorage.clear();
+    expect(takePostLoginRedirect('?next=' + encodeURIComponent('/app/investigations'))).toBe(
+      '/investigations',
+    );
+    expect(takePostLoginRedirect('?next=' + encodeURIComponent('https://evil.example/'))).toBeNull();
+  });
+
+  it('prefers the stored destination over a ?next= someone appended (#84)', () => {
+    sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, '/app/alerts');
+    expect(takePostLoginRedirect('?next=' + encodeURIComponent('/app/config'))).toBe('/alerts');
   });
 });
 

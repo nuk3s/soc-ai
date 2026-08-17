@@ -9,17 +9,22 @@ in ``routes_hunts``) so availability annotation is deterministic without an ES.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from elastic_transport import ConnectionError as EsConnectionError
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from soc_ai import main as main_mod
 from soc_ai.config import Settings
+from soc_ai.dossier.types import Fact
 from soc_ai.so_client.inventory import DatasetInfo, GridInventory
+from soc_ai.so_client.inventory import _clear_cache as _clear_inventory_cache
+from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import hunt_templates as ht_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from sqlalchemy import inspect
@@ -241,6 +246,32 @@ def test_list_best_effort_when_inventory_fails(client: TestClient) -> None:
     assert all(t["available"] is True and t["missingDatasets"] == [] for t in payload)
 
 
+def test_list_available_when_the_grid_is_down(client: TestClient) -> None:
+    """G7: a DOWN grid must not be reported as a grid with no telemetry.
+
+    Unlike the test above this does NOT patch ``discover_datasets`` — it fails
+    the real ES search underneath it, which is the path that shipped the bug:
+    discovery swallowed the error and handed the route a real-looking EMPTY
+    inventory, so the fail-open branch never ran and every starter was dimmed
+    with "your grid carries no DNS/endpoint/network telemetry".
+    """
+    _clear_inventory_cache()
+    es = client.app.state.elastic._client  # type: ignore[attr-defined]
+    es.search = AsyncMock(side_effect=EsConnectionError("connection refused"))
+    try:
+        resp = client.get("/api/v1/hunt-templates")
+    finally:
+        _clear_inventory_cache()
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    with_datasets = [t for t in payload if t["requiredDatasets"]]
+    assert with_datasets, "expected builtins that require datasets"
+    for template in with_datasets:
+        assert template["available"] is True, template["name"]
+        assert template["missingDatasets"] == [], template["name"]
+
+
 def test_custom_template_create_and_delete(client: TestClient) -> None:
     """A custom template round-trips (create → list → delete). builtin=False."""
     empty_inv = _inventory()  # no datasets → everything flagged, but shape is fine
@@ -319,6 +350,170 @@ def test_create_template_requires_name_and_objective(client: TestClient) -> None
     assert (
         client.post("/api/v1/hunt-templates", json={"objective_template": "y"}).status_code == 422
     )
+
+
+# ---------------------------------------------------------------------------
+# Environment fit — the SECOND annotation axis (dataset presence ≠ relevance).
+# A builtin whose target machinery the network has never shown (Kerberoasting
+# with no domain-joined host) is applicable=False + missingEnvironment — and
+# STILL in the list: not-applicable is a demotion, never a hiding. Fail-open on
+# a profile error and on a never-built table, and one qualifying host suffices.
+# ---------------------------------------------------------------------------
+
+# The three environment-gated builtins, and the three network-generic ones.
+ENV_GATED = ("Credential abuse / lockouts", "Lateral movement", "Suspicious PowerShell / LOLBins")
+NETWORK_GENERIC = ("Beaconing to rare IPs", "DNS / C2 exfiltration", "New external services")
+
+# A full inventory so availability is all-green and the tests below isolate the
+# environment axis from the telemetry axis.
+_FULL_INV = (
+    "zeek.conn",
+    "zeek.kerberos",
+    "zeek.smb_files",
+    "zeek.rdp",
+    "zeek.dns",
+    "endpoint",
+)
+
+
+def _seed_dossier_host(
+    client: TestClient,
+    ip: str,
+    *,
+    os_family: str | None = None,
+    domain: str | None = None,
+    built: bool = True,
+) -> None:
+    """One host through the builder's own write path (fresh, strong facts)."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    async def _run() -> None:
+        maker = client.app.state.db_sessionmaker  # type: ignore[attr-defined]
+        async with maker() as db:
+            host = await dossier_store.upsert_host(
+                db, ip, last_built_at=now if built else None, now=now
+            )
+            facts = []
+            if os_family is not None:
+                facts.append(("os_family", os_family))
+            if domain is not None:
+                facts.append(("domain_membership", domain))
+            for field, value in facts:
+                await dossier_store.upsert_inferred(
+                    db,
+                    host,
+                    Fact(
+                        field=field,
+                        value=value,
+                        confidence=0.9,
+                        strength="strong",
+                        source="hostlog",
+                        evidence=[f"{value} (from hostlog)"],
+                        observed_at=now,
+                    ),
+                    now=now,
+                )
+            await db.commit()
+
+    asyncio.run(_run())
+
+
+def _list_templates(client: TestClient) -> dict[str, dict[str, Any]]:
+    with patch(
+        "soc_ai.api.webui.routes_hunts.discover_datasets",
+        AsyncMock(return_value=_inventory(*_FULL_INV)),
+    ):
+        resp = client.get("/api/v1/hunt-templates")
+    assert resp.status_code == 200, resp.text
+    return _templates_by_name(resp.json())
+
+
+def test_environment_fit_demotes_on_an_owner_shaped_network(client: TestClient) -> None:
+    """A few linux hosts, zero Windows, zero domain: the domain/Windows hunts
+    are applicable=False with the human phrase, still listed (never hidden),
+    while the network-generic three stay applicable. Telemetry availability is
+    all-green here — the two axes are independent."""
+    for ip in ("10.0.0.11", "10.0.0.12", "10.0.0.13"):
+        _seed_dossier_host(client, ip, os_family="linux")
+    by_name = _list_templates(client)
+
+    assert set(by_name) >= set(ENV_GATED)  # demoted, NOT hidden
+    cred = by_name["Credential abuse / lockouts"]
+    assert cred["applicable"] is False
+    assert cred["missingEnvironment"] == ["a domain-joined host"]
+    for name in ("Lateral movement", "Suspicious PowerShell / LOLBins"):
+        assert by_name[name]["applicable"] is False
+        assert by_name[name]["missingEnvironment"] == ["a Windows host"]
+        assert by_name[name]["available"] is True  # the axes are independent
+    for name in NETWORK_GENERIC:
+        assert by_name[name]["applicable"] is True
+        assert by_name[name]["missingEnvironment"] == []
+
+
+def test_environment_fit_fail_open_when_nothing_ever_built(client: TestClient) -> None:
+    """An unknown network is not an empty network: census rows with no build
+    (and an empty table before them) must not demote anything."""
+    by_name = _list_templates(client)  # empty table
+    assert all(t["applicable"] is True for t in by_name.values())
+
+    _seed_dossier_host(client, "10.0.0.14", built=False)  # census-only row
+    by_name = _list_templates(client)
+    assert all(t["applicable"] is True for t in by_name.values())
+    assert all(t["missingEnvironment"] == [] for t in by_name.values())
+
+
+def test_environment_fit_fail_open_when_profile_query_raises(client: TestClient) -> None:
+    """A broken profile query must never demote a hunt (mirrors the inventory
+    fail-open one field over)."""
+    with patch(
+        "soc_ai.api.webui.routes_hunts.dossier_store.environment_profile",
+        AsyncMock(side_effect=RuntimeError("db broke")),
+    ):
+        by_name = _list_templates(client)
+    assert by_name  # builtins seeded
+    assert all(t["applicable"] is True for t in by_name.values())
+
+
+def test_environment_fit_one_qualifying_host_reopens_the_hunts(client: TestClient) -> None:
+    """The moment ONE Windows domain-joined host resolves, every demotion lifts
+    — computed per request from the store, so no cache to wait out."""
+    for ip in ("10.0.0.11", "10.0.0.12", "10.0.0.13"):
+        _seed_dossier_host(client, ip, os_family="linux")
+    assert _list_templates(client)["Lateral movement"]["applicable"] is False
+
+    _seed_dossier_host(client, "10.0.0.20", os_family="windows", domain="CORP.EXAMPLE.COM")
+    by_name = _list_templates(client)
+    for name in (*ENV_GATED, *NETWORK_GENERIC):
+        assert by_name[name]["applicable"] is True, name
+        assert by_name[name]["missingEnvironment"] == []
+
+
+def test_environment_fit_custom_templates_are_always_applicable(client: TestClient) -> None:
+    """An operator template is never demoted — the operator knows their network
+    — even one that shares a builtin's name on a network that demotes that
+    builtin."""
+    for ip in ("10.0.0.11", "10.0.0.12"):
+        _seed_dossier_host(client, ip, os_family="linux")
+    with patch(
+        "soc_ai.api.webui.routes_hunts.discover_datasets",
+        AsyncMock(return_value=_inventory(*_FULL_INV)),
+    ):
+        created = client.post(
+            "/api/v1/hunt-templates",
+            json={
+                "name": "Lateral movement",  # deliberate collision with the builtin
+                "objective_template": "My own lateral-movement sweep.",
+                "required_datasets": [],
+            },
+        )
+        assert created.status_code == 200, created.text
+        assert created.json()["applicable"] is True
+        listing = client.get("/api/v1/hunt-templates").json()
+    rows = [t for t in listing if t["name"] == "Lateral movement"]
+    assert len(rows) == 2
+    by_kind = {t["builtin"]: t for t in rows}
+    assert by_kind[True]["applicable"] is False  # the builtin stays demoted
+    assert by_kind[False]["applicable"] is True  # the operator's is untouched
 
 
 def test_mutate_routes_admin_gated(settings_kratos: Settings) -> None:

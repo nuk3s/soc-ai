@@ -20,6 +20,14 @@ Time window: ``days=N`` bounds the scan to records with ``timestamp >= now-Nd``
 contiguous *within* the returned window, but a windowed scan cannot verify
 linkage across the window boundary — the record before the window is not fetched,
 so its ``hash`` can't be confirmed against the first in-window ``prev_hash``).
+
+Partial reads: every page is checked against ``_shards``/``timed_out`` and a
+page the grid did not fully read raises :class:`GridPartialResultsError` (see
+:func:`_raise_if_partial` for why the ``es_fail_on_partial_results`` opt-out
+deliberately does not apply here). The paging in this module goes through the
+raw ``elastic._client`` handle — :meth:`ElasticClient.search` does not expose
+``search_after`` — so it does NOT inherit the wrapper's own partial-read check
+and must carry its own.
 """
 
 from __future__ import annotations
@@ -30,7 +38,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from soc_ai.audit.chain import verify_chain
-from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.elastic import (
+    ElasticClient,
+    GridPartialResultsError,
+    _as_int,
+    _first_failure_reason,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +79,64 @@ class ChainVerifyResult:
     capped: bool
 
 
+def _raise_if_partial(
+    index: str,
+    response: Any,
+    *,
+    consequence: str = "the chain cannot be verified from a partial read",
+) -> None:
+    """Refuse to hash a page the grid did not fully read.
+
+    Mirrors the tolerant parse of :meth:`ElasticClient._check_complete` — no
+    ``_shards`` key (test stubs, replay fixtures) means zero failures, and
+    skipped shards are a healthy grid's business — but deliberately does NOT
+    honor the ``es_fail_on_partial_results`` opt-out. On every other read a
+    partial answer degrades one panel; here it corrupts the verdict itself, in
+    one of two ways depending on which records went missing. A missing tail (or
+    a fully empty read) verifies as an INTACT chain — a tamper-evidence check
+    handing out a clean bill of health from records it never read. A missing
+    middle leaves a ``seq`` gap that :func:`verify_chain` reports as TAMPERED —
+    an outage rendered as the most expensive false alarm this product can raise.
+    Both are worse than the honest answer, which is that the chain cannot be
+    verified from a partial read; so a partial page always raises, and the
+    callers map it to CLI exit-2 / a 502 — never to ``ok=true`` and never to a
+    ``first_broken_seq``.
+
+    The logger's chain-head recovery reads the same audit index through the same
+    raw ``_client`` handle and shares this guard (see
+    :meth:`soc_ai.audit.logger.AuditLogger._ensure_chain_head`), passing its own
+    ``consequence`` clause so the raised message names what a half-read actually
+    cost there — a head that cannot be recovered, not a chain that cannot be
+    verified.
+    """
+    shards_raw = response.get("_shards")
+    shards: dict[str, Any] = shards_raw if isinstance(shards_raw, dict) else {}
+    shards_failed = _as_int(shards.get("failed"))
+    shards_total = _as_int(shards.get("total"))
+    # `is True`, not truthiness: a Mock double answers every .get with a truthy
+    # child object, and absent/garbled metadata must never be made to look like
+    # a timeout (the same stance _as_int takes on the shard counters).
+    timed_out = response.get("timed_out") is True
+    if not shards_failed and not timed_out:
+        return
+
+    parts: list[str] = []
+    if shards_failed:
+        parts.append(f"{shards_failed} of {shards_total} shards failed")
+    if timed_out:
+        parts.append("the search timed out before all shards answered")
+    reason = _first_failure_reason(shards)
+    detail = f" ({reason})" if reason else ""
+    raise GridPartialResultsError(
+        f"could not read the whole audit index ({index}): {' and '.join(parts)}{detail} — "
+        f"{consequence}",
+        shards_failed=shards_failed,
+        shards_total=shards_total,
+        timed_out=timed_out,
+        reason=reason,
+    )
+
+
 async def _search_page(
     elastic: ElasticClient,
     index: str,
@@ -81,6 +152,10 @@ async def _search_page(
     underlying client (mirroring the tolerant ``ignore_unavailable`` /
     ``allow_no_indices`` flags the wrapper sets) and return the raw hit dicts —
     each carries ``_source`` (the stored record) and ``sort`` (the next cursor).
+
+    Because this bypasses the wrapper it also bypasses the wrapper's partial-read
+    check, so every page is re-checked here: a half-read page raises
+    :class:`GridPartialResultsError` before a single hit from it is hashed.
     """
     body: dict[str, Any] = {
         "query": query,
@@ -98,6 +173,7 @@ async def _search_page(
         ignore_unavailable=True,
         allow_no_indices=True,
     )
+    _raise_if_partial(index, response)
     return list(response.get("hits", {}).get("hits", []))
 
 
@@ -172,6 +248,10 @@ async def verify_audit_chain(
     Shared by the ``soc-ai audit verify`` CLI and the admin verify-chain endpoint.
     Raises on a transport/ES error (the caller maps that to exit-2 / a 5xx) — this
     is a *verification*, so an unreachable index is "could not run", NOT "intact".
+    A half-read index is the same refusal with a quieter cause: ES answers 200
+    with only the surviving shards' records, and :class:`GridPartialResultsError`
+    (raised per page, see :func:`_raise_if_partial`) keeps that from being scored
+    as either an intact chain or a tampered one.
     """
     records, capped = await _fetch_audit_records(
         elastic, audit_index_alias, days=days, max_records=max_records

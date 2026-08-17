@@ -18,12 +18,16 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Checkbox } from '../components/Controls';
+import { ListToolbar } from '../components/ListToolbar';
+import { useListSelection } from '../lib/useListSelection';
+import { useSavedViews } from '../lib/useSavedViews';
 import { Panel } from '../components/Panel';
 import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { rangeToSinceUntil } from '../lib/timeRange';
 import {
+  MAX_OBJECTIVE_CHARS,
   bulkDeleteHunts,
   createHuntSchedule,
   createHuntTemplate,
@@ -41,7 +45,7 @@ import {
 import type { HuntSchedule, HuntScheduleList, HuntTemplate } from '../lib/api';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { useAsync } from '../lib/useAsync';
-import type { HuntRehuntResult, HuntRow, HuntStatus } from '../lib/types';
+import type { HuntRehuntResult, HuntRow, HuntStat, HuntStatus, SavedViewQuery } from '../lib/types';
 
 // The backend floors a schedule's interval at 60 minutes (MIN_INTERVAL_MINUTES);
 // mirror that here so the picker can't offer an interval the API would clamp.
@@ -58,6 +62,10 @@ const MIN_INTERVAL_MINUTES = 60;
 // (re-hunt + delete). The actions gutter grew from 44px to fit two icon buttons.
 const GRID = '28px 1fr 120px 110px 110px 130px 72px';
 
+// The window this screen lands on, and the one a saved view that names no
+// window restores. Named so the two cannot drift apart.
+const DEFAULT_RANGE = '24h';
+
 // Raw rehunt skip-reason codes (routes_hunts.py::bulk_rehunt) → friendly text.
 // Unknown codes fall through to the raw code so a new backend reason is never
 // silently swallowed (mirrors Investigations' rehuntSkipReason).
@@ -69,11 +77,16 @@ const REHUNT_SKIP_REASONS: Record<string, string> = {
 };
 const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
-const TONE: Record<string, string> = {
-  accent: '#4b8bf5',
-  sigma: '#a371f7',
-  warn: '#d29922',
-  danger: '#f85149',
+// The header's count line reads "7 hunts · 10 findings · 1 in progress" from
+// whatever /hunts/stats returns — the labels are the server's, only lowercased
+// and de-pluralised at 1 ("1 hunt", never "1 hunts"). Generic on purpose: a new
+// stat the backend adds joins the line instead of needing a new card. The `ss`
+// guard keeps "In progress" whole; an English noun ending in `ss` is not a
+// plural, and that label is a phrase, not a count noun.
+const statNoun = (s: HuntStat): string => {
+  const plural = s.label.endsWith('s') && !s.label.endsWith('ss');
+  const label = s.value === '1' && plural ? s.label.slice(0, -1) : s.label;
+  return label.toLowerCase();
 };
 
 // Fallback pills — the six canned hunts, used ONLY when the template API is
@@ -135,19 +148,43 @@ function intervalLabel(minutes: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Template picker — curated, availability-annotated hunt starters (E3.2).
-// Fed by GET /hunt-templates: each chip fills the objective box (like the old
-// static pills). Templates the grid CAN run are HIGHLIGHTED (accent styling —
-// "the telemetry for these is here"); one needing telemetry this grid LACKS
-// stays muted + flagged (a warning icon + "missing telemetry: zeek.rdp") rather
-// than hidden — honesty over hiding. Clicking it still fills the box (the
-// operator may want to see the objective, or knows the data is coming). Falls
-// back to the six static pills when the template API is unreachable/empty so
-// the picker never disappears. An admin can save a modest custom template inline.
+// Template picker — curated hunt starters annotated on TWO independent axes
+// (E3.2 + hunt-fit). Fed by GET /hunt-templates: each chip fills the objective
+// box (like the old static pills). Three states, three operator actions:
+//   · available + applicable → normal accent chip ("the telemetry is here").
+//   · missing telemetry (available=false) → amber flag + "missing telemetry:
+//     zeek.rdp" — a FIXABLE collection gap.
+//   · availability UNKNOWN (availabilityKnown=false — the server could not read
+//     the grid inventory, so `available` is a fail-open default and not a
+//     measurement) → neutral gray chip, no glyph, one caption for the strip.
+//     Deliberately unlike the amber state: "we looked and the telemetry is
+//     missing" and "we could not look" are different facts and must not share a
+//     colour. What they must NOT share is the accent chip, which asserts the
+//     grid is seeing this telemetry — that assertion is how an analyst came to
+//     launch a hunt against data a half-read grid could not read.
+//   · not applicable (applicable=false — the network shows none of the
+//     machinery the hunt targets, e.g. Kerberoasting with no domain) → DEMOTED
+//     into a collapsed "Not applicable here" cluster at the end of the strip,
+//     grayed, never hidden, still runnable. The server recomputes fit per
+//     request from the dossier store, and this picker polls every 60s, so the
+//     first observed domain join reopens the hunt on its own.
+// Clicking any chip still fills the box (the operator may want to see the
+// objective, or knows the data is coming). Falls back to the six static pills
+// when the template API is unreachable/empty so the picker never disappears.
+// An admin can save a modest custom template inline.
 // ---------------------------------------------------------------------------
 function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
   const [reloadKey, setReloadKey] = useState(0);
-  const { data, error } = useAsync<HuntTemplate[]>(getHuntTemplates, [reloadKey]);
+  const { data, error } = useAsync<HuntTemplate[]>(getHuntTemplates, [reloadKey], {
+    // Amber (missing telemetry) and demotion (environment fit) must clear on
+    // their own once the grid or the dossier sweep catches up — the server side
+    // is TTL-cached (300s inventory) so a 60s poll is cheap, and worst-case
+    // staleness becomes TTL+interval instead of "until the operator reloads".
+    refetchInterval: 60_000,
+  });
+  // The not-applicable cluster's expand state (collapsed by default — demoted,
+  // not hidden).
+  const [showDemoted, setShowDemoted] = useState(false);
 
   // Inline "add custom template" form (collapsed by default — modest, like the
   // schedule editor). builtin templates are code-owned; customs are operator-saved.
@@ -201,9 +238,39 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
   const templates = data ?? [];
   const useFallback = !!error || templates.length === 0;
 
+  // `!== false` rather than a truthiness check is the fail-open half: the field
+  // is optional on HuntTemplate, so a payload from a server predating it reads
+  // as "known", which is what it was.
+  const availabilityKnown = (t: HuntTemplate): boolean => t.availabilityKnown !== false;
+  // One unreadable inventory annotates the whole strip — the server evaluates
+  // the axis once for the list, so this is never mixed.
+  const fitUnknown = !useFallback && templates.some((t) => !availabilityKnown(t));
+
+  // The two-axis split: applicable chips render inline (normal or amber);
+  // not-applicable ones cluster at the end, collapsed. `!== false` keeps a
+  // payload without the field (older server) on the inline path — fail open.
+  const applicableTemplates = templates.filter((t) => t.applicable !== false);
+  const demoted = templates.filter((t) => t.applicable === false);
+
+  const demotedTitle = (t: HuntTemplate): string => {
+    const needs = t.missingEnvironment.length
+      ? t.missingEnvironment.join(' and ')
+      : 'machinery this network has not shown';
+    return (
+      `${t.objectiveTemplate}\n\nNeeds ${needs} — none observed on this network. ` +
+      'Re-checked after every dossier sweep. Still runnable.'
+    );
+  };
+
   return (
-    <div className="mb-2.5">
+    <div className="mb-2">
       <div className="flex flex-wrap items-center gap-1.5">
+        {/* Names the row the way the toolbar's "Views" label names its own —
+            the compact composer dropped the "New hunt" heading that used to
+            introduce these chips. */}
+        <span className="mr-0.5 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
+          Starters
+        </span>
         {useFallback
           ? FALLBACK_PRESETS.map((p) => (
               <button
@@ -216,22 +283,36 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
                 {p.label}
               </button>
             ))
-          : templates.map((t) => {
-              const flagged = !t.available;
+          : applicableTemplates.map((t) => {
+              // Three states, and `unknown` is checked FIRST: when the server
+              // could not read the inventory it reports every template
+              // available, so asking `!t.available` alone can only ever produce
+              // the confident answer.
+              const unknown = !availabilityKnown(t);
+              const flagged = !unknown && !t.available;
               const missing = t.missingDatasets.join(', ');
-              const title = flagged
-                ? `${t.objectiveTemplate}\n\n⚠ missing telemetry: ${missing}`
-                : t.objectiveTemplate;
+              const title = unknown
+                ? `${t.objectiveTemplate}\n\nAvailability unknown — the grid inventory could not be read, so this template has not been checked against live telemetry.`
+                : flagged
+                  ? `${t.objectiveTemplate}\n\n⚠ missing telemetry: ${missing}`
+                  : t.objectiveTemplate;
               return (
                 <span key={t.id} className="inline-flex items-center">
                   <button
                     type="button"
                     onClick={() => onPick(t.objectiveTemplate)}
                     title={title}
+                    // The state is in the DOM, not only in a class name: it is
+                    // the contract the picker is tested against, and "no chip
+                    // claims availability" is otherwise an assertion about
+                    // Tailwind strings.
+                    data-availability={unknown ? 'unknown' : flagged ? 'missing' : 'available'}
                     className={
-                      flagged
-                        ? 'flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/5 px-[9px] py-[3px] text-[11.5px] font-medium text-warn/80 opacity-70 transition-opacity hover:opacity-100'
-                        : 'flex items-center gap-1 rounded-badge border border-accent/40 bg-accent/5 px-[9px] py-[3px] text-[11.5px] font-medium text-accent transition-colors hover:border-accent hover:bg-accent/10'
+                      unknown
+                        ? 'flex items-center gap-1 rounded-badge border border-border-strong bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-dim transition-colors hover:border-accent hover:text-accent'
+                        : flagged
+                          ? 'flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/5 px-[9px] py-[3px] text-[11.5px] font-medium text-warn/80 opacity-70 transition-opacity hover:opacity-100'
+                          : 'flex items-center gap-1 rounded-badge border border-accent/40 bg-accent/5 px-[9px] py-[3px] text-[11.5px] font-medium text-accent transition-colors hover:border-accent hover:bg-accent/10'
                     }
                   >
                     {flagged && <AlertTriangle size={11} className="flex-none" />}
@@ -250,6 +331,35 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
                 </span>
               );
             })}
+        {/* Not-applicable cluster — demoted, never hidden. Grayed (muted
+            border/text, no warn color: nothing here is broken or fixable, the
+            network just hasn't shown the machinery), each chip still fills the
+            objective box exactly like an inline one. */}
+        {!useFallback && demoted.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowDemoted((v) => !v)}
+            title="Hunts whose target machinery hasn't been observed on this network — demoted, not hidden. Re-checked after every dossier sweep; each is still runnable."
+            className="flex items-center gap-1 rounded-badge border border-dashed border-border-strong bg-transparent px-[9px] py-[3px] text-[11px] font-medium text-faint transition-colors hover:text-dim"
+          >
+            {showDemoted ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+            Not applicable here · {demoted.length}
+          </button>
+        )}
+        {!useFallback &&
+          showDemoted &&
+          demoted.map((t) => (
+            <span key={t.id} className="inline-flex items-center">
+              <button
+                type="button"
+                onClick={() => onPick(t.objectiveTemplate)}
+                title={demotedTitle(t)}
+                className="flex items-center gap-1 rounded-badge border border-border bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-faint opacity-70 transition-opacity hover:opacity-100"
+              >
+                {t.name}
+              </button>
+            </span>
+          ))}
         {/* add-custom toggle */}
         <button
           type="button"
@@ -261,12 +371,34 @@ function TemplatePicker({ onPick }: { onPick: (objective: string) => void }) {
         </button>
       </div>
 
-      {/* legend — only when at least one template is unavailable (nothing to
-          contrast otherwise). Positive framing: the highlighted ones are the
-          runnable ones; the AlertTriangle stays on the unavailable chips only. */}
-      {!useFallback && templates.some((t) => !t.available) && (
+      {/* legend — only when at least one INLINE template is unavailable
+          (nothing to contrast otherwise; the collapsed cluster explains
+          itself). Positive framing: the highlighted ones are the runnable
+          ones; the AlertTriangle stays on the unavailable chips only. It is
+          gated on `!fitUnknown` because the claim it makes ("these match live
+          telemetry") is exactly the one an unread inventory cannot support. */}
+      {!useFallback && !fitUnknown && applicableTemplates.some((t) => !t.available) && (
         <div className="mt-1.5 text-[10.5px] text-accent/80">
           highlighted templates match telemetry this grid is seeing.
+        </div>
+      )}
+
+      {/* The template list LOADED, but the server could not read the grid
+          inventory to annotate it — the half-read-grid case, where every chip
+          came back available because that is what fail-open means. Say the axis
+          is unevaluated rather than let six confident chips imply it passed. */}
+      {fitUnknown && (
+        <div className="mt-1.5 text-[10.5px] text-faint">
+          availability unknown — the grid inventory could not be read, so these templates are
+          unchecked against live telemetry.
+        </div>
+      )}
+
+      {/* Fallback pills carry NO annotation (neither axis is knowable without
+          the template service) — say so once, muted, instead of per-pill. */}
+      {useFallback && !!error && (
+        <div className="mt-1.5 text-[10.5px] text-faint">
+          availability unknown while the template service is unreachable.
         </div>
       )}
 
@@ -565,8 +697,22 @@ export function Hunts() {
   const navigate = useNavigate();
   const [reloadKey, setReloadKey] = useState(0);
   const [objective, setObjective] = useState('');
+  // The empty state's CTA puts the cursor where a hunt is actually written.
+  const objectiveRef = useRef<HTMLTextAreaElement | null>(null);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  // The composer is one row at rest and a four-row brief box while it is in use
+  // — focused, or already holding an objective (a template chip fills it, so a
+  // 1-click starter opens the box too). Never collapses text out of sight.
+  const [composerFocused, setComposerFocused] = useState(false);
+  const composerOpen = composerFocused || objective.length > 0;
+  // Collapsing has to drop any height the analyst DRAGGED onto the box as well
+  // as the row count. The grip writes an inline height, and an inline height
+  // beats `rows` — so one drag would pin the composer tall for the life of the
+  // page, putting the toolbar lower than it sat before this screen was fixed.
+  useEffect(() => {
+    if (!composerOpen && objectiveRef.current) objectiveRef.current.style.height = '';
+  }, [composerOpen]);
   // Per-row delete: a trash icon arms an inline confirm in the row, then deletes
   // just that hunt. A running hunt returns 409 (cancel it first).
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
@@ -575,10 +721,6 @@ export function Hunts() {
   // double-click doesn't fire two fresh hunts for the same objective.
   const [rehuntingId, setRehuntingId] = useState<string | null>(null);
 
-  // Multi-select (mirrors Investigations): a plain id→bool map, independent of
-  // the time filter (`range`/`custom` feed the fetch, not the selection). The
-  // bulk action bar appears when selCount > 0.
-  const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [rehunting, setRehunting] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -593,7 +735,7 @@ export function Hunts() {
   // or a custom from/to, held in plain component state. Unlike those screens the
   // range feeds the FETCH (GET /hunts?since=&until= — server-side filtering);
   // bounds are recomputed inside the loader so every 8s poll re-anchors "now".
-  const [range, setRange] = useState('24h');
+  const [range, setRange] = useState(DEFAULT_RANGE);
   const [custom, setCustom] = useState<CustomRange | null>(null);
 
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
@@ -679,32 +821,26 @@ export function Hunts() {
       });
   };
 
-  // Selection helpers (independent of the time filter — operate over the fetched
-  // rows). Mirrors Investigations' toggleSelectAll / selCount / allSelected.
+  // Selection: the shared hook, independent of the time filter (`range` /
+  // `custom` feed the fetch, not the selection).
   const rows = data ?? [];
-  const rowIds = rows.map((h) => h.id);
-  const selCount = Object.values(selected).filter(Boolean).length;
-  const allSelected = rowIds.length > 0 && rowIds.every((id) => selected[id]);
-  const someSelected = rowIds.some((id) => selected[id]);
+  const sel = useListSelection(rows.map((h) => h.id));
+  const selCount = sel.count;
 
-  const toggleSelectAll = () => {
-    if (allSelected) {
-      setSelected((prev) => {
-        const next = { ...prev };
-        rowIds.forEach((id) => delete next[id]);
-        return next;
-      });
-    } else {
-      setSelected((prev) => {
-        const next = { ...prev };
-        rowIds.forEach((id) => (next[id] = true));
-        return next;
-      });
-    }
-  };
+  // Saved views for the hunt list. Its only facet is the window, so a view here
+  // is "the window I keep coming back to" — which is exactly the one an analyst
+  // re-picks every morning.
+  const savedQuery: SavedViewQuery = { range, custom };
+  // A TOTAL apply: a view that names no window restores THIS screen's default
+  // one. That is also what makes the chip a real toggle — clicking an active
+  // chip applies the empty query, which is this screen unfiltered.
+  const views = useSavedViews('hunts', savedQuery, (saved) => {
+    setRange(typeof saved.range === 'string' ? saved.range : DEFAULT_RANGE);
+    setCustom((saved.custom as CustomRange | null) ?? null);
+  });
 
   const handleBulkRehunt = async () => {
-    const ids = Object.keys(selected).filter((k) => selected[k]);
+    const ids = sel.ids;
     if (!ids.length) return;
     setRehunting(true);
     setBulkMsg(null);
@@ -714,7 +850,7 @@ export function Hunts() {
       // Surface the per-id started/skipped detail (the batch is throttled — only
       // the first few start, the rest come back "queued").
       setRehuntResult(await rehuntHunts(ids));
-      setSelected({});
+      sel.clear();
       setReloadKey((k) => k + 1);
     } catch (err) {
       setBulkMsg(`Re-hunt failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -724,7 +860,7 @@ export function Hunts() {
   };
 
   const handleBulkDelete = async () => {
-    const ids = Object.keys(selected).filter((k) => selected[k]);
+    const ids = sel.ids;
     if (!ids.length) return;
     setBulkDeleting(true);
     setBulkMsg(null);
@@ -738,7 +874,7 @@ export function Hunts() {
     } catch (err) {
       setBulkMsg(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    setSelected({});
+    sel.clear();
     setConfirmDelete(false);
     setBulkDeleting(false);
     setReloadKey((k) => k + 1);
@@ -762,43 +898,31 @@ export function Hunts() {
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
-      {/* page header */}
-      <div className="mb-5 flex items-end gap-3">
-        <div>
-          <div className="flex items-baseline gap-3">
-            <div className="text-[20px] font-semibold tracking-[-.015em]">Hunt Console</div>
-            <Freshness at={lastUpdated} />
-          </div>
-          <div className="mt-0.5 text-[13px] text-dim">
-            Describe a hunt in plain language — the agent correlates across hosts &amp; time and
-            reports findings + a narrative. Read-only.
-          </div>
+      {/* Page header — the same two lines Alerts, Investigations and Hosts wear:
+          title + freshness, then ONE line of counts. Those counts used to be a
+          three-card KPI band; the figures (and their sub-labels, now hover
+          context) are unchanged, the 112px of chrome around them is not. */}
+      <div className="mb-4">
+        <div className="flex items-baseline gap-3">
+          <div className="text-title">Hunt Console</div>
+          <Freshness at={lastUpdated} />
+        </div>
+        <div data-testid="hunt-stats-line" className="mt-0.5 text-[13px] text-dim">
+          {(stats.data ?? []).map((s, i) => (
+            <span key={s.label} title={s.sub}>
+              {i > 0 && ' · '}
+              <span className="tabular-nums">{s.value}</span> {statNoun(s)}
+            </span>
+          ))}
         </div>
       </div>
 
-      {/* stat cards */}
-      {stats.data && (
-        <div className="mb-5 grid grid-cols-3 gap-3">
-          {stats.data.map((s) => (
-            <Panel key={s.label} className="px-4 py-3">
-              <div className="text-[11px] uppercase tracking-[.05em] text-dim">{s.label}</div>
-              <div
-                className="mt-1 text-[24px] font-semibold tabular-nums"
-                style={{ color: TONE[s.tone] ?? '#e6edf3' }}
-              >
-                {s.value}
-              </div>
-              <div className="mt-0.5 text-[11px] text-faint">{s.sub}</div>
-            </Panel>
-          ))}
-        </div>
-      )}
-
-      {/* new-hunt objective box */}
-      <Panel className="mb-5 p-4">
-        <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold">
-          <Sparkles size={15} className="text-accent" /> New hunt
-        </div>
+      {/* New hunt — this screen's primary action, so it stays at the top and
+          keeps its 1-click template chips. It is COMPACT until used: one row of
+          input, growing to a full brief the moment the box has focus or text.
+          That is what lets the list section below start where the other three
+          screens start it. */}
+      <Panel className="mb-4 p-3">
         {/* Curated hunt templates — click a chip to load a high-payoff objective,
             then tweak the scope and launch. Templates the grid can run are
             highlighted; one needing telemetry this grid lacks stays muted +
@@ -809,95 +933,132 @@ export function Hunts() {
             setStartError(null);
           }}
         />
-        <div className="flex items-center gap-2">
-          <input
-            value={objective}
-            onChange={(e) => setObjective(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') launch();
-            }}
-            placeholder="e.g. hunt for beaconing to rare external IPs, or credential-abuse lockouts on the DCs"
-            className="flex-1 rounded-control border border-border-input bg-bg px-3 py-2.5 text-[13px] text-text outline-none focus:border-accent"
-          />
+        <div className="flex items-start gap-2">
+          <div className="relative flex-1">
+            <Sparkles
+              size={15}
+              className="pointer-events-none absolute left-[11px] top-[10px] text-accent"
+            />
+            <textarea
+              ref={objectiveRef}
+              value={objective}
+              onChange={(e) => setObjective(e.target.value)}
+              onFocus={() => setComposerFocused(true)}
+              onBlur={() => setComposerFocused(false)}
+              onKeyDown={(e) => {
+                // Enter submits, Shift+Enter newlines — a multi-line brief needs
+                // a way to break lines without launching (dogfood 2026-08-06).
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  launch();
+                }
+              }}
+              rows={composerOpen ? 4 : 1}
+              maxLength={MAX_OBJECTIVE_CHARS}
+              placeholder="Describe a hunt in plain language — e.g. hunt for beaconing to rare external IPs, or credential-abuse lockouts on the DCs"
+              className={`w-full overflow-y-auto rounded-control border border-border-input bg-bg py-2 pl-9 pr-3 text-[13px] leading-[20px] text-text outline-none focus:border-accent ${
+                // A grip on a one-row box is an invitation to break the compact
+                // rest state; it belongs on the open brief box, where dragging a
+                // long objective taller is the point.
+                composerOpen ? 'resize-y' : 'resize-none'
+              }`}
+            />
+          </div>
           <button
             onClick={launch}
             disabled={!objective.trim() || starting}
-            className="flex items-center gap-1.5 rounded-control bg-accent px-[15px] py-2.5 text-[13px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex flex-none items-center gap-1.5 rounded-control bg-accent px-[15px] py-2 text-[13px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
           >
             {starting ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
             {starting ? 'Starting…' : 'Start hunt'}
           </button>
         </div>
+        {/* The brief-writing hints the old 4-row placeholder carried. Shown only
+            while the box is open, where they are actually actionable. */}
+        {composerOpen && (
+          <div className="mt-1.5 text-[11px] text-faint">
+            The agent correlates across hosts &amp; time and reports findings + a narrative.
+            Read-only. Shift+Enter for a new line — a detailed brief (scope, exclusions, specific
+            behaviors) gets a better hunt.
+          </div>
+        )}
+        {objective.length > MAX_OBJECTIVE_CHARS * 0.8 && (
+          <div className="mt-1 text-right text-[11px] text-faint">
+            {objective.length.toLocaleString()} / {MAX_OBJECTIVE_CHARS.toLocaleString()} characters
+          </div>
+        )}
         {startError && <div className="mt-2 text-[12px] text-danger">{startError}</div>}
         {deleteMsg && <div className="mt-2 text-[12px] text-danger">{deleteMsg}</div>}
       </Panel>
 
-      {/* filter bar + bulk action — same placement as Alerts/Investigations:
-          directly above the list. The stat cards above stay UNFILTERED, mirroring
-          the Investigations header counts (which ignore its time filter). */}
-      <div className="mb-3.5 flex flex-wrap items-center gap-2">
+      {/* The shared list toolbar — same placement as the other lists: directly
+          above the table. The stat cards above stay UNFILTERED, mirroring the
+          Investigations header counts (which ignore its time filter). */}
+      <ListToolbar
+        views={views.views}
+        activeViewId={views.activeViewId}
+        onApplyView={views.onApplyView}
+        onDeleteView={views.onDeleteView}
+        onSaveView={views.onSaveView}
+        viewError={views.error}
+        note={bulkMsg}
+        selection={{
+          count: selCount,
+          offPageCount: sel.offPageCount,
+          onClearOffPage: sel.clearOffPage,
+          onClear: sel.clear,
+          actions: (
+            <>
+              <button
+                disabled={rehunting}
+                onClick={() => { void handleBulkRehunt(); }}
+                title="Re-run the selected objectives as fresh hunts (throttled — starts a few, queues the rest)"
+                className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
+                style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+              >
+                <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
+                {rehunting ? 'Starting…' : `Re-hunt selected (${selCount})`}
+              </button>
+              {confirmDelete ? (
+                <>
+                  <button
+                    disabled={bulkDeleting}
+                    onClick={() => { void handleBulkDelete(); }}
+                    className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
+                  >
+                    <Trash2 size={12} />
+                    {bulkDeleting ? 'Deleting…' : `Confirm delete (${selCount})`}
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(false)}
+                    className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text"
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  title="Delete the selected hunts (admin)"
+                  className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+                >
+                  <Trash2 size={12} /> Delete selected ({selCount})
+                </button>
+              )}
+            </>
+          ),
+        }}
+      >
         <TimeRangeFilter
           value={range}
           custom={custom}
           onChange={(v, r) => {
             setRange(v);
             if (r) setCustom(r);
+            views.clearActive();
           }}
         />
-
-        {selCount > 0 && (
-          <>
-            <div className="h-4 w-px bg-border-strong" />
-            <span className="text-[12.5px] text-dim">
-              <span className="font-mono text-accent">{selCount}</span> selected
-            </span>
-            <button
-              disabled={rehunting}
-              onClick={() => { void handleBulkRehunt(); }}
-              title="Re-run the selected objectives as fresh hunts (throttled — starts a few, queues the rest)"
-              className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
-              style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
-            >
-              <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
-              {rehunting ? 'Starting…' : `Re-hunt selected (${selCount})`}
-            </button>
-            {confirmDelete ? (
-              <>
-                <button
-                  disabled={bulkDeleting}
-                  onClick={() => { void handleBulkDelete(); }}
-                  className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
-                >
-                  <Trash2 size={12} />
-                  {bulkDeleting ? 'Deleting…' : `Confirm delete (${selCount})`}
-                </button>
-                <button
-                  onClick={() => setConfirmDelete(false)}
-                  className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text"
-                >
-                  Cancel
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={() => setConfirmDelete(true)}
-                title="Delete the selected hunts (admin)"
-                className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-              >
-                <Trash2 size={12} /> Delete selected ({selCount})
-              </button>
-            )}
-            <button
-              onClick={() => setSelected({})}
-              className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-            >
-              Clear
-            </button>
-          </>
-        )}
-
-        {bulkMsg && <span className="text-[12.5px] text-text-2">{bulkMsg}</span>}
-      </div>
+      </ListToolbar>
 
       {/* Bulk re-hunt result: a collapsed "Started N · M skipped" header expands
           to the per-id detail the API returns — WHICH objectives re-ran and WHY
@@ -975,9 +1136,9 @@ export function Hunts() {
         >
           <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
             <Checkbox
-              checked={allSelected}
-              indeterminate={!allSelected && someSelected}
-              onChange={toggleSelectAll}
+              checked={sel.allVisibleSelected}
+              indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
+              onChange={sel.toggleAll}
               title="Select all"
             />
           </div>
@@ -994,16 +1155,25 @@ export function Hunts() {
         ) : error ? (
           <ErrorState error={error} onRetry={() => setReloadKey((k) => k + 1)} />
         ) : !data || data.length === 0 ? (
-          <EmptyState>
-            {huntsExist ? (
-              'No hunts in this window — widen the time range above.'
-            ) : (
-              <>
-                No hunts yet. Describe one above — try &ldquo;look for hosts beaconing to rare
-                external IPs&rdquo;.
-              </>
-            )}
-          </EmptyState>
+          huntsExist ? (
+            <EmptyState>No hunts in this window — widen the time range above.</EmptyState>
+          ) : (
+            <EmptyState
+              title="No hunts yet"
+              action={
+                <button
+                  onClick={() => objectiveRef.current?.focus()}
+                  className="flex items-center gap-1.5 rounded-control border border-accent bg-accent/10 px-3.5 py-1.5 text-[12.5px] font-semibold text-accent hover:bg-accent/20"
+                >
+                  <Plus size={12} /> Describe a hunt
+                </button>
+              }
+            >
+              A hunt is a question you ask of the whole network rather than of one alert.
+              Describe it in the box above — try &ldquo;look for hosts beaconing to rare external
+              IPs&rdquo;.
+            </EmptyState>
+          )
         ) : (
           data.map((h) => (
             <div
@@ -1016,10 +1186,10 @@ export function Hunts() {
                 className="flex items-center"
                 onClick={(e) => {
                   e.stopPropagation();
-                  setSelected((prev) => ({ ...prev, [h.id]: !prev[h.id] }));
+                  sel.toggle(h.id);
                 }}
               >
-                <Checkbox checked={!!selected[h.id]} title="Select" />
+                <Checkbox checked={sel.isSelected(h.id)} title="Select" />
               </div>
               <div className="flex items-center gap-2 truncate">
                 <Crosshair size={14} className="flex-none text-accent" />

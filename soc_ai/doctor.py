@@ -73,13 +73,15 @@ def exit_code(results: list[CheckResult]) -> int:
 # Per-check wall-clock bounds (seconds). Each check is wrapped in
 # ``asyncio.wait_for`` so a hung upstream becomes a FAIL line quickly; a DOWN
 # service (connection refused) fails near-instantly regardless. The fitness
-# probe self-bounds at 30s (probes._FITNESS_TOTAL_TIMEOUT_S) — its wrapper is
-# the belt to that suspender.
+# probe self-bounds at probes._FITNESS_TOTAL_TIMEOUT_S — the wrapper here must
+# sit ABOVE that bound, or doctor cancels a healthy probe mid-leg and reports
+# its own impatience as a model failure (this happened: the wrapper sat at 40s
+# while the probe's own budget had grown to 100s, then 130s).
 _STORE_TIMEOUT_S = 10.0
 _SO_TIMEOUT_S = 8.0
 _ES_TIMEOUT_S = 8.0
 _GATEWAY_TIMEOUT_S = 12.0  # list_gateway_models carries its own 10s HTTP timeout
-_FITNESS_TIMEOUT_S = 40.0
+_FITNESS_TIMEOUT_S = 150.0  # probes._FITNESS_TOTAL_TIMEOUT_S (130s) + headroom
 
 # Client-side per-request timeout for the doctor's ES calls — deliberately
 # tighter than the app's es_request_timeout_s (30s) so a slow/wedged cluster

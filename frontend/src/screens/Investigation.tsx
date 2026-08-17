@@ -23,7 +23,7 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
@@ -33,7 +33,7 @@ import { Panel } from '../components/Panel';
 import { KindBadge, RecordedRunChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { Spinner } from '../components/States';
 import {
-  type ChatThread,
+  ApiError,
   ackGroup,
   dismissInvestigationError,
   escalateGroup,
@@ -47,7 +47,7 @@ import {
   resolveInvestigation,
   startHunt,
 } from '../lib/api';
-import { clearChatDraft, loadChatDraft, saveChatDraft } from '../lib/chatDraft';
+import { useChatThread } from '../lib/useChatThread';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
 import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
@@ -139,31 +139,22 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const [flashStep, setFlashStep] = useState<string | null>(null);
   const [timelineOpen, setTimelineOpen] = useState(true);
   const [reasoningOpen, setReasoningOpen] = useState(false);
-  const [chat, setChat] = useState<ChatMessage[]>(inv.seedChat);
-  const [pending, setPending] = useState(false);
-  // Restore any draft saved before the drawer last unmounted (close + reopen).
-  const [draft, setDraft] = useState(() => loadChatDraft(inv.id));
+  // The chat transport (mount fetch, pending-only poll, send, draft) lives in
+  // useChatThread so the Dashboard general chat runs the identical loop instead
+  // of a third near-copy. The investigation-specific parts stay here: the
+  // subject is the investigation id (so a drawer swap resets the thread and
+  // drops a late reply), and the endpoints are the per-investigation ones.
+  const chat = useChatThread({
+    subject: inv.id,
+    seed: inv.seedChat,
+    fetchThread: getChatThread,
+    sendMessage: postChat,
+  });
   const [elapsed, setElapsed] = useState(0);
   // Client-side stuck-guard: flips true if the run is still 'investigating'
   // after a generous cap, so the spinner can't hang forever even if the backend
   // reaper hasn't yet marked it 'error'.
   const [stuck, setStuck] = useState(false);
-  const chatTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // False once the component has unmounted. Guards the chat poll continuations:
-  // an in-flight postChat/getChatThread that resolves after unmount must not
-  // re-arm chatTimer (a detached loop nothing would ever clear) or setState.
-  const aliveRef = useRef(true);
-  // The investigation id the current `draft` belongs to. Lets the persist effect
-  // skip the render where inv.id just changed (draft still holds the PREVIOUS
-  // investigation's text then) so it can't clobber the new id's stored draft.
-  const draftIdRef = useRef(inv.id);
-  // The investigation id the component is CURRENTLY showing, updated by the
-  // identity-reset effect below. An in-flight postChat/getChatThread request
-  // closes over the id it was fired for; applyThread compares against this ref
-  // so a response that lands after the drawer has switched to another
-  // investigation (re-hunt / request-more-info before the reply arrives) is
-  // dropped instead of clobbering the new investigation's chat.
-  const currentInvIdRef = useRef(inv.id);
   // Entity graph always starts collapsed — for most investigations the blast
   // radius is noise, and the collapsed bar narrative carries the gist.
   const [graphOpen, setGraphOpen] = useState(false);
@@ -205,34 +196,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     return () => clearTimeout(t);
   }, [investigating, inv.id, lastStepId]);
 
-  // Persist the draft so it survives the component unmounting (drawer close).
-  // Skip the render where inv.id JUST changed: at that point `draft` still holds
-  // the PREVIOUS investigation's text (the reset effect below hasn't reloaded it
-  // yet), and since this effect runs before that one, persisting here would
-  // clobber the new id's stored draft — bleeding the old text into it.
-  useEffect(() => {
-    if (draftIdRef.current !== inv.id) {
-      draftIdRef.current = inv.id;
-      return;
-    }
-    saveChatDraft(inv.id, draft);
-  }, [inv.id, draft]);
-
   // reset transient state only when the investigation IDENTITY changes (drawer
-  // reuse / re-hunt) — never on a poll refresh of the same investigation.
+  // reuse / re-hunt) — never on a poll refresh of the same investigation. The
+  // chat half of this reset (thread, pending, draft, poll timer) is keyed on
+  // the same id inside useChatThread.
   useEffect(() => {
-    currentInvIdRef.current = inv.id;
     setActions({});
     setActionMsg({});
     setSettledAction(null);
     setSettledMsg(null);
     setOpenSteps({});
-    setChat(inv.seedChat);
-    setPending(false);
     setStuck(false);
-    // Restore this investigation's saved draft (the drawer is reused across
-    // investigations, so the previous one's draft must not bleed through).
-    setDraft(loadChatDraft(inv.id));
     setErrDismiss('idle');
     setErrDismissMsg(null);
     // Seed from the REAL elapsed (backend) so opening the same run in the drawer
@@ -244,18 +218,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     setOverrideVerdictVal(inv.verdict);
     setOverrideRationale('');
     setOverrideError(null);
-    if (chatTimer.current) clearTimeout(chatTimer.current);
+    setReRunError(null);
+    setRequestInfoError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inv.id]);
-
-  // stop any chat poll when the component unmounts
-  useEffect(() => {
-    aliveRef.current = true;
-    return () => {
-      aliveRef.current = false;
-      if (chatTimer.current) clearTimeout(chatTimer.current);
-    };
-  }, []);
 
   const [reHunting, setReHunting] = useState(false);
   const [overrideOpen, setOverrideOpen] = useState(false);
@@ -287,6 +253,51 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       });
   };
 
+  // Why a start that never landed is reported the way it is.
+  //
+  // Both of this screen's start buttons used to end in an empty catch, so a
+  // POST /hunt that 503'd against a down grid changed not one pixel: the status
+  // chip still read "complete · 1m 14s" over a re-run that never began (dogfood
+  // D6, 2026-08-14). The analyst either trusts a stale verdict they believe is
+  // being re-examined, or decides the button is dead and clicks it again.
+  //
+  // What is claimed depends on whether a server answered. An ApiError carries a
+  // status, so the request reached the API and was REFUSED — quote the refusal,
+  // because the 503's `detail.hint` is the sentence written for the analyst
+  // ("…retry shortly") and api.ts already puts it on the error. Anything else is
+  // a transport failure with NO response: api.ts's 20s budget fired, or the
+  // network dropped. That cannot support "it did not start" — the backend may
+  // have accepted the run and be working on it right now — so report that we got
+  // no answer and name the surface that knows. Unknown is not failure.
+  //
+  // A durable strip, not a toast: this action leaves no other trace, and a
+  // notice that fades takes the only evidence of the click with it.
+  const [reRunError, setReRunError] = useState<string | null>(null);
+  const [requestInfoError, setRequestInfoError] = useState<string | null>(null);
+
+  // Close a sentence somebody else wrote — the wire's `detail.hint`, or api.ts's
+  // transport message. How it is punctuated is not ours to decide (api.ts's
+  // network failure is a QUESTION), so add the full stop only when the author
+  // left the sentence open. Twin of the helper in Alerts.tsx.
+  const endSentence = (s: string): string => {
+    const text = s.trim();
+    return /[.!?…]$/.test(text) ? text : `${text}.`;
+  };
+  // `action` is the button's own label, so the report names what the analyst
+  // just clicked rather than the endpoint behind it.
+  const startFailure = (err: unknown, action: string): string => {
+    const detail = err instanceof Error ? err.message.trim() : '';
+    if (err instanceof ApiError) {
+      return `${action} was refused. ${endSentence(detail || `The API answered ${err.status}`)}`;
+    }
+    return (
+      `No answer to ${action} — the run may have started anyway, so check the ` +
+      `Investigations list for a newer run of this alert before starting another. ${endSentence(
+        detail || 'The request did not complete',
+      )}`
+    );
+  };
+
   // Re-run the investigation: start a fresh hunt on the same alert and hand the
   // new investigation id to the container so it switches to (and polls) it.
   // `deep` forces the full tool-driven loop — offered when THIS run was a
@@ -294,10 +305,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // same fast path just repeats the heuristic (dogfood 2026-07-15).
   const startReRun = (deep: boolean) => {
     if (reHunting) return;
+    setReRunError(null);
     setReHunting(true);
     startHunt(inv.groupId, deep ? { deep: true } : undefined)
       .then((newId) => onReHunt?.(newId))
-      .catch(() => {})
+      .catch((err: unknown) => setReRunError(startFailure(err, 'Re-run investigation')))
       .finally(() => setReHunting(false));
   };
   const reRun = () => startReRun(false);
@@ -316,59 +328,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const [requestingInfo, setRequestingInfo] = useState(false);
   const requestInfo = () => {
     if (requestingInfo) return;
+    setRequestInfoError(null);
     setRequestingInfo(true);
     requestMoreInfo(inv.id)
       .then((newId) => onReHunt?.(newId))
-      .catch(() => {})
+      .catch((err: unknown) => setRequestInfoError(startFailure(err, 'Request more info')))
       .finally(() => setRequestingInfo(false));
-  };
-
-  const NET_ERR_TEXT = 'Could not reach the server — please try again.';
-
-  // Apply a chat thread from the API; keep polling while the assistant works.
-  // The pending assistant turn comes back with empty text — drop it and let the
-  // typing indicator stand in until the real reply lands.
-  const applyThread = (thread: ChatThread) => {
-    // This closure was created for whichever investigation was current when
-    // the request fired (postChat / getChatThread below both close over the
-    // same `inv.id`). If the drawer has since switched to another
-    // investigation (re-hunt / request-more-info before this reply landed),
-    // applying it would clobber the new investigation's chat — drop it.
-    if (!aliveRef.current) return; // unmounted mid-flight — don't re-arm the poll
-    if (currentInvIdRef.current !== inv.id) return;
-    setChat(thread.messages.filter((m) => m.text || m.role === 'user'));
-    setPending(thread.pending);
-    if (chatTimer.current) clearTimeout(chatTimer.current);
-    if (thread.pending) {
-      chatTimer.current = setTimeout(() => {
-        getChatThread(inv.id).then(applyThread).catch(() => {
-          if (!aliveRef.current || currentInvIdRef.current !== inv.id) return;
-          setPending(false);
-          // Only push the error message if the last message isn't already it
-          // (repeated poll failures must not stack duplicate error bubbles).
-          setChat((c) => {
-            const last = c[c.length - 1];
-            if (last?.role === 'assistant' && last.text === NET_ERR_TEXT) return c;
-            return [...c, { role: 'assistant', text: NET_ERR_TEXT }];
-          });
-        });
-      }, 1500);
-    }
-  };
-
-  const send = () => {
-    const t = draft.trim();
-    // Block double-submit while a turn is in flight (matches the hunt chat).
-    if (!t || pending) return;
-    setChat((c) => [...c, { role: 'user', text: t }]);
-    setDraft('');
-    clearChatDraft(inv.id); // sent — drop the persisted draft
-    setPending(true);
-    postChat(inv.id, t).then(applyThread).catch(() => {
-      if (currentInvIdRef.current !== inv.id) return; // drawer moved on — don't clobber the new investigation's chat
-      setPending(false);
-      setChat((c) => [...c, { role: 'assistant', text: NET_ERR_TEXT }]);
-    });
   };
 
   // A citation [n] in the narrative points at the n-th timeline step — its
@@ -435,6 +400,33 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       </button>
     </div>
   );
+
+  // The durable half of a start that never landed. Rendered directly under the
+  // toolbar, so it sits with the button that produced it and above every other
+  // Re-run on the screen (the terminal-failure banner's and the pipeline-error
+  // panel's both call the same handler). Cleared by the next attempt and by a
+  // switch to another investigation — a successful re-run navigates to the new
+  // run, which resets it on the way through.
+  const startFailureStrip = (text: string, onDismiss: () => void, margin: string) => (
+    <div
+      role="alert"
+      className={`${margin} flex items-start gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]`}
+      style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.08)' }}
+    >
+      <span className="mt-px flex flex-shrink-0 text-danger"><AlertTriangle size={15} /></span>
+      <div className="min-w-0 flex-1 break-words leading-[1.5] text-text-2">{text}</div>
+      <button
+        onClick={onDismiss}
+        aria-label="Dismiss"
+        className="mt-px flex flex-shrink-0 text-dim hover:text-text"
+      >
+        <X size={14} />
+      </button>
+    </div>
+  );
+  const reRunErrorEl = reRunError
+    ? startFailureStrip(reRunError, () => setReRunError(null), 'mb-3.5')
+    : null;
 
   const runningEl = (
     <div
@@ -670,6 +662,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Resolve in chat
           </button>
         </div>
+        {/* The focused re-investigation that never started, kept beside the
+            button that was supposed to start it. */}
+        {requestInfoError &&
+          startFailureStrip(requestInfoError, () => setRequestInfoError(null), 'mt-2.5')}
       </div>
     )}
     {inv.resolution?.resolved_via === 'manual' && (
@@ -912,8 +908,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     ) : null;
 
   const onResolved = () =>
-    getChatThread(inv.id).then(applyThread).catch(() => {}).finally(() => onVerdictApplied?.());
-  const chatProps = { messages: chat, pending, draft, onDraft: setDraft, onSend: send, invId: inv.id, onResolved };
+    chat.refresh().catch(() => {}).finally(() => onVerdictApplied?.());
+  const chatProps = {
+    messages: chat.messages,
+    pending: chat.pending,
+    progressTools: chat.progressTools,
+    draft: chat.draft,
+    onDraft: chat.setDraft,
+    onSend: chat.send,
+    invId: inv.id,
+    onResolved,
+  };
 
   // ── Override verdict modal ────────────────────────────────────────────────
   const overrideModalEl = overrideOpen ? (
@@ -1018,6 +1023,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     return (
       <div className="mx-auto max-w-workstation font-sans text-text">
         {toolbarEl}
+        {reRunErrorEl}
         {failed ? (
           <>
             {failedEl}
@@ -1053,6 +1059,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   return (
     <div className="font-sans text-text" style={{ padding: '18px 18px 30px' }}>
       {toolbarEl}
+      {reRunErrorEl}
       {failed ? (
         <>
           {failedEl}
@@ -1086,6 +1093,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 function ChatPanel({
   messages,
   pending,
+  progressTools,
   draft,
   onDraft,
   onSend,
@@ -1096,6 +1104,7 @@ function ChatPanel({
 }: {
   messages: ChatMessage[];
   pending: boolean;
+  progressTools?: string[];
   draft: string;
   onDraft: (v: string) => void;
   onSend: () => void;
@@ -1163,11 +1172,17 @@ function ChatPanel({
         listSizeClass={fill ? 'min-h-0 flex-1' : 'max-h-[460px] min-h-[260px]'}
         messages={messages}
         pending={pending}
+        progressTools={progressTools}
         draft={draft}
         onDraft={onDraft}
         onSend={onSend}
         fill={fill}
         onClose={onClose}
+        // A verdict card REPLACES its row: the proposal's rationale is the
+        // model's answer restated, so showing the prose too would say it twice.
+        // The Dashboard's hunt card composes ChatDock's AssistantBubble instead
+        // — there the answer and the proposed sweep are different halves of the
+        // reply. Both go through renderSpecial; only this one drops the bubble.
         renderSpecial={(m, i) =>
           m.role !== 'user' && m.kind === 'verdict_proposal' && m.proposal ? (
             <div key={i} className="max-w-[88%] min-w-0 self-start break-words rounded-card border px-3 py-2.5"

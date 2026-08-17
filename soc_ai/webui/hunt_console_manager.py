@@ -15,16 +15,21 @@ import asyncio
 import logging
 from typing import Any
 
-from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT, build_chat_agent
-from soc_ai.agent.egress_guard import EgressGuard
-from soc_ai.agent.models import build_investigator_model
-from soc_ai.agent.prompts import oql_primer_block
+from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.hunt_runner import hunt_recorded_run
 from soc_ai.api.runner import CancelToken
-from soc_ai.so_client.inventory import inventory_prompt_block
+from soc_ai.demo.chat import canned_reply
+from soc_ai.demo.guard import is_demo
+from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_text
 from soc_ai.store import hunts as hunt_svc
-from soc_ai.webui.probes import _scrub
+from soc_ai.webui.chat_turn import (
+    ChatTaskManager,
+    ChatTurnSpec,
+    TurnInputs,
+    run_chat_turn,
+    split_history,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -167,14 +172,27 @@ def get_manager(state: Any) -> HuntConsoleManager:
 # ── "Chat about this hunt" follow-up thread ──────────────────────────────────
 #
 # A completed hunt gets a read-only Q&A thread, mirroring the investigation
-# "Chat about this" feature (soc_ai.webui.chat_manager) but for a HuntReport. The
-# POST handler writes the user turn + a pending assistant turn (as hunt_events),
-# spawns a background task here, and the UI polls the thread until the assistant
-# row flips to done/error. The agent is the SAME read-only chat agent the
-# investigation chat uses — no write tools, no Oracle, and NO propose_verdict
-# (a hunt never acks/escalates), so ``proposal_sink`` is left None.
-
-_MAX_HISTORY = 12  # prior chat turns embedded into the prompt
+# "Chat about this" feature but for a HuntReport. The POST handler writes the
+# user turn + a pending assistant turn (as hunt_events), spawns a background
+# task here, and the UI polls the thread until the assistant row flips to
+# done/error.
+#
+# This surface is a CLIENT of the shared turn engine
+# (:mod:`soc_ai.webui.chat_turn`), exactly like the investigation, host and
+# general chats. It used to fork the engine, so it silently missed the live tool
+# progress, grounding check, regrounding loop and fabricated-citation gate that
+# shipped 2026-08-06 (the un-fork the ``chat_turn`` docstring names). Everything
+# generic to a turn now comes from the engine; here we supply only the
+# hunt-shaped half as a :class:`~soc_ai.webui.chat_turn.ChatTurnSpec`:
+#
+# * the ANCHOR is the HuntReport — its objective + narrative + findings, plus
+#   the identity of the hosts the report named (seeded into the grounding corpus
+#   so naming a host correctly comes back grounded, not caveated);
+# * the thread is stored as ``hunt_events`` keyed by the hunt id, so ``finish``
+#   and ``set_progress`` route through ``hunt_svc``;
+# * there is NO proposal tool — a hunt never acks/escalates and a follow-up is
+#   not itself a sweep — so the engine's default read-only agent (no
+#   ``propose_verdict``, no ``propose_hunt``) is exactly right.
 
 
 def _hunt_chat_seed_context(hunt: Any) -> str:
@@ -215,64 +233,58 @@ def _hunt_chat_seed_context(hunt: Any) -> str:
     return "\n".join(lines)
 
 
-def _hunt_chat_build_prompt(prior: list[tuple[str, str]], question: str) -> str:
-    if not prior:
-        return question
-    convo = "\n\n".join(
-        f"{'Analyst' if role == 'user' else 'You'}: {content}" for role, content in prior
+async def _hunt_chat_seed_block(ctx: Any, hunt: Any) -> str:
+    """The hunt-chat seed corpus, RAW: what the hunt concluded + who its hosts ARE.
+
+    Two blocks ride the seed: what the hunt concluded (:func:`_hunt_chat_seed_context`)
+    and what the hosts the report named ARE. The host identity is read off the
+    seed text itself (a hunt has no alert to take endpoints from), so a follow-up
+    like "was that host even allowed to answer SSH?" is answerable without
+    re-deriving the host's role from telemetry the hunt already read.
+
+    Returned unsanitized ON PURPOSE: it lands in ``TurnInputs.seed_context``,
+    which the engine folds into the system prompt and THEN sweeps as one string,
+    so the dossier's addresses collapse onto the same egress labels the seed's
+    own addresses get. Sanitizing here would leak the block in the clear when the
+    engine appended it after its own sweep. seed_context is also the corpus the
+    grounding check grades against, so it must stay in real-value space.
+
+    The OQL primer and the dataset inventory are NOT composed here — the shared
+    engine appends both (``oql_flavor="hunt"``, ``append_inventory=True``), the
+    same way it does for every other chat shape.
+    """
+    seed_context = _hunt_chat_seed_context(hunt)
+    named = internal_ips_in_text(seed_context, ctx.settings)
+    # `known_only`: the addresses come from the stored REPORT — text a model
+    # wrote. Rendering a "no dossier" line for one would put it in this thread's
+    # grounding corpus and let a host the hunt merely asserted ground itself.
+    dossier = (
+        await host_dossier_prompt_block(
+            {ip: "named in this hunt" for ip in named}, ctx=ctx, known_only=True
+        )
+        if named
+        else ""
     )
-    return f"Conversation so far:\n{convo}\n\nAnalyst's new question: {question}"
+    return seed_context + dossier
 
 
-def _hunt_chat_extract_tools(result: Any) -> list[str]:
-    names: list[str] = []
-    for msg in result.all_messages():
-        for part in getattr(msg, "parts", []) or []:
-            if type(part).__name__ == "ToolCallPart":
-                name = getattr(part, "tool_name", "")
-                if name:
-                    names.append(name)
-    return names
+class HuntChatManager(ChatTaskManager):
+    """Hunt-chat task tracker.
 
-
-class HuntChatManager:
-    """Tracks in-flight hunt-chat-turn tasks to prevent GC collection.
-
-    Mirrors :class:`soc_ai.webui.chat_manager.ChatManager` but for the hunt
-    thread (stored as ``hunt_events``, keyed by the hunt id).
+    The GC-safe task registry and the stuck-pending backstop come from
+    :class:`~soc_ai.webui.chat_turn.ChatTaskManager`; this subclass only knows
+    how to name a hunt-chat turn, so the route keeps a narrow call site. The
+    backstop resolves a still-``pending`` assistant *hunt_event*, since this
+    thread lives in ``hunt_events`` keyed by the hunt id — not the general-chat
+    table the host/dashboard chats share.
     """
 
-    def __init__(self) -> None:
-        self._tasks: dict[int, asyncio.Task[None]] = {}
-        self._backstops: set[asyncio.Task[None]] = set()
-
     def start(self, state: Any, *, hunt_id: str, assistant_event_id: int) -> None:
-        task: asyncio.Task[None] = asyncio.create_task(
-            _run_hunt_chat_turn(state, hunt_id, assistant_event_id)
+        self.spawn(
+            row_id=assistant_event_id,
+            runner=_run_turn(state, hunt_id, assistant_event_id),
+            backstop=lambda: _hunt_chat_resolve_if_pending(state, assistant_event_id),
         )
-        self._tasks[assistant_event_id] = task
-        task.add_done_callback(lambda t: self._on_task_done(state, assistant_event_id, t))
-
-    def _on_task_done(self, state: Any, assistant_event_id: int, task: asyncio.Task[None]) -> None:
-        self._tasks.pop(assistant_event_id, None)
-        if task.cancelled():
-            _LOGGER.warning("hunt-chat: task for event=%s was cancelled", assistant_event_id)
-            self._spawn_backstop(state, assistant_event_id)
-            return
-        if task.exception() is not None:
-            _LOGGER.error(
-                "hunt-chat: task for event=%s ended with an unhandled exception: %r",
-                assistant_event_id,
-                task.exception(),
-            )
-            self._spawn_backstop(state, assistant_event_id)
-
-    def _spawn_backstop(self, state: Any, assistant_event_id: int) -> None:
-        bt: asyncio.Task[None] = asyncio.ensure_future(
-            _hunt_chat_resolve_if_pending(state, assistant_event_id)
-        )
-        self._backstops.add(bt)
-        bt.add_done_callback(self._backstops.discard)
 
 
 def get_chat_manager(state: Any) -> HuntChatManager:
@@ -282,24 +294,59 @@ def get_chat_manager(state: Any) -> HuntChatManager:
     return getattr(state, _CHAT_STATE_ATTR)  # type: ignore[no-any-return]
 
 
-async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int) -> None:
-    """Run one read-only follow-up turn on a COMPLETED hunt and persist the answer."""
-    try:
-        settings = state.settings
-        # Demo mode: never build the model/gateway (the egress guard would raise).
-        # Short-circuit BEFORE any agent/ES work with a canned, zero-egress reply
-        # looked up from the seeded fixtures, then finish the pending row exactly
-        # as the live path does. `is True` (not truthy) so a MagicMock settings in
-        # a unit test can't accidentally trip the demo branch (real Settings is a bool).
-        if getattr(settings, "soc_ai_demo", False) is True:
-            from soc_ai.demo.chat import canned_reply  # noqa: PLC0415
+def demo_chat_reply(state: Any, hunt_id: str) -> str:
+    """The demo's scripted answer for this hunt's follow-up chat.
 
-            text = canned_reply(getattr(state, "demo_fixtures", None), "hunt", hunt_id)
-            async with state.db_sessionmaker() as db:
-                await hunt_svc.finish_chat_assistant(
-                    db, assistant_event_id, content=text, status="done", meta={"demo": True}
-                )
-            return
+    Public because the ROUTE serves it: on the public demo
+    ``api_auth_required`` is false, so every visitor is the same caller and this
+    thread is keyed on a hunt they all share — persisted, one visitor's typed
+    question shows up in another's panel. So the demo answers on the POST and
+    stores nothing (see
+    :func:`soc_ai.api.webui.routes_hunts._demo_hunt_chat_thread`).
+
+    It lives HERE rather than in the route for the same reason
+    :func:`soc_ai.webui.chat_manager.demo_reply` does: this module owns what the
+    hunt chat says, so there is ONE answer per surface instead of two that can
+    drift. The import runs route → manager; the reverse would be a cycle.
+    """
+    return canned_reply(getattr(state, "demo_fixtures", None), "hunt", hunt_id)
+
+
+async def _run_turn(state: Any, hunt_id: str, assistant_event_id: int) -> None:
+    """Run one hunt-chat follow-up turn through the shared engine."""
+    await run_chat_turn(state, _hunt_chat_spec(state, hunt_id, assistant_event_id))
+
+
+def _hunt_chat_spec(state: Any, hunt_id: str, assistant_event_id: int) -> ChatTurnSpec:
+    """Bind the shared turn engine to ONE completed hunt's follow-up thread.
+
+    Read-only Q&A anchored on a HuntReport instead of an alert, stored as
+    ``hunt_events``. No proposal tool (a hunt never acks/escalates, and a
+    follow-up is not itself a sweep), so ``build_agent`` and ``finalize_meta``
+    stay unset — the engine's default read-only agent is exactly right.
+    """
+
+    async def _finish(*, content: str, status: str, meta: dict[str, Any] | None) -> None:
+        async with state.db_sessionmaker() as db:
+            await hunt_svc.finish_chat_assistant(
+                db, assistant_event_id, content=content, status=status, meta=meta
+            )
+
+    async def _set_progress(tools: list[str]) -> None:
+        async with state.db_sessionmaker() as pdb:
+            await hunt_svc.set_progress(pdb, assistant_event_id, tools)
+
+    async def _prepare() -> TurnInputs | None:
+        settings = state.settings
+        # Demo backstop — the route answers demo POSTs itself (see
+        # :func:`demo_chat_reply`); a spawned turn must still never build a model,
+        # since the demo egress guard refuses to construct an outbound client.
+        # Resolve the pending row from here and tell the engine to stop.
+        if is_demo(settings):
+            await _finish(
+                content=demo_chat_reply(state, hunt_id), status="done", meta={"demo": True}
+            )
+            return None
         ctx = ctx_from_state(state)
         async with state.db_sessionmaker() as db:
             loaded = await hunt_svc.get_with_events(db, hunt_id)
@@ -307,86 +354,34 @@ async def _run_hunt_chat_turn(state: Any, hunt_id: str, assistant_event_id: int)
         if loaded is None:
             raise RuntimeError("hunt not found")
         hunt, _events = loaded
-
-        # The user's question is the latest done chat turn; everything before it is
-        # prior conversation.
-        question = history[-1][1] if history and history[-1][0] == "user" else ""
-        prior = history[:-1][-_MAX_HISTORY:] if history and history[-1][0] == "user" else history
-
-        seed_context = _hunt_chat_seed_context(hunt)
-        # Cloud-egress guard (opt-in): same pattern as the orchestrator/hunt
-        # runner. Attach BEFORE building the agent so register_read_tools
-        # wraps the tool closures. `is True` (not truthiness) so a MagicMock
-        # settings double in tests can never flip redaction on.
-        if settings.analyst_cloud_redaction is True and ctx.egress_guard is None:
-            ctx.egress_guard = await EgressGuard.for_settings(
-                settings, getattr(state, "db_sessionmaker", None)
-            )
-        guard = ctx.egress_guard
-        # The chat agent runs OQL too — give it the primer AND the auto-discovered
-        # dataset inventory so a follow-up like "what about SSH?" both writes a valid
-        # query and knows zeek.ssh (or endpoint/windows/etc.) actually exists here.
-        sys_prompt = (
-            CHAT_SYSTEM_PROMPT.format(context=seed_context)
-            + oql_primer_block(flavor="hunt")
-            + await inventory_prompt_block(ctx.elastic, settings)
-        )
-        if guard is not None:
-            # The seed block (stored hunt narrative/findings/hosts) and the
-            # inventory both carry internal identifiers — sanitize the
-            # composed system prompt at the egress boundary.
-            sys_prompt = guard.sanitize_text(sys_prompt)
-        # proposal_sink=None → the read-only chat agent WITHOUT propose_verdict:
-        # a hunt never dispositions an alert, so there is no verdict to propose.
-        agent = build_chat_agent(build_investigator_model(settings), ctx, system_prompt=sys_prompt)
-        turn_prompt = _hunt_chat_build_prompt(prior, question)
-        if guard is not None:
-            # The analyst's question + prior turns carry real identifiers.
-            turn_prompt = guard.sanitize_text(turn_prompt)
-        async with asyncio.timeout(settings.hunt_chat_turn_timeout_s):
-            result = await agent.run(turn_prompt)
-        answer = (str(result.output) or "").strip() or "(no answer produced)"
-        if guard is not None:
-            # The reply is in label space — restore real values before it is
-            # persisted/displayed.
-            answer = str(guard.desanitize_obj(answer))
-        meta: dict[str, Any] = {"tools": _hunt_chat_extract_tools(result)}
-        async with state.db_sessionmaker() as db:
-            await hunt_svc.finish_chat_assistant(
-                db, assistant_event_id, content=answer, status="done", meta=meta
-            )
-    except TimeoutError:
-        timeout_s = getattr(state.settings, "hunt_chat_turn_timeout_s", 600)
-        _LOGGER.warning("hunt-chat turn timed out for hunt=%s after %ss", hunt_id, timeout_s)
-        await _hunt_chat_persist_error(
-            state,
-            assistant_event_id,
-            f"The assistant ran out of time on this question (hit the {timeout_s}s "
-            "limit). Try a narrower follow-up.",
-        )
-    except Exception as e:
-        _LOGGER.exception("hunt-chat turn failed for hunt=%s", hunt_id)
-        # Scrub the exception text before it becomes user-facing content — a
-        # verbose provider/gateway error body could otherwise echo a credential
-        # (same defensive scrub probes.py applies to its error surfaces).
-        await _hunt_chat_persist_error(
-            state,
-            assistant_event_id,
-            f"Sorry — the chat turn failed ({_scrub(str(e))}). Try again.",
+        question, prior = split_history(history)
+        # RAW seed — the engine folds it into the system prompt and sanitizes the
+        # whole string at the egress boundary, and grades the answer against it.
+        seed_context = await _hunt_chat_seed_block(ctx, hunt)
+        return TurnInputs(
+            ctx=ctx,
+            seed_context=seed_context,
+            question=question,
+            prior=prior,
+            system_prompt=CHAT_SYSTEM_PROMPT,
+            # Telemetry-first OQL examples: a hunt follow-up slices datasets, it
+            # does not pivot from an alert.
+            oql_flavor="hunt",
+            # The engine appends the dataset inventory (default True): the seed
+            # does not already carry it.
         )
 
-
-async def _hunt_chat_persist_error(state: Any, assistant_event_id: int, content: str) -> None:
-    try:
-        async with state.db_sessionmaker() as db:
-            await hunt_svc.finish_chat_assistant(
-                db, assistant_event_id, content=content, status="error", meta=None
-            )
-    except Exception:
-        _LOGGER.exception(
-            "hunt-chat: FAILED to persist error row for event=%s — pending stuck",
-            assistant_event_id,
-        )
+    return ChatTurnSpec(
+        row_id=assistant_event_id,
+        label=f"hunt={hunt_id}",
+        # The hunt chat's budget is MINUTES (a follow-up can run a real sweep),
+        # not the investigation chat's seconds — its own setting, unchanged from
+        # the fork this replaces.
+        timeout_s=state.settings.hunt_chat_turn_timeout_s,
+        finish=_finish,
+        prepare=_prepare,
+        set_progress=_set_progress,
+    )
 
 
 async def _hunt_chat_resolve_if_pending(state: Any, assistant_event_id: int) -> None:

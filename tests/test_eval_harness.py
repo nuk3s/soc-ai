@@ -23,6 +23,7 @@ The contract under test:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -480,6 +481,53 @@ async def test_oracle_call_uses_litellm_settings(
     assert captured["verify_ssl"] is False
     assert captured["model"] == "claude-opus-4-7"
     assert captured["max_tokens"] == 4096
+
+
+async def test_graded_oracle_call_runs_off_the_event_loop(
+    tmp_path: Path,
+    patch_investigate: list[StepEvent],
+) -> None:
+    """The blocking oracle POST must be offloaded, not run on the loop.
+
+    ``call_oracle`` is a synchronous ``httpx.Client`` POST with a timeout up to
+    300s; run inline it freezes the single-worker event loop for the whole
+    critique. Proof it is offloaded: the caller executes in a DIFFERENT thread
+    than the loop's, AND a coroutine scheduled concurrently makes progress while
+    the (deliberately blocking) caller sleeps — impossible if the loop were
+    blocked. Both keyed off :func:`asyncio.to_thread`.
+    """
+    import threading
+    import time as _time
+
+    loop_thread = threading.get_ident()
+    caller_thread: dict[str, int] = {}
+    progressed = asyncio.Event()
+
+    def _blocking_caller(**kwargs: Any) -> OracleResponse:
+        caller_thread["ident"] = threading.get_ident()
+        # Block the calling thread. If this ran on the event loop, the ticker
+        # coroutine below could never set `progressed` before we return.
+        deadline = _time.monotonic() + 1.0
+        while not progressed.is_set() and _time.monotonic() < deadline:
+            _time.sleep(0.005)
+        return OracleResponse(text="ok", model=kwargs["model"], usage={}, elapsed_ms=1)
+
+    async def _ticker() -> None:
+        await asyncio.sleep(0.02)
+        progressed.set()
+
+    build_settings = _settings_for_eval  # aliased; the call site is below
+    ticker = asyncio.create_task(_ticker())
+    await harness_run(
+        "KDG7CZ4BVBs3R9hXQbPY",
+        settings=build_settings(),
+        out_dir=tmp_path,
+        oracle_caller=_blocking_caller,
+    )
+    await ticker
+
+    assert progressed.is_set(), "a concurrent coroutine made no progress → loop was blocked"
+    assert caller_thread["ident"] != loop_thread, "oracle call ran on the event loop thread"
 
 
 async def test_meta_json_records_verdict_and_usage(

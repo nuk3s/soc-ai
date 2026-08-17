@@ -264,6 +264,35 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=2.0,
     ),
     SettingSpec(
+        key="chat_regrounding_attempts",
+        attr="chat_regrounding_attempts",
+        type="int",
+        label="Chat re-grounding attempts",
+        section="Agent",
+        hot=True,
+        help=(
+            "How many times a chat turn is re-run to fix claims the grounding "
+            "validator found unsupported (cite it with a tool, or remove it). "
+            "0 = warn only, the historical behavior."
+        ),
+        min_value=0,
+        max_value=3,
+    ),
+    SettingSpec(
+        key="general_chat_enabled",
+        attr="general_chat_enabled",
+        type="bool",
+        label="Dashboard chat (Ask soc-ai on the landing screen)",
+        section="Agent",
+        hot=True,
+        help=(
+            "Answer questions in one turn on the Dashboard, proposing a hunt when a "
+            "question needs a sweep. On by default; nothing runs until an analyst "
+            "asks. Turn off to reclaim model capacity — the box disappears from the "
+            "UI. Applies live."
+        ),
+    ),
+    SettingSpec(
         key="synthesizer_output_mode",
         attr="synthesizer_output_mode",
         type="select",
@@ -564,6 +593,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
         min_value=0,
         max_value=365,
+    ),
+    SettingSpec(
+        key="es_fail_on_partial_results",
+        attr="es_fail_on_partial_results",
+        type="bool",
+        label="Fail queries that only read part of the grid",
+        section="Queries",
+        hot=True,  # read per search off the live Settings the ES client holds
+        help=(
+            "On (default): a search whose shards failed or timed out raises "
+            "'grid unavailable' instead of returning partial hits, so an outage "
+            "can never render as a quiet network. Turn off only if you knowingly "
+            "run with a red shard and prefer partial data (failures are logged)."
+        ),
     ),
     SettingSpec(
         key="pcap_enabled",
@@ -887,6 +930,179 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help="Hours between automatic scans (1-168). Default 24 (daily).",
         min_value=1,
         max_value=168,
+    ),
+    # ---- HOST DOSSIER: the self-refreshing asset-context builder -------------
+    # Every spec here is hot: the sweep re-reads settings on each wake and the
+    # resolver reads its two thresholds per call, so a knob saved here applies to
+    # the next build with no restart. That matters more than usual on a Docker
+    # deployment, where `docker compose restart` does NOT reload .env — the
+    # config console is the only reliable path to these values in production.
+    SettingSpec(
+        key="dossier_enabled",
+        attr="dossier_enabled",
+        type="bool",
+        label="Host dossier enabled",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Build and use durable per-host asset context (what a host IS, not "
+            "just what it did). Off disables the sweep, the tool and the prompt block."
+        ),
+    ),
+    SettingSpec(
+        key="dossier_schedule_enabled",
+        attr="dossier_schedule_enabled",
+        type="bool",
+        label="Refresh the dossier automatically on a schedule",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Sweep the network in the background on the interval below. Off runs "
+            "it only on demand ('Rebuild now'). Honors the master switch above. "
+            "Takes effect live."
+        ),
+    ),
+    SettingSpec(
+        key="dossier_schedule_interval_hours",
+        attr="dossier_schedule_interval_hours",
+        type="int",
+        label="Dossier refresh interval (hours)",
+        section="Host dossier",
+        hot=True,
+        help="Hours between automatic sweeps (1-168). Default 24 (daily).",
+        min_value=1,
+        max_value=168,
+    ),
+    SettingSpec(
+        key="dossier_lookback_days",
+        attr="dossier_lookback_days",
+        type="int",
+        label="Dossier baseline window (days)",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Days of events each host's behavioral baseline is built from. "
+            "Default 14 — two weekends and two patch cycles, so routine "
+            "fortnightly activity doesn't read as a first-ever event."
+        ),
+        min_value=1,
+        max_value=90,
+    ),
+    SettingSpec(
+        key="dossier_max_hosts_per_run",
+        attr="dossier_max_hosts_per_run",
+        type="int",
+        label="Hosts built per sweep",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Per-sweep cap. Hosts are built staleness-first, so anything over "
+            "the cap is picked up by the next sweep rather than skipped."
+        ),
+        min_value=1,
+        max_value=5000,
+    ),
+    SettingSpec(
+        key="dossier_max_hosts",
+        attr="dossier_max_hosts",
+        type="int",
+        label="Maximum stored dossiers",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Table cap, so a scanned /16 can't explode it. Pruning removes the "
+            "least-recently-seen hosts and never a host with an operator override."
+        ),
+        min_value=1,
+        max_value=100000,
+    ),
+    SettingSpec(
+        key="dossier_min_events",
+        attr="dossier_min_events",
+        type="int",
+        label="Minimum events before inferring a role",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Below this many events in the window the host's role stays "
+            "'unknown' (identity facts are still recorded). A host with three "
+            "packets is not a workstation."
+        ),
+        min_value=1,
+        max_value=100000,
+    ),
+    SettingSpec(
+        key="dossier_min_confidence",
+        attr="dossier_min_confidence",
+        type="float",
+        label="Minimum confidence to use an inferred value",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Inferred values below this (0-1) resolve to 'unknown' instead of "
+            "being asserted, and never prompt about a conflict. The classifier "
+            "emits 0.9 strong / 0.5 weak, so 0.6 admits strong evidence only."
+        ),
+        min_value=0.0,
+        max_value=1.0,
+    ),
+    SettingSpec(
+        key="dossier_staleness_hours",
+        attr="dossier_staleness_hours",
+        type="int",
+        label="Inferred values go stale after (hours)",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Past this age an inferred value resolves to 'unknown' rather than "
+            "being reasserted. Default 72 — survives one failed sweep, not a "
+            "builder that's been off for a week."
+        ),
+        min_value=1,
+        max_value=8760,
+    ),
+    SettingSpec(
+        key="dossier_context_enabled",
+        attr="dossier_context_enabled",
+        type="bool",
+        label="Include the dossier in agent prompts",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Inject host asset context into investigation, chat and hunt "
+            "prompts. Separate from the master switch so the data can keep "
+            "building while the injection is off."
+        ),
+    ),
+    SettingSpec(
+        key="dossier_conflict_min_observations",
+        attr="dossier_conflict_min_observations",
+        type="int",
+        label="Disagreeing builds before prompting about an override",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "Consecutive builds that disagree with your override before you're "
+            "asked to review it. Resets to zero as soon as a build agrees, so "
+            "this is continued evidence, not a running total."
+        ),
+        min_value=1,
+        max_value=50,
+    ),
+    SettingSpec(
+        key="dossier_conflict_prompt_interval_hours",
+        attr="dossier_conflict_prompt_interval_hours",
+        type="int",
+        label="Minimum hours between override-conflict prompts",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "How rarely the same disagreement may be raised. Default 336 "
+            "(14 days). 0 = never prompt. A 'keep mine' snooze doubles from "
+            "here per prompt already sent, capped at 90 days."
+        ),
+        min_value=0,
+        max_value=8760,
     ),
     # ---- API KEYS: enrichment provider secrets (write-only) ------------------
     # Distinct from the Danger-Zone secrets: MOST of these feed per-call
@@ -1247,6 +1463,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "PCAP",
     "Web research",
     "Online enrichment",
+    "Host dossier",
 )
 
 # Top-level Config-page information architecture: sub-section → parent header.
@@ -1272,6 +1489,10 @@ SECTION_PARENTS: dict[str, str] = {
     "PCAP": "Data & Enrichment",
     "Web research": "Data & Enrichment",
     "Online enrichment": "Data & Enrichment",
+    # The dossier is enrichment that runs against the grid's own data rather
+    # than a third party, so it sits beside the other data sources — not under
+    # Privacy & Egress with Discovery, whose job is deciding what gets redacted.
+    "Host dossier": "Data & Enrichment",
 }
 
 

@@ -8,9 +8,18 @@ from the ``alerts[]`` section of a packaged soc_ai/demo/fixtures.json.
 from __future__ import annotations
 
 import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+from scripts.demo import mock_es
 from scripts.demo.mock_es import _search_response_from_docs, load_fixture_docs
 
 
@@ -145,3 +154,111 @@ def test_load_fixture_docs_invalid_json_is_fail_soft(tmp_path: Path):
     fx = tmp_path / "fixtures.json"
     fx.write_text("{not json")
     assert load_fixture_docs(fx) == []
+
+
+# ---------------------------------------------------------------------------
+# Degraded-grid control endpoint. The security constraint is the test: this file
+# also serves the PUBLIC demo container, where an unauthenticated switch into a
+# fabricated Security Onion outage would let any visitor break the demo for
+# everyone else. The endpoint must not exist unless --degraded-control was
+# passed, and the four states must present the way real Elasticsearch does,
+# because the app's guards key off the transport/HTTP shape.
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _serving() -> Iterator[str]:
+    """The real handler on a loopback ephemeral port; yields the base URL."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), mock_es.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _post(url: str) -> tuple[int, str]:
+    req = urllib.request.Request(url, data=b"", method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.read().decode()
+
+
+def test_control_endpoint_is_absent_unless_the_flag_was_passed():
+    """THE security invariant: no --degraded-control, no way in.
+
+    The public demo container runs this file WITHOUT the flag, so a visitor
+    posting to /__degrade must get the same "unknown path" answer as any other
+    made-up URL — never a state switch. Asserted against the real handler rather
+    than against the routing expression, so a refactor that mounts the endpoint
+    unconditionally fails here instead of shipping.
+    """
+    assert mock_es.CONTROL_ENABLED is False, "the flag must default to OFF"
+    with _serving() as base:
+        status, body = _post(f"{base}/__degrade/down")
+        assert (status, json.loads(body)) == (200, {"acknowledged": True})
+        assert mock_es.degrade_state() == "healthy", "an unmounted route changed state"
+
+
+def test_control_endpoint_switches_state_when_the_flag_is_on(monkeypatch):
+    monkeypatch.setattr(mock_es, "CONTROL_ENABLED", True)
+    try:
+        with _serving() as base:
+            status, body = _post(f"{base}/__degrade/half-read")
+            assert status == 200
+            assert json.loads(body)["state"] == "half-read"
+            assert mock_es.degrade_state() == "half-read"
+            # An unknown state is rejected, not silently accepted as healthy.
+            with pytest.raises(urllib.error.HTTPError) as err:
+                _post(f"{base}/__degrade/bananas")
+            assert err.value.code == 400
+    finally:
+        mock_es.set_degrade_state("healthy")
+
+
+def test_degraded_states_are_the_documented_five():
+    assert mock_es.DEGRADE_STATES == ("healthy", "down", "half-read", "saturated", "stalled")
+
+
+def test_half_read_is_a_200_that_hides_failed_shards():
+    """The sneakiest state: no exception, no error status — only `_shards`."""
+    body = mock_es.half_read_response()
+    assert body["timed_out"] is True
+    assert body["_shards"]["failed"] == 2
+    assert body["_shards"]["successful"] == 2
+    assert body["_shards"]["total"] == 4
+    assert len(body["_shards"]["failures"]) == 2
+    # Zero hits on purpose — the shape a quiet, healthy grid also returns.
+    assert body["hits"]["hits"] == []
+    assert body["hits"]["total"]["value"] == 0
+
+
+def test_saturated_is_a_retryable_circuit_breaker_not_a_bad_query():
+    body = mock_es.saturated_response()
+    assert body["status"] == 429
+    assert body["error"]["type"] == "circuit_breaking_exception"
+    assert body["error"]["durability"] == "TRANSIENT"
+    assert body["error"]["root_cause"][0]["type"] == "circuit_breaking_exception"
+
+
+def test_set_degrade_state_round_trips_and_releases_the_tarpit():
+    """Switching state must wake anything parked in `stalled`, or the next
+    screen queues behind an outage that is already over."""
+    released = threading.Event()
+
+    def parked() -> None:
+        mock_es._state_changed.wait(10)
+        released.set()
+
+    try:
+        mock_es.set_degrade_state("stalled")
+        t = threading.Thread(target=parked, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        assert mock_es.degrade_state() == "stalled"
+        mock_es.set_degrade_state("healthy")
+        assert released.wait(2), "a state change did not release the stalled waiter"
+        assert mock_es.degrade_state() == "healthy"
+    finally:
+        mock_es.set_degrade_state("healthy")

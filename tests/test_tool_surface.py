@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from pydantic import SecretStr
 from pydantic_ai.models.test import TestModel
 from soc_ai.agent.chat_agent import build_chat_agent
@@ -25,8 +26,8 @@ from soc_ai.config import Settings
 NEW_TOOLS = {"t_get_rule_content", "t_decode_payload"}
 
 
-def _ctx(settings: Settings) -> InvestigationContext:
-    return InvestigationContext(settings=settings, auth=AsyncMock(), elastic=AsyncMock())
+def _ctx(settings: Settings, **kwargs: Any) -> InvestigationContext:
+    return InvestigationContext(settings=settings, auth=AsyncMock(), elastic=AsyncMock(), **kwargs)
 
 
 def _names(agent: Any) -> set[str]:
@@ -77,6 +78,17 @@ CORE = {
     "t_enrich_domain",
     "t_enrich_hash",
     "t_host_summary",
+    # Origin-chain pivot: "who was DRIVING this host?" — added 2026-08-06 after
+    # soc-ai attributed SSH probing to a host without checking the inbound
+    # session that explained it. Core for every role: the question applies to
+    # investigations, hunts and chat alike.
+    "t_origin_chain",
+    # Host dossier: "what IS this host, and is this normal for it?" — the
+    # durable asset record, read from the local store. Core for every role:
+    # a hunt sweeping the network and an analyst asking about a host in chat
+    # need the answer as much as the investigator writing a verdict does, and
+    # the read is a local DB lookup, so no gate buys anything.
+    "t_host_dossier",
     "t_prevalence",
     "t_rule_prevalence",
     "t_shodan_internetdb",
@@ -181,3 +193,101 @@ def test_golden_tool_sets_flags_off_hunt(settings_kratos: Settings) -> None:
         system_prompt=HUNT_SYSTEM_PROMPT.format(objective="hunt"),
     )
     assert _names(agent) == HUNT_EXPECTED - GATED
+
+
+# ---------------------------------------------------------------------------
+# One host, one label: t_host_dossier must answer in the caller's spelling.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSession:
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_answers_in_the_callers_ip_spelling(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An IPv6 host must not come back wearing a second egress label.
+
+    The store canonicalises its key through ``ipaddress``, so the stored spelling
+    of ``FD00:0:0:0:0:0:0:1`` is ``fd00::1``. The egress guard allocates labels per
+    literal string, so echoing the STORED spelling back gets the host a fresh
+    ``IP_02`` while the rest of the investigation has been calling it ``IP_01`` —
+    the model then sees two machines where there is one and cannot correlate them.
+    Echo what the caller asked about.
+    """
+    from soc_ai.agent.egress_guard import EgressGuard
+    from soc_ai.store import host_dossier as store
+    from soc_ai.store.models import HostDossier
+
+    async def _get(db: object, ip: str) -> tuple[HostDossier, list[Any]]:
+        # Exactly what the real store does: look up by the canonical key and hand
+        # back the row, whose ``ip`` column holds that canonical spelling.
+        key = store.normalize_host_key(ip)
+        return HostDossier(host_key=key, ip=key, event_count=7), []
+
+    monkeypatch.setattr(store, "get_dossier", _get)
+
+    guard = EgressGuard(extra_hosts=(), extra_suffixes=())
+    # The address has already been seen this run in its caller spelling — say, in
+    # the alert prefetch — so it already owns a label.
+    spelling = "FD00:0:0:0:0:0:0:1"
+    label = guard.sanitize_text(f"inbound session from {spelling}").split()[-1]
+    assert label.startswith("IP_")
+
+    agent = build_investigator(
+        TestModel(call_tools=[]),
+        _ctx(
+            settings_kratos.model_copy(update={"dossier_enabled": True}),
+            egress_guard=guard,
+            db_sessionmaker=_FakeSession,
+        ),
+    )
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip=label)
+
+    assert result["found"] is True
+    assert result["ip"] == label
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_ip_is_unchanged_without_a_guard(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The un-guarded path echoes the caller's spelling verbatim too."""
+    from soc_ai.store import host_dossier as store
+    from soc_ai.store.models import HostDossier
+
+    async def _get(db: object, ip: str) -> tuple[HostDossier, list[Any]]:
+        key = store.normalize_host_key(ip)
+        return HostDossier(host_key=key, ip=key, event_count=7), []
+
+    monkeypatch.setattr(store, "get_dossier", _get)
+    agent = build_investigator(
+        TestModel(call_tools=[]),
+        _ctx(
+            settings_kratos.model_copy(update={"dossier_enabled": True}),
+            db_sessionmaker=_FakeSession,
+        ),
+    )
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip="FD00:0:0:0:0:0:0:1")
+    assert result["ip"] == "FD00:0:0:0:0:0:0:1"
+
+
+def test_non_evidential_tools_stay_off_the_phase_d_surface() -> None:
+    """Phase-D dispatch grants its tool the evidence exemption by NAME.
+
+    ``_downgrade_unevidenced_verdict`` exempts a verdict whenever
+    ``targeted_tool_called is not None``, without inspecting the result — so
+    putting an inference-only tool on the Phase-D surface would reopen the
+    laundering route that ``NON_EVIDENTIAL_TOOLS`` closes on the loop path.
+    Adding one there is a real design change; make it fail here first.
+    """
+    from soc_ai.agent.evidence import NON_EVIDENTIAL_TOOLS
+    from soc_ai.agent.toolset import PHASE_D_TOOLS
+
+    assert NON_EVIDENTIAL_TOOLS.isdisjoint(PHASE_D_TOOLS)

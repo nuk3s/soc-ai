@@ -1,9 +1,10 @@
-import { Bell, BookOpen, ChevronsLeft, ChevronsRight, Crosshair, History, Info, LayoutDashboard, LogOut, Search, Settings, Triangle } from 'lucide-react';
-import { NavLink, useLocation, useNavigate } from 'react-router-dom';
-import { type ReactNode, useEffect, useRef, useState } from 'react';
-import { getAbout, getMe, setMyStatus, signOut } from '../lib/api';
+import { Bell, BookOpen, ChevronsLeft, ChevronsRight, Crosshair, History, Info, LayoutDashboard, Search, Server, Settings, Triangle } from 'lucide-react';
+import { NavLink, useLocation } from 'react-router-dom';
+import { type ReactNode, useEffect, useState } from 'react';
+import { getAbout, getMe } from '../lib/api';
 import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
+import { AccountMenu } from './AccountMenu';
 import { useShell } from './ShellContext';
 
 interface NavItem {
@@ -20,6 +21,9 @@ const NAV: NavItem[] = [
   { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
   { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
   { to: '/investigations', label: 'Investigations', icon: <Search size={16} />, match: ['/investigations', '/investigation', '/entity'] },
+  // Sits beside Investigations rather than under Config: the dossier is a
+  // network view an analyst pivots INTO from an alert, not a settings panel.
+  { to: '/hosts', label: 'Hosts', icon: <Server size={16} />, match: ['/hosts'] },
   { to: '/notifications', label: 'Notifications', icon: <Bell size={16} /> },
   { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, match: ['/hunts'] },
   { to: '/backtest', label: 'Backtest', icon: <History size={16} /> },
@@ -27,47 +31,17 @@ const NAV: NavItem[] = [
   { to: '/config', label: 'Config', icon: <Settings size={16} /> },
 ];
 
-function initials(username: string): string {
-  const parts = username.trim().split(/[\s._-]+/).filter(Boolean);
-  if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-  return username.slice(0, 2).toUpperCase();
-}
-
 export function Sidebar() {
   const { collapsed, toggleNav } = useShell();
-  const navigate = useNavigate();
   const location = useLocation();
 
   const [me, setMe] = useState<Me>({ username: 'analyst', role: 'analyst', status: '' });
   const [about, setAbout] = useState<AboutInfo | null>(null);
-  const [editingStatus, setEditingStatus] = useState(false);
-  const [statusDraft, setStatusDraft] = useState('');
-  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getMe().then(setMe).catch(() => {/* keep placeholder */});
     getAbout().then(setAbout).catch(() => {/* version line just stays hidden */});
   }, []);
-
-  function startEdit() {
-    setStatusDraft(me.status);
-    setEditingStatus(true);
-    // Focus after render
-    setTimeout(() => inputRef.current?.focus(), 0);
-  }
-
-  function commitEdit() {
-    const trimmed = statusDraft.trim().slice(0, 64);
-    setEditingStatus(false);
-    setMyStatus(trimmed)
-      .then((r) => setMe((prev) => ({ ...prev, status: r.status })))
-      .catch(() => {/* silently leave old value */});
-  }
-
-  function cancelEdit() {
-    setEditingStatus(false);
-    setStatusDraft('');
-  }
 
   return (
     <div
@@ -163,57 +137,8 @@ export function Sidebar() {
         </NavLink>
       )}
 
-      {/* user row */}
-      <div
-        className="flex items-center gap-[9px] border-t border-border pt-2.5"
-        style={{ justifyContent: collapsed ? 'center' : 'flex-start' }}
-      >
-        <div
-          title={`${me.username} · ${me.role}`}
-          className="flex h-7 w-7 flex-none items-center justify-center rounded-full border border-border-input text-[11px] font-semibold text-[#b9c2cf]"
-          style={{ background: 'linear-gradient(135deg,#2c3340,#1a1f28)' }}
-        >
-          {initials(me.username)}
-        </div>
-        {!collapsed && (
-          <>
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[12.5px] font-semibold">{me.username}</div>
-              {editingStatus ? (
-                <input
-                  ref={inputRef}
-                  value={statusDraft}
-                  maxLength={64}
-                  onChange={(e) => setStatusDraft(e.target.value)}
-                  onBlur={commitEdit}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') commitEdit();
-                    if (e.key === 'Escape') cancelEdit();
-                  }}
-                  className="w-full rounded bg-bg px-1 py-px text-[10.5px] text-text outline-none focus:ring-1 focus:ring-accent"
-                  placeholder="Set status…"
-                />
-              ) : (
-                <div
-                  onClick={startEdit}
-                  title="Click to set status"
-                  className="cursor-text truncate text-[10.5px] text-faint hover:text-text"
-                >
-                  {me.status || <span className="italic opacity-50">Set status…</span>}
-                </div>
-              )}
-            </div>
-            <button
-              onClick={() => signOut(navigate)}
-              title="Sign out"
-              aria-label="Sign out"
-              className="flex text-faint hover:text-text"
-            >
-              <LogOut size={15} />
-            </button>
-          </>
-        )}
-      </div>
+      {/* account — one menu, reachable in BOTH sidebar states */}
+      <AccountMenu me={me} onMe={setMe} />
     </div>
   );
 }

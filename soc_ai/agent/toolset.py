@@ -11,6 +11,10 @@ Role deltas are encoded as module constants (:data:`INVESTIGATOR_ONLY`,
 a 1440-minute window (a hunt looks across time), investigator/chat to 60 —
 and the two windowed query tools carry a role-appropriate window docstring
 (the hunt variant does not claim to center on an alert's ``@timestamp``).
+A caller with no alert to anchor to (the dashboard's general chat) overrides
+that default via ``register_read_tools(..., default_window=)``, which moves the
+window AND its docstring sentence together; it never changes which tools a role
+gets, so the golden per-role surfaces stay pinned.
 
 Settings-gated tools (the online quartet, PCAP, web search, crawl) are gated
 at REGISTRATION time in every role, so a disabled tool never appears in the
@@ -32,10 +36,21 @@ import functools
 import json
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from elastic_transport import TransportError
+from elasticsearch import ApiError
 from pydantic_ai import Agent
 
+from soc_ai.dossier.resolve import (
+    ResolvedDossier,
+    ResolvedField,
+    resolve_dossier_from_settings,
+    unknown_dossier,
+)
+from soc_ai.oracle.identifiers import effective_internal_identifiers
+from soc_ai.store import host_dossier as dossier_store
 from soc_ai.tools.crawl_page import crawl_page
 from soc_ai.tools.cvedb import cve_lookup
 from soc_ai.tools.decode_payload import decode_payload
@@ -48,6 +63,7 @@ from soc_ai.tools.get_rule_content import get_rule_content
 from soc_ai.tools.greynoise import greynoise
 from soc_ai.tools.host_summary import host_summary
 from soc_ai.tools.lookup_runbook import lookup_runbook
+from soc_ai.tools.origin_chain import origin_chain
 from soc_ai.tools.prevalence import prevalence
 from soc_ai.tools.query_cases import query_cases
 from soc_ai.tools.query_detections import query_detections
@@ -71,7 +87,7 @@ Role = Literal["investigator", "chat", "hunt"]
 INVESTIGATOR_ONLY = frozenset({"t_query_detections", "t_get_playbooks", "t_lookup_runbook"})
 
 # Tools every role EXCEPT hunt gets (tuning nominations are per-rule triage
-# work, not estate-wide hunting).
+# work, not network-wide hunting).
 NOT_ON_HUNT = frozenset({"t_suggest_rule_tuning"})
 
 # The Phase-D targeted-dispatch surface: the tools a synth round-1
@@ -95,6 +111,101 @@ PHASE_D_TOOLS: tuple[str, ...] = (
     "t_crawl_page",
 )
 
+# Tools whose answers come FROM the Security Onion grid — every one of them
+# reads the SO Elasticsearch cluster (cases, rules and playbooks live in ES
+# indices too), except ``t_get_pcap``, which reads the sensor over SSH. A
+# SUCCESSFUL call to one of these is proof the run could actually see the
+# network; a failed one is a hole in what the run could see.
+#
+# Consumed by :func:`soc_ai.api.hunt_runner._grid_tool_outcomes`, whose whole
+# job is the arithmetic "did this hunt look at the network at all?" — so an
+# unclassified new tool would silently stop counting as a look.
+# ``tests/test_hunt_outage_report.py`` pins the two sets as a partition of the
+# registered surface, forcing that decision at review time.
+GRID_BACKED_TOOLS = frozenset(
+    {
+        "t_query_events_oql",
+        "t_query_zeek_logs",
+        "t_describe_dataset",
+        "t_field_values",
+        "t_query_cases",
+        "t_query_detections",
+        "t_get_event_raw",
+        "t_get_rule_content",
+        "t_host_summary",
+        "t_origin_chain",
+        "t_prevalence",
+        "t_rule_prevalence",
+        "t_suggest_rule_tuning",
+        "t_get_playbooks",
+        "t_get_pcap",
+    }
+)
+
+# The complement: tools answered by local computation, the local store, or the
+# public internet. None of them says anything about whether the grid is
+# readable — a working web search on a blind sensor is still a blind sensor.
+OFF_GRID_TOOLS = frozenset(
+    {
+        "t_decode_payload",
+        "t_enrich_ip",
+        "t_enrich_domain",
+        "t_enrich_hash",
+        "t_host_dossier",
+        "t_lookup_runbook",
+        "t_shodan_internetdb",
+        "t_shodan_host",
+        "t_greynoise",
+        "t_cve_lookup",
+        "t_web_search",
+        "t_crawl_page",
+    }
+)
+
+# The ``reason`` stamped on a tool error the grid caused, rather than the
+# model's own query. Same vocabulary the HTTP layer uses for the 503
+# (``routes_alerts._GRID_UNAVAILABLE``), so one word means one thing across
+# the product.
+GRID_UNAVAILABLE_REASON = "grid_unavailable"
+
+# What the MODEL is told when the grid fails. Deliberately not the exception
+# text: a raw "Connection error caused by ConnectionRefusedError(111)" is a
+# string a weak model paraphrases into "no results", and an all-clear written
+# off a failed read is the worst output this product has. State the epistemics
+# instead — the answer is unknown, and unknown is not empty.
+_GRID_UNAVAILABLE_MESSAGE = (
+    "The Security Onion grid did not answer this query — it is unreachable, timing "
+    "out, or returned only partial results. This result is UNKNOWN, not empty: it is "
+    "NOT evidence that nothing matched, and it rules nothing out. Do not describe the "
+    "network as quiet, clean or clear on the strength of it. Do not re-send this exact "
+    "call — an identical repeat short-circuits as a duplicate instead of re-querying; "
+    "to re-check, vary the query, once. If the grid keeps failing, say plainly that "
+    "the grid was unavailable and the question could not be answered."
+)
+
+
+def _is_grid_unavailable(exc: BaseException) -> bool:
+    """Is ``exc`` the grid failing, rather than the model's query being wrong?
+
+    ``elastic_transport.TransportError`` covers connection refused, connect and
+    read timeouts, TLS failures — and, once the partial-shard detection lands,
+    ``GridPartialResultsError``, which subclasses it precisely so guards like
+    this one pick it up with no edit.
+
+    ``ApiError`` is NOT a ``TransportError``, so it is checked separately and
+    split by status the way ``routes_alerts._es_api_error_http`` splits it: a
+    4xx is a bad query the model can fix and keeps its own message, anything
+    else is the grid. The exceptions to that split are 408 (request timeout)
+    and 429 (search queue full / circuit breaker tripped) — 4xx codes that
+    describe a struggling grid, not a malformed query.
+    """
+    if isinstance(exc, ApiError):
+        status = getattr(getattr(exc, "meta", None), "status", None)
+        if status is None:
+            return True
+        return status in (408, 429) or status >= 500
+    return isinstance(exc, TransportError)
+
 
 # Cap on the JSON-serialized size of any single tool return. Both Nemotron 3
 # models on the lab grid are deployed with 64K context; a single t_query_*
@@ -112,7 +223,25 @@ def _tool_error(exc: BaseException) -> dict[str, Any]:
     them at every tool boundary and surface them as a `{error, type, message}`
     dict — PydanticAI sends that back to the model as a tool result, and the
     model can either retry with corrected args or move on.
+
+    A GRID failure (:func:`_is_grid_unavailable`) is rendered differently from a
+    bad query, because the two call for opposite responses. A malformed query
+    keeps its own message — that text is how the model fixes it. A grid failure
+    is stamped ``reason: "grid_unavailable"`` and carries a fixed message about
+    what the result MEANS (unknown, not empty); the exception string is dropped
+    rather than passed through, so there is no raw transport text for a weak
+    model to paraphrase into "no results found". The ``reason`` is also what the
+    hunt runner counts deterministically — see
+    :func:`soc_ai.api.hunt_runner._grid_tool_outcomes` — so a hunt that could
+    not read the grid cannot land as a clean sweep whatever the model writes.
     """
+    if _is_grid_unavailable(exc):
+        return {
+            "error": True,
+            "type": type(exc).__name__,
+            "reason": GRID_UNAVAILABLE_REASON,
+            "message": _GRID_UNAVAILABLE_MESSAGE,
+        }
     payload: dict[str, Any] = {
         "error": True,
         "type": type(exc).__name__,
@@ -257,6 +386,108 @@ def _clamp_tool_result[T](value: T) -> T:
     return cast("T", text[: _TOOL_RESULT_BUDGET_BYTES - 100] + " …[truncated]")
 
 
+# Framing carried on every t_host_dossier result. The dossier is inferred from
+# telemetry a host can influence (the name it announces over DHCP, the banner it
+# serves), so the payload says what it is every time rather than relying on the
+# tool description having been read.
+_DOSSIER_NOTE = (
+    "System-inferred asset context. An operator value outranks an inferred one; "
+    "an inferred value is only as good as its strength, and an unknown field "
+    "carries the reason it is unknown."
+)
+_DOSSIER_ABSENT_NOTE = (
+    "Absence is an answer, not evidence: the network sweep has no record of this "
+    "address (external, or never observed). It is not a finding that the host is "
+    "benign — check whether the address is internal at all before reading into it."
+)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _host_dossier_field_payload(field: ResolvedField) -> dict[str, Any]:
+    """One resolved field, with everything a reader needs to weigh it.
+
+    Optional keys are omitted rather than sent as nulls: twelve fields x a dozen
+    always-present nulls is a third of the tool-result budget spent saying
+    nothing. The inference lane is reported ALONGSIDE a winning operator value —
+    an override suppresses effect, never observation, and a reader deciding
+    whether the override is still right needs to see what it is suppressing.
+    """
+    payload: dict[str, Any] = {
+        "value": field.value,
+        "source": field.source,
+        "confidence": round(field.confidence, 2),
+        "strength": field.strength,
+    }
+    if field.value_json is not None:
+        payload["value_json"] = field.value_json
+    if field.reason is not None:
+        payload["unknown_reason"] = field.reason
+    if field.evidence:
+        payload["evidence"] = field.evidence
+    if field.observed_at is not None:
+        payload["last_confirmed"] = _iso(field.observed_at)
+    if field.last_run_at is not None:
+        payload["last_evaluated"] = _iso(field.last_run_at)
+    if field.overridden:
+        payload["operator_actor"] = field.operator_actor
+        payload["operator_note"] = field.operator_note
+        payload["operator_set_at"] = _iso(field.operator_set_at)
+        if field.inferred_value is not None or field.inferred_value_json is not None:
+            payload["inferred_value"] = field.inferred_value
+            payload["inferred_source"] = field.inferred_source
+            payload["inferred_confidence"] = field.inferred_confidence
+    if field.conflict is not None:
+        payload["conflict"] = {
+            "kind": field.conflict.kind,
+            "since": _iso(field.conflict.first_seen_at),
+            "disagreeing_builds": field.conflict.observations,
+        }
+    return payload
+
+
+def _host_dossier_payload(entry: ResolvedDossier, *, asked_as: str) -> dict[str, Any]:
+    """Render a resolved dossier for the model, absence included.
+
+    The answer echoes ``asked_as`` — the spelling the CALLER used — not
+    ``entry.ip``, which for a stored host is the key the store canonicalised
+    through ``ipaddress`` (``FD00:0:0:0:0:0:0:1`` is filed as ``fd00::1``). The
+    egress guard allocates a redaction label per literal string, so returning the
+    canonical spelling earns the host a second label and the model sees two
+    machines where the investigation has one. Same host, same name, every time.
+    """
+    if not entry.found:
+        return {
+            "ip": asked_as,
+            "found": False,
+            "reason": "no dossier — the network sweep has no record of this address",
+            "note": _DOSSIER_ABSENT_NOTE,
+        }
+    payload: dict[str, Any] = {
+        "ip": asked_as,
+        "found": True,
+        "fields": {
+            name: _host_dossier_field_payload(field) for name, field in entry.fields.items()
+        },
+        "first_seen": _iso(entry.first_seen),
+        "last_seen": _iso(entry.last_seen),
+        "last_built_at": _iso(entry.last_built_at),
+        "event_count": entry.event_count,
+        "note": _DOSSIER_NOTE,
+    }
+    if entry.identity_rebound_at is not None:
+        payload["identity_rebound_at"] = _iso(entry.identity_rebound_at)
+        payload["identity_rebound_warning"] = (
+            "A different machine appears to hold this address now; an operator "
+            "value set before that date may describe a host that has moved on."
+        )
+    if entry.build_error:
+        payload["build_error"] = entry.build_error
+    return payload
+
+
 _DUPLICATE_HINT = (
     "Same args were already called this investigation. Result hasn't changed; "
     "calling again wastes the budget. Pivot to a different field, time window, "
@@ -281,6 +512,61 @@ def _dedup_result(
         "args": args,
         "hint": _DUPLICATE_HINT,
     }
+
+
+async def _egress_tool_idents(
+    ctx: InvestigationContext,
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None]:
+    """Resolve the effective (suffixes, hosts) for the online egress tool guards
+    (web_search / crawl_page), ONCE per run, cached on ``ctx``.
+
+    The orchestrator pre-seeds ``ctx.effective_internal_*`` from the set it already
+    resolved for EgressGuard (no second DB round-trip); other entrypoints leave
+    them unset and we resolve them lazily here on first tool use. ``(None, None)``
+    ⇒ no DB session (CLI / eval / tests) — the tool guard then falls back to the
+    raw ``settings`` tuples, so behaviour is unchanged for a db-less path.
+    """
+    if ctx._egress_idents_resolved:
+        return ctx.effective_internal_suffixes, ctx.effective_internal_hosts
+    maker = ctx.db_sessionmaker
+    if maker is not None:
+        try:
+            async with maker() as db:
+                effective = await effective_internal_identifiers(db, ctx.settings)
+            ctx.effective_internal_suffixes = effective.suffixes
+            ctx.effective_internal_hosts = effective.hosts
+        except Exception:  # never block a tool on a DB hiccup — fall back to settings
+            _LOGGER.warning(
+                "toolset: failed to resolve effective internal identifiers for the "
+                "egress tool guard; falling back to settings",
+                exc_info=True,
+            )
+    ctx._egress_idents_resolved = True
+    return ctx.effective_internal_suffixes, ctx.effective_internal_hosts
+
+
+def _progress[F: Callable[..., Any]](ctx: InvestigationContext, fn: F) -> F:
+    """Report each tool START through ``ctx.on_tool_call``, if a caller set one.
+
+    Single choke point: every tool registration routes through here, so live
+    progress needs no per-tool wiring. Fire-and-forget by contract — a progress
+    sink that raises must never turn into a failed tool call, so the callback is
+    fully guarded. Absent a callback the closure is returned unchanged, keeping
+    the default path free of an extra frame.
+    """
+    sink = ctx.on_tool_call
+    if sink is None:
+        return fn
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            sink(getattr(fn, "__name__", "tool"))
+        except Exception:  # progress is cosmetic; never break the tool
+            _LOGGER.debug("tool progress sink failed", exc_info=True)
+        return await fn(*args, **kwargs)
+
+    return cast("F", wrapper)
 
 
 def _guarded[F: Callable[..., Any]](ctx: InvestigationContext, fn: F) -> F:
@@ -350,6 +636,23 @@ _ZEEK_HUNT_WINDOW_NOTE = (
     "time; `time_range_minutes` is the total width. Narrow it when you "
     "only need the immediate surroundings of one flow."
 )
+# Third flavor, for a caller that overrode the window (see `default_window`):
+# it is not anchored to an alert, so the alert-centered note above would be a
+# false description of the tool's own behaviour — with no `time_anchor` the
+# window is `[now - width, now]`, not `[anchor ± width/2]` — and its "60 = ±30
+# min" example would sit next to a 1440 default. `{minutes}` is filled with the
+# override at registration time.
+_OQL_WIDE_WINDOW_NOTE = (
+    "The default window is WIDE ({minutes} minutes) and is counted BACK FROM "
+    "NOW: this agent is not anchored to a single alert. `time_range_minutes` "
+    "is the total window width; pass a larger value to look further back or a "
+    "smaller one to focus on a burst."
+)
+_ZEEK_WIDE_WINDOW_NOTE = (
+    "The default window is wide ({minutes} minutes), counted back from now — "
+    "there is no alert to center on. `time_range_minutes` is the total width; "
+    "narrow it when you only need the immediate surroundings of one flow."
+)
 
 
 def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently long
@@ -357,6 +660,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
     ctx: InvestigationContext,
     *,
     role: Role,
+    default_window: int | None = None,
 ) -> None:
     """Register the full read-tool surface for ``role`` on ``agent``.
 
@@ -364,12 +668,21 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
     semantic-only (no auth/elastic/etc. parameters in the schema). Settings-
     gated tools are skipped entirely when their flag is off, so the model
     never sees a tool it can't use.
+
+    ``default_window`` overrides the role-derived implicit window (minutes) on
+    the two time-windowed query tools. Pass it only when the run has NO alert
+    to anchor to — the dashboard's general chat asks network-wide, over-a-day
+    questions, and the chat role's implicit 60 minutes would silently answer a
+    different question than the one asked. It moves the window default and the
+    window sentence in the two tool descriptions; it does not add, remove or
+    rename a tool, so the per-role surface pinned by tests/test_tool_surface.py
+    is unaffected.
     """
     s = ctx.settings
     # Defaults bind at def time, so the LLM-visible schema advertises the
     # role's real window: a hunt looks across time (24h), the investigator
     # and chat pivot around one alert (±30 min).
-    default_window = 1440 if role == "hunt" else 60
+    window = default_window if default_window is not None else (1440 if role == "hunt" else 60)
 
     def _register[F: Callable[..., Any]](fn: F) -> F:
         # EVERY tool registration routes through the egress guard so a cloud
@@ -378,11 +691,11 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         # (the default), _guarded returns fn unchanged and this is exactly
         # agent.tool_plain(fn). The cast mirrors _guarded's: tool_plain hands
         # back the (wrapped) function it was given.
-        return cast("F", agent.tool_plain(_guarded(ctx, fn)))
+        return cast("F", agent.tool_plain(_progress(ctx, _guarded(ctx, fn))))
 
     async def t_query_events_oql(
         query: str,
-        time_range_minutes: int = default_window,
+        time_range_minutes: int = window,
         max_results: int = 25,
     ) -> dict[str, Any]:
         # Hard ceiling BEFORE the dedup key — defends the 64K window, and
@@ -411,15 +724,19 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
     # The docstring is the LLM-visible tool description, so assign the
     # role-appropriate window note BEFORE registering (pydantic_ai captures
     # the doc at registration time).
-    t_query_events_oql.__doc__ = _OQL_DOC_BASE + (
-        _OQL_HUNT_WINDOW_NOTE if role == "hunt" else _OQL_ALERT_WINDOW_NOTE
-    )
+    if default_window is not None:
+        oql_window_note = _OQL_WIDE_WINDOW_NOTE.format(minutes=window)
+    elif role == "hunt":
+        oql_window_note = _OQL_HUNT_WINDOW_NOTE
+    else:
+        oql_window_note = _OQL_ALERT_WINDOW_NOTE
+    t_query_events_oql.__doc__ = _OQL_DOC_BASE + oql_window_note
     _register(t_query_events_oql)
 
     async def t_query_zeek_logs(
         community_id: str,
         log_types: list[str] | None = None,
-        time_range_minutes: int = default_window,
+        time_range_minutes: int = window,
         max_results: int = 25,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         # Read-prefetch-first rule: if this community_id is
@@ -464,9 +781,13 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             return _tool_error(e)
         return _clamp_tool_result(zeek_rows)
 
-    t_query_zeek_logs.__doc__ = _ZEEK_DOC_BASE + (
-        _ZEEK_HUNT_WINDOW_NOTE if role == "hunt" else _ZEEK_ALERT_WINDOW_NOTE
-    )
+    if default_window is not None:
+        zeek_window_note = _ZEEK_WIDE_WINDOW_NOTE.format(minutes=window)
+    elif role == "hunt":
+        zeek_window_note = _ZEEK_HUNT_WINDOW_NOTE
+    else:
+        zeek_window_note = _ZEEK_ALERT_WINDOW_NOTE
+    t_query_zeek_logs.__doc__ = _ZEEK_DOC_BASE + zeek_window_note
     _register(t_query_zeek_logs)
 
     @_register
@@ -637,6 +958,97 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         return _clamp_tool_result(result)
 
     @_register
+    async def t_origin_chain(ip: str, lookback_minutes: int = 30) -> dict[str, Any]:
+        """Who was DRIVING this internal host? Inbound remote-access sessions.
+
+        Returns the SSH/RDP/WinRM/SMB sessions that arrived AT `ip` in the
+        window before the activity, time-ordered, with `closest_preceding` —
+        the session nearest before the alert, i.e. the most likely driver.
+
+        Call this whenever an INTERNAL host appears to be the source of hostile
+        or unexpected behavior, BEFORE attributing that behavior to it. A host
+        with an inbound session is a waypoint, not an origin: the real actor is
+        upstream, and you should pivot again on that source. An empty result is
+        equally decisive — it means the host acted on its own, which is a
+        different and usually more serious finding.
+
+        `t_host_summary` cannot answer this: its `top_peers` is a volume-ranked
+        aggregation, so a brief session is invisible beside routine traffic, and
+        it carries no ordering.
+        """
+        if dup := _dedup_result(
+            ctx, "t_origin_chain", {"ip": ip, "lookback_minutes": lookback_minutes}
+        ):
+            return dup
+        try:
+            result = await origin_chain(
+                ip,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                lookback_minutes=lookback_minutes,
+                time_anchor=ctx.default_time_anchor,
+            )
+        except Exception as e:
+            _LOGGER.warning("t_origin_chain failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(result)
+
+    @_register
+    async def t_host_dossier(ip: str) -> dict[str, Any]:
+        """What IS this host, and is this behaviour normal FOR IT?
+
+        The durable asset record the network sweep keeps for an internal IP:
+        hostname, OS, inferred role (hypervisor / domain controller / security
+        appliance / server / workstation / network device / IoT), the services
+        it offers, its behavioural baseline (what it normally does, and what it
+        has never done), and any operator-set criticality and site policy.
+
+        Call it whenever the verdict turns on what the host IS rather than on
+        what happened — "outbound SSH from a hypervisor whose policy forbids
+        interactive SSH" is a different finding from "outbound SSH from a
+        workstation". `t_host_summary` recomputes a 24h snapshot; this is the
+        stored record, built over a much wider window, and its role inference
+        is far stronger.
+
+        Reading the result: `source: "operator"` means a human asserted the
+        value and it OUTRANKS any inference — `inferred_value` beside it is
+        what the builder still believes underneath. An inferred value carries a
+        `strength`; weak is a lead, not a fact. A null `value` carries an
+        `unknown_reason`, and none of the three means "no": `no_signal` = a
+        build looked and found nothing in its window (with no `last_evaluated`,
+        nothing has looked yet), `low_confidence` = too weak to assert, `stale`
+        = nobody has re-confirmed it lately. `found: false` means the sweep has
+        no record of this address at all — not that it is benign.
+        """
+        if dup := _dedup_result(ctx, "t_host_dossier", {"ip": ip}):
+            return dup
+        # Answered rather than unregistered when off: a tool that vanishes
+        # leaves the model guessing why it cannot ask, and this is a local DB
+        # read, so there is no egress to gate.
+        if getattr(ctx.settings, "dossier_enabled", False) is not True:
+            return {"available": False, "reason": "host dossier disabled"}
+        maker = ctx.db_sessionmaker
+        if maker is None:
+            return {
+                "available": False,
+                "reason": "host dossier unavailable — this run has no database",
+            }
+        try:
+            async with maker() as db:
+                stored = await dossier_store.get_dossier(db, ip)
+            if stored is None:
+                entry = unknown_dossier(ip)
+            else:
+                host, rows = stored
+                entry = resolve_dossier_from_settings(
+                    host, rows, now=datetime.now(UTC), settings=ctx.settings
+                )
+        except Exception as e:
+            _LOGGER.warning("t_host_dossier failed: %s", e)
+            return _tool_error(e)
+        return _clamp_tool_result(_host_dossier_payload(entry, asked_as=ip))
+
+    @_register
     async def t_prevalence(
         ip: str,
         peer_ip: str | None = None,
@@ -679,7 +1091,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
 
     @_register
     async def t_rule_prevalence(rule_name: str, lookback_days: int = 30) -> dict[str, Any]:
-        """Base-rate / noisiness of a Suricata detection rule across the estate.
+        """Base-rate / noisiness of a Suricata detection rule across the network.
 
         Answers whether this rule is NOISY (fires constantly across many hosts —
         so its next firing is likely benign HERE and is weak evidence) or RARE /
@@ -914,7 +1326,10 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             if dup := _dedup_result(ctx, "t_web_search", {"query": query}):
                 return dup
             try:
-                result = await web_search(query, settings=ctx.settings)
+                sfx, hosts = await _egress_tool_idents(ctx)
+                result = await web_search(
+                    query, settings=ctx.settings, suffixes=sfx, extra_hosts=hosts
+                )
             except Exception as e:
                 _LOGGER.warning("t_web_search failed: %s", e)
                 return _tool_error(e)
@@ -940,7 +1355,10 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             if dup := _dedup_result(ctx, "t_crawl_page", {"url": url}):
                 return dup
             try:
-                result = await crawl_page(url, settings=ctx.settings)
+                sfx, hosts = await _egress_tool_idents(ctx)
+                result = await crawl_page(
+                    url, settings=ctx.settings, suffixes=sfx, extra_hosts=hosts
+                )
             except Exception as e:
                 _LOGGER.warning("t_crawl_page failed: %s", e)
                 return _tool_error(e)

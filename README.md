@@ -42,7 +42,7 @@ Under the hood, for one alert the agent will:
 - weigh the evidence and write a verdict with its confidence and rationale;
 - recommend the write actions (acknowledge, escalate to a case, comment) for you to run with one click.
 
-## Hunt across the estate, not just one alert
+## Hunt across the network, not just one alert
 
 Some questions are bigger than a single detection: *"is anything beaconing to a rare external IP?"*, *"are the DCs seeing credential-abuse lockouts?"*, *"APT-X uses technique Y; is it showing up here?"* The **Hunt Console** takes an objective in plain English and turns the same read-only agent loose across many hosts and a time window, then hands back **findings + a narrative** mapped to MITRE ATT&CK, rather than a single-alert verdict.
 

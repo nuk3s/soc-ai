@@ -42,8 +42,15 @@ function clearFlag(): void {
  * a repeat failure (flag already set) reaches the error boundary.
  *
  * Drop-in for `lazy()`: keep the named-export `.then` shim in the importer.
+ *
+ * The bound matches React's own `lazy` (`ComponentType<any>`) so it accepts a
+ * no-prop route AND a props-taking component like Markdown/HuntVisuals, while
+ * `T` still infers each component's exact props for the return type. `<unknown>`
+ * would reject any component that requires props; `<never>` collides with
+ * React's internal `lazy` signature.
  */
-export function lazyWithReload<T extends ComponentType<unknown>>(
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic bound only, never a value
+export function lazyWithReload<T extends ComponentType<any>>(
   importer: () => Promise<{ default: T }>,
 ): LazyExoticComponent<T> {
   return lazy(() =>

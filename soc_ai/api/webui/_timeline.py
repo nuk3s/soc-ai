@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import BaseModel
@@ -528,6 +530,15 @@ class TimelineStepOut(BaseModel):
     detail: str = ""
 
 
+# Assistant-message ``meta["kind"]`` values that render as a CARD with a control
+# on it (Apply this verdict / Start this hunt) rather than as prose. The registry
+# lives next to the serializer that consumes it so a new proposal-producing chat
+# registers its kind here and is on the wire — the first one that didn't
+# (hunt_proposal, from the Dashboard chat) serialized with kind/messageId/
+# proposal all None and the analyst never saw the control.
+PROPOSAL_KINDS = frozenset({"verdict_proposal", "hunt_proposal"})
+
+
 class ChatMessageOut(BaseModel):
     role: str
     text: str
@@ -666,6 +677,19 @@ def _collect_reasoning(events: list[Any]) -> list[str]:
     return out
 
 
+# Share of ``webui_grid_timeout_s`` the discardable acked-state probe may spend.
+# It is one optional badge on a page built mostly from the DB, and its documented
+# failure mode is "return False and offer the action anyway" — so it gets a slice
+# of the console budget, not all of it. Floored at 1 s so a small
+# ``webui_grid_timeout_s`` can never round the probe down to an instant expiry.
+_ACKED_PROBE_BUDGET = 0.25
+
+
+def _acked_probe_timeout_s(settings: Settings) -> float:
+    """Wall-clock bound for the acked-state probe, derived from the console budget."""
+    return max(1.0, settings.webui_grid_timeout_s * _ACKED_PROBE_BUDGET)
+
+
 async def _alert_currently_acked(
     elastic: ElasticClient, settings: Settings, alert_es_id: str | None
 ) -> bool:
@@ -677,16 +701,24 @@ async def _alert_currently_acked(
     investigation (group-ack, another run's auto-ack, the SO web UI).
     Resilient by design: any ES error/miss returns False so the detail page
     falls back to current behavior (offer the action) instead of breaking.
+
+    Bounded TIGHTER than the console-wide grid budget (see
+    :data:`_ACKED_PROBE_BUDGET`): the answer is discarded on any failure, so a
+    silent grid must not spend the investigation-detail page's whole budget —
+    let alone the ES client's ~90 s retry budget — on a signal we are already
+    willing to do without. Wrong-direction risk is nil: guessing "not acked"
+    only re-offers an idempotent ack.
     """
     if not alert_es_id:
         return False
     try:
-        lookup = await elastic.search(
-            settings.events_index_pattern,
-            {"ids": {"values": [alert_es_id]}},
-            size=1,
-            source=["event.acknowledged"],
-        )
+        async with asyncio.timeout(_acked_probe_timeout_s(settings)):
+            lookup = await elastic.search(
+                settings.events_index_pattern,
+                {"ids": {"values": [alert_es_id]}},
+                size=1,
+                source=["event.acknowledged"],
+            )
         if not lookup.hits:
             return False
         source = lookup.hits[0].get("_source", {})
@@ -845,6 +877,71 @@ def _build_actions(
     return out
 
 
+# Sanitizer categories (soc_ai.oracle.sanitize) in the order they are read out,
+# singular and plural. Anything unrecognised falls back to the raw key, because a
+# new category must not be able to silence the note.
+_REDACTION_NOUNS: dict[str, tuple[str, str]] = {
+    "IP": ("IP address", "IP addresses"),
+    "HOST": ("hostname", "hostnames"),
+    "USER": ("username", "usernames"),
+    "EMAIL": ("email address", "email addresses"),
+    "MAC": ("MAC address", "MAC addresses"),
+}
+
+
+def _join_phrases(parts: list[str]) -> str:
+    """``[a]`` -> "a"; ``[a, b]`` -> "a and b"; ``[a, b, c]`` -> "a, b and c"."""
+    if len(parts) == 1:
+        return parts[0]
+    return f"{', '.join(parts[:-1])} and {parts[-1]}"
+
+
+def _redaction_note(redaction: object) -> str | None:
+    """One sentence describing what the egress guard replaced, or None.
+
+    The producer records per-category COUNTS — ``{"IP": 3, "HOST": 1}``, see
+    :func:`soc_ai.oracle.sanitize.redaction_summary`, which never carries the
+    values themselves. This field is a string on the wire and the console renders
+    it as a sentence, so the counts are phrased here.
+
+    Passing that dict through raw is what made every investigation whose Oracle
+    run actually redacted something answer 500: pydantic rejected a dict for a
+    ``str`` field and took the whole detail page down with it. An empty dict is
+    falsy, so the bug only ever appeared once redaction had real work to do.
+
+    Total by construction. This renders payloads written by arbitrarily old
+    versions, and a page that cannot be opened is worse than a note that cannot
+    be phrased — so every unexpected shape degrades to a usable answer rather
+    than raising.
+    """
+    if not redaction:
+        return None
+    if isinstance(redaction, str):
+        return redaction.strip() or None
+    if isinstance(redaction, Mapping):
+        parts: list[str] = []
+        all_counted = True
+        for key, count in redaction.items():
+            if not isinstance(count, int) or isinstance(count, bool):
+                all_counted = False
+                continue
+            if count <= 0:
+                continue
+            singular, plural = _REDACTION_NOUNS.get(
+                str(key), (str(key).lower(), f"{str(key).lower()}s")
+            )
+            parts.append(f"{count} {singular if count == 1 else plural}")
+        if parts:
+            return f"{_join_phrases(parts)} redacted before the second opinion"
+        # Nothing to name. Which of the two reasons matters: a summary that
+        # counted and found zero ({"IP": 0}) means nothing was replaced, and
+        # saying otherwise would tell every analyst their data went off-box
+        # redacted when it did not. A summary we could not read is the other
+        # case, and there silence would be the lie.
+        return None if all_counted else "redacted before the second opinion"
+    return "redacted before the second opinion"
+
+
 def _build_oracle(events: list[Any]) -> OracleOut | None:
     """Scan event stream for oracle_escalation / oracle_adjudication and build OracleOut.
 
@@ -869,8 +966,8 @@ def _build_oracle(events: list[Any]) -> OracleOut | None:
     oracle_confidence = (adj_payload or {}).get("oracle_confidence")
     oracle_model = (adj_payload or {}).get("oracle_model")
     redaction = (adj_payload or {}).get("redaction")
-    redacted = bool(redaction)
-    redaction_note = redaction if redacted else None
+    redaction_note = _redaction_note(redaction)
+    redacted = redaction_note is not None
     changed = bool(oracle_verdict and local_verdict and oracle_verdict != local_verdict)
     return OracleOut(
         escalated=True,
@@ -947,9 +1044,15 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
 
 
 def _chat_msg_out(m: Any) -> ChatMessageOut:
+    """Serialize one chat row for the wire, shared by every chat surface.
+
+    The proposal fields are gated on :data:`PROPOSAL_KINDS` so an ordinary answer
+    can never arrive carrying a row id and a card — an analyst offered an
+    "Apply this verdict" button on prose the agent never proposed.
+    """
     meta = (m.meta or {}) if isinstance(m.meta, dict) else {}
     tools = ", ".join(meta.get("tools", [])) if meta.get("tools") else None
-    is_prop = meta.get("kind") == "verdict_proposal"
+    is_prop = meta.get("kind") in PROPOSAL_KINDS
     return ChatMessageOut(
         role=m.role,
         text=m.content,

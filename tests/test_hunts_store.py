@@ -59,11 +59,14 @@ async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     # hunt_objective_hash → 0014 hunt_schedules → 0015 assignment_state → 0016
     # hunt_templates → 0017 runbook_fts → 0018 chat_fts → 0019 quality_snapshots
     # → 0020 runbook_draft → 0021 investigation_error_dismissed → 0022
-    # model_battery_results → 0023 model_fitness_cache → …).
+    # model_battery_results → 0023 model_fitness_cache → 0024 host_dossier →
+    # 0025 general_chat → 0026 quality_counts → 0027 alarm_identity → 0028
+    # status_created_index_denorm → 0029 dossier_run_notes → 0030 saved_view →
+    # …).
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0023"
+        assert row.scalar_one() == "0030"
     await engine.dispose()
 
 
@@ -124,6 +127,49 @@ async def test_finalize_lands_report(settings_kratos: Settings) -> None:
     # finalize on a missing id is a no-op (does not raise)
     async with maker() as db:
         await hunt_svc.finalize(db, "missing", status="complete")
+    await engine.dispose()
+
+
+async def test_finalize_stamps_findings_count(settings_kratos: Settings) -> None:
+    """finalize denormalizes len(report["findings"]) onto the row so the bell
+    never deserializes the report. A report with no findings list stamps 0."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        two = await hunt_svc.create(db, objective="two", started_by="a")
+        await hunt_svc.finalize(db, two.id, status="complete", report=REPORT)  # 1 finding
+        row = await db.get(Hunt, two.id)
+        assert row is not None and row.findings_count == 1
+
+        empty = await hunt_svc.create(db, objective="none", started_by="a")
+        await hunt_svc.finalize(db, empty.id, status="complete", report={"narrative": "clean"})
+        erow = await db.get(Hunt, empty.id)
+        assert erow is not None and erow.findings_count == 0
+    await engine.dispose()
+
+
+async def test_list_recent_notifications_reads_the_findings_count_column(
+    settings_kratos: Settings,
+) -> None:
+    """The bell reads the denormalized ``findings_count`` column, not the report:
+    desync the report to a different finding count and the notif row keeps the
+    stamped value — proof the report blob is never on the select list."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        h = await hunt_svc.create(db, objective="beacons", started_by="a")
+        await hunt_svc.finalize(
+            db, h.id, status="complete", report={"findings": [{"title": "f1"}, {"title": "f2"}]}
+        )
+        # Mutate the report to 5 findings WITHOUT re-stamping the column.
+        row = await db.get(Hunt, h.id)
+        assert row is not None
+        row.report = {"findings": [{"title": f"x{i}"} for i in range(5)]}
+        await db.commit()
+
+        rows = await hunt_svc.list_recent_notifications(db, status="complete", limit=10)
+        assert len(rows) == 1
+        assert isinstance(rows[0], hunt_svc.HuntNotifRow)
+        assert not hasattr(rows[0], "report")
+        assert rows[0].findings_count == 2  # the stamped column, not the 5 in report
     await engine.dispose()
 
 

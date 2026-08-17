@@ -8,6 +8,7 @@ the filter part of OQL is accepted here — grouping is built in.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from soc_ai.config import Settings
@@ -81,6 +82,10 @@ class AlertEvent:
     dst_ip: str | None = None
     dst_port: int | None = None
     kind: str = "suricata"
+    # Address of the machine the detection fired ON (the endpoint agent), for
+    # host-shaped detections that observed no network flow. Deliberately separate
+    # from src_ip/dst_ip — see :func:`_host_ip`.
+    host_ip: str | None = None
 
 
 def _dig(source: dict[str, Any], path: str) -> Any:
@@ -99,6 +104,27 @@ def _oql_filter_dsl(oql: str) -> dict[str, Any]:
     ast = parse_oql(oql)
     validate_oql(ast)
     return filter_to_dsl(ast.filter_)
+
+
+# Absolute @timestamp ranges arrive as raw query-param strings and go straight
+# into an ES ``range``. Two hazards: a non-ISO value makes ES 400 (which used to
+# escape as a 500, since a BadRequestError is an ApiError, not a TransportError),
+# and an unbounded span from a stale ``now-100y`` bookmark issues a century-wide
+# aggregation across the shared grid — the expensive-query class the OQL
+# leading-wildcard rule exists to prevent. Reject non-ISO here (the routes map
+# OqlValidationError to 400) and clamp the span to a bounded window.
+_MAX_ABS_WINDOW = timedelta(days=366)
+
+
+def _parse_abs_ts(value: str, *, bound: str) -> datetime:
+    """Parse an absolute-range bound, rejecting non-ISO input as OqlValidationError."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OqlValidationError(
+            f"{bound} must be an ISO 8601 timestamp (e.g. 2026-08-10T00:00:00Z), got {value!r}",
+            fragment=value,
+        ) from exc
 
 
 def build_filter(
@@ -138,7 +164,16 @@ def build_filter(
             raise OqlValidationError("pipes are not supported here — grouping is built in")
         must.append(_oql_filter_dsl(oql))
     if abs_from and abs_to:
-        ts_range: dict[str, Any] = {"gte": abs_from, "lte": abs_to}
+        lo = _parse_abs_ts(abs_from, bound="from")
+        hi = _parse_abs_ts(abs_to, bound="to")
+        gte, lte = abs_from, abs_to
+        # Clamp an oversized span, comparing tz-naive so a mixed-awareness pair
+        # (one bound with an offset, one without) can't raise — the guard is a
+        # coarse cost ceiling, not a tz-exact computation. Only the lower bound
+        # is pulled up; the upper (the analyst's anchor) is preserved.
+        if hi.replace(tzinfo=None) - lo.replace(tzinfo=None) > _MAX_ABS_WINDOW:
+            gte = (hi - _MAX_ABS_WINDOW).isoformat()
+        ts_range: dict[str, Any] = {"gte": gte, "lte": lte}
         if time_zone:
             ts_range["time_zone"] = time_zone
     else:
@@ -298,6 +333,41 @@ def _endpoint(source: dict[str, Any], side: str) -> str:
     return str(ip) if ip is not None else "—"
 
 
+# Host-shaped detections (Sigma process/file rules built from endpoint events)
+# carry NO top-level host and NO source/destination: Security Onion nests the
+# whole originating endpoint document under `event_data`. These are the nested
+# paths that hold the same two facts.
+_NESTED_HOST_NAME = "event_data.host.name"
+_NESTED_HOST_IP = "event_data.metadata.input.beats.host.ip"
+
+
+def _host_name(source: dict[str, Any]) -> str:
+    """Name of the machine a detection fired on, or the "—" placeholder.
+
+    Top-level ``host.name`` WINS where it exists: on a Suricata alert it is the
+    SENSOR name and the grid is read that way, so the nested endpoint document is
+    only consulted when there is no top-level host at all. Without that fallback
+    every endpoint/process detection showed "—" — soc-ai could not name the
+    machine on exactly the detection class host-log shipping is growing.
+    """
+    name = _dig(source, "host.name") or _dig(source, _NESTED_HOST_NAME)
+    return str(name) if name else "—"
+
+
+def _host_ip(source: dict[str, Any]) -> str | None:
+    """Address of the machine a detection fired on (its agent), or None.
+
+    Deliberately NOT folded into ``src_ip``/``dst_ip``. Those two mean FLOW
+    endpoints, and they are the cluster key the sweep planner and the
+    pair-inheritance lookups key on ``(rule_name, src_ip, dest_ip)``. Putting an
+    agent address there would both assert a flow that was never observed and
+    desync that key from the investigation the recorder writes for these alerts
+    (which carries no flow at all), so a sweep would miss its own prior verdict
+    and re-investigate the rule on every pass.
+    """
+    return _first_ip(_dig(source, "host.ip") or _dig(source, _NESTED_HOST_IP))
+
+
 async def fetch_group_events(
     elastic: ElasticClient,
     settings: Settings,
@@ -365,11 +435,12 @@ async def fetch_group_events(
                 src=_endpoint(source, "source"),
                 dst=_endpoint(source, "destination"),
                 severity=str(_dig(source, "event.severity_label") or "unknown").lower(),
-                host=str(_dig(source, "host.name") or "—"),
+                host=_host_name(source),
                 src_ip=str(src_ip_raw) if src_ip_raw is not None else None,
                 dst_ip=str(dst_ip_raw) if dst_ip_raw is not None else None,
                 dst_port=int(dst_port_raw) if dst_port_raw is not None else None,
                 kind=_kind_for(_dig(source, "event.dataset")),
+                host_ip=_host_ip(source),
             )
         )
     return events

@@ -19,7 +19,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -32,15 +34,17 @@ from soc_ai.api.routes import router
 from soc_ai.api.webui_api import open_router as api_v1_open_router
 from soc_ai.api.webui_api import router as api_v1_router
 from soc_ai.audit.logger import AuditLogger
+from soc_ai.bootstrap_credential import bootstrap_credential_path
 from soc_ai.config import get_settings
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import backtests as bt_svc
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import general_chat as general_chat_svc
 from soc_ai.store import hunt_templates as hunt_templates_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
-from soc_ai.store.auth import bootstrap_admin
+from soc_ai.store.auth import bootstrap_admin, purge_expired_sessions
 from soc_ai.store.config_overrides import apply_to_settings, load_overrides
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.secret_box import make_secret_box
@@ -99,11 +103,16 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
     continues — the reaper must never take the app down. Disabled (no-op loop)
     when either investigation knob is <= 0.
 
-    The chat sweep rides the same cadence: it marks ``pending`` assistant chat
-    rows older than ``chat_turn_timeout_s`` as ``error`` (a turn still inside its
-    timeout is legitimately in flight and is spared). It is a backstop for the
-    in-process timeout/cancel handlers — it catches a turn whose handlers never
+    The chat sweeps ride the same cadence: they mark ``pending`` assistant rows
+    older than ``chat_turn_timeout_s`` as ``error`` (a turn still inside its
+    timeout is legitimately in flight and is spared). They are a backstop for the
+    in-process timeout/cancel handlers — they catch a turn whose handlers never
     ran (e.g. a wedged event loop) or a row a transient DB error left pending.
+
+    Investigation chat and dashboard (general) chat are separate tables with
+    separate reapers, swept in separate try blocks: neither store's sweep may be
+    skipped because the other one raised, since a table that goes unswept has no
+    symptom until an analyst is looking at a turn that will never finish.
     """
     interval_min = settings.investigation_reaper_interval_minutes
     age_min = settings.investigation_reaper_minutes
@@ -153,6 +162,17 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
             raise
         except Exception:
             _LOGGER.exception("chat reaper iteration failed; continuing")
+        try:
+            async with db_sessionmaker() as db:
+                ng = await general_chat_svc.reap_stale_pending(db, older_than=chat_age)
+            if ng:
+                _LOGGER.info(
+                    "reaper: marked %d stale 'pending' dashboard chat turn(s) as error", ng
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("dashboard chat reaper iteration failed; continuing")
 
 
 def _discovery_due(last_scan_iso: str | None, interval_hours: int) -> bool:
@@ -169,6 +189,20 @@ def _discovery_due(last_scan_iso: str | None, interval_hours: int) -> bool:
     except ValueError:
         return True
     return (datetime.now(UTC) - last) >= timedelta(hours=interval_hours)
+
+
+def _dossier_due(last_run_iso: str | None, interval_hours: int) -> bool:
+    """True iff a scheduled host-dossier sweep is due.
+
+    The elapsed-time maths is :func:`_discovery_due`'s; what differs is where
+    ``last_run_iso`` comes from. It is the newest ``dossier_run.started_at`` —
+    a DURABLE stamp — not an ``app.state`` field. An in-memory stamp is ``None``
+    on every boot and ``None`` reads as due, so a crash-restart loop would
+    re-sweep the whole network (hundreds of hosts, several ES round trips each) on
+    each boot. Read from the run table, ``None`` means "no sweep has ever
+    started", which genuinely is due.
+    """
+    return _discovery_due(last_run_iso, interval_hours)
 
 
 def _eval_nightly_due(
@@ -292,6 +326,74 @@ async def _discovery_scheduler_loop(app: FastAPI, settings: Any) -> None:
             raise
         except Exception:
             _LOGGER.exception("discovery scheduler iteration failed; continuing")
+
+
+async def _dossier_scheduler_loop(app: FastAPI, settings: Any) -> None:
+    """Periodically refresh the host dossier (the network's asset context).
+
+    Models :func:`_discovery_scheduler_loop` in every respect — fixed wake
+    cadence, live settings read each wake (a config-console toggle applies
+    without a restart), the shared "Rebuild now" single-flight slot so a manual
+    and a scheduled sweep can never overlap, and a logged-and-swallowed failed
+    iteration because a scheduler must never take the app down.
+
+    The one deliberate difference is the due-check's input. Discovery compares
+    against an ``app.state`` timestamp; this loop reads the newest
+    ``dossier_run`` row, because an in-memory stamp is ``None`` after every
+    restart and ``None`` reads as due — a restart loop would then re-sweep the
+    entire network on each boot. The durable stamp is read once and cached onto
+    the status object, so every later wake stays a settings read and a timestamp
+    compare.
+
+    A failing durable read degrades toward sweeping rather than toward never
+    sweeping again: the sweep itself opens a ``dossier_run`` row against the same
+    database, so a genuinely broken store returns immediately, and the worker
+    stamps ``last_run`` in its ``finally`` regardless — there is no retry storm
+    behind the fail-soft.
+    """
+    # Lazy import: reuse the rebuild-now single-flight + worker (one direction).
+    from soc_ai.api.webui import _get_dossier_status, _run_dossier_task  # noqa: PLC0415
+    from soc_ai.enrichment.host_dossier import latest_run_started_at  # noqa: PLC0415
+
+    wake_seconds = 300
+    while True:
+        await asyncio.sleep(wake_seconds)
+        try:
+            # Re-read every wake → GUI toggle / interval edits apply live.
+            if not settings.dossier_enabled or not settings.dossier_schedule_enabled:
+                continue
+            status = _get_dossier_status(app.state)
+            if status.running:
+                continue  # a sweep (manual or scheduled) is already in flight
+            if status.last_run is None:
+                try:
+                    stamp = await latest_run_started_at(app.state.db_sessionmaker)
+                except Exception:
+                    _LOGGER.warning(
+                        "host dossier: durable last-run read failed; treating the sweep "
+                        "as due (continuing)",
+                        exc_info=True,
+                    )
+                    stamp = None
+                if stamp is not None:
+                    status.last_run = stamp.isoformat()
+                # RE-READ the shared slot: the check above happened before the
+                # await, and a "Rebuild now" landing inside that window would
+                # otherwise get a second network sweep started on top of it —
+                # hundreds of hosts times several ES round trips, twice, which
+                # is the connection-pool pressure that has frozen this app
+                # before. (Read through the accessor, not the narrowed local:
+                # the await is exactly where the value can change.)
+                if _get_dossier_status(app.state).running:
+                    continue
+            if not _dossier_due(status.last_run, settings.dossier_schedule_interval_hours):
+                continue
+            status.running = True  # claim the single-flight slot before scheduling
+            status._task = asyncio.create_task(_run_dossier_task(app.state))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("host dossier scheduler iteration failed; continuing")
 
 
 async def _auto_triage_scheduler_loop(app: FastAPI, settings: Any) -> None:
@@ -449,7 +551,7 @@ def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
     from. Mirrors the chmod(0o600) treatment backup.py gives the Ed25519
     signing key sidecar.
     """
-    cred_path = settings.soc_ai_data_dir / "bootstrap-admin-password.txt"
+    cred_path = bootstrap_credential_path(settings)
     try:
         cred_path.write_text(created_pw + "\n")
         cred_path.chmod(0o600)
@@ -467,6 +569,73 @@ def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
             "change the password, then delete that file.",
             cred_path,
         )
+
+
+async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
+    """Resolve every row the previous process left mid-flight.
+
+    Anything still ``running``/``pending`` when we boot can never finish — the
+    background task that owned it died with the old process — so each store is
+    swept here, with the terminal status that fits its semantics: ``interrupted``
+    where the work is re-runnable, ``error`` where it is a one-shot measurement
+    or an answer nobody will ever receive.
+
+    Split out of :func:`_init_store` because it is ONE concern spread over five
+    stores, and the list only grows: each new background-backed table needs a
+    line here, and a missing one is invisible until a restart happens to land
+    mid-run.
+    """
+    # Investigations: mark 'interrupted' (NOT 'error') — a clean restart cut them
+    # off; they didn't fail. 'interrupted' is re-huntable, so continuous
+    # auto-triage (or a manual re-hunt) picks them back up, and the UI shows a
+    # benign state instead of a scary "error" in a healthy environment.
+    async with db_sessionmaker() as db:
+        orphaned = await inv_svc.reap_stale_running(
+            db, older_than_minutes=None, status="interrupted"
+        )
+    if orphaned:
+        _LOGGER.info("reaped %d orphaned 'running' investigation(s) at startup", orphaned)
+
+    # Hunts mirror the investigation reaper: re-runnable, so 'interrupted'.
+    async with db_sessionmaker() as db:
+        orphaned_hunts = await hunt_svc.reap_stale_running(
+            db, older_than_minutes=None, status="interrupted"
+        )
+    if orphaned_hunts:
+        _LOGGER.info("reaped %d orphaned 'running' hunt(s) at startup", orphaned_hunts)
+
+    # Backtests: mark 'error' — a backtest is a one-shot measurement whose replay
+    # task died, not a re-huntable target.
+    async with db_sessionmaker() as db:
+        orphaned_bt = await bt_svc.reap_stale_running(db, older_than_minutes=None, status="error")
+    if orphaned_bt:
+        _LOGGER.info("reaped %d orphaned 'running' backtest(s) at startup", orphaned_bt)
+
+    # Investigation chat: a 'pending' assistant row would otherwise stay pending —
+    # empty — forever, because the task that was writing the answer is gone.
+    async with db_sessionmaker() as db:
+        orphaned_chat = await chat_svc.reap_stale_pending(db, older_than=None)
+    if orphaned_chat:
+        _LOGGER.info("reaped %d orphaned 'pending' chat turn(s) at startup", orphaned_chat)
+
+    # …and the dashboard's general chat, a SEPARATE table with its own reaper
+    # (chat_svc only scans chat_messages). Skipping it leaves an empty answer
+    # bubble on the landing screen — the first thing every analyst sees — with no
+    # path back to 'done'.
+    async with db_sessionmaker() as db:
+        orphaned_general = await general_chat_svc.reap_stale_pending(db, older_than=None)
+    if orphaned_general:
+        _LOGGER.info(
+            "reaped %d orphaned 'pending' dashboard chat turn(s) at startup", orphaned_general
+        )
+
+    # Expired sessions: get_session_user rejects them but leaves the row, so an
+    # abandoned cookie's row lingers forever. Sweep them here (storage hygiene) —
+    # the lookup is indexed so this is not a hot-path cost, just unbounded growth.
+    async with db_sessionmaker() as db:
+        purged_sessions = await purge_expired_sessions(db)
+    if purged_sessions:
+        _LOGGER.info("purged %d expired session(s) at startup", purged_sessions)
 
 
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
@@ -530,43 +699,7 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
         except Exception:
             _LOGGER.warning("demo fixture seed failed; continuing with empty store", exc_info=True)
 
-    # Reap investigations orphaned by the previous process: any row still
-    # 'running' at startup can never finish (its background task is gone). Mark
-    # them 'interrupted' (NOT 'error') — a clean restart cut them off; they
-    # didn't fail. 'interrupted' is re-huntable, so continuous auto-triage (or a
-    # manual re-hunt) picks them back up, and the UI shows a benign state instead
-    # of a scary "error" in a healthy environment.
-    async with db_sessionmaker() as db:
-        orphaned = await inv_svc.reap_stale_running(
-            db, older_than_minutes=None, status="interrupted"
-        )
-    if orphaned:
-        _LOGGER.info("reaped %d orphaned 'running' investigation(s) at startup", orphaned)
-
-    # Same for hunts orphaned by the previous process (mirror the investigation
-    # reaper): a row still 'running' at startup can't finish — mark 'interrupted'.
-    async with db_sessionmaker() as db:
-        orphaned_hunts = await hunt_svc.reap_stale_running(
-            db, older_than_minutes=None, status="interrupted"
-        )
-    if orphaned_hunts:
-        _LOGGER.info("reaped %d orphaned 'running' hunt(s) at startup", orphaned_hunts)
-
-    # Same for backtests orphaned by the previous process: a row still 'running'
-    # at startup can't finish (its background replay task died). Mark 'error' —
-    # a backtest is a one-shot measurement, not a re-huntable target.
-    async with db_sessionmaker() as db:
-        orphaned_bt = await bt_svc.reap_stale_running(db, older_than_minutes=None, status="error")
-    if orphaned_bt:
-        _LOGGER.info("reaped %d orphaned 'running' backtest(s) at startup", orphaned_bt)
-
-    # Same for chat turns: any 'pending' assistant chat row at startup was
-    # orphaned by the restart (its background chat task died with the previous
-    # process) and would otherwise stay pending — empty — forever.
-    async with db_sessionmaker() as db:
-        orphaned_chat = await chat_svc.reap_stale_pending(db, older_than=None)
-    if orphaned_chat:
-        _LOGGER.info("reaped %d orphaned 'pending' chat turn(s) at startup", orphaned_chat)
+    await _reap_orphans_at_startup(db_sessionmaker)
 
     return db_sessionmaker
 
@@ -660,6 +793,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
 
     reaper_task = asyncio.create_task(_reaper_loop(db_sessionmaker, settings))
     discovery_task = asyncio.create_task(_discovery_scheduler_loop(app, settings))
+    dossier_task = asyncio.create_task(_dossier_scheduler_loop(app, settings))
     autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
     hunt_schedule_task = asyncio.create_task(_hunt_schedule_loop(app))
     eval_nightly_task = asyncio.create_task(_eval_nightly_loop(app, settings))
@@ -674,6 +808,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         discovery_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await discovery_task
+        dossier_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await dossier_task
         autotriage_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await autotriage_task
@@ -704,6 +841,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
             _st._task.cancel()
             with contextlib.suppress(BaseException):
                 await _st._task
+        # Same for an in-flight host-dossier sweep (scheduled or "Rebuild now"):
+        # it holds the ES + DB clients for minutes at a time, so it must be
+        # cancelled and drained BEFORE they are torn down or it lands a
+        # use-after-close ES search partway through the network.
+        from soc_ai.api.webui import _get_dossier_status  # noqa: PLC0415
+
+        _ds = _get_dossier_status(app.state)
+        if _ds._task is not None and not _ds._task.done():
+            _ds._task.cancel()
+            with contextlib.suppress(BaseException):
+                await _ds._task
         # The scheduler LOOPS are cancelled above, but the WORKER tasks they
         # spawn (auto-triage drain, backtest replay) and manually-started hunt
         # console drains hold references to the ES + DB clients. Cancel + drain
@@ -775,22 +923,41 @@ def _resolve_cors_origins(cors_setting: str, so_host: str) -> list[str]:
 # against the live route table: the soc_ai.api.routes router is included with
 # NO prefix, so investigate lives at /investigate (not /api/v1/investigate);
 # the webui hunts router is under /api/v1.
+#
+# The Dashboard general chat is here too, and it is the one entry that is not a
+# replay: on a demo BOTH its verbs resolve inside soc_ai/api/webui/routes_chat.py
+# without touching the store (see the demo section there), so allow-listing them
+# hands a visitor no write. Both verbs are needed and neither is surplus:
+# POST is the reply itself — this box sits on the LANDING SCREEN, so refusing it
+# means the first thing a visitor touches errors; DELETE backs the panel's
+# "Clear conversation" control, which appears as soon as a reply does, and
+# refusing it would put an error under the landing screen instead. PUT/PATCH are
+# not routes here and stay refused.
 _DEMO_WRITE_ALLOW: set[tuple[str, str]] = {
     ("POST", "/investigate"),
     ("POST", "/api/v1/hunt"),
+    ("POST", "/api/v1/chat"),
+    ("DELETE", "/api/v1/chat"),
 }
 
-# Chat + hunt-start POSTs carry a variable id in the path, so they can't live in
-# the exact-match set above — match them by pattern. In demo mode these POSTs are
-# turned into canned, ZERO-EGRESS replies by the demo branches in the chat/hunt
-# managers (soc_ai/webui/chat_manager.py, soc_ai/webui/hunt_console_manager.py);
-# ``/api/v1/hunts/chat`` (hunt-start) is wired to a fixture replay in a later task.
+# Chat routes carry a variable id in the path, so they can't live in the
+# exact-match set above — match them by (method, pattern). In demo mode these
+# POSTs are turned into canned, ZERO-EGRESS replies by the demo branches in the
+# chat/hunt route handlers and managers (soc_ai/api/webui/routes_chat.py,
+# soc_ai/webui/chat_manager.py, host_chat_manager.py, hunt_console_manager.py);
+# ``/api/v1/hunts/chat`` (hunt-start) is wired to a fixture replay in a later
+# task. The host chat's DELETE is the one non-POST: like the general chat's
+# DELETE it backs the panel's "Clear conversation" control and, on a demo,
+# deletes nothing (routes_chat serves it as a no-op) — refusing it would put an
+# error under the first reply a visitor gets.
 # Anchored ``^...$`` so a pattern can only allow the exact chat routes — never a
 # broader mutating route that merely contains the substring.
-_DEMO_WRITE_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^/api/v1/investigations/[^/]+/chat$"),
-    re.compile(r"^/api/v1/hunts/[^/]+/chat$"),
-    re.compile(r"^/api/v1/hunts/chat$"),  # hunt-start (fixture replay wired later)
+_DEMO_WRITE_ALLOW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/api/v1/investigations/[^/]+/chat$")),
+    ("POST", re.compile(r"^/api/v1/hunts/[^/]+/chat$")),
+    ("POST", re.compile(r"^/api/v1/hunts/chat$")),  # hunt-start → seeded hunt id (ephemeral)
+    ("POST", re.compile(r"^/api/v1/dossiers/[^/]+/chat$")),
+    ("DELETE", re.compile(r"^/api/v1/dossiers/[^/]+/chat$")),
 )
 
 
@@ -814,6 +981,32 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         redoc_url="/redoc" if _expose_docs else None,
         openapi_url="/openapi.json" if _expose_docs else None,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_without_input(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """422 body with the rejected ``input`` stripped out.
+
+        FastAPI's default handler serialises the offending value back to the
+        caller. For every credential field in this API — ``/login``'s password,
+        create-user's password, ``/me/password``'s current AND new password —
+        that value IS the plaintext secret, and a 422 is exactly what an
+        over-long one produces (the Field(max_length=…) bound fires before the
+        handler's own checks). The echoed plaintext then lands wherever 4xx
+        bodies land: reverse-proxy capture logs, frontend error reporters,
+        browser devtools history.
+
+        Nothing in the SPA reads ``input`` — it renders ``detail.hint`` or the
+        status line — so dropping it costs no diagnostics. ``ctx`` goes too: for
+        string-length errors it carries no value, but it is a serialiser of
+        arbitrary validator context and not worth auditing per-error-type.
+        """
+        scrubbed = [
+            {k: v for k, v in err.items() if k not in ("input", "ctx")} for err in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(scrubbed)})
+
     try:
         _demo = get_settings().soc_ai_demo
     except Exception:
@@ -834,8 +1027,8 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         @app.middleware("http")
         async def _demo_readonly(request: Any, call_next: Any) -> Response:
             _path = request.url.path
-            _allowed = (request.method, _path) in _DEMO_WRITE_ALLOW or (
-                request.method == "POST" and any(p.match(_path) for p in _DEMO_WRITE_ALLOW_PATTERNS)
+            _allowed = (request.method, _path) in _DEMO_WRITE_ALLOW or any(
+                request.method == m and p.match(_path) for m, p in _DEMO_WRITE_ALLOW_PATTERNS
             )
             if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _allowed:
                 return JSONResponse(

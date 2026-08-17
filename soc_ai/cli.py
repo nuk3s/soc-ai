@@ -1364,8 +1364,14 @@ def _register_eval_nightly(sub: Any) -> None:
     )
     p_en.add_argument(
         "--out-dir",
-        default="evals",
-        help="Parent directory for the batch-<ts>/ artifact subdir (default: ./evals)",
+        # None (not "evals") so the default is resolved against the install's
+        # data dir — in a container the WORKDIR is not a volume, so a relative
+        # default silently discards every bundle on the next recreate, taking
+        # the oracle critiques behind each alarm with it.
+        default=None,
+        help="Parent directory for the batch-<ts>/ artifact subdir "
+        "(default: alongside the data dir, e.g. /var/lib/soc-ai/evals; ./evals "
+        "on a host install)",
     )
     p_en.add_argument(
         "--per-run-timeout-s",

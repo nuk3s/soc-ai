@@ -90,6 +90,14 @@ services:
       # Seed with: docker compose run --rm soc-ai soc-ai blocklists refresh
       - soc_ai_cloud_prefixes:/var/lib/soc-ai/cloud_prefixes
 
+      # Nightly quality-eval artifacts: the per-alert bundles and oracle
+      # critiques behind every point on the dashboard's Quality card. NOT
+      # optional if you want the regression alarm to be actionable — the
+      # critiques are the only evidence for or against an alarm, and without
+      # this volume they live in the container filesystem, so every recreate
+      # (image update, `docker compose up -d`) deletes them.
+      - soc_ai_evals:/var/lib/soc-ai/evals
+
     # ── Health check ─────────────────────────────────────────────────────────
     # Mirrors the HEALTHCHECK in the Dockerfile; compose uses it to gate
     # dependent services (e.g. a future nginx reverse-proxy).
@@ -139,3 +147,8 @@ volumes:
   soc_ai_blocklists:
   soc_ai_maxmind:
   soc_ai_cloud_prefixes:
+
+  # Nightly quality-eval artifacts — evidence, not cache: nothing regenerates
+  # a deleted bundle, and the trend row that points at it outlives it by
+  # ~3 months.
+  soc_ai_evals:

@@ -330,6 +330,19 @@ async def test_check_gateway_unset_rag_models_skipped(tmp_path: Path) -> None:
 # ── check 5: model fitness ───────────────────────────────────────────────────
 
 
+def test_doctor_fitness_bound_sits_above_the_probes_own_budget() -> None:
+    """The wrapper must outlast the probe it wraps.
+
+    These constants live in different modules and have drifted twice: doctor's
+    40s wrapper sat under a probe budget that had grown to 100s and then 130s,
+    so doctor cancelled healthy probes mid-leg and reported its own impatience
+    as a model failure. Pinning the relation, not the numbers, lets the probe
+    budget move without re-breaking doctor."""
+    from soc_ai.webui import probes
+
+    assert doctor._FITNESS_TIMEOUT_S > probes._FITNESS_TOTAL_TIMEOUT_S
+
+
 async def test_check_model_fitness_unfit_is_fail(tmp_path: Path) -> None:
     probe = AsyncMock(return_value=_fitness("fail", "m: structured_output=fail"))
     with patch("soc_ai.doctor.probe_model_fitness", probe):

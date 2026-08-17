@@ -237,10 +237,16 @@ class ModelFitnessLegOut(BaseModel):
     ok: bool
     grade: str  # "pass" | "degraded" | "fail"
     detail: str
+    # How slow, and on which backend (2026-08-07). Every recorded FAIL in the
+    # first 50 checks was a timeout reported as an unfalsifiable "timed out";
+    # these two make the same event arguable. Null on a leg that never ran far
+    # enough to measure, and on results cached before this shipped.
+    elapsed_s: float | None = None
+    backend: str | None = None
 
 
 class ModelFitnessOut(BaseModel):
-    grade: str  # "pass" | "degraded" | "fail"
+    grade: str  # "pass" | "degraded" | "fail" | "unknown"
     model: str
     legs: list[ModelFitnessLegOut] = []
     detail: str
@@ -249,11 +255,205 @@ class ModelFitnessOut(BaseModel):
     # route does — so within the TTL the route answers from the stored result.
     cached: bool = False
     checked_at: str | None = None
+    # Which gateway backend served the probe (LiteLLM attribution headers). An
+    # alias can be re-routed without the client seeing it, so "model X is unfit"
+    # otherwise names what we asked for, not what ran.
+    served_backend: dict[str, str] | None = None
+    # Was a measurement actually taken for this response? False when the
+    # self-load guard declined to probe (see ``_self_load_reason``), in which
+    # case ``note`` says why and the verdict is the cached one (or "unknown").
+    measured: bool = True
+    note: str | None = None
+    # n-of-m history from the audit store. ``alarm`` is the ONE boolean the chip
+    # should key its red state on; the rest is the sentence under it ("unfit —
+    # 2 of last 5 checks failed, last pass 3h ago"). All null when the audit
+    # store could not be read, where ``alarm`` degrades to the single sample.
+    alarm: bool = False
+    recent_checks: int | None = None
+    recent_fails: int | None = None
+    consecutive_fails: int | None = None
+    last_pass_at: str | None = None
 
 
 # One day: the operator's "maybe once a day" (dogfood 2026-08-05). The manual
 # "Check fitness" button always bypasses via ?force=true.
 _FITNESS_CACHE_TTL_S = 24 * 3600
+
+# How many checks the n-of-m window holds, and how many consecutive fails it
+# takes to call the model unfit. WHY 2: of the 50 recorded checks for the live
+# analyst model, 25 graded FAIL and every one was a timeout — several of them
+# while soc-ai's own eval was saturating the same gateway. One adverse sample is
+# a measurement; two in a row is a verdict.
+_FITNESS_HISTORY_N = 5
+_FITNESS_ALARM_CONSECUTIVE = 2
+# How many docs to pull per window slot, since the model match is applied after
+# the fetch (see _recent_fitness_checks). Covers an operator A/B-ing two models
+# without a second round trip.
+_HISTORY_OVERFETCH = 4
+
+
+def _self_load_reason(state: Any) -> str | None:
+    """Name the soc-ai batch currently saturating the gateway, or None.
+
+    A fitness probe measures the model AND everything queued in front of it. At
+    22:37:10 on 2026-08-06 the probe graded deepseek-v4-flash UNFIT while a
+    graded eval was in flight against the same gateway — and that eval landed
+    nine minutes later with agreement 1.0 over n_ok=5. The model "unable to
+    produce a TriageReport" produced five, correctly, concurrently.
+
+    Reads each batch through its OWNER's accessor rather than poking app.state
+    attribute names, so a renamed status slot fails in CI (the tests import the
+    same accessors) instead of quietly disabling the guard. At runtime it is
+    fail-soft: the guard is a refinement of a read-only diagnostic and must never
+    be the reason the Config page 500s.
+    """
+    try:
+        from soc_ai.api.webui.routes_quality import _get_quality_eval_status  # noqa: PLC0415
+        from soc_ai.webui import autotriage as at  # noqa: PLC0415
+
+        if _get_quality_eval_status(state).running:
+            return "quality-eval batch in flight"
+        if at.get_status(state).active:
+            return "auto-triage batch in flight"
+        if _battery_status(state).running:
+            return "model battery in flight"
+    except Exception:
+        _LOGGER.warning("model_fitness self-load check failed (probing anyway)", exc_info=True)
+    return None
+
+
+def _fitness_history_summary(window: list[dict[str, str]]) -> dict[str, Any]:
+    """Fold the last-N checks (newest first) into the chip's n-of-m summary.
+
+    ``window`` entries are ``{"grade": ..., "at": <iso>}``. ``alarm`` is True
+    only on :data:`_FITNESS_ALARM_CONSECUTIVE` consecutive fails ending at the
+    newest check, so a single slow measurement reports honestly without
+    condemning the model.
+    """
+    consecutive = 0
+    for entry in window:
+        if entry["grade"] != "fail":
+            break
+        consecutive += 1
+    return {
+        "alarm": consecutive >= _FITNESS_ALARM_CONSECUTIVE,
+        "recent_checks": len(window),
+        "recent_fails": sum(1 for e in window if e["grade"] == "fail"),
+        "consecutive_fails": consecutive,
+        "last_pass_at": next((e["at"] for e in window if e["grade"] == "pass"), None),
+    }
+
+
+async def _recent_fitness_checks(
+    request: Request, settings: Settings, *, model: str, limit: int
+) -> list[dict[str, str]] | None:
+    """The last *limit* stored ``model_fitness`` checks for *model*, newest first.
+
+    The audit index already holds every check ever run — the history the chip
+    needs exists without a schema change. Returns None (NOT an empty list) when
+    the audit store can't be read, so the caller degrades to single-sample
+    behaviour instead of claiming a clean history off a failed query. Never
+    raises: an unreadable audit index must not break the Config page.
+
+    Only ``kind`` is filtered server-side; the model match happens here, on the
+    returned payloads. ``payload`` is mapped ``flattened`` only on indices created
+    after that template landed, so a term query on ``payload.model`` would match
+    NOTHING on an older daily index — and a silently empty history means the
+    alarm can never fire again. Over-fetching a handful of docs is the cheaper
+    failure mode.
+    """
+    elastic = getattr(request.app.state, "elastic", None)
+    if elastic is None:
+        return None
+    query = {"bool": {"filter": [{"term": {"kind": "model_fitness"}}]}}
+    try:
+        # Same bound as the egress counts below: a silent grid must cost the chip
+        # its history, not cost the operator ninety seconds of frozen Config page.
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            result = await elastic.search(
+                f"{settings.audit_index_alias}-*",
+                query,
+                size=limit * _HISTORY_OVERFETCH,
+                sort=[{"timestamp": {"order": "desc"}}],
+            )
+        hits = result.hits
+    except Exception:
+        _LOGGER.info("model_fitness history unavailable (chip falls back to one sample)")
+        return None
+    if not isinstance(hits, list):
+        return None
+    checks: list[dict[str, str]] = []
+    for hit in hits:
+        src = hit.get("_source") if isinstance(hit, dict) else None
+        if not isinstance(src, dict):
+            continue
+        payload = src.get("payload")
+        if not isinstance(payload, dict) or str(payload.get("model", "")) != model:
+            continue  # another model's checks must not colour this one's history
+        grade = str(payload.get("grade", ""))
+        at = str(src.get("timestamp", ""))
+        if grade and at:
+            checks.append({"grade": grade, "at": at})
+        if len(checks) >= limit:
+            break
+    return checks
+
+
+async def _fitness_out(
+    request: Request,
+    settings: Settings,
+    *,
+    result: dict[str, Any],
+    model_id: str,
+    cached: bool = False,
+    checked_at: str | None = None,
+    measured: bool = True,
+    note: str | None = None,
+) -> ModelFitnessOut:
+    """Compose the chip payload: this verdict plus its n-of-m history.
+
+    Every return path goes through here so the cached verdict — which is what
+    the Config page actually renders most of the time — carries the same
+    history summary as a fresh measurement.
+
+    A freshly measured verdict is not in the audit index yet, so it is prepended
+    to the window; a cached or not-measured one already is, so the window is the
+    stored history alone (prepending would double-count it).
+    """
+    history = await _recent_fitness_checks(
+        request, settings, model=model_id, limit=_FITNESS_HISTORY_N
+    )
+    grade = str(result.get("grade", "unknown"))
+    if measured and not cached:
+        window = [{"grade": grade, "at": checked_at or ""}, *(history or [])][:_FITNESS_HISTORY_N]
+    else:
+        window = list(history or [])[:_FITNESS_HISTORY_N]
+
+    if history is None or not window:
+        # No readable history: keep today's behaviour (one sample decides) rather
+        # than claim a clean record we never read.
+        summary: dict[str, Any] = {
+            "alarm": grade == "fail",
+            "recent_checks": None,
+            "recent_fails": None,
+            "consecutive_fails": None,
+            "last_pass_at": None,
+        }
+    else:
+        summary = _fitness_history_summary(window)
+
+    return ModelFitnessOut(
+        grade=grade,
+        model=str(result.get("model", model_id)),
+        legs=[ModelFitnessLegOut(**leg) for leg in result.get("legs", [])],
+        detail=str(result.get("detail", "")),
+        cached=cached,
+        checked_at=checked_at,
+        served_backend=result.get("served_backend"),
+        measured=measured,
+        note=note,
+        **summary,
+    )
 
 
 @router.get(
@@ -280,10 +480,18 @@ async def api_model_fitness(
     write is best-effort: config routes are otherwise audit-free, and a failed
     audit index must never turn a read-only diagnostic into a 500 — so it is
     wrapped and logged, never raised.
+
+    Two guards on the AUTO path (``force=false``), both from the 2026-08-07 audit
+    of all 50 stored checks. First, the probe does not run while soc-ai's own
+    eval/auto-triage/battery is saturating the gateway — that measures the queue,
+    not the model. Second, the red state is n-of-m: the response carries the last
+    checks read back out of the audit index, and ``alarm`` needs two consecutive
+    fails. ``?force=true`` (the operator's "Check fitness") bypasses the first.
     """
     from soc_ai.store import model_battery as mb_svc  # noqa: PLC0415
 
     model_id = str(settings.analyst_model or "")
+    cached: dict[str, Any] | None = None
     if not force:
         # Serve the cached verdict inside the TTL — page loads must not cost a
         # gateway probe (dogfood 2026-08-05: "Checking fitness…" every visit).
@@ -296,9 +504,39 @@ async def api_model_fitness(
             except ValueError:
                 age_s = _FITNESS_CACHE_TTL_S + 1
             if age_s < _FITNESS_CACHE_TTL_S:
-                return ModelFitnessOut(
-                    **cached["result"], cached=True, checked_at=cached["checked_at"]
+                return await _fitness_out(
+                    request,
+                    settings,
+                    result=cached["result"],
+                    model_id=model_id,
+                    cached=True,
+                    checked_at=cached["checked_at"],
                 )
+
+        # Stale (or absent) cache AND soc-ai is hammering its own gateway: keep
+        # the old verdict rather than manufacture a new one from queue latency.
+        load = _self_load_reason(request.app.state)
+        if load is not None:
+            note = f"not measured: {load}"
+            if cached is not None:
+                return await _fitness_out(
+                    request,
+                    settings,
+                    result=cached["result"],
+                    model_id=model_id,
+                    cached=True,
+                    checked_at=cached["checked_at"],
+                    measured=False,
+                    note=note,
+                )
+            return await _fitness_out(
+                request,
+                settings,
+                result={"grade": "unknown", "model": model_id, "legs": [], "detail": note},
+                model_id=model_id,
+                measured=False,
+                note=note,
+            )
 
     result = await probes.probe_model_fitness(settings)
     checked_at_now = datetime.now(UTC).replace(tzinfo=None).isoformat()
@@ -307,6 +545,12 @@ async def api_model_fitness(
             await mb_svc.upsert_fitness(db, model=model_id, result=result)
     except Exception:  # cache write is best-effort — never fail the diagnostic
         _LOGGER.warning("model_fitness cache write failed (continuing)", exc_info=True)
+
+    # Compose (and read the history) BEFORE the audit write: this run's own
+    # record must not land in its own n-of-m window.
+    out = await _fitness_out(
+        request, settings, result=result, model_id=model_id, checked_at=checked_at_now
+    )
 
     # Best-effort audit. request.app.state.audit is the shared AuditLogger; its
     # own log() swallows ES write errors for non-mutating events, but we still
@@ -335,23 +579,21 @@ async def api_model_fitness(
     # graded FAIL + notify_on_model_fitness_fail is on, and fire it (a hard no-op
     # unless notifications are enabled + a webhook is configured). Wrapped so a
     # webhook can never turn this read-only diagnostic into a 500.
+    #
+    # Gated on the SAME n-of-m alarm as the chip: paging on every transient
+    # measurement is what taught on-call to ignore the unfit-model alert (25 of
+    # the first 50 checks graded FAIL, all of them timeouts).
     try:
-        from soc_ai import notify  # noqa: PLC0415
+        if out.alarm:
+            from soc_ai import notify  # noqa: PLC0415
 
-        event = notify.event_for_model_fitness(result=result, settings=settings)
-        if event is not None:
-            await notify.fire_safe(event, settings, getattr(request.app.state, "audit", None))
+            event = notify.event_for_model_fitness(result=result, settings=settings)
+            if event is not None:
+                await notify.fire_safe(event, settings, getattr(request.app.state, "audit", None))
     except Exception:  # a notification must never break the diagnostic
         _LOGGER.warning("model_fitness notify trigger failed (continuing)", exc_info=True)
 
-    return ModelFitnessOut(
-        grade=result["grade"],
-        model=result["model"],
-        legs=[ModelFitnessLegOut(**leg) for leg in result.get("legs", [])],
-        detail=result["detail"],
-        cached=False,
-        checked_at=checked_at_now,
-    )
+    return out
 
 
 # ── Audit chain verification (admin) ───────────────────────────────────────
@@ -400,6 +642,7 @@ async def api_audit_verify_chain(
     from datetime import UTC, datetime  # noqa: PLC0415
 
     from soc_ai.audit.verify import verify_audit_chain  # noqa: PLC0415
+    from soc_ai.so_client.elastic import GridPartialResultsError  # noqa: PLC0415
 
     elastic = getattr(request.app.state, "elastic", None)
     if elastic is None:
@@ -410,6 +653,17 @@ async def api_audit_verify_chain(
 
     try:
         result = await verify_audit_chain(elastic, settings.audit_index_alias, days=days)
+    except GridPartialResultsError as exc:
+        # ES answered 200 but read only part of the audit index. The same refusal
+        # as any other read failure — unverifiable, never a verdict either way —
+        # but with the full shard story in the message: the operator must be able
+        # to tell "could not read the whole index" apart from "the chain broke",
+        # and the generic arm below deliberately reports only an exception type.
+        _LOGGER.warning("audit chain verification read only part of the index: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail={"reason": "audit_verify_failed", "message": str(exc)},
+        ) from exc
     except Exception as exc:
         # A verification is meaningless if we couldn't read the records — surface
         # it as "could not run", never as an intact chain.
@@ -611,9 +865,17 @@ async def api_egress_policy(
     if all_kinds:
         try:
             elastic = getattr(request.app.state, "elastic", None)
-            counts_by_kind = await audit_counts_by_kind(
-                elastic, settings.audit_index_alias, all_kinds, days=7
-            )
+            # Bounded at the console's grid budget rather than the ES client's
+            # retry budget (~90 s at shipped defaults). A grid that accepts the
+            # connection and never answers raises nothing, so the fail-soft
+            # handler below never ran and the page simply hung — and the one page
+            # an operator opens to check "is anything leaving this box" is the
+            # worst place in the product to look frozen. A timeout lands in that
+            # handler like any other failure: unknown counts, table still drawn.
+            async with asyncio.timeout(settings.webui_grid_timeout_s):
+                counts_by_kind = await audit_counts_by_kind(
+                    elastic, settings.audit_index_alias, all_kinds, days=7
+                )
         except Exception:  # the helper is fail-soft, but never trust it to a 500
             _LOGGER.warning("egress-policy audit counts failed (continuing null)", exc_info=True)
             counts_by_kind = {}
@@ -1225,6 +1487,15 @@ async def api_danger_test_connection(
 ) -> ConnTestOut:
     """Run a connectivity probe for target ∈ {es, llm}.
     Returns {ok, detail}. Detail is secret-free — probes.py scrubs credentials internally.
+
+    The ES leg is bounded by ``webui_grid_timeout_s``. ``probe_es`` never raises,
+    so against a grid that accepts the connection and never answers it simply did
+    not come back: the probe sat on the ES client's retry budget (~90 s at shipped
+    defaults) and the BROWSER produced the verdict when it gave up at 20 s. The one
+    control on this page whose entire job is diagnosing the grid was the one control
+    that could not state a diagnosis. On expiry it states one — definitive, from the
+    server, naming the budget it waited out. The LLM leg needs no wrapper: it is an
+    HTTP call to the gateway under its own per-request timeout, not an ES read.
     """
     if target not in _DANGER_TEST_TARGETS:
         valid = sorted(_DANGER_TEST_TARGETS)
@@ -1234,7 +1505,18 @@ async def api_danger_test_connection(
         )
 
     if target == "es":
-        result = await probes.probe_es(request.app.state.elastic)
+        budget = settings.webui_grid_timeout_s
+        try:
+            async with asyncio.timeout(budget):
+                result = await probes.probe_es(request.app.state.elastic)
+        except TimeoutError:
+            return ConnTestOut(
+                ok=False,
+                detail=(
+                    f"Security Onion did not answer within {budget}s — treating the grid "
+                    "as down. Check Elasticsearch load and shard health."
+                ),
+            )
     else:
         result = await probes.probe_llm(settings)
 
@@ -1388,6 +1670,14 @@ async def api_model_battery_status(
     target = model or settings.analyst_model
     async with request.app.state.db_sessionmaker() as db:
         stored = await mb_svc.get(db, model=target)
+    # A fitness-only row carries an empty-dict result marker: a quick fitness
+    # check ran (the one that fires on Config mount) but no full battery. A real
+    # battery report always has a ``configs`` key; the marker has none. Serve the
+    # marker as absent — a truthy ``{}`` on the wire has no configs array, and the
+    # UI's table render did ``result.configs.map`` on it, taking down the whole
+    # Config page (P0). Null in, honest wire shape out.
+    result = stored["result"] if stored else None
+    has_battery = isinstance(result, dict) and "configs" in result
     return {
         "running": False,
         "model": target,
@@ -1395,6 +1685,6 @@ async def api_model_battery_status(
         "completed": 0,
         "total": 4,
         "error": status.error,
-        "result": stored["result"] if stored else None,
-        "stored_at": stored["created_at"] if stored else None,
+        "result": result if has_battery else None,
+        "stored_at": stored["created_at"] if (stored and has_battery) else None,
     }

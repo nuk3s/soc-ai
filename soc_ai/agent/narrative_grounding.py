@@ -34,6 +34,51 @@ UNVERIFIED_CAVEAT = (
 _SCOPED_CAVEAT_CAP = 4
 
 
+# Cap on artifacts named in a correction prompt — enough to be actionable
+# without letting a pathological answer blow the turn's context budget.
+_REGROUND_CAP = 8
+
+
+def regrounding_instruction(ungrounded: list[str]) -> str:
+    """Correction prompt for an answer that asserted ungrounded artifacts.
+
+    The validator has always been able to NAME the fabricated claims; until now
+    it only warned the analyst about them. Feeding the same finding back to the
+    agent turns a caveat into a fix: verify the claim with a tool call, or take
+    it out.
+
+    The wording matters in two ways learned from live failures. It offers only
+    those two resolutions — never "hedge it", because a softened fabrication is
+    still a fabrication and reads as analysis. And it explicitly forbids
+    manufacturing support, since the adjacent failure mode is an agent
+    "grounding" a claim by describing a tool result it never received (the
+    fabricated-tool-citation class this module already guards separately).
+
+    Returns "" when there is nothing to correct, so the caller can treat an
+    empty string as "no retry needed".
+    """
+    if not ungrounded:
+        return ""
+    shown = ungrounded[:_REGROUND_CAP]
+    listing = ", ".join(f"`{a}`" for a in shown)
+    more = (
+        "" if len(ungrounded) <= _REGROUND_CAP else f" (and {len(ungrounded) - _REGROUND_CAP} more)"
+    )
+    return (
+        "\n\nCORRECTION REQUIRED. Your previous answer stated these as observed "
+        f"facts, but none of them appear in this turn's tool results or in the "
+        f"investigation's evidence: {listing}{more}.\n"
+        "Rewrite the answer. For EACH claim above, do exactly one of:\n"
+        "  1. Call a tool that actually establishes it, then state it citing that "
+        "tool result; or\n"
+        "  2. Remove the claim entirely.\n"
+        "Do NOT soften, hedge or re-word an unsupported claim to make it sound "
+        "tentative — an unverified assertion is still unverified. Do NOT describe "
+        "a tool result you did not receive. If a claim cannot be verified, say "
+        "plainly that it is unknown and what you would need to check."
+    )
+
+
 def scoped_unverified_caveat(ungrounded: list[str]) -> str:
     """Caveat for a turn that DID run tools but asserted some ungrounded artifacts.
 
@@ -68,7 +113,20 @@ _HOSTNAME = re.compile(
 # Dotted FQDNs / domains: ad.local, wsus.internal, foo.corp.example.com.
 # Requires at least one dot and an alphabetic TLD-ish final label (>=2 chars) so
 # we don't catch version strings or "e.g".
-_DOMAIN = re.compile(r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,24}\b")
+#
+# Two changes keep it LINEAR on dot-dense text (a payload_printable / DNS blob a
+# model can echo into the narrative) instead of the old quadratic backtracking:
+#   * the label-dot group repeats a BOUNDED {1,126} times (127 labels incl. the
+#     TLD is the DNS maximum), so a failing match at each dotted start position
+#     does O(1) work instead of re-walking the whole chain — this is what removes
+#     the O(n^2);
+#   * the optional interior run is POSSESSIVE (``?+``) so a single label has one
+#     decomposition and never backtracks internally.
+# Both preserve matching semantics for every real domain (verified by a
+# same-matches test); only pathological >126-label strings differ.
+_DOMAIN = re.compile(
+    r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?+\.){1,126}[a-zA-Z]{2,24}\b"
+)
 # IPv4 dotted-quad.
 _IPV4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 # JA3 / JA3S / MD5-shaped 32-hex fingerprints.

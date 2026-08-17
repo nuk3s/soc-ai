@@ -271,6 +271,12 @@ if [[ $RECFG == y ]]; then
   # Carry the same cross-cluster prefix to the cases/detections/playbooks indices.
   EIDX_PFX=""; [[ ${EVENTS_INDEX_PATTERN} == \*:* ]] && EIDX_PFX="*:"
   yesno APIAUTH "  Require login/token for the API? (recommended)" "$(b2yn "${API_AUTH_REQUIRED:-true}")"
+  if [[ $APIAUTH == n ]]; then
+    warn "API auth OFF — admin endpoints answer ANY caller that can reach the port."
+    warn "  Not just writes (secret edits, user/token creation) but admin READS:"
+    warn "  the user table, config, and which connection secrets are set. Safe only"
+    warn "  on a loopback-bound dev box — choose 'yes' for any host reachable on the LAN."
+  fi
 
   echo
   info "Enrichment feeds (optional):"

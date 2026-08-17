@@ -6,6 +6,326 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **A Dashboard assistant that answers you instead of handing you off.** The
+  "Ask soc-ai" box on the landing screen used to prefill the Hunt Console and
+  navigate away, so "what datasets do I have?" became a multi-minute background
+  job. It is now a chat: it answers in one turn using the investigation chat's
+  read tools, at roughly the same latency. Each analyst gets one rolling thread
+  that survives navigation and restarts; **Clear** discards it. When a question
+  needs a sweep, the agent does not start one. It writes the hunt objective from
+  what it just looked at, says what the sweep would settle, and puts a **Start
+  hunt** control in front of you. It has no write tools and cannot change a
+  verdict. New setting `general_chat_enabled` (Config → Models & Reasoning →
+  Agent, hot, on by default) switches it off without a restart. That matters if
+  a shared analyst model is already busy with the triage backlog: this is the
+  one agent that sits on the screen everyone lands on. New endpoints
+  `GET`/`POST`/`DELETE /api/v1/chat`, migration 0025,
+  and the flag rides on `GET /api/v1/about` so a disabled deployment hides the
+  box rather than failing the first question someone asks.
+- **soc-ai knows what a host is.** Every internal address was only an address:
+  "10.0.0.5 is probing SSH" read as unremarkable internal noise, where "the
+  hypervisor running your SIEM and your backups is probing SSH" would have been
+  escalated on sight. Same events, opposite urgency, and the whole difference is
+  asset knowledge the product did not hold. A sweep now builds a durable record
+  for each internal host out of telemetry already in Elasticsearch — hostname,
+  OS, the services it answers on, a behavioral baseline, and an inferred role
+  (hypervisor / domain controller / security appliance / server / workstation /
+  network device / IoT) — and the agent reads it through `t_host_dossier` and a
+  prompt block on every investigation, chat and hunt. Classification is
+  rule-based and deterministic, never model-written: an ordered port-set table
+  with peer-count and hour-spread preconditions, so one inbound SSH connection
+  can no longer promote a laptop to "server". A dossier is context and never
+  evidence — it is marked system-inferred in the prompt and cannot satisfy the
+  evidence gate, because "this is probably a hypervisor" is a conclusion, and a
+  conclusion must not unlock a confident verdict the way an observation does.
+  What you declare and what the system infers are stored in separate columns
+  and resolved at read time, so an override survives every later sweep
+  structurally rather than by convention; the builder keeps observing an
+  overridden host anyway, so three consecutive builds that disagree with your
+  value earn one prompt, then at most one per 14 days, with "keep mine"
+  snoozing on a backoff capped at 90 days. Thirteen hot settings under
+  Config → Host dossier. **The schedule (`dossier_schedule_enabled`) is off by
+  default** — a sweep is hundreds of hosts times several Elasticsearch round
+  trips, so you choose when it runs; `POST /api/v1/dossiers/refresh` (admin,
+  single-flight) runs one now, and `dossier_context_enabled` takes the dossier
+  back out of prompts while leaving the data building. Reads are
+  `GET /api/v1/dossiers`, `/dossiers/{ip}`, `/dossiers/conflicts` and
+  `/dossiers/summary`; overrides are admin-gated and audited. Migration 0024.
+  The record reaches you through the agent, the API, and the Hosts screen
+  below.
+- **The agent asks who was driving an internal host before it blames the
+  host.** On 2026-08-05 soc-ai attributed SSH username-probing to an internal
+  host and stopped there, while the events it had already pulled included a
+  `zeek.ssh` record showing a different machine opening an SSH session to that
+  host seconds earlier. The real actor was one pivot away and never got named.
+  `t_host_summary` cannot answer this by construction: its peer list is
+  a volume-ranked aggregation over 24 hours, so a two-second session is
+  invisible beside thousands of routine events, and an aggregation carries no
+  ordering — "immediately before" is not expressible in it. The new
+  `t_origin_chain` lists remote-access sessions inbound to a host in the window
+  before the activity, time-ordered, and names the closest preceding one as the
+  likely driver. It matches SSH, RDP, WinRM and SMB by dataset or by well-known
+  port, because a short session often lands as a bare `zeek.conn` with no
+  protocol log at all. Both answers are load-bearing: a session found means the
+  host is a waypoint and attribution belongs upstream, and no session found
+  means it acted on its own, which is usually the more serious finding — so an
+  empty result is reported as a result rather than a shrug. The tool alone would
+  not have changed the outcome above (`t_host_summary` was available, and was
+  called twice), so investigator doctrine now makes the pivot a precondition for
+  attributing hostile behavior to an internal host.
+- **A Hosts screen that says what a machine is and what it is doing right now.**
+  The dossier had no screen: what the sweep concluded reached you only through
+  the agent or the API, and `/entity/10.0.0.5` showed traffic with no idea whose
+  traffic it was. `/app/hosts` lists every host the sweep knows, with a search
+  box, role and lane filters, and a queue of the fields where the sweep
+  disagrees with something you declared. `/app/hosts/<ip>` is the host itself:
+  a banner naming the machine and its role, four counters (services, accounts
+  seen authenticating, connection volume, alerts over seven days), a peer graph
+  and a volume chart, then the twelve two-lane field cards. An internal address
+  opened from anywhere in the console — an alert, the peer graph, a saved
+  `/entity/` link — lands here. Identity and activity have different freshness
+  rules and the page keeps them apart: identity comes from the last sweep and
+  still renders with Security Onion down, activity is read off the grid on the
+  request that draws it, over 24h or 7d. When the grid is unreachable the
+  activity half says so and the rest of the page carries on, rather than
+  reporting a quiet host. New endpoint `GET /api/v1/dossiers/{ip}/activity`
+  (analyst; three aggregations, nothing cached). Declaring a value, accepting
+  the sweep's, "keep mine" and Rebuild now stay admin-only.
+- **The host list opens with four numbers about the whole network.** That list
+  is one SQL page of a table capped at 5,000 hosts, so nothing on the screen
+  said how large the network was, how much of it had a name, or whether the
+  host-log agents were reaching it. Counting the fifty rows on screen would
+  have described a page while reading as the network, which this project has
+  shipped twice. `/app/hosts` now leads with four counts and one new endpoint
+  behind them, `GET /api/v1/dossiers/summary` (analyst; three aggregate
+  queries, nothing per-host): hosts held and how many have no clean build,
+  hosts whose name the resolver will assert, hosts where an agent on the
+  machine reports about itself, and disagreements waiting on a decision. Two of
+  those are defined carefully. **Named** applies the resolver's own confidence
+  floor and staleness window in SQL, so a stored name the resolver withholds is
+  not counted and the number agrees with the Hostname column under it.
+  **Reporting** counts the observation rather than the resolved value, so
+  declaring a hostname yourself does not hide that the machine is shipping
+  logs. The strip dates itself from the newest host build and says when
+  automatic sweeps are off, because they are off by default and the counts are
+  otherwise only as fresh as your last Rebuild. A summary that cannot be read
+  shows dashes rather than zeroes; a refresh that fails over good numbers keeps
+  them and marks them stale.
+- **The sweep names the hosts only DNS can name.** Hostname was blank on most
+  rows — 122 of 147 on the network this was built against — because the lanes
+  that name a machine need it to announce itself: a DHCP request, an NTLM
+  exchange, a log agent. A printer, an appliance or a VM that answers nothing
+  does none of that. Those are the addresses an analyst has least context for. One aggregation per sweep now reads what the network's own DNS answers
+  call each internal address and takes the name a majority of answers agree on.
+  Contention is left unresolved on purpose: two names tied means no name, and a
+  name spread across several addresses of one family is a service record rather
+  than a machine, so a round-robin VIP claims none of its members. It sits at
+  the `telemetry` rung, below anything the machine says about itself, so an
+  agent's or a DHCP client's answer still wins the field — and the name shows
+  its weight ("214 A/AAAA answers over the window") so you can judge it. A host
+  DNS names also becomes a row in its own right, which is how the quiet machine
+  finally gets a dossier. Mined names are proposed to the internal-identifier
+  list as muted suggestions, so a name that would otherwise leave the box in the
+  clear can be accepted into the redaction vocabulary.
+- **The agent is told which machine an address is, on every surface that names
+  one.** The dossier block reached the investigation pipeline and stopped there,
+  and only for the alert's own source and destination — so a hunt objective
+  about `10.0.0.5`, a chat question about it, and any other address in the same
+  alert group all went to the model as bare numbers. The investigation block now
+  covers every internal address in the group (bounded at eight), and the hunt
+  planner, the hunt console's seed, the investigation chat and the Dashboard
+  chat each carry the same identity lines for the addresses their own text
+  names. Free-text surfaces only describe hosts the sweep already has a record
+  of: a "no dossier for this address" line about an address the analyst or the
+  model just typed would put that address into the corpus the grounding check
+  reads, letting it vouch for itself. `dossier_context_enabled` still takes the
+  whole thing back out of every prompt.
+
+### Changed
+
+- **"Estate" is now "network".** The word appeared on screens and in the
+  dossier's own prose; the product says network. Nothing on the wire moved: no
+  setting, route, JSON field or database column ever carried it. This is labels
+  and documentation, and no configuration needs changing. If you alert on
+  soc-ai's own logs, one thing did move: a failed census records `census pass: …`
+  on the run row and logs `dossier: census aggregation failed`, where both used
+  to say `estate`. An alert keyed on the old text stops matching and needs
+  re-keying.
+
+### Fixed
+
+- **The Investigations list is a query now, not a page pretending to be one.**
+  `GET /api/v1/investigations` fetched the newest 100 rows and the screen
+  filtered them in the browser, so once one outcome saturated those 100 —
+  on the live deployment, 98 completed false positives — every older failed
+  run was unreachable under any filter: selecting Status=error searched the
+  same 100 completed rows and found nothing, while 107 errored and 2
+  interrupted runs sat in the table. Filtering, counting and paging now run
+  in SQL (`rows` + `total` + `limit` + `offset`, the host-list shape): the
+  time range, the Status multi-select and the Verdict multi-select (including
+  the synthetic "Pipeline error") are WHERE clauses, the header figures come
+  from server-side counts over the same filter set instead of a tally of the
+  visible page, and the table pages at 50 rows with an exact "X–Y of N".
+  Status filtering matches the status a row *renders* with, so a run that
+  finished without a verdict is found under Error, where the table shows it.
+  A retry's `isPrimary` is decided over its alert's whole run group — never
+  over whatever matched the filter — and the screen shows a retry top-level
+  whenever its primary is not on the page, which retires the pipeline-error
+  and needs-more-info promotion special cases by generalizing them.
+  The Dashboard's "N pipeline errors" KPI moves onto the same footing: it
+  used to count fallbacks in the newest-100 sample, which read "0 pipeline
+  errors" over a store holding 19 the moment the list started telling the
+  truth. It now runs the exact query its deep link opens (the 30-day
+  pipeline-error filter) and applies its documented exclusions — dismissed
+  and superseded runs — over that full match set, so the tile counts the same
+  query the list runs, minus the dismissed and superseded runs it deliberately
+  excludes. Past the 500-row page the tile reads "500+" rather than quietly
+  undercounting.
+- **Auto-triage no longer ignores every detection that has no IP.** The
+  scheduled sweep clustered alerts by `(rule, source.ip, destination.ip)` and
+  dropped anything missing an endpoint, tallying it as a `no_ip` skip. Sigma
+  process, file and endpoint rules carry no `source.*` or `destination.*` at
+  all, so that whole detection class was seen and discarded on every five-minute
+  sweep — forever. On the live deployment every investigation of such an alert
+  had been started by a human; the scheduler had never once picked one up. A
+  missing endpoint now degrades the cluster key to empty instead of dropping the
+  event, which keeps the dedupe that clustering exists for (one investigation
+  per rule per sweep, not one per event). The alert table also names the machine
+  on these detections, falling back to the endpoint document's own
+  `event_data.host.name` where Security Onion nests it, and shows the agent's
+  address on a second line; the address is deliberately kept out of
+  `source.ip`/`destination.ip`, which mean flow endpoints. And a blank endpoint
+  in an alert row is no longer a live link to an entity page for an em-dash.
+- **The dashboard's untriaged count leads somewhere that can hold it.**
+  Clicking the Untriaged tile opened `/investigations?verdict=untriaged`, which
+  was empty by construction: an alert group nobody has investigated has no
+  investigation row, and cannot get one while it stays untriaged. The tile read
+  "1" and the destination read "no investigations". It now opens the Alerts list
+  — the same endpoint counting the same unit — carrying the dashboard's time
+  range and un-hiding acked groups, so the destination holds exactly what the
+  tile counted. The Investigations screen's "Untriaged" verdict filter is gone
+  for the same reason; a run that ended without a verdict is still reachable
+  through the Status filter's Error and Interrupted options.
+- **The nightly quality alarm tests for a regression instead of firing inside
+  its own noise.** `agreement_rate` is a handful of oracle grades, five by
+  default, so as a rate it moves in 0.2 steps. Comparing it against a median of
+  other such rates alarmed roughly one night in eleven at the deployment's own
+  healthy agreement — near-certain to page spuriously within a month, which is
+  what it did. The detector now pools the trailing month's grade counts into a
+  single baseline and runs an exact binomial test against it. A night has to be
+  both statistically unlikely (2% or less under that baseline) and worse by the
+  operator's `quality_alarm_drop` before it fires, a budget of about one false
+  alarm per fifty graded nights. Add-one smoothing keeps a flawless month from
+  making the next single disagreement look impossible, so one flipped verdict
+  still cannot page anyone on its own. That was the job of the sample-size floor
+  this replaces, which bought the guarantee by pinning `quality_alarm_drop` to
+  0.20 and silently ignoring any lower value an operator set. Migration 0026
+  records the grades behind each rate (`n_yes`, `n_partial`, `n_no`,
+  `n_classified`); rows written before it fall back to the old median rule
+  rather than going quiet. The Quality card now shows the composition ("3 agree
+  · 2 partial", since a partial critique costs the same as a flat disagreement)
+  and, on an alarm, the path to the eval bundle holding the oracle critiques
+  that settle it.
+- **Nightly eval bundles survive a container recreate.** They were written to a
+  path relative to the container's working directory, which is not a volume, so
+  every `docker compose up -d` deleted every bundle — and with them the oracle
+  critiques that are the only evidence for or against an alarm on the quality
+  trend. On 2026-08-07 a recreate destroyed the artifacts for both of that day's
+  alarms while they were being diagnosed. Bundles now land beside the data dir
+  (`/var/lib/soc-ai/evals` in the packaged layout, `./evals` on a host install),
+  and the run logs a warning and keeps going if that directory is not writable
+  instead of failing the nightly. **Upgrading a Docker install adds a fifth
+  named volume, `soc_ai_evals`**: `git pull && docker compose up -d --build`
+  picks it up from the repo's compose file, but a hand-maintained compose file
+  needs the mount added by hand. Bundles written before the upgrade are lost in
+  that recreate. The upgrade note is in `docs/DOCKER.md` under "Updating".
+- **The web UI no longer freezes when Elasticsearch goes down.** Backend routes
+  that talk to the grid can hang for about ninety seconds against an
+  unreachable Elasticsearch (client timeout times retries), and no frontend
+  request had a timeout at all. Polls stacked until they exhausted the
+  browser's six connections per origin, so widgets reading only the local
+  database froze too, and screens you had not visited yet could not fetch their
+  code. The degraded-mode banner that exists to explain exactly this was itself
+  stuck behind the queue. Every request now carries a 20-second timeout, a poll
+  will not start while its predecessor is still in flight, each health-probe
+  leg is hard-bounded at five seconds (a timeout is the down verdict), and the
+  health cache is single-flight, so N cold polls no longer launch N parallel
+  hanging probes. The banner arrives in seconds instead of a minute and a half.
+  The notification bell also carries a standing entry for each dependency that
+  is currently down (Security Onion / Elasticsearch, the LLM gateway), read
+  from the warm health cache — the notifications path never probes
+  Elasticsearch itself, so it keeps working precisely when Elasticsearch is
+  what is broken. A dismissal holds for the duration of that outage.
+- **The agent is made to fix an ungrounded claim instead of publishing it with
+  a caveat.** The narrative-grounding validator has always detected per-event
+  facts an answer asserted that appear in no tool result, and has only ever
+  appended a warning. On 2026-08-05 a chat answer asserted a successful
+  authentication to overturn a correct true-positive verdict; the validator
+  flagged that exact claim as ungrounded, and the answer shipped anyway —
+  caveat attached, verdict flipped. Detecting a fabrication and then publishing
+  it is not a guardrail. The finding now goes back to the agent as a correction
+  naming the offending claims, with two permitted resolutions: call a tool that
+  establishes the claim and cite it, or remove the claim. Hedging the claim is
+  not a third option, because a softened fabrication is still a fabrication.
+  `chat_regrounding_attempts` (Config → Agent, hot, default 1) bounds it; each
+  attempt costs a full turn against `chat_turn_timeout_s`, and 0 restores the
+  warn-only behavior. The caveat is still the terminal fallback for an agent
+  that will not comply, so nothing got weaker.
+- **A hunt query written as `field:(a OR b)` no longer matches nothing and
+  then reports that as a finding.** The OQL grammar rejected the Lucene-style
+  value group at the parenthesis, and the analyst model writes that shape
+  constantly — 23 of 47 parse failures in one 4,000-event window on the live
+  deployment. Each rejected query became zero coverage, and the hunt reported
+  the absence with confidence: one live hunt concluded a term appeared nowhere
+  on the grid on the strength of queries that could not have matched. Value
+  groups now parse and expand to one term per value under a single `OR`. Bare
+  terms (`... AND somename`) stay unsupported, since implicit full-text would be
+  guessing at what was meant, but the parse error now states the contract it
+  will accept — `field:value`, `AND`/`OR`/`NOT`, both parenthesis forms,
+  `message:term*` for full text — because that error string is the agent's only
+  channel for correcting itself.
+- **A long chat turn no longer looks the same as a hung one.** A turn that
+  called several tools showed a bare typing indicator until it finished, so a
+  thorough answer and a wedged one were indistinguishable, and analysts stopped
+  waiting on the good ones. The dock now names the current step under the dots
+  in analyst language ("Querying events · 3 steps"), updated as each tool
+  starts. It rides the poll that was already there: no new endpoint, no
+  streaming connection, nothing extra to get through a reverse proxy.
+- **A hunt objective longer than a paragraph is accepted.** The cap was 2,000
+  characters, and a brief that names scope, exclusions and the behaviors to
+  look for runs past that easily. It came back as a bare 422 with nothing the
+  analyst could act on. The limit is now 12,000 characters across the console,
+  schedules and templates, which all take the same analyst-written text. It is
+  still bounded, because the objective is prepended to the agent's prompt and
+  an unbounded paste would eat the context budget. The objective box is a
+  textarea rather than a single-line input: four rows, scrolls and resizes,
+  Shift+Enter for a newline (Enter still launches), a counter past 80% of the
+  limit, and a client-side maximum mirroring the server's so the UI cannot
+  compose a request the API will reject.
+- **The dashboard's verdict tiles and severity bars are links.** Both were dead
+  numbers. A verdict tile opens the Investigations list filtered to that
+  verdict over 30 days — deliberately wider than the dashboard's own window,
+  which closes the gap where a standing needs-more-info count had no age bound
+  while the list it should have pointed at defaulted to 24 hours. A severity
+  bar opens the Alerts list filtered to that severity (`/alerts?sev=`, a new
+  URL parameter), since severity belongs to the alert group rather than to an
+  investigation.
+- **A superseded needs-more-info run is reachable under the needs-more-info
+  filter.** The Investigations list groups runs by alert group and shows the
+  newest as the visible row, so a run left at needs-more-info that a later run
+  superseded disappeared from its own filter: the newer row did not match, and
+  the older one was folded underneath it. That filter now promotes the matching
+  run to the visible row, which the pipeline-error filter already did.
+- **A chat reply that lands while you are on another screen is not lost.** The
+  investigation chat took a one-shot snapshot of its thread when the screen
+  mounted and only began polling once you sent a message, so a reply that
+  completed while you were elsewhere existed only in the database — navigate
+  away and back and it was gone, along with any sign that a turn was still
+  running. The screen now syncs the thread on mount, restoring both a finished
+  reply and the typing indicator for a turn still in flight.
+
 ## [1.2.7] - 2026-08-05
 
 The lesser-model release: soc-ai now adapts to whatever analyst backend is
@@ -1093,7 +1413,7 @@ correctness / security / performance review hardened the engine.
 
 ### Added
 
-- **Hunt Console — estate-wide, objective-driven hunting.** Give it a hunting
+- **Hunt Console — network-wide, objective-driven hunting.** Give it a hunting
   objective in plain English and it turns the same read-only agent loose across
   many hosts and a time window, then reports **findings + a narrative** mapped to
   MITRE ATT&CK — rather than a single-alert verdict. Read-only (no acks, no case

@@ -3,14 +3,15 @@ const LABEL: Record<string, string> = {
   already_triaged: 'already triaged',
   inherited: 'verdict inherited',
   running: 'already running',
-  no_ip: 'no IP to investigate',
 };
 
 /**
  * "80 already triaged · 10 verdict inherited" from the skipped_reasons map —
  * the bare "91 skipped" count told the analyst nothing about why. Unknown
  * codes pass through with underscores humanized so a new backend reason is
- * never silently swallowed. Null when there is nothing to explain.
+ * never silently swallowed — and so a RETIRED one (e.g. "no_ip", still held by
+ * historical status rows) stays legible after its label is dropped from LABEL.
+ * Null when there is nothing to explain.
  */
 export function formatSkipReasons(
   reasons: Record<string, number> | undefined | null,

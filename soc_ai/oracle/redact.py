@@ -86,6 +86,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from soc_ai.oracle._cred_data import CRED_KEYS, CRED_VALUE_STOPSET
 from soc_ai.oracle.sanitize import (
     Mapping,
     _is_private_ipv4,
@@ -124,6 +125,15 @@ _USER_FIELDS: frozenset[str] = frozenset(
         "source.user.name",
         "destination.user.name",
     }
+)
+
+# Winlog/EVTX credential LEAF keys — matched case-insensitively against the last
+# path segment, wherever they nest (``winlog.event_data.TargetUserName``). These
+# carry the account name verbatim and are not in ``_USER_FIELDS``. The credential
+# stopset still applies, so a universal built-in (``SYSTEM`` / ``-`` / ``ANONYMOUS
+# LOGON``) is not tokenised — matching the free-text credential rule's discipline.
+_WINLOG_USER_LEAF_KEYS: frozenset[str] = frozenset(
+    {"targetusername", "subjectusername", "samaccountname", "accountname"}
 )
 
 # IP fields: tokenised only when the value is a private/internal address.
@@ -277,20 +287,38 @@ def _redact_netbios_hostnames(text: str, mapping: Mapping) -> str:
 # emails (``user=alice@gmail.com``) are left to the email rule via a trailing
 # ``(?![\w@-])`` guard that refuses to match when an ``@`` follows the value.
 
-# Credential keys, longest-first so the alternation prefers ``username`` over
-# ``user``.  ``(?<![\w.])`` rejects the ``user`` inside ``superuser`` / ``a.user``.
-_CRED_KEYS = r"samaccountname|username|user[_ -]?name|account|acct|logon|user|usr"
+# Credential keys — SHARED with the residue net via :mod:`soc_ai.oracle._cred_data`
+# so the two independent regex engines cannot silently diverge (finding
+# oracle-cred-twin-nets).  ``(?<![\w.])`` (applied where this alternation is
+# embedded below) rejects the ``user`` inside ``superuser`` / ``a.user``.
+_CRED_KEYS = CRED_KEYS
 
 # A username value: starts and ends alphanumeric, inner ``. _ -`` allowed.  The
 # trailing ``(?![\w@-])`` forces a maximal match AND rejects the whole match when
 # an ``@`` follows (i.e. it's the local-part of an email — the email rule's job).
 _CRED_VALUE = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?"
 
+# ``sep`` tolerates a closing quote BETWEEN key and the ``:``/``=`` separator, so
+# the JSON rendering ``"TargetUserName": "<val>"`` is covered (the quote that
+# closes the key previously defeated the match) as well as the ordinary
+# ``key="value"`` opening-quote form.
 _CRED_KV_RE = re.compile(
     r"(?P<key>(?<![\w.])(?:" + _CRED_KEYS + r"))"
-    r"(?P<sep>\s*[:=]\s*\"?)"
+    r"(?P<sep>\s*\"?\s*[:=]\s*\"?)"
     r"(?P<val>" + _CRED_VALUE + r")"
     r"(?![\w@-])",
+    re.IGNORECASE,
+)
+
+# The literal 4624/4625 message rendering: ``Account Name:  <user>`` (the label is
+# two space-joined words, matching no key alternation) and its domain sibling
+# ``Account Domain:  <DOMAIN>``.  The value runs after the ``:`` + whitespace.
+_CRED_ACCOUNT_NAME_RE = re.compile(
+    r"(?P<key>Account Name\s*:\s+)(?P<val>" + _CRED_VALUE + r")(?![\w@-])",
+    re.IGNORECASE,
+)
+_CRED_ACCOUNT_DOMAIN_RE = re.compile(
+    r"(?P<key>Account Domain\s*:\s+)(?P<val>" + _CRED_VALUE + r")(?![\w@-])",
     re.IGNORECASE,
 )
 
@@ -299,84 +327,45 @@ _CRED_KV_RE = re.compile(
 # ``\\srv\share``) are not mis-read as a NetBIOS domain.  ``dom`` requires ≥2 chars
 # (``[A-Za-z0-9]`` + ``{1,62}``) so a single drive letter (``C\…``) is not taken as
 # a domain; it accepts ``_``/``.`` so an already-tokenised ``HOST_01\jdoe`` still
-# has its user component redacted.
+# has its user component redacted.  The separator is ``\\{1,2}`` (captured and
+# reproduced verbatim) because a winlog / nested-JSON message field carries the
+# down-level name with TWO literal backslashes (``DOMAIN\\jdoe``); the single form
+# is the common case.
 _CRED_NETBIOS_RE = re.compile(
-    r"(?<![\w.\\])(?P<dom>[A-Za-z0-9][A-Za-z0-9._-]{1,62})\\"
+    r"(?<![\w.\\])(?P<dom>[A-Za-z0-9][A-Za-z0-9._-]{1,62})(?P<sep>\\{1,2})"
     r"(?P<usr>" + _CRED_VALUE + r")(?![\w.\\@-])"
 )
 
 # Tokens that are NOT internal-identifying usernames — never tokenise these.
-_CRED_VALUE_STOPSET: frozenset[str] = frozenset(
-    {
-        # booleans / status words that can follow ``account=`` / ``logon=`` in logs
-        "true",
-        "false",
-        "null",
-        "none",
-        "nil",
-        "yes",
-        "no",
-        "unknown",
-        "na",
-        "success",
-        "successful",
-        "failure",
-        "failed",
-        "fail",
-        "denied",
-        "allowed",
-        "enabled",
-        "disabled",
-        "active",
-        "inactive",
-        "valid",
-        "invalid",
-        "error",
-        "ok",
-        "expired",
-        "locked",
-        "unlocked",
-        # universal built-in accounts (every host has them — not identifying)
-        "root",
-        "system",
-        "localsystem",
-        "administrator",
-        "admin",
-        "guest",
-        "nobody",
-        "daemon",
-        "bin",
-        "sys",
-        "sync",
-        "lp",
-        "mail",
-        "news",
-        "uucp",
-        "proxy",
-        "backup",
-        "list",
-        "irc",
-        "gnats",
-        "www-data",
-        "sshd",
-        "postfix",
-        "anonymous",
-        "ftp",
-        "operator",
-        "service",
-        "localservice",
-        "networkservice",
-        "everyone",
-        "self",
-    }
+# SHARED with the residue net via :mod:`soc_ai.oracle._cred_data` so a stopword
+# added here cannot diverge from the net that would still flag it (finding
+# oracle-cred-twin-nets).
+_CRED_VALUE_STOPSET: frozenset[str] = CRED_VALUE_STOPSET
+
+# NetBIOS authorities that are universal, not internal-identifying domains.  The
+# bare ``nt`` covers the ``Account Domain:  NT AUTHORITY`` / ``NT SERVICE`` message
+# rendering, where the value capture stops at the first space and yields only
+# ``NT`` — the phrase forms never match a single captured token.
+_NT_DOMAIN_STOPSET: frozenset[str] = frozenset(
+    {"nt", "nt authority", "authority", "builtin", "nt service"}
 )
 
-# NetBIOS authorities that are universal, not internal-identifying domains.
-_NT_DOMAIN_STOPSET: frozenset[str] = frozenset(
-    {"nt authority", "authority", "builtin", "nt service"}
-)
+# Registry hives (and the like) that a ``HIVE\Subkey`` path shares the
+# ``TOKEN\TOKEN`` shape of a down-level logon name.  A path is NOT a credential;
+# reject the NetBIOS match when the left token is one of these technical prefixes
+# so ``HKLM\Software`` is left verbatim (multi-segment paths are already rejected
+# by the trailing ``(?![\w.\\@-])`` — this covers the single-separator 2-segment
+# case a structural constraint cannot distinguish from ``DOMAIN\user``).
+_NONDOMAIN_PREFIXES: frozenset[str] = frozenset({"hklm", "hkcu", "hkcr", "hku", "hkcc"})
 
 _OPAQUE_LABEL_FULL_RE = re.compile(r"(?:USER|HOST|IP|MAC|EMAIL)_\d+\Z")
+
+
+def _is_nondomain_prefix(tok: str) -> bool:
+    """True iff *tok* is a registry hive / non-domain technical prefix, so a
+    ``tok\\segment`` match is a filesystem/registry PATH, not a NetBIOS logon."""
+    low = tok.lower()
+    return low in _NONDOMAIN_PREFIXES or low.startswith("hkey")
 
 
 def _is_nonusername_token(val: str) -> bool:
@@ -420,13 +409,39 @@ def _redact_credentials(text: str, mapping: Mapping) -> str:
 
     text = _CRED_KV_RE.sub(_kv_sub, text)
 
+    # 4624/4625 ``Account Name:`` (a USER) and ``Account Domain:`` (a HOST/NetBIOS
+    # domain).  Both preserve the ``key`` prefix (label + separator) verbatim; the
+    # ``key`` group already carries the ``:`` and trailing whitespace, so there is
+    # no separate ``sep`` group here.
+    def _acct_name_sub(m: re.Match[str]) -> str:
+        val = m.group("val")
+        if _is_nonusername_token(val):
+            return m.group(0)
+        return f"{m.group('key')}{mapping.label_for(val, 'USER')}"
+
+    text = _CRED_ACCOUNT_NAME_RE.sub(_acct_name_sub, text)
+
+    def _acct_domain_sub(m: re.Match[str]) -> str:
+        val = m.group("val")
+        if val.lower() in _NT_DOMAIN_STOPSET or _OPAQUE_LABEL_FULL_RE.match(val):
+            return m.group(0)
+        return f"{m.group('key')}{mapping.label_for(val, 'HOST')}"
+
+    text = _CRED_ACCOUNT_DOMAIN_RE.sub(_acct_domain_sub, text)
+
     def _nb_sub(m: re.Match[str]) -> str:
         dom, usr = m.group("dom"), m.group("usr")
+        # A registry-hive / drive-shaped left token means this is a PATH
+        # (``HKLM\Software``), not a logon name — leave it wholly untouched.
+        if _is_nondomain_prefix(dom):
+            return m.group(0)
         out_dom = dom
         if dom.lower() not in _NT_DOMAIN_STOPSET and not _OPAQUE_LABEL_FULL_RE.match(dom):
             out_dom = mapping.label_for(dom, "HOST")
         out_usr = usr if _is_nonusername_token(usr) else mapping.label_for(usr, "USER")
-        return f"{out_dom}\\{out_usr}"
+        # Reproduce the ORIGINAL separator (one or two backslashes) so a doubled
+        # winlog/nested-JSON down-level name round-trips byte-for-byte.
+        return f"{out_dom}{m.group('sep')}{out_usr}"
 
     return _CRED_NETBIOS_RE.sub(_nb_sub, text)
 
@@ -589,6 +604,15 @@ def _try_harvest_scalar(
         mapping.label_for(value, "USER")
         return
 
+    # Winlog/EVTX credential leaf keys (TargetUserName / SubjectUserName /
+    # SamAccountName / AccountName) — case-insensitive LEAF match, wherever they
+    # nest.  Honour the credential stopset so a built-in (SYSTEM / "-") is left
+    # verbatim rather than over-redacted.
+    if path.rsplit(".", maxsplit=1)[-1].lower() in _WINLOG_USER_LEAF_KEYS:
+        if not _is_nonusername_token(value):
+            mapping.label_for(value, "USER")
+        return
+
     # IP fields — private only.
     if any(s in _IP_FIELDS for s in suffixes_of_path):
         if _is_internal_ip(value):
@@ -692,6 +716,48 @@ def _replace_learned(text: str, mapping: Mapping, learned_re: re.Pattern[str] | 
         return label if label is not None else matched
 
     return learned_re.sub(_sub, text)
+
+
+def _build_resweep_re(values: Iterable[str]) -> re.Pattern[str] | None:
+    """Compile an alternation over *values* for the Pass-2 propagation re-sweep.
+
+    Unlike :func:`_build_learned_re`, the boundaries reject a leading/trailing
+    ``.`` or ``-`` as well as a word char.  A value learned during Pass 2 (from a
+    free-text credential / NetBIOS context) is lower-confidence than a typed
+    field, so it is propagated ONLY to standalone whole-word occurrences — never
+    spliced into a compound token (a filename ``mimikatz.exe``, an FQDN
+    ``FINANCE-PC.example.com``) where the same substring might be a public IOC.
+    Values are sorted longest-first so a shorter value cannot consume a prefix of
+    a longer one.  Returns ``None`` when *values* is empty.
+    """
+    vals = sorted({v for v in values if v}, key=len, reverse=True)
+    if not vals:
+        return None
+    escaped = [re.escape(v) for v in vals]
+    return re.compile(r"(?<![\w.-])(?:" + "|".join(escaped) + r")(?![\w.-])", re.IGNORECASE)
+
+
+def _resweep_learned(obj: Any, mapping: Mapping, resweep_re: re.Pattern[str] | None) -> Any:
+    """Walk *obj* replacing re-sweep matches with their opaque labels only.
+
+    A learned-value replacement pass with no credential re-detection and no
+    shape rules, so it is bounded: it cannot learn new values or touch
+    already-labelled text (opaque labels never match ``resweep_re``).
+    """
+    if resweep_re is None:
+        return obj
+    if isinstance(obj, str):
+        return _replace_learned(obj, mapping, resweep_re)
+    if isinstance(obj, dict):
+        return {
+            _resweep_learned(k, mapping, resweep_re): _resweep_learned(v, mapping, resweep_re)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_resweep_learned(item, mapping, resweep_re) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_resweep_learned(item, mapping, resweep_re) for item in obj)
+    return obj
 
 
 def _global_scan_pass(
@@ -805,6 +871,7 @@ def sanitize_case(
     allowlist: Iterable[str] = (),
     extra_hosts: Iterable[str] = (),
     extra_suffixes: Iterable[str] = (),
+    no_propagate_out: set[str] | None = None,
 ) -> dict[str, Any]:
     """Field-aware, learning redacter for a structured SO/ECS case dict.
 
@@ -827,6 +894,12 @@ def sanitize_case(
             ones and the policy-field-learned ones).
         extra_suffixes: Additional internal DNS suffixes beyond the settings
             default.
+        no_propagate_out: Optional mutable set.  When provided, it is populated
+            with the short (≤3 char) DOMAIN_LIKE values the harvest pass declined
+            to propagate globally (to protect public FQDNs).  The caller (client)
+            excludes these from ``known_values`` when running the residue gate —
+            otherwise the gate flags the same substring inside a legitimate public
+            FQDN and refuses by construction (finding oracle-refuse-by-design).
 
     Returns:
         A sanitized copy of *case* with the same structure.
@@ -849,6 +922,10 @@ def sanitize_case(
     # ----- Pass 2: global scan + shape rules -----
     _np = frozenset(no_propagate)
     learned_re = _build_learned_re(mapping, no_propagate=_np)
+    # Snapshot the values known BEFORE Pass 2 so we can tell which were learned
+    # DURING it (credential-context / NetBIOS free-text values, redacted in place
+    # only — they are not in ``learned_re``, which was compiled just above).
+    pre_pass2_values = set(mapping.forward)
     # _global_scan_pass is typed Any→Any for generality; since we passed a
     # dict[str, Any] in, the return value is guaranteed to be dict[str, Any].
     result: dict[str, Any] = _global_scan_pass(
@@ -860,4 +937,28 @@ def sanitize_case(
         learned_re=learned_re,
         direct_replace=_np,
     )
+
+    # ----- Pass 2b: propagate values learned DURING Pass 2 -----
+    # A credential/NetBIOS value learned in place during Pass 2 that also appears
+    # bare in ANOTHER field would survive to the wire and trip the independent
+    # residue gate by construction (finding oracle-refuse-by-design). Rebuild a
+    # learned regex from ONLY the newly-learned values — length ≥ 4 (short tokens
+    # stay unpropagated, per the no_propagate rationale), still honouring
+    # no_propagate and _is_nonusername_token — and sweep once more with a strict
+    # boundary that will not corrupt a public IOC embedding the value.
+    newly_learned = {
+        real
+        for real in mapping.forward
+        if real not in pre_pass2_values
+        and len(real) >= 4
+        and real not in _np
+        and not _is_nonusername_token(real)
+    }
+    resweep_re = _build_resweep_re(newly_learned)
+    if resweep_re is not None:
+        result = _resweep_learned(result, mapping, resweep_re)
+
+    if no_propagate_out is not None:
+        no_propagate_out.update(no_propagate)
+
     return result

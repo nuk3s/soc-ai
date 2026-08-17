@@ -62,11 +62,17 @@ class TestScore:
         assert m["missed_tp_rows"] == []
         assert m["counts"] == {
             "total": 4,
+            # Every row was judged, so decided == total and the "over decided
+            # rows only" rebasing is a no-op on a healthy run.
+            "decided": 4,
+            "no_verdict": 0,
             "human_tp": 2,
             "human_fp": 2,
+            "human_fp_decided": 2,
             "agreements": 4,
             "fp_cleared": 2,
         }
+        assert m["completion_rate"] == 1.0
 
     def test_missed_tp_is_the_critical_number(self) -> None:
         # A human-escalated (TP) alert soc-ai calls false_positive = a missed incident.
@@ -433,3 +439,416 @@ class TestBacktestEndpoints:
         data = resp.json()
         assert data["active"] is False
         assert data["results"] is None
+
+
+# ---------------------------------------------------------------------------
+# 4. Degraded-grid honesty — G4 (sweep 2026-08-13)
+#
+# An outage was reported as "no dispositioned alerts in the window to replay":
+# a false statement about the operator's own triage history, made on the screen
+# built to earn their trust.
+# ---------------------------------------------------------------------------
+
+
+class TestBacktestRefusesToReportAnOutageAsAnEmptyWindow:
+    def test_start_on_a_down_grid_is_503_not_an_empty_window(self, bt_settings: Settings) -> None:
+        """The status code is the assertion: a changed note still passes if the
+        route keeps answering 200 with an idle, finished status."""
+        from elastic_transport import ConnectionError as EsConnectionError
+
+        fake_es = AsyncMock()
+        fake_es.search.side_effect = EsConnectionError("connection refused")
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                resp = client.post("/api/v1/backtest", json={"window_days": 30})
+                assert resp.status_code == 503
+                assert resp.json()["detail"]["reason"] == "grid_unavailable"
+                after = client.get("/api/v1/backtest").json()
+                # No fake finished run may be written: a note-only assertion
+                # misses a persisted row that later reads as a real, empty one.
+                assert after["backtest_id"] is None
+                assert after["results"] is None
+                # ...and the single-flight slot is released, or every later
+                # backtest silently no-ops with "already running".
+                assert after["active"] is False
+
+    def test_start_on_a_down_grid_persists_no_backtest_row(self, bt_settings: Settings) -> None:
+        import asyncio
+
+        from elastic_transport import ConnectionError as EsConnectionError
+
+        async def _rows() -> int:
+            engine, maker = await _db(bt_settings)
+            async with maker() as db:
+                latest = await bt_svc.latest(db)
+            await engine.dispose()
+            return 0 if latest is None else 1
+
+        fake_es = AsyncMock()
+        fake_es.search.side_effect = EsConnectionError("connection refused")
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                client.post("/api/v1/backtest", json={"window_days": 30})
+        assert asyncio.run(_rows()) == 0
+
+    def test_a_readable_but_empty_window_still_reports_empty(self, bt_settings: Settings) -> None:
+        """The control: a grid that answers with zero dispositioned alerts is a
+        genuinely empty window and must still say so, at 200."""
+        fake_es = AsyncMock()
+        fake_es.search.return_value = {"took": 1, "hits": {"total": {"value": 0}, "hits": []}}
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                resp = client.post("/api/v1/backtest", json={"window_days": 30})
+        assert resp.status_code == 200
+        assert resp.json()["active"] is False
+        assert "no dispositioned alerts" in (resp.json()["note"] or "")
+
+    def test_the_note_that_outlives_the_error_still_carries_the_remedy(
+        self, bt_settings: Settings
+    ) -> None:
+        """D18 (dogfood 2026-08-14): the durable half of the failure lost its advice.
+
+        Two things say the run failed and they do not say the same thing. The
+        inline error the POST raises carries the guidance — "slow or unreachable,
+        retry shortly" — and it is gone the moment the page reloads. What survives
+        is this note, rendered on its own in the empty panel, and it was a
+        lowercase fragment with no next move on it: "grid unavailable — the window
+        could not be read". The remedy has to be on the copy that LASTS, not only
+        on the one that flashes.
+        """
+        from elastic_transport import ConnectionError as EsConnectionError
+
+        fake_es = AsyncMock()
+        fake_es.search.side_effect = EsConnectionError("connection refused")
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                assert client.post("/api/v1/backtest", json={"window_days": 30}).status_code == 503
+                note = str(client.get("/api/v1/backtest").json()["note"] or "")
+
+        assert note, "the failure left no durable note at all"
+        assert note[0].isupper(), f"the note reads as a fragment, not a sentence: {note!r}"
+        assert "retry" in note.lower(), f"the surviving note dropped its remedy: {note!r}"
+        # It must still blame the grid rather than the operator's window: "your
+        # window holds nothing" was the original lie this whole class exists for.
+        assert "window" in note.lower() and "grid" in note.lower(), note
+
+    def test_the_durable_note_reaches_a_console_that_has_run_a_backtest_before(
+        self, bt_settings: Settings
+    ) -> None:
+        """The same note, on the only instance shape that ships: one with history.
+
+        ``GET /backtest`` serves the newest STORED row whenever one exists, and a
+        run that dies in its sampling read never gets a row — the row is created
+        after the sampling search returns. So on any console that has completed a
+        backtest even once, the failed run was served as the PREVIOUS run's
+        finished results with ``note: null``: the remedy above is real and
+        unreachable, and the failure vanishes behind a stale score. That is the
+        "hides under the stale verdict" shape this dogfood found twice, and the
+        empty fixture DB is the one state where it does not happen.
+        """
+        from elastic_transport import ConnectionError as EsConnectionError
+
+        grid_down = {"yes": False}
+
+        async def _search(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            if grid_down["yes"]:
+                raise EsConnectionError("connection refused")
+            return SAMPLING_ES_RESPONSE
+
+        fake_es = AsyncMock()
+        fake_es.search.side_effect = _search
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                # The history: one real, completed, scored run.
+                assert client.post("/api/v1/backtest", json={"window_days": 30}).status_code == 200
+                stored = _poll_backtest(client)
+                assert stored["status"] == "complete" and stored["results"], stored
+
+                grid_down["yes"] = True
+                assert client.post("/api/v1/backtest", json={"window_days": 30}).status_code == 503
+                after = client.get("/api/v1/backtest").json()
+
+        note = str(after["note"] or "")
+        assert note, (
+            "the failed run left no trace on a console with history — it is served as the "
+            f"previous run's finished results, which is the false all-clear: {after}"
+        )
+        assert "retry" in note.lower(), f"the surviving note dropped its remedy: {note!r}"
+        # The over-correction control, and the reason this is a merge rather than a
+        # swap: a real measurement from last week is not deleted by today's outage.
+        # It is dated on screen ("Ran …") and the newest attempt is stated over it.
+        assert after["results"], (
+            "today's grid outage threw away a score that was actually measured — the run "
+            f"the operator adopted this product on: {after}"
+        )
+
+    def test_a_sampling_read_in_flight_outranks_the_last_run_on_the_status(
+        self, bt_settings: Settings
+    ) -> None:
+        """The sampling phase has to be visible on a console with history too.
+
+        ``start_backtest`` claims the slot with
+        ``status.reset(active=True, total=0, backtest_id=None)`` and only then
+        issues the sampling search, so for the length of that read the live status
+        is active with no id — which is exactly what the screen reads as "reading
+        Security Onion", and exactly what ``_bt_row_out`` dropped on the floor
+        whenever a stored row existed (its ``active`` is ``live.backtest_id ==
+        bt.id``, and during sampling there is no id to match). The console then
+        showed the last finished run, idle, while a read was in flight.
+        """
+        fake_es = AsyncMock()
+        fake_es.search.return_value = SAMPLING_ES_RESPONSE
+        fake_auth = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                assert client.post("/api/v1/backtest", json={"window_days": 30}).status_code == 200
+                stored = _poll_backtest(client)
+                assert stored["status"] == "complete", stored
+                # Put the live status in the exact shape start_backtest leaves it
+                # in while the sampling search is out, rather than racing a real
+                # one: a tarpit read would make this a timing test.
+                backtest_svc.get_status(app.state).reset(active=True, total=0, backtest_id=None)
+                during = client.get("/api/v1/backtest").json()
+
+        assert during["active"] is True, (
+            "a sampling read in flight was reported as an idle console — the run the "
+            f"analyst just started is invisible: {during}"
+        )
+        assert during["backtest_id"] is None, (
+            "the in-flight run was labelled with the PREVIOUS run's id, so the screen "
+            f"renders it as a replay in progress of a run that already finished: {during}"
+        )
+
+    async def test_a_caller_that_walks_away_mid_sample_does_not_wedge_the_slot(
+        self, bt_settings: Settings
+    ) -> None:
+        """The other half of D18's stalled screenshot: a claim that outlived its request.
+
+        ``stalled/backtest-after-run-backtest-later.png`` shows the button stuck on
+        "Running…" over "0 / 0 replayed" for a run that did not exist. The POST was
+        abandoned by the browser at 20 s while the sampling read was still out;
+        Starlette cancelled the handler, ``CancelledError`` sailed past every arm
+        below (it is a BaseException), and the single-flight claim stayed set — so
+        every later backtest answered "already running" until the process
+        restarted. The grid budget makes the 20 s case unreachable, but a user who
+        navigates away two seconds in cancels the same way, so the claim has to be
+        released on the cancellation path itself.
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        reading = asyncio.Event()
+
+        class _NeverAnswers:
+            async def search(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+                reading.set()
+                await asyncio.Event().wait()  # the tarpit: accepted, never answered
+                return {}
+
+        state = SimpleNamespace(settings=bt_settings, elastic=_NeverAnswers())
+        task = asyncio.create_task(
+            backtest_svc.start_backtest(
+                state, window_days=30, sample_size=5, min_severity=None, started_by="test"
+            )
+        )
+        await asyncio.wait_for(reading.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert backtest_svc.get_status(state).active is False, (
+            "the single-flight slot survived the cancelled request — every later backtest "
+            "will answer 'already running' and the console will render a run that is gone"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Degraded-grid honesty — G5 (sweep 2026-08-13)
+#
+# A backtest that lost the grid MID-RUN finalized status=complete and priced
+# every unreadable replay as a model disagreement: the report an owner uses to
+# judge adoption read "soc-ai disagrees with human analysts 90% of the time"
+# when the truth was the sensor was blind for 18 of 20 replays. That is a
+# persisted, wrong conclusion about model quality caused by an infrastructure
+# failure.
+# ---------------------------------------------------------------------------
+
+
+class TestScoreDoesNotPriceOutagesAsDisagreement:
+    def test_agreement_is_over_decided_rows_not_all_rows(self) -> None:
+        """18 of 20 replays produced NO verdict. soc-ai decided twice and was
+        right twice: that is 100% agreement over what it judged, at 10%
+        coverage — not 10% agreement."""
+        rows = [
+            _row(HUMAN_FP, "false_positive", alert_id="d1"),
+            _row(HUMAN_TP, "true_positive", alert_id="d2"),
+        ]
+        rows += [_row(HUMAN_FP, None, alert_id=f"n{i}") for i in range(18)]
+        m = score(rows)
+        assert m["agreement_rate"] == 1.0
+        assert m["counts"]["no_verdict"] == 18
+        assert m["counts"]["decided"] == 2
+        assert m["completion_rate"] == pytest.approx(0.1)
+        # fp_reduction was depressed by the same arithmetic: 1 human-FP row was
+        # decided, and soc-ai cleared it.
+        assert m["fp_reduction"] == 1.0
+
+    def test_all_no_verdict_is_zero_coverage_not_zero_agreement(self) -> None:
+        rows = [_row(HUMAN_TP, None), _row(HUMAN_FP, None)]
+        m = score(rows)
+        assert m["completion_rate"] == 0.0
+        assert m["counts"]["decided"] == 0
+        # No opinion was formed, so no agreement rate can be claimed.
+        assert m["agreement_rate"] == 0.0
+        assert m["counts"]["no_verdict"] == 2
+
+    def test_a_missed_tp_still_counts_when_others_were_unreadable(self) -> None:
+        """The safety number must NOT be diluted away by the coverage fix."""
+        rows = [
+            _row(HUMAN_TP, "false_positive", alert_id="danger", rule="ET MALWARE x"),
+            _row(HUMAN_TP, None, alert_id="blind"),
+        ]
+        m = score(rows)
+        assert m["missed_tp"] == 1
+        assert m["agreement_rate"] == 0.0  # the one decided row disagreed
+
+
+def _dispositioned_investigation(settings: Settings, alert_es_id: str, verdict: str) -> None:
+    """Persist a complete Investigation the backtest can read a verdict back off."""
+    import asyncio
+
+    from soc_ai.store import investigations as inv_svc
+
+    async def _go() -> None:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            inv = await inv_svc.create(db, alert_es_id=alert_es_id, started_by="backtest")
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict=verdict, confidence=0.9, rationale="x"
+            )
+        await engine.dispose()
+
+    asyncio.run(_go())
+
+
+class TestBacktestInterruptedMidRunIsNotComplete:
+    def test_losing_the_grid_mid_run_does_not_finalize_clean(self, bt_settings: Settings) -> None:
+        """20 samples, the grid goes away after sample 2. The PERSISTED record —
+        not the transient in-memory counter, which already existed and did not
+        help — must say the run was cut short, and must not price the 18 blind
+        replays as model disagreement."""
+        import asyncio
+
+        from elastic_transport import ConnectionError as EsConnectionError
+        from soc_ai.webui import backtest as bt
+
+        samples = [
+            backtest_svc.BacktestSample(
+                alert_es_id=f"a{i}", rule_name=f"rule {i}", human_disposition=HUMAN_FP
+            )
+            for i in range(20)
+        ]
+        # The two replays that landed before the outage agree with the analyst.
+        for s in samples[:2]:
+            _dispositioned_investigation(bt_settings, s.alert_es_id, "false_positive")
+
+        calls = {"n": 0}
+
+        def _run_recorded(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+            calls["n"] += 1
+            nth = calls["n"]
+
+            async def _gen() -> AsyncIterator[Any]:
+                if nth > 2:
+                    raise EsConnectionError("connection refused")
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+            return _gen()
+
+        async def _go() -> Any:
+            engine = make_engine(bt_settings)
+            await run_migrations(engine)
+            maker = make_sessionmaker(engine)
+
+            class _State:
+                settings = bt_settings
+                db_sessionmaker = maker
+
+            async with maker() as db:
+                row = await bt_svc.create(db, params={"window_days": 30}, started_by="admin")
+            with (
+                patch.object(bt, "run_recorded", _run_recorded),
+                patch.object(bt, "ctx_from_state", lambda _s: None),
+            ):
+                await bt.run_backtest(
+                    _State(), backtest_id=row.id, samples=samples, params={"window_days": 30}
+                )
+            async with maker() as db:
+                got = await bt_svc.get(db, row.id)
+            await engine.dispose()
+            return got
+
+        got = asyncio.run(_go())
+        assert got is not None
+        # Distinguishable from a clean run, on the record a reader loads later.
+        assert got.status != "complete"
+        results = got.results or {}
+        completion = results.get("completion") or {}
+        assert completion.get("degraded") is True
+        assert completion.get("no_verdict") == 18
+        assert completion.get("decided") == 2
+        # And the headline number is NOT a 90% model regression.
+        assert results["metrics"]["agreement_rate"] == 1.0
+
+    def test_a_clean_run_is_still_complete_and_not_degraded(self, bt_client: TestClient) -> None:
+        """The control: without it the fix could be 'always degrade'."""
+        resp = bt_client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 20})
+        assert resp.status_code == 200
+        data = _poll_backtest(bt_client)
+        assert data["status"] == "complete"
+        assert data["results"]["completion"]["degraded"] is False
+        assert data["results"]["completion"]["no_verdict"] == 0

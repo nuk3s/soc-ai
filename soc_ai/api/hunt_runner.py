@@ -32,6 +32,7 @@ from soc_ai.agent._partial_replay import (
 from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.hunt import (
     HUNT_SYSTEM_PROMPT,
+    HuntFinding,
     HuntReport,
     build_hunt_agent,
     build_hunt_prompt,
@@ -41,8 +42,10 @@ from soc_ai.agent.hunt_gates import _validate_hunt_charts, _validate_hunt_findin
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.orchestrator import InvestigationContext, StepEvent, _walk_message
 from soc_ai.agent.prompts import oql_primer_block
+from soc_ai.agent.toolset import GRID_BACKED_TOOLS, GRID_UNAVAILABLE_REASON
 from soc_ai.api.hunt_recorder import HuntRecorder
 from soc_ai.api.runner import CancelToken
+from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_text
 from soc_ai.so_client.inventory import inventory_prompt_block
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,8 +59,9 @@ async def _build_hunt_run(
     The egress guard MUST be attached to ``ctx`` before ``build_hunt_agent``
     runs — ``register_read_tools`` wraps the tool closures at registration
     time. When the guard is active, the system prompt (objective + dataset
-    inventory) and the user message (objective + prior-hunt summary) are
-    sanitized here — they are the hunt's prompt-side egress boundary.
+    inventory + host dossier) and the user message (objective + prior-hunt
+    summary) are sanitized here — they are the hunt's prompt-side egress
+    boundary.
     """
     guard = await _egress_guard_for(ctx)
     # The hunt agent runs OQL — append the primer so it writes VALID queries
@@ -65,10 +69,17 @@ async def _build_hunt_run(
     # errors. And append the auto-discovered dataset inventory so the hunt knows
     # what data ACTUALLY exists on this grid (network today, host logs later)
     # instead of guessing from a hardcoded list.
+    #
+    # The dossier block goes on the same seam, and for the same reason the
+    # inventory does: a hunt should know what the hosts its objective names ARE
+    # before it plans what to look for. Composed HERE, above the sanitize sweep
+    # below — appending it after the sweep would send the network's hostnames and
+    # addresses to a cloud model in the clear.
     system_prompt = (
         HUNT_SYSTEM_PROMPT.format(objective=objective)
         + oql_primer_block(flavor="hunt")
         + await inventory_prompt_block(ctx.elastic, ctx.settings)
+        + await _objective_dossier_block(ctx, objective, prior)
     )
     if guard is not None:
         # The objective is analyst-typed free text that may name internal
@@ -81,6 +92,34 @@ async def _build_hunt_run(
     if guard is not None:
         user_msg = guard.sanitize_text(user_msg)
     return guard, agent, user_msg
+
+
+async def _objective_dossier_block(
+    ctx: InvestigationContext, objective: str, prior: str | None
+) -> str:
+    """The host-dossier block for the addresses the hunt's own brief names.
+
+    A hunt has no alert to read endpoints off, so the host set comes from the
+    text the analyst wrote plus the prior hunt's narrative it is refining —
+    those are the addresses the hunt is already about. Nothing is discovered
+    here: this is not a sweep of the network, it is the identity of the hosts
+    already on the page, bounded by
+    :data:`~soc_ai.dossier.prompt.MAX_PROMPT_HOSTS`.
+
+    Returns ``""`` on every off-switch and every failure (the renderer's
+    contract), so a deployment with the dossier off pays nothing.
+
+    ``known_only`` because the addresses came from free text: an analyst can
+    type an address that was never observed, and a rendered "no dossier" line
+    would put it into the hunt's own prompt as though it were an asset. Only
+    hosts the sweep knows are described.
+    """
+    named = internal_ips_in_text(f"{objective}\n{prior or ''}", ctx.settings)
+    if not named:
+        return ""
+    return await host_dossier_prompt_block(
+        {ip: "named in the objective" for ip in named}, ctx=ctx, known_only=True
+    )
 
 
 async def _egress_guard_for(ctx: InvestigationContext) -> EgressGuard | None:
@@ -337,12 +376,286 @@ async def run_hunt(
     if citation_ev is not None:
         yield citation_ev
 
+    # ── Evidence-count gate (deterministic, G6) ──────────────────────────────
+    # Count what the tools ACTUALLY returned rather than trusting the write-up to
+    # mention the failures. A hunt may only stand as a clean sweep if at least ONE
+    # grid read SUCCEEDED — whether every grid call errored (an outage), every
+    # query was rejected by the grid (the model wrote queries ES said no to), or
+    # the hunt never made a grid call at all, it looked at nothing, so its report
+    # cannot read as "the network is quiet" however confidently it is worded.
+    # Runs LAST so the visibility-gap finding it adds is not stripped by the
+    # citation gate for citing nothing — a blind hunt has nothing to cite.
+    report, degraded_reason = _gate_hunt_evidence(report, gathered_tool_results)
+
     report_payload = report.model_dump(mode="json")
     yield _ev("hunt_report", report_payload)
-    yield _ev("done", {"finding_count": len(report.findings)})
+    yield _ev(
+        "done",
+        {
+            "finding_count": len(report.findings),
+            # Read by hunt_recorded_run to finalize the row as a degraded run
+            # rather than a completed hunt. On the done event (not a new event
+            # kind) so the persisted trace carries it without a UI that must
+            # learn a kind. The reason names the CAUSE: ``grid_unavailable``
+            # (the grid could not be read), ``grid_queries_rejected`` (the grid
+            # answered and rejected every query), or ``no_grid_reads`` (the hunt
+            # never ran a grid query).
+            "degraded": degraded_reason is not None,
+            "degraded_reason": degraded_reason,
+        },
+    )
 
 
 _PARTIAL_HUMILITY_NOTE = "budget/timeout-partial — uncorroborated; corroborate before acting"
+
+_GRID_OUTAGE_NOTE = (
+    "grid unavailable — every grid query in this hunt failed, so nothing was checked "
+    "and nothing was ruled out"
+)
+_GRID_OUTAGE_TITLE = "Grid unavailable — this hunt could not look"
+
+# The two evidence-count reasons beside the transport outage. Persisted on the
+# ``done`` event's ``degraded_reason``, so they are vocabulary, not prose: the
+# refused/rejected distinction matters — ``grid_unavailable`` blames grid
+# health, ``grid_queries_rejected`` blames the QUERIES (the grid answered every
+# call; the model wrote queries ES said no to), and ``no_grid_reads`` means the
+# hunt never asked the grid anything at all.
+QUERIES_REJECTED_REASON = "grid_queries_rejected"
+NO_GRID_READS_REASON = "no_grid_reads"
+
+_QUERIES_REJECTED_NOTE = (
+    "every grid query rejected — the grid answered and turned down each query this "
+    "hunt wrote as invalid, so nothing was checked and nothing was ruled out"
+)
+_QUERIES_REJECTED_TITLE = "Every query rejected — this hunt could not look"
+
+_NO_GRID_READS_NOTE = (
+    "no grid reads — this hunt never ran a successful grid query, so nothing was "
+    "checked and nothing was ruled out"
+)
+_NO_GRID_READS_TITLE = "No grid reads — this hunt never looked"
+
+
+def _grid_tool_outcomes(tool_results: list[Any]) -> tuple[int, int, int]:
+    """Count ``(succeeded, failed, rejected)`` over the GRID-backed tool results.
+
+    The arithmetic behind the evidence-count gate, and the hunt-side mirror of
+    :func:`soc_ai.agent.evidence.count_successful_tool_calls`, which already
+    excludes errored results from the triage evidence gate.
+
+    Only grid-backed tools count (:data:`~soc_ai.agent.toolset.GRID_BACKED_TOOLS`)
+    — the question is whether this hunt could read the NETWORK, and a working web
+    search or a local dossier lookup says nothing about that. A FAILURE is a
+    result the tool boundary stamped ``reason: "grid_unavailable"`` (the grid
+    could not be read). A REJECTION is any other error from a grid-backed tool —
+    a bad query or bad arguments the grid answered and said no to; the model can
+    fix those and try again, which is why a rejection is not a failure, but a run
+    made of NOTHING BUT rejections still read nothing, which is why they are
+    counted at all.
+
+    A zero-hit result counts as a SUCCESS: the grid answered, and an empty answer
+    from a healthy grid is a real, valuable result. Distinguishing "quiet" from
+    "blind" is the entire point.
+
+    A SHORT-CIRCUITED call never reached the grid, so it is none of the three:
+    the tool wrappers answer some calls from local state without querying — a
+    repeat of an identical call (``duplicate_call``) and a community_id the
+    orchestrator already prefetched (``prefetch_already_has_this``). Both come
+    back as non-error dicts from a grid-backed tool, and counting them as reads
+    would let a blind hunt certify itself: the dedup tracker registers a call's
+    key BEFORE the underlying query runs, so the retry of a query that timed out
+    is a duplicate hit, and one such retry would silence the gate. These are the
+    same two exclusions ``count_successful_tool_calls`` carries — deliberately
+    without its DISCRIMINATING-DATA standard, which is right for the evidence gate
+    (a throwaway zero-hit call must not license a verdict) and wrong here (a
+    zero-hit answer is exactly what a healthy quiet grid returns).
+    """
+    succeeded = failed = rejected = 0
+    for item in tool_results:
+        if not isinstance(item, dict):
+            continue
+        grid_tool = str(item.get("tool_name") or "") in GRID_BACKED_TOOLS
+        result = item.get("result")
+        if not isinstance(result, dict):
+            if grid_tool:
+                succeeded += 1
+            continue
+        if result.get("error"):
+            if result.get("reason") == GRID_UNAVAILABLE_REASON:
+                failed += 1
+            elif grid_tool:
+                rejected += 1
+        elif result.get("duplicate_call") or result.get("prefetch_already_has_this"):
+            continue
+        elif grid_tool:
+            succeeded += 1
+    return succeeded, failed, rejected
+
+
+def _gate_hunt_evidence(report: Any, tool_results: list[Any]) -> tuple[Any, str | None]:
+    """Run the deterministic evidence-count gate; return ``(report, degraded_reason)``.
+
+    Counterpart to :func:`_gate_hunt_citations`, and the half of G6 that does not
+    depend on the model cooperating. A hunt may only stand as a clean
+    ``complete`` if it made AT LEAST ONE successful grid read — a genuine
+    zero-hit answer included (the grid answered; quiet is a real result). Absent
+    that, the report is stamped blind and a non-``None`` reason comes back for
+    the caller to finalize the row as a degraded run instead of a completed
+    hunt, worded by cause:
+
+    * :data:`~soc_ai.agent.toolset.GRID_UNAVAILABLE_REASON` — at least one grid
+      call failed as a transport outage: the GRID could not be read. Wins when
+      causes mix, because "re-run once the grid is reachable" is the instruction
+      that fixes it.
+    * :data:`QUERIES_REJECTED_REASON` — every grid call was rejected (an ES 4xx
+      / bad arguments): the grid was reachable, the QUERIES were the problem.
+    * :data:`NO_GRID_READS_REASON` — the hunt never made a grid call at all:
+      the zero-tool hunt, or one that answered purely from off-grid tools.
+
+    The gate applies to EVERY hunt — no hunt path legitimately completes without
+    a fresh grid read. A hunt context carries no prefetched alert evidence
+    (``ctx_from_state`` builds it with an empty ``prefetched_community_ids``;
+    hunts are not alert-anchored), and the off-grid tools (dossier, enrichment,
+    web) are context ABOUT the network, not a look AT it — a hunt is, by
+    contract, a look.
+
+    The reason is computed from the counts alone, so it survives a decoration
+    failure — a marker that blew up must still not leave a clean, complete hunt.
+    """
+    succeeded, failed, rejected = _grid_tool_outcomes(tool_results)
+    if succeeded:
+        return report, None
+    if failed:
+        _LOGGER.warning(
+            "hunt could not read the grid (%d grid queries failed, none succeeded); "
+            "marking the report degraded",
+            failed,
+        )
+        return _mark_grid_outage(report, failed), GRID_UNAVAILABLE_REASON
+    if rejected:
+        _LOGGER.warning(
+            "hunt read nothing (%d grid queries rejected, none succeeded); "
+            "marking the report degraded",
+            rejected,
+        )
+        return _mark_queries_rejected(report, rejected), QUERIES_REJECTED_REASON
+    _LOGGER.warning("hunt made no grid reads at all; marking the report degraded")
+    return _mark_no_grid_reads(report), NO_GRID_READS_REASON
+
+
+def _mark_grid_outage(report: Any, failures: int) -> Any:
+    """Stamp a hunt report that could not read the grid as exactly that."""
+    return _mark_blind_hunt(
+        report,
+        title=_GRID_OUTAGE_TITLE,
+        detail=(
+            f"All {failures} Security Onion queries this hunt ran failed and none "
+            "succeeded, so the objective was neither confirmed nor ruled out. This "
+            "report is not evidence that the network is quiet — it is evidence that "
+            "the grid could not be read. Re-run the hunt once the grid is reachable."
+        ),
+        note=_GRID_OUTAGE_NOTE,
+        banner=(
+            "**Grid unavailable — this hunt could not read the network.** "
+            f"All {failures} grid queries failed and none succeeded, so nothing below "
+            "rules anything out. The write-up that follows was produced without grid "
+            "data."
+        ),
+    )
+
+
+def _mark_queries_rejected(report: Any, rejections: int) -> Any:
+    """Stamp a hunt report whose every grid query was rejected as exactly that.
+
+    Worded at the QUERIES, not at grid health: the grid was reachable and
+    answered every call — it rejected what the model asked. The remedy is a
+    re-run (fresh queries), not waiting out an outage.
+    """
+    return _mark_blind_hunt(
+        report,
+        title=_QUERIES_REJECTED_TITLE,
+        detail=(
+            f"All {rejections} Security Onion queries this hunt ran were rejected as "
+            "invalid (bad query or arguments) and none succeeded — the grid was "
+            "reachable, but every question this hunt asked it was malformed, so the "
+            "objective was neither confirmed nor ruled out. This report is not "
+            "evidence that the network is quiet — it is evidence that nothing was "
+            "successfully read. Re-run the hunt; if every query is rejected again, "
+            "the queries being written no longer match this grid."
+        ),
+        note=_QUERIES_REJECTED_NOTE,
+        banner=(
+            "**Every grid query was rejected — this hunt read nothing.** "
+            f"All {rejections} queries were rejected as invalid and none succeeded, so "
+            "nothing below rules anything out. The write-up that follows was produced "
+            "without grid data."
+        ),
+    )
+
+
+def _mark_no_grid_reads(report: Any) -> Any:
+    """Stamp a hunt report produced without a single grid query as exactly that.
+
+    The zero-tool arm: the hunt wrote its report without ever asking the grid a
+    question (no grid call at all, or only off-grid context lookups). Nothing was
+    checked, so nothing was cleared.
+    """
+    return _mark_blind_hunt(
+        report,
+        title=_NO_GRID_READS_TITLE,
+        detail=(
+            "This hunt produced its report without running a single Security Onion "
+            "query, so the objective was neither confirmed nor ruled out against the "
+            "network's actual telemetry. This report is not evidence that the network "
+            "is quiet — it is evidence that nothing was looked at. Re-run the hunt."
+        ),
+        note=_NO_GRID_READS_NOTE,
+        banner=(
+            "**No grid reads — this hunt never queried the network.** "
+            "Not one grid query ran, so nothing below rules anything out. The "
+            "write-up that follows was produced without grid data."
+        ),
+    )
+
+
+def _mark_blind_hunt(report: Any, *, title: str, detail: str, note: str, banner: str) -> Any:
+    """Stamp a hunt report that never successfully read the grid.
+
+    Three marks, because three different readers need them: the narrative (what
+    the analyst reads) gets ``banner`` prepended, a ``visibility_gap`` finding
+    carrying ``note`` in ``validator_note`` (the structured, machine-readable
+    record, and the channel the deterministic gates already own) is prepended to
+    the findings, and confidence drops to ``0.0`` (a hunt that never saw the
+    network has no confidence in anything — this is a floor-to-zero, not the
+    partial path's 0.5 ceiling).
+
+    The finding is a ``visibility_gap`` and never a ``threat``: the schema's own
+    rule is that telemetry you cannot read is a coverage statement, and a blind
+    hunt must not page anyone.
+
+    Fail-soft and PURE, like the humility clamp: on any surprise shape the report
+    is returned unchanged. The caller's degraded REASON does not depend on this
+    succeeding, so a decoration failure can still not land a clean hunt.
+    """
+    try:
+        gap = HuntFinding(
+            title=title,
+            detail=detail,
+            severity="high",
+            category="visibility_gap",
+            validator_note=note,
+        )
+        narrative = (banner + "\n\n" + str(getattr(report, "narrative", "") or "")).strip()
+        return report.model_copy(
+            update={
+                "findings": [gap, *report.findings],
+                "narrative": narrative,
+                "confidence": 0.0,
+            }
+        )
+    except Exception:
+        _LOGGER.warning("hunt blind-hunt marker failed; persisting report as-is", exc_info=True)
+        return report
 
 
 def _apply_partial_humility(report: Any) -> Any:
@@ -443,8 +756,18 @@ async def hunt_recorded_run(
 
     yield "hunt_created", {"hunt_id": hunt_id}
 
+    # Set from the terminal ``done`` event when the runner's deterministic
+    # evidence-count gate fired: the run made not one successful grid read —
+    # every grid query failed, or every one was rejected, or none ever ran — so
+    # it never looked at the network. Such a hunt must NOT finalize 'complete' —
+    # a completed hunt is a covered objective (it seeds the vs-last-run diff, the
+    # per-host findings scan and the schedule's freshness marker), and a blind
+    # hunt covered nothing.
+    grid_blind = False
     try:
         async for ev in run_hunt(ctx, objective=objective, prior=prior):
+            if ev.kind == "done" and ev.payload.get("degraded"):
+                grid_blind = True
             await recorder.record(ev.kind, ev.sequence, ev.payload)
             yield (
                 ev.kind,
@@ -454,13 +777,18 @@ async def hunt_recorded_run(
                     "payload": ev.payload,
                 },
             )
-        await recorder.finish("complete")
+        await recorder.finish("error" if grid_blind else "complete")
         # E2.4 notification trigger — a completed hunt whose report contains a
         # threat-category finding pings on-call. THIN + fail-soft: build a
         # NotifyEvent from the recorder's captured report and fire it (a hard
         # no-op unless notifications are enabled + a webhook is configured). Wrapped
         # so a webhook can never break the finalized hunt.
-        await _maybe_notify_hunt(state, recorder)
+        #
+        # Skipped when the hunt was blind: a "threat" asserted by a hunt that made
+        # no successful grid read has nothing behind it, and waking on-call for it
+        # is the blindness generating the alarm.
+        if not grid_blind:
+            await _maybe_notify_hunt(state, recorder)
     except asyncio.CancelledError:
         # Only an EXPLICIT operator cancel is 'cancelled'; any other cancellation
         # (SSE client disconnect, app/container shutdown) is an interrupted run

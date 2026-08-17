@@ -7,6 +7,9 @@ Covers:
 - :func:`resolve_agg_field` against a fake ES client returning canned counts:
   picks the first populated candidate, caches the result, and falls back to
   ``candidates[0]`` on all-zero counts or on a probe error.
+- The host-dossier identity tuples: ECS-first ordering, coalescing on both
+  document layouts, and the deliberate exclusion of ``zeek.dce_rpc.named_pipe``
+  from the SMB host-name candidates.
 """
 
 from __future__ import annotations
@@ -18,7 +21,22 @@ import pytest
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.so_client.fields import (
     CONN_ORIG_BYTES,
+    DHCP_CLIENT_FQDN,
+    DHCP_DOMAIN,
+    DHCP_HOSTNAME,
+    DHCP_MAC,
     DNS_QUERY,
+    HOST_MAC,
+    KERBEROS_REALM,
+    NTLM_DOMAIN,
+    NTLM_HOSTNAME,
+    NTLM_SERVER_NB,
+    SMB_HOST_NAME,
+    SOFTWARE_NAME,
+    SOFTWARE_TYPE,
+    SOFTWARE_VERSION,
+    SSH_DIRECTION,
+    SSH_VERSION,
     SSL_JA3S,
     _clear_agg_field_cache,
     first_present,
@@ -209,6 +227,32 @@ async def test_resolve_agg_field_error_does_not_cache() -> None:
     assert await resolve_agg_field(es_ok, "logs-*", DNS_QUERY) == "zeek.dns.query"
 
 
+async def test_resolve_agg_field_probe_error_reaches_on_probe_error() -> None:
+    # The swallow is deliberate (a best-effort resolver must not crash a query
+    # path) but callers that gate irreversible writes on the field CHOICE need
+    # to see it: discovery's retirement gate must not read "aggregated the
+    # ECS default because the probe blew up" as a grounded read of the estate.
+    es = FakeES({"dns.query.name": 5}, raise_on="dns.query.name")
+    seen: list[Exception] = []
+    field = await resolve_agg_field(es, "logs-*", DNS_QUERY, on_probe_error=seen.append)
+    assert field == "dns.query.name"  # fallback unchanged — still never raises
+    assert len(seen) == 1
+    assert "mapping missing" in str(seen[0])
+
+
+async def test_resolve_agg_field_on_probe_error_quiet_on_success_and_all_zero() -> None:
+    # A clean resolution and the all-zero fallback are OBSERVATIONS of the
+    # grid, not blind reads — the callback stays quiet for both.
+    seen: list[Exception] = []
+    es = FakeES({"dns.query.name": 0, "zeek.dns.query": 9})
+    resolved = await resolve_agg_field(es, "logs-*", DNS_QUERY, on_probe_error=seen.append)
+    assert resolved == "zeek.dns.query"
+    es_zero = FakeES({})  # every candidate probes clean with 0 docs
+    fallback = await resolve_agg_field(es_zero, "logs-*", SSL_JA3S, on_probe_error=seen.append)
+    assert fallback == "hash.ja3s"
+    assert seen == []
+
+
 def test_resolve_agg_field_accepts_sequence_not_just_tuple() -> None:
     # Candidates may arrive as a list; cache key normalizes to a tuple.
     async def _run() -> str:
@@ -219,3 +263,97 @@ def test_resolve_agg_field_accepts_sequence_not_just_tuple() -> None:
     import asyncio
 
     assert asyncio.run(_run()) == "client.bytes"
+
+
+# ---------------------------------------------------------------------------
+# Host-dossier identity tuples
+#
+# The dossier collector must not hardcode raw field names the way
+# host_summary._DHCP_HOSTNAME / _SOFTWARE do — on a modern SO grid those
+# zeek-first tables read the mapped-but-empty legacy fields and the dossier
+# would infer "no DHCP lease" (and therefore "statically addressed") on a host
+# that renews every hour.
+# ---------------------------------------------------------------------------
+
+_DOSSIER_TUPLES: dict[str, tuple[str, ...]] = {
+    "DHCP_HOSTNAME": DHCP_HOSTNAME,
+    "DHCP_CLIENT_FQDN": DHCP_CLIENT_FQDN,
+    "DHCP_DOMAIN": DHCP_DOMAIN,
+    "DHCP_MAC": DHCP_MAC,
+    "HOST_MAC": HOST_MAC,
+    "NTLM_HOSTNAME": NTLM_HOSTNAME,
+    "NTLM_DOMAIN": NTLM_DOMAIN,
+    "NTLM_SERVER_NB": NTLM_SERVER_NB,
+    "KERBEROS_REALM": KERBEROS_REALM,
+    "SMB_HOST_NAME": SMB_HOST_NAME,
+    "SSH_VERSION": SSH_VERSION,
+    "SSH_DIRECTION": SSH_DIRECTION,
+    "SOFTWARE_NAME": SOFTWARE_NAME,
+    "SOFTWARE_VERSION": SOFTWARE_VERSION,
+    "SOFTWARE_TYPE": SOFTWARE_TYPE,
+}
+
+
+def _nested(path: str, value: Any) -> dict[str, Any]:
+    """Build the nested-object document layout for one dotted path."""
+    root: dict[str, Any] = {}
+    cursor = root
+    segments = path.split(".")
+    for segment in segments[:-1]:
+        child: dict[str, Any] = {}
+        cursor[segment] = child
+        cursor = child
+    cursor[segments[-1]] = value
+    return root
+
+
+@pytest.mark.parametrize(("name", "candidates"), sorted(_DOSSIER_TUPLES.items()))
+def test_dossier_tuple_is_ecs_first(name: str, candidates: tuple[str, ...]) -> None:
+    # The FIRST candidate is what resolve_agg_field falls back to when every
+    # probe comes back empty, so a zeek.* head would make the ECS grid (the
+    # common case) the one that silently aggregates on an empty field.
+    assert candidates, name
+    assert not candidates[0].startswith("zeek."), name
+    assert len(candidates) == len(set(candidates)), name
+
+
+@pytest.mark.parametrize(("name", "candidates"), sorted(_DOSSIER_TUPLES.items()))
+def test_dossier_tuple_coalesces_flat_and_nested(name: str, candidates: tuple[str, ...]) -> None:
+    # Every candidate must be readable from BOTH document layouts: SO writes
+    # flat-dotted keys, the synth fixtures write nested objects.
+    for candidate in candidates:
+        assert first_present({candidate: "sentinel"}, candidates) == "sentinel", candidate
+        assert first_present(_nested(candidate, "sentinel"), candidates) == "sentinel", candidate
+
+
+def test_smb_host_name_excludes_dce_rpc_named_pipe() -> None:
+    """``zeek.dce_rpc.named_pipe`` carries ``srvsvc`` / ``svcctl`` / ``lsarpc``.
+
+    Those are RPC endpoint names, not host names. ``host_summary._SMB_HOSTNAME``
+    lists it FIRST and will therefore report ``srvsvc`` as a host's hostname; the
+    dossier tuple must not inherit that defect.
+    """
+    assert "zeek.dce_rpc.named_pipe" not in SMB_HOST_NAME
+    assert SMB_HOST_NAME[0] == "smb.host_name"
+
+
+def test_dhcp_hostname_prefers_ecs_over_legacy_zeek() -> None:
+    doc = {"dhcp.hostname": "pve01", "zeek.dhcp.host_name": "stale-lease-name"}
+    assert first_present(doc, DHCP_HOSTNAME) == "pve01"
+    # ECS absent (older SO / synth fixtures) -> the legacy name still resolves.
+    assert first_present({"zeek.dhcp.host_name": "pve01"}, DHCP_HOSTNAME) == "pve01"
+
+
+def test_host_mac_falls_back_through_endpoint_fields() -> None:
+    # host.mac is the ECS home for the address; source/destination.mac are what
+    # a Zeek conn record carries when the agent doesn't populate host.*.
+    assert first_present({"host.mac": "AA:BB:CC:00:11:22"}, HOST_MAC) == "AA:BB:CC:00:11:22"
+    assert first_present({"source": {"mac": "de:ad:be:ef:00:01"}}, HOST_MAC) == "de:ad:be:ef:00:01"
+
+
+def test_kerberos_realm_prefers_client_realm_over_bare_realm() -> None:
+    # zeek.kerberos.client_realm is the field SO actually populates; the bare
+    # zeek.kerberos.realm is a last-resort variant.
+    assert KERBEROS_REALM.index("zeek.kerberos.client_realm") < KERBEROS_REALM.index(
+        "zeek.kerberos.realm"
+    )

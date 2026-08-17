@@ -4,6 +4,9 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { Checkbox } from '../components/Controls';
+import { ListToolbar } from '../components/ListToolbar';
+import { useListSelection } from '../lib/useListSelection';
+import { useSavedViews } from '../lib/useSavedViews';
 import { Drawer } from '../components/Drawer';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
@@ -12,6 +15,7 @@ import { hideOptimisticallyAcked } from '../lib/alertFilters';
 import {
   type AlertQuery,
   type AutoTriageStatus,
+  ApiError,
   ackEvents,
   ackGroup,
   assignAlert,
@@ -28,6 +32,7 @@ import {
   stopAutoTriage,
 } from '../lib/api';
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
+import { plural } from '../lib/plural';
 import { useToast } from '../lib/toast';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
@@ -36,6 +41,7 @@ import type {
   AlertEvent,
   AlertGroup,
   Investigation as Inv,
+  SavedViewQuery,
   Severity,
   TriageState,
 } from '../lib/types';
@@ -57,35 +63,45 @@ type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 const GRID = '28px minmax(240px,1fr) 104px 136px 48px 40px 100px 170px';
 
 // Per-alert (expanded) event row: checkbox | alert time (abs+rel) | sev |
-// src→dst:port | host | verdict provenance (+ when) | investigate. Each row now
-// carries the alert's OWN timestamp AND the investigation's timestamp. The sev
-// column fits the widest label ("Critical") — narrower and the tag bleeds into
-// the src endpoint with zero gap.
+// src→dst:port | host (+ its address) | verdict provenance (+ when) |
+// investigate. Each row now carries the alert's OWN timestamp AND the
+// investigation's timestamp. The sev column fits the widest label ("Critical") —
+// narrower and the tag bleeds into the src endpoint with zero gap. The host
+// column stacks its second line (the endpoint agent's IP, host detections only)
+// rather than taking a column of its own: it is absent on every flow alert, so a
+// column would be empty on the common case.
 const EVENT_GRID = '16px 132px 76px minmax(150px,1fr) 116px 172px 92px';
 
 // Page size for an expanded group's events ("Load more" pulls one page at a time).
 const EVENTS_PAGE_SIZE = 50;
 
 // Auto-triage skip-reason codes (webui/autotriage.py planner) → friendly text.
-// Unknown codes fall through to the raw code so a new backend reason is surfaced
-// rather than silently dropped.
+// An entry earns its place only if the planner emits the code AND the wording
+// beats the humanized fallback below. "no_ip" fails the first test: it was
+// retired when _cluster_events stopped DROPPING alerts that carry no
+// source/destination IP, and keeping its label would have gone on advertising a
+// behaviour (endpoint-shaped detections discarded every sweep) the product no
+// longer has. "not_found" failed the second — its label read "not found", which
+// is character-for-character what the fallback already produces.
 const TRIAGE_SKIP_REASONS: Record<string, string> = {
   already_triaged: 'already triaged',
   running: 'in-flight',
   inherited: 'covered by a prior verdict',
-  no_ip: 'no source/dest IP',
-  not_found: 'not found',
 };
 
-// " (8 already triaged, 3 in-flight, 1 no source/dest IP)" — the per-reason
-// breakdown of a batch's skip count, or "" when the backend didn't carry one.
+// " (8 already triaged, 3 in-flight)" — the per-reason breakdown of a batch's
+// skip count, or "" when the backend didn't carry one.
+//
+// An unmapped code is humanized rather than printed raw: a new backend reason is
+// surfaced instead of silently dropped, and a RETIRED one (a historical status
+// row can still hold "no_ip") reads as words, not as wire format.
 function triageSkipDetail(s: AutoTriageStatus): string {
   const reasons = s.skipped_reasons;
   if (!reasons) return '';
   const parts = Object.entries(reasons)
     .filter(([, n]) => n > 0)
     .sort((a, b) => b[1] - a[1])
-    .map(([code, n]) => `${n} ${TRIAGE_SKIP_REASONS[code] ?? code}`);
+    .map(([code, n]) => `${n} ${TRIAGE_SKIP_REASONS[code] ?? code.replace(/_/g, ' ')}`);
   return parts.length ? ` (${parts.join(', ')})` : '';
 }
 
@@ -98,6 +114,88 @@ const VERDICT_RANK: Record<string, number> = { true_positive: 6, false_positive:
 // by verdict — rank it just above untriaged so triaging rows cluster together.
 const TRIAGING_RANK = 2;
 const verdictRank = (g: AlertGroup): number => (g.triaging ? TRIAGING_RANK : VERDICT_RANK[g.verdict] ?? 0);
+
+// ---- deep-link seeding ------------------------------------------------------
+// Allow-lists for the URL-seeded filters. A value outside its set is DROPPED,
+// not applied: a filter the on-screen control can't display is one the operator
+// can't clear, so a mangled or stale bookmark would silently hide rows with no
+// visible way back.
+const SEV_LINK_VALUES = new Set(['critical', 'high', 'medium', 'low']);
+/** Exactly the Verdict MultiSelect's options below. 'pipeline_error' is
+ * deliberately absent even though matchesVerdict() understands it — this
+ * screen's MultiSelect offers no such option, so a link carrying it would set a
+ * filter with no checkbox to un-tick. */
+const VERDICT_LINK_VALUES = new Set([
+  'untriaged',
+  'true_positive',
+  'false_positive',
+  'needs_more_info',
+  'inconclusive',
+]);
+/** TimeRangeFilter's presets, themselves pinned to the backend's TIME_RANGES
+ * (alerts_query.py). An unknown ?range= would query a window the backend
+ * rejects and leave the segmented control with nothing highlighted. */
+const RANGE_LINK_VALUES = new Set(['15m', '1h', '4h', '24h', '3d', '7d', '30d']);
+
+/**
+ * Filter state carried in on the URL. The Dashboard's severity bars land here
+ * on ?sev=, and its Untriaged tile on ?verdict=&range=&hide_acked= — that tile
+ * counts alert GROUPS with no standing investigation, the unit only this screen
+ * lists. The range/hide_acked params are load-bearing rather than decorative:
+ * this screen defaults to 24h with acked groups hidden, while the Dashboard
+ * counts the operator's chosen range with them included, so a link without them
+ * lands on a list that structurally cannot hold the group just counted.
+ *
+ * Read off the router's search params rather than window.location so seeding
+ * survives a basename (the SPA is served under /app).
+ */
+// This screen's own defaults, named once so a saved view that omits a facet can
+// restore the default rather than an arbitrary empty value. `hideAcked` is ON
+// by default (see seedFromLink's `!== 'false'`), which is exactly the default a
+// partial apply used to flip off.
+const DEFAULT_VIEW: ViewId = 'all';
+const DEFAULT_RANGE = '24h';
+const DEFAULT_HIDE_ACKED = true;
+
+function seedFromLink(params: URLSearchParams): {
+  sevs: string[];
+  verdicts: string[];
+  range: string | null;
+  custom: CustomRange | null;
+  hideAcked: boolean;
+  q: string | null;
+} {
+  const list = (raw: string | null, allowed: Set<string>): string[] =>
+    raw
+      ? raw
+          .split(',')
+          .map((v) => v.trim())
+          .filter((v) => allowed.has(v))
+      : [];
+  const range = params.get('range');
+  const from = params.get('from');
+  const to = params.get('to');
+  // 'custom' is only honoured with BOTH endpoints — a bare ?range=custom would
+  // ask the backend for a window with no bounds.
+  const custom = range === 'custom' && from && to ? { from, to } : null;
+  return {
+    sevs: list(params.get('sev'), SEV_LINK_VALUES),
+    verdicts: list(params.get('verdict'), VERDICT_LINK_VALUES),
+    range: custom ? 'custom' : range && RANGE_LINK_VALUES.has(range) ? range : null,
+    custom,
+    // Only an explicit ?hide_acked=false turns the toggle off; absent or
+    // mangled keeps this screen's default ON.
+    hideAcked: params.get('hide_acked') !== 'false',
+    // An OQL filter clause — the host page's Alerts KPI narrows this screen to
+    // one host with it (`(source.ip:x OR destination.ip:x)`). Passed to the
+    // backend verbatim, where the OQL trust boundary (parse + field whitelist)
+    // validates it; a bad clause is the server's named 400, not a silent list.
+    // Honouring the param is the point: a deep link this screen ignored would
+    // land a host-scoped count on a network-wide list — the untriaged-tile
+    // defect this file's header describes.
+    q: (params.get('q') ?? '').trim() || null,
+  };
+}
 
 /** Stable per-detection identity for client-side row state (expansion,
  * selection, keyboard focus, refs). The backend sets `g.id` to the NEWEST
@@ -158,6 +256,21 @@ function clockTime(iso?: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+/** The entity an event-table cell may pivot to, or null when there is nothing
+ * to pivot to.
+ *
+ * The backend does not send null for a missing endpoint or host — it sends the
+ * EM-DASH placeholder it wants displayed. That string is truthy, so the obvious
+ * `ev.host ? <link> : <text>` guard made every absent value a live link to
+ * `/entity/%E2%80%94`, an entity page for a punctuation mark. Emptiness here is
+ * a matter of VALUE, not truthiness, and host-shaped detections (no source.ip,
+ * no destination.ip) hit it on two cells out of three. */
+const PLACEHOLDER = '—';
+function pivotTarget(value?: string | null): string | null {
+  const v = value?.trim();
+  return v && v !== PLACEHOLDER ? v : null;
 }
 
 /** The verdict-provenance chip for a single event row: whether this exact event
@@ -294,6 +407,10 @@ export function Alerts() {
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [reloadKey, setReloadKey] = useState(0);
+  // Deep-link seed (see seedFromLink). Recomputed each render, but only the
+  // first render's value reaches the useState calls below — after that the
+  // controls own the filters.
+  const seed = seedFromLink(searchParams);
   // Demo content is rebased to "now" but still spans a couple of hours; widen the
   // default window so nothing the seed shipped ages out of view. The /demo-status
   // probe resolves async (demo is false on first render), so widen via an effect
@@ -301,14 +418,21 @@ export function Alerts() {
   // otherwise a hard-refresh straight to /alerts keeps the 24h default. demo flips
   // once, early, before any user pick, so this never clobbers a manual choice.
   const demo = useDemo();
-  const [filterTime, setFilterTime] = useState('24h');
+  const [filterTime, setFilterTime] = useState(seed.range ?? DEFAULT_RANGE);
+  // Frozen at mount: an explicit ?range= IS an operator choice (made on the
+  // Dashboard), so the demo widening above must not overwrite it.
+  const rangeFromLink = useRef(seed.range != null);
   useEffect(() => {
-    if (demo) setFilterTime('30d');
+    if (demo && !rangeFromLink.current) setFilterTime('30d');
   }, [demo]);
-  const [customRange, setCustomRange] = useState<CustomRange | null>(null);
-  const [filterSevs, setFilterSevs] = useState<string[]>([]); // [] = all
-  const [filterVerdicts, setFilterVerdicts] = useState<string[]>([]); // [] = all
-  const [hideAcked, setHideAcked] = useState(true);
+  const [customRange, setCustomRange] = useState<CustomRange | null>(seed.custom);
+  const [filterSevs, setFilterSevs] = useState<string[]>(seed.sevs); // [] = all
+  const [filterVerdicts, setFilterVerdicts] = useState<string[]>(seed.verdicts); // [] = all
+  const [hideAcked, setHideAcked] = useState(seed.hideAcked);
+  // The deep-linked OQL filter. Seeded once like the rest; cleared from its
+  // own chip in the filter bar (which also drops ?q= from the URL, so a reload
+  // does not resurrect a filter the analyst just dismissed).
+  const [filterQ, setFilterQ] = useState<string | null>(seed.q);
   // Current username — the "Mine" filter matches g.owner against it, and the
   // row actions use it to decide whose assignment they are toggling. Empty until
   // getMe resolves (falls back to "any owner" for the filter until then).
@@ -326,6 +450,10 @@ export function Alerts() {
       ? { range: 'custom', from: customRange.from, to: customRange.to }
       : { range: filterTime }),
     hideAcked: hideAcked || undefined,
+    // In alertQuery (not a one-off param) so the lazy event pages and the
+    // representative pick fetched under this filter stay scoped to the same
+    // set the rows on screen came from.
+    q: filterQ || undefined,
   };
   const view = (searchParams.get('view') as ViewId) || 'all';
   const drawerId = searchParams.get('drawer');
@@ -334,9 +462,9 @@ export function Alerts() {
   // that instead — same gotcha/pattern as Investigations.tsx, Hunts.tsx, etc.
   const drawerOpenRef = useRef(false);
   drawerOpenRef.current = !!drawerId;
-  const { data: groups, loading, error, lastUpdated } = useAsync(
+  const { data: groups, loading, error, lastUpdated, refetch } = useAsync(
     () => getAlerts(alertQuery),
-    [filterTime, customRange?.from, customRange?.to, hideAcked, reloadKey],
+    [filterTime, customRange?.from, customRange?.to, hideAcked, filterQ, reloadKey],
     {
       refetchInterval: 10000, // keep the grid + verdict/status badges live without a reload
       // Pause the 10s ES aggregation while an investigation drawer is open, so
@@ -354,8 +482,10 @@ export function Alerts() {
   const [eventsMore, setEventsMore] = useState<Record<string, boolean>>({});
   const [eventsLoadingMore, setEventsLoadingMore] = useState<Record<string, boolean>>({});
   const [starting, setStarting] = useState<AlertGroup | null>(null);
-  const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [selEvents, setSelEvents] = useState<Record<string, boolean>>({});
+  // How much is selected right now, readable from the filter-change effect
+  // without making that effect depend on (and re-run for) every tick.
+  const selectedRef = useRef(0);
   const [ackingEvents, setAckingEvents] = useState(false);
   const [density, setDensity] = useState<Density>('comfortable');
 
@@ -410,10 +540,59 @@ export function Alerts() {
 
   const showTriageMsg = (m: string) => toast({ message: m, tone: 'info' });
 
+  // Why a start that never landed is reported the way it is.
+  //
+  // "Bulk Investigate failed to start" is a claim about the SERVER, and only a
+  // server that answered can support it. An ApiError means the API responded
+  // and refused: its message is the wire's `detail.hint`, the sentence written
+  // for the analyst ("…retry shortly"), which the old toast dropped — leaving a
+  // failure that named no cause and no next step. Anything else is a transport
+  // failure with NO response at all: api.ts's 20s client budget fired, or the
+  // network dropped. On a stalled grid that is exactly what happens — the
+  // browser aborts the POST at 20s while the backend goes on running the sweep
+  // it already accepted — so "failed to start" is not merely vague there, it is
+  // false, and it invites a second click and a duplicate sweep over the same
+  // alerts. Unknown is not failure: report that we got no answer, and point at
+  // the surface that does know.
+  // Close a sentence somebody else wrote. Both halves of this report end by
+  // quoting one: the wire's `detail.hint`, or api.ts's transport message. How
+  // they are punctuated is not ours to decide — api.ts's network failure is a
+  // QUESTION ("…is the soc-ai API reachable?") — so add the full stop only when
+  // the author left the sentence open, and never restyle one they closed.
+  const endSentence = (s: string): string => {
+    const text = s.trim();
+    return /[.!?…]$/.test(text) ? text : `${text}.`;
+  };
+  const triageStartFailure = (err: unknown): string => {
+    // The server's sentence, or the transport's.
+    const detail = err instanceof Error ? err.message.trim() : '';
+    if (err instanceof ApiError) {
+      return `Bulk Investigate was refused. ${endSentence(
+        detail || `The API answered ${err.status}`,
+      )}`;
+    }
+    // The next step leads here, because it is the part that stops a duplicate
+    // sweep; the transport's own words follow it.
+    return (
+      'No answer to Bulk Investigate — the sweep may have started anyway, so check the ' +
+      `Auto-Investigate tile on the Dashboard before starting another. ${endSentence(
+        detail || 'The request did not complete',
+      )}`
+    );
+  };
+
+  // The durable half of that report. The toast is the notice; this strip is the
+  // record, and it stays until the next attempt — a click that failed used to
+  // leave no trace at all once the 6s toast expired. It cannot collide with the
+  // in-progress activity slot below: a failed start means `triaging` is false,
+  // and any new attempt clears this first.
+  const [triageError, setTriageError] = useState<string | null>(null);
+
   // A one-line summary of how a batch landed — never let it finish silently.
   // When the backend carries a per-reason skip breakdown (E2.2), spell it out
-  // ("12 skipped: 8 already triaged, 3 in-flight, 1 no source/dest IP") instead
-  // of a bare count so an operator can see WHY work was skipped.
+  // ("12 skipped (8 already triaged, 3 in-flight, 1 covered by a prior
+  // verdict)") instead of a bare count so an operator can see WHY work was
+  // skipped.
   const triageSummary = (s: AutoTriageStatus): string => {
     const parts = [`${s.hunted} investigated`];
     if (s.skipped) parts.push(`${s.skipped} skipped${triageSkipDetail(s)}`);
@@ -425,6 +604,7 @@ export function Alerts() {
   // minSeverity only applies to the global sweep (ignored when alertIds given).
   const startTriage = (alertIds?: string[], minSeverity?: string) => {
     setTriaging(true);
+    setTriageError(null);
     setPct(0);
     if (triageTimer.current) clearInterval(triageTimer.current);
     const finish = (msg: string | null) => {
@@ -460,9 +640,14 @@ export function Alerts() {
         setTimeout(() => setReloadKey((k) => k + 1), 1500);
         triageTimer.current = setInterval(poll, 2000);
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         setTriaging(false);
-        showTriageMsg('Bulk Investigate failed to start');
+        const msg = triageStartFailure(err);
+        setTriageError(msg);
+        // 'danger', so the toaster's own rule applies and it persists until
+        // dismissed. As an 'info' it inherited the 6s auto-dismiss and was gone
+        // from the screen before an analyst who looked away had read it.
+        toast({ message: msg, tone: 'danger' });
       });
   };
 
@@ -501,7 +686,27 @@ export function Alerts() {
     // outside the new window — clear it too, else the bulk bar keeps offering
     // "Ack N events" against ES ids the analyst can no longer see (F59).
     setSelEvents({});
-  }, [filterTime, customRange?.from, customRange?.to, hideAcked]);
+    // The same argument applies to GROUPS, and more sharply. A group selection
+    // is a `kind:name` KEY, but every bulk action resolves it against the
+    // CURRENT `groups` array to get the representative event id — so a group
+    // that falls outside the new filter keeps inflating the strip's count while
+    // contributing nothing to the action it appears to be part of. That is the
+    // count lying about the work, which is the whole disease this screen keeps
+    // catching. Unlike the paged lists, this screen refetches its entire result
+    // set on a filter change, so there is no legitimate off-page selection to
+    // preserve here.
+    //
+    // This is ALSO what lets the filter row stay on screen during a selection.
+    // The row used to be hidden while selecting, which prevented a stranded
+    // selection structurally — by removing the controls. That cure cost Hunts
+    // its only filter and blanked a live search term, so the guarantee is made
+    // here instead: change a filter and the selection is dropped, out loud.
+    if (selectedRef.current > 0) {
+      showAckMsg('Filter changed — selection cleared');
+    }
+    sel.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterTime, customRange?.from, customRange?.to, hideAcked, filterQ]);
 
   const setView = (v: ViewId) => {
     searchParams.set('view', v);
@@ -624,15 +829,7 @@ export function Alerts() {
 
   // Toggle a single group's selection (keyboard `x`) into the same `selected`
   // map the checkboxes + bulk bar use.
-  const toggleSelectGroup = (g: AlertGroup) => {
-    const gk = groupKey(g);
-    setSelected((s) => {
-      const next = { ...s };
-      if (next[gk]) delete next[gk];
-      else next[gk] = true;
-      return next;
-    });
-  };
+  const toggleSelectGroup = (g: AlertGroup) => sel.toggle(groupKey(g));
 
   const toggleExpand = (g: AlertGroup) => {
     const gk = groupKey(g);
@@ -719,7 +916,11 @@ export function Alerts() {
   );
 
   const visIds = visible.map(groupKey);
-  const allSelected = visIds.length > 0 && visIds.every((id) => selected[id]);
+  // The shared selection hook. Keyed by the STABLE group key, not the list
+  // index, for the same reason keyboard focus is: the 10s poll reorders rows
+  // under the analyst's cursor.
+  const sel = useListSelection(visIds);
+  const allSelected = sel.allVisibleSelected;
   // Resolve the focused row from its stable key (see focusedKey). -1 when the
   // key is null or the row is no longer visible — the keyboard layer then no-ops
   // its row actions gracefully.
@@ -806,22 +1007,36 @@ export function Alerts() {
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paletteOpen, modalOpen, keyHelpOpen, visible, focusedIndex, drawerId]);
-  const selCount = Object.keys(selected).filter((k) => selected[k]).length;
+  const selCount = sel.count;
   const selectedEventIds = Object.entries(selEvents).filter(([, v]) => v).map(([k]) => k);
   const hasSelection = selCount > 0 || selectedEventIds.length > 0;
   const rowPad = density === 'compact' ? '7px 14px' : '11px 14px';
 
-  const toggleSelectAll = () => {
-    setSelected((s) => {
-      const next = { ...s };
-      const all = visIds.every((id) => next[id]);
-      visIds.forEach((id) => {
-        if (all) delete next[id];
-        else next[id] = true;
-      });
-      return next;
-    });
-  };
+  // The selection is a PARTITION, computed once and used by every surface that
+  // speaks about it — the strip, the Acknowledge label, and both bulk actions.
+  //
+  // Ticking a group's checkbox also ticks every LOADED event under it, so the
+  // expanded rows agree with the header box. Those event ids are already
+  // covered by the group, so counting them a second time is double counting:
+  // two expanded groups plus three loose events used to print "2 groups · 10
+  // events" and submit twelve ids for five things' worth of work. `looseEvents`
+  // is the events NOT already covered by a selected group, and it is what the
+  // count, the button label and the request all use.
+  //
+  // `alertsInWindow` is the groups' whole-window fire count — hundreds, often —
+  // so it is labelled as such rather than sat next to a loaded-event count as
+  // if the two were the same kind of number.
+  const selectedGroups = (groups ?? []).filter((g) => sel.isSelected(groupKey(g)));
+  const coveredEventIds = new Set(
+    selectedGroups.flatMap(
+      (g) => ((groupEvents[groupKey(g)] ?? []).map((ev) => ev.id).filter(Boolean) as string[]),
+    ),
+  );
+  const looseEventIds = selectedEventIds.filter((id) => !coveredEventIds.has(id));
+  selectedRef.current = selCount + selectedEventIds.length;
+  const alertsInWindow = selectedGroups.reduce((n, g) => n + (g.count || 0), 0);
+
+  const toggleSelectAll = () => sel.toggleAll();
 
   const { counts, untriaged, totalEvents } = useMemo(() => {
     const gs = groups ?? [];
@@ -840,13 +1055,60 @@ export function Alerts() {
     };
   }, [groups, me]);
 
-  const TABS: Array<{ id: ViewId; label: string; count: number }> = [
-    { id: 'mine', label: 'Mine', count: counts.mine },
-    { id: 'inreview', label: 'In review', count: counts.inreview },
-    { id: 'critical', label: 'Critical', count: counts.critical },
-    { id: 'decision', label: 'Needs decision', count: counts.decision },
-    { id: 'all', label: 'All', count: counts.all },
+  // Unknown is not zero. Every number on this screen is derived from `groups`,
+  // which is an empty array both before the first load lands and after a failed
+  // one — so the header, the view chips and the footer each printed a literal 0
+  // for a count the screen never obtained. On a down grid that put
+  // "0 untriaged · 0 detections · 0 events in window" directly above this
+  // screen's own "Couldn't load this view" card: a false all-clear, which is the
+  // one thing worse than a loud error, sitting on the top line a tired analyst
+  // scans first. Same convention (and the same shape) as the Dashboard's stat
+  // cards: the real number once we have data — INCLUDING a genuine 0, because a
+  // quiet shift is a real and common answer — an em-dash for a number we asked
+  // for and did not get, an ellipsis while we are still asking. Keyed off
+  // `groups`, not off `error`, so stale rows left on screen by a failed
+  // background poll keep counts that describe the rows actually rendered.
+  const num = (n: number): string => (groups ? n.toLocaleString() : error ? '—' : '…');
+  const countOf = (n: number, one: string, many = `${one}s`): string =>
+    groups ? plural(n, one, many) : `${num(n)} ${many}`;
+  // A chip badge is one glyph wide with no room for that distinction, so an
+  // uncounted view carries NO badge rather than a confident "0" one.
+  const chipCount = (n: number): number | undefined => (groups ? n : undefined);
+
+  const TABS: Array<{ id: ViewId; label: string; count: number | undefined }> = [
+    { id: 'mine', label: 'Mine', count: chipCount(counts.mine) },
+    { id: 'inreview', label: 'In review', count: chipCount(counts.inreview) },
+    { id: 'critical', label: 'Critical', count: chipCount(counts.critical) },
+    { id: 'decision', label: 'Needs decision', count: chipCount(counts.decision) },
+    { id: 'all', label: 'All', count: chipCount(counts.all) },
   ];
+
+  // Saved views sit beside the preset tabs in the same chip row: a preset is a
+  // view this screen ships with, a saved view is one the analyst named, and
+  // there is no reason for them to look like different mechanisms.
+  const savedQuery: SavedViewQuery = {
+    view,
+    sevs: filterSevs,
+    verdicts: filterVerdicts,
+    hideAcked,
+    range: filterTime,
+    custom: customRange,
+  };
+  const views = useSavedViews('alerts', savedQuery, (saved) => {
+    // A TOTAL apply: every facet the view names is set, and every facet it does
+    // NOT name goes back to this screen's own default — not to an arbitrary
+    // empty value. The half-and-half version set view/range only when present
+    // while hard-resetting sevs/verdicts/custom, and `!!saved.hideAcked` forced
+    // the ON-by-default hide-acked OFF for any view saved before that key
+    // existed. A saved view that silently unhides acknowledged alerts is worse
+    // than no saved views.
+    setView(typeof saved.view === 'string' ? (saved.view as ViewId) : DEFAULT_VIEW);
+    setFilterSevs(Array.isArray(saved.sevs) ? (saved.sevs as string[]) : []);
+    setFilterVerdicts(Array.isArray(saved.verdicts) ? (saved.verdicts as string[]) : []);
+    setHideAcked(typeof saved.hideAcked === 'boolean' ? saved.hideAcked : DEFAULT_HIDE_ACKED);
+    setFilterTime(typeof saved.range === 'string' ? saved.range : DEFAULT_RANGE);
+    setCustomRange((saved.custom as CustomRange | null) ?? null);
+  });
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
@@ -858,7 +1120,8 @@ export function Alerts() {
             <Freshness at={lastUpdated} />
           </div>
           <div className="mt-0.5 text-[13px] text-dim">
-            {untriaged} untriaged · {counts.all} detections · {totalEvents} events in window
+            {num(untriaged)} untriaged · {countOf(counts.all, 'detection')} ·{' '}
+            {countOf(totalEvents, 'event')} in window
           </div>
         </div>
         <div className="flex-1" />
@@ -884,6 +1147,28 @@ export function Alerts() {
           </button>
         </div>
       </div>
+
+      {/* The last Bulk Investigate that never started, kept beside the control
+          that started it until the next attempt. Mutually exclusive with the
+          activity slot below by construction, so the header height stays
+          bounded. */}
+      {triageError && (
+        <div
+          role="alert"
+          className="mb-3.5 flex items-start gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
+          style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.08)' }}
+        >
+          <span className="mt-px flex flex-shrink-0 text-danger"><Zap size={15} /></span>
+          <div className="min-w-0 flex-1 break-words leading-[1.5] text-text-2">{triageError}</div>
+          <button
+            onClick={() => setTriageError(null)}
+            aria-label="Dismiss"
+            className="mt-px flex flex-shrink-0 text-dim hover:text-text"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {/* Activity slot — capacity 1. Only IN-PROGRESS screen work renders here;
           results go to the toaster. Both jobs at once show as two lines in ONE
@@ -940,44 +1225,213 @@ export function Alerts() {
         </div>
       )}
 
-      {/* saved-view tabs */}
-      <div className="mb-3.5 flex items-center gap-0.5 border-b border-border">
-        {TABS.map((t) => {
-          const active = view === t.id;
-          return (
-            <button
-              key={t.id}
-              onClick={() => setView(t.id)}
-              className="-mb-px flex items-center gap-1.5 px-[13px] py-2 text-[13px]"
-              style={{
-                fontWeight: active ? 600 : 500,
-                color: active ? '#e6e9ef' : '#8b94a3',
-                borderBottom: `2px solid ${active ? '#4b8bf5' : 'transparent'}`,
-              }}
-            >
-              {t.label}
-              <span
-                className="rounded-chip px-1.5 py-px font-mono text-[10.5px] text-dim"
-                style={{ background: active ? '#141b25' : '#11161e' }}
+      {/* The shared list toolbar. The preset tabs became chips in its view row
+          so they read as the same mechanism as a saved view — one is a view
+          this screen ships with, the other one the analyst named. The selection
+          strip takes the facet row's slot, which is where that behaviour came
+          from in the first place. */}
+      <ListToolbar
+        presets={TABS.map((t) => ({ id: t.id, label: t.label, count: t.count, active: view === t.id }))}
+        onPreset={(id) => {
+          setView(id as ViewId);
+          views.clearActive();
+        }}
+        views={views.views}
+        activeViewId={views.activeViewId}
+        onApplyView={views.onApplyView}
+        onDeleteView={views.onDeleteView}
+        onSaveView={views.onSaveView}
+        viewError={views.error}
+        trailing={
+          <>
+            {/* density toggle */}
+            <div className="flex overflow-hidden rounded-[7px] border border-border-2">
+              <button
+                onClick={() => setDensity('comfortable')}
+                title="Comfortable"
+                aria-label="Comfortable density"
+                aria-pressed={density !== 'compact'}
+                className="flex items-center px-2 py-1.5"
+                style={{ color: density !== 'compact' ? '#e6e9ef' : '#7d8896', background: density !== 'compact' ? '#141b25' : 'transparent' }}
               >
-                {t.count}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Context row: the filter bar. Hidden while rows are selected — the
-          bulk-action bar takes this same slot (below) so the table never shifts
-          down as you multi-select. */}
-      {!hasSelection && (
-      <div className="mb-3 flex min-h-[51px] flex-wrap items-center gap-2">
+                <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+              </button>
+              <button
+                onClick={() => setDensity('compact')}
+                title="Compact"
+                aria-label="Compact density"
+                aria-pressed={density === 'compact'}
+                className="flex items-center border-l border-border-2 px-2 py-1.5"
+                style={{ color: density === 'compact' ? '#e6e9ef' : '#7d8896', background: density === 'compact' ? '#141b25' : 'transparent' }}
+              >
+                <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 5h16M4 9h16M4 13h16M4 17h16M4 21h16" /></svg>
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5 text-[12.5px] text-dim">
+              Sort <span className="font-mono font-semibold text-text">{sort.key} {sort.dir === 'asc' ? '↑' : '↓'}</span>
+            </div>
+          </>
+        }
+        selection={
+          hasSelection
+            ? {
+                count: selCount + looseEventIds.length,
+                offPageCount: sel.offPageCount,
+                onClearOffPage: sel.clearOffPage,
+                onClear: () => {
+                  sel.clear();
+                  setSelEvents({});
+                },
+                summary: (
+                  <span className="font-semibold text-text-2">
+                    {selCount > 0 && (
+                      <>
+                        <span className="font-mono text-accent">{selCount}</span> group{selCount !== 1 ? 's' : ''}
+                        <span
+                          className="ml-1 text-[11.5px] font-normal text-faint"
+                          title="How many times the selected detections fired in the current window. Acknowledging a group covers all of them."
+                        >
+                          ({alertsInWindow.toLocaleString()} alert{alertsInWindow !== 1 ? 's' : ''} in window)
+                        </span>
+                      </>
+                    )}
+                    {selCount > 0 && looseEventIds.length > 0 && <span className="mx-1 text-faint">·</span>}
+                    {looseEventIds.length > 0 && (
+                      <>
+                        <span className="font-mono text-accent">{looseEventIds.length}</span>{' '}
+                        {selCount > 0 ? 'more ' : ''}event{looseEventIds.length !== 1 ? 's' : ''}
+                      </>
+                    )}
+                  </span>
+                ),
+                actions: (
+                  <>
+                  <button
+                    onClick={() => {
+                      // Map the selected STABLE group keys back to each group's CURRENT
+                      // representative event id (fresh from the latest poll) — that id is
+                      // what the triage backend resolves, not the kind:name key.
+                      const groupIds = selectedGroups.map((g) => g.id);
+                      // looseEventIds, NOT selectedEventIds: an event under a
+                      // selected group is already covered by that group's id,
+                      // and sending both investigates the same thing twice.
+                      const allIds = [...groupIds, ...looseEventIds];
+                      if (!allIds.length) return;
+                      startTriage(allIds);
+                      sel.clear();
+                      setSelEvents({});
+                    }}
+                    className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
+                    style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+                  >
+                    <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Bulk Investigate
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (!selectedGroups.length) return;
+                      const blocked = demoBlocked(demo);
+                      if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
+                      const n = selectedGroups.length;
+                      // allSettled: a single assign failing must not silently drop the rest.
+                      // Keep failed groups selected so the analyst can retry them.
+                      Promise.allSettled(selectedGroups.map((g) => assignAlert(g.name)))
+                        .then((outcomes) => {
+                          const failedIds = outcomes
+                            .map((o, i) => (o.status === 'rejected' ? groupKey(selectedGroups[i]) : null))
+                            .filter((id): id is string => id !== null);
+                          const ok = n - failedIds.length;
+                          sel.select(failedIds);
+                          if (failedIds.length) {
+                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed — still selected, click Assign to me to retry`);
+                          } else {
+                            showAckMsg(`Assigned ${ok} group${ok !== 1 ? 's' : ''} to you`);
+                          }
+                          setReloadKey((k) => k + 1);
+                        });
+                    }}
+                    className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-accent"
+                  >
+                    Assign to me
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (!selectedGroups.length) return;
+                      const blocked = demoBlocked(demo);
+                      if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write (before setAcking so the strip shows)
+                      const n = selectedGroups.length;
+                      const alertTotal = alertsInWindow;
+                      setAckingCount(n);
+                      setAckingAlertTotal(alertTotal);
+                      setAcking(true);
+                      // allSettled: one group failing must not wipe the whole batch. Keep
+                      // failed groups selected so the analyst can retry them.
+                      Promise.allSettled(selectedGroups.map((g) => ackGroup(g, alertQuery)))
+                        .then((outcomes) => {
+                          const failedIds: string[] = [];
+                          let totalAcked = 0;
+                          let totalFailed = 0;
+                          let okGroups = 0;
+                          let anyCapped = false;
+                          outcomes.forEach((o, i) => {
+                            if (o.status === 'fulfilled') {
+                              okGroups += 1;
+                              totalAcked += o.value.acked;
+                              totalFailed += o.value.failed;
+                              if (o.value.capped) anyCapped = true;
+                            } else {
+                              failedIds.push(groupKey(selectedGroups[i]));
+                            }
+                          });
+                          const failedGroups = failedIds.length;
+                          // Clear only the groups that succeeded; retain failed ones for retry.
+                          sel.select(failedIds);
+                          const parts = [`Acknowledged ${totalAcked} alert${totalAcked !== 1 ? 's' : ''} across ${okGroups} group${okGroups !== 1 ? 's' : ''}`];
+                          if (totalFailed) parts.push(`${totalFailed} event${totalFailed !== 1 ? 's' : ''} failed`);
+                          if (failedGroups) parts.push(`${failedGroups} group${failedGroups !== 1 ? 's' : ''} failed — still selected, click Acknowledge to retry`);
+                          showAckMsg(parts.join(' · ') + (anyCapped ? ' — some groups exceeded the 200-event cap, click Acknowledge again to finish.' : ''));
+                          setReloadKey((k) => k + 1);
+                        })
+                        .finally(() => setAcking(false));
+                    }}
+                    className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success"
+                  >
+                    {selectedGroups.length > 0
+                      ? `Acknowledge ${selectedGroups.length} group${selectedGroups.length !== 1 ? 's' : ''} · ${alertsInWindow.toLocaleString()} alert${alertsInWindow !== 1 ? 's' : ''}`
+                      : 'Acknowledge'}
+                  </button>
+                  {looseEventIds.length > 0 && (
+                    <button
+                      disabled={ackingEvents}
+                      onClick={async () => {
+                        const blocked = demoBlocked(demo);
+                        if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
+                        setAckingEvents(true);
+                        try {
+                          await ackEvents(looseEventIds);
+                          setSelEvents({});
+                          setReloadKey((k) => k + 1);
+                        } finally {
+                          setAckingEvents(false);
+                        }
+                      }}
+                      className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success disabled:opacity-50"
+                    >
+                      {ackingEvents ? 'Acking…' : `Ack ${looseEventIds.length} event${looseEventIds.length !== 1 ? 's' : ''}`}
+                    </button>
+                  )}
+                  </>
+                ),
+              }
+            : undefined
+        }
+      >
         <TimeRangeFilter
           value={filterTime}
           custom={customRange}
           onChange={(v, r) => {
             setFilterTime(v);
             if (r) setCustomRange(r);
+            views.clearActive();
           }}
         />
         <MultiSelect
@@ -990,7 +1444,10 @@ export function Alerts() {
             { value: 'low', label: 'Low' },
           ]}
           value={filterSevs}
-          onChange={setFilterSevs}
+          onChange={(v) => {
+            setFilterSevs(v);
+            views.clearActive();
+          }}
         />
         <MultiSelect
           label="Verdict"
@@ -1003,10 +1460,16 @@ export function Alerts() {
             { value: 'inconclusive', label: 'Inconclusive' },
           ]}
           value={filterVerdicts}
-          onChange={setFilterVerdicts}
+          onChange={(v) => {
+            setFilterVerdicts(v);
+            views.clearActive();
+          }}
         />
         <button
-          onClick={() => setHideAcked((v) => !v)}
+          onClick={() => {
+            setHideAcked((v) => !v);
+            views.clearActive();
+          }}
           title="Hide acknowledged and escalated groups"
           className="flex items-center gap-1.5 rounded-control border px-[11px] py-[7px] text-[12.5px] font-semibold transition-colors"
           style={
@@ -1018,181 +1481,35 @@ export function Alerts() {
           <Check size={12} />
           Hide acknowledged
         </button>
-        <div className="flex-1" />
-        {/* density toggle */}
-        <div className="flex overflow-hidden rounded-[7px] border border-border-2">
-          <button
-            onClick={() => setDensity('comfortable')}
-            title="Comfortable"
-            aria-label="Comfortable density"
-            aria-pressed={density !== 'compact'}
-            className="flex items-center px-2 py-1.5"
-            style={{ color: density !== 'compact' ? '#e6e9ef' : '#7d8896', background: density !== 'compact' ? '#141b25' : 'transparent' }}
+        {/* The deep-linked OQL filter, VISIBLE and dismissable. A list narrowed
+            by an invisible filter reads as the whole network having only these
+            detections — the chip is what keeps the narrowing honest. */}
+        {filterQ && (
+          <span
+            data-testid="alerts-q-chip"
+            title="Only detections matching this filter (a host page deep-link). The backend validates the clause; clear it to see every detection."
+            className="flex max-w-[420px] items-center gap-1.5 rounded-control border border-accent/40 bg-accent/10 px-[10px] py-[7px] text-[12px] text-accent"
           >
-            <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
-          </button>
-          <button
-            onClick={() => setDensity('compact')}
-            title="Compact"
-            aria-label="Compact density"
-            aria-pressed={density === 'compact'}
-            className="flex items-center border-l border-border-2 px-2 py-1.5"
-            style={{ color: density === 'compact' ? '#e6e9ef' : '#7d8896', background: density === 'compact' ? '#141b25' : 'transparent' }}
-          >
-            <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 5h16M4 9h16M4 13h16M4 17h16M4 21h16" /></svg>
-          </button>
-        </div>
-        <div className="flex items-center gap-1.5 text-[12.5px] text-dim">
-          Sort <span className="font-mono font-semibold text-text">{sort.key} {sort.dir === 'asc' ? '↑' : '↓'}</span>
-        </div>
-      </div>
-      )}
-
-      {/* Bulk-action bar — occupies the SAME slot as the filter bar, replacing it
-          during selection so the table's top edge stays put. */}
-      {hasSelection && (
-        <div className="mb-3 flex min-h-[51px] animate-fadeUp items-center gap-[9px] rounded-card border border-accent-deep bg-[#0d1726] px-[13px] py-2">
-          <span className="text-[12.5px] font-semibold text-text-2">
-            {selCount > 0 && (
-              <>
-                <span className="font-mono text-accent">{selCount}</span> group{selCount !== 1 ? 's' : ''}
-                {' · '}
-                <span className="font-mono text-accent">
-                  {(groups ?? []).filter((g) => selected[groupKey(g)]).reduce((s, g) => s + (g.count || 0), 0)}
-                </span> alerts
-              </>
-            )}
-            {selCount > 0 && selectedEventIds.length > 0 && <span className="mx-1 text-faint">·</span>}
-            {selectedEventIds.length > 0 && <><span className="font-mono text-accent">{selectedEventIds.length}</span> event{selectedEventIds.length !== 1 ? 's' : ''}</>}
-          </span>
-          <div className="h-4 w-px bg-[#23314a]" />
-          <button
-            onClick={() => {
-              // Map the selected STABLE group keys back to each group's CURRENT
-              // representative event id (fresh from the latest poll) — that id is
-              // what the triage backend resolves, not the kind:name key.
-              const groupIds = (groups ?? []).filter((g) => selected[groupKey(g)]).map((g) => g.id);
-              const allIds = [...groupIds, ...selectedEventIds];
-              if (!allIds.length) return;
-              startTriage(allIds);
-              setSelected({});
-              setSelEvents({});
-            }}
-            className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
-            style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
-          >
-            <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Bulk Investigate
-          </button>
-          <button
-            onClick={() => {
-              const selectedGroups = (groups ?? []).filter((g) => selected[groupKey(g)]);
-              if (!selectedGroups.length) return;
-              const blocked = demoBlocked(demo);
-              if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
-              const n = selectedGroups.length;
-              // allSettled: a single assign failing must not silently drop the rest.
-              // Keep failed groups selected so the analyst can retry them.
-              Promise.allSettled(selectedGroups.map((g) => assignAlert(g.name)))
-                .then((outcomes) => {
-                  const failedIds = outcomes
-                    .map((o, i) => (o.status === 'rejected' ? groupKey(selectedGroups[i]) : null))
-                    .filter((id): id is string => id !== null);
-                  const ok = n - failedIds.length;
-                  setSelected((s) => {
-                    const next: Record<string, boolean> = {};
-                    for (const id of failedIds) if (s[id]) next[id] = true;
-                    return next;
-                  });
-                  if (failedIds.length) {
-                    showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed — still selected, click Assign to me to retry`);
-                  } else {
-                    showAckMsg(`Assigned ${ok} group${ok !== 1 ? 's' : ''} to you`);
-                  }
-                  setReloadKey((k) => k + 1);
-                });
-            }}
-            className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-accent"
-          >
-            Assign to me
-          </button>
-          <button
-            onClick={() => {
-              const selectedGroups = (groups ?? []).filter((g) => selected[groupKey(g)]);
-              if (!selectedGroups.length) return;
-              const blocked = demoBlocked(demo);
-              if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write (before setAcking so the strip shows)
-              const n = selectedGroups.length;
-              const alertTotal = selectedGroups.reduce((s, g) => s + (g.count || 0), 0);
-              setAckingCount(n);
-              setAckingAlertTotal(alertTotal);
-              setAcking(true);
-              // allSettled: one group failing must not wipe the whole batch. Keep
-              // failed groups selected so the analyst can retry them.
-              Promise.allSettled(selectedGroups.map((g) => ackGroup(g, alertQuery)))
-                .then((outcomes) => {
-                  const failedIds: string[] = [];
-                  let totalAcked = 0;
-                  let totalFailed = 0;
-                  let okGroups = 0;
-                  let anyCapped = false;
-                  outcomes.forEach((o, i) => {
-                    if (o.status === 'fulfilled') {
-                      okGroups += 1;
-                      totalAcked += o.value.acked;
-                      totalFailed += o.value.failed;
-                      if (o.value.capped) anyCapped = true;
-                    } else {
-                      failedIds.push(groupKey(selectedGroups[i]));
-                    }
-                  });
-                  const failedGroups = failedIds.length;
-                  // Clear only the groups that succeeded; retain failed ones for retry.
-                  setSelected((s) => {
-                    const next: Record<string, boolean> = {};
-                    for (const id of failedIds) if (s[id]) next[id] = true;
-                    return next;
-                  });
-                  const parts = [`Acknowledged ${totalAcked} alert${totalAcked !== 1 ? 's' : ''} across ${okGroups} group${okGroups !== 1 ? 's' : ''}`];
-                  if (totalFailed) parts.push(`${totalFailed} event${totalFailed !== 1 ? 's' : ''} failed`);
-                  if (failedGroups) parts.push(`${failedGroups} group${failedGroups !== 1 ? 's' : ''} failed — still selected, click Acknowledge to retry`);
-                  showAckMsg(parts.join(' · ') + (anyCapped ? ' — some groups exceeded the 200-event cap, click Acknowledge again to finish.' : ''));
-                  setReloadKey((k) => k + 1);
-                })
-                .finally(() => setAcking(false));
-            }}
-            className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success"
-          >
-            {(() => {
-              const sg = (groups ?? []).filter((g) => selected[groupKey(g)]);
-              const n = sg.length;
-              const a = sg.reduce((s, g) => s + (g.count || 0), 0);
-              return n > 0 ? `Acknowledge ${n} group${n !== 1 ? 's' : ''} · ${a} alert${a !== 1 ? 's' : ''}` : 'Acknowledge';
-            })()}
-          </button>
-          {selectedEventIds.length > 0 && (
+            <Filter size={12} className="flex-none" />
+            <span className="min-w-0 truncate font-mono text-[11.5px]">{filterQ}</span>
             <button
-              disabled={ackingEvents}
-              onClick={async () => {
-                const blocked = demoBlocked(demo);
-                if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
-                setAckingEvents(true);
-                try {
-                  await ackEvents(selectedEventIds);
-                  setSelEvents({});
-                  setReloadKey((k) => k + 1);
-                } finally {
-                  setAckingEvents(false);
-                }
+              onClick={() => {
+                setFilterQ(null);
+                views.clearActive();
+                // Drop ?q= from the URL too: a reload must not resurrect a
+                // filter the analyst just dismissed.
+                const next = new URLSearchParams(searchParams);
+                next.delete('q');
+                setSearchParams(next, { replace: true });
               }}
-              className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success disabled:opacity-50"
+              aria-label="Clear the alert filter"
+              className="flex flex-none items-center hover:text-text"
             >
-              {ackingEvents ? 'Acking…' : `Ack ${selectedEventIds.length} event${selectedEventIds.length !== 1 ? 's' : ''}`}
+              <X size={12} />
             </button>
-          )}
-          <div className="flex-1" />
-          <button onClick={() => { setSelected({}); setSelEvents({}); }} className="text-[12px] text-dim hover:text-text">Clear selection</button>
-        </div>
-      )}
+          </span>
+        )}
+      </ListToolbar>
 
       {/* Group-hunt (pivot) representative reason — a subtle 12px annotation
           attached beneath the context row, not a standalone strip (DESIGN Q4). */}
@@ -1239,7 +1556,11 @@ export function Alerts() {
         </div>
 
         {loading && !groups && <LoadingState label="Loading detections…" />}
-        {error && <div className="p-3"><ErrorState error={error} /></div>}
+        {/* The card's own remedy is "retry shortly" — so give it something to
+            click. Without onRetry, acting on that advice meant reloading the
+            whole page, while the Dashboard's card for the same outage has had a
+            Retry button all along. */}
+        {error && <div className="p-3"><ErrorState error={error} onRetry={refetch} /></div>}
         {!loading && !error && visible.length === 0 && (
           <div className="px-4 py-10 text-center text-[13px] text-faint">No detections match this view.</div>
         )}
@@ -1248,7 +1569,7 @@ export function Alerts() {
           const gk = groupKey(g);
           const isExp = !!expanded[gk];
           const owner = ownerOf(g);
-          const seld = !!selected[gk];
+          const seld = sel.isSelected(gk);
           const kbFocused = rowIdx === focusedIndex;
           return (
             <div key={gk} ref={(el) => { rowRefs.current[gk] = el; }}>
@@ -1277,12 +1598,7 @@ export function Alerts() {
                         onClick={(e) => {
                           e.stopPropagation();
                           const turning = !seld;
-                          setSelected((s) => {
-                            const next = { ...s };
-                            if (next[gk]) delete next[gk];
-                            else next[gk] = true;
-                            return next;
-                          });
+                          sel.toggle(gk);
                           setSelEvents((prev) => {
                             const next = { ...prev };
                             if (turning) {
@@ -1547,7 +1863,14 @@ export function Alerts() {
                   {!eventsLoading[gk] && (groupEvents[gk]?.length ?? 0) === 0 && (
                     <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">No events in window.</div>
                   )}
-                  {(groupEvents[gk] ?? []).map((ev, i) => (
+                  {(groupEvents[gk] ?? []).map((ev, i) => {
+                    // Resolved once per row: which of these are real values and
+                    // which are the backend's "—" placeholder (see pivotTarget).
+                    const srcPivot = pivotTarget(ev.src);
+                    const dstPivot = pivotTarget(ev.dst);
+                    const hostPivot = pivotTarget(ev.host);
+                    const hostIpPivot = pivotTarget(ev.hostIp);
+                    return (
                     <div
                       key={ev.id ?? i}
                       className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
@@ -1576,11 +1899,11 @@ export function Alerts() {
                           destination port renders exactly once here, hugging the
                           dst (inside the same span group, outside the flex gap). */}
                       <div className="flex min-w-0 items-center gap-1.5 truncate">
-                        {ev.src ? (
+                        {srcPivot ? (
                           <span
                             className="cursor-pointer text-mono-green hover:underline"
-                            onClick={() => navigate(`/entity/${encodeURIComponent(ev.src)}`)}
-                            title={`Pivot to ${ev.src}`}
+                            onClick={() => navigate(`/entity/${encodeURIComponent(srcPivot)}`)}
+                            title={`Pivot to ${srcPivot}`}
                           >
                             {ev.src}
                           </span>
@@ -1589,11 +1912,11 @@ export function Alerts() {
                         )}
                         <span className="text-ghost">→</span>
                         <span className="flex min-w-0 items-center truncate">
-                          {ev.dst ? (
+                          {dstPivot ? (
                             <span
                               className="cursor-pointer truncate text-mono-amber hover:underline"
-                              onClick={() => navigate(`/entity/${encodeURIComponent(ev.dst)}`)}
-                              title={`Pivot to ${ev.dst}`}
+                              onClick={() => navigate(`/entity/${encodeURIComponent(dstPivot)}`)}
+                              title={`Pivot to ${dstPivot}`}
                             >
                               {ev.dst}
                             </span>
@@ -1605,18 +1928,37 @@ export function Alerts() {
                           )}
                         </span>
                       </div>
-                      {/* host — pivots to its entity page */}
-                      {ev.host ? (
-                        <div
-                          className="cursor-pointer truncate text-dim hover:text-text hover:underline"
-                          title={`Pivot to ${ev.host}`}
-                          onClick={() => navigate(`/entity/${encodeURIComponent(ev.host)}`)}
-                        >
-                          {ev.host}
-                        </div>
-                      ) : (
-                        <div className="truncate text-dim" title={ev.host}>{ev.host}</div>
-                      )}
+                      {/* The machine the detection fired ON: name, and beneath it
+                          the endpoint agent's own address when the backend could
+                          resolve one. It lives HERE and not in the flow cell on
+                          purpose — a host-shaped detection observed no
+                          connection, and rendering the address as an endpoint
+                          would invent one. On a flow alert hostIp is absent and
+                          this collapses back to the single name line. Both lines
+                          pivot independently; for a host detection the address is
+                          the only pivot the row has. */}
+                      <div className="flex min-w-0 flex-col leading-tight">
+                        {hostPivot ? (
+                          <span
+                            className="cursor-pointer truncate text-dim hover:text-text hover:underline"
+                            title={`Pivot to ${hostPivot}`}
+                            onClick={() => navigate(`/entity/${encodeURIComponent(hostPivot)}`)}
+                          >
+                            {ev.host}
+                          </span>
+                        ) : (
+                          <span className="truncate text-dim">{ev.host}</span>
+                        )}
+                        {hostIpPivot && (
+                          <span
+                            className="cursor-pointer truncate text-[10px] text-faint hover:text-dim hover:underline"
+                            title={`Pivot to ${hostIpPivot}`}
+                            onClick={() => navigate(`/entity/${encodeURIComponent(hostIpPivot)}`)}
+                          >
+                            {hostIpPivot}
+                          </span>
+                        )}
+                      </div>
                       {/* verdict provenance + WHEN the investigation ran/inherited */}
                       <div className="flex min-w-0 items-center">
                         <ProvenanceBadge ev={ev} onOpen={openDrawer} />
@@ -1633,7 +1975,8 @@ export function Alerts() {
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                   {!eventsLoading[gk] && eventsMore[gk] && (
                     <div className="py-1.5 pl-[36px] pr-3.5">
                       <button
@@ -1658,7 +2001,7 @@ export function Alerts() {
       </div>
 
       <div className="mt-2.5 font-mono text-[12px] text-faint">
-        {counts.all} detections · grouped · click a row to expand events
+        {countOf(counts.all, 'detection')} · grouped · click a row to expand events
       </div>
 
       {/* keyboard cheatsheet (E2.5) — `?` opens; Esc / backdrop closes */}
@@ -1752,7 +2095,7 @@ function AlertDrawer({
   const [tick, setTick] = useState(0);
   const [cancelling, setCancelling] = useState(false);
   const demo = useDemo(); // demo: cancel is demo-blocked — don't offer it
-  const { data: inv, loading, error } = useAsync<Inv | null>(
+  const { data: inv, loading, error, refetch } = useAsync<Inv | null>(
     () => (drawerId ? getInvestigation(drawerId) : Promise.resolve(null)),
     [drawerId, tick]
   );
@@ -1821,7 +2164,7 @@ function AlertDrawer({
     >
       {isStarting && <LoadingState label={`Starting investigation on ${starting?.name}…`} />}
       {drawerId && loading && !inv && <LoadingState label="Loading investigation…" />}
-      {error && <div className="p-4"><ErrorState error={error} /></div>}
+      {error && <div className="p-4"><ErrorState error={error} onRetry={refetch} /></div>}
       {inv && <Investigation inv={inv} layout="drawer" onReHunt={onReHunt} onVerdictApplied={() => setTick((x) => x + 1)} onAcked={onAcked} />}
     </Drawer>
   );

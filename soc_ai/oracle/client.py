@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
+from soc_ai import metrics
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_egress_allowed
 from soc_ai.oracle.redact import Mapping, sanitize_case
@@ -489,12 +490,19 @@ async def adjudicate(
         effective_suffixes=resolved_suffixes,
     )
 
+    # ``no_propagate`` collects the short (≤3 char) DOMAIN_LIKE values the
+    # sanitizer intentionally did NOT globally propagate (they would corrupt
+    # public FQDNs).  They must be excluded from the residue gate's known_values
+    # below — otherwise the gate flags the same substring inside a legitimate
+    # public FQDN and refuses by construction (finding oracle-refuse-by-design).
+    no_propagate: set[str] = set()
     sanitized_case = sanitize_case(
         case_dict,
         mapping,
         allowlist=allowlist,
         extra_hosts=resolved_hosts,
         extra_suffixes=resolved_suffixes,
+        no_propagate_out=no_propagate,
     )
 
     # 3. Serialize to the ACTUAL outbound bytes.
@@ -518,7 +526,13 @@ async def adjudicate(
         allowlist=allowlist,
         extra_hosts=resolved_hosts,
         extra_suffixes=resolved_suffixes,
-        known_values=tuple(mapping.reverse.values()),
+        # Exclude the no_propagate values (short DOMAIN_LIKE labels the sanitizer
+        # intentionally left un-propagated to protect public FQDNs) — see above.
+        known_values=tuple(v for v in mapping.reverse.values() if v not in no_propagate),
+        # payload_text is json.dumps output — every real backslash is doubled, so
+        # a lone single backslash is a JSON escape (``\n``), not a NetBIOS
+        # separator.  WIRE mode rejects that multi-line-transcript false positive.
+        wire_escaped=True,
     )
     if leaks:
         # Log categories only — never log the actual leaked values.
@@ -528,6 +542,9 @@ async def adjudicate(
             "(categories: %s); local verdict retained",
             categories,
         )
+        # Count it so a silently-disabled Oracle (a gate refusing every real
+        # transcript) is visible on the next /metrics scrape, not just in the log.
+        await metrics.get_metrics().record_oracle_refusal()
         return None
 
     # 5. Call the frontier model via the LiteLLM gateway (raw async httpx).

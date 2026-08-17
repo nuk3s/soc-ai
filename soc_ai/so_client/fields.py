@@ -15,7 +15,9 @@ regardless of which schema a given document/deployment uses:
 - :func:`resolve_agg_field` — per-deployment, cached: probe the cluster and
   return the first candidate that actually has data, for use as an aggregation
   / sort field name. Falls back to ``candidates[0]`` (the ECS default) on any
-  error or all-zero so it can never crash a query path.
+  error or all-zero so it can never crash a query path; ``on_probe_error``
+  lets a caller observe the swallowed failure (a blind field CHOICE must not
+  read as a grounded one to callers that gate irreversible writes on it).
 
 ``get_dotted`` lives here (not in :mod:`soc_ai.so_client.models`) so this module
 is import-cycle-free: ``models.py`` imports *from* ``fields.py``, never the
@@ -26,7 +28,7 @@ re-exports it for backward compatibility.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -122,6 +124,14 @@ KERBEROS_SERVICE: tuple[str, ...] = ("kerberos.service", "zeek.kerberos.service"
 KERBEROS_CLIENT: tuple[str, ...] = ("kerberos.client", "zeek.kerberos.client")
 KERBEROS_REQUEST_TYPE: tuple[str, ...] = ("kerberos.request_type", "zeek.kerberos.request_type")
 KERBEROS_SUCCESS: tuple[str, ...] = ("kerberos.success", "zeek.kerberos.success")
+# Domain membership: the realm a host authenticates INTO. SO populates
+# ``client_realm``; the bare ``realm`` is a last-resort variant seen on raw
+# Zeek integrations, so it trails.
+KERBEROS_REALM: tuple[str, ...] = (
+    "kerberos.realm",
+    "zeek.kerberos.client_realm",
+    "zeek.kerberos.realm",
+)
 
 # --- smb / dce-rpc (lateral movement: PsExec-style service creation) ---
 # smb_files.name=PSEXESVC.exe + action=SMB::FILE_WRITE onto smb_mapping.service
@@ -133,6 +143,12 @@ SMB_MAPPING_SERVICE: tuple[str, ...] = ("smb.mapping.service", "zeek.smb_mapping
 SMB_MAPPING_SHARE_TYPE: tuple[str, ...] = ("smb.mapping.share_type", "zeek.smb_mapping.share_type")
 DCE_RPC_ENDPOINT: tuple[str, ...] = ("dce_rpc.endpoint", "zeek.dce_rpc.endpoint")
 DCE_RPC_OPERATION: tuple[str, ...] = ("dce_rpc.operation", "zeek.dce_rpc.operation")
+# The NetBIOS name a host announces over SMB — an identity signal, not a
+# lateral-movement one. ``zeek.dce_rpc.named_pipe`` is DELIBERATELY EXCLUDED:
+# it carries ``srvsvc`` / ``svcctl`` / ``lsarpc``, which are endpoint names, so
+# reading it as a hostname (as ``host_summary._SMB_HOSTNAME`` does, first in its
+# list) reports the pipe as the machine's name.
+SMB_HOST_NAME: tuple[str, ...] = ("smb.host_name", "zeek.smb.host_name")
 
 # --- ssh (interactive lateral movement; a completed auth from a bad-reputation
 # source is a confirmed intrusion) ---
@@ -140,6 +156,50 @@ SSH_AUTH_SUCCESS: tuple[str, ...] = ("ssh.auth_success", "zeek.ssh.auth_success"
 SSH_AUTH_ATTEMPTS: tuple[str, ...] = ("ssh.auth_attempts", "zeek.ssh.auth_attempts")
 SSH_CLIENT: tuple[str, ...] = ("ssh.client", "zeek.ssh.client")
 SSH_SERVER: tuple[str, ...] = ("ssh.server", "zeek.ssh.server")
+# The SSH banner is the strongest OS signal a headless Linux box emits:
+# ``OpenSSH_9.6p1 Debian-3`` names the distribution outright, on a host that has
+# no User-Agent and no vendor DNS telemetry to hint from. ``version`` is the
+# protocol version and ``direction`` says which side of the handshake this
+# record describes (a client banner identifies the ORIGINATOR, a server banner
+# the RESPONDER) — reading the banner without the direction attributes the
+# wrong OS to the wrong host.
+SSH_VERSION: tuple[str, ...] = ("ssh.version", "zeek.ssh.version")
+SSH_DIRECTION: tuple[str, ...] = ("ssh.direction", "zeek.ssh.direction")
+
+# --- dhcp (lease-derived identity: the first-party name a host announces) ---
+# A DHCP lease is the only signal that positively proves an address is
+# dynamically assigned; its ABSENCE proves nothing unless the grid carries
+# ``zeek.dhcp`` at all. ECS-first matters more here than anywhere else: on a
+# modern SO grid the ``zeek.dhcp.*`` fields are mapped but empty, so a
+# zeek-first read (``host_summary._DHCP_HOSTNAME``) sees no lease on a host
+# that renews hourly.
+DHCP_HOSTNAME: tuple[str, ...] = ("dhcp.hostname", "zeek.dhcp.host_name", "dhcp.host_name")
+DHCP_CLIENT_FQDN: tuple[str, ...] = ("dhcp.client_fqdn", "zeek.dhcp.client_fqdn")
+DHCP_DOMAIN: tuple[str, ...] = ("dhcp.domain", "zeek.dhcp.domain")
+DHCP_MAC: tuple[str, ...] = ("dhcp.client.mac", "zeek.dhcp.mac")
+# The hardware address, wherever the document happens to carry it. No zeek.*
+# fallback exists: Zeek's conn log has no MAC, so the endpoint fields are the
+# fallback rather than a legacy schema.
+HOST_MAC: tuple[str, ...] = ("host.mac", "source.mac", "destination.mac")
+
+# --- ntlm (Windows identity: the machine's own announcement of itself) ---
+# NTLM negotiation carries the client's hostname, its domain, and the server's
+# NetBIOS computer name — first-party identity claims that survive on a
+# network-only grid where no host logs are shipped.
+NTLM_HOSTNAME: tuple[str, ...] = ("ntlm.hostname", "zeek.ntlm.hostname")
+NTLM_DOMAIN: tuple[str, ...] = ("ntlm.domainname", "zeek.ntlm.domainname")
+NTLM_SERVER_NB: tuple[str, ...] = (
+    "ntlm.server_nb_computer_name",
+    "zeek.ntlm.server_nb_computer_name",
+)
+
+# --- software (Zeek's passive version detection) ---
+# ``unparsed_version`` is the full banner ("Apache/2.4.58 (Debian)"); ``name``
+# and ``software_type`` are Zeek's parse of it. All three are read because the
+# banner often names the OS the parsed fields drop.
+SOFTWARE_NAME: tuple[str, ...] = ("software.name", "zeek.software.name")
+SOFTWARE_VERSION: tuple[str, ...] = ("software.unparsed_version", "zeek.software.unparsed_version")
+SOFTWARE_TYPE: tuple[str, ...] = ("software.software_type", "zeek.software.software_type")
 
 # --- behavioral-summary pivots (derived/aggregated docs) ---
 # Some deployments surface a per-(host,dest) BEHAVIORAL SUMMARY document rather
@@ -227,6 +287,7 @@ async def resolve_agg_field(
     candidates: Sequence[str],
     *,
     ttl_seconds: float = _AGG_FIELD_CACHE_TTL_SECONDS,
+    on_probe_error: Callable[[Exception], None] | None = None,
 ) -> str:
     """Return the first candidate that actually has data on this deployment.
 
@@ -236,6 +297,16 @@ async def resolve_agg_field(
     free until the deployment's schema might plausibly have changed. On any
     error, or when no candidate has data, returns ``candidates[0]`` — the
     ECS-first default — so a query path can proceed (it never raises).
+
+    ``on_probe_error`` makes the swallowed failure OBSERVABLE without changing
+    the never-raise contract: when a probe raises, the exception is passed to
+    the callback (once — the first failure aborts the walk) before the default
+    is returned. A caller whose correctness depends on the field CHOICE being
+    grounded — discovery's retirement gate must not treat "aggregated the
+    ECS default because the probe blew up" as having read the estate — hooks
+    this to count the resolution as a failed read. The all-zero fallback does
+    NOT fire it: probes that ran and found no data are an observation of the
+    grid, not a blind read. The callback must not raise.
     """
     cand_tuple = tuple(candidates)
     default = cand_tuple[0]
@@ -251,10 +322,12 @@ async def resolve_agg_field(
             if await _candidate_has_data(es_client, index, field):
                 resolved = field
                 break
-    except Exception:
+    except Exception as exc:
         # Never let field probing crash a query path — fall back to the
         # ECS-first default. (BLE001 is project-wide ignored; bare-broad is the
         # right call for a best-effort resolver.)
+        if on_probe_error is not None:
+            on_probe_error(exc)
         return default
 
     _AGG_FIELD_CACHE[cache_key] = (now + ttl_seconds, resolved)

@@ -197,6 +197,16 @@ def aggregate(rows: list[dict[str, Any]]) -> Aggregates:  # noqa: PLR0915 - sing
             a = "unknown"
         agreement_counts[a] += 1
 
+    # `partial` sits in the DENOMINATOR but not the numerator: an oracle
+    # critique of "right verdict, thin reasoning" costs exactly as much as a
+    # flat disagreement, which on an n=5 nightly batch is a full 0.2 of the
+    # headline. That asymmetry is deliberate — a verdict the oracle can't fully
+    # stand behind is not an agreement — but it makes the rate alone
+    # un-diagnosable, so `agreement_counts` is the honest artifact and every
+    # consumer that has room for three numbers should show them (the nightly
+    # snapshot persists yes/partial/no separately for exactly this reason).
+    # The rate itself stays as-is: reports, gates and the trend all compare
+    # against historical values computed this way.
     classified = sum(agreement_counts[k] for k in ("yes", "no", "partial"))
     agreement_rate: float | None = agreement_counts["yes"] / classified if classified > 0 else None
 

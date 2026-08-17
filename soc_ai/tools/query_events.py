@@ -34,6 +34,11 @@ from soc_ai.tools._registry import tool
 # is 10_080m = 7 days) while bounding worst-case query cost.
 _MAX_TIME_RANGE_MINUTES = 43_200
 
+# Same 2048-char ceiling the HTTP q params enforce. parse_oql is a synchronous
+# lark parse; an agent steered into emitting a 30k-term OQL would otherwise burn
+# ~1s of event loop here. Bound it before the parse, agent trust boundary or not.
+_MAX_OQL_LEN = 2048
+
 
 def _build_time_filter(
     time_range_minutes: int,
@@ -112,6 +117,8 @@ async def query_events_oql(
             f"time_range_minutes must be <= {_MAX_TIME_RANGE_MINUTES}, got {time_range_minutes}"
         )
 
+    if len(query) > _MAX_OQL_LEN:
+        raise ValueError(f"query must be <= {_MAX_OQL_LEN} chars, got {len(query)}")
     ast = parse_oql(query)
     validate_oql(ast, max_results=max_results)
     body = ast_to_es_dsl(ast, default_size=max_results)

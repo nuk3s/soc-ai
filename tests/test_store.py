@@ -109,6 +109,31 @@ async def test_session_roundtrip_and_expiry(settings_kratos: Settings) -> None:
     await engine.dispose()
 
 
+async def test_purge_expired_sessions_removes_only_expired(settings_kratos: Settings) -> None:
+    """Expired sessions must be reclaimed by a maintenance sweep.
+
+    ``get_session_user`` rejects an expired session but LEAVES the row, and the
+    only other deletes are explicit logout and the per-user wipe in
+    ``reset_user_password`` — so an abandoned cookie's row lingers forever. The
+    purge deletes the dead rows while live sessions survive.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        user = await auth_svc.create_user(db, "ivan", "pw")
+        live = await auth_svc.create_session(db, user, ttl_hours=12)
+        await auth_svc.create_session(db, user, ttl_hours=-1)  # already expired
+        await auth_svc.create_session(db, user, ttl_hours=-5)  # already expired
+
+        removed = await auth_svc.purge_expired_sessions(db)
+
+        assert removed == 2
+        # The live session still authenticates; only the live row remains.
+        assert await auth_svc.get_session_user(db, live) is not None
+        rows = (await db.scalars(select(UserSession))).all()
+        assert len(rows) == 1
+    await engine.dispose()
+
+
 async def test_api_token_roundtrip(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
@@ -213,6 +238,22 @@ def test_login_throttle_protects_near_threshold_entry_from_eviction() -> None:
     # "admin"'s failure history survived: the 5th failure locks it out, proving
     # it was never reset to zero by the eviction flood.
     assert throttle.record_failure("1.1.1.1", "admin") is True
+
+
+def test_login_throttle_bounds_the_lockout_map() -> None:
+    """The lockout map must be bounded like the failure map.
+
+    ``is_locked()`` only reclaims a locked key LAZILY — when that exact key is
+    probed again after cooldown. A distributed spray that locks a permanent
+    ``(ip, username) -> unlock-at`` entry per distinct key and never re-probes
+    would otherwise grow ``_locked`` monotonically for the life of the process.
+    It is capped at ``max_keys`` the same way ``_fails`` is.
+    """
+    throttle = auth_svc.LoginThrottle(max_failures=1, max_keys=8)
+    for i in range(200):  # max_failures=1 → each distinct key locks on first hit
+        assert throttle.record_failure(f"10.0.0.{i}", f"user{i}") is True
+    assert len(throttle._locked) <= throttle.max_keys
+    assert len(throttle._fails) <= throttle.max_keys
 
 
 # ---------------------------------------------------------------------------

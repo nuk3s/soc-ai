@@ -418,7 +418,7 @@ def test_startup_seed_fail_soft_when_fixtures_missing(
     monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", tmp_path / "absent.json")
     with _app_client(_demo_app_settings()) as client:
         assert client.get("/healthz").status_code == 200
-        assert client.get("/api/v1/investigations").json() == []
+        assert client.get("/api/v1/investigations").json()["rows"] == []
 
 
 def test_startup_seeds_fixtures_in_demo_mode(
@@ -432,7 +432,7 @@ def test_startup_seeds_fixtures_in_demo_mode(
     path.write_text(json.dumps(FIXTURE))
     monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", path)
     with _app_client(_demo_app_settings()) as client:
-        rows = client.get("/api/v1/investigations").json()
+        rows = client.get("/api/v1/investigations").json()["rows"]
     assert [r["id"] for r in rows] == ["01DEMO0000000000000000TEST"]
 
 
@@ -446,4 +446,4 @@ def test_startup_does_not_seed_outside_demo(
     path.write_text(json.dumps(FIXTURE))
     monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", path)
     with _app_client(Settings(**_base_settings_kwargs())) as client:
-        assert client.get("/api/v1/investigations").json() == []
+        assert client.get("/api/v1/investigations").json()["rows"] == []

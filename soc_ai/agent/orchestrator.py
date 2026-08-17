@@ -143,6 +143,7 @@ from soc_ai.agent.toolset import (  # noqa: F401
 )
 from soc_ai.agent.triage import InvestigationTranscript, RecommendedAction, TriageReport
 from soc_ai.config import Settings
+from soc_ai.dossier.prompt import MAX_PROMPT_HOSTS, host_dossier_prompt_block
 from soc_ai.errors import OqlValidationError, SoApiError
 
 # Module import (not `from ... import adjudicate`) so tests patching
@@ -567,6 +568,18 @@ def _hint_for(exc: BaseException) -> str | None:
         return (
             "context window exceeded; transcript or prompt is too large. "
             "The alert context or accumulated evidence may exceed the model's window."
+        )
+    # MUST precede the generic timeout arm: a partial-read error's message reads
+    # "the search timed out before all shards answered", which that arm would
+    # blame on the model gateway — sending the operator to debug LiteLLM while a
+    # shard is down. Same misdirection class as the connect-error split below,
+    # which accounted for 8 of 15 recorded prod error events (2026-08-03).
+    if "partial search results" in msg:
+        return (
+            "the grid answered but did not read all of it — failed or unassigned "
+            "shards, or a search that gave up mid-flight. The results would have "
+            "been incomplete, so the run stopped rather than reason from a partial "
+            "view of the network. Check Elasticsearch shard health and retry."
         )
     if "timed out" in msg or "timeout" in msg:
         return "LiteLLM gateway slow or unreachable; retry."
@@ -1590,6 +1603,115 @@ def _format_chat_memory_block(digests: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Host dossier — the ambient "what IS this host?" block
+# ---------------------------------------------------------------------------
+
+# Headings the dossier block is woven in AHEAD of, first match wins. The model
+# should learn what the hosts ARE before it reads what they DID, and the current
+# evidence must still arrive last. Two anchors because the messages come from
+# two different formatters: the synth-first ones carry the enriched context, the
+# post-loop synthesizer message carries only the transcript. A message with
+# NEITHER is appended to rather than skipped — silently dropping the block is
+# the exact failure this feature exists to fix, and it would be invisible.
+#
+# Woven here rather than threaded as a `host_dossier_block=` kwarg through each
+# formatter in prompts.py: the ordering that actually matters is "composed
+# before this site's sanitize_text", and keeping composition in the orchestrator
+# puts that ordering on ONE screen beside the sweep it must precede. A kwarg
+# passed at a call site three hundred lines from its guard is a correct-looking
+# line that cannot be read for the property it has to hold.
+_DOSSIER_ANCHORS = ("## Enriched alert context", "## Investigation transcript")
+
+# Floor under the enriched context's token budget once the dossier's cost has
+# been taken out of it. `trim_enriched_for_budget` grinds every pivot down to
+# two events and STILL returns an over-budget string, so an unclamped
+# subtraction cannot buy the dossier its space — it can only destroy the
+# correlation signal on the way to failing anyway.
+_MIN_ENRICHED_BUDGET = 2000
+
+
+def dossier_hosts_for_alert(context: Any, settings: Any) -> dict[str, str]:
+    """Every host this alert puts in play, as ``{ip: role-in-alert}``, source first.
+
+    The two endpoints come first — order is the caller's contract with the
+    renderer, so the source host reads first — followed by every distinct
+    INTERNAL address the alert's prefetched group events name. A host that
+    appears twice is described once: two identical entries would spend the
+    block's budget saying the same thing twice.
+
+    Widened past the endpoints because the endpoints are not the cast. The
+    motivating incident's real actor was a VM one pivot away from the address
+    the alert named, and it was already sitting in ``community_id_events`` —
+    prefetched, in memory, and never described. Reading the pivots costs no I/O
+    (:func:`~soc_ai.tools.get_alert_context.get_alert_context` already fetched
+    them) and the returned set is bounded downstream by
+    :data:`~soc_ai.dossier.prompt.MAX_PROMPT_HOSTS`, which also states how many
+    it left out.
+
+    The internal filter applies to the WIDENED hosts only. An external
+    destination on the alert itself is still named, because "the network sweep
+    has no record of this address" is something the block owes the model about
+    the host under discussion; an external peer three pivots deep is just noise
+    that no dossier will ever describe.
+
+    The address is passed through EXACTLY as the alert spells it. The egress
+    guard allocates one label per spelling, and the whole mechanic — "IP_01 is a
+    hypervisor whose policy forbids interactive SSH" — depends on the dossier's
+    address collapsing onto the same ``IP_01`` the alert already carries.
+    """
+    alert = getattr(context, "alert", context)
+    hosts: dict[str, str] = {}
+    for ip, label in ((alert.source_ip, "source"), (alert.destination_ip, "destination")):
+        if isinstance(ip, str) and ip.strip() and ip not in hosts:
+            hosts[ip] = label
+    for event in _group_events(context):
+        for ip in (event.source_ip, event.destination_ip):
+            if not isinstance(ip, str) or not ip.strip() or ip in hosts:
+                continue
+            if settings.network_is_internal(ip):
+                hosts[ip] = "related event"
+    return hosts
+
+
+def _group_events(context: Any) -> list[Any]:
+    """The alert's five prefetched pivots, flattened in the order they are read.
+
+    ``getattr`` per list rather than attribute access: the block is also built
+    for a bare :class:`~soc_ai.so_client.models.SoAlert` (the chat seeds from a
+    stored investigation whose context fetch may have failed), and asking an
+    alert for its pivots must degrade to "no group" rather than raise.
+
+    The field list is ``context_budget.PIVOT_FIELDS`` rather than a local copy:
+    the two must not drift, or a sixth pivot gets trimmed for budget but never
+    read for identity and nothing fails. Its order is the order
+    ``get_alert_context`` fans the pivots out in, so the hosts nearest the
+    alert's own flow (its community_id) are the ones that survive the cap.
+    """
+    events: list[Any] = []
+    for name in context_budget.PIVOT_FIELDS:
+        events.extend(getattr(context, name, None) or [])
+    return events
+
+
+def _inject_dossier_block(message: str, block: str) -> str:
+    """Weave the ``\\n\\n``-prefixed dossier *block* into a composed *message*.
+
+    Called at every site whose message reaches the analyst model, and always
+    BEFORE that site's ``guard.sanitize_text`` — appending after the sweep leaks
+    the dossier's internal hostnames and addresses to a cloud model in the
+    clear, and appending between the sweep and the fail-closed residue gate
+    kills the investigation with an ``egress_blocked`` verdict instead.
+    """
+    if not block:
+        return message
+    for anchor in _DOSSIER_ANCHORS:
+        at = message.find(anchor)
+        if at >= 0:
+            return f"{message[:at]}{block.strip()}\n\n{message[at:]}"
+    return f"{message}{block}"
+
+
 async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pipeline is inherently long
     *,
     alert_id: str,
@@ -1599,7 +1721,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
 ) -> AsyncGenerator[StepEvent, None]:
     """Phase A → B → C → optional D → C round 2 → done.
 
-    The synth-first pipeline. Defaults OFF until v8 measurement validates.
+    The synth-first pipeline, and the SOLE production triage path: ``investigate()``
+    calls only this, having deleted the legacy investigator→synthesizer loop in
+    2026-07 after synth-first had been the production default since 2026-05-29.
+    Any change to a phase here changes the one path every alert takes.
 
     ``focus_hint`` (optional): prior open questions from a re-launched
     ``needs_more_info`` investigation, woven into the round-1 seed + the
@@ -1718,6 +1843,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     effective_idents = await _resolve_effective_identifiers(ctx)
     classification_cidrs = _classification_cidrs(ctx, effective_idents)
 
+    # Pre-seed the effective suffix/host sets the ONLINE egress tool guards
+    # (web_search / crawl_page) consult, reusing the set already resolved above so
+    # those tools no longer read env-only identifiers (a DB-discovered internal
+    # name on an empty .env otherwise fanned out to public search). Marking it
+    # resolved even when None (no DB) keeps the tool closures from re-resolving —
+    # they fall back to the raw settings tuples, unchanged.
+    ctx.effective_internal_suffixes = (
+        effective_idents.suffixes if effective_idents is not None else None
+    )
+    ctx.effective_internal_hosts = effective_idents.hosts if effective_idents is not None else None
+    ctx._egress_idents_resolved = True
+
     # ----- Cloud-egress guard for the ANALYST model path (opt-in) -----
     # When analyst_cloud_redaction is on, everything sent to the analyst model
     # below (enriched context, prompts, tool results — the toolset wraps tools
@@ -1790,6 +1927,43 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # re-sets it (with dedup / prefetched_community_ids) harmlessly.
     ctx.default_time_anchor = enriched.alert.timestamp
 
+    # ----- Host dossier: what the hosts in this alert ARE -----
+    # Built ONCE here, from THIS alert's hosts (nothing is cached on ctx —
+    # an InvestigationContext is reused across auto-triage / backtest sweeps,
+    # the bug class that already bit default_time_anchor above), and woven into
+    # every message that reaches the analyst model below. Without it the model
+    # only ever learns what a host DID; the motivating failure was attributing
+    # SSH probing to an address without knowing it was the hypervisor running
+    # the SOC's own stack, whose policy forbids interactive SSH.
+    #
+    # RAW at this point, deliberately: every injection site below composes the
+    # block into its message BEFORE that site's sanitize sweep, so the dossier's
+    # addresses collapse onto the same labels the alert already carries.
+    # `host_dossier_prompt_block` never raises and returns "" on every off
+    # switch, so this costs a disabled or unswept deployment nothing.
+    dossier_hosts = dossier_hosts_for_alert(enriched, ctx.settings)
+    dossier_block = await host_dossier_prompt_block(dossier_hosts, ctx=ctx)
+    if dossier_block:
+        # Timeline transparency, emitted ONLY when a non-empty block is actually
+        # injected: WHAT the model was told about these hosts, with real values.
+        # Local storage, never egress — the same rule the enriched_alert_context
+        # event follows.
+        #
+        # `hosts` is capped to the same ceiling the block is, with the remainder
+        # as its own count. The full map here beside a block describing eight
+        # would be an audit record naming hosts the model was never told about,
+        # and the analyst reading it cannot tell the two apart.
+        dossier_ev = _ev(
+            "host_dossier",
+            {
+                "hosts": dict(list(dossier_hosts.items())[:MAX_PROMPT_HOSTS]),
+                "hosts_omitted": max(0, len(dossier_hosts) - MAX_PROMPT_HOSTS),
+                "block": dossier_block.strip(),
+            },
+        )
+        await _audit(dossier_ev)
+        yield dossier_ev
+
     # ----- Phase B: decision template -----
     candidate = match_decision_template(enriched)
     template_ev = _ev(
@@ -1816,9 +1990,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # model_context_window_tokens override), drop the oldest pivot events now —
     # a ContextWindowExceeded later burns the whole run into a fallback verdict.
     _ctx_window = await context_budget.resolve_model_window(ctx.settings)
-    enriched_json, _trim_note = context_budget.trim_enriched_for_budget(
-        enriched, context_budget.input_budget_tokens(_ctx_window)
-    )
+    _enriched_budget = context_budget.input_budget_tokens(_ctx_window)
+    if _enriched_budget is not None and dossier_block:
+        # The dossier is paid for OUT OF this budget, not on top of it: it rides
+        # the same messages the enriched context does, so charging it nowhere
+        # would let a fat dossier push real evidence past the window. Clamped at
+        # _MIN_ENRICHED_BUDGET — see that constant.
+        _enriched_budget = max(
+            _MIN_ENRICHED_BUDGET,
+            _enriched_budget - context_budget.estimate_tokens(dossier_block),
+        )
+    enriched_json, _trim_note = context_budget.trim_enriched_for_budget(enriched, _enriched_budget)
     if guard is not None:
         # EGRESS BOUNDARY: enriched_json feeds every analyst-model call below
         # (round-1 synth, the investigation-loop prompt, round-2 synth) —
@@ -1982,6 +2164,11 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # Same egress contract as the priors block (composed pre-sweep).
             chat_memory_block=chat_memory_block,
         )
+        # Injection 1 of 4. Rendered ahead of the enriched context so the model
+        # reads what the hosts ARE before what they DID, and so the current
+        # evidence still arrives last. Composed here, one statement before the
+        # sanitize sweep below — never after it.
+        user_msg_round1 = _inject_dossier_block(user_msg_round1, dossier_block)
         if guard is not None:
             # Final sweep over the COMPOSED message — catches the decision-
             # template candidate block (rationale/cited_evidence carry real
@@ -2141,13 +2328,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             ),
             ctx,
         )
-        inv_user_msg = _format_investigator_prompt(
-            alert_id, enriched_json, focus_hint=focus_hint
-        ) + await inventory_prompt_block(ctx.elastic, ctx.settings)
+        # Injection 2 of 4, beside the grid inventory: the two blocks are the
+        # same class of ambient ground truth, and rubric step 5 already tells the
+        # model to weigh what the host IS — this supplies the missing input.
+        inv_user_msg = (
+            _format_investigator_prompt(alert_id, enriched_json, focus_hint=focus_hint)
+            + await inventory_prompt_block(ctx.elastic, ctx.settings)
+            + dossier_block
+        )
         if guard is not None:
             # enriched_json/focus_hint are already labeled; this sweep covers
-            # the dataset-inventory block (grid host/dataset names) so the
-            # WHOLE investigator prompt crosses the egress boundary sanitized.
+            # the dataset-inventory and host-dossier blocks (grid host/dataset
+            # names, dossier hostnames and addresses) so the WHOLE investigator
+            # prompt crosses the egress boundary sanitized.
             inv_user_msg = guard.sanitize_text(inv_user_msg)
         inv_result: Any = None
         # The labeled node messages streamed so far — the budget-partial
@@ -2387,8 +2580,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 ),
                 output_mode=ctx.settings.synthesizer_output_mode,
             )
-            loop_synth_msg = _format_transcript_for_synthesizer(
-                alert_id, [loop_transcript], candidate=candidate
+            # Injection 3 of 4, and the one that matters most: this is the
+            # verdict writer, and it sees ONLY the transcript plus the candidate
+            # — no enriched JSON, no inventory, no memory. Without the block, a
+            # loop-settled investigation reaches its verdict knowing nothing
+            # about what the hosts are.
+            loop_synth_msg = _inject_dossier_block(
+                _format_transcript_for_synthesizer(
+                    alert_id, [loop_transcript], candidate=candidate
+                ),
+                dossier_block,
             )
             if guard is not None:
                 # The transcript is already in label space (the loop ran over
@@ -2545,6 +2746,11 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 focus_hint=focus_hint,
                 allow_further_gap=rounds_left > 0,
             )
+            # Injection 4 of 4. Unlike the memory blocks — deliberately round-1
+            # only, because a prior verdict competes with gathered evidence —
+            # asset facts describe the hosts the targeted result is about, and
+            # this round is a verdict site.
+            user_msg_round2 = _inject_dossier_block(user_msg_round2, dossier_block)
             if guard is not None:
                 # The Phase-D dispatch ran with REAL args (the round-1 report
                 # was desanitized at its assignment source) and returned a RAW

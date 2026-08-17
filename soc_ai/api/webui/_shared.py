@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from soc_ai.api.security import require_api_auth, require_csrf_safe
+from soc_ai.demo.guard import is_demo
 from soc_ai.webui.deps import current_user
 
 _LOGGER = logging.getLogger(__name__)
@@ -80,8 +81,25 @@ def client_ip(request: Request, settings: Any) -> str:
 
 
 async def require_admin_api(request: Request) -> None:
-    """Admin gate for sensitive reads (config). No-op when API auth is off (dev)."""
-    if not request.app.state.settings.api_auth_required:
+    """Admin gate for sensitive reads (config, the user table, the secrets-set map).
+
+    Demo mode (``SOC_AI_DEMO``) refuses admin reads outright — the read-side
+    mirror of the demo write lock in :func:`soc_ai.main.create_app`. A public demo
+    runs with ``API_AUTH_REQUIRED=false``, so without this branch the gate below
+    would no-op and every admin-gated read (users, config, ``/config/danger``,
+    data-sources, egress-policy) would answer anonymously.
+
+    Outside demo mode with API auth OFF — an operator who declined ``setup.sh``'s
+    auth prompt — the gate stays a no-op: the documented open-dev posture,
+    unchanged. ``setup.sh`` warns there that admin reads are open on the LAN.
+    """
+    settings = request.app.state.settings
+    if is_demo(settings):
+        raise HTTPException(
+            status_code=403,
+            detail={"reason": "demo_mode", "hint": "Demo — read-only; admin config is disabled."},
+        )
+    if not settings.api_auth_required:
         return
     user = await current_user(request)
     if user is None or user.role != "admin":

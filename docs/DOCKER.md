@@ -169,8 +169,14 @@ The image serves two surfaces on the same port (bare `/` redirects to `/app`):
 | `soc_ai_blocklists` (vol)| `/var/lib/soc-ai/blocklists`        | rw   | URLhaus/Feodo/Tor/internal blocklist cache |
 | `soc_ai_maxmind` (vol)   | `/var/lib/soc-ai/maxmind`           | rw   | MaxMind GeoLite2 .mmdb files               |
 | `soc_ai_cloud_prefixes`  | `/var/lib/soc-ai/cloud_prefixes`    | rw   | AWS/GCP/Azure/Cloudflare prefix JSON       |
+| `soc_ai_evals` (vol)     | `/var/lib/soc-ai/evals`             | rw   | Nightly quality-eval bundles + critiques   |
 
-The four named volumes are created automatically by `docker compose up`. They persist across
+`soc_ai_evals` holds the per-alert bundles and oracle critiques behind every point on the
+dashboard's Quality card. It is the only evidence for or against a regression alarm, and nothing
+regenerates it — without the volume it lives in the container filesystem and every recreate
+deletes it.
+
+The five named volumes are created automatically by `docker compose up`. They persist across
 `docker compose down` (data is only deleted with `docker compose down -v`).
 
 ---
@@ -224,6 +230,36 @@ Specifically:
   `docker compose down -v` deletes them.
 - **Your `.env` keeps working.** Unknown keys are ignored, so a setting that was
   removed or renamed in a new version won't stop the container from booting.
+- **A new release can add a volume.** `docker compose up -d` reads the mounts
+  out of the repo's `docker-compose.yml`, so a `git pull` picks one up on its
+  own. If you maintain your own compose file, diff it against the repo's after
+  every upgrade: a mount you didn't copy across won't error. It writes into the
+  container filesystem and loses the data on the next recreate.
+
+!!! warning "Upgrading from 1.2.7 or earlier: one new volume"
+
+    This release adds a fifth named volume, `soc_ai_evals`, mounted at
+    `/var/lib/soc-ai/evals`. It holds the nightly quality-eval bundles — the
+    per-alert artifacts and oracle critiques behind every point on the
+    dashboard's Verdict quality card, and the only evidence for or against a
+    regression alarm. Before this release they were written inside the
+    container, so every `docker compose up -d` deleted them.
+
+    On the repo's compose file the upgrade command above is all you need. Two
+    consequences:
+
+    - **Bundles written before the upgrade are gone.** They lived on the
+      container filesystem that the upgrade recreate replaces. The trend rows
+      survive (they're in the DB); only the artifacts they point at are lost.
+      Nothing regenerates them, so an alarm from before the upgrade can no
+      longer be adjudicated from its critiques.
+    - **Hand-maintained compose files need the mount added** —
+      `soc_ai_evals:/var/lib/soc-ai/evals` under the service, plus
+      `soc_ai_evals:` in the top-level `volumes:` block. Mount it at that exact
+      path: the image creates `/var/lib/soc-ai/evals` as uid 1000, and a volume
+      mounted at a path the image never created comes up root-owned. The
+      nightly detects that, keeps running against `./evals`, and logs
+      `cannot use … for eval bundles (not writable by this user)`.
 
 Verify the new build is healthy:
 
@@ -490,6 +526,20 @@ and the dashboard card labels which mode measured each point). Force either
 with `--graded` / `--local`. Tune the sample size (`quality_nightly_n`) and the
 alarm threshold (`quality_alarm_drop`) live in the config console's Quality
 section.
+
+Each run also writes a `batch-<timestamp>/` bundle to `/var/lib/soc-ai/evals`
+(the `soc_ai_evals` volume) holding the per-alert artifacts, the oracle
+critiques, and a `report.md`. Read one when a point alarms — the critiques say
+*why* the oracle disagreed, and the dashboard card prints the path of the run
+that fired:
+
+```bash
+docker exec soc-ai ls /var/lib/soc-ai/evals
+docker exec soc-ai cat /var/lib/soc-ai/evals/batch-<timestamp>/report.md
+```
+
+`--out-dir` overrides the location; without it the bundles follow the data dir,
+which is what keeps them on a volume rather than in the container.
 
 ### 1 GB memory cap can OOM-kill a runaway hunt
 

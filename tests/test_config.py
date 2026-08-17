@@ -769,3 +769,231 @@ def test_scaffolding_knobs_are_hot_whitelisted() -> None:
     assert rounds.min_value == 1
     assert rounds.max_value == 3
     assert rounds.section == "Agent"
+
+
+# ---------------------------------------------------------------------------
+# Host dossier — the self-refreshing asset-context builder
+# ---------------------------------------------------------------------------
+
+# key -> (SettingSpec.type, default, min_value, max_value). One table drives the
+# defaults test, the whitelist test and the section test, so a knob added to
+# Settings without a spec (or vice versa) fails here rather than rendering as an
+# invisible, un-editable field in the config console.
+_DOSSIER_KNOBS: dict[str, tuple[str, object, float | None, float | None]] = {
+    "dossier_enabled": ("bool", True, None, None),
+    "dossier_schedule_enabled": ("bool", False, None, None),
+    "dossier_schedule_interval_hours": ("int", 24, 1, 168),
+    "dossier_lookback_days": ("int", 14, 1, 90),
+    "dossier_max_hosts_per_run": ("int", 200, 1, 5000),
+    "dossier_max_hosts": ("int", 5000, 1, 100000),
+    "dossier_min_events": ("int", 20, 1, 100000),
+    "dossier_min_confidence": ("float", 0.6, 0.0, 1.0),
+    "dossier_staleness_hours": ("int", 72, 1, 8760),
+    "dossier_context_enabled": ("bool", True, None, None),
+    "dossier_conflict_min_observations": ("int", 3, 1, 50),
+    "dossier_conflict_prompt_interval_hours": ("int", 336, 0, 8760),
+}
+
+
+def test_dossier_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped defaults: builder on, timer off, 14-day baseline window."""
+    _setenv_required(monkeypatch)
+    s = Settings()
+    for key, (_type, default, _lo, _hi) in _DOSSIER_KNOBS.items():
+        assert getattr(s, key) == default, f"{key} default drifted"
+    # The two that decide whether the network sweep runs at all on a fresh
+    # install: the feature is available, but nothing sweeps until an operator
+    # turns the timer on (the house pattern for every background job).
+    assert s.dossier_enabled is True
+    assert s.dossier_schedule_enabled is False
+
+
+def test_dossier_settings_are_never_required() -> None:
+    """No dossier knob is a required field.
+
+    ``tests/conftest._base_settings_kwargs`` builds ``Settings`` from six kwargs;
+    a required field here would raise a ValidationError in every fixture that
+    constructs one, i.e. the whole suite, not just the dossier tests.
+    """
+    for key in _DOSSIER_KNOBS:
+        field = Settings.model_fields[key]
+        assert field.is_required() is False, f"{key} has no default"
+
+
+def test_dossier_settings_are_hot_whitelisted() -> None:
+    """Every dossier knob is admin-editable, live, non-secret, and bounded.
+
+    ``hot=True`` is only a claim that ``apply_to_settings`` setattrs the
+    singleton — the builder holds up its end by re-reading ``settings.*`` on
+    every wake. It matters on prod because ``docker compose restart`` does not
+    reload ``.env``: the config console is the reliable path to a knob change.
+    """
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    for key, (type_, _default, lo, hi) in _DOSSIER_KNOBS.items():
+        spec = WHITELIST_BY_KEY[key]
+        assert spec.attr == key
+        assert spec.type == type_
+        assert spec.section == "Host dossier"
+        assert spec.hot is True
+        assert spec.secret is False, "a dossier knob is a threshold, never a credential"
+        assert spec.danger is False
+        assert spec.min_value == lo, f"{key} min bound"
+        assert spec.max_value == hi, f"{key} max bound"
+
+
+def test_dossier_section_is_rendered_and_parented() -> None:
+    """The dossier section is in SECTION_ORDER *and* SECTION_PARENTS.
+
+    ``get_config`` iterates SECTION_ORDER, not WHITELIST, so a section missing
+    from it renders nothing at all — thirteen whitelisted knobs that no admin can
+    reach. The parent map is the Config page's two-level nav.
+    """
+    from soc_ai.store.config_overrides import SECTION_ORDER, SECTION_PARENTS
+
+    assert "Host dossier" in SECTION_ORDER
+    assert SECTION_PARENTS["Host dossier"] == "Data & Enrichment"
+
+
+def test_dossier_settings_coerce_from_form_strings() -> None:
+    """Each dossier type coerces a representative raw form string."""
+    from soc_ai.store import config_overrides as cfg
+
+    samples: dict[str, tuple[str, object]] = {
+        "dossier_enabled": ("true", True),
+        "dossier_schedule_enabled": ("", False),  # unchecked checkbox → False
+        "dossier_schedule_interval_hours": ("24", 24),
+        "dossier_lookback_days": ("14", 14),
+        "dossier_max_hosts_per_run": ("200", 200),
+        "dossier_max_hosts": ("5000", 5000),
+        "dossier_min_events": ("20", 20),
+        "dossier_min_confidence": ("0.6", 0.6),
+        "dossier_staleness_hours": ("72", 72),
+        "dossier_context_enabled": ("on", True),
+        "dossier_conflict_min_observations": ("3", 3),
+        "dossier_conflict_prompt_interval_hours": ("336", 336),
+    }
+    assert set(samples) == set(_DOSSIER_KNOBS)
+    for key, (raw, expected) in samples.items():
+        assert cfg.coerce(key, raw) == expected
+
+
+def test_dossier_never_prompt_is_in_bounds_but_zero_hosts_is_not() -> None:
+    """0 is a real setting for the prod interval and a typo everywhere else.
+
+    ``dossier_conflict_prompt_interval_hours = 0`` means "never prod me about a
+    disagreement" — an operator resolution, not a disabled feature. The host
+    caps take 0 as what it is: a sweep that would silently build nothing.
+    """
+    from soc_ai.store.config_overrides import coerce
+
+    assert coerce("dossier_conflict_prompt_interval_hours", "0") == 0
+    with pytest.raises(ValueError):
+        coerce("dossier_max_hosts_per_run", "0")
+    with pytest.raises(ValueError):
+        coerce("dossier_min_events", "0")
+    # A min_value of 0 must still be ENFORCED, not read as "unbounded". -1 is
+    # the plausible typo from an operator reaching for "never" the C way, and a
+    # negative interval would make every elapsed-time check pass forever.
+    with pytest.raises(ValueError):
+        coerce("dossier_conflict_prompt_interval_hours", "-1")
+
+
+def test_dossier_coerce_rejects_out_of_range() -> None:
+    """Bounds reject the typo that would turn a knob into an outage.
+
+    A confidence floor above 1.0 makes the resolver return "unknown" for every
+    field forever — the dossier would exist, be built on schedule, and assert
+    nothing.
+    """
+    from soc_ai.store.config_overrides import coerce
+
+    with pytest.raises(ValueError):
+        coerce("dossier_min_confidence", "1.5")
+    with pytest.raises(ValueError):
+        coerce("dossier_schedule_interval_hours", "0")
+    with pytest.raises(ValueError):
+        coerce("dossier_lookback_days", "365")
+
+
+def test_dossier_env_vars_are_stripped_by_clean_env() -> None:
+    """``DOSSIER_*`` is on the conftest strip list.
+
+    ``Settings`` has no ``env_prefix``, so ``dossier_enabled`` reads
+    ``DOSSIER_ENABLED`` from the ambient environment. Without the prefix on the
+    strip list, an operator's exported knob on the dev box (or a CI runner
+    variable) silently changes the defaults under every test that constructs a
+    ``Settings`` — the failure mode the fixture exists to prevent.
+    """
+    from tests.conftest import _PREFIXES
+
+    for key in _DOSSIER_KNOBS:
+        assert key.upper().startswith(_PREFIXES), f"{key.upper()} would leak into Settings()"
+
+
+# ---------------------------------------------------------------------------
+# Dashboard general chat — the general_chat_enabled kill switch
+# ---------------------------------------------------------------------------
+
+
+def test_general_chat_enabled_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dashboard chat ships ON: it REPLACES the Ask box already on the
+    landing screen, so defaulting it off would delete a shipped surface on
+    upgrade. Nothing runs until an analyst types (idle cost is one GET), so an
+    on-by-default agent here costs nothing on a quiet grid."""
+    _setenv_required(monkeypatch)
+    assert Settings().general_chat_enabled is True
+
+
+def test_general_chat_enabled_is_a_hot_non_secret_toggle() -> None:
+    """The kill switch has to be flippable while the box is misbehaving.
+
+    hot=True: an operator whose model backend is saturated turns the landing-page
+    agent off NOW, without a restart that would also drop every in-flight
+    investigation. It carries no credential, so it is neither secret nor
+    Danger-Zone, and it lives in a section GET /config actually serializes.
+    """
+    from soc_ai.store.config_overrides import SECTION_ORDER, WHITELIST_BY_KEY
+
+    spec = WHITELIST_BY_KEY["general_chat_enabled"]
+    assert spec.type == "bool"
+    assert spec.hot is True
+    assert spec.secret is False
+    assert spec.danger is False
+    assert spec.section in SECTION_ORDER
+
+
+def test_general_chat_enabled_coerce_round_trips_from_the_console_form(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A console save is coerce() → apply_to_settings(), and an unchecked
+    checkbox posts an EMPTY string, not "false" — the round trip is what proves
+    turning the box off actually reaches ``settings``."""
+    from soc_ai.store.config_overrides import apply_to_settings, coerce
+
+    assert coerce("general_chat_enabled", "on") is True
+    assert coerce("general_chat_enabled", "true") is True
+    assert coerce("general_chat_enabled", "") is False  # unchecked checkbox
+
+    _setenv_required(monkeypatch)
+    s = Settings()
+    applied = apply_to_settings(s, {"general_chat_enabled": coerce("general_chat_enabled", "")})
+    assert "general_chat_enabled" in applied
+    assert s.general_chat_enabled is False
+
+
+async def test_about_reports_general_chat_enabled(settings_kratos: Settings) -> None:
+    """GET /api/v1/about carries the flag so the SPA can HIDE the box.
+
+    Without it the dashboard has no way to know the feature is off before it
+    mounts, so it would render the box and issue a request the server is going
+    to refuse — an error toast on the landing screen of a deployment that
+    deliberately disabled the feature.
+    """
+    from soc_ai.api.webui.routes_meta import about
+
+    settings_kratos.general_chat_enabled = False
+    assert (await about(settings=settings_kratos)).general_chat_enabled is False
+
+    settings_kratos.general_chat_enabled = True
+    assert (await about(settings=settings_kratos)).general_chat_enabled is True

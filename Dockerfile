@@ -16,6 +16,10 @@
 #   - /var/lib/soc-ai/blocklists  (named volume — optional, survives restarts)
 #   - /var/lib/soc-ai/maxmind     (named volume — optional GeoIP .mmdb files)
 #   - /var/lib/soc-ai/cloud_prefixes (named volume — optional cloud prefix JSON)
+#   - /var/lib/soc-ai/evals     (named volume — nightly quality-eval artifacts)
+# The /var/lib/soc-ai/* directories are created HERE, owned by uid 1000, so a
+# named volume mounted over one inherits that ownership; a volume mounted at a
+# path the image never created would be root-owned and unwritable.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: dependency build ─────────────────────────────────────────────────
@@ -83,6 +87,7 @@ RUN mkdir -p \
         /var/lib/soc-ai/blocklists \
         /var/lib/soc-ai/maxmind \
         /var/lib/soc-ai/cloud_prefixes \
+        /var/lib/soc-ai/evals \
         /etc/soc-ai \
     && chown -R soc-ai:soc-ai \
         /opt/soc-ai \

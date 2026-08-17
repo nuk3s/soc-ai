@@ -34,7 +34,7 @@ impact.
 - **Payload delivery**: a download follows the click. Capture filename,
   type, and hash. Executables, script files, ISO/IMG containers, and
   macro-bearing documents from fresh domains are near-certain malicious.
-  Pivot the hash across the estate for other victims.
+  Pivot the hash across the network for other victims.
 
 ## Assess post-click impact
 

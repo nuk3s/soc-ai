@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from elastic_transport import ObjectApiResponse
 from soc_ai.audit.chain import GENESIS_PREV_HASH, compute_hash, verify_chain
 from soc_ai.audit.logger import AuditLogger, AuditWriteError
 from soc_ai.audit.redact import redact_text, redact_value
@@ -458,6 +459,234 @@ async def test_chain_head_recovers_across_restart(settings_kratos: Settings) -> 
 
     assert [d["seq"] for d in es.docs] == [0, 1, 2, 3]
     assert es.docs[3]["prev_hash"] == es.docs[2]["hash"]
+    ok, broken = verify_chain(es.docs)
+    assert ok is True
+    assert broken is None
+
+
+@pytest.mark.asyncio
+async def test_chain_head_recovery_parses_the_real_transport_response_shape(
+    settings_kratos: Settings,
+) -> None:
+    """Head recovery must survive what the REAL client returns, not just a dict.
+
+    elasticsearch-py 8.x answers :class:`elastic_transport.ObjectApiResponse` —
+    neither a ``dict`` nor a ``Mapping`` — and ``_top_source``'s tolerant
+    isinstance check read it as a non-conforming double: ``{}``, "no chained
+    record to find", genesis. Against a live grid that meant EVERY process
+    restart renumbered the chain from seq 0 on top of the existing records, and
+    every verify thereafter reported TAMPER — no outage required. The restart
+    test above stayed green throughout because its double returns plain dicts,
+    the one response shape production never sends.
+    """
+
+    class _RealShapeES(_CapturingES):
+        async def search(self, *, index: str, body: dict[str, Any]) -> Any:
+            resp = await super().search(index=index, body=body)
+            resp["_shards"] = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}
+            return ObjectApiResponse(body=resp, meta=None)  # type: ignore[arg-type]
+
+    es = _RealShapeES()
+    logger1 = _logger_with(es, settings_kratos)
+    for i in range(3):
+        await logger1.log_kind("s", "tool_call", {"i": i})
+    assert [d["seq"] for d in es.docs] == [0, 1, 2]
+
+    # Simulated restart: recovery reads the head through the real response type.
+    logger2 = _logger_with(es, settings_kratos)
+    await logger2.log_kind("s", "tool_call", {"i": 3})
+
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3]
+    assert es.docs[3]["prev_hash"] == es.docs[2]["hash"]
+    ok, broken = verify_chain(es.docs)
+    assert ok is True
+    assert broken is None
+
+
+# =====================================================================
+# Half-read head recovery — never a stale head, never a genesis restart
+# =====================================================================
+#
+# Head recovery reads the audit index through the raw ``_client`` handle, so
+# the wrapper's partial-read guard never runs on it: an index whose shards are
+# half down still answers 200, carrying only what the surviving shards held.
+# Taken at face value that either resumes the chain from a STALE seq (the true
+# head sat on the dead shards) or restarts it at genesis (the surviving shards
+# showed nothing) — and both write duplicate seqs INTO the index, so every
+# verify thereafter reports TAMPER, permanently, for a one-time outage. The
+# logger now refuses a half-read head the same way the verifier refuses a
+# half-read page, and falls back on its documented fail policy: drop the
+# best-effort record, abort a fail-closed mutating one, keep the head unknown
+# so the next write retries recovery.
+
+
+def _half_read(hits: list[dict[str, Any]]) -> dict[str, Any]:
+    """An ES 200 for a half-read index: 2 of 4 shards failed, ``hits`` carries
+    only what the surviving shards held, and the outage is visible nowhere but
+    ``_shards``."""
+    return {
+        "took": 3,
+        "timed_out": False,
+        "_shards": {
+            "total": 4,
+            "successful": 2,
+            "skipped": 0,
+            "failed": 2,
+            "failures": [
+                {
+                    "shard": 0,
+                    "index": "soc-ai-audit-2026.01.01",
+                    "reason": {
+                        "type": "no_shard_available_action_exception",
+                        "reason": "no shard available",
+                    },
+                }
+            ],
+        },
+        "hits": {"hits": hits},
+    }
+
+
+class _HalfReadableES(_CapturingES):
+    """A ``_CapturingES`` whose ``search`` can serve a canned half-read page.
+
+    While ``half_read`` is set it is returned as-is (the outage); set it back
+    to None to heal the grid, after which ``search`` serves the true head WITH
+    explicit clean shard metadata — so the healthy side of these tests
+    exercises the ``_shards``-present parse, not just the absent-metadata shape
+    the rest of this file's doubles produce.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.half_read: dict[str, Any] | None = None
+
+    async def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
+        if self.half_read is not None:
+            return self.half_read
+        resp = await super().search(index=index, body=body)
+        resp["_shards"] = {"total": 4, "successful": 4, "skipped": 0, "failed": 0}
+        return resp
+
+
+@pytest.mark.asyncio
+async def test_half_read_head_recovery_never_adopts_a_stale_head(
+    settings_kratos: Settings,
+) -> None:
+    """A restart against a half-read index must not resume the chain mid-stream.
+
+    The surviving shards' newest record can be an OLD one — here seq 1, while
+    the true head (seq 4) sits on the shards that did not answer. Adopting it
+    stamps the next write with a seq the index already holds. The honest move
+    is the documented drop policy: audit loss over a corrupted chain, head kept
+    unknown, true head recovered when the grid heals.
+    """
+    es = _HalfReadableES()
+    logger1 = _logger_with(es, settings_kratos)
+    for i in range(5):
+        await logger1.log_kind("s", "tool_call", {"i": i})
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3, 4]
+
+    # Restart mid-outage: recovery sees a half-read page whose top hit is stale.
+    logger2 = _logger_with(es, settings_kratos)
+    es.half_read = _half_read([{"_source": es.docs[1]}])
+    await logger2.log_kind("s", "tool_call", {"i": "during outage"})
+
+    # Dropped, not stamped with a reused seq 2.
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3, 4]
+
+    # The grid heals: the next write recovers the TRUE head and continues.
+    es.half_read = None
+    await logger2.log_kind("s", "tool_call", {"i": "after outage"})
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3, 4, 5]
+    ok, broken = verify_chain(es.docs)
+    assert ok is True
+    assert broken is None
+
+
+@pytest.mark.asyncio
+async def test_half_read_head_recovery_never_restarts_at_genesis(
+    settings_kratos: Settings,
+) -> None:
+    """A half-read page that shows ZERO records is not a fresh deployment.
+
+    The empty page came off the surviving shards; the chain lives on the ones
+    that did not answer. Falling back to genesis renumbers every future record
+    from 0 on top of the existing trail — the duplicate-seq shape verify-chain
+    reports as tampered forever after.
+    """
+    es = _HalfReadableES()
+    logger1 = _logger_with(es, settings_kratos)
+    for i in range(3):
+        await logger1.log_kind("s", "tool_call", {"i": i})
+    assert [d["seq"] for d in es.docs] == [0, 1, 2]
+
+    logger2 = _logger_with(es, settings_kratos)
+    es.half_read = _half_read([])
+    await logger2.log_kind("s", "tool_call", {"i": "during outage"})
+
+    # No genesis restart: no second seq-0 record was written.
+    assert [d["seq"] for d in es.docs] == [0, 1, 2]
+
+    es.half_read = None
+    await logger2.log_kind("s", "tool_call", {"i": "after outage"})
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3]
+    ok, broken = verify_chain(es.docs)
+    assert ok is True
+    assert broken is None
+
+
+@pytest.mark.asyncio
+async def test_half_read_head_recovery_fail_closed_aborts_mutating_write(
+    settings_kratos: Settings,
+) -> None:
+    """Fail-closed holds when it is the chain HEAD that cannot be trusted.
+
+    A mutating write gates an SO state change on its audit record. With the
+    head unrecoverable from a half-read index, writing means guessing a seq —
+    so under ``audit_fail_closed`` the action aborts exactly as it does when
+    the index write itself fails, and the analyst retries once the grid heals.
+    """
+    settings = settings_kratos.model_copy(update={"audit_fail_closed": True})
+    es = _HalfReadableES()
+    logger1 = _logger_with(es, settings)
+    await logger1.log_kind("s", "tool_call", {"i": 0})
+
+    logger2 = _logger_with(es, settings)
+    es.half_read = _half_read([])
+    with pytest.raises(AuditWriteError):
+        await logger2.log_kind("s", "tool_call", {"tool": "ack_alert"}, mutating=True)
+    assert [d["seq"] for d in es.docs] == [0]
+
+
+@pytest.mark.asyncio
+async def test_half_read_reread_after_unacknowledged_write_keeps_known_head(
+    settings_kratos: Settings,
+) -> None:
+    """The head-uncertain re-read treats a half-read like a failed re-read.
+
+    After a write whose bound expired, the head is re-read before the next
+    record is stamped. A half-read page there can show a STALE top hit, and
+    adopting it walks the chain backwards — strictly worse than the one
+    ambiguous seq the re-read set out to recover from. The established stance
+    for a re-read that could not answer is to keep the last known head and
+    warn; a half-read gets the same.
+    """
+    es = _HalfReadableES()
+    logger = _logger_with(es, settings_kratos)
+    for i in range(5):
+        await logger.log_kind("s", "tool_call", {"i": i})
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3, 4]
+
+    # A write's outcome went unclassified (its bound expired mid-flight), so
+    # the head must be re-read — against a grid that is half-read at that
+    # moment, with a stale newest record on the surviving shards.
+    logger._head_uncertain = True
+    es.half_read = _half_read([{"_source": es.docs[1]}])
+    await logger.log_kind("s", "tool_call", {"i": "after expiry"})
+
+    # Continued from the KEPT head (seq 4) — not from the stale seq 1.
+    assert [d["seq"] for d in es.docs] == [0, 1, 2, 3, 4, 5]
     ok, broken = verify_chain(es.docs)
     assert ok is True
     assert broken is None

@@ -12,6 +12,7 @@ import type { ChatThread } from '../lib/api';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getChatThread: vi.fn().mockResolvedValue({ messages: [], pending: false }),
+  getMe: vi.fn().mockResolvedValue({ username: 'analyst' }),
   postChat: vi.fn(),
 }));
 

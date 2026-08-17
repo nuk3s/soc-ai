@@ -354,32 +354,36 @@ def test_investigation_chat_returns_canned_reply(demo_mode_stack: dict) -> None:
     """A chat turn on a seeded investigation returns the SCRIPTED canned reply.
 
     Drives the real demo chat path against the demo server: POST the authored
-    user turn, poll the thread until the assistant turn settles, and assert the
-    persisted assistant text is the exact authored reply (zero egress — a live
-    call would hit the demo egress guard and never produce this text).
+    user turn and assert the response thread carries the exact authored reply,
+    already settled (zero egress — a live call would hit the demo egress guard
+    and never produce this text).
+
+    The answer arrives ON THE POST and is never stored: a demo's investigations
+    are shared by every visitor, so a persisted thread would put one visitor's
+    typed question in another's chat panel. Hence the follow-up assertion that
+    the thread reads back EMPTY — the property the SPA relies on, since it
+    renders what the POST returned.
     """
     base: str = demo_mode_stack["base_url"]
     fixtures: dict = demo_mode_stack["fixtures"]
     inv_id, user_turn, expected_reply = _canned_investigation_chat(fixtures)
 
-    status_code, _ = _post_json(
+    status_code, thread = _post_json(
         f"{base}/api/v1/investigations/{inv_id}/chat", {"message": user_turn}
     )
     assert status_code == 200, f"chat POST not accepted (HTTP {status_code}) — demo allowlist?"
-
-    thread: dict = {}
-    for _ in range(40):
-        code, thread = _get_json(f"{base}/api/v1/investigations/{inv_id}/chat")
-        if code == 200 and not thread.get("pending"):
-            break
-        time.sleep(0.5)
-    assert code == 200, f"chat thread not readable (HTTP {code})"
-    assert not thread.get("pending"), "assistant turn never settled"
+    assert not thread.get("pending"), "the canned reply is the whole turn — nothing to poll"
 
     replies = [m.get("text") for m in thread.get("messages") or [] if m.get("role") == "assistant"]
     assert replies, f"no assistant turn in the thread: {thread}"
     assert expected_reply in replies, (
         f"canned reply not served — got {replies!r}, expected authored {expected_reply!r}"
+    )
+
+    code, stored = _get_json(f"{base}/api/v1/investigations/{inv_id}/chat")
+    assert code == 200, f"chat thread not readable (HTTP {code})"
+    assert stored.get("messages") == [], (
+        f"the demo stored a visitor's turn — the next visitor would read it: {stored}"
     )
 
 

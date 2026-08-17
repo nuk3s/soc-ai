@@ -33,7 +33,7 @@ differ from the commercial web's.
 
 - **Fingerprint rarity** (JA3/JA3S or equivalent client/server hello
   hashes, where available): a TLS client stack seen on exactly one host in
-  the estate — while the fleet's browsers share a handful of common
+  the network — while the fleet's browsers share a handful of common
   fingerprints — indicates a custom client. Match known-malware fingerprint
   lists but treat them as hints; fingerprints collide.
 - **SNI anomalies**: missing SNI from a modern host, SNI that is a bare IP,

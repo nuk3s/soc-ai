@@ -58,3 +58,65 @@ export function formatNotificationTitle(title: string): string {
   if (!meta) return title;
   return `${meta.label}: ${m[2]}`;
 }
+
+/**
+ * The row's relative time, as a phrase.
+ *
+ * The API sends a bare magnitude ('3m', '2h', '5d') — except under a minute,
+ * where it sends the WORD "now". Appending " ago" unconditionally therefore
+ * printed "now ago" on every fresh notification, which on a screen about what
+ * just happened is most of them. The Topbar bell fixed that inline (F61) and
+ * the pane kept the wart, so the same row read two ways depending on where you
+ * looked at it; both surfaces call this now. An absent timestamp returns null
+ * so callers render nothing rather than a lone "ago".
+ */
+export function formatNotificationWhen(when: string | null | undefined): string | null {
+  if (!when) return null;
+  return when === 'now' ? 'just now' : `${when} ago`;
+}
+
+// ── What produced this notification ────────────────────────────────────────
+
+/** Which part of the app raised the item. */
+export type NotificationKind = 'system' | 'host' | 'investigation' | 'hunt';
+
+/**
+ * The kinds in the order /notifications itself emits them: standing conditions
+ * first (a down dependency, a dossier disagreement), then work — in flight, then
+ * finished. The pane's preset chips and its group headers both read this, so the
+ * two can never disagree about what a kind is called or where it sits.
+ */
+export const NOTIFICATION_KINDS: ReadonlyArray<{ id: NotificationKind; label: string }> = [
+  { id: 'system', label: 'System' },
+  { id: 'host', label: 'Hosts' },
+  { id: 'investigation', label: 'Investigations' },
+  { id: 'hunt', label: 'Hunts' },
+];
+
+/**
+ * The source of a notification, off the id prefix the API mints.
+ *
+ * The id is already this list's stable identity — the dismissal store above is
+ * built on it — so the prefix is the one discriminator that is guaranteed
+ * present, unlike `href` (a down dependency has none) or `tone` (which says how
+ * loud, not who). Matching the segment BEFORE the first colon rather than a
+ * `startsWith` keeps `inv:` and `inv-done:` apart from anything that merely
+ * begins with those letters.
+ *
+ * Anything unrecognised is `system`, never dropped: the bell badge counts the
+ * same rows this pane shows, so a source a future build adds has to land in a
+ * bucket rather than disappear out of one.
+ */
+export function notificationKind(n: { id: string }): NotificationKind {
+  switch (n.id.split(':', 1)[0]) {
+    case 'inv':
+    case 'inv-done':
+      return 'investigation';
+    case 'hunt-done':
+      return 'hunt';
+    case 'dossier-conflict':
+      return 'host';
+    default:
+      return 'system';
+  }
+}

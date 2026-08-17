@@ -22,17 +22,53 @@ import ipaddress
 import logging
 import socket
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
 from soc_ai.demo.guard import assert_egress_allowed
+from soc_ai.tools.online import first_internal_identifier
 
 _LOGGER = logging.getLogger(__name__)
 
 # Cap on redirect hops we will follow + revalidate before giving up. A chain
 # longer than this is treated as hostile (redirect loop / evasion) and refused.
 _MAX_REDIRECT_HOPS = 8
+
+
+def _url_path_leaks_internal_identifier(
+    url: str,
+    settings: Any,
+    *,
+    suffixes: tuple[str, ...] | None = None,
+    extra_hosts: tuple[str, ...] | None = None,
+) -> str | None:
+    """Return the first internal identifier smuggled into *url*'s path / query /
+    fragment (URL-decoded once), else ``None``.
+
+    ``_host_is_internal`` inspects ONLY the hostname, so an attacker who lands
+    text in a monitored field can steer the model to fetch
+    ``https://<attacker>/c?h=<internal-fqdn>&u=<user>`` — an external, globally
+    routable host whose query string carries internal identifiers straight to the
+    remote crawler (delivered even by the redirect preflight's ``client.head``).
+    This scans everything AFTER the host with the SAME internal-identifier
+    predicate the web_search / online-enrichment egress guards use, so the three
+    can no longer drift.  The host itself is left to ``_host_is_internal`` (which
+    additionally DNS-resolves and suffix-checks it), so an internal IP-literal or
+    suffix host keeps its precise refusal reason.
+
+    ``suffixes`` / ``extra_hosts`` are the effective (env + DB) identifier sets;
+    ``None`` falls back to the raw settings tuples.
+    """
+    parsed = urlparse(url)
+    scan_target = " ".join(
+        part for part in (parsed.path, parsed.params, parsed.query, parsed.fragment) if part
+    )
+    if not scan_target:
+        return None
+    return first_internal_identifier(
+        unquote(scan_target), settings, suffixes=suffixes, extra_hosts=extra_hosts
+    )
 
 
 def _ip_is_internal(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, settings: Any) -> bool:
@@ -80,7 +116,9 @@ async def _resolve_addrs(host: str) -> list[str]:
     return addrs
 
 
-async def _host_is_internal(url: str, settings: Any) -> str | None:
+async def _host_is_internal(
+    url: str, settings: Any, *, suffixes: tuple[str, ...] | None = None
+) -> str | None:
     """Return a reason string if *url*'s host is internal/unsafe, else None.
 
     The host is DNS-resolved and EVERY resolved address (v4 + v6) is checked
@@ -93,6 +131,9 @@ async def _host_is_internal(url: str, settings: Any) -> str | None:
     internal target, so :func:`_preflight_redirects` re-applies this same guard
     to every redirect hop before crawl4ai is handed a (terminal) url. Operators
     should still egress-restrict the crawl4ai service as defence in depth.
+
+    ``suffixes`` is the effective (env + DB) internal-suffix set; ``None`` falls
+    back to ``settings.oracle_internal_suffixes``.
     """
     try:
         parsed = urlparse(url)
@@ -121,8 +162,13 @@ async def _host_is_internal(url: str, settings: Any) -> str | None:
     if "." not in host:
         return f"bare hostname {host!r} (likely internal)"
 
-    # 3. Configured internal DNS suffix.
-    for suffix in getattr(settings, "oracle_internal_suffixes", ()) or ():
+    # 3. Configured internal DNS suffix (effective env + DB set when threaded).
+    effective_suffixes = (
+        suffixes
+        if suffixes is not None
+        else (getattr(settings, "oracle_internal_suffixes", ()) or ())
+    )
+    for suffix in effective_suffixes:
         if host.endswith(suffix):
             return f"internal suffix {suffix}"
 
@@ -143,7 +189,12 @@ async def _host_is_internal(url: str, settings: Any) -> str | None:
 
 
 async def _preflight_redirects(
-    url: str, *, settings: Any, client: httpx.AsyncClient
+    url: str,
+    *,
+    settings: Any,
+    client: httpx.AsyncClient,
+    suffixes: tuple[str, ...] | None = None,
+    extra_hosts: tuple[str, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     """Walk *url*'s redirect chain ourselves, revalidating every hop's host.
 
@@ -167,19 +218,30 @@ async def _preflight_redirects(
             if resp.status_code == 405:  # method not allowed → retry with GET
                 resp = await client.get(current, follow_redirects=False)
         except Exception as e:
-            # A preflight failure is non-fatal: the host already passed the
-            # internal-IP guard, so let crawl4ai attempt the original url. We
-            # only *gain* safety from the chain we did manage to validate.
-            _LOGGER.debug("redirect preflight stopped early (%s)", type(e).__name__)
-            return current, None
+            # Fail CLOSED: a preflight that cannot verify the chain must not
+            # permit egress. crawl4ai follows 30x server-side that we never see,
+            # so proceeding here would let a server that resets or fingerprints
+            # the preflight client (forcing this except) then serve crawl4ai a
+            # 302 to an internal target — the exact redirect-SSRF this preflight
+            # exists to close. A verification we could not complete is a refusal.
+            _LOGGER.debug("redirect preflight could not verify chain (%s)", type(e).__name__)
+            return None, f"redirect preflight could not verify the chain ({type(e).__name__})"
         if not resp.is_redirect:
             return current, None  # terminal: hand THIS url to crawl4ai
         location = resp.headers.get("location")
         if not location:
             return current, None  # 30x with no target — let crawl4ai handle it
-        # Resolve relative redirects against the current url, then revalidate.
+        # Resolve relative redirects against the current url, then revalidate —
+        # both the whole-URL identifier scan (path/query/fragment) and the
+        # host guard, so a 30x to an external host carrying an internal
+        # identifier in its query is refused before crawl4ai is handed it.
         next_url = urljoin(current, location)
-        bad = await _host_is_internal(next_url, settings)
+        leaked = _url_path_leaks_internal_identifier(
+            next_url, settings, suffixes=suffixes, extra_hosts=extra_hosts
+        )
+        if leaked is not None:
+            return None, f"redirect URL contains internal identifier {leaked!r}"
+        bad = await _host_is_internal(next_url, settings, suffixes=suffixes)
         if bad is not None:
             return None, f"redirect to internal target ({bad})"
         current = next_url
@@ -202,11 +264,21 @@ def _extract_content(result: Any) -> str:
     return ""
 
 
-async def crawl_page(url: str, *, settings: Any) -> dict[str, Any]:
+async def crawl_page(
+    url: str,
+    *,
+    settings: Any,
+    suffixes: tuple[str, ...] | None = None,
+    extra_hosts: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Fetch + extract the content of *url* via crawl4ai. Never raises.
 
     Returns ``{"ok": True, "url", "title", "content", "truncated"}`` on success,
     else ``{"ok": False, "error": ...}``.
+
+    ``suffixes`` / ``extra_hosts`` are the *effective* internal-identifier sets
+    (env-config unioned with active DB rows) resolved once per run by the caller;
+    ``None`` falls back to the raw settings tuples.
     """
     url = (url or "").strip()
     if not url:
@@ -216,7 +288,21 @@ async def crawl_page(url: str, *, settings: Any) -> dict[str, Any]:
     base = str(getattr(settings, "crawl4ai_url", "") or "").rstrip("/")
     if not base:
         return {"ok": False, "error": "crawl4ai_url not configured"}
-    bad = await _host_is_internal(url, settings)
+    # Scan the WHOLE URL (path/query/fragment, decoded once) for an internal
+    # identifier BEFORE the host check — closes the ``?h=<internal-fqdn>`` exfil
+    # channel that the host-only guard never inspected.
+    leaked = _url_path_leaks_internal_identifier(
+        url, settings, suffixes=suffixes, extra_hosts=extra_hosts
+    )
+    if leaked is not None:
+        return {
+            "ok": False,
+            "error": (
+                f"refused: URL contains internal identifier {leaked!r}; "
+                "crawl_page is for EXTERNAL pages only"
+            ),
+        }
+    bad = await _host_is_internal(url, settings, suffixes=suffixes)
     if bad is not None:
         return {"ok": False, "error": f"refused: {bad}; crawl_page is for EXTERNAL pages only"}
 
@@ -237,7 +323,9 @@ async def crawl_page(url: str, *, settings: Any) -> dict[str, Any]:
             # Resolve+revalidate the redirect chain BEFORE handing crawl4ai a
             # url, so a 30x to an internal host can't slip past the SSRF guard
             # server-side. We pass crawl4ai the final non-redirecting url.
-            fetch_url, redir_bad = await _preflight_redirects(url, settings=settings, client=client)
+            fetch_url, redir_bad = await _preflight_redirects(
+                url, settings=settings, client=client, suffixes=suffixes, extra_hosts=extra_hosts
+            )
             if redir_bad is not None:
                 return {
                     "ok": False,

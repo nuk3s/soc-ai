@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import Counter
 
 from elastic_transport import TransportError
+from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -21,7 +23,7 @@ from soc_ai.api.webui._shared import (
 )
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
-from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 from soc_ai.store import assignments as assign_svc
 from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import investigations as inv_svc
@@ -31,12 +33,141 @@ from soc_ai.webui import alerts_query as aq
 
 _LOGGER = logging.getLogger(__name__)
 
+# Cap the OQL filter query param: it parses synchronously (lark) on the event
+# loop with no length/clause limit, so an oversized ``q`` is ~1 s of
+# uninterruptible CPU. Reject it at validation (422) before the parse runs —
+# the query-param mirror of ``AckGroupIn``'s ``_OQL_Q`` body cap.
+_OQL_Q_MAXLEN = 2048
+
+# The default 503 body: the grid never answered, because the connection was
+# refused or the read ran out of time. "Retry shortly" is real advice there —
+# the next attempt genuinely may succeed — and it must stay on those classes.
+_GRID_UNAVAILABLE = {
+    "reason": "grid_unavailable",
+    "hint": ("The Security Onion grid (Elasticsearch) is slow or unreachable — retry shortly."),
+}
+
+# An Elasticsearch exception TYPE token, e.g. ``circuit_breaking_exception``.
+_ES_FAILURE_TYPE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _es_failure_type(reason: str | None) -> str | None:
+    """The ES exception type from a shard-failure reason, or ``None``.
+
+    Deliberately not the whole reason string. A shard failure reason carries
+    node names and ``host:port`` pairs, and an operator-facing hint is the wrong
+    place for grid internals — the type alone is the actionable half, and the
+    pattern keeps everything else out by construction rather than by scrubbing.
+    """
+    if not reason:
+        return None
+    head = reason.split(":", 1)[0].strip()
+    return head if _ES_FAILURE_TYPE_RE.fullmatch(head) else None
+
+
+def _partial_read_hint(exc: GridPartialResultsError) -> str:
+    """What to tell the operator when the grid answered from only some shards.
+
+    A partial read is not slowness and not unreachability: the grid answered
+    200, fast, off part of the index. Both halves of the default hint are wrong
+    for it, and the second half is actively harmful — "retry shortly" sends the
+    analyst around a loop that returns the same short answer every time, because
+    nothing about the next request changes shard health. Say which shards were
+    missed (the count the exception already carries), say the result is
+    incomplete rather than empty, and point at the one system that can fix it.
+    """
+    parts: list[str] = []
+    if exc.shards_failed:
+        if exc.shards_total:
+            read = max(exc.shards_total - exc.shards_failed, 0)
+            parts.append(f"read only {read} of {exc.shards_total} shards")
+        else:
+            noun = "shard" if exc.shards_failed == 1 else "shards"
+            parts.append(f"could not read {exc.shards_failed} {noun}")
+    if exc.timed_out:
+        parts.append("ran out of time before every shard answered")
+    if not parts:
+        # Defensive: a partial read with neither counter set still gets a
+        # partial read's advice, never the unreachable-grid advice.
+        parts.append("did not read every shard")
+    cause = _es_failure_type(exc.reason)
+    detail = f" (first shard failure: {cause})" if cause else ""
+    return (
+        f"The Security Onion grid answered, but the search {' and '.join(parts)}{detail}. "
+        "These results are incomplete, not empty — a short or missing answer here means "
+        "unknown. Repeating the search returns the same partial read until Elasticsearch "
+        "shard health recovers; check the cluster's shard allocation."
+    )
+
+
+def _grid_unavailable(exc: BaseException | None = None) -> dict[str, str]:
+    """The 503 body for a grid failure, with the hint chosen by failure CLASS.
+
+    One hint for every way a grid can fail is one hint too few. A refused
+    connection and a half-read index are different outages with different
+    remedies, and the flat constant described the second as the first — "slow or
+    unreachable" for a grid that answered in under 100 ms, followed by the only
+    advice on screen being an action that cannot work.
+
+    ``GridPartialResultsError`` gets the shard story; everything else keeps
+    :data:`_GRID_UNAVAILABLE` unchanged, because "retry shortly" is true of a
+    connect failure and a read timeout and pointing those at shard health would
+    send the analyst to the wrong system.
+    """
+    if isinstance(exc, GridPartialResultsError):
+        return {"reason": "grid_unavailable", "hint": _partial_read_hint(exc)}
+    return _GRID_UNAVAILABLE
+
+
+def _es_api_error_http(exc: ApiError) -> HTTPException:
+    """Map an ``elasticsearch.ApiError`` to a clean HTTP error.
+
+    A ``BadRequestError`` (and its ApiError siblings) is NOT a ``TransportError``,
+    so it slips past the ``(TimeoutError, TransportError)`` tuple and used to
+    surface as an unhandled 500. A 4xx from ES is a bad query → 400; anything
+    else (a 5xx the transport did not already retry) is a grid problem → 503.
+
+    429 is the exception to that split, and it is not a corner case: it is what a
+    saturated grid answers — search queue full, or an aggregation tripping the
+    parent circuit breaker. Nothing is wrong with the query, the cluster is over
+    its limits, and the same request succeeds once it recovers. Sorting it by HTTP
+    number put it in the bad-query bucket and told the analyst to check fields and
+    a time range they may never have typed (the dossier activity panel and the
+    detection-tuning panel take no query at all), while hiding the one fact that
+    matters: this is retryable. It is the grid's story, so it gets the grid's
+    answer — a 503 the SPA already renders as a retryable card.
+
+    408 joins it for the same reason, and more plainly still: a request-timeout
+    status is a statement about the GRID, never about the query text. Nothing an
+    analyst can type makes a search finish inside a proxy's patience, and RFC
+    9110 says outright that the client may repeat the request — the definition of
+    retryable. In practice a 408 in front of Elasticsearch is a load balancer
+    giving up under load, and filing it as a bad query told the analyst to check
+    the fields and time range of a filter they never typed. Three classifiers
+    answer this question (here, ``webui.autotriage._is_query_class`` and
+    ``agent.toolset._is_grid_unavailable``); the toolset had 408 right first.
+    """
+    status = getattr(getattr(exc, "meta", None), "status", None)
+    if status is not None and 400 <= status < 500 and status not in (408, 429):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "reason": "bad_query",
+                "hint": "Elasticsearch rejected the query — check the fields and time range.",
+            },
+        )
+    return HTTPException(status_code=503, detail=_GRID_UNAVAILABLE)
+
 
 class AlertEventOut(BaseModel):
     id: str = ""  # es _id — needed by the upcoming per-event selection feature
     src: str
     dst: str
     host: str
+    # Address of the machine the detection fired ON, when it is an endpoint agent
+    # rather than a flow. Separate from src/dst on purpose: those are FLOW
+    # endpoints, and a host detection has none. None for flow-shaped alerts.
+    hostIp: str | None = None
     proto: str = ""
     sev: str = "low"  # normalized severity label
     port: int | None = None  # destination port
@@ -162,12 +293,16 @@ def _last_attempt(
 def _inherited_reason(inv: Investigation) -> str:
     """Human explanation for an inherited verdict — WHICH investigation and WHEN,
     so the analyst can trust (and open) the source rather than seeing an opaque
-    'inherited' badge."""
+    'inherited' badge.
+
+    The flow is named only when the source run HAS one. A host/process detection
+    observes no network flow at all, and rendering its verdict as "on ? → ?" made
+    a perfectly good inherited verdict read like missing data.
+    """
     when = _ago(inv.created_at.isoformat()) if inv.created_at else "?"
-    flow = f"{inv.src_ip or '?'} → {inv.dest_ip or '?'}"
+    flow = f" on {inv.src_ip or '?'} → {inv.dest_ip or '?'}" if (inv.src_ip or inv.dest_ip) else ""
     return (
-        f"Inherited — same detection, investigated {when} ago on {flow} "
-        f"(investigation {inv.id[:8]}…)"
+        f"Inherited — same detection, investigated {when} ago{flow} (investigation {inv.id[:8]}…)"
     )
 
 
@@ -176,7 +311,7 @@ async def list_alerts(
     request: Request,
     range_: str = Query("24h", alias="range"),
     severity: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(None, max_length=_OQL_Q_MAXLEN),
     sort: str = "count",
     from_: str | None = Query(None, alias="from"),
     to: str | None = None,
@@ -211,16 +346,11 @@ async def list_alerts(
     except (TimeoutError, TransportError) as exc:
         # Fail fast with a clean error instead of hanging the console while the
         # ES client retries a slow/unreachable Security Onion grid.
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "reason": "grid_unavailable",
-                "hint": (
-                    "The Security Onion grid (Elasticsearch) is slow or unreachable "
-                    "— retry shortly."
-                ),
-            },
-        ) from exc
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        # An ES ApiError (e.g. BadRequestError) is NOT a TransportError — map it
+        # here so a bad query is a 400, not an unhandled 500.
+        raise _es_api_error_http(exc) from exc
 
     # Verdict badge per rule = the rule's STANDING verdict (its latest COMPLETE,
     # verdict-bearing investigation). A later interrupted run (error/cancelled/
@@ -332,7 +462,7 @@ async def list_group_events(
     kind: str = "suricata",
     range_: str = Query("24h", alias="range"),
     severity: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(None, max_length=_OQL_Q_MAXLEN),
     hide_acked: bool = Query(False),
     size: int = Query(aq.EVENTS_PER_GROUP, ge=1, le=aq.MAX_EVENTS),
     offset: int = Query(0, ge=0),
@@ -366,16 +496,9 @@ async def list_group_events(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
         ) from exc
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "reason": "grid_unavailable",
-                "hint": (
-                    "The Security Onion grid (Elasticsearch) is slow or unreachable "
-                    "— retry shortly."
-                ),
-            },
-        ) from exc
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
 
     # Three batched DB lookups — no per-event queries (no N+1).
     # 1. Direct: events whose exact es_id was investigated.
@@ -383,10 +506,15 @@ async def list_group_events(
     # 3. Rule: any complete investigation for this rule (rule-level fallback).
     async with request.app.state.db_sessionmaker() as db:
         direct = await inv_svc.latest_for_alerts(db, [e.es_id for e in events])
-        ip_events = [e for e in events if e.src_ip and e.dst_ip]
+        # A missing endpoint DEGRADES to "" rather than dropping the event from the
+        # pair tier — the same coalescing the sweep planner's clustering uses, and
+        # the shape the store's pair helpers already key on. Filtering to
+        # both-endpoints-present meant a host/process detection could never match
+        # its own cluster's verdict and fell through to the rule-level standing
+        # verdict, which on a rule that ALSO fires on flows credited the host
+        # detection to an unrelated flow.
         pairs: list[tuple[str, str, str]] = [
-            (rule_name, e.src_ip, e.dst_ip)  # type: ignore[misc]
-            for e in ip_events
+            (rule_name, e.src_ip or "", e.dst_ip or "") for e in events
         ]
         pair_map = await inv_svc.latest_for_pairs(
             db, pairs, window_days=settings.webui_inherit_window_days
@@ -412,13 +540,14 @@ async def list_group_events(
             src=e.src,
             dst=e.dst,
             host=e.host,
+            hostIp=e.host_ip,
             sev=_sev(e.severity),
             port=e.dst_port,
             ts=e.timestamp,
             ago=_ago(e.timestamp),
         )
         direct_inv = direct.get(e.es_id)
-        pair_inv = pair_map.get((rule_name, e.src_ip, e.dst_ip)) if e.src_ip and e.dst_ip else None
+        pair_inv = pair_map.get((rule_name, e.src_ip or "", e.dst_ip or ""))
         # A DIRECT run of this exact alert only "owns" it (investigated, NOT
         # inherited) when it is complete (a landed verdict) or still running (an
         # in-flight re-run). An error/cancelled direct run produced no verdict, so
@@ -459,55 +588,59 @@ class RepresentativeOut(BaseModel):
     reason: str
 
 
+# The shape an event is clustered by when picking a representative: a missing
+# endpoint coalesces to "" so no-flow events form their own legitimate shape
+# instead of being excluded from the count.
+_FlowKey = tuple[str, str, int | None]
+
+
+def _flow_key(event: aq.AlertEvent) -> _FlowKey:
+    return (event.src_ip or "", event.dst_ip or "", event.dst_port)
+
+
 def _pick_representative(
     events: list[aq.AlertEvent],
 ) -> tuple[aq.AlertEvent, int, str]:
     """Return (event, matched_count, reason) for the most-representative event.
 
     Selection rule:
-    1. Count occurrences of each (src_ip, dst_ip, dst_port) tuple across all
-       events that have at least src_ip + dst_ip populated.
-    2. Modal tuple wins; ties broken by the most-recent event in that tuple.
-    3. Within the winning tuple choose the *newest* event.
-    4. If no IP-bearing events exist, fall back to the globally newest event.
+    1. Count occurrences of each (src_ip, dst_ip, dst_port) shape across ALL
+       events, coalescing a missing endpoint to "" (see :func:`_flow_key`).
+    2. Modal shape wins; ties broken by the most-recent event in that shape.
+    3. Within the winning shape choose the *newest* event.
+
+    Counting only both-endpoints-present events is what this used to do, and on a
+    host/process detection — which carries no source/destination at all — it meant
+    a single stray flow-bearing event could be elected "most representative" of a
+    cluster it was a 1-in-N outlier of, sending the operator's hunt at the outlier.
+    A group with no flow anywhere degenerates to one shape, so the representative
+    is simply its newest event (what the old no-IP fallback did) — but ``matched``
+    now reports the whole shape instead of a hardcoded 1.
     """
-    # Only consider events that have both IPs (port may be None).
-    ip_events = [e for e in events if e.src_ip and e.dst_ip]
-    if not ip_events:
-        # Fallback: newest overall.
-        newest = max(events, key=lambda e: e.timestamp)
-        return (
-            newest,
-            1,
-            "No IP-bearing events in cluster —"
-            f" representative = newest overall ({newest.timestamp}).",
-        )
-
-    # Count tuples.
-    FlowKey = tuple[str | None, str | None, int | None]
-    counts: Counter[FlowKey] = Counter((e.src_ip, e.dst_ip, e.dst_port) for e in ip_events)
-    # Find the maximum count, then among all tuples with that count pick the one
-    # whose most-recent event is latest (tie-break by recency of the tuple).
+    counts: Counter[_FlowKey] = Counter(_flow_key(e) for e in events)
+    # Find the maximum count, then among all shapes with that count pick the one
+    # whose most-recent event is latest (tie-break by recency of the shape).
     max_count = max(counts.values())
-    winning_tuples = [t for t, c in counts.items() if c == max_count]
+    winning_keys = [t for t, c in counts.items() if c == max_count]
 
-    def _tuple_newest_ts(tup: FlowKey) -> str:
-        return max(
-            (e.timestamp for e in ip_events if (e.src_ip, e.dst_ip, e.dst_port) == tup),
-            default="",
-        )
+    def _key_newest_ts(key: _FlowKey) -> str:
+        return max((e.timestamp for e in events if _flow_key(e) == key), default="")
 
-    winning_tuple = max(winning_tuples, key=_tuple_newest_ts)
-    src_ip, dst_ip, dst_port = winning_tuple
+    winning_key = max(winning_keys, key=_key_newest_ts)
+    src_ip, dst_ip, dst_port = winning_key
 
-    # Pick the newest event within the winning tuple.
-    candidates = [e for e in ip_events if (e.src_ip, e.dst_ip, e.dst_port) == winning_tuple]
+    # Pick the newest event within the winning shape.
+    candidates = [e for e in events if _flow_key(e) == winning_key]
     representative = max(candidates, key=lambda e: e.timestamp)
 
-    dst_label = f"{dst_ip}:{dst_port}" if dst_port is not None else str(dst_ip)
+    if not src_ip and not dst_ip:
+        # Never render "— → —": these events observed no flow, they didn't lose one.
+        shape = "No network flow on these events (host-shaped detection)"
+    else:
+        dst_label = f"{dst_ip or '—'}:{dst_port}" if dst_port is not None else (dst_ip or "—")
+        shape = f"Most common flow {src_ip or '—'} → {dst_label}"
     reason = (
-        f"Most common flow {src_ip} → {dst_label}"
-        f" — {max_count} of {len(events)} events;"
+        f"{shape} — {max_count} of {len(events)} events;"
         f" representative = newest ({representative.timestamp})."
     )
     return representative, max_count, reason
@@ -519,7 +652,7 @@ async def get_representative(
     kind: str = "suricata",
     range_: str = Query(aq.DEFAULT_RANGE, alias="range"),
     severity: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(None, max_length=_OQL_Q_MAXLEN),
     hide_acked: bool = Query(False),
     from_: str | None = Query(None, alias="from"),
     to: str | None = None,
@@ -532,26 +665,37 @@ async def get_representative(
     common across up to 200 events in the cluster, breaking ties by recency.
     Returns the ES ``_id`` to hunt and a human-readable rationale so the UI
     can show the operator which event was chosen and why.
+
+    Bounded by ``webui_grid_timeout_s`` like its sibling list routes. This one
+    was the exception, and a grid that accepts connections without answering
+    raises nothing for the arms below to catch — so the picker sat on the ES
+    client's retry budget (~90 s at shipped defaults) while the analyst waited
+    on the button that opens an investigation.
     """
     try:
-        events = await aq.fetch_group_events(
-            elastic,
-            settings,
-            rule_name=rule_name,
-            kind=kind,
-            time_range=range_,
-            severity=severity,
-            oql=q,
-            size=aq.MAX_EVENTS,
-            hide_acked=hide_acked,
-            abs_from=from_,
-            abs_to=to,
-            time_zone=settings.so_timezone,
-        )
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            events = await aq.fetch_group_events(
+                elastic,
+                settings,
+                rule_name=rule_name,
+                kind=kind,
+                time_range=range_,
+                severity=severity,
+                oql=q,
+                size=aq.MAX_EVENTS,
+                hide_acked=hide_acked,
+                abs_from=from_,
+                abs_to=to,
+                time_zone=settings.so_timezone,
+            )
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
         ) from exc
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
 
     if not events:
         raise HTTPException(

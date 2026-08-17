@@ -13,6 +13,7 @@ from soc_ai.api.webui._shared import (
     require_admin_api,
     router,
 )
+from soc_ai.bootstrap_credential import clear_bootstrap_credential
 from soc_ai.store import auth as auth_svc
 from soc_ai.webui.deps import current_user
 
@@ -112,12 +113,12 @@ async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str
             status_code=400,
             detail={"reason": "username_required", "hint": "Username must not be empty."},
         )
-    if len(body.password) < 8:
+    if len(body.password) < auth_svc.MIN_PASSWORD_LENGTH:
         raise HTTPException(
             status_code=400,
             detail={
                 "reason": "password_too_short",
-                "hint": "Password must be at least 8 characters.",
+                "hint": (f"Password must be at least {auth_svc.MIN_PASSWORD_LENGTH} characters."),
             },
         )
     if body.role not in auth_svc.VALID_ROLES:
@@ -209,7 +210,13 @@ async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[s
                 detail={"reason": "user_not_found", "hint": f"No user with id {user_id}."},
             )
         new_pw = secrets.token_urlsafe(12)
+        username = target.username
         await auth_svc.reset_user_password(db, user_id, new_pw)
+    # An admin reset invalidates the bootstrap sidecar's contents just as surely
+    # as a self-service change does, so retire the file here too — otherwise a
+    # dead credential lingers at mode 0600 in the data dir with nothing to tell
+    # the operator it is stale.
+    clear_bootstrap_credential(request.app.state.settings, username)
     return {"ok": True, "password": new_pw}
 
 

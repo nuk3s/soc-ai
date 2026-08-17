@@ -48,6 +48,25 @@ export function rangeToSinceUntil(
   return { since: new Date(from).toISOString() };
 }
 
+/** Relative age for a wire timestamp ("now", "8m ago", "4h ago", "3d ago").
+ *
+ * A list or a KPI strip is scanned for "is this recent?", which a wall-clock
+ * time answers only after the reader does the subtraction; the absolute time
+ * rides in a `title` for when the answer is "not recent". `null` is 'never' —
+ * an ISO field that is null means the thing has not happened, not that its date
+ * is missing. */
+export function ago(iso: string | null | undefined): string {
+  if (!iso) return 'never';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return '—';
+  if (ms < 60_000) return 'now';
+  const minutes = ms / 60_000;
+  if (minutes < 60) return `${Math.round(minutes)}m ago`;
+  const hours = minutes / 60;
+  if (hours < 48) return `${Math.round(hours)}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
 /** Format an ISO timestamp as a readable absolute LOCAL time ("Jul 06, 2026,
  * 14:23:05"). Falls back to the raw string when unparseable, '—' when empty. */
 export function absTime(iso?: string | null): string {

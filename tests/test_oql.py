@@ -7,12 +7,15 @@ validator's whitelist and pipe-stage rules, and the translator's ES DSL output.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.oql import (
     _HARD_MAX_RESULTS,
     And,
     BareValue,
+    ContainsValue,
     Count,
     GroupBy,
     Head,
@@ -211,6 +214,25 @@ def test_parse_unknown_pipe_stage_rejected() -> None:
         parse_oql("* | take 10")
 
 
+def test_parse_head_huge_digit_string_raises_oql_error() -> None:
+    """``head <huge-digit-string>`` must raise OqlValidationError (a clean 400),
+    NOT a bare ValueError from CPython's 4300-digit int-conversion guard.
+
+    ``mcp_server`` wraps ``query_events_oql`` with no try/except, so a bare
+    ValueError escaped as an unhandled 500 rather than the self-correcting
+    OqlValidationError the module contract promises.
+    """
+    with pytest.raises(OqlValidationError):
+        parse_oql("event.kind:alert | head " + "9" * 5000)
+
+
+def test_parse_head_over_ten_digits_rejected() -> None:
+    """A head N with more than ten digits is out of range — rejected at parse
+    with a hint that names the real ceiling, well before int() is attempted."""
+    with pytest.raises(OqlValidationError, match="too large"):
+        parse_oql("* | head 999999999999999999999")
+
+
 def test_parse_unknown_pipe_stage_error_names_valid_stages() -> None:
     """U3: the unknown-stage error is returned verbatim to the LLM agent, so
     it must name the real pipe-stage surface (self-correcting error) and
@@ -228,6 +250,33 @@ def test_parse_unknown_pipe_stage_error_names_valid_stages() -> None:
 def test_parse_groupby_no_fields_rejected() -> None:
     with pytest.raises(OqlValidationError, match="groupby requires"):
         parse_oql("* | groupby   ,  ")
+
+
+@pytest.mark.parametrize("case", [str.lower, str.upper, str.title])
+@pytest.mark.parametrize(
+    ("stage", "expected_type"),
+    [
+        ("groupby host.name", GroupBy),
+        ("sortby @timestamp desc", SortBy),
+        ("head 5", Head),
+        ("count", Count),
+    ],
+)
+def test_pipe_stage_keywords_are_case_insensitive(
+    case: Any, stage: str, expected_type: type
+) -> None:
+    """All four pipe-stage keywords parse regardless of case.
+
+    ``groupby`` was the only case-sensitive stage (it lacked ``re.IGNORECASE``
+    while sortby/head/count all had it), so ``| GROUPBY x`` failed with an
+    ``unknown pipe stage`` error while the other three worked in any case — and
+    the error never named casing as the cause, so an SQL-habituated analyst or
+    the agent burned a tool call on it.
+    """
+    keyword, _, rest = stage.partition(" ")
+    cased = case(keyword) + (f" {rest}" if rest else "")
+    ast = parse_oql(f"* | {cased}")
+    assert isinstance(ast.pipes[0], expected_type)
 
 
 # =====================================================================
@@ -284,6 +333,36 @@ def test_validate_forbidden_field_rejected() -> None:
         validate_oql(parse_oql("_source:foo"))
 
 
+def test_field_reject_suggests_nearest_allowed_field() -> None:
+    """A filter field reject appends difflib's closest allowed field names.
+
+    The error is returned verbatim to the LLM agent — its only self-correction
+    channel — and prod logs show field rejects recurring, so naming the nearest
+    whitelisted names/prefixes converges it faster than a re-guess.
+    """
+    with pytest.raises(OqlValidationError) as ei:
+        validate_oql(parse_oql("sourc:foo"))
+    msg = str(ei.value)
+    assert "did you mean" in msg
+    assert "source" in msg  # not a substring of the bad field "sourc"
+
+
+def test_groupby_reject_suggests_nearest_allowed_field() -> None:
+    with pytest.raises(OqlValidationError) as ei:
+        validate_oql(parse_oql("* | groupby sourc"))
+    msg = str(ei.value)
+    assert "did you mean" in msg
+    assert "source" in msg
+
+
+def test_sortby_reject_suggests_nearest_allowed_field() -> None:
+    with pytest.raises(OqlValidationError) as ei:
+        validate_oql(parse_oql("* | sortby destinatio"))
+    msg = str(ei.value)
+    assert "did you mean" in msg
+    assert "destination" in msg
+
+
 def test_validate_groupby_unknown_field() -> None:
     ast = parse_oql("* | groupby fictional.field")
     with pytest.raises(OqlValidationError, match="groupby"):
@@ -294,6 +373,29 @@ def test_validate_sortby_unknown_field() -> None:
     ast = parse_oql("* | sortby fictional.field")
     with pytest.raises(OqlValidationError, match="sortby"):
         validate_oql(ast)
+
+
+def test_validate_groupby_whitespace_field_rejected() -> None:
+    """A whitespace-bearing groupby token must be rejected, not emitted to ES.
+
+    ``groupby source.ip destination.port evil`` splits on commas to the single
+    token ``"source.ip destination.port evil"``, which ``is_allowed`` accepts
+    because it still ``startswith`` the ``source.`` prefix. Before the fix that
+    reached ES verbatim as ``{"terms": {"field": "source.ip destination.port
+    evil"}}`` — a 400 with an opaque grid error instead of the self-correcting
+    ``unknown or forbidden field in groupby`` hint. The filter path's lark FIELD
+    terminal already forbids whitespace, so the two paths had disagreed.
+    """
+    ast = parse_oql("* | groupby source.ip destination.port evil")
+    with pytest.raises(OqlValidationError, match="groupby"):
+        validate_oql(ast)
+
+
+def test_validate_groupby_quoted_field_rejected() -> None:
+    """A quoted groupby field is rejected cleanly (an OqlValidationError), never
+    passed through to ES."""
+    with pytest.raises(OqlValidationError):
+        validate_oql(parse_oql('* | groupby "a b"'))
 
 
 def test_validate_leading_wildcard_rejected() -> None:
@@ -530,3 +632,95 @@ def test_full_translate_count_emits_track_total_hits() -> None:
     assert body["size"] == 0
     assert body["track_total_hits"] == _HARD_MAX_RESULTS
     assert body["track_total_hits"] is not True
+
+
+# ── Field-scoped value groups + prescriptive parse hints (dogfood 2026-08-06) ─
+# Live hunts wrote Lucene-style `field:(a OR b)` 23 times in 4000 events; each
+# parse failure became a zero-coverage query and, downstream, a confident
+# false-negative finding ("that account appears nowhere on the grid").
+#
+# The account name below is deliberately synthetic (the suite's alice/bob/carol
+# convention): this file ships to the public mirror, and a username lifted from a
+# live grid is a lab identifier, same class as a hostname or an internal subnet.
+
+
+def test_field_scoped_or_group_parses() -> None:
+    """`event.dataset:(a OR b)` expands to per-value terms under one OR."""
+    ast = parse_oql("event.dataset:(zeek.ssh OR sigma.alert)")
+    node = ast.filter_
+    assert isinstance(node, Or)
+    assert [t.field for t in node.children] == ["event.dataset", "event.dataset"]
+    assert [t.value.text for t in node.children] == ["zeek.ssh", "sigma.alert"]
+
+
+def test_field_scoped_group_composes_with_and() -> None:
+    ast = parse_oql("event.dataset:(soc.detections OR sigma.alert) AND message:alicesmith*")
+    assert isinstance(ast.filter_, And)
+
+
+def test_field_scoped_group_accepts_quoted_and_wildcard_members() -> None:
+    """A group member may be quoted (space and all — `OR` must not split it) or
+    a wildcard; each keeps its own value kind, so the members are two spellings
+    of one account name the way a real hunt writes them."""
+    ast = parse_oql('user.name:("alice smith" OR alicesmith*)')
+    node = ast.filter_
+    assert isinstance(node, Or)
+    assert node.children[0].value.text == "alice smith"
+    assert node.children[1].value.pattern == "alicesmith*"
+
+
+# ── Contains primitive (`field:~value`) ─────────────────────────────────────
+# OQL emitted only term/wildcard/range, so contains-intent had no expressible
+# form; the leading-wildcard reject taught `foo*`, which on a keyword-mapped
+# field only matches value-initial text and misses mid-string occurrences — a
+# confident false negative. The explicit `:~` form compiles to a full-text
+# `match` (bounded scope, no per-field mapping-type table needed).
+
+
+def test_contains_parses_to_contains_value() -> None:
+    ast = parse_oql("message:~beacon")
+    assert ast.filter_ == Term(field="message", value=ContainsValue(text="beacon", phrase=False))
+
+
+def test_contains_bare_compiles_to_match() -> None:
+    """`field:~value` compiles to an ES `match` (analyzed full-text)."""
+    ast = parse_oql("message:~beacon")
+    validate_oql(ast)
+    dsl = filter_to_dsl(ast.filter_)
+    assert dsl == {"match": {"message": "beacon"}}
+
+
+def test_contains_quoted_compiles_to_match_phrase() -> None:
+    """A quoted contains value is a phrase — compiled to `match_phrase` so the
+    words must be adjacent, the natural reading of a quoted substring."""
+    ast = parse_oql('message:~"powershell -enc"')
+    assert ast.filter_ == Term(
+        field="message", value=ContainsValue(text="powershell -enc", phrase=True)
+    )
+    dsl = filter_to_dsl(ast.filter_)
+    assert dsl == {"match_phrase": {"message": "powershell -enc"}}
+
+
+def test_contains_composes_with_boolean() -> None:
+    """The contains form is a first-class term — it joins under AND/OR/NOT."""
+    ast = parse_oql("event.dataset:zeek.dns AND dns.query.name:~beacon")
+    assert isinstance(ast.filter_, And)
+
+
+def test_leading_wildcard_hint_mentions_contains_form() -> None:
+    """The leading-wildcard reject teaches `foo*`, which misses mid-string on a
+    keyword field — so it must also name the `field:~value` contains outlet."""
+    with pytest.raises(OqlValidationError) as ei:
+        validate_oql(parse_oql("message:*beacon"))
+    assert ":~" in str(ei.value)
+
+
+def test_bare_term_error_teaches_the_fix() -> None:
+    """`... AND alicesmith` (a bare term) must fail with a hint that names the
+    supported shape — the error text is returned verbatim to the agent, which
+    is the only feedback channel it has to self-correct."""
+    with pytest.raises(OqlValidationError) as ei:
+        parse_oql("event.dataset:zeek.ssh AND alicesmith")
+    msg = str(ei.value)
+    assert "field:value" in msg
+    assert "message:" in msg  # points at the full-text idiom

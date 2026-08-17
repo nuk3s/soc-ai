@@ -39,6 +39,11 @@ on the hard ones; it's off until you turn it on, and its input is sanitized firs
     confidence inline next to each one. Open an alert to investigate it, or sweep the whole
     untriaged queue with auto-triage. Every investigation gets a shareable permalink.
 
+    The dashboard has an assistant that answers questions about your grid in one turn,
+    using the same read-only tools. Ask it what datasets you have or which rule was
+    noisiest overnight; when a question needs a sweep it writes the hunt objective and
+    waits for you to confirm.
+
     [:octicons-arrow-right-24: Web console guide](WEBUI_GUIDE.md)
 
 </div>
@@ -58,7 +63,7 @@ See [what the agent can do](AGENT_TOOLS.md) for the full tool surface and its gu
 
 ---
 
-## Hunt across the estate, not just one alert
+## Hunt across the network, not just one alert
 
 Some questions are bigger than a single detection: *"is anything beaconing to a rare
 external IP?"*, *"are the DCs seeing credential-abuse lockouts?"*, *"APT-X uses technique

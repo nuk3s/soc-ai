@@ -35,14 +35,44 @@ const ROWS = vi.hoisted(() => [
     ts: '2026-07-14T09:59:00+00:00',
     fallback: false,
   },
+  {
+    // A real-length Suricata rule name — the case the narrow-width row has to
+    // survive (see the row-layout describe at the bottom of this file).
+    id: 'INV-LONG',
+    name: 'ET MALWARE Win32/Emotet CnC Activity Observed (Variant B) M2',
+    kind: 'suricata',
+    verdict: 'true_positive',
+    conf: 0.88,
+    host: '192.0.2.70',
+    dst: '10.0.0.40',
+    status: 'complete',
+    when: '3m ago',
+    ts: '2026-07-14T09:58:00+00:00',
+    fallback: false,
+  },
 ]);
+
+const LONG_NAME = 'ET MALWARE Win32/Emotet CnC Activity Observed (Variant B) M2';
 
 const startQualityEvalMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getAlerts: vi.fn().mockResolvedValue([]),
-  getInvestigations: vi.fn().mockResolvedValue(ROWS),
+  getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
+  getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
+  // The recent-sample call feeds ROWS; the pipeline-error KPI's own query
+  // (verdict filter set) answers empty — these tests exercise the recent list.
+  listInvestigations: vi.fn().mockImplementation(async (q: { verdict?: string[] } = {}) => ({
+    rows: q.verdict?.length ? [] : ROWS,
+    total: q.verdict?.length ? 0 : ROWS.length,
+    running: 0,
+    truePositives: 0,
+    totalAll: ROWS.length,
+    active: false,
+    limit: 100,
+    offset: 0,
+  })),
   getAutoTriageStatus: vi.fn().mockResolvedValue({ active: false, hunted: 0, total: 0 }),
   getDataSources: vi.fn().mockResolvedValue({ sources: [] }),
   getQualityTrend: vi.fn().mockResolvedValue({ points: [] }),
@@ -92,5 +122,48 @@ describe('Dashboard quality eval — demo guard', () => {
     fireEvent.click(await screen.findByText('Run now'));
     await screen.findByText(/Not available in the read-only demo/);
     expect(startQualityEvalMock).not.toHaveBeenCalled();
+  });
+});
+
+// Below `lg` the row used to render as "SURICATA │ E… │ 192.0.2.70 → 10.0.0.40"
+// (dogfood, 2026-08-12): the flow's 230px floor and the fixed status column ate
+// the line, and the one element with no floor — the detection name — collapsed
+// to a single character. A row that names no detection is a row an analyst
+// cannot read, and this is the landing screen's only list.
+describe('Dashboard recent-investigations row layout', () => {
+  const row = async () => {
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    return (await screen.findByTitle(LONG_NAME)) as HTMLElement;
+  };
+
+  it('renders the whole detection name — nothing is clipped in JS', async () => {
+    const name = await row();
+    // Guards the cheap "fix": shortening the string instead of the layout.
+    // Clipping stays CSS-only, so the full name is in the DOM (and the title
+    // attribute), and the tooltip an analyst hovers is the real rule name.
+    expect(name.textContent).toBe(LONG_NAME);
+    expect(name.textContent!.length).toBeGreaterThan(40);
+  });
+
+  it('stacks the name above the endpoints below lg, so the flow yields width, not the name', async () => {
+    const name = await row();
+    // jsdom has no layout engine, so the pixel proof of "legible at 900px" is
+    // the render gate. What is checkable here is the contract that produced the
+    // clipped row: the name and the flow sharing one line while only the flow
+    // had a width floor. Now they share a SLOT that is a column below `lg`…
+    const slot = name.parentElement!;
+    expect(slot.className).toContain('flex-col');
+    expect(slot.className).toContain('lg:flex-row');
+    // …and the 230px two-IPv4 floor only applies where there is room for it.
+    const flow = name.nextElementSibling as HTMLElement;
+    expect(flow.className).toContain('lg:min-w-[230px]');
+    expect(flow.className).not.toMatch(/(^|\s)min-w-\[230px\]/);
+    // The endpoints are not dropped to buy the width at tablet/laptop sizes —
+    // they move to the second line and both facts stay on the row.
+    expect(within(flow).getByTitle('192.0.2.70 → 10.0.0.40')).toBeTruthy();
   });
 });

@@ -39,7 +39,7 @@ who/where/when/what-next.
   once. One-off random-name service from a workstation source = escalate.
 - **SMB executable/script writes**: an .exe/.dll/.ps1/.bat written to an
   admin share (C$, ADMIN$) outside a deployment window is tool transfer.
-  Capture the filename and hash; pivot the hash across the estate.
+  Capture the filename and hash; pivot the hash across the network.
 - **RDP**: a single interactive session is thin evidence alone. Chained RDP
   (A→B then B→C within minutes), first-ever source→target pairs, and RDP
   from a host that just received a suspicious file are the escalating

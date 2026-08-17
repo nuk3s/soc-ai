@@ -164,17 +164,41 @@ def test_sanitize_and_unsafe_residue_extra_hosts_agree() -> None:
 
 
 def test_redos_adversarial_inputs_complete_fast() -> None:
-    """Bounded quantifiers: a 40k-char adversarial run with no valid match must
-    not cause catastrophic backtracking. Both the email rule and the internal-
-    suffix host rule run; the whole sanitize must finish well under 1s."""
-    email_bomb = ("a-" * 20000) + "@x"  # no valid TLD → email rule must bail fast
-    host_bomb = ("a." * 20000) + "lan"  # long label run before a suffix-looking tail
-    for payload in (email_bomb, host_bomb):
-        start = time.perf_counter()
+    """Bounded quantifiers: an adversarial run with no valid match must not cause
+    catastrophic backtracking.
+
+    Asserts SCALING, not wall-clock. A stopwatch bound measures the machine, so
+    it passes on an idle box and fails on a loaded one: this test failed at
+    1.21s against a 1.0s bound on 2026-08-07 purely from CPU contention, while
+    the healthy path was nowhere near a regression. Doubling the input is the
+    load-invariant discriminator — backtracking is superlinear (quadratic gives
+    4x, exponential far worse) while a bounded quantifier is linear, and both
+    measurements slow down together under load so their ratio holds.
+
+    The email rule is ~55x slower than benign text of the same length even when
+    healthy, so comparing against a benign baseline would not discriminate;
+    only the shape of the growth curve does.
+    """
+
+    def run(payload: str) -> None:
         san.sanitize(payload, extra_suffixes=[".lan"])
         san.unsafe_residue(payload, extra_suffixes=[".lan"])
-        elapsed = time.perf_counter() - start
-        assert elapsed < 1.0, f"ReDoS: sanitize took {elapsed:.2f}s on {payload[:20]!r}…"
+
+    def elapsed(payload: str) -> float:
+        start = time.perf_counter()
+        run(payload)
+        return time.perf_counter() - start
+
+    bombs = {
+        "email": lambda n: ("a-" * n) + "@x",  # no valid TLD → email rule must bail
+        "host": lambda n: ("a." * n) + "lan",  # long label run before a suffix tail
+    }
+    run("ab" * 100)  # warm every pattern's compile before anything is timed
+    for name, build in bombs.items():
+        single = elapsed(build(10000))
+        double = elapsed(build(20000))
+        scaling = double / max(single, 1e-6)
+        assert scaling < 3.0, f"ReDoS: {name} scaled {scaling:.2f}x on 2x input (linear is 2.0)"
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,9 @@ guardrails.
 > tool (anything that changes Security Onion state) runs only when a human
 > explicitly executes it from the report's recommended actions in the UI (the
 > actions API — the single write path). The agent can *recommend* a write but
-> never executes one on its own. See `docs/SAFETY_MODEL.md`.
+> never executes one on its own. The third class, **proposal** tools, changes
+> nothing at all — it puts a control on screen for you to press. See
+> `docs/SAFETY_MODEL.md`.
 
 ## Read tools (run without a human in the loop)
 
@@ -28,6 +30,8 @@ guardrails.
 | `get_event_raw` / `t_get_event_raw` | Fetch the full raw JSON of a single event by id when the summarized context isn't enough. | Elasticsearch events index |
 | `t_describe_dataset` / `t_field_values` | On-demand discovery: describe a dataset's shape, or list the observed values of a field. Lets the agent learn what's actually in *this* grid instead of assuming a fixed schema. | Elasticsearch (terms aggregations) |
 | `t_host_summary` | Summarize a host's recent activity (datasets seen, top peers, notable events) for the internal side of a flow. | Elasticsearch |
+| `t_origin_chain` | **Who was driving this host?** Remote-access sessions (SSH/RDP/WinRM/SMB) *inbound* to an internal host in the window before the activity, time-ordered, with the closest-preceding session flagged as the likely driver. Call before attributing hostile behavior to an internal host: a host with an inbound session is a **waypoint**, not the origin — attribute upstream. An empty result is equally decisive (the host acted autonomously). | Elasticsearch |
+| `t_host_dossier` | **What IS this host, and is this normal for it?** The durable asset record kept for an internal IP by the network sweep: hostname, OS, inferred role (hypervisor / domain controller / security appliance / server / workstation / network device / IoT), the services it offers, its behavioural baseline, and any operator-set criticality and site policy. Every field carries its provenance — an **operator** value outranks an inferred one — plus the evidence behind it and when it was last confirmed. Unlike `t_host_summary` (a fresh 24h snapshot) this is the stored record built over a much wider window. A field with no value says *why* (`no_signal` / `low_confidence` / `stale`), and "no dossier" means the sweep has no record of the address, not that it is benign. | Local store (built from Elasticsearch by the dossier sweep) |
 | `t_prevalence` / `t_rule_prevalence` | How common is this indicator / this rule across the grid and window? Rare-vs-noisy is decisive for FP calls. | Elasticsearch (aggregations) |
 | `t_suggest_rule_tuning` | *Suggest* a tuning for a noisy detection (the analyst applies it in Detection Tuning; the agent never mutates a rule). | Local store + Elasticsearch |
 | `t_shodan_internetdb` / `t_shodan_host` / `t_greynoise` / `t_cve_lookup` | **External** reputation lookups on a single indicator — Shodan InternetDB (free), Shodan host (paid key), GreyNoise, CIRCL CVE DB. Outbound egress; used in the **hunt** and **chat** agents. Only the indicator leaves the network, never alert payloads. See `docs/SAFETY_MODEL.md` → external-intel egress. | Public Shodan / GreyNoise / CIRCL APIs |
@@ -41,6 +45,22 @@ guardrails.
 > its result is embedded directly in the agent's prompt, so the agent never has
 > to pull the alert picture itself (and cannot accidentally skip it). See the
 > prefetch enrichments below.
+
+## Proposal tools (chat only — the agent asks, you decide)
+
+Neither read nor write: a proposal tool changes nothing anywhere, it puts a
+control in front of you. The agent has already looked at the evidence, so it
+writes a better proposal than a blank form would get from you — and you still
+press the button.
+
+Each one is offered only on the surface it belongs to, so the model cannot
+reach for the wrong one: the investigation chat can propose a verdict but not a
+hunt, the Dashboard assistant the reverse.
+
+| Tool | Where | What happens |
+|------|-------|--------------|
+| `propose_verdict` | Investigation chat | The agent proposes `true_positive` / `false_positive` with confidence, rationale and citations. The stored verdict does **not** change; an **Apply** control appears, and it only appears if the proposal is evidence-backed. |
+| `propose_hunt` | Dashboard assistant | For a question that genuinely needs a sweep across many hosts or a long window, the agent writes the hunt objective — sharpened by what it just looked at — and says what the sweep would settle. Nothing starts: a **Start hunt** control appears, and you confirm. |
 
 ## Write tools (analyst-executed from the report in the UI)
 

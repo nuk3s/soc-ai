@@ -32,7 +32,7 @@ re-check with a longer window before escalating.
 
 - Reputation: blocklists, passive DNS, ASN. Newly registered domains and
   hosting ASNs with no business relationship to the org raise the score.
-- Rarity: how many *other* hosts in the estate talk to this destination?
+- Rarity: how many *other* hosts in the network talk to this destination?
   A destination unique to one workstation is far more suspicious than one
   the whole fleet uses (that pattern is usually telemetry or an update CDN).
 - Port/protocol mismatch: TLS on a non-standard port, HTTP with an empty or

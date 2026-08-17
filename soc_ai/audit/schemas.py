@@ -139,6 +139,24 @@ AuditKind = Literal[
     # them would defect on the whole point of the block). A failed audit index
     # must never turn a blocked-egress into an actual egress (fail-soft).
     "egress_blocked",
+    # Host dossier — durable, provenance-tagged asset context (soc_ai/dossier,
+    # soc_ai/api/webui/routes_dossier.py). Three kinds, one per way a host's
+    # asset facts change hands:
+    #   * host_dossier — the block injected into an investigation prompt.
+    #     Emitted ONLY when a non-empty block was actually built (the
+    #     prior_outcomes rule above), so "the model was told this host is a
+    #     hypervisor whose policy forbids interactive SSH" is provable later.
+    #   * dossier_override — an operator declaring a field by hand. That lane
+    #     outranks every inference for as long as it stands, so who set it, on
+    #     what host, and when belongs on the record.
+    #   * dossier_conflict_nudge — the rate-limited prod raised when telemetry
+    #     keeps disagreeing with an operator value (and the snooze that answers
+    #     it). The audit line is what makes a prod nobody clicked visible.
+    # Undeclared kinds are silently dropped by _audit — the same trap the
+    # downgrade kinds above document.
+    "host_dossier",
+    "dossier_override",
+    "dossier_conflict_nudge",
     "done",
     "error",
 ]

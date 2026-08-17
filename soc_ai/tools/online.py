@@ -100,7 +100,13 @@ def is_internal_ip(ip: str, settings: Any) -> bool:
     return False
 
 
-def first_internal_identifier(text: str, settings: Any) -> str | None:
+def first_internal_identifier(
+    text: str,
+    settings: Any,
+    *,
+    suffixes: tuple[str, ...] | None = None,
+    extra_hosts: tuple[str, ...] | None = None,
+) -> str | None:
     """Return the first token in *text* that is an INTERNAL identifier (and so must
     NOT be sent to a third party), else ``None``.
 
@@ -116,9 +122,21 @@ def first_internal_identifier(text: str, settings: Any) -> str | None:
 
     Bare single-label tokens are refused ONLY when they exactly match a configured
     internal host, so ordinary English/query words are never over-refused.
+
+    ``suffixes`` / ``extra_hosts`` let the caller pass the *effective* identifier
+    sets (env-config unioned with active DB rows, minus muted) that only the
+    EgressGuard / Oracle sanitizer used to see; a deployment that configured its
+    internal names through discovery with an empty ``.env`` otherwise has empty
+    env sets here and leaks a discovered FQDN/host to public search. ``None`` (the
+    default) falls back to the raw ``settings`` tuples, so a db-less caller is
+    unchanged.
     """
-    suffixes = tuple(s.lower() for s in (getattr(settings, "oracle_internal_suffixes", ()) or ()))
-    extra_hosts = {str(h).lower() for h in (getattr(settings, "oracle_extra_hosts", ()) or ())}
+    if suffixes is None:
+        suffixes = tuple(getattr(settings, "oracle_internal_suffixes", ()) or ())
+    if extra_hosts is None:
+        extra_hosts = tuple(getattr(settings, "oracle_extra_hosts", ()) or ())
+    suffix_set = tuple(s.lower() for s in suffixes)
+    host_set = {str(h).lower() for h in extra_hosts}
     for raw in _IDENTIFIER_TOKEN_RE.findall(_refang(text or "")):
         # Strip only dot/hyphen punctuation from the ends — NOT colons, which are
         # part of an IPv6 literal (``::1``) or an IPv4 ``host:port``.
@@ -141,7 +159,7 @@ def first_internal_identifier(text: str, settings: Any) -> str | None:
         if is_ip:
             continue  # an external IP literal — not a leak
         low = tok.lower()
-        if any(low.endswith(sfx) for sfx in suffixes) or low in extra_hosts:
+        if any(low.endswith(sfx) for sfx in suffix_set) or low in host_set:
             return tok
     return None
 

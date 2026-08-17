@@ -10,6 +10,7 @@ import type { Investigation as Inv } from '../lib/types';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getChatThread: vi.fn().mockResolvedValue({ messages: [], pending: false }),
+  getMe: vi.fn().mockResolvedValue({ username: 'analyst' }),
 }));
 
 import { Investigation } from './Investigation';

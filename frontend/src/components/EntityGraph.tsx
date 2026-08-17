@@ -12,6 +12,18 @@ interface EntityGraphProps {
   highlight?: string;
   height?: number;
   showLegend?: boolean;
+  /**
+   * Rename a node kind for THIS graph, in the legend and in the tooltips.
+   *
+   * The built-in vocabulary was written for the investigation blast radius,
+   * where an external node genuinely is a C2 candidate. A host page draws every
+   * non-RFC1918 peer — the package mirror, the CDN, the DNS resolver — with the
+   * same `c2` style because it is the "outside the network" style, and legending
+   * those as command-and-control asserts something the data does not support.
+   * The KIND stays a style choice; this lets the caller say what its own nodes
+   * actually are.
+   */
+  kindLabels?: Partial<Record<EntityKind, string>>;
 }
 
 interface NodeStyle {
@@ -52,8 +64,16 @@ const LEGEND: Record<EntityKind, { c: string; label: string; radius: string }> =
 // truncate for the on-canvas text; the full value stays in the hover <title>
 const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + '…' : s);
 
-export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: EntityGraphProps) {
+export function EntityGraph({
+  nodes,
+  edges,
+  height = 320,
+  showLegend = true,
+  kindLabels,
+}: EntityGraphProps) {
   const navigate = useNavigate();
+  /** What this graph calls a kind — the caller's word when it gave one. */
+  const kindLabel = (k: EntityKind): string => kindLabels?.[k] ?? LEGEND[k]?.label ?? k;
   const VW = 600;
   const VH = height;
   const mx = 46;
@@ -64,15 +84,27 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
 
   const presentKinds = [...new Set(nodes.map((n) => n.kind))];
   const anyFlagged = nodes.some((n) => n.flagged);
+  // The red wash is a STATEMENT — "there is something dangerous on this graph" —
+  // so it is drawn only when something on the graph represents that. It used to
+  // be unconditional, which put a faint danger tint under every host page's peer
+  // list of a gateway and a package mirror.
+  const anyDanger =
+    anyFlagged ||
+    nodes.some((n) => n.kind === 'compromised') ||
+    edges.some((e) => e.kind === 'lateral');
 
   return (
     <div className="font-sans">
       <div
         className="relative"
-        style={{
-          background:
-            'radial-gradient(60% 70% at 32% 42%,rgba(240,68,56,.06),transparent 72%)',
-        }}
+        style={
+          anyDanger
+            ? {
+                background:
+                  'radial-gradient(60% 70% at 32% 42%,rgba(240,68,56,.06),transparent 72%)',
+              }
+            : undefined
+        }
       >
         <svg
           viewBox={`0 0 ${VW} ${VH}`}
@@ -156,7 +188,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
             // the node; the lone left (source) node keeps its label underneath
             const side = n.x >= 60;
             const tip = [
-              `${n.id} — ${LEGEND[n.kind]?.label ?? n.kind}`,
+              `${n.id} — ${kindLabel(n.kind)}`,
               n.sub,
               n.flagged
                 ? `flagged by: ${(n.flagSources ?? []).join(', ') || 'threat intel'}`
@@ -241,7 +273,7 @@ export function EntityGraph({ nodes, edges, height = 320, showLegend = true }: E
             return (
               <span key={k} className="flex items-center gap-1.5">
                 <span className="h-[9px] w-[9px]" style={{ background: l.c, borderRadius: l.radius }} />
-                {l.label}
+                {kindLabel(k)}
               </span>
             );
           })}

@@ -36,6 +36,8 @@ vi.mock('../lib/api', async (importOriginal) => ({
   deleteHuntSchedule: deleteHuntScheduleMock,
 }));
 
+import { getHunts } from '../lib/api';
+import type { HuntRow } from '../lib/types';
 import { Hunts } from './Hunts';
 
 function renderHunts(demo = false) {
@@ -145,5 +147,36 @@ describe('ScheduledHunts demo guard', () => {
 
     await screen.findByText(/Not available in the read-only demo/);
     expect(deleteHuntScheduleMock).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('Hunts selection does not cost the only filter', () => {
+  // Hunts has exactly one facet — the time range. The shared toolbar's first
+  // cut swapped the facet row out for the selection strip, so ticking a hunt
+  // deleted the screen's entire filtering ability until the selection was
+  // discarded.
+  it('keeps the time-range filter on screen while hunts are selected', async () => {
+    vi.mocked(getHunts).mockResolvedValue([
+      {
+        id: 'H1',
+        objective: 'Look for hosts beaconing to rare external IPs',
+        status: 'complete',
+        findings: 2,
+        hosts: 1,
+        started: '20m',
+        startedTs: '2026-08-12T10:00:00+00:00',
+      } as unknown as HuntRow,
+    ]);
+    renderHunts();
+    await screen.findByText('Look for hosts beaconing to rare external IPs');
+    const boxes = screen.getAllByRole('checkbox');
+    fireEvent.click(boxes[boxes.length - 1]);
+    const strip = await screen.findByTestId('list-toolbar-selection');
+    expect(within(strip).getByText(/Re-hunt selected \(1\)/)).toBeTruthy();
+    // The presets are still there and still clickable — and NOT inside the strip.
+    expect(screen.getByText('24h')).toBeTruthy();
+    expect(screen.getByText('7d')).toBeTruthy();
+    expect(within(strip).queryByText('24h')).toBeNull();
   });
 });

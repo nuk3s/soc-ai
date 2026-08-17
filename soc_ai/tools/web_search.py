@@ -30,12 +30,22 @@ from soc_ai.tools.online import first_internal_identifier
 _LOGGER = logging.getLogger(__name__)
 
 
-async def web_search(query: str, *, settings: Any) -> dict[str, Any]:
+async def web_search(
+    query: str,
+    *,
+    settings: Any,
+    suffixes: tuple[str, ...] | None = None,
+    extra_hosts: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Search the configured SearXNG instance for *query*. Never raises.
 
     Returns ``{"ok": True, "query", "result_count", "results": [{title, url,
     content, engine}], "answers": [...]}`` on success, else
     ``{"ok": False, "error": ...}``.
+
+    ``suffixes`` / ``extra_hosts`` are the *effective* internal-identifier sets
+    (env-config unioned with active DB rows) resolved once per run by the caller.
+    ``None`` falls back to the raw settings tuples.
     """
     query = (query or "").strip()
     if not query:
@@ -49,8 +59,9 @@ async def web_search(query: str, *, settings: Any) -> dict[str, Any]:
     # Covers internal IPs (RFC1918/CGNAT/benchmark/loopback/link-local + IPv6),
     # internal FQDNs on a configured suffix, and known internal hostnames — the
     # same predicate the crawl_page + online-enrichment egress paths use, so the
-    # three can't drift.
-    leaked = first_internal_identifier(query, settings)
+    # three can't drift.  The effective (env + DB) sets are threaded in so a
+    # DB-discovered internal name on an empty .env is caught too.
+    leaked = first_internal_identifier(query, settings, suffixes=suffixes, extra_hosts=extra_hosts)
     if leaked is not None:
         return {
             "ok": False,

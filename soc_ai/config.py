@@ -23,6 +23,13 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from soc_ai.dossier.policy import (
+    DEFAULT_CONFLICT_MIN_OBSERVATIONS,
+    DEFAULT_CONFLICT_PROMPT_INTERVAL_HOURS,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_STALENESS_HOURS,
+)
+
 
 class Settings(BaseSettings):
     """Top-level configuration for soc-ai."""
@@ -80,6 +87,16 @@ class Settings(BaseSettings):
     # fully-unreachable grid can't stall a call for request_timeout x (1+retries):
     # 30s x 3 = 90s worst case (was 60 x 4 = 240s).
     es_max_retries: int = 2
+    # Elasticsearch defaults `allow_partial_search_results=true`: a search over
+    # failed or unassigned shards comes back HTTP 200 with PARTIAL — often zero
+    # — hits and no error, so one dead data node reads as a quiet network right
+    # across the console. When true (default) soc-ai detects that locally and
+    # raises, which every route already maps to the standard 503 "grid
+    # unavailable" and the agent already reads as a failed tool call. Set false
+    # only if you knowingly run with a chronically red shard and prefer partial
+    # data to an error: failures are then logged at WARNING and the hits used
+    # as-is.
+    es_fail_on_partial_results: bool = True
     # Orchestrator-level retries around the WHOLE Phase-A prefetch call
     # (`get_enriched_alert_context`), on top of `es_max_retries` above. The ES
     # client's own retry budget covers a single pivot query hiccup; this covers
@@ -307,10 +324,34 @@ class Settings(BaseSettings):
     ]
 
     # --- Index patterns ------------------------------------------------
-    # Patterns that match the SO indices. On Security Onion 3.0 the Suricata/Zeek
-    # event + alert data lives in Elasticsearch DATA STREAMS named `logs-*` (e.g.
-    # `.ds-logs-suricata.alerts-so-*`), while cases/detections/playbooks use the
-    # older `so-*` indices. The defaults below target a SINGLE-NODE grid.
+    # Patterns that match the SO indices. On Security Onion 3.x the Suricata/Zeek
+    # event + alert data lives in Elasticsearch DATA STREAMS named `logs-*`, while
+    # cases/detections/playbooks use the older `so-*` indices. The defaults below
+    # target a SINGLE-NODE grid.
+    #
+    # WHY THE DEFAULT IS `logs-*` AND NOT `.ds-logs-...`
+    # A data stream's documents physically sit in hidden backing indices named
+    # `.ds-<stream>-<date>-<generation>` (e.g.
+    # `.ds-logs-suricata.alerts-so-2026.08.05-000001`). A search pattern never has
+    # to name those: `logs-*` matches the DATA-STREAM name and Elasticsearch
+    # expands it to every backing index underneath. (The leading dot is why the
+    # two forms are not interchangeable — dot-prefixed indices are hidden and a
+    # plain `logs-*` would never match a `.ds-…` name directly.) Writing the
+    # pattern against backing indices instead forces you to spell out the Elastic
+    # Agent NAMESPACE segment, and that segment is the trap:
+    #   `.ds-logs-*-so-*`       SO's own integrations — suricata, zeek, soc,
+    #                           kratos, strelka, import, detections.
+    #   `.ds-logs-*-default-*`  Elastic's stock integrations — system.auth,
+    #                           system.syslog, endpoint, winlog. This is the
+    #                           login/syslog evidence an investigation leans on.
+    #   `logs-synth-*`          soc-ai's own synthetic / eval data.
+    # On 2026-08-05 a deployment ran `.ds-logs-*-so-*,logs-synth-*` and lost the
+    # entire `-default-` namespace: ~117K auth and ~48M syslog records were
+    # invisible to every query, with no error — the pattern still matched 139M
+    # documents, so the doctor's "matched no documents" check stayed green — and
+    # an investigation was wrong because of it. `logs-*` covers all three groups
+    # above plus any namespace an operator adds later. Narrow it only for a
+    # concrete reason, and never to a single namespace.
     #
     # MULTI-NODE / distributed grids reach the data through cross-cluster search,
     # so prefix every pattern with the remote-cluster wildcard, e.g.
@@ -360,6 +401,104 @@ class Settings(BaseSettings):
     is on. Bounded 1..168 (hourly to weekly). The scheduler checks elapsed time
     against the last completed scan, so a freshly-toggled-on schedule that has
     never run scans on the next wake."""
+
+    # --- Host dossier ---------------------------------------------------
+    # Durable, system-inferred asset context: what a host IS, as opposed to what
+    # it did in the last 24h. A deterministic rule-based sweep aggregates ES per
+    # internal host into an inference lane; an operator overlay writes a
+    # physically separate lane that always wins at read time. See
+    # soc_ai/dossier/ and soc_ai/enrichment/host_dossier.py.
+    dossier_enabled: bool = True
+    """Master switch for the host dossier — the sweep, the tool and the prompt
+    block. Off, `t_host_dossier` answers "host dossier disabled" rather than
+    disappearing from the tool surface: an agent that can see a tool and be told
+    it is off will not invent the answer, and one that never sees it may."""
+
+    dossier_schedule_enabled: bool = False
+    """Run the network sweep automatically on a schedule (an in-process
+    background loop in the API server). Off by default, matching every other
+    background job here even though the sweep spends no tokens: it is a few
+    hundred Elasticsearch aggregations against a live production grid, and the
+    operator who installed soc-ai an hour ago should decide when that starts.
+    On demand via 'Rebuild now' meanwhile. Toggling takes effect live."""
+
+    dossier_schedule_interval_hours: int = 24
+    """Hours between automatic dossier sweeps when `dossier_schedule_enabled` is
+    on. Bounded 1..168 (hourly to weekly). Daily by default because the thing
+    being measured — what a host is for — changes on the timescale of a
+    provisioning ticket, not a shift. The due-check reads the durable
+    `dossier_run` table rather than an in-memory stamp, so a restart loop cannot
+    re-sweep the whole network on every boot."""
+
+    dossier_lookback_days: int = 14
+    """ES window (days) each host's observations are aggregated over. Wider than
+    `discovery_lookback_days` (7) on purpose: this window is a BEHAVIORAL
+    BASELINE, and the claim that carries weight in an investigation is "this host
+    has never initiated outbound SSH". Seven days spans one weekend and one
+    patch cycle; fourteen spans two, so a Monday-only backup job or a fortnightly
+    maintenance window reads as routine instead of as a first-ever event."""
+
+    dossier_max_hosts_per_run: int = 200
+    """Hosts built per sweep. Each host costs up to seven ES round trips, built
+    sequentially — 200 is roughly 3.5 minutes of wall clock. Overflow is not
+    dropped: rows are selected staleness-first (`last_built_at ASC NULLS FIRST`)
+    from a durable column, not walked with a cursor, so the hosts skipped this
+    sweep are exactly the ones at the front of the queue on the next."""
+
+    dossier_max_hosts: int = 5000
+    """Cap on stored dossier rows. A scanned /16 puts 65k source IPs through the
+    network aggregation in one afternoon; without a cap the table (and the ~12
+    field rows per host behind it) grows to match. Pruning deletes oldest-
+    `last_seen` first and NEVER touches a row carrying an operator override —
+    losing hand-entered criticality to a port scan would be the worse outcome."""
+
+    dossier_min_events: int = 20
+    """Events in the window below which the classifier refuses to guess a role.
+    Identity facts (hostname, MAC, domain) still get emitted — a single DHCP
+    lease is enough to name a host — but `role` comes back `unknown` with
+    evidence saying how thin the window was. A host with three packets is not a
+    workstation; it is a host with three packets, and asserting otherwise is the
+    exact confident-wrongness this feature exists to remove."""
+
+    dossier_min_confidence: float = DEFAULT_MIN_CONFIDENCE
+    """Floor (0-1) an inferred value must clear to be used. Two jobs: the
+    resolver returns "unknown" below it rather than asserting a weak guess, and
+    the conflict detector will not prod an operator about a disagreement it is
+    not itself confident in. The classifier emits 0.9 (strong) / 0.5 (weak) /
+    0.0 (none), so 0.6 admits strong evidence only — deliberately, since the
+    output of this system lands in a prompt as ambient ground truth."""
+
+    dossier_staleness_hours: int = DEFAULT_STALENESS_HOURS
+    """Age (hours) past which an inferred value is treated as unknown rather than
+    reasserted. Three days = three missed daily sweeps, so a single failed run
+    does not blank the network, but a builder that has been broken or switched off
+    for a week stops quietly feeding week-old asset facts into live
+    investigations. Staleness is measured from `inferred_last_run_at` — the last
+    build that EVALUATED the field, not the last one that found something —
+    so a host that legitimately went quiet does not read as stale."""
+
+    dossier_context_enabled: bool = True
+    """Inject the dossier block into investigation, chat and hunt prompts.
+    Separate from `dossier_enabled` so the data can keep building while the
+    prompt injection is switched off — the knob to reach for when diagnosing a
+    prompt-size or model-behaviour regression, without throwing away the
+    accumulated inference and the operator overrides on top of it."""
+
+    dossier_conflict_min_observations: int = DEFAULT_CONFLICT_MIN_OBSERVATIONS
+    """Consecutive disagreeing builds before the system prods the operator that
+    its inference still disagrees with their override. One disagreement is
+    noise: a transient banner, a DHCP lease mid-renewal, a scan. Three
+    consecutive builds is a standing signal. The counter resets to zero the
+    moment a build agrees again, so this is genuinely "continued evidence" and
+    not a running total."""
+
+    dossier_conflict_prompt_interval_hours: int = DEFAULT_CONFLICT_PROMPT_INTERVAL_HOURS
+    """Minimum hours between prods about the same field. 336 = 14 days. The
+    override exists because the operator knows something the telemetry does not,
+    so the default posture is to shut up; a fortnight is long enough that the
+    reminder reads as a periodic review rather than nagging. 0 disables prodding
+    entirely. A 'keep mine' snooze doubles from here per prompt already sent,
+    capped at 90 days — the nag decays instead of repeating."""
 
     # --- Server --------------------------------------------------------
     soc_ai_host: str = "127.0.0.1"
@@ -474,6 +613,26 @@ class Settings(BaseSettings):
     editable live in the config console. Single uvicorn worker only (workers>1
     would double-fire — Epoch 6.2 territory)."""
 
+    general_chat_enabled: bool = True
+    """Master switch for the Dashboard's general chat (the "Ask soc-ai" box).
+
+    Governs whether the landing screen offers a one-turn agent thread that
+    answers with the read tools and PROPOSES a hunt when a question needs a
+    sweep. ON by default because it replaces a surface that already ships (the
+    Ask box that hands off to the Hunt Console), and because it costs nothing
+    until an analyst types — the idle page issues one transcript GET and the
+    poll only re-arms while a turn is pending.
+
+    It is a kill switch for the one risk the surface introduces: unlike the
+    investigation chat (reached by opening an alert) or a hunt (an explicit
+    launch), this agent sits on the screen every analyst lands on, so it is the
+    easiest place in the product to spend model capacity by accident — a room of
+    analysts idly asking it things while the backlog waits behind the same
+    backend. Off hides the box in the SPA entirely (the flag is published on
+    ``/api/v1/about``) and refuses the endpoints, so a saturated deployment can
+    reclaim the capacity without a restart. Editable live in the config console;
+    turning it off does not delete stored threads."""
+
     backtest_max_sample: int = 50
     """Hard ceiling on how many already-dispositioned alerts a single Backtest
     run will replay through the agent. Each sampled alert is a FULL LLM
@@ -582,6 +741,24 @@ class Settings(BaseSettings):
     needs_more_info verdict). 32000 covers the worst observed reasoning trace
     with ample headroom; lower it for latency, raise it for very verbose
     reasoning models."""
+
+    chat_regrounding_attempts: int = 1
+    """How many times a chat turn may be re-run to fix ungrounded claims.
+
+    The narrative-grounding validator names the per-event facts an answer
+    asserted that appear in neither this turn's tool results nor the seeded
+    evidence. Historically that finding only produced a caveat appended to the
+    published answer — detection without correction. On 2026-08-05 the chat
+    asserted ``auth.success=true`` to justify overturning a correct
+    true_positive verdict; the validator flagged that exact claim and the answer
+    shipped regardless.
+
+    With this > 0 the finding is fed back as a correction prompt ("cite it with
+    a tool call, or remove it") and the turn re-runs. 1 is the default: the
+    common case is a single over-reach the agent fixes immediately, and each
+    attempt costs a full turn against ``chat_turn_timeout_s``. 0 restores the
+    old warn-only behavior. The caveat remains the terminal fallback when the
+    agent will not comply."""
 
     analyst_tool_choice_required: bool = False
     """Allow ``tool_choice='required'`` for the analyst model's structured output.
