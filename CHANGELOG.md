@@ -6,6 +6,89 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.8] - 2026-08-17
+
+The degraded-grid release: what soc-ai says when Security Onion is down,
+saturated, stalled, or answering with half its shards is now as engineered as
+what it says when everything works. The rule the whole release enforces: a
+false all-clear outranks any loud error — a blind sensor must never be
+reported as a calm network. No breaking changes; seven migrations (0024–0030),
+applied automatically on upgrade.
+
+### Degraded-grid honesty
+
+- **A partial read is no longer a complete read, anywhere.** Elasticsearch
+  answers 200 having read only some shards; the client used to discard
+  `_shards`/`timed_out`, so every surface reasoned from a partial view as if it
+  were whole. Partial reads now raise, every route answers 503 with the shard
+  story, and the diagnostics probe and topbar health pill detect the state
+  instead of reporting green. Opt-out for exploratory reads:
+  `es_fail_on_partial_results`.
+- **An outage can no longer dismiss identifier suggestions.** The discovery
+  scan's public-suffix retirement — the one irreversible write in the product —
+  now requires that the sub-queries feeding that signal succeeded AND observed
+  events; and it is gated per signal, so one persistently failing unrelated
+  sub-query no longer suppresses retirement forever.
+- **A sweep that could not read the backlog is not an empty backlog.**
+  Auto-triage cycles that land zero because the grid refused are marked
+  degraded, durably; a refused (429) sweep no longer records as
+  "Last batch · 0 investigated"; a malformed query is answered as a bad query
+  (400) instead of accusing the grid of an outage.
+- **A backtest cannot mistake an outage for a bad model.** An unreadable
+  window is reported as unreadable rather than "no dispositioned alerts";
+  a run that loses the grid mid-flight no longer scores unread rows as model
+  disagreement; and the failure note now survives onto consoles that have run
+  a backtest before.
+- **A hunt with no successful grid read cannot land as a clean sweep.**
+  Includes closing the retry hole where a deduplicated retry of a failed query
+  counted as a success, and the all-rejected case, which is labelled a query
+  problem — not grid health.
+- **The buttons an analyst clicks while the grid is sick answer instead of
+  crashing.** Investigate, group ack/escalate, find-alert and bulk re-hunt
+  return honest 503/400s (nothing acknowledged before a failure is reported),
+  and bulk re-hunt stops burning one grid timeout per row against a dead grid.
+- **The server produces the outage verdict, not the browser.** The routes that
+  used to hang until the SPA gave up at 20 s (Test ES, auto-triage, backtest,
+  model-fitness) answer within the console grid budget with a definitive
+  diagnosis; an ES 429 reads as "overloaded — retryable", never as "check your
+  query".
+- **The audit chain cannot report intact from a half-read index.** Verification
+  of a partial read is answered as *unverifiable* — never a pass, and never a
+  tamper claim — and chain-head recovery at write time is guarded against the
+  same state, so a stalled grid can no longer manufacture a future false
+  tamper verdict.
+- **The screens stop asserting numbers they never obtained.** Alerts renders
+  em-dashes, not zeros, when its query failed; the Dashboard no longer prints
+  "queue clear" under an unknown count; failed actions say so on screen; a
+  scan that is running, or that came back blind, says which — for every role.
+
+### Added
+
+- **`GET /api/v1/dossiers/sweep-health`** — a non-privileged projection of
+  sweep health (`running`, `degraded`, `last_run`, `error_count`; never the
+  raw failure strings), so non-admin analysts see "the sweep came back blind"
+  instead of "the sweep hasn't run yet" over a sweep that ran and died.
+- **A degraded-grid dogfood harness.** The demo mock grid gains five
+  runtime-switchable states (healthy, down, half-read, saturated, stalled) —
+  strictly opt-in, off in the packaged demo — and a capture script walks every
+  screen and action in each state.
+
+### Fixed
+
+- **The hosted demo's Config screen renders its read lock as policy, not as an
+  outage.** The demo refuses admin-gated reads (a security fix: the public
+  demo used to answer the user table and which secrets were set); that refusal
+  now reads "Read-only demo" instead of an alarm-red failure card.
+- **A Send button that did nothing.** The chat draft was restored twice on
+  mount, so text typed before the second restore was silently replaced and the
+  send dropped. Type, press Send, nothing — no request, no error. Fixed at the
+  source.
+- **Opening an investigation whose Oracle run redacted something answered
+  500.** The redaction record is per-category counts; the detail page expected
+  a sentence. Every investigation the egress guard had actually protected was
+  unopenable; the counts are now phrased ("1 IP address and 2 hostnames
+  redacted before the second opinion").
+
 ### Added
 
 - **A Dashboard assistant that answers you instead of handing you off.** The
