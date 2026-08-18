@@ -71,6 +71,31 @@ export function ErrorState({
 }
 
 /**
+ * A surface the read-only demo deliberately refuses — policy, not an incident.
+ *
+ * Same reasoning as NotFoundState below: the demo's admin-read lock (403
+ * `demo_mode`, a security fix — the public demo used to answer the full user
+ * table and which secrets are set) rendered as the alarm-red "Couldn't load
+ * this view" card, so a visitor's first look at Config read as breakage. No
+ * Retry: retrying a policy answers the same policy.
+ */
+export function DemoDisabledState({ what }: { what: string }) {
+  return (
+    <div className="flex flex-col items-center gap-2 rounded-card border border-border bg-surface-1 px-4 py-8 text-center">
+      <span className="text-faint">
+        <SearchX size={20} />
+      </span>
+      <div className="text-[13.5px] font-semibold text-text-2">Read-only demo</div>
+      <div className="max-w-[460px] text-[12.5px] leading-[1.6] text-faint">
+        {what} is switched off here: this hosted demo replays recorded investigations, and its
+        settings, users and secrets are neither editable nor visible. Run your own soc-ai to see
+        this screen live.
+      </div>
+    </div>
+  );
+}
+
+/**
  * The id asked for isn't there — a calm answer, not an incident.
  *
  * Deliberately NOT the ErrorState: an unknown investigation/hunt/host id used

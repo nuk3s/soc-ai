@@ -255,13 +255,22 @@ def test_banner_on_backtest(page: Page, demo_mode_stack: dict) -> None:
 
 @pytest.mark.browser
 def test_banner_on_config(page: Page, demo_mode_stack: dict) -> None:
-    """The config screen renders under the banner (read-only demo)."""
+    """Config in the demo is a POLICY refusal, rendered calmly under the banner.
+
+    This used to assert the "Check fitness" button — a live config control. The
+    demo now refuses admin-gated READS outright (403 ``demo_mode``: before that
+    fix, the public demo answered the full user table and which secrets were
+    set to anyone), so no config control can ever render here again. What the
+    screen owes a demo visitor instead: the read-only explanation, and NOT the
+    alarm-red outage card that made the demo's Config look broken.
+    """
     base: str = demo_mode_stack["base_url"]
     page.goto(f"{base}/app/config", wait_until="networkidle")
 
     expect(page.get_by_text(_BANNER, exact=False).first).to_be_visible(timeout=_WAIT_MS)
-    # A stable config control — the analyst-model row's fitness check.
-    expect(page.get_by_role("button", name="Check fitness").first).to_be_visible(timeout=_WAIT_MS)
+    # Policy, not incident: the calm demo notice, and no outage card.
+    expect(page.get_by_text("Read-only demo", exact=True).first).to_be_visible(timeout=_WAIT_MS)
+    expect(page.get_by_text("Couldn't load", exact=False)).not_to_be_visible()
 
 
 @pytest.mark.browser

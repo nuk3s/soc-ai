@@ -6,7 +6,7 @@ import { ApplyBadge, RoleChip, SourceBadge, StatusTag } from '../components/Badg
 import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
-import { ErrorState, LoadingState, Spinner } from '../components/States';
+import { DemoDisabledState, ErrorState, LoadingState, Spinner } from '../components/States';
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
@@ -18,6 +18,7 @@ import { AboutPanel } from './AboutPanel';
 import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import { ApiError } from '../lib/api';
 import type { BatteryRecommendation, ModelBatteryStatus } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { demoBlocked, useDemo } from '../lib/demo';
@@ -977,6 +978,13 @@ export function Config() {
   };
 
   if (loading && !data) return <div className="p-6"><LoadingState label="Loading settings…" /></div>;
+  // The hosted demo refuses admin-gated reads outright (403 `demo_mode` — the
+  // read-side mirror of its write lock). That is policy, not an incident, and
+  // it must not wear the alarm-red outage card: it is the first thing a demo
+  // visitor who clicks Config ever sees.
+  if (error instanceof ApiError && error.reason === 'demo_mode') {
+    return <div className="p-6"><DemoDisabledState what="Admin configuration" /></div>;
+  }
   if (error) return <div className="p-6"><ErrorState error={error} /></div>;
   if (!data) return null;
 
