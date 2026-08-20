@@ -17,7 +17,7 @@ import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { AboutPanel } from './AboutPanel';
 import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
-import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled } from '../lib/api';
+import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled, verifyAuditChain } from '../lib/api';
 import { ApiError } from '../lib/api';
 import type { BatteryRecommendation, ModelBatteryStatus } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
@@ -25,13 +25,15 @@ import { demoBlocked, useDemo } from '../lib/demo';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { useAsync } from '../lib/useAsync';
-import type { AdminUser, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
+import type { AdminUser, AuditChainVerifyResult, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav, ConfigNavSelect } from './ConfigNav';
 import {
   type ConfigParent,
   SUB_ANCHOR_HOSTS,
   buildConfigLayout,
+  keyToDay1,
   keyToSectionId,
+  keyToSectionTitle,
 } from '../lib/configLayout';
 
 /** Nearest scrollable ancestor (the AppShell's overflow-y-auto content pane). */
@@ -434,6 +436,17 @@ export function Config() {
   }, [collapsed]);
   const toggleSection = (title: string) =>
     setCollapsed((c) => ({ ...c, [title]: !c[title] }));
+  // Advanced folds (day1 tier, Wave 2) don't have ONE fixed default: a mixed
+  // section (some day1 items, some not) starts collapsed, but an all-advanced
+  // section starts OPEN (see advCollapsed in renderGroup below — the single
+  // source of truth for that default). So the toggle takes the CURRENT
+  // EFFECTIVE value as an explicit argument and flips exactly that, instead
+  // of re-deriving its own default: a hardcoded fallback here (e.g. `?? true`)
+  // would silently disagree with a section whose default is "open", making
+  // the first click on an all-advanced fold's toggle do nothing — the same
+  // dead-click shape this file was already careful about, just inverted.
+  const toggleAdvanced = (key: string, currentlyCollapsed: boolean) =>
+    setCollapsed((c) => ({ ...c, [key]: !currentlyCollapsed }));
   const { data, loading, error } = useAsync(getConfig, [nonce]);
 
   // Fetch users in sync with nonce
@@ -642,6 +655,17 @@ export function Config() {
   const [dangerSaving, setDangerSaving] = useState(false);
   const [dangerSaveMsg, setDangerSaveMsg] = useState<{ key: string; msg: string; ok: boolean } | null>(null);
   const [connTestResults, setConnTestResults] = useState<Record<string, ConnTestResult & { loading?: boolean }>>({});
+  // Audit chain verify — its own state, not folded into connTestResults: the
+  // endpoint is NOT fail-soft (raises rather than answering on an unreachable
+  // or partial read), so a request failure and an `ok:false` (tampered)
+  // result are two different outcomes that must render as two different
+  // things — `error` and `result` are therefore tracked separately rather
+  // than collapsed into one ok/detail pair the way ConnTestResult is.
+  const [auditVerify, setAuditVerify] = useState<{
+    loading: boolean;
+    result: AuditChainVerifyResult | null;
+    error: string | null;
+  }>({ loading: false, result: null, error: null });
 
   // ── Runbook re-embed (E4.1) ────────────────────────────────────────────────
   // One admin action for the opt-in semantic tier: embed every runbook whose
@@ -709,6 +733,14 @@ export function Config() {
   const layout = useMemo<ConfigParent[]>(() => buildConfigLayout(data?.groups), [data?.groups]);
   const flatSections = useMemo(() => layout.flatMap((p) => p.children), [layout]);
   const keyToSection = useMemo(() => keyToSectionId(layout), [layout]);
+  // Same shape as keyToSection, but title-valued — the apply-bar chip needs
+  // the group's TITLE (not its DOM id) to name the Advanced-fold key it may
+  // need to unfold (see the chip's onClick below).
+  const keyToTitle = useMemo(() => keyToSectionTitle(layout), [layout]);
+  // Same derivation, day1-valued. The chip and search-hit paths below already
+  // have a Setting/SearchHit in hand to read `.day1` off directly; the
+  // palette hand-off effect only has the bare key, so it needs this map.
+  const keyIsDay1 = useMemo(() => keyToDay1(layout), [layout]);
 
   // Selection: nav click > the URL's hash > last-visited (localStorage) > the
   // first section. Stored so "come back to where I was tuning" survives.
@@ -819,7 +851,21 @@ export function Config() {
       if (label) setCollapsed((c) => ({ ...c, [label]: false }));
       setSelectedId(target);
     }
-    if (state?.highlightKey) setHighlightKey(state.highlightKey);
+    if (state?.highlightKey) {
+      setHighlightKey(state.highlightKey);
+      // Tier-aware unfold — same rule as the search-hit and chip jumps below:
+      // a palette jump can land on a non-day1 setting folded behind its
+      // section's Advanced reveal, and unfolding is the only way the flash
+      // below lands on a row actually in the DOM. Gated to non-day1 targets
+      // only: a day1 target is already visible, and unfolding it anyway
+      // would also PERSIST the unfold (`collapsed` mirrors to localStorage),
+      // silently popping that section's Advanced fold open for every later
+      // visit — the day-1 view eroding through normal use.
+      const title = keyToTitle[state.highlightKey];
+      if (title && keyIsDay1[state.highlightKey] === false) {
+        setCollapsed((c) => ({ ...c, [`${title}:advanced`]: false }));
+      }
+    }
     if (subAnchor) {
       const t = setTimeout(
         () => document.getElementById(subAnchor)?.scrollIntoView?.({ behavior: 'auto', block: 'start' }),
@@ -841,6 +887,11 @@ export function Config() {
     sectionId: string;
     sectionLabel: string;
     parent: string;
+    /** Day1 tier of the underlying setting — absent for a section-kind hit
+     * (no single tier) and for a Danger Zone hit (no Advanced fold to gate).
+     * Threaded through so a click can decide whether to unfold the owning
+     * section's Advanced fold (see resultsPane's onClick below). */
+    day1?: boolean;
   }
   const searchIndex = useMemo<SearchHit[]>(() => {
     const out: SearchHit[] = [];
@@ -864,6 +915,7 @@ export function Config() {
               sectionId: c.id,
               sectionLabel: c.label,
               parent: p.label,
+              day1: it.day1,
             });
           }
         }
@@ -1312,6 +1364,63 @@ export function Config() {
     }
   };
 
+  const handleVerifyChain = async () => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setAuditVerify({ loading: false, result: null, error: blocked }); return; } // demo: no doomed probe against the demo's mock ES
+    setAuditVerify({ loading: true, result: null, error: null });
+    try {
+      const result = await verifyAuditChain();
+      setAuditVerify({ loading: false, result, error: null });
+    } catch (e: unknown) {
+      // Civil, same idiom as handleConnTest's catch — but this one is load-
+      // bearing rather than cosmetic: the endpoint is NOT fail-soft, so EVERY
+      // non-2xx or network failure lands here, and it must never be confused
+      // with a tampered chain (that's `result.ok === false`, a 200 response).
+      const detail = e instanceof Error ? e.message : 'Could not verify the audit chain';
+      setAuditVerify({ loading: false, result: null, error: detail });
+    }
+  };
+
+  // Chain verify's result line — built client-side because, unlike
+  // ConnTestResult, the endpoint answers structured fields rather than a
+  // pre-formatted `detail` string. `first_broken_seq` is guaranteed non-null
+  // whenever `ok` is false (soc_ai.audit.chain.verify_chain's own contract),
+  // so the tampered branch never has to guess at a seq to show.
+  //
+  // Three outcomes, not two: a capped-but-ok scan must NOT wear full success
+  // livery (soc_ai/audit/verify.py's own module docstring: "a capped scan
+  // cannot claim the whole chain was verified... the caller MUST surface
+  // it"), so capped+ok gets its own amber "Partial verification" line with
+  // no checkmark — never the green ✓. Tampered stays its own red line
+  // regardless of capped (a break found within the scanned prefix is a
+  // real, definitive finding either way).
+  //
+  // The records a capped scan actually covers are the OLDEST ones, not the
+  // newest: `_fetch_audit_records` pages `search_after` on `seq ASCENDING`
+  // (soc_ai/audit/verify.py `_fetch_audit_records`/`sort`) and the cap fires
+  // mid-scan — before the newest (highest-seq) records are ever reached. So
+  // a capped read has verified nothing about recent activity, which is the
+  // direction that matters most for "is something being tampered with right
+  // now" — the copy below says "from the start of the chain" rather than
+  // "newest" for exactly that reason.
+  const auditChainColor = (result: AuditChainVerifyResult): string =>
+    !result.ok ? '#f04438' : result.capped ? '#f5a623' : '#12b76a';
+
+  const auditChainPrefix = (result: AuditChainVerifyResult): string =>
+    !result.ok ? '✗' : result.capped ? '⚠' : '✓';
+
+  const auditChainDetail = (result: AuditChainVerifyResult): string => {
+    const verified = plural(result.records_verified, 'record');
+    if (!result.ok) {
+      const cappedNote = result.capped ? ' (capped — not the full chain)' : '';
+      return `Chain tampered — break at seq ${result.first_broken_seq} (${verified} verified${cappedNote}).`;
+    }
+    if (result.capped) {
+      return `Partial verification — ${verified} intact from the start of the chain (capped; the full chain was not checked).`;
+    }
+    return `Chain intact — ${verified} verified.`;
+  };
+
   // What the last scan could not read. The lists below are the scan's OUTPUT,
   // so a scan that failed half its queries renders as a shorter list rather
   // than as a failure — indistinguishable, with only the timestamp on screen,
@@ -1492,9 +1601,88 @@ export function Config() {
     </div>
   );
 
+  // One row of a settings group: label/key/badges, its control, and the
+  // (setting-specific) auto-ack coupling note. Factored out of renderGroup so
+  // day1 rows and folded Advanced rows share identical markup —
+  // `data-setting-key` must land on every row either way (search flash and
+  // the apply-bar chip jump both depend on it).
+  const renderSettingRow = (s: Setting) => (
+    <div
+      key={s.key}
+      data-setting-key={s.key}
+      data-highlighted={highlightKey === s.key ? 'true' : undefined}
+      className="border-b border-border-faint px-[15px] py-[13px] transition-shadow"
+      style={
+        highlightKey === s.key
+          ? { boxShadow: 'inset 0 0 0 2px rgb(var(--accent) / 0.7)' }
+          : undefined
+      }
+    >
+      {/* items-start (not center): tall controls like the analyst-model
+          cell (select + fitness + battery) otherwise float the title to
+          the middle of the cell (dogfood 2026-08-05). */}
+      <div className="flex items-start gap-3.5">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
+            <span className="font-mono text-[11px] text-faint">{s.key}</span>
+            <SourceBadge source={s.source} />
+            <ApplyBadge apply={s.apply} />
+            {staged[s.key] !== undefined && (
+              <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}>
+                unsaved
+              </span>
+            )}
+          </div>
+          <div className="mt-1 text-[12px] text-dim">{s.help}</div>
+        </div>
+        <div className="flex-none">{renderControl(s)}</div>
+      </div>
+      {/* #7 Auto-ack coupling note — auto-ack only acks FPs that get
+          INVESTIGATED, so it is inert without auto-triage running and a
+          medium/low floor. Warn when we can see the inert case; else hint. */}
+      {s.key === 'auto_ack_fp_enabled' && autoAckOn && (
+        <div
+          className="mt-2.5 flex items-start gap-2 rounded-control border px-3 py-2 text-[11.5px] leading-relaxed"
+          style={autoAckInert
+            ? { borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)', color: '#f5a623' }
+            : { borderColor: '#161c25', background: 'rgba(148,163,184,.05)', color: '#94a3b8' }}
+        >
+          <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
+          <span>
+            Auto-ack only acks false positives that get investigated — it does nothing on its own.
+            {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off, so nothing is being investigated automatically.'}
+            {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”, but high/critical are never auto-acked — so it can never fire.`}
+            {' '}To clear a backlog, run a sweep or enable continuous auto-investigate (in this group) and set its
+            severity floor to medium or low.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+
   // One server-driven settings group (id = the pre-computed collision-proof
   // slug from `layout`). The RAG group carries the re-embed card as an appendix.
-  const renderGroup = (id: string, g: SettingGroup) => (
+  //
+  // Day1 tier (Wave 2): a group's day1 items render up front; everything else
+  // sits behind a per-section "Advanced (N)" fold, keyed `${g.title}:advanced`
+  // in the SAME `collapsed` record whole-section folds already use (so it
+  // persists the same way). A group with no day1 items at all still shows its
+  // header — the nav must stay complete — with every item behind the fold
+  // (day1Items is simply empty; advItems is simply all of them).
+  const renderGroup = (id: string, g: SettingGroup) => {
+    const day1Items = g.items.filter((s) => s.day1);
+    const advItems = g.items.filter((s) => !s.day1);
+    const advKey = `${g.title}:advanced`;
+    // Default: collapsed for a MIXED section, OPEN for an all-advanced one.
+    // The fold exists to protect a day-1 surface from overload; where a
+    // section has no day1 items, folding everything adds a click without
+    // decluttering anything (reviewer's rationale, controller-ratified). The
+    // user's own stored choice (`collapsed[advKey]`) always wins over either
+    // default. See toggleAdvanced above for why the toggle takes this exact
+    // computed value as an argument rather than re-deriving its own default.
+    const advCollapsed = collapsed[advKey] ?? day1Items.length > 0;
+    return (
     <>
       <div id={id} className="mb-[22px] scroll-mt-6">
         <button
@@ -1519,66 +1707,32 @@ export function Config() {
         </button>
         {!collapsed[g.title] && (
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
-          {g.items.map((s) => (
-            <div
-              key={s.key}
-              data-setting-key={s.key}
-              data-highlighted={highlightKey === s.key ? 'true' : undefined}
-              className="border-b border-border-faint px-[15px] py-[13px] transition-shadow"
-              style={
-                highlightKey === s.key
-                  ? { boxShadow: 'inset 0 0 0 2px rgb(var(--accent) / 0.7)' }
-                  : undefined
-              }
-            >
-              {/* items-start (not center): tall controls like the analyst-model
-                  cell (select + fitness + battery) otherwise float the title to
-                  the middle of the cell (dogfood 2026-08-05). */}
-              <div className="flex items-start gap-3.5">
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[13px] font-semibold text-text">{s.label || s.key}</span>
-                    <span className="font-mono text-[11px] text-faint">{s.key}</span>
-                    <SourceBadge source={s.source} />
-                    <ApplyBadge apply={s.apply} />
-                    {staged[s.key] !== undefined && (
-                      <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}>
-                        unsaved
-                      </span>
-                    )}
-                  </div>
-                  <div className="mt-1 text-[12px] text-dim">{s.help}</div>
-                </div>
-                <div className="flex-none">{renderControl(s)}</div>
-              </div>
-              {/* #7 Auto-ack coupling note — auto-ack only acks FPs that get
-                  INVESTIGATED, so it is inert without auto-triage running and a
-                  medium/low floor. Warn when we can see the inert case; else hint. */}
-              {s.key === 'auto_ack_fp_enabled' && autoAckOn && (
-                <div
-                  className="mt-2.5 flex items-start gap-2 rounded-control border px-3 py-2 text-[11.5px] leading-relaxed"
-                  style={autoAckInert
-                    ? { borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)', color: '#f5a623' }
-                    : { borderColor: '#161c25', background: 'rgba(148,163,184,.05)', color: '#94a3b8' }}
-                >
-                  <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
-                  <span>
-                    Auto-ack only acks false positives that get investigated — it does nothing on its own.
-                    {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off, so nothing is being investigated automatically.'}
-                    {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”, but high/critical are never auto-acked — so it can never fire.`}
-                    {' '}To clear a backlog, run a sweep or enable continuous auto-investigate (in this group) and set its
-                    severity floor to medium or low.
-                  </span>
-                </div>
-              )}
-            </div>
-          ))}
+          {day1Items.map(renderSettingRow)}
+          {advItems.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => toggleAdvanced(advKey, advCollapsed)}
+                aria-expanded={!advCollapsed}
+                className="group flex w-full items-center gap-1.5 border-b border-border-faint bg-surface-2/50 px-[15px] py-[9px] text-left text-[11px] font-semibold uppercase tracking-wide text-faint hover:text-text-2"
+              >
+                <ChevronRight
+                  size={12}
+                  className="flex-none transition-transform"
+                  style={{ transform: advCollapsed ? 'none' : 'rotate(90deg)' }}
+                />
+                Advanced ({advItems.length})
+              </button>
+              {!advCollapsed && advItems.map(renderSettingRow)}
+            </>
+          )}
         </div>
         )}
       </div>
       {g.title === 'Retrieval (RAG)' && ragReembedSection}
     </>
-  );
+    );
+  };
 
   // Standalone System-parent sections, lifted out of the return so the
   // two-level layout loop can place them by id (see PANELS).
@@ -1844,6 +1998,37 @@ export function Config() {
                 </div>
               );
             })}
+          </div>
+          {/* Audit chain verify — its own row, not folded into the ES/LLM
+              map above: unlike those two, this probe is NOT fail-soft (the
+              endpoint raises rather than answering on an unreachable or
+              partial read) and its result needs THREE visually distinct
+              states rather than two — intact (green), TAMPERED (red, its
+              own line, never the success line above it), and "couldn't
+              verify" (amber — a network/permission failure must never read
+              as either of the other two; a false all-clear outranks any
+              500, and a false alarm is nearly as costly). */}
+          <div className="flex flex-wrap items-center gap-2 border-t border-border-faint px-4 py-3">
+            <button
+              className="rounded px-2.5 py-1 text-[11.5px] font-medium border border-border bg-surface-2 hover:bg-surface-3 transition-colors"
+              onClick={handleVerifyChain}
+              disabled={auditVerify.loading}
+            >
+              {auditVerify.loading ? 'Verifying…' : 'Verify audit chain'}
+            </button>
+            {auditVerify.result && !auditVerify.loading && (
+              <span
+                className="text-[11px]"
+                style={{ color: auditChainColor(auditVerify.result) }}
+              >
+                {auditChainPrefix(auditVerify.result)} {auditChainDetail(auditVerify.result)}
+              </span>
+            )}
+            {auditVerify.error && !auditVerify.loading && (
+              <span className="text-[11px]" style={{ color: '#f5a623' }}>
+                ⚠ Could not verify: {auditVerify.error}
+              </span>
+            )}
           </div>
         </div>
       </CollapsibleConfigSection>
@@ -2116,7 +2301,21 @@ export function Config() {
             data-testid={`search-result-${h.kind === 'setting' ? h.settingKey : `section-${h.sectionId}`}`}
             onClick={() => {
               navigateToSection(h.sectionId);
-              if (h.kind === 'setting') setHighlightKey(h.settingKey ?? null);
+              if (h.kind === 'setting') {
+                setHighlightKey(h.settingKey ?? null);
+                // The hit may be a non-day1 item sitting behind its section's
+                // Advanced fold — unfolding the section alone would flash a
+                // row that was never in the DOM. `sectionLabel` IS the
+                // group's title for a group-kind hit (see the searchIndex
+                // build above), the same key renderGroup folds under. Gated
+                // to non-day1 hits only: a day1 hit is already visible, and
+                // unfolding (and thereby PERSIST-unfolding, since `collapsed`
+                // mirrors to localStorage) its section's fold anyway would
+                // silently pop it open for every later visit.
+                if (!h.day1) {
+                  setCollapsed((c) => ({ ...c, [`${h.sectionLabel}:advanced`]: false }));
+                }
+              }
             }}
             className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-[11px] text-left last:border-0 hover:bg-surface-2"
           >
@@ -2171,6 +2370,27 @@ export function Config() {
                 {dirtyKeys.map((key) => {
                   const s = findSetting(key);
                   const label = s?.label || key;
+                  // Jump to the owning section and flash the row — shared by
+                  // the chip's click AND its Enter-key path so they can't
+                  // drift apart (the fold-unfold miss this fixes was exactly
+                  // that shape: a handler fixed in one place, not its twin).
+                  const jumpToChip = () => {
+                    navigateToSection(keyToSection[key] ?? effectiveId);
+                    setHighlightKey(key);
+                    // The staged setting may be a non-day1 item sitting
+                    // behind its section's Advanced fold — stage it, wander
+                    // off, and the fold can still be collapsed when the chip
+                    // is clicked. Unfold it too, or the flash lands on a row
+                    // that isn't in the DOM (same fix as the search hit above).
+                    // Gated to non-day1 settings only: staging (and revisiting
+                    // via its chip) a day1 setting must not unfold — and
+                    // thereby PERSIST-unfold, since `collapsed` mirrors to
+                    // localStorage — a fold the analyst never asked to open.
+                    const title = keyToTitle[key];
+                    if (title && s && !s.day1) {
+                      setCollapsed((c) => ({ ...c, [`${title}:advanced`]: false }));
+                    }
+                  };
                   return (
                     <span
                       key={key}
@@ -2178,15 +2398,9 @@ export function Config() {
                       role="button"
                       tabIndex={0}
                       title={`${String(s?.value ?? '')} → ${staged[key]}`}
-                      onClick={() => {
-                        navigateToSection(keyToSection[key] ?? effectiveId);
-                        setHighlightKey(key);
-                      }}
+                      onClick={jumpToChip}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          navigateToSection(keyToSection[key] ?? effectiveId);
-                          setHighlightKey(key);
-                        }
+                        if (e.key === 'Enter') jumpToChip();
                       }}
                       className="inline-flex cursor-pointer items-center gap-1.5 rounded-chip border border-border-strong bg-surface-3 px-2 py-0.5 text-[11.5px] font-medium text-text hover:border-accent"
                     >

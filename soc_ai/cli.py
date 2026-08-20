@@ -9,10 +9,12 @@ The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
   browser is overhead.
 - ``healthz``: prints the health endpoint's JSON.
 - ``doctor``: checks the whole dependency surface (config, local store +
-  migration head, Security Onion, Elasticsearch, gateway, analyst-model
-  fitness, egress posture, blocklist freshness) and prints a pass/fail
-  table. Exit 0 only when every required check passes (warnings don't
-  fail it); ``--json`` emits the results for automation.
+  migration head, DNS/TCP/TLS-layered upstream reachability, Security Onion,
+  Elasticsearch — including the audit write grant and index-pattern dataset
+  coverage — gateway, analyst-model fitness, egress posture, blocklist
+  freshness) and prints a pass/fail table. Exit 0 only when every required
+  check passes (warnings don't fail it); ``--json`` emits the results for
+  automation.
 - ``backup`` / ``restore``: snapshot the live SQLite store (+ app-owned
   sidecar files) into a portable tar.gz, and put one back. Backup is safe
   while the app runs; restore wants the app stopped and gates every
@@ -1386,9 +1388,10 @@ def _register_doctor(sub: Any) -> None:
     """Register the ``doctor`` subparser (split out of :func:`main` for size)."""
     p_doc = sub.add_parser(
         "doctor",
-        help="Check the whole dependency surface (config, store, SO/ES, gateway, "
-        "model fitness) and print a pass/fail table; exit 0 iff all required "
-        "checks pass",
+        help="Check the whole dependency surface (config, store, DNS/TCP/TLS "
+        "reachability, SO/ES — including the audit write grant and index-pattern "
+        "coverage — gateway, model fitness) and print a pass/fail table; exit 0 "
+        "iff all required checks pass",
     )
     p_doc.add_argument(
         "--json",

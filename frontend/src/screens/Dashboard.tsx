@@ -1,4 +1,4 @@
-import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Server, ShieldAlert, ShieldCheck, WifiOff, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Crosshair, Database, Gauge, RotateCw, Server, ShieldAlert, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
@@ -23,16 +23,29 @@ import {
   getDossierConflicts,
   getHealth,
   getDetectionTuningSummary,
+  getMe,
+  getPreflight,
+  getPreflightDetail,
   getQualityEvalStatus,
   getQualityTrend,
   listInvestigations,
+  refreshPreflight,
   startQualityEval,
 } from '../lib/api';
 import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFilters';
 import { formatSkipReasons } from '../lib/skipReasons';
 import { rangeToSinceUntil } from '../lib/timeRange';
 import { VERDICT } from '../lib/tokens';
-import type { AlertGroup, InvestigationRow, Severity, Verdict } from '../lib/types';
+import type {
+  AlertGroup,
+  InvestigationRow,
+  Me,
+  PreflightDetail,
+  PreflightRow,
+  PreflightSummary,
+  Severity,
+  Verdict,
+} from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 
 // Status presentation mirrors the Investigations screen so a verdict reads the
@@ -390,6 +403,128 @@ function EnrichmentPanel({
   );
 }
 
+/**
+ * Setup health — Wave 1's doctor checks (minus the ~130s fitness probe),
+ * server-cached and polled every 5 min. Unlike every other panel in this
+ * rail, this one is PERSISTENT: it renders in every state (loading, green,
+ * degraded) rather than hiding itself when there's nothing to review, so a
+ * broken integration is visible on arrival instead of discovered when a
+ * triage run silently comes up empty.
+ *
+ * The failing/warned counts are safe for any role (the closed
+ * `GET /health/preflight` projection). Per-check names, detail strings and
+ * remediation hints are NOT — they come from the admin-only detail read — so
+ * an analyst sees only the counts and a pointer to Config → Diagnostics,
+ * never the rows themselves. `detailLoading` covers the brief window between
+ * "degraded, admin" being known and the detail read landing.
+ *
+ * Three states share the `!summary` slot: loading (no error yet), errored
+ * (a persistently rejecting `getPreflight`), and — once a summary lands —
+ * green or degraded. The errored state is distinct so a dead read reads as
+ * "couldn't tell", not as a "Checking…" that never resolves.
+ */
+function SetupHealthCard({
+  summary,
+  error,
+  detailRows,
+  detailLoading,
+  isAdmin,
+  rechecking,
+  recheckFailed,
+  onRecheck,
+  onOpenDiagnostics,
+}: {
+  summary: PreflightSummary | null;
+  error: Error | null;
+  detailRows: PreflightRow[];
+  detailLoading: boolean;
+  isAdmin: boolean;
+  rechecking: boolean;
+  recheckFailed: boolean;
+  onRecheck: () => void;
+  onOpenDiagnostics: () => void;
+}) {
+  // checked_at is the SERVER's cache time, not this client's fetch time — with
+  // a 600s TTL behind a 300s poll, that gap is exactly what the freshness
+  // marker (and the Re-check affordance below) exist to make visible.
+  const checkedAtMs = summary ? new Date(summary.checked_at).getTime() : null;
+  const degraded = summary?.status === 'degraded';
+  const failingRows = detailRows.filter((r) => r.status === 'FAIL' || r.status === 'WARN');
+  return (
+    <Panel>
+      <PanelHeader
+        icon={<Stethoscope size={15} />}
+        title="Setup health"
+        right={<Freshness at={checkedAtMs} />}
+      />
+      {!summary ? (
+        error ? (
+          // A persistently rejecting getPreflight (500 / proxy 504 / an old
+          // backend without this route) must not sit under "Checking setup
+          // health…" forever — that reads as still-in-progress when the read
+          // has, in fact, failed outright. Same honesty rationale as
+          // `recheckFailed` below: say what isn't known rather than look
+          // calm. Quiet styling (not danger-red), same as "Checking…" — this
+          // is "couldn't tell", not a confirmed degraded state.
+          <div className="px-[15px] py-3 text-[13px] text-dim">Couldn't check setup health.</div>
+        ) : (
+          <div className="px-[15px] py-3 text-[13px] text-dim">Checking setup health…</div>
+        )
+      ) : !degraded ? (
+        <div className="px-[15px] py-3 text-[13px] text-text-2">All checks passing.</div>
+      ) : isAdmin ? (
+        <div className="px-[15px] py-3">
+          <div className="text-[13px] text-text-2">
+            <span className="font-semibold" style={{ color: '#f04438' }}>
+              {summary.failing} check{summary.failing === 1 ? '' : 's'} failing
+            </span>
+            {summary.warned > 0 && (
+              <span className="text-dim"> · {summary.warned} warned</span>
+            )}
+          </div>
+          {detailLoading && !detailRows.length ? (
+            <div className="mt-2 text-[12px] text-faint">Loading details…</div>
+          ) : (
+            failingRows.map((r) => (
+              <div key={r.name} className="mt-2.5 text-[12.5px] leading-[1.5]">
+                <span className="font-semibold text-text-2">{r.name}</span>
+                <span className="text-dim"> — {r.detail}</span>
+                {r.hint && <div className="mt-0.5 text-faint">{r.hint}</div>}
+              </div>
+            ))
+          )}
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              onClick={onOpenDiagnostics}
+              className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline"
+            >
+              Open Diagnostics
+              <ArrowUpRight size={13} />
+            </button>
+            <button
+              onClick={onRecheck}
+              disabled={rechecking}
+              title="Force a fresh check now, past the 10-minute cache — for when the problem is already fixed"
+              className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
+            >
+              <RotateCw size={11} />
+              {rechecking ? 'Re-checking…' : 'Re-check'}
+            </button>
+            {recheckFailed && !rechecking && (
+              <span className="text-[11.5px] text-faint">Re-check failed — try again</span>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="px-[15px] py-3 text-[13px] text-text-2">
+          {summary.failing} check{summary.failing === 1 ? '' : 's'} failing — an admin can see
+          the details in Config → Diagnostics.
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 // A dependency that's down, in operator terms. The `detail` comes verbatim from
 // the (secret-free) backend probe; `label` humanizes which upstream it is, and
 // `headline` says which kind of trouble it is in.
@@ -569,6 +704,76 @@ export function Dashboard() {
   // Errors resolve to null (health data is null) → no banner, so a transient
   // /health hiccup can't itself raise a false "not connected" alarm.
   const health = useAsync(getHealth, [], { refetchInterval: 30_000 });
+  // Setup-health card — Wave 1's doctor checks minus the fitness probe,
+  // surfaced as a PERSISTENT card (never a conditional nudge): a broken
+  // integration should be visible before it silently eats a triage run.
+  // Role read is the SPA's only source (Hosts.tsx precedent — no auth
+  // context): getMe failing (demo, unauthenticated) leaves `me` null, which
+  // the card treats as non-admin rather than erroring — it still renders from
+  // the summary alone.
+  const [me, setMe] = useState<Me | null>(null);
+  useEffect(() => {
+    getMe()
+      .then(setMe)
+      .catch(() => {
+        /* unknown role — the card still renders from the summary alone */
+      });
+  }, []);
+  const isAdmin = me?.role === 'admin';
+  const preflight = useAsync(getPreflight, [], { refetchInterval: 300_000 });
+  const preflightDegraded = preflight.data?.status === 'degraded';
+  // The detail read carries per-check names, detail strings and hints —
+  // admin-only server-side (require_admin_api) — and must never be REQUESTED
+  // for a non-admin session, not merely hidden client-side once it lands.
+  // useAsync's `pauseWhen` only gates the background poll timer, not the
+  // foreground run the effect does on every dep change (mount included), so
+  // it can't by itself keep this off an analyst's first render — the gate has
+  // to live in the loader, same ternary shape as Hosts.tsx's role-gated
+  // sweep-status read.
+  //
+  // Demo mode needs no special case here: the API already short-circuits
+  // preflight to green in demo (Task 3), so `preflightDegraded` is false, and
+  // /health/preflight/detail 403s for everyone in demo even if this somehow
+  // fired — the server contract makes a client-side demo branch redundant,
+  // not merely unnecessary.
+  const preflightDetail = useAsync<PreflightDetail | null>(
+    () => (preflightDegraded && isAdmin ? getPreflightDetail() : Promise.resolve(null)),
+    [preflightDegraded, isAdmin],
+  );
+  const [rechecking, setRechecking] = useState(false);
+  // Say what we don't know rather than look calm: a rejected refreshPreflight
+  // must not read as a successful re-check that simply found nothing new —
+  // that's indistinguishable, on screen, from the fix actually having landed.
+  // Cleared by the next successful re-check (explicitly, below) or by any
+  // later successful summary read landing on its own (a scheduled poll
+  // tick) — either one is evidence the read path is working again, which is
+  // the only claim this marker makes.
+  const [recheckFailed, setRecheckFailed] = useState(false);
+  useEffect(() => {
+    if (preflight.lastUpdated) setRecheckFailed(false);
+  }, [preflight.lastUpdated]);
+  const handleRecheck = () => {
+    if (rechecking) return;
+    setRechecking(true);
+    // Re-caches server-side (bypassing the 600s TTL) so the very next summary
+    // poll reads correctly — without this affordance, a problem fixed a
+    // minute ago could still read degraded for up to 10 minutes with nothing
+    // on screen to force a look. Both reads are refetched, not just the
+    // summary: a PARTIAL fix (still degraded, but a different set of checks
+    // failing) leaves `preflightDegraded` unchanged, so preflightDetail's own
+    // dep array never moves and its loader never re-runs on its own — the
+    // row list would otherwise go on showing an already-fixed check under a
+    // freshly-correct count. A full fix masks this (status flips to green,
+    // hiding the stale rows along with it), which is why it's easy to miss.
+    refreshPreflight()
+      .then(() => setRecheckFailed(false))
+      .catch(() => setRecheckFailed(true))
+      .finally(() => {
+        setRechecking(false);
+        preflight.refetch();
+        preflightDetail.refetch();
+      });
+  };
   // The Dashboard assistant's kill switch, read from /about (one mount GET; a
   // flip takes effect on the next load). Gating on a SETTLED probe is the point:
   // rendering the panel optimistically would fire a GET /chat that 403s on
@@ -960,6 +1165,23 @@ export function Dashboard() {
             number surfaces, and those two are the reason the screen exists. At
             `lg`+ the columns sit side by side and order is moot. */}
         <div className="flex flex-col gap-4">
+          {/* Setup health — PERSISTENT, unlike every other panel in this rail
+              (which hide themselves when there's nothing to review). Placed
+              first, above the assistant, so a degraded integration is the
+              first thing seen rather than something discovered later via a
+              mysteriously-empty triage run. */}
+          <SetupHealthCard
+            summary={preflight.data}
+            error={preflight.error}
+            detailRows={preflightDetail.data?.rows ?? []}
+            detailLoading={preflightDetail.loading}
+            isAdmin={isAdmin}
+            rechecking={rechecking}
+            recheckFailed={recheckFailed}
+            onRecheck={handleRecheck}
+            onOpenDiagnostics={() => navigate('/config#diagnostics')}
+          />
+
           {/* Ask soc-ai — the Dashboard assistant. This slot used to hold a box
               that prefilled the Hunt Console's objective and navigated, which
               turned every question into a multi-minute background job ("a cheap

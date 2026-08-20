@@ -12,6 +12,7 @@ import type {
   AdminUser,
   AlertEvent,
   AlertGroup,
+  AuditChainVerifyResult,
   Backtest,
   ChatMessage,
   Config,
@@ -39,6 +40,8 @@ import type {
   InvestigationRow,
   Me,
   Notification,
+  PreflightDetail,
+  PreflightSummary,
   RehuntResult,
   RepresentativeOut,
   SavedView,
@@ -255,13 +258,23 @@ async function request<T>(path: string, init?: RequestInit & RequestOpts): Promi
     let reason: string | undefined;
     try {
       const body = await res.json();
-      const hint = body?.detail?.hint ?? (typeof body?.detail === 'string' ? body.detail : null);
+      const hint =
+        body?.detail?.hint ??
+        body?.detail?.message ??
+        (typeof body?.detail === 'string' ? body.detail : null);
       if (hint) detail = hint;
       // The house error shape is {reason, hint}: `hint` is the sentence shown to
       // the analyst, `reason` the machine-readable code. Dropping `reason` forced
       // callers to regex the prose to work out WHAT failed — which breaks the
       // moment the wording is edited, and can't separate two rejections that read
       // alike. Carry it on the Error instead.
+      //
+      // `?? body?.detail?.message`: one endpoint (GET /config/audit/verify-chain)
+      // uses {reason, message} instead of {reason, hint} — deliberately, per its
+      // own pinned test (tests/test_degraded_grid_panels.py) — so its partial-read
+      // shard narrative was being flattened to the generic "502 Bad Gateway" one
+      // layer from the screen. `??` only falls through when `hint` is absent, so
+      // every existing {reason, hint} caller is unaffected.
       if (typeof body?.detail?.reason === 'string') reason = body.detail.reason;
     } catch {
       /* non-JSON error body — keep the status line */
@@ -1183,6 +1196,33 @@ export function getHealth(): Promise<Health> {
   return request<Health>('/health');
 }
 
+/** Closed setup-health projection (any authenticated caller) — Wave 1's
+ *  doctor checks minus the fitness probe, server-cached at a 600s TTL. Feeds
+ *  the Dashboard's persistent setup-health card. */
+export function getPreflight(): Promise<PreflightSummary> {
+  return request<PreflightSummary>('/health/preflight');
+}
+
+/** Per-check rows + hints behind the summary above — admin-only
+ *  (require_admin_api). Read from cache; use `refreshPreflight` to force a
+ *  fresh run. */
+export function getPreflightDetail(): Promise<PreflightDetail> {
+  return request<PreflightDetail>('/health/preflight/detail');
+}
+
+/** Force a fresh doctor run past the server cache and re-cache the result
+ *  server-side, so the very next `getPreflight` poll reads correctly.
+ *  Admin-only. Returns the same shape as `getPreflightDetail` (the refreshed
+ *  detail) — but its only caller (the Dashboard's Re-check) doesn't rely on
+ *  that return value; it always refetches both `getPreflight` and
+ *  `getPreflightDetail` afterward regardless, since a partial fix can leave
+ *  the summary's `degraded` boolean unchanged while the failing check itself
+ *  changes, and only an explicit refetch moves the detail rows off a
+ *  now-stale one. */
+export function refreshPreflight(): Promise<PreflightDetail> {
+  return request<PreflightDetail>('/health/preflight/detail?refresh=true');
+}
+
 /** Build metadata (version, repo, license) plus the feature flags a screen needs
  *  before it renders — see `AboutInfo`, which is the whole contract. */
 export function getAbout(): Promise<AboutInfo> {
@@ -1421,6 +1461,16 @@ export function saveDangerSetting(
 
 export function testConnection(target: 'es' | 'llm'): Promise<ConnTestResult> {
   return post<ConnTestResult>(`/config/danger/test/${target}`);
+}
+
+/** Re-run the tamper-evident audit hash chain check against the live ES audit
+ * index (soc_ai.audit.verify.verify_audit_chain) — the Diagnostics panel's
+ * "Verify audit chain" control. Admin-only server-side. NOT fail-soft: an
+ * unreachable or partially-read index rejects this promise rather than
+ * resolving with a result (see AuditChainVerifyResult's doc) — a caller must
+ * not fold that rejection into "tampered". */
+export function verifyAuditChain(): Promise<AuditChainVerifyResult> {
+  return request<AuditChainVerifyResult>('/config/audit/verify-chain');
 }
 
 export interface AutoTriageStatus {

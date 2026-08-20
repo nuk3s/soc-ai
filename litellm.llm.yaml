@@ -1,0 +1,8 @@
+# LiteLLM proxy config for the optional local backend (docker-compose.llm.yml).
+# The app always asks for `soc-ai-analyst`; swap the backing model here without
+# touching soc-ai's .env.
+model_list:
+  - model_name: soc-ai-analyst
+    litellm_params:
+      model: ollama_chat/qwen3:14b
+      api_base: http://ollama:11434

@@ -28,6 +28,7 @@ const Investigations = lazyWithReload(() => import('./screens/Investigations').t
 const InvestigationPage = lazyWithReload(() => import('./screens/InvestigationPage').then((m) => ({ default: m.InvestigationPage })));
 const Login = lazyWithReload(() => import('./screens/Login').then((m) => ({ default: m.Login })));
 const Notifications = lazyWithReload(() => import('./screens/Notifications').then((m) => ({ default: m.Notifications })));
+const Operate = lazyWithReload(() => import('./screens/Operate').then((m) => ({ default: m.Operate })));
 const Runbooks = lazyWithReload(() => import('./screens/Runbooks').then((m) => ({ default: m.Runbooks })));
 
 /**
@@ -83,6 +84,7 @@ export function App() {
             <Route path="/entity/:value" element={<EntityRoute />} />
             <Route path="/hosts" element={<Hosts />} />
             <Route path="/hosts/:ip" element={<HostDetail />} />
+            <Route path="/operate" element={<Operate />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/runbooks" element={<Runbooks />} />
             <Route path="/config" element={<Config />} />

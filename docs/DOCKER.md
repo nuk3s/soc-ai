@@ -131,7 +131,7 @@ Health check:
 
 ```bash
 curl -k https://localhost:8443/healthz
-# → {"status":"ok","version":"1.2.6","so_auth":"kratos",...}
+# → {"status":"ok","version":"1.2.9","so_auth":"kratos",...}
 ```
 
 ---
@@ -554,9 +554,9 @@ container restarting mid-hunt, raise `deploy.resources.limits.memory` in
 ## Troubleshooting
 
 **First move: run the doctor.** `docker exec soc-ai python -m soc_ai doctor` checks the whole
-dependency surface (config, store + migration head, Security Onion, Elasticsearch, gateway,
-model fitness) and prints a pass/fail table with a fix hint on every failing line. Start
-there before the per-symptom entries below.
+dependency surface (config, store + migration head, Security Onion, Elasticsearch, the audit
+grant, gateway, model fitness) and prints a pass/fail table with a fix hint on every failing
+line. Start there before the per-symptom entries below.
 
 **Container exits immediately after start**
 Check that `.env` exists and `SOC_AI_TLS_CERT` / `SOC_AI_TLS_KEY` point at files that are

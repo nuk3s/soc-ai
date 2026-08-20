@@ -595,6 +595,10 @@ export interface Setting {
   value: boolean | number | string;
   bounds?: string;
   options?: string[];
+  /** Day-1 tier (server-curated): true = shown by default; false = folded
+   * behind the section's "Advanced" reveal. Never hardcode which keys are
+   * day1 on the frontend — this flag is the only source of truth. */
+  day1: boolean;
 }
 
 export interface SettingGroup {
@@ -1154,4 +1158,62 @@ export interface SavedView {
   name: string;
   query: SavedViewQuery;
   created_at: string | null;
+}
+
+// ── Preflight (setup-health) ────────────────────────────────────────────────
+// Wave 1's doctor checks, minus the expensive fitness probe, cached
+// server-side and exposed as a closed non-admin projection plus an
+// admin-only detail read — see soc_ai/api/webui/routes_meta.py.
+
+/** Closed projection any authenticated caller may read: GET /health/preflight.
+ *  `status` is 'degraded' iff `failing` > 0 — a WARN never flips it. */
+export interface PreflightSummary {
+  status: 'green' | 'degraded';
+  failing: number;
+  warned: number;
+  checked_at: string;
+}
+
+/** One doctor check's row, as the admin detail read returns it. `status` is
+ *  the raw doctor grade ('PASS' | 'WARN' | 'FAIL' | 'INFO'), not narrowed to
+ *  the summary's two-state projection. */
+export interface PreflightRow {
+  name: string;
+  status: string;
+  detail: string;
+  hint: string;
+}
+
+/** GET /health/preflight/detail (admin, require_admin_api). */
+export interface PreflightDetail {
+  rows: PreflightRow[];
+  checked_at: string;
+}
+
+// ── Audit chain verification (admin) ────────────────────────────────────────
+// GET /config/audit/verify-chain (soc_ai/api/webui/routes_config.py) re-runs
+// the tamper-evident hash chain check (soc_ai.audit.verify.verify_audit_chain,
+// soc_ai.audit.chain.verify_chain) against the live ES audit index — the
+// Diagnostics panel's "Verify audit chain" control, and what makes the
+// Operate hub's "Audit chain" card promise real.
+//
+// NOT fail-soft like the checks above: an unreachable or partially-read audit
+// index makes the backend RAISE (502/503) rather than answer, so a 200
+// response's `ok: false` always means TAMPERED, never "couldn't check" — a
+// caller must keep a thrown/rejected call and an `ok: false` result visually
+// distinct (never render a request failure as "tampered", and never render
+// tampered as success).
+
+/** GET /config/audit/verify-chain (admin, require_admin_api). Mirrors
+ *  soc_ai.audit.verify.ChainVerifyResult (+ `checked_at`, stamped by the
+ *  route). `first_broken_seq` is non-null iff `ok` is false — that invariant
+ *  is enforced server-side by verify_chain's own contract. */
+export interface AuditChainVerifyResult {
+  ok: boolean;
+  records_verified: number;
+  first_broken_seq: number | null;
+  first_seq: number | null;
+  last_seq: number | null;
+  capped: boolean;
+  checked_at: string;
 }

@@ -53,3 +53,29 @@ def test_compose_quickstart_pull_command_pins_a_tag() -> None:
         "that does not set SOC_AI_IMAGE_TAG inline, so copy-pasting it rides the "
         "mutable :latest tag: " + "; ".join(unpinned)
     )
+
+
+def test_llm_compose_images_pinned_by_tag() -> None:
+    """The optional local-LLM profile (docker-compose.llm.yml) declares both
+    images pinned — its own header comment says "Tags are PINNED (verified
+    against the registries ...). Never run :latest — it's an unaudited moving
+    target." Hold that promise to the same standard as the Dockerfile/
+    docker-compose.yml gates above: a bare or ``:latest`` image tag must not
+    silently creep back in."""
+    text = (REPO_ROOT / "docker-compose.llm.yml").read_text(encoding="utf-8")
+    image_lines = [line.strip() for line in text.splitlines() if re.match(r"^\s*image:\s*\S", line)]
+    assert len(image_lines) == 2, (
+        f"expected exactly 2 'image:' lines in docker-compose.llm.yml (ollama, litellm), "
+        f"found {len(image_lines)}: {image_lines} — did a service get added, removed, or "
+        "renamed? Update this test."
+    )
+    for line in image_lines:
+        image = line.split(":", 1)[1].strip()
+        assert ":latest" not in image, f"docker-compose.llm.yml rides :latest: {line!r}"
+        # rpartition, not a bare count(":") == 1 — a lab-registry re-pin
+        # (registry.lan:5000/ollama/ollama:0.32.14) puts a second colon in the
+        # host:port before the tag separator, which count() can't tell apart
+        # from a missing tag (same trap tests/test_setup_script.py's
+        # test_llm_compose_profile_is_wellformed already guards against).
+        _, sep, tag = image.rpartition(":")
+        assert sep and tag and "/" not in tag, f"docker-compose.llm.yml image not pinned: {line!r}"

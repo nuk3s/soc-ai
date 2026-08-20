@@ -2,10 +2,10 @@
 
 One command an installer/operator runs right after setup — or when something is
 wrong — that probes every external dependency the app needs (config, the local
-store + migration head, the Security Onion API, Elasticsearch, the LiteLLM
-gateway, and the analyst model's actual fitness) and returns structured
-pass/fail results. Pure logic lives here; ``soc_ai.cli`` owns argparse and the
-table/JSON printing.
+store + migration head, the Security Onion API, Elasticsearch, the audit write
+grant, index-pattern dataset coverage, the LiteLLM gateway, and the analyst
+model's actual fitness) and returns structured pass/fail results. Pure logic
+lives here; ``soc_ai.cli`` owns argparse and the table/JSON printing.
 
 Design rules (mirrors ``soc_ai.webui.probes``):
 
@@ -17,6 +17,12 @@ Design rules (mirrors ``soc_ai.webui.probes``):
 - No detail string may carry a secret — the reused probe helpers
   (:func:`soc_ai.webui.probes._safe_reason` / ``_scrub``) strip
   credential-shaped substrings.
+- A check that reaches past ``ElasticClient`` into the raw ``_client``
+  namespace (``check_audit_write_privileges`` does, for ``security``) owns
+  the partial-read guard ``ElasticClient.search`` would otherwise have
+  applied — go through ``elastic.search(...)`` instead whenever the call has
+  a search-shaped equivalent, so a half-read grid can't be misread as a real
+  answer (see ``GridPartialResultsError``).
 
 Exit-code contract (:func:`exit_code`): 0 iff no check FAILed. WARN and INFO
 never fail the doctor — they flag things that degrade gracefully.
@@ -26,10 +32,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
+import ssl
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 from alembic.script import ScriptDirectory
 from elasticsearch import ApiError, AuthenticationException
@@ -40,7 +49,7 @@ from sqlalchemy.exc import OperationalError
 from soc_ai.config import Settings
 from soc_ai.errors import SoAuthError
 from soc_ai.so_client.auth import make_auth
-from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 from soc_ai.store.db import _migration_config, make_engine
 from soc_ai.webui.probes import _safe_reason, _scrub, list_gateway_models, probe_model_fitness
 
@@ -77,9 +86,18 @@ def exit_code(results: list[CheckResult]) -> int:
 # sit ABOVE that bound, or doctor cancels a healthy probe mid-leg and reports
 # its own impatience as a model failure (this happened: the wrapper sat at 40s
 # while the probe's own budget had grown to 100s, then 130s).
+# getaddrinfo has no timeout parameter, so a slow resolver alone can burn ~5s;
+# add ~5s for connect plus the TLS handshake, per target. The three targets
+# run CONCURRENTLY (see check_upstream_reachability), so 15s bounds the
+# slowest SINGLE target with headroom rather than the sum of three — without
+# that headroom, one slow probe collapses all three named rows into one
+# generic "check timed out" FAIL instead of naming which target is slow.
+_REACH_TIMEOUT_S = 15.0
 _STORE_TIMEOUT_S = 10.0
 _SO_TIMEOUT_S = 8.0
 _ES_TIMEOUT_S = 8.0
+_AUDIT_TIMEOUT_S = 8.0  # one _has_privileges call — same cost profile as the ES check
+_COVERAGE_TIMEOUT_S = 8.0  # 3 CONCURRENT searches — worst case is ~one 5s round trip, not 3x
 _GATEWAY_TIMEOUT_S = 12.0  # list_gateway_models carries its own 10s HTTP timeout
 _FITNESS_TIMEOUT_S = 150.0  # probes._FITNESS_TOTAL_TIMEOUT_S (130s) + headroom
 
@@ -87,6 +105,21 @@ _FITNESS_TIMEOUT_S = 150.0  # probes._FITNESS_TOTAL_TIMEOUT_S (130s) + headroom
 # tighter than the app's es_request_timeout_s (30s) so a slow/wedged cluster
 # fails fast here, and with retries off (one honest attempt, not 3).
 _ES_REQUEST_TIMEOUT_S = 5
+
+
+def _probe_client(settings: Settings) -> ElasticClient:
+    """A narrowed-timeout, no-retry :class:`ElasticClient` for doctor probes.
+
+    Mirrors ``check_elasticsearch``'s own narrowing below: tight client-side
+    timeout and retries off, so a slow/wedged cluster fails fast here (one
+    honest attempt) instead of riding the app's normal ``es_request_timeout_s``
+    x ``es_max_retries`` retry budget.
+    """
+    return ElasticClient(
+        settings.model_copy(
+            update={"es_request_timeout_s": _ES_REQUEST_TIMEOUT_S, "es_max_retries": 0}
+        )
+    )
 
 
 # ── Check 1: config ──────────────────────────────────────────────────────────
@@ -115,6 +148,169 @@ def check_config() -> tuple[Settings | None, CheckResult]:
             hint="check that .env exists, is readable, and parses as KEY=value lines",
         )
     return settings, CheckResult("config", "PASS", "settings loaded from env/.env")
+
+
+# ── Check 1b: upstream reachability (DNS vs TCP/firewall vs TLS trust) ───────
+
+# check_so_api / check_elasticsearch / check_gateway below each report a dead
+# upstream as one undifferentiated "unreachable" — accurate, but it leaves the
+# operator guessing which of three unrelated fixes applies. The two documented
+# onboarding traps are hostname resolution failing INSIDE the container's
+# bridge network (a host that resolves fine from the operator's own shell may
+# not resolve from inside Docker) and a private/self-signed CA the container
+# doesn't trust — both today only ever surface as a failed first hunt. This
+# check classifies the LAYER (DNS / TCP-reach-or-firewall / TLS-trust) so each
+# FAIL line names its one fix instead of sending the operator down the wrong
+# troubleshooting path.
+
+# "dns" is one shared string (one resolver, inside one container, regardless
+# of which upstream). "reach" and "tls" are NOT shared: SO/ES sit behind the
+# SO firewall and have a *_CA_BUNDLE knob, but the gateway (LiteLLM) is a
+# different service entirely — telling an operator to pinhole the SO firewall
+# for a dead LiteLLM box, or to set a LITELLM_CA_BUNDLE that doesn't exist in
+# Settings, would send them nowhere. Keyed by (target slug, failure kind) so
+# each FAIL line's hint names the fix that actually applies to that target.
+_REACH_DNS_HINT = (
+    "This container can't resolve the hostname. Use an IP address in .env, or add "
+    "an extra_hosts entry for it in docker-compose.yml."
+)
+_REACH_SO_ES_FIREWALL_HINT = (
+    "No route or refused. Pinhole this host's IP through the SO firewall "
+    "(Elasticsearch is TCP 9200) — docs/SECURITY-ONION-SETUP.md, section 0."
+)
+_REACH_TLS_FALLBACK_NOTE = "If the endpoint isn't serving TLS on this port, use http:// instead."
+_REACH_HINTS: dict[tuple[str, str], str] = {
+    ("so", "dns"): _REACH_DNS_HINT,
+    ("so", "tls"): (
+        "Private CA or self-signed certificate. Point SO_CA_BUNDLE at the CA, "
+        "or set SO_VERIFY_SSL=false if you accept unverified TLS. " + _REACH_TLS_FALLBACK_NOTE
+    ),
+    ("so", "reach"): _REACH_SO_ES_FIREWALL_HINT,
+    ("es", "dns"): _REACH_DNS_HINT,
+    ("es", "tls"): (
+        "Private CA or self-signed certificate. Point ES_CA_BUNDLE at the CA, "
+        "or set ES_VERIFY_SSL=false if you accept unverified TLS. " + _REACH_TLS_FALLBACK_NOTE
+    ),
+    ("es", "reach"): _REACH_SO_ES_FIREWALL_HINT,
+    ("gateway", "dns"): _REACH_DNS_HINT,
+    ("gateway", "tls"): (
+        "Self-signed or private-CA gateway cert. Set LITELLM_VERIFY_SSL=false if you "
+        "accept unverified TLS to the gateway. " + _REACH_TLS_FALLBACK_NOTE
+    ),
+    ("gateway", "reach"): (
+        "No route or refused. Check the gateway URL and port, and that the gateway "
+        "process/container is up and reachable from inside this container (Docker network)."
+    ),
+}
+
+
+def _tls_handshake(sock: socket.socket, host: str) -> None:
+    """Isolated so tests can stub the handshake without a real TLS peer."""
+    ctx = ssl.create_default_context()
+    with ctx.wrap_socket(sock, server_hostname=host):
+        pass
+
+
+def _classify_endpoint(url: str, *, verify_tls: bool, timeout_s: float = 5.0) -> tuple[str, str]:
+    """Return ("", detail) when reachable, else (failure_kind, detail).
+
+    Synchronous — call through ``asyncio.to_thread``.
+    """
+    first = url.split(",", maxsplit=1)[0].strip()
+    parsed = urlparse(first if "//" in first else f"//{first}")
+    host = parsed.hostname or first
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    # This call exists PURELY to classify a DNS failure as its own layer —
+    # its result is otherwise discarded (see the hostname-connect comment
+    # below). NOTE: getaddrinfo has no timeout parameter (a stdlib gap, no
+    # fix available); a blackholed resolver stalls THIS worker thread past
+    # timeout_s. _isolated still caps the ROW at _REACH_TIMEOUT_S via
+    # asyncio.wait_for, so the doctor's output is never late — but the
+    # underlying thread keeps blocking until the resolver eventually answers
+    # or errors, which process shutdown may have to wait on.
+    try:
+        socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError) as exc:
+        # UnicodeError: getaddrinfo raises it for a >63-char DNS label, which
+        # pydantic's AnyHttpUrl accepts without complaint — without this arm,
+        # one such URL falls through to the generic OSError arm below and
+        # collapses all three rows into a single undifferentiated FAIL
+        # instead of naming it a DNS problem.
+        return "dns", f"{host}: DNS resolution failed inside the container ({exc})"
+    try:
+        # Connect by HOSTNAME, not a resolved address pinned to whichever
+        # entry getaddrinfo happened to sort first: create_connection does
+        # its own resolution and tries every returned address in turn (AAAA
+        # then A), so a dual-stack host on a v4-only network connects the
+        # same way the app's own HTTP client would, instead of hard-failing
+        # on an address the app itself would have skipped past.
+        with socket.create_connection((host, port), timeout=timeout_s) as sock:
+            if parsed.scheme == "https" and verify_tls:
+                _tls_handshake(sock, host)
+    except ssl.SSLCertVerificationError as exc:
+        return "tls", f"{host}:{port}: TLS verification failed ({exc})"
+    except ssl.SSLError as exc:
+        # Broader than a cert-trust failure: the TCP connection succeeded but
+        # the peer didn't speak TLS at all (e.g. an http-only service sitting
+        # behind an https:// URL). Order matters — SSLCertVerificationError
+        # is an SSLError subclass, so this arm MUST come after it, and both
+        # MUST come before the OSError arm (SSLError is also an OSError).
+        return "tls", f"{host}:{port}: TLS handshake failed ({exc})"
+    except TimeoutError:  # socket.timeout is TimeoutError as of Python 3.10
+        return "reach", f"{host}:{port}: connection timed out"
+    except OSError as exc:
+        return "reach", f"{host}:{port}: {exc.strerror or exc}"
+    return "", f"{host}:{port} resolves and connects"
+
+
+async def check_upstream_reachability(settings: Settings) -> list[CheckResult]:
+    """Layer-classified reachability for the three upstreams, each failure with its one fix.
+
+    Runs all three probes CONCURRENTLY via ``asyncio.to_thread`` (``socket``
+    has no asyncio-native API) — worst case is ~one 5s probe inside the outer
+    ``_REACH_TIMEOUT_S`` bound, not three run in series.
+    """
+    targets: list[tuple[str, str, str, bool]] = [
+        ("SO reachability", "so", str(settings.so_host), bool(settings.so_verify_ssl)),
+        (
+            "ES reachability",
+            "es",
+            ",".join(str(host) for host in settings.es_hosts),
+            bool(settings.es_verify_ssl),
+        ),
+        (
+            "gateway reachability",
+            "gateway",
+            str(settings.litellm_base_url),
+            bool(settings.litellm_verify_ssl),
+        ),
+    ]
+    outcomes = await asyncio.gather(
+        *(
+            asyncio.to_thread(_classify_endpoint, url, verify_tls=verify)
+            for _, _, url, verify in targets
+        )
+    )
+    es_host_count = len(settings.es_hosts)
+    results: list[CheckResult] = []
+    for (name, slug, url, verify), (kind, detail) in zip(targets, outcomes, strict=True):
+        # A multi-node grid's ES row only ever probes the FIRST configured
+        # host (see the comma-join above) — say so on both PASS and FAIL, so
+        # a green row doesn't read as "the whole cluster is reachable" when
+        # it only ever checked one member of it.
+        es_note = ""
+        if slug == "es" and es_host_count > 1:
+            es_note = f" (first of {es_host_count} es_hosts)"
+        if kind:
+            results.append(
+                CheckResult(name, "FAIL", f"{detail}{es_note}", hint=_REACH_HINTS[(slug, kind)])
+            )
+            continue
+        first = url.split(",", maxsplit=1)[0].strip()
+        scheme = urlparse(first if "//" in first else f"//{first}").scheme
+        tls_note = ", TLS verifies" if verify and scheme == "https" else ""
+        results.append(CheckResult(name, "PASS", f"{detail}{tls_note}{es_note}"))
+    return results
 
 
 # ── Check 2: local store (DB + migration head + FTS5) ────────────────────────
@@ -292,10 +488,7 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
     """
     name = "elasticsearch"
     pattern = settings.events_index_pattern
-    probe_settings = settings.model_copy(
-        update={"es_request_timeout_s": _ES_REQUEST_TIMEOUT_S, "es_max_retries": 0}
-    )
-    elastic = ElasticClient(probe_settings)
+    elastic = _probe_client(settings)
     try:
         info = await elastic.ping()
         cluster = str(info.get("cluster") or "") or "(unknown cluster)"
@@ -354,6 +547,240 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
     finally:
         with contextlib.suppress(Exception):  # best-effort cleanup on a probe path
             await elastic.aclose()
+
+
+# ── Check 3c: audit write grant (ES _has_privileges, no canary write) ────────
+
+# The exact grant scripts/setup-audit-index.sh applies to the analyst-class
+# role, in its order. Split into what breaks WRITES (fail-closed abort — a
+# FAIL) vs. what only breaks reading the chain back (verify / chain-head
+# recovery — a WARN, since ack/escalate/comment still work).
+_AUDIT_PRIVILEGES = (
+    "auto_configure",
+    "create_index",
+    "index",
+    "read",
+    "view_index_metadata",
+    "write",
+)
+_AUDIT_WRITE_CRITICAL = frozenset({"auto_configure", "create_index", "index", "write"})
+_AUDIT_READ_ONLY = frozenset({"read", "view_index_metadata"})
+
+
+async def check_audit_write_privileges(settings: Settings) -> CheckResult:
+    """Preflight the SO-manager-side audit grant (``scripts/setup-audit-index.sh``).
+
+    Requests all six privileges the setup script grants and grades them in two
+    tiers: missing ``write``/``index``/``create_index``/``auto_configure`` is a
+    FAIL (fail-closed: every ack/escalate/comment aborts with no UI error — or,
+    with ``audit_fail_closed=false``, the forensic trail silently drops
+    instead). Missing only ``read``/``view_index_metadata`` is a WARN (writes
+    still land, but chain verification and the startup chain-head-recovery
+    read both fail).
+
+    Checked with ``_has_privileges`` rather than a real write: a canary
+    document would enter the tamper-evident audit hash chain
+    (``soc_ai.audit.logger``).
+
+    Reaches past the ``ElasticClient`` wrapper into the raw
+    ``_client.security`` namespace (which ``ElasticClient`` doesn't expose),
+    using the same module-level ``ElasticClient`` import ``check_elasticsearch``
+    uses above — so the existing ``patch("soc_ai.doctor.ElasticClient", ...)``
+    test idiom covers this check too, with no separate patch target.
+    """
+    name = "audit write grant"
+    fix = (
+        "Run on the SO manager: "
+        "ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh "
+        "(docs/SECURITY-ONION-SETUP.md, section 3)"
+    )
+    index_name = f"{settings.audit_index_alias}-{datetime.now(tz=UTC).strftime('%Y.%m.%d')}"
+    elastic = _probe_client(settings)
+    try:
+        resp = await elastic._client.security.has_privileges(
+            index=[{"names": [index_name], "privileges": list(_AUDIT_PRIVILEGES)}]
+        )
+    except Exception as exc:
+        return CheckResult(
+            name,
+            "WARN",
+            f"couldn't query _has_privileges: {_safe_reason(exc)}",
+            hint=(
+                "Fix Elasticsearch connectivity first, then re-run the doctor. "
+                f"If ack/escalate/comment fail silently once ES is reachable, the "
+                f"grant may be missing. {fix}"
+            ),
+        )
+    finally:
+        with contextlib.suppress(Exception):  # best-effort cleanup on a probe path
+            await elastic.aclose()
+
+    # elasticsearch-py answers an ObjectApiResponse, not a dict — unwrap
+    # explicitly rather than lean on its __getattr__ proxy (the same trap
+    # soc_ai/audit/logger.py's _top_source documents and guards against).
+    resp_any: Any = resp  # load-bearing: mypy --strict would flag isinstance below as unreachable
+    if isinstance(resp_any, dict):
+        body: dict[str, Any] = resp_any
+    else:
+        maybe_body = getattr(resp_any, "body", None)
+        body = maybe_body if isinstance(maybe_body, dict) else {}
+
+    if "has_all_requested" not in body:
+        return CheckResult(
+            name,
+            "WARN",
+            "unexpected _has_privileges response shape — couldn't determine whether "
+            "the audit grant is present",
+            hint="Not a confirmed problem — verify the grant manually "
+            "(docs/SECURITY-ONION-SETUP.md, section 3) if ack/escalate/comment ever "
+            "fail silently.",
+        )
+    if bool(body["has_all_requested"]):
+        return CheckResult(
+            name, "PASS", f"{settings.audit_index_alias}-* is writable by the ES identity"
+        )
+
+    index_block = body.get("index")
+    granted: dict[str, Any] = {}
+    if isinstance(index_block, dict):
+        candidate = index_block.get(index_name)
+        if isinstance(candidate, dict):
+            granted = candidate
+    missing = [priv for priv in _AUDIT_PRIVILEGES if not granted.get(priv)]
+    write_missing = [p for p in missing if p in _AUDIT_WRITE_CRITICAL]
+    read_missing = [p for p in missing if p in _AUDIT_READ_ONLY]
+
+    if write_missing:
+        consequence = (
+            "every ack/escalate/comment will abort (fail-closed audit), with no UI error"
+            if settings.audit_fail_closed
+            else "the forensic audit trail is being dropped "
+            "(audit_fail_closed=false: actions still succeed)"
+        )
+        return CheckResult(
+            name,
+            "FAIL",
+            f"the ES identity is missing {', '.join(write_missing)} on {index_name} — "
+            f"{consequence}",
+            hint=fix,
+        )
+    if read_missing:
+        return CheckResult(
+            name,
+            "WARN",
+            f"the ES identity is missing {', '.join(read_missing)} on {index_name} — "
+            "audit chain verification and chain-head recovery will fail",
+            hint=fix,
+        )
+    return CheckResult(
+        name,
+        "WARN",
+        f"_has_privileges reported {index_name} as not fully granted but named no "
+        "specific missing privilege — unexpected response shape",
+        hint=fix,
+    )
+
+
+# ── Check 3d: index-pattern dataset coverage (the .ds-* narrowing trap) ──────
+
+# The three datasets a narrowed EVENTS_INDEX_PATTERN can silently split apart
+# (see the warning block in .env.example): SO's own integrations (suricata
+# alerts) live under one Elastic Agent namespace, Elastic's stock integrations
+# (system.auth, system.syslog — the login + syslog evidence) live under
+# another. A pattern narrowed to list `.ds-*` backing indices instead of the
+# `logs-*` data-stream name can keep matching the first namespace while
+# dropping the second entirely, with zero errors anywhere — a 2026-08-05
+# production install did exactly this and got an investigation wrong. Order
+# matters here: it drives both the per-dataset ES calls below and the WARN
+# detail string.
+_COVERAGE_DATASETS = ("suricata.alert", "system.auth", "system.syslog")
+
+
+async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
+    """Count suricata.alert / system.auth / system.syslog under EVENTS_INDEX_PATTERN.
+
+    ``check_elasticsearch`` above only confirms the pattern matches
+    *something*; a narrowed pattern can still pass that check while quietly
+    dropping an entire Elastic Agent namespace. This check counts each
+    dataset independently — concurrently, through ``ElasticClient.search``
+    rather than the raw ``_client`` — and WARNs when alerts are present but
+    the login/syslog evidence is entirely absent: the specific shape of the
+    ``.ds-*`` foot-gun.
+
+    Going through ``search`` (not a raw ``_client.count()``) is deliberate:
+    it inherits ``_check_complete``'s partial-read guard, so a half-read grid
+    (failed/unassigned shards) raises :class:`GridPartialResultsError`
+    instead of quietly answering with an undercount that this check would
+    otherwise misdiagnose as a narrowed pattern.
+    """
+    name = "index pattern coverage"
+    pattern = settings.events_index_pattern
+    hint_connectivity = "Fix Elasticsearch connectivity first, then re-run the doctor."
+    elastic = _probe_client(settings)
+    try:
+        results = await asyncio.gather(
+            *(
+                elastic.search(
+                    pattern,
+                    {"term": {"event.dataset": dataset}},
+                    size=0,
+                    track_total_hits=True,
+                )
+                for dataset in _COVERAGE_DATASETS
+            )
+        )
+    except GridPartialResultsError as exc:
+        return CheckResult(
+            name,
+            "WARN",
+            f"the grid returned partial results counting datasets under {pattern!r} — "
+            f"some shards failed; counts are unreliable ({_safe_reason(exc)})",
+            hint=hint_connectivity,
+        )
+    except Exception as exc:
+        return CheckResult(
+            name,
+            "WARN",
+            f"couldn't count datasets under {pattern!r}: {_safe_reason(exc)}",
+            hint=hint_connectivity,
+        )
+    finally:
+        with contextlib.suppress(Exception):  # best-effort cleanup on a probe path
+            await elastic.aclose()
+
+    counts: dict[str, int] = dict(zip(_COVERAGE_DATASETS, (r.total for r in results), strict=True))
+    alerts = counts["suricata.alert"]
+    auth = counts["system.auth"]
+    syslog = counts["system.syslog"]
+    detail_counts = f"suricata.alert={alerts}, system.auth={auth}, system.syslog={syslog}"
+
+    if alerts > 0 and auth == 0 and syslog == 0:
+        return CheckResult(
+            name,
+            "WARN",
+            f"{pattern!r} sees alerts but zero auth/syslog events ({detail_counts}) — "
+            "the pattern is likely narrowed to backing indices",
+            hint="Set EVENTS_INDEX_PATTERN=logs-* (multi-node: *:logs-*). Never list "
+            ".ds-* backing indices — see the warning block in .env.example.",
+        )
+    if alerts == 0 and auth == 0 and syslog == 0:
+        return CheckResult(
+            name,
+            "WARN",
+            f"{pattern!r} matches no suricata/auth/syslog events",
+            hint="Wrong pattern or an idle grid. Single-node grids use logs-*, "
+            "multi-node *:logs-*.",
+        )
+    if alerts == 0:
+        # auth and/or syslog are present, so the pattern itself is fine — just
+        # a quiet alert stream (idle grid, or Suricata not yet firing).
+        return CheckResult(
+            name,
+            "PASS",
+            f"{pattern!r}: {detail_counts} — no suricata.alert events; "
+            "the triage queue will be empty",
+        )
+    return CheckResult(name, "PASS", f"{pattern!r}: {detail_counts}")
 
 
 # ── Check 4: gateway (/v1/models + configured model ids) ─────────────────────
@@ -563,6 +990,11 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
 # ── Runner ───────────────────────────────────────────────────────────────────
 
 
+async def _solo(coro: Awaitable[CheckResult]) -> list[CheckResult]:
+    """Adapt a single-``CheckResult`` check coroutine into ``_isolated``'s list contract."""
+    return [await coro]
+
+
 async def _isolated(
     name: str, coro: Awaitable[list[CheckResult]], timeout_s: float
 ) -> list[CheckResult]:
@@ -591,13 +1023,21 @@ async def _isolated(
         ]
 
 
-async def run_doctor(settings: Settings | None = None) -> list[CheckResult]:
+async def run_doctor(
+    settings: Settings | None = None, *, include_fitness: bool = True
+) -> list[CheckResult]:
     """Run every doctor check; return the results in display order.
 
     ``settings=None`` (the CLI path) loads Settings from env/.env as check 1;
     when that fails the dependent checks are skipped (nothing can run without
     a config) and the single FAIL comes back. Passing a ``Settings`` (tests /
     embedding) skips the env load but still records config as PASS.
+
+    ``include_fitness`` (default True, unchanged CLI behavior) gates the model
+    fitness check — the one expensive probe (worst-case ~130s,
+    ``_FITNESS_TIMEOUT_S``). The cached preflight API (routes_meta.py) passes
+    ``include_fitness=False`` so a dashboard poll never pays that cost; the
+    fitness card in the config console still runs it directly.
     """
     results: list[CheckResult] = []
     if settings is None:
@@ -618,13 +1058,30 @@ async def run_doctor(settings: Settings | None = None) -> list[CheckResult]:
 
     # Independent upstreams — run concurrently so a slow one doesn't serialize
     # the rest; each is individually bounded and never raises.
-    batches = await asyncio.gather(
+    checks: list[Awaitable[list[CheckResult]]] = [
+        _isolated(
+            "upstream reachability",
+            check_upstream_reachability(settings),
+            _REACH_TIMEOUT_S,
+        ),
         _isolated("store", check_store(settings), _STORE_TIMEOUT_S),
         _isolated("security onion", check_so_api(settings), _SO_TIMEOUT_S),
         _isolated("elasticsearch", check_elasticsearch(settings), _ES_TIMEOUT_S),
+        _isolated(
+            "audit write grant",
+            _solo(check_audit_write_privileges(settings)),
+            _AUDIT_TIMEOUT_S,
+        ),
+        _isolated(
+            "index pattern coverage",
+            _solo(check_index_pattern_coverage(settings)),
+            _COVERAGE_TIMEOUT_S,
+        ),
         _isolated("gateway", check_gateway(settings), _GATEWAY_TIMEOUT_S),
-        _isolated("model fitness", check_model_fitness(settings), _FITNESS_TIMEOUT_S),
-    )
+    ]
+    if include_fitness:
+        checks.append(_isolated("model fitness", check_model_fitness(settings), _FITNESS_TIMEOUT_S))
+    batches = await asyncio.gather(*checks)
     for batch in batches:
         results.extend(batch)
     results.extend(check_egress_posture(settings))

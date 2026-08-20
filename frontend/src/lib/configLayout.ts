@@ -143,3 +143,40 @@ export function keyToSectionId(layout: ConfigParent[]): Record<string, string> {
   }
   return map;
 }
+
+/** Setting key → the TITLE of the group that owns it — the same string
+ * Config.tsx's per-section Advanced fold keys under (`${title}:advanced` in
+ * the `collapsed` record). Distinct from keyToSectionId above, whose values
+ * are DOM ids, not display titles (a group's `label` and its owning
+ * SettingGroup's `title` are the same string by construction — see
+ * buildConfigLayout). */
+export function keyToSectionTitle(layout: ConfigParent[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const p of layout) {
+    for (const c of p.children) {
+      if (c.kind === 'group') {
+        for (const item of c.group.items) map[item.key] = c.label;
+      }
+    }
+  }
+  return map;
+}
+
+/** Setting key → its day1 tier, indexed the same way as keyToSectionTitle
+ * above. A jump that only has the KEY (the palette's router-state
+ * highlightKey hand-off) needs this to decide whether unfolding the owning
+ * section's Advanced fold is correct: doing it for a day1 target would be
+ * wrong (day1 rows render unfolded already) AND would persist the unfold —
+ * `collapsed` mirrors to localStorage — silently eroding the day-1 view on
+ * every such jump. */
+export function keyToDay1(layout: ConfigParent[]): Record<string, boolean> {
+  const map: Record<string, boolean> = {};
+  for (const p of layout) {
+    for (const c of p.children) {
+      if (c.kind === 'group') {
+        for (const item of c.group.items) map[item.key] = item.day1;
+      }
+    }
+  }
+  return map;
+}

@@ -250,14 +250,14 @@ class Settings(BaseSettings):
     CLOUD provider.  When True, every payload sent to the analyst model —
     the enriched alert context, all tool results, and the composed prompts
     (investigation, hunt, and chat) — has internal IPs, hostnames, usernames,
-    and domains replaced with stable opaque labels (``IP_01``, ``HOST_02``, …)
-    via the same reversible redaction tunnel the Oracle path uses
-    (:class:`soc_ai.agent.egress_guard.EgressGuard`).  Every model OUTPUT —
-    verdicts, rationales, reasoning traces, hunt reports, chat replies — has
-    those labels restored to the real values before storage/display, and tool
-    arguments coming FROM the model (e.g. a query string citing ``HOST_01``)
-    are label-restored before they hit Elasticsearch, so the agent loop still
-    works end to end.
+    MACs, and internal-domain emails replaced with stable opaque labels
+    (``IP_01``, ``HOST_02``, …) via the same reversible redaction tunnel the
+    Oracle path uses (:class:`soc_ai.agent.egress_guard.EgressGuard`).  Every
+    model OUTPUT — verdicts, rationales, reasoning traces, hunt reports, chat
+    replies — has those labels restored to the real values before
+    storage/display, and tool arguments coming FROM the model (e.g. a query
+    string citing ``HOST_01``) are label-restored before they hit
+    Elasticsearch, so the agent loop still works end to end.
 
     COST: some verdict quality.  The model reasons over opaque labels, so it
     cannot use identity knowledge it would otherwise infer — e.g. it can't

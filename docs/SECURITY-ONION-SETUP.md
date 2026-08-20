@@ -243,8 +243,11 @@ To let soc-ai ack/escalate/comment *and* keep a forensic trail:
 > Whatever you leave off is invisible, and **nothing tells you**. On 2026-08-05 a
 > production install running `.ds-logs-*-so-*,logs-synth-*` had no access to ~117K
 > `system.auth` records and ~48M `system.syslog` records. Every query succeeded, the
-> pattern still matched 139M documents so `soc-ai doctor` stayed green, and an
-> investigation reached the wrong conclusion because the login evidence wasn't there.
+> pattern still matched 139M documents so `soc-ai doctor` stayed green at the time,
+> and an investigation reached the wrong conclusion because the login evidence wasn't
+> there. The doctor's **index pattern coverage** check now catches this exact shape by
+> name (alerts present, zero auth/syslog under the same pattern); the count below is
+> still the fastest way to verify it by hand.
 >
 > **If you are upgrading and previously narrowed this value, widen it now** — in `.env`
 > (`EVENTS_INDEX_PATTERN=logs-*`, then restart) or live from **Config → Queries → Events

@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import timedelta
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 from soc_ai import __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
@@ -23,6 +23,8 @@ from soc_ai.api.webui._shared import (
 )
 from soc_ai.bootstrap_credential import clear_bootstrap_credential
 from soc_ai.config import Settings
+from soc_ai.demo.guard import is_demo
+from soc_ai.doctor import CheckResult, run_doctor
 from soc_ai.store import auth as auth_svc
 from soc_ai.store import host_dossier as dossier_svc
 from soc_ai.store import hunts as hunts_svc
@@ -800,6 +802,158 @@ async def health(
     if settings.pcap_enabled:
         out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))
     return out
+
+
+# ── Preflight (cached doctor checks minus fitness) — Dashboard setup-health ─
+#
+# The Wave-1 `soc-ai doctor` checks, reachable from the app itself: a closed
+# projection any authenticated caller may read (DossierSweepHealthOut
+# precedent, routes_dossier.py), plus an admin-only row-level detail. Fitness
+# (worst-case ~130s, _FITNESS_TIMEOUT_S) is excluded — run_doctor's slowest
+# remaining check is upstream reachability at _REACH_TIMEOUT_S=15s, and the
+# gather runs concurrently, so a cold-cache first hit costs at most ~15s. That
+# is fine for a background poll (the Dashboard card polls every 5 minutes)
+# and never acceptable for a page load, which is why it is TTL-cached below.
+
+_PREFLIGHT_TTL_S = 600.0  # 10 minutes: the checks hit SO/ES/the gateway, and
+# the FE polls every 5 minutes, so this amortizes to about one real doctor run
+# per two poll cycles instead of one per poll.
+
+
+class PreflightSummaryOut(BaseModel):
+    """Closed preflight projection any authenticated caller may read.
+
+    ``extra="forbid"`` so a refactor can't quietly widen this past the four
+    fields the Dashboard card is allowed to see — row-level detail (names,
+    hints) is admin-only, via :class:`PreflightDetailOut`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["green", "degraded"]
+    failing: int
+    warned: int
+    checked_at: str
+
+
+class PreflightRowOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    status: str
+    detail: str
+    hint: str = ""
+
+
+class PreflightDetailOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[PreflightRowOut]
+    checked_at: str
+
+
+async def _cached_preflight(request: Request, *, refresh: bool) -> tuple[list[CheckResult], str]:
+    """The doctor checks (minus fitness), TTL-cached on app state (single-flight).
+
+    Mirrors :func:`_cached_health_probes` exactly, including why the LOCK
+    matters as much as the TTL: without it, several concurrent pollers hitting
+    a cold or just-expired cache would each launch their own full doctor
+    gather (worst case ~15s apiece, hitting SO/ES/the gateway every time)
+    instead of collapsing onto one run. ``refresh=True`` (the detail route's
+    ``?refresh=true``) bypasses a fresh-enough cache on purpose, for an
+    explicit "recheck now" action; either way the result is re-cached so the
+    TTL clock restarts from the run that actually happened.
+    """
+    state: Any = request.app.state
+    settings = get_settings_dep(request)
+
+    # Third instance of the demo false-alarm class already hotfixed for
+    # probe_llm (soc_ai/webui/probes.py:226-233) and probe_model_fitness
+    # (soc_ai/webui/probes.py:828-841): every check that reaches an upstream
+    # would hit the egress guard and FAIL unconditionally — demo mode —
+    # replayed fixtures, no live upstreams; the egress guard's refusal is the
+    # demo working as designed, not degradation. Short-circuit before the
+    # lock/doctor with a synthetic green result, cached normally so the TTL
+    # machinery stays uniform.
+    if is_demo(settings):
+        now = time.monotonic()
+        checked_at = datetime.now(tz=UTC).isoformat()
+        result: tuple[list[CheckResult], str] = ([], checked_at)
+        # Never actually read back: every future call re-hits this same
+        # is_demo branch and returns before reaching the cache read further
+        # down. Written anyway only so `_preflight_cache` holds the same
+        # (monotonic-time, result) shape whether or not the branch above ran.
+        state._preflight_cache = (now, result)
+        return result
+
+    lock = getattr(state, "_preflight_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        state._preflight_lock = lock
+    async with lock:
+        now = time.monotonic()
+        cached = getattr(state, "_preflight_cache", None)
+        # Two concurrent ?refresh=true admins each pass the `not refresh` gate
+        # and both re-run the doctor (serialized by the lock, not deduped) —
+        # accepted: the route is admin-gated and the double-run is bounded by
+        # however many admins click "recheck now" at once, not open to the
+        # public.
+        if not refresh and cached is not None and now - cached[0] < _PREFLIGHT_TTL_S:
+            return cached[1]  # type: ignore[no-any-return]
+        rows = await run_doctor(settings, include_fitness=False)
+        checked_at = datetime.now(tz=UTC).isoformat()
+        result = (rows, checked_at)
+        state._preflight_cache = (now, result)
+        return result
+
+
+@router.get("/health/preflight", response_model=PreflightSummaryOut)
+async def health_preflight(request: Request) -> PreflightSummaryOut:
+    """Closed setup-health summary for any authenticated caller.
+
+    Backs the Dashboard's persistent setup-health card. ``degraded`` iff any
+    check FAILed; WARN rows are counted but never flip the status (the same
+    exit_code semantics ``soc-ai doctor`` uses on the CLI). INFO rows are
+    excluded from both counts.
+
+    Latency: a cold cache runs the full doctor gather concurrently, so
+    worst-case first-hit latency is ~``_REACH_TIMEOUT_S`` (15s) — the slowest
+    check still included once fitness is excluded. That is fine for a
+    background poll and never acceptable for a page load; the FE polls this
+    every 5 minutes, and ``_PREFLIGHT_TTL_S`` (10 minutes) amortizes it to
+    roughly one real doctor run per two poll cycles.
+    """
+    rows, checked_at = await _cached_preflight(request, refresh=False)
+    graded = [r for r in rows if r.status in ("PASS", "WARN", "FAIL")]
+    failing = sum(1 for r in graded if r.status == "FAIL")
+    warned = sum(1 for r in graded if r.status == "WARN")
+    return PreflightSummaryOut(
+        status="degraded" if failing else "green",
+        failing=failing,
+        warned=warned,
+        checked_at=checked_at,
+    )
+
+
+@router.get(
+    "/health/preflight/detail",
+    response_model=PreflightDetailOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def health_preflight_detail(request: Request, refresh: bool = False) -> PreflightDetailOut:
+    """Admin-only row-level detail behind the summary above.
+
+    ``?refresh=true`` bypasses the TTL cache for an explicit "recheck now"
+    action; otherwise it serves the same cached rows the summary reads.
+    """
+    rows, checked_at = await _cached_preflight(request, refresh=refresh)
+    return PreflightDetailOut(
+        rows=[
+            PreflightRowOut(name=r.name, status=r.status, detail=r.detail, hint=r.hint)
+            for r in rows
+        ],
+        checked_at=checked_at,
+    )
 
 
 class AboutOut(BaseModel):

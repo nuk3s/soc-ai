@@ -26,6 +26,13 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getAbout: vi.fn(),
   getGeneralChat: vi.fn(),
   postGeneralChat: vi.fn(),
+  // Setup-health card: unconditional on mount, so every Dashboard-rendering
+  // test needs it named or the global fetch guard rejects loudly. Green here
+  // (this file isn't about setup health), so the admin-only detail read is
+  // never reached regardless of role.
+  getMe: vi.fn().mockResolvedValue({ username: 'ana', role: 'analyst', status: '' }),
+  getPreflight: vi.fn().mockResolvedValue({ status: 'green', failing: 0, warned: 0, checked_at: '2026-08-19T00:00:00+00:00' }),
+  getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
 }));
 
 import { Dashboard } from './Dashboard';

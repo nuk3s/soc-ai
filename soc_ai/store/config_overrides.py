@@ -54,6 +54,11 @@ class SettingSpec:
     # Secret value: persisted Fernet-encrypted, never rendered back, write-only
     # (an empty submission leaves it unchanged). Requires a config_secret_key.
     secret: bool = False
+    day1: bool = False
+    """Day-1 tier: shown by default in the Config console. Everything else sits
+    behind a per-section Advanced fold. Default False so a NEW setting is
+    hidden-by-default — the day-1 wall cannot regrow by accident. Hard bound
+    (<=10) and the exact curated set are pinned by tests/test_config_day1_tier.py."""
     # Fixed-choice string setting (type="select"): the exact allowed values, in
     # display order. Membership is enforced in coerce()/_validate_typed(), so a
     # typo'd override fails the SAVE instead of crashing agent construction on
@@ -161,6 +166,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Analyst model",
         section="Agent",
         hot=True,
+        day1=True,
         help=(
             "LiteLLM model the analyst agent uses for every investigation. "
             "A bad value fails investigations."
@@ -353,6 +359,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Investigate sweep: max alerts per run",
         section="Triage automation",
         hot=True,
+        day1=True,
         help="Cap on how many alerts a single Bulk/Auto-Investigate run will investigate.",
         min_value=1,
         max_value=500,
@@ -438,6 +445,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Auto-Investigate minimum severity",
         section="Triage automation",
         hot=True,
+        day1=True,
         help=(
             "Sweeps triage this severity and above (critical, high, medium, low). "
             "Default: high — triages critical and high detections. "
@@ -466,6 +474,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Continuous auto-investigate (drain the backlog automatically)",
         section="Triage automation",
         hot=True,
+        day1=True,
         help=(
             "Run Auto-Investigate on a schedule so the untriaged backlog drains itself — "
             "no ⚡ click needed. Sweeps every detection at/above the minimum severity "
@@ -479,6 +488,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Continuous auto-investigate interval (minutes)",
         section="Triage automation",
         hot=True,
+        day1=True,
         help="Minimum minutes between scheduled sweeps. Lower drains faster but costs more LLM.",
         min_value=1,
         max_value=1440,
@@ -536,6 +546,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Events index pattern",
         section="Queries",
         hot=True,
+        day1=True,
         help=(
             "Wildcard ES index/alias pattern for SO events (e.g. *:so-* or logs-*). "
             "Used by every alert/event query."
@@ -575,6 +586,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Web-UI alerts feed query (OQL)",
         section="Queries",
         hot=True,
+        day1=True,
         help=(
             "OQL filter selecting which events appear in the alerts feed "
             "(default tags:alert). Read fresh on every feed fetch."
@@ -1201,6 +1213,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Notifications enabled (outbound webhook)",
         section="Notifications",
         hot=True,
+        # Day1 (final-review I6, curated in as the 8th decision): hot,
+        # non-danger, non-secret — passes the invariant test
+        # (test_day1_specs_are_hot_and_never_danger_or_secret). The master
+        # toggle is the one outbound-egress call worth a day-one look; its
+        # per-trigger/format/threshold siblings stay behind Advanced.
+        day1=True,
         help=(
             "Master switch. Off (default) = zero egress: no webhook is ever called. "
             "On lets soc-ai POST a notification to your configured webhook on the "

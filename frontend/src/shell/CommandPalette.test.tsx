@@ -32,6 +32,9 @@ const setting = (key: string, label: string, help: string): Setting => ({
   apply: 'hot-apply',
   type: 'text',
   value: '',
+  // None of this fixture's keys are in the real day1 curation — this file
+  // tests the palette's own search/navigate contract, not the tier split.
+  day1: false,
 });
 
 const CONFIG_FIXTURE: Config = {
@@ -87,9 +90,9 @@ describe('CommandPalette', () => {
     getConfigMock.mockResolvedValue(CONFIG_FIXTURE);
   });
 
-  it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest', async () => {
+  it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest/Operate', async () => {
     await openPalette();
-    for (const label of ['Dashboard', 'Notifications', 'Backtest', 'Alerts', 'Investigations', 'Hunts', 'Runbooks', 'Config']) {
+    for (const label of ['Dashboard', 'Notifications', 'Backtest', 'Alerts', 'Investigations', 'Hunts', 'Operate', 'Runbooks', 'Config']) {
       expect(screen.getByRole('option', { name: new RegExp(`${label}\\s+Go to`) })).toBeInTheDocument();
     }
   });

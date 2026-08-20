@@ -32,6 +32,13 @@ vi.mock('../lib/api', async (importOriginal) => ({
   startQualityEval: vi.fn(),
   getDataSources: vi.fn().mockRejectedValue(new Error('403 Forbidden')),
   getQualityTrend: vi.fn().mockRejectedValue(new Error('403 Forbidden')),
+  // Setup-health card: unconditional on mount, so every Dashboard-rendering
+  // test needs it named or the global fetch guard rejects loudly. Green here
+  // (this file isn't about setup health) — matching the server contract,
+  // which already short-circuits preflight to green in demo mode.
+  getMe: vi.fn().mockResolvedValue({ username: 'ana', role: 'analyst', status: '' }),
+  getPreflight: vi.fn().mockResolvedValue({ status: 'green', failing: 0, warned: 0, checked_at: '2026-08-19T00:00:00+00:00' }),
+  getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
 }));
 
 import { Dashboard } from './Dashboard';

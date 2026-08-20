@@ -1,77 +1,91 @@
 # Quickstart
 
-Get soc-ai triaging alerts on your grid in a few minutes.
+From `git clone` to an AI verdict on one of **your** alerts in about 30
+minutes — most of it the one-time Security Onion prerequisites. Try the
+demo first; it costs five.
 
-## Prerequisites
-
-You'll need:
-
-- a **Linux host** with `git` and `curl`,
-- **network reach** to your Security Onion grid, and
-- a **LiteLLM gateway** serving at least one model.
-
-`setup.sh` handles Docker for you, including the automatic install on RHEL / Rocky /
-Alma 10.
-
-!!! warning "Read the SO prerequisites first"
-    First-time installers should skim the
-    [Security Onion account + firewall prerequisites](SECURITY-ONION-SETUP.md) before
-    running the installer. Pinholing soc-ai's IP through SO's firewall and the audit-log
-    role grant are the two things that reliably bite.
-
-`git` and `curl` aren't preinstalled on minimal images, so add them first:
-
-=== "RHEL / Rocky / Alma / Fedora"
-
-    ```bash
-    sudo dnf install -y git curl
-    ```
-
-=== "Debian / Ubuntu"
-
-    ```bash
-    sudo apt install -y git curl
-    ```
-
-## Install
+## 0. See it working first (5 minutes, no SO, no LLM)
 
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
+docker compose -f docker-compose.demo.yml up --build
+# → http://127.0.0.1:8080/ui/alerts
+```
+
+A full local replay of recorded investigations, hunts, and a backtest — the
+same console you're about to connect for real, on canned data. Nothing
+leaves the box. (The hosted twin: [the live demo](https://soc-ai-demo.onrender.com/).)
+
+## 1. What you need for the real thing
+
+- A **Linux host** with `git` and `curl` (`setup.sh` installs Docker itself if
+  needed, including on RHEL / Rocky / Alma 10).
+- **Network reach** to your Security Onion grid — the SO web UI and
+  Elasticsearch on TCP 9200. Pinhole this host's IP through SO's firewall:
+  [SO prerequisites](SECURITY-ONION-SETUP.md).
+- **An AI model, one of two routes** (the installer asks which):
+
+| Route | What it is | Day-1 cost |
+| --- | --- | --- |
+| **Local / self-hosted** (primary) | Any OpenAI-compatible endpoint you run — a LiteLLM gateway, vLLM, Ollama. No backend yet? The bundled profile stands one up: [Standing one up](LESSER_MODELS.md#standing-one-up). | Model download + hardware |
+| **Cloud API key** | OpenRouter or another OpenAI-compatible provider. The installer turns on **redacted egress** (internal IPs, hostnames, usernames, MACs, and internal-domain emails tokenized before anything leaves; the reversal map stays local) and prints exactly what the provider sees. | An API key; alert data (redacted) leaves your network |
+
+```bash
+# minimal images lack git/curl:
+sudo dnf install -y git curl    # RHEL / Rocky / Alma / Fedora
+sudo apt install -y git curl    # Debian / Ubuntu
+```
+
+## 2. The one Security Onion step people skip (don't)
+
+soc-ai's tamper-evident audit log needs an Elasticsearch write grant the stock
+`analyst` role doesn't have — and it **fails closed**: without the grant,
+every ack / escalate / comment aborts, silently. One command against your SO
+manager:
+
+```bash
+ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh
+```
+
+You can run it before or after the installer; the doctor (below) tells you if
+it's missing. Details: [SO prerequisites](SECURITY-ONION-SETUP.md).
+
+## 3. Install
+
+```bash
 ./setup.sh
 ```
 
-`setup.sh` walks you through the connection settings and checks them *before* it builds
-anything (a wrong password or an unreachable gateway fails in seconds, not after a
-three-minute build), lets you pick your model from the gateway's live list (it
-authenticates to fetch it), generates the secrets and a TLS cert, brings the stack up, and
-prints the URL and admin password.
+The installer validates the SO/ES credentials **before** the ~3-minute build,
+asks the local-vs-cloud model question, lets you pick the model — a curated
+shortlist on the cloud route, your endpoint's live list on the local one —
+offers day-1 auto-triage (every 5 min, capped at 25
+targets a sweep, high-severity and up) and the 10-runbook starter pack,
+generates secrets and a TLS cert, starts the stack, and finishes with the
+**doctor**: a pass/fail table over every dependency — connectivity by layer
+(DNS / TCP / TLS), ES privileges *including the audit grant*, index-pattern
+coverage, and the model's measured fitness on the real triage contract. Every
+failing line names its fix.
+
+Re-run it any time: `docker exec soc-ai python -m soc_ai doctor`.
 
 !!! tip "Unattended installs"
-    To stand up more hosts without the prompts, fill in `setup.conf` once and run
-    `./setup.sh --auto`.
+    Fill in `setup.conf` once and run `./setup.sh --auto` on the next host.
 
-!!! tip "Something not working?"
-    Run the doctor: `docker exec soc-ai python -m soc_ai doctor` (or `uv run soc-ai doctor`
-    from a source checkout). It checks config, the local store + migrations, Security Onion,
-    Elasticsearch, the gateway, and the analyst model's fitness, and prints a pass/fail table with a
-    fix hint on every failing line.
+## 4. Work an alert
 
-Full Docker detail (required mounts, SELinux relabeling, upstream TLS trust
-via `*_VERIFY_SSL`, the port-8443-vs-SO-nginx conflict, and the manual + rsync/systemd
-paths) is in [Docker deployment](DOCKER.md).
-
-## Work an alert in the browser
-
-Open `https://<host>:8443/app`, accept the self-signed cert, and sign in as `admin`. Pick
-a detection, hit **Investigate**, and watch the agent work live: it pulls the
-alert and its Zeek/PCAP context, enriches the indicators, and lands an evidence-cited
-verdict. Anything it recommends writing back to Security Onion waits in the report as a
-recommended action until you execute it with one click.
+Open `https://<host>:8443/app`, accept the self-signed cert, sign in as
+`admin` with the printed password. Pick a detection, hit **Investigate**, and
+watch the agent pull the alert's context, enrich the indicators, and land an
+evidence-cited verdict. Write-backs wait for your click. If you enabled
+auto-triage, the backlog starts draining on its own — check back in five
+minutes.
 
 ![soc-ai web UI: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline](img/screenshot-investigation.png)
 
 Next steps:
 
-- [Web console guide](WEBUI_GUIDE.md): triage, auto-triage, investigations, the admin config page
-- [Agent tools](AGENT_TOOLS.md): every tool the agent can call, and the guardrails on them
-- [Safety model](SAFETY_MODEL.md): the analyst write path, audit schema, and Oracle redaction
+- [Web console guide](WEBUI_GUIDE.md) — triage, auto-triage, investigations, config
+- [Running on a lesser model](LESSER_MODELS.md) — standing up a backend, qualifying small/slow models
+- [Agent tools](AGENT_TOOLS.md) · [Safety model](SAFETY_MODEL.md)
+- Full Docker detail (mounts, SELinux, TLS trust, port conflicts): [Docker deployment](DOCKER.md)

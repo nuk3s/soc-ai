@@ -1,0 +1,84 @@
+# OPTIONAL local LLM backend for soc-ai — Ollama serving the model, LiteLLM
+# proxying it under the stable alias `soc-ai-analyst`.
+#
+# For the local route when you have no model server yet. Joins the main
+# stack's Docker network so the app reaches it as http://litellm:4000 with
+# nothing published to the host at all.
+#
+# Usage (from the repo root, main stack already up — it owns the network):
+#   docker compose -f docker-compose.llm.yml up -d
+#   docker compose -f docker-compose.llm.yml exec ollama ollama pull qwen3:14b
+#   # then in .env:  LITELLM_BASE_URL=http://litellm:4000
+#   # and qualify it:  docker compose exec soc-ai python -m soc_ai model-probe
+#
+# Ordering note: on a FRESH install, run ./setup.sh before this file and enter
+# http://litellm:4000 at its gateway-URL prompt (accept the model-list warning
+# — the host can't resolve that name yet); it seeds .env for you. Editing
+# .env by hand afterward instead? Apply it with `docker compose up -d`, not
+# `restart` — restart does not re-read .env.
+#
+# Model choice: qwen3:14b is a reasonable tool-calling default on 16 GB+ of
+# RAM/VRAM; docs/LESSER_MODELS.md covers qualifying ANY candidate with
+# model-probe before pointing triage at it. Swap the pull + litellm.llm.yaml
+# entry freely.
+#
+# Network: `soc-ai_default` below is Compose's own default project network
+# name, derived from the repo directory name (docker-compose.yml declares no
+# explicit `networks:`, so Compose falls back to `<project>_default`, and the
+# project name defaults to the directory basename — `soc-ai` for a normal
+# clone). Cloned into a differently named directory, or already running the
+# main stack under a custom COMPOSE_PROJECT_NAME? Export that same
+# COMPOSE_PROJECT_NAME before running this file too, so `<project>_default`
+# still resolves to the network the main stack actually created.
+#
+# Tags are PINNED (verified against the registries 2026-08-19). Never run
+# :latest — it's an unaudited moving target.
+
+services:
+
+  ollama:
+    image: ollama/ollama:0.32.14
+    container_name: soc-ai-ollama
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # cap_drop ALL untested against ollama's runtime needs (GPU passthrough
+    # uses device requests, not caps) — hardened to no-new-privileges;
+    # tighten further if your deployment proves it out.
+    security_opt:
+      - no-new-privileges:true
+    # No memory limit on purpose: a cap below the model's working set turns a
+    # slow load into an OOM kill — size the host instead (14b Q4 ≈ 10 GB
+    # working set).
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.97.0
+    container_name: soc-ai-litellm
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm.llm.yaml:/etc/litellm/config.yaml:ro,Z  # see docker-compose.yml's mounts note: SELinux relabel, no-op elsewhere
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  ollama_models:
+
+networks:
+  default:
+    name: soc-ai_default
+    external: true

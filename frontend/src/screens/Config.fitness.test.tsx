@@ -41,6 +41,10 @@ const GROUPS = vi.hoisted(() => [
         apply: 'hot-apply',
         type: 'text',
         value: 'analyst-model-x',
+        // analyst_model IS one of the real curated day1 keys — day1: true
+        // keeps this group's Advanced fold empty so the fitness chip under
+        // test renders on mount, same as before the tier split existed.
+        day1: true,
       },
     ],
   },

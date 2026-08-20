@@ -6,13 +6,15 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.2.6-3fb950" alt="1.2.6">
+  <img src="https://img.shields.io/badge/status-1.2.9-3fb950" alt="1.2.9">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
 ### [Try the live demo](https://soc-ai-demo.onrender.com/)
 
 Click through recorded investigations, hunts, and a backtest in the real console. No install, no login, and nothing leaves the box.
+
+Or run the same demo locally in five minutes, no SO or model needed: `docker compose -f docker-compose.demo.yml up --build` → `http://127.0.0.1:8080`.
 
 </div>
 
@@ -93,7 +95,9 @@ model to work on your queue.
 
 ## Quickstart
 
-You'll need a Linux host with `git` and `curl`, network reach to your SO grid, and a LiteLLM gateway serving at least one model. `setup.sh` handles Docker for you, including the automatic install on RHEL / Rocky / Alma 10. **First-time installers: skim [the Security Onion account + firewall prerequisites](docs/SECURITY-ONION-SETUP.md) first.** Pinholing soc-ai's IP through SO's firewall and the audit-log role grant are the two things that reliably bite.
+Full path — including the five-minute local demo and the one Security Onion grant everyone skips: [docs/quickstart.md](docs/quickstart.md).
+
+You'll need a Linux host with `git` and `curl`, network reach to your SO grid, and an AI model on one of two routes — a local OpenAI-compatible endpoint you run (primary; the repo can stand one up: [docs/LESSER_MODELS.md](docs/LESSER_MODELS.md)), or a cloud API key with redacted egress. `setup.sh` asks which and handles Docker for you, including the automatic install on RHEL / Rocky / Alma 10. **First-time installers: skim [the Security Onion account + firewall prerequisites](docs/SECURITY-ONION-SETUP.md) first.** Pinholing soc-ai's IP through SO's firewall and the audit-log role grant are the two things that reliably bite.
 
 `git` and `curl` aren't preinstalled on minimal images, so add them first:
 
@@ -113,13 +117,13 @@ git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 
 > **Prefer a prebuilt image?** Once a tagged release is published, `./setup.sh --prebuilt` pulls it from [GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai) instead of building, a faster path (pin a version with `SOC_AI_IMAGE_TAG=<x.y.z>`). Until the first release tag lands, no image is published yet, so `--prebuilt` will report `error from registry: denied`; use plain `./setup.sh` (above) to build from source. [Watch the releases page](https://github.com/nuk3s/soc-ai/releases) for the first tag.
 
-`setup.sh` walks you through the connection settings and checks them *before* it builds anything (a wrong password or an unreachable gateway fails in seconds, not after a three-minute build), lets you pick your model from the gateway's live list (it authenticates to fetch it), generates the secrets and a TLS cert, brings the stack up, and prints the URL and admin password:
+`setup.sh` walks you through the connection settings and checks them *before* it builds anything, asks the local-vs-cloud model question, lets you pick your model from the endpoint's live list, offers day-1 auto-triage and the runbook starter pack, generates the secrets and a TLS cert, brings the stack up, runs the doctor, and prints the URL and admin password:
 
 <div align="center">
-  <img src="docs/img/install-walkthrough.gif" alt="soc-ai install: git clone, guided ./setup.sh (SO + LiteLLM connection check, API-key + model pick, build), and the running banner with the URL and admin password" width="900">
+  <img src="docs/img/install-walkthrough.gif" alt="soc-ai install: git clone, guided ./setup.sh (SO connection check, the local-vs-cloud model route, model pick, day-1 automation prompts, build, and the doctor preflight), and the running banner with the URL and admin password" width="900">
 </div>
 
-> **Something not working?** Run the doctor: `docker exec soc-ai python -m soc_ai doctor` (or `uv run soc-ai doctor` from a source checkout). It checks the whole dependency surface (config, local store + migrations, Security Onion, Elasticsearch, the gateway, and the analyst model's actual fitness) and prints a pass/fail table with a fix hint on every failing line.
+> **Something not working?** Run the doctor: `docker exec soc-ai python -m soc_ai doctor` (or `uv run soc-ai doctor` from a source checkout). It checks the whole dependency surface (config, the local store + migrations, connectivity by layer (DNS / TCP / TLS), Security Onion, Elasticsearch — including the audit-grant privilege and index-pattern coverage — the gateway, and the analyst model's measured fitness) and prints a pass/fail table with a fix hint on every failing line.
 
 > **Your data is one command to save:** `soc-ai backup` snapshots the live store (investigations, audit history, runbooks, config) into a portable tar.gz, safe while the app runs, and `soc-ai restore` puts it back. See [docs/DOCKER.md](docs/DOCKER.md#backup-and-restore).
 
@@ -154,6 +158,7 @@ docs as below, searchable, with dark mode. Build it locally with `uv run --group
 - [docs/OQL_PRIMER.md](docs/OQL_PRIMER.md): the query language the agent searches with
 - [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md): the write-action flow, the audit schema, and redaction (Oracle + cloud analyst models)
 - [docs/DOCKER.md](docs/DOCKER.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): installing it
+- [docs/LESSER_MODELS.md](docs/LESSER_MODELS.md): standing up a backend, and qualifying small/slow models with `model-probe`
 - [docs/ROADMAP.md](docs/ROADMAP.md): where the project is and where it's going
 - [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](.github/SECURITY.md)
 
@@ -170,7 +175,7 @@ cd frontend && npm ci && npm run build   # the React console
 ## Where it's headed
 
 <div align="center">
-  <img src="docs/img/roadmap.svg" alt="soc-ai roadmap: 1.0 triage engine, 1.0.x hunt console, 1.1 measurement, and 1.2 operations all shipped; 1.2.6 is current; 1.3 and later milestones are planned" width="900">
+  <img src="docs/img/roadmap.svg" alt="soc-ai roadmap: 1.0 triage engine, 1.0.x hunt console, 1.1 measurement, and 1.2 operations all shipped; 1.2.9 is current; 1.3 and later milestones are planned" width="900">
 </div>
 
 The project moved quickly and it moved in public. 1.0 shipped the triage engine and the always-on console in June 2026. The 1.0.x line added the Hunt Console, backtests, runbooks, and grid discovery. 1.1 made quality continuously measured, and 1.2 was built from fourteen findings out of a full analyst shift on a live deployment.

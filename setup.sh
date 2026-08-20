@@ -8,6 +8,7 @@
 #   Automated, named file:    ./setup.sh --auto myhost.conf
 #   Pre-seed interactive:     ./setup.sh --config myhost.conf
 #   Prebuilt image (no build): ./setup.sh --prebuilt   # pulls ghcr.io/nuk3s/soc-ai
+#   Test/CI mode:              ./setup.sh --auto --env-only   # write .env, then stop
 #
 # It installs Docker if missing, collects connection settings (validating them
 # before the build), generates the encryption key + admin password + a TLS cert,
@@ -17,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ── args ──────────────────────────────────────────────────────────────────────
-AUTO=0; CONF=""; SHOW_HELP=0; PREBUILT=0
+AUTO=0; CONF=""; SHOW_HELP=0; PREBUILT=0; ENVONLY=0
 DEFAULT_CONF="setup.conf"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     -c|--config|--file) CONF="${2:-}"; shift ;;
     -p|--prebuilt) PREBUILT=1 ;;
     -h|--help) SHOW_HELP=1 ;;
+    --env-only) ENVONLY=1 ;;
     *.conf|*.txt|*.env) CONF="$1" ;;     # bare filename → config file
     *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
   esac
@@ -32,7 +34,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $SHOW_HELP -eq 1 ]]; then
-  sed -n '3,15p' "$0" | sed 's/^#\s\{0,1\}//; s/^#$//'
+  sed -n '3,16p' "$0" | sed 's/^#\s\{0,1\}//; s/^#$//'
   exit 0
 fi
 
@@ -75,11 +77,38 @@ asksecret(){ local __v=$1 __p=$2 __cur=${!1:-} ans
   if [[ $AUTO -eq 1 || -n $__cur ]]; then printf -v "$__v" '%s' "$__cur"; return; fi
   read -rsp "  $__p: " ans || true; echo; printf -v "$__v" '%s' "$ans"; }
 yesno(){ local __v=$1 __p=$2 __d=${3:-y} ans
+  # The default can be a raw, unvalidated conf-file value (e.g. AUTO_TRIAGE=yes
+  # or STARTER_PACK=true), not just the clean y/n every existing caller passes
+  # (literals, or b2yn()'s always-y/n output) — coerce ONCE, up front, so
+  # --auto and the interactive Enter-takes-default fallback agree on what
+  # counts as "yes" instead of each doing its own ad hoc test.
+  #
+  # Widened past a bare ^[Yy] so common truthy spellings in a hand-edited
+  # setup.conf (true/True/TRUE, 1, on/ON) also read as yes — every alternative
+  # except [Yy] is fully anchored (a leading ^ shared by the whole group, and
+  # its own trailing $) so it matches the WHOLE default value, not a prefix:
+  # "TRUE" isn't missed by a lowercase-only "true" test, and "online"/"1000"
+  # can't false-positive off the "on"/"1" arms the way an unanchored substring
+  # test would. A default of "" can't reach this test at all — `${3:-y}` above
+  # already turned it into "y" (bash's `:-` triggers on unset OR empty).
+  [[ $__d =~ ^([Yy]|[Tt][Rr][Uu][Ee]$|1$|[Oo][Nn]$) ]] && __d=y || __d=n
   if [[ $AUTO -eq 1 ]]; then printf -v "$__v" '%s' "$__d"; return; fi
   read -rp "  $__p ($([[ $__d == y ]] && echo 'Y/n' || echo 'y/N')): " ans || true
   ans=${ans:-$__d}; [[ $ans =~ ^[Yy] ]] && printf -v "$__v" '%s' y || printf -v "$__v" '%s' n; }
 
 httpcode(){ curl -k -s -o /dev/null -w '%{http_code}' -m "${2:-8}" "$1" 2>/dev/null || echo 000; }
+
+# Fetch a gateway/provider's /v1/models ids, sorted, one per line. Silent on
+# any failure (empty output) — callers tell "reachable but empty" from
+# "fetch failed" via `${#MODELS[@]}`. Shared by both LLM_ROUTE branches below.
+fetch_gateway_models(){
+  local base=$1 key=$2 insecure=$3 vflag=""
+  local hdr=()
+  [[ $insecure == n ]] && vflag="-k"
+  [[ -n $key ]] && hdr=(-H "Authorization: Bearer ${key}")
+  curl -fsS $vflag -m 12 "${hdr[@]}" "${base%/}/v1/models" 2>/dev/null \
+    | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | sort
+}
 
 # Resolve the release version to pin the prebuilt GHCR image to, so --prebuilt
 # never rides the mutable `:latest` tag (an unaudited moving target — every pull
@@ -134,6 +163,7 @@ hr
 info "Checking prerequisites…"
 for t in curl openssl; do command -v "$t" >/dev/null 2>&1 || die "'$t' is required but not installed (try: sudo dnf install -y $t  /  sudo apt install -y $t)"; done
 
+if [[ $ENVONLY -eq 0 ]]; then
 need_docker=0
 command -v docker >/dev/null 2>&1 || need_docker=1
 if [[ $need_docker -eq 0 ]] && ! docker compose version >/dev/null 2>&1; then
@@ -181,6 +211,7 @@ fi
 if docker info >/dev/null 2>&1; then DC="docker compose"
 else DC="sudo docker compose"; warn "Using sudo for docker this run — log out/in (or run 'newgrp docker') to use docker without sudo."; fi
 ok "Docker ready — $(docker --version 2>/dev/null | cut -d, -f1)"
+fi
 
 # ── 2. configuration (.env) ───────────────────────────────────────────────────
 hr
@@ -213,41 +244,112 @@ if [[ $RECFG == y ]]; then
   esac
 
   echo
-  info "LLM gateway (LiteLLM):"
-  ask LITELLM_BASE_URL "  Gateway URL" "${LITELLM_BASE_URL:-http://localhost:4000}"
-  asksecret LITELLM_API_KEY "  Gateway API key (blank if none)"
-  yesno LLM_TLS "  Verify the gateway's TLS cert? (No for a self-signed gateway)" "$(b2yn "${LITELLM_VERIFY_SSL:-true}")"
+  info "AI model — how will soc-ai reach one?"
+  echo "      1) Local / self-hosted endpoint you run (LiteLLM gateway, vLLM, Ollama) — nothing leaves your network"
+  echo "      2) Cloud API key (OpenRouter or another OpenAI-compatible provider) — no local infra, redacted egress"
+  ask LLM_ROUTE "  Route" "${LLM_ROUTE:-1}"
+  case $LLM_ROUTE in
+    1|2) ;;
+    *) die "LLM_ROUTE must be 1 (local) or 2 (cloud) — got '${LLM_ROUTE}'" ;;
+  esac
+  if [[ $LLM_ROUTE == 2 ]]; then
+    info "Cloud route — triage prompts leave this box, redacted first (disclosure below)."
+    ask LITELLM_BASE_URL "  Provider base URL" "${LITELLM_BASE_URL:-https://openrouter.ai/api/v1}"
+    asksecret LITELLM_API_KEY "  Provider API key"
+    yesno LLM_TLS "  Verify the provider's TLS cert? (Yes for real cloud providers; No only behind a TLS-inspecting proxy)" "$(b2yn "${LITELLM_VERIFY_SSL:-true}")"
+    ANALYST_CLOUD_REDACTION=true
+  else
+    info "LLM gateway (local / self-hosted; no backend yet? see docs/LESSER_MODELS.md → 'Standing one up'):"
+    ask LITELLM_BASE_URL "  Gateway URL" "${LITELLM_BASE_URL:-http://localhost:4000}"
+    asksecret LITELLM_API_KEY "  Gateway API key (blank if none)"
+    yesno LLM_TLS "  Verify the gateway's TLS cert? (No for a self-signed gateway)" "$(b2yn "${LITELLM_VERIFY_SSL:-true}")"
+    ANALYST_CLOUD_REDACTION=""
+  fi
 
-  # Fetch the gateway's model list so ANALYST_MODEL can't be silently wrong (a
-  # wrong value answers /v1/models fine but 400s every hunt). No python needed.
-  vflag=""; [[ $LLM_TLS == n ]] && vflag="-k"
-  hdr=(); [[ -n ${LITELLM_API_KEY:-} ]] && hdr=(-H "Authorization: Bearer ${LITELLM_API_KEY}")
-  mapfile -t MODELS < <(curl -fsS $vflag -m 12 "${hdr[@]}" "${LITELLM_BASE_URL%/}/v1/models" 2>/dev/null \
-    | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | sort)
   # HEAVY_MODEL is the old name for ANALYST_MODEL — honor it if a config file
   # still uses it, so upgrades don't silently lose the setting.
   ANALYST_MODEL="${ANALYST_MODEL:-${HEAVY_MODEL:-}}"
-  if [[ ${#MODELS[@]} -gt 0 ]]; then
-    ok "Gateway serves ${#MODELS[@]} models."
-    # default: existing value, else a sensible reasoning model if present
-    hv="${ANALYST_MODEL:-}"
-    if [[ -z $hv ]]; then for m in "${MODELS[@]}"; do [[ $m == *deepseek* || $m == *70b* || $m == *qwen*reason* ]] && { hv=$m; break; }; done; fi
+
+  if [[ $LLM_ROUTE == 2 ]]; then
+    # A cloud provider's /v1/models is a public catalog hundreds of ids long
+    # (OpenRouter's alone runs 400+) — enumerating it here the way the local
+    # route does below would bury a first-timer in irrelevant choices. Curated
+    # shortlist instead, with an escape hatch for any other id the provider
+    # serves.
+    #
+    # Curated cloud defaults — verified against openrouter.ai 2026-08-19
+    # (curl -s https://openrouter.ai/api/v1/models | python3 -c "import
+    # json,sys; [print(m['id']) for m in json.load(sys.stdin)['data']]" |
+    # sort): one id per family, the newest stable (non-preview, non-free-tier)
+    # release, each confirmed to advertise tools/tool_choice support. Any
+    # other OpenAI-compatible id works too — qualify it first with:
+    #   soc-ai model-probe --model <id>
+    CLOUD_MODELS=(
+      "anthropic/claude-sonnet-5"          # Anthropic — Sonnet-class
+      "openai/gpt-5.4-mini"                # OpenAI — flagship-mini, tool-calling
+      "deepseek/deepseek-v4-flash"         # DeepSeek — chat-class, non-reasoning
+      "qwen/qwen3-next-80b-a3b-instruct"   # Qwen — large instruct
+    )
     if [[ $AUTO -eq 1 ]]; then
-      ANALYST_MODEL="${ANALYST_MODEL:-$hv}"
+      ANALYST_MODEL="${ANALYST_MODEL:-${CLOUD_MODELS[0]}}"
     else
-      echo "    Pick the analyst model (used for every hunt):"
-      i=1; for m in "${MODELS[@]}"; do printf '      %2d) %s%s\n' "$i" "$m" "$([[ $m == "$hv" ]] && echo '   ← suggested')"; i=$((i+1)); done
-      read -rp "  Number or model name [${hv:-1}]: " sel || true
-      sel=${sel:-$hv}
-      if [[ $sel =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#MODELS[@]} )); then ANALYST_MODEL="${MODELS[$((sel-1))]}"
-      else ANALYST_MODEL="$sel"; fi
+      echo "    Known-good cloud models (tool-calling verified classes):"
+      i=1; for m in "${CLOUD_MODELS[@]}"; do printf '      %2d) %s\n' "$i" "$m"; i=$((i+1)); done
+      read -rp "  Number, or any model id from your provider [1]: " sel || true
+      sel=${sel:-1}
+      if [[ $sel =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#CLOUD_MODELS[@]} )); then
+        ANALYST_MODEL="${CLOUD_MODELS[$((sel-1))]}"
+      else
+        ANALYST_MODEL="$sel"
+      fi
     fi
-    printf '%s\n' " ${MODELS[*]} " | grep -q " ${ANALYST_MODEL} " \
-      && ok "Analyst model: ${B}${ANALYST_MODEL}${N}" \
-      || warn "ANALYST_MODEL '${ANALYST_MODEL}' isn't in the gateway list — hunts will fail until it is."
+    # Best-effort, silent validation against the provider's real list — same
+    # fetch the local route uses below, just not rendered as a picker.
+    mapfile -t MODELS < <(fetch_gateway_models "$LITELLM_BASE_URL" "${LITELLM_API_KEY:-}" "$LLM_TLS")
+    if [[ ${#MODELS[@]} -gt 0 ]]; then
+      printf '%s\n' " ${MODELS[*]} " | grep -q " ${ANALYST_MODEL} " \
+        && ok "Analyst model: ${B}${ANALYST_MODEL}${N}" \
+        || warn "ANALYST_MODEL '${ANALYST_MODEL}' isn't in the gateway list — hunts will fail until it is."
+    else
+      warn "Couldn't list gateway models (unreachable / wrong key / TLS mismatch)."
+    fi
   else
-    warn "Couldn't list gateway models (unreachable / wrong key / TLS mismatch)."
-    ask ANALYST_MODEL "  Analyst model your gateway serves" "${ANALYST_MODEL:-soc-ai-analyst}"
+    # Fetch the gateway's model list so ANALYST_MODEL can't be silently wrong (a
+    # wrong value answers /v1/models fine but 400s every hunt). No python needed.
+    mapfile -t MODELS < <(fetch_gateway_models "$LITELLM_BASE_URL" "${LITELLM_API_KEY:-}" "$LLM_TLS")
+    if [[ ${#MODELS[@]} -gt 0 ]]; then
+      ok "Gateway serves ${#MODELS[@]} models."
+      # default: existing value, else a sensible reasoning model if present
+      hv="${ANALYST_MODEL:-}"
+      if [[ -z $hv ]]; then for m in "${MODELS[@]}"; do [[ $m == *deepseek* || $m == *70b* || $m == *qwen*reason* ]] && { hv=$m; break; }; done; fi
+      if [[ $AUTO -eq 1 ]]; then
+        ANALYST_MODEL="${ANALYST_MODEL:-$hv}"
+      else
+        echo "    Pick the analyst model (used for every hunt):"
+        i=1; for m in "${MODELS[@]}"; do printf '      %2d) %s%s\n' "$i" "$m" "$([[ $m == "$hv" ]] && echo '   ← suggested')"; i=$((i+1)); done
+        read -rp "  Number or model name [${hv:-1}]: " sel || true
+        sel=${sel:-$hv}
+        if [[ $sel =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#MODELS[@]} )); then ANALYST_MODEL="${MODELS[$((sel-1))]}"
+        else ANALYST_MODEL="$sel"; fi
+      fi
+      printf '%s\n' " ${MODELS[*]} " | grep -q " ${ANALYST_MODEL} " \
+        && ok "Analyst model: ${B}${ANALYST_MODEL}${N}" \
+        || warn "ANALYST_MODEL '${ANALYST_MODEL}' isn't in the gateway list — hunts will fail until it is."
+    else
+      warn "Couldn't list gateway models (unreachable / wrong key / TLS mismatch)."
+      ask ANALYST_MODEL "  Analyst model your gateway serves" "${ANALYST_MODEL:-soc-ai-analyst}"
+    fi
+  fi
+
+  if [[ $LLM_ROUTE == 2 ]]; then
+    echo
+    info "Cloud egress disclosure — per investigation/hunt/chat turn, the provider sees:"
+    echo "      SENT:     the triage prompts — alert fields, related-event summaries, enrichment"
+    echo "                results, runbook excerpts — with internal IPs, hostnames, usernames,"
+    echo "                MACs, and internal-domain emails replaced by opaque tokens (the"
+    echo "                reversal map never leaves this box)."
+    echo "      NOT SENT: raw pcap files, credentials or .env contents, the audit trail."
+    echo "      Details:  docs/SAFETY_MODEL.md (redaction — Oracle + cloud analyst models)."
   fi
 
   echo
@@ -284,6 +386,20 @@ if [[ $RECFG == y ]]; then
   # it those three feeds are skipped on every `blocklists refresh` (Tor + cloud
   # prefixes still work). Blank = skip. Register at https://auth.abuse.ch/ .
   ask ABUSE_CH_AUTH_KEY "  abuse.ch Auth-Key (blank to skip URLhaus/ThreatFox/Feodo)" "${ABUSE_CH_AUTH_KEY:-}"
+  # MaxMind GeoLite2 (GeoIP/ASN enrichment). Free key: https://www.maxmind.com/en/geolite2/signup
+  # Documented in docs/DOCKER.md but previously missing here — GeoIP silently
+  # no-ops without it.
+  ask MAXMIND_LICENSE_KEY "  MaxMind GeoLite2 license key (blank to skip GeoIP/ASN)" "${MAXMIND_LICENSE_KEY:-}"
+
+  echo
+  info "Day-1 automation:"
+  # Plain yesno, no `case`/die validation like LLM_ROUTE's — deliberate. yesno's
+  # --auto branch coerces its default through the same ^[Yy] test the interactive
+  # branch uses (see yesno() above), so a junk conf value (e.g. AUTO_TRIAGE=maybe)
+  # degrades to "n", never an unsafe state; a hard validation gate would be
+  # redundant here.
+  yesno AUTO_TRIAGE "  Auto-triage the alert backlog on a schedule? (every 5 min, ≤25 targets/sweep, high-severity+)" "${AUTO_TRIAGE:-y}"
+  yesno STARTER_PACK "  Install the 10-runbook starter pack after start? (grounds verdicts; idempotent)" "${STARTER_PACK:-y}"
 
   CONFIG_SECRET_KEY=${CONFIG_SECRET_KEY:-$(genfernet)}
   BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-$(genpw)}
@@ -307,6 +423,9 @@ if [[ $RECFG == y ]]; then
     echo "LITELLM_API_KEY=${LITELLM_API_KEY}"
     echo "LITELLM_VERIFY_SSL=$([[ $LLM_TLS == y ]] && echo true || echo false)"
     echo "ANALYST_MODEL=${ANALYST_MODEL}"
+    [[ -n ${ANALYST_CLOUD_REDACTION:-} ]] && echo "ANALYST_CLOUD_REDACTION=true"
+    [[ -n ${MAXMIND_LICENSE_KEY:-} ]] && echo "MAXMIND_LICENSE_KEY=${MAXMIND_LICENSE_KEY}"
+    [[ ${AUTO_TRIAGE:-n} == y ]] && echo "AUTO_TRIAGE_SCHEDULE_ENABLED=true"
     [[ -n ${ABUSE_CH_AUTH_KEY:-} ]] && echo "ABUSE_CH_AUTH_KEY=${ABUSE_CH_AUTH_KEY}"
     # Prebuilt installs pin the image to a specific release rather than :latest
     # (an unaudited moving target). Source builds don't pull, so no pin is written.
@@ -344,8 +463,9 @@ if [[ $RECFG == y ]]; then
         echo "# soc-ai automated-install settings — consumed by ./setup.sh --auto"
         echo "# Contains secrets; keep private (chmod 600, gitignored)."
         for k in SO_HOST SO_VERIFY_SSL SO_USERNAME SO_PASSWORD ES_HOSTS ES_VERIFY_SSL \
-                 LITELLM_BASE_URL LITELLM_API_KEY LITELLM_VERIFY_SSL ANALYST_MODEL \
+                 LLM_ROUTE LITELLM_BASE_URL LITELLM_API_KEY LITELLM_VERIFY_SSL ANALYST_MODEL \
                  WEBUI_ALERTS_QUERY EVENTS_INDEX_PATTERN API_AUTH_REQUIRED \
+                 MAXMIND_LICENSE_KEY AUTO_TRIAGE STARTER_PACK \
                  CONFIG_SECRET_KEY BOOTSTRAP_ADMIN_PASSWORD; do
           case $k in
             SO_VERIFY_SSL|ES_VERIFY_SSL) v=$([[ $SO_TLS == y ]] && echo true || echo false) ;;
@@ -359,6 +479,11 @@ if [[ $RECFG == y ]]; then
       ok "Saved ${DEFAULT_CONF} (chmod 600). Reuse it on another host with: ./setup.sh --auto"
     fi
   fi
+fi
+
+if [[ $ENVONLY -eq 1 ]]; then
+  ok "env-only run: .env written; skipping cert generation, build, and start."
+  exit 0
 fi
 
 # ── 3. TLS certificate ────────────────────────────────────────────────────────
@@ -427,10 +552,79 @@ for _ in $(seq 1 60); do
 done
 if [[ $healthy -ne 1 ]]; then
   warn "Health check timed out. Two things to try, in order:"
-  warn "  1. Run the doctor — it pinpoints which dependency is unhappy (config, store, SO, ES, gateway, model):"
-  printf '          %s\n' "${B}${DC/ compose/} exec soc-ai python -m soc_ai doctor${N}"
+  warn "  1. The doctor runs next — read its FAIL lines, each carries a fix."
   warn "  2. Read the container logs:"
   printf '          %s\n' "${B}${DC} logs soc-ai${N}"
+fi
+
+# Run the doctor either way — healthy or not. /healthz is a liveness probe
+# (process up, DB reachable); the doctor is the fitness probe (config, store,
+# SO/ES reachability, the audit-write grant, AND check_model_fitness — a real
+# structured-output call against the configured analyst model). Both the
+# --prebuilt and source-build routes land here, so this is the one place every
+# install path ends in the same live check.
+hr
+info "Preflight — the doctor checks every dependency, the model's fitness, and the audit grant…"
+if $DC exec -T soc-ai python -m soc_ai doctor; then
+  ok "Preflight clean."
+elif [[ -z $($DC ps -q soc-ai 2>/dev/null) ]]; then
+  # `ps -q` (no -a) lists only currently-RUNNING containers for the service —
+  # empty means the exec above never reached the doctor at all (build/start
+  # failed, or the container crashed after the health poll), a compose-level
+  # problem, not a doctor finding. Narrating that as "doctor FAIL lines" would
+  # send the operator chasing fixes for checks that never ran.
+  warn "Couldn't run the doctor — the soc-ai container isn't up."
+  printf '        %s\n' "${B}${DC} ps${N}   /   ${B}${DC} logs soc-ai${N}"
+else
+  warn "Doctor reported FAIL lines above — each carries its fix."
+  warn "The audit-grant one is the classic: without it every ack/escalate/comment silently aborts."
+  printf '        %s\n' "${B}ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh${N}"
+fi
+
+# ── seed the runbook starter pack ─────────────────────────────────────────────
+if [[ ${STARTER_PACK:-y} == y ]]; then
+  # BOOTSTRAP_ADMIN_PASSWORD is set in this shell on a fresh configure; on a
+  # keep-existing-.env run, read it back from .env. .env is written as
+  # `.env.example` (which ships BOOTSTRAP_ADMIN_PASSWORD= empty and
+  # SOC_AI_PORT=8443) with the real managed block APPENDED after it, so the
+  # file INTENTIONALLY carries duplicate keys — dotenv semantics are
+  # last-value-wins, so any shell read-back has to take the LAST occurrence
+  # too, same as the app itself and the test harness's env_values() helper
+  # (tests/test_setup_script.py). A first-match read silently returns
+  # .env.example's placeholder/default instead of the real value.
+  if [[ -z ${BOOTSTRAP_ADMIN_PASSWORD:-} && -f .env ]]; then
+    BOOTSTRAP_ADMIN_PASSWORD=$(grep '^BOOTSTRAP_ADMIN_PASSWORD=' .env | tail -1 | cut -d= -f2- | tr -d '\r') || true
+  fi
+  # The managed block always writes SOC_AI_PORT=8443, but a keep-existing .env
+  # (RECFG=n) can carry a different port — read it back the same last-wins way
+  # as the password instead of assuming 8443. (The earlier health poll
+  # predates this task and stays hardcoded to 8443 — out of scope here.)
+  _port=$(grep '^SOC_AI_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '\r') || true
+  _port=${_port:-8443}
+  # genpw() (base64, tr -d '/+=') only ever emits alphanumerics, so naive JSON
+  # interpolation is safe for a freshly generated password — but a
+  # keep-existing .env can carry a user-set password with a quote or backslash
+  # in it. Escape both before they go inside the JSON string literal.
+  _pw_json=${BOOTSTRAP_ADMIN_PASSWORD//\\/\\\\}
+  _pw_json=${_pw_json//\"/\\\"}
+  info "Installing the runbook starter pack (idempotent)…"
+  jar=$(mktemp)
+  # The starter-pack route sits behind require_csrf_safe (soc_ai/api/security.py):
+  # ANY cookie-authenticated mutating request with no Origin/Referer matching the
+  # app's own origin is rejected 403 bad_origin — curl sends neither by default.
+  # Send an Origin that matches this exact request's scheme+host+port (verified
+  # live against the hermetic harness: the bare call 403s without this header).
+  if curl -fsk -c "$jar" -m 10 -X POST "https://localhost:${_port}/api/v1/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"admin\",\"password\":\"${_pw_json}\"}" >/dev/null 2>&1 \
+     && out=$(curl -fsk -b "$jar" -m 30 -X POST "https://localhost:${_port}/api/v1/runbooks/starter-pack" \
+        -H "Origin: https://localhost:${_port}" 2>/dev/null); then
+    ok "Runbook starter pack: ${out}"
+  else
+    warn "Couldn't install the pack automatically (changed admin password?) —"
+    warn "  click 'Load starter pack' on the Runbooks page instead."
+  fi
+  rm -f "$jar"
 fi
 
 # ── 5. seed enrichment ────────────────────────────────────────────────────────
@@ -460,6 +654,14 @@ else
 fi
 echo
 echo "    ${B}Recommended next steps:${N}"
+if [[ ${AUTO_TRIAGE:-n} == y ]]; then
+  echo "      • Auto-triage is ON — a sweep runs every 5 min (≤25 alerts, high-severity+)."
+  echo "        Turn it off in Config → Triage automation, or set AUTO_TRIAGE_SCHEDULE_ENABLED=false in .env."
+  if [[ ${LLM_ROUTE:-} == 2 ]]; then
+    echo "        Each sweep calls your cloud provider — metered spend starts now; cap or"
+    echo "        disable in Config → Triage automation."
+  fi
+fi
 echo "      • Back up before every upgrade:  ${DC} exec soc-ai python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz"
 echo "      • Schedule the blocklist refresh (feeds go stale without it):"
 echo "          cp scripts/cron.d/soc-ai-blocklists.example /etc/cron.d/soc-ai-blocklists   # edit the path first"

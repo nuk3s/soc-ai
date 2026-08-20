@@ -1,4 +1,4 @@
-import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard, Search, Server, Settings, SlidersHorizontal, Triangle, Zap } from 'lucide-react';
+import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard, Search, Server, Settings, SlidersHorizontal, Triangle, Wrench, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -100,8 +100,10 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Hosts', icon: <Server size={15} />, run: go('/hosts') },
       { group: 'Go to', label: 'Notifications', icon: <Bell size={15} />, run: go('/notifications') },
       { group: 'Go to', label: 'Hunts', icon: <Crosshair size={15} />, run: go('/hunts') },
-      { group: 'Go to', label: 'Backtest', icon: <History size={15} />, run: go('/backtest') },
+      // Operate group, sidebar order: the hub first, then its three items.
+      { group: 'Go to', label: 'Operate', icon: <Wrench size={15} />, run: go('/operate') },
       { group: 'Go to', label: 'Runbooks', icon: <BookOpen size={15} />, run: go('/runbooks') },
+      { group: 'Go to', label: 'Backtest', icon: <History size={15} />, run: go('/backtest') },
       { group: 'Go to', label: 'Config', icon: <Settings size={15} />, run: go('/config') },
       { group: 'Go to', label: 'About soc-ai', icon: <Info size={15} />, run: go('/config#about') },
       {

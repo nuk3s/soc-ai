@@ -18,6 +18,11 @@ vi.mock('./MaintenancePanel', () => ({ MaintenancePanel: () => null }));
 vi.mock('./RunbooksPanel', () => ({ RunbooksPanel: () => null }));
 vi.mock('./AboutPanel', () => ({ AboutPanel: () => null }));
 
+// Both settings are marked day1 — this suite is about section switching,
+// search, deep-links and the apply bar, not the tier split (that lives in
+// Config.day1tier.test.tsx). day1: true keeps every group's Advanced fold
+// empty (advItems.length === 0 skips the fold entirely), so these rows render
+// exactly as they did before the day1 feature existed.
 const GROUPS = vi.hoisted(() => [
   {
     title: 'Agent',
@@ -31,6 +36,7 @@ const GROUPS = vi.hoisted(() => [
         apply: 'hot',
         type: 'toggle',
         value: true,
+        day1: true,
       },
     ],
   },
@@ -47,6 +53,7 @@ const GROUPS = vi.hoisted(() => [
         type: 'number',
         value: 14,
         bounds: '1 to 90',
+        day1: true,
       },
     ],
   },
@@ -82,6 +89,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
             apply: 'hot',
             type: 'toggle',
             value: false,
+            day1: false,
           },
         ],
       });

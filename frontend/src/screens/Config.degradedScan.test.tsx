@@ -42,6 +42,10 @@ const GROUPS = vi.hoisted(() => [
         apply: 'hot-apply',
         type: 'toggle',
         value: true,
+        // Not a real day1 key, and this group's own pane is never the
+        // section under test here (these tests deep-link straight to the
+        // internal-identifiers panel) — the value is inert either way.
+        day1: false,
       },
     ],
   },

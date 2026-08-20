@@ -7,6 +7,39 @@ recognizable ways. This page lists the failure shapes we have actually recorded,
 the knobs that address each one, and the probe workflow for qualifying a
 candidate backend before prod points at it.
 
+## Standing one up
+
+No backend yet? Two zero-to-endpoint paths, both landing on the same
+OpenAI-compatible `LITELLM_BASE_URL` contract:
+
+- **Local, bundled profile** — Ollama plus a LiteLLM proxy on the app's own
+  Docker network (nothing published to the host). Order matters — the main
+  stack owns the `soc-ai_default` network this profile joins:
+
+  1. `./setup.sh` first. At the gateway-URL prompt enter
+     `http://litellm:4000` and accept the model-list warning — the host
+     can't resolve that name yet; the doctor validates it once everything
+     is up.
+  2. `docker compose -f docker-compose.llm.yml up -d`, then
+     `docker compose -f docker-compose.llm.yml exec ollama ollama pull qwen3:14b`.
+  3. Any later `.env` edit (model swap, a key) needs `docker compose up -d`
+     to apply — `restart` does **not** re-read `.env`.
+
+  On CPU expect minutes-per-verdict, not seconds — read the time-budget
+  ladder below before deciding it is broken.
+
+  The pull is several GB: until it finishes, the model lists on the gateway
+  but every call fails, so a model-fitness FAIL from the doctor during that
+  window means "still downloading," not "broken." No GPU? Ollama runs on
+  system RAM, just slower.
+
+- **Cloud key** — pick route 2 in `./setup.sh`: an OpenRouter (or any
+  OpenAI-compatible) key, with `ANALYST_CLOUD_REDACTION=true` set for you and
+  the egress disclosure printed. No local model process at all.
+
+Whichever path: qualify the backend with `model-probe` (next section) before
+pointing real triage at it.
+
 ## Qualify the backend first: `model-probe`
 
 Before changing any setting, measure the candidate against the real contract:

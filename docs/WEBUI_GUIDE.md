@@ -43,10 +43,37 @@ holds only a pointer line, not the password.
 Change it after first login (Config → Users → reset password), then **delete the
 sidecar file** — it is no longer needed and should not linger on the volume.
 
+## Navigation
+
+The sidebar groups into two. **Investigate** (Dashboard, Alerts,
+Investigations, Hosts, Notifications, Hunts) stays open; it's the loop most of
+a shift runs in. **Operate** (the Operate hub, Runbooks, Backtest, Config)
+starts collapsed, since those are once-a-shift or once-a-week stops rather
+than per-alert ones. Click its heading to expand it, or navigate straight to
+one of its screens: Operate expands itself whenever the current page lives
+inside it, so your screen is never hidden behind a closed group.
+
 ## Dashboard (`/app/dashboard`)
 
 Where signing in lands you. What the grid is doing right now and what soc-ai
 has made of it, with a box to ask about either.
+
+### Setup health
+
+A persistent card at the top of the Dashboard's side column. Persistent means
+it never hides itself the way the panels below it do when there's nothing to
+review. Clean, it's one compact line: "All checks passing," with how long ago
+that was confirmed. Degraded, admins see each failing or warned check by
+name, with its detail and a hint where there is one, plus a **Re-check**
+button that forces a fresh check past the ten-minute cache, for when the
+problem is already fixed. A re-check that itself fails says so ("Re-check
+failed — try again") and leaves the last known-good rows on screen instead of
+blanking them. Analysts get a count and a pointer to Config → Diagnostics,
+never the row names.
+
+It's fed by the same doctor checks Wave 1 added, minus the model fitness
+probe. That one can take a couple of minutes, too slow for a dashboard poll,
+so fitness stays on the model battery in Config.
 
 ### Ask soc-ai
 
@@ -235,6 +262,31 @@ a sweep that has not happened, not a network with no hosts on it.
 - Config → Host dossier turns on the schedule and sets its interval. Every
   setting there is hot: no restart, and the next sweep picks it up.
 
+## Operate hub (`/app/operate`)
+
+![The Operate hub: six cards for model fitness, verdict quality, audit chain, backtest, diagnostics, and runbooks](img/screenshot-operate.png)
+
+A map of the console's trust instruments: six cards, each naming one thing
+soc-ai can prove and linking to where you prove it. It carries no live status
+of its own. That's the Dashboard's setup-health card's job.
+
+- **Model fitness**: prove the analyst model is fit before triage depends on
+  it. Links to Config → Agent.
+- **Verdict quality**: prove the verdicts held up, the nightly micro-eval
+  trend. Links to Config → Quality.
+- **Audit chain**: prove the tamper-evident record is intact. Links to
+  Config → Diagnostics, which carries a **Verify audit chain** button.
+  Pressing it reports one of four outcomes: intact (green check, records
+  verified), partial verification (amber; capped to the start of the chain,
+  not the whole thing), tampered (red; names the sequence number where it
+  breaks), or couldn't verify (amber; the console couldn't read the chain at
+  all). A capped scan never wears the green check. Only a full, clean scan
+  does.
+- **Backtest**: replay history against today's pipeline. Links to Backtest.
+- **Diagnostics**: the doctor's view from inside the app. Links to Config →
+  Diagnostics.
+- **Runbooks**: the procedures grounding every verdict. Links to Runbooks.
+
 ## Runbooks (`/app/runbooks`)
 
 The authoring space for your team's own triage guidance, the corpus the
@@ -263,6 +315,25 @@ Retrieval settings.
 ## Config console (`/app/config`, admin only)
 
 In-UI configuration. A non-admin who reaches it gets a clean 403 (no login loop).
+
+### The day-1 view
+
+![The Config day-1 view: a section's day-1 settings up front, the rest collapsed behind an Advanced fold](img/screenshot-config-day1.png)
+
+Config opens on eight decisions, not the full list: the analyst model, the
+events index pattern, the alerts query, the four auto-triage knobs (schedule
+on/off, interval, per-run target cap, minimum severity), and the
+notifications master toggle. Most of those are the ones setup.sh already asks
+about at install time, or ones that decide whether the console shows anything
+at all; the notifications toggle is the one opt-in outbound-egress decision
+worth a day-one look rather than a trip behind Advanced. Everything else in a
+section folds behind an **Advanced (N)** reveal, collapsed by default. A
+section with no day-1 settings in it starts with its Advanced fold open
+instead, so it doesn't read as empty.
+
+Settings search is unaffected: it still finds every setting, day-1 or tucked
+behind Advanced, and clicking a result opens both its section and its
+Advanced fold if that's where the setting lives.
 
 ### Settings sections (Oracle / Agent / PCAP)
 

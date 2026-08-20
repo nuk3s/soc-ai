@@ -1769,6 +1769,24 @@ export function Alerts() {
                     "Last seen" column; each button is nowrap so its own label
                     can't break mid-word. */}
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  {/* Wave 2 Task 7: Detection tuning now lives in the Operate
+                      hub, but noise NOMINATIONS still start here — an analyst
+                      staring at a noisy group needs a way there without
+                      hunting through the nav. Quiet (text only, no border/
+                      background) so it doesn't compete with the row's real
+                      triage actions below; once per GROUP row, not per event
+                      (lives here, not inside the expanded event map). */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigate('/config#detection-tuning');
+                    }}
+                    title="Open Detection tuning"
+                    className="inline-flex items-center whitespace-nowrap text-[11px] font-semibold text-dim hover:text-accent"
+                  >
+                    Tune rule
+                  </button>
                   {/* E2.3 triage-state actions: only on an OWNED row. "Review"
                       moves owned → in_review; "Done" marks it done (from owned or
                       in_review); the owner avatar in the Owner cell releases it.

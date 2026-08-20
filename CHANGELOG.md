@@ -4,7 +4,78 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
-## [Unreleased]
+## [1.2.9] - 2026-08-19
+
+The front-door release: the path from `git clone` to a first verdict on your
+own alert is now engineered with the same care as the verdicts themselves. The
+installer asks how you'll reach a model and redacts the cloud route by
+default, the doctor names each silent trap with its fix attached, Config opens
+on eight decisions instead of 109, and an Operate hub gives the trust
+instruments one page that says what each proves.
+
+### Added
+
+- **The installer asks how you'll reach a model — and the cloud route
+  redacts by default.** `setup.sh` forks local (primary) vs. cloud API key;
+  route 2 sets `ANALYST_CLOUD_REDACTION=true` and prints exactly what
+  egresses before the first hunt runs; a junk route answer fails loudly
+  instead of silently defaulting.
+- **The quickstart leads with a working demo, not a wall of config.**
+  `docs/quickstart.md` opens with a five-minute, no-SO, no-LLM local replay
+  (`docker compose -f docker-compose.demo.yml up`, plus a hosted twin) before
+  asking for a single Security Onion or LLM credential.
+- **Day one turns the lights on instead of leaving them for an admin to
+  find.** `setup.sh` now prompts for auto-triage (a 5-minute schedule, ≤25
+  targets/sweep, high-severity+) and the 10-runbook starter pack — both
+  default to yes — plus an optional MaxMind GeoLite2 key for GeoIP/ASN
+  enrichment.
+- **Setup doesn't stop at "the container is up."** A doctor preflight
+  (`python -m soc_ai doctor`) runs automatically once the stack reports
+  healthy, and the runbook starter pack installs itself through the admin API
+  (`POST /api/v1/runbooks/starter-pack`) — a fresh box is triage-ready, not
+  just running.
+- **Doctor gained three checks, each with a fix attached to its failure.**
+  The SO audit write grant (`_has_privileges`, no canary writes, graded per
+  privilege), index-pattern coverage (catches the `.ds-*` narrowing trap and
+  reports a partial match honestly rather than pass/fail), and layered
+  DNS/TCP/TLS upstream reachability, with a hint scoped to whichever layer
+  actually failed.
+- **A local LLM stack is one file away.** Optional `docker-compose.llm.yml`
+  runs a pinned Ollama + LiteLLM profile on the app network for the local
+  route; `docs/LESSER_MODELS.md` gained a "Standing one up" walkthrough.
+- **CI now catches doc drift that used to ship silently.** The README's
+  version badge and the quickstart's internal links are checked against
+  `pyproject.toml` and the doc tree on every run — a stale badge or a dead
+  link fails the build instead of waiting for a reader to find it.
+- **The 30-minute clone-to-verdict bar is now a release gate, not a claim.**
+  `scripts/first-verdict-timer.sh` times `setup.sh --auto` plus the wait for
+  a real completed verdict and reports pass/fail against the 1800-second bar;
+  `setup.sh --env-only` plus a pytest harness cover the installer's config
+  generation (both LLM routes, the day-1 prompts, junk-input handling), so
+  the installer itself is under test.
+- **The sidebar now reads like an analyst tool.** Navigation splits into
+  Investigate (the analyst loop) and a collapsed-by-default Operate group;
+  nothing moved routes, only shelves. Detection tuning stays one click from
+  alert-group context, where noise nominations originate: a Tune rule link
+  on each group row jumps straight to Config → Detection tuning.
+- **Config opens on eight decisions, not 109.** Day-1 settings render up
+  front; the rest folds behind per-section Advanced reveals. Settings search
+  still finds everything and expands whatever it lands on. The day-1 set is
+  snapshot-tested at ten or fewer.
+- **An Operate hub presents the trust instruments.** One page names what
+  each proves: model fitness, verdict quality, the audit chain, backtest
+  replay, diagnostics, runbooks. No more scattered peer screens.
+- **The Dashboard carries a persistent setup-health card.** Wave 1's doctor
+  checks (minus the expensive fitness probe) feed a cached preflight API:
+  green when clean, named failures with fixes for admins, honest counts for
+  analysts. A Re-check button forces a fresh read past the cache; if the
+  attempt itself fails, the card says so plainly instead of going quiet.
+- **The audit chain is now verifiable from the console.** Config →
+  Diagnostics (what the Operate hub's audit-chain card points to) runs a
+  real chain walk on demand and reports one of four honest outcomes: intact,
+  partially verified (capped short of the full chain), tampered at a named
+  sequence number, or couldn't verify. A capped scan never gets the green
+  check; only a full, clean one does.
 
 ## [1.2.8] - 2026-08-17
 

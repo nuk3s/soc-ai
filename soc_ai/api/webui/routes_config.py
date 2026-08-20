@@ -53,6 +53,7 @@ class SettingOut(BaseModel):
     value: bool | float | str
     bounds: str | None = None
     options: list[str] | None = None
+    day1: bool = False
 
 
 class SettingGroupOut(BaseModel):
@@ -178,6 +179,7 @@ async def get_config(
                     else _setting_value(spec, settings)
                 ),
                 bounds=_bounds(spec),
+                day1=spec.day1,
             )
             for spec in cfg_svc.WHITELIST
             if spec.section == section and not spec.danger and not spec.secret

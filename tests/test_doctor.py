@@ -65,8 +65,41 @@ def _by_name(results: list[CheckResult], name: str) -> CheckResult:
     return matches[0]
 
 
+class _StubSecurity:
+    """``_client.security`` double for the audit write-grant check.
+
+    ``check_audit_write_privileges`` reaches past the ``ElasticClient``
+    wrapper into the raw ``_client.security`` namespace (see its docstring in
+    ``soc_ai/doctor.py`` for why), so the double needs this one extra layer.
+    """
+
+    def __init__(self, has_all_requested: bool) -> None:
+        self._has_all_requested = has_all_requested
+
+    async def has_privileges(self, **kwargs: Any) -> dict[str, Any]:
+        # Derives the per-privilege breakdown from whatever was actually
+        # requested, so this double doesn't hardcode (and drift from)
+        # doctor.py's own privilege list.
+        index_req = kwargs.get("index") or [{}]
+        names = index_req[0].get("names", [])
+        privileges = index_req[0].get("privileges", [])
+        index_name = names[0] if names else ""
+        return {
+            "has_all_requested": self._has_all_requested,
+            "index": {index_name: dict.fromkeys(privileges, self._has_all_requested)},
+        }
+
+
 class _StubElastic:
-    """ElasticClient double: scripted ping/search outcomes."""
+    """ElasticClient double: scripted ping/search outcomes.
+
+    ``search`` (below) ignores the query content and always answers
+    ``total``, so it doubles for both ``check_elasticsearch``'s single
+    match-all search AND the index-pattern coverage check's three concurrent
+    per-dataset term-searches — all get the same nonzero total, which is
+    enough to keep ``test_run_doctor_all_green`` clear of the coverage
+    check's WARN branches (they fire only when a dataset total is zero).
+    """
 
     def __init__(
         self,
@@ -74,11 +107,13 @@ class _StubElastic:
         ping_exc: Exception | None = None,
         search_exc: Exception | None = None,
         total: int = 42,
+        has_all_requested: bool = True,
     ) -> None:
         self._ping_exc = ping_exc
         self._search_exc = search_exc
         self._total = total
         self.closed = False
+        self._client = SimpleNamespace(security=_StubSecurity(has_all_requested))
 
     async def ping(self) -> dict[str, Any]:
         if self._ping_exc is not None:
@@ -418,6 +453,7 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
         patch("soc_ai.doctor.ElasticClient", return_value=_StubElastic()),
         patch("soc_ai.doctor.list_gateway_models", listing),
         patch("soc_ai.doctor.probe_model_fitness", probe),
+        patch("soc_ai.doctor._classify_endpoint", return_value=("", "resolves and connects")),
     ):
         results = await run_doctor(settings)
     bad = [r for r in results if r.status in ("FAIL", "WARN")]
@@ -425,10 +461,15 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
     names = {r.name for r in results}
     assert {
         "config",
+        "SO reachability",
+        "ES reachability",
+        "gateway reachability",
         "store",
         "store fts5",
         "security onion",
         "elasticsearch",
+        "audit write grant",
+        "index pattern coverage",
         "gateway",
         "analyst model",
         "model fitness",
@@ -451,6 +492,7 @@ async def test_run_doctor_isolation_one_failure_never_blocks_others(tmp_path: Pa
         patch("soc_ai.doctor.ElasticClient", return_value=_StubElastic(ping_exc=es_exc)),
         patch("soc_ai.doctor.list_gateway_models", listing),
         patch("soc_ai.doctor.probe_model_fitness", probe),
+        patch("soc_ai.doctor._classify_endpoint", return_value=("", "resolves and connects")),
     ):
         results = await run_doctor(settings)
     assert _by_name(results, "gateway").status == "FAIL"

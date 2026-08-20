@@ -28,6 +28,7 @@ the suite. No network, no app startup, no new dependencies.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 from typing import get_args
 
@@ -407,4 +408,241 @@ def test_every_declared_audit_kind_is_referenced_somewhere() -> None:
         f"schemas.py: {sorted(unreferenced)}. Either the kind is dead (remove "
         "it) or it is emitted dynamically (add it to "
         "DECLARED_KINDS_WITHOUT_LITERAL_EMISSION in tests/test_docs_accuracy.py)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 — quickstart.md / README.md drift (onboarding-wedge review)
+# ---------------------------------------------------------------------------
+#
+# docs/quickstart.md is now the one page that owns clone-to-verdict, and the
+# README status badge is the first version number a visitor sees. Both rot
+# silently: nobody edits a hand-written badge on every release, and a
+# relative markdown link has no compiler to catch a typo'd target. The badge
+# sat at 1.2.6 for two releases before this gate was added; that's the
+# regression class these pin.
+
+DOCS_DIR = REPO_ROOT / "docs"
+QUICKSTART_DOC = DOCS_DIR / "quickstart.md"
+README_DOC = REPO_ROOT / "README.md"
+
+
+def test_readme_version_badge_matches_pyproject() -> None:
+    """Pins the README status badge to pyproject's version — the badge sat at
+    1.2.6 while the repo shipped 1.2.8; hand-edited badges rot."""
+    version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["version"]
+    readme = README_DOC.read_text()
+    m = re.search(r"badge/status-(\d+\.\d+\.\d+)-", readme)
+    assert m is not None, "README status badge not found"
+    assert m.group(1) == version, f"README badge {m.group(1)} != pyproject {version}"
+
+
+def test_quickstart_internal_links_resolve() -> None:
+    """Every relative .md link in the quickstart must exist — the page owns
+    clone-to-verdict and a dangling link strands a first-run user."""
+    text = QUICKSTART_DOC.read_text()
+    for target in re.findall(r"\]\(([A-Za-z0-9_\-./]+\.md)(?:#[^)]*)?\)", text):
+        assert (DOCS_DIR / target).exists() or (REPO_ROOT / target).exists(), (
+            f"broken quickstart link: {target}"
+        )
+
+
+def test_quickstart_leads_with_the_demo() -> None:
+    """Step 0 must stay the risk-free local demo (docker-compose.demo.yml was
+    undocumented for months while fully working)."""
+    text = QUICKSTART_DOC.read_text()
+    first_section = re.split(r"(?m)^## ", text)[1]
+    assert "docker-compose.demo.yml" in first_section
+
+
+def test_quickstart_standing_one_up_anchor_matches_heading_slug() -> None:
+    """Pins the anchor half of the quickstart's cross-doc link.
+
+    quickstart.md links ``LESSER_MODELS.md#standing-one-up``. mkdocs' default
+    toc-extension slugifier lowercases and hyphenates heading text, so
+    ``## Standing one up`` -> ``standing-one-up`` (checked against a live
+    ``markdown`` toc conversion while writing this test, not assumed blind;
+    also confirmed by ``mkdocs build --strict`` + grepping the built site).
+    The heading side of this pin — that docs/LESSER_MODELS.md still carries
+    that exact ``## Standing one up`` heading — already lives in
+    tests/test_setup_script.py::test_lesser_models_doc_has_standing_one_up_heading;
+    this test only pins quickstart.md's href string so the two sides can't
+    drift apart silently.
+    """
+    text = QUICKSTART_DOC.read_text()
+    assert "LESSER_MODELS.md#standing-one-up" in text, (
+        "quickstart.md no longer links LESSER_MODELS.md#standing-one-up — if "
+        "the LESSER_MODELS.md heading text changed, update the anchor here to "
+        "match its new slug (and re-verify with mkdocs build --strict)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 5 — the audit-grant ssh one-liner stays identical across its 4 homes
+# (final-review batch, M5)
+# ---------------------------------------------------------------------------
+#
+# An operator meets this command in four independent places depending on
+# which doc/output led them there: the doctor's own FAIL hint, setup.sh's
+# post-start warning, the quickstart's "one command" step, and the full SO
+# prerequisites doc. A hand-edit to any one of them (a typo fix, a rewording)
+# silently forks the recipe the other three still advertise. Extract the
+# command from each file with the SAME pattern and compare the matches
+# against each other, rather than hardcoding the golden string four times —
+# a divergence fails on its own merits, not against a possibly-stale copy
+# pinned here.
+#
+# The pattern is deliberately NOT fully literal: `\S+@\S+` and `\S*` let the
+# placeholder (`<admin>@<so-manager>`) and the path ahead of the script name
+# vary across matches, while the script name itself and the surrounding
+# shell shape stay fixed. A fully literal pattern would make the distinct-
+# set comparison below dead code: if every home has to match one exact fixed
+# string to be found at all, the four extracted matches can never disagree
+# with each other, so only the earlier "not found" assert could ever fire —
+# the comparison would never be the thing that fails. With this looser
+# shape, a home that rewords the placeholder or moves the script still
+# MATCHES (the "not found" assert doesn't mask the drift) but extracts a
+# genuinely different string, so the set comparison is what catches it.
+_AUDIT_GRANT_SSH_PATTERN = re.compile(r"ssh \S+@\S+ 'sudo bash -s' < \S*setup-audit-index\.sh")
+_AUDIT_GRANT_SSH_HOMES: dict[str, Path] = {
+    "soc_ai/doctor.py": REPO_ROOT / "soc_ai" / "doctor.py",
+    "setup.sh": REPO_ROOT / "setup.sh",
+    "docs/quickstart.md": QUICKSTART_DOC,
+    "docs/SECURITY-ONION-SETUP.md": DOCS_DIR / "SECURITY-ONION-SETUP.md",
+}
+
+
+def test_audit_grant_ssh_oneliner_identical_across_homes() -> None:
+    """The audit-grant ssh one-liner must read byte-identical wherever an
+    operator meets it — a fork here means someone followed a rewritten copy
+    while the other three still point at whatever it drifted from."""
+    found: dict[str, str] = {}
+    for label, path in _AUDIT_GRANT_SSH_HOMES.items():
+        m = _AUDIT_GRANT_SSH_PATTERN.search(path.read_text())
+        assert m is not None, f"audit-grant ssh one-liner not found in {label}"
+        found[label] = m.group(0)
+    distinct = set(found.values())
+    assert len(distinct) == 1, (
+        f"the audit-grant ssh one-liner diverges across its homes: {found}. "
+        "Make all four read byte-identical."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 6 — advertised auto-triage caps == Settings defaults (final-review
+# batch, M7)
+# ---------------------------------------------------------------------------
+#
+# setup.sh's day-1 prompt and quickstart.md's install-step prose both quote
+# the scheduler's caps (interval / per-sweep target cap / severity floor) as
+# plain numbers so a first-run analyst knows what "on" means before opting
+# in. Nothing re-derives those numbers from soc_ai.config.Settings, so a
+# future default change (e.g. auto_triage_max_targets 25 -> 50) would leave
+# both surfaces quietly advertising the old cap forever. Each assertion below
+# derives its expected text FROM the live Settings default, so the direction
+# of drift that matters — code changed, docs didn't — is what fails.
+#
+# Both files are read through _normalized_whitespace() before the substring
+# check: quickstart.md's prose wraps at ~80 columns in the markdown source
+# (rendering as one continuous sentence), so a cap phrase can straddle a
+# source line break — e.g. "...capped at 25\ntargets a sweep..." — even
+# though the rendered page reads it as one run of text. A raw substring check
+# would false-fail on that wrap instead of on real drift.
+
+
+def _normalized_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_auto_triage_interval_matches_advertised_cap() -> None:
+    """Pins the "every N min" cadence in setup.sh's prompt and quickstart's
+    install-step prose to ``auto_triage_schedule_interval_minutes``."""
+    from soc_ai.config import Settings
+
+    minutes = Settings.model_fields["auto_triage_schedule_interval_minutes"].default
+    needle = f"every {minutes} min"
+    assert needle in _normalized_whitespace((REPO_ROOT / "setup.sh").read_text()), (
+        f"setup.sh's auto-triage prompt no longer says {needle!r} — it must match "
+        "Settings.auto_triage_schedule_interval_minutes."
+    )
+    assert needle in _normalized_whitespace(QUICKSTART_DOC.read_text()), (
+        f"quickstart.md's install-step prose no longer says {needle!r} — it must "
+        "match Settings.auto_triage_schedule_interval_minutes."
+    )
+
+
+def test_auto_triage_max_targets_matches_advertised_cap() -> None:
+    """Pins the per-sweep target cap to ``auto_triage_max_targets`` — setup.sh
+    and quickstart.md phrase the cap with different connector words
+    ("targets/sweep" vs. "targets a sweep"), so each gets its own needle."""
+    from soc_ai.config import Settings
+
+    max_targets = Settings.model_fields["auto_triage_max_targets"].default
+    assert f"≤{max_targets} targets/sweep" in _normalized_whitespace(
+        (REPO_ROOT / "setup.sh").read_text()
+    ), (
+        f"setup.sh's auto-triage prompt no longer says '≤{max_targets} targets/sweep' "
+        "— it must match Settings.auto_triage_max_targets."
+    )
+    assert f"{max_targets} targets a sweep" in _normalized_whitespace(QUICKSTART_DOC.read_text()), (
+        f"quickstart.md's install-step prose no longer says "
+        f"'{max_targets} targets a sweep' — it must match Settings.auto_triage_max_targets."
+    )
+
+
+def test_auto_triage_min_severity_matches_advertised_cap() -> None:
+    """Pins the severity floor to ``auto_triage_min_severity``."""
+    from soc_ai.config import Settings
+
+    min_severity = Settings.model_fields["auto_triage_min_severity"].default
+    needle = f"{min_severity}-severity"
+    assert needle in _normalized_whitespace((REPO_ROOT / "setup.sh").read_text()), (
+        f"setup.sh's auto-triage prompt no longer says {needle!r} — it must match "
+        "Settings.auto_triage_min_severity."
+    )
+    assert needle in _normalized_whitespace(QUICKSTART_DOC.read_text()), (
+        f"quickstart.md's install-step prose no longer says {needle!r} — it must "
+        "match Settings.auto_triage_min_severity."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 7 — CHANGELOG's "Config opens on N decisions" claim == the day1
+# curation (Wave-2 progressive-disclosure review)
+# ---------------------------------------------------------------------------
+#
+# The Config console's day-1 tier is a curated, tested set (see
+# tests/test_config_day1_tier.py), and the Wave-2 CHANGELOG entry names the
+# count in prose ("Config opens on seven decisions, not 109"). Nothing ties
+# those two together: a future re-curation that adds or removes a day1 flag
+# has no reason to touch CHANGELOG.md, so the shipped claim would keep
+# reading "seven" after the real count moved. This gate derives the expected
+# word straight from the live curation, so the direction of drift that
+# matters — code changed, the shipped claim didn't — is what fails.
+
+_NUMBER_WORDS = [
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+]
+
+
+def test_changelog_day1_claim_matches_curation() -> None:
+    """The changelog's 'Config opens on N decisions' line must track the real
+    day1 curation — a re-curation that forgets the prose ships a false claim."""
+    from soc_ai.store import config_overrides as cfg
+
+    day1 = sum(1 for s in cfg.WHITELIST if s.day1)
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "CHANGELOG.md").read_text().lower()
+    assert f"config opens on {_NUMBER_WORDS[day1]} decisions" in text, (
+        f"CHANGELOG's day-1 claim doesn't match the curated count ({day1})"
     )
