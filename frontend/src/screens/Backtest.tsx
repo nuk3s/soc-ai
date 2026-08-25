@@ -1,6 +1,7 @@
 import { AlertTriangle, CheckCircle2, History, Loader2, Play, ShieldCheck } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { Panel } from '../components/Panel';
+import { middleEllipsis } from '../lib/text';
 import { ErrorState } from '../components/States';
 import { getBacktest, startBacktest } from '../lib/api';
 import { absTime } from '../lib/timeRange';
@@ -462,8 +463,8 @@ function MissedTpCard({
       {!safe && rows.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11.5px]" style={{ color: '#e88' }}>
           {rows.slice(0, 4).map((row) => (
-            <li key={row.alert_id} className="truncate">
-              • {row.rule_name || row.alert_id}
+            <li key={row.alert_id} className="truncate" title={row.rule_name || row.alert_id}>
+              • {middleEllipsis(row.rule_name || row.alert_id)}
             </li>
           ))}
           {rows.length > 4 && <li className="text-faint">+ {rows.length - 4} more</li>}
@@ -538,7 +539,7 @@ function RowsTable({ rows }: { rows: BacktestRow[] }) {
             return (
               <tr key={row.alert_id} className="border-b border-border last:border-0">
                 <td className="max-w-[280px] truncate px-4 py-2 text-text" title={row.rule_name}>
-                  {row.rule_name || row.alert_id}
+                  {middleEllipsis(row.rule_name || row.alert_id)}
                 </td>
                 <td className="px-4 py-2" style={{ color: VERDICT_COLOR[row.human_disposition] }}>
                   {DISPOSITION_LABEL[row.human_disposition]}

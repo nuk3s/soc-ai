@@ -22,16 +22,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# A trailing caveat appended to the stored answer when the narrative asserts
-# concrete artifacts that are grounded in NEITHER a tool result NOR the seed context.
-# Used for ZERO-TOOL turns, where "not backed by a tool result" is literally true.
-UNVERIFIED_CAVEAT = (
-    "\n\n⚠ Unverified: the above was not backed by a tool result or the "
-    "investigation's evidence; treat as a hypothesis, not a finding."
-)
-
-# Bound on how many suspect artifacts the scoped caveat names inline.
-_SCOPED_CAVEAT_CAP = 4
+# Appended once, after `redact_ungrounded` below has mechanically stripped
+# whatever stayed ungrounded through the regrounding loop. Ground-or-strip
+# (2026-08-20, the owner's ruling): a 2026-08-05 chat turn shipped a caveat
+# banner naming its suspect claims inline, and a 2026-08-20 dogfood turn
+# shipped one listing ordinary prose fragments ("closest-preceding",
+# "package-update") as "unverified hostnames" — a "verify before acting"
+# banner is not an acceptable substitute for actually grounding or removing
+# the specific. This line says something was removed, once, with no ⚠ and no
+# token list — the tokens themselves are gone from the text, not flagged.
+UNVERIFIED_QUIET_LINE = "\n\n_Some unverifiable specifics were removed from this reply._"
 
 
 # Cap on artifacts named in a correction prompt — enough to be actionable
@@ -79,23 +79,23 @@ def regrounding_instruction(ungrounded: list[str]) -> str:
     )
 
 
-def scoped_unverified_caveat(ungrounded: list[str]) -> str:
-    """Caveat for a turn that DID run tools but asserted some ungrounded artifacts.
+def redact_ungrounded(answer: str, ungrounded: list[str]) -> str:
+    """Ground-or-strip's terminal half: replace each ungrounded artifact string
+    with ``(unverified)``.
 
-    The blanket :data:`UNVERIFIED_CAVEAT` under a visible tool-call footer reads
-    as a contradiction — "not backed by a tool result" directly beneath five
-    tool calls (dogfood 2026-07-15). Name the specific suspect claims instead,
-    so the analyst knows exactly which parts to double-check and which parts
-    the tool output stands behind.
+    Whole-token, case-insensitive, every occurrence — an artifact that survives
+    the regrounding loop is never shipped dressed as fact under a "verify
+    before acting" caveat (the old :func:`scoped_unverified_caveat` /
+    ``UNVERIFIED_CAVEAT`` banners this replaces); it is mechanically removed
+    from the visible answer instead, and :data:`UNVERIFIED_QUIET_LINE` says so
+    once, without naming it again. Longest-first so a shorter artifact that is
+    a substring of a longer one (e.g. an IP that is also a JA3-adjacent
+    prefix) cannot partially clobber the longer replacement first.
     """
-    shown = [f"`{a}`" for a in ungrounded[:_SCOPED_CAVEAT_CAP]]
-    listing = ", ".join(shown) + (" …" if len(ungrounded) > _SCOPED_CAVEAT_CAP else "")
-    return (
-        f"\n\n⚠ Partially unverified: {listing} "
-        "do not appear in this turn's tool results or the investigation's "
-        "evidence — verify before acting on them. The reply's other specifics "
-        "are grounded in the tool output."
-    )
+    redacted = answer
+    for artifact in sorted({a for a in ungrounded if a}, key=len, reverse=True):
+        redacted = re.compile(re.escape(artifact), re.IGNORECASE).sub("(unverified)", redacted)
+    return redacted
 
 
 # ── Artifact detectors ──────────────────────────────────────────────────────
@@ -104,9 +104,19 @@ def scoped_unverified_caveat(ungrounded: list[str]) -> str:
 # internal domains, dotted IPs, JA3 hashes) rather than trying to parse prose.
 
 # Windows / NetBIOS-style host labels: DESKTOP-XXXX, WIN11-01, DC01, SRV-FILE2 …
-# Case-insensitive: a fabricated hostname written lowercase (common LLM prose,
-# e.g. "desktop-jsm4n2p") is the same hallucination as its all-caps form and must
-# be caught too — the char classes are ASCII-only, so IGNORECASE stays ASCII.
+# Case-insensitive so the regex still FINDS a candidate written in lowercase
+# (e.g. "desktop-jsm4n2p") or backticked lowercase — the char classes are
+# ASCII-only, so IGNORECASE stays ASCII. Matching case-insensitively does not
+# mean every case qualifies, though: `_hostname_qualifies` below is a second,
+# non-regex gate a match must also clear, and as of 2026-08-21 it rejects
+# anything with a lowercase letter in it unless backticked (see that
+# function's docstring) — so this flag's practical job is narrower than it
+# looks, mostly keeping backticked-lowercase names findable.
+#
+# The SHAPE alone over-matches: any hyphen-joined pair of alnum runs is also
+# what ordinary hyphenated English compounds look like ("closest-preceding",
+# "package-update"), and a 2026-08-20 dogfood turn shipped exactly those as a
+# caveat banner's "hostnames".
 _HOSTNAME = re.compile(
     r"\b(?:[A-Z][A-Z0-9]{1,14}-[A-Z0-9]{2,15}|DESKTOP-[A-Z0-9]{3,})\b", re.IGNORECASE
 )
@@ -229,11 +239,48 @@ def _looks_like_domain(token: str) -> bool:
     return not low.split(".")[-1].isdigit()
 
 
+def _hostname_qualifies(answer: str, match: re.Match[str]) -> bool:
+    """Second gate a `_HOSTNAME`-shaped match must clear to count as an artifact.
+
+    The regex shape (alnum-hyphen-alnum) is identical for a real machine name
+    and for ordinary hyphenated English prose ("closest-preceding",
+    "malicious-external", "origin-chain", "package-update" — the exact tokens a
+    2026-08-20 dogfood turn shipped as a caveat banner's "hostnames").
+
+    2026-08-20 ruling: a match counted if it contained a digit OR an uppercase
+    letter ANYWHERE, or was backticked. That was still too loose — ordinary
+    security prose is full of capitalized or digit-bearing hyphenated terms
+    ("C2-like", "C2-style", "Origin-chain", "Tor-check", "Cloudflare-fronted").
+    A live 2026-08-21 turn burned BOTH of its regrounding attempts chasing
+    these as "unverified hostnames" before the terminal check flagged two of
+    them again and redacted them out of an otherwise-correct answer.
+
+    2026-08-21 ruling (this fix): a match counts only if it (a) is wrapped in
+    backticks in the reply, or (b) is NetBIOS-shaped — EVERY character in the
+    token is uppercase or a digit, i.e. no lowercase letter anywhere
+    (``DESKTOP-JSM4N2P``, ``WIN-AB12CD``). A single lowercase letter anywhere —
+    even next to a digit or an initial capital, as in "C2-style" or
+    "Origin-chain" — now reads as prose, not a machine name. This is a further
+    owner-ratified narrowing of the same tradeoff: false negatives on a rare
+    unformatted-but-real hostname (now including ones with a stray digit, e.g.
+    an unbackticked "desktop-jsm4n2p") beat flagging ordinary hyphenated
+    security vocabulary as unverified. Code-formatting (backticks) remains the
+    escape hatch for a genuine unformatted name.
+    """
+    token = match.group(0)
+    if not any(ch.islower() for ch in token):
+        return True
+    start, end = match.span()
+    return answer[start - 1 : start] == "`" and answer[end : end + 1] == "`"
+
+
 def extract_artifacts(answer: str) -> NarrativeArtifacts:
     """Pull concrete identity claims out of the answer's free text."""
     ips = sorted({m.group(0) for m in _IPV4.finditer(answer)})
     ip_set = set(ips)
-    hostnames = sorted({m.group(0) for m in _HOSTNAME.finditer(answer)})
+    hostnames = sorted(
+        {m.group(0) for m in _HOSTNAME.finditer(answer) if _hostname_qualifies(answer, m)}
+    )
     ja3 = sorted({m.group(0).lower() for m in _JA3.finditer(answer)})
     domains = sorted(
         {

@@ -2340,6 +2340,37 @@ def test_format_focus_hint_block_empty_is_noop() -> None:
     assert "needs_more_info" in block
 
 
+def test_format_focus_hint_block_default_origin_wording_is_pinned() -> None:
+    """Pins the exact pre-Task-6 wording (default origin="rerun") so a future
+    change to the NMI re-run flow — or an accidental default-origin change on
+    the promoted-finding path — can't silently alter this header without
+    breaking a test."""
+    from soc_ai.agent.prompts import format_focus_hint_block
+
+    block = format_focus_hint_block("1. Was the payload executed?")
+    assert "## Focus — a prior investigation ended `needs_more_info`" in block
+    assert "CLOSE the open questions below" in block
+    # Explicit origin="rerun" is byte-identical to the default.
+    assert format_focus_hint_block("1. Was the payload executed?", origin="rerun") == block
+
+
+def test_format_focus_hint_block_hunt_finding_origin_is_honest() -> None:
+    """origin="hunt_finding" (Task 6, finding promotion) must NOT claim a prior
+    investigation exists — the focus text here is the promoted finding's own
+    framing, not a prior run's open questions."""
+    from soc_ai.agent.prompts import format_focus_hint_block
+
+    block = format_focus_hint_block(
+        "Promoted hunt finding: Beaconing to rare external IP.", origin="hunt_finding"
+    )
+    assert "## Focus — promoted hunt finding" in block
+    assert "promoted a hunt finding" in block
+    assert "do not assume it is correct" in block
+    assert "Promoted hunt finding: Beaconing to rare external IP." in block
+    assert "needs_more_info" not in block
+    assert "open questions" not in block
+
+
 def test_build_synth_first_user_message_candidate_before_evidence() -> None:
     """B4: candidate block must appear BEFORE the evidence/context blocks so the
     synth reads evidence last, not the template verdict last (anchoring mitigation)."""
@@ -6890,6 +6921,27 @@ def test_hunt_prompt_frames_data_as_untrusted() -> None:
     HUNT_SYSTEM_PROMPT.format(objective="probe")
 
 
+def test_hunt_narrative_leads_with_the_bottom_line() -> None:
+    """2026-08-20 answer-quality batch: a hunt follow-up on "what's going on
+    with 192.0.2.61" (a benign duplicate-IP dig) came back as a verbose
+    non-answer, same as the dashboard chat that day. The narrative's first
+    sentence must be the bottom line — same vocabulary as the chat prompts'
+    ``_ANSWER_SHAPE`` — on both the normal-budget prompt and the cut-short
+    synthesizer, and on the schema field itself so a weak model sees the
+    instruction twice."""
+    from soc_ai.agent.hunt import HUNT_SYNTH_PROMPT, HUNT_SYSTEM_PROMPT, HuntReport
+
+    fragment = "is the bottom line"
+    assert fragment in HUNT_SYSTEM_PROMPT
+    assert fragment in HUNT_SYNTH_PROMPT
+    description = HuntReport.model_fields["narrative"].description
+    assert description is not None
+    assert fragment in description
+    # Template still renders (no stray braces introduced).
+    HUNT_SYSTEM_PROMPT.format(objective="probe")
+    HUNT_SYNTH_PROMPT.format(objective="probe")
+
+
 # ── Host naming: the dossier's answer, in the verdict's own words ────────────
 
 
@@ -6937,3 +6989,23 @@ def test_the_never_invent_hard_rule_survives_the_naming_rule() -> None:
     for prompt in (CHAT_SYSTEM_PROMPT, GENERAL_CHAT_SYSTEM_PROMPT):
         assert "HARD RULE — never invent per-event facts (this is non-negotiable)" in prompt
         assert "are HALLUCINATIONS, not answers" in prompt
+
+
+def test_hunt_prompt_names_the_analytics_tools() -> None:
+    """1.3 slice 2 Task 6: the four measuring tools registered on the hunt
+    surface (t_beacon_profile, t_dns_entropy_scan, t_dcerpc_histogram,
+    t_first_seen — Task 5, commit 26887142) are useless if the hunt agent
+    doesn't know to prefer them over eyeballing raw rows. The tool-usage
+    section must name all four so the planner reaches for the measurement
+    tool instead of hand-rolling a groupby."""
+    from soc_ai.agent.hunt import HUNT_SYSTEM_PROMPT
+
+    for tool_name in (
+        "t_beacon_profile",
+        "t_dns_entropy_scan",
+        "t_dcerpc_histogram",
+        "t_first_seen",
+    ):
+        assert tool_name in HUNT_SYSTEM_PROMPT
+    # Template still renders (no stray braces introduced).
+    HUNT_SYSTEM_PROMPT.format(objective="probe")

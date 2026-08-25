@@ -24,9 +24,10 @@ import {
   Zap,
 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
+import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
@@ -36,8 +37,10 @@ import {
   ApiError,
   ackGroup,
   dismissInvestigationError,
+  draftInvestigationDetection,
   escalateGroup,
   executeAction,
+  getAbout,
   getChatThread,
   downloadInvestigationExport,
   overrideVerdict as submitOverride,
@@ -47,6 +50,7 @@ import {
   resolveInvestigation,
   startHunt,
 } from '../lib/api';
+import { useAsync } from '../lib/useAsync';
 import { useChatThread } from '../lib/useChatThread';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
@@ -126,6 +130,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       .then((m) => setMe(m.username))
       .catch(() => {});
   }, []);
+  // The detection-bridge "Draft detection" affordance's kill switch, read the
+  // same one-mount-GET way the Dashboard assistant gates on general_chat_enabled
+  // (Dashboard.tsx `about`). Unlike that flag, sigma_authoring_enabled defaults
+  // OFF, so an unsettled or failed probe must fail CLOSED (hidden), not open —
+  // no `!!about.error` fallback here.
+  const about = useAsync(getAbout, []);
+  const sigmaAuthoringEnabled = about.data?.sigma_authoring_enabled === true;
   const demo = useDemo(); // demo deployment → label the verdict as a recorded run
   const [actions, setActions] = useState<
     Record<string, 'approved' | 'rejected' | 'executing' | 'failed'>
@@ -305,6 +316,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // same fast path just repeats the heuristic (dogfood 2026-07-15).
   const startReRun = (deep: boolean) => {
     if (reHunting) return;
+    // Defense in depth: every visible Re-run affordance is already hidden for
+    // a promoted finding (toolbar, failedEl, the fallback panel), and the API
+    // refuses it too (409 hunt_kind_no_rerun) — but a stray caller reaching
+    // this function directly should still no-op rather than mint an
+    // unlabeled kind='suricata' duplicate.
+    if (inv.kind === 'hunt') return;
     setReRunError(null);
     setReHunting(true);
     startHunt(inv.groupId, deep ? { deep: true } : undefined)
@@ -371,15 +388,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           Override verdict
         </button>
       )}
-      <button
-        onClick={reRun}
-        disabled={reHunting}
-        className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
-      >
-        {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
-        {reHunting ? 'Re-running…' : 'Re-run investigation'}
-      </button>
-      {wasHeuristic && (
+      {/* Re-run / Deep re-run: hidden for a promoted hunt finding. Re-promoting
+          from the hunt page is the sanctioned re-run in this slice — startHunt
+          would mint an unlabeled kind='suricata' duplicate on the anchor
+          telemetry doc, and the API refuses these paths anyway (Task 6b). */}
+      {inv.kind !== 'hunt' && (
+        <button
+          onClick={reRun}
+          disabled={reHunting}
+          className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
+        >
+          {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
+          {reHunting ? 'Re-running…' : 'Re-run investigation'}
+        </button>
+      )}
+      {inv.kind !== 'hunt' && wasHeuristic && (
         <button
           onClick={reRunDeep}
           disabled={reHunting}
@@ -390,13 +413,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           Deep re-run
         </button>
       )}
+      {/* Named for its artifact: a complete TP hunt investigation can show the
+          detection pane's "Download .yml" on the same screen, and a bare
+          "Export" beside it reads as the same download. */}
       <button
         onClick={() => { void downloadInvestigationExport(inv.id); }}
         title="Download the decision record (tools, cited events, verdict — JSON with a sha256 integrity checksum)"
         className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
       >
         <Download size={13} />
-        Export
+        Export decision record
       </button>
     </div>
   );
@@ -462,6 +488,25 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </div>
   );
 
+  // Substitute for a Re-run button on a promoted finding: the API refuses a
+  // re-run of the anchor event once promotion owns its latest investigation
+  // (409 hunt_kind_no_rerun), so offering the button is a click that
+  // dead-ends. Points at the sanctioned path instead — re-promoting from the
+  // hunt page — with the same link idiom as the provenance strip.
+  const reRunOrPromoteLine = (className: string) => (
+    <div className={className}>
+      Re-promote this finding from its hunt to re-run it.
+      {inv.huntId && (
+        <>
+          {' '}
+          <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
+            {inv.huntObjective || inv.huntId}
+          </Link>
+        </>
+      )}
+    </div>
+  );
+
   // Terminal failure: a reaped/interrupted run (status 'error') OR one the
   // client-side stuck-guard gave up on. Replaces both the spinner and the
   // (empty) verdict so the analyst never stares at "Investigating…" forever.
@@ -485,21 +530,36 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <div className="font-mono text-[12.5px] text-faint">elapsed {fmt(elapsed)}</div>
       </div>
       <div className="mt-2 text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
+        {/* A hunt-kind row points at the "Re-promote this finding from its
+            hunt" line right below instead of telling the analyst to
+            "re-run it" here too — the API refuses a direct re-run of a
+            promoted finding's anchor (409 hunt_kind_no_rerun), so the two
+            instructions would mean different things at the same spot. */}
         {interrupted
-          ? 'No verdict yet — the service restarted while this was running. It will be re-investigated automatically if Auto-Investigate is on, or re-run it now.'
+          ? inv.kind === 'hunt'
+            ? 'No verdict yet — the service restarted while this was running. It will be re-investigated automatically if Auto-Investigate is on — or re-promote it from its hunt to try again.'
+            : 'No verdict yet — the service restarted while this was running. It will be re-investigated automatically if Auto-Investigate is on, or re-run it now.'
           : cancelled
-            ? 'No verdict was reached — the run was stopped (an operator cancel, or the service restarting) before it finished. Re-run it to get a verdict.'
-            : 'No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-run it to try again.'}
+            ? inv.kind === 'hunt'
+              ? 'No verdict was reached — the run was stopped (an operator cancel, or the service restarting) before it finished — re-promote it from its hunt to try again.'
+              : 'No verdict was reached — the run was stopped (an operator cancel, or the service restarting) before it finished. Re-run it to get a verdict.'
+            : inv.kind === 'hunt'
+              ? 'No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-promote it from its hunt to try again.'
+              : 'No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-run it to try again.'}
       </div>
       <div className="mt-[14px]">
-        <button
-          onClick={reRun}
-          disabled={reHunting}
-          className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
-        >
-          {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
-          {reHunting ? 'Re-running…' : 'Re-run investigation'}
-        </button>
+        {inv.kind === 'hunt' ? (
+          reRunOrPromoteLine('text-[13px] leading-[1.5] text-dim')
+        ) : (
+          <button
+            onClick={reRun}
+            disabled={reHunting}
+            className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
+          >
+            {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
+            {reHunting ? 'Re-running…' : 'Re-run investigation'}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -584,17 +644,28 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <div className="mb-2.5 text-[13px] leading-[1.55] text-text-2" style={{ textWrap: 'pretty' }}>
           This run failed before reaching a verdict
           {inv.fallback.hint ? <>: {inv.fallback.hint}</> : '.'}
-          {' '}It was recorded as needs_more_info as a placeholder — re-run it to get a real verdict.
+          {' '}It was recorded as needs_more_info as a placeholder
+          {/* Same re-run/re-promote split as failedEl above: the button (or
+              the re-promote pointer) right below already says how to get a
+              real verdict, so this sentence must agree with it instead of
+              also instructing "re-run" for a row the API refuses to re-run. */}
+          {inv.kind === 'hunt'
+            ? ' — re-promote it from its hunt to try again.'
+            : ' — re-run it to get a real verdict.'}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={reRun}
-            disabled={reHunting}
-            className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
-          >
-            {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
-            {reHunting ? 'Re-running…' : 'Re-run investigation'}
-          </button>
+          {inv.kind === 'hunt' ? (
+            reRunOrPromoteLine('text-[12.5px] leading-[1.5] text-dim')
+          ) : (
+            <button
+              onClick={reRun}
+              disabled={reHunting}
+              className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
+            >
+              {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
+              {reHunting ? 'Re-running…' : 'Re-run investigation'}
+            </button>
+          )}
           {errorDismissed ? (
             <span className="flex items-center gap-1.5 text-[12.5px] text-dim">
               <Check size={13} /> Dismissed — no longer counted on the Dashboard
@@ -637,23 +708,39 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           <ul className="mb-2.5 list-disc pl-5 text-[13px] text-text-2">
             {inv.openQuestions!.map((q, i) => <li key={i} className="mb-0.5">{q}</li>)}
           </ul>
-        ) : (
+        ) : inv.kind !== 'hunt' ? (
           <div className="mb-2.5 text-[13px] text-text-2">
             The model could not converge on a verdict — dig deeper with a focused
             re-investigation, or resolve it in chat.
           </div>
+        ) : null}
+        {/* Honest wayfinding for a promoted finding: every re-run affordance
+            (Re-run, Deep re-run, Request more info) is hidden for kind='hunt'
+            because the API refuses them — so "dig deeper with a focused
+            re-investigation" would name a path that does not exist on this
+            screen. Say what actually refines a promoted finding instead. */}
+        {inv.kind === 'hunt' && (
+          <div className="mb-2.5 text-[13px] text-text-2">
+            Promoted findings are refined by re-promoting from the hunt or asking a follow-up
+            below — not by re-running here.
+          </div>
         )}
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={requestInfo}
-            disabled={requestingInfo}
-            title="Launch a fresh investigation focused on the open questions above"
-            className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#0b0f16] disabled:opacity-60"
-            style={{ background: '#f5a623', borderColor: '#f5a623' }}
-          >
-            {requestingInfo ? <Spinner size={13} /> : <Crosshair size={13} />}
-            {requestingInfo ? 'Requesting…' : 'Request more info'}
-          </button>
+          {/* A promoted finding has no re-run affordance in this slice — the
+              server refuses it (409 hunt_kind_no_rerun); re-promote from the
+              hunt page instead. */}
+          {inv.kind !== 'hunt' && (
+            <button
+              onClick={requestInfo}
+              disabled={requestingInfo}
+              title="Launch a fresh investigation focused on the open questions above"
+              className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#0b0f16] disabled:opacity-60"
+              style={{ background: '#f5a623', borderColor: '#f5a623' }}
+            >
+              {requestingInfo ? <Spinner size={13} /> : <Crosshair size={13} />}
+              {requestingInfo ? 'Requesting…' : 'Request more info'}
+            </button>
+          )}
           <button
             onClick={() => document.querySelector('[data-chat-panel]')?.scrollIntoView({ behavior: 'smooth' })}
             className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
@@ -666,6 +753,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             button that was supposed to start it. */}
         {requestInfoError &&
           startFailureStrip(requestInfoError, () => setRequestInfoError(null), 'mt-2.5')}
+      </div>
+    )}
+    {inv.kind === 'hunt' && inv.huntId && (
+      <div
+        className="rounded-card border px-3.5 py-2.5 text-[12px] text-dim"
+        style={{ borderColor: 'rgba(244,114,182,.35)', background: 'rgba(244,114,182,.06)' }}
+      >
+        <span style={{ color: '#f472b6' }}>Promoted from hunt</span>
+        {' — '}
+        <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
+          {inv.huntObjective || inv.huntId}
+        </Link>
       </div>
     )}
     {inv.resolution?.resolved_via === 'manual' && (
@@ -760,6 +859,15 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         setActionMsg((m) => ({ ...m, [a.id]: e instanceof Error ? e.message : 'request failed' }));
       });
   };
+  // A promoted finding's recommended actions (ack/escalate/comment) each map
+  // to an Approve/Execute that IS an SO write — the server refuses every one
+  // of them (Task 6, WRITE_TOOLS covers all three tags). Render Approve
+  // disabled with an explanation rather than let the analyst click into a
+  // 400. Reject/Dismiss is untouched: ActionCard's onReject only flips local
+  // `actions` state (never reaches the server), so it stays clickable even
+  // for a hunt-kind row.
+  const actionsDisabledReason =
+    inv.kind === 'hunt' ? 'A promoted finding has no Security Onion alert to act on' : undefined;
   const actionsEl = (
     <CollapsibleSection
       title="Recommended actions"
@@ -775,6 +883,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             executedBy={me ?? 'you'}
             onApprove={() => runAdvisory(a, i)}
             onReject={() => setActions((s) => ({ ...s, [a.id]: 'rejected' }))}
+            disabledReason={actionsDisabledReason}
           />
         ))}
       </div>
@@ -807,8 +916,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // Suppressed for a pipeline fallback: the run FAILED before reaching a
   // verdict — offering "verdict settled, acknowledge it" directly under the
   // "re-run to get a real verdict" panel contradicts the only sane next step.
+  // Also suppressed for kind='hunt': there is nothing in Security Onion to
+  // ack — the promoted finding's anchor is telemetry, not an alert, and the
+  // server refuses the write too (Task 6). This is the honest-UI half.
   const settledActionEl =
-    inv.status === 'complete' && inv.actions.length === 0 && !inv.fallback ? (
+    inv.status === 'complete' && inv.actions.length === 0 && !inv.fallback && inv.kind !== 'hunt' ? (
       <div
         className="rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
@@ -856,6 +968,50 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </div>
       </div>
     ) : null;
+
+  // Draft-detection affordance (1.3 slice 3): a promoted hunt finding that
+  // landed a CONFIRMED true_positive verdict can be turned into a Sigma rule
+  // for export (never deployed by soc-ai — see DraftDetectionPane). Gated on
+  // the SAME kind==='hunt' shape settledActionEl suppresses itself for (there
+  // is no Security Onion alert here to draft "from" other than the finding's
+  // own evidence) plus a settled TP verdict and the sigma_authoring_enabled
+  // flag — a running/needs-more-info/FP run has nothing confirmed to codify
+  // into a detection yet.
+  const confirmedTpHunt =
+    inv.kind === 'hunt' && inv.status === 'complete' && inv.verdict === 'true_positive';
+  const canDraftDetection = confirmedTpHunt && sigmaAuthoringEnabled;
+  // Explicitly off (the probe answered, flag false) — NOT `!sigmaAuthoringEnabled`,
+  // which is also true while the probe is unsettled and must render nothing.
+  const sigmaKnownOff = about.data?.sigma_authoring_enabled === false;
+  const draftDetectionEl = canDraftDetection ? (
+    <DraftDetectionPane
+      onDraft={() => draftInvestigationDetection(inv.id)}
+      provenance={
+        inv.huntId ? (
+          <div className="text-[12px] text-dim">
+            Drafted from the finding promoted from{' '}
+            <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
+              {inv.huntObjective || inv.huntId}
+            </Link>
+          </div>
+        ) : undefined
+      }
+    />
+  ) : confirmedTpHunt && sigmaKnownOff ? (
+    // The one investigation shape that COULD draft a detection, with the flag
+    // off: a quiet pointer at the switch instead of rendering nothing — the
+    // flag is hot-editable, so this is a live path, not a dead end.
+    <div className="text-[12px] text-faint">
+      Detection authoring is off —{' '}
+      <Link
+        to="/config#triage-automation"
+        state={{ highlightKey: 'sigma_authoring_enabled' }}
+        className="underline hover:text-dim"
+      >
+        enable it in Config
+      </Link>
+    </div>
+  ) : null;
 
   const timelineEl = (
     <CollapsibleSection
@@ -1038,6 +1194,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               <div className="flex min-w-0 flex-col gap-[18px]">
                 {inv.nodes.length > 0 && entityEl}
                 {inv.actions.length > 0 ? actionsEl : settledActionEl}
+                {draftDetectionEl}
                 {timelineEl}
                 {reasoningEl}
               </div>
@@ -1072,6 +1229,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {verdictEl}
           {inv.nodes.length > 0 && <div className="mt-[18px]">{entityEl}</div>}
           <div className="mt-[18px]">{inv.actions.length > 0 ? actionsEl : settledActionEl}</div>
+          {draftDetectionEl && <div className="mt-[18px]">{draftDetectionEl}</div>}
           <div className="mt-5">{timelineEl}</div>
           {reasoningEl && <div className="mt-5">{reasoningEl}</div>}
           <div className="mt-5">
@@ -1617,6 +1775,7 @@ function ActionCard({
   executedBy,
   onApprove,
   onReject,
+  disabledReason,
 }: {
   action: RecommendedAction;
   decision?: 'approved' | 'rejected' | 'executing' | 'failed';
@@ -1625,6 +1784,11 @@ function ActionCard({
   executedBy?: string;
   onApprove: () => void;
   onReject: () => void;
+  /** set when this action has no SO target to act on (a promoted hunt
+   * finding) — renders the Approve button disabled with this as the
+   * explanatory title, instead of letting the click reach a 400. Reject is
+   * NOT gated by this: it only sets local state, never an SO write. */
+  disabledReason?: string;
 }) {
   const Icon = ACTION_ICON[action.tag];
   const tagStyle = ACTION_TAG_COLOR[action.tag];
@@ -1684,14 +1848,16 @@ function ActionCard({
           <div className="mt-[13px] flex gap-[9px] pl-[31px]">
           <button
             onClick={onApprove}
-            className="flex items-center gap-1.5 rounded-control border border-success-btn-border bg-success-btn px-4 py-2 text-[13px] font-semibold text-[#eafff2] hover:bg-[#22824c]"
+            disabled={!!disabledReason}
+            title={disabledReason}
+            className="flex items-center gap-1.5 rounded-control border border-success-btn-border bg-success-btn px-4 py-2 text-[13px] font-semibold text-[#eafff2] hover:bg-[#22824c] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-success-btn"
           >
             <Check size={15} /> {decision === 'failed' ? 'Retry' : action.token ? 'Approve' : 'Execute'}
           </button>
           {!action.token && decision === 'failed' ? null : (
             <button
               onClick={onReject}
-              className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[13px] font-semibold text-text-2 hover:border-danger hover:text-danger"
+              className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[13px] font-semibold text-text-2 hover:border-danger hover:text-danger disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border-strong disabled:hover:text-text-2"
             >
               <X size={15} /> {action.token ? 'Reject' : 'Dismiss'}
             </button>

@@ -1226,6 +1226,7 @@ async def list_dossiers(
     role: str | None = None,
     source: str | None = None,
     health: str | None = None,
+    activity: str | None = None,
     limit: int = DEFAULT_LIST_LIMIT,
     offset: int = 0,
     sort: str = "attention",
@@ -1254,6 +1255,12 @@ async def list_dossiers(
     ``build_error`` only) would make the strip say "2" over a list showing 1,
     the untriaged-tile defect rebuilt here. Unknown values are ignored like the
     ``source`` filter's; the route's ``Literal`` is what rejects typos.
+
+    ``activity="active"`` keeps only hosts the network has actually shown
+    traffic for (``event_count > 0``). DNS-only census entries land with
+    ``event_count=0`` (:func:`soc_ai.enrichment.host_dossier._ingest_dns_names`)
+    and were drowning the list — 185 of 234 rows on the lab grid. It is the
+    Hosts screen's default; unknown values are ignored like ``source``.
 
     ``sort`` defaults to ``attention`` (:func:`_attention_order`): what needs
     the operator, not what talked last. ``importance``
@@ -1307,6 +1314,11 @@ async def list_dossiers(
         conditions.append(overridden if source == "operator" else ~overridden)
     if health == "broken":
         conditions.append(_no_clean_build())
+    if activity == "active":
+        # Hosts the network has actually shown traffic for. DNS-only census
+        # entries land with event_count=0 (enrichment/host_dossier._ingest_dns_names)
+        # and were drowning the list — 185 of 234 rows on the lab grid.
+        conditions.append(HostDossier.event_count > 0)
 
     total = await db.scalar(select(func.count(HostDossier.id)).where(*conditions)) or 0
 

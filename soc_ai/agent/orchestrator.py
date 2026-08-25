@@ -125,6 +125,7 @@ from soc_ai.agent.prompts import (
     BUDGET_PARTIAL_SYNTH_PROMPT,
     INVESTIGATOR_PROMPT,
     SYNTHESIZER_PROMPT,
+    FocusOrigin,
     _format_investigator_prompt,
     _format_transcript_for_synthesizer,
 )
@@ -884,12 +885,45 @@ async def maybe_auto_ack_fp(
     return ack_ev
 
 
+async def _maybe_auto_ack_fp_gated(
+    report: TriageReport,
+    es_id: str,
+    *,
+    alert: SoAlert,
+    ctx: InvestigationContext,
+    emit_ev: Any,
+    audit_ev: Any,
+    allow_so_writes: bool = True,
+) -> StepEvent | None:
+    """Call-site guard in front of :func:`maybe_auto_ack_fp` (Task 6, finding
+    promotion): a promoted hunt finding's ``alert_es_id`` is a cited telemetry
+    document, not an SO alert — there is nothing in Security Onion to ack, ever,
+    regardless of verdict/confidence/threshold. When ``allow_so_writes`` is
+    False, the write is skipped BEFORE ``maybe_auto_ack_fp`` (and therefore
+    ``execute_write_tool``) is ever reached, and an ``auto_ack_skipped`` event
+    with reason ``promoted_finding`` records why — mirroring the
+    ``below_threshold`` / ``high_stakes`` skip events maybe_auto_ack_fp itself
+    emits for its own held-back cases.
+    """
+    if not allow_so_writes:
+        # emit_ev is Any-typed at this seam; annotate so --strict sees StepEvent.
+        skipped: StepEvent = emit_ev(
+            "auto_ack_skipped", {"es_id": es_id, "reason": "promoted_finding"}
+        )
+        return skipped
+    return await maybe_auto_ack_fp(
+        report, es_id, alert=alert, ctx=ctx, emit_ev=emit_ev, audit_ev=audit_ev
+    )
+
+
 async def investigate(
     alert_id: str,
     *,
     ctx: InvestigationContext,
     focus_hint: str | None = None,
     deep: bool = False,
+    allow_so_writes: bool = True,
+    focus_origin: FocusOrigin = "rerun",
 ) -> AsyncIterator[StepEvent]:
     """Public entry point for the synth-first triage pipeline.
 
@@ -903,6 +937,16 @@ async def investigate(
     ``needs_more_info`` verdict (the "request more info" action), the prior
     open questions are passed here and woven into the seed prompt so the fresh
     run TARGETS those gaps. ``None`` ⇒ normal cold run.
+
+    ``allow_so_writes`` (default True): a promoted hunt finding's anchor is
+    cited telemetry, not an SO alert — there is nothing to ack. When False
+    (finding-promotion, Task 6), the opt-in auto-ack step is skipped entirely
+    regardless of verdict/confidence.
+
+    ``focus_origin`` (default ``"rerun"``): which header ``focus_hint`` gets
+    in the seed prompt — see :func:`soc_ai.agent.prompts.format_focus_hint_block`.
+    ``"hunt_finding"`` for a promoted finding's framing; the default assumes
+    ``focus_hint`` (when present) is a prior run's open questions.
 
     **Pipeline stages** (all executed by :func:`_run_synth_first_pipeline`):
 
@@ -939,6 +983,8 @@ async def investigate(
         ctx=ctx,
         focus_hint=focus_hint,
         deep=deep,
+        allow_so_writes=allow_so_writes,
+        focus_origin=focus_origin,
     ):
         yield ev
 
@@ -1718,6 +1764,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     ctx: InvestigationContext,
     focus_hint: str | None = None,
     deep: bool = False,
+    allow_so_writes: bool = True,
+    focus_origin: FocusOrigin = "rerun",
 ) -> AsyncGenerator[StepEvent, None]:
     """Phase A → B → C → optional D → C round 2 → done.
 
@@ -1729,6 +1777,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     ``focus_hint`` (optional): prior open questions from a re-launched
     ``needs_more_info`` investigation, woven into the round-1 seed + the
     investigation-loop investigator prompt so this run targets those gaps.
+
+    ``allow_so_writes`` / ``focus_origin``: see :func:`investigate`.
     """
     from soc_ai.agent._prefetch_retry import retry_prefetch  # noqa: PLC0415
     from soc_ai.agent.decision_templates import match_decision_template  # noqa: PLC0415
@@ -2158,6 +2208,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             materialized_evidence=materialized,
             candidate=candidate,
             focus_hint=focus_hint,
+            focus_origin=focus_origin,
             # Included BEFORE the final sanitize sweep + _guard_egress below,
             # so prior rationale text is redacted on the cloud-analyst path.
             prior_outcomes_block=prior_outcomes_block,
@@ -2332,7 +2383,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # same class of ambient ground truth, and rubric step 5 already tells the
         # model to weigh what the host IS — this supplies the missing input.
         inv_user_msg = (
-            _format_investigator_prompt(alert_id, enriched_json, focus_hint=focus_hint)
+            _format_investigator_prompt(
+                alert_id, enriched_json, focus_hint=focus_hint, focus_origin=focus_origin
+            )
             + await inventory_prompt_block(ctx.elastic, ctx.settings)
             + dossier_block
         )
@@ -2745,6 +2798,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 targeted_tool_result=targeted_result,
                 focus_hint=focus_hint,
                 allow_further_gap=rounds_left > 0,
+                focus_origin=focus_origin,
             )
             # Injection 4 of 4. Unlike the memory blocks — deliberately round-1
             # only, because a prior verdict competes with gathered evidence —
@@ -3150,8 +3204,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     yield triage_ev
 
     # ----- Auto-acknowledge high-confidence false positives (opt-in) -----
-    auto_ack_ev = await maybe_auto_ack_fp(
-        triage_final, alert_id, alert=enriched.alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+    auto_ack_ev = await _maybe_auto_ack_fp_gated(
+        triage_final,
+        alert_id,
+        alert=enriched.alert,
+        ctx=ctx,
+        emit_ev=_ev,
+        audit_ev=_audit,
+        allow_so_writes=allow_so_writes,
     )
     if auto_ack_ev is not None:
         yield auto_ack_ev

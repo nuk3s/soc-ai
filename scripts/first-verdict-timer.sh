@@ -6,6 +6,9 @@
 # It times: setup.sh --auto (build + start + doctor), then polls until the
 # first completed investigation appears — kick one off by clicking
 # Investigate in the UI, or let the setup-time auto-triage opt-in do it.
+# A scripted kick via `soc-ai triage <id>` instead needs SOC_AI_API_TOKEN set
+# on an auth-on install (the shipped default) — this script's own polling
+# below uses the cookie-session login, not the CLI's bearer-token path.
 #
 # Release gate: run once per release on a fresh VM, one run per LLM route;
 # record both times in the release notes.

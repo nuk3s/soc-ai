@@ -9,6 +9,7 @@ you're moving registration elsewhere.
 from soc_ai.tools import (  # noqa: F401
     ack_alert,
     add_case_comment,
+    analytics,
     cvedb,
     enrichment,
     escalate_to_case,

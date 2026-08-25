@@ -8,6 +8,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { listDossiers } from '../lib/api';
 import type { Config, Setting } from '../lib/types';
 import { CommandPalette } from './CommandPalette';
 import { ShellProvider } from './ShellContext';
@@ -64,6 +65,7 @@ vi.mock('../lib/api', () => ({
   getAlerts: vi.fn(() => Promise.resolve([])),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: () => getConfigMock(),
+  listDossiers: vi.fn(),
   signOut: vi.fn(),
 }));
 
@@ -88,6 +90,9 @@ describe('CommandPalette', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getConfigMock.mockResolvedValue(CONFIG_FIXTURE);
+    // Default: no hosts corpus, so the existing (host-agnostic) tests below
+    // see the palette behave exactly as before host search was added.
+    vi.mocked(listDossiers).mockResolvedValue({ rows: [], total: 0, limit: 8, offset: 0 });
   });
 
   it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest/Operate', async () => {
@@ -172,5 +177,31 @@ describe('CommandPalette', () => {
 
     type('');
     expect(screen.queryAllByText('Settings')).toHaveLength(0);
+  });
+
+  it('an IP query surfaces the host page as a first-class hit', async () => {
+    vi.mocked(listDossiers).mockResolvedValue({
+      rows: [
+        {
+          ip: '192.168.10.15',
+          found: true,
+          event_count: 199468,
+          fields: [
+            { field: 'hostname', value: 'bazzite', overridden: false },
+            { field: 'role', value: 'workstation', overridden: false },
+          ],
+        } as never,
+      ],
+      total: 1,
+      limit: 8,
+      offset: 0,
+    });
+    await openPalette();
+    type('192.168.10.15');
+    const hit = await screen.findByText(/192\.168\.10\.15 — bazzite/);
+    expect(hit).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Enter' });
+    expect(navigateMock).toHaveBeenCalledWith('/hosts/192.168.10.15');
   });
 });

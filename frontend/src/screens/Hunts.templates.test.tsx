@@ -165,7 +165,7 @@ describe('TemplatePicker fallback presets (template service unreachable)', () =>
     getHuntTemplatesMock.mockRejectedValue(new Error('api down'));
     renderHunts();
 
-    // the six static pills still render (the picker never vanishes) …
+    // the seven static pills still render (the picker never vanishes) …
     expect(await screen.findAllByText('Beaconing to rare IPs')).toBeTruthy();
     // … under a single un-annotated note, not per-pill flags.
     //

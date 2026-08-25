@@ -14,6 +14,7 @@ import asyncio
 import logging
 from typing import Any
 
+from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import CancelToken, run_recorded
 
@@ -40,6 +41,11 @@ class HuntManager:
         rule_name: str | None = None,
         focus_hint: str | None = None,
         deep: bool = False,
+        kind: str = "suricata",
+        hunt_id: str | None = None,
+        finding_ordinal: int | None = None,
+        allow_so_writes: bool = True,
+        focus_origin: FocusOrigin = "rerun",
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -57,9 +63,28 @@ class HuntManager:
         ``deep`` (optional): force the full tool-driven loop for this run
         (the analyst's "deep re-run" of a heuristic verdict).
 
+        ``kind`` / ``hunt_id`` / ``finding_ordinal`` (optional): promotion
+        provenance for a hunt-launched investigation (finding-promotion route,
+        Task 5) — threaded straight through to ``run_recorded``. Every
+        existing caller omits these and gets the ordinary Suricata defaults.
+
+        ``allow_so_writes`` / ``focus_origin`` (optional, default True /
+        "rerun"): threaded straight through to ``run_recorded`` -> ``investigate()``.
+        The promotion route passes ``allow_so_writes=False,
+        focus_origin="hunt_finding"`` explicitly — a promoted finding's anchor
+        has nothing in Security Onion to ack, and its focus text is the
+        finding's framing, not a prior run's open questions.
+
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
         """
+        if kind == "hunt":
+            # Single source of truth, forced HERE rather than trusted from the
+            # caller: the promotion route's explicit allow_so_writes=False stays
+            # as documentation at the call site, but a FUTURE kind="hunt" caller
+            # that forgets the kwarg must not reopen the unattended-auto-ack
+            # hole — a promoted finding's anchor never has an SO alert to ack.
+            allow_so_writes = False
         ctx = ctx_from_state(state)
         token = CancelToken()
         gen = run_recorded(
@@ -71,6 +96,11 @@ class HuntManager:
             rule_name=rule_name,
             focus_hint=focus_hint,
             deep=deep,
+            kind=kind,
+            hunt_id=hunt_id,
+            finding_ordinal=finding_ordinal,
+            allow_so_writes=allow_so_writes,
+            focus_origin=focus_origin,
         )
 
         # Consume until the first event — must be "investigation_created".

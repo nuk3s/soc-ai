@@ -71,6 +71,15 @@ describe('listDossiers', () => {
     expect(p.get('health')).toBe('broken');
   });
 
+  it('spells the traffic filter the way the server does', async () => {
+    // `activity=active` is the Hosts screen's default — hosts the network has
+    // actually shown traffic for, hiding the DNS-only census rows that land
+    // with event_count=0. Pinned here so a mistyped param cannot silently
+    // widen the default back to the whole census.
+    await listDossiers({ activity: 'active' });
+    expect(params().get('activity')).toBe('active');
+  });
+
   it('drops an empty search but keeps an explicit offset of 0', async () => {
     // An empty search box is "no filter", not "match the empty string". Offset 0
     // is a real page (the first one) — dropping it as falsy is how a pager that

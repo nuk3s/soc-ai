@@ -918,6 +918,11 @@ async def list_dossiers(
             "counts, so that KPI can click through to the rows behind its number."
         ),
     ),
+    activity: Literal["active"] | None = Query(
+        None,
+        description="'active' keeps only hosts with observed events (event_count > 0) — "
+        "the screen's default; omit for the full census including DNS-only entries.",
+    ),
     limit: int = Query(dossier_store.DEFAULT_LIST_LIMIT, ge=1, le=dossier_store.MAX_LIST_LIMIT),
     offset: int = Query(0, ge=0),
     sort: DossierSort = "attention",
@@ -958,6 +963,7 @@ async def list_dossiers(
             role=role,
             source=source,
             health=health,
+            activity=activity,
             limit=limit,
             offset=offset,
             sort=sort,

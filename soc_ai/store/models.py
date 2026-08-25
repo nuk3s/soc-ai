@@ -81,6 +81,19 @@ class Investigation(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
     alert_es_id: Mapped[str] = mapped_column(String(128), index=True)
+    # Where this investigation came from. 'suricata' | 'sigma' | 'notice' are
+    # detector-flag kinds (the alert feed's vocabulary); 'hunt' marks a
+    # promoted hunt finding — anchored on a cited evidence doc, with NOTHING in
+    # SO to ack (every SO-write surface must gate on this).
+    kind: Mapped[str] = mapped_column(String(16), default="suricata", server_default="suricata")
+    # Promotion provenance: the hunt and the zero-based index into its
+    # report["findings"]. Set only when kind == 'hunt'. The ordinal is stable:
+    # Hunt.report is written exactly once, at finalize. Deliberately NO foreign
+    # key: a promoted investigation must survive hunt deletion (RESTRICT would
+    # break hunts.delete, CASCADE would destroy analyst work), so the link may
+    # dangle — provenance readers must tolerate a missing hunt.
+    hunt_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    finding_ordinal: Mapped[int | None] = mapped_column(Integer, default=None)
     rule_name: Mapped[str | None] = mapped_column(String(512), default=None, index=True)
     verdict: Mapped[str | None] = mapped_column(String(32), default=None)
     confidence: Mapped[float | None] = mapped_column(Float, default=None)

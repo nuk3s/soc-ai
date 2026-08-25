@@ -288,6 +288,66 @@ describe('Investigations selection does not cost the filters', () => {
   });
 });
 
+describe('Investigations bulk re-investigate excludes promoted findings', () => {
+  // A promoted finding (kind='hunt') has no re-run affordance — re-promoting
+  // from its hunt is the sanctioned re-run in this slice (Task 6b). The
+  // checkbox is disabled at the selection layer so a hunt-kind row can never
+  // enter the bulk selection: select-all skips it and the strip's count can
+  // never disagree with what the bulk action actually submits.
+  it('disables the checkbox for a hunt-kind row, with the plain explanatory title', async () => {
+    listInvestigations.mockResolvedValue(
+      list([row({ id: 'INV-A', name: 'Alpha', kind: 'suricata' }), row({ id: 'INV-B', name: 'Bravo', kind: 'hunt' })], {
+        totalAll: 2,
+      }),
+    );
+    mount('/investigations');
+    await screen.findByText('Alpha');
+    const boxes = screen.getAllByRole('checkbox');
+    // [0] header select-all, [1] Alpha (suricata), [2] Bravo (hunt).
+    expect(boxes[1]).not.toBeDisabled();
+    expect(boxes[2]).toBeDisabled();
+    expect(boxes[2]).toHaveAttribute(
+      'title',
+      "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead",
+    );
+
+    fireEvent.click(boxes[2]);
+    expect(screen.queryByText(/selected/i)).toBeNull();
+  });
+
+  it('select-all only picks up eligible rows, and the bulk count agrees', async () => {
+    listInvestigations.mockResolvedValue(
+      list([row({ id: 'INV-A', name: 'Alpha', kind: 'suricata' }), row({ id: 'INV-B', name: 'Bravo', kind: 'hunt' })], {
+        totalAll: 2,
+      }),
+    );
+    mount('/investigations');
+    await screen.findByText('Alpha');
+    fireEvent.click(screen.getAllByRole('checkbox')[0]); // header select-all
+
+    expect(await screen.findByText(/Re-investigate \(1\)/i)).toBeTruthy();
+  });
+
+  it('disables the header select-all when every visible row is a promoted finding', async () => {
+    listInvestigations.mockResolvedValue(
+      list([row({ id: 'INV-A', name: 'Alpha', kind: 'hunt' }), row({ id: 'INV-B', name: 'Bravo', kind: 'hunt' })], {
+        totalAll: 2,
+      }),
+    );
+    mount('/investigations');
+    await screen.findByText('Alpha');
+    const headerBox = screen.getAllByRole('checkbox')[0];
+    expect(headerBox).toBeDisabled();
+    expect(headerBox).toHaveAttribute(
+      'title',
+      "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead",
+    );
+
+    fireEvent.click(headerBox);
+    expect(screen.queryByText(/selected/i)).toBeNull();
+  });
+});
+
 describe('Investigations retry tucking', () => {
   it('still tucks a retry under its primary when BOTH are on the page', async () => {
     listInvestigations.mockResolvedValue(

@@ -191,6 +191,11 @@ class Settings(BaseSettings):
     backoff) on a slow stack — cutting such a turn mid-retry would throw away work
     that was about to succeed. Raise further for very slow GPUs."""
 
+    sigma_draft_timeout_s: float = 150.0
+    """Server wall-clock budget for a single Sigma-draft model call; kept below
+    the SPA's client draft timeout so the server returns an honest 504 before
+    the client gives up."""
+
     auto_triage_per_target_timeout_s: int = 1200
     """Wall-clock backstop for a single auto-triage investigation (seconds).
 
@@ -742,7 +747,7 @@ class Settings(BaseSettings):
     with ample headroom; lower it for latency, raise it for very verbose
     reasoning models."""
 
-    chat_regrounding_attempts: int = 1
+    chat_regrounding_attempts: int = 2
     """How many times a chat turn may be re-run to fix ungrounded claims.
 
     The narrative-grounding validator names the per-event facts an answer
@@ -754,11 +759,14 @@ class Settings(BaseSettings):
     shipped regardless.
 
     With this > 0 the finding is fed back as a correction prompt ("cite it with
-    a tool call, or remove it") and the turn re-runs. 1 is the default: the
-    common case is a single over-reach the agent fixes immediately, and each
-    attempt costs a full turn against ``chat_turn_timeout_s``. 0 restores the
-    old warn-only behavior. The caveat remains the terminal fallback when the
-    agent will not comply."""
+    a tool call, or remove it") and the turn re-runs. 2 is the default (raised
+    from 1 in the 2026-08-20 answer-quality batch): the terminal fallback is no
+    longer a caveat but a mechanical redaction of whatever stays ungrounded, so
+    a second attempt buys another real chance at a clean, unredacted answer
+    before that happens — each attempt costs a full turn against
+    ``chat_turn_timeout_s``. 0 restores the old warn-only behavior. Ground-or-
+    strip redaction remains the terminal fallback when the agent will not
+    comply."""
 
     analyst_tool_choice_required: bool = False
     """Allow ``tool_choice='required'`` for the analyst model's structured output.
@@ -1128,6 +1136,13 @@ class Settings(BaseSettings):
 
     crawl_max_chars: int = 6000
     """Cap on extracted page content (chars) returned to the agent per crawl."""
+
+    # --- Detection authoring (Sigma bridge) -----------------------------
+    sigma_authoring_enabled: bool = False
+    """Enable the detection-engineering bridge: draft a Sigma rule from a
+    confirmed hunt finding, validate it (schema + would-have-fired dry run),
+    and EXPORT it for the analyst to paste into Security Onion. Export-only —
+    never writes to SO. Console-editable, hot."""
 
     # --- Runbook retrieval (RAG) — opt-in gateway tier -----------------
     # The DEFAULT runbook retrieval is SQLite FTS5 BM25 (migration 0017): zero

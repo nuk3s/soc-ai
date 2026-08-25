@@ -14,6 +14,7 @@ import {
   updateRunbook,
 } from '../lib/api';
 import { Markdown } from '../components/Markdown';
+import { middleEllipsis } from '../lib/text';
 import { mdToPlainExcerpt } from '../lib/mdExcerpt';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
 import { useAsync } from '../lib/useAsync';
@@ -605,7 +606,7 @@ export function Runbooks() {
               className="flex flex-wrap items-center gap-2.5 border-t border-border-faint py-2 first:border-t-0"
             >
               <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium" title={r.rule_name}>
-                {r.rule_name}
+                {middleEllipsis(r.rule_name)}
               </span>
               <span className="text-[11.5px] text-faint">
                 {r.investigations} investigation{r.investigations === 1 ? '' : 's'} ·{' '}

@@ -148,6 +148,12 @@ export function Topbar() {
     setHealthOpen(false);
   };
 
+  // The badge is a call to action, so it counts only items that ARE one:
+  // danger (true positives) and warn (needs-info, hunts with findings,
+  // dependency-down). `accent` completions — the "FP closed itself" firehose —
+  // stay in the dropdown and on /notifications but never light the badge.
+  const actionable = notifs.filter((n) => n.tone !== 'accent');
+
   return (
     <div className="relative z-30 flex h-[52px] flex-none items-center gap-[11px] border-b border-border bg-[rgba(11,14,19,.7)] py-0 pl-4 pr-3.5 backdrop-blur-[8px]">
       {/* workspace switcher — dropdown only when >1 workspace exists */}
@@ -243,9 +249,12 @@ export function Topbar() {
         className="relative flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <Bell size={16} />
-        {notifs.length > 0 && (
-          <span className="absolute -right-[5px] -top-[5px] flex h-4 min-w-[16px] items-center justify-center rounded-lg border-2 border-surface-1 bg-danger px-[3px] font-mono text-[9px] font-bold text-white">
-            {notifs.length}
+        {actionable.length > 0 && (
+          <span
+            data-testid="notif-badge"
+            className="absolute -right-[5px] -top-[5px] flex h-4 min-w-[16px] items-center justify-center rounded-lg border-2 border-surface-1 bg-danger px-[3px] font-mono text-[9px] font-bold text-white"
+          >
+            {actionable.length}
           </span>
         )}
       </button>

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { middleEllipsis } from '../lib/text';
 import {
   type DetectionNomination,
   type DetectionOverride,
@@ -131,7 +132,7 @@ export function DetectionTuningPanel({
               >
                 <div className="min-w-0">
                   <div className="truncate text-[13px] font-medium" title={n.rule_name}>
-                    {n.rule_name}
+                    {middleEllipsis(n.rule_name)}
                   </div>
                   <div className="mt-0.5 text-[11px] leading-[1.4] text-faint">{n.reason}</div>
                   {analystSignal(n) && (
@@ -203,7 +204,7 @@ export function DetectionTuningPanel({
           >
             <div className="min-w-0">
               <div className="truncate text-[13px] font-medium" title={o.rule_name}>
-                {o.rule_name}
+                {middleEllipsis(o.rule_name)}
               </div>
               {o.reason && (
                 <div className="mt-0.5 text-[11px] leading-[1.4] text-faint">{o.reason}</div>

@@ -155,11 +155,11 @@ def _investigation_spec(state: Any, inv_id: str, assistant_msg_id: int) -> ChatT
         # The alert's hosts as IDENTITY, appended to the seed rather than to the
         # system prompt. seed_context is the corpus the engine's grounding gate
         # grades the answer against, so putting it here is what makes "pve01 is
-        # the hypervisor" a GROUNDED sentence instead of one that ships under an
-        # ⚠ Unverified caveat — the same reason the general chat seeds the
-        # grid's own identifiers. The engine sanitizes the composed prompt
-        # later, so this stays RAW and collapses onto the same egress labels the
-        # rest of the seed gets.
+        # the hypervisor" a GROUNDED sentence instead of one that ships with
+        # "pve01" mechanically redacted back out of it — the same reason the
+        # general chat seeds the grid's own identifiers. The engine sanitizes
+        # the composed prompt later, so this stays RAW and collapses onto the
+        # same egress labels the rest of the seed gets.
         #
         # Degrades with the fetch above: on an ES failure the host set is the
         # stored endpoints, which is what the summary line falls back to too.

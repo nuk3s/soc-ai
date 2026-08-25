@@ -113,7 +113,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
 
   it('still forms a sentence when the role is missing but other facts are not', () => {
     expect(sentenceText(identitySentence(host({ os_family: val('linux') })))).toBe(
-      '192.0.2.44 is a machine running linux.',
+      '192.0.2.44 is a machine running Linux.',
     );
   });
 
@@ -158,6 +158,29 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
     );
     expect(text).not.toContain('null');
     expect(text).toContain('nothing else is known');
+  });
+
+  it('renders os_family tokens as human labels, not internal vocabulary', () => {
+    // os_family is the backend's internal classifier token
+    // (soc_ai/dossier/infer.py:_HOSTLOG_OS_FAMILY) — "apple" is what
+    // macOS/iOS/Darwin resolve to, and it must not leak onto the page verbatim.
+    const text = sentenceText(
+      identitySentence(host({ role: val('workstation'), os_family: val('apple') })),
+    );
+    expect(text).toContain('running an Apple OS');
+    expect(text).not.toContain('running apple');
+  });
+
+  it('os_detail still passes through verbatim and beats the family label', () => {
+    const text = sentenceText(
+      identitySentence(
+        host(
+          { os_detail: val('Debian GNU/Linux 13 (trixie)'), os_family: val('linux') },
+          '192.168.9.201',
+        ),
+      ),
+    );
+    expect(text).toContain('running Debian GNU/Linux 13 (trixie)');
   });
 });
 

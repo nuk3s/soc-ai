@@ -2,15 +2,16 @@ import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAlerts, getConfig, getInvestigations, signOut } from '../lib/api';
+import { getAlerts, getConfig, getInvestigations, listDossiers, signOut } from '../lib/api';
 import { buildConfigLayout, keyToSectionId } from '../lib/configLayout';
 import type { ConfigParent } from '../lib/configLayout';
+import { roleLabel, scalarOf } from '../lib/hostDossier';
 import { searchEntities } from '../lib/paletteSearch';
-import type { AlertGroup, InvestigationRow } from '../lib/types';
+import type { AlertGroup, DossierRow, InvestigationRow } from '../lib/types';
 import { useShell } from './ShellContext';
 
 interface Command {
-  group: 'Go to' | 'Action' | 'View' | 'Account' | 'Investigations' | 'Alerts' | 'Settings';
+  group: 'Go to' | 'Action' | 'View' | 'Account' | 'Investigations' | 'Alerts' | 'Settings' | 'Hosts';
   label: string;
   icon: ReactNode;
   run: () => void;
@@ -160,11 +161,55 @@ export function CommandPalette() {
   const [layout, setLayout] = useState<ConfigParent[] | null>(null);
   const configRequested = useRef(false);
 
+  // Hosts are searched SERVER-side per keystroke — the dossier list has a real
+  // `q` over IP + hostname, and the host table can exceed any one-shot corpus
+  // (MAX_LIST_LIMIT is 200; the lab grid alone holds 234). 150ms debounce,
+  // fail-soft like the other corpora.
+  const [hostRows, setHostRows] = useState<DossierRow[]>([]);
+  useEffect(() => {
+    if (!paletteOpen || q.trim().length < 2) {
+      setHostRows([]);
+      return;
+    }
+    let alive = true;
+    const t = setTimeout(() => {
+      listDossiers({ q: q.trim(), limit: 8 })
+        .then((res) => {
+          if (alive) setHostRows(res.rows);
+        })
+        // Unlike the client-filtered corpora, a kept-on-error page here would
+        // show hits for a query the user is no longer typing — clear instead.
+        .catch(() => {
+          if (alive) setHostRows([]);
+        });
+    }, 150);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, [paletteOpen, q]);
+
   const filtered = useMemo(() => {
     const query = q.toLowerCase();
     const base = query
       ? commands.filter((c) => c.label.toLowerCase().includes(query) || c.group.toLowerCase().includes(query))
       : commands;
+    // IP → host page is the analyst's primary pivot, so host hits sit ahead of
+    // investigation/alert entity hits.
+    const hostCmds = hostRows.map<Command>((h) => {
+      const hostname = scalarOf(h.fields, 'hostname');
+      const rawRole = scalarOf(h.fields, 'role');
+      const role = rawRole && rawRole.toLowerCase() !== 'unknown' ? roleLabel(rawRole) : null;
+      return {
+        group: 'Hosts',
+        label: `${h.ip}${hostname ? ` — ${hostname}` : ''}${role ? ` · ${role}` : ''}`,
+        icon: <Server size={15} />,
+        run: () => {
+          closePalette();
+          navigate(`/hosts/${h.ip}`);
+        },
+      };
+    });
     const entities = searchEntities(q, invs, groups).map<Command>((h) => ({
       group: h.group,
       label: h.label,
@@ -188,9 +233,9 @@ export function CommandPalette() {
         else navigate(h.to);
       },
     }));
-    return [...base, ...entities, ...settings];
+    return [...base, ...hostCmds, ...entities, ...settings];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, commands, invs, groups, layout]);
+  }, [q, commands, hostRows, invs, groups, layout]);
 
   // reset query + selection on open; focus the input; refresh the entity corpus;
   // count into the shared modal stack and restore focus to the opener on close.

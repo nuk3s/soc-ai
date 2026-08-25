@@ -279,7 +279,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "How many times a chat turn is re-run to fix claims the grounding "
             "validator found unsupported (cite it with a tool, or remove it). "
-            "0 = warn only, the historical behavior."
+            "0 = skip straight to redacting whatever stays ungrounded."
         ),
         min_value=0,
         max_value=3,
@@ -504,6 +504,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "Run saved hunts automatically on their per-hunt interval (managed in the "
             "Hunt Console). Master switch — off means no scheduled hunt fires. Off by "
             "default (recurring LLM calls); applies live."
+        ),
+    ),
+    SettingSpec(
+        key="sigma_authoring_enabled",
+        attr="sigma_authoring_enabled",
+        type="bool",
+        label="Draft detections from hunt findings (Sigma bridge)",
+        section="Triage automation",
+        hot=True,
+        help=(
+            "Draft a Sigma rule from a confirmed true-positive hunt finding, validate "
+            "it (schema + a would-have-fired dry run over the grid), and export it for "
+            "the analyst to paste into Security Onion's Detections module. Export-only "
+            "— soc-ai never writes the rule to SO. Off by default; applies live."
         ),
     ),
     SettingSpec(

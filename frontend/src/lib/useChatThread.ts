@@ -54,8 +54,9 @@ export interface ChatThreadState {
   progressTools: string[];
   draft: string;
   setDraft: (text: string) => void;
-  /** Send the trimmed draft. No-op on an empty draft or while `pending`. */
-  send: () => void;
+  /** Send the trimmed draft, or `textOverride` when given (starter chips). No-op
+   *  on empty text or while `pending`. */
+  send: (textOverride?: string) => void;
   /**
    * Re-read the thread and apply it — for a screen action that changes the
    * thread server-side (applying a chat verdict proposal). Rejects on a
@@ -224,8 +225,10 @@ export function useChatThread({
     }
   };
 
-  const send = () => {
-    const t = draft.trim();
+  const send = (textOverride?: string) => {
+    // `typeof` guard, not truthiness: `onClick={onSend}` passes a MouseEvent,
+    // which must fall through to the draft, not be stringified.
+    const t = (typeof textOverride === 'string' ? textOverride : draft).trim();
     // Block double-submit while a turn is in flight — the backend answers one
     // turn per thread and would 409 the second.
     if (!t || pending) return;

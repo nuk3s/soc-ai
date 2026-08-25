@@ -116,6 +116,12 @@ const mountEmpty = async (
   running = false,
 ) => {
   vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+  // The first-run branch is keyed off the CENSUS (summary.hosts), not off the
+  // page's own total — a census that has been swept but is entirely quiet
+  // must read as "no hosts match", never as "the sweep hasn't run". This
+  // fixture is the genuine article: nothing has ever been built, so the
+  // census itself is empty too.
+  vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
   vi.mocked(getDossierRefreshStatus).mockResolvedValue({
     running,
     last_run,
@@ -342,6 +348,7 @@ describe('Hosts first run — a sweep in flight is not a sweep that has not run'
     // yet" is the one claim this screen has just proven it cannot make;
     // HostDetail answers the identical failure with "could not check".
     vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     vi.mocked(getDossierRefreshStatus).mockRejectedValue(new Error('503 Service Unavailable'));
     render(
       <MemoryRouter initialEntries={['/hosts']}>
@@ -421,6 +428,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
   it('says the first sweep died rather than that none has run', async () => {
     asAnalyst();
     vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     stubSweepHealth({ running: false, degraded: true, last_run: LAST_RUN, error_count: 1 });
     mountScreen();
     const lead = await settledLead('blind');
@@ -440,6 +448,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
   it('says a sweep is running rather than that none has run', async () => {
     asAnalyst();
     vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     stubSweepHealth({ running: true, degraded: false, last_run: null, error_count: 0 });
     mountScreen();
     const lead = await settledLead('running');
@@ -454,6 +463,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     // same false story pointing the other way.
     asAnalyst();
     vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     stubSweepHealth({ running: false, degraded: false, last_run: null, error_count: 0 });
     mountScreen();
     const lead = await settledLead('read');
@@ -472,6 +482,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     // on HostDetail reads "could not check"; this screen now says the same.
     asAnalyst();
     vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

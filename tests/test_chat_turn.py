@@ -279,6 +279,52 @@ async def test_timeout_uses_the_specs_clock_not_a_settings_key() -> None:
     assert "narrower" in finish.last["content"]
 
 
+async def test_a_stuck_finish_after_the_answer_is_produced_still_resolves() -> None:
+    """Live incident (2026-08-21): a turn's answer was already generated —
+    the agent-run's own ``asyncio.timeout(spec.timeout_s)`` block had already
+    exited normally — but the tail after it (grounding re-check, ground-or-
+    strip redaction, finalize_meta, ``spec.finish``'s DB write) ran with NO
+    wall clock at all, because it sits entirely outside that block. On the
+    live turn this tail contended with a concurrent background job for the
+    same SQLite database and took several minutes instead of the
+    milliseconds it normally costs; nothing would have caught it even if the
+    contention had never cleared. This pins that the tail now gets its own
+    bounded timeout, distinct from the agent-run one (a different, accurate
+    message — not "narrower follow-up", which is about the LLM/tool loop,
+    not persistence)."""
+    state = _state()
+    ctx = _ctx(state)
+    calls: list[dict[str, Any]] = []
+
+    async def _stuck_finish(*, content: str, status: str, meta: Any) -> None:
+        calls.append({"content": content, "status": status, "meta": meta})
+        if status == "done":
+            await asyncio.sleep(10)  # simulates a contended/stuck DB write
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Grid: lab",
+            question="q",
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, c, _p: _Agent(c, ["Nothing unusual."], tools=[]),
+        )
+
+    with _patched(), patch("soc_ai.webui.chat_turn._TAIL_TIMEOUT_S", 0.02):
+        # The wait_for is a test-harness safety net, not the mechanism under
+        # test: on unfixed code this call never returns (spec.finish hangs
+        # with nothing bounding it), so without it a regression would hang
+        # the whole suite instead of failing this one test.
+        await asyncio.wait_for(
+            run_chat_turn(state, _spec(prepare=_prepare, finish=_stuck_finish)), timeout=2.0
+        )
+
+    assert calls[0]["status"] == "done"  # the answer was produced and an attempt made to save it
+    assert calls[-1]["status"] == "error"  # the tail's own timeout unstuck the row
+    assert "ran out of time saving the reply" in calls[-1]["content"]
+    assert "narrower follow-up" not in calls[-1]["content"]  # not the agent-run's message
+
+
 async def test_progress_rides_the_specs_writer() -> None:
     """Live tool progress is generic plumbing; only the WRITE is shape-specific
     (a different table per shape), so the engine hands snapshots to the spec."""
@@ -435,7 +481,12 @@ async def test_finalize_meta_hook_sees_the_turns_evidence() -> None:
 # ── the guardrails, exercised through a non-investigation shape ─────────────
 
 
-async def test_ungrounded_answer_is_caveated_for_any_chat_shape() -> None:
+async def test_ungrounded_answer_is_redacted_for_any_chat_shape() -> None:
+    """Ground-or-strip (2026-08-20): once regrounding is exhausted, an
+    ungrounded specific is mechanically replaced in the visible answer — not
+    named inline under a "verify before acting" caveat. This must fire
+    identically regardless of which chat shape is running (the whole point of
+    the shared engine)."""
     state = _state()
     ctx = _ctx(state)
     finish = _Finish()
@@ -456,7 +507,58 @@ async def test_ungrounded_answer_is_caveated_for_any_chat_shape() -> None:
 
     assert finish.last["meta"]["narrative_grounding"]["grounded"] is False
     assert "evil.example.com" in finish.last["meta"]["narrative_grounding"]["ungrounded"]
-    assert "Unverified" in finish.last["content"]
+    assert finish.last["meta"]["narrative_grounding"]["stripped"] == ["evil.example.com"]
+    assert "evil.example.com" not in finish.last["content"]
+    assert "(unverified)" in finish.last["content"]
+    assert "Some unverifiable specifics were removed" in finish.last["content"]
+    assert "⚠" not in finish.last["content"]
+
+
+async def test_ungrounded_artifact_and_fabricated_citation_both_get_redacted() -> None:
+    """Leak found in review (2026-08-20): when Layer 2 (the ungrounded-artifact
+    check) already fired, F1's merge branch updated meta's reason to say
+    fabricated citations were caught but never actually redacted the citation
+    text from the answer — the phrase shipped in the content while meta
+    claimed it was handled. A confabulating zero-tool model is likely to
+    produce BOTH shapes in the same breath (an ungrounded artifact AND a fake
+    "verified by the tools" claim), so the intersection needs its own pin, not
+    just each half alone."""
+    state = _state()
+    ctx = _ctx(state)
+    finish = _Finish()
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Grid: lab",
+            question="q",
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, c, _p: _Agent(
+                c,
+                ["The host resolved evil.example.com repeatedly. Verified by the tools."],
+                tools=[],
+            ),
+        )
+
+    with _patched():
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish))
+
+    content = finish.last["content"]
+    grounding = finish.last["meta"]["narrative_grounding"]
+
+    assert grounding["grounded"] is False
+    assert "evil.example.com" not in content
+    assert "Verified by the tools" not in content
+    assert "(unverified)" in content
+    # Exactly one quiet line — not one per detector that fired.
+    assert content.count("Some unverifiable specifics were removed") == 1
+    assert "⚠" not in content
+    # Both causes are on the record, not just whichever fired last.
+    assert "evil.example.com" in grounding["ungrounded"]
+    assert "evil.example.com" in grounding["reason"]
+    assert "fabricated tool citations" in grounding["reason"]
+    assert any("evil.example.com" in s for s in grounding["stripped"])
+    assert any("verified by the tools" in s.lower() for s in grounding["stripped"])
 
 
 async def test_regrounding_loop_reruns_the_agent_and_records_the_attempt() -> None:
@@ -498,9 +600,11 @@ async def test_regrounding_loop_reruns_the_agent_and_records_the_attempt() -> No
     assert "Unverified" not in finish.last["content"]
 
 
-async def test_fabricated_tool_citations_on_a_zero_tool_turn_are_caveated() -> None:
+async def test_fabricated_tool_citations_on_a_zero_tool_turn_are_redacted() -> None:
     """An answer that cites tools it never ran is fabricated evidence, even
-    when it asserts no artifact for the grounding check to catch."""
+    when it asserts no artifact for the grounding check to catch. Same
+    ground-or-strip policy as an ungrounded identifier: the fabricated
+    citation text is stripped, not caveated."""
     state = _state()
     ctx = _ctx(state)
     finish = _Finish()
@@ -521,7 +625,11 @@ async def test_fabricated_tool_citations_on_a_zero_tool_turn_are_caveated() -> N
 
     assert finish.last["meta"]["tools"] == []
     assert finish.last["meta"]["narrative_grounding"]["grounded"] is False
-    assert "Unverified" in finish.last["content"]
+    assert finish.last["meta"]["narrative_grounding"]["stripped"]
+    assert "Verified by the tools" not in finish.last["content"]
+    assert "(unverified)" in finish.last["content"]
+    assert "Some unverifiable specifics were removed" in finish.last["content"]
+    assert "⚠" not in finish.last["content"]
 
 
 # ── the task tracker ────────────────────────────────────────────────────────

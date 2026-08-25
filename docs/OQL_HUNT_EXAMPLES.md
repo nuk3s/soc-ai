@@ -66,6 +66,10 @@ event.dataset:zeek.dns AND zeek.dns.rcode_name:NXDOMAIN
 
 ### H7. Cadence check for one suspect pair (eyeball the interval)
 
+`t_beacon_profile` runs this cadence measurement (inter-arrival CV) across all
+src→dst pairs in the window at once — call it first. Fall back to the manual
+query below only if the tool errors:
+
 Pull the raw conn records time-ordered and measure the spacing yourself — the
 MEASURED periodicity is the finding, not any alert title:
 

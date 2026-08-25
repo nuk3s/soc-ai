@@ -30,8 +30,8 @@ import { useChatThread } from '../lib/useChatThread';
  */
 const THREAD_SUBJECT = 'dashboard-general';
 
-/** Openers that show the surface's range; clicking one fills the box, so the
- *  analyst edits a question rather than facing a blank prompt. */
+/** Openers that show the surface's range; clicking one asks it outright. While
+ *  a turn is already in flight the click falls back to filling the box instead. */
 const STARTERS = [
   'What datasets do I have?',
   'What is my noisiest rule this week?',
@@ -95,7 +95,9 @@ export function GeneralChatPanel() {
                 <button
                   key={q}
                   type="button"
-                  onClick={() => chat.setDraft(q)}
+                  // Submit outright; while a turn is in flight, fall back to
+                  // filling the composer so the click is never swallowed.
+                  onClick={() => (chat.pending ? chat.setDraft(q) : chat.send(q))}
                   className="rounded-pill border border-border-input bg-surface-3 px-2.5 py-1 text-[12px] text-text-2 hover:border-accent hover:text-text"
                 >
                   {q}

@@ -4,6 +4,126 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
+## [Unreleased]
+
+## [1.3.1] - 2026-08-25
+
+A critical dogfood of the 1.3 journey before it went public — a live walk of hunt → promote →
+investigate → draft, plus correctness and performance passes. The fixes below all land before the
+first public 1.3 release.
+
+### Fixed
+
+- **The Draft-detection button no longer times out before the rule arrives.** The request carried the
+  20-second budget meant for database reads, but drafting a rule takes 16–44 seconds on the analyst
+  model — so the button reliably failed while the server finished a good draft and threw it away. The
+  client now waits long enough, and the server has its own 150-second budget that returns an honest
+  "took too long" before the client gives up.
+- **A detection can only be drafted from a confirmed true positive.** The two draft buttons had drifted
+  apart: the hunt-console button would draft a rule from any finding — including one whose investigation
+  concluded *false positive* — while the investigation screen required a confirmed true positive. Both
+  surfaces and both API routes now enforce the same rule: investigate and confirm the finding first.
+- **Drafted rules are grounded in the events that were actually seen.** The drafter used to receive only
+  the finding's prose and a list of document IDs, never the events themselves, so it could invent field
+  values the UI then called "grounded." It now reads the cited events and keys the rule on their observed
+  values, and refuses to draft when nothing resolves on the grid.
+- **"Rule structure valid" and the would-have-fired count now match what you export.** Editing the rule
+  in the review box no longer leaves a green validity badge and a firing count describing the *original*
+  draft — once you edit, the pane says the checks reflect the pre-edit rule until re-checked. The badge
+  was also renamed so it no longer implies the rule is guaranteed to load in Security Onion, and Sigma
+  field names are now checked against the same allow-list the query engine uses.
+- **The would-have-fired dry run is anchored to when the activity happened**, not the last 30 days from
+  now, so a rule drafted from older evidence no longer reports a misleading zero. Over-broad rules that
+  match everything now surface as "not specific enough to dry-run" instead of a reassuring huge count.
+- **Exported rules carry their origin.** The copied/downloaded `.yml` now names the hunt and finding it
+  came from and marks soc-ai as the author, so a rule pasted into Security Onion can be traced back.
+- **A drafting failure returns an honest error, not a raw 500** — a slow or unavailable analyst model
+  now maps to a clear "model unavailable / timed out, retry" instead of an opaque server error.
+- **`first_seen` no longer floods a hunt with false "novel" destinations** when the baseline window has
+  no data (a young grid, short retention, or a coverage gap): it says novelty could not be determined
+  instead of calling every established destination brand-new.
+- **Beaconing analysis stops ranking a burst of identical timestamps as the strongest beacon** (a
+  zero-interval burst is not a cadence), and internal destinations are now excluded in the query rather
+  than after hauling them back and discarding them — so the external candidates the tool exists for are
+  no longer crowded out.
+- **Plainer, more discoverable copy across the journey**: the "citation gate stripped this finding"
+  tooltip is gone; the investigation toolbar's "Export" is now "Export decision record" so it doesn't
+  compete with the Sigma "Download .yml"; a completed hunt points the way to promote → investigate →
+  draft; and when detection authoring is off, a confirmed finding shows a quiet "enable it in Config"
+  link instead of nothing.
+
+### Performance
+
+- The polled hunt-detail endpoint and the triage prior-outcomes memory no longer deserialize whole
+  investigation report blobs to read a handful of scalar fields; the detection dry run makes one grid
+  round trip instead of two.
+
+## [1.3.0] - 2026-08-25
+
+The hunting release: three capabilities that compound. A confirmed hunt finding
+becomes a first-class investigation; behavioral-analytics tools surface the
+findings worth confirming; and a confirmed finding becomes a drafted detection
+you review and export.
+
+### Added
+
+- **Promote a hunt finding into its own investigation.** A finding you want to
+  pursue becomes a full investigation with the hunt as its provenance. It
+  anchors on the finding's own cited telemetry — the exact event the hunt
+  surfaced — so the verdict is grounded in what you were looking at rather than
+  re-derived from scratch. Hunt-kind investigations never write back to Security
+  Onion (no ack, escalate, or auto-close), and re-promoting the same finding
+  returns the existing investigation instead of a duplicate.
+- **Behavioral-analytics hunt tools.** Four tools the hunt agent can call, each
+  bounded to a candidate set before the model sees it: beaconing by inter-arrival
+  regularity, high-entropy DNS query names, a DCE-RPC operation histogram with
+  dangerous/rare flags, and first-seen external destinations measured against a
+  trailing baseline. Each cites the underlying events by ID, so a finding can be
+  confirmed against real telemetry and carried into a promotion. A "DCE-RPC abuse
+  / DC attacks" hunt template ships alongside them.
+- **Draft a detection from a confirmed finding (export-only).** A confirmed hunt
+  finding can be turned into a Sigma rule: soc-ai drafts it grounded in the
+  finding's evidence, checks it against the Sigma schema, and runs a
+  would-have-fired dry run over your grid so you see how many events it matches —
+  with a few sample IDs — before you trust it. You review and edit the rule, then
+  copy it or download a `.yml` to paste into Security Onion yourself; soc-ai never
+  writes a detection to the grid. Off by default — enable `sigma_authoring_enabled`
+  in the config console.
+
+### Changed
+
+- **A usability pass across the deployed app.** Notification badge counts, the
+  Ask panel's chip-submit, middle-ellipsis truncation for long names, host results
+  in the command palette, window-derived hunt stats, hosts defaulting to the
+  active filter, GUID-hostname rejection, OS-family labels, and alert-event
+  bucketing.
+
+### Fixed
+
+- **A chat turn can no longer hang after its answer exists.** The post-answer
+  tail (grounding check, redaction, save) ran with no deadline of its own; a
+  stalled save left the turn pending with the reply already written. The tail
+  now has a 20-second bound and a timeout message that says what actually
+  happened instead of blaming the question.
+- **The grounding check stops reading security prose as hostnames.** Terms like
+  "C2-style" and "Cloudflare-fronted" qualified as artifacts and burned both
+  regrounding attempts on every reply that used them; a hyphenated token now
+  counts only when backticked or shaped like a real machine name
+  (all capitals and digits).
+- **The audit chain stops crying tamper over its own restarts.** A chain-head
+  recovery bug (fixed 2026-08-17) reset the hash chain to genesis on every
+  process restart for eight weeks; prod's trail carries 134 of those
+  legitimate boundaries, and verification used to report the whole thing
+  broken at the second one. Verification is now epoch-aware — each restart
+  checks as its own chain — and an all-clear spanning more than one epoch
+  renders amber, never the green full-success line, because cross-epoch
+  linkage is not provable. `soc-ai audit verify`, the verify-chain endpoint,
+  and the Diagnostics control all now name which epoch a real break falls in,
+  tally the blast radius ("1 of 134 epochs broken"), and say the thing an
+  operator actually needs: whether every epoch after the newest break verified
+  intact — suppressed under a capped scan, which cannot make claims about the
+  chain's newest end in either direction.
+
 ## [1.2.9] - 2026-08-19
 
 The front-door release: the path from `git clone` to a first verdict on your

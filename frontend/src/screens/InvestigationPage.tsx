@@ -12,8 +12,11 @@ export function InvestigationPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: string } | null)?.from;
-  const backTo = from === '/investigations' ? '/investigations' : '/alerts';
-  const backLabel = from === '/investigations' ? 'Investigations' : 'Alerts';
+  // A promoted finding's back-link returns to the hunt it came from — the
+  // hunt page is where re-promotion (this slice's sanctioned re-run) lives.
+  const fromHunt = from?.startsWith('/hunts/') ? from : null;
+  const backTo = fromHunt ?? (from === '/investigations' ? '/investigations' : '/alerts');
+  const backLabel = fromHunt ? 'Hunt' : from === '/investigations' ? 'Investigations' : 'Alerts';
   const [reloadKey, setReloadKey] = useState(0);
   // useAsync captures pauseWhen at setup and can't see `inv` there, so track the
   // status in a ref and let pauseWhen consult it. Driving the live refresh

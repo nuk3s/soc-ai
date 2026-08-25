@@ -127,19 +127,23 @@ async def test_seed_builtins_seeds_the_pill_set(settings_kratos: Settings) -> No
         assert n == len(ht_svc._BUILTINS)  # every builtin seeded
         rows = await ht_svc.list_all(db)
         names = {r.name for r in rows}
-        # the six canned pills are present, all flagged builtin
+        # the seven canned pills are present, all flagged builtin
         assert "Beaconing to rare IPs" in names
         assert "Lateral movement" in names
         assert "Suspicious PowerShell / LOLBins" in names
+        assert "DCE-RPC abuse / DC attacks" in names
         assert all(r.builtin for r in rows)
         # the lateral-movement builtin carries the RDP telemetry requirement
         lat = next(r for r in rows if r.name == "Lateral movement")
         assert "zeek.rdp" in lat.required_datasets
+        # the DCE-RPC builtin carries its telemetry requirement, no env gate
+        dcerpc = next(r for r in rows if r.name == "DCE-RPC abuse / DC attacks")
+        assert "zeek.dce_rpc" in dcerpc.required_datasets
     await engine.dispose()
 
 
 async def test_seed_builtins_is_idempotent(settings_kratos: Settings) -> None:
-    """Calling seed twice does NOT duplicate — the same six rows, keyed by name."""
+    """Calling seed twice does NOT duplicate — the same seven rows, keyed by name."""
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
         await ht_svc.seed_builtins(db)
@@ -230,6 +234,27 @@ def test_list_annotates_availability_missing_rdp(client: TestClient) -> None:
 
     # DNS/C2 needs zeek.dns (present) → available
     assert by_name["DNS / C2 exfiltration"]["available"] is True
+
+
+def test_list_annotates_availability_missing_dcerpc(client: TestClient) -> None:
+    """On a grid WITHOUT zeek.dce_rpc, the DCE-RPC builtin is flagged (amber), not
+    hidden or demoted — flag-not-demote: a dataset gap is fixable collection, not
+    an environment mismatch, so `applicable` stays True while `available` flips."""
+    inv = _inventory("zeek.conn", "zeek.kerberos", "zeek.smb_files", "zeek.dns", "endpoint")
+    with patch(
+        "soc_ai.api.webui.routes_hunts.discover_datasets",
+        AsyncMock(return_value=inv),
+    ):
+        resp = client.get("/api/v1/hunt-templates")
+    assert resp.status_code == 200, resp.text
+    by_name = _templates_by_name(resp.json())
+
+    dcerpc = by_name["DCE-RPC abuse / DC attacks"]
+    assert dcerpc["available"] is False
+    assert dcerpc["missingDatasets"] == ["zeek.dce_rpc"]
+    assert dcerpc["applicable"] is True  # flag, not demote — no env requirement
+    assert dcerpc["missingEnvironment"] == []
+    assert dcerpc["builtin"] is True
 
 
 def test_list_best_effort_when_inventory_fails(client: TestClient) -> None:
@@ -360,9 +385,14 @@ def test_create_template_requires_name_and_objective(client: TestClient) -> None
 # a profile error and on a never-built table, and one qualifying host suffices.
 # ---------------------------------------------------------------------------
 
-# The three environment-gated builtins, and the three network-generic ones.
+# The three environment-gated builtins, and the four network-generic ones.
 ENV_GATED = ("Credential abuse / lockouts", "Lateral movement", "Suspicious PowerShell / LOLBins")
-NETWORK_GENERIC = ("Beaconing to rare IPs", "DNS / C2 exfiltration", "New external services")
+NETWORK_GENERIC = (
+    "Beaconing to rare IPs",
+    "DNS / C2 exfiltration",
+    "New external services",
+    "DCE-RPC abuse / DC attacks",
+)
 
 # A full inventory so availability is all-green and the tests below isolate the
 # environment axis from the telemetry axis.
@@ -373,6 +403,7 @@ _FULL_INV = (
     "zeek.rdp",
     "zeek.dns",
     "endpoint",
+    "zeek.dce_rpc",
 )
 
 

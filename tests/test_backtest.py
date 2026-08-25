@@ -302,6 +302,8 @@ async def _fake_investigate(
     ctx: Any,
     focus_hint: str | None = None,
     deep: bool = False,
+    allow_so_writes: bool = True,
+    focus_origin: str = "rerun",
 ) -> AsyncIterator[StepEvent]:
     sid = "fake-bt-sid"
     yield StepEvent(

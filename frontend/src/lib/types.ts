@@ -12,7 +12,7 @@ export type Verdict =
 
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
-export type DetectionKind = 'suricata' | 'sigma' | 'notice';
+export type DetectionKind = 'suricata' | 'sigma' | 'notice' | 'hunt';
 
 /** Human triage state on an alert assignment (E2.3). "unassigned" (no owner) is
  * modelled as the ABSENCE of state (null), so a set state is always one of these. */
@@ -329,6 +329,11 @@ export interface Investigation {
   errorDismissed?: boolean;
   /** Live acked state of this investigation's alert in Security Onion (false on ES error). */
   alertAcked?: boolean;
+  /** Promotion provenance (kind === 'hunt'): the source hunt and its objective
+   *  for the provenance strip. huntObjective is null when the hunt was deleted
+   *  (no FK server-side — the link may dangle). */
+  huntId?: string | null;
+  huntObjective?: string | null;
 }
 
 /** The triggering detection's raw facts — the "what fired" reference panel. */
@@ -464,6 +469,46 @@ export interface HuntFinding {
   /** Set by the deterministic post-hunt citation gate when it stripped
    *  non-resolving citations or capped severity (mirrors Investigation). */
   validatorNote?: string | null;
+  /** The newest investigation promoted from this finding, or null/absent when
+   *  never promoted. An errored/cancelled/interrupted promotion frees the
+   *  re-promote slot server-side, so the card falls back to Investigate even
+   *  though this is non-null — status is what decides the card's state, not
+   *  presence alone. */
+  investigation?: { id: string; status: string; verdict?: string | null; conf?: number | null } | null;
+}
+
+// ---- Detection bridge (1.3 slice 3): draft-detection review pane ----------
+// Both wire shapes match the backend pydantic models field-for-field
+// (soc_ai/detection/models.py) — no camelCase translation, same convention
+// as the rest of this file's snake_case wire mirrors.
+
+/** Deterministic "would-have-fired" evidence — set by the backend validator,
+ *  never the drafting model. */
+export interface DryRunResult {
+  ran: boolean;
+  hit_count: number;
+  total_is_lower_bound: boolean;
+  /** Up to 5 ES `_id`s that matched — rendered as chips in the review pane. */
+  sample_ids: string[];
+  window_days: number;
+  /** Set when the dry run couldn't run at all (bad/whitelist-rejected OQL,
+   *  grid down) — the review pane shows this instead of a hit count. */
+  error: string | null;
+}
+
+/** A drafted detection: the Sigma rule to export + the OQL that IS its
+ *  dry-run logic. Returned by `draftFindingDetection`/`draftInvestigationDetection`
+ *  — export-only (copy/download in the review pane), never written to
+ *  Security Onion by soc-ai. */
+export interface SigmaDraft {
+  title: string;
+  sigma_yaml: string;
+  oql: string;
+  rationale: string;
+  /** Set by the deterministic Sigma-schema validator, never the model. */
+  validator_note: string | null;
+  schema_ok: boolean | null;
+  dry_run: DryRunResult | null;
 }
 
 export interface HuntAction {
@@ -676,6 +721,19 @@ export interface AboutInfo {
    * delete the feature for anyone running a mixed build.
    */
   general_chat_enabled?: boolean;
+  /**
+   * The detection-bridge "Draft detection" affordance's kill switch
+   * (Investigation / hunt-finding screens) — rides on this response for the
+   * same reason `general_chat_enabled` does: a screen that renders the
+   * button optimistically and only THEN discovers the route 403s teaches
+   * nothing but distrust.
+   *
+   * OPTIONAL for the same mixed-build reason as `general_chat_enabled`, but
+   * the missing-field default is the OPPOSITE: this setting defaults OFF, so
+   * an older backend (or a failed probe) omitting the field must mean
+   * "hidden", not "shown" — the inverse of general_chat_enabled's fail-open.
+   */
+  sigma_authoring_enabled?: boolean;
 }
 
 export interface UpdateCheckResult {
@@ -899,6 +957,11 @@ export type DossierHealthFilter = 'broken';
 /** The `?source=` prefilter: hosts carrying an operator declaration, or hosts
  *  running purely on inference. */
 export type DossierLane = 'operator' | 'inferred';
+
+/** The `?activity=` prefilter: `active` keeps only hosts with observed events
+ *  (`event_count > 0`) — the Hosts screen's default, hiding the DNS-only
+ *  census entries that otherwise drown the list. */
+export type DossierActivityFilter = 'active';
 
 /** An OPEN disagreement, with the state of its rate limiter. Present only while
  *  the lanes actually disagree — the backend NULLs it the moment they agree
@@ -1207,7 +1270,36 @@ export interface PreflightDetail {
 /** GET /config/audit/verify-chain (admin, require_admin_api). Mirrors
  *  soc_ai.audit.verify.ChainVerifyResult (+ `checked_at`, stamped by the
  *  route). `first_broken_seq` is non-null iff `ok` is false — that invariant
- *  is enforced server-side by verify_chain's own contract. */
+ *  is enforced server-side by verify_chain's own contract.
+ *
+ *  `epochs` / `first_broken_epoch_start`: the chain is verified PER EPOCH, cut
+ *  at every process-restart boundary (a genesis `seq=0` record never links
+ *  back to whatever epoch came before it — see the backend module docstring
+ *  for the chain-head recovery bug, fixed 2026-08-17, that made a
+ *  134-epoch chain a real prod shape rather than a hypothetical). `ok: true`
+ *  with `epochs > 1` means "no tamper found within any restart's own trail" —
+ *  a genuinely weaker claim than one unbroken chain, since cross-epoch
+ *  linkage can never be checked, so every consumer renders it amber, distinct
+ *  from both the single-epoch green success line and the capped-amber line.
+ *  `first_broken_epoch_start` is set iff `ok` is false: `first_broken_seq`
+ *  alone is ambiguous once more than one epoch exists (it resets to 0 at
+ *  every genesis), so this is what actually locates a real break — the
+ *  OLDEST one specifically (kept for compat with the single-break era).
+ *
+ *  `epochs_broken` / `newest_broken_epoch_start` / `latest_epoch_broken`:
+ *  EVERY epoch is checked, never just the first broken one found — live prod
+ *  (2026-08-21) found a REAL duplicate-seq artifact from the historic
+ *  pre-1.2.8 write-side stale-head seq-reuse bug, mid-epoch, on top of the
+ *  already-known genesis-reset fragmentation, and stopping at the first break
+ *  could not answer "is anything MORE recent also broken" — see the backend
+ *  module docstring. `epochs_broken` is the count; `newest_broken_epoch_start`
+ *  names the MOST RECENT broken epoch specifically (distinct from
+ *  `first_broken_epoch_start`, the oldest); `latest_epoch_broken` is True iff
+ *  the temporally last epoch FETCHED was itself broken — computed the same
+ *  way regardless of `capped`, but only trustworthy for "is the chain sound
+ *  right now" reasoning when `capped` is false (a capped scan cannot vouch
+ *  for epochs past its own prefix — the cap always truncates the NEWEST end,
+ *  since the fetch is oldest-first). */
 export interface AuditChainVerifyResult {
   ok: boolean;
   records_verified: number;
@@ -1215,5 +1307,10 @@ export interface AuditChainVerifyResult {
   first_seq: number | null;
   last_seq: number | null;
   capped: boolean;
+  epochs: number;
+  first_broken_epoch_start: string | null;
+  epochs_broken: number;
+  newest_broken_epoch_start: string | null;
+  latest_epoch_broken: boolean;
   checked_at: string;
 }

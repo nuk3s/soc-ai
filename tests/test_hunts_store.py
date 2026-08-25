@@ -62,11 +62,11 @@ async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     # model_battery_results → 0023 model_fitness_cache → 0024 host_dossier →
     # 0025 general_chat → 0026 quality_counts → 0027 alarm_identity → 0028
     # status_created_index_denorm → 0029 dossier_run_notes → 0030 saved_view →
-    # …).
+    # 0031 investigation_kind_provenance → …).
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0030"
+        assert row.scalar_one() == "0031"
     await engine.dispose()
 
 

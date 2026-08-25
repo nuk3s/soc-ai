@@ -5,7 +5,7 @@
 // `masterSwitchEnabled` alongside the rows so the panel can render an honest
 // state: a persistent banner with a real deep-link into Config, and a muted
 // "on (paused)" pill instead of the plain accent "on".
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
@@ -36,7 +36,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   deleteHuntSchedule: deleteHuntScheduleMock,
 }));
 
-import { getHunts } from '../lib/api';
+import { getHunts, getHuntStats } from '../lib/api';
 import type { HuntRow } from '../lib/types';
 import { Hunts } from './Hunts';
 
@@ -178,5 +178,38 @@ describe('Hunts selection does not cost the only filter', () => {
     expect(screen.getByText('24h')).toBeTruthy();
     expect(screen.getByText('7d')).toBeTruthy();
     expect(within(strip).queryByText('24h')).toBeNull();
+  });
+});
+
+// The header line used to read straight off GET /hunts/stats, which is
+// unwindowed (all-time) — while the table below is server-filtered to the
+// screen's time range. "89 hunts" over a 1-row table read as broken. The
+// header must instead be derived from the same windowed rows the table shows.
+describe('Hunts header counts the window, not all time', () => {
+  it('the header line counts the WINDOW (the rows), not all time', async () => {
+    vi.mocked(getHuntStats).mockResolvedValue([
+      { label: 'Hunts', value: '89', sub: 'recent', tone: 'accent' },
+      { label: 'Findings', value: '427', sub: 'surfaced', tone: 'warn' },
+      { label: 'In progress', value: '0', sub: 'running now', tone: 'sigma' },
+    ]);
+    vi.mocked(getHunts).mockResolvedValue([
+      {
+        id: 'h1',
+        objective: 'sweep',
+        kind: 'scheduled',
+        status: 'complete',
+        findingCount: 3,
+        affectedHosts: 2,
+        confidence: 0.72,
+        startedBy: 'scheduler',
+        when: '1h',
+        ts: '2026-08-22T06:14:40Z',
+      },
+    ]);
+    renderHunts();
+    const line = await screen.findByTestId('hunt-stats-line');
+    await waitFor(() => expect(line.textContent).toContain('1 hunt'));
+    expect(line.textContent).toContain('3 findings');
+    expect(line.textContent).not.toContain('89');
   });
 });

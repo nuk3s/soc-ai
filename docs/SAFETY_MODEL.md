@@ -29,6 +29,17 @@ Every LLM I/O and tool invocation is written to a date-stamped ES audit index
   restarts. The hash chain provides tamper-*evidence*, not tamper-*prevention*:
   it lets you detect that records were altered, but does not stop a privileged ES
   user from altering them.
+- **Epoch-aware verification:** a restart is a legitimate reason the chain
+  can't be linked all the way back — a genesis (`seq=0`) record's `prev_hash`
+  is the all-zero hash by construction, so it never links to whatever epoch
+  came before it. A 2026-06-24→08-16 chain-head recovery bug (fixed
+  2026-08-17) turned that rare case into 134 of them, resetting the head on
+  every restart. `soc-ai audit verify` and the Diagnostics "Verify audit
+  chain" control check each restart boundary as its own epoch rather than
+  reporting every boundary after the first as tamper — but an all-clear
+  spanning more than one epoch is shown as a distinct state (amber, no
+  checkmark), not the same livery as one unbroken chain: cross-epoch linkage
+  can't be proven.
 - **Fail-closed for mutating writes:** with `AUDIT_FAIL_CLOSED=true` (default), an
   SO-state-changing action (ack/escalate/comment/auto-ack) is aborted if its
   audit record cannot be written. No acknowledged or escalated alert without an

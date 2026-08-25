@@ -607,12 +607,38 @@ async def api_model_fitness(
 
 
 class AuditChainVerifyOut(BaseModel):
-    ok: bool  # True iff the chain (over the scanned records) is intact
+    ok: bool  # True iff every epoch (see soc_ai.audit.verify) is internally intact
     records_verified: int  # number of chained records checked
-    first_broken_seq: int | None = None  # seq of the first break, else null
+    first_broken_seq: int | None = None  # seq of the first break, LOCAL to its epoch
     first_seq: int | None = None  # seq span actually covered (null on empty)
     last_seq: int | None = None
     capped: bool = False  # True iff the scan hit the record cap (prefix only)
+    # Epoch count (0 empty, 1 ordinary/unbroken, >1 spans a restart boundary —
+    # see soc_ai/audit/verify.py's module docstring for the chain-head recovery
+    # bug that made this a real prod shape, not a hypothetical) and, when
+    # !ok, the ISO timestamp of the OLDEST broken epoch's own genesis —
+    # first_broken_seq alone is ambiguous once more than one epoch exists (it
+    # resets to 0 at every genesis), so this is what actually locates a break
+    # (kept for compat with the single-break era; see the fields below for the
+    # rest of the picture once more than one epoch can be broken).
+    epochs: int = 1
+    first_broken_epoch_start: str | None = None  # set iff ok is False
+    # Blast-radius fields: every epoch is checked, not just the first broken
+    # one (soc_ai/audit/verify.py's module docstring has the prod finding that
+    # made this necessary — a real, separate tamper artifact from the historic
+    # pre-1.2.8 write-side stale-head seq-reuse bug, found mid-epoch, on top of
+    # the chain-head-recovery-bug fragmentation). `epochs_broken` counts every
+    # broken epoch found; `newest_broken_epoch_start` names the MOST RECENT
+    # one (distinct from `first_broken_epoch_start`, the oldest) — that is
+    # what answers "is anything current broken", not the oldest scar.
+    # `latest_epoch_broken` is True iff the temporally last epoch fetched was
+    # itself among the broken ones — computed from what was scanned only; a
+    # capped scan cannot vouch for epochs past its own prefix (the cap always
+    # truncates the NEWEST end), so consumers must not treat either of these
+    # as a claim about anything beyond the capped prefix.
+    epochs_broken: int = 0
+    newest_broken_epoch_start: str | None = None  # set iff epochs_broken > 0
+    latest_epoch_broken: bool = False
     checked_at: str  # ISO-8601 UTC timestamp of this verification
 
 
@@ -629,11 +655,24 @@ async def api_audit_verify_chain(
 ) -> AuditChainVerifyOut:
     """Verify the tamper-evident audit hash chain against the live ES audit index.
 
-    Pulls every audit record (optionally the last ``?days=N`` days) sorted by
-    ``seq`` and recomputes the chain (see :mod:`soc_ai.audit.chain`). ``ok`` is
-    True iff no record was edited, reordered, inserted, or deleted since it was
-    written; ``first_broken_seq`` names the first break otherwise. An empty index
-    is intact by definition.
+    Pulls every audit record (optionally the last ``?days=N`` days), partitions
+    it into epochs at each restart boundary, and recomputes EVERY epoch's chain
+    independently (see :mod:`soc_ai.audit.verify`, :mod:`soc_ai.audit.chain`) —
+    never stopping at the first broken one. ``ok`` is True iff every epoch is
+    internally intact — no record was edited, reordered, inserted, or deleted
+    within any of them since it was written; ``first_broken_seq``/
+    ``first_broken_epoch_start`` name the OLDEST break, and ``epochs_broken``/
+    ``newest_broken_epoch_start``/``latest_epoch_broken`` give the rest of the
+    blast radius — see :mod:`soc_ai.audit.verify`'s module docstring for the
+    live prod finding (2026-08-21) that made "keep checking past the first
+    break" a real requirement: a genuine, separate tamper artifact from the
+    historic pre-1.2.8 write-side stale-head seq-reuse bug, found mid-epoch, on
+    top of the already-known chain-head-recovery-bug fragmentation. An empty
+    index is intact by definition, with ``epochs=0``. ``epochs > 1`` is not
+    itself a fault — but it IS a weaker claim than one unbroken chain
+    (cross-epoch linkage is unprovable by construction), which is why callers
+    must render ``ok=True, epochs>1`` distinctly from a single-epoch clean scan
+    rather than with the same full-success livery.
 
     Unlike the other config diagnostics this is NOT fail-soft: a verification
     against an unreachable audit index is "could not run", never a clean chain —
@@ -682,6 +721,11 @@ async def api_audit_verify_chain(
         first_seq=result.first_seq,
         last_seq=result.last_seq,
         capped=result.capped,
+        epochs=result.epochs,
+        first_broken_epoch_start=result.first_broken_epoch_start,
+        epochs_broken=result.epochs_broken,
+        newest_broken_epoch_start=result.newest_broken_epoch_start,
+        latest_epoch_broken=result.latest_epoch_broken,
         checked_at=datetime.now(UTC).isoformat(),
     )
 

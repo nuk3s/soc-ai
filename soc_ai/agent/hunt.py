@@ -162,7 +162,10 @@ class HuntReport(BaseModel):
         description=(
             "Plain-English narrative tying the findings together into a story "
             "(what happened across hosts/time), written for the on-call analyst. "
-            "If nothing notable was found, say so plainly."
+            "The FIRST sentence is the bottom line: the objective's assessment "
+            "(no malicious indication / suspicious / malicious / can't determine) "
+            "plus what happened, in plain words — before any narrative detail. "
+            "If nothing notable was found, say so plainly in that first sentence."
         )
     )
     affected_hosts: list[str] = Field(
@@ -242,12 +245,19 @@ its OWN dataset (e.g. `event.dataset:zeek.ssh` for SSH); an empty `zeek.conn` sl
 not mean there is no SSH. Use `t_query_zeek_logs` to pull a flow's zeek records by \
 community_id, `t_host_summary` to identify an internal host by IP, `t_prevalence` to \
 judge how rare a host→dest/domain pairing is, `t_rule_prevalence` to judge whether a \
-firing rule is noise or notable, and the `t_enrich_*` tools for indicator reputation.
+firing rule is noise or notable, and the `t_enrich_*` tools for indicator reputation. \
+For cadence, DNS-entropy, DCE-RPC, and novelty questions, prefer the MEASURING tools — \
+`t_beacon_profile` (inter-arrival CV), `t_dns_entropy_scan` (qname entropy/volume), \
+`t_dcerpc_histogram` (DC-attack operations), `t_first_seen` (novel external \
+destinations) — over eyeballing raw rows: their output IS the measured pattern the \
+correlation rules below demand.
 4. Map what you find to MITRE ATT&CK techniques where you can (technique IDs).
 5. Produce a `HuntReport`: discrete `findings` (each with a SHORT title — max ~8 words \
 / 60 characters, no trailing punctuation — grounded detail, severity, a `category`, the \
-hosts involved, and citations), a `narrative` tying them together, the \
-`affected_hosts`, the `mitre_techniques`, advisory \
+hosts involved, and citations), a `narrative` tying them together — its FIRST SENTENCE \
+is the bottom line: the objective's assessment (no malicious indication / suspicious / \
+malicious / can't determine) plus what happened, in plain words, before any supporting \
+detail — the `affected_hosts`, the `mitre_techniques`, advisory \
 `recommended_actions`, and an overall `confidence`. Categorize honestly: `"threat"` \
 ONLY for activity you actually observed in tool results; `"visibility_gap"` for \
 telemetry that doesn't exist here; `"observation"` for benign context. The console's \
@@ -272,8 +282,9 @@ radius), even if each host alone looks minor.
 to ONE destination is decisive C2 evidence — but the decisiveness comes from the \
 MEASURED pattern (the periodicity, the entropy, the volume you actually pulled), NOT \
 from the alert title. A firing ET HUNTING / Informational rule is a REASON TO LOOK, not \
-the finding itself: confirm the periodicity or the DNS pattern (or a `*_summary` rollup \
-if present) in a tool result and grade it on THAT. Do not upgrade an alert to "decisive \
+the finding itself: confirm the periodicity with `t_beacon_profile` or the DNS pattern \
+with `t_dns_entropy_scan` (or a `*_summary` rollup if present) in a tool result and \
+grade it on THAT. Do not upgrade an alert to "decisive \
 C2" on its title alone — corroborate the behaviour first, then grade it high.
 
 ## Trust the evidence, not the detector's claim (hard-won FP lessons)
@@ -384,11 +395,13 @@ already ran this session — and their results — is in the conversation above.
 Write the final `HuntReport` NOW from ONLY the evidence already gathered above. You have \
 NO remaining tool budget — do not ask for more tools. Apply the same HARD RULE: state a \
 concrete fact (host, domain, IP/port, hash, user) ONLY if it appears in a tool result \
-above; never invent or "example" a value. Because the hunt was cut short, say so plainly \
-in the `narrative`, keep `findings` to what you can actually cite, and set a LOWER \
-`confidence`. A short, honest, grounded PARTIAL report is the goal — never a fabricated \
-complete one. If nothing was substantiated before the budget ran out, return an empty \
-`findings` list and a narrative that says so.
+above; never invent or "example" a value. The `narrative`'s FIRST SENTENCE is the bottom \
+line even when the hunt was cut short: the objective's assessment (no malicious \
+indication / suspicious / malicious / can't determine) plus what happened, in plain \
+words. Say so plainly there, keep `findings` to what you can actually cite, and set a \
+LOWER `confidence`. A short, honest, grounded PARTIAL report is the goal — never a \
+fabricated complete one. If nothing was substantiated before the budget ran out, return \
+an empty `findings` list and a narrative that says so.
 
 ## A detector claim is not a threat (this is where cut-short hunts go wrong)
 When a hunt is cut short, the transcript above is often DOMINATED by loud alert \

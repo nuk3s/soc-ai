@@ -289,6 +289,28 @@ def test_list_health_broken_is_the_kpi_click_through(client: TestClient) -> None
     assert client.get("/api/v1/dossiers", params={"health": "meh"}).status_code == 422
 
 
+def test_list_activity_active_hides_quiet_hosts(client: TestClient) -> None:
+    """``?activity=active`` is the Hosts screen's default filter.
+
+    DNS-only census entries land with ``event_count=0`` and, on the lab grid,
+    made up 185 of 234 rows. ``activity=active`` is the escape from that —
+    omitting it still returns the full census.
+    """
+    _seed_host(client, "192.168.10.1", event_count=5)
+    _seed_host(client, "192.168.10.2", event_count=0)
+
+    active = client.get("/api/v1/dossiers", params={"activity": "active"}).json()
+    assert [row["ip"] for row in active["rows"]] == ["192.168.10.1"]
+    assert active["total"] == 1
+
+    full = client.get("/api/v1/dossiers").json()
+    assert {row["ip"] for row in full["rows"]} == {"192.168.10.1", "192.168.10.2"}
+    assert full["total"] == 2
+
+    # A typo is a 422 naming the legal set, not a silently ignored filter.
+    assert client.get("/api/v1/dossiers", params={"activity": "meh"}).status_code == 422
+
+
 def test_list_defaults_to_attention_order(client: TestClient) -> None:
     """The landing screen ranks what needs the operator, not what talked last.
 

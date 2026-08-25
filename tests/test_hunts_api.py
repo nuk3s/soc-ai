@@ -1127,13 +1127,14 @@ def test_hunt_chat_spec_builds_the_hunt_shape(client: TestClient) -> None:
     assert "hunt for beaconing" in inputs.seed_context
 
 
-def test_hunt_chat_ungrounded_answer_now_gets_the_caveat(
+def test_hunt_chat_ungrounded_answer_now_gets_redacted(
     client: TestClient, settings_kratos: Settings
 ) -> None:
     """The payoff of the un-fork: an answer asserting a host/domain absent from
-    the hunt's evidence comes back wearing the Unverified caveat — the guardrail
-    the fork lacked, now inherited from the shared engine (matches
-    test_chat_turn's cross-shape grounding test)."""
+    the hunt's evidence comes back with that specific mechanically redacted —
+    the guardrail the fork lacked, now inherited from the shared engine
+    (matches test_chat_turn's cross-shape grounding test). Ground-or-strip
+    (2026-08-20): no caveat banner, the artifact itself is gone from the text."""
     import time
 
     hunt_id = _seed_complete_hunt(client)
@@ -1158,10 +1159,14 @@ def test_hunt_chat_ungrounded_answer_now_gets_the_caveat(
             time.sleep(0.1)
 
     assert done is not None
-    assert "Unverified" in done["payload"]["content"]
+    assert "evil.example.com" not in done["payload"]["content"]
+    assert "(unverified)" in done["payload"]["content"]
+    assert "Some unverifiable specifics were removed" in done["payload"]["content"]
+    assert "⚠" not in done["payload"]["content"]
     grounding = done["payload"]["meta"]["narrative_grounding"]
     assert grounding["grounded"] is False
     assert "evil.example.com" in grounding["ungrounded"]
+    assert grounding["stripped"] == ["evil.example.com"]
 
 
 def test_hunt_chat_thread_surfaces_live_tool_progress(client: TestClient) -> None:

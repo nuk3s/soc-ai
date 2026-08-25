@@ -52,10 +52,15 @@ you already know your grid's host groups:
 ```bash
 # <hostgroup> is grid-specific — list yours first, then add the IP to one that
 # opens Elasticsearch REST (9200) and the analyst/web ports:
-sudo so-firewall list-hostgroups       # inspect the available groups
+sudo so-firewall list-hostgroups       # inspect the available groups (newer SO builds)
 sudo so-firewall includehost <hostgroup> <soc-ai-host-ip>
 sudo so-firewall apply
 ```
+
+`list-hostgroups` is missing on SO 3.0.x (`so-firewall help` there only lists
+`help|apply|includehost|removehost|addhostgroup`) — use the web UI above, or
+read the group names straight off
+`/opt/so/saltstack/local/pillar/firewall/soc_firewall.sls` + `minions/*.sls`.
 
 **Symptom if you skip it:** the first hunt (or the startup ES health check) hangs and
 then fails with a connection *timeout* / "connection refused" to `…:9200`, even though the

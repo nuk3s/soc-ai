@@ -14,6 +14,7 @@ import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '..
 import { deleteInvestigation, listInvestigations, rehuntInvestigations } from '../lib/api';
 import { verdictFilterFromSearch } from '../lib/investigationFilters';
 import { plural } from '../lib/plural';
+import { middleEllipsis } from '../lib/text';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import { useListSelection } from '../lib/useListSelection';
@@ -28,6 +29,10 @@ const REHUNT_SKIP_REASONS: Record<string, string> = {
   not_found: 'not found',
   no_alert: 'no alert to hunt',
   could_not_start: "couldn't start",
+  // Defense in depth — the checkbox for a promoted finding is disabled, so
+  // this code should be unreachable from the UI, but a server refusal still
+  // deserves a readable reason if it ever fires (e.g. a stale selection).
+  hunt_kind: 'promoted finding — re-promote from its hunt instead',
 };
 const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
@@ -340,8 +345,14 @@ export function Investigations() {
   }
 
   // Selection: the shared hook, which IS this screen's logic — the other lists
-  // now borrow it from here rather than each keeping their own copy.
-  const sel = useListSelection(visible.map((r) => r.id));
+  // now borrow it from here rather than each keeping their own copy. A
+  // promoted finding (kind='hunt') is excluded from the eligible id set, not
+  // just from the bulk request: passing only eligible ids means select-all
+  // skips those rows and the strip's count can never disagree with what the
+  // bulk action actually submits (the server's `hunt_kind` rehunt-skip guard
+  // stays a defense in depth, not the only guard).
+  const bulkEligible = visible.filter((r) => r.kind !== 'hunt');
+  const sel = useListSelection(bulkEligible.map((r) => r.id));
   const selCount = sel.count;
 
   // Saved views. The filter state travels as one object, so a chip restores the
@@ -647,7 +658,12 @@ export function Investigations() {
               checked={sel.allVisibleSelected}
               indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
               onChange={sel.toggleAll}
-              title="Select all visible"
+              disabled={bulkEligible.length === 0}
+              title={
+                bulkEligible.length === 0
+                  ? "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead"
+                  : 'Select all visible'
+              }
             />
           </div>
           <div className={headerCls('name')} onClick={() => toggleSort('name')}>
@@ -708,7 +724,9 @@ export function Investigations() {
             <Fragment key={r.id}>
               {showHeader && (
                 <div className="flex items-center gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[12px] font-semibold text-text-2">
-                  <span className="min-w-0 truncate">{groupName}</span>
+                  <span title={groupName} className="min-w-0 truncate">
+                    {middleEllipsis(groupName)}
+                  </span>
                   <span className="font-mono text-[11px] text-faint">{groupCounts.get(groupName)}</span>
                 </div>
               )}
@@ -721,17 +739,25 @@ export function Investigations() {
                 className="flex items-center"
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (r.kind === 'hunt') return;
                   sel.toggle(r.id);
                 }}
               >
                 <Checkbox
                   checked={sel.isSelected(r.id)}
-                  title="Select"
+                  disabled={r.kind === 'hunt'}
+                  title={
+                    r.kind === 'hunt'
+                      ? "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead"
+                      : 'Select'
+                  }
                 />
               </div>
               <div className="flex min-w-0 items-center gap-[9px]">
                 <KindBadge kind={r.kind} />
-                <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{r.name}</span>
+                <span title={r.name} className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                  {middleEllipsis(r.name)}
+                </span>
                 {/* The row is representative but not current. Says so on the
                     row itself, because the "N earlier" chip beside it does not
                     — and on a filtered page the failed run may not be here to

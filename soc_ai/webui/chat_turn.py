@@ -5,7 +5,7 @@ follow-ups, the dashboard general chat) and they differ only in what ANCHORS the
 turn and where the answer is stored. Everything else — attaching the egress
 guard and sanitizing at that boundary, composing the system prompt, reporting
 live tool progress, bounding the run with a wall clock, closing the grounding
-loop, caveating what stays ungrounded, refusing fabricated tool citations,
+loop, redacting what stays ungrounded, refusing fabricated tool citations,
 resolving the pending row on every terminal path — is identical.
 
 It did not stay identical when it was copied. ``hunt_console_manager`` forked
@@ -38,10 +38,10 @@ from soc_ai.agent.context import InvestigationContext
 from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.narrative_grounding import (
-    UNVERIFIED_CAVEAT,
+    UNVERIFIED_QUIET_LINE,
     check_narrative_grounding,
+    redact_ungrounded,
     regrounding_instruction,
-    scoped_unverified_caveat,
 )
 from soc_ai.agent.prompts import oql_primer_block
 from soc_ai.so_client.inventory import inventory_prompt_block
@@ -61,7 +61,33 @@ _FABRICATED_TOOL_CITATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Same shapes as above, widened for REDACTION rather than detection: consumes
+# the full `t_xxx(args)` call through its closing paren, and "tool(s)" /
+# "citation(s)" whole, so replacing a match with `(unverified)` never leaves a
+# dangling `)` or a stray trailing "s" in the answer. Kept separate from the
+# detection regex above so widening this one can never change what a
+# zero-tool turn gets FLAGGED for — only what gets redacted once it is.
+_FABRICATED_CITATION_REDACT_RE = re.compile(
+    r"\bt_[a-z][a-z0-9_]*\s*\([^)]*\)|verified by the tools?|evidence citations?",
+    re.IGNORECASE,
+)
+
 MAX_HISTORY = 12  # prior turns embedded into the prompt
+
+# Wall clock for the TAIL that runs after the agent has already produced an
+# answer: the grounding re-check, ground-or-strip redaction, finalize_meta,
+# and spec.finish's DB write. Normally sub-millisecond sync code plus one DB
+# round trip — but it sits entirely OUTSIDE the `asyncio.timeout(spec.timeout_s)`
+# block that bounds the agent run (that block ends the instant agent.run()
+# returns), so nothing bounded it at all. A live incident (2026-08-21) left a
+# turn's answer already generated but its pending row unresolved for several
+# minutes while this tail contended with a concurrent background job for the
+# same SQLite database; nothing here would have caught it even if the
+# contention had never cleared. Small and fixed rather than derived from
+# spec.timeout_s: this phase's real work is orders of magnitude cheaper than
+# the agent run it follows, so it does not need — and should not get — that
+# budget too.
+_TAIL_TIMEOUT_S = 20
 
 
 class FinishRow(Protocol):
@@ -211,6 +237,23 @@ def _finish_run(result: Any, guard: Any) -> tuple[str, dict[str, Any], Any]:
     return answer, meta, tool_evidence
 
 
+def _redact_fabricated_citations(answer: str) -> tuple[str, list[str]]:
+    """Ground-or-strip for the OTHER shape a zero-tool answer can fake: not an
+    ungrounded identifier (:func:`~soc_ai.agent.narrative_grounding.redact_ungrounded`
+    handles that), but a citation of evidence that was never pulled — "verified
+    by the tools", `t_enrich_ip(...)`. Strips each fabricated-citation match and
+    returns what it removed, so the caller can record it in meta (the trace
+    keeps the receipts) the same way the artifact path does.
+    """
+    stripped: list[str] = []
+
+    def _sub(m: re.Match[str]) -> str:
+        stripped.append(m.group(0))
+        return "(unverified)"
+
+    return _FABRICATED_CITATION_REDACT_RE.sub(_sub, answer), stripped
+
+
 def _progress_reporter(write: SetProgress) -> Callable[[str], None]:
     """Adapt the toolset's sync progress hook to the spec's async writer.
 
@@ -238,7 +281,7 @@ def _progress_reporter(write: SetProgress) -> Callable[[str], None]:
     return _note_tool
 
 
-async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR0915
+async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR0915, PLR0912
     """Run one chat turn end to end and resolve *spec.row_id* to a terminal row.
 
     Never raises: every exit — answer, timeout, failure while preparing, failure
@@ -246,6 +289,13 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
     written is a thread the analyst can never use again (the POST handler 409s
     while one is in flight).
     """
+    # Which wall-clock phase raised, for the `except TimeoutError` handler below
+    # to report accurately: "run" covers spec.prepare() and the agent-run block
+    # (an over-budget question — the historical case), "finalize" covers the
+    # post-answer tail bounded by `_TAIL_TIMEOUT_S` (an answer that was produced
+    # but could not be saved promptly — a different failure with a different
+    # analyst-facing message).
+    stage = "run"
     try:
         settings = state.settings
         inputs = await spec.prepare()
@@ -338,66 +388,111 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
         if reground_used:
             meta["regrounding_attempts"] = reground_used
 
-        # Layer 2 — narrative grounding (defense-in-depth for the free-text answer).
-        # Detect concrete per-event artifacts (hostnames, domains, IPs, JA3, SMB) the
-        # answer asserts and verify each is grounded in either a tool result from this
-        # turn or the seeded context. The canonical failure is the zero-tool turn that
-        # fabricates a host/DNS/SMB story; when the answer asserts such artifacts and
-        # NONE are grounded, append a clearly-marked caveat to the stored answer
-        # (rendered as Markdown) and record the verdict in meta.
-        grounding = check_narrative_grounding(
-            answer, seed_context=inputs.seed_context, tool_evidence=tool_evidence
-        )
-        if not grounding.grounded:
-            _LOGGER.warning(
-                "chat: ungrounded narrative for %s (tools=%d) — %s",
-                spec.label,
-                len(meta["tools"]),
-                grounding.reason,
+        # The answer is produced from here on — what remains is bookkeeping
+        # (grounding re-check, ground-or-strip redaction, finalize_meta) and one
+        # DB write (spec.finish), not model/tool work. It still gets its OWN
+        # wall clock (see _TAIL_TIMEOUT_S) rather than none at all.
+        stage = "finalize"
+        async with asyncio.timeout(_TAIL_TIMEOUT_S):
+            # Layer 2 — narrative grounding (defense-in-depth for the free-text answer).
+            # Detect concrete per-event artifacts (hostnames, domains, IPs, JA3, SMB) the
+            # answer asserts and verify each is grounded in either a tool result from this
+            # turn or the seeded context. The canonical failure is the zero-tool turn that
+            # fabricates a host/DNS/SMB story. Ground-or-strip (2026-08-20, the owner's
+            # ruling): once the regrounding loop above has exhausted its attempts, an
+            # artifact that is STILL ungrounded gets mechanically redacted out of the
+            # answer — never shipped under a "verify before acting" caveat naming it.
+            grounding = check_narrative_grounding(
+                answer, seed_context=inputs.seed_context, tool_evidence=tool_evidence
             )
-            # A turn that RAN tools gets the scoped caveat naming the suspect
-            # claims — the blanket "not backed by a tool result" under a
-            # footer listing real tool calls read as a contradiction
-            # (dogfood 2026-07-15). Zero-tool turns keep the blanket wording.
-            answer = answer + (
-                scoped_unverified_caveat(grounding.ungrounded)
-                if tool_evidence and grounding.ungrounded
-                else UNVERIFIED_CAVEAT
-            )
-            meta["narrative_grounding"] = {
-                "grounded": False,
-                "ungrounded": grounding.ungrounded,
-                "reason": grounding.reason,
-            }
-        else:
-            meta["narrative_grounding"] = {"grounded": True}
+            if not grounding.grounded:
+                _LOGGER.warning(
+                    "chat: ungrounded narrative for %s (tools=%d) — %s",
+                    spec.label,
+                    len(meta["tools"]),
+                    grounding.reason,
+                )
+                # Whole-token, case-insensitive replace of every ungrounded artifact,
+                # then one quiet line — no ⚠, no per-token listing. Tool calls or not,
+                # the treatment is now identical: the old "scoped" (tools ran) vs
+                # "blanket" (zero-tool) caveat split (dogfood 2026-07-15) existed only
+                # to word a banner that no longer ships.
+                answer = redact_ungrounded(answer, grounding.ungrounded) + UNVERIFIED_QUIET_LINE
+                meta["narrative_grounding"] = {
+                    "grounded": False,
+                    "ungrounded": grounding.ungrounded,
+                    "stripped": list(grounding.ungrounded),
+                    "reason": grounding.reason,
+                }
+            else:
+                meta["narrative_grounding"] = {"grounded": True}
 
-        # F1: a zero-tool turn must never present tool-call citations it never
-        # made ("verified by the tools", `t_enrich_ip(...)`) — that is fabricated
-        # evidence to the analyst. Force the unverified caveat + ungrounded meta.
-        if not meta["tools"] and _FABRICATED_TOOL_CITATION_RE.search(answer):
-            _LOGGER.warning(
-                "chat: fabricated tool citations on a zero-tool turn for %s", spec.label
-            )
-            if meta.get("narrative_grounding", {}).get("grounded", True):
-                answer = answer + UNVERIFIED_CAVEAT
-            meta["narrative_grounding"] = {
-                "grounded": False,
-                "reason": "fabricated tool citations on a zero-tool turn",
-            }
+            # F1: a zero-tool turn must never present tool-call citations it never
+            # made ("verified by the tools", `t_enrich_ip(...)`) — that is fabricated
+            # evidence to the analyst. Same ground-or-strip policy, applied to the
+            # OTHER shape a zero-tool answer can fake: strip the fabricated-citation
+            # text itself (it is extraction-shaped noise, not a named artifact) rather
+            # than caveat around it. ALWAYS redact — even when Layer 2 above already
+            # fired — because a confabulating zero-tool model routinely produces
+            # BOTH shapes in the same breath (an ungrounded artifact AND a fake
+            # citation); skipping the redaction here left the citation phrase
+            # shipping unredacted while meta claimed it was caught (2026-08-20
+            # review finding). Only the SECOND quiet-line append is skipped — one
+            # line total — and the two detectors' reasons/stripped lists merge
+            # rather than clobber each other.
+            if not meta["tools"] and _FABRICATED_TOOL_CITATION_RE.search(answer):
+                _LOGGER.warning(
+                    "chat: fabricated tool citations on a zero-tool turn for %s", spec.label
+                )
+                prior_grounding = meta.get("narrative_grounding", {})
+                answer, fab_stripped = _redact_fabricated_citations(answer)
+                if prior_grounding.get("grounded", True):
+                    answer = answer + UNVERIFIED_QUIET_LINE
+                    meta["narrative_grounding"] = {
+                        "grounded": False,
+                        "reason": "fabricated tool citations on a zero-tool turn",
+                        "stripped": fab_stripped,
+                    }
+                else:
+                    prior_reason = prior_grounding.get("reason") or ""
+                    merged_reason = (
+                        f"{prior_reason}; fabricated tool citations on a zero-tool turn"
+                        if prior_reason
+                        else "fabricated tool citations on a zero-tool turn"
+                    )
+                    meta["narrative_grounding"] = {
+                        **prior_grounding,
+                        "reason": merged_reason,
+                        "stripped": [*prior_grounding.get("stripped", []), *fab_stripped],
+                    }
 
-        if inputs.finalize_meta is not None:
-            inputs.finalize_meta(meta, tool_evidence, guard)
-        await spec.finish(content=answer, status="done", meta=meta)
+            if inputs.finalize_meta is not None:
+                inputs.finalize_meta(meta, tool_evidence, guard)
+            await spec.finish(content=answer, status="done", meta=meta)
     except TimeoutError:
-        # The turn hit spec.timeout_s (the asyncio.timeout block above). Write a
-        # user-facing, actionable terminal row so the pending status never gets stuck.
-        _LOGGER.warning("chat turn timed out for %s after %ss", spec.label, spec.timeout_s)
-        await _persist_terminal_error(
-            spec,
-            f"The assistant ran out of time on this question (hit the {spec.timeout_s}s "
-            "limit). Try a narrower follow-up.",
-        )
+        if stage == "finalize":
+            # The answer existed; only saving it ran over _TAIL_TIMEOUT_S (e.g.
+            # DB contention). Distinct log + message from the agent-run timeout
+            # below — "narrower follow-up" would be actively wrong advice here.
+            _LOGGER.warning(
+                "chat turn tail timed out for %s after %ss (post-answer finalize/persist)",
+                spec.label,
+                _TAIL_TIMEOUT_S,
+            )
+            await _persist_terminal_error(
+                spec,
+                "The assistant finished analyzing but ran out of time saving the reply "
+                "(storage was slow). Try again.",
+            )
+        else:
+            # The turn hit spec.timeout_s (the asyncio.timeout block above). Write a
+            # user-facing, actionable terminal row so the pending status never gets stuck.
+            _LOGGER.warning("chat turn timed out for %s after %ss", spec.label, spec.timeout_s)
+            await _persist_terminal_error(
+                spec,
+                f"The assistant ran out of time on this question (hit the {spec.timeout_s}s "
+                "limit). Try a narrower follow-up.",
+            )
     except Exception as e:
         _LOGGER.exception("chat turn failed for %s", spec.label)
         # Scrub the exception text before it becomes user-facing content — a

@@ -109,7 +109,9 @@ async def require_admin_api(request: Request) -> None:
 # The React unions are narrower than what the backend can emit; coerce to them
 # so the client never sees a value outside its TypeScript types.
 _FE_SEV = {"critical", "high", "medium", "low"}
-_FE_KIND = {"suricata", "sigma", "notice"}
+# 'suricata' | 'sigma' | 'notice' are detector-flag kinds (the alert feed's
+# vocabulary); 'hunt' marks a promoted hunt finding (migration 0031).
+_FE_KIND = {"suricata", "sigma", "notice", "hunt"}
 
 
 def _sev(value: str | None) -> str:

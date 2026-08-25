@@ -215,6 +215,7 @@ async def _stream_investigation(
                 f"{_C['red']}HTTP {resp.status_code}{_C['reset']}: {await resp.aread()!r}",
                 file=sys.stderr,
             )
+            _print_401_hint_if_no_token(resp.status_code, token)
             return 2
         kind: str | None = None
         buf = ""
@@ -338,6 +339,28 @@ def _warn_insecure_auth(token: str | None, verify: bool | str) -> None:
         )
 
 
+def _print_401_hint_if_no_token(status_code: int, token: str | None) -> None:
+    """One actionable line when the API answers 401 and the CLI sent no token.
+
+    Live-VM regression (2026-08-20): ``docker exec soc-ai python -m soc_ai
+    triage <id>`` on an ``API_AUTH_REQUIRED=true`` (the shipped default) install
+    prints the raw server JSON — ``{"reason":"no_session","hint":"Log in at
+    /app/login or send 'Authorization: Bearer scai_…'."}`` — which is correct but
+    doesn't say *how* the CLI itself takes a token. This adds that, and only
+    that: gated on ``not token`` so a 401 the CLI got back AFTER attaching a
+    token (a bad/expired/revoked one — the server's own ``invalid_token`` hint
+    already covers that case correctly) never sees this "set a token" line,
+    which would be actively misleading there.
+    """
+    if status_code == 401 and not token:
+        print(
+            f"{_C['yellow']}hint{_C['reset']}: this deployment requires authentication. "
+            "Set SOC_AI_API_TOKEN or pass --token scai_...; mint one in the web UI "
+            "under Config → API tokens.",
+            file=sys.stderr,
+        )
+
+
 def _triage(args: argparse.Namespace) -> int:
     base_url = _resolve_base_url(args.url)
     token = _resolve_token(args)
@@ -373,6 +396,7 @@ def _healthz(args: argparse.Namespace) -> int:
         # error) must not crash healthz with a raw traceback — show the status
         # and a snippet so the operator can see what answered.
         print(f"HTTP {resp.status_code} (non-JSON body): {resp.text[:200]}")
+    _print_401_hint_if_no_token(resp.status_code, token)
     return 0 if resp.status_code == 200 else 1
 
 
@@ -1018,14 +1042,38 @@ def _audit_verify(args: argparse.Namespace) -> int:
     """argparse handler for ``soc-ai audit verify``.
 
     Pulls every record from the audit index (``{audit_index_alias}-*``), sorted
-    ascending by ``seq``, and runs the tamper-evident hash chain over them
-    (:func:`soc_ai.audit.verify.verify_audit_chain`). This is the operator's way
-    to actually exercise the tamper-evidence: an intact chain proves no audit
-    record was edited, reordered, inserted, or deleted since it was written.
+    ascending by timestamp, partitions it into epochs at each restart boundary,
+    and runs the tamper-evident hash chain over EVERY epoch — never stopping at
+    the first broken one (:func:`soc_ai.audit.verify.verify_audit_chain`). This
+    is the operator's way to actually exercise the tamper-evidence: every epoch
+    intact proves no audit record was edited, reordered, inserted, or deleted
+    since it was written, within any process incarnation's own trail.
+
+    A chain that spans more than one epoch is NOT itself a problem — a process
+    restart is a legitimate boundary (prod carried 134 of them, 2026-06-24 →
+    2026-08-16, from a chain-head recovery bug fixed 2026-08-17; see
+    :mod:`soc_ai.audit.verify`'s module docstring) — but it is a genuinely
+    weaker claim than one unbroken chain, since cross-epoch linkage can never be
+    checked (a genesis record's ``prev_hash`` is the all-zero hash by
+    construction). So a multi-epoch all-clear prints amber, not green: a
+    partial all-clear must never wear full success livery.
+
+    A TAMPER verdict now reports its blast radius, not just its existence: live
+    prod (2026-08-21) found a REAL duplicate-seq artifact from the historic
+    pre-1.2.8 write-side stale-head seq-reuse bug, mid-epoch, on top of the
+    already-known genesis-reset fragmentation — and stopping at the first break
+    (the old behavior) could not answer "is anything MORE recent also broken".
+    Every epoch is checked regardless of earlier breaks; the tally names how
+    many broke, the oldest (compat) and newest broken epoch, and either
+    reassures ("every epoch after the newest break verified intact") or, if the
+    break reaches the current epoch, says so plainly ("the latest epoch is
+    broken") — see :mod:`soc_ai.audit.verify`'s module docstring for the finding
+    that made this a real requirement.
 
     Exit codes:
-      0   chain intact (including an empty index — nothing to tamper with)
-      1   TAMPER DETECTED — the chain broke at some seq
+      0   every epoch intact (including an empty index — nothing to tamper
+          with), whether that is one epoch or many
+      1   TAMPER DETECTED — at least one epoch broke
       2   could not run (ES unreachable / settings didn't load)
     """
     from soc_ai.audit.verify import (  # noqa: PLC0415 - lazy
@@ -1077,21 +1125,62 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
 
     if not result.ok:
-        broken = result.first_broken_seq
+        # The tally: how many epochs broke, and where the oldest and newest
+        # breaks are. `epochs_broken == 1` gets the tighter singular phrasing
+        # (naming "oldest" and "newest" for the same one epoch twice would be
+        # true but redundant) — both name the seq LOCAL to that epoch, since
+        # seq resets to 0 at every genesis.
+        if result.epochs_broken == 1:
+            tally = (
+                f"1 of {result.epochs} epochs broken — break at seq "
+                f"{result.first_broken_seq} (epoch {result.first_broken_epoch_start})"
+            )
+        else:
+            tally = (
+                f"{result.epochs_broken} of {result.epochs} epochs broken — oldest "
+                f"break seq {result.first_broken_seq} (epoch {result.first_broken_epoch_start}), "
+                f"newest broken epoch {result.newest_broken_epoch_start}"
+            )
+        # A capped scan cannot vouch for anything beyond its own prefix — the
+        # cap always truncates the NEWEST end of the chain (the fetch is
+        # oldest-first) — so neither claim below is honest under `capped`,
+        # regardless of which way `latest_epoch_broken` happens to land for
+        # the prefix actually scanned. The standalone capped warning above
+        # already carries the "this is not the full picture" signal.
+        if result.capped:
+            trailing = ""
+        elif result.latest_epoch_broken:
+            trailing = " The latest epoch is broken."
+        else:
+            trailing = f" Every epoch after {result.newest_broken_epoch_start} verified intact."
         print(
             f"{_C['red']}{_C['bold']}TAMPER DETECTED{_C['reset']}{_C['red']} — "
-            f"chain broke at seq {broken}{_C['reset']}{scope}",
+            f"{tally}.{trailing}{_C['reset']}{scope}",
             file=sys.stderr,
         )
         print(
-            f"{_C['dim']}{result.records_verified} record(s) scanned before the break. "
-            f"A record was edited, reordered, inserted, or deleted.{_C['reset']}",
+            f"{_C['dim']}{result.records_verified} record(s) scanned. A record was "
+            f"edited, reordered, inserted, or deleted.{_C['reset']}",
             file=sys.stderr,
         )
         return 1
 
     if result.records_verified == 0:
         print(f"{_C['green']}audit chain intact{_C['reset']} — 0 records{scope}")
+        return 0
+
+    # epochs > 1: every epoch checked out, but that is "no tamper found within
+    # any restart's own trail" — never "one unbroken chain". No green, no
+    # checkmark-shaped wording; amber, same livery `capped` already uses above,
+    # because this is the same species of caveat (an honest all-clear that
+    # falls short of the full claim).
+    if result.epochs > 1:
+        print(
+            f"{_C['yellow']}chain intact within {result.epochs} epochs{_C['reset']} — "
+            f"{result.records_verified} records verified{scope}. Epoch boundaries "
+            f"are process restarts — a chain-head recovery bug fixed 2026-08-17 — "
+            f"and cross-epoch linkage is not provable."
+        )
         return 0
 
     span = f"seq {result.first_seq}..{result.last_seq}"

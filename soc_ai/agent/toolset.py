@@ -51,6 +51,7 @@ from soc_ai.dossier.resolve import (
 )
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.store import host_dossier as dossier_store
+from soc_ai.tools.analytics import beacon_profile, dcerpc_histogram, dns_entropy_scan, first_seen
 from soc_ai.tools.crawl_page import crawl_page
 from soc_ai.tools.cvedb import cve_lookup
 from soc_ai.tools.decode_payload import decode_payload
@@ -89,6 +90,14 @@ INVESTIGATOR_ONLY = frozenset({"t_query_detections", "t_get_playbooks", "t_looku
 # Tools every role EXCEPT hunt gets (tuning nominations are per-rule triage
 # work, not network-wide hunting).
 NOT_ON_HUNT = frozenset({"t_suggest_rule_tuning"})
+
+# Tools ONLY the hunt gets: network-wide behavioral analytics sweeps. Triage
+# pivots around ONE alert and already has alert-anchored equivalents
+# (t_prevalence, pcap-derived cadence); registering four sweep schemas on
+# every role widens each agent's tool prompt for nothing.
+HUNT_ONLY = frozenset(
+    {"t_beacon_profile", "t_dns_entropy_scan", "t_dcerpc_histogram", "t_first_seen"}
+)
 
 # The Phase-D targeted-dispatch surface: the tools a synth round-1
 # ``gap_for_investigator`` may name. Single source of truth — TargetedGap's
@@ -139,6 +148,10 @@ GRID_BACKED_TOOLS = frozenset(
         "t_suggest_rule_tuning",
         "t_get_playbooks",
         "t_get_pcap",
+        "t_beacon_profile",
+        "t_dns_entropy_scan",
+        "t_dcerpc_histogram",
+        "t_first_seen",
     }
 )
 
@@ -599,6 +612,8 @@ def _guarded[F: Callable[..., Any]](ctx: InvestigationContext, fn: F) -> F:
 def _in_role(tool_name: str, role: Role) -> bool:
     """Whether ``tool_name`` belongs to ``role``'s surface (settings gates aside)."""
     if tool_name in INVESTIGATOR_ONLY and role != "investigator":
+        return False
+    if tool_name in HUNT_ONLY and role != "hunt":
         return False
     return not (tool_name in NOT_ON_HUNT and role == "hunt")
 
@@ -1116,6 +1131,165 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             _LOGGER.warning("t_rule_prevalence failed: %s", e)
             return _tool_error(e)
         return _clamp_tool_result(result)
+
+    # Hunt-only behavioral analytics sweeps (1.3 slice 2, soc_ai.tools.analytics):
+    # network-wide measurements a hunt runs when it has no seed alert to pivot
+    # around. Gated the same way t_suggest_rule_tuning is below (_in_role wraps
+    # the definition+registration; the golden surface test in
+    # tests/test_tool_surface.py is the arbiter of whether the gate matches
+    # HUNT_ONLY).
+    if _in_role("t_beacon_profile", role):
+
+        @_register
+        async def t_beacon_profile(
+            window_minutes: int = window,
+            src: str | None = None,
+            dst: str | None = None,
+            min_events: int = 8,
+            include_internal: bool = False,
+        ) -> dict[str, Any]:
+            """Measure inter-arrival cadence (coefficient of variation) per
+            src→dst pair over `zeek.conn`, network-wide — a low CV is the
+            measured signature of a periodic beacon. Use this to CONFIRM a
+            beacon before claiming one; the measured cadence is the evidence,
+            not any alert title. Narrow to a known pair with `src`/`dst`, or
+            leave both unset to sweep the grid.
+            """
+            if dup := _dedup_result(
+                ctx,
+                "t_beacon_profile",
+                {
+                    "window_minutes": window_minutes,
+                    "src": src,
+                    "dst": dst,
+                    "min_events": min_events,
+                    "include_internal": include_internal,
+                },
+            ):
+                return dup
+            try:
+                result = await beacon_profile(
+                    elastic=ctx.elastic,
+                    settings=ctx.settings,
+                    window_minutes=window_minutes,
+                    src=src,
+                    dst=dst,
+                    min_events=min_events,
+                    include_internal=include_internal,
+                )
+            except Exception as e:
+                _LOGGER.warning("t_beacon_profile failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
+
+    if _in_role("t_dns_entropy_scan", role):
+
+        @_register
+        async def t_dns_entropy_scan(
+            window_minutes: int = window,
+            parent_domain: str | None = None,
+            min_queries: int = 50,
+        ) -> dict[str, Any]:
+            """Measure per-parent-domain qname entropy and volume over
+            `zeek.dns`, network-wide — high mean subdomain entropy together
+            with volume is the measured signature of a DGA or DNS-tunnel
+            channel. Use this to CONFIRM a DGA/tunnel before claiming one;
+            the measured entropy is the evidence, not an eyeballed "these
+            subdomains look random" read of raw rows.
+            """
+            if dup := _dedup_result(
+                ctx,
+                "t_dns_entropy_scan",
+                {
+                    "window_minutes": window_minutes,
+                    "parent_domain": parent_domain,
+                    "min_queries": min_queries,
+                },
+            ):
+                return dup
+            try:
+                result = await dns_entropy_scan(
+                    elastic=ctx.elastic,
+                    settings=ctx.settings,
+                    window_minutes=window_minutes,
+                    parent_domain=parent_domain,
+                    min_queries=min_queries,
+                )
+            except Exception as e:
+                _LOGGER.warning("t_dns_entropy_scan failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
+
+    if _in_role("t_dcerpc_histogram", role):
+
+        @_register
+        async def t_dcerpc_histogram(
+            window_minutes: int = window,
+            rare_max: int = 5,
+        ) -> dict[str, Any]:
+            """Histogram DCE-RPC operations over `zeek.dce_rpc`, network-wide,
+            and flag individually-dangerous ops (Zerologon-style
+            `NetrServerAuthenticate*`, DCSync's `DRSGetNCChanges`/
+            `DsGetNCChanges`, remote service creation) plus ops rare against a
+            busy baseline. Use this to CONFIRM a domain-controller attack
+            pattern before claiming one; a flagged or rare operation is the
+            evidence, not the alert that pointed here.
+            """
+            if dup := _dedup_result(
+                ctx,
+                "t_dcerpc_histogram",
+                {"window_minutes": window_minutes, "rare_max": rare_max},
+            ):
+                return dup
+            try:
+                result = await dcerpc_histogram(
+                    elastic=ctx.elastic,
+                    settings=ctx.settings,
+                    window_minutes=window_minutes,
+                    rare_max=rare_max,
+                )
+            except Exception as e:
+                _LOGGER.warning("t_dcerpc_histogram failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
+
+    if _in_role("t_first_seen", role):
+
+        @_register
+        async def t_first_seen(
+            recent_minutes: int = window,
+            baseline_days: int = 30,
+            dataset: str = "zeek.conn",
+        ) -> dict[str, Any]:
+            """Diff destinations seen in a recent window against a trailing
+            baseline (ending exactly where the recent window begins) to
+            surface novel EXTERNAL destinations — no prior sighting in the
+            baseline is the measured signature of a new external service or
+            C2 channel. Use this to CONFIRM a destination is genuinely new
+            before claiming it, rather than assuming novelty from one alert.
+            """
+            if dup := _dedup_result(
+                ctx,
+                "t_first_seen",
+                {
+                    "recent_minutes": recent_minutes,
+                    "baseline_days": baseline_days,
+                    "dataset": dataset,
+                },
+            ):
+                return dup
+            try:
+                result = await first_seen(
+                    elastic=ctx.elastic,
+                    settings=ctx.settings,
+                    recent_minutes=recent_minutes,
+                    baseline_days=baseline_days,
+                    dataset=dataset,
+                )
+            except Exception as e:
+                _LOGGER.warning("t_first_seen failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(result)
 
     if _in_role("t_suggest_rule_tuning", role):
 

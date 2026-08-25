@@ -961,6 +961,17 @@ def test_hostname_rejects_ip_literals_junk_and_stubs() -> None:
     assert hostname.strength == "none"
 
 
+def test_clean_hostname_rejects_machine_guid_mdns_names() -> None:
+    from soc_ai.dossier.infer import _clean_hostname
+
+    assert _clean_hostname("3a7471a9-8964-4f54-8aab-23af820978fb.local") is None
+    # Bare GUID (no suffix) — some stacks answer without .local:
+    assert _clean_hostname("3a7471a9-8964-4f54-8aab-23af820978fb") is None
+    # Real names keep working:
+    assert _clean_hostname("bazzite") == "bazzite"
+    assert _clean_hostname("nano-pve.example.com") == "nano-pve.example.com"
+
+
 # ---------------------------------------------------------------------------
 # MAC
 # ---------------------------------------------------------------------------

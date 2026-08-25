@@ -43,7 +43,7 @@ from soc_ai.store import hunt_schedules as hs_svc
 from soc_ai.store import hunt_templates as ht_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
-from soc_ai.store.models import Hunt, HuntEvent, HuntSchedule, HuntTemplate
+from soc_ai.store.models import Hunt, HuntEvent, HuntSchedule, HuntTemplate, Investigation
 from soc_ai.webui import (
     hunt_console_manager,
     hunt_manager,
@@ -107,6 +107,13 @@ _HUNT_TL_SKIP = {
 }
 
 
+class HuntFindingInvOut(BaseModel):
+    id: str
+    status: str  # running | complete | error | cancelled | interrupted
+    verdict: str | None  # true_positive | false_positive | needs_more_info | inconclusive | None
+    conf: float | None
+
+
 class HuntFindingOut(BaseModel):
     title: str
     detail: str
@@ -119,6 +126,11 @@ class HuntFindingOut(BaseModel):
     # Set by the E1.3 post-hunt citation gate when it stripped non-resolving
     # citations or capped the severity (mirrors InvestigationOut.validatorNote).
     validatorNote: str | None = None
+    # Promotion state: the newest investigation promoted from this finding, or
+    # null when never promoted. An errored/cancelled promotion frees the slot
+    # (mirrors the promotion route's idempotency), so the UI shows Investigate
+    # again — status is included so the card can tell running from complete.
+    investigation: HuntFindingInvOut | None = None
 
 
 # Legacy reports predate the finding `category` field. A coverage/visibility
@@ -136,6 +148,28 @@ def _finding_category(f: dict[str, Any]) -> str:
     if raw in ("threat", "visibility_gap", "observation"):
         return raw
     return "visibility_gap" if _GAP_TITLE_RE.search(str(f.get("title") or "")) else "threat"
+
+
+def _finding_inv_out(inv: Investigation | None) -> HuntFindingInvOut | None:
+    """A finding's promotion-state card, or None when never promoted.
+
+    ``status`` reuses ``_HUNT_STATUS`` (declared further down, same five-value
+    vocabulary an Investigation and a Hunt share) rather than
+    ``routes_investigations._row_status``: that module already imports THIS one
+    (for the hunt-kind guards), so importing back would cycle. ``verdict`` is
+    passed through RAW — unlike ``_verdict`` (which coerces None to the display
+    sentinel "untriaged" for the investigations list), a promoted-but-undecided
+    finding must stay a genuine ``null`` here so the client can tell "no verdict
+    yet" from an actual untriaged badge.
+    """
+    if inv is None:
+        return None
+    return HuntFindingInvOut(
+        id=inv.id,
+        status=_HUNT_STATUS.get(inv.status, "error"),
+        verdict=inv.verdict,
+        conf=inv.confidence,
+    )
 
 
 # Charts are stored inside the report dict already validated (the post-hunt chart
@@ -460,10 +494,14 @@ def _compute_hunt_diff(
 @router.get("/hunts/{hunt_id}", response_model=HuntOut)
 async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
     diff: HuntDiffOut | None = None
+    inv_map: dict[int, Investigation] = {}
     async with request.app.state.db_sessionmaker() as db:
         got = await hunt_svc.get_with_events(db, hunt_id)
         if got is not None:
             hunt, _ = got
+            # Per-finding promotion state (newest investigation per ordinal) —
+            # the card's Investigate/Investigating…/Open state.
+            inv_map = await inv_svc.latest_per_finding(db, hunt_id)
             # Diff vs the previous COMPLETE run of the same objective. Only a
             # completed current hunt has settled findings worth diffing.
             if hunt.status == "complete":
@@ -504,8 +542,9 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
                 hosts=[str(h) for h in (f.get("hosts") or [])],
                 citations=[str(c) for c in (f.get("citations") or [])],
                 validatorNote=f.get("validator_note") or None,
+                investigation=_finding_inv_out(inv_map.get(i)),
             )
-            for f in findings
+            for i, f in enumerate(findings)
             if isinstance(f, dict)
         ],
         charts=[out for c in charts if isinstance(c, dict) and (out := _chart_out(c)) is not None],
@@ -1071,6 +1110,29 @@ async def start_hunt(
         # /investigate abort becomes "latest" and defeats reuse (same guard the
         # /investigate path uses).
         completed = await inv_svc.complete_for_alert(db, body.alert_id)
+    if existing is not None and existing.kind == "hunt":
+        # Promotion already owns this doc as a finding's anchor — an ad-hoc
+        # POST /hunt against the same alert_id would mint an unlabeled
+        # kind='suricata' duplicate and re-enable SO writes on an event a
+        # promoted finding already claims. Re-promotion from the hunt page is
+        # the sanctioned re-run (mirrors bulk_rehunt/request_more_info, 4fbe8132).
+        # An alert_id promotion never touched (existing is None, or its latest
+        # row isn't kind='hunt') is unaffected — this only fires once
+        # promotion owns the latest row for the doc.
+        hunt_kind_detail: dict[str, str] = {
+            "reason": "hunt_kind_no_rerun",
+            "hint": (
+                "This event is a promoted finding's anchor — re-promote "
+                "the finding from its hunt instead."
+            ),
+        }
+        # The row this guard is blocking a re-run of may itself still be
+        # running — carry its id the same way the hunt_in_progress branch
+        # below does, so a caller that only checks for a deep-link (not the
+        # specific reason) doesn't lose it to this guard firing first.
+        if existing.status == "running":
+            hunt_kind_detail["running_inv_id"] = existing.id
+        raise HTTPException(status_code=409, detail=hunt_kind_detail)
     if existing is not None and existing.status == "running":
         raise HTTPException(
             status_code=409,
@@ -1103,6 +1165,156 @@ async def start_hunt(
             rule_name=rule_name,
             deep=body.deep,
         )
+    if inv_id is None:
+        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
+    return {"investigation_id": inv_id}
+
+
+# ── Task 5: promote a hunt finding into an investigation of its cited evidence ──
+# Not in the demo write-allowlist (main.py `_DEMO_WRITE_ALLOW*`) — a public demo
+# has no recorded replay for a promoted finding, so the read-only middleware
+# refuses it with the standard demo_mode 403 before this handler ever runs. No
+# demo branch belongs here.
+
+# Detector-flag datasets: an anchor from these is another detector's CLAIM, not
+# raw telemetry — prefer any cited telemetry doc over them (a promoted finding
+# should be investigated from its evidence).
+_DETECTOR_DATASETS = {"suricata.alert", "sigma.alert", "zeek.notice"}
+# Long-alphanumeric citation shapes only — prose citations can't be ES ids.
+_ID_SHAPED = re.compile(r"^[A-Za-z0-9_\-:.]{12,128}$")
+
+
+async def _resolve_finding_anchor(
+    elastic: ElasticClient, settings: Settings, citations: list[str]
+) -> str | None:
+    """Pick the finding's anchor doc: the cited ES id the promoted
+    investigation runs against. Citation order is preserved within each class;
+    telemetry beats detector docs. None when nothing resolves.
+
+    Only ``event.dataset`` is read from each hit (the telemetry-vs-detector
+    call), so the lookup asks for exactly that field — never full ``_source``
+    — and caps the id list: a pathological report with hundreds of citations
+    must not turn one anchor pick into a bulk document fetch."""
+    ids = [c for c in citations if _ID_SHAPED.match(c)][:100]
+    if not ids:
+        return None
+    lookup = await elastic.search(
+        settings.events_index_pattern,
+        {"ids": {"values": ids}},
+        size=len(ids),
+        source=["event.dataset"],
+    )
+    hits = list(lookup.hits or [])
+    if not hits:
+        return None
+    by_id = {h.get("_id"): h for h in hits}
+    ordered = [by_id[i] for i in ids if i in by_id]
+    for h in ordered:
+        ds = str(get_dotted(h.get("_source", {}), "event.dataset") or "").lower()
+        if ds not in _DETECTOR_DATASETS:
+            return h.get("_id")
+    return ordered[0].get("_id")
+
+
+@router.post("/hunts/{hunt_id}/findings/{ordinal}/investigate")
+async def promote_finding(
+    request: Request,
+    hunt_id: str,
+    ordinal: int,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> dict[str, Any]:
+    """Promote one hunt finding into a full investigation of its cited
+    evidence. Idempotent: while a promotion for this exact finding is running
+    or landed a verdict, re-posting returns it; only an errored/cancelled one
+    frees the slot.
+
+    ``ordinal`` is the finding's index into ``hunt.report["findings"]`` — the
+    FastAPI ``int`` path convertor already refuses a negative segment with a
+    bare 404 before this body runs, so the ``0 <= ordinal`` check below only
+    has to catch a positive ordinal past the end of the list.
+    """
+    started_by = await identify_caller(request)
+    async with request.app.state.db_sessionmaker() as db:
+        hunt = await db.get(Hunt, hunt_id)
+        if hunt is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        if hunt.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "still_running",
+                    "hint": (
+                        "The hunt is still running — findings promote once it lands its report."
+                    ),
+                },
+            )
+        findings = _hunt_report(hunt).get("findings") or []
+        if not (0 <= ordinal < len(findings)) or not isinstance(findings[ordinal], dict):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "reason": "finding_not_found",
+                    "hint": "That finding is not in this hunt's report.",
+                },
+            )
+        finding = findings[ordinal]
+        # Idempotency probe: a running or already-complete promotion of this
+        # exact finding is returned as-is; only an error/cancelled one frees
+        # the slot for a fresh promotion (mirrors POST /hunt's re-hunt guard).
+        existing = await inv_svc.latest_for_finding(db, hunt_id, ordinal)
+    if existing is not None and inv_svc.blocks_rehunt(existing):
+        return {"investigation_id": existing.id, "existing": True}
+
+    citations = finding.get("citations")
+    if not isinstance(citations, list):
+        citations = []
+    # Stored report JSON isn't schema-enforced — a legacy or partially-written
+    # report can carry a stray int/None in `citations`. Coerce to str (dropping
+    # anything else) before `_ID_SHAPED.match`, which requires a str and would
+    # otherwise TypeError on the first non-str entry — the same
+    # don't-trust-stored-JSON posture as the ordinal/dict guards above.
+    citations = [str(c) for c in citations if isinstance(c, (str, int))]
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            anchor_id = await _resolve_finding_anchor(elastic, settings, citations)
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
+    if anchor_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "reason": "no_promotable_evidence",
+                "hint": "None of the finding's citations resolve to an event on the grid.",
+            },
+        )
+
+    title = str(finding.get("title") or "Hunt finding")
+    detail = str(finding.get("detail") or "")
+    hosts = ", ".join(str(h) for h in (finding.get("hosts") or [])) or "—"
+    focus = (
+        f"Promoted hunt finding: {title}. {detail} Hosts involved: {hosts}. "
+        "This investigation targets the finding's cited evidence event. Assess "
+        "whether the finding describes real malicious activity; do not assume "
+        "the hunt's framing is correct."
+    )
+    inv_id = await hunt_manager.get_manager(request.app.state).start(
+        request.app.state,
+        alert_id=anchor_id,
+        started_by=started_by,
+        rule_name=title,
+        focus_hint=focus,
+        kind="hunt",
+        hunt_id=hunt_id,
+        finding_ordinal=ordinal,
+        # A promoted finding's anchor is cited telemetry, not an SO alert — no
+        # unattended write can ever apply to it — and its focus text is the
+        # finding's own framing, not a prior investigation's open questions.
+        allow_so_writes=False,
+        focus_origin="hunt_finding",
+    )
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
     return {"investigation_id": inv_id}

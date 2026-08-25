@@ -8,7 +8,7 @@ against the LIVE grid inventory so a template that needs telemetry the grid lack
 renders FLAGGED, not hidden.
 
 Small-table CRUD in the runbooks/schedules mould (create / get / list_all /
-update / delete), plus :func:`seed_builtins` — an IDEMPOTENT upsert of the six
+update / delete), plus :func:`seed_builtins` — an IDEMPOTENT upsert of the seven
 builtin templates matching the current pills. Seeding runs on every startup
 (after ``run_migrations``); idempotence is keyed by ``name`` so a restart never
 duplicates a builtin, and the builtin's fields are refreshed to the code's values
@@ -38,17 +38,21 @@ class _Builtin:
     required_datasets: tuple[str, ...]
 
 
-# The six builtin templates. `objective_template` text is VERBATIM from the
+# The seven builtin templates. `objective_template` text is VERBATIM from the
 # frontend PRESETS (frontend/src/screens/Hunts.tsx) so the picker is a superset of
 # the old static pills — same objectives, now availability-annotated. Each names
 # the `event.dataset` values it correlates over; a grid missing one flags the
-# template rather than hiding it (honesty over hiding).
+# template rather than hiding it (honesty over hiding). Four objectives also name
+# the analytics tools (t_beacon_profile / t_dns_entropy_scan / t_first_seen /
+# t_dcerpc_histogram) the hunt agent should reach for — the objective text is the
+# agent's prompt, so naming the tool there is how a template steers tool choice.
 _BUILTINS: tuple[_Builtin, ...] = (
     _Builtin(
         name="Beaconing to rare IPs",
         objective_template=(
             "Hunt for internal hosts beaconing to rare external IPs in the last 24h — "
-            "regular cadence, low data volume, novel destinations."
+            "regular cadence, low data volume, novel destinations. Use t_beacon_profile "
+            "to measure cadence and t_first_seen for novel destinations before concluding."
         ),
         required_datasets=("zeek.conn",),
     ),
@@ -72,7 +76,8 @@ _BUILTINS: tuple[_Builtin, ...] = (
         name="DNS / C2 exfiltration",
         objective_template=(
             "Hunt for DNS tunneling and C2 exfiltration: high-entropy or high-volume DNS, "
-            "long TXT records, and beaconing over DNS."
+            "long TXT records, and beaconing over DNS. Use t_dns_entropy_scan to measure "
+            "qname entropy and volume before concluding."
         ),
         required_datasets=("zeek.dns",),
     ),
@@ -80,7 +85,8 @@ _BUILTINS: tuple[_Builtin, ...] = (
         name="New external services",
         objective_template=(
             "Hunt for internal hosts newly exposing or reaching new external services this "
-            "week that they never used before."
+            "week that they never used before. Use t_first_seen to diff recent destinations "
+            "against the 30-day baseline."
         ),
         required_datasets=("zeek.conn",),
     ),
@@ -90,6 +96,16 @@ _BUILTINS: tuple[_Builtin, ...] = (
             "Hunt for suspicious PowerShell and living-off-the-land binary use across endpoints."
         ),
         required_datasets=("endpoint",),
+    ),
+    _Builtin(
+        name="DCE-RPC abuse / DC attacks",
+        objective_template=(
+            "Hunt for domain-controller attack patterns in DCE-RPC: Zerologon-style "
+            "NetrServerAuthenticate floods, DCSync (DRSGetNCChanges), and remote service "
+            "creation. Use t_dcerpc_histogram first; investigate any flagged or rare "
+            "dangerous operation."
+        ),
+        required_datasets=("zeek.dce_rpc",),
     ),
 )
 
@@ -113,8 +129,12 @@ BUILTIN_ENV_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "Credential abuse / lockouts": (ENV_DOMAIN,),
     "Lateral movement": (ENV_WINDOWS,),
     "Suspicious PowerShell / LOLBins": (ENV_WINDOWS,),
-    # The three network-generic builtins (Beaconing, DNS/C2, New external
-    # services) are deliberately absent: every network qualifies.
+    # The four network-generic builtins (Beaconing, DNS/C2, New external
+    # services, DCE-RPC abuse) are deliberately absent: every network qualifies.
+    # DCE-RPC in particular is a DATASET gap (zeek.dce_rpc, flagged via
+    # `available`/`missingDatasets` above), not an environment gap — DC attack
+    # patterns don't presuppose a resolved domain-joined host the way
+    # Kerberoasting or PsExec do, so it stays off this axis (flag-not-demote).
 }
 
 # requirement -> the human phrase the API reports in `missingEnvironment`.

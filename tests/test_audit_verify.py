@@ -13,7 +13,9 @@ Two layers, both hermetic (no live ES):
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -28,24 +30,45 @@ from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 
 # ── chain builder (mirrors AuditLogger.log's hash stamping) ────────────────────
 
+# Arbitrary fixed instant. Epoch-boundary tests offset from this by whole hours
+# so two epochs' timestamp ranges never accidentally overlap.
+_BASE_TS = datetime(2026, 7, 11, 0, 0, 0, tzinfo=UTC)
 
-def _build_chain(n: int, *, start_seq: int = GENESIS_SEQ) -> list[dict[str, Any]]:
+
+def _build_chain(
+    n: int,
+    *,
+    start_seq: int = GENESIS_SEQ,
+    start_time: datetime = _BASE_TS,
+    step: timedelta = timedelta(seconds=1),
+) -> list[dict[str, Any]]:
     """Build ``n`` valid, correctly-linked audit records (as ES ``_source`` bodies).
 
     Mirrors :meth:`soc_ai.audit.logger.AuditLogger.log`: the hash is computed over
     the content (every field but ``hash``) plus the previous record's hash.
+
+    ``timestamp`` advances by ``step`` per record using real ``datetime`` math —
+    not the old zero-padded-seconds string trick, which silently produced
+    unparseable/non-monotonic strings past 60 records (e.g. ``"...:00:99..."``).
+    That was harmless while the fetch sort was seq-major (seq alone was unique
+    and monotonic; timestamp was only ever a tiebreak), but the fetch sort is now
+    timestamp-major (see ``soc_ai/audit/verify.py``'s ``_fetch_audit_records``),
+    so a builder used by a 2 500-record test has to hand back real, ordered
+    timestamps. ``step=timedelta(0)`` builds an epoch where every record shares
+    one timestamp, for the same-millisecond-write tests.
     """
     records: list[dict[str, Any]] = []
     prev_hash = GENESIS_PREV_HASH
     for i in range(n):
         seq = start_seq + i
+        ts = start_time + step * i
         content: dict[str, Any] = {
             "session_id": f"s{seq}",
             "kind": "tool_call",
             "payload": {"i": seq},
             "seq": seq,
             "prev_hash": prev_hash,
-            "timestamp": f"2026-07-11T00:00:{seq:02d}+00:00",
+            "timestamp": ts.isoformat(),
         }
         digest = compute_hash(content, prev_hash)
         record = {**content, "hash": digest}
@@ -57,31 +80,151 @@ def _build_chain(n: int, *, start_seq: int = GENESIS_SEQ) -> list[dict[str, Any]
 # ── fake ES that serves records with search_after paging + sort cursors ────────
 
 
-class _FakeES:
-    """Minimal ES double honoring the helper's ``search_after`` seq paging.
+def _es9_shard_failure_if_id_sort(sort: Any) -> dict[str, Any] | None:
+    """Mirror real ES 9's refusal to sort on ``_id``, or None if the sort is fine.
 
-    Serves a fixed list of records (in seq order) as ``hits`` with a per-hit
-    ``sort`` cursor of ``[seq, _id]`` — exactly what ``_search_page`` reads to
-    advance. Empty index → no hits.
+    Stock ES 9 ships ``indices.id_field_data.enabled=false``: sorting on ``_id``
+    needs fielddata, so every data-bearing shard fails with
+    ``illegal_argument_exception``. Pre-fix, every fake in this suite accepted any
+    sort — including the ``_id`` tiebreak ``_fetch_audit_records`` used to send —
+    so CI never saw what a real 93M-doc ES 9 grid did: ``58 of 76 shards failed``
+    (the exact shape reproduced below) on every ``soc-ai audit verify`` run. This
+    check makes the fake refuse the same way, so a sort that reintroduces ``_id``
+    fails here again instead of only on a live upgrade.
+    """
+    if not isinstance(sort, list) or not any(
+        isinstance(clause, dict) and "_id" in clause for clause in sort
+    ):
+        return None
+    return {
+        "took": 4,
+        "timed_out": False,
+        "_shards": {
+            "total": 76,
+            "successful": 18,
+            "skipped": 0,
+            "failed": 58,
+            "failures": [
+                {
+                    "shard": 0,
+                    "index": "soc-ai-audit-000001",
+                    "reason": {
+                        "type": "illegal_argument_exception",
+                        "reason": (
+                            "Fielddata access on the _id field is disallowed, you can "
+                            "re-enable it by updating the dynamic cluster setting: "
+                            "indices.id_field_data.enabled"
+                        ),
+                    },
+                }
+            ],
+        },
+        "hits": {"hits": []},
+    }
+
+
+def _sort_fields_from_request(sort_spec: Any) -> list[tuple[str, str]]:
+    """Extract ``(field, order)`` pairs from an ES ``sort`` clause, in priority order.
+
+    Mirrors what a real ES node does with the ``sort`` array — apply each field
+    in order, tie-breaking with the next — reading the request the same way
+    :func:`_es9_shard_failure_if_id_sort` already does for the ``_id`` check.
+
+    This is what makes :class:`_FakeES` actually serve whatever order
+    ``_fetch_audit_records`` asked for, rather than a hardcoded guess at what it
+    SHOULD ask for. The earlier version of this fake pre-sorted every response
+    to ``(timestamp, seq)`` in its constructor, independent of the request body
+    — so reverting the production sort back to the old seq-major order
+    (``[{"seq": ...}, {"timestamp": ...}]``) changed nothing about what the fake
+    served, and every multi-epoch behavioral test (``epochs``, ``ok``,
+    ``first_broken_seq``) stayed green. Only the one test that inspects
+    ``body["sort"]`` directly would have caught it, and only as a body-shape
+    diff with no visible consequence — exactly the kind of regression this
+    module exists to catch with a legible failure, not a silent pass.
+    """
+    fields: list[tuple[str, str]] = []
+    if isinstance(sort_spec, list):
+        for clause in sort_spec:
+            if not isinstance(clause, dict):
+                continue
+            for field, spec in clause.items():
+                order = spec.get("order", "asc") if isinstance(spec, dict) else "asc"
+                fields.append((field, str(order)))
+    return fields
+
+
+def _record_sort_values(record: dict[str, Any], fields: list[tuple[str, str]]) -> list[Any]:
+    """A record's values for ``fields``, in order — the shape ES's own ``sort``
+    cursor takes, so this doubles as both a sort key's input and a cursor."""
+    return [record.get(field) for field, _order in fields]
+
+
+def _compare_sort_values(a: list[Any], b: list[Any], fields: list[tuple[str, str]]) -> int:
+    """-1 if ``a`` sorts before ``b``, 1 if after, 0 if tied — per each field's
+    own ``asc``/``desc``, first field wins, later fields only break ties."""
+    for (_field, order), av, bv in zip(fields, a, b, strict=True):
+        if av == bv:
+            continue
+        ascending = -1 if av < bv else 1
+        return ascending if order != "desc" else -ascending
+    return 0
+
+
+class _FakeES:
+    """Minimal ES double honoring the helper's ``search_after`` paging.
+
+    Serves records ordered by whatever ``sort`` clause the REQUEST carries —
+    derived per call via :func:`_sort_fields_from_request` /
+    :func:`_compare_sort_values`, never a hardcoded field order — so a
+    regression in ``_fetch_audit_records``'s own sort changes what this fake
+    actually hands back, and the multi-epoch tests fail BEHAVIORALLY (wrong
+    ``epochs``/``ok``/``first_broken_seq``, with a legible assertion message)
+    instead of silently staying green. See :func:`_sort_fields_from_request`
+    for why that distinction matters. Empty index → no hits.
+
+    Enforces the ES 9 ``_id``-sort restriction (see
+    :func:`_es9_shard_failure_if_id_sort`) BEFORE serving anything, exactly
+    where a real cluster would refuse — every test in this file that reaches
+    ``verify_audit_chain`` through this fake doubles as a regression guard for
+    the ``_id`` tiebreak.
     """
 
     def __init__(self, records: list[dict[str, Any]]) -> None:
-        self._records = sorted(records, key=lambda r: r["seq"])
+        # Kept in whatever order the caller built them in — the actual serving
+        # order is derived per-request in `search()`, from that request's own
+        # `sort`, not fixed here.
+        self._records = list(records)
 
     async def search(self, *, index: str, body: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        failure = _es9_shard_failure_if_id_sort(body.get("sort"))
+        if failure is not None:
+            return failure
+        fields = _sort_fields_from_request(body.get("sort"))
+        ordered = sorted(
+            self._records,
+            key=functools.cmp_to_key(
+                lambda a, b: _compare_sort_values(
+                    _record_sort_values(a, fields), _record_sort_values(b, fields), fields
+                )
+            ),
+        )
         size = int(body.get("size", 1000))
         after = body.get("search_after")
         start = 0
         if after is not None:
-            after_seq = after[0]
-            # First record whose seq is strictly greater than the cursor seq.
+            # First record that sorts strictly after the cursor, per the SAME
+            # per-field ordering `ordered` was just built with.
             start = next(
-                (i for i, r in enumerate(self._records) if r["seq"] > after_seq),
-                len(self._records),
+                (
+                    i
+                    for i, r in enumerate(ordered)
+                    if _compare_sort_values(_record_sort_values(r, fields), after, fields) > 0
+                ),
+                len(ordered),
             )
-        page = self._records[start : start + size]
+        page = ordered[start : start + size]
         hits = [
-            {"_source": r, "_id": f"id-{r['seq']}", "sort": [r["seq"], f"id-{r['seq']}"]}
+            {"_source": r, "_id": f"id-{r.get('seq')}", "sort": _record_sort_values(r, fields)}
             for r in page
         ]
         return {"hits": {"hits": hits}}
@@ -146,6 +289,33 @@ def _elastic_with(
 # ── helper: intact / tampered / empty ──────────────────────────────────────────
 
 
+def test_es9_fake_rejects_id_sort_and_accepts_timestamp_sort() -> None:
+    """Direct pin of the enforcement contract in :func:`_es9_shard_failure_if_id_sort`.
+
+    Regression for the ES 9 ``id_field_data`` restriction (found 2026-08-20 against
+    a real 93M-doc grid): ``_fetch_audit_records`` used to tiebreak ``search_after``
+    on ``_id``, which stock ES 9 refuses (``indices.id_field_data.enabled=false``),
+    failing every data-bearing shard and turning the (correct) partial-read guard
+    into a permanent couldn't-verify. Every other test in this file proves
+    ``verify_audit_chain`` no longer sends that sort (all pass through this same
+    enforcing fake); this test pins the fake's contract in isolation so the shape it
+    rejects/accepts is obvious without reading the paging logic.
+    """
+    id_sort = [{"timestamp": {"order": "asc"}}, {"_id": {"order": "asc"}}]
+    failure = _es9_shard_failure_if_id_sort(id_sort)
+    assert failure is not None
+    assert failure["_shards"]["failed"] == 58
+    assert failure["_shards"]["total"] == 76
+    assert failure["_shards"]["failures"][0]["reason"]["type"] == "illegal_argument_exception"
+
+    # Real shape sent by `_fetch_audit_records` since the epoch partition landed:
+    # timestamp-major, seq tiebreak (neither is `_id`).
+    ts_sort = [{"timestamp": {"order": "asc"}}, {"seq": {"order": "asc"}}]
+    assert _es9_shard_failure_if_id_sort(ts_sort) is None
+    assert _es9_shard_failure_if_id_sort(None) is None
+    assert _es9_shard_failure_if_id_sort([{"seq": {"order": "asc"}}]) is None
+
+
 async def test_verify_intact_chain() -> None:
     records = _build_chain(5)
     elastic = _elastic_with(records)
@@ -157,6 +327,11 @@ async def test_verify_intact_chain() -> None:
     assert result.first_seq == 0
     assert result.last_seq == 4
     assert result.capped is False
+    # One unbroken chain is one epoch — the common case, and the ONLY case
+    # before the chain-head recovery bug (fixed 2026-08-17) started fragmenting
+    # prod's chain into 134 of them.
+    assert result.epochs == 1
+    assert result.first_broken_epoch_start is None
 
 
 async def test_verify_tampered_record() -> None:
@@ -168,6 +343,14 @@ async def test_verify_tampered_record() -> None:
     result = await verify_audit_chain(elastic, "soc-ai-audit")
     assert result.ok is False
     assert result.first_broken_seq == 2
+    assert result.epochs == 1
+    assert result.first_broken_epoch_start == records[0]["timestamp"]
+    # A single-epoch scan: the one broken epoch is trivially both the oldest
+    # AND the newest (and only) broken one, and — being the only epoch at
+    # all — trivially the latest too.
+    assert result.epochs_broken == 1
+    assert result.newest_broken_epoch_start == records[0]["timestamp"]
+    assert result.latest_epoch_broken is True
 
 
 async def test_verify_deleted_record_breaks_chain() -> None:
@@ -178,6 +361,11 @@ async def test_verify_deleted_record_breaks_chain() -> None:
     result = await verify_audit_chain(elastic, "soc-ai-audit")
     assert result.ok is False
     assert result.first_broken_seq == 3
+    assert result.epochs == 1
+    assert result.first_broken_epoch_start == records[0]["timestamp"]
+    assert result.epochs_broken == 1
+    assert result.newest_broken_epoch_start == records[0]["timestamp"]
+    assert result.latest_epoch_broken is True
 
 
 async def test_verify_windowed_slice_is_not_tamper() -> None:
@@ -194,6 +382,13 @@ async def test_verify_windowed_slice_is_not_tamper() -> None:
     assert result.records_verified == 4
     assert result.first_seq == 6
     assert result.last_seq == 9
+    # No seq=0 anywhere in the window, so it is one (legitimately headless)
+    # epoch, not zero — `epochs` counts groups actually present in the fetch.
+    assert result.epochs == 1
+    assert result.first_broken_epoch_start is None
+    assert result.epochs_broken == 0
+    assert result.newest_broken_epoch_start is None
+    assert result.latest_epoch_broken is False
 
 
 async def test_verify_full_scan_still_flags_missing_head() -> None:
@@ -206,6 +401,11 @@ async def test_verify_full_scan_still_flags_missing_head() -> None:
     result = await verify_audit_chain(elastic, "soc-ai-audit")  # days=None
     assert result.ok is False
     assert result.first_broken_seq == 3
+    assert result.epochs == 1
+    assert result.first_broken_epoch_start == missing_head[0]["timestamp"]
+    assert result.epochs_broken == 1
+    assert result.newest_broken_epoch_start == missing_head[0]["timestamp"]
+    assert result.latest_epoch_broken is True
 
 
 async def test_verify_empty_index_is_intact() -> None:
@@ -217,6 +417,16 @@ async def test_verify_empty_index_is_intact() -> None:
     assert result.first_seq is None
     assert result.last_seq is None
     assert result.capped is False
+    # Nothing to partition — zero epochs, not one. The verdict tri-state (CLI,
+    # API consumers, Config.tsx) treats epochs<=1 as the green/unchanged path,
+    # so 0 must land there beside 1, not in the amber multi-epoch branch.
+    assert result.epochs == 0
+    assert result.first_broken_epoch_start is None
+    # Vacuously true: no epochs at all means nothing can be "the broken latest
+    # epoch" either.
+    assert result.epochs_broken == 0
+    assert result.newest_broken_epoch_start is None
+    assert result.latest_epoch_broken is False
 
 
 async def test_verify_pages_past_page_size() -> None:
@@ -228,6 +438,8 @@ async def test_verify_pages_past_page_size() -> None:
     assert result.records_verified == 2500
     assert result.last_seq == 2499
     assert result.capped is False
+    assert result.epochs == 1
+    assert result.epochs_broken == 0
 
 
 async def test_verify_respects_max_records_cap() -> None:
@@ -237,6 +449,318 @@ async def test_verify_respects_max_records_cap() -> None:
     result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=10)
     assert result.capped is True
     assert result.records_verified == 10
+    # A capped scan mid-way through a single long-running epoch: still 1 epoch,
+    # same amber "partial" branch as before the epoch feature existed (the
+    # multi-epoch amber branch is a distinct state — see the epochs>1 tests
+    # below).
+    assert result.epochs == 1
+    assert result.epochs_broken == 0
+
+
+# ── epoch partition: restart boundaries are history, not tamper ────────────────
+#
+# Prod's audit chain carries 134 genesis (seq=0) records, 2026-06-24 →
+# 2026-08-16: `_top_source`'s `isinstance(resp, dict)` never matched the real
+# ES client's `ObjectApiResponse` (fixed 2026-08-17, commit 8032258), so
+# `_ensure_chain_head` "recovered" an empty head and restarted the chain from
+# genesis on every process restart for ~8 weeks. Zero new genesis records since
+# the fix. Every test below builds that exact shape — multiple independently-
+# intact chains, back to back in time — and pins that the verifier reports it
+# as what it is (N intact epochs), not as one chain broken 133 times.
+
+
+async def test_verify_multi_epoch_all_intact_reports_epoch_count() -> None:
+    """Three restarts, each internally intact: epochs=3, ok=True, not tampered.
+
+    This is prod's actual shape. Before the epoch partition,
+    ``verify_audit_chain`` ran ONE ``verify_chain(records)`` pass over
+    everything fetched; sorted seq-major (the old sort), every epoch after the
+    first interleaved its seq=0 in among every other epoch's low seqs, and
+    sorted timestamp-major without partitioning, the second epoch's seq=0
+    simply looks like seq going backwards after the first epoch's seq=1 — a
+    "duplicate/out-of-order seq" that reports TAMPER at the second epoch's
+    genesis, permanently, for a grid that was never tampered with.
+    """
+    e0 = _build_chain(3, start_time=_BASE_TS)
+    e1 = _build_chain(4, start_time=_BASE_TS + timedelta(hours=1))
+    e2 = _build_chain(2, start_time=_BASE_TS + timedelta(hours=2))
+    elastic = _elastic_with(e0 + e1 + e2)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+    assert result.ok is True
+    assert result.epochs == 3
+    assert result.records_verified == 9
+    assert result.first_broken_seq is None
+    assert result.first_broken_epoch_start is None
+    assert result.epochs_broken == 0
+    assert result.newest_broken_epoch_start is None
+    assert result.latest_epoch_broken is False
+
+
+async def test_verify_break_inside_a_later_epoch_locates_that_epoch() -> None:
+    """A break in epoch 2 (not epoch 1) is located by EPOCH 2's own genesis.
+
+    ``first_broken_seq`` is LOCAL to the broken epoch (every epoch renumbers
+    from 0 — seq 2 here means the third record of epoch 2, not the ninth
+    record overall), and ``first_broken_epoch_start`` names epoch 2's genesis
+    timestamp specifically, not epoch 1's and not a global record count. An
+    operator locating a real tamper needs to know WHICH restart it happened in.
+    """
+    e0 = _build_chain(4, start_time=_BASE_TS)
+    e1 = _build_chain(5, start_time=_BASE_TS + timedelta(hours=1))
+    e1[2]["payload"] = {"i": "tampered"}  # edit inside epoch 2, local seq 2, no re-stamp
+    e2 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=2))
+    elastic = _elastic_with(e0 + e1 + e2)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+    assert result.ok is False
+    assert result.first_broken_seq == 2
+    assert result.first_broken_epoch_start == e1[0]["timestamp"]
+    # The full shape is still reported even though the break is in the middle —
+    # records_verified counts everything FETCHED (the existing, pre-epoch
+    # convention: it is not "records checked before the break"), and epochs
+    # mirrors that same convention for the partition.
+    assert result.epochs == 3
+    assert result.records_verified == 4 + 5 + 3
+    # Exactly ONE epoch is broken (epoch 2) — epoch 3, which comes AFTER it and
+    # is perfectly intact, must not be swept into the tally just because the
+    # scan continues past the break to see it.
+    assert result.epochs_broken == 1
+    assert result.newest_broken_epoch_start == e1[0]["timestamp"]
+    # Epoch 3 (intact) is the last epoch fetched, so the break is NOT in the
+    # latest epoch — this is the "broken, then clean since" shape.
+    assert result.latest_epoch_broken is False
+
+
+async def test_verify_break_in_the_first_epoch_of_a_multi_epoch_fetch() -> None:
+    """A break in epoch 1 must not be masked by later, perfectly intact epochs."""
+    e0 = _build_chain(4, start_time=_BASE_TS)
+    del e0[1]  # seq gap inside epoch 1 (local seq 1 missing; seq 2 breaks)
+    e1 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=1))
+    elastic = _elastic_with(e0 + e1)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+    assert result.ok is False
+    assert result.first_broken_seq == 2
+    assert result.first_broken_epoch_start == e0[0]["timestamp"]
+    assert result.epochs_broken == 1
+    assert result.newest_broken_epoch_start == e0[0]["timestamp"]
+    # e1 (intact) is the last epoch fetched — the operator's real question,
+    # "am I sound NOW", is answered here: yes, the most recent epoch is clean.
+    assert result.latest_epoch_broken is False
+
+
+# ── verify EVERY epoch: a break reports its blast radius, not just its
+# existence ──────────────────────────────────────────────────────────────────
+#
+# Live prod, 2026-08-21: ``soc-ai audit verify`` reported "TAMPER — chain broke
+# at seq 38 in the epoch starting 2026-06-26T21:55:52Z". Verified by hand: a
+# REAL duplicate-seq artifact — two interleaved series both claiming seq
+# 38/39/40, one starting 2026-06-26T22:17 and the other 2026-06-27T02:13 —
+# from the historic pre-1.2.8 write-side stale-head seq-reuse bug (a stalled
+# write left the in-memory chain head stale; the next write reused its seq).
+# Not a false positive — the chain genuinely IS broken there — but the OLD
+# code stopped at the first broken epoch it found, leaving prod's operator
+# unable to tell whether that June scar was the ONLY damage or whether
+# anything more recent (possibly the live, current epoch) was also broken.
+# The tests below build chains with breaks BEFORE and/or AFTER other breaks
+# and pin that every epoch gets checked, every break gets tallied, and the
+# NEWEST break is named specifically — the field an operator actually needs
+# to answer "am I sound right now".
+
+
+async def test_verify_two_epochs_broken_tallies_both_oldest_and_newest_kept() -> None:
+    """Two independent breaks, an intact epoch between AND after them.
+
+    Five epochs: intact, BROKEN, intact, BROKEN, intact. This is the general
+    shape of prod's actual finding — the chain-head recovery bug (fixed
+    2026-08-17) created 134 restart boundaries, and separately, at least one
+    of those pre-1.2.8 epochs carries a REAL duplicate-seq artifact from the
+    historic write-side stale-head seq-reuse bug (a stalled write left the
+    head stale; the next write reused its seq — two interleaved series both
+    claiming the same seq numbers). Stopping at the first break (the old
+    behavior) would report ONE broken epoch and go silent about whether
+    anything since is also broken — unable to answer "am I sound NOW".
+    Verifying every epoch answers it: ``epochs_broken`` counts BOTH breaks,
+    ``first_broken_*`` keeps the OLDEST (compat with the single-break era),
+    and ``newest_broken_epoch_start`` names the most recent one specifically.
+    """
+    e0 = _build_chain(3, start_time=_BASE_TS)
+    e1 = _build_chain(4, start_time=_BASE_TS + timedelta(hours=1))
+    e1[1]["payload"] = {"i": "tampered"}  # break epoch 1 (local seq 1)
+    e2 = _build_chain(2, start_time=_BASE_TS + timedelta(hours=2))
+    e3 = _build_chain(5, start_time=_BASE_TS + timedelta(hours=3))
+    e3[3]["payload"] = {"i": "also tampered"}  # break epoch 3 (local seq 3)
+    e4 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=4))
+    elastic = _elastic_with(e0 + e1 + e2 + e3 + e4)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert result.ok is False
+    assert result.epochs == 5
+    assert result.epochs_broken == 2
+    # Oldest break kept for compat — this is epoch 1's, not epoch 3's.
+    assert result.first_broken_seq == 1
+    assert result.first_broken_epoch_start == e1[0]["timestamp"]
+    # Newest broken epoch is epoch 3's, specifically — not epoch 1's (the
+    # oldest) and not epoch 4's (which is intact and comes after it).
+    assert result.newest_broken_epoch_start == e3[0]["timestamp"]
+    # Epoch 4, intact, is the last epoch fetched — "every epoch after the
+    # newest broken one" (epoch 3) is genuinely, verifiably clean.
+    assert result.latest_epoch_broken is False
+
+
+async def test_verify_latest_epoch_broken_is_flagged() -> None:
+    """When the MOST RECENT epoch itself is the broken one, say so distinctly.
+
+    Two clean restarts, then the current (most recent) epoch is tampered —
+    there is nothing intact "after" the newest break to reassure the operator
+    with, because the newest break IS the latest thing on record.
+    """
+    e0 = _build_chain(3, start_time=_BASE_TS)
+    e1 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=1))
+    e2 = _build_chain(4, start_time=_BASE_TS + timedelta(hours=2))
+    e2[2]["payload"] = {"i": "tampered"}  # break the LAST (most recent) epoch
+    elastic = _elastic_with(e0 + e1 + e2)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert result.ok is False
+    assert result.epochs == 3
+    assert result.epochs_broken == 1
+    assert result.first_broken_epoch_start == e2[0]["timestamp"]
+    assert result.newest_broken_epoch_start == e2[0]["timestamp"]
+    assert result.latest_epoch_broken is True
+
+
+async def test_verify_cap_tallies_only_scanned_epochs() -> None:
+    """A capped scan's tally covers what it actually scanned — nothing more.
+
+    Epoch 0 broken, epoch 1 intact, epoch 2 (never fetched — the cap fires
+    right after epoch 1) would-be intact. The tally must reflect exactly the
+    TWO epochs the scan reached: ``epochs_broken=1`` (only epoch 0),
+    ``newest_broken_epoch_start`` is epoch 0's own start (the only break), and
+    ``latest_epoch_broken`` is False because epoch 1 — the last epoch this
+    capped scan actually fetched — verified intact. This is a data-layer pin:
+    the CAVEAT that a capped scan cannot vouch for anything beyond its own
+    prefix (so a consumer must not present ``latest_epoch_broken=False`` here
+    as "the chain is currently sound" — there may be a real epoch 2 this scan
+    never saw) is a RENDERING decision, tested at the CLI/Config.tsx layer,
+    not something this function computes differently based on ``capped``.
+    """
+    e0 = _build_chain(3, start_time=_BASE_TS)
+    e0[1]["payload"] = {"i": "tampered"}
+    e1 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=1))
+    e2 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=2))  # never fetched
+    elastic = _elastic_with(e0 + e1 + e2)
+    result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=6)
+
+    assert result.capped is True
+    assert result.records_verified == 6
+    assert result.epochs == 2
+    assert result.epochs_broken == 1
+    assert result.first_broken_epoch_start == e0[0]["timestamp"]
+    assert result.newest_broken_epoch_start == e0[0]["timestamp"]
+    assert result.latest_epoch_broken is False
+
+
+async def test_verify_tolerates_identical_timestamps_within_an_epoch() -> None:
+    """Same-millisecond writes within one epoch must not scramble the chain.
+
+    ``_fetch_audit_records``'s sort is timestamp-major with a ``seq`` tiebreak
+    specifically so a burst of records landing in the same ES-visible
+    millisecond still comes back seq-ascending — the ordering the epoch
+    partition (cut at seq==0) and ``verify_chain``'s own per-epoch seq check
+    both depend on. Real clock granularity is coarser than write rate under
+    load, so this is not a hypothetical.
+    """
+    records = _build_chain(6, step=timedelta(0))  # every record: identical timestamp
+    elastic = _elastic_with(records)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+    assert result.ok is True
+    assert result.epochs == 1
+    assert result.records_verified == 6
+    assert result.epochs_broken == 0
+
+
+async def test_verify_identical_timestamp_at_an_epoch_boundary_still_resolves() -> None:
+    """The one collision the compound sort cannot fully absorb: a break, not a lie.
+
+    If a dying process's last write and the next incarnation's genesis write
+    ever landed in the exact same ES-visible millisecond, the seq tiebreak would
+    sort the new genesis (seq=0) ahead of the old epoch's tail (a high seq) —
+    the old epoch's tail record would then be read as arriving mid-epoch-2,
+    where its seq does not fit, and ``verify_chain`` reports a break there. That
+    is the conservative failure mode this module always wants for an ambiguous
+    ordering: a break, never a silent "intact". In practice a process must fully
+    exit before the next one starts and recovers a fresh chain head (see
+    ``AuditLogger._ensure_chain_head``), so the two writes are never truly
+    concurrent — this test pins the fallback behavior anyway, in case that
+    assumption is ever wrong.
+    """
+    e0 = _build_chain(3, start_time=_BASE_TS)
+    e1 = _build_chain(3, start_time=_BASE_TS)  # same timestamps as e0 (worst case)
+    elastic = _elastic_with(e0 + e1)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+    # Whatever the outcome, it must be a definitive break, never a false
+    # "intact" — an ambiguous ordering is never allowed to read as a clean bill
+    # of health.
+    assert result.ok is False
+    assert result.first_broken_seq is not None
+    assert result.epochs_broken >= 1
+
+
+async def test_verify_cap_can_stop_mid_epoch_after_earlier_epochs_completed() -> None:
+    """A capped scan's LAST epoch can be a genuine partial — never itself a break.
+
+    Three epochs of 5 records each; the cap (8) lands 3 records into epoch 2.
+    ``verify_chain`` never requires a group to end on any particular record — a
+    forward-only prefix is intact by construction — so this must report
+    ``ok=True``, ``capped=True``, and ``epochs=2``: epoch 3 was never fetched at
+    all (the cap fired before reaching it), so it does not exist in the
+    returned records and is not counted. Mirrors the pre-epoch capped
+    contract (a capped scan verifies the OLDEST records) one level up: now the
+    oldest EPOCHS.
+    """
+    e0 = _build_chain(5, start_time=_BASE_TS)
+    e1 = _build_chain(5, start_time=_BASE_TS + timedelta(hours=1))
+    e2 = _build_chain(5, start_time=_BASE_TS + timedelta(hours=2))
+    elastic = _elastic_with(e0 + e1 + e2)
+    result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=8)
+    assert result.capped is True
+    assert result.records_verified == 8
+    assert result.ok is True
+    assert result.epochs == 2
+    assert result.first_broken_epoch_start is None
+    assert result.epochs_broken == 0
+    assert result.newest_broken_epoch_start is None
+    assert result.latest_epoch_broken is False
+
+
+async def test_fetch_requests_timestamp_major_sort_and_excludes_legacy_docs() -> None:
+    """Pins the two structural facts the epoch partition depends on.
+
+    1. The fetch sort is timestamp-major (``[{timestamp: asc}, {seq: asc}]``) —
+       epochs were written sequentially in time, and the OLD seq-major sort
+       interleaves every epoch's seq=0 first, making partition on seq alone
+       impossible (see the multi-epoch tests above for what that did to the
+       verdict).
+    2. The query still filters ``exists: seq``, so legacy pre-chain docs
+       (written before the hash chain existed — no ``seq`` at all) can never
+       reach the partition logic. Nothing downstream has to guess what a
+       seq-less record means; it structurally cannot appear.
+    """
+    captured: dict[str, Any] = {}
+
+    class _CapturingES(_FakeES):
+        async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+            captured["sort"] = body.get("sort")
+            captured["query"] = body.get("query")
+            return await super().search(index=index, body=body, **kw)
+
+    elastic = _elastic_with([], fake=_CapturingES(_build_chain(3)))
+    await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert captured["sort"] == [
+        {"timestamp": {"order": "asc"}},
+        {"seq": {"order": "asc"}},
+    ]
+    assert {"exists": {"field": "seq"}} in captured["query"]["bool"]["filter"]
 
 
 async def test_verify_half_read_index_raises_not_intact() -> None:
@@ -389,6 +913,11 @@ def test_endpoint_returns_shape_on_intact_chain(client: TestClient) -> None:
             first_seq=0,
             last_seq=6,
             capped=False,
+            epochs=1,
+            first_broken_epoch_start=None,
+            epochs_broken=0,
+            newest_broken_epoch_start=None,
+            latest_epoch_broken=False,
         )
     )
     with patch("soc_ai.audit.verify.verify_audit_chain", fake):
@@ -401,6 +930,11 @@ def test_endpoint_returns_shape_on_intact_chain(client: TestClient) -> None:
     assert body["first_seq"] == 0
     assert body["last_seq"] == 6
     assert body["capped"] is False
+    assert body["epochs"] == 1
+    assert body["first_broken_epoch_start"] is None
+    assert body["epochs_broken"] == 0
+    assert body["newest_broken_epoch_start"] is None
+    assert body["latest_epoch_broken"] is False
     assert isinstance(body["checked_at"], str) and body["checked_at"]
 
 
@@ -415,6 +949,11 @@ def test_endpoint_reports_tamper(client: TestClient) -> None:
             first_seq=0,
             last_seq=4,
             capped=False,
+            epochs=1,
+            first_broken_epoch_start="2026-08-01T00:00:00+00:00",
+            epochs_broken=1,
+            newest_broken_epoch_start="2026-08-01T00:00:00+00:00",
+            latest_epoch_broken=True,
         )
     )
     with patch("soc_ai.audit.verify.verify_audit_chain", fake):
@@ -423,6 +962,128 @@ def test_endpoint_reports_tamper(client: TestClient) -> None:
     body = resp.json()
     assert body["ok"] is False
     assert body["first_broken_seq"] == 3
+
+
+def test_endpoint_surfaces_epoch_fields_on_a_multi_epoch_intact_scan(
+    client: TestClient,
+) -> None:
+    """``epochs`` passes through exactly like the seq fields already do.
+
+    This is the field the tri-state verdict (CLI / this endpoint's consumers /
+    Config.tsx) keys the amber "intact within N epochs" branch on, so the raw
+    count reaching the wire is what makes that branch reachable at all.
+    """
+    fake = AsyncMock(
+        return_value=ChainVerifyResult(
+            ok=True,
+            records_verified=9,
+            first_broken_seq=None,
+            first_seq=0,
+            last_seq=4,
+            capped=False,
+            epochs=3,
+            first_broken_epoch_start=None,
+            epochs_broken=0,
+            newest_broken_epoch_start=None,
+            latest_epoch_broken=False,
+        )
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", fake):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["epochs"] == 3
+    assert body["first_broken_epoch_start"] is None
+
+
+def test_endpoint_surfaces_which_epoch_broke(client: TestClient) -> None:
+    """A tampered multi-epoch chain surfaces WHICH epoch broke, not just which seq.
+
+    ``first_broken_seq`` alone is ambiguous once more than one epoch exists (it
+    resets to 0 at every genesis) — ``first_broken_epoch_start`` is what lets an
+    operator find the right restart.
+    """
+    fake = AsyncMock(
+        return_value=ChainVerifyResult(
+            ok=False,
+            records_verified=7,
+            first_broken_seq=2,
+            first_seq=0,
+            last_seq=3,
+            capped=False,
+            epochs=2,
+            first_broken_epoch_start="2026-08-01T00:00:00+00:00",
+            epochs_broken=1,
+            newest_broken_epoch_start="2026-08-01T00:00:00+00:00",
+            latest_epoch_broken=False,
+        )
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", fake):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["epochs"] == 2
+    assert body["first_broken_epoch_start"] == "2026-08-01T00:00:00+00:00"
+
+
+def test_endpoint_surfaces_the_broken_epoch_tally(client: TestClient) -> None:
+    """The blast-radius fields — ``epochs_broken``, ``newest_broken_epoch_start``,
+    ``latest_epoch_broken`` — pass through exactly like the seq/epoch fields do.
+
+    This is the shape prod's June finding actually has once every epoch is
+    checked instead of stopping at the first break: a scar in old history,
+    nothing broken since.
+    """
+    fake = AsyncMock(
+        return_value=ChainVerifyResult(
+            ok=False,
+            records_verified=134,
+            first_broken_seq=38,
+            first_seq=0,
+            last_seq=40,
+            capped=False,
+            epochs=134,
+            first_broken_epoch_start="2026-06-26T21:55:52+00:00",
+            epochs_broken=1,
+            newest_broken_epoch_start="2026-06-26T21:55:52+00:00",
+            latest_epoch_broken=False,
+        )
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", fake):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["epochs_broken"] == 1
+    assert body["newest_broken_epoch_start"] == "2026-06-26T21:55:52+00:00"
+    assert body["latest_epoch_broken"] is False
+
+
+def test_endpoint_surfaces_latest_epoch_broken(client: TestClient) -> None:
+    """``latest_epoch_broken=True`` is a distinct, real shape from the reassuring
+    one above — the endpoint must not collapse the two."""
+    fake = AsyncMock(
+        return_value=ChainVerifyResult(
+            ok=False,
+            records_verified=10,
+            first_broken_seq=1,
+            first_seq=0,
+            last_seq=3,
+            capped=False,
+            epochs=3,
+            first_broken_epoch_start="2026-08-19T00:00:00+00:00",
+            epochs_broken=1,
+            newest_broken_epoch_start="2026-08-19T00:00:00+00:00",
+            latest_epoch_broken=True,
+        )
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", fake):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["latest_epoch_broken"] is True
 
 
 def test_endpoint_passes_days_param(client: TestClient) -> None:
@@ -435,6 +1096,11 @@ def test_endpoint_passes_days_param(client: TestClient) -> None:
             first_seq=0,
             last_seq=0,
             capped=False,
+            epochs=1,
+            first_broken_epoch_start=None,
+            epochs_broken=0,
+            newest_broken_epoch_start=None,
+            latest_epoch_broken=False,
         )
     )
     with patch("soc_ai.audit.verify.verify_audit_chain", fake):
@@ -474,6 +1140,11 @@ def test_endpoint_admin_gated() -> None:
                 first_seq=None,
                 last_seq=None,
                 capped=False,
+                epochs=0,
+                first_broken_epoch_start=None,
+                epochs_broken=0,
+                newest_broken_epoch_start=None,
+                latest_epoch_broken=False,
             )
         )
         with patch("soc_ai.audit.verify.verify_audit_chain", fake):

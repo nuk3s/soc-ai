@@ -357,6 +357,328 @@ def _rebase_docs_to_now(docs: list[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Query matching + generic aggregation (the detection-bridge slice, Task 8).
+#
+# The Alerts-console paths above answer only the two hardcoded ``rule.name`` /
+# ``notice.note`` shapes. The detection bridge and the slice-2 behavioral-
+# analytics tools issue a WIDER — but still small and fixed — set of request
+# shapes this mock has to serve from the same fixture docs:
+#
+#   * ``dry_run_detection`` (soc_ai.detection.validators) runs a drafted OQL as
+#     a would-have-fired ``| count`` (``size=0`` + ``track_total_hits``) and a
+#     ``| head 5`` sample — so we need to actually MATCH the translated ES DSL
+#     against the docs and return a real ``hits.total.value`` / hit list.
+#   * the analytics tools (soc_ai.tools.analytics) and ``resolve_agg_field``
+#     (soc_ai.so_client.fields) issue generic ``terms`` aggregations (nested
+#     ``terms`` / ``top_hits`` / ``avg`` / ``min`` sub-aggs) and ``size=0``
+#     ``exists`` count probes.
+#
+# The matcher below covers EXACTLY the DSL clause shapes those two producers
+# emit (soc_ai.so_client.oql.ast_to_es_dsl + the analytics query bodies) — no
+# general-purpose ES engine, just enough to answer them faithfully. A ``range``
+# on ``@timestamp`` is treated as always-true: fixture docs are rebased to
+# 'now' (:func:`_rebase_docs_to_now`), so any recent/count window contains them.
+# ---------------------------------------------------------------------------
+
+
+def _is_absent(value) -> bool:
+    """A value is absent iff ``None`` / ``""`` / empty collection (a ``0`` is real)."""
+    if value is None:
+        return True
+    if isinstance(value, (str, list, tuple, dict)):
+        return len(value) == 0
+    return False
+
+
+def _get_field(source: dict, path: str):
+    """Read a dotted ECS path from a doc ``_source`` (flat-dotted first, then nested).
+
+    Local twin of :func:`soc_ai.so_client.fields.get_dotted`, kept here so this
+    mock stays importable standalone (it only imports ``demo_dataset``) — the
+    same reason :func:`_doc_group_key` navigates nested docs by hand.
+    """
+    if path in source:
+        return source[path]
+    value = source
+    for segment in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(segment)
+        if value is None:
+            return None
+    return value
+
+
+def _value_matches(actual, expected) -> bool:
+    """``term``/``terms`` equality, string-coerced; membership when the doc value is a list."""
+    if actual is None:
+        return False
+    if isinstance(actual, list):
+        return any(str(a) == str(expected) for a in actual)
+    return str(actual) == str(expected)
+
+
+def _bool_matches(node: dict, source: dict) -> bool:
+    """Evaluate an ES ``bool`` clause (must / filter / must_not / should)."""
+    if any(not _doc_matches(c, source) for c in node.get("must") or []):
+        return False
+    if any(not _doc_matches(c, source) for c in node.get("filter") or []):
+        return False
+    if any(_doc_matches(c, source) for c in node.get("must_not") or []):
+        return False
+    should = node.get("should") or []
+    if should:
+        msm = node.get("minimum_should_match")
+        if msm is None:
+            # ES default: 1 when `should` stands alone, 0 alongside must/filter.
+            msm = 0 if (node.get("must") or node.get("filter")) else 1
+        if sum(1 for c in should if _doc_matches(c, source)) < int(msm):
+            return False
+    return True
+
+
+def _doc_matches(clause: dict, source: dict) -> bool:
+    """True iff ``source`` satisfies one ES query DSL ``clause``.
+
+    Supports the bounded clause set the OQL translator and the analytics tools
+    emit: ``bool``, ``term``, ``terms``, ``match``/``match_phrase`` (substring),
+    ``exists``, ``match_all``, and ``range`` (always-true, see the module note).
+    """
+    if not isinstance(clause, dict) or not clause:
+        return True  # {} == match_all (ES default)
+    if "bool" in clause:
+        return _bool_matches(clause["bool"], source)
+    if "match_all" in clause:
+        return True
+    if "term" in clause:
+        field, value = next(iter(clause["term"].items()))
+        return _value_matches(_get_field(source, field), value)
+    if "terms" in clause:
+        field, values = next(iter(clause["terms"].items()))
+        actual = _get_field(source, field)
+        return any(_value_matches(actual, v) for v in values or [])
+    if "match" in clause or "match_phrase" in clause:
+        op = "match" if "match" in clause else "match_phrase"
+        field, text = next(iter(clause[op].items()))
+        actual = _get_field(source, field)
+        return actual is not None and str(text).lower() in str(actual).lower()
+    if "exists" in clause:
+        return not _is_absent(_get_field(source, clause["exists"].get("field", "")))
+    # A range (only ever on @timestamp here) is always-true: rebased-to-now
+    # fixtures fall inside any real window. Any other clause type: no match.
+    return "range" in clause
+
+
+def _is_matchable(query: dict) -> bool:
+    """True when a query is worth evaluating doc-by-doc (i.e. not a bare match_all).
+
+    Keeps ``{"match_all": {}}`` / ``{}`` answering EMPTY the way the demo app's
+    unknown-query contract expects, while a ``bool``/``term``/… query gets
+    matched against the docs.
+    """
+    return isinstance(query, dict) and any(
+        k in query for k in ("bool", "term", "terms", "match", "match_phrase", "exists", "range")
+    )
+
+
+def _sorted_by_sort(docs: list[dict], sort) -> list[dict]:
+    """Order ``docs`` by a top_hits ``sort`` clause — only ``@timestamp`` is honoured."""
+    if not isinstance(sort, list) or not sort or not isinstance(sort[0], dict) or not sort[0]:
+        return list(docs)
+    field, spec = next(iter(sort[0].items()))
+    order = spec.get("order") if isinstance(spec, dict) else spec
+    if field == "@timestamp":
+        return sorted(docs, key=_doc_ts, reverse=str(order).lower() == "desc")
+    return list(docs)
+
+
+def _top_hits_agg(opts: dict, docs: list[dict]) -> dict:
+    """A ``top_hits`` sub-agg: the (sorted, sliced) raw hits, each with its ``_id``."""
+    ordered = _sorted_by_sort(docs, opts.get("sort"))
+    size = int(opts.get("size", 3))
+    hits = [
+        {"_index": d.get("_index", "logs-demo"), "_id": d.get("_id"), "_source": _doc_source(d)}
+        for d in ordered[:size]
+    ]
+    return {"hits": {"total": {"value": len(docs), "relation": "eq"}, "hits": hits}}
+
+
+def _metric_agg(field: str, docs: list[dict], kind: str) -> dict:
+    """A single-value metric sub-agg (``avg`` / ``min`` / ``max``).
+
+    ``@timestamp`` returns the ES date shape (``value`` epoch-millis +
+    ``value_as_string``) so ``first_seen``'s ``min`` first-seen read works.
+    """
+    if field == "@timestamp":
+        stamps = [_doc_ts(d) for d in docs if _doc_source(d).get("@timestamp") is not None]
+        if not stamps:
+            return {"value": None}
+        chosen = min(stamps) if kind == "min" else max(stamps)
+        return {"value": chosen.timestamp() * 1000.0, "value_as_string": _iso(chosen)}
+    values = [
+        float(v)
+        for d in docs
+        if isinstance((v := _get_field(_doc_source(d), field)), (int, float))
+        and not isinstance(v, bool)
+    ]
+    if not values:
+        return {"value": None}
+    if kind == "avg":
+        return {"value": sum(values) / len(values)}
+    return {"value": min(values) if kind == "min" else max(values)}
+
+
+def _terms_agg(body: dict, docs: list[dict]) -> dict:
+    """A ``terms`` agg over ``docs``: buckets by field value, with nested sub-aggs.
+
+    ES default bucket order (doc_count desc, term asc) unless an explicit
+    ``order: {"_count": "asc"}`` is given; ``sum_other_doc_count`` reflects docs
+    dropped by the ``size`` cap.
+    """
+    spec = body["terms"]
+    field = spec["field"]
+    size = int(spec.get("size", 10))
+    count_asc = (spec.get("order") or {}).get("_count") == "asc"
+
+    groups: dict = {}
+    for doc in docs:
+        key = _get_field(_doc_source(doc), field)
+        if _is_absent(key):
+            continue
+        groups.setdefault(key, []).append(doc)
+
+    items = sorted(
+        groups.items(),
+        key=lambda kv: (len(kv[1]), str(kv[0])) if count_asc else (-len(kv[1]), str(kv[0])),
+    )
+    kept, dropped = items[:size], items[size:]
+    nested = body.get("aggs")
+    buckets = []
+    for key, members in kept:
+        bucket = {"key": key, "doc_count": len(members)}
+        if nested:
+            bucket.update(_run_aggs(nested, members))
+        buckets.append(bucket)
+    return {
+        "doc_count_error_upper_bound": 0,
+        "sum_other_doc_count": sum(len(m) for _, m in dropped),
+        "buckets": buckets,
+    }
+
+
+def _run_aggs(aggs_spec: dict, docs: list[dict]) -> dict:
+    """Evaluate a named-agg spec against ``docs`` — the bounded set the tools emit."""
+    out: dict = {}
+    for name, body in (aggs_spec or {}).items():
+        if "terms" in body:
+            out[name] = _terms_agg(body, docs)
+        elif "top_hits" in body:
+            out[name] = _top_hits_agg(body["top_hits"], docs)
+        elif "avg" in body:
+            out[name] = _metric_agg(body["avg"]["field"], docs, "avg")
+        elif "min" in body:
+            out[name] = _metric_agg(body["min"]["field"], docs, "min")
+        elif "max" in body:
+            out[name] = _metric_agg(body["max"]["field"], docs, "max")
+        else:
+            out[name] = {}
+    return out
+
+
+def _build_detection_fixture_docs() -> list[dict]:
+    """A small, self-contained fixture for the detection-bridge slice's tests.
+
+    A Zerologon-shaped ``zeek.dce_rpc`` cluster (a burst of
+    ``NetrServerAuthenticate3`` — plus the ``NetrServerReqChallenge`` that
+    precedes each — from one workstation against a domain controller's netlogon
+    pipe, alongside benign DCE-RPC noise so the operation histogram is
+    discriminating and a would-have-fired count on the dangerous operations is
+    meaningful), plus a handful of ``zeek.dns`` and ``zeek.conn`` docs so the
+    slice-2 behavioral-analytics tools have something to read.
+
+    Addressing is RFC5737 / RFC2606 placeholder space ONLY (192.0.2.0/24,
+    198.51.100.0/24, 203.0.113.0/24, ``example.test``) so this fixture carries
+    no lab identifier and ``tests/test_demo_leak_gate.py`` stays green. The
+    operation lives under ``zeek.dce_rpc.operation`` (not the ECS
+    ``dce_rpc.operation``) because that is the only form the OQL field whitelist
+    admits — so a drafted rule keying on it can actually dry-run against these.
+    """
+    dc = "192.0.2.10"  # the domain controller under attack
+    attacker = "198.51.100.23"  # the workstation running the Zerologon burst
+    workstation = "198.51.100.50"  # a benign internal host
+    resolver = "192.0.2.53"
+    external = "203.0.113.77"
+    base = datetime(2026, 8, 23, 9, 0, 0, tzinfo=UTC)
+    docs: list[dict] = []
+
+    def _dce(op: str, *, src: str, minute: int) -> None:
+        seq = len(docs) + 1
+        docs.append(
+            {
+                "_index": "logs-detection",
+                "_id": f"zl-dce-{seq:06d}",
+                "_source": {
+                    "@timestamp": _iso(base + timedelta(minutes=minute)),
+                    "event": {"dataset": "zeek.dce_rpc"},
+                    "source": {"ip": src, "port": 50000 + seq},
+                    "destination": {"ip": dc, "port": 135},
+                    "host": {"name": "dc01.example.test"},
+                    "zeek": {"dce_rpc": {"operation": op, "endpoint": "netlogon"}},
+                },
+            }
+        )
+
+    for minute in range(8):  # the malicious burst — the discriminating signal
+        _dce("NetrServerAuthenticate3", src=attacker, minute=minute)
+    for minute in range(3):
+        _dce("NetrServerReqChallenge", src=attacker, minute=minute)
+    for i in range(4):  # benign DCE-RPC noise (must NOT match the drafted rule)
+        _dce("NetrLogonSamLogonEx", src=workstation, minute=20 + i)
+    _dce("SamrConnect5", src=workstation, minute=30)
+
+    for i, qname in enumerate(
+        ["www.example.test", "mail.example.test", "api.example.test", "cdn.example.test"]
+    ):
+        docs.append(
+            {
+                "_index": "logs-detection",
+                "_id": f"zl-dns-{i + 1:02d}",
+                "_source": {
+                    "@timestamp": _iso(base + timedelta(minutes=40 + i)),
+                    "event": {"dataset": "zeek.dns"},
+                    "source": {"ip": workstation, "port": 40000 + i},
+                    "destination": {"ip": resolver, "port": 53},
+                    "host": {"name": "ws50.example.test"},
+                    "dns": {"query": {"name": qname}},
+                },
+            }
+        )
+
+    for i in range(3):
+        docs.append(
+            {
+                "_index": "logs-detection",
+                "_id": f"zl-conn-{i + 1:02d}",
+                "_source": {
+                    "@timestamp": _iso(base + timedelta(minutes=50 + i)),
+                    "event": {"dataset": "zeek.conn"},
+                    "source": {"ip": workstation, "port": 45000 + i},
+                    "destination": {"ip": external, "port": 443},
+                    "host": {"name": "ws50.example.test"},
+                    "client": {"bytes": 512 + i},
+                },
+            }
+        )
+    return docs
+
+
+# The detection-bridge slice's shared fixture — imported by the mock-ES agg
+# tests and the hermetic Zerologon draft e2e. Not wired into the running server
+# by default (that serves --fixtures / demo_dataset); it is a test constant.
+DETECTION_FIXTURE_DOCS: list[dict] = _build_detection_fixture_docs()
+
+
 def _search_response_from_docs(body: dict, docs: list[dict]) -> dict:
     docs = _rebase_docs_to_now(docs)
     aggs = body.get("aggs") or {}
@@ -389,6 +711,18 @@ def _search_response_from_docs(body: dict, docs: list[dict]) -> dict:
             "aggregations": {"rules": {"buckets": buckets}},
         }
 
+    # --- generic aggregation (behavioral-analytics tools + resolve_agg_field) --
+    # Any terms agg OTHER than the two console shapes above: match the query
+    # against the docs, then run the (possibly nested) aggs over what matched.
+    if aggs:
+        matched = [d for d in visible if _doc_matches(query, _doc_source(d))]
+        return {
+            "took": 3,
+            "timed_out": False,
+            "hits": {"total": {"value": len(matched), "relation": "eq"}, "hits": []},
+            "aggregations": _run_aggs(aggs, matched),
+        }
+
     # --- ids lookup (acked-state probe on the investigation detail page) -----
     ids = query.get("ids") or {}
     if ids.get("values"):
@@ -415,6 +749,37 @@ def _search_response_from_docs(body: dict, docs: list[dict]) -> dict:
         field = "rule.name" if terms.get("rule.name") else "notice.note"
         matching = sorted(
             (d for d in visible if _doc_group_key(d, field) == str(rule)),
+            key=_doc_ts,
+            reverse=True,
+        )
+        size = body.get("size")
+        hits = matching[:size] if isinstance(size, int) and size >= 0 else matching
+        return {
+            "took": 2,
+            "timed_out": False,
+            "hits": {"total": {"value": len(matching), "relation": "eq"}, "hits": hits},
+        }
+
+    # --- count (dry_run `| count`; resolve_agg_field's exists probe) ----------
+    # A size=0 query with no aggregation asks only for a total: match the query
+    # against the docs and return the real count, so a drafted rule's
+    # would-have-fired dry run reports a true `hits.total.value`.
+    if body.get("size") == 0:
+        matched = [d for d in visible if _doc_matches(query, _doc_source(d))]
+        return {
+            "took": 1,
+            "timed_out": False,
+            "hits": {"total": {"value": len(matched), "relation": "eq"}, "hits": []},
+        }
+
+    # --- generic hit listing (dry_run `| head N`) ----------------------------
+    # Any other bool/term/… query (not a bare match_all): return the matching
+    # docs newest-first, capped to `size`, so the dry run's sample-id fetch
+    # resolves against real evidence. A match_all/empty query stays EMPTY here,
+    # preserving the demo's "unknown query answers empty, not an error" contract.
+    if _is_matchable(query):
+        matching = sorted(
+            (d for d in visible if _doc_matches(query, _doc_source(d))),
             key=_doc_ts,
             reverse=True,
         )
@@ -551,6 +916,55 @@ def saturated_response() -> dict:
     return {"error": {"root_cause": [cause], **cause}, "status": 429}
 
 
+# A sort on `_id` needs fielddata, which stock ES 9 ships disabled
+# (`indices.id_field_data.enabled=false`) — every data-bearing shard fails.
+# Unlike the opt-in /__degrade states above, this is not a simulated outage: it
+# is what a real ES 9 cluster does on ANY request that asks for it, healthy or
+# not, so the check below runs unconditionally wherever `_search` is dispatched.
+ID_SORT_REJECTED_SHARDS = {
+    "total": 76,
+    "successful": 18,
+    "skipped": 0,
+    "failed": 58,
+    "failures": [
+        {
+            "shard": 0,
+            "index": "soc-ai-audit-000001",
+            "node": None,
+            "reason": {
+                "type": "illegal_argument_exception",
+                "reason": "Fielddata access on the _id field is disallowed, you can "
+                "re-enable it by updating the dynamic cluster setting: "
+                "indices.id_field_data.enabled",
+            },
+        }
+    ],
+}
+
+
+def id_sort_rejected_response(body: dict) -> dict | None:
+    """The ES 9 shard-failure shape for a search that sorts on ``_id``, or None.
+
+    Regression guard for the audit-verify fix (``soc_ai/audit/verify.py``, found
+    2026-08-20): ``_fetch_audit_records``'s ``search_after`` tiebreak used to sort
+    on ``_id``, which a real 93M-doc ES 9 grid refused on every data-bearing shard
+    ("58 of 76 shards failed"). Reproduced here so this mock stays faithful to a
+    real ES 9 cluster and a reintroduced ``_id`` sort fails against the demo/CI
+    replay path too, not only on a live upgrade.
+    """
+    sort = body.get("sort")
+    if not isinstance(sort, list) or not any(
+        isinstance(clause, dict) and "_id" in clause for clause in sort
+    ):
+        return None
+    return {
+        "took": 4,
+        "timed_out": False,
+        "_shards": copy.deepcopy(ID_SORT_REJECTED_SHARDS),
+        "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MockES/1.0"
 
@@ -659,7 +1073,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(MODELS)
         elif "_search" in path:
             body = self._body()
-            if FIXTURE_DOCS is not None:
+            rejected = id_sort_rejected_response(body)
+            if rejected is not None:
+                self._send(rejected)
+            elif FIXTURE_DOCS is not None:
                 self._send(_search_response_from_docs(body, FIXTURE_DOCS))
             else:
                 self._send(_search_response(body))

@@ -16,7 +16,15 @@ def test_investigate_threads_deep_to_pipeline() -> None:
 
     captured: dict[str, Any] = {}
 
-    async def fake_pipeline(*, alert_id: str, ctx: Any, focus_hint: Any = None, deep: bool = False):
+    async def fake_pipeline(
+        *,
+        alert_id: str,
+        ctx: Any,
+        focus_hint: Any = None,
+        deep: bool = False,
+        allow_so_writes: bool = True,
+        focus_origin: str = "rerun",
+    ):
         captured["deep"] = deep
         return
         yield  # pragma: no cover - makes this an async generator
@@ -35,7 +43,15 @@ def test_run_recorded_threads_deep_to_investigate() -> None:
 
     captured: dict[str, Any] = {}
 
-    def fake_investigate(alert_id: str, *, ctx: Any, focus_hint: Any = None, deep: bool = False):
+    def fake_investigate(
+        alert_id: str,
+        *,
+        ctx: Any,
+        focus_hint: Any = None,
+        deep: bool = False,
+        allow_so_writes: bool = True,
+        focus_origin: str = "rerun",
+    ):
         captured["deep"] = deep
 
         async def gen():

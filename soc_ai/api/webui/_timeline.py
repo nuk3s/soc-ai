@@ -657,6 +657,13 @@ class InvestigationOut(BaseModel):
     # web UI) so the UI never offers "Acknowledge" for an already-acked alert.
     # False on any ES error (resilient: the page must never break on this).
     alertAcked: bool = False
+    # Promotion provenance (migration 0031) — set only when kind == "hunt".
+    huntId: str | None = None
+    # First 160 chars of the source hunt's objective. None when the hunt was
+    # never set OR has since been deleted — hunt_id carries no FK (a promoted
+    # investigation must survive hunt deletion), so this degrades gracefully
+    # rather than 404ing the whole drawer.
+    huntObjective: str | None = None
 
 
 def _collect_reasoning(events: list[Any]) -> list[str]:

@@ -53,9 +53,11 @@ def test_empty_list_yields_no_instruction() -> None:
 # ── Wiring: the loop must actually run, and must fail safe ──────────────────
 
 
-def test_setting_exists_and_defaults_to_one_attempt() -> None:
-    """Default ON at 1: the common case is a single over-reach the agent fixes
-    immediately. 0 restores the historical warn-only behavior."""
+def test_setting_exists_and_defaults_to_two_attempts() -> None:
+    """Default ON at 2 (raised from 1 in the 2026-08-20 answer-quality batch):
+    a caveat banner is no longer the terminal fallback (ground-or-strip is), so
+    the loop gets a second chance to fix its own answer before the redaction
+    path kicks in. 0 restores the historical warn-only behavior."""
     from pydantic import SecretStr
     from soc_ai.config import Settings
 
@@ -67,13 +69,14 @@ def test_setting_exists_and_defaults_to_one_attempt() -> None:
         litellm_base_url="http://localhost:4000",
         api_auth_required=False,
     )
-    assert s.chat_regrounding_attempts == 1
+    assert s.chat_regrounding_attempts == 2
 
 
-def test_chat_turn_reruns_on_ungrounded_and_keeps_caveat_fallback() -> None:
+def test_chat_turn_reruns_on_ungrounded_and_keeps_redaction_fallback() -> None:
     """Pin the two halves of the contract in the turn engine's source: the loop
-    re-runs the agent with the correction, and the caveat path survives as the
-    terminal fallback when the agent will not comply."""
+    re-runs the agent with the correction, and ground-or-strip redaction
+    (2026-08-20 — replaced the caveat banner) survives as the terminal
+    fallback when the agent will not comply."""
     import inspect
 
     from soc_ai.webui import chat_turn
@@ -83,6 +86,8 @@ def test_chat_turn_reruns_on_ungrounded_and_keeps_caveat_fallback() -> None:
     assert "chat_regrounding_attempts" in src
     # Re-runs the agent inside the loop, not just once.
     assert src.count("await agent.run(") >= 2
-    # And the historical caveat is still applied when grounding ultimately fails.
-    assert "scoped_unverified_caveat" in src
+    # And the ground-or-strip redaction is still applied when grounding
+    # ultimately fails — no caveat banner left in the terminal fallback.
+    assert "redact_ungrounded" in src
+    assert "scoped_unverified_caveat" not in src
     assert "regrounding_attempts" in src

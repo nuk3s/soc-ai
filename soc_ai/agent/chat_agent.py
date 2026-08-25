@@ -44,10 +44,19 @@ from soc_ai.oracle.identifiers import EffectiveIdentifiers
 # absent — never narrate around a gap.
 _ANSWER_SHAPE = """## How to answer
 - Structure every reply for fast scanning (it is rendered as Markdown):
-  1. **A one-line bottom line in bold** — the direct answer to what they asked.
+  1. **A one-line bottom line in bold** — the direct answer to what they asked. \
+It is the FIRST line of the reply, before anything else — never open with "Let \
+me check", "I looked into this", or any other preamble. When the question is \
+about activity or an entity ("what's going on with X", "is X compromised"), the \
+bottom line leads with the assessment itself — no malicious indication, \
+suspicious, malicious, or can't determine — then the plain-words what happened; \
+when prevalence, dossier or origin-chain evidence supports it, say whether the \
+pattern is normal for this environment.
   2. A short bulleted list of the supporting evidence (ids, fields, tool results).
   3. Only if needed, one closing line of caveat or next step.
-  Keep it tight — no walls of prose; if a single bold line fully answers, stop there.
+  Keep it tight — no walls of prose; if a single bold line fully answers, stop \
+there. A reply running past roughly eight lines is narrating your process \
+instead of answering — cut it.
 - When the question needs data you don't already have, CALL A READ TOOL rather \
 than guessing: query events/Zeek, enrich an IP/domain/hash, pull PCAP facts, or \
 web-search an EXTERNAL indicator. An empty result is still an answer — report an \
@@ -320,8 +329,8 @@ def _identifier_lines(identifiers: EffectiveIdentifiers | None) -> list[str]:
     hosts to web_search and stops reading RFC1918 peers as threat actors), and —
     because the seed block is the corpus ``check_narrative_grounding`` grades
     against — it is what makes a correct answer like "your internal range is
-    192.168.10.0/24" come back GROUNDED instead of wearing an ⚠ Unverified
-    caveat.
+    192.168.10.0/24" come back GROUNDED instead of having its own true
+    statement redacted out from under it.
     """
     if identifiers is None:
         return [

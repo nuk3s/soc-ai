@@ -261,9 +261,11 @@ describe('selection counts are a true partition, not a double count', () => {
       mkGroup({ id: 'es-1', name: 'ET SCAN Noisy', count: 2000 }),
     ]);
     vi.mocked(getAlertGroupEvents).mockResolvedValue([
-      mkEvent({ id: 'ev-1', ts: '2026-07-30T00:00:00Z' }),
-      mkEvent({ id: 'ev-2', ts: '2026-07-30T00:01:00Z' }),
-      mkEvent({ id: 'ev-3', ts: '2026-07-30T00:02:00Z' }),
+      // Distinct dst per event: three DIFFERENT events under one group, not a
+      // ≥3-identical flood — bucketing must not collapse these into one row.
+      mkEvent({ id: 'ev-1', dst: '10.0.0.11', ts: '2026-07-30T00:00:00Z' }),
+      mkEvent({ id: 'ev-2', dst: '10.0.0.12', ts: '2026-07-30T00:01:00Z' }),
+      mkEvent({ id: 'ev-3', dst: '10.0.0.13', ts: '2026-07-30T00:02:00Z' }),
     ]);
   };
 

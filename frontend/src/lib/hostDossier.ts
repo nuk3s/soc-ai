@@ -350,8 +350,11 @@ function fieldOf(
   return fields.find((f) => f.field === name);
 }
 
-/** A field's resolved scalar, or null. */
-function scalarOf(fields: DossierFieldBrief[], name: DossierFieldName): string | null {
+/** A field's resolved scalar, or null. Exported: the palette's host results
+ *  (CommandPalette.tsx) read hostname/role off a DossierRow the same way the
+ *  identity sentence does — one extractor, not a second one re-deriving the
+ *  same "resolved and non-blank" rule. */
+export function scalarOf(fields: DossierFieldBrief[], name: DossierFieldName): string | null {
   const f = fieldOf(fields, name);
   if (!f || !isResolved(f)) return null;
   const v = (f.value ?? '').trim();
@@ -359,6 +362,17 @@ function scalarOf(fields: DossierFieldBrief[], name: DossierFieldName): string |
 }
 
 const startsWithVowel = (word: string): boolean => /^[aeiou]/i.test(word);
+
+// os_family is internal vocabulary (soc_ai/dossier/infer.py:_HOSTLOG_OS_FAMILY)
+// — "apple" covers macOS/iOS/Darwin. Display labels for the sentence; a family
+// this map does not know falls through verbatim rather than hiding the field.
+const OS_FAMILY_LABELS: Record<string, string> = {
+  apple: 'an Apple OS',
+  linux: 'Linux',
+  windows: 'Windows',
+  android: 'Android',
+  freebsd: 'FreeBSD',
+};
 
 /**
  * The one sentence the page exists for: what this machine IS, composed from
@@ -403,7 +417,9 @@ export function identitySentence(host: {
     ]);
   }
 
-  const os = scalarOf(fields, 'os_detail') ?? scalarOf(fields, 'os_family');
+  const osDetail = scalarOf(fields, 'os_detail');
+  const osFamily = scalarOf(fields, 'os_family');
+  const os = osDetail ?? (osFamily ? OS_FAMILY_LABELS[osFamily.toLowerCase()] ?? osFamily : null);
   if (os) clauses.push([{ text: 'running ' }, { text: os, strong: true }]);
 
   const domain = scalarOf(fields, 'domain_membership');

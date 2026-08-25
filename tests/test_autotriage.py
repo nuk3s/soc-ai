@@ -197,6 +197,8 @@ async def _fake_investigate_success(
     ctx: Any,
     focus_hint: str | None = None,
     deep: bool = False,
+    allow_so_writes: bool = True,
+    focus_origin: str = "rerun",
 ) -> AsyncIterator[StepEvent]:
     sid = "fake-at-sid"
     yield StepEvent(
@@ -492,6 +494,8 @@ class TestAutoTriageSingleFlight:
             ctx: Any,
             focus_hint: str | None = None,
             deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
         ) -> AsyncIterator[StepEvent]:
             sid = "slow-sid"
             yield StepEvent(
@@ -546,6 +550,8 @@ class TestAutoTriageFailedCountsStreamErrors:
             ctx: Any,
             focus_hint: str | None = None,
             deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
         ) -> AsyncIterator[StepEvent]:
             sid = "err-sid"
             yield StepEvent(
@@ -588,6 +594,8 @@ class TestAutoTriageFailedCountsStreamErrors:
             ctx: Any,
             focus_hint: str | None = None,
             deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
         ) -> AsyncIterator[StepEvent]:
             sid = "hang-sid"
             yield StepEvent(
@@ -932,6 +940,8 @@ class TestAutoTriageLiveProgress:
             ctx: Any,
             focus_hint: str | None = None,
             deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
         ) -> AsyncIterator[StepEvent]:
             sid = "tc-sid"
             yield StepEvent(
@@ -1005,6 +1015,8 @@ class TestAutoTriageLiveProgress:
             ctx: Any,
             focus_hint: str | None = None,
             deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
         ) -> AsyncIterator[StepEvent]:
             sid = "gate-sid"
             yield StepEvent(
@@ -1515,6 +1527,85 @@ class TestMaybeAutoAckFp:
         assert result.payload["success"] is True
 
 
+class TestMaybeAutoAckFpGated:
+    """Task 6 (finding promotion): ``_maybe_auto_ack_fp_gated`` wraps
+    ``maybe_auto_ack_fp`` at the pipeline call site so a promoted hunt
+    finding's investigation — whose ``alert_es_id`` is cited telemetry, not an
+    SO alert — can never fire an unattended ack, regardless of verdict,
+    confidence, or the auto-ack toggle. Reuses ``TestMaybeAutoAckFp``'s
+    report/alert/ctx/emit builders directly (they're @staticmethod) rather
+    than subclassing, so this class doesn't re-collect and re-run every one
+    of that class's tests under a second name.
+    """
+
+    _make_ctx = staticmethod(TestMaybeAutoAckFp._make_ctx)
+    _make_report = staticmethod(TestMaybeAutoAckFp._make_report)
+    _make_alert = staticmethod(TestMaybeAutoAckFp._make_alert)
+    _make_emit_audit = staticmethod(TestMaybeAutoAckFp._make_emit_audit)
+
+    def test_allow_so_writes_false_skips_before_any_write(self) -> None:
+        """auto_ack_fp_enabled=True + a false_positive report ABOVE threshold
+        is exactly the condition that fires a real ack (see
+        TestMaybeAutoAckFp.test_auto_ack_fires_on_fp_above_threshold) — but
+        allow_so_writes=False must still produce NO execute_write_tool call
+        and an auto_ack_skipped event with reason 'promoted_finding'."""
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import _maybe_auto_ack_fp_gated
+
+        ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+        report = self._make_report(verdict="false_positive", confidence=0.85)
+        _ev, _audit, captured = self._make_emit_audit()
+        alert = self._make_alert()
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+            result = asyncio.run(
+                _maybe_auto_ack_fp_gated(
+                    report,
+                    "ev-promoted",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    allow_so_writes=False,
+                )
+            )
+
+        mock_write.assert_not_awaited()
+        assert result is not None
+        assert result.kind == "auto_ack_skipped"
+        assert result.payload["reason"] == "promoted_finding"
+        assert result.payload["es_id"] == "ev-promoted"
+        assert captured == [result]
+
+    def test_allow_so_writes_true_is_unchanged(self) -> None:
+        """The default (allow_so_writes=True, every existing caller) delegates
+        straight through to maybe_auto_ack_fp — identical behavior to calling
+        it directly."""
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import _maybe_auto_ack_fp_gated
+
+        ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+        report = self._make_report(verdict="false_positive", confidence=0.85)
+        _ev, _audit, _captured = self._make_emit_audit()
+        alert = self._make_alert()
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+            result = asyncio.run(
+                _maybe_auto_ack_fp_gated(
+                    report, "ev-normal", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                )
+            )
+
+        mock_write.assert_awaited_once()
+        assert result is not None
+        assert result.kind == "auto_ack"
+        assert result.payload["success"] is True
+
+
 # ---------------------------------------------------------------------------
 # Config floor: auto_triage_min_severity drives the sweep band
 # ---------------------------------------------------------------------------
@@ -1541,6 +1632,8 @@ class TestAutoTriageProgress:
             ctx: Any,
             focus_hint: str | None = None,
             deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
         ) -> AsyncIterator[StepEvent]:
             sid = "pend-sid"
             yield StepEvent(

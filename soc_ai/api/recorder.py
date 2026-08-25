@@ -59,6 +59,9 @@ class InvestigationRecorder:
         alert_id: str,
         started_by: str,
         rule_name: str | None = None,
+        kind: str = "suricata",
+        hunt_id: str | None = None,
+        finding_ordinal: int | None = None,
     ) -> None:
         self._maker = maker
         self._alert_id = alert_id
@@ -73,6 +76,13 @@ class InvestigationRecorder:
         self._dest_ip: str | None = None
         self._finished = False
         self.investigation_id: str | None = None
+        # Promotion provenance (finding-promotion slice 1): kind='hunt' plus the
+        # source hunt/finding it was promoted from. Every pre-existing caller
+        # (alert grid, re-hunt, auto-triage) omits these and gets today's
+        # defaults — an ordinary Suricata-anchored investigation.
+        self._kind = kind
+        self._hunt_id = hunt_id
+        self._finding_ordinal = finding_ordinal
 
     async def start(self) -> str | None:
         try:
@@ -82,6 +92,9 @@ class InvestigationRecorder:
                     alert_es_id=self._alert_id,
                     started_by=self._started_by,
                     rule_name=self._rule_name,
+                    kind=self._kind,
+                    hunt_id=self._hunt_id,
+                    finding_ordinal=self._finding_ordinal,
                 )
         except Exception:
             _LOGGER.exception(

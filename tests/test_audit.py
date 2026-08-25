@@ -16,13 +16,55 @@ from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 
 
+def _es9_shard_failure_if_id_sort(sort: Any) -> dict[str, Any] | None:
+    """Mirror real ES 9's refusal to sort on ``_id`` — see the twin helper (and its
+    full rationale) in ``tests/test_audit_verify.py``.
+
+    ``_ensure_chain_head``'s recovery search sorts only on ``seq`` DESC (no
+    ``_id`` tiebreak — unlike the ``_id`` tiebreak :mod:`soc_ai.audit.verify`
+    used to send), so every test below routing through :class:`_CapturingES`
+    exercises this and stays green: proof this read path is NOT a member of the
+    ES 9 ``id_field_data`` bug class, not just an assertion of it.
+    """
+    if not isinstance(sort, list) or not any(
+        isinstance(clause, dict) and "_id" in clause for clause in sort
+    ):
+        return None
+    return {
+        "took": 4,
+        "timed_out": False,
+        "_shards": {
+            "total": 76,
+            "successful": 18,
+            "skipped": 0,
+            "failed": 58,
+            "failures": [
+                {
+                    "shard": 0,
+                    "index": "soc-ai-audit-000001",
+                    "reason": {
+                        "type": "illegal_argument_exception",
+                        "reason": (
+                            "Fielddata access on the _id field is disallowed, you can "
+                            "re-enable it by updating the dynamic cluster setting: "
+                            "indices.id_field_data.enabled"
+                        ),
+                    },
+                }
+            ],
+        },
+        "hits": {"hits": []},
+    }
+
+
 class _CapturingES:
     """Minimal in-memory ES double for hash-chain tests.
 
     Captures every indexed body (so we can recover the stored records) and
     serves them back via ``search`` so a fresh :class:`AuditLogger` can recover
     the chain head on restart. ``index`` may be told to raise to simulate an ES
-    outage.
+    outage. ``search`` enforces the ES 9 ``_id``-sort restriction (see
+    :func:`_es9_shard_failure_if_id_sort`) exactly where a real cluster would.
     """
 
     def __init__(self, *, fail: bool = False) -> None:
@@ -36,6 +78,9 @@ class _CapturingES:
         self.docs.append(body)
 
     async def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
+        failure = _es9_shard_failure_if_id_sort(body.get("sort"))
+        if failure is not None:
+            return failure
         chained = [d for d in self.docs if d.get("seq") is not None]
         if not chained:
             return {"hits": {"hits": []}}
@@ -442,6 +487,28 @@ async def test_deleting_record_breaks_chain(settings_kratos: Settings) -> None:
     assert ok is False
     # The record that should have been seq=2 is now seq=3 → first mismatch at 3.
     assert broken == 3
+
+
+def test_es9_fake_chain_head_search_never_sorts_by_id() -> None:
+    """Direct pin of the enforcement contract in :func:`_es9_shard_failure_if_id_sort`.
+
+    Companion finding to the ``_id``-tiebreak fix in ``soc_ai/audit/verify.py``
+    (found 2026-08-20, ES 9 ``id_field_data``): ``_ensure_chain_head``'s recovery
+    search is the OTHER read path through the raw ``_client`` handle, and so the
+    other suspect. Its sort is ``[{"seq": {"order": "desc"}}]`` — no ``_id`` — so
+    it is NOT a member of that bug class; every test below routing through
+    :class:`_CapturingES` stays green under this same enforcing fake, proving it
+    rather than merely assuming it. This pins the fake's contract in isolation
+    (mirrors the twin helper in ``tests/test_audit_verify.py``) so a future ``_id``
+    tiebreak added here would be caught the same way.
+    """
+    id_sort = [{"seq": {"order": "desc"}}, {"_id": {"order": "desc"}}]
+    failure = _es9_shard_failure_if_id_sort(id_sort)
+    assert failure is not None
+    assert failure["_shards"]["failed"] == 58
+
+    seq_only_sort = [{"seq": {"order": "desc"}}]
+    assert _es9_shard_failure_if_id_sort(seq_only_sort) is None
 
 
 @pytest.mark.asyncio

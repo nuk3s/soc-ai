@@ -512,6 +512,20 @@ describe('Hosts controls reach the server', () => {
     await waitFor(() => expect(lastQuery()).toMatchObject({ offset: 50 }));
   });
 
+  it('lands on hosts with traffic — the screen default, server-side', async () => {
+    mount();
+    await screen.findByText('192.168.10.8');
+    expect(lastQuery()).toMatchObject({ activity: 'active' });
+    expect(lastQuery()?.source).toBeUndefined();
+    // The escape hatch names what it hides and offers the way out.
+    expect(screen.getByText(/quiet hosts.*are hidden/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
+    await waitFor(() => expect(lastQuery()?.activity).toBeUndefined());
+    expect(lastQuery()?.source).toBeUndefined();
+    expect(screen.queryByText(/quiet hosts.*are hidden/i)).toBeNull();
+  });
+
   it('sends the search to the server, debounced, from the first page', async () => {
     vi.mocked(listDossiers).mockResolvedValue(page([BLUE, QUIET], 120));
     mount();
@@ -554,6 +568,51 @@ describe('Hosts controls reach the server', () => {
   });
 });
 
+describe('Hosts — quiet-but-real census', () => {
+  it('a real but entirely quiet census is "no hosts match", never "first run"', async () => {
+    // getDossierSummary's default mock (SUMMARY.hosts = 147, from beforeEach)
+    // is the TRUE census — a network that has been swept. This pins the
+    // DNS-only-census case the activity filter exists for: every host on it
+    // reads event_count=0, so the default activity=active page reports
+    // total=0 even though the network is real and has been swept — `total`
+    // driving `firstRun` was the bug; `summary.hosts` is the fix.
+    vi.mocked(listDossiers).mockImplementation((q) =>
+      Promise.resolve(q?.activity === 'active' ? page([], 0) : page([QUIET], 1)),
+    );
+    mount();
+
+    await waitFor(() => expect(lastQuery()).toMatchObject({ activity: 'active' }));
+    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.getByText(/no hosts match/i)).toBeTruthy();
+    // The escape hatch is exactly where it matters most here: a zero-row page
+    // has no pager to carry it, so the note has to reach off the EmptyState
+    // too, not only off a table that this page never renders.
+    expect(screen.getByText(/quiet hosts.*are hidden/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
+    await waitFor(() => expect(lastQuery()?.activity).toBeUndefined());
+    await screen.findByText('192.168.10.9');
+  });
+
+  it('a failed list fetch is an error with Retry, never the first-run panel', async () => {
+    // The summary and the list are two SEPARATE requests. Before this fix,
+    // `firstRun` read straight off `kpis.data.hosts === 0` — so a summary
+    // reporting an empty census while the list fetch itself failed (a
+    // transient 500) rendered "The network sweep hasn't run yet" over an
+    // outage, with no Retry in sight.
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
+    vi.mocked(listDossiers).mockRejectedValue(new Error('500 Internal Server Error'));
+    mount();
+
+    expect(await screen.findByText(/couldn't load the host list/i)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
+    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    // Retry over an outage, not a verdict about a page that never arrived —
+    // "quiet hosts are hidden" claims a result the failed fetch never returned.
+    expect(screen.queryByText(/quiet hosts.*are hidden/i)).toBeNull();
+  });
+});
+
 describe('Hosts broken-builds filter', () => {
   it('filters server-side from the summary door (?health=broken)', async () => {
     vi.mocked(listDossiers).mockResolvedValue(page([BROKEN, NEVER_BUILT]));
@@ -579,6 +638,24 @@ describe('Hosts broken-builds filter', () => {
     mount('/hosts?health=broken');
     expect(await screen.findByText(/no hosts match/i)).toBeTruthy();
     expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+  });
+
+  it('does not compose the traffic default with the broken-builds view', async () => {
+    // Broken hosts are often exactly the quiet ones — a build that never ran
+    // never saw traffic either. The default filter must not hide the rows
+    // this view exists to find, and its own "quiet hosts hidden" note (whose
+    // button text collides with this view's own "Show all hosts") must not
+    // render over it.
+    vi.mocked(listDossiers).mockResolvedValue(page([BROKEN, NEVER_BUILT]));
+    mount('/hosts?health=broken');
+    await screen.findByText('192.168.10.140');
+    expect(lastQuery()).toMatchObject({ health: 'broken' });
+    expect(lastQuery()?.activity).toBeUndefined();
+    expect(screen.queryByText(/quiet hosts.*are hidden/i)).toBeNull();
+    expect(screen.getAllByRole('button', { name: /show all hosts/i })).toHaveLength(1);
+    // The Show control must not keep claiming "with traffic" over a request
+    // that, per the assertions above, does not actually filter on it.
+    expect((screen.getByLabelText('Show') as HTMLSelectElement).value).toBe('');
   });
 });
 

@@ -962,6 +962,7 @@ class AboutOut(BaseModel):
     license: str
     update_check_enabled: bool
     general_chat_enabled: bool
+    sigma_authoring_enabled: bool
 
 
 class UpdateCheckOut(BaseModel):
@@ -986,6 +987,11 @@ async def about(settings: Settings = Depends(get_settings_dep)) -> AboutOut:
     so without this flag a disabled deployment would render the Ask box and then
     fail the first request an analyst made — an error on the landing screen of a
     deployment that turned the feature off deliberately.
+
+    ``sigma_authoring_enabled`` rides along the same way for the detection-bridge
+    "Draft detection" affordance (Investigation / hunt-finding screens): off by
+    default, so the SPA hides the button rather than rendering one whose first
+    click is a guaranteed 403.
     """
     return AboutOut(
         version=__version__,
@@ -993,6 +999,7 @@ async def about(settings: Settings = Depends(get_settings_dep)) -> AboutOut:
         license=updates_svc.LICENSE,
         update_check_enabled=settings.update_check_enabled,
         general_chat_enabled=settings.general_chat_enabled,
+        sigma_authoring_enabled=settings.sigma_authoring_enabled,
     )
 
 

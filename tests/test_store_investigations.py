@@ -206,6 +206,55 @@ async def test_latest_for_pairs(settings_kratos: Settings) -> None:
     await engine.dispose()
 
 
+async def test_latest_for_pairs_excludes_hunt_kind_rows(settings_kratos: Settings) -> None:
+    """A promoted finding's verdict is about its cited evidence, never a license
+    to ack a whole detection group. Its rule_name is the finding TITLE, which
+    can coincidentally collide with a live rule's name — a hunt-kind row must
+    never come back as an inheritance source, or auto-triage's inherited-ack
+    path would write unattended acks against real SO alerts it never
+    investigated."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        hunt_row = await inv_svc.create(
+            db,
+            alert_es_id="tel-anchor-1",
+            started_by="x",
+            rule_name="Beaconing to rare external IP",
+            src_ip="10.0.0.1",
+            dest_ip="10.0.0.2",
+            kind="hunt",
+            hunt_id="01HUNTCOLLIDE00000000000000",
+            finding_ordinal=0,
+        )
+        await inv_svc.finalize(db, hunt_row.id, status="complete", verdict="false_positive")
+
+        hits = await inv_svc.latest_for_pairs(
+            db,
+            [("Beaconing to rare external IP", "10.0.0.1", "10.0.0.2")],
+            window_days=7,
+        )
+        assert ("Beaconing to rare external IP", "10.0.0.1", "10.0.0.2") not in hits
+
+        # Control: an ordinary suricata-kind row with the SAME key still
+        # inherits normally — the exclusion is kind-scoped, not a regression.
+        plain = await inv_svc.create(
+            db,
+            alert_es_id="ev-plain-collide",
+            started_by="x",
+            rule_name="Beaconing to rare external IP",
+            src_ip="10.0.0.5",
+            dest_ip="10.0.0.6",
+        )
+        await inv_svc.finalize(db, plain.id, status="complete", verdict="true_positive")
+        hits2 = await inv_svc.latest_for_pairs(
+            db,
+            [("Beaconing to rare external IP", "10.0.0.5", "10.0.0.6")],
+            window_days=7,
+        )
+        assert hits2[("Beaconing to rare external IP", "10.0.0.5", "10.0.0.6")].id == plain.id
+    await engine.dispose()
+
+
 async def test_latest_for_pairs_finds_no_ip_investigations(settings_kratos: Settings) -> None:
     """A NULL-endpoint investigation must be reachable under the ('rule','','') key.
 
@@ -313,6 +362,33 @@ async def test_running_for_pairs_blocks_a_no_ip_duplicate(settings_kratos: Setti
                 ("ET FLOW", "", ""),
             ],
         ) == {("SIGMA HOST", "", ""), ("ET FLOW", "10.0.0.1", "1.2.3.4")}
+    await engine.dispose()
+
+
+async def test_running_for_pairs_ignores_hunt_kind_title_collision(
+    settings_kratos: Settings,
+) -> None:
+    """An in-flight PROMOTED-FINDING investigation whose title equals a rule
+    name must not mark that rule's pair as running — otherwise the sweep would
+    skip the rule's real alerts for as long as the promotion runs."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        promo = await inv_svc.create(
+            db,
+            alert_es_id="ev-cited-doc",
+            started_by="x",
+            rule_name="SIGMA HOST",  # a finding title colliding with a rule name
+            kind="hunt",
+            hunt_id="01HUNTRFP0000000000000000000",
+            finding_ordinal=0,
+        )
+        assert promo.status == "running"
+        # A genuinely running alert investigation of the same shape still counts.
+        await inv_svc.create(db, alert_es_id="ev-real", started_by="x", rule_name="ET REAL")
+
+        assert await inv_svc.running_for_pairs(
+            db, [("SIGMA HOST", "", ""), ("ET REAL", "", "")]
+        ) == {("ET REAL", "", "")}
     await engine.dispose()
 
 
@@ -716,6 +792,7 @@ async def _seed_prior(
     rationale: str | None = "benign gateway heartbeat",
     report: dict | None = None,
     age_days: int = 0,
+    kind: str = "suricata",
 ) -> Investigation:
     """Seed one COMPLETE candidate row (optionally backdated) for memory tests."""
     inv = await inv_svc.create(
@@ -725,6 +802,7 @@ async def _seed_prior(
         rule_name=rule_name,
         src_ip=src_ip,
         dest_ip=dest_ip,
+        kind=kind,
     )
     await inv_svc.finalize(
         db,
@@ -852,11 +930,28 @@ async def test_prior_outcomes_drops_pipeline_fallback_keeps_analyst_override(
     await engine.dispose()
 
 
+async def test_prior_outcomes_excludes_hunt_kind_title_collision(
+    settings_kratos: Settings,
+) -> None:
+    """A promoted hunt finding whose TITLE equals a live rule's name must never
+    surface as that rule's prior-outcome memory: its verdict is about its cited
+    evidence, not the rule, and the name match is coincidence."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # Newest, exact-triple, true_positive — would rank first if admitted.
+        await _seed_prior(db, alert_es_id="h1", verdict="true_positive", kind="hunt")
+        real = await _seed_prior(db, alert_es_id="h2", age_days=1)
+        got = await _lookup(db)
+        assert [d["id"] for d in got] == [real.id]
+    await engine.dispose()
+
+
 async def test_prior_outcomes_limit_applies_after_fallback_filter(
     settings_kratos: Settings,
 ) -> None:
     """``limit`` bounds the RETURNED digests (newest first within the tier), and
-    a fallback row between real ones doesn't eat a slot (bounded overscan)."""
+    a fallback row between real ones doesn't eat a slot (the ``is_fallback``
+    column filter runs in SQL, before the LIMIT)."""
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
         rows = [

@@ -15,7 +15,7 @@ from typing import Any, NamedTuple
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, load_only
 from ulid import ULID
 
 from soc_ai.store import chat_memory
@@ -40,6 +40,9 @@ async def create(
     rule_name: str | None = None,
     src_ip: str | None = None,
     dest_ip: str | None = None,
+    kind: str = "suricata",
+    hunt_id: str | None = None,
+    finding_ordinal: int | None = None,
 ) -> Investigation:
     # Seed the display name at birth when the caller already knows it (the alert
     # grid / re-hunt / group sweep all do). Otherwise it stays NULL and the
@@ -54,6 +57,9 @@ async def create(
         rule_name=seed_name,
         src_ip=src_ip,
         dest_ip=dest_ip,
+        kind=kind,
+        hunt_id=hunt_id,
+        finding_ordinal=finding_ordinal,
     )
     db.add(inv)
     await db.commit()
@@ -552,6 +558,64 @@ async def complete_for_alert(db: AsyncSession, alert_id: str) -> Investigation |
     return (await db.scalars(q)).first()
 
 
+async def latest_for_finding(
+    db: AsyncSession, hunt_id: str, finding_ordinal: int
+) -> Investigation | None:
+    """Newest investigation promoted from this exact finding — the promotion
+    route's idempotency probe (re-promoting returns it instead of spawning a
+    duplicate). May return rows whose hunt has since been deleted: hunt_id has
+    no FK on purpose, so the provenance link can dangle."""
+    # scalars().first() rather than db.scalar(): identical result, but typed
+    # (db.scalar returns Any under mypy --strict) and it matches the module's
+    # other single-row readers.
+    rows = await db.scalars(
+        select(Investigation)
+        .where(
+            Investigation.hunt_id == hunt_id,
+            Investigation.finding_ordinal == finding_ordinal,
+        )
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .limit(1)
+    )
+    return rows.first()
+
+
+async def latest_per_finding(db: AsyncSession, hunt_id: str) -> dict[int, Investigation]:
+    """Newest investigation per promoted finding of one hunt — the hunt page's
+    per-card promotion state. One indexed query; first row seen per ordinal
+    wins (newest-first ordering).
+
+    Column-scoped via ``load_only``: the caller (the hunt detail's per-finding
+    card) renders id / status / verdict / confidence and nothing else, and
+    GET /hunts/{id} is polled by the SPA — loading every promotion row's
+    ``report``/``summary`` blob would deserialize megabytes per tick to answer
+    four scalars. ``raiseload=True`` makes an accidental read of an unloaded
+    column a loud error instead of a silent async lazy-load.
+    """
+    rows = await db.scalars(
+        select(Investigation)
+        .options(
+            load_only(
+                Investigation.id,
+                Investigation.finding_ordinal,
+                Investigation.status,
+                Investigation.verdict,
+                Investigation.confidence,
+                Investigation.created_at,
+                raiseload=True,
+            )
+        )
+        .where(Investigation.hunt_id == hunt_id, Investigation.finding_ordinal.is_not(None))
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+    )
+    out: dict[int, Investigation] = {}
+    for inv in rows:
+        ordinal = inv.finding_ordinal
+        if ordinal is not None and ordinal not in out:
+            out[ordinal] = inv
+    return out
+
+
 def blocks_rehunt(inv: Investigation) -> bool:
     """Whether a prior investigation should suppress starting a NEW hunt for its
     alert. Only an in-flight (``running``) or genuinely finished (``complete``)
@@ -946,6 +1010,13 @@ async def latest_for_pairs(
     on every sweep that saw a newer event id. Both-endpoint rows are unaffected:
     a coalesced key always carries an empty component where the row had a NULL,
     so it can never collide with a flow's key.
+
+    ``kind == "hunt"`` rows are EXCLUDED at the query level: a promoted
+    finding's verdict is about its cited evidence, never a license to ack a
+    whole detection group. Its ``rule_name`` is the finding's title, which can
+    collide with a live rule's name by coincidence — without this filter such
+    a row would become an inheritance source and ``_ack_inherited_fps`` would
+    write unattended acks against real SO alerts it never investigated.
     """
     if not pairs:
         return {}
@@ -958,6 +1029,7 @@ async def latest_for_pairs(
                 Investigation.rule_name.in_(rules),
                 Investigation.status == "complete",
                 Investigation.created_at >= cutoff,
+                Investigation.kind != "hunt",
             )
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         )
@@ -1035,13 +1107,19 @@ async def prior_outcomes(
     SQL where it is trivially deterministic. A ``None`` endpoint contributes no
     tier condition (NULL == NULL is shared *absence*, not a shared endpoint).
 
-    Post-filter in Python: rows whose report is an E1.2 pipeline fallback
-    (``report.resolution.provenance == "pipeline_fallback"``, read via the
-    shared :func:`~soc_ai.triage_models.is_pipeline_fallback` predicate) are
-    dropped — memory must reflect model/analyst conclusions, not failure noise.
-    ``report`` is a portable JSON column, so this is inspected in Python (like
-    :func:`override_counts_by_rule`) with a bounded SQL overscan (``limit * 5``)
-    to survive a streak of fallback rows without an unbounded scan.
+    Pipeline-fallback rows (E1.2 failure noise, never memory) are excluded IN
+    SQL via the persisted ``is_fallback`` column — the twin of
+    :func:`~soc_ai.triage_models.is_pipeline_fallback` stamped at
+    finalize/resolve. ``.isnot(True)`` folds NULL (legacy / not-yet-finalized
+    rows) to not-a-fallback, exactly as :func:`query_page` does. That retires
+    the old load-every-report Python post-filter and its 5x overscan: the query
+    now selects only the digest columns and fetches exactly ``limit`` rows.
+
+    ``kind == "hunt"`` rows are excluded for the same reason as
+    :func:`latest_for_pairs`: a promoted finding's ``rule_name`` is the
+    finding's TITLE, which can collide with a live rule's name by coincidence —
+    without the filter a promotion's verdict would bleed into a real alert's
+    prior-outcome prompt as if that rule had been triaged before.
 
     ``exclude_id`` drops the caller's own row. The orchestrator's in-flight row
     is still ``running`` (complete-only already excludes it) — this is for
@@ -1069,39 +1147,43 @@ async def prior_outcomes(
     # No known endpoint at all ⇒ every candidate is tier 2 (rule-only).
     tier = case(*whens, else_=2) if whens else literal(2)
     q = (
-        select(Investigation, tier.label("tier"))
+        # Digest columns only — never the ORM entity, whose report/summary
+        # blobs this function would deserialize just to throw away.
+        select(
+            Investigation.id,
+            Investigation.created_at,
+            Investigation.verdict,
+            Investigation.confidence,
+            Investigation.rationale,
+            tier.label("tier"),
+        )
         .where(
             Investigation.rule_name == rule_name,
             Investigation.status == "complete",
             Investigation.verdict.is_not(None),
             Investigation.created_at >= cutoff,
+            # NULL-tolerant not-a-fallback, same treatment as query_page.
+            Investigation.is_fallback.isnot(True),
+            # A promoted hunt finding is titled, not ruled — see the docstring.
+            Investigation.kind != "hunt",
         )
         .order_by(tier, Investigation.created_at.desc(), Investigation.id.desc())
-        # Bounded overscan: the fallback post-filter below drops rows AFTER the
-        # SQL limit, so fetch a small multiple. Fallbacks are rare relative to
-        # real completions; 5x is generous without becoming a table scan.
-        .limit(limit * 5)
+        .limit(limit)
     )
     if exclude_id is not None:
         q = q.where(Investigation.id != exclude_id)
     rows = (await db.execute(q)).all()
-    out: list[dict[str, Any]] = []
-    for inv, tier_rank in rows:
-        if is_pipeline_fallback(inv.report):
-            continue
-        out.append(
-            {
-                "id": inv.id,
-                "created_at": inv.created_at,
-                "verdict": inv.verdict,
-                "confidence": inv.confidence,
-                "matched_on": _PRIOR_TIER_LABELS[int(tier_rank)],
-                "rationale_digest": _digest_rationale(inv.rationale),
-            }
-        )
-        if len(out) >= limit:
-            break
-    return out
+    return [
+        {
+            "id": row.id,
+            "created_at": row.created_at,
+            "verdict": row.verdict,
+            "confidence": row.confidence,
+            "matched_on": _PRIOR_TIER_LABELS[int(row.tier)],
+            "rationale_digest": _digest_rationale(row.rationale),
+        }
+        for row in rows
+    ]
 
 
 async def running_for_pairs(
@@ -1123,6 +1205,11 @@ async def running_for_pairs(
     in :func:`latest_for_pairs` — otherwise the guard covers only network flows
     and a host-shaped rule can be investigated twice concurrently (a manual run
     in flight would not block the scheduled one).
+
+    ``kind == "hunt"`` rows are excluded exactly as in :func:`latest_for_pairs`:
+    a promotion's ``rule_name`` is a finding title that can collide with a live
+    rule's name, and an in-flight promotion must not suppress the sweep from
+    investigating that rule's real alerts.
     """
     if not pairs:
         return set()
@@ -1132,6 +1219,7 @@ async def running_for_pairs(
             select(Investigation).where(
                 Investigation.rule_name.in_(rules),
                 Investigation.status == "running",
+                Investigation.kind != "hunt",
             )
         )
     ).all()

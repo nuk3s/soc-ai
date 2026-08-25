@@ -30,6 +30,7 @@ from pydantic_ai.models.test import TestModel
 from soc_ai.agent.chat_agent import (
     CHAT_SYSTEM_PROMPT,
     GENERAL_CHAT_SYSTEM_PROMPT,
+    HOST_CHAT_SYSTEM_PROMPT,
     build_chat_agent,
     build_general_context_block,
 )
@@ -85,6 +86,18 @@ tried the relevant tool.',
 def test_general_prompt_carries_the_investigation_chat_rules_verbatim(marker: str) -> None:
     assert marker in CHAT_SYSTEM_PROMPT, "marker drifted out of the investigation chat prompt"
     assert marker in GENERAL_CHAT_SYSTEM_PROMPT
+
+
+def test_bottom_line_first_rule_is_shared_across_all_three_chat_prompts() -> None:
+    """2026-08-20 answer-quality batch: the dashboard chat AND a hunt follow-up
+    both answered "what's going on with 192.0.2.61" (a benign duplicate-IP dig)
+    with a verbose non-answer instead of leading with the assessment. The
+    bottom-line-first instruction lives in the shared ``_ANSWER_SHAPE`` block,
+    so this one fragment reaching all three chat prompts is what proves the
+    fix isn't scoped to just one surface."""
+    fragment = "is narrating your process instead of answering"
+    for prompt in (CHAT_SYSTEM_PROMPT, GENERAL_CHAT_SYSTEM_PROMPT, HOST_CHAT_SYSTEM_PROMPT):
+        assert fragment in prompt
 
 
 def test_general_prompt_drops_the_investigation_scoping() -> None:

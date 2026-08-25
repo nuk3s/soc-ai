@@ -108,11 +108,14 @@ describe('Hunts list-screen anatomy', () => {
     await screen.findByText(ROW.objective);
 
     // One node carries all three figures — three cards cannot satisfy this.
+    // The figures are derived from the windowed rows (ROW: 1 hunt, 4
+    // findings, not running), NOT the unwindowed STATS fixture above (7/10/1)
+    // — header and table must agree by construction.
     const stats = screen.getByTestId('hunt-stats-line');
-    expect(within(stats).getByText('7')).toBeTruthy();
-    expect(within(stats).getByText('10')).toBeTruthy();
     expect(within(stats).getByText('1')).toBeTruthy();
-    expect(stats.textContent).toMatch(/7 hunts.*10 findings.*1 in progress/);
+    expect(within(stats).getByText('4')).toBeTruthy();
+    expect(within(stats).getByText('0')).toBeTruthy();
+    expect(stats.textContent).toMatch(/1 hunt.*4 findings.*0 in progress/);
     // The card band's own sub-labels survive as hover context, not as layout.
     expect(within(stats).getByTitle('surfaced')).toBeTruthy();
   });

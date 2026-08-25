@@ -184,6 +184,45 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "populates a field.",
         (_ES,),
     ),
+    _ToolDef(
+        "beacon_profile",
+        "Query",
+        True,
+        "Beacon-cadence sweep over zeek.conn: measures inter-arrival coefficient "
+        "of variation per src→dst pair so a hunt reports a measured cadence "
+        "instead of an eyeballed guess (hunt-only — no alert-anchored "
+        "equivalent on triage).",
+        (_ES,),
+    ),
+    _ToolDef(
+        "dns_entropy_scan",
+        "Query",
+        True,
+        "DNS-entropy sweep over zeek.dns: groups qnames by parent domain and "
+        "flags DGA/tunnel candidates by mean subdomain-label Shannon entropy "
+        "plus query volume (hunt-only).",
+        (_ES,),
+    ),
+    _ToolDef(
+        "dcerpc_histogram",
+        "Query",
+        True,
+        "Operation histogram over zeek.dce_rpc: flags individually-dangerous "
+        "operations (Zerologon-style NetrServerAuthenticate*, DCSync's "
+        "DRSGetNCChanges/DsGetNCChanges, remote service creation) and "
+        "operations rare against a busy baseline (hunt-only).",
+        (_ES,),
+    ),
+    _ToolDef(
+        "first_seen",
+        "Query",
+        True,
+        "Novelty sweep: diffs external destinations seen in a recent window "
+        "against a trailing baseline window that ends exactly where the "
+        "recent window begins, surfacing destinations with no prior baseline "
+        "sighting (hunt-only).",
+        (_ES,),
+    ),
     # ── Enrichment (local-mirror feeds; online opt-in) ───────────────────────
     _ToolDef(
         "enrich_ip",

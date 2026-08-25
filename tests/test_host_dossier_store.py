@@ -1231,6 +1231,31 @@ async def test_health_broken_selects_exactly_the_kpi_no_clean_build_set(
     await engine.dispose()
 
 
+async def test_list_dossiers_activity_active_hides_zero_event_hosts(
+    settings_kratos: Settings,
+) -> None:
+    """``activity="active"`` is the Hosts screen's default filter.
+
+    DNS-only census entries land with ``event_count=0`` — on the lab grid, 185
+    of 234 rows — and were drowning the list behind hosts nobody has to look
+    at. The filter must compose with the pager honestly: the total the pager
+    reports has to match the rows it can actually page to.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await store.upsert_host(db, "192.168.10.10", last_seen=T0, event_count=5)
+        await store.upsert_host(db, "192.168.10.11", last_seen=T0)
+        await db.commit()
+
+        rows, total = await store.list_dossiers(db, activity="active")
+        assert [r.ip for r, _fields in rows] == ["192.168.10.10"]
+        assert total == 1
+
+        _rows_all, total_all = await store.list_dossiers(db)
+        assert total_all == 2
+    await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # sort=attention — the DEFAULT list order, and why it exists
 #

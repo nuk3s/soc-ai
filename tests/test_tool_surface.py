@@ -106,7 +106,16 @@ INVESTIGATOR_EXPECTED = CORE | {
     "t_suggest_rule_tuning",
 }
 CHAT_EXPECTED = CORE | {"t_suggest_rule_tuning", "propose_verdict"}
-HUNT_EXPECTED = CORE
+# Hunt-only behavioral analytics sweeps (1.3 slice 2): network-wide, no
+# alert-anchored equivalent on triage. Investigator/chat sets stay CORE-only
+# so this delta is the proof the four are hunt-exclusive.
+HUNT_ONLY_ANALYTICS = {
+    "t_beacon_profile",
+    "t_dns_entropy_scan",
+    "t_dcerpc_histogram",
+    "t_first_seen",
+}
+HUNT_EXPECTED = CORE | HUNT_ONLY_ANALYTICS
 
 
 def _all_flags_on(settings_kratos: Settings) -> Settings:

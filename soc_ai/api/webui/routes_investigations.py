@@ -42,7 +42,7 @@ from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
-from soc_ai.store.models import Investigation
+from soc_ai.store.models import Hunt, Investigation
 from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import (
     hunt_manager,
@@ -182,7 +182,10 @@ def _row(
     return InvestigationRowOut(
         id=inv.id,
         name=inv.rule_name or f"Alert {(inv.alert_es_id or inv.id)[:12]}…",
-        kind="suricata",
+        # Persisted since migration 0031. Legacy rows were backfilled
+        # kind='suricata' regardless of their feed doc's real kind — accepted;
+        # no ES-derived fallback.
+        kind=inv.kind,
         verdict=_verdict(inv.verdict),
         conf=inv.confidence,
         host=inv.src_ip or "—",
@@ -421,6 +424,10 @@ async def get_investigation(
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
         inv, events = got
         chat = await chat_svc.list_messages(db, inv.id)
+        # Promotion provenance: hunt_id has no FK (the referenced hunt may be
+        # deleted — see the Investigation model note), so this must degrade
+        # gracefully rather than 404/500 when the row is gone.
+        hunt = await db.get(Hunt, inv.hunt_id) if inv.kind == "hunt" and inv.hunt_id else None
 
     report = inv.report or {}
     # Live acked state so an ack performed OUTSIDE this run (group-ack, another
@@ -460,7 +467,7 @@ async def get_investigation(
         id=inv.id,
         groupId=inv.alert_es_id or inv.id,
         name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
-        kind="suricata",
+        kind=inv.kind,
         host=alert_obj.get("host_name") or inv.src_ip or "—",
         ip=inv.dest_ip or inv.src_ip or "—",
         verdict=_verdict(inv.verdict),
@@ -505,6 +512,8 @@ async def get_investigation(
         # panel instead of the amber Needs-info block.
         fallback=_timeline._fallback_out(report),
         errorDismissed=inv.error_dismissed_at is not None,
+        huntId=inv.hunt_id,
+        huntObjective=(hunt.objective[:160] if hunt else None),
         alertAcked=alert_acked,
     )
 
@@ -618,7 +627,7 @@ def _grid_skip_reason(exc: BaseException) -> str:
 
 
 @router.post("/investigations/rehunt", response_model=RehuntResultOut)
-async def bulk_rehunt(
+async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each guard is a short early continue
     request: Request,
     body: RehuntIn,
     settings: Settings = Depends(get_settings_dep),
@@ -678,6 +687,15 @@ async def bulk_rehunt(
         inv = inv_by_id.get(inv_id)
         if inv is None:
             skipped.append({"invId": inv_id, "reason": "not_found"})
+            continue
+
+        if inv.kind == "hunt":
+            # A promoted finding's anchor is cited telemetry, not an SO alert —
+            # relaunching it here would mint an unlabeled kind="suricata"
+            # duplicate carrying the finding title as rule_name (the exact
+            # string the group-ack guard exists to keep out). Re-promotion
+            # from the hunt page is the sanctioned re-run.
+            skipped.append({"invId": inv_id, "reason": "hunt_kind"})
             continue
 
         if not inv.alert_es_id:
@@ -781,6 +799,17 @@ async def request_more_info(
 
     if inv is None:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
+    if inv.kind == "hunt":
+        # Re-promotion from the hunt page is the sanctioned re-run for a
+        # promoted finding — relaunching here would mint an unlabeled
+        # kind="suricata" duplicate against the same anchor telemetry doc.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "hunt_kind_no_rerun",
+                "hint": "Re-promote the finding from its hunt instead.",
+            },
+        )
     if not inv.alert_es_id:
         raise HTTPException(
             status_code=409,

@@ -1387,36 +1387,112 @@ export function Config() {
   // whenever `ok` is false (soc_ai.audit.chain.verify_chain's own contract),
   // so the tampered branch never has to guess at a seq to show.
   //
-  // Three outcomes, not two: a capped-but-ok scan must NOT wear full success
-  // livery (soc_ai/audit/verify.py's own module docstring: "a capped scan
-  // cannot claim the whole chain was verified... the caller MUST surface
-  // it"), so capped+ok gets its own amber "Partial verification" line with
-  // no checkmark — never the green ✓. Tampered stays its own red line
-  // regardless of capped (a break found within the scanned prefix is a
-  // real, definitive finding either way).
+  // Not two outcomes, not even three: a capped-but-ok scan must NOT wear full
+  // success livery (soc_ai/audit/verify.py's own module docstring: "a capped
+  // scan cannot claim the whole chain was verified... the caller MUST surface
+  // it"), so capped+ok gets its own amber "Partial verification" line with no
+  // checkmark — never the green ✓. Tampered stays its own red line regardless
+  // of capped or epochs (a break found within the scanned prefix, or within
+  // one epoch of a fragmented chain, is a real, definitive finding either
+  // way) — but now reports its BLAST RADIUS, not just its existence: every
+  // epoch is checked (never just the first broken one), so the line names how
+  // many broke, the oldest (`first_broken_seq`/`first_broken_epoch_start`,
+  // kept for compat) and the newest (`newest_broken_epoch_start` — the field
+  // that actually answers "is anything current broken"). Live prod
+  // (2026-08-21) is why this matters: a REAL duplicate-seq artifact from the
+  // historic pre-1.2.8 write-side stale-head seq-reuse bug, mid-epoch, on top
+  // of the already-known genesis-reset fragmentation — stopping at the first
+  // break could not say whether that was the only damage. `latest_epoch_broken`
+  // picks the closing sentence: reassuring ("every epoch after the newest
+  // break verified intact") when something clean comes after it, or the loud
+  // "the latest epoch is broken" when the break IS the most recent thing on
+  // record — and neither claim is made at all when `capped`, since a capped
+  // scan cannot vouch for epochs it never fetched (the cap always truncates
+  // the NEWEST end — see the capped note below).
+  //
+  // epochs > 1 is its own amber branch too, distinct from capped: the audit
+  // chain is verified PER EPOCH, cut at every process-restart boundary (a
+  // genesis `seq=0` record's `prev_hash` is the all-zero hash by
+  // construction, so it never links back to whatever epoch preceded it — see
+  // soc_ai/audit/verify.py's module docstring for the chain-head recovery bug,
+  // fixed 2026-08-17, that made a 134-epoch chain a real prod shape). An
+  // all-clear across every epoch is still short of "one unbroken chain" —
+  // cross-epoch linkage can never be checked — so it never wears the green
+  // line's livery either, even though nothing capped the scan and no tamper
+  // was found. Checked after `capped` on purpose: a capped scan that also
+  // spans multiple epochs is still, first and foremost, a read that did not
+  // reach the end of the index, so the capped branch (below) keeps the
+  // amber/no-checkmark precedence — it does not fall through to a sixth
+  // state. Its copy composes the epoch count in rather than staying silent
+  // about it, though: "intact from the start of the chain" with no epoch
+  // mention would overstate a fragmented chain's coverage.
   //
   // The records a capped scan actually covers are the OLDEST ones, not the
-  // newest: `_fetch_audit_records` pages `search_after` on `seq ASCENDING`
+  // newest — now the oldest EPOCHS, not just the oldest records:
+  // `_fetch_audit_records` pages `search_after` timestamp-ascending
   // (soc_ai/audit/verify.py `_fetch_audit_records`/`sort`) and the cap fires
-  // mid-scan — before the newest (highest-seq) records are ever reached. So
-  // a capped read has verified nothing about recent activity, which is the
-  // direction that matters most for "is something being tampered with right
-  // now" — the copy below says "from the start of the chain" rather than
-  // "newest" for exactly that reason.
+  // mid-scan — before the newest records (whichever epoch they belong to) are
+  // ever reached. So a capped read has verified nothing about recent
+  // activity, which is the direction that matters most for "is something
+  // being tampered with right now" — the copy below says "from the start of
+  // the chain" rather than "newest" for exactly that reason.
   const auditChainColor = (result: AuditChainVerifyResult): string =>
-    !result.ok ? '#f04438' : result.capped ? '#f5a623' : '#12b76a';
+    !result.ok
+      ? '#f04438'
+      : result.capped
+        ? '#f5a623'
+        : result.epochs > 1
+          ? '#f5a623'
+          : '#12b76a';
 
   const auditChainPrefix = (result: AuditChainVerifyResult): string =>
-    !result.ok ? '✗' : result.capped ? '⚠' : '✓';
+    !result.ok ? '✗' : result.capped ? '⚠' : result.epochs > 1 ? '⚠' : '✓';
 
   const auditChainDetail = (result: AuditChainVerifyResult): string => {
     const verified = plural(result.records_verified, 'record');
     if (!result.ok) {
+      // The tally: how many epochs broke (every epoch is checked, never just
+      // the first broken one — see soc_ai/audit/verify.py's module docstring
+      // for the live prod finding — a real duplicate-seq artifact from the
+      // historic pre-1.2.8 write-side stale-head seq-reuse bug — that made
+      // "keep checking past the first break" a real requirement). Singular
+      // gets its own phrasing: naming "oldest" and "newest" for the same one
+      // broken epoch would be true but redundant.
+      const tally =
+        result.epochs_broken === 1
+          ? `1 of ${result.epochs} epochs broken — break at seq ${result.first_broken_seq} ` +
+            `(epoch ${result.first_broken_epoch_start})`
+          : `${result.epochs_broken} of ${result.epochs} epochs broken — oldest break seq ` +
+            `${result.first_broken_seq} (epoch ${result.first_broken_epoch_start}), newest ` +
+            `broken epoch ${result.newest_broken_epoch_start}`;
+      // Neither claim below is honest under `capped`: the cap always
+      // truncates the NEWEST end of the chain (the fetch is oldest-first),
+      // so a capped scan cannot vouch for anything past its own prefix —
+      // regardless of which way `latest_epoch_broken` happens to land for
+      // what it did see. The cappedNote below already says "not the full
+      // chain".
+      let trailing = '';
+      if (!result.capped) {
+        trailing = result.latest_epoch_broken
+          ? ' The latest epoch is broken.'
+          : ` Every epoch after ${result.newest_broken_epoch_start} verified intact.`;
+      }
       const cappedNote = result.capped ? ' (capped — not the full chain)' : '';
-      return `Chain tampered — break at seq ${result.first_broken_seq} (${verified} verified${cappedNote}).`;
+      return `Chain tampered — ${tally}${cappedNote}.${trailing}`;
     }
     if (result.capped) {
-      return `Partial verification — ${verified} intact from the start of the chain (capped; the full chain was not checked).`;
+      // A fragmented chain's capped read is still just a prefix — but an
+      // un-composed "intact from the start of the chain" overstates it when
+      // that prefix itself already spans more than one restart: say so.
+      const epochNote = result.epochs > 1 ? ` within ${result.epochs} epochs` : '';
+      return `Partial verification — ${verified} intact${epochNote} from the start of the chain (capped; the full chain was not checked).`;
+    }
+    if (result.epochs > 1) {
+      return (
+        `Chain intact within ${result.epochs} epochs (${verified}). Epoch boundaries are ` +
+        `process restarts — a chain-head recovery bug fixed 2026-08-17 — and cross-epoch ` +
+        `linkage is not provable.`
+      );
     }
     return `Chain intact — ${verified} verified.`;
   };
@@ -2002,12 +2078,16 @@ export function Config() {
           {/* Audit chain verify — its own row, not folded into the ES/LLM
               map above: unlike those two, this probe is NOT fail-soft (the
               endpoint raises rather than answering on an unreachable or
-              partial read) and its result needs THREE visually distinct
-              states rather than two — intact (green), TAMPERED (red, its
-              own line, never the success line above it), and "couldn't
-              verify" (amber — a network/permission failure must never read
-              as either of the other two; a false all-clear outranks any
-              500, and a false alarm is nearly as costly). */}
+              partial read) and its result needs FIVE visually distinct
+              states rather than two — intact (green), partial/capped (amber,
+              no checkmark — the scan hit the record cap), intact within N
+              epochs (amber, no checkmark — every restart's own trail checked
+              out, but that is short of one unbroken chain; see
+              auditChainDetail above), TAMPERED (red, its own line, never the
+              success line above it), and "couldn't verify" (amber — a
+              network/permission failure must never read as any of the other
+              four; a false all-clear outranks any 500, and a false alarm is
+              nearly as costly). */}
           <div className="flex flex-wrap items-center gap-2 border-t border-border-faint px-4 py-3">
             <button
               className="rounded px-2.5 py-1 text-[11.5px] font-medium border border-border bg-surface-2 hover:bg-surface-3 transition-colors"

@@ -105,3 +105,26 @@ describe('Topbar pollers respect tab visibility', () => {
     expect(getNotifications).toHaveBeenCalledTimes(3);
   });
 });
+
+describe('Topbar badge counts actionable notifications only', () => {
+  it('does not badge when every notification is informational (accent)', async () => {
+    vi.mocked(getNotifications).mockResolvedValue([
+      { id: 'inv-done:1', tone: 'accent', title: 'Verdict false_positive: ET INFO X', when: '2m', href: '/investigation/1' },
+      { id: 'inv-done:2', tone: 'accent', title: 'Verdict false_positive: ET INFO Y', when: '5m', href: '/investigation/2' },
+    ]);
+    const { container } = mount();
+    await flush();
+    expect(container.querySelector('[data-testid="notif-badge"]')).toBeNull();
+  });
+
+  it('badges only the danger/warn count when informational items are mixed in', async () => {
+    vi.mocked(getNotifications).mockResolvedValue([
+      { id: 'inv-done:1', tone: 'accent', title: 'Verdict false_positive: ET INFO X', when: '2m', href: null },
+      { id: 'inv-done:2', tone: 'danger', title: 'Verdict true_positive: ET MALWARE Z', when: '3m', href: null },
+      { id: 'hunt-done:3', tone: 'warn', title: 'Hunt finished — 2 findings: sweep', when: '4m', href: null },
+    ]);
+    const { container } = mount();
+    await flush();
+    expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('2');
+  });
+});

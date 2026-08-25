@@ -35,6 +35,7 @@ import {
 import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFilters';
 import { formatSkipReasons } from '../lib/skipReasons';
 import { rangeToSinceUntil } from '../lib/timeRange';
+import { middleEllipsis } from '../lib/text';
 import { VERDICT } from '../lib/tokens';
 import type {
   AlertGroup,
@@ -1117,7 +1118,7 @@ export function Dashboard() {
                           title={r.name}
                           className="min-w-0 truncate text-[13px] font-medium lg:flex-[1.4]"
                         >
-                          {r.name}
+                          {middleEllipsis(r.name)}
                         </span>
                         {/* Still dropped below `sm`, as before: on a phone-width
                             column the second line is itself too narrow to hold

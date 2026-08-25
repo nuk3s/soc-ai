@@ -19,6 +19,7 @@ import type {
   ConnTestResult,
   DangerSetting,
   Dossier,
+  DossierActivityFilter,
   DossierConflicts,
   DossierFieldName,
   DossierHealthFilter,
@@ -47,6 +48,7 @@ import type {
   SavedView,
   SavedViewQuery,
   SavedViewScreen,
+  SigmaDraft,
   StartBacktestOpts,
   TriageState,
   UpdateCheckResult,
@@ -440,6 +442,51 @@ export function getHuntStats(): Promise<HuntStat[]> {
 
 export function getHunt(id: string): Promise<HuntDetailData> {
   return request<HuntDetailData>(`/hunts/${encodeURIComponent(id)}`);
+}
+
+/** Promote one hunt finding into a full investigation of its cited evidence.
+ * Idempotent server-side: a running/complete promotion returns its id. */
+export function promoteFinding(
+  huntId: string,
+  ordinal: number,
+): Promise<{ investigation_id: string; existing?: boolean }> {
+  return post(`/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/investigate`);
+}
+
+/**
+ * Client budget for the two draft-detection calls below. A draft is ONE
+ * synchronous heavy-model call — 16–44s measured live — so the default 20s
+ * request budget guaranteed "Request timed out" while the server finished
+ * (and then discarded) a perfectly good draft. Sits ABOVE the server's own
+ * 150s draft budget (`sigma_draft_timeout_s`), so a slow draft gets the
+ * server's honest 504 before the client aborts; the review pane's spinner
+ * covers the wait. Drafts are deliberately stateless in v1 — no enqueue/poll
+ * — so a bounded synchronous call is the whole contract.
+ */
+const DRAFT_DETECTION_TIMEOUT_MS = 180_000;
+
+/**
+ * Draft a Sigma detection rule (+ its would-have-fired dry run) from one hunt
+ * finding, by ordinal (1.3 slice 3, export-only — no Security Onion write).
+ * 403 `sigma_authoring_disabled` when `sigma_authoring_enabled` is off; the
+ * caller gates the button on that same flag (see `AboutInfo`) so this is a
+ * backstop, not the primary guard.
+ */
+export function draftFindingDetection(huntId: string, ordinal: number): Promise<SigmaDraft> {
+  return post(`/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/draft-detection`, undefined, {
+    timeoutMs: DRAFT_DETECTION_TIMEOUT_MS,
+  });
+}
+
+/**
+ * Draft a Sigma detection rule from a complete, hunt-kind investigation's
+ * promoted finding — same pipeline as `draftFindingDetection`, addressed by
+ * investigation id instead of hunt id + ordinal.
+ */
+export function draftInvestigationDetection(invId: string): Promise<SigmaDraft> {
+  return post(`/investigations/${encodeURIComponent(invId)}/draft-detection`, undefined, {
+    timeoutMs: DRAFT_DETECTION_TIMEOUT_MS,
+  });
 }
 
 /**
@@ -1223,10 +1270,40 @@ export function refreshPreflight(): Promise<PreflightDetail> {
   return request<PreflightDetail>('/health/preflight/detail?refresh=true');
 }
 
+// Resolve-once caches for the two per-mount probes (F19, dogfood 1.3). Every
+// detail screen re-fetched /about on mount just to gate a default-off flag,
+// and most re-fetched /me for a username — both answers are stable for a whole
+// session. Cache the PROMISE (so concurrent mounts share one in-flight fetch),
+// and invalidate on the events that can actually change the answer: a config
+// apply for /about (its feature flags are hot-appliable), a session or status
+// change for /me. A REJECTED probe is never cached — fail-closed callers hide
+// the feature for that mount, and the next mount deserves a fresh attempt
+// rather than a remembered failure.
+let aboutPromise: Promise<AboutInfo> | null = null;
+let mePromise: Promise<Me> | null = null;
+
+/** Drop the cached `/about` + `/me` answers so the next call re-fetches.
+ *  Called after a config apply (a hot flag flip must be honored) and on
+ *  session changes (login/logout/status). Exported for tests. */
+export function invalidateSessionProbes(): void {
+  aboutPromise = null;
+  mePromise = null;
+}
+
 /** Build metadata (version, repo, license) plus the feature flags a screen needs
- *  before it renders — see `AboutInfo`, which is the whole contract. */
+ *  before it renders — see `AboutInfo`, which is the whole contract. Cached for
+ *  the session; a config apply invalidates it (see `invalidateSessionProbes`). */
 export function getAbout(): Promise<AboutInfo> {
-  return request<AboutInfo>('/about');
+  if (aboutPromise === null) {
+    const p: Promise<AboutInfo> = request<AboutInfo>('/about').catch((e: unknown) => {
+      // Clear only our own entry — an invalidation while this was in flight
+      // may already have installed a fresh probe we must not discard.
+      if (aboutPromise === p) aboutPromise = null;
+      throw e;
+    });
+    aboutPromise = p;
+  }
+  return aboutPromise;
 }
 
 /** Manually compare the running version to the latest GitHub release (admin,
@@ -1383,7 +1460,14 @@ export function setSetting(
   key: string,
   value: string,
 ): Promise<{ ok: boolean; restart_required: boolean }> {
-  return post('/config/setting', { key, value });
+  return post<{ ok: boolean; restart_required: boolean }>('/config/setting', { key, value }).then(
+    (r) => {
+      // A config apply can flip the feature flags the cached /about carries
+      // (hot-apply), so the cache must not outlive it.
+      invalidateSessionProbes();
+      return r;
+    },
+  );
 }
 
 /** Mint an API token — the raw value is returned once. */
@@ -1412,17 +1496,32 @@ export function resetUserPassword(id: number): Promise<{ ok: boolean; password: 
 }
 
 export function setUserRole(id: number, role: string): Promise<{ ok: boolean }> {
-  return post<{ ok: boolean }>(`/config/users/${id}/set-role`, { role });
+  return post<{ ok: boolean }>(`/config/users/${id}/set-role`, { role }).then((r) => {
+    invalidateSessionProbes(); // an admin editing their OWN row changes /me
+    return r;
+  });
 }
 
-/** Return the currently-logged-in user's username, role, and status. */
+/** Return the currently-logged-in user's username, role, and status. Cached for
+ *  the session (see `invalidateSessionProbes`); login/logout/status changes
+ *  invalidate it. */
 export function getMe(): Promise<Me> {
-  return request<Me>('/me');
+  if (mePromise === null) {
+    const p: Promise<Me> = request<Me>('/me').catch((e: unknown) => {
+      if (mePromise === p) mePromise = null;
+      throw e;
+    });
+    mePromise = p;
+  }
+  return mePromise;
 }
 
 /** Update the current user's status string (trim + cap enforced server-side). */
 export function setMyStatus(status: string): Promise<{ ok: boolean; status: string }> {
-  return post<{ ok: boolean; status: string }>('/me/status', { status });
+  return post<{ ok: boolean; status: string }>('/me/status', { status }).then((r) => {
+    invalidateSessionProbes(); // the cached /me carries the old status
+    return r;
+  });
 }
 
 /**
@@ -1456,6 +1555,9 @@ export function saveDangerSetting(
     key,
     value,
     confirm,
+  }).then((r) => {
+    invalidateSessionProbes(); // same config-apply rule as setSetting
+    return r;
   });
 }
 
@@ -1792,6 +1894,10 @@ export interface DossierQuery {
    *  build errored. The same predicate `DossierSummary.never_built` counts, so
    *  the count and the filtered view describe one set. */
   health?: DossierHealthFilter;
+  /** `active`: hosts with observed events (`event_count > 0`) — the Hosts
+   *  screen's default. Hides the DNS-only census entries that land with
+   *  `event_count=0` and otherwise drown the list. */
+  activity?: DossierActivityFilter;
   limit?: number;
   offset?: number;
   sort?: DossierSortKey;
@@ -1805,6 +1911,7 @@ export function listDossiers(query: DossierQuery = {}): Promise<DossierList> {
   if (query.role) p.set('role', query.role);
   if (query.source) p.set('source', query.source);
   if (query.health) p.set('health', query.health);
+  if (query.activity) p.set('activity', query.activity);
   // `!= null` rather than truthiness: offset 0 is a real page (the first one),
   // and dropping it as falsy is how a pager that pages forward can never page
   // back to the top.
@@ -2003,6 +2110,9 @@ export async function login(username: string, password: string): Promise<LoginRe
     }
     throw new Error(detail);
   }
+  // A different person may now be signed in — the cached /me (and /about,
+  // whose flag view is cheap to re-probe) must not carry over.
+  invalidateSessionProbes();
   return (await res.json()) as LoginResult;
 }
 
@@ -2016,6 +2126,8 @@ export async function logout(): Promise<void> {
     });
   } catch {
     // Best-effort — if the request fails we still navigate to login.
+  } finally {
+    invalidateSessionProbes();
   }
 }
 

@@ -307,6 +307,11 @@ uv run soc-ai healthz --url https://<soc-ai-host>:8443
 uv run soc-ai triage <alert_id> --url https://<soc-ai-host>:8443
 ```
 
+The shipped default (`API_AUTH_REQUIRED=true`) requires these to authenticate
+too, same as a browser: pass `--token scai_...` or set `SOC_AI_API_TOKEN`
+(mint one in the web UI under Config → API tokens). Without one, `healthz` and
+`triage` get a 401 — the CLI prints a one-line reminder of the fix alongside it.
+
 Sample successful SSE transcript (alert KDG7CZ4BVBs3R9hXQbPY,
 verdict=false_positive, confidence=0.7):
 

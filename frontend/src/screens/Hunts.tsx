@@ -15,7 +15,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Checkbox } from '../components/Controls';
 import { ListToolbar } from '../components/ListToolbar';
@@ -45,7 +45,7 @@ import {
 import type { HuntSchedule, HuntScheduleList, HuntTemplate } from '../lib/api';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { useAsync } from '../lib/useAsync';
-import type { HuntRehuntResult, HuntRow, HuntStat, HuntStatus, SavedViewQuery } from '../lib/types';
+import type { HuntRehuntResult, HuntRow, HuntStatus, SavedViewQuery } from '../lib/types';
 
 // The backend floors a schedule's interval at 60 minutes (MIN_INTERVAL_MINUTES);
 // mirror that here so the picker can't offer an interval the API would clamp.
@@ -77,19 +77,19 @@ const REHUNT_SKIP_REASONS: Record<string, string> = {
 };
 const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
-// The header's count line reads "7 hunts · 10 findings · 1 in progress" from
-// whatever /hunts/stats returns — the labels are the server's, only lowercased
-// and de-pluralised at 1 ("1 hunt", never "1 hunts"). Generic on purpose: a new
-// stat the backend adds joins the line instead of needing a new card. The `ss`
+// The header's count line reads "7 hunts · 10 findings · 1 in progress",
+// lowercased and de-pluralised at 1 ("1 hunt", never "1 hunts"). The `ss`
 // guard keeps "In progress" whole; an English noun ending in `ss` is not a
-// plural, and that label is a phrase, not a count noun.
-const statNoun = (s: HuntStat): string => {
+// plural, and that label is a phrase, not a count noun. `value` is compared
+// as a string so it works whether the source is the server's HuntStat
+// (string value) or the window-derived stats below (numeric value).
+const statNoun = (s: { label: string; value: string | number }): string => {
   const plural = s.label.endsWith('s') && !s.label.endsWith('ss');
-  const label = s.value === '1' && plural ? s.label.slice(0, -1) : s.label;
+  const label = String(s.value) === '1' && plural ? s.label.slice(0, -1) : s.label;
   return label.toLowerCase();
 };
 
-// Fallback pills — the six canned hunts, used ONLY when the template API is
+// Fallback pills — the seven canned hunts, used ONLY when the template API is
 // unreachable or empty (a fresh store before the builtin seed). Normally the
 // picker is fed by GET /hunt-templates (curated + availability-annotated). Kept
 // in sync with the backend builtins (soc_ai/store/hunt_templates.py::_BUILTINS).
@@ -97,7 +97,7 @@ const FALLBACK_PRESETS: { label: string; objective: string }[] = [
   {
     label: 'Beaconing to rare IPs',
     objective:
-      'Hunt for internal hosts beaconing to rare external IPs in the last 24h — regular cadence, low data volume, novel destinations.',
+      'Hunt for internal hosts beaconing to rare external IPs in the last 24h — regular cadence, low data volume, novel destinations. Use t_beacon_profile to measure cadence and t_first_seen for novel destinations before concluding.',
   },
   {
     label: 'Credential abuse / lockouts',
@@ -112,17 +112,22 @@ const FALLBACK_PRESETS: { label: string; objective: string }[] = [
   {
     label: 'DNS / C2 exfiltration',
     objective:
-      'Hunt for DNS tunneling and C2 exfiltration: high-entropy or high-volume DNS, long TXT records, and beaconing over DNS.',
+      'Hunt for DNS tunneling and C2 exfiltration: high-entropy or high-volume DNS, long TXT records, and beaconing over DNS. Use t_dns_entropy_scan to measure qname entropy and volume before concluding.',
   },
   {
     label: 'New external services',
     objective:
-      'Hunt for internal hosts newly exposing or reaching new external services this week that they never used before.',
+      'Hunt for internal hosts newly exposing or reaching new external services this week that they never used before. Use t_first_seen to diff recent destinations against the 30-day baseline.',
   },
   {
     label: 'Suspicious PowerShell / LOLBins',
     objective:
       'Hunt for suspicious PowerShell and living-off-the-land binary use across endpoints.',
+  },
+  {
+    label: 'DCE-RPC abuse / DC attacks',
+    objective:
+      'Hunt for domain-controller attack patterns in DCE-RPC: Zerologon-style NetrServerAuthenticate floods, DCSync (DRSGetNCChanges), and remote service creation. Use t_dcerpc_histogram first; investigate any flagged or rare dangerous operation.',
   },
 ];
 
@@ -761,6 +766,21 @@ export function Hunts() {
   // polled for the cards) is the signal. Stats not loaded yet → onboarding text.
   const huntsExist = (stats.data?.find((s) => s.label === 'Hunts')?.value ?? '0') !== '0';
 
+  // The header describes the WINDOW the table shows, derived from the same
+  // windowed rows — header and table can never disagree again. The unwindowed
+  // `stats` poll stays: `huntsExist` needs "any hunts EVER" (a quiet window
+  // must not flip the screen to onboarding). Counts describe the fetched page:
+  // the backend caps rows (default 100), so a huge window undercounts — but
+  // consistently with the table below, which is the invariant that matters.
+  const windowStats = useMemo(() => {
+    const rows = data ?? [];
+    return [
+      { label: 'Hunts', value: rows.length, sub: 'in window' },
+      { label: 'Findings', value: rows.reduce((n, h) => n + (h.findingCount || 0), 0), sub: 'surfaced' },
+      { label: 'In progress', value: rows.filter((h) => h.status === 'running').length, sub: 'running now' },
+    ];
+  }, [data]);
+
   // A hunt started elsewhere won't appear while this list is idle — force one
   // refetch when the tab regains focus.
   useEffect(() => {
@@ -908,7 +928,7 @@ export function Hunts() {
           <Freshness at={lastUpdated} />
         </div>
         <div data-testid="hunt-stats-line" className="mt-0.5 text-[13px] text-dim">
-          {(stats.data ?? []).map((s, i) => (
+          {windowStats.map((s, i) => (
             <span key={s.label} title={s.sub}>
               {i > 0 && ' · '}
               <span className="tabular-nums">{s.value}</span> {statNoun(s)}

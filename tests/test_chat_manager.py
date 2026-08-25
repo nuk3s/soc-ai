@@ -514,12 +514,12 @@ def test_run_turn_timeout_error_passthrough() -> None:
     assert "42" in content
 
 
-def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
+def test_run_turn_redacts_fabricated_tool_citations_on_zero_tool_turn() -> None:
     """F1: a zero-tool answer that cites tools it never ran ("verified by the
-    tools", t_enrich_ip(...)) is force-caveated and marked ungrounded, never
-    presented to the analyst as verified evidence."""
-    from soc_ai.agent.narrative_grounding import UNVERIFIED_CAVEAT
-
+    tools", t_enrich_ip(...)) is force-redacted and marked ungrounded, never
+    presented to the analyst as verified evidence. Ground-or-strip
+    (2026-08-20): the fabricated citation text is stripped from the reply, not
+    named under a caveat."""
     captured: dict[str, Any] = {}
 
     async def _finish(_db: Any, _msg_id: int, *, content: str, status: str, meta: Any) -> None:
@@ -585,7 +585,12 @@ def test_run_turn_caveats_fabricated_tool_citations_on_zero_tool_turn() -> None:
 
     assert captured["meta"]["tools"] == []
     assert captured["meta"]["narrative_grounding"]["grounded"] is False
-    assert UNVERIFIED_CAVEAT in captured["content"]
+    assert captured["meta"]["narrative_grounding"]["stripped"]
+    assert "t_enrich_ip" not in captured["content"]
+    assert "Verified by the tools" not in captured["content"]
+    assert "(unverified)" in captured["content"]
+    assert "Some unverifiable specifics were removed" in captured["content"]
+    assert "⚠" not in captured["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -619,13 +624,12 @@ def test_chat_online_tools_gated_by_master_toggle(settings_kratos: Any) -> None:
     assert online <= names_on, sorted(online - names_on)
 
 
-def test_run_turn_scopes_caveat_when_tools_ran() -> None:
-    """A turn that RAN tools but asserted an ungrounded artifact gets the
-    scoped caveat naming the suspect claim — the blanket 'not backed by a tool
-    result' under a real tool-call footer read as a contradiction (dogfood
-    2026-07-15)."""
-    from soc_ai.agent.narrative_grounding import UNVERIFIED_CAVEAT
-
+def test_run_turn_redacts_ungrounded_claim_when_tools_ran() -> None:
+    """A turn that RAN tools but asserted an ungrounded artifact gets the same
+    ground-or-strip redaction as a zero-tool turn (2026-08-20) — the old
+    'scoped' vs 'blanket' caveat distinction (dogfood 2026-07-15) is gone
+    because there is no more banner to scope: the specific is removed from the
+    text in place, tool calls or not."""
     captured: dict[str, Any] = {}
 
     async def _finish(_db: Any, _msg_id: int, *, content: str, status: str, meta: Any) -> None:
@@ -686,9 +690,12 @@ def test_run_turn_scopes_caveat_when_tools_ran() -> None:
         asyncio.run(_run_turn(state, "inv-scoped", 9))
 
     assert captured["meta"]["narrative_grounding"]["grounded"] is False
-    assert "ad.local" in captured["content"]
-    assert "Partially unverified" in captured["content"]
-    assert UNVERIFIED_CAVEAT not in captured["content"]
+    assert captured["meta"]["narrative_grounding"]["stripped"] == ["ad.local"]
+    assert "ad.local" not in captured["content"]
+    assert "(unverified)" in captured["content"]
+    assert "Some unverifiable specifics were removed" in captured["content"]
+    assert "Partially unverified" not in captured["content"]
+    assert "⚠" not in captured["content"]
 
 
 # ── The alert's hosts, seeded as identity — and therefore as grounding ───────
@@ -797,11 +804,21 @@ def test_chat_seed_grounds_an_answer_that_names_the_host(settings_kratos: Any) -
     """The payoff, and the reason the block goes in seed_context rather than
     straight into the system prompt: ``check_narrative_grounding`` grades the
     answer against seed_context, so naming the host correctly becomes a GROUNDED
-    sentence instead of one that ships wearing an ⚠ Unverified caveat."""
+    sentence instead of one that ships wearing an ⚠ Unverified caveat.
+
+    ``CHAT_HOSTNAME`` is backticked in the answer: it is an all-lowercase,
+    non-NetBIOS-shaped label ("pve-01"), so as of the 2026-08-21
+    ``_hostname_qualifies`` tightening (ordinary hyphenated prose like
+    "C2-style"/"Origin-chain" must never read as an unverified hostname) an
+    unformatted mention no longer registers as an identity claim at all —
+    code-formatting is the documented escape hatch for a genuine unformatted
+    name, and is what lets this test still prove the seed block matters."""
     from soc_ai.agent.narrative_grounding import check_narrative_grounding
     from soc_ai.dossier.prompt import HEADING
 
-    answer = f"**No.** {CHAT_HOSTNAME} (hypervisor, {CHAT_SRC}) has a policy of no interactive SSH."
+    answer = (
+        f"**No.** `{CHAT_HOSTNAME}` (hypervisor, {CHAT_SRC}) has a policy of no interactive SSH."
+    )
 
     async def _go() -> str:
         engine, state = await _seeded_state(settings_kratos)

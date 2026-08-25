@@ -179,6 +179,16 @@ const SORTS: Array<{ value: DossierSortKey; label: string }> = [
 // whatever the operator happened to be sorting by.
 const DEFAULT_SORT: DossierSortKey = 'importance';
 
+// The landing FILTER: hosts the network has actually shown traffic for. DNS-
+// only census entries land with event_count=0 (enrichment/host_dossier.py::
+// _ingest_dns_names) and, on the lab grid, were 185 of 234 rows — quiet noise
+// in front of every host worth a glance. 'active' rides in the same `source`
+// facet as the operator/inferred lane split (see the Show control below) so a
+// saved view captures it with everything else in one field; named here for
+// the same reason DEFAULT_SORT is — a saved view or a cleared chip that does
+// not name a source must restore THIS, not the empty ''-for-all-hosts value.
+const DEFAULT_SOURCE = 'active';
+
 // How a disagreement undermines the declaration, weakest first. The word alone
 // is jargon; the gloss is what tells an operator whether their answer was wrong
 // or merely about a machine that is no longer there.
@@ -385,7 +395,7 @@ export function Hosts() {
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [role, setRole] = useState('');
-  const [source, setSource] = useState('');
+  const [source, setSource] = useState(DEFAULT_SOURCE);
   const [sort, setSort] = useState<DossierSortKey>(DEFAULT_SORT);
   const [offset, setOffset] = useState(0);
   // The broken-builds view lives in the URL so the summary bar's count can be
@@ -410,6 +420,11 @@ export function Hosts() {
         q: debouncedQ || undefined,
         role: role || undefined,
         source: source === 'operator' || source === 'inferred' ? source : undefined,
+        // Broken hosts are often exactly the quiet ones — a build that never
+        // ran is a build that never saw traffic either. The broken-builds view
+        // must not hide the rows it exists to find, so activity never composes
+        // with health.
+        activity: source === 'active' && !health ? 'active' : undefined,
         health,
         sort,
         limit: PAGE_SIZE,
@@ -577,9 +592,25 @@ export function Hosts() {
 
   // First run: nothing swept, nothing filtered. One sentence and one action —
   // not four zero tiles, two competing calls to action and a live search box
-  // over zero rows.
-  const unfiltered = !debouncedQ && !role && !source && !health;
-  const firstRun = !!list.data && total === 0 && unfiltered;
+  // over zero rows. `source` narrows the network only at 'operator' /
+  // 'inferred' — its default ('active') and the explicit 'all hosts' ('') are
+  // both the screen's un-narrowed state, or a fresh install with nothing
+  // swept yet would read as "filtered" and never show the first-run screen.
+  const unfiltered =
+    !debouncedQ && !role && source !== 'operator' && source !== 'inferred' && !health;
+  // Gated on the SUMMARY's `hosts` — the whole table, never filtered by
+  // activity — rather than the page's own `total`. The screen's default
+  // already asks for `activity=active`, so a census that has been swept but
+  // is entirely quiet (every host event_count=0, the DNS-only-census case
+  // this filter exists for) also reports total=0 on the filtered page. That
+  // is "no hosts match", not "the sweep hasn't run" — a real census reading
+  // as an empty one is the exact defect the KPI strip exists to prevent
+  // (dossier_summary's own docstring), rebuilt here if `total` drove this.
+  //
+  // `!list.error` too: a failed list fetch must surface as an error with
+  // Retry, never get dressed up as first-run just because the summary (a
+  // SEPARATE request) came back with an empty census.
+  const firstRun = !!kpis.data && kpis.data.hosts === 0 && unfiltered && !list.error;
 
   // The role options the screen can honestly offer: the classifier's closed
   // vocabulary read from the summary wire (frontend list as fallback), plus any
@@ -632,7 +663,12 @@ export function Hosts() {
   const views = useSavedViews('hosts', currentQuery, (saved) => {
     setQ(typeof saved.q === 'string' ? saved.q : '');
     setRole(typeof saved.role === 'string' ? saved.role : '');
-    setSource(typeof saved.source === 'string' ? saved.source : '');
+    // A view saved with an explicit '' (all hosts, from before this filter
+    // existed, or chosen on purpose) must restore to THAT, not the new
+    // default — `typeof === 'string'` tells '' apart from "not saved" so it
+    // does. Only a facet the saved query never named at all falls back to the
+    // screen's own default, same as every other facet here.
+    setSource(typeof saved.source === 'string' ? saved.source : DEFAULT_SOURCE);
     setSort(typeof saved.sort === 'string' ? (saved.sort as DossierSortKey) : DEFAULT_SORT);
     setOffset(0);
   });
@@ -724,6 +760,19 @@ export function Hosts() {
   // seconds long, and is time the empty state below spends asserting that no
   // sweep has ever run.
   const sweepInFlight = running || starting;
+
+  // The Show control's DISPLAYED value under the broken-builds view. The
+  // query builder above already drops `activity` while `health` is set — a
+  // build that never ran never saw traffic either, so a broken host is often
+  // exactly a quiet one, and the view must not hide the rows it exists to
+  // find. The control has to stay honest about that: showing "with traffic"
+  // while the request behind it does not actually filter on traffic is the
+  // control lying about its own state. Narrowed to the 'active' value only —
+  // 'operator' and 'inferred' genuinely still compose with `health` (unlike
+  // `activity`, nothing suppresses them), so forcing the control to 'all
+  // hosts' for those too would make a real, still-applied choice stop
+  // showing as selected.
+  const displayedSource = health && source === 'active' ? '' : source;
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
@@ -845,8 +894,9 @@ export function Hosts() {
               Show
             </span>
             <Select
-              value={source}
+              value={displayedSource}
               options={[
+                { value: 'active', label: 'with traffic' },
                 { value: '', label: 'all hosts' },
                 { value: 'operator', label: 'with declarations' },
                 { value: 'inferred', label: 'sweep answers only' },
@@ -1251,6 +1301,32 @@ export function Hosts() {
                 </div>
               </div>
             </>
+          )}
+
+          {/* The honest note for the screen's default: rows are hidden, not
+              gone, and the way back is one click. Independent of rows.length
+              on purpose — a census that is real but entirely quiet (every
+              host event_count=0) still renders the EmptyState above, and that
+              is exactly the case the escape hatch matters most for: without
+              it, "no hosts match" reads as an empty network rather than a
+              filtered one. Suppressed while still loading (no verdict to
+              give yet), on a failed fetch (a Retry over an outage is not the
+              moment to also print a verdict about a result that never
+              arrived), and under the broken-builds view — that filter already
+              dropped activity (a build that never ran never saw traffic
+              either), so claiming quiet hosts are hidden there would describe
+              a filter that is not actually applied. */}
+          {!(list.loading && !list.data) && !list.error && source === 'active' && !health && (
+            <div className="px-[15px] pb-2.5 text-[11.5px] text-faint">
+              Quiet hosts (no observed events) are hidden —{' '}
+              <button
+                type="button"
+                className="text-dim underline hover:text-text"
+                onClick={() => onSource('')}
+              >
+                show all hosts
+              </button>
+            </div>
           )}
         </Panel>
       )}

@@ -276,12 +276,20 @@ of its own. That's the Dashboard's setup-health card's job.
   trend. Links to Config → Quality.
 - **Audit chain**: prove the tamper-evident record is intact. Links to
   Config → Diagnostics, which carries a **Verify audit chain** button.
-  Pressing it reports one of four outcomes: intact (green check, records
+  Pressing it reports one of five outcomes: intact (green check, records
   verified), partial verification (amber; capped to the start of the chain,
-  not the whole thing), tampered (red; names the sequence number where it
-  breaks), or couldn't verify (amber; the console couldn't read the chain at
-  all). A capped scan never wears the green check. Only a full, clean scan
-  does.
+  not the whole thing), intact within N epochs (amber; every restart's own
+  trail checked out, but restart boundaries can't be linked to each other, so
+  this stops short of "one unbroken chain" — see below), tampered (red; names
+  the sequence number and the restart it broke in), or couldn't verify (amber;
+  the console couldn't read the chain at all). Only a full, single-epoch,
+  uncapped scan gets the green check.
+
+  A chain that spans more than one epoch isn't itself a red flag: a process
+  restart legitimately can't link back to what came before it (a fixed bug
+  once turned restarts into 134 of them — see the Diagnostics panel's own
+  copy for specifics), and the console names that plainly rather than crying
+  tamper on every one of them.
 - **Backtest**: replay history against today's pipeline. Links to Backtest.
 - **Diagnostics**: the doctor's view from inside the app. Links to Config →
   Diagnostics.

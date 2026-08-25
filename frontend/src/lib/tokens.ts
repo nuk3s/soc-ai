@@ -47,10 +47,14 @@ export interface KindMeta {
   bg: string;
   border: string;
 }
+// 'hunt' covers a finding PROMOTED out of a hunt into a full investigation —
+// distinct from the three detection-fired kinds above it (pink, not a shade
+// of any of them, so a promoted row never reads as a stray Suricata/Sigma hit).
 export const KIND: Record<DetectionKind, KindMeta> = {
   suricata: { color: '#4b8bf5', bg: 'rgba(75,139,245,.1)', border: 'rgba(75,139,245,.3)' },
   sigma: { color: '#a472f0', bg: 'rgba(164,114,240,.1)', border: 'rgba(164,114,240,.3)' },
   notice: { color: '#2dd4bf', bg: 'rgba(45,212,191,.1)', border: 'rgba(45,212,191,.3)' },
+  hunt: { color: '#f472b6', bg: 'rgba(244,114,182,.1)', border: 'rgba(244,114,182,.3)' },
 };
 
 // Timeline-group colors for the investigation steps.

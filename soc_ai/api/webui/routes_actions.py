@@ -279,6 +279,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         alert_es_id = inv.alert_es_id
         rule_name = inv.rule_name
         inv_real_id = inv.id
+        inv_kind = inv.kind
         next_seq = max((e.sequence for e in events), default=0) + 1
 
     recs = report.get("recommended_actions") or []
@@ -295,6 +296,21 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         raise HTTPException(
             status_code=400,
             detail={"reason": "not_executable", "tool": tool_name},
+        )
+
+    if inv_kind == "hunt":
+        # A promoted finding's anchor is cited telemetry, not an SO alert —
+        # there is nothing to ack/escalate, and the rule-keyed group ack below
+        # must never see a finding title as a rule_name. No `and tool_name in
+        # WRITE_TOOLS` conjunct here: the check above already 400s any
+        # non-write tool, so by this point tool_name is proven to be a write
+        # tool — restating the condition would just be dead weight.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "hunt_kind_no_so_target",
+                "hint": "A promoted finding has no Security Onion alert to act on.",
+            },
         )
 
     # Already executed through this endpoint? Never write twice (the escalate

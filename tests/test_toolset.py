@@ -12,7 +12,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from soc_ai.agent.orchestrator import InvestigationContext
 from soc_ai.agent.targeted_investigator import _dispatch_table
-from soc_ai.agent.toolset import PHASE_D_TOOLS, register_read_tools
+from soc_ai.agent.toolset import HUNT_ONLY, PHASE_D_TOOLS, register_read_tools
 from soc_ai.config import Settings
 from soc_ai.store.models import HostDossier, HostDossierField
 from soc_ai.triage_models import TargetedGap
@@ -39,7 +39,22 @@ def test_roles_register_disjoint_extras(settings_kratos: Settings) -> None:
     hunt = _names(_agent_with("hunt", settings_kratos))
     assert {"t_query_detections", "t_get_playbooks", "t_lookup_runbook"} <= inv - chat
     assert "t_suggest_rule_tuning" in chat and "t_suggest_rule_tuning" not in hunt
-    assert hunt <= chat  # hunt is the minimal surface
+    # Hunt's only extras over chat are the network-wide analytics sweeps
+    # (HUNT_ONLY, 1.3 slice 2) — everything else hunt gets is also on chat.
+    assert hunt - chat == HUNT_ONLY
+    assert hunt <= chat | HUNT_ONLY
+
+
+def test_hunt_only_analytics_registered_on_hunt_alone(settings_kratos: Settings) -> None:
+    """The four behavioral-analytics sweeps (1.3 slice 2) are hunt-exclusive:
+    present on the hunt agent's registered surface, absent from investigator
+    and chat."""
+    inv = _names(_agent_with("investigator", settings_kratos))
+    chat = _names(_agent_with("chat", settings_kratos))
+    hunt = _names(_agent_with("hunt", settings_kratos))
+    assert hunt >= HUNT_ONLY
+    assert HUNT_ONLY.isdisjoint(inv)
+    assert HUNT_ONLY.isdisjoint(chat)
 
 
 def test_hunt_oql_default_window_is_wide(settings_kratos: Settings) -> None:

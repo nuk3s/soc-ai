@@ -1,5 +1,5 @@
 import { ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
@@ -12,6 +12,7 @@ import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { ErrorState, Freshness, LoadingState, Spinner } from '../components/States';
 import { hideOptimisticallyAcked } from '../lib/alertFilters';
+import { MIN_BUCKET, bucketEvents } from '../lib/alertEventBuckets';
 import {
   type AlertQuery,
   type AutoTriageStatus,
@@ -33,6 +34,7 @@ import {
 } from '../lib/api';
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
 import { plural } from '../lib/plural';
+import { middleEllipsis } from '../lib/text';
 import { useToast } from '../lib/toast';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
@@ -401,6 +403,128 @@ function matchView(g: AlertGroup, view: ViewId, me: string): boolean {
   }
 }
 
+function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEvent }: {
+  ev: AlertEvent;
+  g: AlertGroup;
+  selEvents: Record<string, boolean>;
+  setSelEvents: Dispatch<SetStateAction<Record<string, boolean>>>;
+  navigate: ReturnType<typeof useNavigate>;
+  openDrawer: (id: string) => void;
+  huntEvent: (g: AlertGroup, ev: AlertEvent) => void;
+}) {
+  // Resolved once per row: which of these are real values and
+  // which are the backend's "—" placeholder (see pivotTarget).
+  const srcPivot = pivotTarget(ev.src);
+  const dstPivot = pivotTarget(ev.dst);
+  const hostPivot = pivotTarget(ev.host);
+  const hostIpPivot = pivotTarget(ev.hostIp);
+  return (
+    <div
+      className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
+      style={{ gridTemplateColumns: EVENT_GRID }}
+    >
+      {/* per-event checkbox */}
+      <div onClick={(e) => e.stopPropagation()}>
+        <Checkbox
+          checked={!!(ev.id && selEvents[ev.id])}
+          onChange={(checked) => {
+            if (!ev.id) return;
+            setSelEvents((prev) => ({ ...prev, [ev.id!]: checked }));
+          }}
+          onClick={(e) => e.stopPropagation()}
+        />
+      </div>
+      {/* this alert's OWN timestamp: clock time + relative age */}
+      <div className="flex min-w-0 flex-col leading-tight" title={absTime(ev.ts) ?? ev.ts ?? ''}>
+        <span className="truncate text-text-2">{clockTime(ev.ts) || '—'}</span>
+        {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
+      </div>
+      {/* severity */}
+      <div><SeverityTag sev={(ev.sev ?? 'low') as Severity} /></div>
+      {/* src → dst:port — each endpoint pivots to its entity page.
+          The backend sends BARE endpoints (the pivot value); the
+          destination port renders exactly once here, hugging the
+          dst (inside the same span group, outside the flex gap). */}
+      <div className="flex min-w-0 items-center gap-1.5 truncate">
+        {srcPivot ? (
+          <span
+            className="cursor-pointer text-mono-green hover:underline"
+            onClick={() => navigate(`/entity/${encodeURIComponent(srcPivot)}`)}
+            title={`Pivot to ${srcPivot}`}
+          >
+            {ev.src}
+          </span>
+        ) : (
+          <span className="text-mono-green">{ev.src}</span>
+        )}
+        <span className="text-ghost">→</span>
+        <span className="flex min-w-0 items-center truncate">
+          {dstPivot ? (
+            <span
+              className="cursor-pointer truncate text-mono-amber hover:underline"
+              onClick={() => navigate(`/entity/${encodeURIComponent(dstPivot)}`)}
+              title={`Pivot to ${dstPivot}`}
+            >
+              {ev.dst}
+            </span>
+          ) : (
+            <span className="text-mono-amber">{ev.dst}</span>
+          )}
+          {ev.port != null && (
+            <span className="text-faint">:{ev.port}</span>
+          )}
+        </span>
+      </div>
+      {/* The machine the detection fired ON: name, and beneath it
+          the endpoint agent's own address when the backend could
+          resolve one. It lives HERE and not in the flow cell on
+          purpose — a host-shaped detection observed no
+          connection, and rendering the address as an endpoint
+          would invent one. On a flow alert hostIp is absent and
+          this collapses back to the single name line. Both lines
+          pivot independently; for a host detection the address is
+          the only pivot the row has. */}
+      <div className="flex min-w-0 flex-col leading-tight">
+        {hostPivot ? (
+          <span
+            className="cursor-pointer truncate text-dim hover:text-text hover:underline"
+            title={`Pivot to ${hostPivot}`}
+            onClick={() => navigate(`/entity/${encodeURIComponent(hostPivot)}`)}
+          >
+            {ev.host}
+          </span>
+        ) : (
+          <span className="truncate text-dim">{ev.host}</span>
+        )}
+        {hostIpPivot && (
+          <span
+            className="cursor-pointer truncate text-[10px] text-faint hover:text-dim hover:underline"
+            title={`Pivot to ${hostIpPivot}`}
+            onClick={() => navigate(`/entity/${encodeURIComponent(hostIpPivot)}`)}
+          >
+            {hostIpPivot}
+          </span>
+        )}
+      </div>
+      {/* verdict provenance + WHEN the investigation ran/inherited */}
+      <div className="flex min-w-0 items-center">
+        <ProvenanceBadge ev={ev} onOpen={openDrawer} />
+      </div>
+      {/* investigate this exact event */}
+      <div className="flex justify-end">
+        <button
+          onClick={() => huntEvent(g, ev)}
+          className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
+          style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+        >
+          <Sparkles size={12} />
+          {ev.invId ? 'Open' : 'Investigate'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function Alerts() {
   const { paletteOpen, modalOpen } = useShell();
   const navigate = useNavigate();
@@ -481,6 +605,9 @@ export function Alerts() {
   // a follow-up page is currently fetching.
   const [eventsMore, setEventsMore] = useState<Record<string, boolean>>({});
   const [eventsLoadingMore, setEventsLoadingMore] = useState<Record<string, boolean>>({});
+  // Which event buckets (keyed "<groupKey>:<bucketIndex>") an analyst has
+  // unfolded into individual rows via "Show each".
+  const [openBuckets, setOpenBuckets] = useState<Record<string, boolean>>({});
   const [starting, setStarting] = useState<AlertGroup | null>(null);
   const [selEvents, setSelEvents] = useState<Record<string, boolean>>({});
   // How much is selected right now, readable from the filter-change effect
@@ -681,6 +808,11 @@ export function Alerts() {
     setEventsLoading({});
     setEventsMore({});
     setEventsLoadingMore({});
+    // Bucket-unfold state is keyed on "<groupKey>:<bucketIndex>", and the
+    // index is only stable within one fetched event page — the group key
+    // alone collides across a filter change, so a stale unfold would show
+    // the new flood pre-expanded instead of summarized.
+    setOpenBuckets({});
     // The cached event pages these ids came from were just discarded, so any
     // per-event selection now points at rows that are off-screen and may fall
     // outside the new window — clear it too, else the bulk bar keeps offering
@@ -846,6 +978,19 @@ export function Alerts() {
         })
         .catch(() => setGroupEvents((s) => ({ ...s, [gk]: [] })))
         .finally(() => setEventsLoading((s) => ({ ...s, [gk]: false })));
+    } else if (!opening) {
+      // Collapsing: forget which buckets were unfolded, so re-expanding
+      // starts summarized again rather than reopening a stale flood.
+      setOpenBuckets((s) => {
+        const prefix = `${gk}:`;
+        const next: Record<string, boolean> = {};
+        let changed = false;
+        for (const [k, v] of Object.entries(s)) {
+          if (k.startsWith(prefix)) { changed = true; continue; }
+          next[k] = v;
+        }
+        return changed ? next : s;
+      });
     }
   };
 
@@ -1620,7 +1765,9 @@ export function Alerts() {
                   <KindBadge kind={g.kind} />
                   <div className="flex min-w-0 flex-1 flex-col gap-px">
                     <div className="flex min-w-0 items-center gap-1.5">
-                      <span className="truncate text-[13.5px] font-medium">{g.name}</span>
+                      <span title={g.name} className="truncate text-[13.5px] font-medium">
+                        {middleEllipsis(g.name)}
+                      </span>
                       {g.count > 1 && (
                         <span
                           className="flex-shrink-0 font-mono text-[10.5px] text-faint"
@@ -1881,118 +2028,86 @@ export function Alerts() {
                   {!eventsLoading[gk] && (groupEvents[gk]?.length ?? 0) === 0 && (
                     <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">No events in window.</div>
                   )}
-                  {(groupEvents[gk] ?? []).map((ev, i) => {
-                    // Resolved once per row: which of these are real values and
-                    // which are the backend's "—" placeholder (see pivotTarget).
-                    const srcPivot = pivotTarget(ev.src);
-                    const dstPivot = pivotTarget(ev.dst);
-                    const hostPivot = pivotTarget(ev.host);
-                    const hostIpPivot = pivotTarget(ev.hostIp);
-                    return (
-                    <div
-                      key={ev.id ?? i}
-                      className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
-                      style={{ gridTemplateColumns: EVENT_GRID }}
-                    >
-                      {/* per-event checkbox */}
-                      <div onClick={(e) => e.stopPropagation()}>
-                        <Checkbox
-                          checked={!!(ev.id && selEvents[ev.id])}
-                          onChange={(checked) => {
-                            if (!ev.id) return;
-                            setSelEvents((prev) => ({ ...prev, [ev.id!]: checked }));
-                          }}
-                          onClick={(e) => e.stopPropagation()}
+                  {bucketEvents(groupEvents[gk] ?? []).map((b, bi) => {
+                    const bk = `${gk}:${bi}`;
+                    // Runs under the threshold — and buckets an analyst has
+                    // explicitly unfolded — render as plain per-event rows,
+                    // byte-identical to the pre-bucketing behavior.
+                    if (b.events.length < MIN_BUCKET || openBuckets[bk]) {
+                      return b.events.map((ev, i) => (
+                        <EventRow
+                          key={ev.id ?? `${bk}-${i}`}
+                          ev={ev}
+                          g={g}
+                          selEvents={selEvents}
+                          setSelEvents={setSelEvents}
+                          navigate={navigate}
+                          openDrawer={openDrawer}
+                          huntEvent={huntEvent}
                         />
-                      </div>
-                      {/* this alert's OWN timestamp: clock time + relative age */}
-                      <div className="flex min-w-0 flex-col leading-tight" title={absTime(ev.ts) ?? ev.ts ?? ''}>
-                        <span className="truncate text-text-2">{clockTime(ev.ts) || '—'}</span>
-                        {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
-                      </div>
-                      {/* severity */}
-                      <div><SeverityTag sev={(ev.sev ?? 'low') as Severity} /></div>
-                      {/* src → dst:port — each endpoint pivots to its entity page.
-                          The backend sends BARE endpoints (the pivot value); the
-                          destination port renders exactly once here, hugging the
-                          dst (inside the same span group, outside the flex gap). */}
-                      <div className="flex min-w-0 items-center gap-1.5 truncate">
-                        {srcPivot ? (
-                          <span
-                            className="cursor-pointer text-mono-green hover:underline"
-                            onClick={() => navigate(`/entity/${encodeURIComponent(srcPivot)}`)}
-                            title={`Pivot to ${srcPivot}`}
-                          >
-                            {ev.src}
+                      ));
+                    }
+                    const ids = b.events.map((e) => e.id).filter(Boolean) as string[];
+                    const allSel = ids.length > 0 && ids.every((id) => selEvents[id]);
+                    return (
+                      <div
+                        key={bk}
+                        data-testid="event-bucket-row"
+                        className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
+                        style={{ gridTemplateColumns: EVENT_GRID }}
+                      >
+                        {/* selects every event this bucket covers */}
+                        <div onClick={(e) => e.stopPropagation()}>
+                          <Checkbox
+                            checked={allSel}
+                            onChange={(checked) => setSelEvents((prev) => {
+                              const next = { ...prev };
+                              for (const id of ids) next[id] = checked;
+                              return next;
+                            })}
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`Select ${b.events.length} identical events`}
+                          />
+                        </div>
+                        {/* span of the collapsed run: oldest–newest clock time */}
+                        <div className="flex min-w-0 flex-col leading-tight" title={`${absTime(b.first) ?? ''} – ${absTime(b.last) ?? ''}`}>
+                          <span className="truncate text-text-2">{clockTime(b.first) || '—'}–{clockTime(b.last) || '—'}</span>
+                          {b.head.ago && <span className="text-[10px] text-faint">newest {b.head.ago} ago</span>}
+                        </div>
+                        {/* severity */}
+                        <div><SeverityTag sev={(b.head.sev ?? 'low') as Severity} /></div>
+                        {/* src → dst:port, plus the collapsed count */}
+                        <div className="flex min-w-0 items-center gap-1.5 truncate">
+                          <span className="text-mono-green">{b.head.src}</span>
+                          <span className="text-ghost">→</span>
+                          <span className="truncate text-mono-amber">{b.head.dst}</span>
+                          {b.head.port != null && <span className="text-faint">:{b.head.port}</span>}
+                          <span className="flex-shrink-0 text-faint" title={`${b.events.length} identical events collapsed`}>
+                            ×{b.events.length}
                           </span>
-                        ) : (
-                          <span className="text-mono-green">{ev.src}</span>
-                        )}
-                        <span className="text-ghost">→</span>
-                        <span className="flex min-w-0 items-center truncate">
-                          {dstPivot ? (
-                            <span
-                              className="cursor-pointer truncate text-mono-amber hover:underline"
-                              onClick={() => navigate(`/entity/${encodeURIComponent(dstPivot)}`)}
-                              title={`Pivot to ${dstPivot}`}
-                            >
-                              {ev.dst}
-                            </span>
-                          ) : (
-                            <span className="text-mono-amber">{ev.dst}</span>
-                          )}
-                          {ev.port != null && (
-                            <span className="text-faint">:{ev.port}</span>
-                          )}
-                        </span>
-                      </div>
-                      {/* The machine the detection fired ON: name, and beneath it
-                          the endpoint agent's own address when the backend could
-                          resolve one. It lives HERE and not in the flow cell on
-                          purpose — a host-shaped detection observed no
-                          connection, and rendering the address as an endpoint
-                          would invent one. On a flow alert hostIp is absent and
-                          this collapses back to the single name line. Both lines
-                          pivot independently; for a host detection the address is
-                          the only pivot the row has. */}
-                      <div className="flex min-w-0 flex-col leading-tight">
-                        {hostPivot ? (
-                          <span
-                            className="cursor-pointer truncate text-dim hover:text-text hover:underline"
-                            title={`Pivot to ${hostPivot}`}
-                            onClick={() => navigate(`/entity/${encodeURIComponent(hostPivot)}`)}
+                        </div>
+                        {/* host the detection fired on */}
+                        <div className="flex min-w-0 flex-col leading-tight">
+                          <span className="truncate text-dim">{b.head.host}</span>
+                        </div>
+                        {/* verdict provenance, shared by every event in the run */}
+                        <div className="flex min-w-0 items-center">
+                          <ProvenanceBadge ev={b.head} onOpen={openDrawer} />
+                        </div>
+                        {/* unfold into individual rows */}
+                        <div className="flex justify-end">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenBuckets((s) => ({ ...s, [bk]: true }));
+                            }}
+                            className="inline-flex items-center whitespace-nowrap font-sans text-[11px] font-semibold text-dim hover:text-accent"
                           >
-                            {ev.host}
-                          </span>
-                        ) : (
-                          <span className="truncate text-dim">{ev.host}</span>
-                        )}
-                        {hostIpPivot && (
-                          <span
-                            className="cursor-pointer truncate text-[10px] text-faint hover:text-dim hover:underline"
-                            title={`Pivot to ${hostIpPivot}`}
-                            onClick={() => navigate(`/entity/${encodeURIComponent(hostIpPivot)}`)}
-                          >
-                            {hostIpPivot}
-                          </span>
-                        )}
+                            Show each ({b.events.length})
+                          </button>
+                        </div>
                       </div>
-                      {/* verdict provenance + WHEN the investigation ran/inherited */}
-                      <div className="flex min-w-0 items-center">
-                        <ProvenanceBadge ev={ev} onOpen={openDrawer} />
-                      </div>
-                      {/* investigate this exact event */}
-                      <div className="flex justify-end">
-                        <button
-                          onClick={() => huntEvent(g, ev)}
-                          className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
-                          style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
-                        >
-                          <Sparkles size={12} />
-                          {ev.invId ? 'Open' : 'Investigate'}
-                        </button>
-                      </div>
-                    </div>
                     );
                   })}
                   {!eventsLoading[gk] && eventsMore[gk] && (
@@ -2150,7 +2265,9 @@ function AlertDrawer({
           <span className="rounded-chip border px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase" style={{ color: '#4b8bf5', background: 'rgba(75,139,245,.1)', borderColor: 'rgba(75,139,245,.3)' }}>
             {inv?.kind ?? starting?.kind ?? 'suricata'}
           </span>
-          <div className="flex-1 truncate text-[14px] font-semibold">{inv?.name ?? starting?.name ?? 'Investigation'}</div>
+          <div className="flex-1 truncate text-[14px] font-semibold" title={inv?.name ?? starting?.name ?? 'Investigation'}>
+            {middleEllipsis(inv?.name ?? starting?.name ?? 'Investigation')}
+          </div>
           {inv?.status === 'investigating' && !demo && (
             <button
               disabled={cancelling}

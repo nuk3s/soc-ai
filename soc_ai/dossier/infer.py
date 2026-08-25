@@ -197,6 +197,14 @@ _HOSTNAME_MIN_LEN = 3
 # stay readable in a prompt block and a UI chip.
 _MAX_SIGNAL_CHARS = 80
 
+# A UUID/GUID as the entire first label — Windows/Apple mDNS/LLMNR per-device
+# names ("05bc0f86-f13e-4904-a92b-11dee17856a1.local" or the bare GUID). Same
+# shape enrichment/discovery.py classifies at the SUFFIX layer
+# (_MACHINE_GUID_LABEL_RE); this one gates the hostname DISPLAY lane.
+_MACHINE_GUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.|$)", re.IGNORECASE
+)
+
 # SSH banner → OS, the strongest signal a headless Linux host emits. A banner
 # like ``SSH-2.0-OpenSSH_9.6p1 Debian-3`` names the distribution outright on a
 # machine with no User-Agent and no vendor DNS telemetry — the exact
@@ -716,9 +724,9 @@ def _clean_hostname(value: Any) -> str | None:
     """Normalise a hostname candidate, or reject it.
 
     Rejects addresses (``host.name`` frequently carries the IP), stubs under
-    three characters, and everything ``discovery._junk_host_reason`` knows to be
-    a protocol artifact (``WORKGROUP``, ``__MSBROWSE__``, escaped NetBIOS suffix
-    bytes, a bare public TLD).
+    three characters, everything ``discovery._junk_host_reason`` knows to be a
+    protocol artifact (``WORKGROUP``, ``__MSBROWSE__``, escaped NetBIOS suffix
+    bytes, a bare public TLD), and a per-device mDNS GUID name.
     """
     # Lazy: `discovery` pulls in the identifier store and the ES field helpers,
     # and this module's whole contract is that importing it costs nothing and
@@ -732,6 +740,11 @@ def _clean_hostname(value: Any) -> str | None:
     if len(text) < _HOSTNAME_MIN_LEN or _looks_like_ip(text):
         return None
     if _junk_host_reason(text) is not None:
+        return None
+    if _MACHINE_GUID_RE.match(text):
+        # A per-device mDNS GUID ("3a7471a9-….local") identifies nothing to a
+        # human — reject it so the ranking falls to the next candidate, or the
+        # host stays IP-titled rather than wearing a UUID on every screen.
         return None
     return text
 

@@ -118,11 +118,14 @@ interface CheckboxProps {
   onChange?: (checked: boolean) => void;
   title?: string;
   indeterminate?: boolean;
+  /** Renders inert (dimmed, no click) — a row that bulk actions can't reach. */
+  disabled?: boolean;
   'aria-label'?: string;
 }
-export function Checkbox({ checked, onClick, onChange, title, indeterminate, 'aria-label': ariaLabel }: CheckboxProps) {
+export function Checkbox({ checked, onClick, onChange, title, indeterminate, disabled, 'aria-label': ariaLabel }: CheckboxProps) {
   const active = checked || !!indeterminate;
   const handleClick = (e: React.MouseEvent) => {
+    if (disabled) return;
     onClick?.(e);
     if (onChange) onChange(!checked);
   };
@@ -131,10 +134,12 @@ export function Checkbox({ checked, onClick, onChange, title, indeterminate, 'ar
       type="button"
       role="checkbox"
       aria-checked={indeterminate ? 'mixed' : checked}
+      aria-disabled={disabled || undefined}
+      disabled={disabled}
       aria-label={ariaLabel}
       title={title}
       onClick={handleClick}
-      className="flex h-4 w-4 flex-none cursor-pointer items-center justify-center rounded-[4px] border-[1.5px] p-0"
+      className={`flex h-4 w-4 flex-none items-center justify-center rounded-[4px] border-[1.5px] p-0 ${disabled ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'}`}
       style={{
         borderColor: active ? '#4b8bf5' : '#2a3645',
         background: active ? '#4b8bf5' : 'transparent',

@@ -24,6 +24,7 @@ from soc_ai.agent.orchestrator import (
     StepEvent,
     investigate,
 )
+from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.recorder import InvestigationRecorder
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ async def recorded_run(
     event_stream: AsyncIterator[StepEvent],
     cancel_token: CancelToken | None = None,
     rule_name: str | None = None,
+    kind: str = "suricata",
+    hunt_id: str | None = None,
+    finding_ordinal: int | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap *event_stream* with the investigation recorder tee.
 
@@ -63,12 +67,20 @@ async def recorded_run(
     ``investigation_created`` event is always first.  The caller is
     responsible for building the event stream (so the route can keep its
     own patchable ``investigate`` binding without circular imports).
+
+    ``kind`` / ``hunt_id`` / ``finding_ordinal`` (optional): promotion
+    provenance for a hunt-launched investigation — passed straight through to
+    the recorder. Every existing caller omits them and gets the recorder's
+    ``kind="suricata"`` default.
     """
     recorder = InvestigationRecorder(
         state.db_sessionmaker,
         alert_id=alert_id,
         started_by=started_by,
         rule_name=rule_name,
+        kind=kind,
+        hunt_id=hunt_id,
+        finding_ordinal=finding_ordinal,
     )
     inv_id = await recorder.start()
 
@@ -229,6 +241,11 @@ async def run_recorded(
     rule_name: str | None = None,
     focus_hint: str | None = None,
     deep: bool = False,
+    kind: str = "suricata",
+    hunt_id: str | None = None,
+    finding_ordinal: int | None = None,
+    allow_so_writes: bool = True,
+    focus_origin: FocusOrigin = "rerun",
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Call investigate() and tee it through the recorder.
 
@@ -242,12 +259,23 @@ async def run_recorded(
 
     ``deep`` (optional): force the full tool-driven loop for this run
     (the analyst's "deep re-run" of a heuristic verdict).
+
+    ``kind`` / ``hunt_id`` / ``finding_ordinal`` (optional): promotion
+    provenance, passed straight through to ``recorded_run``.
+
+    ``allow_so_writes`` / ``focus_origin`` (optional, default True / "rerun"):
+    threaded straight through to ``investigate()`` — see its docstring. The
+    promotion route (finding-promotion, Task 6) passes
+    ``allow_so_writes=False, focus_origin="hunt_finding"`` explicitly; every
+    other caller gets the ordinary defaults.
     """
     event_gen = investigate(
         alert_id,
         ctx=ctx,
         focus_hint=focus_hint,
         deep=deep,
+        allow_so_writes=allow_so_writes,
+        focus_origin=focus_origin,
     )
 
     async for name, data in recorded_run(
@@ -257,6 +285,9 @@ async def run_recorded(
         event_stream=event_gen,
         cancel_token=cancel_token,
         rule_name=rule_name,
+        kind=kind,
+        hunt_id=hunt_id,
+        finding_ordinal=finding_ordinal,
     ):
         yield name, data
 

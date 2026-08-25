@@ -20,7 +20,11 @@ from pathlib import Path
 
 import pytest
 from scripts.demo import mock_es
-from scripts.demo.mock_es import _search_response_from_docs, load_fixture_docs
+from scripts.demo.mock_es import (
+    DETECTION_FIXTURE_DOCS,
+    _search_response_from_docs,
+    load_fixture_docs,
+)
 
 
 def _doc(
@@ -157,6 +161,136 @@ def test_load_fixture_docs_invalid_json_is_fail_soft(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Generic aggregation + count/hit matching (detection-bridge slice, Task 8).
+#
+# Beyond the two hardcoded Alerts-console aggs, the mock now answers the request
+# shapes the detection bridge (dry_run_detection's `| count` / `| head`) and the
+# slice-2 analytics tools (+ resolve_agg_field's exists probe) issue against the
+# DETECTION_FIXTURE_DOCS. These assert the mock's response CONTRACT for those
+# shapes; test_detection_bridge_e2e.py drives the real producers through it.
+# ---------------------------------------------------------------------------
+
+# The Zerologon draft's OQL, translated to ES DSL and wrapped exactly as
+# query_events_oql wraps it (must=[filter expr], filter=[time], must_not=[synth]).
+# `dce_rpc.operation` lives under `zeek.*` because the OQL whitelist admits only
+# that form (see the fixture docstring).
+_TIME_FILTER = {"range": {"@timestamp": {"gte": "now-43200m", "lte": "now"}}}
+_SYNTH_KILL = {"exists": {"field": "synth.scenario_id"}}
+_ZEROLOGON_OPS = {
+    "bool": {
+        "must": [
+            {"term": {"event.dataset": "zeek.dce_rpc"}},
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"zeek.dce_rpc.operation": "NetrServerAuthenticate3"}},
+                        {"term": {"zeek.dce_rpc.operation": "NetrServerReqChallenge"}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+        ]
+    }
+}
+
+
+def _wrapped(inner: dict) -> dict:
+    return {"bool": {"must": [inner], "filter": [_TIME_FILTER], "must_not": [_SYNTH_KILL]}}
+
+
+def test_generic_terms_agg_dispatches_on_any_named_field():
+    """Not just rule.name/notice.note: a terms agg groups by whatever field it
+    names. dce_rpc.operation resolves to the whitelisted zeek.* form."""
+    for field, expected in [
+        (
+            "zeek.dce_rpc.operation",
+            {"NetrServerAuthenticate3": 8, "NetrLogonSamLogonEx": 4, "NetrServerReqChallenge": 3},
+        ),
+        ("destination.ip", {"192.0.2.10": 16, "192.0.2.53": 4, "203.0.113.77": 3}),
+    ]:
+        body = {"size": 0, "query": {"match_all": {}}, "aggs": {"g": {"terms": {"field": field}}}}
+        resp = _search_response_from_docs(body, DETECTION_FIXTURE_DOCS)
+        counts = {b["key"]: b["doc_count"] for b in resp["aggregations"]["g"]["buckets"]}
+        for key, n in expected.items():
+            assert counts.get(key) == n, (field, key)
+
+    # dns.query.name groups each distinct qname (one doc apiece here).
+    body = {
+        "size": 0,
+        "query": {"terms": {"event.dataset": ["zeek.dns"]}},
+        "aggs": {"q": {"terms": {"field": "dns.query.name", "size": 200}}},
+    }
+    resp = _search_response_from_docs(body, DETECTION_FIXTURE_DOCS)
+    keys = {b["key"] for b in resp["aggregations"]["q"]["buckets"]}
+    assert "www.example.test" in keys and "api.example.test" in keys
+
+
+def test_terms_agg_carries_nested_top_hits_and_sub_terms():
+    """The nested sub-aggs the histogram/beacon tools rely on: a per-bucket
+    top_hits (citable _ids) and a source.ip sub-terms (peer attribution)."""
+    body = {
+        "size": 0,
+        "query": _wrapped({"term": {"event.dataset": "zeek.dce_rpc"}}),
+        "aggs": {
+            "ops": {
+                "terms": {"field": "zeek.dce_rpc.operation", "size": 100},
+                "aggs": {
+                    "sample": {"top_hits": {"size": 3}},
+                    "sources": {"terms": {"field": "source.ip", "size": 5}},
+                },
+            }
+        },
+    }
+    resp = _search_response_from_docs(body, DETECTION_FIXTURE_DOCS)
+    buckets = {b["key"]: b for b in resp["aggregations"]["ops"]["buckets"]}
+    auth = buckets["NetrServerAuthenticate3"]
+    assert auth["doc_count"] == 8
+    sample_ids = [h["_id"] for h in auth["sample"]["hits"]["hits"]]
+    assert len(sample_ids) == 3
+    assert all(s.startswith("zl-dce") for s in sample_ids)
+    assert [b["key"] for b in auth["sources"]["buckets"]] == ["198.51.100.23"]
+
+
+def test_count_query_returns_a_real_matching_total():
+    """dry_run_detection's `| count`: size=0, no aggs → the real number of docs
+    the drafted rule would have fired on (the malicious ops only, not benign)."""
+    body = {"query": _wrapped(_ZEROLOGON_OPS), "size": 0, "track_total_hits": 10000}
+    resp = _search_response_from_docs(body, DETECTION_FIXTURE_DOCS)
+    assert resp["hits"]["total"]["value"] == 11  # 8 Authenticate3 + 3 ReqChallenge
+    assert resp["hits"]["hits"] == []
+
+
+def test_exists_probe_counts_field_presence_like_resolve_agg_field():
+    """resolve_agg_field probes each candidate with a size=0 exists count; only
+    the field the docs actually carry comes back non-zero."""
+
+    def _total(field: str) -> int:
+        body = {"query": {"exists": {"field": field}}, "size": 0}
+        return _search_response_from_docs(body, DETECTION_FIXTURE_DOCS)["hits"]["total"]["value"]
+
+    assert _total("zeek.dce_rpc.operation") == 16  # the form the docs carry
+    assert _total("dce_rpc.operation") == 0  # the ECS form is absent → probe moves on
+
+
+def test_head_query_returns_matching_docs_newest_first():
+    """dry_run_detection's `| head 5`: size>0 bool query → the matching docs,
+    newest first, capped to size — the sample-id evidence the dry run cites."""
+    body = {"query": _wrapped(_ZEROLOGON_OPS), "size": 5}
+    resp = _search_response_from_docs(body, DETECTION_FIXTURE_DOCS)
+    ids = [h["_id"] for h in resp["hits"]["hits"]]
+    assert len(ids) == 5
+    assert all(s.startswith("zl-dce") for s in ids)
+    assert resp["hits"]["total"]["value"] == 11  # total counts matches, not the page
+
+
+def test_matchall_without_size_still_answers_empty():
+    """The unknown-query contract is unchanged: a bare match_all is not matched
+    doc-by-doc, so it answers empty rather than dumping the whole fixture."""
+    resp = _search_response_from_docs({"query": {"match_all": {}}}, DETECTION_FIXTURE_DOCS)
+    assert resp["hits"]["hits"] == []
+
+
+# ---------------------------------------------------------------------------
 # Degraded-grid control endpoint. The security constraint is the test: this file
 # also serves the PUBLIC demo container, where an unauthenticated switch into a
 # fabricated Security Onion outage would let any visitor break the demo for
@@ -232,6 +366,28 @@ def test_half_read_is_a_200_that_hides_failed_shards():
     # Zero hits on purpose — the shape a quiet, healthy grid also returns.
     assert body["hits"]["hits"] == []
     assert body["hits"]["total"]["value"] == 0
+
+
+def test_id_sort_is_rejected_like_a_real_es9_cluster():
+    """Regression for the audit-verify fix (soc_ai/audit/verify.py, found 2026-08-20).
+
+    `_fetch_audit_records`'s `search_after` tiebreak used to sort on `_id`, which a
+    real ES 9 grid refuses (`indices.id_field_data.enabled=false`) on every
+    data-bearing shard. This mock answers `_search` for ANY index — including
+    `soc-ai-audit-*`, which `soc-ai audit verify` hits directly against the demo
+    stack — so it has to mirror that refusal unconditionally, not just under an
+    opt-in degraded state, or a reintroduced `_id` sort would silently pass here.
+    """
+    id_sort_body = {"sort": [{"seq": {"order": "asc"}}, {"_id": {"order": "asc"}}]}
+    rejected = mock_es.id_sort_rejected_response(id_sort_body)
+    assert rejected is not None
+    assert rejected["_shards"]["failed"] == 58
+    assert rejected["_shards"]["failures"][0]["reason"]["type"] == "illegal_argument_exception"
+    assert rejected["hits"]["hits"] == []
+
+    timestamp_sort_body = {"sort": [{"seq": {"order": "asc"}}, {"timestamp": {"order": "asc"}}]}
+    assert mock_es.id_sort_rejected_response(timestamp_sort_body) is None
+    assert mock_es.id_sort_rejected_response({}) is None
 
 
 def test_saturated_is_a_retryable_circuit_breaker_not_a_bad_query():

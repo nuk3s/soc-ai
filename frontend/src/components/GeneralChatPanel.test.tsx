@@ -8,7 +8,7 @@
 // the answer lands on the Dashboard, a long turn shows what the agent is doing
 // (a bare typing indicator reads as "hung" — dogfood 2026-08-06), and the
 // proposed hunt never starts itself.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatThread } from '../lib/api';
@@ -189,5 +189,19 @@ describe('GeneralChatPanel — starting over', () => {
 
     expect(clearGeneralChat).toHaveBeenCalled();
     expect(await screen.findByText(/answered here/i)).toBeTruthy(); // back to the empty hint
+  });
+});
+
+describe('GeneralChatPanel — starter chips', () => {
+  it('a starter chip submits the question immediately — no second click on Send', async () => {
+    vi.mocked(postGeneralChat).mockResolvedValue(
+      thread([{ role: 'user', text: 'What datasets do I have?' }], { pending: true }),
+    );
+    mount();
+    await screen.findByText('What datasets do I have?'); // the chip
+
+    fireEvent.click(screen.getByRole('button', { name: 'What datasets do I have?' }));
+
+    await waitFor(() => expect(postGeneralChat).toHaveBeenCalledWith('What datasets do I have?'));
   });
 });

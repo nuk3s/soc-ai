@@ -163,7 +163,7 @@ describe('events table — hostIp gives a host detection an address', () => {
     const row = eventRow();
     expect(within(row).getByText('so-sensor')).toBeTruthy();
     // Absence is the quiet default — no empty slot, no placeholder line.
-    expect(within(row).queryByTitle(/^Pivot to 10\.9\.8\.51$/)).toBeNull();
+    expect(within(row).queryByTitle(/^Pivot to 192\.168\.9\.51$/)).toBeNull();
     expect(within(row).queryByText('null')).toBeNull();
     expect(within(row).queryByText('undefined')).toBeNull();
   });

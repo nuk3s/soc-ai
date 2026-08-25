@@ -167,6 +167,10 @@ from soc_ai.api.webui.routes_config import (
     get_config,
     set_setting,
 )
+from soc_ai.api.webui.routes_detection import (
+    draft_hunt_finding_detection,
+    draft_investigation_detection,
+)
 from soc_ai.api.webui.routes_detection_tuning import (
     DetectionNominationOut,
     DetectionOverrideIn,
@@ -597,6 +601,8 @@ __all__ = [
     "delete_runbook",
     "discovery_scan_status",
     "dossier_refresh_status",
+    "draft_hunt_finding_detection",
+    "draft_investigation_detection",
     "escalate_group",
     "execute_action",
     "export_investigation",

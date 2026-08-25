@@ -3,19 +3,22 @@ import {
   ChevronDown,
   ChevronLeft,
   Crosshair,
+  FileCode2,
   GitBranch,
   Loader2,
   RotateCw,
   ShieldAlert,
+  Sparkles,
   Trash2,
   Wrench,
   X,
 } from 'lucide-react';
 import { type ReactNode, Suspense, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { RecordedRunChip } from '../components/Badges';
+import { RecordedRunChip, VerdictPill } from '../components/Badges';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
+import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
 import {
@@ -31,15 +34,18 @@ import {
   type HuntChatThread,
   cancelHuntConsole,
   deleteHunt,
+  draftFindingDetection,
+  getAbout,
   getHunt,
   getHuntChat,
   isNotFound,
   postHuntChat,
+  promoteFinding,
   startHuntConsole,
 } from '../lib/api';
 import { useDemo } from '../lib/demo';
 import { HUNT_STATUS } from '../lib/statusMeta';
-import { SEVERITY, TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
+import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
 import { lazyWithReload } from '../lib/lazyWithReload';
 import { useChatThread } from '../lib/useChatThread';
@@ -50,6 +56,7 @@ import type {
   HuntStatus,
   Severity,
   TimelineStep,
+  Verdict,
 } from '../lib/types';
 
 // Derived from the single app-wide severity ramp (lib/tokens) — no second palette.
@@ -254,8 +261,54 @@ function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
 
 // Rich finding card — mirrors the investigation timeline rows: a severity dot,
 // the title, prose detail, and mono host/citation chips.
-function FindingCard({ f }: { f: HuntFinding }) {
+function FindingCard({
+  f,
+  huntId,
+  ordinal,
+  sigmaOn,
+  sigmaOff,
+}: {
+  f: HuntFinding;
+  huntId: string;
+  ordinal: number;
+  /** `sigma_authoring_enabled` (detection-bridge kill switch) — off by
+   *  default, so the Draft-detection badge stays hidden until an operator
+   *  opts in (see `HuntDetail`'s `about` fetch). */
+  sigmaOn: boolean;
+  /** The probe answered and the flag is EXPLICITLY off — distinct from
+   *  `!sigmaOn`, which is also true while the probe is unsettled. Drives the
+   *  quiet "authoring is off" pointer on a confirmed-TP card; an unsettled
+   *  probe shows neither the button nor the pointer. */
+  sigmaOff: boolean;
+}) {
   const color = SEV_COLOR[f.severity] ?? SEV_COLOR.info;
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [promoteErr, setPromoteErr] = useState<string | null>(null);
+  // Draft detection (1.3 slice 3): one-way open, like Investigate — once the
+  // analyst has drafted a rule for this finding, the pane stays put rather
+  // than unmounting on a toggle (which would silently re-draft on reopen).
+  const [draftOpen, setDraftOpen] = useState(false);
+  // Promotion state (E1.3 slice 1 dogfood fix): a finding already promoted
+  // shows Investigating…/Open instead of a re-clickable Investigate that just
+  // lands on the same investigation (idempotent server-side, but dishonest —
+  // the analyst got no signal that a verdict may already exist). An
+  // errored/cancelled/interrupted promotion frees the slot server-side
+  // (mirrors inv_svc.blocks_rehunt), so only running/complete change the button.
+  const inv = f.investigation ?? null;
+  const invRunning = inv != null && inv.status === 'running';
+  const invComplete = inv != null && inv.status === 'complete';
+  const chipVerdict: Verdict | null =
+    invComplete && inv?.verdict && inv.verdict in VERDICT ? (inv.verdict as Verdict) : null;
+  // Confirm-first doctrine: a detection may be drafted ONLY from a finding
+  // whose promoted investigation completed AND confirmed true_positive. An
+  // unpromoted, running, or non-TP finding gets no draft affordance — the
+  // Investigate/Open flow is how the analyst confirms first.
+  const confirmedTP = invComplete && inv?.verdict === 'true_positive';
+  const openInvestigation = () => {
+    if (inv == null) return;
+    navigate(`/investigation/${inv.id}`, { state: { from: `/hunts/${huntId}` } });
+  };
   return (
     <div
       className="relative overflow-hidden rounded-card border bg-surface-2 p-[14px_15px]"
@@ -283,13 +336,106 @@ function FindingCard({ f }: { f: HuntFinding }) {
             observation
           </span>
         )}
+        {invRunning || invComplete ? (
+          // Already promoted: Investigating… (running) or Open (complete) —
+          // both just navigate to the existing investigation, never re-promote.
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              openInvestigation();
+            }}
+            title={
+              invRunning
+                ? 'This finding is already being investigated'
+                : 'Open the investigation this finding was promoted to'
+            }
+            className="ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
+            style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+          >
+            <Sparkles size={12} />
+            {invRunning ? 'Investigating…' : 'Open'}
+          </button>
+        ) : (
+          // Investigate: promotes this finding's cited evidence into a full
+          // investigation (E1.3 authoring bridge). Idempotent server-side — a
+          // re-click on an already-promoted finding lands on the same
+          // investigation rather than minting a duplicate. Disabled when the
+          // finding has no citations left to investigate (the post-hunt
+          // citation gate can strip every one), since that request can only
+          // ever 422.
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (busy) return;
+              setBusy(true);
+              setPromoteErr(null);
+              promoteFinding(huntId, ordinal)
+                .then((r) => navigate(`/investigation/${r.investigation_id}`, { state: { from: `/hunts/${huntId}` } }))
+                .catch((err) => setPromoteErr(err instanceof Error ? err.message : 'could not start'))
+                .finally(() => setBusy(false));
+            }}
+            disabled={f.citations.length === 0}
+            title={
+              f.citations.length === 0
+                ? 'This finding has no linked evidence events, so there is nothing to open an investigation on.'
+                : "Run a full investigation of this finding's cited evidence"
+            }
+            className="ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
+            style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+          >
+            <Sparkles size={12} />
+            {busy ? 'Starting…' : 'Investigate'}
+          </button>
+        )}
+        {sigmaOn && confirmedTP && !draftOpen && (
+          // Draft detection (1.3 slice 3): export-only, flag-gated — see
+          // DraftDetectionPane. Confirm-first: offered ONLY once this finding's
+          // promoted investigation completed with a true_positive verdict —
+          // the same gate the Investigation pane and both backend routes
+          // enforce. One-way open (no collapse) so a re-click never re-fires
+          // the draft call.
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setDraftOpen(true);
+            }}
+            title="Draft a Sigma detection rule from this confirmed finding's evidence — review, edit, and export"
+            className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
+            style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+          >
+            <FileCode2 size={12} />
+            Draft detection
+          </button>
+        )}
+        {sigmaOff && confirmedTP && (
+          // The one card that COULD draft a detection, with the flag off:
+          // point at the switch instead of rendering nothing — the flag is
+          // hot-editable, so this is a live path, not a dead end.
+          <span className="flex-none font-sans text-[10.5px] text-faint">
+            Detection authoring is off —{' '}
+            <Link
+              to="/config#triage-automation"
+              state={{ highlightKey: 'sigma_authoring_enabled' }}
+              className="underline hover:text-dim"
+            >
+              enable it in Config
+            </Link>
+          </span>
+        )}
+        {chipVerdict && <VerdictPill verdict={chipVerdict} conf={inv?.conf} />}
         <span
-          className="ml-auto flex-none rounded-chip border px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em]"
+          className="flex-none rounded-chip border px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em]"
           style={{ color, borderColor: `${color}55`, background: `${color}14` }}
         >
           {f.severity}
         </span>
       </div>
+      {promoteErr && (
+        <div className="mb-1.5 font-mono text-[11px] text-danger">{promoteErr}</div>
+      )}
       <div className="text-[12.5px] leading-[1.6] text-text-2" style={{ textWrap: 'pretty' }}>
         {f.detail}
       </div>
@@ -322,6 +468,11 @@ function FindingCard({ f }: { f: HuntFinding }) {
               {c}
             </span>
           ))}
+        </div>
+      )}
+      {draftOpen && (
+        <div className="mt-2.5">
+          <DraftDetectionPane autoRun onDraft={() => draftFindingDetection(huntId, ordinal)} />
         </div>
       )}
     </div>
@@ -428,6 +579,17 @@ export function HuntDetail() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [rehunting, setRehunting] = useState(false);
   const [rehuntError, setRehuntError] = useState<string | null>(null);
+
+  // Draft-detection's kill switch — same one-mount-GET pattern the
+  // Investigation screen reads it with (Investigation.tsx `about`). Defaults
+  // off: an unsettled or failed probe fails CLOSED (hides every finding's
+  // Draft-detection badge), not open.
+  const about = useAsync(getAbout, []);
+  const sigmaOn = about.data?.sigma_authoring_enabled === true;
+  // Explicitly off (probe answered, flag false) — NOT the same as `!sigmaOn`,
+  // which is also true mid-probe. Only the settled "off" answer earns the
+  // quiet enable-it pointer on a confirmed-TP finding card.
+  const sigmaOff = about.data?.sigma_authoring_enabled === false;
 
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // the current status in a ref and let pauseWhen consult it: stop polling once
@@ -773,8 +935,23 @@ export function HuntDetail() {
                   </Panel>
                 ) : (
                   <div className="flex flex-col gap-2.5">
+                    {/* Journey wayfinding: what these cards are FOR. One quiet
+                        line, only once the hunt has concluded with findings. */}
+                    {complete && (
+                      <div className="text-[12px] leading-[1.5] text-faint" style={{ textWrap: 'pretty' }}>
+                        Promote a finding to investigate it; a confirmed true positive can then be
+                        drafted into a detection.
+                      </div>
+                    )}
                     {data.findings.map((f, i) => (
-                      <FindingCard key={i} f={f} />
+                      <FindingCard
+                        key={i}
+                        f={f}
+                        huntId={data.id}
+                        ordinal={i}
+                        sigmaOn={sigmaOn}
+                        sigmaOff={sigmaOff}
+                      />
                     ))}
                   </div>
                 )}
