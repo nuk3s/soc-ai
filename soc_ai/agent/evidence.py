@@ -77,6 +77,140 @@ def _classify_citation(citation: str) -> tuple[str, str | None]:
     return "unknown", None
 
 
+# Document-identity keys (M2, 2026-08-25 audit). An id-shaped citation must name
+# EVIDENCE the run actually RETRIEVED, so the resolvers collect values from the
+# real STRUCTURE of retrieved payloads — never by substring-searching dumped
+# text, which an attacker can seed through any plantable field (a DNS label,
+# TLS SNI, URI, User-Agent). Keys are matched on the LEAF segment
+# (``log.id.uid`` in ES fields-form counts as ``uid``):
+#   * ``_id``  — the ES hit id
+#   * ``uid``  — the Zeek connection/log uid (zeek rows carry no ``_id``)
+#   * ``sid`` / ``uuid`` — detector rule identifiers (t_get_rule_content)
+#   * ``sample_ids`` — the analytics tools' per-aggregate ES ``_id`` samples
+#     (soc_ai.tools.analytics collects them from top_hits ``_id``s, documented
+#     as the citable anchor for a hunt finding)
+# Bare ``id`` is deliberately absent: ECS leaves like ``user.id`` can carry
+# attacker-supplied text (a probed username), while the contexts that use ``id``
+# for document identity (SoAlert / pivot events) are collected explicitly by
+# attribute in :func:`soc_ai.agent.gates._retrieved_evidence_tokens`. Embedded
+# JSON *strings* are never parsed here — an attacker-controlled payload that
+# happens to be valid JSON must not mint identifiers.
+_DOC_IDENTITY_KEYS: frozenset[str] = frozenset({"_id", "uid", "sid", "uuid", "sample_ids"})
+
+# The pivot attrs whose values may ALSO satisfy an id-shaped citation (see
+# `_TYPED_EVIDENCE_KEYS` below): sensor-computed hashes/fingerprints and a
+# fixed-vocabulary cipher enum. An attacker can influence WHICH such value
+# appears (by sending different traffic), never mint an arbitrary chosen token.
+_PIVOT_ID_SAFE_ATTRS: tuple[str, ...] = (
+    "zeek_ssl_ja3",
+    "zeek_ssl_ja3s",
+    "zeek_files_sha256",
+    "zeek_files_md5",
+    "zeek_kerberos_cipher",
+)
+
+# Pivot event attributes whose values are distinctive enough to prove a verdict
+# was grounded in correlated evidence when cited (a JA3, a file hash, a Kerberos
+# SPN, a service binary name, an RPC endpoint — not generic fields like a port
+# or state). Shared with :mod:`soc_ai.agent.gates` (`_pivot_evidence_tokens`).
+#
+# Beyond the id-safe subset above, this set carries four attacker-chosen
+# free-form WIRE strings — an SMB file name, a client-requested Kerberos SPN,
+# a DCE-RPC endpoint and operation. Citing one of those is legitimate
+# GROUNDING (it proves the model read the pivot the orchestrator prefetched),
+# but they must never feed id-citation RESOLUTION: the attacker's own flow
+# raises the alert, community-id prefetch normalizes that same flow's
+# smb/kerberos/dce_rpc rows, and a token planted there would resolve as a
+# strict document id (the M2 forgery, reopened through a typed slot).
+_PIVOT_DECISIVE_ATTRS: tuple[str, ...] = (
+    *_PIVOT_ID_SAFE_ATTRS,
+    "zeek_kerberos_service",
+    "zeek_smb_name",
+    "zeek_dce_rpc_endpoint",
+    "zeek_dce_rpc_operation",
+)
+
+# Typed-evidence keys (D1, pre-merge review of the M2 fix). `_classify_citation`
+# reads ANY bare 12+-char token as id-shaped, which covers a lot of legitimate
+# evidence beyond document ids: MD5/SHA-* file hashes, JA3/JA3S fingerprints,
+# and long bare detector-metadata values ("Informational", "policy-violation").
+# Wave 2 removed the (forgeable) substring fallback those relied on, so every
+# such citation became an unforgeable identity claim with no route to
+# resolution — a correctly-grounded TP got its severity capped / verdict
+# floored. The fix keeps the M2 discipline (STRUCTURAL key membership, never a
+# scan of dumped text) and simply widens WHICH leaves count as evidence:
+#   * hash leaves — ``file.hash.md5``/``sha1``/``sha256``/``sha512``/``ssdeep``
+#     and Zeek/SO ``hash.ja3``/``ja3s`` (also ECS ``tls.client.ja3``): computed
+#     by the sensor over observed content; citing one cites the real artifact.
+#   * the :data:`_PIVOT_ID_SAFE_ATTRS` leaves — the hash/fingerprint/enum
+#     SUBSET of the decisive pivot values. NOT the full
+#     :data:`_PIVOT_DECISIVE_ATTRS`: its other four leaves
+#     (``zeek_smb_name``, ``zeek_kerberos_service``, ``zeek_dce_rpc_endpoint``,
+#     ``zeek_dce_rpc_operation``) are attacker-chosen free-form wire strings
+#     that ride the attacker's own flow into the community-id prefetch, so
+#     admitting them here reopened M2 through a typed slot. They stay citable
+#     GROUNDING evidence in the gates (``_pivot_evidence_tokens``) — they just
+#     cannot satisfy an id-shaped citation's identity claim.
+#   * detector-assigned rule metadata — ``signature_severity`` / ``classtype``
+#     / ``severity_label`` / ``alert_action``: written by the matched RULE, not
+#     by wire content an attacker controls.
+# Deliberately absent: every leaf whose VALUE is a free-form string the
+# attacker composes — content leaves planted through traffic
+# (``dns.query.name`` / ``question.name`` (leaf ``name``), TLS SNI
+# (``server_name``), URIs (``full``/``original``/``path``), User-Agent
+# (``original``), usernames) and the four wire-string pivot leaves above.
+# A token planted in any of them still resolves to nothing.
+_TYPED_EVIDENCE_KEYS: frozenset[str] = frozenset(
+    {
+        "md5",
+        "sha1",
+        "sha256",
+        "sha512",
+        "ssdeep",
+        "ja3",
+        "ja3s",
+        "signature_severity",
+        "classtype",
+        "severity_label",
+        "alert_action",
+        *_PIVOT_ID_SAFE_ATTRS,
+    }
+)
+
+# The full evidence-key set a bare id-shaped citation may resolve against:
+# document identity plus decisive typed values. Membership-only — the VALUES
+# under these keys are harvested; nothing is ever substring-matched.
+_EVIDENCE_KEYS: frozenset[str] = _DOC_IDENTITY_KEYS | _TYPED_EVIDENCE_KEYS
+
+_MAX_IDENTITY_WALK_DEPTH = 12
+
+
+def _collect_evidence_values(node: Any, out: set[str], depth: int = 0) -> None:
+    """Collect lowercased document-id / typed-evidence strings from real structure.
+
+    Walks dicts/lists only (never parses strings), harvesting string values —
+    including fields-form list-wrapped values — whose key's leaf segment is in
+    :data:`_EVIDENCE_KEYS`. Depth-bounded and never raises on shape
+    surprises; a malformed payload just contributes nothing.
+    """
+    if depth > _MAX_IDENTITY_WALK_DEPTH:
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            leaf = key.rsplit(".", 1)[-1] if isinstance(key, str) else ""
+            if leaf in _EVIDENCE_KEYS:
+                if isinstance(value, str) and value:
+                    out.add(value.lower())
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str) and item:
+                            out.add(item.lower())
+            _collect_evidence_values(value, out, depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_evidence_values(item, out, depth + 1)
+
+
 def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
     """Walk a dotted path against an AlertContext / SoAlert dump.
 

@@ -325,8 +325,10 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
         sys_prompt = inputs.system_prompt.format(context=inputs.seed_context) + oql_primer_block(
             flavor=inputs.oql_flavor
         )
+        inv_block = ""
         if inputs.append_inventory:
-            sys_prompt += await inventory_prompt_block(ctx.elastic, settings)
+            inv_block = await inventory_prompt_block(ctx.elastic, settings)
+            sys_prompt += inv_block
         if guard is not None:
             # seed_context (stored verdict/rationale from real investigation
             # data) + inventory both carry internal identifiers; sanitize the
@@ -334,12 +336,27 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
             # itself stays RAW — the narrative-grounding check below compares
             # against it in real-value space.
             sys_prompt = guard.sanitize_text(sys_prompt)
+            # Independent fail-closed residue sweep over the DYNAMIC (untrusted)
+            # system-prompt fragments — the identifiers only the sweep catches
+            # (NetBIOS bare hostnames, credential usernames) must not egress.
+            # The STATIC template + OQL primer stay outside the sweep: the
+            # primer's worked examples (`workstation-01`) are residue-shaped by
+            # construction and would otherwise fail-close every turn on
+            # version-controlled repo text that carries no deployment data.
+            fail_closed = settings.analyst_redaction_fail_closed is True
+            for fragment in (inputs.seed_context, inv_block):
+                guard.check_or_raise(guard.sanitize_text(fragment), fail_closed=fail_closed)
         build = inputs.build_agent or _default_build_agent
         agent = build(build_investigator_model(settings), ctx, sys_prompt)
         turn_prompt = build_turn_prompt(inputs.prior, inputs.question)
         if guard is not None:
             # The analyst's question + prior turns carry real identifiers.
             turn_prompt = guard.sanitize_text(turn_prompt)
+            # Fully dynamic, so the whole final user string is swept — refuse
+            # to call the model rather than egress a sanitize miss.
+            guard.check_or_raise(
+                turn_prompt, fail_closed=settings.analyst_redaction_fail_closed is True
+            )
         # Run the turn, then CLOSE THE GROUNDING LOOP: if the answer asserts
         # per-event facts that appear in neither this turn's tool results nor
         # the seeded evidence, hand the validator's finding back to the agent
@@ -375,6 +392,11 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
                     break
                 if guard is not None:
                     correction = guard.sanitize_text(correction)
+                    # The correction quotes the answer's ungrounded artifacts —
+                    # dynamic text; sweep it before the re-run egresses it.
+                    guard.check_or_raise(
+                        correction, fail_closed=settings.analyst_redaction_fail_closed is True
+                    )
                 _LOGGER.info(
                     "chat: regrounding attempt %d for %s — %s",
                     reground_used + 1,

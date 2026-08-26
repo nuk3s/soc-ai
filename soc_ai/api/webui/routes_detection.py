@@ -72,6 +72,7 @@ from soc_ai.api.webui.routes_hunts import _ID_SHAPED, _hunt_report
 from soc_ai.config import Settings
 from soc_ai.detection.drafter import draft_detection
 from soc_ai.detection.models import SigmaDraft
+from soc_ai.detection.untrusted import neutralize_untrusted
 from soc_ai.detection.validators import dry_run_detection, validate_sigma_yaml
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
@@ -88,7 +89,11 @@ _MAX_CITED_DOCS = 5
 _MAX_CITED_IDS_LISTED = 20
 
 # Per-value render cap in the evidence string (a runaway field value must not
-# blow up the drafter's prompt).
+# blow up the drafter's prompt). Every untrusted splice below also goes
+# through neutralize_untrusted (2026-08-25 audit, M1): control characters are
+# escaped so a hostile value with an embedded newline cannot break out of its
+# ``- id: path=value`` list item and render injected sentences as their own
+# lines inside the drafter's ground-truth block.
 _MAX_VALUE_CHARS = 120
 
 # Dotted paths surfaced (when non-null) from each resolved cited doc — the
@@ -176,7 +181,13 @@ async def _resolve_cited_docs(
 
 
 def _observed_values(doc: dict[str, Any]) -> list[str]:
-    """Non-null notable field values of one cited doc, as ``path=value`` parts."""
+    """Non-null notable field values of one cited doc, as ``path=value`` parts.
+
+    Field values are ATTACKER-CONTROLLABLE telemetry: each is neutralized
+    (control characters escaped, fence punctuation defused, capped at
+    :data:`_MAX_VALUE_CHARS`) so it stays confined to its list item — see the
+    module note on M1.
+    """
     source = doc.get("_source")
     if not isinstance(source, dict):
         return []
@@ -185,9 +196,7 @@ def _observed_values(doc: dict[str, Any]) -> list[str]:
         value = get_dotted(source, path)
         if value is None or value in ("", [], {}):
             continue
-        rendered = str(value)
-        if len(rendered) > _MAX_VALUE_CHARS:
-            rendered = rendered[:_MAX_VALUE_CHARS] + "…"
+        rendered = neutralize_untrusted(str(value), cap=_MAX_VALUE_CHARS)
         parts.append(f"{path}={rendered}")
     return parts
 
@@ -223,17 +232,23 @@ def _build_evidence(finding: dict[str, Any], cited_docs: list[dict[str, Any]]) -
     :data:`_MAX_CITED_IDS_LISTED`, with an "… and N more" elision), and — the
     part that grounds the rule — the OBSERVED field values read from the
     resolved cited documents themselves.
+
+    Everything spliced here is untrusted (report JSON is not schema-enforced;
+    cited-doc values and ids come off the grid), so every piece rides through
+    :func:`neutralize_untrusted` — a value cannot start a line of its own.
     """
     lines: list[str] = []
     severity = finding.get("severity")
     if severity:
-        lines.append(f"Severity: {severity}")
+        lines.append(f"Severity: {neutralize_untrusted(str(severity), cap=_MAX_VALUE_CHARS)}")
     category = finding.get("category")
     if category:
-        lines.append(f"Category: {category}")
+        lines.append(f"Category: {neutralize_untrusted(str(category), cap=_MAX_VALUE_CHARS)}")
     cite_ids = _citation_ids(finding)
     if cite_ids:
-        listed = cite_ids[:_MAX_CITED_IDS_LISTED]
+        listed = [
+            neutralize_untrusted(c, cap=_MAX_VALUE_CHARS) for c in cite_ids[:_MAX_CITED_IDS_LISTED]
+        ]
         suffix = (
             f", … and {len(cite_ids) - len(listed)} more" if len(cite_ids) > len(listed) else ""
         )
@@ -249,7 +264,8 @@ def _build_evidence(finding: dict[str, Any], cited_docs: list[dict[str, Any]]) -
         for doc in cited_docs:
             parts = _observed_values(doc)
             rendered = "; ".join(parts) if parts else "(no notable field values)"
-            lines.append(f"- {doc.get('_id')}: {rendered}")
+            doc_id = neutralize_untrusted(str(doc.get("_id")), cap=_MAX_VALUE_CHARS)
+            lines.append(f"- {doc_id}: {rendered}")
     return "\n".join(lines)
 
 

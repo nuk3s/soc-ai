@@ -202,6 +202,29 @@ async def toggle_user_disabled(request: Request, user_id: int) -> dict[str, bool
     dependencies=[Depends(require_admin_api)],
 )
 async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[str, str | bool]:
+    """Reset a user's password to a fresh random value (returned once, in plaintext).
+
+    Requires a real authenticated session user — mirroring :func:`create_token`'s
+    ``no_session_user`` refusal. With auth on, ``require_admin_api`` already
+    guarantees a session admin; this check is the defence-in-depth floor for the
+    auth-off posture, where the gate no-ops and an anonymous caller could
+    otherwise mint a plaintext credential that SURVIVES a later flip back to
+    auth-on (and lock the operator out — the reset revokes the target's sessions
+    and tokens and retires the bootstrap sidecar). A logged-in admin session
+    keeps working whether auth is on or off.
+    """
+    if await current_user(request) is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "no_session_user",
+                "hint": (
+                    "Resetting a password requires an authenticated admin session; "
+                    "log in at /app/login (anonymous or bearer-token callers "
+                    "cannot reset passwords)."
+                ),
+            },
+        )
     async with request.app.state.db_sessionmaker() as db:
         target = await auth_svc.get_user_by_id(db, user_id)
         if target is None:

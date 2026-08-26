@@ -10,8 +10,11 @@ from collections.abc import Sequence
 from typing import Any, Literal
 
 from soc_ai.agent.evidence import (
+    _PIVOT_DECISIVE_ATTRS,
+    _PIVOT_ID_SAFE_ATTRS,
     _bundle_dump_text,
     _classify_citation,
+    _collect_evidence_values,
     _path_exists_in_alert,
     _tool_was_invoked,
     count_successful_tool_calls,
@@ -105,6 +108,81 @@ def _semantic_token_resolves(source: str, bundle_text: str) -> bool:
     return False
 
 
+def _retrieved_evidence_tokens(alert_ctx: Any, messages: list[Any] | None) -> frozenset[str]:
+    """Document ids + typed-evidence values this run actually RETRIEVED (lowercased).
+
+    M2 (2026-08-25 audit): an id-shaped citation is a claim that specific
+    retrieved EVIDENCE grounds the verdict, so it must resolve by membership in
+    this set — never by substring-searching the dumped bundle text (which an
+    attacker can seed through any plantable field: a DNS label, TLS SNI, URI,
+    User-Agent). Sources, all structural:
+
+    * the enriched alert's own ES id (``alert_ctx.alert.id``),
+    * every prefetched pivot event's id (the orchestrator fetched those docs on
+      the agent's behalf — same axes as :data:`_PIVOT_ATTRS`) and its id-safe
+      typed values (:data:`_PIVOT_ID_SAFE_ATTRS` — the sensor-computed
+      JA3/hash/cipher subset of the decisive pivot values; the wire-string
+      leaves — SMB file name, requested SPN, DCE-RPC endpoint/operation — are
+      attacker-chosen free-form strings on the attacker's own prefetched flow,
+      so they ground a verdict (``_pivot_evidence_tokens``) but never resolve
+      an id-shaped citation),
+    * evidence-key leaves (:data:`soc_ai.agent.evidence._EVIDENCE_KEYS` —
+      ``_id``/``uid``/``sid``/``uuid``, hash/JA3 leaves, detector rule
+      metadata) inside the prefetch bundle's ``model_dump`` and inside the
+      CONTENTS of real tool returns in the message history — documents the
+      investigation loop / targeted dispatch genuinely pulled.
+
+    The alert/pivot values are read from attributes AND from the ``model_dump``
+    (consistent with the rest of the validator chain, which supports
+    dump-backed contexts) — but only from those specific identity/typed SLOTS,
+    never by scanning arbitrary dumped content, which is the forgeable surface
+    this function exists to avoid.
+    """
+    ids: set[str] = set()
+    alert_id = getattr(getattr(alert_ctx, "alert", None), "id", None)
+    if isinstance(alert_id, str) and alert_id:
+        ids.add(alert_id.lower())
+    for attr in _PIVOT_ATTRS:
+        for ev in getattr(alert_ctx, attr, None) or []:
+            ev_id = getattr(ev, "id", None)
+            if isinstance(ev_id, str) and ev_id:
+                ids.add(ev_id.lower())
+            for decisive in _PIVOT_ID_SAFE_ATTRS:
+                value = getattr(ev, decisive, None)
+                if isinstance(value, str) and value:
+                    ids.add(value.lower())
+    try:
+        dump = alert_ctx.model_dump(mode="json")
+    except Exception:
+        dump = None
+    if isinstance(dump, dict):
+        alert_dump = dump.get("alert")
+        if isinstance(alert_dump, dict):
+            for key in ("id", "alert_id"):
+                value = alert_dump.get(key)
+                if isinstance(value, str) and value:
+                    ids.add(value.lower())
+        for attr in _PIVOT_ATTRS:
+            evs = dump.get(attr)
+            if isinstance(evs, list):
+                for ev_dump in evs:
+                    if isinstance(ev_dump, dict):
+                        value = ev_dump.get("id")
+                        if isinstance(value, str) and value:
+                            ids.add(value.lower())
+        # Evidence-key leaves anywhere in the bundle's real structure — the
+        # typed pivot values and rule metadata a dump-backed context carries.
+        # The walk harvests ONLY _EVIDENCE_KEYS leaves and never parses
+        # embedded strings, so plantable content fields contribute nothing.
+        _collect_evidence_values(dump, ids)
+    for msg in messages or []:
+        for part in getattr(msg, "parts", []) or []:
+            if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
+                continue
+            _collect_evidence_values(getattr(part, "content", None), ids)
+    return frozenset(ids)
+
+
 def _resolve_citations(
     citations: list[str],
     alert_ctx: Any,
@@ -128,10 +206,18 @@ def _resolve_citations(
 
     1. **Strict path** — same dotted-path walk against alert_ctx.
     2. **Strict tool** — same ToolCallPart-history check.
-    3. **Strict id** — same long-alphanumeric check (model-trusted).
-    4. **Semantic substring** — any substantive token from the citation
-       (≥3 chars of `[A-Za-z0-9][\\w./:\\-]+`) must appear (case-
-       insensitive) in the bundle's JSON dump.
+    3. **Strict id** — membership in :func:`_retrieved_evidence_tokens`:
+       the citation must name EVIDENCE the run actually retrieved — a
+       document id (the alert itself, a prefetched pivot, a doc inside a
+       real tool return) or a decisive typed value harvested from an
+       evidence-key leaf (a file hash, a JA3/JA3S, detector rule
+       metadata). Id-shaped citations get NO semantic fallback — a
+       substring match against dumped text is exactly the M2 forgery
+       (an attacker plants an id-shaped token in a DNS label / SNI /
+       URI and the gate credits it as a document).
+    4. **Semantic substring** (non-id kinds only) — any substantive
+       token from the citation (≥3 chars of `[A-Za-z0-9][\\w./:\\-]+`)
+       must appear (case-insensitive) in the bundle's JSON dump.
 
     Resolutions through (4) count as valid; the per_citation entry
     records `kind="semantic"` so audit can distinguish them. Empty
@@ -151,6 +237,7 @@ def _resolve_citations(
     per_citation: list[dict[str, Any]] = []
 
     bundle_text: str | None = None  # lazy
+    retrieved_ids: frozenset[str] | None = None  # lazy
 
     for c in citations:
         kind, target = _classify_citation(c)
@@ -158,16 +245,18 @@ def _resolve_citations(
         resolution_kind = "unresolved"
 
         if kind == "id":
-            # F57: do NOT blind-trust an id-shaped citation. A fabricated id would
-            # otherwise resolve to strict_id without ever touching the bundle,
-            # inflating coverage_ratio (skipping the confidence cap and defeating
-            # the verdict-floor's no-evidence check) — the exact pitfall
-            # hunt_gates documents and avoids. Require the id to actually appear in
-            # the bundle (same distinctive-token check as the semantic fallback):
-            # a real ES id the model was shown is present; a hallucinated one isn't.
-            if bundle_text is None:
-                bundle_text = _bundle_dump_text(alert_ctx)
-            if target and _semantic_token_resolves(target, bundle_text):
+            # F57 + M2: do NOT blind-trust an id-shaped citation, and do NOT
+            # resolve it by substring against dumped text either. The substring
+            # form was forgeable — a fabricated id planted in attacker-
+            # controllable field content (a DNS query name, TLS SNI, URI, UA)
+            # resolved as strict_id with full coverage, skipping the confidence
+            # cap and defeating the verdict-floor's no-evidence check. An id
+            # citation is a claim about RETRIEVED EVIDENCE, so it resolves only
+            # by membership in the set of document ids and typed-evidence
+            # values this run actually retrieved.
+            if retrieved_ids is None:
+                retrieved_ids = _retrieved_evidence_tokens(alert_ctx, messages)
+            if target and target.lower() in retrieved_ids:
                 resolved = True
                 resolution_kind = "strict_id"
         elif kind == "path":
@@ -179,10 +268,13 @@ def _resolve_citations(
                 resolved = True
                 resolution_kind = "strict_tool"
 
-        if not resolved:
+        if not resolved and kind != "id":
             # Fall back to semantic resolution: any DISTINCTIVE token from the
             # citation appearing in the bundle dump counts (see
             # :func:`_semantic_token_resolves` for the stop-word / band rules).
+            # Id-shaped citations are EXCLUDED from this fallback (M2): letting
+            # a failed id membership check fall through to a substring match
+            # would re-open the exact forgery the strict branch closes.
             if bundle_text is None:
                 bundle_text = _bundle_dump_text(alert_ctx)
             if _semantic_token_resolves(c, bundle_text):
@@ -835,17 +927,10 @@ def _has_ioc_hit(enriched_ctx: Any) -> bool:
 # Pivot event attributes whose values are distinctive enough to prove a verdict was
 # grounded in correlated evidence when cited (a JA3, a file hash, a Kerberos SPN, a
 # service binary name, an RPC endpoint — not generic fields like a port or state).
-_PIVOT_DECISIVE_ATTRS: tuple[str, ...] = (
-    "zeek_ssl_ja3",
-    "zeek_ssl_ja3s",
-    "zeek_files_sha256",
-    "zeek_files_md5",
-    "zeek_kerberos_service",
-    "zeek_kerberos_cipher",
-    "zeek_smb_name",
-    "zeek_dce_rpc_endpoint",
-    "zeek_dce_rpc_operation",
-)
+# Defined in soc_ai.agent.evidence (imported above), where the id-citation
+# resolvers' evidence-key set enumerates its hash/fingerprint/enum SUBSET
+# (_PIVOT_ID_SAFE_ATTRS) — the wire-string leaves ground a verdict here but
+# never resolve an id-shaped citation.
 _PIVOT_ATTRS: tuple[str, ...] = (
     "community_id_events",
     "host_events",

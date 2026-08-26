@@ -6,6 +6,47 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-08-26
+
+An adversarial security audit of the whole product, and the fixes it earned. Four attacker positions
+were tested — someone who controls the telemetry soc-ai ingests, a logged-in analyst gone rogue, a
+stranger on the network, and anything that could carry your data out of the building. Every finding
+below came with a working reproduction before it was fixed.
+
+### Fixed
+
+- **A hunt that runs out of budget no longer sends your objective to the model unredacted.** When a
+  hunt exhausted its request budget, tool budget, or timeout, the partial-report step wrote its summary
+  from the raw objective — internal IPs and hostnames included — even with redaction on. Every other
+  step on that path was redacting correctly, which is what made it hard to see.
+- **A detection drafted from an attacker's own traffic can no longer quietly exclude them.** Field
+  values from telemetry were spliced into the drafting prompt as trusted ground truth, so text planted
+  in a payload could steer the rule into skipping the attacker's address — and the checks still passed
+  it, because the "would have fired" count measured a different query than the rule you exported. The
+  telemetry is now fenced off and treated as data, the two are cross-checked, and the console shows you
+  the query the count came from.
+- **A citation now has to name evidence that was actually retrieved.** Citations were confirmed by
+  looking for the reference anywhere in the gathered text, so a string planted in a DNS lookup could
+  pass as a document that was never fetched. Verdicts and hunt findings now resolve citations against
+  the evidence itself — document IDs, sensor-computed hashes and fingerprints, and detector-assigned
+  labels — while anything an attacker composes freely cannot stand in as a source.
+- **Redaction now covers every place that talks to a model.** Three paths sanitized without running the
+  fail-closed check, which mattered because that check catches bare Windows hostnames and
+  credential-style usernames that sanitizing alone does not. The optional runbook-embeddings tier sent
+  queries and runbook text to the gateway with no redaction at all.
+- **A bad password from one person no longer locks out everyone else.** Failed logins accumulated
+  against the whole site and were never cleared by a successful one, so on a shared network connection
+  a handful of typos could refuse valid credentials for fifteen minutes. `PROXY_TRUSTED_IPS`, which
+  tells soc-ai how to identify individual clients behind a proxy, is now documented.
+- **Group acknowledge and escalate now refuse what they cannot honour.** An unrecognized severity was
+  silently dropped rather than rejected, which quietly widened an acknowledgement to every severity in
+  the group. Unrecognized filter values are now refused outright.
+- **A promoted hunt finding cannot be acknowledged or escalated in Security Onion by a side door**, and
+  re-investigating one no longer produces a record that could.
+- **Metrics are no longer readable by anonymous visitors on the public demo**, and resetting a user's
+  password now requires being signed in.
+
+
 ## [1.3.1] - 2026-08-25
 
 A critical dogfood of the 1.3 journey before it went public — a live walk of hunt → promote →

@@ -55,6 +55,7 @@ from soc_ai.rag import runbook_embeddings as rag_svc
 from soc_ai.store.models import Runbook
 
 if TYPE_CHECKING:
+    from soc_ai.agent.egress_guard import EgressGuard
     from soc_ai.config import Settings
 
 _LOGGER = logging.getLogger(__name__)
@@ -278,6 +279,51 @@ async def _fts_hits(
     return [(int(rid), float(score)) for rid, score in rows.all()]
 
 
+async def _semantic_hits(
+    db: AsyncSession,
+    query: str,
+    *,
+    settings: Settings,
+    k: int,
+    guard: EgressGuard | None,
+) -> list[tuple[Runbook, float]]:
+    """Fail-soft fetch of the opt-in semantic tier for :func:`search`.
+
+    ``EgressResidueError`` (fail-closed redaction refused the outbound query)
+    degrades to the local ranking exactly like a gateway outage: fail-closed
+    means "do not egress", not "lose the local results" — and the exception
+    string names a count, never a value, so the log line is safe.
+    """
+    from soc_ai.agent.egress_guard import EgressResidueError  # noqa: PLC0415 - import cycle
+
+    try:
+        return await rag_svc.semantic_search(db, query, settings=settings, k=k, guard=guard)
+    except (rag_svc.RagGatewayError, EgressResidueError) as exc:
+        _LOGGER.warning("semantic tier skipped (fail-soft): %s", exc)
+        return []
+
+
+async def _rerank_or_none(
+    query: str,
+    docs: list[str],
+    *,
+    settings: Settings,
+    guard: EgressGuard | None,
+) -> list[float] | None:
+    """Fail-soft rerank call for :func:`search`; ``None`` keeps the merged order.
+
+    Same posture as :func:`_semantic_hits` — a redaction refusal degrades like
+    a gateway outage rather than erroring the whole retrieval.
+    """
+    from soc_ai.agent.egress_guard import EgressResidueError  # noqa: PLC0415 - import cycle
+
+    try:
+        return await rag_svc.rerank_scores(query, docs, settings=settings, guard=guard)
+    except (rag_svc.RagGatewayError, EgressResidueError) as exc:
+        _LOGGER.warning("rerank skipped (fail-soft): %s", exc)
+        return None
+
+
 async def search(
     db: AsyncSession,
     query: str,
@@ -359,13 +405,19 @@ async def search(
                     candidates[rb.id] = rb
                     scores[rb.id] = scores.get(rb.id, 0.0) + _W_RULE_LINK
 
+    # The two gateway tiers below are the only egress in this function; one
+    # effective-set egress guard covers both calls (None = redaction off).
+    rag_guard: EgressGuard | None = None
+    if (
+        settings is not None
+        and query.strip()
+        and (settings.rag_embed_model or settings.rag_rerank_model)
+    ):
+        rag_guard = await rag_svc.rag_egress_guard(db, settings)
+
     # ── Semantic tier (opt-in): union gateway-embedding hits, weighted ────────
     if settings is not None and settings.rag_embed_model and query.strip():
-        try:
-            sem = await rag_svc.semantic_search(db, query, settings=settings, k=k)
-        except rag_svc.RagGatewayError as exc:
-            _LOGGER.warning("semantic tier skipped (fail-soft): %s", exc)
-            sem = []
+        sem = await _semantic_hits(db, query, settings=settings, k=k, guard=rag_guard)
         for rb, cos in sem:
             if cos <= 0.0:
                 continue
@@ -379,11 +431,8 @@ async def search(
     if settings is not None and settings.rag_rerank_model and query.strip() and len(candidates) > 1:
         ordered = list(candidates.values())
         docs = [f"{rb.title}\n{(rb.content or '')[: rag_svc.RERANK_DOC_CHARS]}" for rb in ordered]
-        try:
-            relevance = await rag_svc.rerank_scores(query, docs, settings=settings)
-        except rag_svc.RagGatewayError as exc:
-            _LOGGER.warning("rerank skipped (fail-soft): %s", exc)
-        else:
+        relevance = await _rerank_or_none(query, docs, settings=settings, guard=rag_guard)
+        if relevance is not None:
             # Recompose: rerank owns the text/semantic ordering (relevance is
             # 0..1), but the rule-link boost still dominates by construction.
             scores = {

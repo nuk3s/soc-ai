@@ -13,15 +13,20 @@ asks the model for short headlines, but the clamp is what guarantees it. No LLM
 calls — this is the trust layer, one layer down from the investigation citation
 gate.
 
-Resolver choice — the TOKEN fallback, not ``gates._resolve_citations``: hunt
-citations are overwhelmingly bare ES ``_id`` strings, and
-``_resolve_citations`` short-circuits any id-shaped citation to ``strict_id``
-(model-trusted) WITHOUT checking the bundle — so a FABRICATED id would resolve
-and defeat the whole gate. We therefore reuse the distinctive-token machinery
-(``_FUZZY_TOKEN_RE`` + ``_CITATION_STOP_WORDS``) from
-:mod:`soc_ai.agent.gates` and require a citation's distinctive tokens to appear
-in the JSON dump of the gathered tool-result payloads — the fallback the E1.3
-spec explicitly sanctions for exactly this shape mismatch.
+Resolver choice — two-tier (M2, 2026-08-25 audit). Hunt citations are
+overwhelmingly bare ES ``_id`` strings, and an id-shaped citation is a claim
+about RETRIEVED EVIDENCE — so it resolves ONLY by membership in the set of
+document identifiers and decisive typed values the hunt actually retrieved
+(``_id``/``uid``/``sid`` plus hash/JA3/rule-metadata evidence-key leaves,
+collected from the real STRUCTURE of the gathered payloads, see
+:func:`_gathered_evidence_tokens`). The previous substring form was forgeable:
+a fabricated id-shaped token planted in attacker-controllable field content (a
+DNS query name, TLS SNI, URI, User-Agent) of a genuinely-retrieved doc
+resolved and defeated the whole gate. Non-id citations (values, IPs, domains,
+free text) keep the distinctive-token machinery (``_FUZZY_TOKEN_RE`` +
+``_CITATION_STOP_WORDS``) from :mod:`soc_ai.agent.gates` against the JSON dump
+of the gathered tool-result payloads — the fallback the E1.3 spec explicitly
+sanctions for value-shaped citations.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import json
 import re
 from typing import Any
 
+from soc_ai.agent.evidence import _classify_citation, _collect_evidence_values
 from soc_ai.agent.gates import _CITATION_STOP_WORDS, _FUZZY_TOKEN_RE
 
 # Severity ordinal — "cap at X" == min(current, X). Only ever LOWERS a severity.
@@ -145,16 +151,47 @@ def _gathered_evidence_text(tool_results: list[Any]) -> str:
         return ""
 
 
-def _citation_resolves(citation: str, evidence_text: str) -> bool:
-    """True iff a DISTINCTIVE token of ``citation`` appears in ``evidence_text``.
+def _gathered_evidence_tokens(tool_results: list[Any]) -> frozenset[str]:
+    """Document ids + typed-evidence values the hunt actually RETRIEVED (lowercased).
 
-    Reuses the investigation gate's distinctive-token discipline (GATE C): a
-    stop-word or a short generic fragment never resolves a citation on its own;
-    a long token (>= 8 chars — an ES ``_id``, a hash, a full IP) resolves on a
-    substring match, a medium token (>= 5 chars — a domain label, a hyphenated
-    host) resolves only on a word boundary. This kills hollow matches while
-    resolving real ids/values the hunt pulled.
+    M2 (2026-08-25 audit): collected from the real STRUCTURE of the gathered
+    payloads — ``_id`` leaves on ES hits, ``uid`` leaves on Zeek rows / raw
+    fetches (``log.id.uid``; zeek rows carry no ``_id``), ``sid``/``uuid`` rule
+    identifiers, plus the decisive typed-evidence leaves (``file.hash.*``,
+    ``hash.ja3``/``ja3s``, detector rule metadata — see
+    :data:`soc_ai.agent.evidence._EVIDENCE_KEYS`) — via
+    :func:`soc_ai.agent.evidence._collect_evidence_values`.
+    Attacker-plantable CONTENT fields (a DNS query name, an SNI, a URI) are
+    never identity or typed-evidence keys, so a token planted there cannot
+    enter this set. Works over both labeled ``{tool_name, result}`` items and
+    bare legacy results (the walk only harvests evidence-keyed leaves either
+    way).
     """
+    ids: set[str] = set()
+    for item in tool_results:
+        _collect_evidence_values(item, ids)
+    return frozenset(ids)
+
+
+def _citation_resolves(citation: str, evidence_text: str, retrieved_ids: frozenset[str]) -> bool:
+    """True iff ``citation`` resolves against the gathered evidence.
+
+    Two-tier (M2): an ID-SHAPED citation (per the shared classifier —
+    ``(id X)`` or a bare 12+-char alphanumeric) is a claim that specific
+    evidence was retrieved (a document, or a decisive typed value like a file
+    hash or JA3), so it resolves ONLY by membership in
+    ``retrieved_ids`` — never by substring, which an attacker could satisfy by
+    planting the token in any content field of a doc the hunt legitimately
+    pulled. Every other shape keeps the investigation gate's distinctive-token
+    discipline (GATE C): a stop-word or a short generic fragment never resolves
+    a citation on its own; a long token (>= 8 chars — a hash, a full IP)
+    resolves on a substring match, a medium token (>= 5 chars — a domain label,
+    a hyphenated host) resolves only on a word boundary. This kills hollow
+    matches while resolving real values the hunt pulled.
+    """
+    kind, target = _classify_citation(citation)
+    if kind == "id":
+        return target is not None and target.lower() in retrieved_ids
     if not evidence_text:
         return False
     for tok in _FUZZY_TOKEN_RE.findall(citation):
@@ -239,8 +276,8 @@ def _oql_aggregations(result: Any) -> Any:
     return None
 
 
-def _corroborating_evidence_text(tool_results: list[Any]) -> str:
-    """Lower-cased JSON dump of ONLY the corroborating (non-alert) tool results.
+def _corroborating_results(tool_results: list[Any]) -> list[Any]:
+    """The corroborating (non-alert) subset of the gathered tool results.
 
     ``tool_results`` are labeled ``{tool_name, result}`` items (the shape
     :func:`soc_ai.api.hunt_runner._stream_node` now gathers). Items whose
@@ -299,24 +336,36 @@ def _corroborating_evidence_text(tool_results: list[Any]) -> str:
         else:
             # Un-labeled / legacy item: not a known alert-query tool → corroborating.
             corroborating.append(item)
-    return _gathered_evidence_text(corroborating)
+    return corroborating
 
 
-def _has_corroborating_citation(citations: list[str], corroborating_text: str) -> bool:
+def _corroborating_evidence_text(tool_results: list[Any]) -> str:
+    """Lower-cased JSON dump of ONLY the corroborating (non-alert) tool results
+    (see :func:`_corroborating_results` for the partition rules)."""
+    return _gathered_evidence_text(_corroborating_results(tool_results))
+
+
+def _has_corroborating_citation(
+    citations: list[str], corroborating_text: str, corroborating_ids: frozenset[str]
+) -> bool:
     """True iff ANY citation resolves into a NON-alert (corroborating) tool result.
 
-    Uses the same distinctive-token resolver as citation resolution, but against
-    ``corroborating_text`` — the JSON dump of only the non-alert tool results (see
-    :func:`_corroborating_evidence_text`). This is what a high/critical THREAT
-    finding must satisfy: at least one piece of support that looked BEYOND the
-    detector alert that raised the claim.
+    Uses the same two-tier resolver as citation resolution, but against the
+    corroborating subset only — ``corroborating_text`` (the JSON dump of the
+    non-alert tool results) for value-shaped citations, ``corroborating_ids``
+    (the identity set collected from those same results) for id-shaped ones, so
+    an alert doc's id can resolve without corroborating. This is what a
+    high/critical THREAT finding must satisfy: at least one piece of support
+    that looked BEYOND the detector alert that raised the claim.
     """
-    if not corroborating_text:
+    if not corroborating_text and not corroborating_ids:
         return False
-    return any(_citation_resolves(c, corroborating_text) for c in citations)
+    return any(_citation_resolves(c, corroborating_text, corroborating_ids) for c in citations)
 
 
-def _resolve_finding_citations(citations: list[str], evidence_text: str) -> tuple[list[str], float]:
+def _resolve_finding_citations(
+    citations: list[str], evidence_text: str, retrieved_ids: frozenset[str]
+) -> tuple[list[str], float]:
     """Return (resolved_citations, coverage_ratio) for one finding's citations.
 
     ``coverage_ratio`` = resolved / total; an empty citation list is vacuously
@@ -325,7 +374,7 @@ def _resolve_finding_citations(citations: list[str], evidence_text: str) -> tupl
     """
     if not citations:
         return [], 1.0
-    resolved = [c for c in citations if _citation_resolves(c, evidence_text)]
+    resolved = [c for c in citations if _citation_resolves(c, evidence_text, retrieved_ids)]
     return resolved, len(resolved) / len(citations)
 
 
@@ -366,10 +415,17 @@ def _validate_hunt_findings(
     ``{findings, findings_capped, citations_total, citations_stripped}``.
     """
     evidence_text = _gathered_evidence_text(tool_results)
+    # Evidence set for id-shaped citations (M2): the document ids and typed
+    # values the hunt actually retrieved, collected from payload STRUCTURE —
+    # never dumped text.
+    retrieved_ids = _gathered_evidence_tokens(tool_results)
     # The corroboration subset: only NON-alert tool results. A high/critical
     # threat finding must cite at least one item resolving into THIS, or the
-    # claim rests solely on the detector alert that raised it. Computed once.
-    corroborating_text = _corroborating_evidence_text(tool_results)
+    # claim rests solely on the detector alert that raised it. Computed once,
+    # with its own (narrower) identity set for id-shaped citations.
+    corroborating = _corroborating_results(tool_results)
+    corroborating_text = _gathered_evidence_text(corroborating)
+    corroborating_ids = _gathered_evidence_tokens(corroborating)
     validated: list[Any] = []
     counts = {
         "findings": len(findings),
@@ -410,7 +466,7 @@ def _validate_hunt_findings(
                 validated.append(finding)
             continue
 
-        resolved, coverage = _resolve_finding_citations(citations, evidence_text)
+        resolved, coverage = _resolve_finding_citations(citations, evidence_text, retrieved_ids)
 
         if coverage == 0.0:
             # None of the finding's citations resolve to gathered evidence:
@@ -433,14 +489,18 @@ def _validate_hunt_findings(
             counts["citations_stripped"] += len(citations) - len(resolved)
             grounded = finding.model_copy(update={"citations": resolved})
             validated.append(
-                _apply_corroboration_cap(grounded, resolved, corroborating_text, counts)
+                _apply_corroboration_cap(
+                    grounded, resolved, corroborating_text, corroborating_ids, counts
+                )
             )
         else:
             # Fully grounded — but a high/critical threat must still corroborate
             # beyond the detector alert (the E1.3 pass above only proved the
             # cited ids EXIST, not that they look past the alert).
             validated.append(
-                _apply_corroboration_cap(finding, resolved, corroborating_text, counts)
+                _apply_corroboration_cap(
+                    finding, resolved, corroborating_text, corroborating_ids, counts
+                )
             )
 
     return validated, counts
@@ -450,6 +510,7 @@ def _apply_corroboration_cap(
     finding: Any,
     resolved_citations: list[str],
     corroborating_text: str,
+    corroborating_ids: frozenset[str],
     counts: dict[str, int],
 ) -> Any:
     """Cap a high/critical THREAT finding that cites only detector alerts.
@@ -468,7 +529,7 @@ def _apply_corroboration_cap(
     severity = str(getattr(finding, "severity", None) or "info")
     if category in _NON_THREAT_CATEGORIES or _SEV_RANK.get(severity.lower(), 0) < _SEV_RANK["high"]:
         return finding
-    if _has_corroborating_citation(resolved_citations, corroborating_text):
+    if _has_corroborating_citation(resolved_citations, corroborating_text, corroborating_ids):
         return finding  # grounded in evidence beyond the detector alert
     counts["findings_capped"] += 1
     return finding.model_copy(
@@ -507,6 +568,9 @@ def _validate_hunt_charts(
     ``{charts, charts_dropped}``.
     """
     evidence_text = _gathered_evidence_text(tool_results)
+    # Same two-tier resolver as findings (M2): id-shaped source_citations must
+    # name evidence the hunt actually retrieved, not a token in dumped text.
+    retrieved_ids = _gathered_evidence_tokens(tool_results)
     kept: list[Any] = []
     counts = {"charts": len(charts), "charts_dropped": 0}
 
@@ -517,7 +581,7 @@ def _validate_hunt_charts(
         if not series or not citations or len(kept) >= _MAX_CHARTS:
             counts["charts_dropped"] += 1
             continue
-        if not any(_citation_resolves(c, evidence_text) for c in citations):
+        if not any(_citation_resolves(c, evidence_text, retrieved_ids) for c in citations):
             counts["charts_dropped"] += 1
             continue
         # Same deterministic title clamp as findings — only for kept charts.

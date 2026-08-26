@@ -35,6 +35,7 @@ from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.api.webui_api import resolve_alert_for_hunt
 from soc_ai.config import Settings
+from soc_ai.demo.guard import is_demo
 from soc_ai.demo.replay import find_replay, replay_recorded_run
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import investigations as inv_svc
@@ -74,10 +75,29 @@ async def healthz(
     )
 
 
+async def _refuse_metrics_in_demo(request: Request) -> None:
+    """Demo-mode refusal for ``/metrics`` — the operational-telemetry mirror of
+    :func:`soc_ai.api.webui._shared.require_admin_api`'s demo branch.
+
+    The public demo runs ``API_AUTH_REQUIRED=false``, so ``require_api_auth``
+    returns early and, without this branch, ``/metrics`` answers anonymously
+    (version, uptime, request/token counters) while every admin-ish read
+    (users, config, danger zone) 403s. Outside demo mode nothing changes: the
+    auth-off dev posture keeps ``/metrics`` open, and with auth on any
+    authenticated caller (session or bearer token — the Prometheus scrape
+    credential) still reads it.
+    """
+    if is_demo(request.app.state.settings):
+        raise HTTPException(
+            status_code=403,
+            detail={"reason": "demo_mode", "hint": "Demo — operational metrics are disabled."},
+        )
+
+
 @router.get(
     "/metrics",
     response_class=PlainTextResponse,
-    dependencies=[Depends(require_api_auth)],
+    dependencies=[Depends(require_api_auth), Depends(_refuse_metrics_in_demo)],
 )
 async def metrics_endpoint() -> str:
     """Prometheus 0.0.4 plain-text exposition.
@@ -162,6 +182,18 @@ async def investigate_endpoint(
 
         return EventSourceResponse(demo_stream())
 
+    # Hunt-anchor guard: this route never goes through HuntManager (whose
+    # kind-keyed force-off protects the promotion path), so re-investigating a
+    # promoted finding's ANCHOR document lands a kind='suricata' row that would
+    # otherwise run with the orchestrator default allow_so_writes=True — and
+    # auto-ack cited telemetry that has no SO alert behind it. Key the guard off
+    # the anchor document itself: once any hunt-kind investigation anchors this
+    # id, every later run over it keeps SO writes off. Ordinary alerts keep the
+    # default (True) — a plain re-investigation still auto-acks as configured.
+    async with request.app.state.db_sessionmaker() as db:
+        anchors_a_hunt = bool(await inv_svc.hunt_anchor_ids(db, [req.alert_id]))
+    allow_so_writes = not anchors_a_hunt
+
     # Resolve the rule name up front so the investigation row is named at creation
     # — a run that dies before its first alert_context event (e.g. an ES prefetch
     # error) must not leave a nameless "Alert <id>…" row. Best-effort: a resolution
@@ -177,7 +209,7 @@ async def investigate_endpoint(
 
     async def stream() -> Any:
         # `investigate` stays a routes-module binding so tests can patch it.
-        event_gen = investigate(req.alert_id, ctx=ctx)
+        event_gen = investigate(req.alert_id, ctx=ctx, allow_so_writes=allow_so_writes)
         async for name, data in recorded_run(
             request.app.state,
             alert_id=req.alert_id,

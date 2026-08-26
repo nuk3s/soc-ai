@@ -100,6 +100,50 @@ _UNC_HOST_RE = re.compile(r"(?<![\w\\])\\\\([A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A
 # already-redacted value on a second pass over the Windows-path rules.
 _LABEL_FULLMATCH_RE = re.compile(r"(?:USER|HOST|IP|MAC|EMAIL)_\d+")
 
+# Pre-existing label-shaped tokens in UNTRUSTED input (2026-08-25 audit, L3):
+# an attacker who plants ``IP_01`` in a telemetry field collides with this
+# module's own allocation namespace — ``desanitize`` would then splice the
+# REAL value behind the allocated ``IP_01`` into the attacker's string (e.g.
+# ``IP_01.attacker.example`` → ``10.x.y.z.attacker.example``) in locally
+# stored/exported artifacts. ``_reserve_planted_labels`` scans for any such
+# token the current mapping did NOT allocate and RESERVES its index (bumping
+# the category counter past it) BEFORE any allocation rule runs: the mapping
+# can then never mint that label for a real value, so the planted token stays
+# textually intact but permanently absent from ``mapping.reverse`` — inert at
+# ``desanitize``, which only replaces labels the mapping allocated. This is
+# deliberately a reservation, NOT a rewrite (the wave-3 ``IP_01`` → ``IP-01``
+# defusal): rewriting mangled ALREADY-LABELLED text re-sanitized under a
+# FRESH mapping (the Oracle/eval ``sanitize_case`` path over pre-redacted
+# corpus data — ``USER_01`` → ``USER-01``), corrupting labels the earlier
+# pass legitimately allocated. With reservation, pre-labelled text is
+# byte-stable under ANY mapping — same-mapping replay (labels are in
+# ``reverse`` → exempt) and fresh-mapping re-sanitize (labels reserved,
+# untouched) alike. Residual window (accepted, unchanged from wave 3): a
+# planted token arriving AFTER the same label was genuinely allocated is
+# textually indistinguishable from that label and passes through.
+_PLANTED_LABEL_RE = re.compile(r"(?<!\w)(USER|HOST|IP|MAC|EMAIL)_(\d+)(?!\w)")
+
+# An index wider than this can never be reached by real allocation (payloads
+# are bounded), so it needs no reservation — and skipping it keeps a hostile
+# thousand-digit index away from int() (CPython's int/str conversion limit).
+_MAX_RESERVED_LABEL_DIGITS = 7
+
+
+def _reserve_planted_labels(text: str, mapping: Mapping) -> None:
+    """Reserve the index of every label-shaped token *this mapping did not
+    allocate* so no later allocation can collide with it (see the note above).
+    Scan-only: the text itself is never modified."""
+    for match in _PLANTED_LABEL_RE.finditer(text):
+        if match.group(0) in mapping.reverse:
+            continue  # this mapping's own label — legitimate, nothing to do
+        digits = match.group(2)
+        if len(digits) > _MAX_RESERVED_LABEL_DIGITS:
+            continue  # unreachable by real allocation; also int()-safe
+        category, idx = match.group(1), int(digits)
+        if idx > mapping.counters.get(category, 0):
+            mapping.counters[category] = idx
+
+
 # Well-known Windows profile folders / universal built-in accounts that are NOT
 # user-identifying — never redact these (mirrors the credential rule's built-in
 # stopset; the Oracle benefits from seeing e.g. the common ``C:\Users\Public``
@@ -229,6 +273,13 @@ def _sanitize_str(
     # --- Park allowlisted tokens (replace original with placeholder) -----
     for original, ph in orig_to_ph.items():
         text = re.sub(rf"(?<!\w){re.escape(original)}(?!\w)", ph, text)
+
+    # 0. Reserve the indices of PLANTED / pre-existing label-shaped tokens
+    # (IP_01 …) the mapping did not allocate, BEFORE any rule below can
+    # allocate a colliding label — an inbound-integrity guard, not a
+    # redaction rule (audit L3). The text is not modified: an unallocated
+    # label is inert at desanitize, and the reservation keeps it that way.
+    _reserve_planted_labels(text, mapping)
 
     # 1. IPv4 (private only)
     def _v4(m: re.Match[str]) -> str:

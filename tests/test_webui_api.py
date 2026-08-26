@@ -4483,7 +4483,14 @@ def test_toggle_disabled_bearer_token_caller_rejected_by_admin_gate(
 
 
 def test_reset_password_returns_password(client: TestClient) -> None:
-    """POST /config/users/{id}/reset-password returns ok=True and a non-empty new password."""
+    """POST /config/users/{id}/reset-password returns ok=True and a non-empty new password.
+
+    Since the 2026-08-25 audit (L7) the reset requires a real authenticated
+    SESSION user even in the auth-off dev posture — mirroring /config/tokens'
+    no_session_user refusal — so an anonymous caller can no longer mint a
+    plaintext credential that survives a later flip back to auth-on. The
+    legitimate flow (a logged-in user's session) still returns the password.
+    """
     client.post(
         "/api/v1/config/users",
         json={"username": "eve", "password": "longpassword1", "role": "analyst"},
@@ -4491,8 +4498,19 @@ def test_reset_password_returns_password(client: TestClient) -> None:
     users = client.get("/api/v1/config/users").json()["users"]
     uid = next(u["id"] for u in users if u["username"] == "eve")
 
+    # Anonymous (no session): refused, no plaintext in the response.
     resp = client.post(f"/api/v1/config/users/{uid}/reset-password")
-    assert resp.status_code == 200
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "no_session_user"
+
+    # A real session user resets and receives the fresh password once.
+    login = client.post("/api/v1/login", json={"username": "eve", "password": "longpassword1"})
+    assert login.status_code == 200, login.text
+    resp = client.post(
+        f"/api/v1/config/users/{uid}/reset-password",
+        headers={"Origin": "http://testserver"},
+    )
+    assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["ok"] is True
     assert isinstance(data["password"], str)

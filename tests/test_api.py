@@ -37,6 +37,7 @@ def app_with_test_model(
         *,
         ctx: Any,
         focus_hint: str | None = None,
+        allow_so_writes: bool = True,  # the route now always threads this (L2 hunt-anchor guard)
     ) -> AsyncIterator[StepEvent]:
         sid = "fake-sid"
         report = TriageReport(

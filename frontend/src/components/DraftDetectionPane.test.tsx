@@ -58,6 +58,36 @@ describe('DraftDetectionPane — autoRun explainer (F20)', () => {
   });
 });
 
+describe('DraftDetectionPane — the measured OQL is shown (2026-08-25 security audit, FIX 3)', () => {
+  it('renders the OQL the would-have-fired count actually measured, labelled as such', async () => {
+    const draft = sigmaDraft();
+    render(<DraftDetectionPane autoRun onDraft={() => Promise.resolve(draft)} />);
+
+    expect(await screen.findByText(/would have fired 4×/i)).toBeTruthy();
+    // The one artifact that exposes Sigma/OQL divergence: the query itself.
+    expect(screen.getByText(draft.oql)).toBeTruthy();
+    // Labelled so the analyst knows THIS produced the count.
+    expect(screen.getByText(/measured by this oql/i)).toBeTruthy();
+  });
+
+  it('still shows the OQL when the dry run could not run — the analyst sees what WOULD have been measured', async () => {
+    const draft = sigmaDraft({
+      dry_run: {
+        ran: false,
+        hit_count: 0,
+        total_is_lower_bound: false,
+        sample_ids: [],
+        window_days: 30,
+        error: 'grid unavailable',
+      },
+    });
+    render(<DraftDetectionPane autoRun onDraft={() => Promise.resolve(draft)} />);
+
+    expect(await screen.findByText(/dry run couldn't run/i)).toBeTruthy();
+    expect(screen.getByText(draft.oql)).toBeTruthy();
+  });
+});
+
 describe('DraftDetectionPane — stale-edit honesty (F4) + structure label (F6)', () => {
   it('relabels the badge, cites the OQL twin for the dry-run count, and withdraws both once the YAML is edited', async () => {
     render(<DraftDetectionPane autoRun onDraft={() => Promise.resolve(sigmaDraft())} />);

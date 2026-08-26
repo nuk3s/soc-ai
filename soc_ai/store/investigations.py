@@ -580,6 +580,28 @@ async def latest_for_finding(
     return rows.first()
 
 
+async def hunt_anchor_ids(db: AsyncSession, alert_ids: Sequence[str]) -> set[str]:
+    """Subset of *alert_ids* that anchor at least one ``kind='hunt'`` investigation.
+
+    A promoted hunt finding's ``alert_es_id`` is a cited telemetry document,
+    not a Security Onion alert — there is nothing in SO to ack/escalate, ever.
+    The SO-write guards key off THIS check (the anchor document itself) rather
+    than a row's own ``kind``, so a fresh non-hunt investigation opened over
+    the same anchor (a re-investigation via ``POST /investigate``) cannot
+    launder the document past the hunt-kind refusal.
+    """
+    ids = [i for i in alert_ids if i]
+    if not ids:
+        return set()
+    rows = await db.scalars(
+        select(Investigation.alert_es_id).where(
+            Investigation.kind == "hunt",
+            Investigation.alert_es_id.in_(ids),
+        )
+    )
+    return set(rows.all())
+
+
 async def latest_per_finding(db: AsyncSession, hunt_id: str) -> dict[int, Investigation]:
     """Newest investigation per promoted finding of one hunt — the hunt page's
     per-card promotion state. One indexed query; first row seen per ordinal

@@ -66,6 +66,19 @@ async def api_login(body: LoginIn, request: Request) -> JSONResponse:
                 detail={"reason": "invalid_credentials", "hint": "Invalid username or password"},
             )
         throttle.clear(caller_ip, body.username)
+        # Also FULLY drain the per-IP spray bucket. That bucket aggregates every
+        # failure from this apparent source across all usernames — behind one NAT
+        # egress (or with proxy_trusted_ips unset behind a reverse proxy, which
+        # collapses every client to the proxy's socket IP) that is a whole SOC's
+        # worth of teammates' typos, and without the drain it only ever grows
+        # until a VALID credential is refused 429 for the cooldown. A successful
+        # login is proof this source is a legitimate egress, so a full clear (not
+        # a decrement) is right: a decrement still locks the shared IP whenever
+        # typos merely outpace logins inside one window, while the spray defence
+        # loses nothing — the per-(ip,username) throttle above independently caps
+        # guessing per account, and a source that only ever fails (a real spray
+        # bot) never reaches this line to clear anything.
+        ip_throttle.clear(caller_ip, "")
         raw = await auth_svc.create_session(db, user, settings.session_ttl_hours)
     resp = JSONResponse({"ok": True, "username": user.username, "role": user.role})
     resp.set_cookie(

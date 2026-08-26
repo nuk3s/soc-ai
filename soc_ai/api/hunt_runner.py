@@ -75,22 +75,35 @@ async def _build_hunt_run(
     # before it plans what to look for. Composed HERE, above the sanitize sweep
     # below — appending it after the sweep would send the network's hostnames and
     # addresses to a cloud model in the clear.
+    inventory = await inventory_prompt_block(ctx.elastic, ctx.settings)
+    dossier = await _objective_dossier_block(ctx, objective, prior)
     system_prompt = (
         HUNT_SYSTEM_PROMPT.format(objective=objective)
         + oql_primer_block(flavor="hunt")
-        + await inventory_prompt_block(ctx.elastic, ctx.settings)
-        + await _objective_dossier_block(ctx, objective, prior)
+        + inventory
+        + dossier
     )
+    user_msg = build_hunt_prompt(objective, prior=prior)
     if guard is not None:
         # The objective is analyst-typed free text that may name internal
         # hosts, and the inventory block carries grid dataset detail.
         system_prompt = guard.sanitize_text(system_prompt)
+        user_msg = guard.sanitize_text(user_msg)
+        # Independent fail-closed residue sweep, on the DYNAMIC (untrusted)
+        # fragments only: the objective + prior (user_msg carries both), the
+        # grid inventory, and the dossier block. The STATIC prompt text is
+        # deliberately outside the sweep — the OQL primer's worked examples
+        # (`workstation-01`) and the system template's own prose (`DC-attack`)
+        # are residue-shaped by construction, and sweeping them would fail-close
+        # every hunt on version-controlled repo text that carries no deployment
+        # data. Fragments are re-sanitized against the run's shared mapping, so
+        # labels match what the composed prompt egresses.
+        fail_closed = ctx.settings.analyst_redaction_fail_closed
+        for fragment in (user_msg, guard.sanitize_text(inventory), guard.sanitize_text(dossier)):
+            guard.check_or_raise(fragment, fail_closed=fail_closed)
     agent = build_hunt_agent(
         build_investigator_model(ctx.settings), ctx, system_prompt=system_prompt
     )
-    user_msg = build_hunt_prompt(objective, prior=prior)
-    if guard is not None:
-        user_msg = guard.sanitize_text(user_msg)
     return guard, agent, user_msg
 
 
@@ -180,11 +193,34 @@ async def _synthesize_partial_hunt(
     :func:`_replay_reasoning_context` and prepended to the synthesizer's user
     message — otherwise only the loud alert titles survive and the write-up
     reasserts an FP the hunt had already dismissed.
+
+    This is an analyst-model EGRESS site like any other: the main hunt agent
+    runs in label space, and the synthesizer must too. When ``ctx`` carries a
+    guard, the objective (raw analyst free text — it rides the synth
+    instructions) and the composed user message are sanitized with the run's
+    shared mapping and swept fail-closed BEFORE the model call; the replayed
+    transcript is already label-space (``_stream_node`` gathers the sanitized
+    node messages). The caller desanitizes the labeled report via
+    :func:`_desanitize_hunt_report`, exactly as on the full-run path.
     """
-    synth = build_hunt_synthesizer(build_investigator_model(ctx.settings), objective=objective)
+    guard = ctx.egress_guard
     reasoning_block = _replay_reasoning_context(gathered)
     user_msg = (
         reasoning_block + "Write the HuntReport now from the evidence already gathered above."
+    )
+    synth_objective = objective
+    if guard is not None:
+        fail_closed = ctx.settings.analyst_redaction_fail_closed
+        synth_objective = guard.sanitize_text(objective)
+        user_msg = guard.sanitize_text(user_msg)
+        # The independent residue sweep covers the two DYNAMIC fragments of the
+        # composed prompt (the surrounding HUNT_SYNTH_PROMPT template is static
+        # repo text carrying no deployment data — same sweep boundary as
+        # ``_build_hunt_run``).
+        guard.check_or_raise(synth_objective, fail_closed=fail_closed)
+        guard.check_or_raise(user_msg, fail_closed=fail_closed)
+    synth = build_hunt_synthesizer(
+        build_investigator_model(ctx.settings), objective=synth_objective
     )
     return await synth.run(
         user_msg,

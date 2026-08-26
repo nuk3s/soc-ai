@@ -242,6 +242,21 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                   </div>
                 )}
 
+                {/* The query the dry run actually measured (2026-08-25 security
+                    audit, FIX 3): without it the analyst cannot see whether the
+                    would-have-fired count and the exported Sigma describe the
+                    same logic. Read-only by design — edits belong in the YAML. */}
+                {draft.oql && (
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[11.5px] font-semibold uppercase tracking-[.05em] text-faint">
+                      Measured by this OQL query (read-only)
+                    </span>
+                    <code className="block w-full overflow-x-auto whitespace-pre-wrap break-all rounded-card border border-border bg-surface-2 px-2.5 py-2 font-mono text-[11.5px] leading-[1.5] text-text-2">
+                      {draft.oql}
+                    </code>
+                  </div>
+                )}
+
                 <label className="flex flex-col gap-1.5">
                   <span className="text-[11.5px] font-semibold uppercase tracking-[.05em] text-faint">
                     Sigma rule (YAML) — edit before export

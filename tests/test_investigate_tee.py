@@ -81,6 +81,7 @@ def tee_client(tee_settings: Settings) -> Iterator[TestClient]:
         *,
         ctx: Any,
         focus_hint: str | None = None,
+        allow_so_writes: bool = True,  # the route now always threads this (L2 hunt-anchor guard)
     ) -> AsyncIterator[StepEvent]:
         sid = "fake-tee-sid"
         # The live synth-first path emits enriched_alert_context (EnrichedAlertContext
@@ -156,6 +157,7 @@ def crash_client(tee_settings: Settings) -> Iterator[TestClient]:
         *,
         ctx: Any,
         focus_hint: str | None = None,
+        allow_so_writes: bool = True,  # the route now always threads this (L2 hunt-anchor guard)
     ) -> AsyncIterator[StepEvent]:
         sid = "fake-crash-sid"
         yield StepEvent(
@@ -284,6 +286,7 @@ def test_tee_complete_without_report_stores_error(tee_settings: Settings) -> Non
         *,
         ctx: Any,
         focus_hint: str | None = None,
+        allow_so_writes: bool = True,  # the route now always threads this (L2 hunt-anchor guard)
     ) -> AsyncIterator[StepEvent]:
         sid = "fake-noreport-sid"
         yield StepEvent(

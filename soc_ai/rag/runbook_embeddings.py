@@ -28,6 +28,17 @@ Gateway calls raise :class:`RagGatewayError` (a single catchable class wrapping
 HTTP/transport/shape failures); CALLERS decide the failure posture — write
 paths and ``search()`` swallow it (fail-soft), the re-embed endpoint reports it
 as failed counts.
+
+Egress redaction: the gateway may be a CLOUD provider, so this tier honours
+``analyst_cloud_redaction`` exactly like every other analyst-model call site.
+:func:`embed_texts` and :func:`rerank_scores` — the module's ONLY two egress
+functions — sanitize every outbound string through an
+:class:`~soc_ai.agent.egress_guard.EgressGuard` and run the independent
+fail-closed residue sweep before any bytes leave. Callers with a DB session in
+hand thread a guard built over the deployment's EFFECTIVE identifier set (via
+:func:`rag_egress_guard`); when none is threaded the egress functions build an
+env-floor guard themselves, so no caller can forget the boundary. Nothing is
+desanitized on the way back — the responses are vectors and scores, not text.
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from soc_ai.agent.egress_guard import EgressGuard
     from soc_ai.config import Settings
 
 _LOGGER = logging.getLogger(__name__)
@@ -110,6 +122,70 @@ def _runbook_text(runbook: Runbook) -> str:
 # ── Gateway calls (the ONLY egress in this module — both to litellm_base_url) ─
 
 
+async def rag_egress_guard(db: AsyncSession | None, settings: Settings) -> EgressGuard | None:
+    """The cloud-egress guard for this tier's gateway calls; ``None`` = off.
+
+    ``is True`` (not truthiness) so a non-Settings test double can never flip
+    redaction on — the same guard-rail every other egress site uses. With a
+    session in hand, the guard covers the deployment's EFFECTIVE identifier set
+    (env config unioned with DB-discovered identifiers), mirroring the
+    runbook-promotion builder; on any DB trouble — or with no session — it
+    falls back to the env-config floor via
+    :meth:`~soc_ai.agent.egress_guard.EgressGuard.for_settings`.
+
+    A fresh guard per call is correct here: nothing this tier receives back is
+    text (vectors and scores carry no labels to restore), so mapping stability
+    with the agent run's guard buys nothing.
+    """
+    if settings.analyst_cloud_redaction is not True:
+        return None
+    # Local imports: soc_ai.agent's package __init__ pulls the orchestrator, and
+    # soc_ai.store.runbooks imports this module at module scope — importing the
+    # guard lazily keeps that cycle broken (same idiom as lookup_runbook).
+    from soc_ai.agent.egress_guard import EgressGuard  # noqa: PLC0415
+
+    if db is not None:
+        try:
+            from soc_ai.oracle.identifiers import (  # noqa: PLC0415
+                effective_internal_identifiers,
+            )
+
+            effective = await effective_internal_identifiers(db, settings)
+            return EgressGuard(extra_hosts=effective.hosts, extra_suffixes=effective.suffixes)
+        except Exception:
+            _LOGGER.warning(
+                "rag: effective-identifier resolution failed; falling back to "
+                "env-config hosts/suffixes",
+                exc_info=True,
+            )
+    return await EgressGuard.for_settings(settings)
+
+
+async def _guarded_texts(
+    texts: list[str], *, settings: Settings, guard: EgressGuard | None
+) -> list[str]:
+    """Sanitize + fail-closed-sweep *texts* for egress; raw when redaction is off.
+
+    The shared outbound boundary for :func:`embed_texts` and
+    :func:`rerank_scores`. When no guard was threaded, one is built here
+    (env-floor) so a caller that forgot cannot egress raw identifiers. Raises
+    :class:`~soc_ai.agent.egress_guard.EgressResidueError` when fail-closed
+    redaction is on and an identifier survived sanitization — before any bytes
+    leave the process.
+    """
+    if guard is None:
+        guard = await rag_egress_guard(None, settings)
+    if guard is None:
+        return texts
+    fail_closed = settings.analyst_redaction_fail_closed is True
+    out: list[str] = []
+    for text in texts:
+        clean = guard.sanitize_text(text)
+        guard.check_or_raise(clean, fail_closed=fail_closed)
+        out.append(clean)
+    return out
+
+
 def _gateway(settings: Settings) -> tuple[str, dict[str, str], bool]:
     """(base_url, auth headers, verify) — mirrors the probes.py gateway wiring
     so the semantic tier reaches exactly the host the analyst model uses."""
@@ -123,14 +199,24 @@ def _gateway(settings: Settings) -> tuple[str, dict[str, str], bool]:
     return base, headers, verify
 
 
-async def embed_texts(texts: list[str], *, settings: Settings) -> list[list[float]]:
+async def embed_texts(
+    texts: list[str], *, settings: Settings, guard: EgressGuard | None = None
+) -> list[list[float]]:
     """Embed *texts* via ``POST {gateway}/v1/embeddings`` (OpenAI shape).
 
     Returns one vector per input, in input order (the response's ``index``
     field is honoured, not the array order). Raises :class:`RagGatewayError`
     on any HTTP/transport/shape failure — callers pick the fail-soft posture.
+
+    With ``analyst_cloud_redaction`` on, *texts* are sanitized (and swept
+    fail-closed) via *guard* — or a guard built here when none is threaded —
+    before they leave for the gateway;
+    :class:`~soc_ai.agent.egress_guard.EgressResidueError` propagates distinctly
+    from :class:`RagGatewayError` so a redaction block is never mistaken for a
+    gateway outage.
     """
     assert_egress_allowed(settings, "embeddings")
+    texts = await _guarded_texts(texts, settings=settings, guard=guard)
     base, headers, verify = _gateway(settings)
     payload = {"model": settings.rag_embed_model, "input": texts}
     try:
@@ -151,14 +237,26 @@ async def embed_texts(texts: list[str], *, settings: Settings) -> list[list[floa
     return vectors
 
 
-async def rerank_scores(query: str, documents: list[str], *, settings: Settings) -> list[float]:
+async def rerank_scores(
+    query: str,
+    documents: list[str],
+    *,
+    settings: Settings,
+    guard: EgressGuard | None = None,
+) -> list[float]:
     """Score *documents* against *query* via ``POST {gateway}/rerank`` (Cohere shape).
 
     Returns one relevance score per document, in DOCUMENT order (a document the
     endpoint omits scores 0.0). Raises :class:`RagGatewayError` on failure —
     ``search()`` catches it and keeps the pre-rerank merged order (fail-soft).
+
+    Same egress redaction as :func:`embed_texts`: with
+    ``analyst_cloud_redaction`` on, the query and every document are sanitized
+    and swept before any bytes leave for the gateway.
     """
     assert_egress_allowed(settings, "embeddings")
+    guarded = await _guarded_texts([query, *documents], settings=settings, guard=guard)
+    query, documents = guarded[0], guarded[1:]
     base, headers, verify = _gateway(settings)
     payload = {
         "model": settings.rag_rerank_model,
@@ -193,7 +291,8 @@ async def embed_runbook(db: AsyncSession, runbook: Runbook, *, settings: Setting
     Raises :class:`RagGatewayError` on gateway failure — use
     :func:`embed_runbook_safe` on write paths that must not fail the write.
     """
-    vec = (await embed_texts([_runbook_text(runbook)], settings=settings))[0]
+    guard = await rag_egress_guard(db, settings)
+    vec = (await embed_texts([_runbook_text(runbook)], settings=settings, guard=guard))[0]
     row = await db.get(RunbookEmbedding, runbook.id)
     if row is None:
         db.add(
@@ -224,10 +323,15 @@ async def embed_runbook_safe(db: AsyncSession, runbook: Runbook, *, settings: Se
     """
     if not settings.rag_embed_model:
         return False
+    from soc_ai.agent.egress_guard import EgressResidueError  # noqa: PLC0415 - import cycle
+
     runbook_id = runbook.id  # captured up front — never triggers a lazy load later
     try:
         await embed_runbook(db, runbook, settings=settings)
-    except RagGatewayError as exc:
+    except (RagGatewayError, EgressResidueError) as exc:
+        # EgressResidueError = fail-closed redaction refused the outbound text;
+        # like a gateway outage, it must never fail the SAVE — the row simply
+        # stays unembedded. The exception string names a count, never a value.
         _LOGGER.warning("runbook %s embedding skipped (fail-soft): %s", runbook_id, exc)
         return False
     return True
@@ -261,9 +365,16 @@ async def reembed_missing(db: AsyncSession, *, settings: Settings) -> dict[str, 
     if not pending:
         return {"total": len(runbooks), "embedded": 0, "skipped": skipped, "failed": 0}
 
+    from soc_ai.agent.egress_guard import EgressResidueError  # noqa: PLC0415 - import cycle
+
     try:
-        vectors = await embed_texts([_runbook_text(rb) for rb in pending], settings=settings)
-    except RagGatewayError as exc:
+        guard = await rag_egress_guard(db, settings)
+        vectors = await embed_texts(
+            [_runbook_text(rb) for rb in pending], settings=settings, guard=guard
+        )
+    except (RagGatewayError, EgressResidueError) as exc:
+        # A redaction block reports as failed counts exactly like an outage —
+        # honest numbers, and the exception string never carries a value.
         _LOGGER.warning("re-embed failed at the gateway: %s", exc)
         return {
             "total": len(runbooks),
@@ -297,7 +408,12 @@ async def reembed_missing(db: AsyncSession, *, settings: Settings) -> dict[str, 
 
 
 async def semantic_search(
-    db: AsyncSession, query: str, *, settings: Settings, k: int = 5
+    db: AsyncSession,
+    query: str,
+    *,
+    settings: Settings,
+    k: int = 5,
+    guard: EgressGuard | None = None,
 ) -> list[tuple[Runbook, float]]:
     """Top-``k`` runbooks by cosine similarity between *query* and stored vectors.
 
@@ -313,6 +429,10 @@ async def semantic_search(
     prompt" guarantee as the FTS/legacy/rule-link tiers in
     :func:`soc_ai.store.runbooks.search`, even if a draft somehow acquired a
     vector (e.g. it was edited through a write path that embeds).
+
+    ``guard`` lets ``search()`` thread one effective-set egress guard across
+    the semantic + rerank calls of a single retrieval; when ``None`` and
+    redaction is on, one is built here from the session.
     """
     if k <= 0 or not query.strip() or not settings.rag_embed_model:
         return []
@@ -330,7 +450,11 @@ async def semantic_search(
     if not usable:
         return []
 
-    query_vec = (await embed_texts([query], settings=settings))[0]
+    if guard is None:
+        # No caller-threaded guard: build one over the effective identifier
+        # set (the session is right here). ``None`` when redaction is off.
+        guard = await rag_egress_guard(db, settings)
+    query_vec = (await embed_texts([query], settings=settings, guard=guard))[0]
     scored = [
         (rb, cosine(query_vec, bytes_to_vector(emb.vector)))
         for rb, emb in usable

@@ -2125,7 +2125,12 @@ def test_validate_hunt_findings_high_threat_with_corroboration_stays_high() -> N
             severity="high",
             category="threat",
             hosts=["10.0.0.5"],
-            citations=["sALERT_DOC_7Zk", "sPCAP_EVIDENCE_9Qm"],
+            # An id citation naming the retrieved alert doc, plus a VALUE-shaped
+            # citation into the pcap facts. (M2, 2026-08-25 audit: an id-shaped
+            # citation resolves only as a retrieved DOCUMENT id — the old
+            # fixture's "sPCAP_EVIDENCE_9Qm" marker resolved by substring into
+            # arbitrary result content, the exact forgeable behavior removed.)
+            citations=["sALERT_DOC_7Zk", "pcap beacon interval_s=60 jitter 0.02"],
         )
     ]
     tool_results = [
@@ -2135,7 +2140,7 @@ def test_validate_hunt_findings_high_threat_with_corroboration_stays_high() -> N
         ),
         _labeled(
             "t_get_pcap",
-            {"beacon": {"interval_s": 60, "jitter": 0.02}, "marker": "sPCAP_EVIDENCE_9Qm"},
+            {"beacon": {"interval_s": 60, "jitter": 0.02}},
         ),
     ]
 
@@ -2566,7 +2571,10 @@ def test_run_hunt_full_run_report_not_clamped(settings_kratos: Settings) -> None
 
     from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
 
-    real_id = "sPCAP_EVIDENCE_9Qm"
+    # A VALUE-shaped citation into the streamed pcap facts (M2, 2026-08-25
+    # audit: an id-shaped citation resolves only as a retrieved DOCUMENT id, so
+    # the old fixture's bare "sPCAP_EVIDENCE_9Qm" marker token no longer
+    # resolves — the corroboration this test needs is the measured value).
     report = HuntReport(
         findings=[
             HuntFinding(
@@ -2574,7 +2582,7 @@ def test_run_hunt_full_run_report_not_clamped(settings_kratos: Settings) -> None
                 detail="Measured 60s cadence in the pcap.",
                 severity="high",
                 category="threat",
-                citations=[real_id],
+                citations=["pcap beacon interval_s=60"],
             )
         ],
         narrative="A confirmed beacon.",
@@ -2597,7 +2605,7 @@ def test_run_hunt_full_run_report_not_clamped(settings_kratos: Settings) -> None
                             parts=[
                                 ToolReturnPart(
                                     tool_name="t_get_pcap",
-                                    content={"beacon": {"interval_s": 60}, "marker": real_id},
+                                    content={"beacon": {"interval_s": 60}},
                                     tool_call_id="c1",
                                 )
                             ]

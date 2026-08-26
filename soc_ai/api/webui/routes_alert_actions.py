@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from elastic_transport import TransportError
 from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
@@ -21,6 +21,7 @@ from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import assignments as assign_svc
+from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.write_exec import execute_write_tool
 from soc_ai.webui import alerts_query as aq
 
@@ -91,7 +92,30 @@ async def _ack_many(
 _OQL_Q = Annotated[str, Field(max_length=2048)]
 
 
+# The source scopes fetch_group_events can actually select. Anything else used
+# to be silently treated as the Suricata/Sigma default — on a WRITE endpoint
+# that means acking a different document set than the caller named.
+# ``alert`` is the app's OWN fallback kind, not an attacker string: ``_kind_for``
+# returns it for any ``tags:alert`` document without a mapped ``event.dataset``,
+# ``fetch_groups`` renders it, and the SPA posts the group's kind back verbatim —
+# so refusing it 422s Acknowledge/Escalate on a group the analyst can SEE.
+# ``fetch_group_events`` treats every non-"notice" kind identically (the default
+# rule.name-scoped source query), so accepting it is not a coercion: the write
+# lands on exactly the document set the group view showed.
+_VALID_GROUP_KINDS = ("suricata", "sigma", "notice", "alert")
+
+
 class AckGroupIn(BaseModel):
+    """Filters for a group-scoped ack/escalate.
+
+    ``kind``/``range``/``severity`` are validated STRICTLY (case-insensitively
+    normalized, unrecognized values 422): these filters decide which events a
+    write lands on, so a bogus value (e.g. a stale deep-link's
+    ``severity=Critical`` before normalization existed) must never be silently
+    dropped — that widened the ack to every severity in the group. The read
+    endpoints stay lenient; a wrong read shows on screen, a wrong write acks it.
+    """
+
     rule_name: str
     kind: str = "suricata"
     range: str = aq.DEFAULT_RANGE
@@ -101,6 +125,40 @@ class AckGroupIn(BaseModel):
     to: str | None = None
 
     model_config = {"populate_by_name": True}
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        low = v.strip().lower()
+        if low not in _VALID_GROUP_KINDS:
+            raise ValueError(
+                f"unrecognized kind {v!r}; expected one of: {', '.join(_VALID_GROUP_KINDS)}"
+            )
+        return low
+
+    @field_validator("range")
+    @classmethod
+    def _validate_range(cls, v: str) -> str:
+        low = v.strip().lower()
+        if low not in aq.TIME_RANGES:
+            raise ValueError(
+                f"unrecognized range {v!r}; expected one of: {', '.join(aq.TIME_RANGES)}"
+            )
+        return low
+
+    @field_validator("severity")
+    @classmethod
+    def _validate_severity(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        low = v.strip().lower()
+        if not low:
+            return None  # empty ≡ absent — "no severity filter", not a bad value
+        if low not in aq.SEVERITIES:
+            raise ValueError(
+                f"unrecognized severity {v!r}; expected one of: {', '.join(aq.SEVERITIES)}"
+            )
+        return low
 
 
 class AckGroupOut(BaseModel):
@@ -344,6 +402,23 @@ async def ack_events(
     capped = len(body.es_ids) > _ACK_CAP
     if not ids:
         return AckGroupOut(acked=0, failed=0, total=0)
+    # The ids are caller-supplied — unlike the group routes above, nothing ties
+    # them to the alert grid. A promoted hunt finding's anchor is cited
+    # telemetry, not an SO alert, and the sibling execute-action route refuses
+    # exactly that document with 400 hunt_kind_no_so_target; this route must
+    # agree, or the id-supplied path acks what the guarded path refuses.
+    # Ordinary alert ids (not hunt anchors) ack normally — that's the job.
+    async with request.app.state.db_sessionmaker() as db:
+        hunt_anchors = await inv_svc.hunt_anchor_ids(db, ids)
+    if hunt_anchors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "hunt_kind_no_so_target",
+                "ids": sorted(hunt_anchors),
+                "hint": "A promoted finding has no Security Onion alert to act on.",
+            },
+        )
     acked, failed = await _ack_many(
         request,
         ids,

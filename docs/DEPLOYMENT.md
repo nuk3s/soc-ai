@@ -391,3 +391,15 @@ without SO Pro. See [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md)
 for the full account/role breakdown (including the `soc-ai-audit-*`
 Elasticsearch write grant that ack/escalate silently depend on under
 `AUDIT_FAIL_CLOSED=true`).
+
+### Behind a reverse proxy: set `PROXY_TRUSTED_IPS`
+
+If you front soc-ai with a reverse proxy (nginx, Caddy, Traefik, …),
+set `PROXY_TRUSTED_IPS` to the proxy's IP(s), e.g.
+`PROXY_TRUSTED_IPS=203.0.113.10`. The login throttle and API rate
+limit are keyed per client IP; without this setting the proxy's own
+socket IP stands in for every client, so all users share one bucket —
+a handful of failed logins across the team can lock everyone out
+until the cooldown expires. `X-Forwarded-For`/`X-Forwarded-Proto` are
+only ever trusted from peers on this list (an arbitrary client could
+forge them), so leave it empty when clients connect directly.

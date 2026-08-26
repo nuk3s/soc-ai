@@ -281,6 +281,13 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         inv_real_id = inv.id
         inv_kind = inv.kind
         next_seq = max((e.sequence for e in events), default=0) + 1
+        # Anchor-keyed hunt check: a fresh non-hunt row over a promoted
+        # finding's anchor (a POST /investigate re-run) must not launder the
+        # document past the kind-keyed guard below — the anchor is still cited
+        # telemetry with no SO alert behind it, whatever THIS row's kind says.
+        anchors_a_hunt = inv_kind == "hunt" or (
+            alert_es_id is not None and bool(await inv_svc.hunt_anchor_ids(db, [alert_es_id]))
+        )
 
     recs = report.get("recommended_actions") or []
     if index < 0 or index >= len(recs):
@@ -298,13 +305,15 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             detail={"reason": "not_executable", "tool": tool_name},
         )
 
-    if inv_kind == "hunt":
+    if anchors_a_hunt:
         # A promoted finding's anchor is cited telemetry, not an SO alert —
         # there is nothing to ack/escalate, and the rule-keyed group ack below
-        # must never see a finding title as a rule_name. No `and tool_name in
-        # WRITE_TOOLS` conjunct here: the check above already 400s any
-        # non-write tool, so by this point tool_name is proven to be a write
-        # tool — restating the condition would just be dead weight.
+        # must never see a finding title as a rule_name. Keyed off the ANCHOR
+        # document (any hunt-kind investigation over this alert_es_id), not
+        # just this row's own kind — see anchors_a_hunt above. No `and
+        # tool_name in WRITE_TOOLS` conjunct here: the check above already
+        # 400s any non-write tool, so by this point tool_name is proven to be
+        # a write tool — restating the condition would just be dead weight.
         raise HTTPException(
             status_code=400,
             detail={

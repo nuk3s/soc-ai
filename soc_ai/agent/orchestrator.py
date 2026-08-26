@@ -77,6 +77,7 @@ from soc_ai.agent.egress_guard import EgressGuard, EgressResidueError
 # tests and callers reach these via orchestrator.
 from soc_ai.agent.evidence import (  # noqa: F401
     _NON_EVIDENCE_RESULT_KEYS,
+    _PIVOT_DECISIVE_ATTRS,
     _beacon_profile_bullet,
     _bundle_dump_text,
     _classify_citation,
@@ -100,7 +101,6 @@ from soc_ai.agent.gates import (  # noqa: F401
     _FUZZY_TOKEN_RE,
     _GROUNDED_EVIDENCE_TOKENS,
     _PIVOT_ATTRS,
-    _PIVOT_DECISIVE_ATTRS,
     _apply_targeted_downgrades,
     _citation_confidence_cap,
     _downgrade_unevidenced_verdict,
