@@ -74,6 +74,38 @@ class EventTemplate(BaseModel):
         return v
 
 
+class HuntJourney(BaseModel):
+    """What a correct hunt JOURNEY looks like for this scenario.
+
+    Optional on :class:`Scenario`: absent means the scenario is single-alert
+    only, which is most of the catalogue as shipped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str
+    """The plain-English objective to run the hunt with."""
+
+    expected_cited_event_ids: list[str] = Field(min_length=1)
+    """Scenario-local event ids a correct finding should cite. At least one.
+
+    Events carry no id field, so ids here are event ``index`` values — the
+    natural scenario-local identifier (Elasticsearch ``_id`` values only
+    exist after ingest). Each must name an event in the scenario's own
+    ``events`` list; the loader rejects anything else.
+
+    REQUIRED, with a floor of one, because an empty list makes the citation
+    half of the rubric vacuous — every finding "cites everything expected", so
+    a journey can reach COMPLETE on the promoted verdict alone. Required
+    rather than defaulted: Pydantic does not validate defaults, so a
+    ``default_factory=list`` beside ``min_length=1`` would refuse an explicit
+    ``[]`` while admitting the same vacuous rubric spelled by omission.
+    """
+
+    expected_promoted_verdict: Verdict
+    """The verdict the promoted investigation should reach."""
+
+
 class Scenario(BaseModel):
     """A complete synthetic-TP scenario.
 
@@ -93,6 +125,7 @@ class Scenario(BaseModel):
     ground_truth: GroundTruth
     events: list[EventTemplate]
     rubric_notes: str = ""
+    hunt_journey: HuntJourney | None = None
 
     @field_validator("attack")
     @classmethod
@@ -111,6 +144,22 @@ class Scenario(BaseModel):
             raise ValueError(
                 f"scenario {self.id!r} has {len(targets)} events with "
                 f"is_triage_target=True; want exactly one triage target"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _journey_cites_only_events_that_exist(self) -> Scenario:
+        # A typo'd id would silently make the journey unscoreable — the
+        # scorer would look for an event that does not exist and report a
+        # false failure. Event ids are event ``index`` values.
+        if self.hunt_journey is None:
+            return self
+        known = {e.index for e in self.events}
+        unknown = [i for i in self.hunt_journey.expected_cited_event_ids if i not in known]
+        if unknown:
+            raise ValueError(
+                f"scenario {self.id!r} hunt_journey cites unknown event id(s) "
+                f"{unknown}; known ids (event indices): {sorted(known)}"
             )
         return self
 

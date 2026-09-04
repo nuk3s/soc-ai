@@ -30,7 +30,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from soc_ai.config import Settings
 from soc_ai.detection.models import SigmaDraft
-from soc_ai.detection.validators import dry_run_detection, validate_sigma_yaml
+from soc_ai.detection.validators import (
+    _sigma_oql_divergence,
+    dry_run_detection,
+    validate_sigma_yaml,
+)
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 
 _QUERY_EVENTS_OQL = "soc_ai.detection.validators.query_events_oql"
@@ -161,7 +165,9 @@ def test_validate_sigma_yaml_non_whitelisted_field_sets_schema_ok_false() -> Non
 
 def test_validate_sigma_yaml_field_modifier_is_stripped_before_whitelist() -> None:
     """A Sigma value modifier (``field|contains``) checks the BARE field name
-    against the whitelist, so a legitimate field with a modifier passes."""
+    against the whitelist, so a legitimate field with a modifier passes. The
+    OQL twin renders the SAME ``NetrServer`` literal as a contains match, so
+    the pair is one rule in two renderings."""
     draft = _draft(
         sigma_yaml=(
             "title: foo\n"
@@ -171,7 +177,8 @@ def test_validate_sigma_yaml_field_modifier_is_stripped_before_whitelist() -> No
             "  selection:\n"
             "    zeek.dce_rpc.operation|contains: NetrServer\n"
             "  condition: selection\n"
-        )
+        ),
+        oql="event.dataset:zeek.dce_rpc AND zeek.dce_rpc.operation:*NetrServer*",
     )
     validated = validate_sigma_yaml(draft)
     assert validated.schema_ok is True
@@ -405,3 +412,193 @@ async def test_dry_run_detection_window_days_over_thirty_is_clamped(
     assert result.dry_run.window_days == 30
     called_kwargs = mock_query.call_args.kwargs
     assert called_kwargs["time_range_minutes"] == 30 * 1440
+
+
+# ── Sigma ⇄ OQL divergence: positive-side value keying (D3) ─────────────────
+#
+# The M1 gate compared VALUES only on the negated side; positive fields were
+# compared by NAME alone. Same threat model as M1, different lever: instead of
+# adding an exclusion, steer the exported Sigma to key on a value the OQL twin
+# never measures — the dry-run count looks honest, the exported rule is dead
+# on arrival. These tests pin the value-level comparison AND every deliberate
+# tolerance (rendering, extra dataset terms, boolean regrouping) that keeps
+# canonical clean drafts validating clean.
+
+
+def test_positive_value_swap_is_flagged_as_divergence() -> None:
+    """D3 reproduction: the exported Sigma keys ``dns.query.name`` on
+    ``benign.example`` while the measured OQL keys the SAME field on
+    ``evil.example`` — the would-have-fired count describes a rule the analyst
+    is not exporting. Field names match, so the name-level check passes; only
+    a value-level comparison catches it."""
+    note = _sigma_oql_divergence(
+        {"selection": {"dns.query.name": "benign.example"}},
+        "selection",
+        "dns.query.name:evil.example",
+    )
+    assert note is not None, "a positive-side value swap passed the divergence gate clean"
+    assert "dns.query.name" in note
+
+
+def test_positive_value_swap_fails_schema_with_analyst_note() -> None:
+    """The full-draft path: a value-swapped rule lands as ``schema_ok=False``
+    with an analyst-facing note in the review pane, the same surfacing as the
+    M1 exclusion divergence."""
+    draft = _draft(
+        sigma_yaml=(
+            "title: DNS beacon to known-bad domain\n"
+            "logsource:\n"
+            "  category: dns\n"
+            "detection:\n"
+            "  selection:\n"
+            "    dns.query.name: benign.example\n"
+            "  condition: selection\n"
+        ),
+        oql="event.dataset:zeek.dns AND dns.query.name:evil.example",
+    )
+    validated = validate_sigma_yaml(draft)
+    assert validated.schema_ok is False
+    assert validated.validator_note is not None
+    assert "diverg" in validated.validator_note.lower()
+    assert "dns.query.name" in validated.validator_note
+    # Analyst-facing: it says what the number no longer means.
+    assert "dry run" in validated.validator_note or "would-have-fired" in validated.validator_note
+
+
+def test_positive_value_list_mismatch_is_flagged() -> None:
+    """A value-set mismatch on a shared field is divergence in EITHER
+    direction: here the OQL measures an extra operation the exported Sigma
+    never keys on, so the count is inflated relative to the exported rule."""
+    note = _sigma_oql_divergence(
+        {"selection": {"zeek.dce_rpc.operation": ["NetrServerAuthenticate3"]}},
+        "selection",
+        "event.dataset:zeek.dce_rpc AND "
+        "zeek.dce_rpc.operation:(NetrServerAuthenticate3 OR NetrServerReqChallenge)",
+    )
+    assert note is not None
+    assert "zeek.dce_rpc.operation" in note
+
+
+def test_positive_anchor_dropped_from_oql_is_flagged() -> None:
+    """The field NAME survives via its exclusion term, but the positive anchor
+    was silently dropped from the measured query — name-level comparison alone
+    would pass this."""
+    note = _sigma_oql_divergence(
+        {
+            "selection": {"source.ip": "10.0.0.5"},
+            "filter": {"source.ip": "203.0.113.66"},
+        },
+        "selection and not filter",
+        "NOT source.ip:203.0.113.66",
+    )
+    assert note is not None
+    assert "source.ip" in note
+
+
+@pytest.mark.parametrize(
+    "oql",
+    [
+        "event.dataset:zeek.dce_rpc AND zeek.dce_rpc.operation:*NetrServer*",
+        "event.dataset:zeek.dce_rpc AND zeek.dce_rpc.operation:~NetrServer",
+    ],
+)
+def test_divergence_tolerates_contains_vs_wildcard_renderings(oql: str) -> None:
+    """Sigma ``|contains`` against the OQL wildcard (``*x*``) and contains
+    (``:~x``) forms of the SAME literal is one rule in two renderings — the
+    normalizer collapses them; no divergence."""
+    assert (
+        _sigma_oql_divergence(
+            {"selection": {"zeek.dce_rpc.operation|contains": "NetrServer"}},
+            "selection",
+            oql,
+        )
+        is None
+    )
+
+
+def test_divergence_tolerates_extra_positive_dataset_term() -> None:
+    """Canonical drafts render Sigma's ``logsource`` as an ``event.dataset``
+    term the Sigma selections never name — it only NARROWS the measurement and
+    must not read as disagreement."""
+    assert (
+        _sigma_oql_divergence(
+            {"selection": {"zeek.dce_rpc.operation": "NetrServerAuthenticate3"}},
+            "selection",
+            "event.dataset:zeek.dce_rpc AND zeek.dce_rpc.operation:NetrServerAuthenticate3",
+        )
+        is None
+    )
+
+
+def test_divergence_tolerates_value_list_vs_grouped_oql() -> None:
+    """The canonical grounded-draft shape: a Sigma value LIST against the
+    OQL field-scoped group ``field:(a OR b)`` — same values, same polarity."""
+    assert (
+        _sigma_oql_divergence(
+            {
+                "selection": {
+                    "zeek.dce_rpc.operation": [
+                        "NetrServerAuthenticate3",
+                        "NetrServerReqChallenge",
+                    ]
+                }
+            },
+            "selection",
+            "event.dataset:zeek.dce_rpc AND "
+            "zeek.dce_rpc.operation:(NetrServerAuthenticate3 OR NetrServerReqChallenge)",
+        )
+        is None
+    )
+
+
+def test_divergence_tolerates_one_of_glob_regrouping() -> None:
+    """``1 of selection_*`` over two selections against a flat OQL OR — equal
+    field/polarity/value sets under a different boolean grouping."""
+    assert (
+        _sigma_oql_divergence(
+            {
+                "selection_auth": {"zeek.dce_rpc.operation": "NetrServerAuthenticate3"},
+                "selection_chal": {"zeek.dce_rpc.operation": "NetrServerReqChallenge"},
+            },
+            "1 of selection_*",
+            "event.dataset:zeek.dce_rpc AND "
+            "(zeek.dce_rpc.operation:NetrServerAuthenticate3 OR "
+            "zeek.dce_rpc.operation:NetrServerReqChallenge)",
+        )
+        is None
+    )
+
+
+def test_divergence_tolerates_all_of_them() -> None:
+    """``all of them`` across two single-field selections against the flat
+    AND rendering."""
+    assert (
+        _sigma_oql_divergence(
+            {
+                "sel_dataset": {"event.dataset": "zeek.conn"},
+                "sel_port": {"destination.port": 9001},
+            },
+            "all of them",
+            "event.dataset:zeek.conn AND destination.port:9001",
+        )
+        is None
+    )
+
+
+def test_divergence_tolerates_parenthesised_negation() -> None:
+    """A parenthesised NOT group — ``not (filter_a or filter_b)`` against
+    ``NOT (x OR y)`` — is the same exclusion set; the positive-side check must
+    not mistake the excluded values for positive keys."""
+    assert (
+        _sigma_oql_divergence(
+            {
+                "selection": {"event.dataset": "zeek.conn", "destination.port": 9001},
+                "filter_a": {"source.ip": "10.0.0.5"},
+                "filter_b": {"source.ip": "10.0.0.6"},
+            },
+            "selection and not (filter_a or filter_b)",
+            "event.dataset:zeek.conn AND destination.port:9001 "
+            "AND NOT (source.ip:10.0.0.5 OR source.ip:10.0.0.6)",
+        )
+        is None
+    )

@@ -1,0 +1,261 @@
+id: h5-ransomware-staging
+name: "Mass share reads then archive creation — ransomware/exfil staging"
+version: 1
+tier: hard
+story: |
+  Finance workstation 10.0.0.101 mounts six file-server shares in ninety
+  seconds — Finance, HR, Legal, Engineering, Contracts, Payroll — five of
+  which its user has never touched. Over the next nine minutes it opens and
+  reads 1,843 distinct documents across all six, at a sustained 204 files a
+  minute, pulling 12.9 GB down the session. Then it writes one file back:
+  backup_2026.7z, 3.2 GB, into \\10.0.0.150\Finance\Temp. Read everything,
+  compress it into one object, put the object somewhere it can be collected
+  from. No signature fires; a Zeek analytic raises an Informational notice on
+  the file-access rate. Nothing has been encrypted yet, which is the only
+  reason this is still worth catching.
+attack:
+  - T1083      # File and Directory Discovery
+  - T1074.002  # Data Staged: Remote Data Staging
+  - T1560.001  # Archive Collected Data: Archive via Utility
+  - T1486      # Data Encrypted for Impact (the staged intent)
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # smb access profile: 1843 files / 6 shares / 9 minutes
+    - prefetch_pivot         # smb_files: the 3.2 GB archive written back
+    - typed_path             # rule.name / the archive filename
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: disable_account
+      target_field: user.name
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.101"
+      source.port: 51204
+      destination.ip: "10.0.0.150"
+      destination.port: 445
+      network.transport: tcp
+      network.protocol: smb
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC Anomalous SMB File Access Rate From Single Host"
+      rule.category: "Misc activity"
+      rule.signature: "9800011"  # illustrative SID — Zeek analytic surfaced as an alert
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "misc-activity"}}'
+      user.name: "kdelacruz"
+      observer.name: "so-sensor-1"
+      synth.scenario_id: h5-ransomware-staging
+      synth.scenario_version: 1
+
+  # Breadth: six shares in ninety seconds. Three shown; the summary carries
+  # the full count.
+  - index: logs-synth-zeek-smb-mapping
+    time_offset_seconds: -630
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-630) }}"
+      event.dataset: zeek.smb_mapping
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      destination.port: 445
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_mapping.path: "\\\\10.0.0.150\\Finance"
+      zeek.smb_mapping.service: "Finance"
+      zeek.smb_mapping.share_type: "DISK"
+      synth.scenario_id: h5-ransomware-staging
+
+  - index: logs-synth-zeek-smb-mapping
+    time_offset_seconds: -604
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-604) }}"
+      event.dataset: zeek.smb_mapping
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      destination.port: 445
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_mapping.path: "\\\\10.0.0.150\\HR"
+      zeek.smb_mapping.service: "HR"
+      zeek.smb_mapping.share_type: "DISK"
+      synth.scenario_id: h5-ransomware-staging
+
+  - index: logs-synth-zeek-smb-mapping
+    time_offset_seconds: -571
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-571) }}"
+      event.dataset: zeek.smb_mapping
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      destination.port: 445
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_mapping.path: "\\\\10.0.0.150\\Payroll"
+      zeek.smb_mapping.service: "Payroll"
+      zeek.smb_mapping.share_type: "DISK"
+      synth.scenario_id: h5-ransomware-staging
+
+  # The rate, measured. A person clicking through documents does not open
+  # 204 distinct files a minute for nine minutes without pause.
+  - index: logs-synth-zeek-smb-summary
+    time_offset_seconds: -540
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-540) }}"
+      event.dataset: zeek.smb_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      synth.smb_access_profile:
+        window_seconds: 540
+        distinct_files_opened: 1843
+        distinct_shares_touched: 6
+        shares_touched: ["Finance", "HR", "Legal", "Engineering", "Contracts", "Payroll"]
+        shares_in_user_baseline_90d: ["Finance"]
+        files_per_minute_mean: 204.8
+        read_bytes_total: 12884901888
+        write_operations: 1
+        extension_mix:
+          docx: 612
+          xlsx: 559
+          pdf: 447
+          pptx: 121
+          msg: 104
+        directory_traversal_order: "breadth-first, alphabetical"
+        user_baseline_files_per_day_mean: 37
+      synth.scenario_id: h5-ransomware-staging
+
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: -598
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-598) }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_OPEN"
+      zeek.smb_files.name: "Q3_forecast_final.xlsx"
+      zeek.smb_files.path: "\\\\10.0.0.150\\Finance\\Planning\\Q3_forecast_final.xlsx"
+      zeek.smb_files.size: 2841600
+      synth.scenario_id: h5-ransomware-staging
+
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: -412
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-412) }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_OPEN"
+      zeek.smb_files.name: "2026_salary_bands.xlsx"
+      zeek.smb_files.path: "\\\\10.0.0.150\\Payroll\\Current\\2026_salary_bands.xlsx"
+      zeek.smb_files.size: 481280
+      synth.scenario_id: h5-ransomware-staging
+
+  # The one write: everything that was read, in one object, put back where it
+  # can be collected. 3.2 GB compressed from 12.9 GB read.
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      destination.ip: "10.0.0.150"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_WRITE"
+      zeek.smb_files.name: "backup_2026.7z"
+      zeek.smb_files.path: "\\\\10.0.0.150\\Finance\\Temp\\backup_2026.7z"
+      zeek.smb_files.size: 3221225472
+      synth.scenario_id: h5-ransomware-staging
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -630
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-630) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.101"
+      source.port: 51204
+      destination.ip: "10.0.0.150"
+      destination.port: 445
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 631.2
+      zeek.conn.orig_bytes: 3233808384
+      zeek.conn.resp_bytes: 12884901888
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "smb"
+      synth.scenario_id: h5-ransomware-staging
+
+rubric_notes: |
+  Hard TP. Informational alert, both hosts internal, no IOC, no signature,
+  and every individual operation is one a finance user is allowed to perform.
+  The verdict lives in the aggregate shape, and each part of it is a measured
+  value in the events:
+
+  (1) BREADTH — six shares, five of which are outside the user's 90-day
+      baseline of one. Access rights and access habits are different things,
+      and the gap between them is the anomaly.
+  (2) RATE — 1,843 distinct files at 204.8 per minute for nine minutes,
+      against a user baseline of 37 files per DAY. This is a program walking
+      a directory tree, not a person working.
+  (3) THE WRITE — one 3.2 GB .7z placed back on a share, immediately after
+      12.9 GB was read. Collection, compression, staging. The archive is the
+      whole point: reads alone could be an over-eager search indexer; reads
+      followed by a single large archive is data being prepared to leave or
+      to be held hostage.
+
+  Nothing is encrypted and nothing has left the network yet, so the window to
+  act is open — which is why this is scored true_positive on staging alone
+  rather than waiting for impact. Disabling the account matters as much as
+  isolating the host: the credential is what carries the access.
+
+  Discrimination against the benign backup shape (see b6-backup-scheduled-
+  transfer): a backup product reads from a DESIGNATED host on a schedule and
+  writes to backup storage, not from a user workstation into a user share
+  under a finance user's account, and it does not have a 90-day baseline of
+  37 files a day. A system that escalates on "large SMB transfer" alone will
+  also escalate on every backup window in the estate.

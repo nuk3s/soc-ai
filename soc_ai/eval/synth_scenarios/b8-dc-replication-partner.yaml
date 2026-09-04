@@ -1,0 +1,203 @@
+id: b8-dc-replication-partner
+name: "Routine domain-controller replication mistaken for DCSync"
+version: 1
+tier: hard
+story: |
+  Domain controller 10.0.0.11 binds drsuapi on its replication partner
+  10.0.0.10 and issues DRSGetNCChanges — the same operation, against the same
+  naming context, as h4-dcsync-replication. It does so every 15 minutes, as it
+  has for the 803 days since it was promoted, under the domain's own machine
+  account. This is not similar to Active Directory replication; it IS Active
+  Directory replication. The analytic that fires on the operation name cannot
+  distinguish the two, which is exactly why this scenario exists.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # replication context: source IS a domain controller
+    - prefetch_pivot         # the 803-day, 15-minute recurrence under a machine account
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.11"
+      source.port: 49688
+      destination.ip: "10.0.0.10"
+      destination.port: 135
+      network.transport: tcp
+      network.protocol: dce_rpc
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC Directory Replication Request Observed"
+      rule.category: "Misc Attack"
+      rule.signature: "9800010"  # same analytic as h4 — the rule cannot tell them apart
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "attempted-admin"}}'
+      user.name: "DC02$"
+      observer.name: "so-sensor-1"
+      synth.scenario_id: b8-dc-replication-partner
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -8
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-8) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.11"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSBind"
+      synth.scenario_id: b8-dc-replication-partner
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -6
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-6) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.11"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSGetNCChanges"
+      synth.naming_context: "DC=corp,DC=example"
+      synth.scenario_id: b8-dc-replication-partner
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.11"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSGetNCChanges"
+      synth.naming_context: "DC=corp,DC=example"
+      synth.scenario_id: b8-dc-replication-partner
+
+  # The same summary shape h4 carries, with the opposite values in every
+  # field that matters. This is where the disposition is decided.
+  - index: logs-synth-zeek-dce-rpc-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.dce_rpc_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.11"
+      destination.ip: "10.0.0.10"
+      synth.replication_context:
+        source_role: "domain-controller"
+        source_is_domain_controller: true
+        destination_role: "domain-controller"
+        domain_controller_ips: ["10.0.0.10", "10.0.0.11"]
+        source_prior_replication_calls_90d: 8632   # ~every 15 minutes, for months
+        replication_calls_this_window: 2
+        replication_interval_seconds_mean: 900
+        naming_context: "DC=corp,DC=example"
+        account: "DC02$"                            # machine account, not a user
+        account_is_machine_account: true
+        first_seen_days_ago: 803
+        bidirectional_partner: true                 # 10.0.0.10 replicates back
+      synth.scenario_id: b8-dc-replication-partner
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -9
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.11"
+      source.port: 49688
+      destination.ip: "10.0.0.10"
+      destination.port: 135
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 9.1
+      zeek.conn.orig_bytes: 6210
+      zeek.conn.resp_bytes: 88420
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "dce_rpc"
+      synth.scenario_id: b8-dc-replication-partner
+
+  # The counterpart flow: the partner replicating back. One-directional pulls
+  # from a single host are what DCSync looks like; a replication topology is
+  # bidirectional.
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -430
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-430) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.10"
+      destination.ip: "10.0.0.11"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSGetNCChanges"
+      synth.naming_context: "DC=corp,DC=example"
+      synth.scenario_id: b8-dc-replication-partner
+
+rubric_notes: |
+  Benign FP that is byte-for-byte the same operation as the attack it twins.
+  h4-dcsync-replication and this scenario both put DRSGetNCChanges against
+  drsuapi on the wire, against the same naming context, on the same domain.
+  Nothing in the operation, the endpoint, the port, or the alert separates
+  them — and t_dcerpc_histogram flags both, because it matches operation
+  names against a fixed dangerous set (`_DANGEROUS_OPS`) and has no notion of
+  who is entitled to call them. That is the correct behaviour for a sweep:
+  it narrows a grid to the calls worth a human's attention.
+
+  The disposition turns entirely on identity and history, both present in the
+  events:
+  (1) The source IS a domain controller — 10.0.0.11 appears in
+      `domain_controller_ips`, and `source_is_domain_controller` is true.
+      In h4 the source is a workstation and is absent from that list.
+  (2) The caller is a MACHINE account (DC02$), not a user account that was
+      added to a privileged group four hours ago.
+  (3) The behaviour has an 803-day history at a 900-second interval
+      (8,632 prior calls in 90 days). In h4 the source had made zero
+      replication calls, ever.
+  (4) The replication is bidirectional — 10.0.0.10 pulls from 10.0.0.11 in
+      the same window. DCSync is one host pulling, never a topology.
+
+  Escalating this is scored as an escalation false positive and drops
+  precision. It is a realistic page-out: "DCSync detected" on routine AD
+  replication is one of the most common false positives in Windows-domain
+  monitoring, and any detection keyed on the operation name alone will
+  produce it every fifteen minutes, forever.

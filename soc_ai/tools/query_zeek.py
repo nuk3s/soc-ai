@@ -16,6 +16,7 @@ from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import first_present
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.query_events import _MAX_TIME_RANGE_MINUTES, _build_time_filter
 
 DEFAULT_LOG_TYPES: tuple[str, ...] = ("conn", "dns", "http", "ssl", "files", "ssh")
@@ -121,6 +122,7 @@ async def query_zeek_logs(
     time_range_minutes: int = 60,
     max_results: int = 100,
     time_anchor: datetime | None = None,
+    include_synth: SynthScope = False,
 ) -> list[dict[str, Any]]:
     """Fetch Zeek log records sharing a Community ID, sorted oldest-first.
 
@@ -168,6 +170,13 @@ async def query_zeek_logs(
             "filter": [_build_time_filter(time_range_minutes, time_anchor)],
         }
     }
+    # Synthetic-eval kill-switch: by default the pivot excludes docs tagged
+    # with synth.scenario_id, so a planted flow whose 5-tuple mirrors a real
+    # one can never join a production community_id pivot. A batch-eval caller
+    # passes its scenario id so only that scenario's own plants are visible;
+    # the hunt-journey eval passes True.
+    if synth_must_not := synth_scope_must_not(include_synth):
+        query["bool"]["must_not"] = synth_must_not
 
     result = await elastic.search(
         settings.events_index_pattern,

@@ -788,3 +788,98 @@ def test_audit_verify_capped_tampered_does_not_claim_everything_after_is_fine(
     assert "hit the record cap" in err  # the existing standalone capped warning
     assert "verified intact" not in err
     assert "the latest epoch is broken" not in err.lower()
+
+
+# --------------------------------------------------------------------
+# validate-batch --repeats (repeated runs per synth scenario)
+# --------------------------------------------------------------------
+
+
+def test_validate_batch_parser_accepts_repeats(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--repeats parses (default 1, explicit N, reject < 1) and reaches the
+    validate-batch handler."""
+    captured: dict[str, Any] = {}
+
+    def fake_validate_batch(args: argparse.Namespace) -> int:
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_validate_batch", fake_validate_batch)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["soc-ai", "validate-batch", "--oql", "q", "--synth-set", "all", "--repeats", "3"],
+    )
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 0
+    assert captured["args"].repeats == 3
+
+    monkeypatch.setattr("sys.argv", ["soc-ai", "validate-batch", "--oql", "q"])
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 0
+    assert captured["args"].repeats == 1
+
+    # argparse rejects a non-positive count before the handler runs.
+    captured.clear()
+    monkeypatch.setattr("sys.argv", ["soc-ai", "validate-batch", "--oql", "q", "--repeats", "0"])
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 2
+    assert "args" not in captured
+
+
+def test_validate_batch_wires_repeats_into_batch_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    settings_kratos: Settings,
+) -> None:
+    """args.repeats lands on BatchConfig.synth_repeats (the one wire the
+    parser test can't see)."""
+    import soc_ai.eval.batch as batch_mod
+    import soc_ai.so_client.elastic as elastic_mod
+    from soc_ai.eval.batch import BatchConfig, BatchSummary
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_batch(cfg: BatchConfig, **_kw: Any) -> BatchSummary:
+        captured["cfg"] = cfg
+        return BatchSummary(
+            batch_dir=tmp_path,
+            n_planned=1,
+            n_attempted=1,
+            n_ok=1,
+            n_error=0,
+            aborted_reason=None,
+            elapsed_s=1,
+        )
+
+    class _FakeElastic:
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(batch_mod, "run_batch", fake_run_batch)
+    monkeypatch.setattr(elastic_mod, "ElasticClient", _FakeElastic)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings_kratos)
+
+    args = argparse.Namespace(
+        oql="q",
+        n=1,
+        concurrency=1,
+        diversity_keys="rule.name",
+        time_range_minutes=60,
+        out_dir=str(tmp_path),
+        resume=False,
+        per_run_timeout_s=10,
+        max_consecutive_failures=3,
+        synth_set=None,
+        repeats=4,
+        no_aggregate=True,
+        no_meta=True,
+    )
+    assert cli._validate_batch(args) == 0
+    assert captured["cfg"].synth_repeats == 4

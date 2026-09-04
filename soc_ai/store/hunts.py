@@ -48,13 +48,18 @@ async def create(
     objective: str,
     started_by: str,
     kind: str = "chat",
+    is_synth_eval: bool = False,
 ) -> Hunt:
+    """``is_synth_eval`` marks a synthetic-evaluation run (the hunt could see
+    planted synth scenarios) — set only from an explicit eval context by the
+    hunt recorder, never from a request body."""
     hunt = Hunt(
         id=str(ULID()),
         objective=objective,
         objective_hash=_objective_hash(objective),
         started_by=started_by,
         kind=kind[:16],
+        is_synth_eval=is_synth_eval,
     )
     db.add(hunt)
     await db.commit()
@@ -176,7 +181,10 @@ async def list_recent(
 class HuntNotifRow(NamedTuple):
     """The scalar columns the /notifications bell reads from a hunt — never the
     report blob. ``findings_count`` is the denormalized column (migration 0028),
-    so the bell shows "N findings" without deserializing ``report``."""
+    so the bell shows "N findings" without deserializing ``report``.
+    ``is_synth_eval`` rides along because the bell DISPLAYS the row ("Hunt
+    finished — N findings: <objective>") — a marked hunt's entry must carry the
+    marker out to the wire like every other surface that shows the row."""
 
     id: str
     objective: str
@@ -184,6 +192,7 @@ class HuntNotifRow(NamedTuple):
     created_at: datetime
     finished_at: datetime | None
     findings_count: int | None
+    is_synth_eval: bool
 
 
 async def list_recent_notifications(
@@ -212,6 +221,7 @@ async def list_recent_notifications(
         Hunt.created_at,
         Hunt.finished_at,
         Hunt.findings_count,
+        Hunt.is_synth_eval,
     )
     if status is not None:
         q = q.where(Hunt.status == status)
@@ -241,12 +251,20 @@ async def findings_for_entity(
     ``{hunt_id, hunt_objective, title, severity, category, ts}`` where ``ts`` is the
     hunt's ``created_at`` (findings have no own timestamp). Only COMPLETE hunts
     carry a report worth scanning; running/errored rows are skipped.
+
+    Synth-eval hunts (migration 0032) are skipped too — same decision as
+    ``investigations.for_entity``, the query that feeds the other half of the
+    entity timeline: the page narrates a host's REAL history, and a planted
+    scenario's findings describe nothing that happened on the box. The hunts
+    stay fully visible (badged) on the Hunts list and detail surfaces.
     """
     if not value:
         return []
     recent = await list_recent(db, status=STATUS_COMPLETE, limit=scan_limit)
     out: list[dict[str, Any]] = []
     for hunt in recent:
+        if hunt.is_synth_eval:
+            continue
         report = hunt.report if isinstance(hunt.report, dict) else {}
         findings = report.get("findings")
         if not isinstance(findings, list):

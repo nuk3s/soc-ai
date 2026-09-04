@@ -43,6 +43,7 @@ async def create(
     kind: str = "suricata",
     hunt_id: str | None = None,
     finding_ordinal: int | None = None,
+    is_synth_eval: bool = False,
 ) -> Investigation:
     # Seed the display name at birth when the caller already knows it (the alert
     # grid / re-hunt / group sweep all do). Otherwise it stays NULL and the
@@ -60,6 +61,9 @@ async def create(
         kind=kind,
         hunt_id=hunt_id,
         finding_ordinal=finding_ordinal,
+        # Synth-eval marker: from the eval context (recorded_run) or inherited
+        # from a marked hunt at promotion — never from an API request body.
+        is_synth_eval=is_synth_eval,
     )
     db.add(inv)
     await db.commit()
@@ -686,10 +690,13 @@ async def list_recent(
 class NotifRow(NamedTuple):
     """The scalar columns the /notifications bell reads from an investigation.
 
-    The bell renders id / rule_name / verdict / status / the two timestamps and
-    nothing else — never the ``report`` JSON blob. Selecting exactly these keeps
-    the app's hottest poll from materializing a report column it discards, the
-    way :class:`RunRef` does for primacy.
+    The bell renders id / rule_name / verdict / status / the two timestamps /
+    the synth-eval marker and nothing else — never the ``report`` JSON blob.
+    Selecting exactly these keeps the app's hottest poll from materializing a
+    report column it discards, the way :class:`RunRef` does for primacy.
+    ``is_synth_eval`` rides along because the bell DISPLAYS the row ("Verdict
+    true_positive: <rule>") — a marked run's entry must carry the marker out to
+    the wire like every other surface that shows the row.
     """
 
     id: str
@@ -698,6 +705,7 @@ class NotifRow(NamedTuple):
     status: str
     created_at: datetime
     finished_at: datetime | None
+    is_synth_eval: bool
 
 
 async def list_recent_notifications(
@@ -727,6 +735,7 @@ async def list_recent_notifications(
         Investigation.status,
         Investigation.created_at,
         Investigation.finished_at,
+        Investigation.is_synth_eval,
     )
     if status is not None:
         q = q.where(Investigation.status == status)
@@ -1001,12 +1010,21 @@ async def for_entity(db: AsyncSession, value: str, *, limit: int = 50) -> list[I
     ``ix_investigations_similarity`` composite index leads with ``rule_name`` so it
     doesn't serve this OR directly, but ``src_ip``/``dest_ip`` are low-cardinality
     and the scan is ``limit``-bounded, so it stays cheap for the read-model.
+
+    Synth-eval rows (migration 0032) are EXCLUDED, not badged. Both callers
+    narrate a host's REAL history — the entity timeline and the host page's
+    latest-investigation chip (``routes_dossier._investigation_lookup``,
+    limit=1) — and a planted scenario describes nothing that happened on the
+    box. At limit=1 a newer planted run would otherwise SHADOW the newest real
+    one and become the host's "latest disposition". The runs themselves stay
+    fully visible (badged) on the Investigations list and detail surfaces.
     """
     if not value:
         return []
     q = (
         select(Investigation)
         .where((Investigation.src_ip == value) | (Investigation.dest_ip == value))
+        .where(Investigation.is_synth_eval.is_(False))
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         .limit(limit)
     )

@@ -1,0 +1,452 @@
+id: m5-cryptomining-stratum-pool
+name: "Unauthorized cryptominer checking in to a Stratum pool"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.88 resolves pool.xmr-eu.example, then opens a TCP session
+  to 45.9.148.99:3333 and re-opens it every ~2 minutes for the next 50
+  minutes. Suricata fires one ET POLICY rule on the Stratum handshake; the
+  captured payload is the miner's own login frame — a JSON-RPC
+  `mining.subscribe` naming the client as XMRig/6.21.0. Each check-in is a
+  short, near-identical exchange: ~1.2 KB up (share submission), ~0.9 KB down
+  (new job). The cadence is a keepalive, not a poll: 25 connections at a
+  measured mean interval of 124.0s with 6.6s of standard deviation.
+attack:
+  - T1496      # Resource Hijacking
+  - T1571      # Non-Standard Port
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - typed_path             # rule.name / payload_printable: mining.subscribe + XMRig
+    - prefetch_pivot         # zeek.dns: the pool FQDN resolved seconds earlier
+    - prefetch_pivot         # zeek.conn: the measured check-in cadence
+  expected_actions:
+    - kind: escalate
+    - kind: block_indicator
+      target_field: destination.ip
+    - kind: isolate
+      target_field: source.ip
+  expected_field_reconciliation: false
+
+# The hunt journey: cadence alone is NOT the finding — b1 and b7 both produce
+# regular or near-regular external HTTPS from an internal host. The objective
+# therefore asks for the protocol evidence behind any flagged pair, which is
+# where the Stratum frame and the pool FQDN live.
+hunt_journey:
+  objective: >-
+    Hunt for internal hosts holding a repeating, machine-timed connection to
+    an external service on a non-standard port. Use t_beacon_profile to
+    measure cadence rather than eyeballing it, then establish what protocol
+    is actually running over any flagged pair — a regular cadence on its own
+    is also what update pollers and telemetry agents produce.
+  expected_cited_event_ids:
+    - logs-synth-zeek-conn        # the raw check-ins the cadence sweep measures + cites
+    - logs-synth-zeek-dns         # the mining-pool FQDN that names the destination
+  expected_promoted_verdict: true_positive
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 2
+      source.ip: "10.0.0.88"
+      source.port: 49384
+      destination.ip: "45.9.148.99"
+      destination.port: 3333
+      network.transport: tcp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET POLICY Cryptocurrency Miner Checkin - Stratum Protocol"
+      rule.category: "Potential Corporate Privacy Violation"
+      rule.signature: "2024792"  # illustrative SID — ET POLICY coin-miner family
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Minor"]
+      message: '{"alert": {"category": "policy-violation"}, "payload_printable": "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"mining.subscribe\",\"params\":[\"XMRig/6.21.0\",null,\"pool.xmr-eu.example\",3333]}"}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: m5-cryptomining-stratum-pool
+      synth.scenario_version: 1
+
+  # The name behind the address. Resolved through the corporate resolver
+  # immediately before the first check-in — the miner is configured with a
+  # pool hostname, not a bare IP.
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -2884
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-2884) }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      source.port: 55310
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      zeek.dns.query: "pool.xmr-eu.example"
+      zeek.dns.qtype_name: "A"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["45.9.148.99"]
+      zeek.dns.TTLs: [120]
+      synth.scenario_id: m5-cryptomining-stratum-pool
+
+  - index: logs-synth-zeek-conn-summary
+    time_offset_seconds: -2884
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-2884) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      destination.ip: "45.9.148.99"
+      destination.port: 3333
+      synth.beacon_profile:
+        connection_count: 25
+        window_seconds: 2976
+        mean_interval_seconds: 124.0
+        interval_stddev_seconds: 6.6
+        interval_similarity: 0.94
+        mean_orig_bytes: 1219
+        mean_resp_bytes: 918
+        orig_bytes_cv: 0.02
+        resp_bytes_cv: 0.03
+        destination_port_class: "non-standard"
+        destination_first_seen_days_ago: 0
+      synth.scenario_id: m5-cryptomining-stratum-pool
+
+  # The raw check-ins the cadence sweep actually measures. FIDELITY, not
+  # tuning: a Stratum client holds a keepalive against the pool and
+  # re-subscribes on every dropped session, so ~2 minutes over ~50 minutes IS
+  # 25 connections. t_beacon_profile (soc_ai/tools/analytics.py) aggregates
+  # RAW event.dataset:zeek.conn rows per src->dst pair and needs >= min_events
+  # (default 8) timestamps with inter-arrival cv <= 0.15 (_CV_PERIODIC) to
+  # call a pair "periodic"; a single row or a pre-aggregated summary doc is
+  # invisible to it (the defect m1 shipped with for months). Measured over
+  # these rows (24 here plus the alert-matched row at t=0): mean 124.00s,
+  # stdev 6.56s, cv 0.053.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2976
+    is_triage_target: false
+    fields: &m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2976) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      source.port: 49213
+      destination.ip: "45.9.148.99"
+      destination.port: 3333
+      network.transport: tcp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 0.46
+      zeek.conn.orig_bytes: 1196
+      zeek.conn.resp_bytes: 883
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      synth.scenario_id: m5-cryptomining-stratum-pool
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2865
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2865) }}"
+      source.port: 49220
+      zeek.conn.duration: 0.28
+      zeek.conn.orig_bytes: 1221
+      zeek.conn.resp_bytes: 915
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2741
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2741) }}"
+      source.port: 49227
+      zeek.conn.duration: 0.27
+      zeek.conn.orig_bytes: 1183
+      zeek.conn.resp_bytes: 940
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2614
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2614) }}"
+      source.port: 49235
+      zeek.conn.duration: 0.21
+      zeek.conn.orig_bytes: 1240
+      zeek.conn.resp_bytes: 895
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2502
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2502) }}"
+      source.port: 49242
+      zeek.conn.duration: 0.34
+      zeek.conn.orig_bytes: 1198
+      zeek.conn.resp_bytes: 903
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2377
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2377) }}"
+      source.port: 49246
+      zeek.conn.duration: 0.48
+      zeek.conn.orig_bytes: 1210
+      zeek.conn.resp_bytes: 952
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2251
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2251) }}"
+      source.port: 49253
+      zeek.conn.duration: 0.58
+      zeek.conn.orig_bytes: 1237
+      zeek.conn.resp_bytes: 887
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2127
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2127) }}"
+      source.port: 49261
+      zeek.conn.duration: 0.57
+      zeek.conn.orig_bytes: 1180
+      zeek.conn.resp_bytes: 920
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2003
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2003) }}"
+      source.port: 49270
+      zeek.conn.duration: 0.46
+      zeek.conn.orig_bytes: 1223
+      zeek.conn.resp_bytes: 925
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1868
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1868) }}"
+      source.port: 49276
+      zeek.conn.duration: 0.53
+      zeek.conn.orig_bytes: 1221
+      zeek.conn.resp_bytes: 919
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1736
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1736) }}"
+      source.port: 49282
+      zeek.conn.duration: 0.4
+      zeek.conn.orig_bytes: 1256
+      zeek.conn.resp_bytes: 951
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1613
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1613) }}"
+      source.port: 49290
+      zeek.conn.duration: 0.31
+      zeek.conn.orig_bytes: 1190
+      zeek.conn.resp_bytes: 941
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1488
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1488) }}"
+      source.port: 49298
+      zeek.conn.duration: 0.4
+      zeek.conn.orig_bytes: 1201
+      zeek.conn.resp_bytes: 916
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1358
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1358) }}"
+      source.port: 49301
+      zeek.conn.duration: 0.55
+      zeek.conn.orig_bytes: 1192
+      zeek.conn.resp_bytes: 928
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1234
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1234) }}"
+      source.port: 49313
+      zeek.conn.duration: 0.3
+      zeek.conn.orig_bytes: 1239
+      zeek.conn.resp_bytes: 940
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1112
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1112) }}"
+      source.port: 49316
+      zeek.conn.duration: 0.39
+      zeek.conn.orig_bytes: 1193
+      zeek.conn.resp_bytes: 959
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -986
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-986) }}"
+      source.port: 49326
+      zeek.conn.duration: 0.57
+      zeek.conn.orig_bytes: 1233
+      zeek.conn.resp_bytes: 908
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -856
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-856) }}"
+      source.port: 49331
+      zeek.conn.duration: 0.36
+      zeek.conn.orig_bytes: 1207
+      zeek.conn.resp_bytes: 947
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -742
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-742) }}"
+      source.port: 49338
+      zeek.conn.duration: 0.29
+      zeek.conn.orig_bytes: 1187
+      zeek.conn.resp_bytes: 948
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -619
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-619) }}"
+      source.port: 49346
+      zeek.conn.duration: 0.51
+      zeek.conn.orig_bytes: 1181
+      zeek.conn.resp_bytes: 883
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -506
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-506) }}"
+      source.port: 49353
+      zeek.conn.duration: 0.29
+      zeek.conn.orig_bytes: 1256
+      zeek.conn.resp_bytes: 953
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -373
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-373) }}"
+      source.port: 49359
+      zeek.conn.duration: 0.61
+      zeek.conn.orig_bytes: 1234
+      zeek.conn.resp_bytes: 942
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -241
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-241) }}"
+      source.port: 49367
+      zeek.conn.duration: 0.27
+      zeek.conn.orig_bytes: 1225
+      zeek.conn.resp_bytes: 911
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -119
+    is_triage_target: false
+    fields:
+      <<: *m5_pool_conn
+      "@timestamp": "{{ run_time | offset_seconds(-119) }}"
+      source.port: 49374
+      zeek.conn.duration: 0.41
+      zeek.conn.orig_bytes: 1244
+      zeek.conn.resp_bytes: 880
+
+  # The newest check-in — the connection the Suricata alert fired on, so it
+  # keeps the alert's 5-tuple and joins via the triage community_id.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      source.port: 49384
+      destination.ip: "45.9.148.99"
+      destination.port: 3333
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 0.41
+      zeek.conn.orig_bytes: 1207
+      zeek.conn.resp_bytes: 921
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      synth.scenario_id: m5-cryptomining-stratum-pool
+
+rubric_notes: |
+  Medium TP, and deliberately one where the alert's own classification argues
+  the other way. The classtype is `policy-violation` and the severity is
+  Minor, because Emerging Threats files coin-mining under policy rather than
+  malware. That is a routing hint, not a verdict: an unauthorized miner on a
+  corporate endpoint is unauthorized code execution with an attacker-chosen
+  payload and an attacker-controlled channel, and it is scored here as
+  true_positive. A system that reads `policy-violation` as "benign by
+  category" fails this scenario, and that failure mode is the point of it —
+  no other scenario in the catalogue tests deference to the rule author's
+  classification.
+
+  The evidence is layered so no single arm carries it:
+  (1) Protocol identity — the alert payload is the miner's own JSON-RPC
+      login frame, naming both the method (`mining.subscribe`) and the client
+      (`XMRig/6.21.0`). This rides in the EVE message JSON as
+      `payload_printable`, where SoAlert reads it, so the citation resolves
+      on the alert without a pivot.
+  (2) Destination identity — zeek.dns shows the pool FQDN resolved through
+      the corporate resolver five seconds before the first check-in, so the
+      address is not incidental CDN space.
+  (3) Behaviour — 25 raw zeek.conn rows at a measured mean of 124.0s
+      (cv 0.053) with near-constant byte counts in both directions.
+
+  Cadence is the WEAKEST of the three and must not be the whole finding:
+  b1-cdn-update-beacon polls even more regularly than this and is benign.
+  The pair (protocol frame + pool FQDN) is what separates them.
+
+  Fidelity note: the destination is a globally routable address rather than
+  an RFC 5737 documentation address, and it has to be. Both t_beacon_profile
+  and t_first_seen drop non-globally-routable destinations — server-side by
+  CIDR and again client-side via `is_internal_ip`, which treats TEST-NET /
+  documentation ranges as internal. A documentation address here would render
+  perfectly and be invisible to the very sweep this scenario exists to
+  exercise. Same reason m1 uses 104.18.42.69 and b1 uses 151.101.65.67.

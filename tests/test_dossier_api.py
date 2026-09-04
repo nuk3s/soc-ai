@@ -1132,6 +1132,46 @@ def test_activity_names_peers_from_the_dossier(activity_client: TestClient) -> N
     assert next(p for p in data["peers"] if p["ip"] == "192.168.20.226")["hostname"] is None
 
 
+def test_activity_latest_investigation_skips_synth_eval_runs(
+    activity_client: TestClient,
+) -> None:
+    """The host page's "latest investigation" chip is the host's current
+    disposition at a glance — a NEWER synthetic-evaluation run (planted
+    scenario, migration 0032) must not become it. The chip's lookup rides
+    ``for_entity``, which excludes marked rows, so the chip shows the newest
+    REAL run instead of the planted one."""
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        async with activity_client.app.state.db_sessionmaker() as db:
+            real = await inv_svc.create(
+                db,
+                alert_es_id="act-real",
+                started_by="analyst",
+                rule_name="ET real detection",
+                src_ip=_ACTIVITY_IP,
+            )
+            await inv_svc.finalize(db, real.id, status="complete", verdict="false_positive")
+            synth = await inv_svc.create(
+                db,
+                alert_es_id="act-synth",
+                started_by="eval",
+                rule_name="Planted C2 beacon",
+                src_ip=_ACTIVITY_IP,
+                is_synth_eval=True,
+            )
+            await inv_svc.finalize(
+                db, synth.id, status="complete", verdict="true_positive", confidence=0.9
+            )
+            return real.id
+
+    real_id = asyncio.run(_seed())
+    data = activity_client.get(f"/api/v1/dossiers/{_ACTIVITY_IP}/activity").json()
+    assert data["latest_investigation"] is not None
+    assert data["latest_investigation"]["id"] == real_id
+    assert data["latest_investigation"]["verdict"] == "false_positive"
+
+
 def test_activity_rejects_a_range_it_cannot_bucket(activity_client: TestClient) -> None:
     """422, not a silent fall back to 24h: the chart's interval comes from the
     range, and a window quietly swapped under the analyst is a lying chart."""

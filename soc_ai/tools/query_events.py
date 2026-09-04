@@ -25,6 +25,7 @@ from soc_ai.so_client.oql import (
     validate_oql,
 )
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
 # Hard ceiling on the requested window. This is an LLM-callable read tool —
 # alert-embedded text is in-scope prompt-injection surface, so an unbounded
@@ -85,7 +86,7 @@ async def query_events_oql(
     time_range_minutes: int = 1440,
     max_results: int = 100,
     time_anchor: datetime | None = None,
-    include_synth: bool = False,
+    include_synth: SynthScope = False,
 ) -> EsSearchResult:
     """Run a validated OQL query against ``settings.events_index_pattern``.
 
@@ -131,9 +132,10 @@ async def query_events_oql(
     # Synthetic-eval kill-switch: by default, every OQL query excludes docs
     # tagged with synth.scenario_id, so synth-TP fixtures cannot leak
     # into prod responses or the eval sampler's view of "real" alerts.
-    # Callers triaging a synth alert can opt in with include_synth=True.
-    if not include_synth:
-        wrapped_bool["must_not"] = [{"exists": {"field": "synth.scenario_id"}}]
+    # A batch-eval caller passes its scenario id so only that scenario's
+    # own plants join the results; the hunt-journey eval passes True.
+    if synth_must_not := synth_scope_must_not(include_synth):
+        wrapped_bool["must_not"] = synth_must_not
     wrapped_query = {"bool": wrapped_bool}
 
     # Groupby/Count queries set size=0; preserve that.

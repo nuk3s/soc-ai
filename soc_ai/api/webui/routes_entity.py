@@ -89,6 +89,12 @@ async def get_entity(request: Request, value: str) -> EntityOut:
     """One screen of an entity's history: its investigations + hunt findings,
     merged and sorted newest-first. An entity we know nothing about returns an
     empty timeline (200, not 404) — "no history" is a valid answer to look at.
+
+    Synth-eval rows never reach this screen: both queries EXCLUDE them (see
+    their docstrings). This page narrates a host's real history — including
+    ``latestVerdict``, the box's current disposition — and a planted scenario
+    describes nothing that happened on the box, so exclusion beats badging
+    here. The runs stay visible (badged) on their list and detail surfaces.
     """
     async with request.app.state.db_sessionmaker() as db:
         investigations = await inv_svc.for_entity(db, value, limit=_INV_LIMIT)

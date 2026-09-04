@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import pytest
+from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.so_client.fields import (
     CONN_ORIG_BYTES,
@@ -357,3 +358,52 @@ def test_kerberos_realm_prefers_client_realm_over_bare_realm() -> None:
     assert KERBEROS_REALM.index("zeek.kerberos.client_realm") < KERBEROS_REALM.index(
         "zeek.kerberos.realm"
     )
+
+
+# ---------------------------------------------------------------------------
+# names_the_shipper — is this document's host identity about the queried IP?
+# ---------------------------------------------------------------------------
+
+
+def test_host_ip_is_authoritative_and_decides_alone() -> None:
+    """When the shipper lists its own addresses, nothing else needs asking."""
+    doc = {"event.dataset": "zeek.conn", "host.ip": ["10.0.0.5"]}
+    assert fields.names_the_shipper(doc, "sensor01", "10.0.0.9") is True
+    assert fields.names_the_shipper(doc, "sensor01", "10.0.0.5") is False
+
+
+def test_a_wire_dataset_names_its_sensor() -> None:
+    for dataset in ("zeek.conn", "suricata.alert", "network_traffic.flow"):
+        doc = {"event.dataset": dataset, "host.name": "SR-router"}
+        assert fields.names_the_shipper(doc, "SR-router", "10.1.10.41") is True
+
+
+def test_a_wire_module_names_its_sensor_when_the_dataset_is_absent() -> None:
+    doc = {"event.module": "zeek", "host.name": "SR-router"}
+    assert fields.names_the_shipper(doc, "SR-router", "10.1.10.41") is True
+
+
+def test_an_observer_watches_something_other_than_itself() -> None:
+    doc = {"event.dataset": "vendor.custom", "observer.name": "sensor01"}
+    assert fields.names_the_shipper(doc, "sensor01", "10.0.0.9") is True
+    assert fields.names_the_shipper(doc, "WS01", "10.0.0.9") is False
+
+
+def test_an_agent_running_on_its_own_host_is_not_a_shipper() -> None:
+    """``agent.name == host.name`` is the NORMAL shape of an endpoint document.
+
+    Treating it as sensor evidence would reject exactly the documents the ECS
+    host-identity lane exists to read.
+    """
+    doc = {"event.dataset": "windows.sysmon_operational", "agent.name": "WS01"}
+    assert fields.names_the_shipper(doc, "WS01", "10.1.10.21") is False
+
+
+def test_it_fails_open_on_a_document_with_no_provenance_at_all() -> None:
+    assert fields.names_the_shipper({}, "WS01", "10.1.10.21") is False
+
+
+def test_host_ip_outranks_a_wire_dataset() -> None:
+    """A sensor's own document about itself still names itself."""
+    doc = {"event.dataset": "zeek.conn", "host.ip": "10.1.10.254"}
+    assert fields.names_the_shipper(doc, "SR-router", "10.1.10.254") is False

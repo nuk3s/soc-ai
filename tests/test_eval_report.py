@@ -549,3 +549,64 @@ def test_bar_zero_value_is_empty_string() -> None:
 def test_bar_full_value_fills_width() -> None:
     bar = report_mod._bar(100, 100, width=10)
     assert bar == "█" * 10
+
+
+def test_build_report_aggregates_repeats_into_stability_and_flip_rate(
+    tmp_path: Path,
+) -> None:
+    """Repeated synth rows for one scenario aggregate into
+    synth_stratum.per_scenario_stability (repeats / strict_passes / pass_rate /
+    confidences) with the batch-level flip_rate alongside; an errored repeat
+    still lands in that scenario's repeats denominator. Headline recall is the
+    per-scenario majority; the per-run numbers live under all_runs."""
+    rows = []
+    # e1 (floor 0.75): 2 strict passes + 1 errored repeat → majority pass, flips.
+    for i, conf in enumerate((0.92, 0.88)):
+        r = _row(f"synth-doc-e1-r{i}", verdict="true_positive", confidence=conf)
+        r["is_synth"] = True
+        r["synth_scenario_id"] = "e1-emotet-feodo-c2"
+        r["synth_repeat"] = i
+        rows.append(r)
+    err = _row("synth-doc-e1-r2", verdict=None, confidence=None, error="timeout after 1800s")
+    err["is_synth"] = True
+    err["synth_scenario_id"] = "e1-emotet-feodo-c2"
+    err["synth_repeat"] = 2
+    rows.append(err)
+    # h1 (floor 0.70): single passing run — unanimous by construction.
+    h1 = _row("synth-doc-h1", verdict="true_positive", confidence=0.9)
+    h1["is_synth"] = True
+    h1["synth_scenario_id"] = "h1-kerberoasting"
+    rows.append(h1)
+
+    (tmp_path / "index.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+
+    json_path, md_path, _ = build_report(tmp_path)
+    synth = json.loads(json_path.read_text())["synth_stratum"]
+
+    stab = synth["per_scenario_stability"]["e1-emotet-feodo-c2"]
+    assert stab["repeats"] == 3
+    assert stab["strict_passes"] == 2
+    assert stab["errored_runs"] == 1
+    assert stab["pass_rate"] == pytest.approx(2 / 3)
+    assert sorted(stab["confidences"]) == [0.88, 0.92]
+    assert synth["per_scenario_stability"]["h1-kerberoasting"]["repeats"] == 1
+
+    # Only e1 ran multiple times; its repeats were not unanimous → flip 1/1.
+    assert synth["flip_rate"] == pytest.approx(1.0)
+
+    # Headline: majority per scenario (both pass) — scenario-denominated.
+    assert synth["true_positive_count"] == 2
+    assert synth["false_negative_count"] == 0
+    assert synth["escalation_recall"] == pytest.approx(1.0)
+    # All-runs: 4 attempted runs, 3 strict passes, 1 errored.
+    assert synth["all_runs"]["true_positive_count"] == 3
+    assert synth["all_runs"]["false_negative_count"] == 1
+    assert synth["all_runs"]["false_negative_breakdown"]["errored"] == 1
+    assert synth["all_runs"]["escalation_recall"] == pytest.approx(3 / 4)
+
+    # The human-readable report surfaces the stability table.
+    md = md_path.read_text(encoding="utf-8")
+    assert "stability" in md.lower()
+    assert "flip rate" in md.lower()

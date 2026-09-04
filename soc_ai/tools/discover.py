@@ -13,6 +13,12 @@ host logs (endpoint/windows/sysmon) exactly as they do for zeek/suricata:
 
 Both are read-only metadata over ``settings.events_index_pattern`` and best-effort
 (an ES error returns a structured ``error`` result, never raises into the agent).
+
+Both carry the synthetic-eval kill-switch every other events reader carries: by
+default the issued body excludes docs tagged ``synth.scenario_id`` so a live eval
+batch's planted scenarios never inflate a described dataset or a field's top
+values; an eval-mode context opts in per call with ``include_synth=True``
+(mirroring :func:`soc_ai.tools.query_events.query_events_oql`).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from typing import Any
 
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +43,20 @@ def _clip(value: Any) -> Any:
     if isinstance(value, str) and len(value) > _EXAMPLE_CLIP:
         return value[:_EXAMPLE_CLIP] + "…"
     return value
+
+
+def _in_marker_namespace(field_path: str) -> bool:
+    """Is ``field_path`` inside the synthetic-eval marker namespace?
+
+    ``synth.*`` (stamped by soc_ai.eval.synth_render) is invisible to the
+    model by policy — even under ``include_synth=True``, which admits the
+    planted DOCUMENTS into a sample, never their answer-key label. These two
+    tools need their own guard because they report field NAMES as values
+    (``{"field": "synth.scenario_id", "example": "m1-…"}``), which the
+    key-level strip at the tool boundary
+    (:func:`soc_ai.agent.toolset.strip_synth_markers`) cannot see.
+    """
+    return field_path == "synth" or field_path.startswith("synth.")
 
 
 def _flatten(obj: Any, prefix: str = "") -> Any:
@@ -68,15 +89,21 @@ async def describe_dataset(
     elastic: ElasticClient,
     settings: Settings,
     sample_size: int = _SAMPLE_SIZE,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Sample recent docs of ``dataset`` and report its POPULATED fields.
 
     Returns ``{dataset, sampled, fields:[{field, coverage, example}]}`` sorted by
-    how many of the sampled docs carry each field (most-common first)."""
+    how many of the sampled docs carry each field (most-common first). By default
+    the sample excludes synthetic-eval docs (``synth.scenario_id``) so planted
+    scenarios can't shape a dataset's described schema; an eval-mode caller opts
+    in with ``include_synth=True``."""
     ds = str(dataset).strip()
     if not ds:
         return {"error": True, "reason": "empty dataset name"}
     query: dict[str, Any] = {"bool": {"filter": [{"term": {"event.dataset": ds}}]}}
+    if synth_must_not := synth_scope_must_not(include_synth):
+        query["bool"]["must_not"] = synth_must_not
     try:
         result = await elastic.search(
             settings.events_index_pattern,
@@ -106,6 +133,11 @@ async def describe_dataset(
         src = h.get("_source", {}) or {}
         seen: set[str] = set()
         for path, val in _flatten(src):
+            if _in_marker_namespace(path):
+                # Never describable: a field report naming synth.scenario_id
+                # (with a scenario id as its example) hands the model the
+                # answer key of the eval it is running in.
+                continue
             if path in seen:
                 continue
             seen.add(path)
@@ -132,18 +164,32 @@ async def field_values(
     dataset: str | None = None,
     size: int = 25,
     window_minutes: int = 1440,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Top values of ``field`` (a terms aggregation), optionally within ``dataset``.
 
     Returns ``{field, dataset, values:[{value, count}]}`` newest-window, most-common
-    first. Use this to learn what actually populates a field before querying on it."""
+    first. Use this to learn what actually populates a field before querying on it.
+    By default the aggregation excludes synthetic-eval docs (``synth.scenario_id``)
+    so planted scenarios can't inflate a field's top values; an eval-mode caller
+    opts in with ``include_synth=True``."""
     f = str(field).strip()
     if not f:
         return {"error": True, "reason": "empty field name"}
+    if _in_marker_namespace(f) or f == "_index":
+        # Active-probe guard: enumerating synth.scenario_id would list every
+        # planted scenario id, and enumerating _index every `logs-synth-*`
+        # index name. Answer exactly as a nonexistent field does — an empty
+        # values list, no ES round-trip — so the refusal itself is not a tell.
+        # Unconditional (not gated on include_synth): the same answer in prod
+        # and eval mode carries no signal either way.
+        return {"field": f, "dataset": dataset, "values": []}
     filters: list[dict[str, Any]] = [{"range": {"@timestamp": {"gte": f"now-{window_minutes}m"}}}]
     if dataset:
         filters.append({"term": {"event.dataset": str(dataset).strip()}})
     query: dict[str, Any] = {"bool": {"filter": filters}}
+    if synth_must_not := synth_scope_must_not(include_synth):
+        query["bool"]["must_not"] = synth_must_not
     aggs: dict[str, Any] = {"vals": {"terms": {"field": f, "size": max(1, min(size, 100))}}}
     try:
         result = await elastic.search(settings.events_index_pattern, query, size=0, aggs=aggs)

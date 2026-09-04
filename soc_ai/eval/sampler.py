@@ -95,7 +95,7 @@ async def sample_diverse_alerts(
 
     Args:
         oql: query string. Must return alerts (not aggregation buckets).
-            E.g. ``event.kind:alert AND _index:*so-detection*``.
+            E.g. ``event.kind:alert AND event.module:suricata``.
         n: target number of distinct-tuple alert IDs to yield.
         settings: app settings (passed to ``query_events_oql``).
         elastic: shared ES client.

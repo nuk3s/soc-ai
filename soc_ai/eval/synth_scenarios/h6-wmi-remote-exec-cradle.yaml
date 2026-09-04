@@ -1,0 +1,220 @@
+id: h6-wmi-remote-exec-cradle
+name: "WMI remote execution followed by a PowerShell download cradle"
+version: 1
+tier: hard
+story: |
+  Workstation 10.0.0.63 opens DCOM to workstation 10.0.0.145 and calls
+  IWbemServices::ExecMethod once — Win32_Process.Create, the WMI way to start
+  a process on another machine without dropping a service or a file. Two
+  seconds later 10.0.0.145, which has never contacted the address before,
+  fetches http://198.51.100.23/a.ps1 with a WindowsPowerShell user agent and
+  gets back 8 KB of text/plain. Nothing is written to disk over the wire,
+  nothing signed or unsigned is transferred to the target, and no service is
+  created — the payload arrives inside the interpreter that the remote call
+  started. Living off the land: every component is a shipped Windows feature,
+  and the only artifact is the sequence.
+attack:
+  - T1047      # Windows Management Instrumentation
+  - T1059.001  # Command and Scripting Interpreter: PowerShell
+  - T1105      # Ingress Tool Transfer
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # dce_rpc: IWbemServices ExecMethod, workstation to workstation
+    - prefetch_pivot         # zeek.http: the target's PowerShell fetch of a .ps1
+    - typed_path             # rule.name / the user agent
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: isolate
+      target_field: destination.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.63"
+      source.port: 51930
+      destination.ip: "10.0.0.145"
+      destination.port: 135
+      network.transport: tcp
+      network.protocol: dce_rpc
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC WMI Remote Method Invocation Observed"
+      rule.category: "Misc activity"
+      rule.signature: "9800012"  # illustrative SID — Zeek analytic surfaced as an alert
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "misc-activity"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -4
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      destination.ip: "10.0.0.145"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "IRemUnknown2"
+      zeek.dce_rpc.operation: "RemQueryInterface"
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      destination.ip: "10.0.0.145"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "IWbemServices"
+      zeek.dce_rpc.operation: "ExecMethod"
+      synth.wmi_class: "Win32_Process"
+      synth.wmi_method: "Create"
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -5
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      source.port: 51930
+      destination.ip: "10.0.0.145"
+      destination.port: 135
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 5.8
+      zeek.conn.orig_bytes: 4210
+      zeek.conn.resp_bytes: 2884
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "dce_rpc"
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+
+  # The consequence, on the TARGET. This is the half that makes the RPC call
+  # mean something: the machine that was told to start a process immediately
+  # fetches a script from an address it has no history with.
+  - index: logs-synth-zeek-http
+    time_offset_seconds: 2
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(2) }}"
+      event.dataset: zeek.http
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.145"
+      source.port: 49811
+      destination.ip: "198.51.100.23"
+      destination.port: 80
+      zeek.http.method: "GET"
+      zeek.http.host: "198.51.100.23"
+      zeek.http.uri: "/a.ps1"
+      zeek.http.status_code: 200
+      zeek.http.user_agent: "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.19045; en-GB) WindowsPowerShell/5.1.19041.4291"
+      zeek.http.resp_mime_types: ["text/plain"]
+      zeek.http.response_body_len: 8214
+      zeek.http.resp_fuids: ["FbT9xK2mQ7dNvRc4Lz"]
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+
+  - index: logs-synth-zeek-files
+    time_offset_seconds: 2
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(2) }}"
+      event.dataset: zeek.files
+      event.module: zeek
+      event.kind: event
+      source.ip: "198.51.100.23"
+      destination.ip: "10.0.0.145"
+      zeek.files.tx_hosts: ["198.51.100.23"]
+      zeek.files.rx_hosts: ["10.0.0.145"]
+      zeek.files.fuid: "FbT9xK2mQ7dNvRc4Lz"
+      zeek.files.mime_type: "text/plain"
+      zeek.files.filename: "a.ps1"
+      zeek.files.total_bytes: 8214
+      zeek.files.sha256: "4d1a7e63b02c85fd93ae71c04b6f28d5a09e37418cb2d6570fe93a15c8b40726"
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+
+  # Roles and history — the fields whose values are inverted in b5.
+  - index: logs-synth-zeek-dce-rpc-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.dce_rpc_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      synth.wmi_context:
+        window_seconds: 3600
+        source_role: "user-workstation"
+        source_is_management_host: false
+        distinct_targets: 1
+        operations:
+          ExecMethod: 1
+        source_prior_wmi_calls_90d: 0
+        recurrence_days: 0
+        targets_with_novel_egress_after_call: 1   # the whole point
+        target_egress_destination: "198.51.100.23"
+        target_prior_days_seen_destination: 0
+      synth.scenario_id: h6-wmi-remote-exec-cradle
+
+rubric_notes: |
+  Hard TP. Every element is a legitimate Windows mechanism: DCOM, WMI,
+  Win32_Process.Create, PowerShell, HTTP GET. There is no malware artifact on
+  the wire at all — the transferred file is 8 KB of text. The finding is the
+  CAUSAL SEQUENCE, and it is visible in the events:
+
+  ExecMethod against Win32_Process on 10.0.0.145 at T+0, then at T+2 that
+  same host fetches a .ps1 from an address it has never contacted, with a
+  PowerShell user agent. A machine does not spontaneously start downloading
+  scripts two seconds after a peer tells it to create a process.
+
+  Supporting discriminators, all in `synth.wmi_context`:
+  * The source is a user workstation with zero prior WMI calls in 90 days.
+    Workstations do not administer each other.
+  * Exactly one target, once — not a fleet sweep.
+  * `targets_with_novel_egress_after_call: 1` — the executed method caused
+    outbound traffic to somewhere new.
+
+  This scenario is paired with b5-sanctioned-wmi-inventory, which puts the
+  IDENTICAL `IWbemServices / ExecMethod` operation on the wire from the
+  management server across 41 hosts. `ExecMethod` is deliberately NOT in
+  t_dcerpc_histogram's dangerous-operation set, so neither scenario is
+  auto-flagged by the sweep and both surface only as ordinary histogram
+  entries — the discrimination has to come from source role, fan-out shape,
+  and whether anything happened downstream. A system that treats "WMI seen"
+  as malicious fails b5; a system that treats it as administration fails
+  this one.

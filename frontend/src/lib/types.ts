@@ -334,6 +334,9 @@ export interface Investigation {
    *  (no FK server-side — the link may dangle). */
   huntId?: string | null;
   huntObjective?: string | null;
+  /** synthetic-evaluation marker (migration 0032): this run investigated PLANTED
+   * synthetic attack scenarios — badged so it can never be read as real activity. */
+  isSynthEval?: boolean;
 }
 
 /** The triggering detection's raw facts — the "what fired" reference panel. */
@@ -404,6 +407,9 @@ export interface InvestigationRow {
   /** operator ack of a fallback run (dismiss-error) — the Dashboard's pipeline-error
    * KPI counts only `fallback && !errorDismissed`; the row itself stays a fallback. */
   errorDismissed?: boolean;
+  /** synthetic-evaluation marker (migration 0032): this run investigated PLANTED
+   * synthetic attack scenarios — badged so it can never be read as real activity. */
+  isSynthEval?: boolean;
 }
 
 /** One SQL page of GET /api/v1/investigations — the /dossiers list shape.
@@ -447,6 +453,9 @@ export interface HuntRow {
   ts: string;
   /** Follow-up chat messages on this hunt (0 = no chat log). */
   chatCount?: number;
+  /** synthetic-evaluation marker (migration 0032): this hunt ran against PLANTED
+   * synthetic attack scenarios — badged so it can never be read as real activity. */
+  isSynthEval?: boolean;
 }
 
 export interface HuntStat {
@@ -575,6 +584,9 @@ export interface HuntDetailData {
   timeline: TimelineStep[];
   /** "vs last run" finding diff — null/absent on the first run of an objective. */
   diff?: HuntDiff | null;
+  /** synthetic-evaluation marker (migration 0032): this hunt ran against PLANTED
+   * synthetic attack scenarios — badged so it can never be read as real activity. */
+  isSynthEval?: boolean;
 }
 
 export interface HostSignal {
@@ -779,6 +791,11 @@ export interface Notification {
   title: string;
   when: string;
   href?: string | null;
+  /** synthetic-evaluation marker (migration 0032): the run this entry describes
+   * executed against PLANTED scenarios — badged so the bell can never read a
+   * planted attack as real activity. Absent on non-run entries (dep outages,
+   * dossier conflicts). */
+  isSynthEval?: boolean;
 }
 
 // ── Backtest ("prove it on my last N days") ─────────────────────────────────

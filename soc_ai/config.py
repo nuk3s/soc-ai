@@ -1259,7 +1259,7 @@ class Settings(BaseSettings):
     """Explicit cloud opt-in.  When False, _should_escalate_to_oracle() is
     always False and no case ever reaches a frontier model."""
 
-    oracle_model: str = "claude-opus-4-8"
+    oracle_model: str = "claude-opus-5"
     """LiteLLM model alias for the frontier adjudicator.  Must be reachable
     via litellm_base_url (typically an oracle alias on the gateway)."""
 
@@ -1285,6 +1285,35 @@ class Settings(BaseSettings):
     oracle_escalate_below_confidence: float = 0.6
     """Escalate to Oracle when local confidence falls below this threshold,
     regardless of verdict or rule class."""
+
+    # --- Oracle read-only tool loop (opt-in inside oracle_enabled) ------
+    oracle_tools_enabled: bool = False
+    """Give the Oracle its own bounded, read-only investigation loop.
+
+    An opt-in INSIDE the ``oracle_enabled`` opt-in: with this False (the
+    default) the Oracle stays single-shot — it reasons over the pre-assembled,
+    sanitized case payload and nothing else, exactly as it shipped. With it
+    True, an adjudicator that doubts a claim can check it: between sanitize and
+    verdict the Oracle runs the read-only ``oracle`` tool surface
+    (:func:`soc_ai.agent.toolset.register_read_tools`, no write / online /
+    pcap tool), its tool arguments desanitized before execution and its tool
+    results re-sanitized on the way back, every outbound request body swept for
+    residue at a single wire-level choke point. Off by default so shipped
+    behaviour is unchanged until the owner flips it (see the 2026-08-27 design
+    ``docs/dev/design/2026-08-27-oracle-tool-use.md``)."""
+
+    oracle_tool_calls_limit: int = 8
+    """Max tool calls in ONE Oracle adjudication loop. The Oracle's own budget,
+    never the investigator's (``agent_tool_calls_limit``): escalation fires
+    precisely when the local loop is exhausted, so sharing its budget would hand
+    the Oracle a spent one in exactly the cases it exists for."""
+
+    oracle_request_limit: int = 6
+    """Max model requests in ONE Oracle adjudication loop (its own budget)."""
+
+    oracle_adjudication_timeout_s: float = 300.0
+    """Overall wall-clock for one tool-running Oracle adjudication (the loop, not
+    a single call — ``oracle_timeout_s`` still bounds the per-request HTTP wait)."""
 
     # --- Oracle privacy gate -------------------------------------------
     oracle_internal_suffixes: Annotated[tuple[str, ...], NoDecode] = (
@@ -1417,7 +1446,7 @@ class Settings(BaseSettings):
     # proxy that holds the cloud credential). This reuses
     # `litellm_base_url` / `litellm_api_key` / `litellm_verify_ssl` —
     # only the model alias and max_tokens are eval-specific.
-    claude_oracle_model: str = "claude-opus-4-8"
+    claude_oracle_model: str = "claude-opus-5"
     claude_oracle_max_tokens: int = 8192
 
     # --- Nightly quality micro-eval (trend + alarm) ---------------------

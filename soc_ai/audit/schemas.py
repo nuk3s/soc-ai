@@ -40,6 +40,15 @@ AuditKind = Literal[
     "citation_cap",
     "template_ceiling",
     "verdict_floor_rewrite",
+    # evidence-conditional confidence floor raise (gates._apply_confidence_
+    # floor_raise): a grounded true_positive below the escalation floor is
+    # raised to 0.70. Payload carries grounded_by (ioc_hit /
+    # decisive_pivot_value / retrieved_decisive_value /
+    # retrieved_beacon_profile) — without this event the 2026-08-27 batch
+    # could not tell a gate-raised 0.70 from a model-asserted one. Must be a
+    # valid audit kind or _audit silently drops it (the recurring trap the
+    # downgrade kinds document below).
+    "confidence_floor_raise",
     # coverage / rubric
     "coverage_cap",
     "rubric_derivation",
@@ -76,8 +85,20 @@ AuditKind = Literal[
     # _audit swallowed the ValidationError — so every such downgrade was silently
     # dropped from the audit trail (caught by the docs-vs-code accuracy gate).
     "evidence_gate_downgrade",
+    # the gate's other outcome: a zero-tool verdict EXEMPTED because it cites
+    # correlated prefetched-pivot evidence. Audit-only until 2026-08-27, which
+    # made "the gate passed this" indistinguishable from "the gate never ran".
+    "evidence_gate_pivot_exemption",
     "ungrounded_host_anchored_tp_downgrade",
     "malware_rule_name_ungrounded_downgrade",
+    # decisive-value support gate (H1's deferred half, 2026-08-25 audit): the
+    # verdict asserts an indicator value (a global IP / a hash) that appears
+    # in no retrieved document. `_cap` = partial support, confidence banded;
+    # `_downgrade` = no asserted value retrieved, verdict coerced to
+    # needs_more_info. Must be valid audit kinds or _audit silently drops them
+    # (the recurring trap documented on the downgrade kinds above).
+    "decisive_value_support_cap",
+    "unsupported_decisive_value_downgrade",
     # retask
     "usage",
     "retask",
@@ -85,6 +106,13 @@ AuditKind = Literal[
     # oracle frontier adjudication
     "oracle_escalation",
     "oracle_adjudication",
+    # adjudicate() returned None (residue refusal, gateway error, unparseable
+    # verdict, or payload-serialization failure) and the local verdict stood.
+    # Before this kind existed a failed second opinion emitted NOTHING after
+    # oracle_escalation (scenario b8, 2026-08-27 measurement) — silently
+    # indistinguishable from an adjudication that never happened. Payload
+    # carries the client-reported reason + the retained local verdict.
+    "oracle_adjudication_failed",
     # model-fitness preflight probe (soc_ai/webui/probes.probe_model_fitness):
     # emitted by GET /config/model-fitness with the overall grade so an operator
     # switching analyst_model to an unfit model leaves an audit trail of the

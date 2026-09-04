@@ -1,4 +1,4 @@
-import { Disc, Wrench } from 'lucide-react';
+import { Disc, FlaskConical, Wrench } from 'lucide-react';
 
 import { KIND, SEVERITY, VERDICT } from '../lib/tokens';
 import type { DetectionKind, Severity, Verdict } from '../lib/types';
@@ -121,6 +121,27 @@ export function PipelineErrorChip({ hint, large }: { hint?: string | null; large
     >
       <Wrench size={large ? 12 : 10} strokeWidth={2.5} />
       Pipeline error
+    </span>
+  );
+}
+
+// ---- synthetic-evaluation badge ---------------------------------------------
+// Marks a hunt/investigation that ran against PLANTED synthetic attack
+// scenarios (is_synth_eval, migration 0032). The marker exists so a planted
+// attack can never be read back as real activity, which only works if the flag
+// is visible on every surface the row appears on — so the label is plain
+// English an analyst parses at a glance, never internal vocabulary ("synth",
+// "is_synth_eval"). Amber caution tone, same family as DevBadge: "true story,
+// staged network".
+export function SyntheticEvalBadge() {
+  return (
+    <span
+      className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
+      style={{ color: '#f5a623', borderColor: 'rgba(245,166,35,.4)', background: 'rgba(245,166,35,.09)' }}
+      title="This run executed against planted synthetic attack scenarios used to evaluate verdict quality — nothing in it describes real activity on your network."
+    >
+      <FlaskConical size={9} strokeWidth={2.5} />
+      Synthetic — evaluation data
     </span>
   );
 }

@@ -25,6 +25,17 @@ def _make_elastic(
     )
     fake_es.indices = AsyncMock()
     fake_es.indices.refresh = AsyncMock(return_value={"acknowledged": True})
+    # The containment pre-check (assert_no_synth_in_production) reads before
+    # any write; default to a clean grid so ingest proceeds. Contamination
+    # tests override this per-test (see tests/test_quality_spine.py).
+    fake_es.search = AsyncMock(
+        return_value={
+            "took": 1,
+            "timed_out": False,
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+        }
+    )
     with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es):
         client = ElasticClient(settings)
     return client, fake_es
@@ -396,6 +407,53 @@ async def test_ingest_refresh_swallows_persistent_404(
 
 
 @pytest.mark.asyncio
+async def test_ingest_captures_the_event_index_to_doc_id_bridge_for_m1(
+    settings_kratos: Settings,
+) -> None:
+    """The journey scorer's citation bridge is captured AT INGEST TIME.
+
+    ``score_journey`` resolves a finding's citations against the ES ``_id``s
+    ingest assigned, keyed by event ``index`` — and refuses to score when the
+    bridge misses an expected event. ``triage_doc_id`` alone covers ZERO of
+    m1's two ``expected_cited_event_ids`` (the triage target is the suricata
+    alert, the expected citations are the two Zeek events), so without this
+    field the flagship journey can never be scored end to end.
+    """
+    from pathlib import Path
+
+    from soc_ai.eval.synth_ingest import ingest_scenario
+    from soc_ai.eval.synth_loader import load_scenario_file
+
+    m1 = load_scenario_file(
+        Path(__file__).parent.parent
+        / "soc_ai"
+        / "eval"
+        / "synth_scenarios"
+        / "m1-cobalt-strike-beacon.yaml"
+    )
+    responses = [{"_id": f"real-es-id-{i}", "result": "created"} for i in range(len(m1.events))]
+    elastic, fake_es = _make_elastic(settings_kratos, index_responses=responses)
+
+    result = await ingest_scenario(m1, elastic=elastic, run_time=RUN_TIME)
+
+    # Rebuild index → ids from the transport calls themselves, so the assertion
+    # holds whatever order the docs were written in.
+    expected: dict[str, list[str]] = {}
+    for call, resp in zip(fake_es.index.call_args_list, responses, strict=True):
+        expected.setdefault(call.kwargs["index"], []).append(str(resp["_id"]))
+    assert result.doc_ids_by_event == expected
+    # Every event is bridged — in particular BOTH journey-expected events,
+    # which the triage locator alone covers none of.
+    assert set(result.doc_ids_by_event) == {e.index for e in m1.events}
+    assert m1.hunt_journey is not None
+    for event_id in m1.hunt_journey.expected_cited_event_ids:
+        assert result.doc_ids_by_event[event_id], f"no ingested _ids bridged for {event_id!r}"
+    # The pre-existing locator fields are untouched (batch.py reads them).
+    assert result.triage_index == "logs-synth-suricata-alert"
+    assert result.doc_ids_by_event[result.triage_index] == [result.triage_doc_id]
+
+
+@pytest.mark.asyncio
 async def test_ingest_refuses_non_synth_index_prefix(settings_kratos: Settings) -> None:
     """The synth pollution kill-switch: refuse to write to a non-synth index.
 
@@ -427,3 +485,112 @@ async def test_ingest_refuses_non_synth_index_prefix(settings_kratos: Settings) 
 
     with pytest.raises(ValueError, match="logs-synth-"):
         await ingest_scenario(scenario, elastic=elastic, run_time=RUN_TIME)
+
+
+# --------------------------------------------------------------------
+# Repeated plants (--repeats): each repeat gets its own scope key.
+# --------------------------------------------------------------------
+
+
+def _two_event_scenario() -> Scenario:
+    return _scenario(
+        [
+            EventTemplate(
+                index="logs-synth-suricata-alert",
+                time_offset_seconds=0,
+                is_triage_target=True,
+                fields={"@timestamp": "{{ run_time }}", "event.dataset": "suricata.alert"},
+            ),
+            EventTemplate(
+                index="logs-synth-zeek-conn",
+                time_offset_seconds=-1,
+                is_triage_target=False,
+                fields={"@timestamp": "{{ run_time | offset_seconds(-1) }}"},
+            ),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_scenarios_repeats_plants_isolated_copies(
+    settings_kratos: Settings,
+) -> None:
+    """repeats=3 plants the scenario three times, each copy stamped with a
+    DISTINCT synth.scenario_id (the SynthScope term key), so one repeat's
+    queries exclude its siblings' documents — same mechanism that already
+    isolates sibling scenarios. Repeat 0 keeps the bare id."""
+    from soc_ai.eval.synth_ingest import ingest_scenarios
+
+    scenario = _two_event_scenario()
+    elastic, fake_es = _make_elastic(settings_kratos)
+
+    results = await ingest_scenarios([scenario], elastic=elastic, run_time=RUN_TIME, repeats=3)
+
+    assert len(results) == 3
+    assert fake_es.index.call_count == 6  # 2 events × 3 plants
+
+    plant_ids = [r.plant_id for r in results]
+    assert plant_ids == ["test-ingest", "test-ingest::r1", "test-ingest::r2"]
+    assert len(set(plant_ids)) == 3  # pairwise distinct — no shared scope key
+    assert [r.repeat for r in results] == [0, 1, 2]
+    # Scoring joins on the BASE id; every repeat keeps it.
+    assert all(r.scenario_id == "test-ingest" for r in results)
+    # Distinct triage targets per plant (the batch runner triages each).
+    assert len({r.triage_doc_id for r in results}) == 3
+
+    stamped = [c.kwargs["body"]["synth.scenario_id"] for c in fake_es.index.call_args_list]
+    # Every doc carries synth.scenario_id (synth-clean deletes by exists on
+    # this field, so all repeats stay removable), valued with its plant's key.
+    assert sorted(set(stamped)) == sorted(plant_ids)
+    assert all(stamped.count(pid) == 2 for pid in plant_ids)
+
+
+@pytest.mark.asyncio
+async def test_ingest_scenarios_default_repeats_is_one_bare_plant(
+    settings_kratos: Settings,
+) -> None:
+    """Omitting repeats keeps today's behavior byte-identical: one plant,
+    stamped with the bare scenario id."""
+    from soc_ai.eval.synth_ingest import ingest_scenarios
+
+    scenario = _two_event_scenario()
+    elastic, fake_es = _make_elastic(settings_kratos)
+
+    results = await ingest_scenarios([scenario], elastic=elastic, run_time=RUN_TIME)
+
+    assert len(results) == 1
+    assert results[0].plant_id == "test-ingest"
+    assert results[0].repeat == 0
+    stamped = {c.kwargs["body"]["synth.scenario_id"] for c in fake_es.index.call_args_list}
+    assert stamped == {"test-ingest"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_scenarios_rejects_nonpositive_repeats(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.eval.synth_ingest import ingest_scenarios
+
+    elastic, _ = _make_elastic(settings_kratos)
+    with pytest.raises(ValueError, match="repeats"):
+        await ingest_scenarios(
+            [_two_event_scenario()], elastic=elastic, run_time=RUN_TIME, repeats=0
+        )
+
+
+def test_synth_scope_of_one_repeat_excludes_sibling_plants() -> None:
+    """The scope clause built from a repeat's plant id term-matches ONLY that
+    plant id; docs stamped with the bare id or another repeat's id carry
+    synth.scenario_id (the exists arm) without matching the term — so a
+    repeat's queries exclude every sibling plant's documents."""
+    from soc_ai.tools._synth_scope import synth_scope_must_not
+
+    clauses = synth_scope_must_not("test-ingest::r1")
+    assert len(clauses) == 1
+    inner = clauses[0]["bool"]
+    assert inner["must"] == [{"exists": {"field": "synth.scenario_id"}}]
+    assert {"term": {"synth.scenario_id": "test-ingest::r1"}} in inner["must_not"]
+    assert {"term": {"synth.scenario_id.keyword": "test-ingest::r1"}} in inner["must_not"]
+    # Neither the bare id nor another repeat's id is exempted.
+    for other in ("test-ingest", "test-ingest::r2"):
+        assert {"term": {"synth.scenario_id": other}} not in inner["must_not"]

@@ -131,6 +131,11 @@ class InvestigationRowOut(BaseModel):
     latestRunId: str = ""
     latestRunStatus: str = ""
     latestRunWhen: str = ""
+    # Migration 0032's synthetic-evaluation marker: this run investigated
+    # PLANTED synthetic attack scenarios (directly, or promoted from a marked
+    # hunt). Surfaced wherever the row is displayed — the SPA badges it so a
+    # planted attack can never be read as real activity.
+    isSynthEval: bool = False
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -204,6 +209,7 @@ def _row(
         latestRunWhen=_ago(
             _iso_utc(inv.created_at if latest_run is None else latest_run.created_at)
         ),
+        isSynthEval=bool(inv.is_synth_eval),
     )
 
 
@@ -515,6 +521,7 @@ async def get_investigation(
         huntId=inv.hunt_id,
         huntObjective=(hunt.objective[:160] if hunt else None),
         alertAcked=alert_acked,
+        isSynthEval=bool(inv.is_synth_eval),
     )
 
 

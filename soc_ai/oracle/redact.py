@@ -136,6 +136,44 @@ _WINLOG_USER_LEAF_KEYS: frozenset[str] = frozenset(
     {"targetusername", "subjectusername", "samaccountname", "accountname"}
 )
 
+# Winlog/EVTX HOST LEAF keys — the parallel of ``_WINLOG_USER_LEAF_KEYS`` for
+# hostnames.  Matched case-insensitively against the last path segment, wherever
+# they nest (``winlog.event_data.TargetServerName``, a raw ``t_get_event_raw``
+# ``_source``, or an OQL hit).  Their VALUE is a bare internal hostname that sits
+# in no ECS host field, so the field-aware harvest never classified it and a
+# single-label NetBIOS name (``FILESRV`` / ``PDC01``) has no regex shape the wire
+# gate could catch — it egressed raw.  Route them onto HOST unconditionally, the
+# same policy as ``host.name`` (NOT the credential-stopset gate the USER leaf
+# uses: an internal host is legitimately named ``MAIL`` / ``PROXY`` / ``BACKUP``,
+# all of which live in the username stopset, so gating on it would re-open the
+# leak).  Only keys whose value is a hostname belong here — a domain/FQDN-only or
+# non-host key would over-redact.
+_WINLOG_HOST_LEAF_KEYS: frozenset[str] = frozenset(
+    {
+        "targetservername",
+        "workstation",
+        "workstationname",
+        "sourceworkstation",
+        "machinename",
+        "computer",
+        "computername",
+        "targetcomputer",
+        "hostname",
+        # Remaining unambiguous internal host-bearing leaves.  ``callercomputername``
+        # (a ``\\``-prefixed NetBIOS name), ``clientname`` / ``remotehost`` /
+        # ``remotemachine`` (RDP/TS session endpoints), ``dnshostname`` (the AD
+        # computer's own DNS name — always internal), ``targethostname``.  Excluded:
+        # ``ServerName`` (can legitimately be an EXTERNAL host), and any domain/FQDN
+        # or path leaf (would over-redact).
+        "callercomputername",
+        "clientname",
+        "dnshostname",
+        "targethostname",
+        "remotehost",
+        "remotemachine",
+    }
+)
+
 # IP fields: tokenised only when the value is a private/internal address.
 _IP_FIELDS: frozenset[str] = frozenset(
     {
@@ -153,9 +191,14 @@ _IP_FIELDS: frozenset[str] = frozenset(
 )
 
 # DOMAIN fields: tokenised only when the value ends in an internal suffix.
+# ``dns.query.name`` sits beside ``dns.question.name`` because THIS grid populates
+# the ``query`` spelling on raw ES docs / OQL hits — a case where the two ECS
+# aliases for the same value are not interchangeable, and covering only one let an
+# internal-suffix DNS name egress under the other (finding oracle-tool-result-leak).
 _DOMAIN_FIELDS: frozenset[str] = frozenset(
     {
         "dns.question.name",
+        "dns.query.name",
         "domain",
         "host.domain",
     }
@@ -182,6 +225,18 @@ _DOMAIN_LIKE_FIELDS: frozenset[str] = frozenset(
         "alert.zeek_http_host",
         "alert.zeek_dns_query",
         "alert.dns_query",
+        # t_decode_payload's L7-sniff leaves — its OWN spellings, distinct from
+        # the zeek_* ones above (``http_host`` ≠ ``zeek_http_host``); an SNI /
+        # Host / DNS name recovered from decoded bytes is gated identically
+        # (finding oracle-tool-result-leak).
+        "dns_qname",
+        "http_host",
+        "tls_sni",
+        # t_host_summary's top-DNS aggregate leaf: ``top_dns: [{value, count}]``.
+        # A single-label / internal-suffix query name the host reached for is an
+        # internal identifier under a generic ``value`` key the harvest could not
+        # otherwise classify.
+        "top_dns.value",
     }
 )
 
@@ -611,6 +666,31 @@ def _try_harvest_scalar(
     if path.rsplit(".", maxsplit=1)[-1].lower() in _WINLOG_USER_LEAF_KEYS:
         if not _is_nonusername_token(value):
             mapping.label_for(value, "USER")
+        return
+
+    # Winlog/EVTX HOST leaf keys (TargetServerName / Workstation / WorkstationName
+    # / MachineName / ComputerName / CallerComputerName …) — case-insensitive LEAF
+    # match, wherever they nest.  Unconditional HOST harvest, exactly as
+    # ``host.name``: a bare internal hostname here has no shape the wire gate can
+    # catch, and internal hosts named ``MAIL`` / ``PROXY`` (in the username stopset)
+    # mean a credential-style gate would re-open the leak.
+    if path.rsplit(".", maxsplit=1)[-1].lower() in _WINLOG_HOST_LEAF_KEYS:
+        # ``CallerComputerName`` often carries a leading ``\\`` (``\\WIN-DC01``); a
+        # hostname never contains a backslash, so strip the down-level prefix and
+        # learn the BARE name.  Otherwise the mapping keys the ``\\``-prefixed form
+        # and the same host appearing bare in another field would not round-trip.
+        # This is LOCAL to the winlog-host route — UNC-path handling elsewhere (the
+        # free-text credential/NetBIOS rules) is untouched.
+        host_val = value.lstrip("\\")
+        # Degenerate-value guard (winlog-host route ONLY): a value with NO
+        # alphanumeric character (``-`` for an absent WorkstationName, ``""``,
+        # ``—``, whitespace, a bare ``\\``) cannot be a real hostname.  Because the
+        # route is unconditional, tokenising ``-`` to a HOST label would propagate
+        # it globally and corrupt free text (``logon type 3 - see details``).  Only
+        # the no-alphanumeric case is skipped — a real host like ``MAIL`` / ``PROXY``
+        # still has an alnum char and is routed, so the prior fix's leak stays shut.
+        if any(c.isalnum() for c in host_val):
+            mapping.label_for(host_val, "HOST")
         return
 
     # IP fields — private only.

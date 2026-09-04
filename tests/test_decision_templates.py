@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from soc_ai.agent.decision_templates import match_decision_template
 from soc_ai.enrichment.blocklists import BlocklistHit
 from soc_ai.enrichment.maxmind import AsnInfo
 from soc_ai.enrichment.zeek_parser import TypedZeekFields
+from soc_ai.eval.synth_loader import load_scenario_file
+from soc_ai.eval.synth_render import render_scenario
 from soc_ai.so_client.models import RuleMetadata, SoAlert
 from soc_ai.tools.enrichment import IndicatorEnrichment
 from soc_ai.tools.get_alert_context import EnrichedAlertContext
+
+_SCENARIOS_DIR = Path(__file__).resolve().parents[1] / "soc_ai" / "eval" / "synth_scenarios"
+_RUN_TIME = datetime(2026, 8, 27, 2, 17, 22, tzinfo=UTC)
+
+
+def _rendered_triage_alert(scenario_file: str) -> SoAlert:
+    """The real triage alert a scenario puts on the wire, via the real renderer
+    and the real ES-hit parse — so these tests pin the shape the measured eval
+    actually produced, not a hand-approximated copy."""
+    scenario = load_scenario_file(_SCENARIOS_DIR / scenario_file)
+    docs = render_scenario(scenario, run_time=_RUN_TIME)
+    triage = next(d for d in docs if d.is_triage_target)
+    return SoAlert.from_es_hit({"_id": f"synth-{scenario.id}", "_source": triage.body})
 
 
 def _ctx(alert: SoAlert, **kwargs: Any) -> EnrichedAlertContext:
@@ -800,3 +817,167 @@ def test_reversed_flow_blocklist_hit_on_external_source_not_cleared() -> None:
     # A flagged external source must NOT be benign-cleared by the reversed-flow
     # change (it routes to needs_more_info / investigation, never false_positive).
     assert cv is None or cv.verdict != "false_positive"
+
+
+# ---------------------------------------------------------------------------
+# Behavioural-analytics guard (2026-08-27 batch, h5/h6). Two genuine attacks
+# — ransomware staging (1,843 files / 6 shares then a 3.2 GB archive) and a
+# WMI ExecMethod followed 2s later by a PowerShell download cradle — settled
+# false_positive with ZERO tool calls on clean_internal_traffic. Their rules
+# are deliberately-informational misc-activity analytics, so neither the
+# attack-classtype guard nor the malware-token guard fired, and "both
+# endpoints internal, no blocklist hits" is vacuous for exactly this class:
+# lateral movement, staging and internal recon are internal-to-internal by
+# definition. A behavioural analytic's verdict lives in baseline/aggregate
+# evidence a template cannot see — no benign template may anchor it.
+# ---------------------------------------------------------------------------
+
+
+def test_h5_ransomware_staging_alert_gets_no_benign_template() -> None:
+    """The real rendered h5 triage alert (misc-activity analytic, Informational,
+    internal→internal, no blocklist hit) must not receive any benign template
+    anchor — measured to settle false_positive @0.85 with zero tool calls on
+    clean_internal_traffic (batch-2026-08-27T021722Z)."""
+    alert = _rendered_triage_alert("h5-ransomware-staging.yaml")
+    assert alert.classtype == "misc-activity"
+    assert alert.rule_name is not None and "ANALYTIC" in alert.rule_name
+    cv = match_decision_template(_ctx(alert))
+    assert cv is None, f"h5's triage alert matched template {cv.template_id!r}"
+
+
+def test_h6_wmi_cradle_alert_gets_no_benign_template() -> None:
+    """The real rendered h6 triage alert (WMI ExecMethod analytic, misc-activity,
+    internal→internal) must not receive any benign template anchor — measured to
+    settle false_positive with zero tool calls on clean_internal_traffic."""
+    alert = _rendered_triage_alert("h6-wmi-remote-exec-cradle.yaml")
+    assert alert.classtype == "misc-activity"
+    cv = match_decision_template(_ctx(alert))
+    assert cv is None, f"h6's triage alert matched template {cv.template_id!r}"
+
+
+def test_b5_wmi_inventory_twin_also_loses_the_zero_tool_fast_path() -> None:
+    """b5 puts the IDENTICAL analytic rule on the wire as h6 — by the scenario's
+    own design "the rule cannot tell them apart". Any alert-level guard that
+    blocks h6 therefore blocks b5 too. This is the accepted, deliberate cost of
+    the fix: b5 is dispositioned benign from evidence (management-source role,
+    41-host fan-out, zero downstream egress) inside an investigation, not from
+    locality with zero tool calls. Pinned so the trade-off stays visible."""
+    alert = _rendered_triage_alert("b5-sanctioned-wmi-inventory.yaml")
+    cv = match_decision_template(_ctx(alert))
+    assert cv is None
+
+
+def test_analytic_rule_blocks_clean_internal_anchor() -> None:
+    """Unit shape of the h5 defect: internal↔internal, misc-activity,
+    Informational severity, analytic rule name → no benign anchor."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="SOC-AI ANALYTIC Anomalous SMB File Access Rate From Single Host",
+        severity_label="low",
+        source_ip="10.0.0.101",
+        destination_ip="10.0.0.150",
+        classtype="misc-activity",
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+    enrich = {
+        "10.0.0.101": IndicatorEnrichment(
+            indicator="10.0.0.101", indicator_type="ip", internal=True
+        ),
+        "10.0.0.150": IndicatorEnrichment(
+            indicator="10.0.0.150", indicator_type="ip", internal=True
+        ),
+    }
+    cv = match_decision_template(_ctx(alert, enrichments=enrich))
+    assert cv is None
+
+
+def test_anomalous_token_alone_blocks_benign_anchor() -> None:
+    """A behavioural detection without the SOC-AI ANALYTIC prefix — the
+    'anomalous' token itself marks a baseline-deviation rule that locality
+    cannot dismiss."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="Anomalous Outbound SMB Volume From Workstation",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="misc-activity",
+    )
+    cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
+    assert cv is None
+
+
+def test_analytic_rule_blocks_policy_violation_anchor() -> None:
+    """The guard covers every internal benign template, not just
+    clean_internal_traffic — a policy-violation-classed analytic must not be
+    auto-cleared on locality either."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="SOC-AI ANALYTIC Unsanctioned Protocol Between Internal Segments",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="policy-violation",
+    )
+    cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
+    assert cv is None
+
+
+def test_analytic_rule_blocks_protocol_housekeeping_anchor() -> None:
+    """An analytic whose name happens to contain a housekeeping protocol token
+    ('NTP') must not slip into the protocol-housekeeping benign template."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="SOC-AI ANALYTIC Anomalous NTP Query Volume From Single Host",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="93.184.216.34",
+    )
+    typed = TypedZeekFields(conn_states=["SF"])
+    cv = match_decision_template(_ctx(alert, typed_zeek=typed))
+    assert cv is None
+
+
+def test_routine_internal_info_alert_keeps_the_fast_path() -> None:
+    """Regression guard for the other direction: a routine signature-based ET
+    INFO alert between internal hosts (misc-activity, no analytic/malware/attack
+    signal) still settles via clean_internal_traffic — the benign twins must not
+    all become full investigations."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET INFO Windows Update Delivery Optimization",
+        severity_label="low",
+        source_ip="10.0.0.40",
+        destination_ip="10.0.0.41",
+        classtype="misc-activity",
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+    cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
+    assert cv is not None
+    assert cv.template_id == "clean_internal_traffic"
+    assert cv.verdict == "false_positive"
+
+
+def test_analytic_guard_does_not_weaken_existing_guards() -> None:
+    """The attack-classtype and malware-token guards still fire on their own,
+    with no analytic token present (the new guard is additive, not a rewrite)."""
+    attack = SoAlert(
+        id="a1",
+        rule_name="ET EXPLOIT Internal SMB attempted-admin",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="attempted-admin",
+    )
+    assert match_decision_template(_ctx(attack, enrichments=_INTERNAL_PAIR)) is None
+    malware = SoAlert(
+        id="a2",
+        rule_name="ET MALWARE BPFDoor Covert Channel ICMP",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="misc-activity",
+    )
+    assert match_decision_template(_ctx(malware, enrichments=_INTERNAL_PAIR)) is None

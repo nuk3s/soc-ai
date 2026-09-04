@@ -38,6 +38,8 @@ _TL_GROUP = {
     "approval_required": "Decision",
     "citation_validation": "Validators",
     "citation_cap": "Validators",
+    "confidence_floor_raise": "Validators",
+    "evidence_gate_pivot_exemption": "Validators",
     "error": "Validators",
     # A taken action (auto-ack on a high-confidence FP) is a verdict
     # consequence, not an investigative tool call — a "no tools" heuristic run
@@ -664,6 +666,11 @@ class InvestigationOut(BaseModel):
     # investigation must survive hunt deletion), so this degrades gracefully
     # rather than 404ing the whole drawer.
     huntObjective: str | None = None
+    # Migration 0032's synthetic-evaluation marker: this run investigated
+    # PLANTED synthetic attack scenarios (directly, or promoted from a marked
+    # hunt). The drawer badges it so a planted attack can never be read as
+    # real activity.
+    isSynthEval: bool = False
 
 
 def _collect_reasoning(events: list[Any]) -> list[str]:

@@ -9,7 +9,9 @@ story: |
   a0e9f5d64349fb13191bc781f81f42e1 (Cobalt Strike Win10 client default) +
   JA3S b742b407517bac9536a77a7b0fee28e9 (CS team server default). Conn-log
   shows regular ~60s ± 6s jitter intervals over 4 hours with nearly constant
-  packet sizes — RITA-style beacon profile.
+  packet sizes — RITA-style beacon profile. The raw zeek.conn rows below
+  carry the trailing ~30 minutes of that window (31 check-ins); the
+  zeek.conn_summary doc is the 4-hour aggregate.
 attack:
   - T1071.001  # Application Layer Protocol: Web Protocols
   - T1102.002  # Web Service: Bidirectional Communication
@@ -29,6 +31,25 @@ ground_truth:
     - kind: isolate
       target_field: source.ip
   expected_field_reconciliation: false
+
+# What a correct hunt JOURNEY looks like: run the objective, surface a
+# finding that cites the decisive events (ids are event `index` values),
+# promote it, land the verdict. The objective describes only the BEHAVIOUR
+# to hunt for — the b1 benign twin tells the same periodic-HTTPS story (its
+# alert + conn_summary present an even more regular cadence), so a hunt
+# that concludes on periodicity alone, without the TLS pivot, measures as
+# obedience rather than discrimination.
+hunt_journey:
+  objective: >-
+    Hunt for internal hosts beaconing to external HTTPS services on a
+    regular cadence with near-constant transfer sizes. Use t_beacon_profile
+    to measure cadence and t_first_seen for novel destinations, then pivot
+    into the TLS metadata for any flagged pair before concluding — a routine
+    software update check-in can look identical on cadence alone.
+  expected_cited_event_ids:
+    - logs-synth-zeek-conn  # the raw check-ins the cadence tool measures + cites (sample_ids)
+    - logs-synth-zeek-ssl   # the TLS evidence that separates this from b1
+  expected_promoted_verdict: true_positive
 
 events:
   - index: logs-synth-suricata-alert
@@ -52,10 +73,14 @@ events:
       rule.name: "ET HUNTING Possible Cobalt Strike Extra Whitespace HTTP Response"
       rule.category: "Potentially Bad Traffic"
       rule.signature: "2029425"
-      classtype: bad-unknown
-      signature_severity: Minor
-      host.name: "so-sensor-1"
-      agent.name: "so-sensor-1"
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Minor"]
+      message: '{"alert": {"category": "bad-unknown"}}'
+      observer.name: "so-sensor-1"
       synth.scenario_id: m1-cobalt-strike-beacon
       synth.scenario_version: 1
 
@@ -79,6 +104,10 @@ events:
       zeek.ssl.established: true
       synth.scenario_id: m1-cobalt-strike-beacon
 
+  # KEPT for the single-alert triage path: the pre-aggregated 4-hour profile
+  # a triage pivot can cite (rubric: "conn.log beacon profile"). The hunt
+  # path does NOT rely on it — t_beacon_profile only measures raw zeek.conn
+  # rows (the check-ins planted below).
   - index: logs-synth-zeek-conn-beacon-summary
     time_offset_seconds: -300
     is_triage_target: false
@@ -103,6 +132,309 @@ events:
         resp_bytes_cv: 0.06
       synth.scenario_id: m1-cobalt-strike-beacon
 
+  # The raw beacon check-ins — FIDELITY, not tuning. The original scenario
+  # encoded the cadence as the one conn_summary doc above plus a single raw
+  # zeek.conn row, and the first end-to-end hunt-journey run died at
+  # FINDING_NOT_PROMOTABLE because t_beacon_profile (soc_ai/tools/analytics.py)
+  # measures cadence from RAW event.dataset:zeek.conn rows: it needs >=
+  # min_events (8) timestamps per src->dst pair and an inter-arrival
+  # cv = stdev/mean <= 0.4 (_CV_MAX) to flag at all, <= 0.15 (_CV_PERIODIC)
+  # to call the pair "periodic". One connection has no inter-arrival profile —
+  # but a real Cobalt Strike beacon at ~60s over 30+ minutes produces dozens
+  # of connections, so a single-row "beacon" was under-specifying the attack
+  # the scenario claims to represent (the 2026-05-29 strategic review warns
+  # against tuning scenarios to pass; making the fixture match the attack is
+  # the opposite). These 30 rows + the t=0 row below span ~30 minutes at a
+  # jittered ~60s cadence: measured mean gap 60.30s, stdev 5.61s, cv 0.093 —
+  # "periodic" with margin, matching the story's ~60s ± 6s jitter. Each
+  # check-in is its own TCP connection (own ephemeral port + community_id),
+  # which is exactly why the tool aggregates by ip pair, not flow.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1809
+    fields: &m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1809) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.115"
+      source.port: 51663
+      destination.ip: "104.18.42.69"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdfFa"
+      zeek.conn.duration: 0.31
+      zeek.conn.orig_bytes: 442
+      zeek.conn.resp_bytes: 1173
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: m1-cobalt-strike-beacon
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1748
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1748) }}"
+      source.port: 51668
+      zeek.conn.duration: 0.37
+      zeek.conn.orig_bytes: 437
+      zeek.conn.resp_bytes: 1201
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1695
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1695) }}"
+      source.port: 51671
+      zeek.conn.duration: 0.6
+      zeek.conn.orig_bytes: 435
+      zeek.conn.resp_bytes: 1159
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1628
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1628) }}"
+      source.port: 51674
+      zeek.conn.duration: 0.41
+      zeek.conn.orig_bytes: 450
+      zeek.conn.resp_bytes: 1196
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1563
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1563) }}"
+      source.port: 51676
+      zeek.conn.duration: 0.58
+      zeek.conn.orig_bytes: 447
+      zeek.conn.resp_bytes: 1172
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1503
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1503) }}"
+      source.port: 51685
+      zeek.conn.duration: 0.59
+      zeek.conn.orig_bytes: 434
+      zeek.conn.resp_bytes: 1206
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1451
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1451) }}"
+      source.port: 51689
+      zeek.conn.duration: 0.65
+      zeek.conn.orig_bytes: 444
+      zeek.conn.resp_bytes: 1175
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1398
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1398) }}"
+      source.port: 51693
+      zeek.conn.duration: 0.41
+      zeek.conn.orig_bytes: 444
+      zeek.conn.resp_bytes: 1164
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1339
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1339) }}"
+      source.port: 51696
+      zeek.conn.duration: 0.49
+      zeek.conn.orig_bytes: 445
+      zeek.conn.resp_bytes: 1212
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1285
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1285) }}"
+      source.port: 51703
+      zeek.conn.duration: 0.6
+      zeek.conn.orig_bytes: 435
+      zeek.conn.resp_bytes: 1204
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1216
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1216) }}"
+      source.port: 51712
+      zeek.conn.duration: 0.57
+      zeek.conn.orig_bytes: 446
+      zeek.conn.resp_bytes: 1163
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1149
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1149) }}"
+      source.port: 51718
+      zeek.conn.duration: 0.71
+      zeek.conn.orig_bytes: 445
+      zeek.conn.resp_bytes: 1194
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1091
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1091) }}"
+      source.port: 51723
+      zeek.conn.duration: 0.65
+      zeek.conn.orig_bytes: 435
+      zeek.conn.resp_bytes: 1200
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1022
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1022) }}"
+      source.port: 51728
+      zeek.conn.duration: 0.69
+      zeek.conn.orig_bytes: 436
+      zeek.conn.resp_bytes: 1212
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -969
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-969) }}"
+      source.port: 51733
+      zeek.conn.duration: 0.73
+      zeek.conn.orig_bytes: 446
+      zeek.conn.resp_bytes: 1175
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -915
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-915) }}"
+      source.port: 51742
+      zeek.conn.duration: 0.62
+      zeek.conn.orig_bytes: 445
+      zeek.conn.resp_bytes: 1168
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -856
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-856) }}"
+      source.port: 51749
+      zeek.conn.duration: 0.48
+      zeek.conn.orig_bytes: 442
+      zeek.conn.resp_bytes: 1202
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -802
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-802) }}"
+      source.port: 51752
+      zeek.conn.duration: 0.6
+      zeek.conn.orig_bytes: 439
+      zeek.conn.resp_bytes: 1192
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -736
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-736) }}"
+      source.port: 51757
+      zeek.conn.duration: 0.38
+      zeek.conn.orig_bytes: 446
+      zeek.conn.resp_bytes: 1175
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -680
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-680) }}"
+      source.port: 51762
+      zeek.conn.duration: 0.64
+      zeek.conn.orig_bytes: 435
+      zeek.conn.resp_bytes: 1172
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -612
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-612) }}"
+      source.port: 51764
+      zeek.conn.duration: 0.7
+      zeek.conn.orig_bytes: 446
+      zeek.conn.resp_bytes: 1175
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -551
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-551) }}"
+      source.port: 51767
+      zeek.conn.duration: 0.41
+      zeek.conn.orig_bytes: 444
+      zeek.conn.resp_bytes: 1171
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -486
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-486) }}"
+      source.port: 51776
+      zeek.conn.duration: 0.5
+      zeek.conn.orig_bytes: 448
+      zeek.conn.resp_bytes: 1167
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -427
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-427) }}"
+      source.port: 51782
+      zeek.conn.duration: 0.37
+      zeek.conn.orig_bytes: 442
+      zeek.conn.resp_bytes: 1205
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -365
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-365) }}"
+      source.port: 51790
+      zeek.conn.duration: 0.75
+      zeek.conn.orig_bytes: 446
+      zeek.conn.resp_bytes: 1181
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -300
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-300) }}"
+      source.port: 51795
+      zeek.conn.duration: 0.8
+      zeek.conn.orig_bytes: 438
+      zeek.conn.resp_bytes: 1190
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -234
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-234) }}"
+      source.port: 51804
+      zeek.conn.duration: 0.35
+      zeek.conn.orig_bytes: 435
+      zeek.conn.resp_bytes: 1213
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -176
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-176) }}"
+      source.port: 51807
+      zeek.conn.duration: 0.38
+      zeek.conn.orig_bytes: 439
+      zeek.conn.resp_bytes: 1208
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -125
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-125) }}"
+      source.port: 51815
+      zeek.conn.duration: 0.6
+      zeek.conn.orig_bytes: 446
+      zeek.conn.resp_bytes: 1182
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -62
+    fields:
+      <<: *m1_beacon_conn
+      "@timestamp": "{{ run_time | offset_seconds(-62) }}"
+      source.port: 51824
+      zeek.conn.duration: 0.56
+      zeek.conn.orig_bytes: 434
+      zeek.conn.resp_bytes: 1201
+
+  # The newest check-in — the connection the Suricata alert fired on, so it
+  # keeps the alert's 5-tuple and joins via the triage community_id.
   - index: logs-synth-zeek-conn
     time_offset_seconds: 0
     is_triage_target: false
@@ -136,3 +468,15 @@ rubric_notes: |
   profile (95% interval similarity, near-constant byte counts). System that
   takes only the alert at face value and emits FP because severity=Minor =
   failure. System that ignores Zeek correlation = failure.
+
+  Fidelity note (2026-08-26): the beacon cadence is planted as 31 RAW
+  zeek.conn check-ins (~60s mean, 5.6s stdev, cv 0.093 over ~30 minutes),
+  not just the pre-aggregated conn_summary doc. This is scenario fidelity,
+  not tuning-to-pass: t_beacon_profile computes cadence from raw rows
+  (min_events=8, cv <= 0.15 for "periodic"), and a real Cobalt Strike beacon
+  over that window produces exactly this many connections — the earlier
+  single-row encoding under-specified the attack and made the flagship hunt
+  journey unwinnable by construction. The summary doc is kept for the triage
+  path. b1 (the benign twin) deliberately keeps its single raw conn row, so
+  the cadence sweep surfaces only m1 and the verdict still turns on the
+  TLS/JA3 evidence, not on the sweep having flagged.

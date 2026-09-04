@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, Suspense, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { RecordedRunChip, VerdictPill } from '../components/Badges';
+import { RecordedRunChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
@@ -738,6 +738,9 @@ export function HuntDetail() {
                 <div className="mb-2.5 flex flex-wrap items-center gap-2.5">
                   {disp && <DispositionBadge label={disp.label} color={disp.color} />}
                   <StatusPill status={data.status} />
+                  {/* A hunt run against planted synthetic scenarios must never
+                      read as a real one — badged right beside the disposition. */}
+                  {data.isSynthEval && <SyntheticEvalBadge />}
                   {demo && <RecordedRunChip />}
                   <Freshness at={lastUpdated} className="ml-auto" />
                 </div>

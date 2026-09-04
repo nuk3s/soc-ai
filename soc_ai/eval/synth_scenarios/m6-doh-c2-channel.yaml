@@ -1,0 +1,313 @@
+id: m6-doh-c2-channel
+name: "DNS-over-HTTPS used as the C2 channel after resolver replacement"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.92 stops using the corporate resolver. In the preceding
+  fourteen days it sent an average of 1,120 plaintext DNS queries a day to
+  10.0.0.1; in the last 51 minutes it has sent zero. Instead it holds a
+  repeating TLS session to 91.121.211.44:443 with SNI doh.privacyrelay.example
+  — a DoH endpoint that appears in the org for the first time today and on no
+  other host. The TLS client fingerprint is a Go HTTP library, not a browser,
+  and the host has no browser session in the window at all. Each exchange is
+  ~1.45 KB up and ~2.2 KB down, repeating every ~5 minutes: 11 connections,
+  measured mean interval 302s, standard deviation 9.2s. The name resolution
+  the host still needs is happening inside that encrypted channel, and so is
+  everything else.
+attack:
+  - T1071.004  # Application Layer Protocol: DNS
+  - T1572      # Protocol Tunneling
+  - T1090.001  # Proxy: Internal Proxy
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # dns_summary: plaintext DNS to the corporate resolver went to zero
+    - prefetch_pivot         # zeek.ssl: non-browser JA3 + first-seen DoH SNI
+    - prefetch_pivot         # zeek.conn: the measured 5-minute cadence
+  expected_actions:
+    - kind: escalate
+    - kind: block_indicator
+      target_field: destination.ip
+    - kind: isolate
+      target_field: source.ip
+  expected_field_reconciliation: false
+
+# The journey deliberately does NOT mention DoH or resolvers: naming the
+# answer in the objective would measure obedience. It asks for the behaviour
+# (a host whose name resolution stopped) and leaves the channel to be found.
+hunt_journey:
+  objective: >-
+    Hunt for internal hosts that have stopped resolving names through the
+    corporate resolver while still generating outbound traffic. Measure any
+    candidate's external cadence with t_beacon_profile rather than asserting
+    it, and inspect the TLS metadata of whatever destination replaced the
+    resolver before drawing a conclusion.
+  expected_cited_event_ids:
+    - logs-synth-zeek-conn        # the raw check-ins the cadence sweep measures + cites
+    - logs-synth-zeek-ssl         # the non-browser client against a first-seen DoH endpoint
+  expected_promoted_verdict: true_positive
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.92"
+      source.port: 51546
+      destination.ip: "91.121.211.44"
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET POLICY DNS over HTTPS Resolver Contacted Outside Approved List"
+      rule.category: "Potential Corporate Privacy Violation"
+      rule.signature: "2027758"  # illustrative SID — ET POLICY DoH family
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "policy-violation"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: m6-doh-c2-channel
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.92"
+      source.port: 51546
+      destination.ip: "91.121.211.44"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.ja3: "51c64c77e60f3980eea90869b68c58a8"   # Go net/http client
+      zeek.ssl.ja3s: "15af977ce25de452b96affa2addb1036"
+      zeek.ssl.server_name: "doh.privacyrelay.example"
+      zeek.ssl.established: true
+      synth.scenario_id: m6-doh-c2-channel
+
+  # The decisive negative: name resolution did not slow down, it MOVED. A
+  # host that legitimately adds DoH keeps its OS resolver traffic; this one
+  # has none.
+  - index: logs-synth-zeek-dns-summary
+    time_offset_seconds: -3070
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3070) }}"
+      event.dataset: zeek.dns_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.92"
+      synth.resolver_profile:
+        window_seconds: 3070
+        plaintext_dns_queries_this_window: 0
+        plaintext_dns_queries_prior_daily_mean_14d: 1120
+        corporate_resolvers: ["10.0.0.1"]
+        doh_endpoint_sni: "doh.privacyrelay.example"
+        doh_endpoint_on_approved_list: false
+        doh_sni_org_first_seen_days_ago: 0
+        doh_sni_other_internal_hosts_30d: 0
+        browser_tls_sessions_this_window: 0
+        distinct_external_destinations_this_window: 1
+      synth.scenario_id: m6-doh-c2-channel
+
+  - index: logs-synth-zeek-conn-summary
+    time_offset_seconds: -3070
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3070) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.92"
+      destination.ip: "91.121.211.44"
+      destination.port: 443
+      synth.beacon_profile:
+        connection_count: 11
+        window_seconds: 3020
+        mean_interval_seconds: 302.0
+        interval_stddev_seconds: 9.2
+        interval_similarity: 0.97
+        mean_orig_bytes: 1452
+        mean_resp_bytes: 2219
+        orig_bytes_cv: 0.02
+        resp_bytes_cv: 0.02
+      synth.scenario_id: m6-doh-c2-channel
+
+  # The raw check-ins the cadence sweep measures. t_beacon_profile aggregates
+  # RAW zeek.conn rows per src->dst pair (min_events default 8, cv <= 0.15 for
+  # "periodic"); measured over these 11 rows: mean 302.0s, stdev 9.15s,
+  # cv 0.030. Its benign twin b7-browser-doh plants the SAME number of rows
+  # against a DoH endpoint and measures cv 1.89 — above the tool's 0.4
+  # candidacy bar — so the sweep separates them on cadence, not on address
+  # class or on which one the rubric prefers.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -3065
+    is_triage_target: false
+    fields: &m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-3065) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.92"
+      source.port: 51423
+      destination.ip: "91.121.211.44"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 0.43
+      zeek.conn.orig_bytes: 1479
+      zeek.conn.resp_bytes: 2237
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: m6-doh-c2-channel
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2769
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2769) }}"
+      source.port: 51435
+      zeek.conn.duration: 0.5
+      zeek.conn.orig_bytes: 1444
+      zeek.conn.resp_bytes: 2203
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2462
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2462) }}"
+      source.port: 51445
+      zeek.conn.duration: 0.41
+      zeek.conn.orig_bytes: 1443
+      zeek.conn.resp_bytes: 2192
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2165
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2165) }}"
+      source.port: 51454
+      zeek.conn.duration: 0.5
+      zeek.conn.orig_bytes: 1431
+      zeek.conn.resp_bytes: 2248
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1869
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1869) }}"
+      source.port: 51469
+      zeek.conn.duration: 0.55
+      zeek.conn.orig_bytes: 1425
+      zeek.conn.resp_bytes: 2256
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1582
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1582) }}"
+      source.port: 51478
+      zeek.conn.duration: 0.3
+      zeek.conn.orig_bytes: 1440
+      zeek.conn.resp_bytes: 2259
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1285
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1285) }}"
+      source.port: 51490
+      zeek.conn.duration: 0.31
+      zeek.conn.orig_bytes: 1428
+      zeek.conn.resp_bytes: 2187
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -969
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-969) }}"
+      source.port: 51498
+      zeek.conn.duration: 0.38
+      zeek.conn.orig_bytes: 1423
+      zeek.conn.resp_bytes: 2239
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -663
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-663) }}"
+      source.port: 51512
+      zeek.conn.duration: 0.36
+      zeek.conn.orig_bytes: 1445
+      zeek.conn.resp_bytes: 2246
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -348
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-348) }}"
+      source.port: 51521
+      zeek.conn.duration: 0.47
+      zeek.conn.orig_bytes: 1483
+      zeek.conn.resp_bytes: 2180
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -45
+    is_triage_target: false
+    fields:
+      <<: *m6_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-45) }}"
+      source.port: 51533
+      zeek.conn.duration: 0.55
+      zeek.conn.orig_bytes: 1455
+      zeek.conn.resp_bytes: 2232
+
+rubric_notes: |
+  Medium TP. The alert is Informational and classed policy-violation — DoH to
+  an unapproved resolver is, on its own, a policy matter and a very common
+  benign finding (see b7-browser-doh, which fires the same rule). What makes
+  this an intrusion is the REPLACEMENT, and it is measurable:
+
+  (1) Plaintext DNS from this host to 10.0.0.1 is zero in the window against
+      a 14-day mean of 1,120 queries a day. The host still needs to resolve
+      names; that traffic has moved inside the TLS channel. b7's host, by
+      contrast, keeps sending hundreds of plaintext queries — a browser's DoH
+      is additive, malware's is a replacement.
+  (2) The TLS client fingerprint is a Go HTTP library and the host opened no
+      browser sessions at all in the window. b7's fingerprint is Chrome's and
+      sits alongside 37 other browsing destinations.
+  (3) The endpoint is first-seen for the org and used by no other host.
+  (4) The cadence is machine-timed — 11 connections, mean 302s, cv 0.030 —
+      with near-constant sizes in both directions. b7's DoH is page-load
+      driven and bursty (measured cv 1.89).
+
+  Reading (4) alone reproduces b1's failure mode; reading (1) alone would also
+  fire on a laptop that simply went idle. The pair (resolution moved) +
+  (non-browser client on a first-seen endpoint) is the finding.
+
+  Fidelity note: the destination is globally routable rather than an RFC 5737
+  documentation address, because t_beacon_profile drops non-globally-routable
+  destinations (server-side by CIDR, then client-side via `is_internal_ip`,
+  which treats TEST-NET ranges as internal). A documentation address here
+  would render cleanly and be invisible to the sweep the journey depends on —
+  the m1 failure mode exactly.

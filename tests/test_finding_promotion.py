@@ -392,6 +392,7 @@ async def _fake_start_creates_row(
     finding_ordinal: int | None = None,
     allow_so_writes: bool = True,
     focus_origin: str = "rerun",
+    is_synth_eval: bool = False,
 ) -> str:
     """Stand-in for HuntManager.start that mirrors just enough of its contract
     to test the route's promotion kwargs end-to-end: it persists a real

@@ -1001,3 +1001,37 @@ async def test_prior_outcomes_rationale_digest_truncates_on_word_boundary(
         assert got[1]["rationale_digest"] == "short note"
         assert got[2]["rationale_digest"] is None
     await engine.dispose()
+
+
+async def test_for_entity_excludes_synth_eval_rows(settings_kratos: Settings) -> None:
+    """``for_entity`` feeds two surfaces that narrate a host's REAL history —
+    the entity timeline and the host page's latest-investigation chip
+    (``routes_dossier._investigation_lookup``, limit=1). A synthetic-evaluation
+    run describes nothing that happened on the box, so it is excluded here
+    rather than badged: at limit=1 a newer planted run would otherwise SHADOW
+    the newest real one and become the host's "latest" disposition."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        real = await inv_svc.create(
+            db,
+            alert_es_id="fe-real",
+            started_by="analyst",
+            rule_name="ET real detection",
+            src_ip="10.0.0.7",
+        )
+        # Created AFTER the real row, so it is the newest match by sort order.
+        await inv_svc.create(
+            db,
+            alert_es_id="fe-synth",
+            started_by="eval",
+            rule_name="Planted C2 beacon",
+            src_ip="10.0.0.7",
+            is_synth_eval=True,
+        )
+        rows = await inv_svc.for_entity(db, "10.0.0.7")
+        assert [r.id for r in rows] == [real.id]
+        # The dossier chip's exact call shape: newest REAL run, not [] and not
+        # the planted one.
+        top = await inv_svc.for_entity(db, "10.0.0.7", limit=1)
+        assert [r.id for r in top] == [real.id]
+    await engine.dispose()

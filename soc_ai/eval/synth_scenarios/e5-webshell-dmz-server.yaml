@@ -1,0 +1,230 @@
+id: e5-webshell-dmz-server
+name: "Web shell dropped into the DMZ webroot, then used"
+version: 1
+tier: easy
+story: |
+  The public-facing web server 10.0.0.30 accepts an upload through the site's
+  own image-upload handler. The stored file is not an image: it is a 4 KB
+  text/x-php file written to /var/www/html/uploads/img/status.php. Ninety
+  seconds later 203.0.113.66 POSTs to that exact new path and gets a 200 back
+  carrying command output (`uid=33(www-data) gid=33(www-data)`), and repeats it
+  four times with different base64 bodies. Two minutes after the first
+  successful POST the WEB SERVER opens an outbound TCP session to
+  203.0.113.66:4444 that stays up for 42 minutes with interactive-shaped
+  traffic. A DMZ web server that has never initiated an outbound connection in
+  its baseline now has an operator on it.
+attack:
+  - T1505.003  # Server Software Component: Web Shell
+  - T1059.004  # Command and Scripting Interpreter: Unix Shell
+  - T1071.001  # Application Layer Protocol: Web Protocols
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.75
+  required_citation_kinds:
+    - prefetch_pivot         # zeek.files: text/x-php written into the upload directory
+    - prefetch_pivot         # zeek.conn: server-initiated egress to the same peer
+    - typed_path             # rule.name / the 200 on the newly-created path
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: destination.ip
+    - kind: block_indicator
+      target_field: source.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 1
+      source.ip: "203.0.113.66"
+      source.port: 51222
+      destination.ip: "10.0.0.30"
+      destination.port: 80
+      network.transport: tcp
+      network.protocol: http
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET WEB_SERVER PHP Generic Webshell Command Execution Response"
+      rule.category: "Web Application Attack"
+      rule.signature: "2016683"  # illustrative SID — ET WEB_SERVER webshell family
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Major"]
+      message: '{"alert": {"category": "web-application-attack"}, "payload_printable": "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nuid=33(www-data) gid=33(www-data) groups=33(www-data)"}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: e5-webshell-dmz-server
+      synth.scenario_version: 1
+
+  # T-92s: the upload. The handler is legitimate; what it stored is not.
+  - index: logs-synth-zeek-http
+    time_offset_seconds: -92
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-92) }}"
+      event.dataset: zeek.http
+      event.module: zeek
+      event.kind: event
+      source.ip: "203.0.113.66"
+      source.port: 51204
+      destination.ip: "10.0.0.30"
+      destination.port: 80
+      zeek.http.method: "POST"
+      zeek.http.host: "www.corp.example"
+      zeek.http.uri: "/admin/upload.php"
+      zeek.http.status_code: 200
+      zeek.http.user_agent: "python-requests/2.31.0"
+      zeek.http.request_body_len: 4312
+      zeek.http.response_body_len: 61
+      zeek.http.orig_mime_types: ["text/x-php"]   # declared image upload, PHP body
+      zeek.http.orig_fuids: ["FqW4tR2LmA1sVcXe9K"]
+      synth.scenario_id: e5-webshell-dmz-server
+
+  # The stored artifact. A text/x-php file inside the image upload directory
+  # is the whole finding: that directory is served by the web server.
+  - index: logs-synth-zeek-files
+    time_offset_seconds: -91
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-91) }}"
+      event.dataset: zeek.files
+      event.module: zeek
+      event.kind: event
+      source.ip: "203.0.113.66"
+      destination.ip: "10.0.0.30"
+      zeek.files.tx_hosts: ["203.0.113.66"]
+      zeek.files.rx_hosts: ["10.0.0.30"]
+      zeek.files.fuid: "FqW4tR2LmA1sVcXe9K"
+      zeek.files.mime_type: "text/x-php"
+      zeek.files.filename: "status.php"
+      zeek.files.total_bytes: 4312
+      zeek.files.md5: "b57c2a19d4f8e6031c9a7d25e4f10b8c"
+      zeek.files.sha256: "9c1f4a7be2d3805fa61c4e97d0b32a58e7f14c6d09ab3e2517d84fc6b031ae72"
+      synth.webroot_path: "/var/www/html/uploads/img/status.php"
+      synth.scenario_id: e5-webshell-dmz-server
+
+  # The shell being used: POST to the path that did not exist 92 seconds ago,
+  # 200 back with a body. Note the URI is the file the upload just created.
+  - index: logs-synth-zeek-http
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.http
+      event.module: zeek
+      event.kind: event
+      source.ip: "203.0.113.66"
+      source.port: 51222
+      destination.ip: "10.0.0.30"
+      destination.port: 80
+      network.community_id: "{{ same_as_triage }}"
+      zeek.http.method: "POST"
+      zeek.http.host: "www.corp.example"
+      zeek.http.uri: "/uploads/img/status.php"
+      zeek.http.status_code: 200
+      zeek.http.user_agent: "python-requests/2.31.0"
+      zeek.http.request_body_len: 96
+      zeek.http.response_body_len: 52
+      zeek.http.resp_mime_types: ["text/plain"]
+      synth.scenario_id: e5-webshell-dmz-server
+
+  - index: logs-synth-zeek-http-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.http_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "203.0.113.66"
+      destination.ip: "10.0.0.30"
+      synth.webshell_access_profile:
+        window_seconds: 300
+        uri: "/uploads/img/status.php"
+        uri_first_seen_seconds_ago: 92     # the path is younger than the session using it
+        requests: 5
+        methods: ["POST"]
+        status_200_count: 5
+        request_bodies_distinct: 5         # different command each time
+        response_mime: "text/plain"        # never an image, from an image directory
+        referrer_count: 0                  # nothing on the site links to it
+        other_clients_requesting_uri: 0    # exactly one client knows the path
+      synth.scenario_id: e5-webshell-dmz-server
+
+  # The direction reversal. The DMZ web server — which answers connections and
+  # never places them — dials out to the same peer on 4444 and holds it open.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 120
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(120) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.30"
+      source.port: 39644
+      destination.ip: "203.0.113.66"
+      destination.port: 4444
+      network.transport: tcp
+      zeek.conn.state: "S1"
+      zeek.conn.history: "ShADad"
+      zeek.conn.duration: 2521.8
+      zeek.conn.orig_bytes: 18442
+      zeek.conn.resp_bytes: 3106
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      synth.scenario_id: e5-webshell-dmz-server
+
+  - index: logs-synth-zeek-conn-summary
+    time_offset_seconds: 120
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(120) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.30"
+      synth.host_egress_profile:
+        role: "dmz-web-server"
+        baseline_days: 90
+        outbound_connections_initiated_baseline: 0   # it has never dialled out
+        outbound_connections_initiated_today: 1
+        inbound_connections_baseline_daily_mean: 41882
+      synth.scenario_id: e5-webshell-dmz-server
+
+rubric_notes: |
+  Easy TP. Three corroborating signals on one story, each independently
+  visible in the events:
+
+  (1) A text/x-php file was written into the site's image-upload directory —
+      a directory the web server executes. The file transfer is in zeek.files
+      with the MIME type and the webroot path; the upload request that carried
+      it declared `orig_mime_types: text/x-php` on an image handler.
+  (2) The path created by that upload is then requested by exactly one client,
+      five times, POST-only, 200 every time, with a different body each time
+      and a text/plain response — and nothing on the site links to it
+      (`referrer_count: 0`, `other_clients_requesting_uri: 0`). A file younger
+      than the session using it, known to one address only, is not a site
+      asset.
+  (3) The direction reverses: the DMZ web server, whose 90-day baseline shows
+      ZERO outbound connections initiated, dials 203.0.113.66:4444 and holds
+      it for 42 minutes.
+
+  Any one of these alone is suspicious; together they are a web shell with an
+  operator attached. The isolate target is `destination.ip` — the compromised
+  asset here is the ALERT'S DESTINATION, not its source, which is the usual
+  shape for an inbound server compromise and a place systems that
+  reflexively isolate `source.ip` get it backwards. Note the response
+  payload (`uid=33(www-data)`) is on the alert itself via the EVE message
+  JSON, so the typed_path citation resolves without a pivot.

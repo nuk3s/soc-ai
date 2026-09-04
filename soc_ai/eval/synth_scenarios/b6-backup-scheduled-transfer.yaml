@@ -1,0 +1,205 @@
+id: b6-backup-scheduled-transfer
+name: "Nightly backup upload mistaken for low-and-slow exfiltration"
+version: 1
+tier: medium
+story: |
+  File server 10.0.0.150 uploads 41 GB to vault.acmebackup.example over six
+  hours starting at 01:00, in steady chunks, with almost nothing coming back.
+  A long connection carrying a large asymmetric outbound volume is precisely
+  the shape the exfiltration analytic looks for, and it fires — the same
+  analytic that catches h3-low-slow-exfil-r2. The corroborating evidence
+  disposes it: the destination hostname has been resolved by this org for 604
+  days and by 92 other hosts, the transfer has started at 01:00 on 361 of the
+  last 365 nights with a volume within ten percent of the trailing median,
+  the name was resolved through the corporate resolver like everything else
+  on the box, and the TLS client fingerprint belongs to the backup vendor's
+  agent — seen on all 92 of those hosts.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # transfer profile: 361/365 nights, 604-day-old SNI, 92 hosts
+    - prefetch_pivot         # zeek.dns: resolved via the corporate resolver, no bypass
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.150"
+      source.port: 44902
+      destination.ip: "203.0.113.90"
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC Long Connection With Asymmetric Outbound Volume"
+      rule.category: "Misc activity"
+      rule.signature: "9800003"  # illustrative SID — same analytic family as h3
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "misc-activity"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: b6-backup-scheduled-transfer
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.150"
+      source.port: 44902
+      destination.ip: "203.0.113.90"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "S1"
+      zeek.conn.history: "ShADad"
+      zeek.conn.duration: 21604.0
+      zeek.conn.orig_bytes: 44023414784
+      zeek.conn.resp_bytes: 8842104
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: b6-backup-scheduled-transfer
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.150"
+      source.port: 44902
+      destination.ip: "203.0.113.90"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.ja3: "3b5074b1b5d032e5620f69f9f700ff0e"   # backup vendor agent, fleet-wide
+      zeek.ssl.ja3s: "ae4edc6faf64d08308082ad26be60767"
+      zeek.ssl.server_name: "vault.acmebackup.example"
+      zeek.ssl.established: true
+      synth.scenario_id: b6-backup-scheduled-transfer
+
+  # No resolver bypass. h3's damning detail was DoT to a public resolver on
+  # 853, sidestepping corporate DNS; this host resolved the name the ordinary
+  # way, on the ordinary resolver.
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -14
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.150"
+      source.port: 57420
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      zeek.dns.query: "vault.acmebackup.example"
+      zeek.dns.qtype_name: "A"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["203.0.113.90"]
+      zeek.dns.TTLs: [300]
+      synth.scenario_id: b6-backup-scheduled-transfer
+
+  - index: logs-synth-zeek-conn-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.150"
+      destination.ip: "203.0.113.90"
+      synth.transfer_profile:
+        source_role: "file-server"
+        destination_sni: "vault.acmebackup.example"
+        sni_org_first_seen_days_ago: 604
+        sni_distinct_internal_hosts_30d: 92
+        ja3_distinct_internal_hosts_30d: 92
+        schedule_start_local: "01:00"
+        nights_started_at_0100_of_last_365: 361
+        bytes_out_median_last_30_nights: 42117928960
+        bytes_out_this_night: 44023414784      # within 5% of the median
+        resolver_used: "10.0.0.1"
+        dot_or_doh_bypass_observed: false
+        destination_port: 443
+        change_window: true
+      synth.scenario_id: b6-backup-scheduled-transfer
+
+  # Fleet context: this is not one host doing something unusual, it is 92
+  # hosts doing the same thing on the same schedule.
+  - index: logs-synth-zeek-ssl-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.ssl_summary
+      event.module: zeek
+      event.kind: event
+      destination.ip: "203.0.113.90"
+      synth.fleet_profile:
+        sni: "vault.acmebackup.example"
+        internal_sources_tonight: 92
+        internal_sources_median_nightly_30d: 92
+        aggregate_bytes_out_tonight: 3884126961664
+        distinct_ja3_values: 1
+      synth.scenario_id: b6-backup-scheduled-transfer
+
+rubric_notes: |
+  Benign FP that looks like exfiltration, and the counterweight to
+  h3-low-slow-exfil-r2: identical alarm (long connection, large asymmetric
+  outbound volume, cloud destination), opposite verdict. Volume alone cannot
+  decide this — a backup IS bulk data leaving the building on purpose.
+
+  The disposing evidence is history and fleet membership, and every part of
+  it is a value in the events:
+  (1) RECURRENCE — started at 01:00 on 361 of the last 365 nights, tonight's
+      volume within five percent of the 30-night median. Exfiltration is an
+      event; backup is a schedule.
+  (2) AGE AND BREADTH — the destination hostname is 604 days old for the org
+      and 92 internal hosts sent to it tonight, all with the same TLS client
+      fingerprint. h3's destination was first-seen and used by one host.
+  (3) NO RESOLVER BYPASS — resolved through 10.0.0.1 like everything else on
+      the box (`dot_or_doh_bypass_observed: false`). h3's host went around
+      corporate DNS with DoT to a public resolver on 853, which is the tell
+      that someone did not want the lookup logged.
+  (4) ROLE — the source is the file server, whose job is to hold the data
+      being backed up, not an engineering workstation.
+
+  Escalating this is scored as an escalation false positive and drops
+  precision. It is also the single most expensive false positive class in
+  practice: every organization runs backups, they are large, and an analytic
+  keyed on outbound volume will fire on all of them nightly.
+
+  Note this scenario is NOT measured by t_first_seen or t_beacon_profile,
+  and deliberately so — its destination is an RFC 5737 documentation address,
+  which both sweeps drop as non-globally-routable. It is an alert-driven
+  scenario whose discrimination lives in the summary evidence, so that
+  exclusion costs it nothing.

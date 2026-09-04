@@ -168,11 +168,20 @@ class ElasticClient:
         source: list[str] | bool | None = None,
         aggs: dict[str, Any] | None = None,
         track_total_hits: bool | None = None,
+        require_complete: bool = False,
     ) -> EsSearchResult:
         """Run a search against ``index`` with a DSL ``query``.
 
         ``query`` is the inner ``{"query": ...}`` value (i.e. callers pass
         ``{"bool": {...}}`` directly, not the wrapping ``query`` key).
+
+        ``require_complete=True`` makes a partial/timed-out read raise
+        :class:`GridPartialResultsError` even under the grid-wide
+        ``es_fail_on_partial_results=False`` opt-out. For callers whose answer
+        is a safety judgement about ABSENCE (the synth containment check): a
+        degraded search returning 0 hits from the surviving shards is "could
+        not see", never "clean", and an operator's tolerance for partial
+        ordinary reads must not soften that.
         """
         body: dict[str, Any] = {"query": query, "size": size}
         if from_:
@@ -197,7 +206,7 @@ class ElasticClient:
             allow_no_indices=True,
         )
 
-        self._check_complete(index, response)
+        self._check_complete(index, response, require_complete=require_complete)
 
         hits_data: dict[str, Any] = response.get("hits", {})
         total_raw = hits_data.get("total", 0)
@@ -217,7 +226,7 @@ class ElasticClient:
             total_is_lower_bound=total_is_lower_bound,
         )
 
-    def _check_complete(self, index: str, response: Any) -> None:
+    def _check_complete(self, index: str, response: Any, *, require_complete: bool = False) -> None:
         """Raise :class:`GridPartialResultsError` unless the search read everything.
 
         Parsing defaults to ZERO failures: a response with no ``_shards`` key
@@ -225,6 +234,9 @@ class ElasticClient:
         Absent metadata must never be made to look like failure. Skipped shards
         are not failures either — ``can_match`` and frozen tiers skip shards on
         a perfectly healthy grid.
+
+        ``require_complete=True`` disables the ``es_fail_on_partial_results``
+        opt-out for this one response (see :meth:`search`).
         """
         shards_raw = response.get("_shards")
         shards: dict[str, Any] = shards_raw if isinstance(shards_raw, dict) else {}
@@ -247,7 +259,7 @@ class ElasticClient:
             f"means 'unknown', not 'nothing happened'"
         )
 
-        if not self._settings.es_fail_on_partial_results:
+        if not require_complete and not self._settings.es_fail_on_partial_results:
             # Knowingly opted in to partial reads (e.g. a chronically red shard).
             _LOGGER.warning("%s; returning them anyway (es_fail_on_partial_results=false)", message)
             return

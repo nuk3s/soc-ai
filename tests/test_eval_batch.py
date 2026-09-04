@@ -334,7 +334,7 @@ async def test_synth_set_ingests_and_tags_rows(tmp_path: Path) -> None:
     ingest_calls: list[Any] = []
 
     async def stub_ingester(
-        scens: list[Scenario], *, elastic: Any, run_time: Any
+        scens: list[Scenario], *, elastic: Any, run_time: Any, repeats: int = 1
     ) -> list[IngestResult]:
         ingest_calls.append((tuple(s.id for s in scens), run_time))
         return [
@@ -384,6 +384,66 @@ async def test_synth_set_ingests_and_tags_rows(tmp_path: Path) -> None:
     assert len(ingest_calls) == 1
     assert ingest_calls[0][0] == ("scen-A", "scen-B")
     assert ingest_calls[0][1] == cfg.synth_run_time
+
+
+async def test_synth_run_scopes_visibility_to_its_own_scenario(tmp_path: Path) -> None:
+    """A synth run's harness call carries ITS scenario id, not a blanket True.
+
+    ``include_synth=True`` made every planted scenario visible to every
+    synthetic run — b3-rmm-admin-lateral's host pivot returned ten sibling
+    scenarios' triage alerts and the oracle cited two as corroboration. The
+    scope must be the scenario under triage; real alerts keep False.
+    """
+    from datetime import UTC, datetime
+
+    from soc_ai.eval.synth_ingest import IngestResult
+    from soc_ai.eval.synth_loader import Scenario
+
+    scenarios = [
+        Scenario.model_construct(id="scen-A", events=[], tier="easy", ground_truth=None),
+        Scenario.model_construct(id="scen-B", events=[], tier="hard", ground_truth=None),
+    ]
+
+    async def stub_ingester(
+        scens: list[Scenario], *, elastic: Any, run_time: Any, repeats: int = 1
+    ) -> list[IngestResult]:
+        return [
+            IngestResult(
+                scenario_id=s.id,
+                triage_doc_id=f"synth-doc-{s.id}",
+                triage_index="logs-synth-suricata-alert",
+                doc_count=1,
+            )
+            for s in scens
+        ]
+
+    include_synth_by_alert: dict[str, Any] = {}
+
+    async def runner(alert_id: str, *, settings: Settings, out_dir: Path, **kw: Any) -> EvalResult:
+        include_synth_by_alert[alert_id] = kw.get("include_synth")
+        return _stub_eval_result(out_dir / f"2026-05-09T120000Z-{alert_id}")
+
+    cfg = BatchConfig(
+        oql="x",
+        n=1,
+        concurrency=1,
+        out_dir=tmp_path,
+        synth_scenarios=tuple(scenarios),
+        synth_run_time=datetime(2026, 5, 13, 22, 30, 0, tzinfo=UTC),
+    )
+    summary = await run_batch(
+        cfg,
+        settings=_settings(),
+        elastic=None,  # type: ignore[arg-type]
+        sampler=_make_sampler(["real-a1"]),
+        runner=runner,
+        synth_ingester=stub_ingester,
+    )
+
+    assert summary.n_ok == 3
+    assert include_synth_by_alert["real-a1"] is False
+    assert include_synth_by_alert["synth-doc-scen-A"] == "scen-A"
+    assert include_synth_by_alert["synth-doc-scen-B"] == "scen-B"
 
 
 async def test_failure_budget_aborts_after_consecutive_errors(tmp_path: Path) -> None:
@@ -674,3 +734,212 @@ async def test_progress_callback_sees_each_completion(tmp_path: Path) -> None:
     assert len(seen) == 3
     assert "1/3" in seen[0]
     assert "3/3" in seen[-1]
+
+
+async def test_repeats_runs_each_scenario_n_times_with_isolated_scopes(tmp_path: Path) -> None:
+    """synth_repeats=3 plants+runs every selected scenario three times. Each
+    run's harness call must carry its OWN plant's scope key (pairwise distinct
+    across repeats) — otherwise repeat 2's pivots would retrieve repeat 1's
+    planted documents, the cross-scenario-bleed defect one layer down. Rows
+    keep the BASE scenario id (the scoring join key) plus the repeat index."""
+    from datetime import UTC, datetime
+
+    from soc_ai.eval.synth_ingest import IngestResult
+    from soc_ai.eval.synth_loader import Scenario
+
+    scenarios = [
+        Scenario.model_construct(id="scen-A", events=[], tier="easy", ground_truth=None),
+        Scenario.model_construct(id="scen-B", events=[], tier="hard", ground_truth=None),
+    ]
+    ingest_calls: list[Any] = []
+
+    async def stub_ingester(
+        scens: list[Scenario], *, elastic: Any, run_time: Any, repeats: int = 1
+    ) -> list[IngestResult]:
+        ingest_calls.append(repeats)
+        return [
+            IngestResult(
+                scenario_id=s.id,
+                triage_doc_id=f"synth-doc-{s.id}-r{k}",
+                triage_index="logs-synth-suricata-alert",
+                doc_count=1,
+                plant_id=s.id if k == 0 else f"{s.id}::r{k}",
+                repeat=k,
+            )
+            for s in scens
+            for k in range(repeats)
+        ]
+
+    include_synth_by_alert: dict[str, Any] = {}
+
+    async def runner(alert_id: str, *, settings: Settings, out_dir: Path, **kw: Any) -> EvalResult:
+        include_synth_by_alert[alert_id] = kw.get("include_synth")
+        return _stub_eval_result(out_dir / f"2026-05-09T120000Z-{alert_id}")
+
+    cfg = BatchConfig(
+        oql="x",
+        n=1,
+        concurrency=2,
+        out_dir=tmp_path,
+        synth_scenarios=tuple(scenarios),
+        synth_run_time=datetime(2026, 5, 13, 22, 30, 0, tzinfo=UTC),
+        synth_repeats=3,
+    )
+    summary = await run_batch(
+        cfg,
+        settings=_settings(),
+        elastic=None,  # type: ignore[arg-type]
+        sampler=_make_sampler(["real-a1"]),
+        runner=runner,
+        synth_ingester=stub_ingester,
+    )
+
+    assert ingest_calls == [3]
+    assert summary.n_ok == 7  # 1 real + 2 scenarios × 3 repeats
+
+    # The bleed guard: every synth run is scoped to its OWN plant id, and the
+    # three scopes of one scenario are pairwise distinct.
+    assert include_synth_by_alert["real-a1"] is False
+    for sid in ("scen-A", "scen-B"):
+        scopes = [include_synth_by_alert[f"synth-doc-{sid}-r{k}"] for k in range(3)]
+        assert scopes == [sid, f"{sid}::r1", f"{sid}::r2"]
+        assert len(set(scopes)) == 3
+
+    rows = [
+        json.loads(line)
+        for line in (summary.batch_dir / "index.jsonl").read_text().splitlines()
+        if line
+    ]
+    by_id = {r["alert_id"]: r for r in rows}
+    for sid in ("scen-A", "scen-B"):
+        for k in range(3):
+            row = by_id[f"synth-doc-{sid}-r{k}"]
+            assert row["is_synth"] is True
+            assert row["synth_scenario_id"] == sid  # base id — the scoring join key
+            assert row["synth_repeat"] == k
+
+
+async def test_repeats_interleave_round_robin_over_the_catalogue(tmp_path: Path) -> None:
+    """Repeats are scheduled round-robin (A,B,A,B,A,B — repeat 0 of every
+    scenario, then repeat 1, ...) so a transient infra wobble lands on one
+    repeat of each scenario instead of every repeat of one."""
+    from datetime import UTC, datetime
+
+    from soc_ai.eval.synth_ingest import IngestResult
+    from soc_ai.eval.synth_loader import Scenario
+
+    scenarios = [
+        Scenario.model_construct(id="scen-A", events=[], tier="easy", ground_truth=None),
+        Scenario.model_construct(id="scen-B", events=[], tier="hard", ground_truth=None),
+    ]
+
+    async def stub_ingester(
+        scens: list[Scenario], *, elastic: Any, run_time: Any, repeats: int = 1
+    ) -> list[IngestResult]:
+        # Scenario-major order (all of A's plants, then B's) — the runner must
+        # re-interleave by repeat.
+        return [
+            IngestResult(
+                scenario_id=s.id,
+                triage_doc_id=f"synth-doc-{s.id}-r{k}",
+                triage_index="logs-synth-suricata-alert",
+                doc_count=1,
+                plant_id=s.id if k == 0 else f"{s.id}::r{k}",
+                repeat=k,
+            )
+            for s in scens
+            for k in range(repeats)
+        ]
+
+    seen: list[str] = []
+
+    async def runner(alert_id: str, *, settings: Settings, out_dir: Path, **kw: Any) -> EvalResult:
+        seen.append(alert_id)
+        return _stub_eval_result(out_dir / f"2026-05-09T120000Z-{alert_id}")
+
+    cfg = BatchConfig(
+        oql="x",
+        n=0,
+        concurrency=1,  # serialize so scheduling order is observable
+        out_dir=tmp_path,
+        synth_scenarios=tuple(scenarios),
+        synth_run_time=datetime(2026, 5, 13, 22, 30, 0, tzinfo=UTC),
+        synth_repeats=3,
+    )
+    await run_batch(
+        cfg,
+        settings=_settings(),
+        elastic=None,  # type: ignore[arg-type]
+        sampler=_make_sampler([]),
+        runner=runner,
+        synth_ingester=stub_ingester,
+    )
+
+    assert seen == [
+        "synth-doc-scen-A-r0",
+        "synth-doc-scen-B-r0",
+        "synth-doc-scen-A-r1",
+        "synth-doc-scen-B-r1",
+        "synth-doc-scen-A-r2",
+        "synth-doc-scen-B-r2",
+    ]
+
+
+async def test_repeats_default_keeps_single_plant_behavior(tmp_path: Path) -> None:
+    """synth_repeats defaults to 1: one plant per scenario, bare-id scope,
+    repeat index 0 on the row — byte-identical to the pre-repeats runner."""
+    from datetime import UTC, datetime
+
+    from soc_ai.eval.synth_ingest import IngestResult
+    from soc_ai.eval.synth_loader import Scenario
+
+    scenarios = [Scenario.model_construct(id="scen-A", events=[], tier="easy", ground_truth=None)]
+
+    async def stub_ingester(
+        scens: list[Scenario], *, elastic: Any, run_time: Any, repeats: int = 1
+    ) -> list[IngestResult]:
+        assert repeats == 1
+        return [
+            IngestResult(
+                scenario_id=s.id,
+                triage_doc_id=f"synth-doc-{s.id}",
+                triage_index="logs-synth-suricata-alert",
+                doc_count=1,
+                plant_id=s.id,
+                repeat=0,
+            )
+            for s in scens
+        ]
+
+    include_synth_by_alert: dict[str, Any] = {}
+
+    async def runner(alert_id: str, *, settings: Settings, out_dir: Path, **kw: Any) -> EvalResult:
+        include_synth_by_alert[alert_id] = kw.get("include_synth")
+        return _stub_eval_result(out_dir / f"2026-05-09T120000Z-{alert_id}")
+
+    cfg = BatchConfig(
+        oql="x",
+        n=1,
+        concurrency=1,
+        out_dir=tmp_path,
+        synth_scenarios=tuple(scenarios),
+        synth_run_time=datetime(2026, 5, 13, 22, 30, 0, tzinfo=UTC),
+    )
+    summary = await run_batch(
+        cfg,
+        settings=_settings(),
+        elastic=None,  # type: ignore[arg-type]
+        sampler=_make_sampler(["real-a1"]),
+        runner=runner,
+        synth_ingester=stub_ingester,
+    )
+
+    assert summary.n_ok == 2
+    assert include_synth_by_alert["synth-doc-scen-A"] == "scen-A"
+    rows = [
+        json.loads(line)
+        for line in (summary.batch_dir / "index.jsonl").read_text().splitlines()
+        if line
+    ]
+    by_id = {r["alert_id"]: r for r in rows}
+    assert by_id["synth-doc-scen-A"]["synth_repeat"] == 0

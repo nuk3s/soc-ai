@@ -44,6 +44,7 @@ from soc_ai.config import Settings
 from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -216,6 +217,7 @@ async def prevalence(
     domain: str | None = None,
     lookback_days: int = 90,
     time_anchor: datetime | None = None,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Answer "has THIS host seen THIS dest/domain before, and how rare is it?".
 
@@ -241,6 +243,9 @@ async def prevalence(
             (``[anchor - lookback, anchor]``) instead of "now". The orchestrator
             passes ``alert.timestamp`` so the baseline reflects what was known up
             to the alert; CLI/live callers leave it ``None``.
+        include_synth: synth-doc visibility (``SynthScope``). False (prod):
+            planted docs never enter the baseline. A scenario id (batch eval):
+            that scenario's plants do, siblings' do not.
 
     Returns:
         On success::
@@ -302,9 +307,10 @@ async def prevalence(
         "bool": {
             "must": [query],
             "filter": [_lookback_filter(lookback_days, time_anchor)],
-            # Never let synthetic-eval fixtures (logs-synth-*) pollute the
-            # prevalence/novelty baseline — every other events reader excludes them.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            # Synth scope, threaded: prod excludes every planted doc from the
+            # baseline; a batch eval scopes to its own scenario so a run can build
+            # a baseline over the plants it is graded on (not a blanket exclude).
+            "must_not": synth_scope_must_not(include_synth),
         }
     }
 

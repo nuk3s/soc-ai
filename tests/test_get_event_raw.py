@@ -56,10 +56,44 @@ async def test_get_event_raw_returns_source(settings_kratos: Settings) -> None:
     result = await get_event_raw("ev1", elastic=elastic, settings=settings_kratos)
 
     assert result == source
-    # Confirm the query used the ids DSL and the correct index
+    # Confirm the query used the ids DSL (now nested under bool.must so the synth
+    # scope can ride alongside it) and the correct index.
     body = fake_es.search.call_args.kwargs["body"]
-    assert body["query"] == {"ids": {"values": ["ev1"]}}
+    assert {"ids": {"values": ["ev1"]}} in body["query"]["bool"]["must"]
     assert fake_es.search.call_args.kwargs["index"] == settings_kratos.events_index_pattern
+
+
+@pytest.mark.asyncio
+async def test_get_event_raw_excludes_synth_docs_in_prod(settings_kratos: Settings) -> None:
+    """F4 (RED before the fix): with the prod default (include_synth=False), the
+    fetch must carry the synth kill-switch, so a bare ids query against
+    ``logs-*`` ⊇ ``logs-synth-*`` can no longer pull a PLANTED doc in production."""
+    elastic, fake_es = _make_elastic(settings_kratos, [_hits([_doc({"a": 1}, doc_id="ev1")])])
+
+    await get_event_raw("ev1", elastic=elastic, settings=settings_kratos)
+
+    body = fake_es.search.call_args.kwargs["body"]
+    assert {"exists": {"field": "synth.scenario_id"}} in body["query"]["bool"]["must_not"]
+
+
+@pytest.mark.asyncio
+async def test_get_event_raw_scenario_scope_is_not_a_blanket_exclude(
+    settings_kratos: Settings,
+) -> None:
+    """A batch-eval scope (a scenario id) sees THAT scenario's plants and excludes
+    siblings' — a scenario-scoped bool, not the prod blanket exists-exclude."""
+    elastic, fake_es = _make_elastic(settings_kratos, [_hits([_doc({"a": 1}, doc_id="ev1")])])
+
+    await get_event_raw(
+        "ev1", elastic=elastic, settings=settings_kratos, include_synth="scenario-x"
+    )
+
+    must_not = fake_es.search.call_args.kwargs["body"]["query"]["bool"]["must_not"]
+    assert {"exists": {"field": "synth.scenario_id"}} not in must_not
+    scoped = [c for c in must_not if isinstance(c, dict) and "bool" in c]
+    assert scoped, must_not
+    inner = scoped[0]["bool"]["must_not"]
+    assert {"term": {"synth.scenario_id": "scenario-x"}} in inner
 
 
 @pytest.mark.asyncio

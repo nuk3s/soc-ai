@@ -95,6 +95,27 @@ def test_host_dossier_is_declared_non_evidential() -> None:
     assert "t_host_dossier" in NON_EVIDENTIAL_TOOLS
 
 
+def test_decode_payload_is_declared_non_evidential() -> None:
+    """t_decode_payload is in-process compute over model-supplied bytes —
+    inference, not observation — so it must not, on its own, count as an
+    investigation (it would otherwise let the Oracle flip a verdict class by
+    decoding a string it invented, with zero grid access)."""
+    assert "t_decode_payload" in NON_EVIDENTIAL_TOOLS
+
+
+def test_decode_payload_return_alone_is_not_gathered_evidence() -> None:
+    """A data-bearing decode result is compute over bytes the model chose, not an
+    observation — it must not count toward the hard evidence / override gate."""
+    decoded = {
+        "encoding_used": "hex",
+        "decoded_bytes": 5,
+        "printable_ratio": 1.0,
+        "preview": "Hello",
+        "strings": ["Hello"],
+    }
+    assert count_successful_tool_calls(_returns(("t_decode_payload", decoded))) == 0
+
+
 def test_dossier_return_alone_is_not_gathered_evidence() -> None:
     """A found dossier is a CONCLUSION about the host, not an observation of it."""
     assert count_successful_tool_calls(_returns(("t_host_dossier", _dossier_result()))) == 0

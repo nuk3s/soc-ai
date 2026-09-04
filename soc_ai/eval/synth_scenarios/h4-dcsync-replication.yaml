@@ -1,0 +1,223 @@
+id: h4-dcsync-replication
+name: "DCSync: directory replication requested by a workstation"
+version: 1
+tier: hard
+story: |
+  Workstation 10.0.0.77 binds the drsuapi interface on the domain controller
+  10.0.0.10 and issues DRSGetNCChanges three times in eleven seconds against
+  the domain naming context. DRSGetNCChanges is how one domain controller
+  pulls another's directory contents, including the credential material in
+  it. Domain controllers replicate with domain controllers. 10.0.0.77 is a
+  user workstation: it has never issued a replication call, it is not in the
+  domain's DC list, and the account driving the session is a helpdesk
+  account that was added to a privileged group four hours earlier. No
+  Emerging Threats signature fires — this is ordinary, well-formed RPC. The
+  only thing wrong with it is who is asking.
+attack:
+  - T1003.006  # OS Credential Dumping: DCSync
+  - T1078.002  # Valid Accounts: Domain Accounts
+  - T1550.002  # Use Alternate Authentication Material
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # dce_rpc: drsuapi / DRSGetNCChanges from a non-DC
+    - prefetch_pivot         # the source's role — workstation, not a replication partner
+    - typed_path             # rule.name / the operation name
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: disable_account
+      target_field: user.name
+  expected_field_reconciliation: false
+
+# The journey names the operation family but NOT the discriminator: the tool
+# flags DRSGetNCChanges wherever it appears, including in the benign twin
+# (b8-dc-replication-partner), so a hunt that stops at "the tool flagged it"
+# measures obedience. The objective asks who is issuing it.
+hunt_journey:
+  objective: >-
+    Hunt for directory-replication activity on the domain. Use
+    t_dcerpc_histogram to enumerate which DCE-RPC operations are in use and
+    which hosts issue them, then establish the ROLE of each source before
+    concluding — replication between domain controllers is how the domain
+    works, and looks identical on the wire.
+  expected_cited_event_ids:
+    - logs-synth-zeek-dce-rpc            # the DRSGetNCChanges calls the histogram flags + cites
+    - logs-synth-zeek-dce-rpc-summary    # the source-role evidence that separates this from b8
+  expected_promoted_verdict: true_positive
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.77"
+      source.port: 50914
+      destination.ip: "10.0.0.10"
+      destination.port: 135
+      network.transport: tcp
+      network.protocol: dce_rpc
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC Directory Replication Request Observed"
+      rule.category: "Misc Attack"
+      rule.signature: "9800010"  # illustrative SID — Zeek analytic surfaced as an alert
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "attempted-admin"}}'
+      user.name: "helpdesk.tvaughn"
+      observer.name: "so-sensor-1"
+      synth.scenario_id: h4-dcsync-replication
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -11
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-11) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.77"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSBind"
+      synth.scenario_id: h4-dcsync-replication
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -9
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.77"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSGetNCChanges"
+      synth.naming_context: "DC=corp,DC=example"
+      synth.scenario_id: h4-dcsync-replication
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -4
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.77"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSGetNCChanges"
+      synth.naming_context: "DC=corp,DC=example"
+      synth.scenario_id: h4-dcsync-replication
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.77"
+      destination.ip: "10.0.0.10"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "drsuapi"
+      zeek.dce_rpc.operation: "DRSGetNCChanges"
+      synth.naming_context: "DC=corp,DC=example"
+      synth.scenario_id: h4-dcsync-replication
+
+  # The whole discriminator, in one document: the source's role. The
+  # operation is identical in b8-dc-replication-partner; only this differs.
+  - index: logs-synth-zeek-dce-rpc-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.dce_rpc_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.77"
+      destination.ip: "10.0.0.10"
+      synth.replication_context:
+        source_role: "user-workstation"
+        source_is_domain_controller: false
+        destination_role: "domain-controller"
+        domain_controller_ips: ["10.0.0.10", "10.0.0.11"]
+        source_prior_replication_calls_90d: 0
+        replication_calls_this_window: 3
+        naming_context: "DC=corp,DC=example"
+        account: "helpdesk.tvaughn"
+        account_privileged_group_added_hours_ago: 4
+        account_prior_dc_rpc_sessions_90d: 0
+      synth.scenario_id: h4-dcsync-replication
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -12
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.77"
+      source.port: 50914
+      destination.ip: "10.0.0.10"
+      destination.port: 135
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 12.4
+      zeek.conn.orig_bytes: 8420
+      zeek.conn.resp_bytes: 1841204
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "dce_rpc"
+      synth.scenario_id: h4-dcsync-replication
+
+rubric_notes: |
+  Hard TP. No signature, no IOC, both endpoints internal, and the RPC itself
+  is entirely well-formed — this is a legitimate protocol operation issued by
+  an illegitimate party. The verdict requires knowing what DRSGetNCChanges
+  IS: the directory-replication call that returns naming-context contents
+  including secrets. Asking for it is asking for the domain's credentials.
+
+  The discriminator is the source's ROLE, not the operation:
+  * 10.0.0.77 is a user workstation and is not in `domain_controller_ips`.
+  * It has issued zero replication calls in 90 days.
+  * The account driving it joined a privileged group four hours ago and has
+    no prior RPC session against a DC.
+  * 1.8 MB came back down the session — the reply, not a probe.
+
+  This scenario is deliberately paired with b8-dc-replication-partner, where
+  a REAL domain controller issues the identical operation against its
+  replication partner and the correct verdict is benign. That pairing is the
+  point: t_dcerpc_histogram flags DRSGetNCChanges on membership in a fixed
+  dangerous-operation set (soc_ai/tools/analytics.py, `_DANGEROUS_OPS`), so
+  it flags BOTH scenarios, by design. The tool narrows the grid to the calls
+  worth looking at; it cannot tell you whether the caller was entitled to
+  make them. A system that escalates on the flag alone will escalate on b8
+  too and lose precision, and a system that closes on "replication is normal"
+  will miss this one. Only the source-role evidence separates them, and it is
+  present in the events of both.

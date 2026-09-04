@@ -107,7 +107,8 @@ Event kinds in the JSONL trail: `session_start`,
 `targeted_tool_result`, `self_consistency_vote`, `citation_validation`,
 `citation_cap`, `verdict_floor_rewrite`, downgrade audits
 (`icmp_solicited_downgrade`, `ungrounded_host_anchored_tp_downgrade`,
-`malware_rule_name_ungrounded_downgrade`, `evidence_gate_downgrade`),
+`malware_rule_name_ungrounded_downgrade`, `decisive_value_support_cap`,
+`unsupported_decisive_value_downgrade`, `evidence_gate_downgrade`),
 `oracle_escalation`, `oracle_adjudication`, `triage_report`,
 `auto_ack`, `done`, `error`.
 

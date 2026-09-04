@@ -69,7 +69,7 @@ async def run(
     settings: Settings | None = None,
     out_dir: Path | None = None,
     oracle_caller: OracleCaller = call_oracle,
-    include_synth: bool = False,
+    include_synth: bool | str = False,
     expected_verdict: str | None = None,
     grade: bool = True,
 ) -> EvalResult:
@@ -81,8 +81,12 @@ async def run(
         out_dir: parent dir for the bundle (default: ``./evals``).
         oracle_caller: pluggable LiteLLM-call function so tests can
             stub without hitting the network.
-        include_synth: if True, the prefetch includes synth docs; set
-            for synthetic-scenario evaluation runs.
+        include_synth: synth-doc visibility for the run's tools. The batch
+            runner passes the SCENARIO ID under triage so the investigation
+            sees that scenario's own planted docs and nothing planted by its
+            sibling scenarios; False (real alerts) keeps every synth doc
+            invisible. True (all synth visible) is reserved for the
+            hunt-journey runner.
         expected_verdict: for synthetic scenarios only — the planted,
             known-correct verdict from ``Scenario.ground_truth.verdict``.
             When set, the oracle prompt gains a ground-truth block so
@@ -357,7 +361,7 @@ def _store_sessionmaker(
 def _build_context(
     settings: Settings,
     *,
-    include_synth: bool = False,
+    include_synth: bool | str = False,
     db_sessionmaker: async_sessionmaker[AsyncSession] | None = None,
 ) -> InvestigationContext:
     """Build an InvestigationContext from settings, no audit logger.

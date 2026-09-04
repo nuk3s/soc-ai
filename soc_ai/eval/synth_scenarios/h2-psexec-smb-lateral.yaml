@@ -53,10 +53,14 @@ events:
       rule.name: "BZAR ATTACK::Execution_Service_Creation"
       rule.category: "Misc Attack"
       rule.signature: "9800002"  # synthetic SID — BZAR notice as alert
-      classtype: attempted-admin
-      signature_severity: Informational
-      host.name: "so-sensor-1"
-      agent.name: "so-sensor-1"
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "attempted-admin"}}'
+      observer.name: "so-sensor-1"
       synth.scenario_id: h2-psexec-smb-lateral
       synth.scenario_version: 1
 

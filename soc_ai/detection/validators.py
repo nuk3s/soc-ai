@@ -137,7 +137,9 @@ def _condition_references_selection(condition: str, selection_keys: set[str]) ->
 #
 # CAUGHT: an exclusion (NOT) present on one side and absent on the other, in
 # EITHER direction; the same field excluded with different values; a Sigma
-# detection field the OQL never queries at all; a Sigma condition/selection
+# detection field the OQL never queries at all; a shared positive field keyed
+# on different VALUES on the two sides (the exported rule watches for a value
+# the dry run never measured — 2026-08 D3); a Sigma condition/selection
 # shape that cannot be structurally compared (fail-closed, honest note).
 #
 # DELIBERATELY TOLERATED: extra positive-polarity OQL fields (the canonical
@@ -246,11 +248,12 @@ def _oql_polarity_terms(node: FilterNode, negated: bool, out: list[tuple[str, st
 
 def _sigma_side(
     selections: dict[str, Any], refs: dict[str, set[bool]]
-) -> tuple[set[str], dict[str, set[str]]] | str:
-    """The Sigma logic's ``(all fields, negated field→values)`` — or an
-    uncomparable-note string."""
+) -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]] | str:
+    """The Sigma logic's ``(all fields, negated field→values, positive
+    field→values)`` — or an uncomparable-note string."""
     fields: set[str] = set()
     negated: dict[str, set[str]] = {}
+    positive: dict[str, set[str]] = {}
     for name, polarities in refs.items():
         pairs = _selection_terms(selections.get(name))
         if pairs is None:
@@ -262,7 +265,9 @@ def _sigma_side(
             fields.add(field)
             if True in polarities:
                 negated.setdefault(field, set()).add(value)
-    return fields, negated
+            if False in polarities:
+                positive.setdefault(field, set()).add(value)
+    return fields, negated, positive
 
 
 def _sigma_oql_divergence(selections: dict[str, Any], condition: str, oql: str) -> str | None:
@@ -278,7 +283,7 @@ def _sigma_oql_divergence(selections: dict[str, Any], condition: str, oql: str) 
     side = _sigma_side(selections, refs)
     if isinstance(side, str):
         return side
-    sigma_fields, sigma_neg = side
+    sigma_fields, sigma_neg, sigma_pos = side
 
     try:
         ast = parse_oql(oql)
@@ -291,9 +296,12 @@ def _sigma_oql_divergence(selections: dict[str, Any], condition: str, oql: str) 
     _oql_polarity_terms(ast.filter_, False, terms)
     oql_fields = {field for field, _value, _neg in terms}
     oql_neg: dict[str, set[str]] = {}
+    oql_pos: dict[str, set[str]] = {}
     for field, value, neg in terms:
         if neg:
             oql_neg.setdefault(field, set()).add(value)
+        else:
+            oql_pos.setdefault(field, set()).add(value)
 
     sigma_only = sorted(set(sigma_neg) - set(oql_neg))
     if sigma_only:
@@ -321,6 +329,20 @@ def _sigma_oql_divergence(selections: dict[str, Any], condition: str, oql: str) 
             f"the Sigma rule's detection logic uses {', '.join(missing)}, which the OQL "
             "twin never queries — the would-have-fired count did not measure the "
             "exported rule."
+        )
+    # Positive-side VALUES (D3): a shared field keyed on different values means
+    # the dry run counted hits for one value while the analyst exports a rule
+    # watching for another — the count is honest-looking and meaningless. Only
+    # fields the Sigma keys positively are compared, so an OQL-only positive
+    # field (the tolerated ``event.dataset`` logsource term) never trips this.
+    keyed_differently = sorted(
+        field for field, values in sigma_pos.items() if values != oql_pos.get(field, set())
+    )
+    if keyed_differently:
+        return _DIVERGENCE_PREFIX + (
+            f"the exported Sigma rule and its OQL twin match different values for "
+            f"{', '.join(keyed_differently)} — the would-have-fired count measured a "
+            "different query than the rule being exported."
         )
     return None
 

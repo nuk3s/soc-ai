@@ -287,6 +287,96 @@ async def test_host_dossier_ip_is_unchanged_without_a_guard(
     assert result["ip"] == "FD00:0:0:0:0:0:0:1"
 
 
+# ---------------------------------------------------------------------------
+# The read-only "oracle" role (2026-08-27 design §2): a POSITIVE 15-tool
+# allowlist. This is the golden lock that keeps a write / online / pcap tool
+# from ever joining the Oracle's adjudication surface — the §3 injection
+# analysis depends on the surface staying read-only with no second egress.
+# ---------------------------------------------------------------------------
+
+ORACLE_EXPECTED = {
+    "t_query_events_oql",
+    "t_query_zeek_logs",
+    "t_describe_dataset",
+    "t_field_values",
+    "t_get_event_raw",
+    "t_get_rule_content",
+    "t_decode_payload",
+    "t_host_summary",
+    "t_origin_chain",
+    "t_host_dossier",
+    "t_prevalence",
+    "t_rule_prevalence",
+    "t_enrich_ip",
+    "t_enrich_domain",
+    "t_enrich_hash",
+}
+
+
+def _oracle_agent(settings: Settings) -> Any:
+    from pydantic_ai import Agent
+    from soc_ai.agent.toolset import register_read_tools
+
+    agent = Agent(TestModel(call_tools=[]), system_prompt="oracle")
+    register_read_tools(agent, _ctx(settings), role="oracle")
+    return agent
+
+
+def test_oracle_expected_matches_module_allowlist() -> None:
+    """The test's golden set and the module's ORACLE_TOOLS are the same 15."""
+    from soc_ai.agent.toolset import ORACLE_TOOLS
+
+    assert set(ORACLE_TOOLS) == ORACLE_EXPECTED
+    assert len(ORACLE_EXPECTED) == 15
+
+
+def test_golden_tool_sets_oracle_flags_on(settings_kratos: Settings) -> None:
+    """With EVERY settings gate on, the oracle surface is still exactly the 15 —
+    the online quartet / web / crawl / pcap are excluded by the role, not by a
+    flag, so a deployment that enables them for the analyst does not widen the
+    Oracle."""
+    assert _names(_oracle_agent(_all_flags_on(settings_kratos))) == ORACLE_EXPECTED
+
+
+def test_golden_tool_sets_oracle_flags_off(settings_kratos: Settings) -> None:
+    """With every gate off the surface is identical — the 15 are all local /
+    grid reads, none behind a settings gate."""
+    assert _names(_oracle_agent(settings_kratos)) == ORACLE_EXPECTED
+
+
+def test_oracle_surface_has_no_write_online_or_pcap_tool(settings_kratos: Settings) -> None:
+    """Each exclusion is a decision, pinned here: no write, no second egress
+    (online enrichment / web search / crawl), no SSH-to-sensor pcap, and no
+    org-context or hunt-analytics tool."""
+    names = _names(_oracle_agent(_all_flags_on(settings_kratos)))
+    forbidden = {
+        "propose_verdict",
+        "t_web_search",
+        "t_crawl_page",
+        "t_shodan_internetdb",
+        "t_shodan_host",
+        "t_greynoise",
+        "t_cve_lookup",
+        "t_get_pcap",
+        "t_query_cases",
+        "t_query_detections",
+        "t_get_playbooks",
+        "t_lookup_runbook",
+        "t_suggest_rule_tuning",
+        "t_beacon_profile",
+        "t_dns_entropy_scan",
+        "t_dcerpc_histogram",
+        "t_first_seen",
+    }
+    assert names.isdisjoint(forbidden), sorted(names & forbidden)
+    # `isdisjoint` alone is silently weak: a RENAMED egress tool (t_web_search →
+    # t_websearch) is absent from `forbidden`, so this check would pass even as the
+    # renamed tool rode onto the surface. Pin the surface as a SUBSET of the golden,
+    # so any tool the golden does not name — renamed or newly added — fails here,
+    # not only in the equality goldens above.
+    assert names <= ORACLE_EXPECTED, sorted(names - ORACLE_EXPECTED)
+
+
 def test_non_evidential_tools_stay_off_the_phase_d_surface() -> None:
     """Phase-D dispatch grants its tool the evidence exemption by NAME.
 

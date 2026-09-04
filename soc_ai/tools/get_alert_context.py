@@ -15,6 +15,24 @@ sorted chronologically, capped at ``max_per_pivot`` rows. Pivots whose source
 field is absent from the alert resolve to an empty list. All five pivot
 queries dispatch via :func:`asyncio.gather` for end-to-end latency.
 
+The ``host.name`` pivot carries a structural guard: on a network-sensor
+document (``suricata.*`` / ``zeek.*``), or whenever ``host.name`` equals the
+sensor identity (``observer.name`` / ``agent.name``), the top-level
+``host.name`` names the SENSOR BOX, not a flow endpoint — Security Onion
+strips it entirely from network-sensor docs, but a stock Filebeat/Elastic
+Agent Suricata pipeline ships it through, and pivoting on it there returns
+"everything that sensor observed". The guard skips the pivot and records why
+in :attr:`AlertContext.prefetch_gaps` (``skipped_*`` reasons), so an empty
+host pivot is distinguishable from a pivot that ran and found nothing.
+
+An **endpoint-coverage check** rides the same fan-out: one bounded ``size=0``
+lookup (:func:`_endpoint_coverage`) that decides whether the alert's hosts
+ship endpoint/host-agent telemetry at all, recording
+``endpoint.coverage: no_endpoint_documents_for_host`` /
+``no_endpoint_dataset_on_grid`` in ``prefetch_gaps`` when they do not — so
+the agent can stop distinguishing "no data yet" from "no coverage" by
+burning its tool budget on guaranteed-empty ``endpoint.events.*`` probes.
+
 The ``community_id`` pivot is the one exception to strict chronological order:
 rare behavioral-summary docs (beacon / DNS-tunnel profiles) are prepended at its
 head so their decisive bullet surfaces first, so it reads decisive-first, not
@@ -54,6 +72,7 @@ from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.enrichment import (
     EnrichmentContext,
     IndicatorEnrichment,
@@ -84,11 +103,25 @@ class AlertContext(BaseModel):
     # activity hours away is visible. Empty when the host has no other alerts
     # in-window or the lookup failed.
     host_alert_profile: dict[str, int] = Field(default_factory=dict)
-    # Pivots that failed AFTER retries and were swallowed so the agent
-    # could still get partial context. Maps pivot field name → exception
-    # class name (e.g., ``"network.community_id": "ConnectionTimeout"``).
-    # Empty when every pivot completed cleanly OR when its alert field
-    # was absent (those return empty lists silently — that's expected).
+    # Pivots that did NOT contribute evidence, with why. Three value shapes:
+    # an exception class name for a pivot that failed AFTER retries and was
+    # swallowed so the agent could still get partial context (e.g.
+    # ``"network.community_id": "ConnectionTimeout"``); a ``skipped_*``
+    # reason for the host pivot's structural guard —
+    # ``skipped_field_absent`` (no ``host.name`` on the alert, the normal
+    # Security Onion network-alert shape), ``skipped_sensor_identity``
+    # (``host.name`` equals ``observer.name``/``agent.name``), or
+    # ``skipped_network_sensor_dataset`` (a ``suricata.*``/``zeek.*`` doc,
+    # where top-level ``host.name`` can only name the sensor); or the
+    # endpoint-coverage verdict under ``"endpoint.coverage"`` —
+    # ``no_endpoint_documents_for_host`` (the grid ships endpoint telemetry
+    # but NONE of it comes from this alert's hosts, so endpoint queries
+    # scoped to them cannot match) or ``no_endpoint_dataset_on_grid`` (the
+    # grid holds no endpoint telemetry at all in the surrounding window).
+    # No ``endpoint.coverage`` entry means covered-or-unknown: an empty
+    # endpoint query then means only "this particular query matched none".
+    # The OTHER pivots still return [] silently when their alert field is
+    # absent.
     prefetch_gaps: dict[str, str] = Field(default_factory=dict)
 
 
@@ -119,7 +152,7 @@ async def get_alert_context(
     settings: Settings,
     window_seconds: int = 300,
     max_per_pivot: int = 10,
-    include_synth: bool = False,
+    include_synth: SynthScope = False,
 ) -> AlertContext:
     """Fetch ``alert_id`` and fan out to five related-event pivots.
 
@@ -130,10 +163,13 @@ async def get_alert_context(
         window_seconds: ±N-second window centered on the alert's ``@timestamp``
             for every pivot. Default 300s = 5min.
         max_per_pivot: hard cap on rows returned per pivot. Default 10.
-        include_synth: when False (the prod default), pivots exclude
-            synthetic-eval docs (``synth.scenario_id``) so fixtures can't leak
-            into a real investigation. The eval harness sets True when triaging
-            a synth alert so the scenario's supporting docs stay visible.
+        include_synth: synth-doc visibility. False (the prod default): pivots
+            exclude all synthetic-eval docs (``synth.scenario_id``) so
+            fixtures can't leak into a real investigation. A scenario id
+            (str): the batch eval's scope — only THAT scenario's own
+            supporting docs are visible, so concurrently-planted sibling
+            scenarios can't contaminate each other's pivots. True: every
+            synth doc visible (hunt-journey eval only).
 
     Raises:
         SoNotFoundError: if no document with ``alert_id`` exists.
@@ -153,13 +189,19 @@ async def get_alert_context(
         raise SoNotFoundError(f"alert not found: {alert_id}")
     alert = SoAlert.from_es_hit(lookup.hits[0])
 
+    # The host pivot's structural guard: pivot on host.name only when it can
+    # plausibly name an ENDPOINT. Skipping resolves the pivot to [] without
+    # an ES call; the reason lands in prefetch_gaps below so the skip is
+    # visible downstream (an honest gap, not a silent empty).
+    host_skip_reason = _host_pivot_skip_reason(alert)
+
     # Each pivot is paired with a stable ``key`` so we can map an
     # exception back to a slot in the result. asyncio.gather with
     # ``return_exceptions=True`` lets one failed pivot not poison the
     # rest — they get swallowed into ``prefetch_gaps``.
     pivot_specs: tuple[tuple[str, str | None, str], ...] = (
         ("community_id", alert.network_community_id, "network.community_id"),
-        ("host", alert.host_name, "host.name"),
+        ("host", None if host_skip_reason else alert.host_name, "host.name"),
         ("user", alert.user_name, "user.name"),
         ("process", alert.process_entity_id, "process.entity_id"),
         ("file", alert.file_hash_sha256, "file.hash.sha256"),
@@ -182,7 +224,12 @@ async def get_alert_context(
     # window, so it catches a compromised host the narrow pivots miss. Gathered
     # in a separate inner call so the pivots keep return_exceptions semantics
     # while host-risk (which swallows its own failures) keeps its dict type.
-    raw_results, host_alert_profile, behavioral_summaries = await asyncio.gather(
+    (
+        raw_results,
+        host_alert_profile,
+        behavioral_summaries,
+        endpoint_coverage_gap,
+    ) = await asyncio.gather(
         asyncio.gather(*pivot_calls, return_exceptions=True),
         _host_risk(
             alert,
@@ -199,10 +246,20 @@ async def get_alert_context(
             max_per_pivot,
             include_synth=include_synth,
         ),
+        _endpoint_coverage(
+            alert,
+            elastic,
+            settings,
+            include_synth=include_synth,
+        ),
     )
 
     events_by_key: dict[str, list[SoAlert]] = {}
     gaps: dict[str, str] = {}
+    if host_skip_reason is not None:
+        gaps["host.name"] = host_skip_reason
+    if endpoint_coverage_gap is not None:
+        gaps[ENDPOINT_COVERAGE_GAP_KEY] = endpoint_coverage_gap
     for (key, _value, field_name), result in zip(pivot_specs, raw_results, strict=True):
         if isinstance(result, BaseException):
             gaps[field_name] = type(result).__name__
@@ -259,7 +316,7 @@ async def get_enriched_alert_context(
     misp: Any = None,  # MispClient | None — typed as Any to dodge circular import
     window_seconds: int = 300,
     max_per_pivot: int = 10,
-    include_synth: bool = False,
+    include_synth: SynthScope = False,
     internal_cidrs: Sequence[Any] | None = None,
 ) -> EnrichedAlertContext:
     """Fattened prefetch: AlertContext + typed Zeek + per-indicator enrichments.
@@ -367,6 +424,212 @@ async def get_enriched_alert_context(
     )
 
 
+# Datasets written by a network sensor. Their originating document describes
+# a FLOW; where a top-level host.name exists on one at all (a stock Filebeat /
+# Elastic Agent pipeline — Security Onion strips it), it names the shipper.
+_NETWORK_SENSOR_DATASET_PREFIXES: tuple[str, ...] = ("suricata.", "zeek.")
+_NETWORK_SENSOR_MODULES: frozenset[str] = frozenset({"suricata", "zeek"})
+
+
+def _host_pivot_skip_reason(alert: SoAlert) -> str | None:
+    """Why the host pivot must not run for ``alert``, or None to run it.
+
+    The pivot is a strict term query on top-level ``host.name``; it is only
+    meaningful when that field names an ENDPOINT. Three shapes where it does
+    not (each returns the ``skipped_*`` token recorded in prefetch_gaps):
+
+    - ``skipped_field_absent`` — no ``host.name`` at all. The normal SO
+      network-alert shape; recorded so an empty host pivot is
+      distinguishable from one that ran and found nothing.
+    - ``skipped_sensor_identity`` — ``host.name`` equals ``observer.name``
+      or ``agent.name``: the shipper stamped its own identity, so a pivot
+      would fan out to everything that sensor observed.
+    - ``skipped_network_sensor_dataset`` — a ``suricata.*``/``zeek.*``
+      document. Whatever a surviving top-level ``host.name`` says there, it
+      is the sensor box, never a flow endpoint.
+    """
+    if not alert.host_name:
+        return "skipped_field_absent"
+    raw = alert.raw or {}
+    sensor_names = {
+        name
+        for field in ("observer.name", "agent.name")
+        if isinstance(name := fields.get_dotted(raw, field), str) and name
+    }
+    if alert.host_name in sensor_names:
+        return "skipped_sensor_identity"
+    dataset = alert.event_dataset or ""
+    if dataset.startswith(_NETWORK_SENSOR_DATASET_PREFIXES):
+        return "skipped_network_sensor_dataset"
+    if (alert.event_module or "") in _NETWORK_SENSOR_MODULES:
+        return "skipped_network_sensor_dataset"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Endpoint coverage: "this host has no data" vs "this host has no coverage".
+#
+# The 2026-08-27 eval batch had 6 runs exhaust their 25-call tool budget
+# probing ``endpoint.events.*`` for hosts that ship NO endpoint telemetry:
+# the dataset inventory truthfully reports that endpoint data exists on the
+# grid, so the model — reasoning correctly from what it was told — retried
+# the probe across field spellings and widening windows, unable to tell
+# "I haven't found it yet" from "it cannot exist". On a real grid every
+# EDR-uncovered host (servers outside the agent rollout, contractor laptops,
+# appliances, IoT) drains an investigation the same way.
+#
+# The prefetch therefore answers the coverage question ONCE, with one bounded
+# ``size=0`` lookup dispatched alongside the other fan-outs, and records the
+# answer in ``prefetch_gaps`` — the channel the host-pivot guard already uses
+# for honest gaps. The dataset-name classes below say which datasets COUNT AS
+# endpoint/host-agent telemetry (mirroring the inventory docstring's
+# host-logging examples); whether any of them exist on THIS grid, and whether
+# any of their documents come from THIS alert's hosts, is answered by the
+# query, never by this list.
+_ENDPOINT_DATASET_EXACT: tuple[str, ...] = ("endpoint", "sysmon", "osquery")
+_ENDPOINT_DATASET_PREFIXES: tuple[str, ...] = (
+    "endpoint.",
+    "windows.",
+    "sysmon.",
+    "osquery.",
+    "system.",
+)
+_ENDPOINT_MODULES: frozenset[str] = frozenset(
+    {"endpoint", "sysmon", "osquery", "windows", "system"}
+)
+
+# The prefetch_gaps key + reason tokens. CONSTANTS on purpose: the tokens (and
+# the prompt blocks keyed on them in soc_ai.agent.prompts) carry no grid
+# counts, dataset lists, index names or host identifiers, so the signal reads
+# byte-identically for a real uncovered host and a planted one — no
+# evaluation tell.
+ENDPOINT_COVERAGE_GAP_KEY = "endpoint.coverage"
+ENDPOINT_COVERAGE_HOST_UNCOVERED = "no_endpoint_documents_for_host"
+ENDPOINT_COVERAGE_DATASET_ABSENT = "no_endpoint_dataset_on_grid"
+
+# Total window (minutes) centered on the alert. 1440 (±12 h) is the widest
+# window the budget-exhausted runs probed, and matches the inventory's default
+# discovery window: an endpoint agent that covered this host would have
+# shipped SOMETHING within half a day of the alert.
+ENDPOINT_COVERAGE_WINDOW_MINUTES = 1440
+
+
+def _alert_is_endpoint_document(alert: SoAlert) -> bool:
+    """The alert itself IS endpoint telemetry — its host is trivially covered."""
+    dataset = alert.event_dataset or ""
+    if dataset in _ENDPOINT_DATASET_EXACT or dataset.startswith(_ENDPOINT_DATASET_PREFIXES):
+        return True
+    return (alert.event_module or "") in _ENDPOINT_MODULES
+
+
+async def _endpoint_coverage(
+    alert: SoAlert,
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    include_synth: SynthScope = False,
+) -> str | None:
+    """Does the alert's host ship endpoint telemetry at all? One bounded lookup.
+
+    Returns a ``prefetch_gaps`` reason token, or ``None`` for covered/unknown:
+
+    - :data:`ENDPOINT_COVERAGE_HOST_UNCOVERED` — the grid holds endpoint
+      documents in the window, but none matching ANY of this alert's host
+      identifiers (``host.ip`` / ``source.ip`` / ``destination.ip`` against
+      both alert IPs, plus ``host.name`` when it names a genuine endpoint).
+      Every endpoint probe keyed on those identifiers is then guaranteed
+      empty — the wild-goose-chase case.
+    - :data:`ENDPOINT_COVERAGE_DATASET_ABSENT` — zero endpoint documents on
+      the whole grid in the window: a network-only deployment (around this
+      alert's time, which is what matters for triaging it).
+    - ``None`` — covered, or undeterminable (no timestamp / no identifiers /
+      the read failed or was partial). A failed read must NEVER claim "no
+      coverage": that claim stops the agent from probing, so it is only made
+      from a COMPLETE successful read (``require_complete=True`` — a
+      partial-shard zero is "could not see", not "not there").
+
+    Cost: one ``size=0`` search (no documents fetched) bounded by the
+    ±``ENDPOINT_COVERAGE_WINDOW_MINUTES``/2 range filter and the endpoint
+    dataset filter, carrying a single ``filter`` sub-aggregation for the
+    host-scoped count — the same order of cost as the existing host-risk
+    aggregation it runs beside. Zero queries when the alert is itself an
+    endpoint document. It runs once per prefetch, never per tool call, and
+    spends nothing from the investigation's tool budget.
+    """
+    if alert.timestamp is None:
+        return None
+    if _alert_is_endpoint_document(alert):
+        return None
+
+    ips = [ip for ip in (alert.source_ip, alert.destination_ip) if ip]
+    host_clauses: list[dict[str, Any]] = [
+        {"terms": {field: ips}} for field in ("host.ip", "source.ip", "destination.ip") if ips
+    ]
+    if alert.host_name and _host_pivot_skip_reason(alert) is None:
+        host_clauses.append({"term": {"host.name": alert.host_name}})
+    if not host_clauses:
+        return None
+
+    delta = timedelta(minutes=ENDPOINT_COVERAGE_WINDOW_MINUTES / 2)
+    gte = (alert.timestamp - delta).isoformat()
+    lte = (alert.timestamp + delta).isoformat()
+
+    dataset_clause: dict[str, Any] = {
+        "bool": {
+            "should": [
+                *({"term": {"event.dataset": d}} for d in _ENDPOINT_DATASET_EXACT),
+                *({"prefix": {"event.dataset": p}} for p in _ENDPOINT_DATASET_PREFIXES),
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+    query: dict[str, Any] = {
+        "bool": {
+            "filter": [
+                {"range": {"@timestamp": {"gte": gte, "lte": lte}}},
+                dataset_clause,
+            ],
+            # Same exclusions as every other fan-out: the alert's own doc
+            # (harmless here — the endpoint-document short-circuit above
+            # already returned — but uniform), and the run's synth scope, so
+            # a scenario-scoped eval sees exactly its own plants and prod
+            # sees none.
+            "must_not": [
+                {"ids": {"values": [alert.id]}},
+                *synth_scope_must_not(include_synth),
+            ],
+        }
+    }
+    aggs: dict[str, Any] = {
+        "host_docs": {"filter": {"bool": {"should": host_clauses, "minimum_should_match": 1}}}
+    }
+
+    try:
+        result = await elastic.search(
+            settings.events_index_pattern,
+            query,
+            size=0,
+            aggs=aggs,
+            require_complete=True,
+        )
+    except Exception as exc:  # best-effort: unknown coverage, never a false claim
+        _LOGGER.warning(
+            "endpoint-coverage check for alert %s failed (coverage unknown): %s",
+            alert.id,
+            type(exc).__name__,
+        )
+        return None
+
+    if result.total == 0:
+        return ENDPOINT_COVERAGE_DATASET_ABSENT
+    host_docs = (result.aggregations or {}).get("host_docs") or {}
+    count = host_docs.get("doc_count")
+    if isinstance(count, int) and count == 0:
+        return ENDPOINT_COVERAGE_HOST_UNCOVERED
+    # Covered — or a malformed agg response, which reads as unknown, not as a claim.
+    return None
+
+
 async def _pivot(
     field_value: str | None,
     field_name: str,
@@ -376,7 +639,7 @@ async def _pivot(
     window_seconds: int,
     max_results: int,
     *,
-    include_synth: bool = False,
+    include_synth: SynthScope = False,
 ) -> list[SoAlert]:
     """Run one pivot query, or return ``[]`` if the alert lacks the pivot value."""
     if not field_value or alert.timestamp is None:
@@ -386,16 +649,17 @@ async def _pivot(
     gte = (alert.timestamp - delta).isoformat()
     lte = (alert.timestamp + delta).isoformat()
 
-    # Always exclude the alert under triage from its own fan-out. By default
-    # also exclude synthetic-eval docs: the prefetch is the
-    # synth-first pipeline's PRIMARY evidence path, and a real alert sharing a
-    # community_id / host.name / user.name with lingering synth fixtures would
-    # otherwise pull fabricated evidence into a production investigation. The
-    # eval harness opts in (`include_synth=True`) so it can still see a synth
-    # scenario's own supporting docs when triaging that synth alert.
-    must_not: list[dict[str, Any]] = [{"ids": {"values": [alert.id]}}]
-    if not include_synth:
-        must_not.append({"exists": {"field": "synth.scenario_id"}})
+    # Always exclude the alert under triage from its own fan-out, plus
+    # whatever the synth-visibility scope excludes: the prefetch is the
+    # synth-first pipeline's PRIMARY evidence path, so in prod (scope False)
+    # a real alert sharing a community_id / host.name / user.name with
+    # lingering synth fixtures must not pull fabricated evidence in, and in
+    # the batch eval (scope = a scenario id) a synth alert must not pull in
+    # its SIBLING scenarios' plants either.
+    must_not: list[dict[str, Any]] = [
+        {"ids": {"values": [alert.id]}},
+        *synth_scope_must_not(include_synth),
+    ]
 
     query: dict[str, Any] = {
         "bool": {
@@ -424,7 +688,7 @@ async def _behavioral_summary_pivot(
     window_seconds: int,
     max_results: int,
     *,
-    include_synth: bool = False,
+    include_synth: SynthScope = False,
 ) -> list[SoAlert]:
     """Fetch derived BEHAVIORAL-SUMMARY docs for the alert's endpoint IPs.
 
@@ -448,9 +712,10 @@ async def _behavioral_summary_pivot(
     gte = (alert.timestamp - delta).isoformat()
     lte = (alert.timestamp + delta).isoformat()
 
-    must_not: list[dict[str, Any]] = [{"ids": {"values": [alert.id]}}]
-    if not include_synth:
-        must_not.append({"exists": {"field": "synth.scenario_id"}})
+    must_not: list[dict[str, Any]] = [
+        {"ids": {"values": [alert.id]}},
+        *synth_scope_must_not(include_synth),
+    ]
 
     query: dict[str, Any] = {
         "bool": {
@@ -502,7 +767,7 @@ async def _host_risk(
     settings: Settings,
     window_hours: int,
     *,
-    include_synth: bool = False,
+    include_synth: SynthScope = False,
 ) -> dict[str, int]:
     """Aggregate the recent alert histogram for the alert's endpoint IPs.
 
@@ -525,9 +790,10 @@ async def _host_risk(
     gte = (alert.timestamp - delta).isoformat()
     lte = (alert.timestamp + delta).isoformat()
 
-    must_not: list[dict[str, Any]] = [{"ids": {"values": [alert.id]}}]
-    if not include_synth:
-        must_not.append({"exists": {"field": "synth.scenario_id"}})
+    must_not: list[dict[str, Any]] = [
+        {"ids": {"values": [alert.id]}},
+        *synth_scope_must_not(include_synth),
+    ]
 
     query: dict[str, Any] = {
         "bool": {
@@ -567,6 +833,10 @@ async def _host_risk(
 
 
 __all__ = [
+    "ENDPOINT_COVERAGE_DATASET_ABSENT",
+    "ENDPOINT_COVERAGE_GAP_KEY",
+    "ENDPOINT_COVERAGE_HOST_UNCOVERED",
+    "ENDPOINT_COVERAGE_WINDOW_MINUTES",
     "AlertContext",
     "EnrichedAlertContext",
     "get_alert_context",

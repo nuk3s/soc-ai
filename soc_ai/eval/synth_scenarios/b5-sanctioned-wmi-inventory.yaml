@@ -1,0 +1,232 @@
+id: b5-sanctioned-wmi-inventory
+name: "Sanctioned WMI inventory sweep mistaken for remote execution"
+version: 1
+tier: hard
+story: |
+  The configuration-management server 10.0.0.25 runs its hourly hardware and
+  software inventory: IWbemServices::ExecQuery against Win32_Product and
+  Win32_OperatingSystem on 41 workstations, plus one ExecMethod per host to
+  trigger the agent's own collection cycle. It is the same DCOM/WMI traffic
+  the h6-wmi-remote-exec-cradle attack produces, from the same interface,
+  with the same operation names. It has run every hour for 412 days. None of
+  the 41 targets makes a new outbound connection afterwards; the collected
+  inventory comes back to 10.0.0.25 over the management agent's own HTTPS
+  channel, as it does every hour.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # wmi context: management source, 41-host fan-out, 412-day recurrence
+    - prefetch_pivot         # zero targets with novel egress after the call
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.25"
+      source.port: 50122
+      destination.ip: "10.0.0.147"
+      destination.port: 135
+      network.transport: tcp
+      network.protocol: dce_rpc
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC WMI Remote Method Invocation Observed"
+      rule.category: "Misc activity"
+      rule.signature: "9800012"  # same analytic as h6 — the rule cannot tell them apart
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "misc-activity"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -3
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.147"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "IWbemServices"
+      zeek.dce_rpc.operation: "ExecQuery"
+      synth.wmi_class: "Win32_OperatingSystem"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.147"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dce_rpc.endpoint: "IWbemServices"
+      zeek.dce_rpc.operation: "ExecMethod"
+      synth.wmi_class: "CCM_SoftwareInventory"
+      synth.wmi_method: "TriggerSchedule"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+  # The same sweep hitting other hosts in the same minute — the fan-out that
+  # h6 does not have.
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -41
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-41) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.145"
+      zeek.dce_rpc.endpoint: "IWbemServices"
+      zeek.dce_rpc.operation: "ExecMethod"
+      synth.wmi_class: "CCM_SoftwareInventory"
+      synth.wmi_method: "TriggerSchedule"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+  - index: logs-synth-zeek-dce-rpc
+    time_offset_seconds: -22
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-22) }}"
+      event.dataset: zeek.dce_rpc
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      destination.ip: "10.0.0.146"
+      zeek.dce_rpc.endpoint: "IWbemServices"
+      zeek.dce_rpc.operation: "ExecMethod"
+      synth.wmi_class: "CCM_SoftwareInventory"
+      synth.wmi_method: "TriggerSchedule"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+  # The same summary shape h6 carries, with the opposite values in the fields
+  # that decide it.
+  - index: logs-synth-zeek-dce-rpc-summary
+    time_offset_seconds: -60
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-60) }}"
+      event.dataset: zeek.dce_rpc_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      synth.wmi_context:
+        window_seconds: 3600
+        source_role: "configuration-management-server"
+        source_is_management_host: true
+        distinct_targets: 41
+        operations:
+          ExecQuery: 328
+          ExecMethod: 41
+        source_prior_wmi_calls_90d: 71544        # hourly, every host, for months
+        recurrence_days: 412
+        recurrence_interval_seconds: 3600
+        targets_with_novel_egress_after_call: 0  # nothing downstream changed
+        targets_are_managed_estate: true
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -4
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.25"
+      source.port: 50122
+      destination.ip: "10.0.0.147"
+      destination.port: 135
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 4.2
+      zeek.conn.orig_bytes: 3980
+      zeek.conn.resp_bytes: 41220
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "dce_rpc"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+  # Where the inventory goes: back to the management server over its agent
+  # channel. h6's target instead reached an external address it had never
+  # seen.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 6
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(6) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.147"
+      source.port: 49702
+      destination.ip: "10.0.0.25"
+      destination.port: 443
+      network.transport: tcp
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 2.9
+      zeek.conn.orig_bytes: 88214
+      zeek.conn.resp_bytes: 1204
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "ssl"
+      synth.scenario_id: b5-sanctioned-wmi-inventory
+
+rubric_notes: |
+  Benign FP with the same operation on the wire as its attack twin. h6-wmi-
+  remote-exec-cradle and this scenario both show `IWbemServices` /
+  `ExecMethod` between two internal hosts under the same analytic rule and the
+  same Informational severity. Remote WMI execution is how large Windows
+  estates are managed; it is also how operators move without dropping files.
+  The operation name carries no information about which is happening.
+
+  The disposition turns on four values, all present in the events:
+  (1) SOURCE ROLE — 10.0.0.25 is the configuration-management server
+      (`source_is_management_host: true`). In h6 the source is a peer
+      workstation with `source_is_management_host: false`.
+  (2) FAN-OUT — 41 targets in one hourly cycle, the whole managed estate. h6
+      touched exactly one host. A sweep across the estate is administration;
+      a single hop to a single peer is movement.
+  (3) HISTORY — 71,544 prior calls over 412 days at a 3,600-second interval.
+      h6's source had made zero WMI calls in 90 days.
+  (4) DOWNSTREAM EFFECT — `targets_with_novel_egress_after_call: 0`, and the
+      one flow that follows goes back to the management server on its own
+      agent channel. In h6 the target immediately fetched a script over plain
+      HTTP from an address it had never contacted.
+
+  (4) is the strongest of the four and the one worth insisting on. Role,
+  fan-out and history can all be forged by an attacker who compromises the
+  management server — that is a real and well-documented attack path. What
+  cannot be hidden is whether the executed method caused the target to do
+  something new. Escalating this scenario is scored as an escalation false
+  positive; a system that pages on every inventory cycle is a system nobody
+  will keep running.

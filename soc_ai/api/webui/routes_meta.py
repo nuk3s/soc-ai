@@ -91,6 +91,12 @@ class NotificationOut(BaseModel):
     title: str
     when: str
     href: str | None = None
+    # Synth-eval marker (migration 0032): the bell displays investigation and
+    # hunt rows, so a run against planted scenarios must carry its marker here
+    # like on every other surface — "Verdict true_positive: <planted rule>"
+    # with nothing beside it reads as real activity. Defaults False for the
+    # entries minted from non-run state (dep outages, dossier conflicts).
+    isSynthEval: bool = False
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -240,6 +246,7 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 title=f"Investigating: {inv.rule_name or inv.id}",
                 when=_ago(inv.created_at.isoformat()),
                 href=f"/investigation/{inv.id}",
+                isSynthEval=bool(inv.is_synth_eval),
             )
         )
     done: list[NotificationOut] = []
@@ -262,6 +269,7 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 title=f"Verdict {verdict}: {inv.rule_name or inv.id}",
                 when=_ago(fin.isoformat()),
                 href=f"/investigation/{inv.id}",
+                isSynthEval=bool(inv.is_synth_eval),
             )
         )
     for h in hunts_done:
@@ -274,6 +282,7 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 title=f"Hunt finished — {n} finding{'' if n == 1 else 's'}: {h.objective[:80]}",
                 when=_ago((h.finished_at or h.created_at).isoformat()),
                 href=f"/hunts/{h.id}",
+                isSynthEval=bool(h.is_synth_eval),
             )
         )
     return (out + done)[:12]

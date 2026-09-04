@@ -309,7 +309,6 @@ class TargetedGap(BaseModel):
         "t_query_detections",
         "t_get_rule_content",
         "t_get_event_raw",
-        "t_decode_payload",
         "t_get_pcap",
         "t_web_search",
         "t_crawl_page",

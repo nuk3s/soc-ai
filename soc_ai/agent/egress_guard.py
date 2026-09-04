@@ -20,9 +20,25 @@ to the real value before storage/display.
 Scope boundary (deliberate): the Oracle path keeps its OWN independent
 sanitize/residue/desanitize pipeline in :mod:`soc_ai.oracle.client` — do NOT
 refactor the oracle code onto this guard.  The Oracle pipeline is
-adjudication-shaped (single payload, fail-closed residue sweep, refuse on
+adjudication-shaped (fail-closed residue sweep, refuse the whole adjudication on
 leak); this guard is loop-shaped (many payloads, stable labels, reversible at
-the tool boundary so the agent loop still works against real Elasticsearch).
+the tool boundary, best-effort ``check_or_raise``).
+
+Update (2026-08-27, Oracle tool loop): when ``oracle_tools_enabled`` is on the
+Oracle is ALSO loop-shaped — it runs the read-only ``oracle`` tool surface
+between sanitize and verdict (design ``docs/dev/design/2026-08-27-oracle-tool-use.md``).
+That path takes this guard's *shape* (stable labels across many payloads,
+reversible at the tool boundary — see :class:`~soc_ai.oracle.client.OracleToolGuard`,
+a thin wrapper bound to the adjudication ``Mapping``) while keeping the Oracle
+pipeline's *strictness*: it sanitizes each tool result field-aware through
+``sanitize_case`` (not plain ``sanitize``), refuses a hallucinated label rather
+than executing, and fails the WHOLE adjudication closed on any wire-level
+residue — never this guard's best-effort mode. It stays its OWN guard bound to
+its OWN mapping, NOT a shared ``ctx.egress_guard``: when the analyst model is
+also cloud there are two mappings alive at once, and the orchestrator's
+cross-restore already handles that seam. So the "do NOT refactor onto this
+guard" rule stands — the tool-running Oracle mirrors the shape, it does not
+share the object.
 """
 
 from __future__ import annotations
@@ -109,8 +125,16 @@ class EgressGuard:
         self._extra_suffixes = extra_suffixes
         self._allowlist = allowlist
 
-    def sanitize_obj(self, obj: Any) -> Any:
-        """Recursively redact internal identifiers in *obj* (str/dict/list/tuple)."""
+    def sanitize_obj(self, obj: Any, *, tool_name: str | None = None) -> Any:
+        """Recursively redact internal identifiers in *obj* (str/dict/list/tuple).
+
+        ``tool_name`` is accepted for signature parity with the Oracle's
+        :class:`~soc_ai.oracle.client.OracleToolGuard` (which the shared
+        ``_guarded`` wrapper threads it into for tool-aware re-keying) and is
+        deliberately UNUSED here: the analyst path uses plain shape-based
+        :func:`~soc_ai.oracle.sanitize.sanitize`, not the field-aware
+        ``sanitize_case``, so there is no envelope to re-key.
+        """
         return sanitize(
             obj,
             self._mapping,

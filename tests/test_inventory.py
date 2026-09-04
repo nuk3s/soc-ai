@@ -90,6 +90,20 @@ async def test_discover_datasets_is_dataset_agnostic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_discover_datasets_body_excludes_synth_unconditionally() -> None:
+    """The inventory feeds ONLY analyst surfaces (hunt-template availability,
+    ambient prompt blocks, dossiers) and its TTL cache is shared across all of
+    them — so the issued body excludes planted eval docs (synth.scenario_id)
+    with no opt-in at all. A live eval batch must never inflate the dataset
+    list or its counts."""
+    _clear_cache()
+    es = _FakeES(_AGG)
+    await discover_datasets(es, _settings())
+    must_not = es.calls[0]["query"]["bool"]["must_not"]
+    assert {"exists": {"field": "synth.scenario_id"}} in must_not
+
+
+@pytest.mark.asyncio
 async def test_discover_datasets_caches() -> None:
     _clear_cache()
     es = _FakeES(_AGG)

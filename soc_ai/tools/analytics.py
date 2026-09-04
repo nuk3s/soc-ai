@@ -12,13 +12,16 @@ underlying rows.
 All tools here issue **raw structured Elasticsearch DSL**, not OQL — OQL is
 the trust boundary for MODEL-AUTHORED query strings (alert-embedded text is
 prompt-injection surface); these tools' query shapes are fixed by the
-implementation, so there is nothing for OQL to gate. Every query carries the
-synthetic-eval kill-switch (``must_not: [{"exists": {"field":
-"synth.scenario_id"}}]``) so synth-TP fixtures never leak into a hunt's
-findings, and every tool self-bounds its output (top-N) and returns a
-structured ``{"error": True, ...}`` dict rather than raising, matching the
-rest of the read-tool surface (see :mod:`soc_ai.tools.prevalence`,
-:mod:`soc_ai.tools.discover`).
+implementation, so there is nothing for OQL to gate. Every query threads a
+:data:`~soc_ai.tools._synth_scope.SynthScope` (``include_synth``) through
+:func:`_hunt_must_not`: ``False`` (the prod default) excludes all planted
+eval docs so fixtures never leak into a hunt's findings, ``True`` (the
+hunt-journey eval) sees every plant, and a scenario id (the batch eval) sees
+only THAT scenario's plants — the same contract as every other events reader
+(:func:`soc_ai.tools.query_events.query_events_oql`). Every tool self-bounds
+its output (top-N) and returns a structured ``{"error": True, ...}`` dict
+rather than raising, matching the rest of the read-tool surface (see
+:mod:`soc_ai.tools.prevalence`, :mod:`soc_ai.tools.discover`).
 
 This module also holds the family's shared statistics helpers, starting with
 :func:`_shannon_entropy_chars` (char-level Shannon entropy).
@@ -47,6 +50,7 @@ from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import resolve_agg_field
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.online import is_internal_ip
 from soc_ai.tools.pcap_decode import _compute_inter_arrival
 from soc_ai.tools.query_events import _MAX_TIME_RANGE_MINUTES, _build_time_filter
@@ -61,6 +65,13 @@ _LOGGER = logging.getLogger(__name__)
 # <= 0.15) at the coarser tool-output granularity this sweep produces.
 _CV_MAX = 0.4
 _CV_PERIODIC = 0.15
+# The default per-pair sample floor (the `min_events` arg): fewer raw
+# timestamps than this make cv meaningless. A named constant rather than a
+# bare signature default because the confidence floor-raise's beacon-profile
+# ground (soc_ai.agent.gates) derives its "decisive" bar from THIS module's
+# thresholds — the tool and the gate must never disagree on what counts as a
+# measured periodic beacon.
+_MIN_EVENTS_DEFAULT = 8
 
 # Cap on how many candidate pairs the terms aggs walk (bounded ES cost) and
 # how many top_hits raw timestamps are pulled per pair (bounded payload —
@@ -181,16 +192,22 @@ def _internal_dest_exclusion(settings: Settings) -> dict[str, Any]:
     return {"terms": {"destination.ip": cidrs}}
 
 
-def _hunt_must_not(settings: Settings, *, exclude_internal_dest: bool) -> list[dict[str, Any]]:
+def _hunt_must_not(
+    settings: Settings, *, exclude_internal_dest: bool, include_synth: SynthScope = False
+) -> list[dict[str, Any]]:
     """The shared ``must_not`` clause set for this module's queries.
 
-    Always carries the synthetic-eval kill-switch (synth-TP fixtures never
-    leak into a hunt's findings — every other events reader excludes them
-    the same way); with ``exclude_internal_dest`` it also carries the
-    server-side internal-destination CIDR exclusion
-    (:func:`_internal_dest_exclusion`).
+    ``include_synth`` is a :data:`~soc_ai.tools._synth_scope.SynthScope`,
+    built into clauses by :func:`~soc_ai.tools._synth_scope.synth_scope_must_not`
+    — the same single decision point every other events reader uses: ``False``
+    (the prod default) excludes ALL planted eval docs so fixtures never leak
+    into a hunt's findings; ``True`` (the hunt-journey eval) excludes none; a
+    scenario id (the batch eval) excludes every OTHER scenario's plants, so a
+    scoped sweep sees its own plants and never a sibling's. With
+    ``exclude_internal_dest`` it also carries the server-side
+    internal-destination CIDR exclusion (:func:`_internal_dest_exclusion`).
     """
-    must_not: list[dict[str, Any]] = [{"exists": {"field": "synth.scenario_id"}}]
+    must_not: list[dict[str, Any]] = list(synth_scope_must_not(include_synth))
     if exclude_internal_dest:
         must_not.append(_internal_dest_exclusion(settings))
     return must_not
@@ -254,8 +271,9 @@ async def beacon_profile(
     window_minutes: int = 1440,
     src: str | None = None,
     dst: str | None = None,
-    min_events: int = 8,
+    min_events: int = _MIN_EVENTS_DEFAULT,
     include_internal: bool = False,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Measure connection cadence per src→dst pair and flag periodic ones.
 
@@ -286,6 +304,13 @@ async def beacon_profile(
             misses (TEST-NET/documentation ranges, unparseable keys). When
             True, no exclusion is applied and internal destinations are
             scored too.
+        include_synth: synth-doc visibility (``SynthScope``). False (the
+            prod default): the sweep excludes ALL synthetic-eval docs
+            (``synth.scenario_id``) so fixtures can't leak into a hunt's
+            findings. True (the hunt-journey eval): every plant visible. A
+            scenario id (the batch eval): only THAT scenario's plants
+            visible — a scoped sweep can never read a sibling scenario's
+            plants as network-wide truth.
 
     Returns:
         On success::
@@ -332,15 +357,20 @@ async def beacon_profile(
     if dst:
         filters.append({"term": {"destination.ip": dst}})
 
-    # Synth kill-switch, plus (by default) the SERVER-SIDE internal-
-    # destination exclusion so internal chatter never occupies the capped
-    # terms-agg slots or the per-pair top_hits payload (~20k docs of internal
-    # chatter would otherwise crowd out the external C2 candidates this tool
-    # exists to find).
+    # Synth-scope exclusion (prod hides all plants; a scenario scope hides
+    # every sibling's), plus (by
+    # default) the SERVER-SIDE internal-destination exclusion so internal
+    # chatter never occupies the capped terms-agg slots or the per-pair
+    # top_hits payload (~20k docs of internal chatter would otherwise crowd
+    # out the external C2 candidates this tool exists to find).
     query: dict[str, Any] = {
         "bool": {
             "filter": filters,
-            "must_not": _hunt_must_not(settings, exclude_internal_dest=not include_internal),
+            "must_not": _hunt_must_not(
+                settings,
+                exclude_internal_dest=not include_internal,
+                include_synth=include_synth,
+            ),
         }
     }
 
@@ -672,6 +702,7 @@ async def dns_entropy_scan(
     window_minutes: int = 1440,
     parent_domain: str | None = None,
     min_queries: int = 50,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Measure per-parent-domain qname entropy/volume and flag DGA/tunnel candidates.
 
@@ -713,6 +744,10 @@ async def dns_entropy_scan(
             parents that cleared the floor (the same convention as
             ``pairs_scanned`` in :func:`beacon_profile` counting only
             fully-formed pairs, not every raw bucket seen).
+        include_synth: synth-doc visibility (``SynthScope``): False (prod)
+            excludes all planted eval docs, True (hunt-journey eval) sees
+            every plant, a scenario id (batch eval) sees only that
+            scenario's plants — see :func:`beacon_profile`.
 
     Returns:
         On success::
@@ -745,9 +780,14 @@ async def dns_entropy_scan(
     query: dict[str, Any] = {
         "bool": {
             "filter": filters,
-            # Never let synthetic-eval fixtures pollute a hunt's DNS-entropy
-            # sweep — every other events reader excludes them the same way.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            # Synth-scope exclusion via the shared helper (prod hides all
+            # plants; a scenario scope hides every sibling's). NO
+            # internal-destination exclusion here — DNS
+            # resolvers are internal, so excluding internal destination.ip
+            # would drop the very traffic this sweep measures.
+            "must_not": _hunt_must_not(
+                settings, exclude_internal_dest=False, include_synth=include_synth
+            ),
         }
     }
 
@@ -930,6 +970,7 @@ async def dcerpc_histogram(
     settings: Settings,
     window_minutes: int = 1440,
     rare_max: int = 5,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Histogram DCE-RPC operations and flag dangerous / rare-against-busy ones.
 
@@ -960,6 +1001,10 @@ async def dcerpc_histogram(
             capped at ``_MAX_TIME_RANGE_MINUTES`` (43_200 = 30 days).
         rare_max: doc_count ceiling for an operation to be considered rare.
             Default 5.
+        include_synth: synth-doc visibility (``SynthScope``): False (prod)
+            excludes all planted eval docs, True (hunt-journey eval) sees
+            every plant, a scenario id (batch eval) sees only that
+            scenario's plants — see :func:`beacon_profile`.
 
     Returns:
         On success::
@@ -1008,9 +1053,14 @@ async def dcerpc_histogram(
     query: dict[str, Any] = {
         "bool": {
             "filter": filters,
-            # Never let synthetic-eval fixtures pollute a hunt's DCE-RPC
-            # sweep — every other events reader excludes them the same way.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            # Synth-scope exclusion via the shared helper (prod hides all
+            # plants; a scenario scope hides every sibling's). NO
+            # internal-destination exclusion here —
+            # DCE-RPC traffic is lateral movement between INTERNAL hosts, so
+            # excluding internal destination.ip would blind the histogram.
+            "must_not": _hunt_must_not(
+                settings, exclude_internal_dest=False, include_synth=include_synth
+            ),
         }
     }
 
@@ -1217,6 +1267,7 @@ async def first_seen(
     recent_minutes: int = 1440,
     baseline_days: int = 30,
     dataset: str = "zeek.conn",
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Diff recent external destinations against a trailing baseline.
 
@@ -1245,6 +1296,11 @@ async def first_seen(
             :mod:`soc_ai.tools.prevalence`'s lookback ceiling).
         dataset: ``event.dataset`` value both queries are scoped to. Default
             ``"zeek.conn"``.
+        include_synth: synth-doc visibility (``SynthScope``), applied to
+            BOTH queries: False (prod) excludes all planted eval docs, True
+            (hunt-journey eval) sees every plant, a scenario id (batch
+            eval) sees only that scenario's plants — see
+            :func:`beacon_profile`.
 
     Returns:
         On success::
@@ -1297,13 +1353,14 @@ async def first_seen(
 
     recent_range, baseline_range = _first_seen_windows(recent_minutes, baseline_days)
     dataset_term = {"term": {"event.dataset": dataset}}
-    # Synth kill-switch plus the SERVER-SIDE internal-destination exclusion
-    # (this tool only ever reports external destinations, so both sides
-    # exclude internal ones up front) — on the baseline side that means the
-    # 1000-slot membership set holds only external destinations, instead of
-    # internal chatter eating slots and forcing spurious baseline_truncated
-    # caveats.
-    must_not = _hunt_must_not(settings, exclude_internal_dest=True)
+    # Synth-scope exclusion (prod hides all plants; a scenario scope hides
+    # every sibling's) plus the
+    # SERVER-SIDE internal-destination exclusion (this tool only ever reports
+    # external destinations, so both sides exclude internal ones up front) —
+    # on the baseline side that means the 1000-slot membership set holds only
+    # external destinations, instead of internal chatter eating slots and
+    # forcing spurious baseline_truncated caveats.
+    must_not = _hunt_must_not(settings, exclude_internal_dest=True, include_synth=include_synth)
 
     recent_query: dict[str, Any] = {
         "bool": {"filter": [recent_range, dataset_term], "must_not": must_not}

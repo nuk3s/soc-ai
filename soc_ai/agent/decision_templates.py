@@ -72,6 +72,26 @@ _ATTACK_CLASSTYPES = frozenset(
         "trojan-activity",
         "command-and-control",
         "exfiltration",
+        # Recon + credential theft (2026-08-26 batch, h1-kerberoasting).
+        # Synthetic alerts used to parse with classtype=None, so this routing
+        # never fired on them and the gap stayed invisible; once they parsed,
+        # h1 — a Sigma-on-Zeek Kerberoasting detection carrying classtype
+        # attempted-recon between two internal hosts — matched
+        # clean_internal_traffic (false_positive @0.85) in both measured runs.
+        # The recon family (with its "successful" grades, mirroring the
+        # attempted/successful-admin pairs above) and credential-theft are
+        # attack signals: between internal endpoints the blocklist anchor is
+        # vacuous, so they must reach the synth, never the benign default.
+        # Deliberately NOT added: network-scan / rpc-portmap-decode —
+        # authorized internal scanners are routine IT, and the benign twins
+        # (b1-b8: bad-unknown, misc-activity, policy-violation,
+        # web-application-attack, attempted-admin) pin that this widening
+        # touches no benign scenario's classtype
+        # (tests/test_quality_spine.py::test_benign_internal_traffic_still_matches_clean_internal).
+        "attempted-recon",
+        "successful-recon-limited",
+        "successful-recon-largescale",
+        "credential-theft",
     }
 )
 
@@ -123,6 +143,39 @@ _MALWARE_SIGNAL_TOKENS = (
 # false positives: "Traversal" must NOT match "rat", "concatenate" must NOT match
 # "cnc", "Bookworm" must NOT match "worm", etc.
 _MALWARE_SIGNAL_WORD_BOUNDARY_RE = re.compile(r"\b(?:c2|cnc|rat|worm)\b", re.IGNORECASE)
+
+# Tokens whose presence in a rule name marks a behavioural/anomaly ANALYTIC —
+# a Zeek analytic surfaced as an alert, a Sigma behavioural detection, the
+# SOC-AI ANALYTIC family. These rules are DELIBERATELY informational
+# (misc-activity / Informational is their normal dress), so the attack-classtype
+# and malware-token guards never fire on them — and "both endpoints internal, no
+# blocklist hits" is vacuous for exactly this class: lateral movement, staging
+# and internal recon are internal-to-internal by definition, and internal IPs
+# never appear on blocklists. An analytic's verdict lives in baseline/aggregate
+# evidence (rate vs the user's history, fan-out, what happened downstream) that
+# no template predicate can see, so no benign template may anchor one — it falls
+# through to the synth/loop and is dispositioned from evidence
+# (2026-08-27 batch: h5-ransomware-staging — 1,843 files across 6 shares then a
+# 3.2 GB archive — and h6-wmi-remote-exec-cradle both settled false_positive on
+# clean_internal_traffic with ZERO tool calls).
+#
+# The cost is accepted and deliberate: benign twins that share an attack twin's
+# exact wire shape (b5 carries h6's identical rule — "the rule cannot tell them
+# apart", per the scenario) lose the zero-tool fast path too, because no
+# alert-level guard can separate a pair the catalogue built to be
+# indistinguishable at the alert level. Routine signature-based ET INFO/POLICY
+# internal traffic carries none of these tokens and keeps the fast path.
+# Substring match ("analytic" covers ANALYTIC/analytics/analytical); every token
+# is long enough that no benign word contains it. Deliberately NOT added:
+# "hunting" (ET HUNTING) — no measured miss, and widening past the measured
+# hole needs a benign-twin check first (see _ATTACK_CLASSTYPES note above).
+_ANALYTIC_SIGNAL_TOKENS = (
+    "analytic",
+    "anomaly",
+    "anomalous",
+    "behavioral",
+    "behavioural",
+)
 
 
 def _rule_signals_attack(ctx: EnrichedAlertContext) -> bool:
@@ -183,6 +236,25 @@ def _rule_signals_malware(ctx: EnrichedAlertContext) -> bool:
     field exists on the model, so we check both rule_name tokens and metadata_tags.
     """
     return _alert_signals_malware(ctx.alert)
+
+
+def _rule_signals_behavioral_analytic(ctx: EnrichedAlertContext) -> bool:
+    """Return True when the rule name marks a behavioural/anomaly analytic.
+
+    Guards every benign template that can short-circuit a case with zero tool
+    calls: a behavioural detection's meaning is in evidence a template cannot
+    see, so it must be investigated, never dismissed on locality or protocol
+    name. See ``_ANALYTIC_SIGNAL_TOKENS`` for the rationale and the measured
+    h5/h6 defect this closes.
+
+    Deliberately NOT applied to the two ``EXTERNAL_REPUTATION_TEMPLATES``:
+    those never short-circuit (``_definitely_investigate`` always runs the
+    loop when they match), so the zero-tool hole does not exist there, and
+    stripping their candidate default would change measured behaviour on
+    external-leg analytics (b6/b7) with no measured defect to justify it.
+    """
+    n = (ctx.alert.rule_name or "").lower()
+    return any(tok in n for tok in _ANALYTIC_SIGNAL_TOKENS)
 
 
 def _host_has_concurrent_threat(ctx: EnrichedAlertContext) -> bool:
@@ -371,6 +443,13 @@ def t_clean_internal_traffic(ctx: EnrichedAlertContext) -> CandidateVerdict | No
     # locality anchor — force the synth to reason from evidence.
     if _rule_signals_malware(ctx):
         return None
+    # Behavioural-analytics guard: a deliberately-informational analytic
+    # (misc-activity dress, no attack classtype, no malware token) is exactly
+    # the class where "both endpoints internal" is LEAST informative — its
+    # verdict lives in baseline/aggregate evidence, so it gets investigated,
+    # never anchored benign (h5/h6, batch-2026-08-27T021722Z).
+    if _rule_signals_behavioral_analytic(ctx):
+        return None
     return CandidateVerdict(
         verdict="false_positive",
         confidence=0.85,
@@ -395,6 +474,9 @@ def t_stun_quic_keepalive(ctx: EnrichedAlertContext) -> CandidateVerdict | None:
     # Malware/exploit-signal guard.
     if _rule_signals_malware(ctx):
         return None
+    # Behavioural-analytics guard (see t_clean_internal_traffic).
+    if _rule_signals_behavioral_analytic(ctx):
+        return None
     if not _zeek_conn_clean(ctx):
         return None
     return CandidateVerdict(
@@ -418,6 +500,9 @@ def t_dns_dnssec_housekeeping(ctx: EnrichedAlertContext) -> CandidateVerdict | N
     # Malware/exploit-signal guard.
     if _rule_signals_malware(ctx):
         return None
+    # Behavioural-analytics guard (see t_clean_internal_traffic).
+    if _rule_signals_behavioral_analytic(ctx):
+        return None
     return CandidateVerdict(
         verdict="false_positive",
         confidence=0.8,
@@ -435,6 +520,10 @@ def t_ntp_protocol_housekeeping(ctx: EnrichedAlertContext) -> CandidateVerdict |
         return None
     # Malware/exploit-signal guard.
     if _rule_signals_malware(ctx):
+        return None
+    # Behavioural-analytics guard (see t_clean_internal_traffic): an analytic
+    # whose name mentions a housekeeping protocol must not ride its template.
+    if _rule_signals_behavioral_analytic(ctx):
         return None
     if not _zeek_conn_clean(ctx):
         return None
@@ -536,6 +625,9 @@ def t_policy_violation_internal(ctx: EnrichedAlertContext) -> CandidateVerdict |
     # Malware/exploit-signal guard.
     if _rule_signals_malware(ctx):
         return None
+    # Behavioural-analytics guard (see t_clean_internal_traffic).
+    if _rule_signals_behavioral_analytic(ctx):
+        return None
     return CandidateVerdict(
         # 0.80: a deterministic internal-only policy verdict, as rule-grounded as
         # the DNSSEC/NTP housekeeping templates — and at/above the hard evidence
@@ -597,6 +689,7 @@ __all__ = [
     "DecisionTemplate",
     "Verdict",
     "_rule_signals_attack",
+    "_rule_signals_behavioral_analytic",
     "_rule_signals_malware",
     "match_decision_template",
 ]

@@ -1,0 +1,299 @@
+id: b7-browser-doh
+name: "Browser DNS-over-HTTPS mistaken for a covert channel"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.94 runs Chrome with its default secure-DNS setting, so
+  the browser resolves through Cloudflare's public DoH endpoint
+  (cloudflare-dns.com) over TLS instead of asking the corporate resolver.
+  The same ET POLICY rule that fires on m6-doh-c2-channel fires here. It is
+  not a covert channel: the operating system still sends 412 plaintext
+  queries to 10.0.0.1 in the same window (a browser's DoH is additive, not a
+  replacement), the TLS client fingerprint is Chrome's, the host has 37 other
+  browsing destinations open, and the DoH traffic is page-load driven — three
+  connections in a burst when a page loads, then four minutes of nothing,
+  then another burst. Measured over the window: 12 connections, mean gap
+  244s, standard deviation 461s.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # resolver profile: plaintext DNS to 10.0.0.1 continues
+    - prefetch_pivot         # zeek.ssl: Chrome JA3 alongside ordinary browsing
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.94"
+      source.port: 52288
+      destination.ip: "1.1.1.1"
+      destination.port: 443
+      network.transport: tcp
+      network.protocol: ssl
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "ET POLICY DNS over HTTPS Resolver Contacted Outside Approved List"
+      rule.category: "Potential Corporate Privacy Violation"
+      rule.signature: "2027758"  # same rule as m6 — it cannot tell them apart
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "policy-violation"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: b7-browser-doh
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.94"
+      source.port: 52288
+      destination.ip: "1.1.1.1"
+      destination.port: 443
+      network.community_id: "{{ same_as_triage }}"
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.ja3: "cd08e31494f9531f560d64c695473da9"   # Chrome on Windows
+      zeek.ssl.ja3s: "eb1d94daa7e0344597e756a1fb6e7054"
+      zeek.ssl.server_name: "cloudflare-dns.com"
+      zeek.ssl.established: true
+      synth.scenario_id: b7-browser-doh
+
+  # The decisive negative: name resolution did NOT move. m6's host sent zero
+  # plaintext queries in its window against a 1,120/day baseline.
+  - index: logs-synth-zeek-dns-summary
+    time_offset_seconds: -2720
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-2720) }}"
+      event.dataset: zeek.dns_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.94"
+      synth.resolver_profile:
+        window_seconds: 2720
+        plaintext_dns_queries_this_window: 412
+        plaintext_dns_queries_prior_daily_mean_14d: 1180
+        corporate_resolvers: ["10.0.0.1"]
+        doh_endpoint_sni: "cloudflare-dns.com"
+        doh_endpoint_on_approved_list: false
+        doh_sni_org_first_seen_days_ago: 511
+        doh_sni_other_internal_hosts_30d: 214
+        browser_tls_sessions_this_window: 194
+        distinct_external_destinations_this_window: 38
+      synth.scenario_id: b7-browser-doh
+
+  # A sample of the ordinary browsing this host is doing at the same time.
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: -1836
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1836) }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.94"
+      source.port: 52190
+      destination.ip: "203.0.113.140"
+      destination.port: 443
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.ja3: "cd08e31494f9531f560d64c695473da9"   # same Chrome fingerprint
+      zeek.ssl.ja3s: "eb1d94daa7e0344597e756a1fb6e7054"
+      zeek.ssl.server_name: "docs.intranet-portal.example"
+      zeek.ssl.established: true
+      synth.scenario_id: b7-browser-doh
+
+  # Raw DoH connections. Deliberately BURSTY: three in a few seconds when a
+  # page loads, then minutes of nothing. t_beacon_profile measures cv 1.89
+  # over these rows, far above its 0.4 candidacy bar (_CV_MAX), so the sweep
+  # does NOT flag this pair — while its attack twin m6-doh-c2-channel measures
+  # cv 0.030 and IS flagged. The destination is globally routable (1.1.1.1)
+  # for exactly that reason: a documentation address would be dropped as
+  # non-global and the twin would read as "not flagged" for the wrong reason,
+  # making the comparison meaningless.
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2715
+    is_triage_target: false
+    fields: &b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2715) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.94"
+      source.port: 52142
+      destination.ip: "1.1.1.1"
+      destination.port: 443
+      network.transport: tcp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 1.26
+      zeek.conn.orig_bytes: 1470
+      zeek.conn.resp_bytes: 3452
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: false
+      zeek.conn.service: "ssl"
+      synth.scenario_id: b7-browser-doh
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2712
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2712) }}"
+      source.port: 52156
+      zeek.conn.duration: 1.24
+      zeek.conn.orig_bytes: 882
+      zeek.conn.resp_bytes: 4099
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2710
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2710) }}"
+      source.port: 52163
+      zeek.conn.duration: 1.04
+      zeek.conn.orig_bytes: 813
+      zeek.conn.resp_bytes: 1570
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2470
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2470) }}"
+      source.port: 52174
+      zeek.conn.duration: 0.12
+      zeek.conn.orig_bytes: 3330
+      zeek.conn.resp_bytes: 5237
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2465
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2465) }}"
+      source.port: 52185
+      zeek.conn.duration: 1.89
+      zeek.conn.orig_bytes: 3082
+      zeek.conn.resp_bytes: 646
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -2464
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-2464) }}"
+      source.port: 52201
+      zeek.conn.duration: 1.66
+      zeek.conn.orig_bytes: 880
+      zeek.conn.resp_bytes: 1801
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1844
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1844) }}"
+      source.port: 52212
+      zeek.conn.duration: 1.43
+      zeek.conn.orig_bytes: 1354
+      zeek.conn.resp_bytes: 7800
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1840
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1840) }}"
+      source.port: 52218
+      zeek.conn.duration: 1.62
+      zeek.conn.orig_bytes: 1331
+      zeek.conn.resp_bytes: 6238
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -1838
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-1838) }}"
+      source.port: 52231
+      zeek.conn.duration: 1.1
+      zeek.conn.orig_bytes: 3372
+      zeek.conn.resp_bytes: 9416
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -338
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-338) }}"
+      source.port: 52242
+      zeek.conn.duration: 1.7
+      zeek.conn.orig_bytes: 3027
+      zeek.conn.resp_bytes: 6377
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -330
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-330) }}"
+      source.port: 52255
+      zeek.conn.duration: 0.7
+      zeek.conn.orig_bytes: 1565
+      zeek.conn.resp_bytes: 2332
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -30
+    is_triage_target: false
+    fields:
+      <<: *b7_doh_conn
+      "@timestamp": "{{ run_time | offset_seconds(-30) }}"
+      source.port: 52265
+      zeek.conn.duration: 1.33
+      zeek.conn.orig_bytes: 2875
+      zeek.conn.resp_bytes: 4717
+
+rubric_notes: |
+  Benign FP that fires the identical rule as its attack twin. m6-doh-c2-
+  channel and this scenario both show an internal host holding TLS to an
+  unapproved DoH resolver, both Informational, both classed policy-violation.
+  Contacting a public DoH endpoint is, on its own, a browser default setting
+  in a large fraction of the world's estates.
+
+  The disposing evidence is that resolution was SUPPLEMENTED, not REPLACED,
+  and it is measured in the events:
+  (1) 412 plaintext DNS queries still went to 10.0.0.1 during the window,
+      against a 14-day mean of 1,180 a day — the OS resolver is alive and
+      working. m6's host sent zero against a mean of 1,120.
+  (2) The TLS client fingerprint is Chrome's, and the SAME fingerprint
+      appears on 194 other TLS sessions to 37 other destinations in the
+      window. m6's fingerprint is a Go HTTP library on a host with no
+      browser session at all.
+  (3) The endpoint is 511 days old for the org and used by 214 other internal
+      hosts. m6's was first seen today, on one host.
+  (4) CADENCE, measured rather than asserted: bursts of three connections a
+      few seconds apart when a page loads, separated by minutes of silence —
+      cv 1.89. m6's is machine-timed at 302s with cv 0.030.
+
+  Point (4) is the one worth insisting on, because it is the one a tool can
+  settle. Both scenarios plant raw zeek.conn rows against a globally routable
+  destination, so t_beacon_profile evaluates both and separates them on the
+  statistic it actually computes. A benign twin that the sweep skips for an
+  addressing reason would prove nothing about the sweep.
+
+  Escalating this is scored as an escalation false positive and drops
+  precision. A system that treats "DoH observed" as compromise will page on
+  every Chrome install in the estate.

@@ -849,6 +849,128 @@ class TestHostnameAliasFields:
 
 
 # ---------------------------------------------------------------------------
+# 8d-bis. Winlog HOST leaf keys — a bare internal hostname under a non-ECS
+#         winlog/EVTX leaf key (TargetServerName / Workstation / WorkstationName
+#         / MachineName / ComputerName …) is tokenised as HOST wherever it nests.
+# ---------------------------------------------------------------------------
+
+
+class TestWinlogHostLeafKeys:
+    """A bare internal hostname under a winlog host leaf key egressed raw: it sits
+    in no ECS host field (not ``host.name``), so the field-aware harvest never
+    classified it, and a single-label NetBIOS name has no regex shape the wire
+    gate could catch. Route these leaf keys onto HOST (unconditional, same as
+    ``host.name``) — the parallel of ``_WINLOG_USER_LEAF_KEYS`` for hosts."""
+
+    @pytest.mark.parametrize(
+        ("leaf", "value"),
+        [
+            ("TargetServerName", "FILESRV"),
+            ("Workstation", "PDC01"),
+            ("WorkstationName", "WKSTN42"),
+            ("MachineName", "APPNODE02"),
+            ("ComputerName", "CORPSRV9"),
+        ],
+    )
+    def test_winlog_host_leaf_key_tokenised(self, leaf: str, value: str) -> None:
+        m = _mapping()
+        out = sanitize_case({"winlog": {"event_data": {leaf: value}}}, m)
+        text = json.dumps(out)
+        assert value not in text, f"{leaf} host value must be tokenised, not egress raw"
+        assert "HOST_" in text
+        assert m.counters.get("HOST", 0) >= 1
+
+    def test_non_host_winlog_leaf_key_untouched(self) -> None:
+        """A winlog leaf key that is NOT a host bearer (``LogonProcessName``) keeps
+        its value verbatim — the widening must not swallow non-host fields."""
+        m = _mapping()
+        out = sanitize_case({"winlog": {"event_data": {"LogonProcessName": "NtLmSsp"}}}, m)
+        text = json.dumps(out)
+        assert "NtLmSsp" in text, "a non-host winlog leaf value must pass through"
+        assert m.counters.get("HOST", 0) == 0
+
+    # -- widening to the remaining unambiguous internal host leaves ------------
+    @pytest.mark.parametrize(
+        ("leaf", "value"),
+        [
+            ("CallerComputerName", "CORPDC"),
+            ("ClientName", "RECEPTION7"),
+            ("DnsHostName", "APPSRV05"),
+            ("TargetHostName", "DBNODE3"),
+            ("RemoteHost", "PRINTSRV"),
+            ("RemoteMachine", "MAILGW"),
+        ],
+    )
+    def test_new_winlog_host_leaf_key_tokenised(self, leaf: str, value: str) -> None:
+        """The six remaining unambiguous internal host leaves route onto HOST just
+        like ``TargetServerName`` — a bare single-label value (no NetBIOS affix, no
+        internal suffix) has no shape any other rule catches, so before the widening
+        it egressed raw."""
+        m = _mapping()
+        out = sanitize_case({"winlog": {"event_data": {leaf: value}}}, m)
+        text = json.dumps(out)
+        assert value not in text, f"{leaf} host value must be tokenised, not egress raw"
+        assert "HOST_" in text
+        assert m.counters.get("HOST", 0) >= 1
+
+    def test_caller_computer_name_backslash_prefix_tokenised(self) -> None:
+        """``CallerComputerName`` often carries a leading ``\\`` (``\\WIN-DC01``).
+        The routed value must tokenise the bare hostname, not the backslash-prefixed
+        form — otherwise the same host appearing bare in another field would not
+        round-trip against the learned mapping."""
+        m = _mapping()
+        out = sanitize_case({"winlog": {"event_data": {"CallerComputerName": "\\\\WIN-DC01"}}}, m)
+        text = json.dumps(out)
+        assert "WIN-DC01" not in text, "the backslash-prefixed host value leaked raw"
+        assert "HOST_" in text
+        assert m.counters.get("HOST", 0) >= 1
+
+    def test_backslash_prefix_stripped_before_learning(self) -> None:
+        """The strip is in the winlog-host routing itself: a non-NetBIOS-shaped host
+        under ``CallerComputerName`` with a leading ``\\`` must learn the BARE name
+        (so a bare occurrence elsewhere round-trips).  Without the strip the mapping
+        keys the backslash-prefixed form and the bare name leaks."""
+        m = _mapping()
+        out = sanitize_case(
+            {
+                "winlog": {"event_data": {"CallerComputerName": "\\\\CORPFS01"}},
+                "message": "share opened from CORPFS01 by a user",
+            },
+            m,
+        )
+        text = json.dumps(out)
+        assert "CORPFS01" in m.forward, "the bare (de-prefixed) hostname must be learned"
+        assert "CORPFS01" not in text, "bare host in free text must round-trip against the mapping"
+        assert out["message"] == "share opened from HOST_01 by a user"
+
+    # -- degenerate-value guard (WorkstationName: "-") -------------------------
+    def test_degenerate_workstation_name_dash_not_tokenised(self) -> None:
+        """Windows renders an absent WorkstationName as ``-``.  Unconditional routing
+        would tokenise ``-`` to a HOST label and propagate it globally, corrupting
+        free text (``logon type 3 - see details`` → ``… HOST_01 …``).  A value with no
+        alphanumeric char cannot be a hostname and must be skipped."""
+        m = _mapping()
+        out = sanitize_case(
+            {
+                "winlog": {"event_data": {"WorkstationName": "-"}},
+                "message": "logon type 3 - see details",
+            },
+            m,
+        )
+        assert out["message"] == "logon type 3 - see details", "the '-' propagation bug is back"
+        assert "-" not in m.forward, "'-' must never be learned as a host"
+        assert m.counters.get("HOST", 0) == 0
+
+    @pytest.mark.parametrize("value", ["-", "", "  ", "—", "\\\\"])
+    def test_degenerate_no_alnum_values_skipped(self, value: str) -> None:
+        """No-alphanumeric values (``-``, empty, whitespace, em-dash, bare ``\\``)
+        under a winlog host leaf are never tokenised."""
+        m = _mapping()
+        sanitize_case({"winlog": {"event_data": {"WorkstationName": value}}}, m)
+        assert m.counters.get("HOST", 0) == 0
+
+
+# ---------------------------------------------------------------------------
 # 8e. Pattern-based NetBIOS/Windows bare-hostname catch in FREE-TEXT fields
 # ---------------------------------------------------------------------------
 

@@ -4,21 +4,28 @@ checks, and the post-synthesis guard stack. No LLM calls; these are the trust la
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Sequence
+from ipaddress import ip_address
 from typing import Any, Literal
 
 from soc_ai.agent.evidence import (
+    _MAX_IDENTITY_WALK_DEPTH,
+    _NON_EVIDENCE_RESULT_KEYS,
     _PIVOT_DECISIVE_ATTRS,
     _PIVOT_ID_SAFE_ATTRS,
+    _RAISE_SAFE_EVIDENCE_KEYS,
     _bundle_dump_text,
     _classify_citation,
     _collect_evidence_values,
+    _num,
     _path_exists_in_alert,
     _tool_was_invoked,
     count_successful_tool_calls,
 )
+from soc_ai.agent.narrative_grounding import _IPV4 as _ASSERTED_IPV4_RE
 from soc_ai.enrichment.blocklists import BlocklistDB
 
 _LOGGER = logging.getLogger(__name__)
@@ -387,6 +394,66 @@ def _no_semantic_evidence(report: Any, coverage_ratio: float) -> bool:
     return len(report.citations) == 0 or coverage_ratio < 0.25
 
 
+def _apply_confidence_floor_raise(
+    report: Any,  # TriageReport
+    enriched_ctx: Any,  # EnrichedAlertContext
+    audit: dict[str, Any],
+    *,
+    targeted_messages: list[Any] | None,
+    targeted_tool_results: Sequence[Any] | None,
+) -> Any:
+    """Floor an evidence-grounded true_positive to escalation confidence.
+
+    The grounds and their doctrine live on the call site's comment block in
+    :func:`_synth_first_post_validate` (checked strongest-first: ioc_hit,
+    decisive_pivot_value, retrieved_decisive_value, retrieved_beacon_profile).
+    Only RAISES, only for true_positive — a no-op otherwise.
+    """
+    if report.verdict != "true_positive" or report.confidence >= _ESCALATION_CONF_FLOOR:
+        return report
+    grounded_by: str | None = None
+    beacon_detail: dict[str, Any] | None = None
+    if _has_ioc_hit(enriched_ctx):
+        grounded_by = "ioc_hit"
+    elif _verdict_cites_decisive_pivot_value(report, enriched_ctx):
+        grounded_by = "decisive_pivot_value"
+    elif _verdict_cites_retrieved_decisive_value(
+        report,
+        enriched_ctx,
+        targeted_messages=targeted_messages,
+        targeted_tool_results=targeted_tool_results,
+    ):
+        grounded_by = "retrieved_decisive_value"
+    else:
+        beacon_detail = _retrieved_decisive_beacon_profile(
+            enriched_ctx, targeted_messages, targeted_tool_results
+        )
+        if beacon_detail is not None:
+            grounded_by = "retrieved_beacon_profile"
+    if grounded_by is None:
+        return report
+    raise_entry: dict[str, Any] = {
+        "original_confidence": report.confidence,
+        "floored_confidence": _ESCALATION_CONF_FLOOR,
+        "grounded_by": grounded_by,
+        "reason": (
+            "true_positive grounded in a concrete IOC / decisive "
+            "retrieved value — a confirmed catch, floored to escalation "
+            "confidence rather than left as an under-confident hedge"
+        ),
+    }
+    if beacon_detail is not None:
+        raise_entry["beacon_profile"] = beacon_detail
+        raise_entry["reason"] = (
+            "true_positive grounded in a retrieved beacon profile at "
+            "the beacon tool's own periodic bar — a confirmed catch, "
+            "floored to escalation confidence rather than left as an "
+            "under-confident hedge"
+        )
+    audit["confidence_floor_raise"] = raise_entry
+    return report.model_copy(update={"confidence": _ESCALATION_CONF_FLOOR})
+
+
 def _synth_first_post_validate(
     report: Any,  # TriageReport
     enriched_ctx: Any,  # EnrichedAlertContext
@@ -394,6 +461,7 @@ def _synth_first_post_validate(
     *,
     targeted_messages: list[Any] | None = None,
     targeted_tool_called: str | None = None,
+    targeted_tool_results: Sequence[Any] | None = None,
     synthesis_confidence_floor: float = 0.6,
     blocklist: BlocklistDB | None = None,
     internal_cidrs: Sequence[Any] | None = None,
@@ -418,6 +486,11 @@ def _synth_first_post_validate(
     didn't run an investigator — there's no tool-call ledger to compute
     rubric coverage from. (The template-confidence ceiling that used to fill
     that role was removed — see the note in the body.)
+
+    ``targeted_tool_results`` carries the raw Phase-D dispatch result(s) —
+    the targeted path threads no message history, so without them a verdict
+    resting on a value the DISPATCH retrieved would read as unsupported to
+    the decisive-value support gate.
 
     ``blocklist`` / ``internal_cidrs`` are forwarded to
     :func:`_apply_targeted_downgrades` (solicited-ICMP downgrade): the
@@ -480,24 +553,30 @@ def _synth_first_post_validate(
     # confidence. Only RAISES, only for true_positive, only when real gathered
     # evidence is present — so it can never manufacture a false escalation
     # (precision is measured on benign scenarios, which are never true_positive).
-    if (
-        report.verdict == "true_positive"
-        and report.confidence < _ESCALATION_CONF_FLOOR
-        and (
-            _has_ioc_hit(enriched_ctx) or _verdict_cites_decisive_pivot_value(report, enriched_ctx)
-        )
-    ):
-        audit["confidence_floor_raise"] = {
-            "original_confidence": report.confidence,
-            "floored_confidence": _ESCALATION_CONF_FLOOR,
-            "grounded_by": "ioc_hit" if _has_ioc_hit(enriched_ctx) else "decisive_pivot_value",
-            "reason": (
-                "true_positive grounded in a concrete IOC / decisive pivot — a "
-                "confirmed catch, floored to escalation confidence rather than "
-                "left as an under-confident hedge"
-            ),
-        }
-        report = report.model_copy(update={"confidence": _ESCALATION_CONF_FLOOR})
+    #
+    # Four grounds, checked strongest-first:
+    #   * ioc_hit — the enrichment layer matched a known-bad indicator;
+    #   * decisive_pivot_value — the CITATIONS name a decisive typed value from
+    #     a prefetched pivot (the legacy path, unchanged);
+    #   * retrieved_decisive_value — the verdict asserts (summary or citations)
+    #     a raise-safe decisive value the run genuinely RETRIEVED, including
+    #     through its own tool calls. Before this path, evidence the
+    #     investigator found for itself was invisible here: a correct TP
+    #     resting on a beacon/kerberos document its own OQL pulled stayed at
+    #     0.6x and scored as a recall miss (2026-08-26 batch, m1/h1);
+    #   * retrieved_beacon_profile — the run retrieved a beacon profile at or
+    #     below the beacon tool's own "periodic" bar with a healthy event
+    #     count. A beacon profile is a decisive RECORD with no citable string
+    #     value (m1's shape: cited by ES id, described statistically), so the
+    #     value-assertion grounds above can never see it — see the block
+    #     comment on :func:`_retrieved_decisive_beacon_profile`.
+    report = _apply_confidence_floor_raise(
+        report,
+        enriched_ctx,
+        audit,
+        targeted_messages=targeted_messages,
+        targeted_tool_results=targeted_tool_results,
+    )
 
     # Evidence-conditional verdict floor rewrite.
     # Coerce verdict to needs_more_info ONLY when:
@@ -606,6 +685,22 @@ def _synth_first_post_validate(
     # host_alert_profile lists malware/C2 rules (which may themselves be FPs)
     # and the external IP has no reputation — with zero per-alert evidence.
     report = _downgrade_ungrounded_host_anchored_tp(report, enriched_ctx, audit)
+
+    # ----- Decisive-value support gate (H1's deferred half) -----
+    # The gates above check evidence was GATHERED; this one checks the gathered
+    # evidence CONTAINS the decisive value the verdict asserts. It is what
+    # stops the H1 shape — one successful tool call carrying an attacker-
+    # dictated TP whose "known-bad IP" appears in nothing the run retrieved.
+    # Runs after the deterministic downgrades (whose corrected verdicts it must
+    # not touch) and before the hard evidence gate (which exempts tool-evidenced
+    # verdicts — exactly the H1 gap this gate closes).
+    report = _enforce_decisive_value_support(
+        report,
+        enriched_ctx,
+        audit,
+        targeted_messages=targeted_messages,
+        targeted_tool_results=targeted_tool_results,
+    )
 
     # ----- Hard evidence gate (zero-tool-verdict defense) -----
     # FINAL backstop: a settled TP/FP that rests on prefetched fields with no
@@ -999,6 +1094,531 @@ def _verdict_cites_decisive_pivot_value(report: Any, enriched_ctx: Any) -> bool:
         return False
     cited = " ".join(str(c) for c in (getattr(report, "citations", None) or [])).lower()
     return bool(cited) and any(v in cited for v in values)
+
+
+def _retrieved_decisive_value_tokens(
+    enriched_ctx: Any,
+    messages: list[Any] | None,
+    targeted_tool_results: Sequence[Any] | None,
+) -> frozenset[str]:
+    """Raise-safe decisive values this run actually RETRIEVED (lowercased).
+
+    The floor-raise's credit set. Sources — the same retrieval surfaces as
+    :func:`_retrieved_evidence_tokens` (prefetch bundle, tool-return message
+    contents, Phase-D dispatch results) — but harvesting ONLY the
+    :data:`_RAISE_SAFE_EVIDENCE_KEYS` leaves: sensor-computed digests and
+    fingerprints plus fixed-vocabulary cipher enums. Never document ids (a
+    doc id proves retrieval, not maliciousness — bare-id citing must not
+    raise confidence) and never detector rule metadata (rule-label
+    anchoring).
+
+    THE PROPERTY THIS GUARANTEES: every credited value was harvested by
+    STRUCTURAL key membership from the real shape of a retrieved payload —
+    dicts/lists only, embedded strings never parsed, tool payloads
+    echo-filtered (:func:`_evidence_payload`) so a tool echoing the model's
+    own argument launders nothing. An attacker who composes free-form wire
+    content (a DNS label, TLS SNI, URI, User-Agent, SMB file name, Kerberos
+    SPN, DCE-RPC string) can plant tokens only in content leaves, which are
+    never harvested; the only values they can influence in the credited
+    slots are true digests/fingerprints of their own observed activity.
+    Planting a token can therefore never mint raise-earning evidence — the
+    same M2 boundary id-citation resolution defends, applied to the side
+    that RAISES.
+    """
+    values: set[str] = set()
+    for attr in _PIVOT_ATTRS:
+        for ev in getattr(enriched_ctx, attr, None) or []:
+            for f in _PIVOT_ID_SAFE_ATTRS:
+                v = getattr(ev, f, None)
+                if isinstance(v, str) and v:
+                    values.add(v.lower())
+    try:
+        dump = enriched_ctx.model_dump(mode="json")
+    except Exception:
+        dump = None
+    if isinstance(dump, dict):
+        _collect_evidence_values(dump, values, keys=_RAISE_SAFE_EVIDENCE_KEYS)
+    for msg in messages or []:
+        for part in getattr(msg, "parts", []) or []:
+            if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
+                continue
+            payload = _evidence_payload(getattr(part, "content", None))
+            if payload is not None:
+                _collect_evidence_values(payload, values, keys=_RAISE_SAFE_EVIDENCE_KEYS)
+    for result in targeted_tool_results or []:
+        payload = _evidence_payload(result)
+        if payload is not None:
+            _collect_evidence_values(payload, values, keys=_RAISE_SAFE_EVIDENCE_KEYS)
+    # Same distinctiveness floor as the prefetch path (`len(v) >= 4`): a
+    # 1-3 char fragment could collide with prose by accident.
+    return frozenset(v for v in values if len(v) >= 4)
+
+
+def _verdict_cites_retrieved_decisive_value(
+    report: Any,
+    enriched_ctx: Any,
+    *,
+    targeted_messages: list[Any] | None,
+    targeted_tool_results: Sequence[Any] | None,
+) -> bool:
+    """True iff the verdict asserts a raise-safe decisive value the run
+    genuinely retrieved — through the prefetch bundle OR its own tool calls.
+
+    The retrieved-evidence cousin of :func:`_verdict_cites_decisive_pivot_value`,
+    closing that check's blind spot: it only reads prefetch pivot attrs, so a
+    correct TP resting on a decisive value the investigation loop found for
+    itself (the m1/h1 shape, 2026-08-26 batch) earned no floor-raise. The
+    assertion surface is summary + citations — the same surface
+    :func:`_asserted_decisive_values` scans — because models routinely cite
+    documents by id and name the decisive value in prose.
+
+    Direction of trust, and why this is safe to widen: the CREDIT side is
+    locked down (:func:`_retrieved_decisive_value_tokens` — structural,
+    unforgeable value classes only); the assertion side is model-authored
+    text either way. A match means "the model asserts a sensor-computed /
+    fixed-vocabulary value that a retrieved document really carries" — which
+    is exactly the grounding the raise exists to reward.
+    """
+    text_parts = [str(getattr(report, "summary", "") or "")]
+    text_parts.extend(str(c) for c in (getattr(report, "citations", None) or []))
+    asserted = " ".join(text_parts).lower()
+    if not asserted.strip():
+        return False
+    values = _retrieved_decisive_value_tokens(
+        enriched_ctx, targeted_messages, targeted_tool_results
+    )
+    return any(v in asserted for v in values)
+
+
+# ----- Beacon-profile ground for the confidence floor-raise -----
+# m1-cobalt-strike-beacon's shape (2026-08-26 batch): the report cites the
+# decisive records — the beacon aggregate and the TLS row — by ES id and
+# describes the beacon STATISTICALLY ("~60s interval, low jitter"). There is no
+# decisive string value to assert, because a beacon profile is a decisive
+# RECORD whose evidence is its measured statistics, not any citable token. The
+# value-assertion grounds above can therefore never see it, and crediting the
+# cited doc ids instead is forbidden (bare-id doctrine,
+# tests/test_recall_fix.py::test_confidence_floor_raise_requires_decisive_value_not_bare_id).
+# This ground credits the PROFILE itself: when the run genuinely RETRIEVED a
+# beacon profile whose measured cadence clears the beacon tool's OWN
+# "periodic" bar (analytics._CV_PERIODIC) with at least its default min_events
+# sample floor, the profile is decisive evidence for a C2-beacon
+# true_positive — regardless of whether the model quoted a string.
+#
+# Raise-side safety (the M2 boundary, reasoned for this ground specifically):
+#   * The statistics are computed by the sensor / by our own analytics tool
+#     over OBSERVED connection timestamps — structural numeric leaves in a
+#     retrieved payload. Embedded strings are never parsed, so a token planted
+#     in free-form wire content can never become a profile dict.
+#   * An attacker does control their own beacon's cadence — they could beacon
+#     regularly on purpose. That manufactures confidence only in the verdict
+#     that THEIR OWN traffic is malicious C2: making your C2 more detectable
+#     is self-defeating, not an attack. Framing an innocent third party is
+#     not reachable this way: producing a periodic profile attributed to host
+#     V requires completing real connections FROM V (spoofed sources cannot
+#     finish the TCP/TLS handshakes the zeek conn/ssl rows record), i.e.
+#     compromising V — at which point the true_positive is correct.
+#   * The profile must concern THIS alert's flow: when the payload names
+#     endpoints (src/dst, source.ip/destination.ip), one must match the
+#     alert's own — a different pair's beacon elsewhere on the grid grounds
+#     nothing about this alert.
+#   * As with every ground here, the raise only lifts an ALREADY-committed
+#     true_positive to the escalation floor; it can never create one. Benign
+#     regular cadences (b1's deliberately MORE regular updater profile) are
+#     decided at the verdict, not here — and b1's own profile (6 connections)
+#     falls below the tool's min_events bar regardless.
+
+# Key leaves a retrieved beacon-profile dict rides under: the SoAlert typed
+# attr (prefetch pivots), the raw-document spellings normalized by
+# so_client.fields.BEACON_PROFILE (`rita.beacon`, `network.beacon_profile`,
+# the eval fixture's `synth.beacon_profile`). `beacon.profile` (leaf
+# `profile`) is deliberately not keyed — far too generic; that spelling still
+# reaches the gate via the typed prefetch attr.
+_BEACON_PROFILE_KEYS: frozenset[str] = frozenset(
+    {"beacon_profile", "zeek_beacon_profile", "beacon"}
+)
+# Leaves that name a flow endpoint on a profile or its carrier document:
+# t_beacon_profile items (`src`/`dst`), typed pivot dumps
+# (`source_ip`/`destination_ip`), raw ES docs (`source.ip` → leaf `ip`).
+_ENDPOINT_LEAF_KEYS: frozenset[str] = frozenset({"src", "dst", "ip", "source_ip", "destination_ip"})
+
+
+def _beacon_profile_stats(profile: dict[str, Any]) -> tuple[float, float] | None:
+    """(inter-arrival cv, event count) a retrieved beacon profile measured.
+
+    Tolerates the two real shapes: a ``t_beacon_profile`` candidate item
+    (``cv``/``events``/``mean_interval_s``) and a RITA-style summary document
+    (``interval_stddev_seconds`` / ``mean_interval_seconds`` /
+    ``connection_count``; alternate spellings per evidence._num). Returns None
+    when the profile does not carry enough to measure a cadence — an
+    unmeasurable profile grounds nothing.
+    """
+    cv = _num(profile, "cv")
+    if cv is None:
+        mean = _num(profile, "mean_interval_seconds", "interval_mean_seconds", "mean_interval_s")
+        stdev = _num(profile, "interval_stddev_seconds", "stdev_s")
+        if mean is None or mean <= 0 or stdev is None:
+            return None
+        cv = stdev / mean
+    events = _num(profile, "events", "connection_count", "total_connections")
+    if events is None:
+        return None
+    return cv, events
+
+
+def _beacon_tool_item_shape(d: dict[str, Any]) -> bool:
+    """A ``t_beacon_profile`` candidate item, recognized by the tool's own
+    output contract: numeric ``cv`` + ``events`` + ``mean_interval_s``
+    co-occurring (soc_ai.tools.analytics.beacon_profile's documented item
+    shape; no other payload in the toolset carries that triple)."""
+
+    def _numeric(v: Any) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    return all(_numeric(d.get(k)) for k in ("cv", "events", "mean_interval_s"))
+
+
+def _collect_beacon_profiles(
+    node: Any,
+    out: list[tuple[dict[str, Any], dict[str, Any]]],
+    depth: int = 0,
+) -> None:
+    """Collect ``(profile, carrier)`` pairs from real retrieved STRUCTURE.
+
+    The same walk discipline as :func:`_collect_evidence_values`: dicts/lists
+    only, depth-bounded, embedded strings never parsed. ``carrier`` is the
+    dict the profile was found on (the pivot dump / ES ``_source`` / the tool
+    item itself) — the surface that names the flow's endpoints.
+    """
+    if depth > _MAX_IDENTITY_WALK_DEPTH:
+        return
+    if isinstance(node, dict):
+        if _beacon_tool_item_shape(node):
+            out.append((node, node))
+        for key, value in node.items():
+            leaf = key.rsplit(".", 1)[-1] if isinstance(key, str) else ""
+            if leaf in _BEACON_PROFILE_KEYS and isinstance(value, dict):
+                out.append((value, node))
+            _collect_beacon_profiles(value, out, depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_beacon_profiles(item, out, depth + 1)
+
+
+def _carrier_endpoints(profile: dict[str, Any], carrier: dict[str, Any]) -> set[str]:
+    """Endpoint IP strings the profile's payload names (lowercased)."""
+    found: set[str] = set()
+    for d in (profile, carrier):
+        for key, value in d.items():
+            leaf = key.rsplit(".", 1)[-1] if isinstance(key, str) else ""
+            if leaf in _ENDPOINT_LEAF_KEYS and isinstance(value, str) and value:
+                found.add(value.lower())
+            elif leaf in ("source", "destination") and isinstance(value, dict):
+                ip = value.get("ip")
+                if isinstance(ip, str) and ip:
+                    found.add(ip.lower())
+    return found
+
+
+def _retrieved_decisive_beacon_profile(
+    enriched_ctx: Any,
+    messages: list[Any] | None,
+    targeted_tool_results: Sequence[Any] | None,
+) -> dict[str, Any] | None:
+    """Audit detail of a decisive beacon profile this run RETRIEVED, or None.
+
+    Retrieval surfaces are exactly the floor-raise's existing ones
+    (:func:`_retrieved_decisive_value_tokens`): the prefetch bundle dump,
+    tool-return message contents, and Phase-D targeted dispatch results —
+    tool payloads echo-filtered through :func:`_evidence_payload`. "Decisive"
+    is the beacon tool's own bar, imported from soc_ai.tools.analytics rather
+    than re-invented: inter-arrival ``cv <= _CV_PERIODIC`` (the threshold
+    behind its "periodic" verdict_hint) AND event count >= its default
+    ``min_events`` floor. A marginal profile — semi-regular cadence
+    (``_CV_PERIODIC < cv <= _CV_MAX``) or too few samples — is not decisive.
+    """
+    from soc_ai.tools.analytics import (  # noqa: PLC0415 — keep the tools stack off gate import
+        _CV_PERIODIC,
+        _MIN_EVENTS_DEFAULT,
+    )
+
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    try:
+        dump = enriched_ctx.model_dump(mode="json")
+    except Exception:
+        dump = None
+    if isinstance(dump, dict):
+        _collect_beacon_profiles(dump, candidates)
+    for msg in messages or []:
+        for part in getattr(msg, "parts", []) or []:
+            if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
+                continue
+            payload = _evidence_payload(getattr(part, "content", None))
+            if payload is not None:
+                _collect_beacon_profiles(payload, candidates)
+    for result in targeted_tool_results or []:
+        payload = _evidence_payload(result)
+        if payload is not None:
+            _collect_beacon_profiles(payload, candidates)
+
+    alert = getattr(enriched_ctx, "alert", None)
+    alert_endpoints = {
+        str(ip).lower()
+        for ip in (getattr(alert, "source_ip", None), getattr(alert, "destination_ip", None))
+        if ip
+    }
+    for profile, carrier in candidates:
+        stats = _beacon_profile_stats(profile)
+        if stats is None:
+            continue
+        cv, events = stats
+        if cv > _CV_PERIODIC or events < _MIN_EVENTS_DEFAULT:
+            continue  # marginal: semi-regular cadence, or too few samples
+        if not (_carrier_endpoints(profile, carrier) & alert_endpoints):
+            continue  # someone else's flow, or no endpoint correlation at all
+        return {
+            "cv": cv,
+            "events": int(events),
+            "cv_periodic_max": _CV_PERIODIC,
+            "min_events": _MIN_EVENTS_DEFAULT,
+        }
+    return None
+
+
+# ----- Decisive-value support gate (H1, 2026-08-25 audit — the deferred half) -----
+# The trust gates checked that evidence was GATHERED, never that it SUPPORTS the
+# verdict: one successful tool call let an attacker-dictated true_positive @0.95
+# persist verbatim, escalate action and all. This gate asks the deterministic
+# half of "does the conclusion follow?": a decisive indicator VALUE the verdict
+# asserts must appear in a document the run actually RETRIEVED. No model call —
+# LLM-checking-LLM is the wrong instrument for a trust gate (declined once
+# already, deliberately).
+
+# Digest-shaped tokens: MD5/JA3 (32), SHA-1 (40), SHA-256 (64) hex. Longest
+# alternative first; \b keeps a 64-hex token from yielding a 32-hex fragment
+# (hex chars are word chars, so an interior boundary never exists). The 32-hex
+# arm is narrative_grounding._JA3 verbatim.
+_ASSERTED_HASH_RE = re.compile(r"\b(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}|[0-9a-fA-F]{32})\b")
+
+
+def _asserted_decisive_values(report: Any) -> frozenset[str]:
+    """The concrete indicator VALUES a verdict asserts (lowercased).
+
+    Scans the report's summary + citations — the assertion surface — for the
+    two shapes that are unambiguously a decisive indicator and never a
+    formatting voice:
+
+    * a **globally-routable unicast IPv4** ("beaconing to a known-bad IP").
+      Private/loopback/link-local/documentation/multicast addresses are
+      scenery, not the decisive indicator — the alert's own internal source IP
+      must never let a fabricated external one ride through on partial credit,
+      and a mistyped internal IP must never gate a sound verdict;
+    * a **file-hash / JA3-shaped hex digest** (32/40/64 hex chars).
+
+    Deliberately NOT extracted: domains and hostnames. A dotted path citation
+    (``alert.rule_metadata.signature_severity``) is indistinguishable from a
+    domain by shape, and the model-variance doctrine forbids punishing
+    citation shape — so those assertions stay out of this gate's reach (an
+    honest, documented limit rather than a false-fire surface).
+
+    An empty return is the gate's SILENCE condition: no decisive value
+    asserted → the gate has nothing to say.
+    """
+    text_parts = [str(getattr(report, "summary", "") or "")]
+    text_parts.extend(str(c) for c in (getattr(report, "citations", None) or []))
+    text = " ".join(text_parts)
+    values: set[str] = set()
+    for m in _ASSERTED_IPV4_RE.finditer(text):
+        try:
+            addr = ip_address(m.group(0))
+        except ValueError:  # pragma: no cover — the regex validates octets
+            continue
+        if addr.is_global and not addr.is_multicast:
+            values.add(m.group(0).lower())
+    for m in _ASSERTED_HASH_RE.finditer(text):
+        values.add(m.group(0).lower())
+    return frozenset(values)
+
+
+def _evidence_payload(content: Any) -> Any | None:
+    """The evidence-bearing STRUCTURE of one retrieved tool payload, or None.
+
+    Error strings and error/dedup/prefetch-short-circuit dicts retrieved
+    nothing. Top-level bookkeeping echo keys (:data:`_NON_EVIDENCE_RESULT_KEYS`
+    — ``ip``, ``query``, ``indicator``, ``hash`` …) are dropped so a tool that
+    merely ECHOES the model's own argument cannot launder a fabricated value
+    into "retrieved" (calling ``t_enrich_ip`` on an invented IP must not make
+    that IP supported — and a fabricated hash echoed back must not earn the
+    floor-raise). Real document content — hits, sources, nested leaves —
+    survives intact. Shared by the decisive-value support gate (which then
+    text-searches the JSON dump; safe, a match only SILENCES a downgrade) and
+    the floor-raise's credit-set harvest (which walks the structure by key
+    membership; a match RAISES, so it never touches dumped text).
+    """
+    if content is None or isinstance(content, str):
+        return None
+    if isinstance(content, dict):
+        if (
+            content.get("error")
+            or content.get("duplicate_call")
+            or content.get("prefetch_already_has_this")
+        ):
+            return None
+        return {k: v for k, v in content.items() if k not in _NON_EVIDENCE_RESULT_KEYS}
+    return content
+
+
+def _support_corpus_fragment(content: Any) -> str | None:
+    """Lowercased JSON text of ONE retrieved tool payload, echo-filtered
+    (see :func:`_evidence_payload` for what is dropped and why)."""
+    payload = _evidence_payload(content)
+    if payload is None:
+        return None
+    try:
+        return json.dumps(payload, default=str).lower()
+    except Exception:
+        return None
+
+
+def _retrieved_support_corpus(
+    bundle_text: str,
+    messages: list[Any] | None,
+    targeted_tool_results: Sequence[Any] | None,
+) -> str:
+    """Everything this run actually retrieved, as lowercased text.
+
+    The prefetched bundle dump, plus the CONTENTS of real tool returns in the
+    message history (the investigation loop), plus any Phase-D targeted
+    dispatch results. Text membership is safe HERE — unlike id-citation
+    resolution (M2), where a substring hit UPGRADED a forged citation to a
+    resolved document, a match in this corpus can only SILENCE a downgrade:
+    the claim being checked is exactly "this value appears in a retrieved
+    document", which a text hit makes literally true. An attacker can only
+    prevent the gate from firing (by actually planting the value in the
+    telemetry the run retrieved), never cause it to fire on someone else's
+    sound verdict.
+    """
+    parts: list[str] = [bundle_text]
+    for msg in messages or []:
+        for part in getattr(msg, "parts", []) or []:
+            if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
+                continue
+            frag = _support_corpus_fragment(getattr(part, "content", None))
+            if frag:
+                parts.append(frag)
+    for result in targeted_tool_results or []:
+        frag = _support_corpus_fragment(result)
+        if frag:
+            parts.append(frag)
+    return "\n".join(parts)
+
+
+def _decisive_value_is_retrieved(value: str, corpus: str) -> bool:
+    """Boundary-aware membership: ``10.0.0.1`` must not match inside
+    ``10.0.0.111``, and a 32-hex digest must not match inside a 64-hex one."""
+    if "." in value:  # dotted IPv4
+        pattern = rf"(?<!\d){re.escape(value)}(?!\d)"
+    else:  # hex digest
+        pattern = rf"(?<![0-9a-f]){re.escape(value)}(?![0-9a-f])"
+    return re.search(pattern, corpus) is not None
+
+
+def _enforce_decisive_value_support(
+    report: Any,  # TriageReport
+    enriched_ctx: Any,  # EnrichedAlertContext
+    audit: dict[str, Any],
+    *,
+    targeted_messages: list[Any] | None,
+    targeted_tool_results: Sequence[Any] | None,
+) -> Any:
+    """A true_positive's asserted decisive value must appear in RETRIEVED evidence.
+
+    This is a support check on cited evidence, NOT a judgment on whether the
+    reasoning is sound. Doctrine, per the floor-rewrite lessons this module
+    encodes:
+
+    * **Silent** when the verdict asserts no decisive value at all
+      (:func:`_asserted_decisive_values` returns empty), when every asserted
+      value IS retrieved, and when the bundle cannot be read at all (fail
+      OPEN — absence of visibility is not absence of evidence).
+    * **Band, never zero** when SOME asserted values are retrieved: the
+      verdict label survives and confidence takes the same banded shave as
+      the citation cap (:func:`_citation_confidence_cap`, floor 0.4).
+    * **Coerce** to ``needs_more_info`` in the 0.4 band — actions cleared,
+      the honest "not yet investigated" state — only when the asserted
+      evidence is genuinely absent: NOT ONE asserted decisive value appears
+      in anything the run retrieved, and no real IOC hit grounds the
+      escalation (an attacker cannot manufacture that exemption; it requires
+      the indicator to actually be on a blocklist).
+
+    Evidence-conditional, not shape-conditional: matching is over VALUES in
+    the full retrieved corpus, never over how a citation was formatted — a
+    model whose voice differs but whose asserted values are real is untouched
+    (``tests/test_validator_model_variance.py`` is the contract).
+    """
+    if report.verdict != "true_positive":
+        return report
+    asserted = _asserted_decisive_values(report)
+    if not asserted:
+        return report  # silence condition: nothing decisive asserted
+    bundle_text = _bundle_dump_text(enriched_ctx)
+    if not bundle_text:
+        return report  # can't see the bundle → fail open, never manufacture a downgrade
+    corpus = _retrieved_support_corpus(bundle_text, targeted_messages, targeted_tool_results)
+    unsupported = sorted(v for v in asserted if not _decisive_value_is_retrieved(v, corpus))
+    if not unsupported:
+        return report
+    support_ratio = (len(asserted) - len(unsupported)) / len(asserted)
+
+    if support_ratio == 0.0 and not _has_ioc_hit(enriched_ctx):
+        capped_conf = min(report.confidence, 0.4)
+        audit["unsupported_decisive_value_downgrade"] = {
+            "original_verdict": report.verdict,
+            "capped_verdict": "needs_more_info",
+            "original_confidence": report.confidence,
+            "capped_confidence": capped_conf,
+            "asserted_values": sorted(asserted),
+            "unsupported_values": unsupported,
+            "reason": (
+                "true_positive asserts decisive indicator value(s) that appear "
+                "in no retrieved document — not in the prefetched bundle and "
+                "not in any tool result this run gathered; the cited evidence "
+                "does not contain the value the verdict rests on, so it is "
+                "coerced to needs_more_info for a real investigation"
+            ),
+        }
+        note = (
+            " (Downgraded to needs_more_info by the decisive-value support "
+            "gate: the verdict asserts " + ", ".join(unsupported) + " — which "
+            "appears in no document this run retrieved.)"
+        )
+        return report.model_copy(
+            update={
+                "verdict": "needs_more_info",
+                "confidence": capped_conf,
+                "recommended_actions": [],
+                "summary": (getattr(report, "summary", "") or "") + note,
+            }
+        )
+
+    original_conf = report.confidence
+    capped = _citation_confidence_cap(original_conf, coverage_ratio=support_ratio)
+    audit["decisive_value_support_cap"] = {
+        "original_confidence": original_conf,
+        "capped_confidence": capped,
+        "support_ratio": support_ratio,
+        "asserted_values": sorted(asserted),
+        "unsupported_values": unsupported,
+        "ioc_hit_exemption": support_ratio == 0.0,
+        "reason": (
+            "some asserted decisive indicator value(s) appear in no retrieved "
+            "document; the verdict label is preserved (retrieved evidence is "
+            "not genuinely absent) and confidence takes the banded shave"
+        ),
+    }
+    if capped != original_conf:
+        report = report.model_copy(update={"confidence": capped})
+    return report
 
 
 def _downgrade_unevidenced_verdict(

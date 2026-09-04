@@ -472,11 +472,22 @@ def desanitize(obj: Any, mapping: Mapping) -> Any:
     pattern = re.compile(
         r"(?<!\w)(?:"
         + "|".join(re.escape(k) for k in sorted(mapping.reverse, key=len, reverse=True))
-        + r")(?!\w)"
+        + r")(?!\w)",
+        re.IGNORECASE,
     )
 
+    def _restore(label: str) -> str:
+        # Labels are minted in canonical UPPER form (Mapping.label_for). Fold a
+        # differently-cased occurrence the model emitted (``ip_01``) to that form
+        # so it still rehydrates — kept SYMMETRIC with the case-insensitive
+        # hallucination guard (find_unknown_oracle_labels): a case-variant label
+        # is either restored here or refused there, never passed through as a
+        # literal that runs as a confidently-wrong empty query (finding
+        # oracle-lowercase-label-evasion).
+        return mapping.reverse.get(label) or mapping.reverse.get(label.upper(), label)
+
     def _subst(text: str) -> str:
-        return pattern.sub(lambda m: mapping.reverse[m.group(0)], text)
+        return pattern.sub(lambda m: _restore(m.group(0)), text)
 
     def _walk(node: Any) -> Any:
         if isinstance(node, str):
@@ -490,6 +501,97 @@ def desanitize(obj: Any, mapping: Mapping) -> Any:
         return node
 
     return _walk(obj)
+
+
+# ---------------------------------------------------------------------------
+# The desanitize direction (Oracle tool loop) — hallucinated-label guard.
+#
+# When the reversible map is applied to MODEL-controlled input (the Oracle emits
+# tool arguments carrying labels, which are desanitized to real grid values
+# before execution — the 2026-08-27 design §3), a label the case never allocated
+# is a new risk unique to that direction. ``desanitize`` substitutes only labels
+# present in ``mapping.reverse``, so a hallucinated ``IP_47`` would flow into the
+# query VERBATIM and return zero hits — not a leak, but a silent empty result,
+# and a silent empty is indistinguishable from "no data" (the ``_index`` refusal
+# rationale). The guard: scan the model's emitted arguments — BEFORE restoring —
+# for label-shaped tokens the mapping never minted, and refuse rather than run a
+# query against a literal placeholder. Same fixed ``CATEGORY_\d+`` alphabet the
+# mapping mints (:meth:`Mapping.label_for`).
+# ---------------------------------------------------------------------------
+
+# IGNORECASE so a label the model emitted in the wrong case (``ip_47``) is still
+# SEEN as label-shaped and put through the known/unknown test below — a
+# case-sensitive net let ``source.ip:ip_47`` slip past as a literal, which then
+# ran as a confidently-wrong empty query (finding oracle-lowercase-label-evasion).
+_UNKNOWN_LABEL_RE = re.compile(r"(?<!\w)(?:USER|HOST|IP|MAC|EMAIL)_\d+(?!\w)", re.IGNORECASE)
+
+
+class OracleUnknownLabelError(ValueError):
+    """A model-emitted tool argument referenced an opaque label no case allocated.
+
+    Raised by the Oracle tool loop's desanitize step when an argument carries a
+    ``CATEGORY_NN`` token absent from ``mapping.reverse`` — a hallucinated
+    identifier. The tool wrapper turns it into a structured, self-correcting tool
+    error (:meth:`tool_error`) INSTEAD of executing the query, so the model gets
+    "not an identifier in this case" back rather than a misleading empty result.
+    The offending labels name what to fix; they are model-invented tokens, never
+    real values, so they are safe to echo.
+    """
+
+    def __init__(self, labels: list[str]) -> None:
+        self.labels = labels
+        super().__init__("tool argument referenced unknown opaque label(s): " + ", ".join(labels))
+
+    def tool_error(self) -> dict[str, Any]:
+        """Render a structured tool result the model can read and correct from."""
+        joined = ", ".join(self.labels)
+        return {
+            "error": True,
+            "type": "UnknownLabel",
+            "reason": "unknown_label",
+            "message": (
+                f"The argument referenced {joined}, which is not an identifier in "
+                "this case. Use only the opaque labels (IP_01, HOST_02, USER_03, …) "
+                "that actually appear in the evidence you were given; do not invent "
+                "new ones. Re-issue the call with a label present in the case, or a "
+                "literal public value."
+            ),
+        }
+
+
+def find_unknown_oracle_labels(obj: Any, mapping: Mapping) -> list[str]:
+    """Return the sorted, de-duplicated label-shaped tokens in *obj* that
+    *mapping* never allocated (i.e. hallucinated by the model).
+
+    Walks ``str`` / ``dict`` (keys and values) / ``list`` / ``tuple`` — the same
+    shapes :func:`desanitize` walks — and matches only whole ``CATEGORY_NN``
+    tokens (word-boundary-guarded, so ``SHIP_01`` is not read as ``IP_01``). A
+    token already in ``mapping.reverse`` is a legitimate allocated label and is
+    NOT flagged; everything else of that shape is unknown.
+    """
+    found: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, str):
+            for m in _UNKNOWN_LABEL_RE.finditer(node):
+                tok = m.group(0)
+                # Case-fold the membership test: labels are minted UPPER, so a
+                # real label emitted in another case (``ip_01``) is KNOWN and NOT
+                # flagged, while a true hallucination (``ip_47``, no IP_47
+                # allocated) is. Symmetric with desanitize's case-insensitive
+                # restore, so a case-variant label never slips through untouched.
+                if tok.upper() not in mapping.reverse:
+                    found.add(tok)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                _walk(k)
+                _walk(v)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                _walk(item)
+
+    _walk(obj)
+    return sorted(found)
 
 
 def unsafe_residue(
@@ -671,14 +773,25 @@ _OPAQUE_LABEL_RE = re.compile(r"(?:USER|HOST|IP|MAC|EMAIL)_\d+")
 # Mirrors the conservative shape used by the redacter but is re-declared here so
 # the two detection paths cannot fail together.  Same affix allow-set, same
 # dot-disqualification (a dot ⇒ FQDN ⇒ suffix rules' job, not this net).
+#
+# The boundaries reject a preceding BACKSLASH (``\\`` added to the lookbehind).
+# This net runs over a ``json.dumps`` blob too, where a real newline/tab renders
+# as a JSON escape (``\n`` = ``\`` + ``n``); without the guard the escape LETTER
+# started a spurious match — a static tool-description phrase like
+# ``…role guess, a\nserver-vs-workstation…`` was flagged as the bare hostname
+# ``nserver-vs-workstation`` and refused EVERY tool-loop adjudication at the wire
+# (surfaced by the real-wire test; the tool schemas ride the body but are never
+# sanitized, so only this gate sees them). A genuine NetBIOS name is never
+# preceded by a backslash (that is a UNC / path context, its own net's job), so
+# the guard is a strict tightening — detector still ⊆ replacer, no leak opened.
 _RESIDUE_NETBIOS_PREFIX_RE = re.compile(
-    r"(?<![\w.-])"
+    r"(?<![\w.\\-])"
     r"(?:DESKTOP|LAPTOP|WIN|WORKSTATION|PC|WKS|SRV|DC)-[A-Z0-9-]*[A-Z0-9]"
     r"(?![\w.-])",
     re.IGNORECASE,
 )
 _RESIDUE_NETBIOS_SUFFIX_RE = re.compile(
-    r"(?<![\w.-])"
+    r"(?<![\w.\\-])"
     r"[A-Z0-9][A-Z0-9-]*-(?:PC|LAPTOP|DESKTOP|WKS|WS|WORKSTATION|SRV)"
     r"(?![\w.-])",
     re.IGNORECASE,

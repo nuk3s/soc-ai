@@ -776,7 +776,37 @@ async def test_software_and_user_agents_are_collected_deduped() -> None:
     assert obs.software[0]["version"] == "Apache/2.4.58 (Debian)"
     assert obs.software[0]["name"] == "Apache"
     assert obs.user_agents == ("curl/8.4.0",)
-    assert obs.host_names == ("pve01",)
+    # The fixture's host.name rides a `zeek.http` document, so it names the
+    # sensor that wrote it, not this host. It used to be collected — which is
+    # how two agentless range targets were each reported as their sensor.
+    assert obs.host_names == ()
+
+
+async def test_host_name_on_a_wire_document_names_the_sensor_not_the_host() -> None:
+    """`host.name` from a network-sensor dataset is the shipper's, and is dropped.
+
+    ``_ENDPOINT_DATASETS`` is ``zeek.http``/``zeek.ssl`` — both written by the
+    sensor watching the flow. An agentless host is the worst case: every
+    document mentioning it is shipped by something else, so a surviving
+    ``host.name`` would be the ONLY name candidate and would win the weak rung
+    uncontested.
+    """
+    hits = dict(_TARGETED_HITS)
+    hits["zeek.http|zeek.ssl"] = [
+        {
+            "@timestamp": "2026-08-06T12:00:00.000Z",
+            "event": {"dataset": "zeek.ssl"},
+            "source": {"ip": _IP},
+            "destination": {"ip": "192.168.10.9"},
+            "host": {"name": "sensor01"},
+            "observer": {"name": "sensor01"},
+        }
+    ]
+    es = _FakeES(main_aggs=_MAIN_AGGS, main_total=3412, targeted_hits=hits)
+
+    obs = await _collect(es)
+
+    assert obs.host_names == ()
 
 
 async def test_ptr_query_uses_the_reverse_zone_and_no_host_filter() -> None:

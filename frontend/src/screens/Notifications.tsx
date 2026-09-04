@@ -1,6 +1,7 @@
 import { Bell, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { SyntheticEvalBadge } from '../components/Badges';
 import { ListToolbar } from '../components/ListToolbar';
 import { MultiSelect } from '../components/MultiSelect';
 import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
@@ -181,8 +182,11 @@ export function Notifications() {
         style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
       />
       <div className="min-w-0 flex-1">
-        <div data-testid="notification-title" className="text-[13px]">
+        <div data-testid="notification-title" className="flex flex-wrap items-center gap-1.5 text-[13px]">
           {formatNotificationTitle(nt.title)}
+          {/* A run against planted synthetic scenarios must never read as a
+              real one — badge it wherever the row appears. */}
+          {nt.isSynthEval && <SyntheticEvalBadge />}
         </div>
         {formatNotificationWhen(nt.when) && (
           <div className="mt-0.5 font-mono text-[11px] text-faint">

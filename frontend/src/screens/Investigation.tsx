@@ -31,7 +31,7 @@ import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
-import { KindBadge, RecordedRunChip, SeverityTag, VerdictPill } from '../components/Badges';
+import { KindBadge, RecordedRunChip, SeverityTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { Spinner } from '../components/States';
 import {
   ApiError,
@@ -526,6 +526,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 ? 'This investigation was cancelled before it finished'
                 : 'This investigation failed or was interrupted'}
         </div>
+        {/* The verdict card carries this badge too, but a failed run renders
+            THIS panel instead — the marker must survive every terminal state,
+            or an errored synthetic run reads as a real failed investigation. */}
+        {inv.isSynthEval && <SyntheticEvalBadge />}
         <div className="flex-1" />
         <div className="font-mono text-[12.5px] text-faint">elapsed {fmt(elapsed)}</div>
       </div>
@@ -576,6 +580,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <div className="absolute left-0 top-0 h-full w-[3px]" style={{ background: v.color }} />
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
         <VerdictPill verdict={inv.verdict} large />
+        {/* A run against planted synthetic scenarios must never read as a
+            real one — badged right beside the verdict. */}
+        {inv.isSynthEval && <SyntheticEvalBadge />}
         {demo && <RecordedRunChip />}
         {inv.sev && <SeverityTag sev={inv.sev} />}
         {/* min-w-0 + max-w-full + break-all: the badge may use the whole header

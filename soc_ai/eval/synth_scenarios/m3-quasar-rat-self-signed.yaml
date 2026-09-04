@@ -53,10 +53,14 @@ events:
       rule.name: "ET MALWARE Quasar RAT CnC Checkin"
       rule.category: "A Network Trojan was detected"
       rule.signature: "2029583"
-      classtype: trojan-activity
-      signature_severity: Major
-      host.name: "so-sensor-1"
-      agent.name: "so-sensor-1"
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Major"]
+      message: '{"alert": {"category": "trojan-activity"}}'
+      observer.name: "so-sensor-1"
       synth.scenario_id: m3-quasar-rat-self-signed
       synth.scenario_version: 1
 

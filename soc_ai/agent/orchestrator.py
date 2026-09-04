@@ -128,6 +128,7 @@ from soc_ai.agent.prompts import (
     FocusOrigin,
     _format_investigator_prompt,
     _format_transcript_for_synthesizer,
+    format_endpoint_coverage_block,
 )
 from soc_ai.agent.reasoning import extract_reasoning_trace
 
@@ -154,6 +155,7 @@ from soc_ai.oracle.identifiers import EffectiveIdentifiers, effective_internal_i
 from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools.enrichment import build_local_enrichment_context
+from soc_ai.tools.get_alert_context import ENDPOINT_COVERAGE_GAP_KEY
 from soc_ai.tools.write_exec import execute_write_tool
 from soc_ai.triage_models import is_pipeline_fallback
 
@@ -2319,6 +2321,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # investigate_when_unsure flag.
     ran_investigation_loop = False
     loop_messages: list[Any] | None = None
+    # The investigator's evidence bullets (claim → supporting-id index), kept
+    # for the Oracle escalation payload. Set only on the completed-loop path;
+    # the budget-cut partial path has no InvestigationTranscript to read.
+    loop_evidence_bullets: list[str] | None = None
     # fast_triage_enabled=False forces the tool-driven loop regardless of how
     # confident round-1 was ("agent does agent things"): deeper but slower.
     # `deep` is the same override scoped to THIS run (the analyst's deep re-run).
@@ -2382,11 +2388,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # Injection 2 of 4, beside the grid inventory: the two blocks are the
         # same class of ambient ground truth, and rubric step 5 already tells the
         # model to weigh what the host IS — this supplies the missing input.
+        #
+        # The endpoint-coverage block renders the prefetch's
+        # ``prefetch_gaps["endpoint.coverage"]`` verdict DIRECTLY AFTER the
+        # inventory, because the inventory's (true, grid-wide) "endpoint data
+        # exists — never conclude absence without querying" is exactly what
+        # sent budget-exhausted runs probing endpoint datasets for hosts with
+        # no endpoint agent. Empty string when covered/unknown.
         inv_user_msg = (
             _format_investigator_prompt(
                 alert_id, enriched_json, focus_hint=focus_hint, focus_origin=focus_origin
             )
             + await inventory_prompt_block(ctx.elastic, ctx.settings)
+            + format_endpoint_coverage_block(enriched.prefetch_gaps.get(ENDPOINT_COVERAGE_GAP_KEY))
             + dossier_block
         )
         if guard is not None:
@@ -2605,6 +2619,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # check (loop_messages feeds _is_evidence_backed / targeted-cite check).
             loop_transcript = inv_result.output
             loop_messages = inv_result.all_messages()
+            # Kept in whatever value-space the loop ran in (label space under a
+            # guard) — consistent with transcript_text at the Oracle call below.
+            loop_evidence_bullets = list(loop_transcript.evidence)
             inv_usage_ev = _usage_ev(1, inv_result, _served_backend(loop_attr))
             if inv_usage_ev is not None:
                 await _audit(inv_usage_ev)
@@ -2732,6 +2749,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # dispatch). A non-final round's message allows the synth to chain ONE
     # more gap (e.g. t_get_event_raw -> t_decode_payload).
     targeted_result: dict[str, Any] | str | None = None
+    # EVERY Phase-D dispatch result, in order — the targeted path threads no
+    # message history into the post-validators, so the decisive-value support
+    # gate needs the raw results to know what the dispatches retrieved.
+    targeted_results_all: list[dict[str, Any] | str] = []
     # Tool name of the most recent dispatch whose result carried discriminating
     # data — feeds the post-validators' evidence exemption below.
     targeted_tool_with_data: str | None = None
@@ -2773,6 +2794,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             yield dispatch_ev
 
             targeted_result = await run_targeted_investigation(gap, ctx=ctx)
+            targeted_results_all.append(targeted_result)
             targeted_result_ev = _ev(
                 "targeted_tool_result",
                 {"tool_name": gap.tool_name, "result": targeted_result},
@@ -2997,6 +3019,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         candidate,
         targeted_messages=targeted_messages,
         targeted_tool_called=targeted_tool,
+        targeted_tool_results=targeted_results_all,
         synthesis_confidence_floor=ctx.settings.synthesis_confidence_floor,
         blocklist=ctx.blocklist,
         internal_cidrs=classification_cidrs,
@@ -3009,6 +3032,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         yield ev
     if "citation_cap" in validation_audit:
         ev = _ev("citation_cap", {"round": 1, **validation_audit["citation_cap"]})
+        await _audit(ev)
+        yield ev
+    # Emitted in gate order: the floor raise runs after the citation cap and
+    # before the verdict-floor rewrite in _synth_first_post_validate. Audit-only
+    # until 2026-08-27 — the eval bundle records YIELDED events, so a raise that
+    # never emitted was unprovable from the very measurement grading it.
+    if "confidence_floor_raise" in validation_audit:
+        ev = _ev("confidence_floor_raise", validation_audit["confidence_floor_raise"])
         await _audit(ev)
         yield ev
     if "verdict_floor_rewrite" in validation_audit:
@@ -3035,6 +3066,22 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(ev)
         yield ev
 
+    if "decisive_value_support_cap" in validation_audit:
+        ev = _ev(
+            "decisive_value_support_cap",
+            validation_audit["decisive_value_support_cap"],
+        )
+        await _audit(ev)
+        yield ev
+
+    if "unsupported_decisive_value_downgrade" in validation_audit:
+        ev = _ev(
+            "unsupported_decisive_value_downgrade",
+            validation_audit["unsupported_decisive_value_downgrade"],
+        )
+        await _audit(ev)
+        yield ev
+
     if "evidence_gate_downgrade" in validation_audit:
         ev = _ev("evidence_gate_downgrade", validation_audit["evidence_gate_downgrade"])
         await _audit(ev)
@@ -3042,6 +3089,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # Metric: a zero-tool TP/FP was coerced to needs_more_info by the hard
         # evidence gate. Counts how often the gate fires (reliability signal).
         await metrics.get_metrics().record_event("zero_tool_verdict_blocked", {})
+
+    # The gate's other outcome — a zero-tool verdict exempted because it cites
+    # correlated prefetched-pivot evidence — was audit-only (same blindness as
+    # confidence_floor_raise above): "the gate passed this" and "the gate never
+    # ran" looked identical in a bundle.
+    if "evidence_gate_pivot_exemption" in validation_audit:
+        ev = _ev(
+            "evidence_gate_pivot_exemption",
+            validation_audit["evidence_gate_pivot_exemption"],
+        )
+        await _audit(ev)
+        yield ev
 
     # ----- Oracle escalation (optional, explicit opt-in) -----
     # After all post-validators, escalate to the frontier Oracle when the local
@@ -3090,10 +3149,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(esc_ev)
         yield esc_ev
 
-        # Build a compact text transcript for the Oracle payload.
+        # Build a compact text transcript for the Oracle payload — the PROSE
+        # parts only. The dict-shaped tool results (the backing evidence) travel
+        # separately via loop_messages → _extract_tool_results in the client,
+        # STRUCTURED, so sanitize_case's field-aware harvest sees their key
+        # paths. (b3 finding: this str-only filter used to be the whole payload,
+        # so every tool result was silently dropped and the Oracle adjudicated
+        # over unbacked prose.)
         transcript_text = ""
         if loop_messages is not None:
-            # Extract evidence text from the investigation loop messages where available.
             parts: list[str] = []
             for msg in loop_messages:
                 for part in getattr(msg, "parts", []) or []:
@@ -3111,13 +3175,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         oracle_suffixes = effective_idents.suffixes if effective_idents is not None else None
         oracle_hosts = effective_idents.hosts if effective_idents is not None else None
 
+        # `oracle_failure` is the client's failure_out channel (the
+        # no_propagate_out precedent): adjudicate() keeps its None-on-failure
+        # contract but names WHY, so the failed-adjudication event below can
+        # carry a reason instead of a shrug.
+        oracle_failure: dict[str, str] = {}
         oracle_result = await _oracle_client.adjudicate(
             ctx,
             enriched=enriched,
             local_report=triage_final,
             transcript_text=transcript_text,
+            loop_messages=loop_messages,
+            evidence_bullets=loop_evidence_bullets,
             extra_hosts=oracle_hosts,
             extra_suffixes=oracle_suffixes,
+            failure_out=oracle_failure,
         )
 
         if oracle_result is not None:
@@ -3151,21 +3223,71 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             adj_ev = _ev(
                 "oracle_adjudication",
                 {
-                    "oracle_verdict": oracle_report.verdict,
+                    # Normally the adjudicated verdict (post targeted-downgrade,
+                    # unchanged from before). When the override gate WITHHELD a
+                    # flip, oracle_report carries the local class, so surface the
+                    # raw class the Oracle ruled instead — the dissent stays on
+                    # the record.
+                    "oracle_verdict": (
+                        oracle_result.raw_oracle_verdict
+                        if oracle_result.override_withheld
+                        else oracle_report.verdict
+                    ),
                     "oracle_confidence": oracle_report.confidence,
                     "redaction": oracle_result.redaction_summary,
                     "oracle_model": oracle_result.oracle_model,
+                    # Observability (design §8): how many successful tool calls
+                    # the Oracle's own loop made — 0 on the single-shot path.
+                    "oracle_tool_calls": oracle_result.oracle_tool_calls,
+                    # The allow-known-safe egress backstop's utility cost: how many
+                    # residual unclassified scalars it masked before the wire (only
+                    # surfaced when non-zero, so a clean adjudication's event is
+                    # unchanged).
+                    **(
+                        {"oracle_masked_values": oracle_result.oracle_masked_values}
+                        if oracle_result.oracle_masked_values
+                        else {}
+                    ),
+                    # The override gate (design §6): a class-changing verdict with
+                    # no supporting tool call did NOT override; the local verdict
+                    # below stands, and that decision is recorded here.
+                    **(
+                        {"override_withheld": True, "local_verdict": local_triage_final.verdict}
+                        if oracle_result.override_withheld
+                        else {}
+                    ),
                     **({"oracle_targeted_downgrades": oracle_audit} if oracle_audit else {}),
                 },
             )
             await _audit(adj_ev)
             yield adj_ev
 
-            # Mark the Oracle report so UI/audit shows it was adjudicated.
-            adjudicated_summary = f"[Oracle adjudicated] {oracle_report.summary}"
-            triage_final = oracle_report.model_copy(update={"summary": adjudicated_summary})
-        # If oracle_result is None (refusal or failure), triage_final stays
-        # unchanged and the local verdict stands.
+            if oracle_result.override_withheld:
+                # The gate withheld the flip: keep the local verdict unchanged.
+                # The report already carries the local verdict class (the gate
+                # applied at the _verdict_to_report seam); do NOT relabel it as an
+                # Oracle override.
+                triage_final = local_triage_final
+            else:
+                # Mark the Oracle report so UI/audit shows it was adjudicated.
+                adjudicated_summary = f"[Oracle adjudicated] {oracle_report.summary}"
+                triage_final = oracle_report.model_copy(update={"summary": adjudicated_summary})
+        else:
+            # Refusal or failure: triage_final stays unchanged and the local
+            # verdict stands — but say so ON THE RECORD. An escalation whose
+            # adjudication silently vanished (scenario b8, 2026-08-27
+            # measurement) was indistinguishable from one still in flight.
+            # "unknown" = a caller (or test stub) that recorded no reason.
+            fail_ev = _ev(
+                "oracle_adjudication_failed",
+                {
+                    "reason": oracle_failure.get("reason", "unknown"),
+                    "local_verdict": triage_final.verdict,
+                    "local_confidence": triage_final.confidence,
+                },
+            )
+            await _audit(fail_ev)
+            yield fail_ev
 
     # ----- Final triage emit -----
     triage_ev = _ev(

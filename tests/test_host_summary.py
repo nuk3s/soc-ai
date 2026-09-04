@@ -549,3 +549,131 @@ async def test_host_summary_os_hint_present_in_empty_result(settings_kratos: Set
 
     assert out["observations"] is False
     assert out["os_hint"] is None
+
+
+# ---------------------------------------------------------------------------
+# Sensor-shipped identity: a network-sensor document names the SHIPPER
+#
+# Found on the live attack range 2026-09-04. Two agentless Vulhub targets
+# (10.1.10.41/.42) were both reported as "SR-router" — the range's Debian
+# router, which is also the Zeek/Suricata sensor. Every document mentioning an
+# agentless host is shipped BY the sensor, so its top-level host.name/host.hostname
+# is the sensor's own. Reading it as the endpoint's name hands every agentless
+# host on the segment its sensor's identity.
+# ---------------------------------------------------------------------------
+
+SENSOR_HITS: list[dict[str, Any]] = [
+    {
+        "@timestamp": "2026-09-04T10:00:00Z",
+        "event.dataset": "zeek.conn",
+        "source.ip": "10.1.10.41",
+        "destination.ip": "10.1.10.21",
+        "destination.port": 8161,
+        "host.name": "SR-router",
+        "host.hostname": "SR-router",
+        "observer.name": "SR-router",
+        "agent.name": "SR-router",
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_does_not_borrow_the_network_sensors_name(
+    settings_kratos: Settings,
+) -> None:
+    """An agentless host must not inherit the hostname of the sensor watching it."""
+    elastic, _ = _make_elastic(settings_kratos, _result(SENSOR_HITS))
+
+    out = await host_summary("10.1.10.41", elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] is None
+    assert out["evidence"].get("hostname") is None
+
+
+@pytest.mark.asyncio
+async def test_host_summary_never_forges_dhcp_provenance_from_host_hostname(
+    settings_kratos: Settings,
+) -> None:
+    """``host.hostname`` is ECS host identity, never a DHCP observation.
+
+    It used to sit in the DHCP candidate table, so a sensor's own hostname was
+    returned as ``SR-router (from dhcp)`` — a source string naming evidence that
+    was never read.
+    """
+    elastic, _ = _make_elastic(settings_kratos, _result(SENSOR_HITS))
+
+    out = await host_summary("10.1.10.41", elastic=elastic, settings=settings_kratos)
+
+    assert "dhcp" not in (out["evidence"].get("hostname") or "")
+
+
+@pytest.mark.asyncio
+async def test_host_summary_rejects_host_name_when_host_ip_excludes_the_query(
+    settings_kratos: Settings,
+) -> None:
+    """``host.ip`` is the shipper's own address list; if the query is absent, so is its identity."""
+    hits = [
+        {
+            "@timestamp": "2026-09-04T10:00:00Z",
+            "event.dataset": "network_traffic.flow",
+            "source.ip": "10.1.10.42",
+            "destination.ip": "10.1.10.21",
+            "host.name": "SR-router",
+            "host.ip": ["10.1.10.254", "192.0.2.101"],
+        }
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("10.1.10.42", elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] is None
+
+
+@pytest.mark.asyncio
+async def test_host_summary_keeps_host_name_from_a_real_endpoint_document(
+    settings_kratos: Settings,
+) -> None:
+    """The guard must not cost the case it exists to serve: an agent ON the host."""
+    hits = [
+        {
+            "@timestamp": "2026-09-04T10:00:00Z",
+            "event.dataset": "windows.sysmon_operational",
+            "source.ip": "10.1.10.21",
+            "destination.ip": "10.1.10.11",
+            "host.name": "SR-WS01",
+            "host.ip": ["10.1.10.21"],
+            "agent.name": "SR-WS01",
+        }
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("10.1.10.21", elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] == "SR-WS01"
+    assert "host.name" in out["evidence"]["hostname"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_prefers_a_dhcp_lease_over_a_sensor_stamp(
+    settings_kratos: Settings,
+) -> None:
+    """A real DHCP observation still wins, and the sensor stamp never displaces it."""
+    hits = [
+        *SENSOR_HITS,
+        {
+            "@timestamp": "2026-09-04T09:00:00Z",
+            "event.dataset": "zeek.dhcp",
+            "source.ip": "10.1.10.41",
+            "destination.ip": "10.1.10.254",
+            "destination.port": 67,
+            "host.name": "SR-router",
+            "observer.name": "SR-router",
+            "zeek": {"dhcp": {"host_name": "sr-vuln2"}},
+        },
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("10.1.10.41", elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] == "sr-vuln2"
+    assert "dhcp" in out["evidence"]["hostname"]

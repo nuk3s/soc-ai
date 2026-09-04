@@ -57,6 +57,7 @@ from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import first_present, get_dotted
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.os_hint import OsHint, os_hint_from_domains
 from soc_ai.tools.query_events import _build_time_filter
 
@@ -135,7 +136,12 @@ def classify_user_agent(ua: str) -> str | None:
 
 # Candidate field tables for signals query_zeek's _COALESCE_FIELDS doesn't cover.
 # ECS-first, zeek.* fallback — same convention as soc_ai.so_client.fields.
-_DHCP_HOSTNAME: tuple[str, ...] = ("zeek.dhcp.host_name", "dhcp.host_name", "host.hostname")
+_DHCP_HOSTNAME: tuple[str, ...] = ("zeek.dhcp.host_name", "dhcp.host_name")
+# ECS host identity. Trustworthy only on a document the host itself authored —
+# on a sensor's document it names the sensor (see fields.names_the_shipper).
+# ``host.hostname`` used to sit in the DHCP table above, which both skipped that
+# check and stamped the answer "(from dhcp)" — provenance for evidence never read.
+_ECS_HOST_IDENTITY: tuple[str, ...] = ("host.name", "host.hostname")
 _SMB_HOSTNAME: tuple[str, ...] = (
     "zeek.dce_rpc.named_pipe",  # weak; real announcement is below
     "zeek.smb.host_name",
@@ -176,9 +182,12 @@ def _bucket_pairs(agg: dict[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def _base_host_query(
-    ip: str, time_range_minutes: int, time_anchor: datetime | None
+    ip: str,
+    time_range_minutes: int,
+    time_anchor: datetime | None,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
-    """Events in the window where ``ip`` is either endpoint, excluding synth docs."""
+    """Events in the window where ``ip`` is either endpoint, synth scope applied."""
     return {
         "bool": {
             "must": [
@@ -193,9 +202,10 @@ def _base_host_query(
                 }
             ],
             "filter": [_build_time_filter(time_range_minutes, time_anchor)],
-            # Synthetic-eval kill-switch — same as query_events_oql: never let a
-            # synth fixture leak into a real host summary.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            # Synth scope, threaded (not a hardcoded blanket exclude): prod never
+            # shows a planted fixture in a real host summary; a batch eval scopes
+            # to its own scenario so the tool can characterise the host it grades.
+            "must_not": synth_scope_must_not(include_synth),
         }
     }
 
@@ -252,22 +262,32 @@ def _guess_role(ip: str, hits: list[dict[str, Any]]) -> tuple[str, list[str]]:
     return "unknown", []
 
 
-def _resolve_hostname(hits: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    """Best hostname for the IP + the evidence string, or ``(None, None)``.
+def _resolve_hostname(hits: list[dict[str, Any]], ip: str) -> tuple[str | None, str | None]:
+    """Best hostname for ``ip`` + the evidence string, or ``(None, None)``.
 
     Preference order: Zeek DHCP ``host_name`` > SMB/DCE-RPC host announcement >
-    ECS ``host.name`` > a reverse-DNS (PTR) answer. A field carrying an IP rather
-    than a name is rejected (``host.name`` sometimes holds the address).
+    ECS ``host.name``/``host.hostname`` > a reverse-DNS (PTR) answer. A field
+    carrying an IP rather than a name is rejected (``host.name`` sometimes holds
+    the address).
+
+    The ECS lane is the only one that reads a *document-level* identity rather
+    than an observation of the host, so it alone is gated on the document
+    actually being about ``ip`` (:func:`~soc_ai.so_client.fields.names_the_shipper`).
+    Without that gate an agentless host inherits the name of whatever sensor
+    watched it, which is how two range targets were both reported as the router.
     """
     for hit in hits:
         for source_label, candidates in (
             ("dhcp", _DHCP_HOSTNAME),
             ("smb/dce_rpc", _SMB_HOSTNAME),
-            ("host.name", ("host.name",)),
+            ("host.name", _ECS_HOST_IDENTITY),
         ):
             value = first_present(hit, candidates)
-            if isinstance(value, str) and value and not _looks_like_ip(value):
-                return value, f"{value} (from {source_label})"
+            if not (isinstance(value, str) and value and not _looks_like_ip(value)):
+                continue
+            if candidates is _ECS_HOST_IDENTITY and fields.names_the_shipper(hit, value, ip):
+                continue
+            return value, f"{value} (from {source_label})"
     # PTR fallback: a reverse-DNS answer naming this IP (only if nothing better).
     for hit in hits:
         qname = first_present(hit, fields.DNS_QUERY)
@@ -336,6 +356,7 @@ async def host_summary(
     settings: Settings,
     lookback_hours: int = 24,
     time_anchor: datetime | None = None,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Summarise what host an IP is, from Zeek/ECS observations in the window.
 
@@ -383,7 +404,7 @@ async def host_summary(
 
     index = settings.events_index_pattern
     time_range_minutes = lookback_hours * 60
-    query = _base_host_query(ip, time_range_minutes, time_anchor)
+    query = _base_host_query(ip, time_range_minutes, time_anchor, include_synth)
 
     # Aggregations: peers (the OTHER endpoint), service ports the host responds
     # on, and DNS names it queried. Built as a single search so it's one round
@@ -418,7 +439,10 @@ async def host_summary(
         "source.port",
         "destination.ip",
         "destination.port",
-        "host.name",
+        "event.module",
+        "host.ip",
+        "observer.name",
+        "agent.name",
     ):
         source_fields.setdefault(f, None)
     for candidates in (
@@ -426,6 +450,7 @@ async def host_summary(
         fields.DNS_QUERY,
         fields.SSL_SNI,  # TLS SNI feeds the telemetry-domain OS hint (TLS-only hosts)
         _DHCP_HOSTNAME,
+        _ECS_HOST_IDENTITY,
         _SMB_HOSTNAME,
         _PTR_ANSWER,
         _SOFTWARE,
@@ -455,7 +480,7 @@ async def host_summary(
     evidence: dict[str, Any] = {}
 
     # --- hostname (DHCP host_name > SMB/DCE-RPC announcement > host.name > PTR) ---
-    hostname, hostname_evidence = _resolve_hostname(hits)
+    hostname, hostname_evidence = _resolve_hostname(hits, ip)
     if hostname_evidence:
         evidence["hostname"] = hostname_evidence
 

@@ -19,6 +19,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from soc_ai.tools.get_alert_context import (
+    ENDPOINT_COVERAGE_DATASET_ABSENT,
+    ENDPOINT_COVERAGE_HOST_UNCOVERED,
+    ENDPOINT_COVERAGE_WINDOW_MINUTES,
+)
+
 if TYPE_CHECKING:
     # Imported only for annotations — `from __future__ import annotations`
     # keeps these as strings at runtime, so there's no circular import.
@@ -659,6 +665,74 @@ def format_focus_hint_block(focus_hint: str | None, origin: FocusOrigin = "rerun
         "definitive verdict if the evidence now supports one:\n\n"
         f"{focus_hint.strip()}\n\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-coverage blocks: the plain-language rendering of the prefetch's
+# ``prefetch_gaps["endpoint.coverage"]`` verdict, appended to the
+# investigation-loop user message DIRECTLY AFTER the grid dataset inventory.
+# Placement is load-bearing: the inventory block truthfully says endpoint
+# datasets exist grid-wide and warns "NEVER conclude a data type is absent
+# without querying its dataset" — exactly the instruction that sent
+# budget-exhausted runs probing ``endpoint.events.*`` for hosts that ship no
+# endpoint telemetry. This block is the per-host answer that already ran.
+#
+# CONSTANT strings on purpose (the window figure is baked in from a module
+# constant, not per-run data): no grid counts, no dataset lists, no host
+# identifiers, no scenario/synth vocabulary — so the block is byte-identical
+# for a real uncovered host and a planted one, and cannot become an
+# evaluation tell.
+_ENDPOINT_COVERAGE_WINDOW_HOURS = ENDPOINT_COVERAGE_WINDOW_MINUTES // 60
+
+_ENDPOINT_COVERAGE_HOST_UNCOVERED_BLOCK = f"""
+
+## Endpoint coverage: this alert's hosts have NO endpoint telemetry
+
+The prefetch already ran the endpoint-coverage check for this alert: the grid
+DOES ship endpoint/host-agent telemetry, but across the
+{_ENDPOINT_COVERAGE_WINDOW_HOURS}-hour window around this alert NONE of it
+comes from this alert's hosts (matched on `host.ip`, `host.name`, `source.ip`
+and `destination.ip`). The dataset inventory above is grid-wide ground truth
+populated by OTHER hosts; it does not mean these hosts are covered.
+
+- Endpoint/process/file/registry queries scoped to these hosts CANNOT return
+  documents — do not spend tool calls retrying them across field spellings or
+  wider windows. (Endpoint queries about OTHER hosts can still answer.)
+- Record the missing endpoint visibility as a COVERAGE GAP in
+  `open_questions` (e.g. "host has no endpoint agent — process ancestry
+  unverifiable"). It is not evidence of absence and not evidence of guilt.
+- Decide the verdict from the telemetry that DOES cover these hosts: the
+  network evidence above and the network-side tools.
+"""
+
+_ENDPOINT_COVERAGE_DATASET_ABSENT_BLOCK = f"""
+
+## Endpoint coverage: this grid ships NO endpoint telemetry
+
+The prefetch already ran the endpoint-coverage check for this alert: in the
+{_ENDPOINT_COVERAGE_WINDOW_HOURS}-hour window around it the grid holds no
+endpoint/host-agent documents at all — a network-only deployment as far as
+this alert's timeframe shows. Endpoint/process/file/registry queries cannot
+return documents for ANY host here; do not spend tool calls on them. Record
+the missing endpoint visibility as a COVERAGE GAP in `open_questions` and
+decide the verdict from the network telemetry.
+"""
+
+
+def format_endpoint_coverage_block(reason: str | None) -> str:
+    """Render the prefetch's endpoint-coverage gap for the model, or ``""``.
+
+    ``reason`` is ``prefetch_gaps.get("endpoint.coverage")``. ``None`` (host
+    covered, or coverage unknown) and any unrecognized future token render
+    nothing — the block only ever makes the two claims the prefetch actually
+    established. Returned blocks start with a blank line so callers append
+    unconditionally, mirroring :func:`inventory_prompt_block`.
+    """
+    if reason == ENDPOINT_COVERAGE_HOST_UNCOVERED:
+        return _ENDPOINT_COVERAGE_HOST_UNCOVERED_BLOCK
+    if reason == ENDPOINT_COVERAGE_DATASET_ABSENT:
+        return _ENDPOINT_COVERAGE_DATASET_ABSENT_BLOCK
+    return ""
 
 
 def build_synth_first_user_message(

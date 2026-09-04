@@ -33,11 +33,17 @@ class HuntRecorder:
         objective: str,
         started_by: str,
         kind: str = "chat",
+        is_synth_eval: bool = False,
     ) -> None:
         self._maker = maker
         self._objective = objective
         self._started_by = started_by
         self._kind = kind
+        # Synthetic-evaluation marker: the run's context opted in to planted
+        # synth scenarios, so the row must never read as real activity.
+        # Derived from ctx.include_synth by hunt_recorded_run — no API caller
+        # can supply it.
+        self._is_synth_eval = is_synth_eval
         self._buffer: list[dict[str, Any]] = []
         self._report: dict[str, Any] | None = None
         self._finished = False
@@ -51,6 +57,7 @@ class HuntRecorder:
                     objective=self._objective,
                     started_by=self._started_by,
                     kind=self._kind,
+                    is_synth_eval=self._is_synth_eval,
                 )
         except Exception:
             _LOGGER.exception(

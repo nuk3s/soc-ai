@@ -60,6 +60,7 @@ async def recorded_run(
     kind: str = "suricata",
     hunt_id: str | None = None,
     finding_ordinal: int | None = None,
+    is_synth_eval: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap *event_stream* with the investigation recorder tee.
 
@@ -72,6 +73,12 @@ async def recorded_run(
     provenance for a hunt-launched investigation — passed straight through to
     the recorder. Every existing caller omits them and gets the recorder's
     ``kind="suricata"`` default.
+
+    ``is_synth_eval`` (optional, default False): marks a synthetic-evaluation
+    run — one that could see planted synth scenarios, or was promoted from a
+    marked hunt — so the row can never be read back as real activity. Only the
+    promotion route (inheriting its hunt's marker) and an eval context (via
+    ``run_recorded``) ever set it; it is unreachable from a request body.
     """
     recorder = InvestigationRecorder(
         state.db_sessionmaker,
@@ -81,6 +88,7 @@ async def recorded_run(
         kind=kind,
         hunt_id=hunt_id,
         finding_ordinal=finding_ordinal,
+        is_synth_eval=is_synth_eval,
     )
     inv_id = await recorder.start()
 
@@ -246,6 +254,7 @@ async def run_recorded(
     finding_ordinal: int | None = None,
     allow_so_writes: bool = True,
     focus_origin: FocusOrigin = "rerun",
+    is_synth_eval: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Call investigate() and tee it through the recorder.
 
@@ -268,6 +277,11 @@ async def run_recorded(
     promotion route (finding-promotion, Task 6) passes
     ``allow_so_writes=False, focus_origin="hunt_finding"`` explicitly; every
     other caller gets the ordinary defaults.
+
+    ``is_synth_eval`` (optional, default False): the synthetic-evaluation
+    marker, OR-combined with ``ctx.include_synth`` below — a run recorded from
+    an eval context is marked even when the caller forgets the kwarg, the same
+    invariant the hunt recorder enforces.
     """
     event_gen = investigate(
         alert_id,
@@ -288,6 +302,10 @@ async def run_recorded(
         kind=kind,
         hunt_id=hunt_id,
         finding_ordinal=finding_ordinal,
+        # A run whose context opted in to planted synth scenarios must persist
+        # marked regardless of what its caller passed (test-double contexts may
+        # lack the attribute — absent means the prod default, not opted in).
+        is_synth_eval=is_synth_eval or bool(getattr(ctx, "include_synth", False)),
     ):
         yield name, data
 

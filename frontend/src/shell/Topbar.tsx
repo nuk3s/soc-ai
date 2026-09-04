@@ -1,7 +1,7 @@
 import { Bell, Check, ChevronDown, HelpCircle, Search, Settings, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { DevBadge } from '../components/Badges';
+import { DevBadge, SyntheticEvalBadge } from '../components/Badges';
 import { type Health, getHealth, getNotifications, getWorkspaces } from '../lib/api';
 import {
   NOTIFICATIONS_DISMISSED_EVENT,
@@ -339,7 +339,17 @@ export function Topbar() {
                 style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
               />
               <div className="min-w-0 flex-1">
-                <div className="text-[12.5px] leading-[1.45]">{formatNotificationTitle(nt.title)}</div>
+                <div className="text-[12.5px] leading-[1.45]">
+                  {formatNotificationTitle(nt.title)}
+                  {/* A run against planted synthetic scenarios must never read
+                      as a real one — badge it wherever the row appears. */}
+                  {nt.isSynthEval && (
+                    <>
+                      {' '}
+                      <SyntheticEvalBadge />
+                    </>
+                  )}
+                </div>
                 {formatNotificationWhen(nt.when) && (
                   <div className="mt-[3px] font-mono text-[10.5px] text-faint">
                     {formatNotificationWhen(nt.when)}

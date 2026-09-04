@@ -25,6 +25,7 @@ import pytest
 from soc_ai.config import Settings
 from soc_ai.so_client import fields as so_fields
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.analytics import (
     _MAX_BASELINE_DAYS,
     _MAX_DNS_SAMPLE_IDS,
@@ -1495,3 +1496,202 @@ async def test_first_seen_es_error_on_first_query_returns_structured_error(
     assert out["type"] == "RuntimeError"
     assert "grid partial results" in out["message"]
     assert elastic.search.call_count == 1  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Per-scenario synth scope (SynthScope threading, 2026-08-27)
+#
+# The 2026-08-27 batch measurement found the four sweeps blinded to ALL synth
+# docs on a scenario-scoped run (the toolset mapped a scenario id to False),
+# while a raw string passed straight through `_hunt_must_not`'s old bool
+# handling made the sweep see EVERY scenario's plants. These tests pin the
+# SynthScope contract on the analytics family: a scenario-scoped sweep sees
+# its own plants, never a sibling's, and the prod default still excludes all.
+# ---------------------------------------------------------------------------
+
+
+def _clause_matches(clause: dict[str, Any], doc: dict[str, Any]) -> bool:
+    """Evaluate one must_not clause shape this module emits against a flat doc.
+
+    Understands exactly the shapes the synth scope produces — ``exists``,
+    ``term`` (including the ``.keyword`` twin), and the nested
+    ``bool(must, must_not)`` — so the tests assert VISIBILITY semantics
+    (which documents a sweep can return), not clause spelling. The CIDR
+    ``terms`` clause never matches a synth-marker doc and returns False.
+    """
+    if "exists" in clause:
+        return clause["exists"]["field"] in doc
+    if "term" in clause:
+        ((field, value),) = clause["term"].items()
+        return doc.get(field.removesuffix(".keyword")) == value
+    if "bool" in clause:
+        inner = clause["bool"]
+        must_ok = all(_clause_matches(m, doc) for m in inner.get("must", []))
+        must_not_ok = not any(_clause_matches(m, doc) for m in inner.get("must_not", []))
+        return must_ok and must_not_ok
+    return False
+
+
+def _excluded_by(must_not: list[dict[str, Any]], doc: dict[str, Any]) -> bool:
+    return any(_clause_matches(c, doc) for c in must_not)
+
+
+_OWN = {"synth.scenario_id": "s1-own-scenario"}
+_SIBLING = {"synth.scenario_id": "s2-sibling-scenario"}
+_REAL = {"event.dataset": "zeek.conn"}
+
+
+def _assert_scoped_visibility(must_not: list[dict[str, Any]]) -> None:
+    """The three-way scenario-scope contract on one query's must_not set."""
+    assert not _excluded_by(must_not, _OWN), "a scoped sweep must see its own plants"
+    assert _excluded_by(must_not, _SIBLING), "a scoped sweep must NOT see a sibling's plants"
+    assert not _excluded_by(must_not, _REAL), "real telemetry stays visible"
+    for clause in synth_scope_must_not("s1-own-scenario"):
+        assert clause in must_not
+
+
+@pytest.mark.asyncio
+async def test_beacon_profile_scenario_scope_sees_own_not_sibling(
+    settings_kratos: Settings,
+) -> None:
+    aggs = _pairs_agg({})
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=aggs))
+
+    out = await beacon_profile(
+        elastic=elastic, settings=settings_kratos, include_synth="s1-own-scenario"
+    )
+
+    assert out.get("error") is not True
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    _assert_scoped_visibility(must_not)
+
+
+@pytest.mark.asyncio
+async def test_dns_entropy_scan_scenario_scope_sees_own_not_sibling(
+    settings_kratos: Settings,
+) -> None:
+    aggs = _qnames_agg([])
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=aggs))
+
+    out = await dns_entropy_scan(
+        elastic=elastic, settings=settings_kratos, include_synth="s1-own-scenario"
+    )
+
+    assert out.get("error") is not True
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    _assert_scoped_visibility(must_not)
+
+
+@pytest.mark.asyncio
+async def test_dcerpc_histogram_scenario_scope_sees_own_not_sibling(
+    settings_kratos: Settings,
+) -> None:
+    aggs = _ops_agg([])
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=aggs))
+
+    out = await dcerpc_histogram(
+        elastic=elastic, settings=settings_kratos, include_synth="s1-own-scenario"
+    )
+
+    assert out.get("error") is not True
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    _assert_scoped_visibility(must_not)
+
+
+@pytest.mark.asyncio
+async def test_first_seen_scenario_scope_on_both_queries(settings_kratos: Settings) -> None:
+    recent = _result([], aggregations=_recent_dsts_agg([]))
+    baseline = _result([], aggregations=_baseline_dsts_agg([]))
+    elastic, _ = _make_elastic_sequence(settings_kratos, [recent, baseline])
+
+    out = await first_seen(
+        elastic=elastic, settings=settings_kratos, include_synth="s1-own-scenario"
+    )
+
+    assert out.get("error") is not True
+    calls = elastic.search.call_args_list  # type: ignore[attr-defined]
+    assert len(calls) == 2, "first_seen must query recent AND baseline"
+    for call in calls:
+        _assert_scoped_visibility(call.args[1]["bool"]["must_not"])
+
+
+@pytest.mark.asyncio
+async def test_analytics_sweeps_prod_default_excludes_all_synth(
+    settings_kratos: Settings,
+) -> None:
+    """include_synth=False (the prod default): every sweep excludes EVERY synth
+    doc — a planted fixture can never surface in a production hunt."""
+    prod_exists = {"exists": {"field": "synth.scenario_id"}}
+
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_pairs_agg({})))
+    await beacon_profile(elastic=elastic, settings=settings_kratos)
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    assert prod_exists in must_not
+    assert _excluded_by(must_not, _OWN) and _excluded_by(must_not, _SIBLING)
+
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_qnames_agg([])))
+    await dns_entropy_scan(elastic=elastic, settings=settings_kratos)
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    assert must_not == [prod_exists]
+
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_ops_agg([])))
+    await dcerpc_histogram(elastic=elastic, settings=settings_kratos)
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    assert must_not == [prod_exists]
+
+    recent = _result([], aggregations=_recent_dsts_agg([]))
+    baseline = _result([], aggregations=_baseline_dsts_agg([]))
+    elastic, _ = _make_elastic_sequence(settings_kratos, [recent, baseline])
+    await first_seen(elastic=elastic, settings=settings_kratos)
+    for call in elastic.search.call_args_list:  # type: ignore[attr-defined]
+        assert prod_exists in call.args[1]["bool"]["must_not"]
+
+
+@pytest.mark.asyncio
+async def test_analytics_sweeps_true_scope_sees_all_synth(settings_kratos: Settings) -> None:
+    """include_synth=True (the hunt-journey eval): no synth exclusion at all."""
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_qnames_agg([])))
+    await dns_entropy_scan(elastic=elastic, settings=settings_kratos, include_synth=True)
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    assert not _excluded_by(must_not, _OWN)
+    assert not _excluded_by(must_not, _SIBLING)
+
+
+@pytest.mark.asyncio
+async def test_hunt_toolset_threads_scenario_scope_into_sweeps(
+    settings_kratos: Settings,
+) -> None:
+    """The hunt toolset call sites pass ctx.include_synth through UNCHANGED.
+
+    Before this fix they mapped a scenario id to False (`ctx.include_synth is
+    True`), blinding a scenario-scoped batch run's sweeps to its OWN plants —
+    the 2026-08-27 measurement's analytics blindness.
+    """
+    from pydantic_ai import Agent
+    from pydantic_ai.models.test import TestModel
+    from soc_ai.agent.orchestrator import InvestigationContext
+    from soc_ai.agent.toolset import register_read_tools
+
+    sweeps = {
+        "t_beacon_profile": "beacon_profile",
+        "t_dns_entropy_scan": "dns_entropy_scan",
+        "t_dcerpc_histogram": "dcerpc_histogram",
+        "t_first_seen": "first_seen",
+    }
+    for scope in ("s1-own-scenario", True, False):
+        agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+        ctx = InvestigationContext(
+            settings=settings_kratos,
+            auth=AsyncMock(),
+            elastic=AsyncMock(),
+            include_synth=scope,
+        )
+        register_read_tools(agent, ctx, role="hunt")
+        for wrapper_name, impl_name in sweeps.items():
+            impl = AsyncMock(return_value={"items": []})
+            with patch(f"soc_ai.agent.toolset.{impl_name}", impl):
+                fn = agent._function_toolset.tools[wrapper_name].function
+                await fn()
+            assert impl.await_count == 1, (wrapper_name, scope)
+            passed = impl.await_args.kwargs["include_synth"]
+            assert passed == scope and type(passed) is type(scope), (wrapper_name, scope, passed)

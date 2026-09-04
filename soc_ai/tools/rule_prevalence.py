@@ -44,6 +44,7 @@ from typing import Any
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools._registry import tool
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +79,9 @@ _NOISY_MIN_HOSTS = 5
 _MAX_LOOKBACK_DAYS = 365
 
 
-def _rule_match_query(rule_name: str, lookback_days: int) -> dict[str, Any]:
+def _rule_match_query(
+    rule_name: str, lookback_days: int, include_synth: SynthScope = False
+) -> dict[str, Any]:
     """Match ``suricata.alert`` docs whose rule name equals ``rule_name``.
 
     The rule-name match is an OR across every ECS/legacy candidate field (and
@@ -102,9 +105,10 @@ def _rule_match_query(rule_name: str, lookback_days: int) -> dict[str, Any]:
             "filter": [
                 {"range": {"@timestamp": {"gte": f"now-{lookback_days}d", "lte": "now"}}},
             ],
-            # Synthetic-eval kill-switch — same convention as query_events_oql /
-            # host_summary: never let a synth fixture leak into a real base rate.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            # Synth scope, threaded: prod keeps a real base rate clean of plants;
+            # a batch eval scopes to its own scenario so a run measures a rule's
+            # prevalence including the plants it is graded on.
+            "must_not": synth_scope_must_not(include_synth),
         }
     }
 
@@ -190,6 +194,7 @@ async def rule_prevalence(
     elastic: ElasticClient,
     settings: Settings,
     lookback_days: int = 30,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """How prevalent is a detection rule across the network over a lookback window?
 
@@ -240,7 +245,7 @@ async def rule_prevalence(
         }
 
     index = settings.events_index_pattern
-    query = _rule_match_query(rule_name, lookback_days)
+    query = _rule_match_query(rule_name, lookback_days, include_synth)
 
     # cardinality aggs give distinct source/dest host counts in one round trip;
     # min/max give the active span. size=0 — we never need the docs themselves,

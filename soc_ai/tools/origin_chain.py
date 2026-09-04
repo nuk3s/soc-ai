@@ -34,6 +34,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.query_events import _build_time_filter
 
 _LOGGER = logging.getLogger(__name__)
@@ -91,7 +92,12 @@ def _tool_error(exc: BaseException) -> dict[str, Any]:
     return {"error": True, "type": type(exc).__name__, "message": str(exc)}
 
 
-def _build_query(ip: str, lookback_minutes: int, time_anchor: datetime | None) -> dict[str, Any]:
+def _build_query(
+    ip: str,
+    lookback_minutes: int,
+    time_anchor: datetime | None,
+    include_synth: SynthScope = False,
+) -> dict[str, Any]:
     """Inbound (destination == ip) remote-access traffic in the window.
 
     Matched either by remote-access DATASET or by well-known remote-access PORT,
@@ -112,9 +118,10 @@ def _build_query(ip: str, lookback_minutes: int, time_anchor: datetime | None) -
                 },
             ],
             "filter": [_build_time_filter(lookback_minutes, time_anchor)],
-            # Never let a synthetic eval fixture masquerade as a real session
-            # (same kill-switch as query_events_oql / host_summary).
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            # Synth scope, threaded (not a hardcoded blanket exclude): prod
+            # excludes every planted doc, a batch eval scopes to its own scenario
+            # so the tool can see the plants it is being graded on.
+            "must_not": synth_scope_must_not(include_synth),
         }
     }
 
@@ -126,6 +133,7 @@ async def origin_chain(
     settings: Any,
     lookback_minutes: int = DEFAULT_LOOKBACK_MINUTES,
     time_anchor: datetime | None = None,
+    include_synth: SynthScope = False,
 ) -> dict[str, Any]:
     """Remote-access sessions INBOUND to *ip* before the activity, time-ordered.
 
@@ -139,7 +147,7 @@ async def origin_chain(
     try:
         response = await elastic.search(
             index=settings.events_index_pattern,
-            query=_build_query(ip, lookback_minutes, time_anchor),
+            query=_build_query(ip, lookback_minutes, time_anchor, include_synth),
             size=_MAX_SESSIONS,
             sort=[{"@timestamp": "asc"}],
         )

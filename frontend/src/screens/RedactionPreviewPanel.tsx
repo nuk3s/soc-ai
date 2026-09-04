@@ -208,7 +208,11 @@ function AnalystPath() {
             </option>
             {complete.map((r) => (
               <option key={r.id} value={r.id}>
+                {/* <option> holds text only, so the synth-eval marker is the
+                    badge's exact wording appended to the label — a planted run
+                    in this picker must never read as real activity. */}
                 {r.id} · {r.name} · {r.verdict} · {r.when}
+                {r.isSynthEval ? ' · Synthetic — evaluation data' : ''}
               </option>
             ))}
           </select>

@@ -231,9 +231,11 @@ async def test_raise_arg_type_error_clamps_long_repr(
 
 
 def test_targeted_gap_accepts_new_tool_names() -> None:
-    """The synth can only name tools in the TargetedGap Literal — the three
-    2026-07-04 additions must be nameable or Phase D can never reach them."""
-    for name in ("t_get_rule_content", "t_decode_payload", "t_get_event_raw"):
+    """The synth can only name tools in the TargetedGap Literal — the
+    2026-07-04 additions must be nameable or Phase D can never reach them.
+    (t_decode_payload was withdrawn from the Phase-D surface as a non-evidential
+    tool — see test_dispatch_refuses_decode_payload_off_phase_d_surface.)"""
+    for name in ("t_get_rule_content", "t_get_event_raw"):
         gap = TargetedGap(
             question="q",
             tool_name=name,  # type: ignore[arg-type]
@@ -290,9 +292,14 @@ async def test_dispatch_get_event_raw_binds_elastic(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_decode_payload_runs_pure() -> None:
-    """t_decode_payload needs no ES/auth — the real function must bind and run
-    (the settings injection is dropped by the signature filter)."""
+async def test_dispatch_refuses_decode_payload_off_phase_d_surface() -> None:
+    """t_decode_payload is deliberately off PHASE_D_TOOLS.
+
+    It is inference over model-supplied bytes (in NON_EVIDENTIAL_TOOLS), and
+    Phase-D grants the evidence exemption by tool NAME without inspecting the
+    result — so a decode dispatch would launder an unevidenced verdict. The
+    dispatch must refuse it as unknown; the local investigator loop still has
+    it. See test_non_evidential_tools_stay_off_the_phase_d_surface."""
     import base64
 
     from soc_ai.agent.targeted_investigator import _dispatch_named_tool
@@ -303,9 +310,8 @@ async def test_dispatch_decode_payload_runs_pure() -> None:
         auth = object()
 
     data = base64.b64encode(b"GET / HTTP/1.1\r\nHost: evil.example.com\r\n\r\n").decode()
-    out = await _dispatch_named_tool("t_decode_payload", {"data": data}, _StubCtx())
-    assert isinstance(out, dict)
-    assert out["http_host"] == "evil.example.com"
+    with pytest.raises(ValueError, match="unknown tool 't_decode_payload'"):
+        await _dispatch_named_tool("t_decode_payload", {"data": data}, _StubCtx())
 
 
 @pytest.mark.asyncio

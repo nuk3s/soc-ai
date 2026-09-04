@@ -510,6 +510,14 @@ def _validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for counts that must be >= 1 (e.g. --repeats)."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
 def _validate_batch(args: argparse.Namespace) -> int:
     """Run the eval harness over a batch of alerts and write index.jsonl.
 
@@ -545,9 +553,10 @@ def _validate_batch(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 5
+        repeats_note = f" x {args.repeats} repeats" if getattr(args, "repeats", 1) > 1 else ""
         print(
             f"{_C['dim']}synth-set: {args.synth_set} → "
-            f"{len(synth_scenarios)} scenarios "
+            f"{len(synth_scenarios)} scenarios{repeats_note} "
             f"({','.join(s.id for s in synth_scenarios)}){_C['reset']}",
             file=sys.stderr,
             flush=True,
@@ -564,6 +573,7 @@ def _validate_batch(args: argparse.Namespace) -> int:
         per_run_timeout_s=args.per_run_timeout_s,
         max_consecutive_failures=args.max_consecutive_failures,
         synth_scenarios=synth_scenarios,
+        synth_repeats=getattr(args, "repeats", 1),
     )
 
     print(
@@ -959,6 +969,139 @@ def _synth_clean(args: argparse.Namespace) -> int:
     scope = f" older than {args.older_than_days}d" if args.older_than_days is not None else ""
     print(f"{_C['dim']}deleted {deleted} synth docs from logs-synth-*{scope}{_C['reset']}")
     return 0
+
+
+def _eval_journey(args: argparse.Namespace) -> int:
+    """argparse handler for ``soc-ai eval-journey``.
+
+    Runs ONE synthetic scenario's flagship journey end to end against the live
+    grid — ingest the scenario (containment pre-check first), hunt its
+    ``hunt_journey.objective`` under the synth opt-in, promote the
+    best-matching finding through the real promotion chain, wait for the
+    promoted investigation's verdict — then scores it stage by stage with
+    :func:`soc_ai.eval.journey.score_journey` and prints the attributed result.
+
+    Grid hygiene is deliberately the CALLER's job: run ``soc-ai synth-clean``
+    BEFORE (a stale fixture must not score this run) and AFTER (no planted doc
+    may outlive the eval) — this command never deletes anything itself.
+
+    Exit codes:
+      0   the journey reached COMPLETE
+      1   the journey fell short (the printed stage/detail says where) — a
+          legitimate measurement, and the CI-gateable signal
+      2   unknown scenario id, or the scenario declares no hunt_journey
+      5   the run itself failed (ingest refusal, scorer refusal, transport)
+    """
+    from pathlib import Path  # noqa: PLC0415 - lazy
+
+    from soc_ai.eval.journey_runner import (  # noqa: PLC0415 - lazy
+        EXIT_ERROR,
+        EXIT_NO_JOURNEY,
+        run_journey,
+    )
+    from soc_ai.eval.synth_loader import load_all_scenarios  # noqa: PLC0415 - lazy
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+
+    settings = get_settings()
+    scenarios_dir = Path(__file__).parent / "eval" / "synth_scenarios"
+    try:
+        catalogue = load_all_scenarios(scenarios_dir)
+    except Exception as e:
+        print(
+            f"{_C['red']}scenario catalogue failed to load{_C['reset']}: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    scenario = next((s for s in catalogue if s.id == args.scenario_id), None)
+    with_journeys = ", ".join(s.id for s in catalogue if s.hunt_journey is not None) or "(none)"
+    if scenario is None:
+        print(
+            f"{_C['red']}unknown scenario id{_C['reset']}: {args.scenario_id!r}. "
+            f"Scenarios with a hunt_journey: {with_journeys}",
+            file=sys.stderr,
+        )
+        return EXIT_NO_JOURNEY
+    if scenario.hunt_journey is None:
+        print(
+            f"{_C['red']}scenario {scenario.id!r} declares no hunt_journey{_C['reset']} — "
+            f"nothing to run. Scenarios with one: {with_journeys}",
+            file=sys.stderr,
+        )
+        return EXIT_NO_JOURNEY
+
+    def _emit(line: str) -> None:
+        print(f"{_C['dim']}{line}{_C['reset']}", file=sys.stderr, flush=True)
+
+    _emit(
+        "eval-journey never cleans the grid — bracket it with `soc-ai synth-clean` before and after"
+    )
+
+    async def _go() -> Any:
+        elastic = ElasticClient(settings)
+        try:
+            return await run_journey(settings, scenario, elastic=elastic, emit=_emit)
+        finally:
+            with contextlib.suppress(Exception):
+                await elastic.aclose()
+
+    try:
+        outcome = asyncio.run(_go())
+    except Exception as e:
+        print(
+            f"{_C['red']}eval-journey failed{_C['reset']}: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    if outcome.result is None:
+        print(f"{_C['red']}{outcome.detail}{_C['reset']}", file=sys.stderr)
+        return int(outcome.exit_code)
+    _print_journey_result(scenario, outcome)
+    return int(outcome.exit_code)
+
+
+def _print_journey_result(scenario: Any, outcome: Any) -> None:
+    """Render a JourneyRunOutcome legibly: stage, verdicts, citations, detail."""
+    from soc_ai.eval.journey import JourneyStage  # noqa: PLC0415 - lazy
+
+    result = outcome.result
+    complete = result.reached is JourneyStage.COMPLETE
+    headline_color = _C["green"] if complete else _C["red"]
+    stage = str(result.reached).upper()
+    print(
+        f"{_C['bold']}journey {result.scenario_id}{_C['reset']} — "
+        f"{headline_color}{stage}{_C['reset']}"
+    )
+    actual = result.actual_verdict if result.actual_verdict is not None else "(none)"
+    print(f"  verdict:  expected {result.expected_verdict} · actual {actual}")
+    expected_events = list(scenario.hunt_journey.expected_cited_event_ids)
+    cited = ", ".join(result.cited_expected_events) or "(none)"
+    print(
+        f"  cited:    {len(result.cited_expected_events)}/{len(expected_events)} "
+        f"expected event(s): {cited}"
+    )
+    print(
+        f"  rows:     hunt {outcome.hunt_id or '—'} · "
+        f"investigation {outcome.investigation_id or '—'}"
+    )
+    print(f"  detail:   {result.detail}")
+
+
+def _register_eval_journey(sub: Any) -> None:
+    """Register the ``eval-journey`` subparser (split out of :func:`main` for size)."""
+    p_ej = sub.add_parser(
+        "eval-journey",
+        help="Run ONE synth scenario's hunt journey (ingest → hunt → promote → "
+        "verdict) against the live grid and score it stage by stage; exit 0 only "
+        "when the journey reaches COMPLETE. Bracket it with `soc-ai synth-clean` "
+        "before and after — this command never wipes the grid itself",
+    )
+    p_ej.add_argument(
+        "scenario_id",
+        help="Scenario id from soc_ai/eval/synth_scenarios/ that declares a "
+        "hunt_journey (e.g. m1-cobalt-strike-beacon)",
+    )
+    p_ej.set_defaults(func=_eval_journey)
 
 
 def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
@@ -1424,6 +1567,11 @@ def _register_synth_clean(sub: Any) -> None:
         help="Only delete synth docs older than N days (default: delete all)",
     )
     p_sc.set_defaults(func=_synth_clean)
+    # Registered here rather than in main(): eval-journey is synth-clean's
+    # sibling (synth-clean is the mandatory hygiene bracket around every
+    # journey run), and main() is at its statement budget (the model-probe
+    # precedent in _register_doctor).
+    _register_eval_journey(sub)
 
 
 def _register_eval_nightly(sub: Any) -> None:
@@ -1588,7 +1736,7 @@ def _add_api_client_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def main() -> None:
+def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statement per flag
     """CLI entry point bound by ``[project.scripts]``."""
     parser = argparse.ArgumentParser(prog="soc-ai", description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
@@ -1706,6 +1854,19 @@ def main() -> None:
             "batch alongside the OQL-sampled real alerts; aggregates.json "
             "carries a separate synth_stratum block with escalation P/R + "
             "Wilson 95%% CI."
+        ),
+    )
+    p_vb.add_argument(
+        "--repeats",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Plant + run each --synth-set scenario this many times (default: 1). "
+            "Each repeat is an isolated plant with its own scope key, so repeats "
+            "never see each other's documents; the report then adds per-scenario "
+            "pass-rate/stability and a batch flip-rate, so scenario-level variance "
+            "is measured instead of masquerading as signal. Real-alert sampling "
+            "(--n) is unaffected; without --synth-set this flag is a no-op."
         ),
     )
     p_vb.set_defaults(func=_validate_batch)

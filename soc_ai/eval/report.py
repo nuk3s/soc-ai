@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -510,6 +511,119 @@ def _render_disagreement_appendix(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Verdict abbreviations for the compact per-scenario distribution column
+# (e.g. ``TP×3 NMI×2``). Unknown verdict strings render as themselves.
+_VERDICT_ABBREV = {
+    "true_positive": "TP",
+    "false_positive": "FP",
+    "needs_more_info": "NMI",
+    "inconclusive": "INC",
+    "error": "ERR",
+}
+
+
+def _fmt_verdict_distribution(verdicts: list[str], errored: int) -> str:
+    counts = Counter(verdicts)
+    if errored:
+        counts["error"] += errored
+    parts = [
+        f"{_VERDICT_ABBREV.get(str(k), str(k))}×{v}"
+        for k, v in sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+    ]
+    return " ".join(parts) or "—"
+
+
+def _fmt_ci_cell(ci: Any) -> str:
+    if not isinstance(ci, (list, tuple)) or len(ci) < 2 or ci[0] is None or ci[1] is None:
+        return "—"
+    return f"[{_fmt_pct(ci[0])}, {_fmt_pct(ci[1])}]"
+
+
+def _render_repeats_section(synth_stratum: dict[str, Any], stability: dict[str, Any]) -> list[str]:
+    """The --repeats > 1 additions: macro table, stability line, k/N table.
+
+    Split out of :func:`_render_synth_stratum` for size; only called when
+    some scenario ran more than once.
+    """
+    out: list[str] = []
+    macro = synth_stratum.get("macro") or {}
+    if macro:
+        # The catalogue-level statistic: mean of per-scenario pass rates
+        # (a 3/5 scenario contributes 0.6, not a rounded majority), CI by
+        # resampling scenarios — never runs, which are not independent.
+        out += [
+            "\n**Macro over scenarios** (mean of per-scenario pass rates; "
+            "bootstrap CI resamples scenarios, not runs — repeated runs of "
+            "one scenario are not independent samples of the catalogue)\n",
+            "| metric | value | 95% bootstrap CI |",
+            "|---|---:|:---:|",
+            f"| Strict recall (macro) | "
+            f"{_fmt_pct(macro.get('strict_recall_macro'))} | "
+            f"{_fmt_ci_cell(macro.get('strict_recall_macro_ci'))} |",
+            f"| Verdict-only recall (macro) | "
+            f"{_fmt_pct(macro.get('verdict_only_recall_macro'))} | "
+            f"{_fmt_ci_cell(macro.get('verdict_only_recall_macro_ci'))} |",
+        ]
+        if macro.get("benign_verdict_only_macro") is not None:
+            out += [
+                f"| Benign twins — correct-close rate (strict, macro) | "
+                f"{_fmt_pct(macro.get('benign_strict_macro'))} | "
+                f"{_fmt_ci_cell(macro.get('benign_strict_macro_ci'))} |",
+                f"| Benign twins — false-escalation rate (macro) | "
+                f"{_fmt_pct(macro.get('false_escalation_rate_macro'))} | — |",
+            ]
+
+    flip = synth_stratum.get("flip_rate")
+    multi = [s for s in stability.values() if int(s.get("repeats") or 1) >= 2]
+    split_n = sum(
+        1 for s in multi if 0 < int(s.get("strict_passes") or 0) < int(s.get("repeats") or 0)
+    )
+    out.append(
+        f"\n**Stability:** {len(multi) - split_n} unanimous / {split_n} split "
+        f"of {len(multi)} multi-run scenarios — flip rate {_fmt_pct(flip)}. "
+        "This is the noise floor made visible: a split scenario's "
+        "single-batch pass/fail is a coin flip.\n"
+    )
+    per_scenario = synth_stratum.get("per_scenario") or {}
+    out.append(
+        "| scenario | expected | strict k/N | verdict-only k/N | "
+        "errored | confidence (mean ± sd) | verdicts | flag |"
+    )
+    out.append("|---|---|---:|---:|---:|---|---|---|")
+    for sid in sorted(stability):
+        s = stability[sid]
+        expected = str((per_scenario.get(sid) or {}).get("expected_verdict") or "—")
+        n_runs = int(s.get("repeats") or 0)
+        strict_k = int(s.get("strict_passes") or 0)
+        errored = int(s.get("errored_runs") or 0)
+        verdicts = [str(v) for v in (s.get("verdicts") or [])]
+        vo_k = sum(1 for v in verdicts if v == expected)
+        confs = [float(c) for c in (s.get("confidences") or [])]
+        if confs:
+            mean = sum(confs) / len(confs)
+            # Sample sd (n-1): these runs are a sample of the model's
+            # verdict distribution, not the whole population of runs.
+            sd = statistics.stdev(confs) if len(confs) > 1 else None
+            conf_txt = f"{mean:.2f} ± {sd:.2f}" if sd is not None else f"{mean:.2f}"
+        else:
+            conf_txt = "—"
+        flag = "⚠ coin-flip" if 0 < strict_k < n_runs else ""
+        out.append(
+            f"| {sid} | {expected} | {strict_k}/{n_runs} | {vo_k}/{n_runs} "
+            f"| {errored} | {conf_txt} "
+            f"| {_fmt_verdict_distribution(verdicts, errored)} | {flag} |"
+        )
+    all_runs = synth_stratum.get("all_runs") or {}
+    if all_runs:
+        out.append(
+            f"\n_All-runs (pooled over {all_runs.get('n_runs', 0)} runs) recall: "
+            f"{_fmt_pct(all_runs.get('escalation_recall'))} — diagnostic only; "
+            "the headline above aggregates per-scenario majorities so one "
+            "unlucky repeat cannot swing it._"
+        )
+    return out
+
+
 def _render_synth_stratum(synth_stratum: dict[str, Any] | None) -> str:
     """Render the synthetic-scenario stratum: escalation precision + recall.
 
@@ -586,6 +700,11 @@ def _render_synth_stratum(synth_stratum: dict[str, Any] | None) -> str:
                 f"| {tier} | {t.get('true_positive_count', 0)} | "
                 f"{t.get('false_negative_count', 0)} | {_fmt_pct(t.get('recall'))} |"
             )
+
+    stability = synth_stratum.get("per_scenario_stability") or {}
+    max_repeats = max((int(s.get("repeats") or 1) for s in stability.values()), default=1)
+    if max_repeats > 1:
+        lines += _render_repeats_section(synth_stratum, stability)
 
     unmatched = synth_stratum.get("unmatched_scenario_ids") or []
     if unmatched:
@@ -677,9 +796,14 @@ def _compute_synth_stratum(
     synth_rows_all = [r for r in rows if r.get("is_synth")]
     if not synth_rows_all:
         return None
-    attempted_ids = {
-        r.get("synth_scenario_id") for r in synth_rows_all if r.get("synth_scenario_id")
-    }
+    # Attempted RUN counts per scenario (errored rows included): under
+    # --repeats these are the per-scenario denominators, so an errored repeat
+    # still counts against its scenario instead of silently shrinking the
+    # sample (the recall-inflation bug pattern, one level down).
+    attempted_counts = Counter(
+        str(r.get("synth_scenario_id")) for r in synth_rows_all if r.get("synth_scenario_id")
+    )
+    attempted_ids = set(attempted_counts)
     try:
         from soc_ai.eval.synth_loader import load_all_scenarios  # noqa: PLC0415
         from soc_ai.eval.synth_score import SynthRow, score_synth_stratum  # noqa: PLC0415
@@ -703,10 +827,13 @@ def _compute_synth_stratum(
             verdict=r.get("verdict") or "unknown",
             confidence=float(r.get("confidence") or 0.0),
             citations=list(r.get("citations") or []),
+            # Absent on pre-capture index files → scores as "recommended
+            # nothing" (the row default), never an error.
+            recommended_actions=list(r.get("recommended_actions") or []),
         )
         for r in synth_rows_raw
     ]
-    score = score_synth_stratum(synth_rows, scenarios=scenarios)
+    score = score_synth_stratum(synth_rows, scenarios=scenarios, attempted_repeats=attempted_counts)
     return score.to_dict()
 
 

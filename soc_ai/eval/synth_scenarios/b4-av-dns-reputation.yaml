@@ -1,0 +1,652 @@
+id: b4-av-dns-reputation
+name: "AV cloud file-reputation DNS lookups mistaken for DNS tunneling"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.57 runs the org-standard AVShield endpoint-protection
+  agent. On every new-file scan the agent looks up the file's hash against the
+  vendor's DNS-based reputation cloud: an A query for
+  <32-hex-char-hash>.filerep.avshield.example against the corporate resolver
+  (10.0.0.1). A software rollout this morning makes the host scan thousands of
+  new files, so the sensor sees ~2,900 machine-generated, high-entropy,
+  never-repeating subdomains in 30 minutes — the exact volume + entropy shape
+  a DNS-tunnel heuristic hunts for, and the analytic fires. The raw zeek.dns
+  rows below carry the trailing ~35 seconds of that burst (56 queries at
+  ~1.6 queries/sec); the zeek.dns_summary doc is the 30-minute aggregate. But the
+  corroborating evidence disposes it as benign: every query is qtype A (zero
+  TXT/NULL — no downstream data channel), every qname is a fixed-length
+  hex-only label (a hash, not variable-length encoded payload), the answers
+  collapse to a 3-value reputation-code set in 127.0.0.0/8 (~1.5 bits per
+  response — nothing can be tunneled back through that), 143 other internal
+  hosts query the same parent domain (an org-wide agent, not a single
+  compromised host), the domain has been seen by the org for over a year, and
+  the host's egress is otherwise normal — including periodic HTTPS from the
+  same agent to the vendor's telemetry endpoint with a stock WinHTTP JA3.
+  A good analyst recognizes DNS-based reputation lookups — a notorious
+  tunnel-heuristic false-positive class — and dispositions it benign.
+attack: []
+sigma_refs: []
+
+ground_truth:
+  verdict: false_positive
+  confidence_min: 0.65
+  required_citation_kinds:
+    - prefetch_pivot         # dns_summary: qtype 100% A + fixed-length hex + tiny answer space
+    - prefetch_pivot         # conn/ssl: normal mixed egress incl. vendor telemetry HTTPS
+  expected_actions:
+    - kind: close_benign
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.57"
+      source.port: 58917
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      network.protocol: dns
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'udp') }}"
+      rule.name: "SOC-AI ANALYTIC High-Volume Machine-Generated DNS Subdomains"
+      rule.category: "Anomalous Traffic"
+      rule.signature: "9700004"  # synthetic SID — analytic-as-alert
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "bad-unknown"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: b4-av-dns-reputation
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.57"
+      source.port: 58917
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.community_id: "{{ same_as_triage }}"
+      zeek.dns.query: "3f8a9c0d1e2b4a5c6d7e8f9012a3b4c5.filerep.avshield.example"
+      zeek.dns.qtype_name: "A"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["127.0.0.2"]   # reputation code (clean), not routable data
+      zeek.dns.TTLs: [300]
+      synth.scenario_id: b4-av-dns-reputation
+
+  # The raw reputation lookups — the benign twin must be MEASURABLE by the
+  # same sweep that flags m2, or it is a negative control the instrument
+  # skips (which proves nothing). These 55 rows + the t=0 row above are the
+  # trailing ~35 seconds of the rollout scan burst at the story's ~1.6
+  # queries/sec: 56 unique fixed-length 32-hex-char hash subdomains, all
+  # qtype A, answers collapsing to the 3-value reputation-code set. Under
+  # t_dns_entropy_scan's naive last-two-labels split the parent is
+  # avshield.example and "filerep" folds into the measured subdomain, so the
+  # sweep's per-sub entropy is ~4.02 (bare hash labels: ~3.63) — above the
+  # 3.5 candidacy bar (entropy alone canNOT clear this twin; hashes ARE
+  # high-entropy) but below the 4.2 decisive arm, and the slice volume sits
+  # below both tunnel-volume arms, so the parent is scanned and NOT flagged.
+  # At the story's full window volume (2,731 unique subdomains >= 200) the
+  # sweep WOULD flag it, and the disposition then turns on the channel shape
+  # in these rows: all-A qtypes, stddev-0 qname length, ~1.5-bit answers.
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -35
+    fields: &b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-35) }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.57"
+      source.port: 57101
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'udp') }}"
+      zeek.dns.query: "febda9a37cb509d9d12d44ebc1097c6d.filerep.avshield.example"
+      zeek.dns.qtype_name: "A"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["127.0.0.2"]
+      zeek.dns.TTLs: [300]
+      synth.scenario_id: b4-av-dns-reputation
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -34
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-34) }}"
+      source.port: 57102
+      zeek.dns.query: "c281862362a64c23a437d682d24ec5f8.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -34
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-34) }}"
+      source.port: 57103
+      zeek.dns.query: "0de291ba975f07eddb764953ce41d4fa.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -33
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-33) }}"
+      source.port: 57104
+      zeek.dns.query: "fe774cc5f60dbb1312ab93817b5f814f.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -32
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-32) }}"
+      source.port: 57105
+      zeek.dns.query: "c8b96f0ac6495899cd3ab4059d1014db.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.4"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -32
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-32) }}"
+      source.port: 57106
+      zeek.dns.query: "7d4f968348f05b7e3340ef231e6a4bc5.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -31
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-31) }}"
+      source.port: 57107
+      zeek.dns.query: "59aff65aadb15782f7327c67b917b94d.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -31
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-31) }}"
+      source.port: 57108
+      zeek.dns.query: "d20ddb97b3080a795c0e87a2e39b7138.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -30
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-30) }}"
+      source.port: 57109
+      zeek.dns.query: "b7cb3c4fe4c4785b638de0d2e024cf80.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -29
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-29) }}"
+      source.port: 57110
+      zeek.dns.query: "2a3c7d14ff7569d4044a9e8ed3161c62.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -29
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-29) }}"
+      source.port: 57111
+      zeek.dns.query: "9c2162a9b0ce62a2e50c76820f6ab0c1.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -28
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-28) }}"
+      source.port: 57112
+      zeek.dns.query: "b7911ac25416f23fb774ae9b9db56048.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -27
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-27) }}"
+      source.port: 57113
+      zeek.dns.query: "3438aee7cafe99bae4f758537f7383bd.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -27
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-27) }}"
+      source.port: 57114
+      zeek.dns.query: "d12aab7b9800da2d71298676ee73b63c.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.4"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -26
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-26) }}"
+      source.port: 57115
+      zeek.dns.query: "85a7e1c60f5e797151f874a7abd9bbf5.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -26
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-26) }}"
+      source.port: 57116
+      zeek.dns.query: "4b2ceac3747b9ec7c54c2410f2e237ad.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -25
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-25) }}"
+      source.port: 57117
+      zeek.dns.query: "69fad44f139b72a0611c2a60498ae5a6.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -24
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-24) }}"
+      source.port: 57118
+      zeek.dns.query: "05e179fcf39920c4c31a7e772d83e005.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -24
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-24) }}"
+      source.port: 57119
+      zeek.dns.query: "5a483a09514ef57c39060625596aeac5.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -23
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-23) }}"
+      source.port: 57120
+      zeek.dns.query: "63edf217f165996fcd032a2709bc7a53.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -22
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-22) }}"
+      source.port: 57121
+      zeek.dns.query: "d4015d7bf2dc59e8cfefcfebba096d3f.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -22
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-22) }}"
+      source.port: 57122
+      zeek.dns.query: "a228d3072a1ceac9cb0a09ca9d6fcfca.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -21
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-21) }}"
+      source.port: 57123
+      zeek.dns.query: "d496c84c6ba1da8cbafcee784660a66b.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.4"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -21
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-21) }}"
+      source.port: 57124
+      zeek.dns.query: "e70b2def1c03c1acdd5c247982bf38e7.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -20
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-20) }}"
+      source.port: 57125
+      zeek.dns.query: "5d0c76497af1feeeed28119f3e730b12.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -19
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-19) }}"
+      source.port: 57126
+      zeek.dns.query: "77d9c5a7c13d1bcccf5d8c2e5d0cdb41.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -19
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-19) }}"
+      source.port: 57127
+      zeek.dns.query: "776032e5da801d9d4359f4b9f20989a6.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -18
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-18) }}"
+      source.port: 57128
+      zeek.dns.query: "be39cdace6d8e018075e6c6a3eed0baa.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -17
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-17) }}"
+      source.port: 57129
+      zeek.dns.query: "a2c3ff0f54176af80934ca9b158d3e26.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -17
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-17) }}"
+      source.port: 57130
+      zeek.dns.query: "d3c5ddf840038cc41d358eacff8959d5.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -16
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-16) }}"
+      source.port: 57131
+      zeek.dns.query: "4e8eeea87a6ceddb805e31f9174036a7.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -15
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-15) }}"
+      source.port: 57132
+      zeek.dns.query: "7931b19629ab1b23b14b8fa9a4fcb4ab.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.4"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -15
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-15) }}"
+      source.port: 57133
+      zeek.dns.query: "d55681f2b51bcaf4aa4237e8d1ca1c62.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -14
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      source.port: 57134
+      zeek.dns.query: "ff48108985abbc0105d433ad1ab527dc.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -14
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      source.port: 57135
+      zeek.dns.query: "93962d564176bc077c6eda287d12eae7.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -13
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-13) }}"
+      source.port: 57136
+      zeek.dns.query: "13b7458de1a57a1add04daeb9c6c8b17.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -12
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      source.port: 57137
+      zeek.dns.query: "f51a9fe86ed2362e2f41b9caa2ea603a.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -12
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      source.port: 57138
+      zeek.dns.query: "1b96335f6b0778cedd49b43767d45e03.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -11
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-11) }}"
+      source.port: 57139
+      zeek.dns.query: "4378f268648f687fdb2d7e35fd5e372b.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -10
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-10) }}"
+      source.port: 57140
+      zeek.dns.query: "8f0ae3342393b74b2e3351c4e6e51777.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -10
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-10) }}"
+      source.port: 57141
+      zeek.dns.query: "f47d944a66c124111fce031e236095b0.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.4"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -9
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      source.port: 57142
+      zeek.dns.query: "e0105bbd9f3bb14fe1bff49f54cc456c.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -9
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      source.port: 57143
+      zeek.dns.query: "b171f1e5aaab3f1d9b05c8bf9cbb5b8e.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -8
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-8) }}"
+      source.port: 57144
+      zeek.dns.query: "351f37cd8fefdbc60628416ad9bf848c.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -7
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-7) }}"
+      source.port: 57145
+      zeek.dns.query: "009a980ec2d0b3b3bc0720cf279e6b3e.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -7
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-7) }}"
+      source.port: 57146
+      zeek.dns.query: "bf3421450dfc95cb1042effcce413b94.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -6
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-6) }}"
+      source.port: 57147
+      zeek.dns.query: "1208364bb12bcc8efd98676cf303335e.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -5
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      source.port: 57148
+      zeek.dns.query: "cbe4a6873456890342df0bb4b4d17d54.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -5
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      source.port: 57149
+      zeek.dns.query: "63ebb7c3598bd061caa322ca0fad908b.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -4
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      source.port: 57150
+      zeek.dns.query: "1df8b56c4e841b149a26a2293b6f76ff.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.4"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -4
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      source.port: 57151
+      zeek.dns.query: "c39232ce8dcead413eee847353a57fde.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -3
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      source.port: 57152
+      zeek.dns.query: "5cd1be1162cc54f752f6c2b71b45d57f.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -2
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-2) }}"
+      source.port: 57153
+      zeek.dns.query: "1e92794766f99ef9c9e037ec40a782d7.filerep.avshield.example"
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -2
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-2) }}"
+      source.port: 57154
+      zeek.dns.query: "ef617eb6d235ec84e89e18d49d0d6d8c.filerep.avshield.example"
+      zeek.dns.answers: ["127.0.0.8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -1
+    fields:
+      <<: *b4_filerep_dns
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      source.port: 57155
+      zeek.dns.query: "d7654a7b071eedad710c3b57d4d68c1e.filerep.avshield.example"
+
+  - index: logs-synth-zeek-dns-summary
+    time_offset_seconds: -1800
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1800) }}"
+      event.dataset: zeek.dns_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.57"
+      synth.dns_profile:
+        parent_domain: "filerep.avshield.example"
+        query_count: 2874
+        window_seconds: 1800
+        unique_subdomains: 2731
+        qname_length_mean: 58.0
+        qname_length_p95: 58        # every qname identical length — hash lookups
+        qname_length_stddev: 0.0
+        # Measured mean over the planted raw slice's bare 32-hex-char labels —
+        # hex hashes ARE high entropy, hence the alarm.
+        qname_label_entropy_mean: 3.63
+        qname_label_charset: "hex-only [0-9a-f], fixed 32 chars"
+        qtype_distribution:
+          A: 2874                   # zero TXT/NULL — no downstream data channel
+        rcode_distribution:
+          NOERROR: 2871
+          SERVFAIL: 3
+        answer_value_set: ["127.0.0.2", "127.0.0.4", "127.0.0.8"]  # reputation codes
+        answer_unique_count: 3      # ~1.5 bits/response — nothing can tunnel back
+        fleet_distinct_internal_sources_24h: 143   # org-wide agent, not one host
+        parent_domain_first_seen_days_ago: 391     # NOT first-seen for the org
+      synth.scenario_id: b4-av-dns-reputation
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.57"
+      source.port: 58917
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "Dd"
+      zeek.conn.duration: 0.02
+      zeek.conn.orig_bytes: 76
+      zeek.conn.resp_bytes: 92
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "dns"
+      synth.scenario_id: b4-av-dns-reputation
+
+  - index: logs-synth-zeek-conn-summary
+    time_offset_seconds: -1800
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-1800) }}"
+      event.dataset: zeek.conn_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.57"
+      synth.host_egress_profile:
+        window_seconds: 1800
+        total_connections: 3061
+        dns_connections: 2874
+        dns_resolver_ips: ["10.0.0.1"]   # corporate resolver only, no bypass
+        non_dns_connections: 187
+        non_dns_bytes_total: 48223804    # normal mixed egress — DNS is NOT the only channel
+        http_connections: 22
+        ssl_connections: 165
+        ssl_destinations_unique: 14
+      synth.scenario_id: b4-av-dns-reputation
+
+  - index: logs-synth-zeek-ssl
+    time_offset_seconds: -420
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-420) }}"
+      event.dataset: zeek.ssl
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.57"
+      source.port: 49702
+      destination.ip: "203.0.113.40"   # vendor telemetry endpoint (TEST-NET-3)
+      destination.port: 443
+      zeek.ssl.version: "TLSv13"
+      zeek.ssl.ja3: "e7d705a3286e19ea42f587b344ee6865"  # stock WinHTTP client
+      zeek.ssl.ja3s: "ae4edc6faf64d08308082ad26be60767"
+      zeek.ssl.server_name: "telemetry.avshield.example"
+      zeek.ssl.established: true
+      synth.scenario_id: b4-av-dns-reputation
+
+rubric_notes: |
+  Benign FP that LOOKS like DNS tunneling — the counterweight to
+  m2-dns-tunnel-exfil: same alarm shape (thousands of high-entropy,
+  never-repeating machine-generated subdomains under one parent domain in a
+  short window), opposite verdict. DNS-based file/URL-reputation lookups by
+  endpoint-protection agents are a notorious real-world FP class for tunnel
+  heuristics. The disposing evidence is IN the events, and it is channel
+  capacity + identity, not vibes: (1) qtype distribution is 100% A with zero
+  TXT/NULL — a tunnel needs a record type that can carry payload downstream,
+  and m2's profile was TXT/NULL-dominated for exactly that reason; (2) every
+  qname is a fixed-length (stddev 0.0) hex-only label — a hash, where m2's
+  qnames were variable-length (p95 132 vs mean 78) encoded payload; (3) the
+  entire answer space is 3 reputation-code values in 127.0.0.0/8 — ~1.5 bits
+  per response, so no C2/exfil return channel exists; (4) 143 distinct
+  internal hosts query the same parent domain, which the org has resolved for
+  391 days — an org-wide agent against an established vendor zone, not a
+  single host against a first-seen domain; (5) the host's egress profile is
+  a normal mix (SSL/HTTP present, corporate resolver only), where m2's damning
+  signal was DNS as the host's ONLY egress; and the same host holds a stock
+  WinHTTP-JA3 HTTPS session to the vendor's telemetry endpoint. A system that
+  escalates on subdomain volume + entropy alone reproduces the classic
+  "security product flagged as malware" page-out. Correct disposition:
+  false_positive, close as benign. Emitting true_positive here is scored as
+  an escalation FP and drops precision. Note the entropy figure (3.63,
+  measured over the planted hash labels) is deliberately real — hashes are
+  high-entropy — so the disposition MUST turn on qtype/answer-space/fleet
+  evidence, not on arguing the entropy away.
+
+  Fidelity note (2026-08-26): the lookup burst is planted as 56 RAW zeek.dns
+  rows, not just the pre-aggregated dns_summary doc — the m2/b4 pair repeated
+  the m1 beacon defect (one raw row each, so t_dns_entropy_scan scanned zero
+  parents for both and the negative control was one the instrument skipped).
+  The sweep now measures this parent (its naive two-label split reads it as
+  avshield.example, folding "filerep" into the subdomain: per-sub entropy
+  ~4.02) and does NOT flag it at slice volume — above the 3.5 candidacy
+  entropy bar but below the 4.2 decisive arm, and below both tunnel-volume
+  arms. At the full window volume the summary describes (2,731 unique
+  subdomains) the sweep WOULD flag it, which is the story: the disposing
+  evidence is channel shape in the raw rows, never entropy.

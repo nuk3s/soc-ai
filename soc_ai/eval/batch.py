@@ -70,6 +70,11 @@ class IndexRow:
     # here so synth_score._score_one can verify citation-kind coverage without
     # re-reading bundle files.
     citations: list[str] = field(default_factory=list)
+    # Tool names from the triage report's `recommended_actions` (e.g.
+    # "escalate_to_case"), in report order. Carried here — same rationale as
+    # `citations` — so synth_score._score_one can check the rubric's
+    # expected_actions without re-reading bundle files.
+    recommended_actions: list[str] = field(default_factory=list)
     # True when the run's report was a pipeline-failure fallback (see
     # soc_ai.triage_models.is_pipeline_fallback): the model call died and the
     # orchestrator fabricated a needs_more_info. Stamped here so the nightly
@@ -78,8 +83,15 @@ class IndexRow:
     is_fallback: bool = False
     # synth-TP stratum tagging. False/None for real alerts;
     # set when the alert was ingested as a known synthetic-TP scenario.
+    # ``synth_scenario_id`` is always the BASE catalogue id (the scoring join
+    # key); ``synth_plant_id`` is the per-copy SynthScope key this run was
+    # scoped to, and ``synth_repeat`` its 0-based repeat index — both matter
+    # only under ``--repeats`` > 1, where the report aggregates the repeats of
+    # one scenario into a stability distribution.
     is_synth: bool = False
     synth_scenario_id: str | None = None
+    synth_plant_id: str | None = None
+    synth_repeat: int = 0
 
 
 @dataclass
@@ -105,6 +117,17 @@ class BatchConfig:
     # into Scenario objects via synth_loader.select_scenarios.
     synth_scenarios: tuple[Scenario, ...] | None = None
     synth_run_time: datetime | None = None
+    # How many times each selected scenario is planted + run (--repeats).
+    # 1 (the default) is the historical single-sample behavior; >1 lets the
+    # report measure per-scenario variance instead of reading one coin flip
+    # as signal. Each repeat is its OWN plant with its own SynthScope key
+    # (see synth_ingest.plant_id_for) so repeats can never retrieve each
+    # other's documents, and each repeat's triage doc id is unique so
+    # --resume and the run records stay per-run. Repeats interleave
+    # round-robin over the catalogue (s1..sk, s1..sk, ...) so a transient
+    # infra wobble lands on one repeat of each scenario instead of every
+    # repeat of one. Real-alert sampling (``n``) is unaffected.
+    synth_repeats: int = 1
 
 
 @dataclass
@@ -301,19 +324,30 @@ async def _run_one(
     timeout_s: int,
     synth_scenario_id: str | None = None,
     expected_verdict: str | None = None,
+    synth_plant_id: str | None = None,
+    synth_repeat: int = 0,
 ) -> IndexRow:
     """Run the harness for one alert; build the IndexRow either way."""
     is_synth = synth_scenario_id is not None
+    # The run's SynthScope key: the plant id its docs were stamped with.
+    # For repeat 0 (and pre-repeats ingesters that don't set plant_id) this
+    # is the bare scenario id — the historical scope.
+    include_synth = synth_plant_id or synth_scenario_id
     try:
         result = await asyncio.wait_for(
-            # Triaging a synth alert: let the prefetch see this scenario's own
-            # supporting docs (real alerts keep the prod-default exclusion).
+            # Triaging a synth alert: scope synth visibility to THIS plant,
+            # so the run sees its own supporting docs but not the sibling
+            # scenarios planted in the same batch (a blanket opt-in let every
+            # scenario's pivots read every other scenario's plants — b3's
+            # host pivot returned ten unrelated triage alerts) NOR its own
+            # scenario's sibling repeats (same defect one layer down). Real
+            # alerts keep the prod-default False (no synth visible at all).
             # Pass the planted expected_verdict so the oracle grades factually.
             runner(
                 alert_id,
                 settings=settings,
                 out_dir=batch_dir,
-                include_synth=is_synth,
+                include_synth=include_synth if include_synth is not None else False,
                 expected_verdict=expected_verdict,
             ),
             timeout=timeout_s,
@@ -324,6 +358,8 @@ async def _run_one(
             error=f"timeout after {timeout_s}s",
             is_synth=is_synth,
             synth_scenario_id=synth_scenario_id,
+            synth_plant_id=synth_plant_id,
+            synth_repeat=synth_repeat,
         )
     except Exception as e:
         return IndexRow(
@@ -331,6 +367,8 @@ async def _run_one(
             error=f"{type(e).__name__}: {e}"[:500],
             is_synth=is_synth,
             synth_scenario_id=synth_scenario_id,
+            synth_plant_id=synth_plant_id,
+            synth_repeat=synth_repeat,
         )
 
     bundle_dir = result.bundle_dir
@@ -353,10 +391,20 @@ async def _run_one(
         output_tokens=usage.get("output_tokens"),
         cache_read_tokens=usage.get("cache_read_input_tokens"),
         citations=list(report.get("citations") or []),
+        # Tool names only — the scoreable unit. Entries are dicts from the
+        # sanitized TriageReport dump; anything malformed is skipped rather
+        # than poisoning the row.
+        recommended_actions=[
+            a["tool_name"]
+            for a in (report.get("recommended_actions") or [])
+            if isinstance(a, dict) and isinstance(a.get("tool_name"), str)
+        ],
         is_fallback=is_pipeline_fallback(report),
         error=None,
         is_synth=is_synth,
         synth_scenario_id=synth_scenario_id,
+        synth_plant_id=synth_plant_id,
+        synth_repeat=synth_repeat,
     )
 
 
@@ -421,20 +469,39 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
     # harness's prefetch can read them back via OpenSearch the same way
     # it reads real alerts. Then mix the triage doc IDs into target_ids
     # and remember which ones came from which scenario for IndexRow tagging.
+    # Under --repeats each scenario is ingested cfg.synth_repeats times,
+    # every plant with its own SynthScope key and its own triage doc id —
+    # one run record, one bundle, one scope per repeat, and --resume keeps
+    # working because no two runs share an alert id.
     synth_id_to_scenario: dict[str, str] = {}
     # Maps triage_doc_id → expected_verdict so the oracle prompt for synth
     # rows gets the planted ground truth.
     synth_id_to_expected_verdict: dict[str, str] = {}
+    # Maps triage_doc_id → (plant scope key, repeat index) for IndexRow
+    # tagging + per-run synth visibility.
+    synth_id_to_plant: dict[str, str] = {}
+    synth_id_to_repeat: dict[str, int] = {}
     if cfg.synth_scenarios:
         scenario_by_id = {s.id: s for s in cfg.synth_scenarios}
         run_time = cfg.synth_run_time or datetime.now(UTC)
         ingest_results = await synth_ingester(
-            list(cfg.synth_scenarios), elastic=elastic, run_time=run_time
+            list(cfg.synth_scenarios),
+            elastic=elastic,
+            run_time=run_time,
+            repeats=cfg.synth_repeats,
         )
-        for res in ingest_results:
+        # Round-robin over the catalogue: repeat 0 of every scenario, then
+        # repeat 1, ... so a transient infra wobble degrades one repeat of
+        # each scenario instead of wiping out one scenario's whole sample.
+        # (Stable sort: catalogue order is preserved within each pass.)
+        for res in sorted(ingest_results, key=lambda r: r.repeat):
             if res.triage_doc_id in completed:
                 continue
             synth_id_to_scenario[res.triage_doc_id] = res.scenario_id
+            # Pre-repeats ingester stubs may leave plant_id empty — the bare
+            # scenario id is the historical scope either way.
+            synth_id_to_plant[res.triage_doc_id] = res.plant_id or res.scenario_id
+            synth_id_to_repeat[res.triage_doc_id] = res.repeat
             scenario = scenario_by_id.get(res.scenario_id)
             if scenario is not None and scenario.ground_truth is not None:
                 synth_id_to_expected_verdict[res.triage_doc_id] = scenario.ground_truth.verdict
@@ -468,6 +535,8 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
                     error="aborted by failure budget",
                     is_synth=scenario_id is not None,
                     synth_scenario_id=scenario_id,
+                    synth_plant_id=synth_id_to_plant.get(alert_id),
+                    synth_repeat=synth_id_to_repeat.get(alert_id, 0),
                 )
             return await _run_one(
                 alert_id,
@@ -477,6 +546,8 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
                 timeout_s=cfg.per_run_timeout_s,
                 synth_scenario_id=scenario_id,
                 expected_verdict=synth_id_to_expected_verdict.get(alert_id),
+                synth_plant_id=synth_id_to_plant.get(alert_id),
+                synth_repeat=synth_id_to_repeat.get(alert_id, 0),
             )
 
     # ---- Cache-warmup: run the first alert sequentially so the
@@ -494,6 +565,8 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
         timeout_s=cfg.per_run_timeout_s,
         synth_scenario_id=synth_id_to_scenario.get(warmup_id),
         expected_verdict=synth_id_to_expected_verdict.get(warmup_id),
+        synth_plant_id=synth_id_to_plant.get(warmup_id),
+        synth_repeat=synth_id_to_repeat.get(warmup_id, 0),
     )
     _append_index_row(batch_dir, warmup_row)
     if warmup_row.error:

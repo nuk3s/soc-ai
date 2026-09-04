@@ -16,44 +16,71 @@ from pydantic import ValidationError
 SCENARIOS_DIR = Path(__file__).parent.parent / "soc_ai" / "eval" / "synth_scenarios"
 
 
-def test_load_all_scenarios_returns_twelve_validated_objects() -> None:
+def test_load_all_scenarios_returns_every_validated_object() -> None:
     from soc_ai.eval.synth_loader import load_all_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
 
-    # 9 malicious (e/m/h) + 3 benign (b) for the precision stratum.
-    assert len(scenarios) == 12
+    # 17 malicious (e/m/h) + 8 benign (b) for the precision stratum. The
+    # catalogue was widened from 9+4 on 2026-08-26: at n=9 a single scenario
+    # was 11% of recall, so a one-scenario swing moved the headline further
+    # than any observed improvement.
+    assert len(scenarios) == 25
     ids = {s.id for s in scenarios}
     expected_ids = {
         "e1-emotet-feodo-c2",
         "e2-urlhaus-pe-delivery",
         "e3-tor-exit-ssh",
+        "e4-password-spray-vpn",
+        "e5-webshell-dmz-server",
         "m1-cobalt-strike-beacon",
         "m2-dns-tunnel-exfil",
         "m3-quasar-rat-self-signed",
+        "m4-lsass-dump-smb-transfer",
+        "m5-cryptomining-stratum-pool",
+        "m6-doh-c2-channel",
         "h1-kerberoasting",
         "h2-psexec-smb-lateral",
         "h3-low-slow-exfil-r2",
+        "h4-dcsync-replication",
+        "h5-ransomware-staging",
+        "h6-wmi-remote-exec-cradle",
         "b1-cdn-update-beacon",
         "b2-authorized-vuln-scanner",
         "b3-rmm-admin-lateral",
+        "b4-av-dns-reputation",
+        "b5-sanctioned-wmi-inventory",
+        "b6-backup-scheduled-transfer",
+        "b7-browser-doh",
+        "b8-dc-replication-partner",
     }
     assert ids == expected_ids
     # The benign class is expected to be false_positive ground truth.
     benign = {s.id for s in scenarios if s.ground_truth.verdict == "false_positive"}
-    assert benign == {"b1-cdn-update-beacon", "b2-authorized-vuln-scanner", "b3-rmm-admin-lateral"}
+    assert benign == {
+        "b1-cdn-update-beacon",
+        "b2-authorized-vuln-scanner",
+        "b3-rmm-admin-lateral",
+        "b4-av-dns-reputation",
+        "b5-sanctioned-wmi-inventory",
+        "b6-backup-scheduled-transfer",
+        "b7-browser-doh",
+        "b8-dc-replication-partner",
+    }
 
 
-def test_easy_tier_filter_returns_four_scenarios() -> None:
+def test_easy_tier_filter_returns_the_easy_stratum() -> None:
     from soc_ai.eval.synth_loader import load_all_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
     easy = [s for s in scenarios if s.tier == "easy"]
-    assert len(easy) == 4
+    assert len(easy) == 6
     assert {s.id for s in easy} == {
         "e1-emotet-feodo-c2",
         "e2-urlhaus-pe-delivery",
         "e3-tor-exit-ssh",
+        "e4-password-spray-vpn",
+        "e5-webshell-dmz-server",
         "b1-cdn-update-beacon",
     }
 
@@ -231,18 +258,20 @@ def test_select_scenarios_by_tier() -> None:
         "e1-emotet-feodo-c2",
         "e2-urlhaus-pe-delivery",
         "e3-tor-exit-ssh",
+        "e4-password-spray-vpn",
+        "e5-webshell-dmz-server",
         "b1-cdn-update-beacon",
     }
     medium = select_scenarios(scenarios, selector="medium")
     assert {s.tier for s in medium} == {"medium"}
-    assert len(medium) == 4  # m1/m2/m3 + benign b2
+    assert len(medium) == 10  # m1/m2/m3/m4/m5/m6 + benign b2/b4/b6/b7
 
 
 def test_select_scenarios_all_returns_all() -> None:
     from soc_ai.eval.synth_loader import load_all_scenarios, select_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
-    assert len(select_scenarios(scenarios, selector="all")) == 12
+    assert len(select_scenarios(scenarios, selector="all")) == 25
 
 
 def test_select_scenarios_by_explicit_ids() -> None:
@@ -294,3 +323,73 @@ def test_attack_techniques_must_match_mitre_pattern(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match=r"ATT.CK"):
         load_scenario_file(bad)
+
+
+# ── hunt_journey must cite at least one event ────────────────────────────────
+# An empty (or omitted) expected_cited_event_ids makes the citation half of the
+# journey rubric vacuous — every finding "cites everything expected", so
+# COMPLETE becomes reachable on the promoted verdict alone. That is an
+# authoring footgun, not a valid scenario: a journey block has to name the
+# evidence a correct finding cites.
+
+_JOURNEY_STEM = """\
+id: {stem}
+name: journey citation-floor probe
+version: 1
+tier: medium
+story: minimal scenario for the journey citation floor
+attack: [T1071.001]
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.7
+events:
+  - index: logs-synth-suricata-alert
+    is_triage_target: true
+    fields: {{}}
+  - index: logs-synth-zeek-ssl
+    fields: {{}}
+"""
+
+
+def _journey_yaml(tmp_path: Path, stem: str, journey_block: str) -> Path:
+    path = tmp_path / f"{stem}.yaml"
+    body = _JOURNEY_STEM.format(stem=stem) + textwrap.dedent(journey_block).strip() + "\n"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_hunt_journey_rejects_an_empty_cited_event_id_list(tmp_path: Path) -> None:
+    from soc_ai.eval.synth_loader import load_scenario_file
+
+    path = _journey_yaml(
+        tmp_path,
+        "journey-empty-citations",
+        """
+        hunt_journey:
+          objective: Hunt for regular-cadence beaconing to external services.
+          expected_cited_event_ids: []
+          expected_promoted_verdict: true_positive
+        """,
+    )
+    with pytest.raises(ValidationError, match="expected_cited_event_ids"):
+        load_scenario_file(path)
+
+
+def test_hunt_journey_rejects_an_omitted_cited_event_id_list(tmp_path: Path) -> None:
+    """Omission must not slip past the floor via a default: Pydantic does not
+    validate defaults, so a default_factory=list with min_length=1 would refuse
+    an explicit [] while silently admitting the same vacuous rubric spelled by
+    leaving the key out. The field is required."""
+    from soc_ai.eval.synth_loader import load_scenario_file
+
+    path = _journey_yaml(
+        tmp_path,
+        "journey-no-citations",
+        """
+        hunt_journey:
+          objective: Hunt for regular-cadence beaconing to external services.
+          expected_promoted_verdict: true_positive
+        """,
+    )
+    with pytest.raises(ValidationError, match="expected_cited_event_ids"):
+        load_scenario_file(path)

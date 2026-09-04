@@ -94,6 +94,11 @@ class Investigation(Base):
     # dangle — provenance readers must tolerate a missing hunt.
     hunt_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
     finding_ordinal: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Synthetic-evaluation marker (migration 0032): this run was allowed to see
+    # planted synth scenarios, so its verdict must never be mistaken for real
+    # activity. Set only from an explicit eval context or inherited from a
+    # marked hunt at promotion — no API request body can supply it.
+    is_synth_eval: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     rule_name: Mapped[str | None] = mapped_column(String(512), default=None, index=True)
     verdict: Mapped[str | None] = mapped_column(String(32), default=None)
     confidence: Mapped[float | None] = mapped_column(Float, default=None)
@@ -165,6 +170,11 @@ class Hunt(Base):
     # without deserializing its report blob. NULL only on legacy / unfinished
     # rows (rendered as 0).
     findings_count: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Synthetic-evaluation marker (migration 0032): this hunt ran with the
+    # synth opt-in (ctx.include_synth) and could see planted scenarios — its
+    # findings must never be read as real activity. Set only when the run is
+    # recorded from an explicit eval context; unreachable from a request body.
+    is_synth_eval: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     started_by: Mapped[str] = mapped_column(String(64), default="anonymous")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)

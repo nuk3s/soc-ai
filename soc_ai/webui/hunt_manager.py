@@ -46,6 +46,7 @@ class HuntManager:
         finding_ordinal: int | None = None,
         allow_so_writes: bool = True,
         focus_origin: FocusOrigin = "rerun",
+        is_synth_eval: bool = False,
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -75,6 +76,11 @@ class HuntManager:
         has nothing in Security Onion to ack, and its focus text is the
         finding's framing, not a prior run's open questions.
 
+        ``is_synth_eval`` (optional, default False): the synthetic-evaluation
+        marker, inherited by the promotion route from a marked hunt so a
+        promoted synth finding can never be read as a real one. No request
+        model carries it — only the promotion route ever passes it.
+
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
         """
@@ -101,6 +107,7 @@ class HuntManager:
             finding_ordinal=finding_ordinal,
             allow_so_writes=allow_so_writes,
             focus_origin=focus_origin,
+            is_synth_eval=is_synth_eval,
         )
 
         # Consume until the first event — must be "investigation_created".

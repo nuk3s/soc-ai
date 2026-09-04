@@ -4294,7 +4294,7 @@ def test_investigation_oracle_adjudication_surface(client: TestClient) -> None:
                     payload={
                         "oracle_verdict": "true_positive",
                         "oracle_confidence": 0.82,
-                        "oracle_model": "claude-opus-4-8",
+                        "oracle_model": "claude-opus-5",
                         "redaction": "2 credentials redacted",
                     },
                 )
@@ -4311,7 +4311,7 @@ def test_investigation_oracle_adjudication_surface(client: TestClient) -> None:
     assert oracle["localVerdict"] == "false_positive"
     assert oracle["oracleVerdict"] == "true_positive"
     assert oracle["changed"] is True
-    assert oracle["model"] == "claude-opus-4-8"
+    assert oracle["model"] == "claude-opus-5"
     assert oracle["redacted"] is True
     assert oracle["redactionNote"] == "2 credentials redacted"
 

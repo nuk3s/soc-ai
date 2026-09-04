@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.3.2-3fb950" alt="1.3.2">
+  <img src="https://img.shields.io/badge/status-1.4.0-3fb950" alt="1.4.0">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
@@ -175,7 +175,7 @@ cd frontend && npm ci && npm run build   # the React console
 ## Where it's headed
 
 <div align="center">
-  <img src="docs/img/roadmap.svg" alt="soc-ai roadmap: 1.0 triage engine, 1.0.x hunt console, 1.1 measurement, and 1.2 operations all shipped; the 1.3 hunting release shipped and 1.3.2 is current; later milestones are planned" width="900">
+  <img src="docs/img/roadmap.svg" alt="soc-ai roadmap: 1.0 triage engine, 1.0.x hunt console, 1.1 measurement, and 1.2 operations all shipped; the 1.3 hunting release and the 1.4 trust release shipped, with 1.4.0 current; proactive hunting is next" width="900">
 </div>
 
 The project moved quickly and it moved in public. 1.0 shipped the triage engine and the always-on console in June 2026. The 1.0.x line added the Hunt Console, backtests, runbooks, and grid discovery. 1.1 made quality continuously measured, and 1.2 was built from fourteen findings out of a full analyst shift on a live deployment.

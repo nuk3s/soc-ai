@@ -9,7 +9,10 @@ story: |
   records). Suricata fires ET POLICY DNS Query for .click TLD (Informational
   severity) — alone, pure noise. The host has zero non-DNS egress in the
   window. The real signal is in Zeek dns.log aggregations: volume + entropy
-  + qtype distribution + absence of corroborating egress.
+  + qtype distribution + absence of corroborating egress. The raw zeek.dns
+  rows below carry the trailing ~20 seconds of that burst (65 queries at the
+  story's ~3.3 queries/sec); the zeek.dns_summary doc is the 30-minute
+  aggregate.
 attack:
   - T1048.003  # Exfiltration Over Alternative Protocol: Unencrypted/Obfuscated Non-C2 Protocol
   - T1071.004  # Application Layer Protocol: DNS
@@ -52,10 +55,14 @@ events:
       rule.name: "ET POLICY DNS Query for .click TLD"
       rule.category: "Potential Corporate Privacy Violation"
       rule.signature: "2027866"
-      classtype: policy-violation
-      signature_severity: Informational
-      host.name: "so-sensor-1"
-      agent.name: "so-sensor-1"
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "policy-violation"}}'
+      observer.name: "so-sensor-1"
       synth.scenario_id: m2-dns-tunnel-exfil
       synth.scenario_version: 1
 
@@ -75,7 +82,10 @@ events:
         unique_subdomains: 5912
         qname_length_mean: 78.4
         qname_length_p95: 132
-        qname_label_entropy_mean: 4.21
+        # Matches the measured mean over the planted raw slice (base32-encoded
+        # payload labels) — a summary that contradicts its own raw rows would
+        # hand the analyst a manufactured inconsistency.
+        qname_label_entropy_mean: 4.56
         qtype_distribution:
           TXT: 4892
           NULL: 1014
@@ -85,6 +95,556 @@ events:
           NXDOMAIN: 8
       synth.scenario_id: m2-dns-tunnel-exfil
 
+  # The raw tunnel queries — FIDELITY, not tuning (the m1 lesson, second
+  # application). The original scenario encoded its volume as the dns_summary
+  # doc above plus ONE raw zeek.dns row, while t_dns_entropy_scan
+  # (soc_ai/tools/analytics.py) measures RAW event.dataset:zeek.dns rows: a
+  # parent domain below the min_queries floor (default 50 total queries)
+  # doesn't even count as scanned, so the sweep returned parents_scanned == 0
+  # and the flagship DNS scenario was invisible to the DNS analytic. These 64
+  # rows + the t=0 row below are the trailing ~20 seconds of the tunnel burst
+  # at the story's ~3.3 queries/sec: 65 unique base32-encoded payload
+  # subdomains (variable length 46-112 chars, mean label entropy ~4.56 —
+  # clearing the tool's decisive entropy_mean >= 4.2 arm with margin, the one
+  # candidacy arm a slice-sized volume can honestly satisfy), TXT/NULL-mixed
+  # qtypes, unique base64 TXT answers. Each query is its own UDP transaction
+  # (own ephemeral port + community_id).
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -20
+    fields: &m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-20) }}"
+      event.dataset: zeek.dns
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.88"
+      source.port: 40011
+      destination.ip: "10.0.0.1"
+      destination.port: 53
+      network.transport: udp
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'udp') }}"
+      zeek.dns.query: "wzfceqfxrc4wh5wznzsdyyedwlunxrqiip7ssfrmmhvxva.update-cdn.click"
+      zeek.dns.qtype_name: "TXT"
+      zeek.dns.rcode_name: "NOERROR"
+      zeek.dns.answers: ["LGt1LUdbRaEu6YjZ"]
+      synth.scenario_id: m2-dns-tunnel-exfil
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -20
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-20) }}"
+      source.port: 40012
+      zeek.dns.query: "gqomqardxtjzjfbhq3ljiii7lkfeey24wgkfwthtdynzyoxoq5p7b.update-cdn.click"
+      zeek.dns.answers: ["M/1h0tkd/NFgtlel"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -19
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-19) }}"
+      source.port: 40013
+      zeek.dns.query: "kvdmjpr32wywcos26obankye7k7bbaed4ofhxnsrol3g3tnzt3mzikmia3b2.update-cdn.click"
+      zeek.dns.answers: ["qo6oPB9m38pUbTya"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -19
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-19) }}"
+      source.port: 40014
+      zeek.dns.query: "mvmp5psoacufzt3tbmfaialbj26vzzzc2ta2nizatn56rwoxt4vqowlxguakmy5fx4v.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -19
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-19) }}"
+      source.port: 40015
+      zeek.dns.query: "qyxneuwylahqez6scpawsphrcihl3r2vpoa7znh625lggwnne.update-cdn.click"
+      zeek.dns.answers: ["Cb/Dt068Mnval59C"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -18
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-18) }}"
+      source.port: 40016
+      zeek.dns.query: "nw6crgg47jrrz3dadlkokvn7tdzevlz4ztnypia7ielmrg7x4swlu4af.update-cdn.click"
+      zeek.dns.answers: ["azgfZbGGKf1iwdoA"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -18
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-18) }}"
+      source.port: 40017
+      zeek.dns.query: "saavkwt5e36nrdkc2cn7nhdkzvile6l4cbgq5zhmdy7myadxiqugfi3vz66p7n6.update-cdn.click"
+      zeek.dns.answers: ["6XU91X2kGB/6F3pP"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -18
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-18) }}"
+      source.port: 40018
+      zeek.dns.query: "5sel2scwyqqzphpmfvpj6k6orvd476sl36d5q6mdtplqubkpbe3wtvte633uodr5z6hzqm.update-cdn.click"
+      zeek.dns.answers: ["SuhCzA3yCkjgTQKi"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -18
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-18) }}"
+      source.port: 40019
+      zeek.dns.query: "5hsey7hgb3lujsajumg3ntonm3q3u7jucs45ghzs27dr7omcbgo6.update-cdn.click"
+      zeek.dns.answers: ["94kZvYGMqM4Y66N6"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -17
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-17) }}"
+      source.port: 40020
+      zeek.dns.query: "iieccscn32dpvrn3yrxj3winicg7jw4lfbg7ionl6troeoh22c6zvui3bvv.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -17
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-17) }}"
+      source.port: 40021
+      zeek.dns.query: "xjcl4jgu6u64zdhpnsebpgfnwjzloffphvcr2453ynnedfxeojwy4jwd5hx6sgt3xw.update-cdn.click"
+      zeek.dns.answers: ["DUyPUeb2Lz2m2WqP"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -17
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-17) }}"
+      source.port: 40022
+      zeek.dns.query: "vrlcyibshmv7cqrmnuyuiwp3avws2cigudbln2pojhyyvf6q.update-cdn.click"
+      zeek.dns.answers: ["DeWqMRCZDBLtLLFt"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -16
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-16) }}"
+      source.port: 40023
+      zeek.dns.query: "vrx25lg4kcez5aarignoh7mon54hthz5zebio2cee5hcms6mkd3x7hq.update-cdn.click"
+      zeek.dns.answers: ["nLPYytOHmiOK3LXu"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -16
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-16) }}"
+      source.port: 40024
+      zeek.dns.query: "aa77nnmocdps4v3f5tpocwn3fzy2qn4iy3rwd6crqmo55dhz2vt76v2uuw3eml.update-cdn.click"
+      zeek.dns.answers: ["/1TMCOysHrWOWRGG"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -16
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-16) }}"
+      source.port: 40025
+      zeek.dns.query: "7sfzeutpwc4pfq4kgcb2mgy6wytvjx7336jymgwxz7yc5kqniukbbwmqvupgfrmrapb4h.update-cdn.click"
+      zeek.dns.answers: ["0RNWY8pHjLeC1Svi"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -15
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-15) }}"
+      source.port: 40026
+      zeek.dns.query: "n6ow6rhjuy2frzigjjtwjtfqkzi53nnjc7js3bpfksgin5bdha5.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -15
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-15) }}"
+      source.port: 40027
+      zeek.dns.query: "c67bqjwehelmuykysslolsecrtnqyvrhy2vddawgbn2c5animtllpzwkcg.update-cdn.click"
+      zeek.dns.answers: ["7LgBbEmdyxe65tnH"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -15
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-15) }}"
+      source.port: 40028
+      zeek.dns.query: "2fmmt7gmj2gznvmys6f27cq7f6tjwzpgt33phhgz3y6ninynrfz5l3hizr5ek6hvz.update-cdn.click"
+      zeek.dns.answers: ["yQgLvhshBHhtA88M"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -15
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-15) }}"
+      source.port: 40029
+      zeek.dns.query: "m22y7imnbyhvwnqchrlxwmgp3mt5akwy3fnc2tqcbuwotfb.update-cdn.click"
+      zeek.dns.answers: ["65SGW/+Hv9AuT0kq"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -14
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      source.port: 40030
+      zeek.dns.query: "tmihneerli6nlizl6pum26axslfe7fgnqw23knnll3dlgyvr22loue.update-cdn.click"
+      zeek.dns.answers: ["1T/vmw6gBRI2K1mu"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -14
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      source.port: 40031
+      zeek.dns.query: "a4boom4dt6jmmdp5dzzrmaxm7ww4477f3xgbt5ybvmk6wnw24roortus3mjhz.update-cdn.click"
+      zeek.dns.answers: ["prUAfcNfKnW8mQYX"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -14
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      source.port: 40032
+      zeek.dns.query: "23xu7i6cbchxdwa2qm55hkjvg3tbbn77asa5ydatbndnpi5dxb74jfjkagcqwe2fiz7s.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -13
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-13) }}"
+      source.port: 40033
+      zeek.dns.query: "avyneppb644jtpsluak7k4rdf2bmkjxy4qhwaefkdvyp6otmys.update-cdn.click"
+      zeek.dns.answers: ["2OQ7gl5MLULTuUgy"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -13
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-13) }}"
+      source.port: 40034
+      zeek.dns.query: "d5swgvn77gw3ygnugus4qymvff3tkzkofuyxz5fpc4xsde54y57zbj5rl.update-cdn.click"
+      zeek.dns.answers: ["co4y6rCl6Qaqc7YD"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -13
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-13) }}"
+      source.port: 40035
+      zeek.dns.query: "7p2dz573ovbralbdoy2qip2octplbgasps6y6f3bok4jhqxos436xlzkrm7agkcy.update-cdn.click"
+      zeek.dns.answers: ["cmHQl5/b497IPsQc"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -12
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      source.port: 40036
+      zeek.dns.query: "xmsx3apem4tgned2jx3b5odr4wxmtzvquptdjlhif6d4cr.update-cdn.click"
+      zeek.dns.answers: ["ZQU3YAnxuJeJqePi"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -12
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      source.port: 40037
+      zeek.dns.query: "p3iwmzonm24ucxtg7kczgak227lsk3gpq4ectpd4n45wthsc7ru2f.update-cdn.click"
+      zeek.dns.answers: ["PhUqEVAgLJ8LkbDb"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -12
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      source.port: 40038
+      zeek.dns.query: "mrxvsde5hua7q4j65rvflcq22c5qytyrejchzzqvzxrs7rn56c4rvf6w2uya.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -12
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-12) }}"
+      source.port: 40039
+      zeek.dns.query: "frvcnj6mywueuv7qpwv4qxvknkj3aj5bjgo44uw7ha4ktdooyhc5ocjxugtr4gds6lk.update-cdn.click"
+      zeek.dns.answers: ["QyMR/aix9vy4kC9q"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -11
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-11) }}"
+      source.port: 40040
+      zeek.dns.query: "htu74q4mfbcplyzn5niwvdmuechp4dia44uibgbd6xghd5dsl.update-cdn.click"
+      zeek.dns.answers: ["PQcjVM1OF+S/doxf"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -11
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-11) }}"
+      source.port: 40041
+      zeek.dns.query: "nn455vqxfhxct6ym54uqylcoic6h4ham42qs4n77sjhykpvkun3mn5sf.update-cdn.click"
+      zeek.dns.answers: ["EeMEdkCGKqpvvDOP"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -11
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-11) }}"
+      source.port: 40042
+      zeek.dns.query: "bprnu2vzhmopltdcajd3ixxplhnmcbluec2rhybbmsmnzl3telwbrdfv3gmzi3j.update-cdn.click"
+      zeek.dns.answers: ["H/LbmyROu85IEZX2"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -10
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-10) }}"
+      source.port: 40043
+      zeek.dns.query: "edtu6fb3z5qmotaihg5naxfxq3diand66jfrybubobuubd5whhdfmqny6drbyn3lompqkf.update-cdn.click"
+      zeek.dns.answers: ["qf5gOeHT5EISiti7"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -10
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-10) }}"
+      source.port: 40044
+      zeek.dns.query: "ig4gtaw64eflhy6igooixvhvslb6zk2qcb6xef6oxgd6a4ddnsbh.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -10
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-10) }}"
+      source.port: 40045
+      zeek.dns.query: "dncz5qyv7vflhfdoopzr67hbjjpzmnjro5vjthobuopylq6mlyo4lybz3pq.update-cdn.click"
+      zeek.dns.answers: ["vFHqZevcrOOCy0o2"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -9
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      source.port: 40046
+      zeek.dns.query: "7xghgcnatqelipjcxc3ms66snf2pcqj3baqumqqyai7g3cboekrzstjj2aqbcbwzjg.update-cdn.click"
+      zeek.dns.answers: ["uR280UhL+I/+I75O"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -9
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      source.port: 40047
+      zeek.dns.query: "cxwjvci4qhksw6cq34wwdvgdjfsyjtehrtbx22tdgh2tu2t5.update-cdn.click"
+      zeek.dns.answers: ["vHxkQjS3WIwk0WB2"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -9
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      source.port: 40048
+      zeek.dns.query: "ymxxouknbunbqp3hhnpd6nqzr5au3tlf55fmnp2pptghixc5rvu5uub.update-cdn.click"
+      zeek.dns.answers: ["z+avM8xGTDAXkmYn"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -9
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-9) }}"
+      source.port: 40049
+      zeek.dns.query: "ienxylovlgylwuv45yzfqswhaqjg5jeueryqd246ahmplmymktneuucsy56t2h.update-cdn.click"
+      zeek.dns.answers: ["cg+1PiNePO9k1FH+"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -8
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-8) }}"
+      source.port: 40050
+      zeek.dns.query: "arkpmmfugkiwt4bgg6z43hhhqvzqdzl5i33pizslz5n523fhkd2lmwk4ens6bbo4fifit.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -8
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-8) }}"
+      source.port: 40051
+      zeek.dns.query: "yatlcvyqjnmcacrkoeiobn4uawr3i4x42cmt2zo4523knybckoe.update-cdn.click"
+      zeek.dns.answers: ["oHPYaVASIEMSyUB8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -8
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-8) }}"
+      source.port: 40052
+      zeek.dns.query: "ohpumauys4wdpsxi5kgyxiz4amfa6mqlr5oirdjm3lwlwasj3k4koin3hq.update-cdn.click"
+      zeek.dns.answers: ["8vERUMyrJaqQNytG"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -7
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-7) }}"
+      source.port: 40053
+      zeek.dns.query: "yi5ac3utsgwrfcwmdeazu6jt522a53rgthfp7r7s4ahue4vgl77zhqs4wxsmxvfml.update-cdn.click"
+      zeek.dns.answers: ["JAEqORI6ZxgseD1o"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -7
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-7) }}"
+      source.port: 40054
+      zeek.dns.query: "lfzor7fy5eiol4ijoittzitoqyveegznpzutoqtj7aec53u.update-cdn.click"
+      zeek.dns.answers: ["ND0Di/NcyxpG39Q0"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -7
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-7) }}"
+      source.port: 40055
+      zeek.dns.query: "74dlle3ay2kohunml5djaqllaj42pjyomvmzgymves7ebrm5zbkgbn.update-cdn.click"
+      zeek.dns.answers: ["9A2nm+YXx8rHLu2t"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -6
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-6) }}"
+      source.port: 40056
+      zeek.dns.query: "b27xhw3va5pri264zyxkquw6xgjaegk46vjgkifu6lwcmb3yp7mwfao7hafbh.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -6
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-6) }}"
+      source.port: 40057
+      zeek.dns.query: "c3t7pndkh76x3g7uovnlwmxnz3rb2p3ho5umruzbi4q6luq35pak53qcmdw5etcbml6q.update-cdn.click"
+      zeek.dns.answers: ["TxhGyDk9yWX+gkkD"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -6
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-6) }}"
+      source.port: 40058
+      zeek.dns.query: "cohpz5omjosmcipzzdeiqeu6vhzdvvccbpj2uncerdgftc7ip2.update-cdn.click"
+      zeek.dns.answers: ["ljN9yaeUNa0vPVE+"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -6
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-6) }}"
+      source.port: 40059
+      zeek.dns.query: "aa4rihyy5gkyhe2lfbthb7jmk7o32lumlrcbx6qpkx6bxea6l3xhbeiyg.update-cdn.click"
+      zeek.dns.answers: ["UPGdeswoPgP9ZNR6"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -5
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      source.port: 40060
+      zeek.dns.query: "nxcmxw7pnu2tmirtyp5ifv4etcfkemqs7puxt2jmxtilqumvt3orplri3njkvs2u.update-cdn.click"
+      zeek.dns.answers: ["W0Eqko5aRaT549Re"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -5
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      source.port: 40061
+      zeek.dns.query: "zi3olk25t6fka26eqmqqdhsl2lrun52sjrk4pf4n7fkk64.update-cdn.click"
+      zeek.dns.answers: ["mwjt35GFpO+9ZeHM"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -5
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-5) }}"
+      source.port: 40062
+      zeek.dns.query: "7chqjhvuj5bxqydbtfalaqj3s67nqh3mwe32phc3o7xwzfh2vkdwz.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -4
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      source.port: 40063
+      zeek.dns.query: "bt4hg24zsqpblc6d7asuinp4pbq6yg2nhs5eiwu4v2hj525h4xjfhbabmzii.update-cdn.click"
+      zeek.dns.answers: ["07ziDbglR+Mdq8/d"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -4
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      source.port: 40064
+      zeek.dns.query: "wru6tpnjb5gf4dzbrig72a43xss27ur356db6skfopxj4jtlwyidxslx6holhkonfnr.update-cdn.click"
+      zeek.dns.answers: ["5t7x2301lBMt7fYu"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -4
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-4) }}"
+      source.port: 40065
+      zeek.dns.query: "jfprw7zqxbisbbcwrq4cuiq2zk2r6ugojzhi2s4cnhdr34kzu.update-cdn.click"
+      zeek.dns.answers: ["vQsvn7x7ZQmsPqPe"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -3
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      source.port: 40066
+      zeek.dns.query: "vc7piprkync4qh6ywwyusvopfv5egnsve2zxe36cudgvcitqcn6zea6q.update-cdn.click"
+      zeek.dns.answers: ["FtUMt6yZNfI4iRQ3"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -3
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      source.port: 40067
+      zeek.dns.query: "7jsuxkwrklw7ynxrw4l66to63ulmfcimvkvko3q44viv5q7ixweo7254ooo2u4d.update-cdn.click"
+      zeek.dns.answers: ["qiQi6+i1uPkiglLM"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -3
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      source.port: 40068
+      zeek.dns.query: "k4plhni53obpm53vitdcrnvqzzjp3g5lful6wz62y42ies3z2who3kjz5ef3ny7fs4srld.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -3
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-3) }}"
+      source.port: 40069
+      zeek.dns.query: "drwkito4iazwj72lb5ttkhdoqspmzl3shebvjwzf7c3zwbfew26jvggrpc3vxcl.s7xb5jkfyd2jbb2o7ttt333soer7ssbu5kkmq5ztoeo7rpqp.update-cdn.click"
+      zeek.dns.answers: ["7/T1ljw6rzYWvqgr"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -2
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-2) }}"
+      source.port: 40070
+      zeek.dns.query: "eaulbmnmn2kz2byuwhgpwyj4iu3q6f7i4qd323qwbnn6fsrsndirnbyofmdnyjr.ogv24b5u5uswvp26svvxscvh7fibwdmwlpznzkwqffkobvaq.update-cdn.click"
+      zeek.dns.answers: ["kUpz56yjM62PRe++"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -2
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-2) }}"
+      source.port: 40071
+      zeek.dns.query: "zx6pdzcdqknoyuu5ky6jpjkyr4uan24qsk6ccfe5qdvhi74eyfhxaqfcqbofziv.fnf7jrikso4vaegmnhzowdd4uj7spp7cddk6tqzrbozlygwa.update-cdn.click"
+      zeek.dns.answers: ["OR1rl3aw78loiLo8"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -2
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-2) }}"
+      source.port: 40072
+      zeek.dns.query: "vspmh4oa42mnvd6xleyf6vz2e4wweommobtx6xtq4opb7qwklog7wykzmolffzf.r2fvakzwnfr4lmgwq7uj557mz4daxlp6bdxehajxydgqltan.update-cdn.click"
+      zeek.dns.answers: ["SDZuSskz8mOL+nZl"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -1
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      source.port: 40073
+      zeek.dns.query: "6bguuwcjrjnq6pyelioiovfdo5rkv6yk7zrqtrhivzd2c2zfkxnacqiqrsutmfm.v2kth3cxdixuveiy2xe3shvuf6owji3j3mnkuw5u6fiyaxlm.update-cdn.click"
+      zeek.dns.answers: ["1YYjQgoTMisusfBc"]
+  - index: logs-synth-zeek-dns
+    time_offset_seconds: -1
+    fields:
+      <<: *m2_tunnel_dns
+      "@timestamp": "{{ run_time | offset_seconds(-1) }}"
+      source.port: 40074
+      zeek.dns.query: "nwmlngmhpkflqi7fzwulofkiq3rne7d4mbp35gczeyfw34viugdbeclvia5q46b.r3jjqsxykvgbetcclhxzaub5znfvnsrg7o6khii4wogi3pxl.update-cdn.click"
+      zeek.dns.qtype_name: "NULL"
+      zeek.dns.answers: []
+
+  # The newest tunnel query — the transaction the Suricata alert fired on,
+  # so it keeps the alert's 5-tuple and joins via the triage community_id.
   - index: logs-synth-zeek-dns
     time_offset_seconds: 0
     is_triage_target: false
@@ -132,3 +692,15 @@ rubric_notes: |
   This scenario tests the system's ability to reason about volume aggregates,
   not single events. It also tests the absence-of-other-egress signal (a
   positive observation, not a "no MISP hit" negative).
+
+  Fidelity note (2026-08-26): the tunnel is planted as 65 RAW zeek.dns rows
+  (unique variable-length base32 payload subdomains, measured mean label
+  entropy 4.56, TXT/NULL-mixed), not just the pre-aggregated dns_summary doc.
+  Same defect class as the m1 beacon: t_dns_entropy_scan aggregates raw
+  event.dataset:zeek.dns rows under a min_queries floor (50 per registrable
+  parent), so the summary-doc-only encoding returned parents_scanned == 0 and
+  the flagship DNS scenario was invisible to the DNS analytic. The slice
+  clears candidacy on the tool's decisive entropy_mean >= 4.2 arm — the arm
+  built for exactly the case where extreme entropy precedes volume. The
+  summary doc is kept for the single-alert triage path. b4 (the benign twin)
+  plants a same-shaped raw slice that the same sweep scans and does NOT flag.

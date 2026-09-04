@@ -41,6 +41,41 @@ def test_heavy_model_is_deprecated_alias(monkeypatch: pytest.MonkeyPatch) -> Non
     assert Settings().analyst_model == "legacy-named-model"
 
 
+def test_oracle_model_defaults_are_claude_opus_5(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both Claude call-site defaults pin to claude-opus-5.
+
+    ``oracle_model`` is the in-product second opinion; ``claude_oracle_model``
+    is the eval judge. A runtime env var or a stored config override can still
+    shadow these — this pins the shipped default only.
+    """
+    _setenv_required(monkeypatch)
+    monkeypatch.delenv("ORACLE_MODEL", raising=False)
+    monkeypatch.delenv("CLAUDE_ORACLE_MODEL", raising=False)
+    s = Settings()
+    assert s.oracle_model == "claude-opus-5"
+    assert s.claude_oracle_model == "claude-opus-5"
+
+
+def test_env_example_oracle_models_match_shipped_defaults() -> None:
+    """.env.example's model lines track the Settings defaults.
+
+    The example file is what operators copy; a stale model id there quietly
+    pins fresh installs to a superseded model (line 183 sat on claude-opus-4-7
+    long after the default moved on). Parse the live (uncommented) lines and
+    compare against the class defaults.
+    """
+    env_example = Path(__file__).resolve().parent.parent / ".env.example"
+    values: dict[str, str] = {}
+    for raw_line in env_example.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    assert values.get("ORACLE_MODEL") == Settings.model_fields["oracle_model"].default
+    assert values.get("CLAUDE_ORACLE_MODEL") == Settings.model_fields["claude_oracle_model"].default
+
+
 def test_audit_redact_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """Audit redaction is default-on (shared ES cluster; secret-shape only)."""
     _setenv_required(monkeypatch)

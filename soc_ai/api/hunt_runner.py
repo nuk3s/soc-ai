@@ -787,6 +787,12 @@ async def hunt_recorded_run(
         objective=objective,
         started_by=started_by,
         kind=kind,
+        # Synth-eval containment: a hunt recorded from an eval context (its
+        # tools may see planted synth scenarios) is permanently marked so its
+        # findings can never be read back as real activity. Every API/scheduler
+        # path builds its context via ctx_from_state, which leaves
+        # include_synth False — only an explicit eval context sets it.
+        is_synth_eval=bool(ctx.include_synth),
     )
     hunt_id = await recorder.start()
 

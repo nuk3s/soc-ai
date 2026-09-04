@@ -6,6 +6,123 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-04
+
+The trust release. Four arcs, one subject: whether soc-ai's judgement can be checked rather than
+taken on faith. After the 1.3.2 security audit closed the ways soc-ai could be abused, this makes its
+judgement measurable, and closes the deterministic half of that audit's most serious finding.
+
+### The hunt journey became measurable
+
+- **soc-ai can now measure whether it actually finds the attacks it should.** The evaluation harness
+  has always been able to plant synthetic attacks and check the verdict on a single alert. It could
+  never check the thing soc-ai is really for: taking a plain-English hunt across the network,
+  surfacing a finding, promoting it to a full investigation, and reaching a verdict. That whole
+  journey can now be scored, and when it falls short it says **which step broke** — the hunt found
+  nothing, the finding cited no usable evidence, or the investigation reached the wrong verdict —
+  rather than just failing.
+- **Synthetic runs are unmistakable.** Anything produced from planted evaluation data is marked as
+  such in the database and carries a "Synthetic — evaluation data" badge everywhere it appears: hunt
+  and investigation lists and detail pages, notifications, the command palette, the dashboard. A
+  planted attack can never be read as something that really happened on your network. Evaluation runs
+  are also kept out of a host's real history entirely, so they cannot alter what soc-ai says a machine
+  has been up to.
+- **The evaluation refuses to run if a planted document ever reached a real index**, rather than
+  quietly measuring against contaminated data — and it now refuses just as firmly when it cannot read
+  the grid completely enough to be sure, instead of reporting a clean result it did not earn.
+- **The actions soc-ai recommends are now scored.** Every scenario has always declared which action a
+  correct triage should suggest; that expectation had never actually been checked.
+
+### Verdicts must rest on evidence the run retrieved
+
+- **A verdict must now rest on evidence soc-ai actually retrieved.** Previously the checks confirmed
+  that evidence had been *gathered*, never that it *supported* the conclusion — so a single successful
+  lookup was enough to let a confidently-wrong true positive stand, including one steered by text
+  planted in the network traffic being analysed. A true positive whose decisive indicator appears in
+  nothing the run actually retrieved is now held back for review instead of escalated, and its
+  recommended actions are withdrawn. Where the evidence is partly there, confidence is reduced rather
+  than the verdict discarded — a sound judgement is never thrown away over formatting.
+
+  This closes the fabricated-indicator case. It does not settle every case: an attacker who plants a
+  real value in their own traffic still passes it, and the broader question of whether a conclusion
+  genuinely follows from its evidence remains open work.
+
+### The detection quality pass
+
+Work on the backlog the trust release produced, before the version was cut. Most of what follows is
+repair to soc-ai's ability to *judge itself*: the pass found seven separate places where a scenario
+rendered perfectly and measured nothing, and four of those were introduced by earlier fixes to the
+evaluation itself.
+
+- **An attack can no longer be dismissed as benign without looking.** Two scenarios — a thousand-file
+  share sweep followed by a 3.2 GB archive, and a remote WMI execution followed two seconds later by
+  a PowerShell download — were both closed as routine internal traffic with **zero tool calls**. The
+  guards covered attack signatures and malware rule names, but not the deliberately-informational
+  analytics rules that behavioural detections actually use. soc-ai already refused to *escalate*
+  without looking; it now refuses to *dismiss* without looking, which matters more, because a missed
+  intrusion is quieter than a false alarm.
+- **The cloud second opinion was reasoning with no evidence in front of it.** Its transcript was
+  assembled from text message parts only — and every tool returns structured data, so **every tool
+  result was silently dropped**. It once overrode a fully-cited local verdict while complaining that
+  "no file hash, signature, or service name is actually present in the evidence." That was literally
+  true of the payload it had been handed. Its scepticism was rational; it was being starved. This
+  affected every escalation in production.
+- **soc-ai can tell "nothing happened" from "nothing was watching."** On a host outside an endpoint
+  rollout it would probe for process telemetry, get nothing back, retry across field shapes and wider
+  windows, and burn its entire budget — then report a hedged verdict that read as uncertainty about
+  the attack rather than a gap in coverage. It now states the gap plainly and spends the budget
+  elsewhere. Runs that exhausted their budget fell from six in twenty-six to one.
+- **Correct verdicts were being recorded as misses.** Citations naming genuinely retrieved evidence
+  could not be resolved when the evidence sat under an IP address key, because the resolver split
+  paths on dots and an address contains dots. Coverage collapsed, a confidence penalty fired, and
+  sound detections were scored as false negatives.
+- **The physical index name is no longer queryable.** It served no purpose in any query soc-ai makes,
+  and it let a search select documents by storage location rather than content. Operators pasting an
+  index filter copied from Security Onion will now get a clear error pointing at `event.dataset`.
+
+  Alongside these, the scenario catalogue nearly doubled (13 → 25), so no single case swings the
+  measurement by more than six percent.
+
+### The Oracle checks its own claims, behind a boundary that is complete by construction
+
+Until now the cloud second opinion adjudicated from a sanitized case payload and nothing else — a
+review formed entirely from what the local run had happened to write down. It can now run the same
+read-only tools the investigator has, with its arguments desanitized before execution and its results
+re-sanitized on the way back. Off by default (`oracle_tools_enabled`).
+
+- **A class-changing Oracle verdict now requires the Oracle to have looked.** At least one successful
+  tool call in its own loop, or the disagreement is recorded on the adjudication event and the local
+  verdict stands. A zero-tool *agreement* still lands, because it adds confidence rather than flipping
+  anything.
+- **Egress flipped from block-known-bad to allow-known-safe, and this is the load-bearing change.**
+  Building the tool loop proved the wire gate was a blocklist. A bare internal name like `filesrv` or
+  `PDC01` has no regex shape, so the residue sweep could only catch it through values the sanitizer's
+  harvest recognised, and the harvest is keyed on field paths — an open set. Five commits each closed
+  one missed category (generic-key envelopes, single-label names on domain fields, non-ECS Windows
+  event leaves), which is the argument that a sixth was always possible. Now any scalar from a field
+  the harvest does not classify is masked before the model can see it, on the initial payload and on
+  every tool result. The cost is utility, not privacy: an unclassified value arrives opaque rather
+  than as a stable token, so the Oracle cannot correlate it across fields.
+
+### A measurement that knows its own noise floor
+
+- **Each scenario can run N times** (`--repeats`), reporting per-scenario stability, macro-averaged
+  recall, and a scenario-bootstrap confidence interval. This exists because a test-retest on code that
+  provably could not affect the outcome moved strict recall by 0.235 and flipped 6 of 25 scenarios
+  between pass and fail. A single batch cannot distinguish a fix from a coin flip, and it no longer
+  claims to.
+- Adjudication and the eval judge moved to `claude-opus-5`.
+
+### Fixed in this release
+
+- **A network sensor's hostname is no longer attributed to the hosts it watches.** Found on a live
+  attack range: two agentless targets were each reported as the router that observed them, because a
+  Zeek or Suricata document's top-level `host.name` names the box that *shipped* it. Any host with no
+  agent of its own was liable to inherit its sensor's identity — including in the stored host dossier,
+  where the wrong name would persist. Host identity from a document is now accepted only when the
+  document is about that host.
+
+
 ## [1.3.2] - 2026-08-26
 
 An adversarial security audit of the whole product, and the fixes it earned. Four attacker positions

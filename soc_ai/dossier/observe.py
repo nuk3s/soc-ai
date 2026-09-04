@@ -112,8 +112,11 @@ _NAME_AGG_SIZE = 100
 _ENVELOPE: tuple[str, ...] = (
     "@timestamp",
     "event.dataset",
+    "event.module",
     "source.ip",
     "destination.ip",
+    "observer.name",
+    *fields.HOST_OWN_ADDRESSES,
     *fields.HOST_MAC,
 )
 
@@ -155,7 +158,10 @@ _SOFTWARE_READS: _Reads = (
 )
 _ENDPOINT_READS: _Reads = (
     ("user_agent", fields.HTTP_USER_AGENT),
-    # Canonical ECS, no dual mapping, so it is spelled inline.
+    # Canonical ECS, no dual mapping, so it is spelled inline. Filtered through
+    # :func:`~soc_ai.so_client.fields.names_the_shipper` in :func:`_record`,
+    # because on the wire datasets below it names the SENSOR — see the comment
+    # on ``_SHIPPER_FILTERED_KEYS``.
     ("host_name", ("host.name",)),
 )
 _PTR_READS: _Reads = (("answer", fields.DNS_RESOLVED_IP),)
@@ -1081,6 +1087,17 @@ def _projection(reads: _Reads) -> list[str]:
     return list(projected)
 
 
+# Record keys holding a DOCUMENT-level host identity rather than an observation
+# of the host. Only these need the shipper test: every other read
+# (``ssh_banner``, ``ntlm.hostname``, a DHCP lease) is a protocol field the host
+# itself put on the wire, so it is attributable by direction alone. ``host.name``
+# is different — it is stamped by whatever shipped the document, which on
+# ``_ENDPOINT_DATASETS`` is the network sensor and never the endpoint. Left in
+# place rather than deleted so the lane still works if an endpoint-authored
+# dataset joins that list.
+_SHIPPER_FILTERED_KEYS: frozenset[str] = frozenset({"host_name"})
+
+
 def _record(source: Mapping[str, Any], reads: _Reads, *, ip: str) -> dict[str, Any]:
     """One identity record: the envelope, plus whichever reads resolved.
 
@@ -1098,8 +1115,11 @@ def _record(source: Mapping[str, Any], reads: _Reads, *, ip: str) -> dict[str, A
     }
     for key, candidates in reads:
         value = _scalar(first_present(source, candidates))
-        if value is not None and value != "":
-            record[key] = value
+        if value is None or value == "":
+            continue
+        if key in _SHIPPER_FILTERED_KEYS and fields.names_the_shipper(source, value, ip):
+            continue
+        record[key] = value
     if "mac" not in record:
         mac = _directional_mac(source, ip)
         if mac:

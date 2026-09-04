@@ -80,6 +80,11 @@ class HuntRowOut(BaseModel):
     # Follow-up chat messages on this hunt — lets the list show a chat badge
     # (same affordance as the investigations list).
     chatCount: int = 0
+    # Migration 0032's synthetic-evaluation marker: this hunt ran against
+    # PLANTED synthetic attack scenarios. Surfaced wherever the row is
+    # displayed — the SPA badges it so a planted attack can never be read as
+    # real activity.
+    isSynthEval: bool = False
 
 
 # Hunt-timeline grouping. The hunt agent emits the same generic tool_call /
@@ -274,6 +279,8 @@ class HuntOut(BaseModel):
     # "vs last run" finding-level diff — None when this is the first run of the
     # objective (no prior COMPLETE run with the same objective_hash to diff).
     diff: HuntDiffOut | None = None
+    # Synthetic-evaluation marker (migration 0032) — see HuntRowOut.isSynthEval.
+    isSynthEval: bool = False
 
 
 _HUNT_STATUS = {
@@ -315,6 +322,7 @@ def _hunt_row(hunt: Hunt, chat_count: int = 0) -> HuntRowOut:
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(hunt.created_at),
         chatCount=chat_count,
+        isSynthEval=bool(hunt.is_synth_eval),
     )
 
 
@@ -563,6 +571,7 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         ts=_iso_utc(hunt.created_at),
         timeline=_build_hunt_timeline(events),
         diff=diff,
+        isSynthEval=bool(hunt.is_synth_eval),
     )
 
 
@@ -1259,6 +1268,10 @@ async def promote_finding(
                 },
             )
         finding = findings[ordinal]
+        # Captured inside the session: a synth-eval hunt's finding is planted
+        # evidence, so the promoted investigation must inherit the marker or a
+        # planted attack could later be read back as a real verdict.
+        hunt_is_synth_eval = bool(hunt.is_synth_eval)
         # Idempotency probe: a running or already-complete promotion of this
         # exact finding is returned as-is; only an error/cancelled one frees
         # the slot for a fresh promotion (mirrors POST /hunt's re-hunt guard).
@@ -1314,6 +1327,10 @@ async def promote_finding(
         # finding's own framing, not a prior investigation's open questions.
         allow_so_writes=False,
         focus_origin="hunt_finding",
+        # Inherit the source hunt's synth-eval marker (migration 0032): a
+        # finding a synth-eval hunt surfaced is planted evidence, and its
+        # promoted investigation must stay marked as such forever.
+        is_synth_eval=hunt_is_synth_eval,
     )
     if inv_id is None:
         raise HTTPException(status_code=503, detail={"reason": "could_not_start"})

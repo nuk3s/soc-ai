@@ -2806,7 +2806,7 @@ async def test_synth_first_phase_d_bounded_loop_two_rounds(
     The synth names a SECOND gap after seeing the first targeted result and
     the orchestrator honors it — two full retask/targeted_dispatch/
     targeted_tool_result sequences — before the final synthesis lands with
-    no gap (e.g. the t_get_event_raw -> t_decode_payload chain).
+    no gap (e.g. the t_get_event_raw -> t_get_rule_content chain).
     """
     from soc_ai.agent.triage import TargetedGap
 
@@ -2821,10 +2821,10 @@ async def test_synth_first_phase_d_bounded_loop_two_rounds(
         why_this_matters="Need the encoded payload before decoding.",
     )
     gap2 = TargetedGap(
-        question="What does the base64 payload decode to?",
-        tool_name="t_decode_payload",
-        tool_args={"data": "aGVsbG8="},
-        why_this_matters="The decoded payload settles the verdict.",
+        question="What does the matching rule actually look for?",
+        tool_name="t_get_rule_content",
+        tool_args={"rule_sid": "2027"},
+        why_this_matters="The rule body settles the verdict.",
     )
     round1_report = TriageReport(
         verdict="needs_more_info",
@@ -2837,7 +2837,7 @@ async def test_synth_first_phase_d_bounded_loop_two_rounds(
     round2_report = TriageReport(
         verdict="needs_more_info",
         confidence=0.5,
-        summary="Got the raw bytes; need them decoded.",
+        summary="Got the raw bytes; need the rule body.",
         citations=[],
         recommended_actions=[],
         gap_for_investigator=gap2,
@@ -2845,12 +2845,12 @@ async def test_synth_first_phase_d_bounded_loop_two_rounds(
     final_report = TriageReport(
         verdict="false_positive",
         confidence=0.85,
-        summary="Payload decodes to a benign keepalive.",
+        summary="Rule matches a benign keepalive pattern.",
         citations=["alert.severity_label"],
         recommended_actions=[],
         gap_for_investigator=None,
     )
-    targeted_results = [{"raw": "aGVsbG8="}, {"decoded": "hello"}]
+    targeted_results = [{"raw": "aGVsbG8="}, {"rule_body": "alert ... keepalive"}]
 
     async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
         return _stub_enriched_alert_context(alert_id)
@@ -2898,10 +2898,10 @@ async def test_synth_first_phase_d_bounded_loop_two_rounds(
 
     dispatches = [e for e in events if e.kind == "targeted_dispatch"]
     assert dispatches[0].payload["tool_name"] == "t_get_event_raw"
-    assert dispatches[1].payload["tool_name"] == "t_decode_payload"
+    assert dispatches[1].payload["tool_name"] == "t_get_rule_content"
     results = [e for e in events if e.kind == "targeted_tool_result"]
     assert results[0].payload["result"] == {"raw": "aGVsbG8="}
-    assert results[1].payload["result"] == {"decoded": "hello"}
+    assert results[1].payload["result"] == {"rule_body": "alert ... keepalive"}
 
     # Three synth runs: round 1 + one re-synthesis per dispatch round.
     assert fake_agent.run.await_count == 3
@@ -5271,6 +5271,54 @@ async def test_oracle_wiring_adjudicate_returns_none_local_verdict_stands(
     assert report_ev.payload["local_verdict"] is None
 
 
+@pytest.mark.asyncio
+async def test_oracle_wiring_passes_loop_messages(
+    settings_kratos: Settings,
+) -> None:
+    """Evidence-parity wiring: the orchestrator hands adjudicate the full loop
+    message history (``loop_messages``), not only the prose transcript — the
+    client extracts the dict-shaped tool results from it for the payload.
+    (b3 finding: those results were dropped, so the Oracle reasoned without
+    the backing evidence.)"""
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.oracle_enabled = True
+    settings_kratos.oracle_escalate_malware_non_tp = True
+    ctx = _make_ctx(settings_kratos)
+
+    local_fp_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.75,
+        summary="Local verdict: benign.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    synth_model = TestModel(call_tools=[], custom_output_args=local_fp_report)
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _malware_signal_enriched(alert_id)
+
+    adjudicate_mock = AsyncMock(return_value=None)
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=synth_model,
+        ),
+        patch("soc_ai.oracle.client.adjudicate", new=adjudicate_mock),
+    ):
+        _ = [ev async for ev in investigate("beacon-001", ctx=ctx)]
+
+    adjudicate_mock.assert_awaited_once()
+    assert "loop_messages" in adjudicate_mock.await_args.kwargs, (
+        "the orchestrator must pass the loop message history so the Oracle "
+        "payload can carry the gathered tool results"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fix 1: _should_escalate_to_oracle now covers attack-class rules too
 # ---------------------------------------------------------------------------
@@ -7009,3 +7057,211 @@ def test_hunt_prompt_names_the_analytics_tools() -> None:
         assert tool_name in HUNT_SYSTEM_PROMPT
     # Template still renders (no stray braces introduced).
     HUNT_SYSTEM_PROMPT.format(objective="probe")
+
+
+# ---------------------------------------------------------------------------
+# Gate observability (2026-08-27): audit-only decisions must emit events.
+#
+# The batch eval reads the YIELDED event stream (the harness records it to the
+# bundle); a gate that only writes the validation-audit dict is invisible to
+# the very measurement that grades it. confidence_floor_raise moved b3's lone
+# false positive from 0.60 to 0.70 in the 2026-08-27 batch and nothing in the
+# bundle could prove (or disprove) the gate fired.
+# ---------------------------------------------------------------------------
+
+
+def _ioc_hit_enriched(alert_id: str = "alert-001") -> Any:
+    """EnrichedAlertContext whose enrichments carry a concrete blocklist hit.
+
+    `_has_ioc_hit` is the strongest confidence-floor-raise ground; a
+    true_positive below the escalation floor with this context must be raised
+    to 0.70 with grounded_by == "ioc_hit".
+    """
+    from soc_ai.tools.enrichment import IndicatorEnrichment
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext, TypedZeekFields
+
+    return EnrichedAlertContext(
+        alert=SoAlert(
+            id=alert_id,
+            severity_label="low",
+            source_ip="10.0.0.42",
+            destination_ip="162.243.103.246",
+        ),
+        community_id_events=[],
+        host_events=[],
+        user_events=[],
+        process_events=[],
+        file_events=[],
+        pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
+        enrichments={
+            "162.243.103.246": IndicatorEnrichment(
+                indicator="162.243.103.246",
+                indicator_type="ip",
+                internal=False,
+                blocklist_hits=[
+                    BlocklistHit(
+                        indicator="162.243.103.246",
+                        indicator_type="ip",
+                        source="abuse.ch Feodo Tracker",
+                        tags=("emotet", "c2"),
+                    )
+                ],
+            )
+        },
+        typed_zeek=TypedZeekFields(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_confidence_floor_raise_emitted_as_event(settings_kratos: Settings) -> None:
+    """When the floor raise fires, a confidence_floor_raise event is emitted
+    carrying grounded_by — alongside its validator siblings, so an eval bundle
+    can tell a gate-raised 0.70 from a model-asserted one."""
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.62,
+        summary="Blocklisted C2 contact confirmed by the Feodo Tracker hit.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+
+    events = await _run_synth_first(ctx, report=report, enriched_factory=_ioc_hit_enriched)
+
+    raise_ev = next((e for e in events if e.kind == "confidence_floor_raise"), None)
+    assert raise_ev is not None, (
+        "confidence_floor_raise fired (the report left at 0.70) but was never "
+        "emitted as an event — the gate is invisible to the eval bundle"
+    )
+    assert raise_ev.payload["grounded_by"] == "ioc_hit"
+    assert raise_ev.payload["original_confidence"] == pytest.approx(0.62)
+    assert raise_ev.payload["floored_confidence"] == pytest.approx(0.70)
+    assert raise_ev.payload["reason"]
+
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "true_positive"
+    assert report_ev.payload["confidence"] == pytest.approx(0.70)
+
+
+@pytest.mark.asyncio
+async def test_confidence_floor_raise_event_absent_when_gate_does_not_fire(
+    settings_kratos: Settings,
+) -> None:
+    """No grounds, no raise, no event — the emission tracks the gate exactly."""
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+
+    report = TriageReport(
+        verdict="false_positive",
+        confidence=0.85,
+        summary="Benign internal traffic.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+
+    events = await _run_synth_first(ctx, report=report, candidate=_strong_benign_candidate())
+
+    assert not any(e.kind == "confidence_floor_raise" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_oracle_adjudication_failed_event_emitted(settings_kratos: Settings) -> None:
+    """A failed/refused Oracle adjudication emits oracle_adjudication_failed.
+
+    Before this event existed, adjudicate() returning None left NOTHING in the
+    stream after oracle_escalation (scenario b8, 2026-08-27 measurement) — a
+    failed second opinion was indistinguishable from one that never happened.
+    """
+    settings_kratos.investigate_when_unsure = False
+    settings_kratos.oracle_enabled = True
+    settings_kratos.oracle_escalate_malware_non_tp = True
+    ctx = _make_ctx(settings_kratos)
+
+    local_fp_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.75,
+        summary="Local verdict: benign.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+    )
+    synth_model = TestModel(call_tools=[], custom_output_args=local_fp_report)
+
+    async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
+        return _malware_signal_enriched(alert_id)
+
+    async def _failing_adjudicate(*_a: Any, **kw: Any) -> None:
+        failure_out = kw.get("failure_out")
+        if failure_out is not None:
+            failure_out["reason"] = "residue_refusal"
+
+    with (
+        patch(
+            "soc_ai.tools.get_alert_context.get_enriched_alert_context",
+            side_effect=_stub_enriched,
+        ),
+        patch(
+            "soc_ai.agent.orchestrator.build_synthesizer_model",
+            return_value=synth_model,
+        ),
+        patch(
+            "soc_ai.oracle.client.adjudicate",
+            new=AsyncMock(side_effect=_failing_adjudicate),
+        ),
+    ):
+        events = [ev async for ev in investigate("beacon-001", ctx=ctx)]
+
+    kinds = [e.kind for e in events]
+    assert "oracle_escalation" in kinds
+    assert "oracle_adjudication" not in kinds
+
+    fail_ev = next((e for e in events if e.kind == "oracle_adjudication_failed"), None)
+    assert fail_ev is not None, (
+        "adjudicate returned None and no oracle_adjudication_failed event was "
+        "emitted — a failed second opinion is invisible in the stream"
+    )
+    assert fail_ev.payload["reason"] == "residue_refusal"
+    assert fail_ev.payload["local_verdict"] == "needs_more_info"
+
+    # The local verdict still stands.
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "needs_more_info"
+    assert "[Oracle adjudicated]" not in (report_ev.payload["summary"] or "")
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_records_failure_reason(settings_kratos: Settings) -> None:
+    """adjudicate() names WHY it returned None via the failure_out param
+    (the no_propagate_out precedent) — the caller turns it into the
+    oracle_adjudication_failed event's reason."""
+    from types import SimpleNamespace
+
+    from soc_ai.oracle.client import _OracleGatewayError, adjudicate
+
+    settings_kratos.oracle_enabled = True
+
+    async def _raise_terminal(payload: str, *, settings: Any) -> str:
+        raise _OracleGatewayError("401 unauthorized", retryable=False)
+
+    failure: dict[str, str] = {}
+    with patch("soc_ai.oracle.client._call_oracle_raw", side_effect=_raise_terminal):
+        result = await adjudicate(
+            SimpleNamespace(settings=settings_kratos),  # type: ignore[arg-type]
+            enriched=_stub_enriched_alert_context(),
+            local_report=TriageReport(
+                verdict="false_positive",
+                confidence=0.7,
+                summary="benign",
+                citations=[],
+                recommended_actions=[],
+            ),
+            transcript_text="",
+            failure_out=failure,
+        )
+
+    assert result is None
+    assert failure["reason"] == "gateway_error"

@@ -88,7 +88,6 @@
   "_comment_ecs_zeek": "Modern SO / Elastic-Agent 9.x populates ECS field names for Zeek data (dns.query.name, client.bytes, hash.ja3s, http.virtual_host, ...) while the zeek.* fields are mapped-but-empty. These ECS names are already covered by the prefixes above (dns/client/server/network/connection/hash/ssl/http/user_agent/file) and so already pass is_allowed(); they are listed explicitly here too as the documented, intended OQL surface for the agent so the field-resolution layer in so_client/fields.py and the OQL allowlist agree on the same canonical names. The zeek.* prefix stays valid for older SO and synth fixtures.",
   "exact_fields": [
     "_id",
-    "_index",
     "_score",
     "dns.query.name",
     "dns.resolved_ip",
@@ -116,6 +115,7 @@
     "file.hash.sha256"
   ],
   "forbidden_fields": [
+    "_index",
     "_source",
     "_type",
     "fields",

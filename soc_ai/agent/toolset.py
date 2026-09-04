@@ -50,6 +50,7 @@ from soc_ai.dossier.resolve import (
     unknown_dossier,
 )
 from soc_ai.oracle.identifiers import effective_internal_identifiers
+from soc_ai.oracle.sanitize import OracleUnknownLabelError
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.tools.analytics import beacon_profile, dcerpc_histogram, dns_entropy_scan, first_seen
 from soc_ai.tools.crawl_page import crawl_page
@@ -81,11 +82,46 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-Role = Literal["investigator", "chat", "hunt"]
+Role = Literal["investigator", "chat", "hunt", "oracle"]
 
 # Tools only the investigator gets (verdict-adjacent context the chat/hunt
 # surfaces never used).
 INVESTIGATOR_ONLY = frozenset({"t_query_detections", "t_get_playbooks", "t_lookup_runbook"})
+
+# The Oracle's read-only adjudication surface (2026-08-27 design §2): a POSITIVE
+# allowlist, not a CORE-minus-deltas subset — the ``oracle`` role registers
+# EXACTLY these 15 closures and nothing else, whatever the settings gates say.
+# Deliberately absent, each an on-the-record decision, not an omission:
+#   - anything that writes (register_read_tools has none by construction);
+#   - the online quartet + t_web_search / t_crawl_page (a SECOND egress the
+#     residue gate does not sit in front of — the Oracle recommends a reputation
+#     check, the analyst runs it);
+#   - t_get_pcap (SSH to the sensor driven by cloud-model args; the local loop's
+#     pcap facts already reach the Oracle via loop_tool_results);
+#   - t_query_cases / t_query_detections / t_get_playbooks / t_lookup_runbook /
+#     t_suggest_rule_tuning (org context, little adjudication value per byte);
+#   - the hunt analytics quartet (network-wide; adjudication pivots on one alert).
+# The golden per-role surface test (tests/test_tool_surface.py) is the lock: a
+# tool cannot join or leave this set without a reviewed diff.
+ORACLE_TOOLS = frozenset(
+    {
+        "t_query_events_oql",
+        "t_query_zeek_logs",
+        "t_describe_dataset",
+        "t_field_values",
+        "t_get_event_raw",
+        "t_get_rule_content",
+        "t_decode_payload",
+        "t_host_summary",
+        "t_origin_chain",
+        "t_host_dossier",
+        "t_prevalence",
+        "t_rule_prevalence",
+        "t_enrich_ip",
+        "t_enrich_domain",
+        "t_enrich_hash",
+    }
+)
 
 # Tools every role EXCEPT hunt gets (tuning nominations are per-rule triage
 # work, not network-wide hunting).
@@ -114,7 +150,6 @@ PHASE_D_TOOLS: tuple[str, ...] = (
     "t_query_detections",
     "t_get_rule_content",
     "t_get_event_raw",
-    "t_decode_payload",
     "t_get_pcap",
     "t_web_search",
     "t_crawl_page",
@@ -228,6 +263,122 @@ def _is_grid_unavailable(exc: BaseException) -> bool:
 # more breadth, but no single round-trip can dominate the budget.
 _TOOL_RESULT_BUDGET_BYTES = 12 * 1024
 
+# ---------------------------------------------------------------------------
+# The model boundary for the synthetic-eval marker.
+#
+# Every planted eval document carries ``synth.scenario_id`` /
+# ``synth.scenario_version`` (stamped by soc_ai.eval.synth_render) and lives
+# in a ``logs-synth-*`` index. Those markers are load-bearing IN
+# Elasticsearch — the prod exclusion filters (``must_not exists
+# synth.scenario_id``), the ingest containment check, the ``synth-clean``
+# teardown and the journey scorer's document joins all key on them — but to
+# the model under test they are an answer key: the 2026-08-26 batch showed
+# the model reading it verbatim off a tool result ("This is a synthetic
+# scenario m1-cobalt-strike-beacon"). A model that knows it is being graded
+# on a planted attack is not the model the eval measures.
+#
+# So the marker is stripped HERE, at the single point every model-bound tool
+# result passes (the interactive wrappers and Phase-D dispatch both funnel
+# through :func:`_clamp_tool_result` / :func:`_tool_error`), and nowhere
+# deeper: harness code reading through ElasticClient or the tool functions
+# still sees everything. UNCONDITIONALLY — there is no legitimate reason for
+# the model to see the marker, so no flag can turn the strip off.
+#
+# The strip covers the MARKER ONLY. Scenarios author their discriminating
+# evidence in the same namespace (h1's ``synth.kerberos_profile``, b3's
+# ``synth.smb_files_signer``, b5/h6's ``synth.wmi_class``/``wmi_method``,
+# e4's ``synth.auth_attempt_profile``, and the ``synth.beacon_profile`` /
+# ``synth.dns_profile`` candidate paths in so_client.fields) — that is
+# exactly what the model is graded on reasoning over. An earlier revision
+# stripped the whole ``synth.*`` namespace and thereby amputated every
+# scenario's evidence; two 26-run batches (2026-08-27) measured the strip,
+# not the model. Only ``synth.scenario_id`` / ``synth.scenario_version`` —
+# the two keys synth_render stamps — are the answer key; everything else
+# under the namespace is testimony.
+_SYNTH_MARKER_SUBKEYS = frozenset({"scenario_id", "scenario_version"})
+_SYNTH_MARKER_KEYS = frozenset({f"synth.{sub}" for sub in _SYNTH_MARKER_SUBKEYS})
+_SYNTH_NAMESPACE_KEY = "synth"
+# ``_index`` goes with the marker: synth indices are named ``logs-synth-*``,
+# so the physical index name alone says "planted". Dropped from every hit —
+# dataset identity lives in ``event.dataset`` / ``event.module``; no prompt or
+# model-side consumer reads ``_index``. The query side is closed too: the OQL
+# whitelist forbids ``_index`` outright (oql_fields.json), because selecting
+# by index name (``_index:logs-synth*``) would be a planted-document oracle
+# even with every hit stripped. This hit-level drop stays as defense in depth.
+_MODEL_HIDDEN_KEYS = frozenset({"_index"})
+
+
+def _is_model_hidden_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    return key in _MODEL_HIDDEN_KEYS or key in _SYNTH_MARKER_KEYS
+
+
+def _strip_marker(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            if _is_model_hidden_key(k):
+                continue
+            if k == _SYNTH_NAMESPACE_KEY:
+                # The mapped-object spelling: the marker rides as
+                # ``{"synth": {"scenario_id": …}}``. Remove the marker
+                # subkeys, keep any evidence subkeys — and if nothing but
+                # the marker was there, drop the ``synth`` key entirely (a
+                # leftover ``"synth": {}`` would itself say "planted"). A
+                # non-dict value under a bare ``synth`` key has no authored
+                # meaning (scenarios only ever write ``synth.<name>``), so
+                # it is dropped rather than risking a marker-shaped value.
+                if isinstance(v, dict):
+                    nested = {
+                        sk: _strip_marker(sv)
+                        for sk, sv in v.items()
+                        if sk not in _SYNTH_MARKER_SUBKEYS
+                    }
+                    if nested:
+                        out[k] = nested
+                continue
+            out[k] = _strip_marker(v)
+        return out
+    if isinstance(obj, list):
+        return [_strip_marker(v) for v in obj]
+    if isinstance(obj, str) and "logs-synth" in obj:
+        # Index names surface as VALUES too — chiefly ES error messages that
+        # name the failing index (``groupby _index`` is refused at OQL
+        # validation now, but this value rewrite stays as defense in depth).
+        # Rewrite the synth spelling out (``.ds-logs-synth-zeek-conn-…`` →
+        # ``.ds-logs-zeek-conn-…``); ``logs-synth-*`` is a reserved namespace
+        # (synth_ingest._check_synth_prefix), so the substring cannot occur in
+        # honest telemetry values.
+        return obj.replace("logs-synth-", "logs-").replace("logs-synth", "logs")
+    return obj
+
+
+def strip_synth_markers[T](value: T) -> T:
+    """Strip the synthetic-eval MARKER — and only the marker — from a
+    model-bound payload.
+
+    Removed, recursively at every level:
+
+    - the marker keys stamped by :mod:`soc_ai.eval.synth_render`:
+      ``synth.scenario_id`` and ``synth.scenario_version`` (dotted
+      spelling), and ``scenario_id`` / ``scenario_version`` inside a nested
+      ``synth`` object (the mapped-object spelling; the ``synth`` key
+      itself goes if nothing else was under it);
+    - ``_index`` from every hit (synth indices spell ``logs-synth-*``);
+    - the ``logs-synth`` index-namespace spelling inside string values
+      (aggregation bucket keys, ES error text).
+
+    Deliberately PRESERVED: every other ``synth.*`` field. Scenarios plant
+    their discriminating evidence there (``synth.kerberos_profile``,
+    ``synth.smb_files_signer``, ``synth.wmi_class``, …) — stripping it
+    makes the eval measure the strip instead of the model, which is exactly
+    what happened before this function was narrowed. All non-``synth``
+    evidence fields are untouched. See the block comment above for why the
+    strip exists and why it is unconditional.
+    """
+    return cast("T", _strip_marker(value))
+
 
 def _tool_error(exc: BaseException) -> dict[str, Any]:
     """Render a tool-side exception into a structured result the model can read.
@@ -263,7 +414,10 @@ def _tool_error(exc: BaseException) -> dict[str, Any]:
     fragment = getattr(exc, "fragment", None)
     if fragment:
         payload["fragment"] = fragment
-    return payload
+    # A 4xx keeps its exception text (that text is how the model fixes its
+    # query) — but ES error messages name indices, so the synth-index spelling
+    # must not ride out on the error path either.
+    return strip_synth_markers(payload)
 
 
 def _clamp_tool_result[T](value: T) -> T:
@@ -281,6 +435,10 @@ def _clamp_tool_result[T](value: T) -> T:
     nested fields (that's domain-specific).
     For primitive / string returns: clip to budget chars and signal.
     """
+    # The synthetic-eval marker never crosses the model boundary. Applied here
+    # because every model-bound tool result — the interactive wrappers AND the
+    # Phase-D targeted dispatch — funnels through this clamp.
+    value = strip_synth_markers(value)
     try:
         encoded = json.dumps(value)
     except (TypeError, ValueError):
@@ -599,18 +757,37 @@ def _guarded[F: Callable[..., Any]](ctx: InvestigationContext, fn: F) -> F:
         # INBOUND (model → tool): the model reasons over opaque labels, so any
         # label it echoes into an argument must become the real value before
         # the tool queries Elasticsearch / enrichment sources.
-        real_args = tuple(guard.desanitize_obj(a) for a in args)
-        real_kwargs = {k: guard.desanitize_obj(v) for k, v in kwargs.items()}
+        try:
+            real_args = tuple(guard.desanitize_obj(a) for a in args)
+            real_kwargs = {k: guard.desanitize_obj(v) for k, v in kwargs.items()}
+        except OracleUnknownLabelError as exc:
+            # The Oracle tool guard refuses a hallucinated label (design §3): the
+            # model named an identifier no case allocated. Do NOT run the query
+            # against a literal placeholder — a silent empty result reads as "no
+            # data" and drives a confidently wrong adjudication. Hand back a
+            # structured, self-correcting tool error instead of executing. The
+            # analyst EgressGuard never raises this, so this arm is inert on the
+            # analyst path.
+            return exc.tool_error()
         result = await fn(*real_args, **real_kwargs)
         # OUTBOUND (tool → model): the result is the egress payload — redact it
-        # with the run's shared mapping so labels stay stable across tools.
-        return guard.sanitize_obj(result)
+        # with the run's shared mapping so labels stay stable across tools. Thread
+        # the tool NAME so the Oracle guard can re-key a known envelope's
+        # identifiers onto classifiable ECS paths before the field-aware harvest
+        # (finding oracle-tool-result-leak); the analyst guard ignores it.
+        return guard.sanitize_obj(result, tool_name=getattr(fn, "__name__", None))
 
     return cast("F", _wrapped)
 
 
 def _in_role(tool_name: str, role: Role) -> bool:
     """Whether ``tool_name`` belongs to ``role``'s surface (settings gates aside)."""
+    # The oracle role is a POSITIVE allowlist — it is the sole arbiter of its own
+    # surface, so it short-circuits the delta logic. A tool absent from
+    # ORACLE_TOOLS is out-of-role even when a settings gate would otherwise
+    # register it (this is what keeps the online / pcap tools off the Oracle).
+    if role == "oracle":
+        return tool_name in ORACLE_TOOLS
     if tool_name in INVESTIGATOR_ONLY and role != "investigator":
         return False
     if tool_name in HUNT_ONLY and role != "hunt":
@@ -700,12 +877,22 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
     window = default_window if default_window is not None else (1440 if role == "hunt" else 60)
 
     def _register[F: Callable[..., Any]](fn: F) -> F:
-        # EVERY tool registration routes through the egress guard so a cloud
-        # analyst model never sees a raw tool result (and its label-bearing
-        # arguments are restored before execution). With no guard on the ctx
-        # (the default), _guarded returns fn unchanged and this is exactly
-        # agent.tool_plain(fn). The cast mirrors _guarded's: tool_plain hands
-        # back the (wrapped) function it was given.
+        # The role's surface is the arbiter: a closure whose name is out-of-role
+        # for THIS role is handed back unregistered (the model never sees it).
+        # This is what trims the unconditionally-defined reads (t_query_cases)
+        # and every settings-gated online / pcap tool off the read-only "oracle"
+        # surface — enforced, not left to omission, and pinned by
+        # tests/test_tool_surface.py. For the three original roles _in_role
+        # returns True for every tool they already registered, so their surfaces
+        # are byte-identical.
+        if not _in_role(getattr(fn, "__name__", ""), role):
+            return fn
+        # EVERY registered tool routes through the egress guard so a cloud
+        # analyst / oracle model never sees a raw tool result (and its
+        # label-bearing arguments are restored before execution). With no guard
+        # on the ctx (the default), _guarded returns fn unchanged and this is
+        # exactly agent.tool_plain(fn). The cast mirrors _guarded's: tool_plain
+        # hands back the (wrapped) function it was given.
         return cast("F", agent.tool_plain(_progress(ctx, _guarded(ctx, fn))))
 
     async def t_query_events_oql(
@@ -730,6 +917,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 time_range_minutes=time_range_minutes,
                 max_results=max_results,
                 time_anchor=ctx.default_time_anchor,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_query_events_oql failed: %s", e)
@@ -790,6 +978,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 time_range_minutes=time_range_minutes,
                 max_results=max_results,
                 time_anchor=ctx.default_time_anchor,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_query_zeek_logs failed: %s", e)
@@ -814,7 +1003,12 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         if dup := _dedup_result(ctx, "t_describe_dataset", {"dataset": dataset}):
             return dup
         try:
-            result = await describe_dataset(dataset, elastic=ctx.elastic, settings=ctx.settings)
+            result = await describe_dataset(
+                dataset,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                include_synth=ctx.include_synth,
+            )
         except Exception as e:
             _LOGGER.warning("t_describe_dataset failed: %s", e)
             return _tool_error(e)
@@ -835,7 +1029,12 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             return dup
         try:
             result = await field_values(
-                field, elastic=ctx.elastic, settings=ctx.settings, dataset=dataset, size=size
+                field,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                dataset=dataset,
+                size=size,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_field_values failed: %s", e)
@@ -936,7 +1135,12 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         if dup := _dedup_result(ctx, "t_get_event_raw", {"event_id": event_id}):
             return dup
         try:
-            raw = await get_event_raw(event_id, elastic=ctx.elastic, settings=ctx.settings)
+            raw = await get_event_raw(
+                event_id,
+                elastic=ctx.elastic,
+                settings=ctx.settings,
+                include_synth=ctx.include_synth,
+            )
         except Exception as e:
             _LOGGER.warning("t_get_event_raw failed: %s", e)
             return _tool_error(e)
@@ -966,6 +1170,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 settings=ctx.settings,
                 lookback_hours=lookback_hours,
                 time_anchor=ctx.default_time_anchor,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_host_summary failed: %s", e)
@@ -1002,6 +1207,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 settings=ctx.settings,
                 lookback_minutes=lookback_minutes,
                 time_anchor=ctx.default_time_anchor,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_origin_chain failed: %s", e)
@@ -1098,6 +1304,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 domain=domain,
                 lookback_days=lookback_days,
                 time_anchor=ctx.default_time_anchor,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_prevalence failed: %s", e)
@@ -1126,6 +1333,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 elastic=ctx.elastic,
                 settings=ctx.settings,
                 lookback_days=lookback_days,
+                include_synth=ctx.include_synth,
             )
         except Exception as e:
             _LOGGER.warning("t_rule_prevalence failed: %s", e)
@@ -1176,6 +1384,11 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                     dst=dst,
                     min_events=min_events,
                     include_internal=include_internal,
+                    # The full SynthScope passes through: prod (False) sees no
+                    # plants, the hunt-journey eval (True) sees them all, and a
+                    # scenario-scoped batch run sees its OWN plants only —
+                    # never a sibling scenario's (analytics._hunt_must_not).
+                    include_synth=ctx.include_synth,
                 )
             except Exception as e:
                 _LOGGER.warning("t_beacon_profile failed: %s", e)
@@ -1214,6 +1427,8 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                     window_minutes=window_minutes,
                     parent_domain=parent_domain,
                     min_queries=min_queries,
+                    # Full SynthScope passthrough (see t_beacon_profile).
+                    include_synth=ctx.include_synth,
                 )
             except Exception as e:
                 _LOGGER.warning("t_dns_entropy_scan failed: %s", e)
@@ -1247,6 +1462,8 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                     settings=ctx.settings,
                     window_minutes=window_minutes,
                     rare_max=rare_max,
+                    # Full SynthScope passthrough (see t_beacon_profile).
+                    include_synth=ctx.include_synth,
                 )
             except Exception as e:
                 _LOGGER.warning("t_dcerpc_histogram failed: %s", e)
@@ -1285,6 +1502,8 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                     recent_minutes=recent_minutes,
                     baseline_days=baseline_days,
                     dataset=dataset,
+                    # Full SynthScope passthrough (see t_beacon_profile).
+                    include_synth=ctx.include_synth,
                 )
             except Exception as e:
                 _LOGGER.warning("t_first_seen failed: %s", e)

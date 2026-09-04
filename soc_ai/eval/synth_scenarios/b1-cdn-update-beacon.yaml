@@ -50,10 +50,14 @@ events:
       rule.name: "ET HUNTING Periodic Outbound HTTPS Connection Possible Beacon"
       rule.category: "Potentially Bad Traffic"
       rule.signature: "2029500"
-      classtype: bad-unknown
-      signature_severity: Minor
-      host.name: "so-sensor-1"
-      agent.name: "so-sensor-1"
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Minor"]
+      message: '{"alert": {"category": "bad-unknown"}}'
+      observer.name: "so-sensor-1"
       synth.scenario_id: b1-cdn-update-beacon
       synth.scenario_version: 1
 

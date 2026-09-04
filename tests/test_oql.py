@@ -333,6 +333,44 @@ def test_validate_forbidden_field_rejected() -> None:
         validate_oql(parse_oql("_source:foo"))
 
 
+def test_validate_rejects_index_selection_of_synth_indices() -> None:
+    """`_index:logs-synth*` used to parse, validate, and compile to a working
+    wildcard query selecting exactly the planted eval documents — the hits came
+    back marker-stripped, but the selection itself (plus the total count) told
+    the model which documents are planted. The physical index name must be
+    refused AT VALIDATION with a correctable message, never by silently
+    returning empty results (indistinguishable from "no data")."""
+    with pytest.raises(OqlValidationError, match="_index") as exc_info:
+        validate_oql(parse_oql("_index:logs-synth*"))
+    # The reject is returned verbatim to the model — it must steer to the
+    # queryable dataset-identity fields, not hint at anything eval-shaped.
+    msg = str(exc_info.value)
+    assert "event.dataset" in msg
+    assert "event.module" in msg
+    assert "synth" not in msg
+
+
+def test_validate_rejects_index_everywhere_it_can_appear() -> None:
+    """No spelling of an `_index` predicate survives validation: plain term,
+    conjunct, negated, grouped-value, groupby, or sortby."""
+    for query in (
+        "_index:so-detections",
+        "event.kind:alert AND _index:foo*",
+        "NOT _index:x",
+        "_index:(a OR b)",
+        "event.kind:alert | groupby _index",
+        "event.kind:alert | sortby _index desc",
+    ):
+        with pytest.raises(OqlValidationError, match="_index"):
+            validate_oql(parse_oql(query))
+
+
+def test_validate_id_field_still_allowed() -> None:
+    """`_id` stays queryable — the citation / deep-dive join key is not the
+    oracle, the physical index name is."""
+    validate_oql(parse_oql("_id:abc123"))
+
+
 def test_field_reject_suggests_nearest_allowed_field() -> None:
     """A filter field reject appends difflib's closest allowed field names.
 

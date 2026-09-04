@@ -7,19 +7,22 @@ by the eval harness immediately afterward.
 
 Synth pollution kill-switch: enforces ``logs-synth-`` index prefix at
 ingest time, even on programmatically-constructed Scenarios that
-bypass the loader's pydantic validation.
+bypass the loader's pydantic validation. The read-side twin,
+:func:`assert_no_synth_in_production`, refuses to ingest at all while a
+synthetic document is sitting in a production index.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from elasticsearch import NotFoundError
 
+from soc_ai.config import Settings
 from soc_ai.eval.synth_loader import Scenario
 from soc_ai.eval.synth_render import RenderedDoc, render_scenario
 from soc_ai.so_client.elastic import ElasticClient
@@ -40,6 +43,22 @@ class IngestResult:
     triage_doc_id: str
     triage_index: str
     doc_count: int
+    # The journey scorer's citation bridge: event ``index`` → the ES ``_id``s
+    # ingest assigned to that scenario's docs, in write order. Events carry no
+    # id field, so the event's ``index`` is its scenario-local identifier (the
+    # same keying as HuntJourney.expected_cited_event_ids); the ``_id``s only
+    # exist after ingest, so here — at ingest time — is the one place the two
+    # can be joined. ``score_journey`` REFUSES to score when this misses an
+    # expected event, and ``triage_doc_id`` alone covers zero of m1's two.
+    doc_ids_by_event: dict[str, list[str]] = field(default_factory=dict)
+    # The ``synth.scenario_id`` value this plant's docs were stamped with —
+    # the run's SynthScope key. Equals ``scenario_id`` for a single plant
+    # (repeat 0); repeated plants get :func:`plant_id_for`'s suffixed form so
+    # sibling repeats' documents stay mutually invisible. Empty string only on
+    # pre-repeats constructions (treated as ``scenario_id`` by the batch runner).
+    plant_id: str = ""
+    # 0-based repeat index of this plant within its batch.
+    repeat: int = 0
 
 
 def _check_synth_prefix(docs: list[RenderedDoc], scenario_id: str) -> None:
@@ -54,6 +73,51 @@ def _check_synth_prefix(docs: list[RenderedDoc], scenario_id: str) -> None:
             f"scenario {scenario_id!r} would write to non-synth indices "
             f"{bad}; refusing — synth pollution kill-switch requires "
             f"every index to start with 'logs-synth-'"
+        )
+
+
+async def assert_no_synth_in_production(elastic: ElasticClient, settings: Settings) -> None:
+    """Refuse to proceed if a synthetic document reached a production index.
+
+    A planted scenario outside ``logs-synth-*`` would be shown to a real
+    analyst as genuine, and would contaminate every measurement taken after
+    it. The synth catalogue README has required this check since the
+    catalogue landed; it is the read-side twin of ``_check_synth_prefix``.
+    """
+    # The production pattern (default ``logs-*``) legitimately matches the
+    # ``logs-synth-*`` datastreams too; exclude them in the multi-target
+    # expression so only an ESCAPED synth doc can match. size=1 — a single
+    # escaped doc is already a refusal.
+    index = f"{settings.events_index_pattern},-{_SYNTH_INDEX_PATTERN}"
+    try:
+        # require_complete: a degraded search that reads only the surviving
+        # shards and finds 0 hits proves nothing — the escaped doc may sit on a
+        # shard that never answered. The grid-wide es_fail_on_partial_results
+        # opt-out (an operator's tolerance for partial ORDINARY reads) must not
+        # soften this check, so a partial/timed-out read raises here and lands
+        # in the same refusal arm as a transport error.
+        result = await elastic.search(
+            index, {"exists": {"field": "synth.scenario_id"}}, size=1, require_complete=True
+        )
+    except Exception as exc:
+        # Fail loud, not soft: if containment cannot be VERIFIED, that is
+        # itself a refusal — an unverifiable grid must not be treated as
+        # clean (a false all-clear outranks any error).
+        raise RuntimeError(
+            f"synth containment check could not be performed against {index!r}: "
+            f"{exc} — refusing to ingest synthetic scenarios on a grid whose "
+            f"production indices cannot be proven clean"
+        ) from exc
+    if result.hits:
+        hit = result.hits[0]
+        bound = "at least " if result.total_is_lower_bound else ""
+        raise RuntimeError(
+            f"synthetic document found in production index "
+            f"{hit.get('_index', '<unknown>')!r} (doc {hit.get('_id', '<unknown>')!r}, "
+            f"{bound}{result.total} matching outside 'logs-synth-'): a planted "
+            f"scenario there would be shown to a real analyst as genuine — "
+            f"refusing to ingest until docs carrying synth.scenario_id are "
+            f"cleaned out of that index"
         )
 
 
@@ -92,19 +156,38 @@ async def _refresh(elastic: ElasticClient, indices: set[str]) -> None:
             return
 
 
+def plant_id_for(scenario_id: str, repeat: int) -> str:
+    """The ``synth.scenario_id`` scope key for one planted copy of a scenario.
+
+    Repeat 0 keeps the bare scenario id, so a single plant (``--repeats 1``,
+    the default) stays byte-identical to the pre-repeats stamp. Repeat k >= 1
+    appends ``::r<k>``. The per-run ``SynthScope`` filter term-matches this
+    exact value, so N plants of one scenario can never retrieve each other's
+    documents — the same isolation that already keeps sibling scenarios apart.
+    """
+    return scenario_id if repeat == 0 else f"{scenario_id}::r{repeat}"
+
+
 async def ingest_scenario(
-    scenario: Scenario, *, elastic: ElasticClient, run_time: datetime
+    scenario: Scenario, *, elastic: ElasticClient, run_time: datetime, repeat: int = 0
 ) -> IngestResult:
-    """Render and ingest one scenario; return the triage-target locator."""
-    docs = render_scenario(scenario, run_time=run_time)
+    """Render and ingest one scenario; return the triage-target locator.
+
+    ``repeat`` selects this plant's :func:`plant_id_for` scope key; 0 (the
+    default) reproduces the single-plant stamp exactly.
+    """
+    plant_id = plant_id_for(scenario.id, repeat)
+    docs = render_scenario(scenario, run_time=run_time, plant_id=plant_id)
     _check_synth_prefix(docs, scenario.id)
 
     triage_doc_id: str | None = None
     triage_index: str | None = None
     touched: set[str] = set()
+    doc_ids_by_event: dict[str, list[str]] = {}
     for doc in docs:
         doc_id = await _index_one(elastic, doc)
         touched.add(doc.index)
+        doc_ids_by_event.setdefault(doc.index, []).append(doc_id)
         if doc.is_triage_target:
             triage_doc_id = doc_id
             triage_index = doc.index
@@ -122,6 +205,9 @@ async def ingest_scenario(
         triage_doc_id=triage_doc_id,
         triage_index=triage_index,
         doc_count=len(docs),
+        doc_ids_by_event=doc_ids_by_event,
+        plant_id=plant_id,
+        repeat=repeat,
     )
 
 
@@ -166,12 +252,29 @@ async def cleanup_synth_docs(
 
 
 async def ingest_scenarios(
-    scenarios: list[Scenario], *, elastic: ElasticClient, run_time: datetime
+    scenarios: list[Scenario], *, elastic: ElasticClient, run_time: datetime, repeats: int = 1
 ) -> list[IngestResult]:
-    """Render + ingest each scenario sequentially.
+    """Render + ingest each scenario sequentially, ``repeats`` copies apiece.
+
+    Runs the production-containment check first: if a synthetic document is
+    already sitting outside ``logs-synth-*``, the whole batch refuses before
+    a single write.
+
+    Each of a scenario's ``repeats`` plants is stamped with its own
+    :func:`plant_id_for` scope key (repeat 0 = the bare id), so repeated runs
+    of one scenario cannot see each other's documents. ``synth-clean`` is
+    unaffected: every copy still carries ``synth.scenario_id`` (the field the
+    cleanup's exists-query deletes on), just with a per-repeat value.
 
     Sequential (not concurrent) on purpose — the catalogue is small (9
     scenarios, up to ~6 events each), and SO ES is rate-sensitive under
     the lab grid's load profile.
     """
-    return [await ingest_scenario(s, elastic=elastic, run_time=run_time) for s in scenarios]
+    if repeats < 1:
+        raise ValueError(f"repeats must be >= 1, got {repeats}")
+    await assert_no_synth_in_production(elastic, elastic._settings)
+    return [
+        await ingest_scenario(s, elastic=elastic, run_time=run_time, repeat=k)
+        for s in scenarios
+        for k in range(repeats)
+    ]

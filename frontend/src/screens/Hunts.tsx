@@ -22,6 +22,7 @@ import { ListToolbar } from '../components/ListToolbar';
 import { useListSelection } from '../lib/useListSelection';
 import { useSavedViews } from '../lib/useSavedViews';
 import { Panel } from '../components/Panel';
+import { SyntheticEvalBadge } from '../components/Badges';
 import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
@@ -1214,6 +1215,9 @@ export function Hunts() {
               <div className="flex items-center gap-2 truncate">
                 <Crosshair size={14} className="flex-none text-accent" />
                 <span className="truncate text-[13px] text-text">{h.objective}</span>
+                {/* A hunt run against planted synthetic scenarios must never
+                    read as a real one — badge it wherever the row appears. */}
+                {h.isSynthEval && <SyntheticEvalBadge />}
                 {(h.chatCount ?? 0) > 0 && (
                   <span
                     className="flex flex-none items-center gap-[4px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-accent"

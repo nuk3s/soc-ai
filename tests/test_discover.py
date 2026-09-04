@@ -14,8 +14,10 @@ class _FakeES:
         self._hits = hits or []
         self._aggs = aggs
         self._raise = raise_exc
+        self.calls: list[dict[str, Any]] = []
 
     async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        self.calls.append({"index": index, "query": query, **kwargs})
         if self._raise:
             raise RuntimeError("es down")
         return EsSearchResult(
@@ -106,3 +108,46 @@ async def test_field_values_error_carries_hint() -> None:
     es = _FakeES(raise_exc=True)
     out = await field_values("some.text.field", elastic=es, settings=_settings())
     assert out["error"] is True and "describe_dataset" in out["hint"]
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-eval kill-switch: both discovery tools read the same events index
+# the planted eval scenarios are written to, so the ISSUED body must exclude
+# synth.scenario_id docs by default — a live eval batch must never inflate a
+# dataset's described fields or a field's top values on an analyst surface.
+# The eval harness opts in per call, like every other events reader.
+# ---------------------------------------------------------------------------
+
+_SYNTH_CLAUSE = {"exists": {"field": "synth.scenario_id"}}
+
+
+@pytest.mark.asyncio
+async def test_describe_dataset_body_excludes_synth_by_default() -> None:
+    es = _FakeES(hits=[{"_source": {"event": {"dataset": "zeek.ssh"}}}])
+    await describe_dataset("zeek.ssh", elastic=es, settings=_settings())
+    must_not = es.calls[0]["query"]["bool"]["must_not"]
+    assert _SYNTH_CLAUSE in must_not
+
+
+@pytest.mark.asyncio
+async def test_describe_dataset_body_admits_synth_when_opted_in() -> None:
+    es = _FakeES(hits=[{"_source": {"event": {"dataset": "zeek.ssh"}}}])
+    await describe_dataset("zeek.ssh", elastic=es, settings=_settings(), include_synth=True)
+    must_not = es.calls[0]["query"]["bool"].get("must_not", [])
+    assert _SYNTH_CLAUSE not in must_not
+
+
+@pytest.mark.asyncio
+async def test_field_values_body_excludes_synth_by_default() -> None:
+    es = _FakeES(aggs={"vals": {"buckets": []}})
+    await field_values("rule.name", elastic=es, settings=_settings(), dataset="suricata.alert")
+    must_not = es.calls[0]["query"]["bool"]["must_not"]
+    assert _SYNTH_CLAUSE in must_not
+
+
+@pytest.mark.asyncio
+async def test_field_values_body_admits_synth_when_opted_in() -> None:
+    es = _FakeES(aggs={"vals": {"buckets": []}})
+    await field_values("rule.name", elastic=es, settings=_settings(), include_synth=True)
+    must_not = es.calls[0]["query"]["bool"].get("must_not", [])
+    assert _SYNTH_CLAUSE not in must_not

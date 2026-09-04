@@ -19,7 +19,7 @@ import logging
 from collections.abc import Callable
 from typing import Any, NoReturn, cast
 
-from soc_ai.agent.toolset import PHASE_D_TOOLS, _clamp_tool_result
+from soc_ai.agent.toolset import PHASE_D_TOOLS, _clamp_tool_result, strip_synth_markers
 from soc_ai.agent.triage import TargetedGap
 
 _LOGGER = logging.getLogger(__name__)
@@ -95,7 +95,10 @@ async def run_targeted_investigation(
         return await _dispatch_named_tool(gap.tool_name, gap.tool_args, ctx)
     except Exception as e:
         _LOGGER.exception("targeted investigation dispatch failed")
-        return f"targeted dispatch error: {type(e).__name__}: {e}"
+        # This string lands verbatim in the round-2 synth prompt; an ES error
+        # can name the failing index, so it passes the same model boundary the
+        # success path does (_clamp_tool_result strips it there).
+        return strip_synth_markers(f"targeted dispatch error: {type(e).__name__}: {e}")
 
 
 def _raise_arg_type_error(tool_name: str, args: dict[str, Any], cause: TypeError) -> NoReturn:
@@ -120,7 +123,6 @@ def _dispatch_table() -> dict[str, Callable[..., Any]]:
     (tests/test_toolset.py) — add new Phase-D tools in BOTH places.
     """
     from soc_ai.tools.crawl_page import crawl_page  # noqa: PLC0415
-    from soc_ai.tools.decode_payload import decode_payload  # noqa: PLC0415
     from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip  # noqa: PLC0415
     from soc_ai.tools.get_event_raw import get_event_raw  # noqa: PLC0415
     from soc_ai.tools.get_pcap import get_pcap_facts  # noqa: PLC0415
@@ -143,7 +145,6 @@ def _dispatch_table() -> dict[str, Callable[..., Any]]:
         "t_query_detections": query_detections,
         "t_get_rule_content": get_rule_content,
         "t_get_event_raw": get_event_raw,
-        "t_decode_payload": decode_payload,
         "t_get_playbooks": get_playbooks,
         "t_lookup_runbook": lookup_runbook,
         "t_get_pcap": get_pcap_facts,
@@ -196,6 +197,19 @@ async def _dispatch_named_tool(
         # get_event_raw / get_playbooks) drop it via the signature filter below —
         # the same mechanism that already drops the injected `auth`.
         base_kwargs["time_anchor"] = getattr(ctx, "default_time_anchor", None)
+        # Thread the synth-doc visibility scope exactly as the interactive
+        # wrappers do (toolset.py passes include_synth=ctx.include_synth on
+        # every query tool). Without it query_events_oql / query_zeek_logs fall
+        # to their prod default (include_synth=False), which injects `must_not
+        # exists synth.scenario_id` — so an eval-mode Phase-D query
+        # STRUCTURALLY cannot return the scenario's own planted documents: it
+        # returns zero hits and round-2 concludes there is nothing there.
+        # (t_get_event_raw fetches by _id with no filter, which is why traces
+        # still showed planted docs arriving by that route.) The default False
+        # keeps the prod kill-switch for any context without an explicit
+        # opt-in; family members without the kwarg drop it via the signature
+        # filter below, like `auth` and `time_anchor`.
+        base_kwargs["include_synth"] = getattr(ctx, "include_synth", False)
     elif tool_name == "t_lookup_runbook":
         # Operator-runbook search hits the local store, not ES — inject the
         # session factory instead of elastic/auth. ``settings`` is unused by

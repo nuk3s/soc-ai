@@ -174,15 +174,20 @@ def _substitute_one(
     return value
 
 
-def _stamp_synth_metadata(body: dict[str, Any], scenario: Scenario) -> None:
+def _stamp_synth_metadata(body: dict[str, Any], scenario: Scenario, plant_id: str | None) -> None:
     """Stamp synth.* fields so prod queries can filter them out.
 
     Only stamps scenario_id + scenario_version — the answer key
     (expected_verdict) is intentionally NOT stamped because the agent
     under test can query these docs via OpenSearch. Scoring reads
     ground truth from the Scenario object, not this field.
+
+    ``plant_id`` (default: the scenario's own id) is the value stamped into
+    ``synth.scenario_id`` — the exact string the per-run ``SynthScope`` filter
+    term-matches. Repeated plants of one scenario pass a distinct plant id per
+    copy so each run sees only its OWN planted documents.
     """
-    body.setdefault("synth.scenario_id", scenario.id)
+    body.setdefault("synth.scenario_id", plant_id or scenario.id)
     body.setdefault("synth.scenario_version", scenario.version)
 
 
@@ -192,6 +197,7 @@ def _render_event(
     scenario: Scenario,
     run_time: datetime,
     triage_community_id: str | None,
+    plant_id: str | None = None,
 ) -> RenderedDoc:
     # First pass: substitute non-community-id placeholders.
     pre_rendered: dict[str, Any] = {}
@@ -217,16 +223,21 @@ def _render_event(
             triage_community_id=triage_community_id,
         )
 
-    _stamp_synth_metadata(body, scenario)
+    _stamp_synth_metadata(body, scenario, plant_id)
     return RenderedDoc(index=event.index, body=body, is_triage_target=event.is_triage_target)
 
 
-def render_scenario(scenario: Scenario, *, run_time: datetime) -> list[RenderedDoc]:
+def render_scenario(
+    scenario: Scenario, *, run_time: datetime, plant_id: str | None = None
+) -> list[RenderedDoc]:
     """Render every event in ``scenario`` into a list of ECS-shaped docs.
 
     The triage-target event is rendered first so its community_id is
     available when supporting events resolve ``{{ same_as_triage }}``.
     The returned list preserves the scenario's authored event order.
+
+    ``plant_id`` overrides the ``synth.scenario_id`` stamp (see
+    :func:`_stamp_synth_metadata`); ``None`` keeps the scenario's own id.
     """
     triage_idx = next((i for i, e in enumerate(scenario.events) if e.is_triage_target), None)
     if triage_idx is None:
@@ -241,6 +252,7 @@ def render_scenario(scenario: Scenario, *, run_time: datetime) -> list[RenderedD
         scenario=scenario,
         run_time=run_time,
         triage_community_id=None,
+        plant_id=plant_id,
     )
     triage_community_id = triage_doc.body.get("network.community_id")
     docs[triage_idx] = triage_doc
@@ -253,6 +265,7 @@ def render_scenario(scenario: Scenario, *, run_time: datetime) -> list[RenderedD
             scenario=scenario,
             run_time=run_time,
             triage_community_id=triage_community_id,
+            plant_id=plant_id,
         )
 
     return [d for d in docs if d is not None]

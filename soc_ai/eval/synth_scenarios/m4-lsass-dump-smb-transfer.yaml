@@ -1,0 +1,194 @@
+id: m4-lsass-dump-smb-transfer
+name: "LSASS memory dump written across SMB after a tool transfer"
+version: 1
+tier: medium
+story: |
+  Workstation 10.0.0.63 mounts \\10.0.0.142\C$ and writes procdump64.exe into
+  \Windows\Temp. Forty-one seconds later it writes a 45 MB file named
+  lsass.DMP back across the same SMB session. No signature fires on either
+  transfer — SMB file writes between domain-joined hosts are ordinary — and a
+  Zeek-side analytic raises an Informational notice on the filename only. The
+  content of the finding is what the two files are TOGETHER: the tool that
+  captures process memory, moved first, then a memory image of the process
+  that holds every cached credential on the box, moved second, in the same
+  five-minute window, between two workstations neither of which is a
+  management server.
+attack:
+  - T1003.001  # OS Credential Dumping: LSASS Memory
+  - T1570      # Lateral Tool Transfer
+  - T1021.002  # Remote Services: SMB/Windows Admin Shares
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - prefetch_pivot         # smb_files: lsass.DMP write, 45 MB
+    - prefetch_pivot         # smb_files: procdump64.exe staged first
+    - typed_path             # rule.name / smb path
+  expected_actions:
+    - kind: escalate
+    - kind: isolate
+      target_field: source.ip
+    - kind: isolate
+      target_field: destination.ip
+  expected_field_reconciliation: false
+
+events:
+  - index: logs-synth-suricata-alert
+    time_offset_seconds: 0
+    is_triage_target: true
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: suricata.alert
+      event.module: suricata
+      event.kind: alert
+      event.category: [network, intrusion_detection]
+      event.action: allowed
+      event.severity: 3
+      source.ip: "10.0.0.63"
+      source.port: 50882
+      destination.ip: "10.0.0.142"
+      destination.port: 445
+      network.transport: tcp
+      network.protocol: smb
+      network.community_id: "{{ community_id(source.ip, source.port, destination.ip, destination.port, 'tcp') }}"
+      rule.name: "SOC-AI ANALYTIC Process Memory Dump Artifact Transferred Over SMB"
+      rule.category: "Attempted Administrator Privilege Gain"
+      rule.signature: "9700021"  # illustrative SID — Zeek analytic surfaced as an alert
+      # Real Security Onion shape: Suricata rule metadata rides rule.metadata
+      # (single-element-list values) and the classtype rides the EVE message
+      # JSON as alert.category — SoAlert reads both from there, and a flat
+      # top-level copy is invisible to the typed parse.
+      rule.metadata:
+        signature_severity: ["Informational"]
+      message: '{"alert": {"category": "attempted-admin"}}'
+      observer.name: "so-sensor-1"
+      synth.scenario_id: m4-lsass-dump-smb-transfer
+      synth.scenario_version: 1
+
+  - index: logs-synth-zeek-smb-mapping
+    time_offset_seconds: -63
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-63) }}"
+      event.dataset: zeek.smb_mapping
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      destination.ip: "10.0.0.142"
+      destination.port: 445
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_mapping.path: "\\\\10.0.0.142\\C$"
+      zeek.smb_mapping.service: "C$"
+      zeek.smb_mapping.share_type: "DISK"
+      synth.scenario_id: m4-lsass-dump-smb-transfer
+
+  # Stage one: the capture tool goes across.
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: -55
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-55) }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      destination.ip: "10.0.0.142"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_WRITE"
+      zeek.smb_files.name: "procdump64.exe"
+      zeek.smb_files.path: "\\\\10.0.0.142\\C$\\Windows\\Temp\\procdump64.exe"
+      zeek.smb_files.size: 674648
+      synth.scenario_id: m4-lsass-dump-smb-transfer
+
+  # Stage two: the memory image comes back.
+  - index: logs-synth-zeek-smb-files
+    time_offset_seconds: -14
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-14) }}"
+      event.dataset: zeek.smb_files
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      destination.ip: "10.0.0.142"
+      network.community_id: "{{ same_as_triage }}"
+      zeek.smb_files.action: "SMB::FILE_WRITE"
+      zeek.smb_files.name: "lsass.DMP"
+      zeek.smb_files.path: "\\\\10.0.0.142\\C$\\Windows\\Temp\\lsass.DMP"
+      zeek.smb_files.size: 47185920
+      synth.scenario_id: m4-lsass-dump-smb-transfer
+
+  - index: logs-synth-zeek-conn
+    time_offset_seconds: -63
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-63) }}"
+      event.dataset: zeek.conn
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      source.port: 50882
+      destination.ip: "10.0.0.142"
+      destination.port: 445
+      network.transport: tcp
+      network.community_id: "{{ same_as_triage }}"
+      zeek.conn.state: "SF"
+      zeek.conn.history: "ShAdDaFf"
+      zeek.conn.duration: 63.9
+      zeek.conn.orig_bytes: 48104832
+      zeek.conn.resp_bytes: 21440
+      zeek.conn.local_orig: true
+      zeek.conn.local_resp: true
+      zeek.conn.service: "smb"
+      synth.scenario_id: m4-lsass-dump-smb-transfer
+
+  # Role context: neither endpoint is a management or backup host, and this
+  # pair has no SMB history. Without this, "one host wrote a file to another"
+  # is unremarkable; with it, the pair itself is novel.
+  - index: logs-synth-zeek-smb-summary
+    time_offset_seconds: -300
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-300) }}"
+      event.dataset: zeek.smb_summary
+      event.module: zeek
+      event.kind: event
+      source.ip: "10.0.0.63"
+      destination.ip: "10.0.0.142"
+      synth.smb_pair_profile:
+        source_role: "user-workstation"
+        destination_role: "user-workstation"
+        pair_prior_days_with_smb: 0        # these two have never spoken over SMB
+        source_admin_share_writes_baseline_30d: 0
+        distinct_admin_shares_touched_today: 1
+        management_host: false             # neither is SCCM / backup / RMM
+      synth.scenario_id: m4-lsass-dump-smb-transfer
+
+rubric_notes: |
+  Medium TP. The alert is Informational and names only a filename pattern —
+  taken at face value it is a naming coincidence. The verdict comes from the
+  SEQUENCE and the SIZE, both of which are in the Zeek SMB records:
+
+  (1) procdump64.exe (674 KB) is written to \Windows\Temp on the peer, then
+  (2) lsass.DMP (47,185,920 bytes) is written back over the same session
+      41 seconds later. Forty-five megabytes is the right order of magnitude
+      for a full LSASS process image and the wrong one for anything that
+      merely borrows the name; a decoy file would not be sized like the
+      process it claims to be.
+  (3) Neither host is a management server and the pair has no SMB history at
+      all in the preceding 30 days.
+
+  This is credential theft in flight: LSASS holds cached domain credentials,
+  so the dump file is functionally a bundle of passwords in transit. Both
+  endpoints are isolate targets — the source ran the tooling, the destination
+  now stores the credential material.
+
+  What must NOT carry the verdict: the filename alone. A system that
+  escalates on `lsass` appearing in a path, without the size and without the
+  staged tool, will also escalate on b3's signed vendor MSI push and on any
+  backup agent that touches an admin share. The paired benign twin for the
+  "workstation writes an executable to a peer's admin share" shape is
+  b3-rmm-admin-lateral, where the artifact is a signed vendor installer, the
+  source is the sanctioned RMM host, and no memory image ever moves.

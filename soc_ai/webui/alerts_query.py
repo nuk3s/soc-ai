@@ -344,9 +344,14 @@ _NESTED_HOST_IP = "event_data.metadata.input.beats.host.ip"
 def _host_name(source: dict[str, Any]) -> str:
     """Name of the machine a detection fired on, or the "—" placeholder.
 
-    Top-level ``host.name`` WINS where it exists: on a Suricata alert it is the
-    SENSOR name and the grid is read that way, so the nested endpoint document is
-    only consulted when there is no top-level host at all. Without that fallback
+    Top-level ``host.name`` WINS where it exists. On Security Onion network-
+    sensor docs (Suricata/Zeek) it never does — SO strips the shipper's
+    ``host.*`` and the sensor identity rides ``observer.name`` instead
+    (verified against the live grid: zero of ~670k suricata.alert docs carry
+    ``host.name``) — so those render "—" here. Where it IS present
+    (endpoint/syslog/osquery datasets, or a non-SO Filebeat pipeline) it
+    names the shipping machine, and the nested endpoint document is only
+    consulted when there is no top-level host at all. Without that fallback
     every endpoint/process detection showed "—" — soc-ai could not name the
     machine on exactly the detection class host-log shipping is growing.
     """

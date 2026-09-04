@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from soc_ai.eval.synth_loader import load_all_scenarios
@@ -53,11 +54,14 @@ def test_score_all_correct_yields_recall_one() -> None:
 
     score = score_synth_stratum(rows, scenarios=scenarios)
 
-    assert score.true_positive_count == 9
+    assert score.true_positive_count == 17
     assert score.false_negative_count == 0
     assert score.escalation_recall == 1.0
-    # 9/9 → Wilson 95% lower bound ≈ 0.701
-    assert score.escalation_recall_ci[0] == pytest.approx(0.701, abs=0.01)
+    # 17/17 → Wilson 95% lower bound ≈ 0.816. The catalogue widening from 9 to
+    # 17 attacks is visible right here: perfect recall on 9 could only claim
+    # 0.70 with 95% confidence, on 17 it claims 0.82 — the same result, said
+    # with more of the noise squeezed out.
+    assert score.escalation_recall_ci[0] == pytest.approx(0.816, abs=0.01)
     assert score.escalation_recall_ci[1] == 1.0
 
 
@@ -78,7 +82,7 @@ def test_score_all_missed_yields_recall_zero() -> None:
     score = score_synth_stratum(rows, scenarios=scenarios)
 
     assert score.true_positive_count == 0
-    assert score.false_negative_count == 9
+    assert score.false_negative_count == 17
     assert score.escalation_recall == 0.0
 
 
@@ -302,7 +306,7 @@ def test_score_to_dict_round_trips_with_floats() -> None:
     score = score_synth_stratum(rows, scenarios=scenarios)
 
     d = score.to_dict()
-    assert d["true_positive_count"] == 9
+    assert d["true_positive_count"] == 17
     assert d["false_negative_count"] == 0
     assert d["escalation_recall"] == 1.0
     assert isinstance(d["escalation_recall_ci"], list)
@@ -310,10 +314,12 @@ def test_score_to_dict_round_trips_with_floats() -> None:
     assert d["per_scenario"]["e1-emotet-feodo-c2"]["correct"] is True
 
 
-def test_nonempty_expected_actions_adds_unscoreable_miss_reason_without_flipping_correct() -> None:
-    """When a scenario has expected_actions and the row carries no action data,
-    miss_reasons must record an unscoreable-miss entry — never silently drop it.
-    correct must NOT be affected (#49: graders, not gatekeepers)."""
+def test_nonempty_expected_actions_adds_miss_reasons_without_flipping_correct() -> None:
+    """When a scenario has expected_actions and the row recommends nothing,
+    miss_reasons must record each unmet expectation — never silently drop it.
+    A mappable kind (escalate) reads as not-recommended; a kind outside the
+    v1 write-tool vocabulary (isolate) reads as unmappable. correct must NOT
+    be affected either way (#49: graders, not gatekeepers)."""
     from soc_ai.eval.synth_loader import Scenario
     from soc_ai.eval.synth_score import SynthRow, _score_one
 
@@ -344,8 +350,7 @@ def test_nonempty_expected_actions_adds_unscoreable_miss_reason_without_flipping
         }
     )
 
-    # Row has correct verdict + confidence; no action data (SynthRow has no
-    # actions field — actions are not captured in the indexed row).
+    # Row has correct verdict + confidence; recommends no actions.
     row = SynthRow(
         scenario_id="test-actions",
         verdict="true_positive",
@@ -356,14 +361,19 @@ def test_nonempty_expected_actions_adds_unscoreable_miss_reason_without_flipping
 
     # Verdict + confidence correct → still correct overall.
     assert detail.correct is True
-    # But miss_reasons must record that expected_actions could not be scored.
-    assert any("expected_actions unscoreable" in r for r in detail.miss_reasons), (
-        f"expected an 'expected_actions unscoreable' miss reason, got: {detail.miss_reasons}"
+    # The unmet escalation is a not-recommended miss...
+    assert any(
+        "expected action not recommended" in r and "escalate" in r for r in detail.miss_reasons
+    ), f"expected a not-recommended miss reason for 'escalate', got: {detail.miss_reasons}"
+    # ...while isolate is reported as unmappable (no v1 write tool), not
+    # blamed on the model.
+    assert any("no write-tool equivalent" in r and "isolate" in r for r in detail.miss_reasons), (
+        f"expected an unmappable-kind reason for 'isolate', got: {detail.miss_reasons}"
     )
 
 
-def test_empty_expected_actions_does_not_add_unscoreable_miss_reason() -> None:
-    """When expected_actions is empty, no unscoreable-miss entry is added."""
+def test_empty_expected_actions_does_not_add_action_miss_reason() -> None:
+    """When expected_actions is empty, no action-related entry is added."""
     from soc_ai.eval.synth_loader import Scenario
     from soc_ai.eval.synth_score import SynthRow, _score_one
 
@@ -400,8 +410,8 @@ def test_empty_expected_actions_does_not_add_unscoreable_miss_reason() -> None:
     detail = _score_one(row, scenario)
 
     assert detail.correct is True
-    assert not any("expected_actions" in r for r in detail.miss_reasons), (
-        f"expected no 'expected_actions' entry in miss_reasons, got: {detail.miss_reasons}"
+    assert not any("expected action" in r for r in detail.miss_reasons), (
+        f"expected no action entry in miss_reasons, got: {detail.miss_reasons}"
     )
 
 
@@ -416,9 +426,24 @@ def test_benign_scenarios_load_and_are_false_positive() -> None:
         "b1-cdn-update-beacon",
         "b2-authorized-vuln-scanner",
         "b3-rmm-admin-lateral",
+        "b4-av-dns-reputation",
+        "b5-sanctioned-wmi-inventory",
+        "b6-backup-scheduled-transfer",
+        "b7-browser-doh",
+        "b8-dc-replication-partner",
     ]
-    # Each spans a distinct difficulty tier.
-    assert sorted(s.tier for s in benign) == ["easy", "hard", "medium"]
+    # The stratum spans all three difficulty tiers, weighted toward medium and
+    # hard — the easy shapes were never where over-escalation lives.
+    assert sorted(s.tier for s in benign) == [
+        "easy",
+        "hard",
+        "hard",
+        "hard",
+        "medium",
+        "medium",
+        "medium",
+        "medium",
+    ]
 
 
 def test_benign_not_escalated_scores_as_true_negative() -> None:
@@ -567,4 +592,229 @@ def test_score_per_tier_breakdown() -> None:
     assert score.per_tier["easy"].recall == 1.0
     assert score.per_tier["medium"].recall == 1.0
     assert score.per_tier["hard"].recall == 0.0
-    assert score.per_tier["hard"].false_negative_count == 3
+    assert score.per_tier["hard"].false_negative_count == 6
+
+
+# --------------------------------------------------------------------
+# Repeated runs per scenario (--repeats): per-scenario stability,
+# majority-vote headline metrics, all-runs sub-aggregate, flip rate.
+# --------------------------------------------------------------------
+
+
+def _tp_scenario(scenario_id: str, *, tier: str = "easy", conf_min: float = 0.7) -> Any:
+    from soc_ai.eval.synth_loader import Scenario
+
+    return Scenario.model_validate(
+        {
+            "id": scenario_id,
+            "name": "test",
+            "version": 1,
+            "tier": tier,
+            "story": "x",
+            "attack": ["T1071.001"],
+            "ground_truth": {
+                "verdict": "true_positive",
+                "confidence_min": conf_min,
+                "required_citation_kinds": [],
+                "expected_actions": [],
+            },
+            "events": [
+                {
+                    "index": "logs-synth-suricata-alert",
+                    "is_triage_target": True,
+                    "fields": {"@timestamp": "2026-01-01T00:00:00Z"},
+                }
+            ],
+        }
+    )
+
+
+def _tp_row(scenario_id: str, *, verdict: str = "true_positive", confidence: float = 0.9) -> Any:
+    from soc_ai.eval.synth_score import SynthRow
+
+    return SynthRow(scenario_id=scenario_id, verdict=verdict, confidence=confidence, citations=[])
+
+
+def test_repeats_stability_block_reports_distribution() -> None:
+    """5 repeats of one scenario (3 strict passes, 2 misses) must surface as a
+    distribution — repeats/strict_passes/pass_rate + every confidence seen —
+    not as 5 rows silently double-counted into the headline."""
+    from soc_ai.eval.synth_score import score_synth_stratum
+
+    scen = _tp_scenario("rep-a")
+    rows = [
+        _tp_row("rep-a", confidence=0.72),
+        _tp_row("rep-a", confidence=0.70),
+        _tp_row("rep-a", confidence=0.75),
+        _tp_row("rep-a", confidence=0.60),  # below floor → strict miss
+        _tp_row("rep-a", verdict="false_positive", confidence=0.80),  # wrong verdict
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[scen])
+
+    stab = score.per_scenario_stability["rep-a"]
+    assert stab.repeats == 5
+    assert stab.strict_passes == 3
+    assert stab.pass_rate == pytest.approx(0.6)
+    assert sorted(stab.confidences) == [0.60, 0.70, 0.72, 0.75, 0.80]
+    assert stab.errored_runs == 0
+    # Non-unanimous repeats → the scenario flips; it is the only multi-run one.
+    assert score.flip_rate == pytest.approx(1.0)
+
+
+def test_repeats_headline_is_per_scenario_majority_all_runs_kept() -> None:
+    """Headline recall aggregates per-scenario MAJORITY (one unlucky repeat
+    can't swing it); the per-run numbers stay available under all_runs. Each
+    tier's Wilson CI uses its own denominator: scenarios for the headline,
+    runs for all_runs."""
+    from soc_ai.eval.synth_score import score_synth_stratum, wilson_ci
+
+    scen_a = _tp_scenario("rep-a")
+    scen_b = _tp_scenario("rep-b", tier="hard")
+    rows = [
+        # A: 2/3 strict passes → majority pass.
+        _tp_row("rep-a"),
+        _tp_row("rep-a"),
+        _tp_row("rep-a", verdict="needs_more_info"),
+        # B: 0/3 → majority fail.
+        _tp_row("rep-b", verdict="false_positive"),
+        _tp_row("rep-b", verdict="false_positive"),
+        _tp_row("rep-b", verdict="false_positive"),
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[scen_a, scen_b])
+
+    # Headline: scenario-denominated (2 scenarios, 1 majority-pass).
+    assert score.true_positive_count == 1
+    assert score.false_negative_count == 1
+    assert score.escalation_recall == pytest.approx(0.5)
+    assert score.escalation_recall_ci == pytest.approx(wilson_ci(1, 2))
+    # Per-tier stays scenario-denominated too.
+    assert score.per_tier["easy"].true_positive_count == 1
+    assert score.per_tier["hard"].false_negative_count == 1
+    # All-runs: run-denominated (6 runs, 2 strict passes).
+    assert score.all_runs is not None
+    assert score.all_runs.true_positive_count == 2
+    assert score.all_runs.false_negative_count == 4
+    assert score.all_runs.escalation_recall == pytest.approx(2 / 6)
+    assert score.all_runs.escalation_recall_ci == pytest.approx(wilson_ci(2, 6))
+    # Flip rate: A non-unanimous, B unanimous → 1 of 2 multi-run scenarios.
+    assert score.flip_rate == pytest.approx(0.5)
+
+
+def test_repeats_tie_is_not_a_majority() -> None:
+    """An even split (1/2) is NOT a majority pass — strict metrics stay
+    conservative under ties."""
+    from soc_ai.eval.synth_score import score_synth_stratum
+
+    scen = _tp_scenario("rep-tie")
+    rows = [
+        _tp_row("rep-tie"),
+        _tp_row("rep-tie", verdict="needs_more_info"),
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[scen])
+
+    assert score.true_positive_count == 0
+    assert score.false_negative_count == 1
+    assert score.false_negative_breakdown["missed"] == 1
+    assert score.per_scenario["rep-tie"].correct is False
+
+
+def test_repeats_errored_runs_count_against_the_scenario() -> None:
+    """attempted_repeats carries the PLANNED run count, so an errored repeat
+    (no scored row) still lands in the denominator — both in the stability
+    block and in the majority vote — instead of silently shrinking it."""
+    from soc_ai.eval.synth_score import score_synth_stratum
+
+    scen_a = _tp_scenario("rep-a")
+    scen_b = _tp_scenario("rep-b")
+    rows = [
+        # A: 2 scored passes of 3 attempted → majority pass (2*2 > 3).
+        _tp_row("rep-a"),
+        _tp_row("rep-a"),
+        # B: 1 scored pass of 3 attempted → no majority (1*2 <= 3) → FN.
+        _tp_row("rep-b"),
+    ]
+
+    score = score_synth_stratum(
+        rows,
+        scenarios=[scen_a, scen_b],
+        attempted_repeats={"rep-a": 3, "rep-b": 3},
+    )
+
+    stab_a = score.per_scenario_stability["rep-a"]
+    assert stab_a.repeats == 3
+    assert stab_a.strict_passes == 2
+    assert stab_a.errored_runs == 1
+    assert score.true_positive_count == 1
+    assert score.false_negative_count == 1
+    # B's majority-fail is dominated by errored runs (2 errored vs 0 scored misses).
+    assert score.false_negative_breakdown["errored"] == 1
+    # All-runs: 6 attempted expected-TP runs, 3 strict passes, 3 errored.
+    assert score.all_runs is not None
+    assert score.all_runs.true_positive_count == 3
+    assert score.all_runs.false_negative_count == 3
+    assert score.all_runs.false_negative_breakdown["errored"] == 3
+
+
+def test_repeats_verdict_only_majority_shares_scenario_denominator() -> None:
+    """Verdict-only recall under repeats is also a per-scenario majority over
+    correct-verdict escalations (any confidence)."""
+    from soc_ai.eval.synth_score import score_synth_stratum, wilson_ci
+
+    scen_a = _tp_scenario("rep-a", conf_min=0.75)
+    scen_b = _tp_scenario("rep-b")
+    rows = [
+        # A: escalates correctly 3/3 but always under the floor → strict fail,
+        # verdict-only pass.
+        _tp_row("rep-a", confidence=0.60),
+        _tp_row("rep-a", confidence=0.62),
+        _tp_row("rep-a", confidence=0.65),
+        # B: never escalates.
+        _tp_row("rep-b", verdict="needs_more_info"),
+        _tp_row("rep-b", verdict="needs_more_info"),
+        _tp_row("rep-b", verdict="needs_more_info"),
+    ]
+
+    score = score_synth_stratum(rows, scenarios=[scen_a, scen_b])
+
+    assert score.escalation_recall == 0.0
+    assert score.escalation_recall_verdict_only == pytest.approx(0.5)
+    assert score.escalation_recall_verdict_only_ci == pytest.approx(wilson_ci(1, 2))
+    assert score.false_negative_breakdown == {"missed": 1, "low_confidence": 1, "errored": 0}
+
+
+def test_single_run_flip_rate_is_none_and_stability_still_reported() -> None:
+    """With one run per scenario the flip rate is UNDEFINED (None, not 0.0 —
+    a single sample can't demonstrate stability), but the stability block is
+    still emitted so consumers have one shape."""
+    from soc_ai.eval.synth_score import score_synth_stratum
+
+    scen = _tp_scenario("rep-a")
+    score = score_synth_stratum([_tp_row("rep-a", confidence=0.8)], scenarios=[scen])
+
+    assert score.flip_rate is None
+    stab = score.per_scenario_stability["rep-a"]
+    assert stab.repeats == 1
+    assert stab.strict_passes == 1
+    assert stab.confidences == [0.8]
+
+
+def test_repeats_to_dict_carries_stability_flip_rate_and_all_runs() -> None:
+    from soc_ai.eval.synth_score import score_synth_stratum
+
+    scen = _tp_scenario("rep-a")
+    rows = [_tp_row("rep-a"), _tp_row("rep-a", verdict="needs_more_info")]
+    d = score_synth_stratum(rows, scenarios=[scen]).to_dict()
+
+    assert d["flip_rate"] == pytest.approx(1.0)
+    stab = d["per_scenario_stability"]["rep-a"]
+    assert stab["repeats"] == 2
+    assert stab["strict_passes"] == 1
+    assert stab["pass_rate"] == pytest.approx(0.5)
+    assert stab["confidences"] == [0.9, 0.9]
+    all_runs = d["all_runs"]
+    assert all_runs["true_positive_count"] == 1
+    assert all_runs["false_negative_count"] == 1
+    assert isinstance(all_runs["escalation_recall_ci"], list)

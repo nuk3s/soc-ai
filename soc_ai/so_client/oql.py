@@ -84,6 +84,25 @@ def get_whitelist() -> FieldWhitelist:
     return _WHITELIST
 
 
+# Deliberately-forbidden fields whose reject carries a targeted redirect
+# instead of the did-you-mean tail. ``_index`` selects documents by PHYSICAL
+# index name — no model-facing consumer needs that (dataset identity lives in
+# ``event.dataset`` / ``event.module``, and toolset.py already drops ``_index``
+# from every model-bound hit) — and on an eval grid ``_index:logs-synth*``
+# would select exactly the planted documents: the hits come back
+# marker-stripped, but the selection itself plus the total count is a
+# planted-document oracle. Refused at validation so the model gets a
+# correctable error; a silent empty result would be indistinguishable from
+# "no data". The hint itself stays eval-neutral — it is returned verbatim to
+# the model.
+_FORBIDDEN_FIELD_HINTS: dict[str, str] = {
+    "_index": (
+        "; the physical index name is not queryable — filter on "
+        "event.dataset or event.module instead"
+    ),
+}
+
+
 def _field_suggestion(name: str) -> str:
     """A ``; did you mean: …?`` tail naming the closest allowed fields, or ``""``.
 
@@ -92,7 +111,12 @@ def _field_suggestion(name: str) -> str:
     recurring, so naming the two or three nearest whitelisted names/prefixes
     (via :func:`difflib.get_close_matches`) converges it faster than the generic
     "use full ECS field names" line. Empty when nothing is close enough.
+    Deliberately-forbidden fields get their targeted redirect instead — a
+    did-you-mean over the whitelist would suggest ``_id`` for ``_index``,
+    which is not the correction the model needs.
     """
+    if hint := _FORBIDDEN_FIELD_HINTS.get(name):
+        return hint
     wl = get_whitelist()
     candidates = sorted(wl.exact | wl.prefixes)
     matches = difflib.get_close_matches(name, candidates, n=3, cutoff=0.6)

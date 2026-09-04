@@ -254,6 +254,64 @@ def first_present(source: Mapping[str, Any], candidates: Sequence[str]) -> Any:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Sensor-shipped identity
+#
+# A network-sensor document describes a FLOW between two endpoints; it is not
+# ABOUT either of them. Where a top-level ``host.name`` / ``host.hostname``
+# survives on one (a stock Filebeat / Elastic Agent pipeline — Security Onion
+# strips it), that field names the box that SHIPPED the document, so reading it
+# as the endpoint's identity hands every host on the segment its sensor's name.
+#
+# Found live on the attack range 2026-09-04: two agentless targets were both
+# reported as "SR-router", the Debian router that doubles as the Zeek/Suricata
+# sensor. Agentless hosts are the worst case — every document mentioning them
+# is shipped by something else, so there is no correct name to fall back to.
+# ---------------------------------------------------------------------------
+
+NETWORK_SENSOR_DATASET_PREFIXES: tuple[str, ...] = ("suricata.", "zeek.", "network_traffic.")
+NETWORK_SENSOR_MODULES: frozenset[str] = frozenset({"suricata", "zeek", "network_traffic"})
+HOST_OWN_ADDRESSES: tuple[str, ...] = ("host.ip",)
+
+
+def names_the_shipper(source: Mapping[str, Any], name: str, ip: str) -> bool:
+    """True when ``name`` identifies the box that shipped ``source``, not ``ip``.
+
+    Three tests in strict precedence:
+
+    1. ``host.ip`` — the shipping host's own address list. When present it is
+       authoritative and decides on its own: the identity belongs to whoever
+       owns those addresses, so the answer is simply whether ``ip`` is one.
+    2. A network-sensor dataset or module, where a surviving top-level host
+       identity is always the sensor rather than either flow endpoint.
+    3. ``observer.name`` equal to the name — an observer, by the word's ECS
+       meaning, watches something other than itself.
+
+    ``agent.name`` is deliberately NOT a test. On an endpoint's own EDR document
+    the agent runs on the host, so ``agent.name == host.name`` is the *normal*
+    shape; treating that as sensor evidence rejects exactly the documents this
+    lane exists to read.
+
+    Fails OPEN. A document with no ``host.ip``, an unenumerated dataset and no
+    ``observer.name`` is read as endpoint-authored. That leaves a real hole — a
+    sensor shipping under a dataset nobody listed — which is why ``host.ip``
+    leads: it is the one test that needs no list kept current.
+    """
+    own = first_present(source, HOST_OWN_ADDRESSES)
+    if isinstance(own, str):
+        own = [own]
+    if isinstance(own, (list, tuple)) and own:
+        return ip not in own
+    dataset = get_dotted(source, "event.dataset")
+    if isinstance(dataset, str) and dataset.startswith(NETWORK_SENSOR_DATASET_PREFIXES):
+        return True
+    module = get_dotted(source, "event.module")
+    if isinstance(module, str) and module in NETWORK_SENSOR_MODULES:
+        return True
+    observer = get_dotted(source, "observer.name")
+    return isinstance(observer, str) and observer == name
+
+
 # Per-(index, candidates) cache of the resolved aggregation field. Once a
 # candidate is confirmed to carry data on this deployment, repeated calls are
 # free until the TTL lapses. Keyed on (index, tuple(candidates)) so distinct

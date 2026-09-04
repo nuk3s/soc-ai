@@ -81,6 +81,8 @@ _ICON: dict[str, str] = {
     "chat_memory": "💬",
     "citation_validation": "✅",
     "citation_cap": "📉",
+    "confidence_floor_raise": "📈",
+    "evidence_gate_pivot_exemption": "✅",
     "coverage_cap": "📉",
     "template_ceiling": "📐",
     "rubric_derivation": "📐",
@@ -88,6 +90,8 @@ _ICON: dict[str, str] = {
     "evidence_gate_downgrade": "📉",
     "ungrounded_host_anchored_tp_downgrade": "📉",
     "malware_rule_name_ungrounded_downgrade": "📉",
+    "decisive_value_support_cap": "📉",
+    "unsupported_decisive_value_downgrade": "📉",
     "icmp_solicited_downgrade": "📉",
     "fast_path_escalation": "⚡",
     "fast_path_evidence_guard": "⚡",
@@ -98,6 +102,7 @@ _ICON: dict[str, str] = {
     "retask_skipped_no_closeable_gap": "·",
     "oracle_escalation": "🔮",
     "oracle_adjudication": "🔮",
+    "oracle_adjudication_failed": "🔮",
     "investigation_transcript": "📝",
     "auto_ack": "☑",
     "triage_report": "📋",
@@ -407,6 +412,14 @@ def _t_citation_cap(p: dict[str, Any]) -> str:
     )
 
 
+def _t_confidence_floor_raise(p: dict[str, Any]) -> str:
+    ground = _humanize(p.get("grounded_by") or "decisive evidence")
+    return (
+        f"Raised confidence to the escalation floor — grounded by {ground} "
+        f"({p.get('original_confidence')}→{p.get('floored_confidence')})"
+    )
+
+
 def _t_template_ceiling(p: dict[str, Any]) -> str:
     return f"Capped confidence to pattern ceiling ({p.get('template_confidence')})"
 
@@ -524,9 +537,19 @@ _STATIC_TITLES: dict[str, str] = {
     "malware_rule_name_ungrounded_downgrade": (
         "Confidence lowered: malware rule name not corroborated by evidence"
     ),
+    "decisive_value_support_cap": (
+        "Confidence lowered: an asserted indicator was not in the retrieved evidence"
+    ),
+    "unsupported_decisive_value_downgrade": (
+        "Verdict downgraded: the decisive indicator appears in no retrieved document"
+    ),
     "icmp_solicited_downgrade": "Verdict downgraded: ICMP replies were solicited (normal ping)",
+    "evidence_gate_pivot_exemption": (
+        "Evidence gate passed: verdict grounded in cited pivot evidence"
+    ),
     "fast_path_escalation": "Fast path escalated to a full investigation",
     "oracle_escalation": "Asked the Oracle for a second opinion",
+    "oracle_adjudication_failed": ("Oracle second opinion failed — the local verdict stands"),
     "investigation_transcript": "Investigation notes compiled",
     "model_response": "Model reasoning",
     "llm_request": "Model prompt sent",
@@ -546,6 +569,7 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "chat_memory": _t_chat_memory,
     "citation_validation": _t_citation_validation,
     "citation_cap": _t_citation_cap,
+    "confidence_floor_raise": _t_confidence_floor_raise,
     "template_ceiling": _t_template_ceiling,
     "coverage_cap": _t_coverage_cap,
     "verdict_floor_rewrite": _t_verdict_floor,

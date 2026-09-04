@@ -91,11 +91,17 @@ class InvestigationContext:
     blocklist: BlocklistDB = field(default_factory=BlocklistDB)
     maxmind: MaxmindReader = field(default_factory=MaxmindReader)
     cloud: CloudPrefixDB = field(default_factory=CloudPrefixDB)
-    # When True, the prefetch pivots are allowed to see synthetic
-    # eval docs (`synth.scenario_id`). Prod leaves this False so synth
-    # fixtures can never contaminate a real investigation; the eval harness
-    # sets it True only when triaging a known synth alert.
-    include_synth: bool = False
+    # Synth-doc visibility for every ES read tool (see
+    # soc_ai.tools._synth_scope.SynthScope). Prod leaves this False so synth
+    # eval docs (`synth.scenario_id`) can never contaminate a real
+    # investigation. The batch eval harness sets it to the SCENARIO ID under
+    # triage so the run sees its own planted docs but not its sibling
+    # scenarios' (a blanket True let every scenario read every other
+    # scenario's plants — cross-contamination). The hunt-journey runner
+    # still sets True: its analytics sweeps must see the plants and it runs
+    # one scenario at a time. Truthiness still means "synth-eval run" for
+    # the run recorders.
+    include_synth: bool | str = False
     # Internal-identifier discovery (increment 2c). The session factory for the
     # local store, threaded so the Oracle escalation path can resolve the
     # *effective* internal-identifier set (env-config union active detected/manual

@@ -1,7 +1,7 @@
 import { Activity, ArrowUpRight, Crosshair, Database, Gauge, RotateCw, Server, ShieldAlert, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { KindBadge, PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
+import { KindBadge, PipelineErrorChip, StatusTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { GeneralChatPanel } from '../components/GeneralChatPanel';
 import { QualityCard } from '../components/QualityCard';
@@ -1099,6 +1099,9 @@ export function Dashboard() {
                       className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-2.5 text-left last:border-0 hover:bg-surface-3"
                     >
                       <KindBadge kind={r.kind} />
+                      {/* A run against planted synthetic scenarios must never
+                          read as a real one — badge it wherever the row appears. */}
+                      {r.isSynthEval && <SyntheticEvalBadge />}
                       {/* Detection name + flow share one slot. Below `lg` they
                           STACK — name on its own line, endpoints under it —
                           because side by side they cannot both fit: the flow

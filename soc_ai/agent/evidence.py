@@ -10,6 +10,16 @@ import json
 import re
 from typing import Any
 
+from soc_ai.tools.get_alert_context import (
+    ENDPOINT_COVERAGE_DATASET_ABSENT as _ENDPOINT_COVERAGE_DATASET_ABSENT,
+)
+from soc_ai.tools.get_alert_context import (
+    ENDPOINT_COVERAGE_GAP_KEY as _ENDPOINT_COVERAGE_KEY,
+)
+from soc_ai.tools.get_alert_context import (
+    ENDPOINT_COVERAGE_HOST_UNCOVERED as _ENDPOINT_COVERAGE_HOST_UNCOVERED,
+)
+
 # Citation validator. Synthesizer prompts allow three citation
 # kinds:
 #   - "(id <es_id>)" or "(id sB86B...)"   — ES / SOC API id
@@ -182,33 +192,76 @@ _TYPED_EVIDENCE_KEYS: frozenset[str] = frozenset(
 # under these keys are harvested; nothing is ever substring-matched.
 _EVIDENCE_KEYS: frozenset[str] = _DOC_IDENTITY_KEYS | _TYPED_EVIDENCE_KEYS
 
+# The value classes that may earn the confidence FLOOR-RAISE when the verdict
+# asserts one (soc_ai.agent.gates, `confidence_floor_raise`). Raising is on the
+# dangerous side of the M2 boundary — a credited value LIFTS a true_positive to
+# escalation confidence — so this set is strictly narrower than
+# :data:`_EVIDENCE_KEYS`:
+#   * sensor-computed digests and fingerprints (``md5``/``sha1``/``sha256``/
+#     ``sha512``/``ssdeep``, ``ja3``/``ja3s``): computed by the sensor over
+#     observed content. An attacker can influence WHICH value appears (by
+#     varying their client or file bytes) but the value is then a true digest
+#     of their own observed activity — never an arbitrary minted token.
+#   * ``cipher`` — the fixed-vocabulary protocol enum leaf (Kerberos etype,
+#     TLS/SSH suite) as raw ES rows spell it (``zeek.kerberos.cipher``); the
+#     typed-attr spelling is covered by :data:`_PIVOT_ID_SAFE_ATTRS` below.
+#     Same class the M2 audit declared id-safe: choose-from-a-menu, not mint.
+#   * the :data:`_PIVOT_ID_SAFE_ATTRS` leaves — the SoAlert typed-attr
+#     spellings of the same hash/fingerprint/enum classes.
+# Deliberately absent, beyond the free-form content leaves `_EVIDENCE_KEYS`
+# already refuses:
+#   * document-identity keys (:data:`_DOC_IDENTITY_KEYS`) — a doc id proves
+#     the run RETRIEVED a document, not that anything malicious was observed;
+#     bare-id citing must never raise confidence (the pinned doctrine in
+#     tests/test_recall_fix.py::test_confidence_floor_raise_requires_decisive_value_not_bare_id);
+#   * detector rule metadata (``signature_severity``/``classtype``/
+#     ``severity_label``/``alert_action``) — crediting the rule's own labels
+#     for a confidence raise is rule-label anchoring, the BPFDoor pattern the
+#     malware-rule-name gate exists to stop.
+_RAISE_SAFE_EVIDENCE_KEYS: frozenset[str] = frozenset(
+    {
+        "md5",
+        "sha1",
+        "sha256",
+        "sha512",
+        "ssdeep",
+        "ja3",
+        "ja3s",
+        "cipher",
+        *_PIVOT_ID_SAFE_ATTRS,
+    }
+)
+
 _MAX_IDENTITY_WALK_DEPTH = 12
 
 
-def _collect_evidence_values(node: Any, out: set[str], depth: int = 0) -> None:
+def _collect_evidence_values(
+    node: Any, out: set[str], depth: int = 0, *, keys: frozenset[str] = _EVIDENCE_KEYS
+) -> None:
     """Collect lowercased document-id / typed-evidence strings from real structure.
 
     Walks dicts/lists only (never parses strings), harvesting string values —
     including fields-form list-wrapped values — whose key's leaf segment is in
-    :data:`_EVIDENCE_KEYS`. Depth-bounded and never raises on shape
-    surprises; a malformed payload just contributes nothing.
+    ``keys`` (default :data:`_EVIDENCE_KEYS`; the confidence floor-raise passes
+    the narrower :data:`_RAISE_SAFE_EVIDENCE_KEYS`). Depth-bounded and never
+    raises on shape surprises; a malformed payload just contributes nothing.
     """
     if depth > _MAX_IDENTITY_WALK_DEPTH:
         return
     if isinstance(node, dict):
         for key, value in node.items():
             leaf = key.rsplit(".", 1)[-1] if isinstance(key, str) else ""
-            if leaf in _EVIDENCE_KEYS:
+            if leaf in keys:
                 if isinstance(value, str) and value:
                     out.add(value.lower())
                 elif isinstance(value, list):
                     for item in value:
                         if isinstance(item, str) and item:
                             out.add(item.lower())
-            _collect_evidence_values(value, out, depth + 1)
+            _collect_evidence_values(value, out, depth + 1, keys=keys)
     elif isinstance(node, list):
         for item in node:
-            _collect_evidence_values(item, out, depth + 1)
+            _collect_evidence_values(item, out, depth + 1, keys=keys)
 
 
 def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
@@ -222,13 +275,28 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
     rather than dicts, so the walk parses a string that holds a JSON
     object and keeps descending. Without that, every citation into a
     message body (``alert.message.app_proto``) read as unresolved.
+
+    Some real keys CONTAIN dots — ``enrichments`` is keyed by indicator,
+    so an IP-keyed enrichment lives under ``"10.0.0.55"`` — and a true
+    citation like ``enrichments.10.0.0.55.internal`` splits into segments
+    no single key matches. At each dict level the walk therefore takes the
+    LONGEST dot-joined prefix of the remaining segments that is literally
+    a key at that level (greedy — it never backtracks to a shorter prefix
+    if the longest one later dead-ends). This stays STRUCTURAL: a segment
+    run only resolves by exact key membership in the retrieved dump, never
+    by scanning dumped text, so a path whose key does not exist in the
+    retrieved structure still cannot resolve (the M2 boundary,
+    2026-08-25 audit). When no key at a level contains a dot, the longest
+    joinable prefix is the single segment and the walk is unchanged.
     """
     try:
         dump = alert_ctx.model_dump(mode="json")
     except Exception:
         return False
+    parts = dotted.split(".")
     cur: Any = dump
-    for part in dotted.split("."):
+    i = 0
+    while i < len(parts):
         if isinstance(cur, str):
             # Embedded JSON object — parse once and keep walking.
             try:
@@ -239,14 +307,20 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
                 return False
             cur = parsed
         if isinstance(cur, dict):
-            if part not in cur:
+            for j in range(len(parts), i, -1):
+                candidate = ".".join(parts[i:j])
+                if candidate in cur:
+                    cur = cur[candidate]
+                    i = j
+                    break
+            else:
                 return False
-            cur = cur[part]
         elif isinstance(cur, list):
             try:
-                cur = cur[int(part)]
+                cur = cur[int(parts[i])]
             except (ValueError, IndexError):
                 return False
+            i += 1
         else:
             return False
     return cur is not None
@@ -321,7 +395,15 @@ def _loop_evidence_marker(
 # `auth.success` of 2026-08-05): inference presented as observation. Excluded here
 # rather than by sniffing the payload shape, because the shape is the dossier's
 # API and would drift; the tool name is the contract.
-NON_EVIDENTIAL_TOOLS = frozenset({"t_host_dossier"})
+#
+# `t_decode_payload` is in-process COMPUTE over model-supplied bytes: it decodes
+# a base64/hex string the model hands it and reports the entropy/strings/L7 sniff.
+# It observes nothing on the grid, so — like the dossier — it must not, on its
+# own, count as an investigation. On the Oracle tool surface this matters twice:
+# a decode of a string the model INVENTED could otherwise satisfy the override
+# gate's "back a flip with ≥1 successful tool call" and flip a verdict class with
+# zero grid access. Same argument, same fix: the tool name is the contract.
+NON_EVIDENTIAL_TOOLS = frozenset({"t_host_dossier", "t_decode_payload"})
 
 
 # Keys on a tool result that are bookkeeping / classification flags, NOT gathered
@@ -708,6 +790,29 @@ def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
             evidence.append(
                 f"MISP hit on {indicator}: {desc[:120]} (path enrichments.{indicator}.misp_hits)"
             )
+
+    # Endpoint coverage. When the prefetch established that the alert's hosts
+    # ship no endpoint telemetry (or the grid holds none at all), hand the
+    # synthesizer that fact as a CITABLE negative finding — otherwise it can
+    # only hedge around the missing process/file evidence, or return NMI
+    # naming an endpoint query that is guaranteed empty. The citation resolves
+    # against the bundle (prefetch_gaps carries the reason token). Constant
+    # wording, no per-run values: identical for a real uncovered host and a
+    # planted one.
+    coverage = (getattr(alert_ctx, "prefetch_gaps", None) or {}).get(_ENDPOINT_COVERAGE_KEY)
+    if coverage == _ENDPOINT_COVERAGE_HOST_UNCOVERED:
+        evidence.append(
+            "endpoint coverage gap: the grid ships endpoint telemetry, but this alert's "
+            "hosts have no endpoint documents in the surrounding window — no endpoint "
+            "agent covers them, so endpoint evidence cannot exist for them; a coverage "
+            "gap, not exoneration and not guilt (path prefetch_gaps.endpoint.coverage)"
+        )
+    elif coverage == _ENDPOINT_COVERAGE_DATASET_ABSENT:
+        evidence.append(
+            "endpoint coverage gap: the grid holds no endpoint/host-agent telemetry at "
+            "all in the surrounding window — endpoint evidence cannot exist for any host "
+            "here; a coverage gap, not exoneration (path prefetch_gaps.endpoint.coverage)"
+        )
 
     return evidence
 

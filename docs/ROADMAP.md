@@ -3,7 +3,7 @@
 soc-ai moves fast, and it moves in public. This page is the honest picture:
 what has shipped, what you can turn on today, and what comes next.
 
-![soc-ai roadmap: 1.0 through 1.2 shipped, 1.2.9 current, 1.3 and later planned](img/roadmap.svg)
+![soc-ai roadmap: 1.0 through 1.3 shipped, 1.4 current, proactive hunting next](img/roadmap.svg)
 
 ## The story so far
 
@@ -62,36 +62,98 @@ every surface an analyst depends on, from the topbar health pill to the audit
 chain, answers honestly instead of asserting numbers it never obtained. The
 rule it enforces end to end: a false all-clear outranks any loud error.
 
-**1.2.9 is where we are today.** The front-door release: the same care, aimed
-at the first thirty minutes. The installer asks how you'll reach a model (a
-local endpoint stays the primary; a cloud key gets redacted egress by default
-and a printed disclosure), the doctor preflights the traps that used to cost
-an afternoon — the audit write grant, a narrowed index pattern, DNS/TLS
-inside the container — with the fix named on every failing line, and the
-console opens as an analyst tool: eight day-1 config decisions with the rest
-behind per-section reveals, an Operate hub for the trust instruments, and a
-setup-health card that says what is broken instead of looking calm.
+**1.2.9 was the front-door release:** the same care, aimed at the first thirty
+minutes. The installer asks how you'll reach a model (a local endpoint stays
+the primary; a cloud key gets redacted egress by default and a printed
+disclosure), the doctor preflights the traps that used to cost an afternoon
+(the audit write grant, a narrowed index pattern, DNS and TLS inside the
+container) with the fix named on every failing line, and the console opens as
+an analyst tool: eight day-1 config decisions with the rest behind per-section
+reveals, an Operate hub for the trust instruments, and a setup-health card that
+says what is broken instead of looking calm.
+
+**1.3 made soc-ai a hunting tool, not a triage tool that also hunts.** A
+finding from a hunt can be promoted into a full investigation on its own
+anchor evidence, so "this looks odd" becomes a verdict without retyping
+anything. Four behavioral analytics sweep the network rather than the alert
+queue: beaconing cadence, DNS entropy, DCE-RPC operation histograms, and
+first-seen external destinations. And a confirmed true positive can be drafted
+into a Sigma rule, exported for you to review and deploy yourself. Nothing
+writes to your detection store.
+
+**1.3.2 was an adversarial security audit of our own work** — eighteen planted
+attacks against the redaction boundary, the citation grounding, and the route
+guards, with every finding either fixed or refuted on the record. Two of the
+defects it found were in earlier fixes.
+
+**1.4 is where we are today: the trust release.** Its subject is whether you
+can check soc-ai's judgement instead of taking it on faith.
+
+The evaluation could always plant an attack and score the verdict on one alert.
+It could never score the thing the product is actually for: a plain-English
+hunt across your network that surfaces a finding, promotes it, and reaches a
+verdict. That journey is now scored end to end, and when it falls short it says
+which step broke — the hunt found nothing, the finding cited no usable
+evidence, or the investigation reached the wrong verdict.
+
+A verdict must now rest on evidence soc-ai actually retrieved. The old checks
+confirmed that evidence had been gathered, never that it supported the
+conclusion, so a single successful lookup was enough to let a confidently wrong
+true positive stand — including one steered by text planted in the network
+traffic being analysed.
+
+And the cloud second opinion, if you turn it on, can now check its own claims
+with read-only tools instead of reasoning from whatever the local run happened
+to write down. Building that proved the outbound privacy gate was a blocklist:
+it blocked the field names we had thought of, and a bare internal hostname has
+no shape a filter can catch. So it flipped to the other polarity. Any value
+from a field the sanitizer does not recognise is masked before the model can
+see it, which makes the boundary complete by construction rather than by
+enumeration.
+
+One more thing in 1.4, less visible and more important than it sounds: the
+evaluation can run each scenario several times and report a confidence
+interval. A test-retest on code that provably could not affect the outcome
+moved a headline recall number by 0.235 and flipped six of twenty-five
+scenarios between pass and fail. A single batch cannot tell a real improvement
+from a coin flip, and now it does not pretend to.
 
 ## Already in the box, waiting on a switch
 
 A lot of soc-ai ships dark: built, tested, and off by default, because you
 should decide what runs on your network. Today that list includes semantic
 runbook search and reranking (point them at an embeddings model on your
-gateway), chat memory, the cloud Oracle second opinion, scheduled auto-triage,
-recurring hunts, scheduled identifier discovery, outbound notifications, PCAP
-fetch and decode, web search, and online enrichment. Each one is a config
-toggle, most of them hot-applied from the admin page.
+gateway), chat memory, the cloud Oracle second opinion and its tool loop,
+scheduled auto-triage, recurring hunts, scheduled identifier discovery,
+outbound notifications, PCAP fetch and decode, Sigma rule drafting, web search,
+and online enrichment. Each one is a config toggle, most of them hot-applied
+from the admin page.
 
-## What's next
+## What's next: hunting that starts without you
 
-**1.3 is the flip-the-switches release.** The schedulers have been burning in
-on a live deployment; the ones that earn it graduate to on-by-default. Chat
-notifications (Slack, Teams, Matrix) and a richer case bridge into Security
-Onion are the leading candidates alongside them.
+Everything through 1.4 waits for a person. An alert arrives, or you type an
+objective. The next line is about soc-ai deciding what to go looking for.
+
+**Analytic hunts that don't spend a model.** Every hunt today runs a language
+model over the whole objective, which puts a floor under what it costs to hunt
+and a ceiling on how often you can. Declarative hunts — a cheap query for
+candidates, deterministic code to refine them, the model spent only on what
+survives — make hunting cheap enough to leave running.
+
+**Baselines worth comparing against.** The analytics that shipped in 1.3
+measure cadence, entropy, and rarity. None of them knows what normal looks like
+for a particular host, at a particular hour, next to hosts that do the same
+job. "Unusual for this machine, compared to its peers, at this time of day" is
+the question we want to be able to ask.
+
+**Hunts that trigger themselves.** When a cluster of alerts shares a host, or a
+run of activity walks from reconnaissance to exploitation to command-and-
+control, that is the moment a hunt should start — not the next time somebody
+opens the console.
 
 **Further out:** multi-tenant deployments with role-based access for MSSPs and
-multi-team SOCs, detection mutation tools if a supported path into SO's
-detection store lands, and specialty copilots (detection engineering, IR
+multi-team SOCs, deploying drafted detections into Security Onion if a
+supported path lands, and specialty copilots (detection engineering, IR
 playbooks) on the same audited core.
 
 Plans change when evidence says they should; this page tracks reality, not

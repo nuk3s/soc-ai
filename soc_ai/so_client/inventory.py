@@ -92,7 +92,18 @@ async def discover_datasets(
         return cached[1]
 
     query: dict[str, Any] = {
-        "bool": {"filter": [{"range": {"@timestamp": {"gte": f"now-{window_minutes}m"}}}]}
+        "bool": {
+            "filter": [{"range": {"@timestamp": {"gte": f"now-{window_minutes}m"}}}],
+            # Synthetic-eval kill-switch, UNCONDITIONAL here: the inventory
+            # feeds only analyst surfaces (hunt-template availability, ambient
+            # prompt blocks, dossiers), and this TTL cache is shared across all
+            # of them — an opt-in would let one caller's synth-inclusive read
+            # be served to the rest for ttl_seconds. A live eval batch must
+            # never inflate the dataset list or its counts; eval-mode reads of
+            # planted docs go through the per-call ``include_synth`` opt-ins on
+            # the query tools instead.
+            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+        }
     }
     aggs: dict[str, Any] = {
         "datasets": {

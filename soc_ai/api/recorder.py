@@ -62,6 +62,7 @@ class InvestigationRecorder:
         kind: str = "suricata",
         hunt_id: str | None = None,
         finding_ordinal: int | None = None,
+        is_synth_eval: bool = False,
     ) -> None:
         self._maker = maker
         self._alert_id = alert_id
@@ -83,6 +84,11 @@ class InvestigationRecorder:
         self._kind = kind
         self._hunt_id = hunt_id
         self._finding_ordinal = finding_ordinal
+        # Synthetic-evaluation marker: this run (or the hunt it was promoted
+        # from) was allowed to see planted synth scenarios — the row must never
+        # be mistaken for real activity. Threaded from recorded_run; no API
+        # request body can supply it.
+        self._is_synth_eval = is_synth_eval
 
     async def start(self) -> str | None:
         try:
@@ -95,6 +101,7 @@ class InvestigationRecorder:
                     kind=self._kind,
                     hunt_id=self._hunt_id,
                     finding_ordinal=self._finding_ordinal,
+                    is_synth_eval=self._is_synth_eval,
                 )
         except Exception:
             _LOGGER.exception(
