@@ -38,6 +38,7 @@ from soc_ai.eval.synth_loader import (
     Scenario,
     load_all_scenarios,
     load_scenario_file,
+    triage_scenarios,
 )
 from soc_ai.eval.synth_render import render_scenario
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult, GridPartialResultsError
@@ -45,6 +46,7 @@ from soc_ai.so_client.models import SoAlert
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Hunt, Investigation
+from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.analytics import (
     _hunt_must_not,
     beacon_profile,
@@ -95,10 +97,21 @@ def test_hunt_must_not_admits_synth_when_opted_in(settings_kratos: Settings) -> 
 # ---------------------------------------------------------------------------
 
 _SYNTH_CLAUSE = {"exists": {"field": "synth.scenario_id"}}
+# The whole prod exclusion, every marker position.
+_SYNTH_MUST_NOT = synth_scope_must_not(False)
 
 
 def _cidr_clauses(must_not: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [c for c in must_not if "terms" in c and "destination.ip" in c["terms"]]
+
+
+# The claim these tests make about the three DNS/DCE-RPC sweeps is narrow: no
+# internal-destination exclusion may ride along, because their traffic IS
+# internal. It used to be spelled as equality with the synth clause list, which
+# asserted something much wider — that the query carries no other scope at all —
+# and so broke the day a second scope was threaded through the same helper,
+# while the thing it was written to protect had not changed. Spelled as itself
+# now, so it fails for its own reason or not at all.
 
 
 @pytest.mark.asyncio
@@ -133,11 +146,12 @@ async def test_dns_entropy_scan_body_excludes_synth_by_default(settings_kratos: 
 
     await dns_entropy_scan(elastic=elastic, settings=settings_kratos)
 
-    # EXACTLY the synth clause: routing through _hunt_must_not must not have
-    # smuggled in the internal-destination exclusion this tool never had
-    # (DNS resolvers are internal destinations).
+    # No internal-destination exclusion may be smuggled in by _hunt_must_not:
+    # DNS resolvers ARE internal destinations, so excluding them would drop the
+    # traffic this sweep measures.
     must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
-    assert must_not == [_SYNTH_CLAUSE]
+    assert all(clause in must_not for clause in _SYNTH_MUST_NOT)
+    assert _cidr_clauses(must_not) == []
 
 
 @pytest.mark.asyncio
@@ -147,7 +161,10 @@ async def test_dns_entropy_scan_body_admits_synth_when_opted_in(settings_kratos:
     await dns_entropy_scan(elastic=elastic, settings=settings_kratos, include_synth=True)
 
     must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
-    assert must_not == []
+    # The opt-in touches ONLY the synth clause, and it still brings no
+    # internal-destination exclusion with it.
+    assert _SYNTH_CLAUSE not in must_not
+    assert _cidr_clauses(must_not) == []
 
 
 @pytest.mark.asyncio
@@ -156,10 +173,11 @@ async def test_dcerpc_histogram_body_excludes_synth_by_default(settings_kratos: 
 
     await dcerpc_histogram(elastic=elastic, settings=settings_kratos)
 
-    # EXACTLY the synth clause: no internal-destination exclusion may ride
-    # along — DCE-RPC is lateral movement between INTERNAL hosts.
+    # No internal-destination exclusion may ride along — DCE-RPC is lateral
+    # movement between INTERNAL hosts.
     must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
-    assert must_not == [_SYNTH_CLAUSE]
+    assert all(clause in must_not for clause in _SYNTH_MUST_NOT)
+    assert _cidr_clauses(must_not) == []
 
 
 @pytest.mark.asyncio
@@ -169,7 +187,10 @@ async def test_dcerpc_histogram_body_admits_synth_when_opted_in(settings_kratos:
     await dcerpc_histogram(elastic=elastic, settings=settings_kratos, include_synth=True)
 
     must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
-    assert must_not == []
+    # The opt-in touches ONLY the synth clause, and it still brings no
+    # internal-destination exclusion with it.
+    assert _SYNTH_CLAUSE not in must_not
+    assert _cidr_clauses(must_not) == []
 
 
 @pytest.mark.asyncio
@@ -2042,7 +2063,12 @@ def _journey_grid(settings: Settings) -> tuple[ElasticClient, AsyncMock]:
         body = kwargs.get("body") or {}
         if "-logs-synth-*" in index:
             return _es_search_response([])  # containment: nothing escaped
-        if "aggs" in body:
+        # A probe asks for aggregates and no hits. "Has aggs" alone stopped
+        # discriminating once every OQL read began carrying a reserved
+        # composition agg (so a count can say what it counted) — routing the
+        # hunt's own grid read here as though it were the inventory probe, and
+        # failing the journey with an empty read rather than a real defect.
+        if "aggs" in body and not body.get("size"):
             return _es_search_response([])  # dataset-inventory probe
         ids = body.get("query", {}).get("ids", {}).get("values")
         if ids is not None:
@@ -2272,7 +2298,9 @@ def test_every_scenario_parses_its_severity_metadata_through_soalert() -> None:
     in a rendered triage document must be reachable through the typed parse.
     Visible-but-unresolvable is exactly what produced the unresolved-citation
     cluster (the model can see the value in raw and tries every spelling)."""
-    scenarios = load_all_scenarios(_SCENARIOS_DIR)
+    # Scoped to the triage population: this asserts a property of the rendered
+    # ALERT, and a spec_journey scenario deliberately has none.
+    scenarios = triage_scenarios(load_all_scenarios(_SCENARIOS_DIR))
     assert scenarios, "scenario catalogue is empty"
     for scenario in scenarios:
         docs = render_scenario(scenario, run_time=RUN_TIME)
@@ -3530,6 +3558,7 @@ def test_kerberoasting_classtype_no_longer_matches_the_benign_template() -> None
     endpoints internal, no blocklist hit) must not receive the benign
     clean_internal_traffic anchor — no template should match at all, so the
     synth reasons from the evidence."""
+    from soc_ai.agent.classifier import normalize_classtype
     from soc_ai.agent.decision_templates import _ATTACK_CLASSTYPES, match_decision_template
     from soc_ai.tools.get_alert_context import EnrichedAlertContext
 
@@ -3539,7 +3568,11 @@ def test_kerberoasting_classtype_no_longer_matches_the_benign_template() -> None
     alert = SoAlert.from_es_hit({"_id": "synth-h1", "_source": triage.body})
 
     assert alert.classtype == "attempted-recon"
-    assert (alert.classtype or "").lower() in _ATTACK_CLASSTYPES, (
+    # Through the normalizer, like every classtype comparison in the product:
+    # the scenarios render shortnames and a sensor sends descriptions, and a
+    # raw comparison here would pass on the fixture while the code it stands
+    # for could never match live data.
+    assert normalize_classtype(alert.classtype) in _ATTACK_CLASSTYPES, (
         "attempted-recon missing from _ATTACK_CLASSTYPES — an internal "
         "Kerberoasting alert falls through to the benign default"
     )
@@ -3554,6 +3587,7 @@ def test_benign_internal_traffic_still_matches_clean_internal() -> None:
     misc-activity, no malware-signal rule name) still gets the benign anchor,
     and no benign scenario in the catalogue carries a classtype this fix
     widened the attack set with."""
+    from soc_ai.agent.classifier import normalize_classtype
     from soc_ai.agent.decision_templates import match_decision_template
     from soc_ai.tools.get_alert_context import EnrichedAlertContext
 
@@ -3588,6 +3622,6 @@ def test_benign_internal_traffic_still_matches_clean_internal() -> None:
         docs = render_scenario(scenario, run_time=RUN_TIME)
         triage = next(d for d in docs if d.is_triage_target)
         alert = SoAlert.from_es_hit({"_id": f"synth-{scenario.id}", "_source": triage.body})
-        assert (alert.classtype or "").lower() not in added, (
+        assert normalize_classtype(alert.classtype) not in added, (
             f"{scenario.id} carries newly-widened attack classtype {alert.classtype!r}"
         )

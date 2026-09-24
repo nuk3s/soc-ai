@@ -272,6 +272,52 @@ async def test_host_summary_aggregations_peers_ports_dns(settings_kratos: Settin
     assert out["last_seen"] == "2026-06-27T10:05:00Z"
 
 
+@pytest.mark.asyncio
+async def test_top_dns_counts_name_the_sample_they_came_from(
+    settings_kratos: Settings,
+) -> None:
+    """top_dns counts a 200-doc sample, top_peers counts the whole window.
+
+    They used to arrive in the identical ``{value, count}`` shape side by side,
+    so a host with 50000 events in the window handed the model "evil.example 12"
+    as a full-window figure that was short by three orders of magnitude. The key
+    now names its denominator, and the sample size travels with it.
+    """
+    hits = [
+        {
+            "@timestamp": "2026-06-27T10:00:00Z",
+            "source.ip": "10.20.30.50",
+            "destination.ip": "8.8.8.8",
+            "destination.port": 53,
+            "dns": {"query": {"name": "example.com"}},
+        },
+        {
+            "@timestamp": "2026-06-27T10:05:00Z",
+            "source.ip": "10.20.30.50",
+            "destination.ip": "8.8.8.8",
+            "destination.port": 53,
+            "dns": {"query": {"name": "example.com"}},
+        },
+    ]
+    aggs = {
+        "peers_src": {"buckets": [{"key": "10.20.30.50", "doc_count": 2}]},
+        "peers_dst": {"buckets": [{"key": "8.8.8.8", "doc_count": 50_000}]},
+        "resp_ports": {"ports": {"buckets": []}},
+        "first_seen": {"value_as_string": "2026-06-27T10:00:00Z"},
+        "last_seen": {"value_as_string": "2026-06-27T10:05:00Z"},
+    }
+    elastic, _ = _make_elastic(settings_kratos, _result(hits, total=50_000, aggregations=aggs))
+
+    out = await host_summary("10.20.30.50", elastic=elastic, settings=settings_kratos)
+
+    entry = next(d for d in out["top_dns"] if d["value"] == "example.com")
+    assert entry["count_in_sample"] == 2
+    assert "count" not in entry
+    assert out["top_dns_sample_size"] == 2
+    # The full-window counts keep the plain key, because they really are one.
+    assert next(p for p in out["top_peers"] if p["value"] == "8.8.8.8")["count"] == 50_000
+
+
 # ---------------------------------------------------------------------------
 # Robustness contract.
 # ---------------------------------------------------------------------------
@@ -342,7 +388,11 @@ async def test_host_summary_centers_window_on_time_anchor(settings_kratos: Setti
     captured: dict[str, Any] = {}
 
     async def _capture(index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
-        captured["query"] = query
+        # First call only. With no observations the tool runs a second search,
+        # the import-volume probe that tells "this grid never watched this
+        # address" apart from "this address is only in a loaded capture", and
+        # that query wraps this one rather than being it.
+        captured.setdefault("query", query)
         return _result([], total=0)
 
     elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
@@ -677,3 +727,147 @@ async def test_host_summary_prefers_a_dhcp_lease_over_a_sensor_stamp(
 
     assert out["hostname"] == "sr-vuln2"
     assert "dhcp" in out["evidence"]["hostname"]
+
+
+# ---------------------------------------------------------------------------
+# Provenance: whose 10.0.0.5 is this?
+#
+# RFC1918 space collides across networks by construction. An imported PCAP of
+# somebody else's lab is full of addresses this grid also uses, so before the
+# scope existed an import could hand the local host a foreign hostname, a
+# foreign peer list, a foreign role and a first-seen belonging to a capture
+# file — with nothing in the output to tell that from an observation.
+# ---------------------------------------------------------------------------
+
+_IMPORT_MARKER = {"exists": {"field": "import.id"}}
+
+
+@pytest.mark.asyncio
+async def test_identity_is_derived_from_this_grids_own_observations(
+    settings_kratos: Settings,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def _capture(index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        captured.setdefault("query", query)
+        return _result([], total=0)
+
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+    elastic.search = _capture  # type: ignore[method-assign]
+
+    await host_summary("10.0.0.5", elastic=elastic, settings=settings_kratos)
+
+    must_not = captured["query"]["bool"]["must_not"]
+    assert _IMPORT_MARKER in must_not
+    assert {"term": {"tags": "replayed-corpus"}} in must_not
+
+
+@pytest.mark.asyncio
+async def test_reading_an_import_on_purpose_is_available(settings_kratos: Settings) -> None:
+    """And it is where the empty result points a caller, so it has to work."""
+    captured: dict[str, Any] = {}
+
+    async def _capture(index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        captured.setdefault("query", query)
+        return _result([], total=0)
+
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+    elastic.search = _capture  # type: ignore[method-assign]
+
+    out = await host_summary(
+        "10.0.0.5", elastic=elastic, settings=settings_kratos, provenance="any"
+    )
+
+    assert _IMPORT_MARKER not in captured["query"]["bool"]["must_not"]
+    assert out["provenance"] == "any"
+
+
+@pytest.mark.asyncio
+async def test_an_answered_summary_says_which_documents_described_the_host(
+    settings_kratos: Settings,
+) -> None:
+    """A hostname is a claim about a machine, and which machine depends on this."""
+    hits = [
+        {
+            "@timestamp": "2026-09-04T09:00:00Z",
+            "event.dataset": "zeek.dhcp",
+            "source.ip": "10.1.10.41",
+            "zeek": {"dhcp": {"host_name": "sr-vuln2"}},
+        }
+    ]
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+
+    out = await host_summary("10.1.10.41", elastic=elastic, settings=settings_kratos)
+
+    assert out["provenance"] == "live"
+    assert "live telemetry only" in out["evidence"]["population"]
+
+
+@pytest.mark.asyncio
+async def test_no_observations_distinguishes_unwatched_from_import_only(
+    settings_kratos: Settings,
+) -> None:
+    """A host that exists only inside a loaded capture is not an unseen host.
+
+    For an analyst holding an alert about that address the two readings point
+    opposite ways, and "no observations" is the one most likely to be believed.
+    """
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_result([], total=0), _result([], total=12_000)]
+    )
+
+    out = await host_summary("10.0.0.5", elastic=elastic, settings=settings_kratos)
+
+    assert out["observations"] is False
+    assert out["imported_matches"] == 12_000
+    assert "12000 imported or replayed document(s)" in out["summary"]
+    assert "provenance='any'" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_unwatched_host_gets_no_extra_sentence(
+    settings_kratos: Settings,
+) -> None:
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+
+    out = await host_summary("10.0.0.5", elastic=elastic, settings=settings_kratos)
+
+    assert out["imported_matches"] == 0
+    assert "imported or replayed document(s) matching it" not in out["summary"]
+    assert "live telemetry only" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_an_unmeasurable_import_volume_stays_unmeasured(settings_kratos: Settings) -> None:
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_result([], total=0), RuntimeError("shard failure")]
+    )
+
+    out = await host_summary("10.0.0.5", elastic=elastic, settings=settings_kratos)
+
+    assert out["imported_matches"] is None
+    assert "could not be measured" in out["summary"]
+    assert "error" not in out
+
+
+def test_top_peers_exclude_multicast_and_link_local() -> None:
+    """224.0.0.251 and 224.0.0.252 were the DC's top "external peers": mDNS
+    and LLMNR are the host addressing the segment, not a peer."""
+    from soc_ai.tools.host_summary import _collect_top_peers
+
+    aggs = {
+        "peers_src": {
+            "buckets": [
+                {"key": "224.0.0.251", "doc_count": 900},
+                {"key": "224.0.0.252", "doc_count": 800},
+                {"key": "169.254.1.1", "doc_count": 5},
+                {"key": "8.8.8.8", "doc_count": 9},
+                {"key": "10.1.10.255", "doc_count": 3},
+            ]
+        },
+        "peers_dst": {"buckets": [{"key": "10.0.0.1", "doc_count": 50}]},
+    }
+    peers = [p["value"] for p in _collect_top_peers("10.0.0.1", aggs)]
+    assert peers == ["8.8.8.8", "10.1.10.255"]

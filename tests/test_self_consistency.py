@@ -219,14 +219,17 @@ def _stub_enriched_alert_context(alert_id: str = "alert-001") -> Any:
     )
 
 
-# A strong benign template so the hard evidence gate exempts the zero-tool FP
-# (mirrors test_agent.py's template-match integration test).
+# A dispositive benign template so the hard evidence gate exempts the zero-tool
+# FP (mirrors test_agent.py's template-match integration test). Was
+# clean_internal_traffic, which is provisional now: it reads the endpoints
+# rather than the rule and cannot settle a case on its own.
 _STRONG_CANDIDATE = CandidateVerdict(
     verdict="false_positive",
     confidence=0.85,
-    cited_evidence=["alert.severity_label"],
-    template_id="clean_internal_traffic",
-    rationale="internal scanner",
+    cited_evidence=["alert.rule_name"],
+    template_id="stun_quic_keepalive",
+    rationale="STUN keepalive with a clean conn",
+    authority="dispositive",
 )
 
 

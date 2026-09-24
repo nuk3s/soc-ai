@@ -14,6 +14,7 @@ import asyncio
 import logging
 from typing import Any
 
+from soc_ai.agent.context import HuntSubject
 from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import CancelToken, run_recorded
@@ -47,6 +48,7 @@ class HuntManager:
         allow_so_writes: bool = True,
         focus_origin: FocusOrigin = "rerun",
         is_synth_eval: bool = False,
+        subject: HuntSubject | None = None,
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -75,6 +77,10 @@ class HuntManager:
         focus_origin="hunt_finding"`` explicitly — a promoted finding's anchor
         has nothing in Security Onion to ack, and its focus text is the
         finding's framing, not a prior run's open questions.
+
+        ``subject`` (optional, D2): a HUNT subject. The run then investigates
+        the hunt as a whole and the row records what it read. Only the two
+        promotion routes pass it.
 
         ``is_synth_eval`` (optional, default False): the synthetic-evaluation
         marker, inherited by the promotion route from a marked hunt so a
@@ -108,6 +114,7 @@ class HuntManager:
             allow_so_writes=allow_so_writes,
             focus_origin=focus_origin,
             is_synth_eval=is_synth_eval,
+            subject=subject,
         )
 
         # Consume until the first event — must be "investigation_created".

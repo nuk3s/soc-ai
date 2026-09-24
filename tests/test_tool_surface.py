@@ -114,6 +114,9 @@ HUNT_ONLY_ANALYTICS = {
     "t_dns_entropy_scan",
     "t_dcerpc_histogram",
     "t_first_seen",
+    # Runs one catalog analytic over a window (merge 5). Hunt-only for the
+    # same reason as the four above.
+    "t_run_analytic",
 }
 HUNT_EXPECTED = CORE | HUNT_ONLY_ANALYTICS
 

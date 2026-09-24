@@ -548,11 +548,14 @@ def test_single_packet_flow_inter_arrival_is_none() -> None:
     assert facts.inter_arrival is None
 
 
-def test_identical_timestamps_no_div_by_zero() -> None:
-    """A flow whose every packet shares one timestamp → mean gap 0 → cv 0.0.
+def test_identical_timestamps_report_no_cadence_rather_than_a_perfect_one() -> None:
+    """A flow whose every packet shares one timestamp has no measurable cadence.
 
-    Adversarial: identical timestamps make the mean inter-arrival 0; the cv
-    formula must guard ``mean == 0`` rather than dividing by zero.
+    Adversarial: identical timestamps make the mean inter-arrival 0. Guarding the
+    division with a 0.0 fallback avoided the ZeroDivisionError but produced the
+    most confident wrong answer available, because the docstring the model reads
+    says cv near 0 means a perfectly periodic beacon. A 30-packet flood is the
+    opposite of a beacon, so cv is None: unmeasurable, not perfect.
     """
     frames = [
         (5.0, _make_packet("1.1.1.1", 1000, "2.2.2.2", 53, "udp", b"\x00" * 12)) for _ in range(30)
@@ -560,7 +563,7 @@ def test_identical_timestamps_no_div_by_zero() -> None:
     facts = decode_pcap(_build_pcap(frames))
     assert facts.inter_arrival is not None
     assert facts.inter_arrival.mean_s == 0.0
-    assert facts.inter_arrival.cv == 0.0  # guarded, not NaN/inf/ZeroDivisionError
+    assert facts.inter_arrival.cv is None  # not 0.0, and not a ZeroDivisionError
 
 
 def test_all_unique_flows_memory_bounded_by_max_packets() -> None:

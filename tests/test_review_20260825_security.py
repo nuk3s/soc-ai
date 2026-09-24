@@ -1461,6 +1461,35 @@ def test_ack_group_accepts_capitalized_severity_and_narrows(
     )
 
 
+def test_ack_group_accepts_the_no_severity_selector(
+    audit_client: TestClient, analyst_session: dict[str, str]
+) -> None:
+    """Defect 2 companion: a queue filtered to the alerts with no severity label
+    must still be actionable.
+
+    The console can now filter to those alerts, and the SPA posts the active
+    severity filter back with Acknowledge and Escalate. A 422 here would leave
+    the analyst looking at a filter they cannot act under, which is the same
+    disagreement between the screen and its own controls one level along.
+    """
+    seen: dict[str, Any] = {}
+
+    async def _fake_fetch(*args: Any, **kwargs: Any) -> list[Any]:
+        seen.update(kwargs)
+        return []
+
+    with patch("soc_ai.webui.alerts_query.fetch_group_events", new=_fake_fetch):
+        resp = audit_client.post(
+            "/api/v1/alerts/ack-group",
+            json={"rule_name": "Ingress Tool Transfer via CURL", "severity": "Unknown"},
+            cookies=analyst_session,
+            headers=_ORIGIN,
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert seen.get("severity") == "unknown"
+
+
 def test_ack_group_accepts_the_alert_kind(
     audit_client: TestClient, analyst_session: dict[str, str]
 ) -> None:

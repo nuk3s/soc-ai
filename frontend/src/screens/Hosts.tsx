@@ -28,7 +28,13 @@ import {
 import { cn } from '../lib/cn';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { criticalityAccent, provenanceTone, roleAccent } from '../lib/hostColors';
-import { fieldLabel, isResolved, roleLabel, roleVocabulary } from '../lib/hostDossier';
+import {
+  fieldLabel,
+  isResolved,
+  isWithheldGuess,
+  roleLabel,
+  roleVocabulary,
+} from '../lib/hostDossier';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { ago } from '../lib/timeRange';
@@ -124,6 +130,27 @@ const fromProjection = (h: SweepHealth): SweepStatusRead => ({
 // the server instead of fetching the table and slicing it.
 const PAGE_SIZE = 50;
 
+/**
+ * The ROLE facet's value for "the sweep guessed, and the resolver withheld the
+ * answer".
+ *
+ * Spelled the way the summary's own bucket is
+ * (soc_ai/store/host_dossier.py, `_LOW_CONFIDENCE_BUCKET`), because it names
+ * the same set. The ROLES bar has always counted these hosts in amber and no
+ * filter on this screen could list them: the facet offers roles, and the
+ * defining fact about this set is that it HAS no role (dogfood 2026-09-17).
+ *
+ * It never reaches the server. `list_dossiers` matches the role facet against
+ * a stored value, and there is no stored value to match, so the request drops
+ * the facet and narrows over the rows that come back.
+ */
+export const LOW_CONFIDENCE_ROLE = '__low_confidence__';
+
+/** The page size while the withheld-guess filter is on: the endpoint's own
+ *  ceiling (MAX_LIST_LIMIT), because every row it returns is a row the client
+ *  has to read before it can say how many matched. */
+const SCAN_SIZE = 200;
+
 // A typed query is a new result set, so a keystroke can't fire a request.
 const SEARCH_DEBOUNCE_MS = 250;
 
@@ -193,9 +220,9 @@ const DEFAULT_SOURCE = 'active';
 // is jargon; the gloss is what tells an operator whether their answer was wrong
 // or merely about a machine that is no longer there.
 const CONFLICT_KIND_HELP: Record<DossierConflictKind, string> = {
-  mismatch: 'The evidence points somewhere else',
-  retracted: 'The evidence this field rested on is gone',
-  rebound: 'A different machine appears to answer on this address now',
+  mismatch: 'The evidence points to a different value.',
+  retracted: 'The evidence for this field is gone.',
+  rebound: 'A different host answers on this address now.',
 };
 
 /** Pull one field out of a row's twelve. The wire order is the backend's render
@@ -210,13 +237,13 @@ function fieldOf(row: DossierRow, name: DossierFieldName): DossierFieldBrief | u
 function unresolvedTitle(f: DossierFieldBrief | undefined): string {
   switch (f?.reason) {
     case 'stale':
-      return 'Last observed too long ago to trust — the sweep has not re-confirmed it';
+      return 'This value is too old to trust. The sweep has not confirmed it again.';
     case 'low_confidence':
-      return 'Observed, but the evidence is too thin to say';
+      return 'The sweep saw some evidence. The evidence is too weak to give a value.';
     case 'no_signal':
-      return 'Nothing found for this yet';
+      return 'The sweep found nothing for this field yet.';
     default:
-      return 'Not known';
+      return 'The value is not known.';
   }
 }
 
@@ -268,7 +295,7 @@ function FlagsCell({ row }: { row: DossierRow }) {
     <span className="flex flex-wrap items-center gap-1.5">
       {row.build_error && (
         <span
-          title={`Last build failed: ${row.build_error}`}
+          title={`The last build failed. Error: ${row.build_error}`}
           aria-label="build failed"
           className="flex items-center text-danger"
         >
@@ -277,7 +304,7 @@ function FlagsCell({ row }: { row: DossierRow }) {
       )}
       {!row.build_error && row.last_built_at == null && (
         <span
-          title="Never built — no sweep has written this host yet"
+          title="Never built. No sweep has written this host yet."
           aria-label="never built"
           className="flex items-center text-faint"
         >
@@ -286,7 +313,7 @@ function FlagsCell({ row }: { row: DossierRow }) {
       )}
       {row.conflict_count > 0 && (
         <span
-          title={`The sweep disagrees with ${row.conflict_count} declared field${row.conflict_count === 1 ? '' : 's'} — open the host to decide`}
+          title={`The sweep disagrees with ${row.conflict_count} declared field${row.conflict_count === 1 ? '' : 's'}. Open the host to decide.`}
           className="flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/10 px-[6px] py-[2px] font-mono text-[10.5px] font-semibold text-warn"
         >
           <AlertTriangle size={10} />
@@ -295,7 +322,7 @@ function FlagsCell({ row }: { row: DossierRow }) {
       )}
       {row.override_count > 0 && (
         <span
-          title={`${row.override_count} field${row.override_count === 1 ? '' : 's'} declared by an operator`}
+          title={`An operator declared ${row.override_count} field${row.override_count === 1 ? '' : 's'} on this host. Open the host to change the declaration.`}
           className="flex items-center gap-1 rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-text-2"
         >
           <UserCheck size={10} />
@@ -307,7 +334,7 @@ function FlagsCell({ row }: { row: DossierRow }) {
           minority keeps the flag rare — absence reads as network-only. */}
       {row.reporting && (
         <span
-          title="An agent on this machine reports its own logs — its host page can say more than traffic alone shows"
+          title="An agent on this host reports its own logs. The host page shows more than the network traffic alone."
           aria-label="agent reporting"
           className={cn('flex items-center', provenanceTone('hostlog'))}
         >
@@ -316,7 +343,7 @@ function FlagsCell({ row }: { row: DossierRow }) {
       )}
       {critValue && (
         <span
-          title="Criticality — how much this machine matters"
+          title="Criticality says how much this host matters. Open the host to change the value."
           className={cn(
             'rounded-chip border px-1.5 py-px font-mono text-[10.5px] font-semibold',
             criticalityAccent(critValue),
@@ -360,14 +387,14 @@ function ConflictRow({ c }: { c: DossierConflictRow }) {
       </span>
       <span
         className="flex-none text-[11px] text-faint"
-        title="Sweeps that concluded this since the disagreement opened"
+        title="The number of sweeps that reached this conclusion. The count starts at the time the disagreement opened."
       >
         seen {c.observations}x
       </span>
       {c.identity_rebound_at && (
         <span
           className="flex-none text-[11px] font-semibold text-warn"
-          title={`A different machine appears to hold this address since ${absolute(c.identity_rebound_at)} — the declaration may describe a host that has moved on`}
+          title={`A different host appears to hold this address since ${absolute(c.identity_rebound_at)}. The declaration may describe a host that has moved.`}
         >
           rebound
         </span>
@@ -414,11 +441,16 @@ export function Hosts() {
     setOffset(0);
   }, [debouncedQ, health]);
 
+  // The one facet this screen resolves itself. Everything else is a server
+  // parameter; see the note on LOW_CONFIDENCE_ROLE for why this cannot be.
+  const scanning = role === LOW_CONFIDENCE_ROLE;
+  const pageSize = scanning ? SCAN_SIZE : PAGE_SIZE;
+
   const list = useAsync(
     () =>
       listDossiers({
         q: debouncedQ || undefined,
-        role: role || undefined,
+        role: scanning ? undefined : role || undefined,
         source: source === 'operator' || source === 'inferred' ? source : undefined,
         // Broken hosts are often exactly the quiet ones — a build that never
         // ran is a build that never saw traffic either. The broken-builds view
@@ -427,10 +459,10 @@ export function Hosts() {
         activity: source === 'active' && !health ? 'active' : undefined,
         health,
         sort,
-        limit: PAGE_SIZE,
+        limit: pageSize,
         offset,
       }),
-    [debouncedQ, role, source, health, sort, offset],
+    [debouncedQ, role, scanning, pageSize, source, health, sort, offset],
   );
 
   // The summary bar's numbers: an AGGREGATE request over the whole table,
@@ -523,9 +555,21 @@ export function Hosts() {
     }
   };
 
-  const rows = list.data?.rows ?? [];
+  const read = list.data?.rows ?? [];
+  // The withheld guesses out of what the server returned. Every other facet is
+  // resolved in SQL and `total` describes the whole match set; this one cannot
+  // be, so the count line below names the stretch of the network it read.
+  const rows = scanning
+    ? read.filter((row) => {
+        const f = fieldOf(row, 'role');
+        return f != null && isWithheldGuess(f);
+      })
+    : read;
   const total = list.data?.total ?? 0;
-  const limit = list.data?.limit ?? PAGE_SIZE;
+  // What the table actually holds, which is the server's count everywhere
+  // except under the one filter this screen resolves itself.
+  const shownCount = scanning ? rows.length : total;
+  const limit = list.data?.limit ?? pageSize;
   const shownFrom = total === 0 ? 0 : offset + 1;
   const shownTo = Math.min(offset + limit, total);
 
@@ -565,15 +609,15 @@ export function Hosts() {
         `${list.slice(0, 3).join(', ')}${list.length > 3 ? `, +${list.length - 3} more` : ''}`;
       const failedIps = (out.failed ?? []).map((f) => f.ip);
       const parts = [
-        `Declared ${bulkField} "${value}" on ${out.updated.length} of ${ips.length} host${ips.length === 1 ? '' : 's'}`,
+        `Declared ${bulkField} "${value}" on ${out.updated.length} of ${ips.length} host${ips.length === 1 ? '' : 's'}.`,
       ];
       if (out.not_found.length) {
-        parts.push(`${out.not_found.length} not swept yet (${names(out.not_found)})`);
+        parts.push(`${out.not_found.length} not swept yet: ${names(out.not_found)}.`);
       }
       if (failedIps.length) {
-        parts.push(`${failedIps.length} failed (${names(failedIps)}) — try those again`);
+        parts.push(`${failedIps.length} failed: ${names(failedIps)}. Try those again.`);
       }
-      setBulkNote(parts.join(' · '));
+      setBulkNote(parts.join(' '));
       // Keep the ones that did not land selected, so "try those again" is one
       // click and not a re-selection exercise (the Alerts retry contract).
       const retry = [...out.not_found, ...failedIps];
@@ -617,18 +661,27 @@ export function Hosts() {
   // declared role visible on this page, plus whatever is currently selected (so
   // an active filter never vanishes from its own list).
   const wireRoles = kpis.data?.role_vocabulary;
+  const lowConfidenceHosts = kpis.data?.roles_low_confidence ?? 0;
   const roleOptions = useMemo(() => {
     const seen = new Set(roleVocabulary(wireRoles));
     for (const r of rows) {
       const v = fieldOf(r, 'role')?.value?.trim();
       if (v) seen.add(v);
     }
-    if (role) seen.add(role);
-    return [
+    // The sentinel is not a role, so it never joins the vocabulary set.
+    if (role && role !== LOW_CONFIDENCE_ROLE) seen.add(role);
+    const options = [
       { value: '', label: 'any role' },
       ...[...seen].sort().map((r) => ({ value: r, label: roleLabel(r) })),
     ];
-  }, [rows, role, wireRoles]);
+    // Last, and only over a network that has one: the ROLES bar's amber
+    // bucket, now reachable. An option that would list nothing is an option
+    // that reads as a broken filter.
+    if (lowConfidenceHosts > 0 || role === LOW_CONFIDENCE_ROLE) {
+      options.push({ value: LOW_CONFIDENCE_ROLE, label: 'low confidence' });
+    }
+    return options;
+  }, [rows, role, wireRoles, lowConfidenceHosts]);
 
   // What a BULK declare may set a role to: the classifier's closed vocabulary,
   // and nothing else. Deliberately NOT `roleOptions` — the filter widens to
@@ -783,8 +836,8 @@ export function Hosts() {
           <Freshness at={list.lastUpdated} />
         </div>
         <div className="mt-0.5 max-w-[760px] text-[13px] text-dim">
-          What the network sweep has learned about each machine, and what you've told it. Your
-          answers win.
+          The network sweep learns facts about each host. You can declare your own answers. Your
+          declaration replaces the sweep's answer.
         </div>
       </div>
 
@@ -803,6 +856,7 @@ export function Hosts() {
           onDeleteView={views.onDeleteView}
           onSaveView={views.onSaveView}
           viewError={views.error}
+          saveViewUnavailable={views.unavailable}
           search={{
             value: q,
             onChange: (v) => {
@@ -855,7 +909,7 @@ export function Hosts() {
                         onClick={() => {
                           void declare();
                         }}
-                        title="Declare this on every selected host. Your answer wins over the sweep's, and survives the next rebuild."
+                        title="Declare this value on every selected host. Your answer wins over the sweep answer and survives the next rebuild."
                         className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
                         style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
                       >
@@ -874,7 +928,7 @@ export function Hosts() {
                   void rebuild();
                 }}
                 disabled={starting || running}
-                title="Sweep the network now — hundreds of hosts across several grid queries, so it runs in the background"
+                title="Start a network sweep now. The sweep runs in the background because it queries hundreds of hosts."
                 className="flex items-center gap-1.5 rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text disabled:opacity-60"
               >
                 <RefreshCw size={12} className={running || starting ? 'animate-spin' : ''} />
@@ -919,7 +973,7 @@ export function Hosts() {
         <div className="mb-3.5 rounded-card border border-warn/30 bg-warn/[0.06] px-3.5 py-2.5 text-[12.5px] text-text-2">
           {note === 'dossier disabled' ? (
             <>
-              The host dossier is switched off, so nothing was swept. Turn it on in{' '}
+              The host dossier is off. The sweep did not run. Turn the host dossier on in{' '}
               <Link to={DOSSIER_CONFIG_HREF} className="font-semibold text-accent hover:underline">
                 Config → Host dossier
               </Link>
@@ -946,12 +1000,12 @@ export function Hosts() {
             >
               <StatusTag color="#d29922" label="Sweep degraded" />
               <div className="mt-1 max-w-[760px] text-[12px] leading-[1.5] text-text-2">
-                The last sweep hit {plural(sweepErrorCount, 'error')} and did not read the whole
-                network, so this list is incomplete. A host that is missing below, or still showing
-                old answers, may be one the sweep could not reach.{' '}
+                The last sweep recorded {plural(sweepErrorCount, 'error')}. The sweep did not read
+                the whole network. This list is incomplete. A host that is missing below, or that
+                shows old answers, may be a host the sweep could not reach.{' '}
                 {sweepErrors.length > 0
-                  ? 'A rebuild runs the same queries, so start with what failed:'
-                  : 'An admin can read what failed on this screen and start another sweep.'}
+                  ? 'A rebuild runs the same queries. Start with what failed:'
+                  : 'An admin can read what failed on this screen. An admin can start another sweep.'}
               </div>
               {/* The strings themselves, not just how many. This channel carries
                   local faults as well as grid ones ("no internal CIDRs
@@ -970,7 +1024,7 @@ export function Hosts() {
                   ))}
                   {sweepErrors.length > SHOWN_ERRORS && (
                     <li className="text-faint">
-                      and {(sweepErrors.length - SHOWN_ERRORS).toLocaleString()} more
+                      {(sweepErrors.length - SHOWN_ERRORS).toLocaleString()} more errors
                     </li>
                   )}
                 </ul>
@@ -980,7 +1034,7 @@ export function Hosts() {
           {showSweptCounts && (
             <div
               data-testid="sweep-run-summary"
-              title="What the most recent sweep wrote. When it ran is in the summary line above, which dates the data itself."
+              title="The most recent sweep wrote these counts. The summary line above gives the age of the data."
               className="text-[11.5px] text-faint"
             >
               Last sweep: {sweptCounts.join(' · ')}
@@ -991,7 +1045,7 @@ export function Hosts() {
 
       {/* Network-wide, above everything the table says about a page of it. */}
       {!firstRun && (
-        <HostsSummary summary={kpis.data} failed={kpis.error != null} queueVisible={pending > 0} />
+        <HostsSummary summary={kpis.data} failed={kpis.error != null} queueVisible={pending > 0} shown={list.data ? shownCount : undefined} filtered={displayedSource !== ''} />
       )}
 
       {/* The disagreement queue — the single conflict surface on this screen,
@@ -1021,7 +1075,8 @@ export function Hosts() {
               ))}
               {pending > (conflicts.data?.rows.length ?? 0) && (
                 <div className="px-3.5 py-2 text-[11.5px] text-faint">
-                  Showing the {conflicts.data?.rows.length} oldest — resolve these first.
+                  This queue shows the {conflicts.data?.rows.length} oldest disagreements. Resolve
+                  these first.
                 </div>
               )}
             </div>
@@ -1035,8 +1090,8 @@ export function Hosts() {
         <div className="mb-3.5 flex flex-wrap items-center gap-3 rounded-card border border-danger/30 bg-danger/[0.05] px-3.5 py-2.5 text-[12.5px] text-text-2">
           <AlertTriangle size={13} className="flex-none text-danger" />
           <span className="min-w-0 flex-1">
-            Showing the hosts the sweep is not getting through to — never built, or the last build
-            failed.
+            This view shows the hosts the sweep is not getting through to. A build never ran, or
+            the last build failed.
           </span>
           <button
             onClick={clearHealth}
@@ -1100,20 +1155,20 @@ export function Hosts() {
                 className="text-[13px] leading-[1.6] text-dim"
               >
                 {sweepInFlight ? (
-                  'The network sweep is running now. This list fills in when it finishes — it builds from telemetry Security Onion already holds, so nothing new touches your network.'
+                  'The network sweep is running now. This list fills in after the sweep finishes. The sweep reads telemetry Security Onion already holds. Nothing new touches your network.'
                 ) : sweepDegraded ? (
-                  'The last sweep could not read the network, so it built nothing. This list is empty because the sweep came back blind, not because there is nothing out there to find.'
+                  'The last sweep could not read the network. The sweep built nothing. This list is empty because the sweep failed. The network may still hold hosts.'
                 ) : sweepUnreadable ? (
                   <>
-                    This screen could not check how the last sweep went, so it cannot tell you why
-                    this list is empty — a sweep that has never run and one that ran and came back
-                    blind both leave it looking exactly like this.
+                    This screen could not check the result of the last sweep. This screen cannot
+                    tell you why this list is empty. A sweep that never ran leaves an empty list. A
+                    sweep that failed leaves the same empty list.
                     <span className="mt-1 block font-mono text-[11.5px] text-faint">
                       {refresh.error?.message}
                     </span>
                   </>
                 ) : (
-                  "The network sweep hasn't run yet. It builds this list from telemetry Security Onion already holds — nothing new touches your network."
+                  "The network sweep hasn't run yet. The sweep builds this list from telemetry Security Onion already holds. Nothing new touches your network."
                 )}
               </div>
               {isAdmin ? (
@@ -1138,7 +1193,7 @@ export function Hosts() {
                 </button>
               ) : (
                 <div className="mt-2 text-[12.5px] text-faint">
-                  An admin starts it from this screen, or turns on the schedule.
+                  An admin starts it from this screen. An admin can also turn on the schedule.
                 </div>
               )}
               <div className="mt-2">
@@ -1156,7 +1211,7 @@ export function Hosts() {
         <Panel>
           <PanelHeader
             icon={<Server size={15} />}
-            title={list.data ? `Hosts · ${total.toLocaleString()}` : 'Hosts'}
+            title={list.data ? `Hosts · ${shownCount.toLocaleString()}` : 'Hosts'}
           />
 
           <div
@@ -1169,7 +1224,7 @@ export function Hosts() {
                   checked={sel.allVisibleSelected}
                   indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
                   onChange={sel.toggleAll}
-                  title="Select all visible"
+                  title="Select every host on this page."
                   aria-label="Select all hosts on this page"
                 />
               </div>
@@ -1189,7 +1244,9 @@ export function Hosts() {
               <ErrorState error={list.error} onRetry={list.refetch} label="the host list" />
             </div>
           ) : rows.length === 0 ? (
-            <EmptyState>No hosts match the current filters.</EmptyState>
+            <EmptyState>
+              No hosts match the current filters. Change a filter to see more hosts.
+            </EmptyState>
           ) : (
             <>
               {rows.map((row) => {
@@ -1215,7 +1272,7 @@ export function Hosts() {
                       >
                         <Checkbox
                           checked={sel.isSelected(row.ip)}
-                          title="Select"
+                          title="Select this host."
                           aria-label={`Select ${row.ip}`}
                         />
                       </div>
@@ -1257,6 +1314,19 @@ export function Hosts() {
                         >
                           {roleLabel(roleValue)}
                         </span>
+                      ) : roleField && isWithheldGuess(roleField) ? (
+                        // The sweep has a guess and the resolver will not
+                        // assert it. The row cannot name the guess — the list
+                        // shape carries the answer, not the inference lane —
+                        // so it says that one exists and where to read it.
+                        <span
+                          data-testid="role-possibly"
+                          title="The sweep inferred a role below the confidence gate. Open the host to read the inferred role."
+                          className="inline-flex max-w-full items-center gap-1.5 truncate rounded-chip border border-warn/40 bg-warn/[0.08] px-1.5 py-px text-[12px] font-medium text-warn"
+                        >
+                          <span className="h-1.5 w-1.5 flex-none rounded-full bg-warn" />
+                          possibly
+                        </span>
                       ) : (
                         <Unknown f={roleField} />
                       )}
@@ -1281,18 +1351,23 @@ export function Hosts() {
                   set, so the range is exact rather than inferred. */}
               <div className="flex items-center justify-between border-t border-border px-[15px] py-2.5">
                 <span className="font-mono text-[11.5px] text-faint">
-                  {`${shownFrom}–${shownTo} of ${total.toLocaleString()}`}
+                  {scanning
+                    ? // The matched count and the stretch of the network it
+                      // came from. The server counted every host it was asked
+                      // for; this filter counted the rows it was handed.
+                      `${rows.length.toLocaleString()} low confidence · read ${shownFrom}–${shownTo} of ${total.toLocaleString()}`
+                    : `${shownFrom}–${shownTo} of ${total.toLocaleString()}`}
                 </span>
                 <div className="flex items-center gap-1.5">
                   <button
-                    onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                    onClick={() => setOffset(Math.max(0, offset - pageSize))}
                     disabled={offset === 0}
                     className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
                   >
                     Previous
                   </button>
                   <button
-                    onClick={() => setOffset(offset + PAGE_SIZE)}
+                    onClick={() => setOffset(offset + pageSize)}
                     disabled={shownTo >= total}
                     className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
                   >
@@ -1318,7 +1393,7 @@ export function Hosts() {
               a filter that is not actually applied. */}
           {!(list.loading && !list.data) && !list.error && source === 'active' && !health && (
             <div className="px-[15px] pb-2.5 text-[11.5px] text-faint">
-              Quiet hosts (no observed events) are hidden —{' '}
+              This table hides quiet hosts. A quiet host has no observed events.{' '}
               <button
                 type="button"
                 className="text-dim underline hover:text-text"

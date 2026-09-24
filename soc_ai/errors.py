@@ -48,3 +48,26 @@ class OqlValidationError(SocAiError):
 
 class ModelError(SocAiError):
     """The LiteLLM gateway / underlying model returned an error or malformed output."""
+
+
+class SyntheticAnchorError(SocAiError):
+    """The alert a run is anchored to is a plant the run's own scope hides.
+
+    Raised at the anchor fetch, before any pivot runs, because everything the
+    run would gather about that alert is already excluded by the same guard.
+    Continuing does not produce a weakly-evidenced answer; it produces a
+    confident one built out of zeros the guard created. Measured on the range:
+    fifteen tool calls, no results from any of them, an explicit statement that
+    the account's purpose could not be independently verified, and a verdict of
+    false positive at 0.60 on a critical detection whose group also held three
+    genuine events.
+
+    Deliberately not a :class:`SoNotFoundError`. The document exists and the
+    grid can read it; this run cannot, and those are different sentences to
+    whoever reads the run afterwards.
+    """
+
+    def __init__(self, message: str, *, alert_id: str, scenario_id: str) -> None:
+        super().__init__(message)
+        self.alert_id = alert_id
+        self.scenario_id = scenario_id

@@ -164,14 +164,23 @@ class ContainsValue:
 
     OQL otherwise emits only ``term``/``wildcard``/``range``, so substring intent
     had no expressible form and the leading-wildcard reject taught ``foo*`` — which
-    on a keyword-mapped field only matches value-initial text. ``:~`` compiles to
-    an ES ``match`` (or ``match_phrase`` when the value was quoted), giving
-    analyzed contains-intent a bounded outlet without a per-field mapping-type
-    table.
+    on a keyword-mapped field only matches value-initial text. ``:~`` gives
+    contains-intent a bounded outlet without a per-field mapping-type table.
+
+    It compiles to a ``multi_match`` over the field AND its ``.text`` sibling,
+    phrase-typed when the value was quoted. Asking the named field alone was the
+    same trap one level down: a ``match`` on a ``keyword`` field runs the keyword
+    analyzer, which emits the whole value as a single token, so the query
+    degenerates into an exact full-value comparison and a substring search
+    returns zero. ``process.command_line`` is keyword-mapped, and on the range a
+    contains query for a command matched 0 documents while 405 held it; the
+    analyzed ``.text`` sibling that Elastic's Windows and endpoint integrations
+    map alongside it matched all 405. Both names go in the clause, so a grid that
+    maps the field as analyzed text with no sibling behaves exactly as before.
     """
 
     text: str
-    phrase: bool  # True → match_phrase (value was quoted); False → match (bare)
+    phrase: bool  # True → phrase match (value was quoted); False → term match (bare)
 
 
 Value = BareValue | QuotedValue | WildcardValue | RangeValue | ContainsValue
@@ -629,8 +638,9 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
             raise OqlValidationError(
                 f"leading-wildcard patterns are too expensive; anchor the "
                 f"wildcard (write foo*, not *foo) — or, for a substring/contains "
-                f"match on analyzed text, use field:~value (compiles to a "
-                f"full-text match): {pattern!r}",
+                f"match, use field:~value, which searches the field's analyzed "
+                f"text and is the right form for process.command_line and "
+                f"message: {pattern!r}",
                 fragment=pattern,
             )
 
@@ -720,6 +730,29 @@ def filter_to_dsl(node: FilterNode) -> dict[str, Any]:
     assert_never(node)
 
 
+# The multi-field name Elastic's integrations give the analyzed copy of a
+# keyword field (``process.command_line.text``, ``message.text``). A fixed
+# suffix on a name the validator already admitted, so the set of field names
+# that can reach Elasticsearch stays the whitelist plus one derived sibling per
+# entry — closed, not an open prefix. An unmapped sibling costs nothing:
+# ``multi_match`` scores no documents for a field the index does not have.
+_ANALYZED_SIBLING_SUFFIX = ".text"
+
+
+def _contains_fields(field_name: str) -> list[str]:
+    if field_name.endswith(_ANALYZED_SIBLING_SUFFIX):
+        return [field_name]
+    return [field_name, field_name + _ANALYZED_SIBLING_SUFFIX]
+
+
+def _contains_shape(field_name: str, phrase: bool) -> dict[str, Any]:
+    shape: dict[str, Any] = {}
+    if phrase:
+        shape["type"] = "phrase"
+    shape["fields"] = _contains_fields(field_name)
+    return shape
+
+
 def _term_to_dsl(field_name: str, value: Value) -> dict[str, Any]:
     if isinstance(value, RangeValue):
         body: dict[str, Any] = {}
@@ -731,8 +764,7 @@ def _term_to_dsl(field_name: str, value: Value) -> dict[str, Any]:
     if isinstance(value, WildcardValue):
         return {"wildcard": {field_name: {"value": value.pattern}}}
     if isinstance(value, ContainsValue):
-        op = "match_phrase" if value.phrase else "match"
-        return {op: {field_name: value.text}}
+        return {"multi_match": {"query": value.text, **_contains_shape(field_name, value.phrase)}}
     if isinstance(value, QuotedValue | BareValue):
         text = value.text
         if "*" in text or "?" in text:

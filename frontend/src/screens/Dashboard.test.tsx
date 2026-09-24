@@ -3,7 +3,7 @@
 // and Alerts lists give it — not the amber Needs-info pill its placeholder verdict
 // would otherwise earn. The chip means "infra broke, retry"; the pill would read
 // as "the analyst should dig deeper", which is exactly the wrong signal.
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
@@ -58,7 +58,7 @@ const startQualityEvalMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [], truncated: false, other_docs: 0 }),
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   // The recent-sample call feeds ROWS; the pipeline-error KPI's own query
@@ -85,8 +85,20 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getMe: vi.fn().mockResolvedValue({ username: 'ana', role: 'analyst', status: '' }),
   getPreflight: vi.fn().mockResolvedValue({ status: 'green', failing: 0, warned: 0, checked_at: '2026-08-19T00:00:00+00:00' }),
   getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
+  // The shadow-hit KPI reads this on mount. Zero here, so the tile is absent
+  // for every test but the two that name it.
+  getShadowHits: vi.fn().mockResolvedValue({ hits: [], unread: 0 }),
 }));
 
+import { getShadowHits, publishShadowHitsChanged } from '../lib/api';
+import {
+  COUNT_ALERT_EVENTS,
+  COUNT_AWAITING,
+  COUNT_RUNNING,
+  COUNT_TRUE_POSITIVES,
+  COUNT_UNREAD_SHADOW_HITS,
+  detectionKindTitle,
+} from '../lib/tooltips';
 import { Dashboard } from './Dashboard';
 
 describe('Dashboard recent investigations', () => {
@@ -96,7 +108,9 @@ describe('Dashboard recent investigations', () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    const fbRow = (await screen.findByText('ET Fallback Run')).closest('button')!;
+    const fbRow = (await screen.findByText('ET Fallback Run')).closest(
+      '[data-testid="recent-investigation"]',
+    )! as HTMLElement;
     expect(within(fbRow).getByText('Pipeline error')).toBeTruthy();
     expect(within(fbRow).queryByText('Needs info')).toBeNull();
   });
@@ -107,9 +121,72 @@ describe('Dashboard recent investigations', () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    const nmiRow = (await screen.findByText('ET Genuine NMI')).closest('button')!;
+    const nmiRow = (await screen.findByText('ET Genuine NMI')).closest(
+      '[data-testid="recent-investigation"]',
+    )! as HTMLElement;
     expect(within(nmiRow).getByText('Needs info')).toBeTruthy();
     expect(within(nmiRow).queryByText('Pipeline error')).toBeNull();
+  });
+
+  // A link goes to a page. The whole row was a button that navigated, so the
+  // address of an investigation could not be copied, opened in a tab or read
+  // before the click.
+  it('puts the click on the name and leaves the row alone', async () => {
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const name = await screen.findByRole('link', { name: 'ET Genuine NMI' });
+    expect(name.getAttribute('href')).toBe('/investigation/INV-NMI');
+    const row = name.closest('[data-testid="recent-investigation"]')!;
+    expect(row.tagName).toBe('DIV');
+    expect(row.querySelector('button')).toBeNull();
+  });
+
+  it('links View all to the investigations list', async () => {
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const link = await screen.findByRole('link', { name: /View all/ });
+    expect(link.getAttribute('href')).toBe('/investigations?range=30d');
+  });
+
+  // Every chip and count carries a sentence. The type chip on a row carried the
+  // detector's name alone, and a landing screen is where an analyst who has not
+  // met these words arrives first.
+  it('gives the detection type chip its sentence', async () => {
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const row = (await screen.findByText('ET Genuine NMI')).closest(
+      '[data-testid="recent-investigation"]',
+    )! as HTMLElement;
+    expect(within(row).getByText('suricata').getAttribute('title')).toBe(
+      detectionKindTitle('suricata'),
+    );
+  });
+});
+
+// The KPI tiles state four numbers and named none of them. A tile called
+// "Awaiting investigation" says what it counts; it did not say what it counts
+// OVER, which is the question a figure that disagrees with a list raises.
+describe('Dashboard KPI sentences', () => {
+  it('states what each headline number counts', async () => {
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByText('ET Genuine NMI');
+    expect(screen.getByTitle(COUNT_ALERT_EVENTS)).toBeTruthy();
+    expect(screen.getByTitle(COUNT_AWAITING)).toBeTruthy();
+    expect(screen.getByTitle(COUNT_TRUE_POSITIVES)).toBeTruthy();
+    expect(screen.getByTitle(COUNT_RUNNING)).toBeTruthy();
   });
 });
 
@@ -172,5 +249,82 @@ describe('Dashboard recent-investigations row layout', () => {
     // The endpoints are not dropped to buy the width at tablet/laptop sizes —
     // they move to the second line and both facts stay on the row.
     expect(within(flow).getByTitle('192.0.2.70 → 10.0.0.40')).toBeTruthy();
+  });
+});
+
+
+// The Dashboard KPI is the fourth of the five surfaces that make a shadow hit
+// obvious. It is the only tile on this screen that comes and goes, because a
+// standing zero teaches the eye to skip the spot where the number will be.
+describe('Dashboard shadow-hit KPI', () => {
+  it('is absent while no shadow hit is unread', async () => {
+    vi.mocked(getShadowHits).mockResolvedValue({ hits: [], unread: 0 });
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByText('Investigations running');
+    expect(screen.queryByTestId('kpi-shadow-hits')).toBeNull();
+  });
+
+  it('names the count and where to read the hits', async () => {
+    vi.mocked(getShadowHits).mockResolvedValue({ hits: [], unread: 2 });
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const tile = await screen.findByTestId('kpi-shadow-hits');
+    expect(within(tile).getByText('Shadow hits · unread')).toBeTruthy();
+    expect(within(tile).getByText('2')).toBeTruthy();
+    expect(within(tile).getByText(/Read them on Hunts/)).toBeTruthy();
+  });
+
+  // The whole card was a button that navigated. The click is on the words that
+  // name the destination, and the destination opens the unread hits.
+  it('links to the unread hits and is not a button', async () => {
+    vi.mocked(getShadowHits).mockResolvedValue({ hits: [], unread: 2 });
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const tile = await screen.findByTestId('kpi-shadow-hits');
+    expect(tile.tagName).toBe('DIV');
+    expect(within(tile).getByRole('link', { name: /Read them on Hunts/ }).getAttribute('href')).toBe(
+      '/hunts?hits=unread',
+    );
+    expect(within(tile).getByText('2').getAttribute('title')).toBe(COUNT_UNREAD_SHADOW_HITS);
+  });
+
+  // A failed read is not a zero. The tile vanished on a 503 and the screen read
+  // exactly like a clean shadow week.
+  it('renders the tile with a sentence when the read fails', async () => {
+    vi.mocked(getShadowHits).mockRejectedValue(new Error('503'));
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const tile = await screen.findByTestId('kpi-shadow-hits');
+    expect(within(tile).getByText('Could not read the shadow hits.')).toBeTruthy();
+    expect(within(tile).getByText('?')).toBeTruthy();
+  });
+
+  it('counts again when the band publishes a read', async () => {
+    vi.mocked(getShadowHits).mockResolvedValue({ hits: [], unread: 3 });
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    const tile = await screen.findByTestId('kpi-shadow-hits');
+    expect(within(tile).getByText('3')).toBeTruthy();
+    vi.mocked(getShadowHits).mockResolvedValue({ hits: [], unread: 2 });
+    publishShadowHitsChanged();
+    await waitFor(() =>
+      expect(within(screen.getByTestId('kpi-shadow-hits')).getByText('2')).toBeTruthy(),
+    );
   });
 });

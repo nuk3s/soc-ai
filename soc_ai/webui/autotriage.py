@@ -1,9 +1,11 @@
 """Auto-triage: hunt alerts above a configurable severity floor, deduped by similarity.
 
-One Target per uncovered (rule, src_ip, dst_ip) cluster among groups at or
-above the configured severity floor is queued for a sequential investigation
-run — endpoint-shaped detections cluster under an empty src/dst rather than
-being dropped.  Progress is tracked in ``AutoTriageStatus`` on ``app.state``.
+One Target per uncovered cluster among groups at or above the configured
+severity floor is queued for a sequential investigation run. A cluster is a
+rule plus the subject it fired about: the two flow endpoints, or the machine
+when there was no flow (see :func:`soc_ai.store.investigations.pair_key`).
+Endpoint-shaped detections cluster rather than being dropped. Progress is
+tracked in ``AutoTriageStatus`` on ``app.state``.
 
 The severity floor is read from ``settings.auto_triage_min_severity`` (default
 "high") and derived into a band by the API layer before being passed in.
@@ -31,7 +33,8 @@ _LOGGER = logging.getLogger(__name__)
 # Fallback band used only when no severity band is passed explicitly (e.g. in
 # tests that construct AutoTriageStatus directly without going through the API
 # layer, which normally derives the band from settings.auto_triage_min_severity).
-_DEFAULT_SEVERITIES: tuple[str, ...] = ("critical", "high")
+# Carries the unlabelled selector for the reason config_severity_band does.
+_DEFAULT_SEVERITIES: tuple[str, ...] = ("critical", "high", aq.UNKNOWN_SEVERITY)
 
 _STATE_ATTR = "_autotriage_status"
 
@@ -79,6 +82,15 @@ class AutoTriageStatus:
     tool_calls: int = 0
     # inherited-verdict FP alerts this run acknowledged in SO (auto_ack_fp_enabled)
     inherited_acked: int = 0
+    # Every inherited-verdict ack ever written, read back from the store at the
+    # end of the pass. The per-run counter above dies with the sweep, which is
+    # how this path reached 110,693 writes to the analyst's grid without any
+    # surface in the product being able to say so.
+    inherited_acked_total: int = 0
+    # Why inherited acks were held back this run (reason code -> count):
+    # ``no_investigation`` (the source verdict retrieved nothing),
+    # ``high_stakes``. Reset per run alongside ``inherited_acked``.
+    inherited_refused: dict[str, int] = field(default_factory=dict)
     # per-reason breakdown of ``skipped`` for this run (reason code -> count).
     # Written by the planner (plan_targets / plan_targets_for_ids) so the polling
     # status can explain WHICH class of skip happened, not just a bare count.
@@ -127,6 +139,7 @@ class AutoTriageStatus:
         self.current = None
         self.tool_calls = 0
         self.inherited_acked = 0
+        self.inherited_refused = {}
         self.cancelled = False
 
 
@@ -181,10 +194,15 @@ def _bump(counts: dict[str, int], reason: str) -> None:
     counts[reason] = counts.get(reason, 0) + 1
 
 
+def _event_key(rule_name: str, ev: aq.AlertEvent) -> inv_svc.PairKey:
+    """The store's inheritance key for one alert-queue event."""
+    return inv_svc.pair_key(rule_name, ev.src_ip, ev.dst_ip, ev.subject_host)
+
+
 def _cluster_events(
     rule_events: dict[str, list[aq.AlertEvent]],
-) -> dict[tuple[str, str, str], aq.AlertEvent]:
-    """Cluster events by (rule, src_ip, dst_ip), keeping the newest per cluster.
+) -> dict[inv_svc.PairKey, aq.AlertEvent]:
+    """Cluster events by :func:`inv_svc.pair_key`, keeping the newest per cluster.
 
     A missing endpoint DEGRADES the key to ``""`` rather than dropping the
     event. Dropping is what this used to do — tallying the event under a
@@ -195,32 +213,24 @@ def _cluster_events(
     started by a human, none by the scheduler.
 
     Degrading rather than abandoning the key preserves the dedupe the clustering
-    exists for: all no-IP events of ONE rule collapse into ONE cluster, so a
-    chatty host rule yields one investigation per sweep, not one per event. A
-    per-event fallback key would have destroyed exactly that.
+    exists for: all events of ONE rule on ONE subject collapse into ONE cluster,
+    so a chatty host rule yields one investigation per sweep, not one per event.
+    A per-event fallback key would have destroyed exactly that.
 
-    The host is deliberately NOT part of the key: on a multi-sensor grid one
-    flow is seen by two sensors under two ``host.name`` values, so keying on it
-    would split that one flow into two investigations of the same thing.
+    The host is in the key only when both endpoints are empty, and the reason is
+    in :func:`inv_svc.pair_key`: a flow seen by two sensors carries two
+    ``host.name`` values and must not split, while a detection with no flow has
+    no other subject at all. Until it did, two machines tripping one Sigma rule
+    were one cluster and one verdict.
 
-    That sensor collision is now the ONLY argument for leaving it out.
-    ``AlertEvent.host`` falls back to the nested ``event_data.host.name``, so on
-    the no-IP class it names the real endpoint rather than the "—" placeholder
-    it used to — a host dimension applied ONLY when both IPs are empty is
-    therefore worth revisiting now that host logs are landing, since two
-    machines tripping one Sigma rule currently collapse into one investigation.
-    It is not a docstring-sized change: the key widens, so the store's pair
-    lookups below have to move with it.
-
-    The 3-tuple shape is load-bearing beyond the dict: the keys are handed
-    straight to the store's pair lookups (:func:`inv_svc.running_for_pairs`,
-    :func:`inv_svc.latest_for_pairs`), which key on
-    ``(rule_name, src_ip, dest_ip)``.
+    The key shape is load-bearing beyond this dict: the keys are handed straight
+    to the store's lookups (:func:`inv_svc.running_for_pairs`,
+    :func:`inv_svc.latest_for_pairs`), which re-derive the same key from DB rows.
     """
-    clusters: dict[tuple[str, str, str], aq.AlertEvent] = {}
+    clusters: dict[inv_svc.PairKey, aq.AlertEvent] = {}
     for rule_name, events in rule_events.items():
         for ev in events:
-            key = (rule_name, ev.src_ip or "", ev.dst_ip or "")
+            key = _event_key(rule_name, ev)
             if key not in clusters:
                 # events are newest-first from fetch_group_events
                 clusters[key] = ev
@@ -312,16 +322,23 @@ async def _read_backlog(
     severities_read = 0
     for severity in severities:
         try:
-            groups, _ = await aq.fetch_groups(
+            page = await aq.fetch_groups(
                 elastic, settings, time_range=time_range, severity=severity, oql=oql
             )
-            all_groups.extend(groups)
+            all_groups.extend(page.groups)
             severities_read += 1
         except Exception as exc:
             if _is_query_class(exc):
                 raise
             _LOGGER.exception("auto-triage: fetch_groups failed for severity=%s", severity)
-            grid_errors.append(f"severity {severity}")
+            # These labels are shown to the operator, so the unlabelled read
+            # names what it was reading. "severity unknown" would read as not
+            # knowing which query failed.
+            grid_errors.append(
+                "alerts with no severity"
+                if severity == aq.UNKNOWN_SEVERITY
+                else f"severity {severity}"
+            )
             last_error = exc
 
     if severities and severities_read == 0 and last_error is not None:
@@ -432,28 +449,29 @@ async def plan_targets(
 
     targets: list[Target] = []
     inherited_acks: list[InheritedAck] = []
-    for (rule_name, src_ip, dst_ip), ev in clusters.items():
+    for key, ev in clusters.items():
+        rule_name, src_ip, dst_ip = key[0], key[1], key[2]
         # Skip only if this event's investigation is in-flight or settled; an
         # errored/cancelled run stays re-huntable (see blocks_rehunt).
         direct = direct_hits.get(ev.es_id)
         if direct is not None and inv_svc.blocks_rehunt(direct):
             _bump(skipped_reasons, "already_triaged")
             continue
-        # Skip if the pair is being investigated RIGHT NOW — the running run's
-        # verdict will cover this cluster via inheritance when it completes.
-        if (rule_name, src_ip, dst_ip) in running_pairs:
+        # Skip if the cluster is being investigated RIGHT NOW — the running
+        # run's verdict will cover it via inheritance when it completes.
+        if key in running_pairs:
             _bump(skipped_reasons, "running")
             continue
-        # Skip if (rule, src, dst) pair has a verdict in the window. A
-        # qualifying inherited FP additionally queues the cluster's events for
-        # acknowledgement — the verdict alone never reached SO.
-        inherited = pair_hits.get((rule_name, src_ip, dst_ip))
+        # Skip if the cluster has a verdict in the window. A qualifying
+        # inherited FP additionally queues the cluster's events for
+        # acknowledgement — the verdict alone never reached SO. A key that
+        # names no subject never appears here: the store refuses to hand a
+        # verdict along it (see inv_svc.latest_for_pairs).
+        inherited = pair_hits.get(key)
         if inherited is not None:
             _bump(skipped_reasons, "inherited")
             inherited_acks.extend(
-                _inherited_ack_candidates(
-                    settings, inherited, rule_events.get(rule_name, []), src_ip, dst_ip
-                )
+                _inherited_ack_candidates(settings, inherited, rule_events.get(rule_name, []), key)
             )
             continue
         targets.append(
@@ -483,8 +501,8 @@ async def plan_targets(
 
 async def _coverage_maps(
     state: Any,
-    clusters: dict[tuple[str, str, str], aq.AlertEvent],
-) -> tuple[dict[str, Any], set[tuple[str, str, str]], dict[tuple[str, str, str], Any]]:
+    clusters: dict[inv_svc.PairKey, aq.AlertEvent],
+) -> tuple[dict[str, Any], set[inv_svc.PairKey], dict[inv_svc.PairKey, Any]]:
     """The three existing-coverage lookups for the planned clusters.
 
     - direct verdicts on the clustered event ids (status-agnostic);
@@ -526,19 +544,20 @@ def _inherited_ack_candidates(
     settings: Any,
     inherited: Any,
     events: list[aq.AlertEvent],
-    src_ip: str,
-    dst_ip: str,
+    key: inv_svc.PairKey,
 ) -> list[InheritedAck]:
     """The cluster's events as ack candidates, when the inherited verdict
     qualifies (empty list otherwise).
 
-    *src_ip*/*dst_ip* are cluster-key components, so a missing endpoint arrives
-    as ``""`` while the event still carries ``None``; both sides are normalised
-    the same way as the key or an empty-endpoint cluster would match none of its
-    own events.
+    Membership is re-derived through :func:`_event_key` rather than compared
+    field by field, so an event joins the ack fan-out on exactly the terms that
+    put it in the cluster. Spelling the comparison out separately is how the
+    host dimension would go missing here and acks would spill onto the machines
+    the verdict was never about.
     """
     if not _qualifies_for_inherited_ack(settings, inherited):
         return []
+    rule_name = key[0]
     return [
         InheritedAck(
             alert_es_id=e.es_id,
@@ -547,7 +566,7 @@ def _inherited_ack_candidates(
             confidence=inherited.confidence or 0.0,
         )
         for e in events
-        if (e.src_ip or "") == src_ip and (e.dst_ip or "") == dst_ip
+        if _event_key(rule_name, e) == key
     ]
 
 
@@ -664,6 +683,37 @@ async def _resolve_rule_names(state: Any, ids: list[str]) -> tuple[dict[str, str
     return resolved, True
 
 
+async def _grounded_inheritance_sources(state: Any, source_ids: list[str]) -> set[str]:
+    """Which of *source_ids* reached their verdict by retrieving something.
+
+    Same bar the direct auto-ack applies to its own run — a successful tool
+    call, a Phase-D targeted dispatch that returned discriminating data, or a
+    tool call in the Oracle's own loop — asked of the recorded events instead of
+    a live message history (see
+    :func:`soc_ai.agent.evidence.recorded_run_retrieved_evidence`).
+
+    FAILS CLOSED. On a store error this returns the empty set, so every
+    candidate is refused: "the database did not answer" is not permission to
+    write to the analyst's grid, and the alerts stay in the queue for the next
+    sweep or a human.
+    """
+    from soc_ai.agent.evidence import recorded_run_retrieved_evidence  # noqa: PLC0415
+
+    if not source_ids:
+        return set()
+    try:
+        async with state.db_sessionmaker() as db:
+            by_source = await inv_svc.retrieval_events_for(db, source_ids)
+    except Exception:
+        _LOGGER.exception(
+            "auto-triage: could not read the inheritance sources' evidence — refusing %d "
+            "inherited acks this sweep",
+            len(source_ids),
+        )
+        return set()
+    return {sid for sid in source_ids if recorded_run_retrieved_evidence(by_source.get(sid, []))}
+
+
 async def _ack_inherited_fps(
     state: Any,
     ctx: Any,
@@ -679,6 +729,22 @@ async def _ack_inherited_fps(
     class alert is never auto-acked, even off an inherited verdict). The write
     goes through :func:`execute_write_tool` so it is audited like every other
     unattended ack.
+
+    The evidence bar the direct path got on 2026-09-05 applies here too, and
+    this is where it matters most. Measured on the deployed instance: 110,693
+    grid writes came out of this function against 2,768 from the direct path,
+    and 16 percent of them inherited a verdict from an investigation that had
+    made no successful tool call, no targeted dispatch and no Oracle retrieval.
+    One uninvestigated false positive fans out to a mean of 145 acknowledgements
+    on the analyst's own grid, and the largest single one reached 790. A verdict
+    nothing was retrieved for is not a verdict to lend.
+
+    Two records come out of every write. ``auto_ack_inherited`` in the audit
+    trail carries ``inherited_from``, so an ack can be walked back to the
+    reasoning that authorized it (``execute_write_tool``'s own records name the
+    alert and the user, and nothing else). An ``inherited_ack`` event on the
+    SOURCE investigation carries the running total, because a counter on the
+    sweep's status object dies with the sweep and this fan-out does not.
     """
     # Heavy import at call time, mirroring the runner's own orchestrator import.
     from soc_ai.agent.orchestrator import _is_high_stakes_alert  # noqa: PLC0415
@@ -687,6 +753,9 @@ async def _ack_inherited_fps(
 
     if not acks:
         return
+    grounded = await _grounded_inheritance_sources(
+        state, list(dict.fromkeys(a.inherited_from for a in acks))
+    )
     try:
         lookup = await state.elastic.search(
             state.settings.events_index_pattern,
@@ -697,6 +766,8 @@ async def _ack_inherited_fps(
         _LOGGER.exception("auto-triage: inherited-ack lookup failed — skipping inherited acks")
         return
     hits_by_id = {h.get("_id"): h for h in lookup.hits}
+    written: dict[str, list[str]] = {}
+    rule_of: dict[str, str] = {}
     for cand in acks:
         if status.cancelled:
             break
@@ -705,12 +776,25 @@ async def _ack_inherited_fps(
             continue
         if get_dotted(hit.get("_source", {}), "event.acknowledged"):
             continue  # already acked (a human, or a previous sweep)
+        if cand.inherited_from not in grounded:
+            # The verdict is not being overturned — it still reads as a
+            # confident false positive on the console. It just stops
+            # authorizing writes to Security Onion that nobody looked at.
+            _bump(status.inherited_refused, "no_investigation")
+            _LOGGER.info(
+                "auto-triage: not acking %s — the inherited verdict (from %s) had no "
+                "successful tool call, targeted dispatch or Oracle retrieval behind it",
+                cand.alert_es_id,
+                cand.inherited_from,
+            )
+            continue
         try:
             alert = SoAlert.from_es_hit(hit)
         except Exception:
             _LOGGER.warning("auto-triage: unparseable alert %s — not acking", cand.alert_es_id)
             continue
         if _is_high_stakes_alert(alert):
+            _bump(status.inherited_refused, "high_stakes")
             continue
         _result, error = await execute_write_tool(
             "ack_alert",
@@ -730,6 +814,8 @@ async def _ack_inherited_fps(
             )
         else:
             status.inherited_acked += 1
+            written.setdefault(cand.inherited_from, []).append(cand.alert_es_id)
+            rule_of.setdefault(cand.inherited_from, cand.rule_name)
             _LOGGER.info(
                 "auto-triage: acked inherited FP %s (rule=%s, conf=%.2f, from %s)",
                 cand.alert_es_id,
@@ -737,6 +823,58 @@ async def _ack_inherited_fps(
                 cand.confidence,
                 cand.inherited_from,
             )
+        await _record_inherited_ack_provenance(ctx, cand, ok=not error)
+    await _persist_inherited_acks(state, status, written, rule_of)
+
+
+async def _record_inherited_ack_provenance(ctx: Any, cand: InheritedAck, *, ok: bool) -> None:
+    """Audit the ack with the investigation whose verdict authorized it.
+
+    Best-effort and never raises: ``execute_write_tool`` has already written the
+    fail-closed intent record, so a lost provenance line must not turn a
+    completed SO write into an exception that aborts the rest of the sweep.
+    """
+    audit = getattr(ctx, "audit", None)
+    if audit is None:
+        return
+    try:
+        await audit.log_kind(
+            f"auto-ack-inherited:{cand.alert_es_id}",
+            "auto_ack_inherited",
+            {
+                "alert_id": cand.alert_es_id,
+                "inherited_from": cand.inherited_from,
+                "rule_name": cand.rule_name,
+                "confidence": cand.confidence,
+                "ok": ok,
+            },
+            user="auto-ack:inherited",
+            approved_by="auto-ack:inherited",
+        )
+    except Exception:
+        _LOGGER.warning(
+            "auto-triage: inherited-ack provenance record failed for %s", cand.alert_es_id
+        )
+
+
+async def _persist_inherited_acks(
+    state: Any,
+    status: AutoTriageStatus,
+    written: dict[str, list[str]],
+    rule_of: dict[str, str],
+) -> None:
+    """Land this sweep's fan-out on the source investigations and refresh the total."""
+    if not written:
+        return
+    try:
+        async with state.db_sessionmaker() as db:
+            for source_id, alert_ids in written.items():
+                await inv_svc.record_inherited_acks(
+                    db, source_id=source_id, alert_ids=alert_ids, rule_name=rule_of.get(source_id)
+                )
+            status.inherited_acked_total = await inv_svc.inherited_ack_total(db)
+    except Exception:
+        _LOGGER.exception("auto-triage: could not record the inherited-ack fan-out")
 
 
 # Headroom the outer per-target cap keeps over the inner whole-run backstop, so
@@ -864,11 +1002,27 @@ async def run_auto_triage(
 
 def config_severity_band(settings: Any) -> tuple[str, ...]:
     """The severity band at/above ``settings.auto_triage_min_severity`` (critical
-    first) — the SCOPE of a config-floor sweep. Falls back to high if unset."""
+    first), plus the alerts that carry no severity label — the SCOPE of a
+    config-floor sweep. Falls back to high if unset.
+
+    The unlabelled selector rides along at EVERY floor, including "critical". A
+    floor is a comparison, and there is nothing to compare an absent label
+    against; the only two options are to sweep those alerts or to drop them
+    without saying so, and dropping them is what made this band unreachable.
+    Measured in-process on the deployed host on 2026-09-06: over 24 hours the
+    critical, high, medium and low queries each returned 0 groups, and the
+    documents with no label returned 3 groups over 40 events, which was the
+    entire queue. They were 37 Elastic Defend endpoint alerts and 3 OpenCanary
+    honeypot hits, neither of which is low-priority merely because the shipper
+    omitted a field.
+
+    Appended rather than mixed in, so the ladder part of the band is unchanged
+    in both content and order and a labelled alert is planned exactly as before.
+    """
     ladder = list(aq.SEVERITIES)  # ("critical", "high", "medium", "low")
     floor = getattr(settings, "auto_triage_min_severity", "high")
     idx = ladder.index(floor) if floor in ladder else ladder.index("high")
-    return tuple(ladder[: idx + 1])
+    return (*ladder[: idx + 1], aq.UNKNOWN_SEVERITY)
 
 
 async def start_config_sweep(state: Any, *, started_by: str) -> int:

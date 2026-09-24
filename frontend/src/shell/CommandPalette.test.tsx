@@ -62,7 +62,7 @@ const CONFIG_FIXTURE: Config = {
 const getConfigMock = vi.fn();
 
 vi.mock('../lib/api', () => ({
-  getAlerts: vi.fn(() => Promise.resolve([])),
+  getAlerts: vi.fn(() => Promise.resolve({ groups: [], truncated: false, other_docs: 0 })),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: () => getConfigMock(),
   listDossiers: vi.fn(),

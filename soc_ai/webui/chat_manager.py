@@ -263,7 +263,7 @@ async def _resolve_if_pending(state: Any, assistant_msg_id: int) -> None:
             await chat_svc.finish_assistant(
                 db,
                 assistant_msg_id,
-                content="The assistant was interrupted — please ask again.",
+                content="The assistant was interrupted. Ask again.",
                 status="error",
                 meta=None,
             )

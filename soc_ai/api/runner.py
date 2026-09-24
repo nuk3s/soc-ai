@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from soc_ai.agent.context import HuntSubject
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
     StepEvent,
@@ -61,6 +62,7 @@ async def recorded_run(
     hunt_id: str | None = None,
     finding_ordinal: int | None = None,
     is_synth_eval: bool = False,
+    subject: dict[str, Any] | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap *event_stream* with the investigation recorder tee.
 
@@ -79,6 +81,10 @@ async def recorded_run(
     marked hunt — so the row can never be read back as real activity. Only the
     promotion route (inheriting its hunt's marker) and an eval context (via
     ``run_recorded``) ever set it; it is unreachable from a request body.
+
+    ``subject`` (optional, D2): the hunt-subject record
+    (``HuntSubject.as_record()``), persisted on the row at birth. None is the
+    ordinary alert subject.
     """
     recorder = InvestigationRecorder(
         state.db_sessionmaker,
@@ -89,6 +95,7 @@ async def recorded_run(
         hunt_id=hunt_id,
         finding_ordinal=finding_ordinal,
         is_synth_eval=is_synth_eval,
+        subject=subject,
     )
     inv_id = await recorder.start()
 
@@ -255,6 +262,7 @@ async def run_recorded(
     allow_so_writes: bool = True,
     focus_origin: FocusOrigin = "rerun",
     is_synth_eval: bool = False,
+    subject: HuntSubject | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Call investigate() and tee it through the recorder.
 
@@ -282,6 +290,11 @@ async def run_recorded(
     marker, OR-combined with ``ctx.include_synth`` below — a run recorded from
     an eval context is marked even when the caller forgets the kwarg, the same
     invariant the hunt recorder enforces.
+
+    ``subject`` (optional, D2): a HUNT subject. It goes to ``investigate()``,
+    which reads the hunt instead of the anchor alert, and its record goes to
+    the row. The two travel together so a run that reads a hunt can never be
+    stored as a run that read an alert.
     """
     event_gen = investigate(
         alert_id,
@@ -290,6 +303,7 @@ async def run_recorded(
         deep=deep,
         allow_so_writes=allow_so_writes,
         focus_origin=focus_origin,
+        subject=subject,
     )
 
     async for name, data in recorded_run(
@@ -306,6 +320,7 @@ async def run_recorded(
         # marked regardless of what its caller passed (test-double contexts may
         # lack the attribute — absent means the prod default, not opted in).
         is_synth_eval=is_synth_eval or bool(getattr(ctx, "include_synth", False)),
+        subject=subject.as_record() if subject is not None else None,
     ):
         yield name, data
 

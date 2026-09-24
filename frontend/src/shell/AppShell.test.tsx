@@ -11,7 +11,7 @@ import { ShellProvider } from './ShellContext';
 
 // Pinned literally (not imported) so a copy edit can't silently self-approve.
 const BANNER_COPY =
-  'Demo — these investigations were run by soc-ai and recorded. Nothing here is live.';
+  'Demo. soc-ai ran these investigations and recorded them. Nothing here is live.';
 
 let fetchMock: ReturnType<typeof vi.fn>;
 

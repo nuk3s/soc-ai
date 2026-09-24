@@ -65,11 +65,17 @@ data/
 !soc_ai/**/data/
 !soc_ai/**/data/**
 
-# Local deploy target (host stays out of the public repo)
+# Local deploy targets (hosts stay out of the public repo)
 .deploy-target
+.range-target
 
 # Claude Code local state (worktrees, settings.local, remember)
 .claude/
 
 # eval batch artifacts (large; deploy already excludes) — repo-root only
 /evals/
+
+# The tester's visual guide is generated from live screenshots of the lab
+# and shipped via frontend/public -> dist; it carries lab addresses and is
+# never committed.
+frontend/public/guide/

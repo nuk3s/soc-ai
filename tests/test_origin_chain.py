@@ -159,6 +159,89 @@ def test_tool_is_registered_for_the_investigator() -> None:
     assert "origin_chain(" in src
 
 
+# ── The window has to be the window the tool claims ──────────────────────────
+
+
+async def test_window_ends_at_the_anchor_rather_than_straddling_it() -> None:
+    """The tool says "the N minutes before the activity". It has to be that.
+
+    It borrowed query_events' anchored filter, which CENTERS the window on the
+    anchor, so at the default 30 it saw 15 minutes before and 15 after. A driving
+    session 20 minutes earlier was invisible, while sessions AFTER the alert were
+    counted and narrated as preceding it. Both directions are load-bearing: this
+    tool's empty result is the sentence "nothing was observed driving this host,
+    so its behavior appears self-originated".
+    """
+    captured: dict[str, Any] = {}
+
+    async def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return type("R", (), {"hits": [], "total": 0, "raw": {"hits": {"hits": []}}})()
+
+    es = AsyncMock()
+    es.search = _capture
+
+    await origin_chain(
+        "192.168.10.202",
+        elastic=es,
+        settings=_Settings(),
+        time_anchor=ANCHOR,
+        lookback_minutes=30,
+    )
+
+    ts = captured["query"]["bool"]["filter"][0]["range"]["@timestamp"]
+    assert ts["lte"] == ANCHOR.isoformat()
+    assert ts["gte"] == datetime(2026, 8, 5, 11, 4, 21, tzinfo=UTC).isoformat()
+
+
+async def test_a_session_after_the_activity_is_not_reported_as_preceding_it() -> None:
+    """Belt and braces: even if a post-anchor hit arrives, it is not a driver."""
+    es = _es([_hit("2026-08-05T11:40:00.000Z", "192.168.20.226", "192.168.10.202")])
+
+    result = await origin_chain(
+        "192.168.10.202", elastic=es, settings=_Settings(), time_anchor=ANCHOR
+    )
+
+    assert result["observations"] is False
+    assert result["inbound_sessions"] == []
+    assert result["closest_preceding"] is None
+
+
+async def test_a_preceding_session_still_survives_the_post_anchor_filter() -> None:
+    """Negative control: the session the tool exists to find must still land."""
+    es = _es(
+        [
+            _hit("2026-08-05T11:32:45.426Z", "192.168.20.226", "192.168.10.202"),
+            _hit("2026-08-05T11:40:00.000Z", "192.168.20.226", "192.168.10.202"),
+        ]
+    )
+
+    result = await origin_chain(
+        "192.168.10.202", elastic=es, settings=_Settings(), time_anchor=ANCHOR
+    )
+
+    assert len(result["inbound_sessions"]) == 1
+    assert result["closest_preceding"]["seconds_before"] == pytest.approx(95.6, abs=1)
+
+
+async def test_without_an_anchor_the_window_stays_now_relative() -> None:
+    """Live callers with no alert to anchor to keep the legacy behaviour."""
+    captured: dict[str, Any] = {}
+
+    async def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return type("R", (), {"hits": [], "total": 0, "raw": {"hits": {"hits": []}}})()
+
+    es = AsyncMock()
+    es.search = _capture
+
+    await origin_chain("192.168.10.202", elastic=es, settings=_Settings(), lookback_minutes=45)
+
+    ts = captured["query"]["bool"]["filter"][0]["range"]["@timestamp"]
+    assert ts["gte"] == "now-45m"
+    assert ts["lte"] == "now"
+
+
 def test_investigator_doctrine_requires_the_pivot_before_attribution() -> None:
     """The 2026-08-05 failure was not a missing tool — host_summary was called
     twice. It was a missing STEP. Pin the instruction that makes it mandatory."""

@@ -269,7 +269,7 @@ function HostTip({ active, payload }: TooltipProps<number, string>) {
 function HostChart({ rows }: { rows: HostRow[] }) {
   return (
     <ResponsiveContainer width="100%" height={Math.max(rows.length * 32 + 26, 90)}>
-      <BarChart accessibilityLayer aria-label="Host involvement — findings per host (top 8 hosts)" data={rows} layout="vertical" margin={{ top: 4, right: 30, bottom: 0, left: 4 }}>
+      <BarChart accessibilityLayer aria-label="Host involvement, findings per host, top 8 hosts" data={rows} layout="vertical" margin={{ top: 4, right: 30, bottom: 0, left: 4 }}>
         <XAxis type="number" allowDecimals={false} tick={TICK} axisLine={AXIS_LINE} tickLine={false} />
         <YAxis
           type="category"
@@ -376,7 +376,7 @@ function HostFindingMap({ findings, hosts }: { findings: HuntFinding[]; hosts: H
           const tip =
             h.count > 0
               ? `${h.host}\nnamed in ${h.count} finding${h.count === 1 ? '' : 's'} · worst ${h.worst}`
-              : `${h.host}\naffected host — no finding names it`;
+              : `${h.host}\naffected host · no finding names it`;
           return (
             // Clicking a host node pivots to its entity page (what we know about
             // this box). SVG <g> takes onClick; cursor signals it's interactive.
@@ -493,7 +493,7 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
         </ResponsiveContainer>
       </div>
       <TableDisclosure
-        caption={`${chart.title || 'Chart'} — data table`}
+        caption={`${chart.title || 'Chart'} · data table`}
         columns={[chart.xLabel ? clip(chart.xLabel, 24) : 'x', chart.yLabel ? clip(chart.yLabel, 24) : 'value']}
         rows={data.map((p) => [String(p.x), typeof p.y === 'number' ? p.y : String(p.y ?? '')])}
       />
@@ -539,7 +539,7 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
     {
       // no single swatch color can say "severity" — a mini severity ramp does
       swatch: `linear-gradient(90deg,${SEV_COLOR.critical},${SEV_COLOR.medium},${SEV_COLOR.low})`,
-      label: 'threat (severity color)',
+      label: 'threat · severity color',
     },
     ...(gaps > 0 ? [{ swatch: GAP_COLOR, label: 'visibility gap' }] : []),
     ...(obs > 0 ? [{ swatch: OBS_COLOR, label: 'observation' }] : []),
@@ -597,12 +597,12 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
                 items={[
                   {
                     swatch: `linear-gradient(90deg,${SEV_COLOR.critical},${SEV_COLOR.medium},${SEV_COLOR.low})`,
-                    label: 'bar color = worst severity',
+                    label: 'bar color is the worst severity',
                   },
                 ]}
               />
               <TableDisclosure
-                caption="Host involvement — findings per host"
+                caption="Host involvement · findings per host"
                 columns={['Host', 'Findings', 'Worst severity']}
                 rows={hostR.map((r) => [r.host, r.count, r.worst])}
               />
@@ -622,19 +622,19 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
           />
           {mapHosts.length === 0 ? (
             <div className="px-4 py-3.5 text-[12.5px] text-dim">
-              No hosts to map — no finding names a host.
+              No hosts to map. No finding names a host.
             </div>
           ) : (
             <>
               <HostFindingMap findings={findings} hosts={mapHosts} />
               <LegendRow
                 items={[
-                  { swatch: SEV_COLOR.high, label: 'finding (severity color)' },
+                  { swatch: SEV_COLOR.high, label: 'finding · severity color' },
                   { swatch: '#4b8bf5', round: true, label: 'host' },
                 ]}
               />
               <TableDisclosure
-                caption="Host–finding map — each finding and the hosts it names"
+                caption="Host–finding map · each finding and the hosts it names"
                 columns={['Finding', 'Severity', 'Category', 'Hosts']}
                 rows={findings.map((f, i) => [
                   `F${i + 1} — ${f.title}`,

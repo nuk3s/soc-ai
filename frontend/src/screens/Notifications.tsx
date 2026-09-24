@@ -1,6 +1,6 @@
 import { Bell, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { SyntheticEvalBadge } from '../components/Badges';
 import { ListToolbar } from '../components/ListToolbar';
 import { MultiSelect } from '../components/MultiSelect';
@@ -17,6 +17,12 @@ import {
   notificationKind,
   type NotificationKind,
 } from '../lib/notifications';
+import {
+  GROUP_HUNTING,
+  TONE_ATTENTION,
+  TONE_INFORMATIONAL,
+  TONE_URGENT,
+} from '../lib/tooltips';
 import type { Notification } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 
@@ -40,6 +46,31 @@ const URGENCY: ReadonlyArray<{ value: Notification['tone']; label: string }> = [
   { value: 'warn', label: 'Attention' },
   { value: 'accent', label: 'Informational' },
 ];
+
+/** What the dot says, in one sentence. The colour was the only statement. */
+const TONE_TITLE: Record<Notification['tone'], string> = {
+  danger: TONE_URGENT,
+  warn: TONE_ATTENTION,
+  accent: TONE_INFORMATIONAL,
+};
+
+/** The group a row names for itself, when the wire carries one. The list holds
+ *  shadow hits and leads whose kind is worked out from an id prefix, and a
+ *  server that already knows the answer should not be second-guessed. */
+function wireGroup(n: Notification): string | null {
+  const g = (n as { group?: unknown }).group;
+  return typeof g === 'string' && g.trim() ? g.trim() : null;
+}
+
+/** The header a named group prints. */
+const GROUP_LABELS: Record<string, string> = { hunting: 'Hunting' };
+
+/** What a named group holds, in one sentence. */
+const GROUP_TITLE: Record<string, string> = { hunting: GROUP_HUNTING };
+
+function groupLabel(id: string): string {
+  return GROUP_LABELS[id] ?? id.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+}
 
 /**
  * Notifications — the same list toolbar its neighbours wear.
@@ -68,7 +99,6 @@ const URGENCY: ReadonlyArray<{ value: Notification['tone']; label: string }> = [
  * two-row toolbar its siblings do.
  */
 export function Notifications() {
-  const navigate = useNavigate();
   const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(getNotifications, [], {
     refetchInterval: 15000,
   });
@@ -122,12 +152,28 @@ export function Notifications() {
     byKind.set(k, c);
   }
 
-  // Group headers earn their place only while the rows actually span kinds:
+  // Group headers earn their place only while the rows actually span groups:
   // under a kind chip they would just repeat the chip that is already pressed.
-  const groups = NOTIFICATION_KINDS.map((k) => ({
-    ...k,
-    rows: visible.filter((n) => notificationKind(n) === k.id),
-  })).filter((g) => g.rows.length > 0);
+  // A row that names its own group wins; the rest fall back to their kind.
+  const named = new Map<string, Notification[]>();
+  const byDerivedKind: Notification[] = [];
+  for (const n of visible) {
+    const g = wireGroup(n);
+    if (g == null) {
+      byDerivedKind.push(n);
+      continue;
+    }
+    const rows = named.get(g) ?? [];
+    rows.push(n);
+    named.set(g, rows);
+  }
+  const groups = [
+    ...[...named.entries()].map(([id, rows]) => ({ id, label: groupLabel(id), rows })),
+    ...NOTIFICATION_KINDS.map((k) => ({
+      ...k,
+      rows: byDerivedKind.filter((n) => notificationKind(n) === k.id),
+    })),
+  ].filter((g) => g.rows.length > 0);
   const grouped = groups.length > 1;
 
   const dismiss = (id: string) => {
@@ -135,8 +181,10 @@ export function Notifications() {
     setDismissTick((t) => t + 1);
   };
 
+  // "Clear all" steps over anything the server marked undismissible. One click
+  // that sweeps away a tamper finding is not a tamper alarm.
   const clearAll = () => {
-    dismissMany(items.map((n) => n.id));
+    dismissMany(items.filter((n) => n.dismissible !== false).map((n) => n.id));
     setDismissTick((t) => t + 1);
   };
 
@@ -165,25 +213,30 @@ export function Notifications() {
     ),
   ];
 
+  // No row is clickable as a whole. The title is the link when the row has a
+  // destination, so the address can be read, copied and opened in a tab. The
+  // row itself is a row.
   const row = (nt: Notification) => (
     <div
       key={nt.id}
       data-testid="notification-row"
-      onClick={() => {
-        if (nt.href) navigate(nt.href);
-      }}
-      className={
-        'flex items-center gap-3 border-b border-border-faint px-4 py-3 ' +
-        (nt.href ? 'cursor-pointer hover:bg-surface-hover' : '')
-      }
+      className="flex items-center gap-3 border-b border-border-faint px-4 py-3 hover:bg-surface-hover"
     >
       <span
+        data-testid="notification-tone"
+        title={TONE_TITLE[nt.tone]}
         className="h-2 w-2 flex-none rounded-full"
         style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
       />
       <div className="min-w-0 flex-1">
         <div data-testid="notification-title" className="flex flex-wrap items-center gap-1.5 text-[13px]">
-          {formatNotificationTitle(nt.title)}
+          {nt.href ? (
+            <Link to={nt.href} className="text-accent hover:underline">
+              {formatNotificationTitle(nt.title)}
+            </Link>
+          ) : (
+            formatNotificationTitle(nt.title)
+          )}
           {/* A run against planted synthetic scenarios must never read as a
               real one — badge it wherever the row appears. */}
           {nt.isSynthEval && <SyntheticEvalBadge />}
@@ -194,16 +247,16 @@ export function Notifications() {
           </div>
         )}
       </div>
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          dismiss(nt.id);
-        }}
-        aria-label="Dismiss"
-        className="flex flex-none p-1 text-faint hover:text-danger"
-      >
-        <X size={15} />
-      </button>
+      {nt.dismissible !== false && (
+        <button
+          onClick={() => dismiss(nt.id)}
+          aria-label="Dismiss"
+          title="Take this notification off the list. It does not change the work it names."
+          className="flex flex-none p-1 text-faint hover:text-danger"
+        >
+          <X size={15} />
+        </button>
+      )}
     </div>
   );
 
@@ -220,14 +273,16 @@ export function Notifications() {
                 counts — it is what the bell badge shows, and the two disagreeing
                 is the phantom-badge bug all over again. When a filter is on, say
                 how much of it is on screen instead of quietly restating it. */}
-            {filtered ? `${visible.length} of ${items.length} shown` : `${items.length} active`} ·
-            in-flight investigations and last-24h completions
+            {filtered
+              ? `${visible.length} of ${items.length} shown`
+              : `${items.length} item${items.length === 1 ? '' : 's'}`}
+            : shadow hits, leads, hunts and investigations from the last 24 h
           </div>
         </div>
         {items.length > 0 && (
           <button
             onClick={clearAll}
-            title="Dismiss every active notification, including any the current filter is hiding"
+            title="Dismiss every active notification. The filter does not limit this action."
             className="mt-1 flex-none rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
           >
             Clear all
@@ -286,6 +341,7 @@ export function Notifications() {
               <div key={g.id}>
                 <div
                   data-testid="notification-group"
+                  title={GROUP_TITLE[g.id]}
                   className="border-b border-border-faint bg-surface-2 px-4 py-1.5 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
                 >
                   {g.label}

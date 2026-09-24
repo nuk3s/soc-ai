@@ -1,6 +1,6 @@
 """Model fitness battery: probe the knob configurations, recommend the winner.
 
-Design: docs/superpowers/specs/2026-08-05-model-battery-design.md. The
+Design: the model-battery design of 2026-08-05. The
 recommendation rule is deterministic on purpose — an operator must be able to
 read WHY a configuration was recommended, and a re-run on the same numbers must
 recommend the same thing.

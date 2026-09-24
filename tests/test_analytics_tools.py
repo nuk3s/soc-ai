@@ -44,6 +44,19 @@ from soc_ai.tools.analytics import (
 from soc_ai.tools.query_events import _MAX_TIME_RANGE_MINUTES
 
 
+def _keeps_internal_destinations(must_not: list[dict[str, Any]]) -> bool:
+    """True when this query carries no internal-destination CIDR exclusion.
+
+    Three of these sweeps deliberately do not exclude internal destinations —
+    DNS resolvers and DCE-RPC peers are internal, and excluding them would drop
+    the traffic being measured. The assertion used to be spelled as equality
+    with the whole synth clause list, which made it a test of every scope the
+    query carries rather than of the one it is about: adding the provenance
+    scope broke it while nothing it was written to protect had changed.
+    """
+    return not any("destination.ip" in (clause.get("terms") or {}) for clause in must_not)
+
+
 def _make_elastic(
     settings: Settings, result: EsSearchResult | Exception
 ) -> tuple[ElasticClient, AsyncMock]:
@@ -381,7 +394,8 @@ async def test_beacon_profile_include_internal_true_skips_server_side_exclusion(
 
     call = elastic.search.call_args  # type: ignore[attr-defined]
     must_not = call.args[1]["bool"]["must_not"]
-    assert must_not == [{"exists": {"field": "synth.scenario_id"}}]
+    assert _keeps_internal_destinations(must_not)
+    assert all(clause in must_not for clause in synth_scope_must_not(False))
 
 
 def test_internal_dest_exclusion_merges_settings_cidrs_deduped(
@@ -792,7 +806,9 @@ async def test_dns_entropy_scan_query_body_shape(settings_kratos: Settings) -> N
     query = args[1]
     filters = query["bool"]["filter"]
     assert {"terms": {"event.dataset": ["zeek.dns"]}} in filters
-    assert query["bool"]["must_not"] == [{"exists": {"field": "synth.scenario_id"}}]
+    must_not = query["bool"]["must_not"]
+    assert all(clause in must_not for clause in synth_scope_must_not(False))
+    assert _keeps_internal_destinations(must_not)
     range_filters = [f for f in filters if "range" in f]
     assert len(range_filters) == 1
     rng = range_filters[0]["range"]["@timestamp"]
@@ -1093,7 +1109,9 @@ async def test_dcerpc_histogram_query_body_shape(settings_kratos: Settings) -> N
     query = args[1]
     filters = query["bool"]["filter"]
     assert {"term": {"event.dataset": "zeek.dce_rpc"}} in filters
-    assert query["bool"]["must_not"] == [{"exists": {"field": "synth.scenario_id"}}]
+    must_not = query["bool"]["must_not"]
+    assert all(clause in must_not for clause in synth_scope_must_not(False))
+    assert _keeps_internal_destinations(must_not)
     range_filters = [f for f in filters if "range" in f]
     assert len(range_filters) == 1
     rng = range_filters[0]["range"]["@timestamp"]
@@ -1395,14 +1413,28 @@ async def test_first_seen_query_bodies_and_windows(settings_kratos: Settings) ->
     assert elastic.search.call_count == 2  # type: ignore[attr-defined]
     recent_call, baseline_call = elastic.search.call_args_list  # type: ignore[attr-defined]
 
+    # The dataset filter matches EITHER identity field. This used to pin
+    # `event.dataset` alone, which selects nothing on a plane that carries only
+    # `data_stream.dataset` — 41% of documents on the development range, and the
+    # single largest plane on it. A baseline drawn with the narrow predicate is
+    # not a small baseline, it is an empty one, and first-seen over an empty
+    # baseline calls everything novel.
+    def _dataset_clause(filters: list[dict[str, object]]) -> dict[str, object]:
+        return next(f for f in filters if "bool" in f and "should" in f["bool"])
+
+    def _dataset_fields(filters: list[dict[str, object]]) -> set[str]:
+        should = _dataset_clause(filters)["bool"]["should"]
+        return {next(iter(c["term"])) for c in should}
+
     recent_query = recent_call.args[1]
     recent_filters = recent_query["bool"]["filter"]
-    assert {"term": {"event.dataset": "zeek.ssl"}} in recent_filters
+    assert _dataset_fields(recent_filters) == {"event.dataset", "data_stream.dataset"}
+    assert _dataset_clause(recent_filters)["bool"]["minimum_should_match"] == 1
     recent_range = next(f for f in recent_filters if "range" in f)["range"]["@timestamp"]
 
     baseline_query = baseline_call.args[1]
     baseline_filters = baseline_query["bool"]["filter"]
-    assert {"term": {"event.dataset": "zeek.ssl"}} in baseline_filters
+    assert _dataset_fields(baseline_filters) == {"event.dataset", "data_stream.dataset"}
     baseline_range = next(f for f in baseline_filters if "range" in f)["range"]["@timestamp"]
 
     # BOTH queries carry the synth kill-switch AND the server-side internal-
@@ -1632,12 +1664,14 @@ async def test_analytics_sweeps_prod_default_excludes_all_synth(
     elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_qnames_agg([])))
     await dns_entropy_scan(elastic=elastic, settings=settings_kratos)
     must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
-    assert must_not == [prod_exists]
+    assert all(clause in must_not for clause in synth_scope_must_not(False))
+    assert _keeps_internal_destinations(must_not)
 
     elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_ops_agg([])))
     await dcerpc_histogram(elastic=elastic, settings=settings_kratos)
     must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
-    assert must_not == [prod_exists]
+    assert all(clause in must_not for clause in synth_scope_must_not(False))
+    assert _keeps_internal_destinations(must_not)
 
     recent = _result([], aggregations=_recent_dsts_agg([]))
     baseline = _result([], aggregations=_baseline_dsts_agg([]))
@@ -1695,3 +1729,117 @@ async def test_hunt_toolset_threads_scenario_scope_into_sweeps(
             assert impl.await_count == 1, (wrapper_name, scope)
             passed = impl.await_args.kwargs["include_synth"]
             assert passed == scope and type(passed) is type(scope), (wrapper_name, scope, passed)
+
+
+# ---------------------------------------------------------------------------
+# Provenance: a sweep measures a network, and an import is a different network.
+#
+# Everything in this module is a population statistic, and an imported capture
+# or replayed corpus supplies all four in quantity: a replayed C2 PCAP is a
+# textbook beacon (it was recorded as one), an imported DNS-tunnel capture
+# contains a tunnel by definition, an EVTX corpus decides which DCE-RPC
+# operation counts as rare, and any of them landing inside a window makes
+# first_seen report on the arrival of a file. On the development range
+# 19,604,032 of 23,055,409 documents are backfill.
+#
+# The failure this prevents is worse than a guess: this module's contract is
+# that its candidates are MEASURED, so a candidate measured off an import
+# arrives with sample ids that resolve to real documents.
+# ---------------------------------------------------------------------------
+
+_IMPORT_MARKER = {"exists": {"field": "import.id"}}
+_REPLAY_MARKER = {"term": {"tags": "replayed-corpus"}}
+
+
+@pytest.mark.asyncio
+async def test_every_sweep_measures_live_telemetry_by_default(
+    settings_kratos: Settings,
+) -> None:
+    for label, run, response in (
+        ("beacon_profile", beacon_profile, _result([], total=0, aggregations=_pairs_agg({}))),
+        ("dns_entropy_scan", dns_entropy_scan, _result([], total=0, aggregations=_qnames_agg([]))),
+        ("dcerpc_histogram", dcerpc_histogram, _result([], total=0, aggregations=_ops_agg([]))),
+    ):
+        elastic, _ = _make_elastic(settings_kratos, response)
+        out = await run(elastic=elastic, settings=settings_kratos)
+        must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+        assert _IMPORT_MARKER in must_not, label
+        assert _REPLAY_MARKER in must_not, label
+        assert out["provenance"] == "live", label
+
+
+@pytest.mark.asyncio
+async def test_the_novelty_diff_scopes_both_of_its_windows(settings_kratos: Settings) -> None:
+    """The recent side and the baseline side must count the same population.
+
+    A baseline that counts backfill against a recent window that does not
+    reports the arrival of an import as half the network going quiet; the
+    reverse pairing reports it as a flood of new destinations. Only one of the
+    two windows being scoped is the single way to get this wrong.
+    """
+    elastic, _ = _make_elastic_sequence(
+        settings_kratos,
+        [
+            _result([], aggregations=_recent_dsts_agg([])),
+            _result([], aggregations=_baseline_dsts_agg([])),
+        ],
+    )
+
+    out = await first_seen(elastic=elastic, settings=settings_kratos)
+
+    calls = elastic.search.call_args_list  # type: ignore[attr-defined]
+    assert len(calls) == 2
+    for call in calls:
+        must_not = call.args[1]["bool"]["must_not"]
+        assert _IMPORT_MARKER in must_not
+        assert _REPLAY_MARKER in must_not
+    assert out["provenance"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_can_be_pointed_at_an_import_deliberately(
+    settings_kratos: Settings,
+) -> None:
+    """Profiling what an import contains is a real task, and it is asked for."""
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0, aggregations=_pairs_agg({})))
+
+    out = await beacon_profile(elastic=elastic, settings=settings_kratos, provenance="any")
+
+    must_not = elastic.search.call_args.args[1]["bool"]["must_not"]  # type: ignore[attr-defined]
+    assert _IMPORT_MARKER not in must_not
+    assert out["provenance"] == "any"
+    assert "imported" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_every_sweep_summary_names_the_population_it_counted(
+    settings_kratos: Settings,
+) -> None:
+    """Including — especially — when the sweep found nothing.
+
+    "No periodic cadence found across 40 pairs" is the sentence a narrowed
+    denominator turns into a clean bill of health for a grid the sweep only
+    partly looked at.
+    """
+    for label, run, response in (
+        ("beacon_profile", beacon_profile, _result([], total=0, aggregations=_pairs_agg({}))),
+        ("dns_entropy_scan", dns_entropy_scan, _result([], total=0, aggregations=_qnames_agg([]))),
+        ("dcerpc_histogram", dcerpc_histogram, _result([], total=0, aggregations=_ops_agg([]))),
+    ):
+        elastic, _ = _make_elastic(settings_kratos, response)
+        out = await run(elastic=elastic, settings=settings_kratos)
+        assert "live telemetry only" in out["summary"], label
+
+    elastic, _ = _make_elastic_sequence(
+        settings_kratos,
+        [
+            _result(
+                [],
+                aggregations=_recent_dsts_agg([_recent_dst_bucket("8.8.4.9", 4, id_prefix="n")]),
+            ),
+            _result([], aggregations=_baseline_dsts_agg(["8.8.9.1"])),
+        ],
+    )
+    out = await first_seen(elastic=elastic, settings=settings_kratos)
+    assert out["items"], "the novel-destination branch is the one under test here"
+    assert "live telemetry only" in out["summary"]

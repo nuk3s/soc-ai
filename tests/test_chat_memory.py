@@ -510,15 +510,17 @@ def _report(citations: list[str] | None = None) -> TriageReport:
 
 
 def _strong_benign_candidate() -> Any:
-    """Strong benign template match so a zero-tool FP verdict settles round-1."""
+    """Dispositive benign template match so a zero-tool FP verdict settles
+    round-1. Was clean_internal_traffic, which is provisional now."""
     from soc_ai.agent.decision_templates import CandidateVerdict
 
     return CandidateVerdict(
         verdict="false_positive",
         confidence=0.85,
-        cited_evidence=["alert.severity_label"],
-        template_id="clean_internal_traffic",
-        rationale="internal scanner",
+        cited_evidence=["alert.rule_name"],
+        template_id="stun_quic_keepalive",
+        rationale="STUN keepalive with a clean conn",
+        authority="dispositive",
     )
 
 

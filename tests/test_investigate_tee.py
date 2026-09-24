@@ -397,6 +397,55 @@ async def test_unseeded_run_falls_back_to_event_dataset(settings_kratos: Setting
 
 
 @pytest.mark.asyncio
+async def test_recorder_stamps_the_host_a_flowless_alert_fired_on(
+    settings_kratos: Settings,
+) -> None:
+    """The write half of the inheritance key.
+
+    A detection with no endpoints is keyed on the machine instead, and the
+    lookup re-derives that key from this row. If the recorder never wrote the
+    host, every such run would key as "this rule, nowhere" and could inherit
+    from, and be inherited by, an unrelated machine's verdict.
+    """
+    from soc_ai.api.recorder import InvestigationRecorder
+    from soc_ai.store import investigations as inv_svc_local
+
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+
+    recorder = InvestigationRecorder(maker, alert_id="es-sigma-host", started_by="t")
+    inv_id = await recorder.start()
+    assert inv_id is not None
+    await recorder.record(
+        "alert_context",
+        1,
+        {
+            "alert": {
+                "rule_name": "Active Directory Replication from Non Machine Account",
+                "source_ip": None,
+                "destination_ip": None,
+                "host_name": "dc-01",
+            }
+        },
+    )
+    await recorder.record("triage_report", 2, REPORT)
+    await recorder.finish("complete")
+
+    async with maker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+        assert got is not None
+        inv, _events = got
+        assert inv.host_name == "dc-01"
+        assert inv.src_ip is None and inv.dest_ip is None
+        # And the row is reachable under the key its own alert would build.
+        wanted = inv_svc_local.pair_key(inv.rule_name, None, None, "dc-01")
+        hits = await inv_svc_local.latest_for_pairs(db, [wanted], window_days=7)
+        assert hits[wanted].id == inv_id
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_finish_is_idempotent(settings_kratos: Settings) -> None:
     """Calling finish() twice must not change the stored status from the first call."""
     from soc_ai.api.recorder import InvestigationRecorder

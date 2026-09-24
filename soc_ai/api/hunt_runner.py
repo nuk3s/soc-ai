@@ -713,13 +713,21 @@ def _apply_partial_humility(report: Any) -> Any:
     hunt-gate severity machinery so "cap" only ever LOWERS a severity.
     """
     try:
-        from soc_ai.agent.hunt_gates import _SEV_RANK, _cap_severity  # noqa: PLC0415
+        # _severity_rank rather than a local _SEV_RANK.get default: an unknown
+        # severity has to rank the same here as it does inside the gates, or the
+        # humility clamp and the citation gate disagree about which findings are
+        # loud enough to cap.
+        from soc_ai.agent.hunt_gates import (  # noqa: PLC0415
+            _SEV_RANK,
+            _cap_severity,
+            _severity_rank,
+        )
 
         new_findings: list[Any] = []
         for finding in report.findings:
             category = str(getattr(finding, "category", None) or "").strip().lower()
             severity = str(getattr(finding, "severity", None) or "info")
-            if category == "threat" and _SEV_RANK.get(severity.lower(), 0) >= _SEV_RANK["high"]:
+            if category == "threat" and _severity_rank(severity) >= _SEV_RANK["high"]:
                 new_findings.append(
                     finding.model_copy(
                         update={
@@ -774,6 +782,8 @@ async def hunt_recorded_run(
     started_by: str,
     prior: str | None = None,
     kind: str = "chat",
+    starter: str = "analyst",
+    lead_id: int | None = None,
     cancel_token: CancelToken | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap :func:`run_hunt` with the hunt recorder tee.
@@ -793,6 +803,8 @@ async def hunt_recorded_run(
         # path builds its context via ctx_from_state, which leaves
         # include_synth False — only an explicit eval context sets it.
         is_synth_eval=bool(ctx.include_synth),
+        starter=starter,
+        lead_id=lead_id,
     )
     hunt_id = await recorder.start()
 
@@ -841,6 +853,9 @@ async def hunt_recorded_run(
         raise
     except Exception as exc:
         _LOGGER.exception("hunt stream crashed")
+        # Tell the recorder why before it finalizes. The stream never reached
+        # an ``error`` event, so this is the only record of the cause.
+        recorder.note_failure(exc)
         await recorder.finish("error")
         yield "error", {"message": str(exc), "type": type(exc).__name__}
     finally:

@@ -217,8 +217,8 @@ function UsersCard({
       <div className="px-[15px] py-3.5">
         <div className="text-[12.5px] text-dim">No host-log users in this window.</div>
         <div className="mt-1 text-[11.5px] leading-[1.5] text-faint">
-          Either nobody authenticated in the last {range}, or the grid holds no host logs for this
-          address at all — this view cannot tell the two apart.
+          Nobody authenticated in the last {range}, or the grid holds no host logs for this address.
+          This view cannot tell the two apart.
         </div>
       </div>
     );
@@ -226,7 +226,7 @@ function UsersCard({
   if (users.length === 0) {
     return (
       <div className="px-[15px] py-3.5 text-[12.5px] leading-[1.6] text-dim">
-        Host logs reached the grid for this address, and nobody authenticated in the last {range}.
+        Host logs reached the grid for this address. Nobody authenticated in the last {range}.
       </div>
     );
   }
@@ -297,14 +297,14 @@ export function HostActivityRow({
         <AlertTriangle size={15} className="flex-none text-warn" />
         <div className="min-w-0 flex-1">
           <div className="text-[12.5px] font-semibold text-warn">
-            This host's live activity could not be read
+            soc-ai could not read this host's live activity
           </div>
           {/* Two sentences, two elements: the grid's message is not guaranteed
               to end in punctuation, and concatenating produced "grid down
               Everything below…". */}
           <div className="mt-0.5 text-[11.5px] leading-[1.5] text-dim">{error?.message}</div>
           <div className="mt-0.5 text-[11.5px] leading-[1.5] text-faint">
-            Everything below comes from the network sweep and is unaffected.
+            Everything below comes from the network sweep. This failure does not affect it.
           </div>
         </div>
         <button
@@ -346,8 +346,8 @@ export function HostActivityRow({
         >
           <AlertTriangle size={13} className="flex-none" />
           <span className="min-w-0 flex-1">
-            Could not re-read the grid ({error?.message}) — the activity below is the last good
-            read.
+            Could not re-read the grid. The activity below is the last good read.
+            {error?.message && <span className="text-dim"> · {error.message}</span>}
           </span>
           <button
             onClick={onRetry}
@@ -389,7 +389,7 @@ export function HostActivityRow({
             <div className="px-[15px] py-8 text-center text-[12.5px] leading-[1.6] text-dim">
               No peer traffic for this host in the last {range}.
               <div className="mt-1 text-[11.5px] text-faint">
-                The grid answered — this host simply exchanged nothing it could see.
+                The grid answered. This host exchanged nothing that the grid can see.
               </div>
             </div>
           ) : (

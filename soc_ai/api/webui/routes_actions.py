@@ -24,6 +24,7 @@ from soc_ai.api.webui._timeline import (
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
 from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
@@ -83,6 +84,50 @@ def _observed_case_id(events: list[Any]) -> str | None:
     return found
 
 
+def _escalate_outcome(result: Any) -> tuple[bool, str]:
+    """``(linked, sentence)`` for an ``escalate_to_case`` result.
+
+    An escalate is three writes and only the first is guaranteed. Creating the
+    case always succeeds once Security Onion answers, so reading the outcome off
+    that alone reported success for a press that put the alert on nothing: on
+    the range, an alert that was no longer on the grid produced a case, an
+    accepted attach that attached nothing, and "Case created: ...".
+
+    ``linked`` is the only thing that decides whether an escalate happened, and
+    it is what the caller keys the count and the ledger claim on. The three
+    outcomes get three different sentences:
+
+    * attached and stamped: the ordinary escalate.
+    * attached, not stamped: the alert IS case work, but Security Onion's own
+      alert list still shows it untriaged, so somebody will meet it there.
+    * not attached: no escalate happened, and an empty case is now sitting in
+      the queue under a title that reads like an incident. Name it, because
+      only the operator can close or reuse it.
+    """
+    if not isinstance(result, dict):
+        return False, "Security Onion returned no answer to the escalate."
+    case_id = _case_id_from_result(result)
+    named = f"case {case_id}" if case_id else "the case"
+    if not result.get("alert_linked"):
+        reason = (
+            str(result.get("link_error") or "").strip().rstrip(".")
+            or f"{named} exists and the alert is not attached to it"
+        )
+        return False, (
+            f"{reason[0].upper()}{reason[1:]}. soc-ai recorded no escalation. "
+            f"Close or reuse {named}."
+        )
+    created = (
+        f"soc-ai created case {case_id}." if case_id else "soc-ai created a Security Onion case."
+    )
+    if not result.get("marked_escalated"):
+        return True, (
+            f"{created} The alert is attached to it. Security Onion did not mark the "
+            "alert escalated. The alert still reads as untriaged in the alert list."
+        )
+    return True, f"{created} The alert is attached to it and marked escalated."
+
+
 def _action_detail(tool_name: str, result: Any) -> str:
     """One-line, analyst-facing confirmation of what the write tool did."""
     if not isinstance(result, dict):
@@ -90,8 +135,7 @@ def _action_detail(tool_name: str, result: Any) -> str:
     if tool_name == "ack_alert":
         return "Alert acknowledged in Security Onion."
     if tool_name == "escalate_to_case":
-        case_id = _case_id_from_result(result)
-        return f"Case created: {case_id}" if case_id else "Case created in Security Onion."
+        return _escalate_outcome(result)[1]
     if tool_name == "add_case_comment":
         case_id = result.get("case_id") or ""
         return f"Comment added to case {case_id}." if case_id else "Comment added to case."
@@ -156,11 +200,110 @@ async def _group_ack_result(
     if failed:
         detail = (
             f"Acknowledged {acked} of {acked + failed} alerts in this "
-            f"detection group ({failed} failed)."
+            f"detection group. {failed} failed."
         )
     else:
         detail = f"Acknowledged {acked} alert{'s' if acked != 1 else ''} in this detection group."
     return (detail, acked)
+
+
+async def _reserve_escalate(
+    request: Request,
+    elastic: ElasticClient,
+    settings: Settings,
+    alert_id: str,
+    *,
+    user: str,
+    inv_real_id: str,
+    sequence: int,
+    receipt: dict[str, Any],
+) -> ExecuteActionResult | None:
+    """Reserve ``alert_id`` in the escalation ledger BEFORE a case is opened.
+
+    Returns ``None`` when the claim is ours and the caller may write, or the
+    answer to give the analyst when it is not.
+
+    This is the half of the duplicate-case guard the single-alert path did not
+    have. Its own idempotency is the persisted ``action_executed`` marker, which
+    is keyed to one investigation and one action, and the per-``(investigation,
+    action)`` lock above, which is process-local. Neither can see a group
+    escalate over the same alert running in the same instant, and the group path
+    could not see this one either, because nothing reserved the alert until
+    after the case was already open. Both presses passed their own check and
+    Security Onion ended with two cases pointing at one alert — the same outcome
+    the ledger was introduced to stop, reached through the door it did not
+    cover.
+
+    :func:`~soc_ai.api.webui.routes_alert_actions._reserve` is reused rather
+    than reimplemented for one alert, so both paths answer "is this already on a
+    case" from the same three sources in the same order (ledger, then Security
+    Onion's case links, then a claim somebody else holds), and a stale claim the
+    grid can disprove is released and retaken here exactly as it is there. A
+    second reservation policy would be a second set of answers.
+    """
+    from soc_ai.api.webui.routes_alert_actions import _reserve  # noqa: PLC0415 — circular
+
+    title = str(receipt.get("title") or "")
+    reserved = await _reserve(request, elastic, settings, [alert_id], caller=user)
+    if alert_id in reserved.claimed:
+        return None
+    if reserved.unresolved:
+        # An earlier escalate claimed this alert and never came back with a case
+        # id, and the grid could not be asked whether one exists. Opening a case
+        # now might duplicate one; refusing leaves the alert where it is. Only
+        # the second of those is reversible. Answered as an error rather than an
+        # execution, so the card stays pressable once the grid is readable.
+        return ExecuteActionResult(
+            status="error",
+            title=title,
+            error=(
+                "An earlier escalate of this alert is not settled. soc-ai could not read "
+                "the Security Onion case index. soc-ai opened no case. Try again once "
+                "the grid is readable."
+            ),
+        )
+    # A case already exists. Same shape as the already-acknowledged arm in the
+    # caller: ok-with-note, and persist the marker so the card reads applied
+    # from now on rather than re-offering a duplicate.
+    await _persist_action_executed(
+        request, inv_real_id, sequence, {**receipt, "success": True, "by": user}
+    )
+    return ExecuteActionResult(
+        status="executed",
+        title=title,
+        detail="This alert is already on a Security Onion case. soc-ai opened no second case.",
+    )
+
+
+async def _record_escalation(
+    request: Request,
+    *,
+    alert_id: Any,
+    case_id: str,
+    linked: bool,
+) -> None:
+    """Resolve this alert's ledger claim with the case that was opened for it.
+
+    The claim itself was taken by :func:`_reserve_escalate` before the write, so
+    there is a row here already and this only writes the answer onto it.
+
+    A case id goes on the row only when the alert is genuinely attached to that
+    case. Writing one for a case that attached nothing is the poisoning half of
+    the range defect: the ledger would then refuse the case actually needed, on
+    the strength of a link that does not exist. An unattached escalate leaves
+    the bare claim standing, which reads as "soc-ai tried, outcome unknown", and
+    the next press of either escalate settles it against the grid.
+
+    Best-effort: the case exists either way, and a store failure must not change
+    what the operator is told about the write.
+    """
+    if not isinstance(alert_id, str) or not alert_id or not linked or not case_id:
+        return
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            await esc_svc.record_case(db, alert_id, case_id)
+    except Exception:
+        _LOGGER.warning("escalation ledger write failed", exc_info=True)
 
 
 async def _persist_action_executed(
@@ -329,7 +472,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         return ExecuteActionResult(
             status="executed",
             title=title,
-            detail="Already executed — not repeated.",
+            detail="Already executed. soc-ai did not repeat it.",
         )
 
     tool_args = dict(rec.get("tool_args") or {})
@@ -413,8 +556,31 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         return ExecuteActionResult(
             status="executed",
             title=title,
-            detail="Alert was already acknowledged in Security Onion.",
+            detail="This alert is already acknowledged in Security Onion.",
         )
+
+    if tool_name == "escalate_to_case":
+        # Reserve the alert BEFORE opening the case, so a group escalate racing
+        # this press collides on the ledger's unique index instead of on
+        # Security Onion's case queue. See _reserve_escalate.
+        refused = await _reserve_escalate(
+            request,
+            elastic,
+            settings,
+            str(tool_args["alert_id"]),
+            user=user,
+            inv_real_id=inv_real_id,
+            sequence=next_seq,
+            receipt={
+                "index": index,
+                "action_key": action_key,
+                "tool_name": tool_name,
+                "title": title,
+                "note": "already_escalated",
+            },
+        )
+        if refused is not None:
+            return refused
 
     result, error = await execute_write_tool(
         tool_name,
@@ -428,22 +594,37 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     if error is not None:
         return ExecuteActionResult(status="error", title=title, error=error)
     detail = _action_detail(tool_name, result)
+    # An escalate that put the alert on no case is a failed escalate, whatever
+    # Security Onion answered the case create with. It decides the status, the
+    # persisted receipt and which ledger row is written.
+    escalated = tool_name != "escalate_to_case" or _escalate_outcome(result)[0]
     exec_payload: dict[str, Any] = {
         "index": index,
         "action_key": action_key,
         "tool_name": tool_name,
         "title": title,
-        "success": True,
+        "success": escalated,
         "by": user,
         "detail": detail,
     }
     if tool_name == "escalate_to_case":
         # Persist the SO-created case id so a later add_case_comment can bind its
-        # write target to a case THIS investigation opened (F07).
+        # write target to a case THIS investigation opened (F07). Recorded on an
+        # unattached case too, so the empty case an operator has to deal with is
+        # not only in a response they may have navigated away from. The
+        # success=False on the receipt keeps it out of _observed_case_id.
         case_id = _case_id_from_result(result)
         if case_id:
             exec_payload["case_id"] = case_id
+        await _record_escalation(
+            request,
+            alert_id=tool_args.get("alert_id"),
+            case_id=case_id,
+            linked=escalated,
+        )
     await _persist_action_executed(request, inv_real_id, next_seq, exec_payload)
+    if not escalated:
+        return ExecuteActionResult(status="error", title=title, error=detail)
     return ExecuteActionResult(status="executed", title=title, detail=detail)
 
 
@@ -522,7 +703,7 @@ async def override_verdict(
                 status_code=409,
                 detail={
                     "reason": "investigation_running",
-                    "hint": "Wait for the investigation to complete before overriding.",
+                    "hint": "Wait for the investigation to complete before you override.",
                 },
             )
         updated = await inv_svc.resolve(

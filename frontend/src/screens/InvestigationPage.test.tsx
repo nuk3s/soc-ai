@@ -5,7 +5,7 @@
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Investigation as Inv } from '../lib/types';
+import type { Investigation as Inv, InvestigationSubject } from '../lib/types';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -40,6 +40,18 @@ const baseInv: Inv = {
   seedChat: [],
 };
 
+/** A run whose subject is a hunt. It has no alert behind it, so the Alerts
+ *  console holds nothing it read. */
+const SUBJECT: InvestigationSubject = {
+  type: 'hunt',
+  hunt_id: '01HUNT0000000000000000000000',
+  objective: 'Sweep for directory replication by a non-machine account',
+  finding_ordinals: [0],
+  lead_id: 10,
+  document_ids: ['doc-a'],
+  observation_ids: [41],
+};
+
 const at = (path: string, state?: unknown) =>
   render(
     <MemoryRouter initialEntries={[{ pathname: path, state }]}>
@@ -70,5 +82,23 @@ describe('InvestigationPage back-link', () => {
     at('/investigation/INV-1');
     const link = await screen.findByRole('link', { name: 'Alerts' });
     expect(link).toHaveAttribute('href', '/alerts');
+  });
+
+  // A hunt subject has no alert behind it. The breadcrumb read "Alerts /
+  // Investigation" and sent the analyst to a console that holds nothing this
+  // run read.
+  it('goes to Hunts on a run whose subject is a hunt', async () => {
+    vi.mocked(getInvestigation).mockResolvedValue({ ...baseInv, subject: SUBJECT });
+    at('/investigation/INV-1');
+    const link = await screen.findByRole('link', { name: 'Hunts' });
+    expect(link).toHaveAttribute('href', '/hunts');
+  });
+
+  // An origin the analyst came from wins over the list of every hunt.
+  it('keeps the hunt it was opened from', async () => {
+    vi.mocked(getInvestigation).mockResolvedValue({ ...baseInv, subject: SUBJECT });
+    at('/investigation/INV-1', { from: '/hunts/01HUNT0000000000000000000000' });
+    const link = await screen.findByRole('link', { name: 'Hunt' });
+    expect(link).toHaveAttribute('href', '/hunts/01HUNT0000000000000000000000');
   });
 });

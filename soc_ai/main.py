@@ -36,6 +36,7 @@ from soc_ai.api.webui_api import router as api_v1_router
 from soc_ai.audit.logger import AuditLogger
 from soc_ai.bootstrap_credential import bootstrap_credential_path
 from soc_ai.config import get_settings
+from soc_ai.hunting.window import sweep_window
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import backtests as bt_svc
@@ -205,27 +206,299 @@ def _dossier_due(last_run_iso: str | None, interval_hours: int) -> bool:
     return _discovery_due(last_run_iso, interval_hours)
 
 
+def _audit_verify_due(last_run_iso: str | None, interval_hours: int) -> bool:
+    """True iff a scheduled audit-chain verification is due.
+
+    :func:`_discovery_due`'s elapsed-time maths against an ``app.state`` stamp.
+    In-memory on purpose, unlike the dossier's durable stamp: a restart
+    re-verifying is a bounded read of one index, and the failure this schedule
+    exists to catch is precisely the kind that hides behind "we already
+    checked".
+    """
+    return _discovery_due(last_run_iso, interval_hours)
+
+
 def _eval_nightly_due(
     now: datetime,
     *,
     hour_utc: int,
     last_scheduled_date: str | None,
     latest_snapshot_date: str | None,
+    last_attempt_date: str | None = None,
 ) -> bool:
     """True iff the in-app nightly quality eval should run at *now*.
 
     Runs at most once per UTC day, at the first wake at/after ``hour_utc``.
-    Two independent once-per-day guards: the in-memory ``last_scheduled_date``
-    (covers failed runs that wrote no snapshot — no retry storm) and the
-    durable ``latest_snapshot_date`` (covers restarts after a successful run,
-    and a host-cron run that already landed today's point).
+    Three once-per-day guards, and each covers a case the others do not:
+
+    * ``last_scheduled_date`` — in memory, claimed the instant this process
+      schedules a run, so two wakes a few minutes apart cannot both fire.
+    * ``latest_snapshot_date`` — durable, and covers a restart after a run
+      that WROTE a point, plus a host-cron run that already landed today's.
+    * ``last_attempt_date`` — durable, and covers the gap between those two:
+      an exit-2 or exit-5 night writes no snapshot, so before this table the
+      only guard on a night the nightly failed was the in-memory one, and a
+      restart loop could re-run it repeatedly on exactly the nights something
+      was already wrong.
     """
     today = now.date().isoformat()
     if last_scheduled_date == today:
         return False
+    if last_attempt_date == today:
+        return False
     if now.hour < hour_utc:
         return False
     return latest_snapshot_date != today
+
+
+async def _hunt_spec_sweep_loop(app: FastAPI) -> None:
+    """Run the declarative hunt catalog on a loop (proactive-hunting slice 3).
+
+    The seventh lifespan task, and the one with the least in it: a sweep costs
+    no model call at all. It compiles each spec to two bounded Elasticsearch
+    queries, drops every condition the fire-once gate has already handled, and
+    records what survives as a ``Hunt(kind="triggered")``. Nothing generative
+    runs, so a finding from this path cannot hallucinate.
+
+    Mirrors :func:`_hunt_schedule_loop`'s discipline — fixed 60s wake, settings
+    read live each wake so a config-console toggle applies without a restart,
+    a no-op unless ``hunt_spec_sweeps_enabled`` — and differs in three ways
+    that follow from costing nothing:
+
+    - the interval floor is 5 minutes rather than 60, because two aggregations
+      per spec is not an LLM hunt;
+    - the LOOK-BACK window is wider than the interval (24h by default), so a
+      condition that landed during an outage, a restart or an ingest lag is
+      still seen. That overlap is deliberate and is exactly what a live-tailing
+      rule engine cannot do — the fire-once gate is what stops it becoming
+      repeat findings;
+    - there is no per-spec schedule row, so the single-flight is a module-level
+      guard on the whole sweep rather than per-item state.
+
+    A spec that fails is reported inside :func:`sweep_catalog` and never stops
+    the rest of the catalog. A sweep that fails as a whole is logged and the
+    loop continues; the next wake re-reads a fresh window.
+
+    Note (workers>1): a second uvicorn worker would run its own copy and double
+    the query load. The gate's unique constraint means it could not double the
+    FINDINGS, which is the part that matters, but soc-ai runs a single worker
+    today and distributed coordination is Epoch 6.2, as for the loop above.
+    """
+    from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415
+    from soc_ai.hunting.sweep import sweep_catalog  # noqa: PLC0415
+
+    last_run: datetime | None = None
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            settings = app.state.settings
+            if not getattr(settings, "hunt_spec_sweeps_enabled", False):
+                continue
+            # The floor and the clamp live in soc_ai.hunting.window, shared
+            # with `soc-ai spec-sweep` and the catalog route, so a hand-run
+            # sweep covers exactly what this loop covers and the panel reports
+            # the same number the trail rows record.
+            window = sweep_window(settings)
+            now = datetime.now(UTC).replace(tzinfo=None)
+            if last_run is not None and (now - last_run) < timedelta(
+                minutes=window.interval_minutes
+            ):
+                continue
+
+            # Said once per sweep, after the interval check, so a
+            # misconfiguration is visible without being repeated every wake.
+            window.say_if_widened(_LOGGER)
+            # The effective catalog, not the files alone: a retired analytic
+            # must stop running and a local one in shadow must start, and both
+            # facts live in the database.
+            async with app.state.db_sessionmaker() as db:
+                tiers = await effective_catalog(db)
+            catalog = tiers.specs
+            if not catalog:
+                continue
+
+            async with app.state.db_sessionmaker() as db:
+                result = await sweep_catalog(
+                    catalog,
+                    session=db,
+                    elastic=app.state.elastic,
+                    settings=settings,
+                    since=window.since,
+                    until="now",
+                    now=now,
+                    shadow_ids=tiers.shadow_ids,
+                )
+                await db.commit()
+            # Stamped only after a completed sweep, so a crash mid-sweep retries
+            # on the next wake rather than skipping a whole interval.
+            last_run = now
+
+            if result.hunts or result.blind or result.errored or result.gaps_cleared:
+                _LOGGER.info(
+                    "spec sweep: %d hunt(s) from %d fresh candidate(s); "
+                    "%d already handled, %d blind, %d errored",
+                    len(result.hunts),
+                    result.fresh_candidates,
+                    result.already_handled,
+                    len(result.blind),
+                    len(result.errored),
+                )
+            # Its own line, and its own condition rather than a clause on the
+            # summary above: a sweep whose only news is a recovery has no
+            # hunts, nothing blind and nothing errored, so before this the
+            # summary did not fire for it and an outage ENDING was the quietest
+            # event in the log. INFO, not WARNING — the transition the other
+            # way is reported at INFO too, and a "things are better now" line
+            # at WARNING is one anybody alerting on the level would misread.
+            if result.gaps_cleared:
+                _LOGGER.info(
+                    "spec sweep: %d spec(s) can see their telemetry again; "
+                    "the visibility gap recorded for them is closed",
+                    result.gaps_cleared,
+                )
+            for spec_id, err in result.errored.items():
+                _LOGGER.warning("spec sweep: %s failed against the grid: %s", spec_id, err)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOGGER.warning("spec sweep loop: %s: %s", type(exc).__name__, exc)
+
+
+# The shortest interval the profile sweep will accept. A sweep makes no model
+# call, so the floor is far below the hour an LLM schedule needs. It is not
+# zero: each sweep is several real aggregations per dimension against the
+# analyst's grid.
+PRIOR_SWEEP_MIN_INTERVAL_MINUTES = 15
+
+
+def _prior_sweep_interval_minutes(settings: Any) -> int:
+    """Minutes between profile sweeps, with the floor applied.
+
+    The console bounds the setting, and this bounds it again. An override
+    written before the bound existed, or a settings object built in code,
+    reaches the loop without passing the console at all.
+    """
+    raw = getattr(settings, "hunting_prior_sweep_interval_minutes", 60)
+    try:
+        minutes = int(raw or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    return max(PRIOR_SWEEP_MIN_INTERVAL_MINUTES, minutes)
+
+
+def _grid_is_known_down(app: FastAPI) -> bool:
+    """Has the health probe loop seen Elasticsearch fail and not recover?
+
+    Reads the map ``_note_dep_transitions`` keeps on ``app.state``, so the
+    answer costs no query. Unknown reads as up: a process that has not probed
+    yet must sweep rather than wait.
+    """
+    down = getattr(app.state, "_dep_down_since", None) or {}
+    return "es" in down
+
+
+async def _prior_sweep_loop(app: FastAPI) -> None:
+    """Run the profile sweep on a loop: the hunting layer's supply of observations.
+
+    This is the code path ``soc-ai priors --record`` runs. The test range runs
+    it from a host timer every hour. A container has no timer, so before this
+    loop a production deployment shipped the profile layer and never ran it:
+    no observation was recorded, no profile lead formed, and every surface
+    stayed green. A job nobody scheduled is the same false all-clear as a
+    surface that lies, arrived at from the supply side.
+
+    Mirrors :func:`_hunt_spec_sweep_loop`'s discipline — fixed 60 s wake,
+    settings read live each wake so a config-console toggle applies without a
+    restart, an interval floor, one line in the log per run — and differs in
+    three ways:
+
+    - it is ON by default. A catalog sweep writes findings, so it is opt-in. A
+      profile sweep writes observations and raises nothing, and a deployment
+      with no profile observation has no hunting layer;
+    - it skips a demo and a grid the health probe already knows is down. Both
+      write the same damage: a sweep that could not measure records that
+      nothing departed, which is a baseline learning from an outage;
+    - it is not coupled to the dossier loop that builds the baselines it
+      reads. If the dossiers are not built yet the sweep runs anyway and
+      reports what it could not measure as blind, exactly as the CLI does.
+      Waiting for the other loop would let either one stop the other.
+
+    The sweep itself never raises: it returns its errors, and they are logged
+    beside the counts. A sweep that fails another way is logged and the loop
+    continues; the last-run stamp is written only after a sweep that returned,
+    so a failure retries on the next wake rather than costing a whole interval.
+
+    Note (workers>1): a second uvicorn worker would run its own copy and
+    double the query load. soc-ai runs a single worker today and distributed
+    coordination is Epoch 6.2, as for the loops above.
+    """
+    from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415
+    from soc_ai.hunting.prior_sweep import run_prior_sweep  # noqa: PLC0415
+    from soc_ai.hunting.priors import COVERAGE_BLIND  # noqa: PLC0415
+    from soc_ai.oracle.identifiers import effective_internal_identifiers  # noqa: PLC0415
+
+    app.state.prior_sweep_last_run = None
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            settings = app.state.settings
+            if not getattr(settings, "hunting_prior_sweep_enabled", True):
+                continue
+            if getattr(settings, "soc_ai_demo", False):
+                continue
+            if _grid_is_known_down(app):
+                continue
+
+            now = datetime.now(UTC).replace(tzinfo=None)
+            last_run = getattr(app.state, "prior_sweep_last_run", None)
+            if last_run is not None and (now - last_run) < timedelta(
+                minutes=_prior_sweep_interval_minutes(settings)
+            ):
+                continue
+
+            async with app.state.db_sessionmaker() as db:
+                # The estate's own address space, so the sweep does not record
+                # observations about the internet and form leads out of them.
+                cidrs = (await effective_internal_identifiers(db, settings)).cidrs
+                # The effective catalog, for the same reason the spec sweep
+                # reads it: a retired prior must stop running and a local one
+                # in shadow must start.
+                tiers = await effective_catalog(db)
+                sweep = await run_prior_sweep(
+                    elastic=app.state.elastic,
+                    settings=settings,
+                    db=db,
+                    record=True,
+                    cidrs=cidrs,
+                    catalog=tiers.specs,
+                    shadow_ids=tiers.shadow_ids,
+                )
+                await db.commit()
+            # Stamped only after a sweep that returned, so a failure retries on
+            # the next wake rather than skipping the whole interval.
+            app.state.prior_sweep_last_run = now
+
+            observations = sum(len(r.departures) for r in sweep.results)
+            leads = len(sweep.leads.formed) if sweep.leads is not None else 0
+            blind = sweep.coverage_counts().get(COVERAGE_BLIND, 0)
+            # Said every run, not only when something departed. A quiet sweep
+            # is how an operator knows the loop is alive, and the blind count
+            # is what separates "nothing departed" from "nothing could be
+            # measured" — the same empty list, and completely different news.
+            _LOGGER.info(
+                "prior sweep: %d observation(s), %d lead(s), %d blind",
+                observations,
+                leads,
+                blind,
+            )
+            for err in sweep.errors:
+                _LOGGER.warning("prior sweep: %s", err)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOGGER.warning("prior sweep loop: %s: %s", type(exc).__name__, exc)
 
 
 async def _eval_nightly_loop(app: FastAPI, settings: Any) -> None:
@@ -257,13 +530,17 @@ async def _eval_nightly_loop(app: FastAPI, settings: Any) -> None:
             # Durable freshness check — fail-soft toward "no snapshot today"
             # (running twice is cheaper than silently never running).
             latest_snapshot_date: str | None = None
+            last_attempt_date: str | None = None
             try:
                 from soc_ai.store import quality as quality_store  # noqa: PLC0415
 
                 async with app.state.db_sessionmaker() as db:
                     rows = await quality_store.recent_snapshots(db, limit=1)
+                    attempt = await quality_store.latest_attempt(db)
                 if rows:
                     latest_snapshot_date = rows[0].created_at.date().isoformat()
+                if attempt is not None:
+                    last_attempt_date = attempt.attempted_at.date().isoformat()
             except Exception:
                 _LOGGER.warning(
                     "eval-nightly: snapshot freshness check failed (continuing)", exc_info=True
@@ -273,6 +550,7 @@ async def _eval_nightly_loop(app: FastAPI, settings: Any) -> None:
                 hour_utc=settings.eval_nightly_hour_utc,
                 last_scheduled_date=status.last_scheduled_date,
                 latest_snapshot_date=latest_snapshot_date,
+                last_attempt_date=last_attempt_date,
             ):
                 # A point already landed today (host cron / pre-restart run):
                 # consume the day so later wakes skip the DB check too.
@@ -281,11 +559,221 @@ async def _eval_nightly_loop(app: FastAPI, settings: Any) -> None:
                 continue
             status.last_scheduled_date = now.date().isoformat()
             status.running = True  # claim the single-flight slot before scheduling
-            status._task = asyncio.create_task(_quality_eval_worker(app.state))
+            status._task = asyncio.create_task(_quality_eval_worker(app.state, trigger="schedule"))
         except asyncio.CancelledError:
             raise
         except Exception:
             _LOGGER.exception("eval-nightly scheduler iteration failed; continuing")
+
+
+async def _health_probe_loop(app: FastAPI, settings: Any) -> None:
+    """Probe the upstreams on a schedule, so an outage is noticed with no tab open.
+
+    Every health surface in this app is pull-only behind a TTL cache, and
+    ``_note_dep_transitions`` — the code that records when a dependency went
+    down, and the only thing that puts a dependency-down entry on the bell —
+    runs solely as a side effect of a client polling ``/api/v1/health``.
+
+    So an open browser tab was the scheduler. Elasticsearch could be down all
+    night, come back before anyone looked, and nothing anywhere would know it
+    had happened: no bell entry, no transition recorded, no log. That is the
+    same false-quiet this codebase keeps finding, arrived at from the other
+    direction — not a surface that lies, a surface nobody asked.
+
+    Cheap by construction. It calls the same cached probe the endpoint does, so
+    a wake inside the TTL costs nothing and a polling client and this loop share
+    one result rather than doubling the load. PCAP is deliberately not probed:
+    it is a heavy SSH round trip on a much longer TTL and nothing on the bell
+    keys on it.
+    """
+    from soc_ai.api.webui.routes_meta import _cached_health_probes  # noqa: PLC0415 - lazy
+
+    wake_seconds = 60
+    while True:
+        await asyncio.sleep(wake_seconds)
+        try:
+            await _cached_health_probes(app.state, settings)
+        except Exception:
+            # A probe that could not run is not a dependency being down, and
+            # must not be recorded as one. probe_* never raise; this guards the
+            # loop against anything else so a single bad wake cannot kill the
+            # only scheduled health check in the process.
+            _LOGGER.warning("scheduled health probe failed to run", exc_info=True)
+
+
+async def _audit_verify_loop(app: FastAPI, settings: Any) -> None:
+    """Periodically verify the tamper-evident audit chain, and alarm on a break.
+
+    A tamper-evident log nobody verifies is a log. The chain has been
+    checkable since v1 — ``soc-ai audit verify``, and the admin verify-chain
+    diagnostic — and in practice nothing ever ran either, so a live deployment
+    carried a broken current epoch for weeks with nothing saying so. This loop
+    is the thing that says so.
+
+    Models :func:`_discovery_scheduler_loop`: fixed wake, live settings read
+    each wake so a console toggle applies without a restart, and a failed
+    iteration logged and swallowed. The scan runs inline rather than in a
+    spawned task — it is a bounded ES read, not a model run — so the loop
+    cannot overlap itself and needs no single-flight slot.
+
+    Three outcomes, three different responses:
+
+    - broken — an audit record (kind ``audit_chain_verification``, into the
+      very chain it is reporting on) plus the opt-in notification webhook plus
+      a standing entry on the in-app bell. Same two channels the nightly
+      quality regression uses, and the bell besides, because notifications are
+      off by default and a tamper finding that reaches nobody on a default
+      install is the failure this loop exists to end.
+    - intact — nothing is sent and any standing alarm is cleared, so the bell
+      entry disappears on its own once the trail is sound again.
+    - could not run (unreachable or half-read index) — logged, never alarmed.
+      A verification that did not happen is not a tamper finding, and treating
+      it as one would teach the operator to ignore the alarm that matters.
+
+    Until a fix lands for whatever is breaking the chain, this reports the
+    break on every run. That is the honest state; it is not suppressed.
+    """
+    from soc_ai import notify  # noqa: PLC0415 - lazy
+    from soc_ai.api.webui.routes_config import _get_audit_verify_status  # noqa: PLC0415
+    from soc_ai.audit.verify import verify_audit_chain  # noqa: PLC0415
+
+    wake_seconds = 300
+    while True:
+        await asyncio.sleep(wake_seconds)
+        try:
+            # Re-read every wake → console toggle / interval edits apply live.
+            if not settings.audit_verify_schedule_enabled:
+                continue
+            status = _get_audit_verify_status(app.state)
+            if not _audit_verify_due(
+                status.last_run, settings.audit_verify_schedule_interval_hours
+            ):
+                continue
+            elastic = getattr(app.state, "elastic", None)
+            if elastic is None:
+                continue
+            days = max(1, int(settings.audit_verify_days))
+            try:
+                result = await verify_audit_chain(elastic, settings.audit_index_alias, days=days)
+            except Exception:
+                # Could not run. NOT a tamper finding — see the docstring.
+                _LOGGER.warning(
+                    "scheduled audit-chain verification could not run (the audit "
+                    "index was unreachable or only partly readable); no verdict "
+                    "either way",
+                    exc_info=True,
+                )
+                status.last_run = datetime.now(UTC).isoformat()
+                continue
+            status.last_run = datetime.now(UTC).isoformat()
+            if result.ok:
+                status.alarm = None
+                _LOGGER.info(
+                    "audit chain verified: %d records, %d epoch(s), last %dd",
+                    result.records_verified,
+                    result.epochs,
+                    days,
+                )
+                continue
+            await _raise_audit_chain_alarm(app, settings, result, status, days, notify)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("audit chain verification scheduler iteration failed; continuing")
+
+
+async def _raise_audit_chain_alarm(
+    app: FastAPI,
+    settings: Any,
+    result: Any,
+    status: Any,
+    days: int,
+    notify: Any,
+) -> None:
+    """Put one chain-break finding in front of a human, three ways.
+
+    Split out of the loop so each channel's failure is contained: the bell
+    entry is set first and from memory, so it survives an audit index that
+    cannot take the record and a webhook that will not answer.
+
+    Every channel carries the blast radius, not one sequence number out of
+    however many broke, and the bell entry carries an identity for the FINDING
+    rather than for the moment it was noticed, so a standing alarm can be
+    dismissed without a new break inheriting the dismissal. See
+    :func:`~soc_ai.audit.verify.finding_key` for what that identity is made of
+    and :func:`~soc_ai.audit.verify.finding_is_dismissible` for the one kind of
+    finding that is never offered as dismissible.
+    """
+    from soc_ai.audit.verify import (  # noqa: PLC0415 - lazy
+        describe_blast_radius,
+        finding_is_dismissible,
+        finding_key,
+    )
+
+    blast_radius = describe_blast_radius(result)
+    payload: dict[str, Any] = {
+        "window_days": days,
+        "records_verified": result.records_verified,
+        "epochs": result.epochs,
+        "epochs_broken": result.epochs_broken,
+        "latest_epoch_broken": result.latest_epoch_broken,
+        "capped": result.capped,
+        "break_kind": result.newest_break_kind,
+        "break_seq": result.first_broken_seq,
+        "break_detail": result.newest_break_detail,
+        "newest_broken_epoch_start": result.newest_broken_epoch_start,
+        "break_kinds": list(result.break_kinds),
+        "duplicate_seqs": result.duplicate_seqs,
+        "extra_records": result.extra_records,
+        "max_claimants": result.max_claimants,
+        "altered_records": result.altered_records,
+        "missing_seqs": result.missing_seqs,
+        "oldest_break_at": result.oldest_break_at,
+        "newest_break_at": result.newest_break_at,
+        "blast_radius": blast_radius,
+    }
+    now = datetime.now(UTC).isoformat()
+    key = finding_key(result)
+    previous = status.alarm if isinstance(status.alarm, dict) else None
+    # The clock the bell renders is when THIS finding was first seen, not when
+    # it was last looked at, so a standing scar does not read as "just now"
+    # every morning.
+    since = previous.get("alarm_since") if previous and previous.get("alarm_key") == key else None
+    status.alarm = dict(
+        payload,
+        detected_at=now,
+        alarm_key=key,
+        alarm_since=since or now,
+        dismissible=finding_is_dismissible(result),
+    )
+    _LOGGER.error(
+        "AUDIT CHAIN BROKEN: %s (%d of %d epochs, last %dd)",
+        blast_radius or result.newest_break_detail or "the chain does not verify",
+        result.epochs_broken,
+        result.epochs,
+        days,
+    )
+    audit = getattr(app.state, "audit", None)
+    if audit is not None:
+        try:
+            await audit.log_kind(
+                session_id="audit-chain-verify",
+                kind="audit_chain_verification",
+                payload=payload,
+            )
+        except Exception:
+            _LOGGER.warning("audit-chain-break record could not be written", exc_info=True)
+    event = notify.event_for_audit_chain_break(
+        epochs_broken=result.epochs_broken,
+        seq=result.first_broken_seq,
+        kind=result.newest_break_kind,
+        detail=result.newest_break_detail,
+        latest_epoch_broken=result.latest_epoch_broken,
+        settings=settings,
+        blast_radius=blast_radius,
+    )
+    if event is not None:
+        await notify.fire_safe(event, settings, audit)
 
 
 async def _discovery_scheduler_loop(app: FastAPI, settings: Any) -> None:
@@ -493,6 +981,7 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
                         objective=sched.objective,
                         started_by="scheduler",
                         kind="scheduled",
+                        starter="schedule",
                     )
                     if hunt_id is None:
                         # Rejected: the shared concurrency ceiling is full (or the
@@ -541,6 +1030,145 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
             _LOGGER.exception("hunt scheduler iteration failed; continuing")
 
 
+# How many leads one wake reads before it decides. Wider than any sensible
+# concurrency cap, because a lead that cites no documents is skipped and must
+# not hold the slot of a lead behind it that does.
+_LEAD_AUTO_HUNT_BATCH = 50
+
+# How often the skip of one lead is said. The loop wakes every 60 seconds, so
+# an unthrottled line would write sixty an hour about one lead that is not
+# moving.
+_LEAD_AUTO_HUNT_QUIET = timedelta(hours=1)
+
+
+async def _leads_the_loop_may_hunt(db: Any) -> tuple[list[int], list[int]]:
+    """The waiting leads, split by whether their observations cite a document.
+
+    The second list is skipped rather than hunted: a hunt of a lead that cites
+    nothing has no evidence to read first, so it searches the grid from
+    scratch. The split is re-read on every wake, because the sweep can record
+    documents for a lead that had none.
+    """
+    from soc_ai.hunting import lead_hunt  # noqa: PLC0415
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415
+
+    cited: list[int] = []
+    bare: list[int] = []
+    for lead in await lead_hunt.leads_awaiting_a_hunt(db, limit=_LEAD_AUTO_HUNT_BATCH):
+        rows = await leads_store.timeline(db, int(lead.id))
+        (cited if leads_store.cites_documents(rows) else bare).append(int(lead.id))
+    return cited, bare
+
+
+def _say_the_skipped_leads(
+    said: dict[int, datetime], no_documents: list[int], now: datetime
+) -> dict[int, datetime]:
+    """Log each skipped lead once an hour. Returns the times to keep.
+
+    The returned map holds only the leads still being skipped, so a process
+    that runs for months does not accumulate an entry per lead ever formed.
+    """
+    kept = {lead_id: at for lead_id, at in said.items() if lead_id in no_documents}
+    for lead_id in no_documents:
+        last = kept.get(lead_id)
+        if last is None or (now - last) >= _LEAD_AUTO_HUNT_QUIET:
+            kept[lead_id] = now
+            _LOGGER.info(
+                "lead auto-hunt: lead %s cites no documents, so it is not hunted. "
+                "Run the sweep again to record them.",
+                lead_id,
+            )
+    return kept
+
+
+async def _lead_auto_hunt_loop(app: FastAPI) -> None:
+    """Start a hunt for every lead that has never had one (D1).
+
+    Mirrors :func:`_hunt_schedule_loop`'s discipline: a fixed 60s wake, live
+    settings read each wake so a config-console toggle applies without a
+    restart, and a no-op unless ``lead_auto_hunt``. It differs in what it
+    reads: not a schedule table but the leads themselves.
+
+    The loop starts the hunt rather than the sweep that forms the lead,
+    because leads also form in the timer process that runs the priors, and
+    that process cannot run an agent.
+
+    The rule, in one sentence: an open lead with no hunt, never dismissed,
+    with no hunt row that names it, oldest first, until the number of the
+    loop's own lead hunts in flight reaches ``lead_auto_hunt_concurrency``.
+    The selection lives in :func:`soc_ai.hunting.lead_hunt.leads_awaiting_a_hunt`
+    and the start in :func:`soc_ai.hunting.lead_hunt.start_lead_hunt`, which
+    the Hunt button on the lead calls as well.
+
+    A lead whose observations cite no documents is skipped, not started: its
+    hunt would have no evidence to read first and would search the grid from
+    scratch. The skip is re-read on every wake, because the sweep can record
+    documents later, but the log line about it is said once an hour per lead.
+
+    One lead that fails is logged and the tick continues, so a single bad lead
+    can never take out the others or the loop.
+
+    Note (workers>1): a second uvicorn worker would run its own copy and could
+    start a second hunt for the same lead between the console call and the
+    mark. soc-ai runs a single worker today; distributed scheduler
+    coordination is Epoch 6.2, as for the loops above.
+    """
+    from soc_ai.hunting import lead_hunt  # noqa: PLC0415
+
+    # Per-process, per-lead: when the skip was last said. Rebuilt each wake
+    # from the leads still being skipped, so it cannot grow without bound.
+    said_no_documents: dict[int, datetime] = {}
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            settings = app.state.settings
+            if not getattr(settings, "lead_auto_hunt", False):
+                continue
+            cap = max(1, int(getattr(settings, "lead_auto_hunt_concurrency", 2) or 1))
+
+            async with app.state.db_sessionmaker() as db:
+                running = await lead_hunt.running_auto_hunts(db)
+                if running >= cap:
+                    continue
+                eligible, no_documents = await _leads_the_loop_may_hunt(db)
+
+            said_no_documents = _say_the_skipped_leads(
+                said_no_documents, no_documents, datetime.now(UTC).replace(tzinfo=None)
+            )
+
+            started = 0
+            for lead_id in eligible:
+                if running + started >= cap:
+                    break
+                try:
+                    out = await lead_hunt.start_lead_hunt(
+                        app.state, lead_id=lead_id, started_by=lead_hunt.AUTO_HUNT_ACTOR
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except lead_hunt.LeadHuntRefused as exc:
+                    # The lead closed or the console is full. Both are normal.
+                    # The lead stays open and the next wake reads it again.
+                    _LOGGER.info(
+                        "lead auto-hunt: lead %s did not take a hunt (%s)", lead_id, exc.reason
+                    )
+                    continue
+                except Exception:
+                    _LOGGER.exception(
+                        "lead auto-hunt: lead %s failed to start a hunt; skipping", lead_id
+                    )
+                    continue
+                if out.existing:
+                    continue
+                started += 1
+                _LOGGER.info("lead auto-hunt: lead %s started hunt %s", lead_id, out.hunt_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("lead auto-hunt iteration failed; continuing")
+
+
 def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
     """Write the one-shot bootstrap admin password to a locked-down sidecar
     file instead of the shared log stream, and log only a pointer to it.
@@ -569,6 +1197,39 @@ def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
             "change the password, then delete that file.",
             cred_path,
         )
+
+
+def _require_prompt_assets() -> None:
+    """Refuse to serve when a declared prompt asset is not on disk.
+
+    The prompt assets (``soc_ai.agent.prompts.PROMPT_ASSETS``) are markdown
+    files that live beside the package rather than inside it, so a build that
+    forgets to copy them produces an app that starts, answers, and is wrong:
+    the primer degrades to a stub that tells the model the query language is
+    unavailable, and the verdicts that come back still look like verdicts.
+
+    This is the one place the product prefers a crash. The standing rule is
+    that a false all-clear outranks a crash, and it holds for upstreams: a
+    half-answering grid is reported, not fatal, because the honest degraded
+    answer exists and we can hand it to the analyst. Here there is no honest
+    degraded answer to hand over. The absence is invisible in the output, it
+    is knowable with two stat calls before the first request, and it is a
+    packaging fault an operator fixes by redeploying, so we fail at the point
+    where somebody is already watching, rather than at the point where an
+    analyst is trusting the answer. The doctor carries the same finding
+    (``check_prompt_assets``) for the installs that reach it another way.
+    """
+    from soc_ai.agent.prompts import missing_prompt_assets  # noqa: PLC0415 - startup-only
+
+    missing = missing_prompt_assets()
+    if not missing:
+        return
+    detail = "; ".join(f"{asset.name} ({asset.path}): {asset.cost}" for asset in missing)
+    raise RuntimeError(
+        f"refusing to start, {len(missing)} prompt asset(s) missing. {detail}. "
+        "The deployment is incomplete; redeploy from an image or install that ships "
+        "the docs/ directory, then run `soc-ai doctor` to confirm."
+    )
 
 
 async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
@@ -698,6 +1359,17 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
                 _LOGGER.info("demo mode: seeded %d fixture row(s)", added)
         except Exception:
             _LOGGER.warning("demo fixture seed failed; continuing with empty store", exc_info=True)
+        # The hunt catalog's sweep trail is generated from the shipped catalog,
+        # not read from the fixture file (see soc_ai/demo/catalog_trail.py), so
+        # it has its own fail-soft step: a fixture problem must not cost the
+        # Operate hub its one live panel, and the reverse holds too.
+        try:
+            from soc_ai.demo.catalog_trail import seed_catalog_trail  # noqa: PLC0415
+
+            if await seed_catalog_trail(db_sessionmaker):
+                _LOGGER.info("demo mode: seeded a week of hunt catalog sweeps")
+        except Exception:
+            _LOGGER.warning("demo catalog trail seed failed; continuing without it", exc_info=True)
 
     await _reap_orphans_at_startup(db_sessionmaker)
 
@@ -712,6 +1384,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Before anything is built: the prompt assets are a packaging fact, and a
+    # deployment missing one answers wrongly rather than not at all.
+    _require_prompt_assets()
     # DB + persisted overrides FIRST, before any client is built. Connection /
     # secret Danger-Zone overrides feed the SO/ES/LiteLLM clients, so they must
     # land on `settings` before make_auth/ElasticClient/etc. read it. The secret
@@ -796,7 +1471,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     dossier_task = asyncio.create_task(_dossier_scheduler_loop(app, settings))
     autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
     hunt_schedule_task = asyncio.create_task(_hunt_schedule_loop(app))
+    lead_auto_hunt_task = asyncio.create_task(_lead_auto_hunt_loop(app))
     eval_nightly_task = asyncio.create_task(_eval_nightly_loop(app, settings))
+    spec_sweep_task = asyncio.create_task(_hunt_spec_sweep_loop(app))
+    prior_sweep_task = asyncio.create_task(_prior_sweep_loop(app))
+    audit_verify_task = asyncio.create_task(_audit_verify_loop(app, settings))
+    health_probe_task = asyncio.create_task(_health_probe_loop(app, settings))
 
     try:
         yield
@@ -817,9 +1497,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         hunt_schedule_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await hunt_schedule_task
+        lead_auto_hunt_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await lead_auto_hunt_task
         eval_nightly_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await eval_nightly_task
+        spec_sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await spec_sweep_task
+        prior_sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await prior_sweep_task
+        health_probe_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await health_probe_task
+        audit_verify_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await audit_verify_task
         # An in-flight quality-eval worker (scheduled or run-now) holds its own
         # engine/ES clients — cancel + drain like the discovery worker below.
         from soc_ai.api.webui_api import _get_quality_eval_status  # noqa: PLC0415
@@ -961,6 +1656,37 @@ _DEMO_WRITE_ALLOW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+# A field whose name matches this is reported WITHOUT its value. See
+# `_validation_error_without_input` for why: the rejected value of a credential
+# field is the plaintext secret, and a 4xx body is copied into proxy logs.
+_SECRET_FIELD_RE = re.compile(r"pass|secret|token|key|credential|otp|pin", re.IGNORECASE)
+
+# The request parts pydantic names in `loc`. They are not field names, so they
+# are dropped before the field is composed.
+_LOC_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
+
+# How much of a rejected value the hint quotes. Long enough to recognise a
+# typo, short enough that a pasted document does not become the error message.
+_HINT_VALUE_CHARS = 60
+
+
+def _validation_hint(err: dict[str, Any]) -> str:
+    """One sentence for one rejected field: what it is, what is wrong, what arrived."""
+    parts = [str(p) for p in (err.get("loc") or ()) if str(p) not in _LOC_PARTS]
+    field = ".".join(parts) or "the request"
+    message = str(err.get("msg") or "is not valid").strip()
+    if message:
+        message = message[0].lower() + message[1:]
+    if _SECRET_FIELD_RE.search(field):
+        return f"{field} {message}."
+    if "input" not in err:
+        return f"{field} {message}."
+    value = str(err.get("input"))
+    if len(value) > _HINT_VALUE_CHARS:
+        value = value[:_HINT_VALUE_CHARS] + "…"
+    return f"{field} {message}; got '{value}'"
+
+
 def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewares + routers
     """Application factory."""
     # Gate the interactive docs + raw schema behind a setting (off in prod) so a
@@ -986,26 +1712,31 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
     async def _validation_error_without_input(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        """422 body with the rejected ``input`` stripped out.
+        """422 with the same ``reason`` + ``hint`` shape every other 4xx uses.
 
-        FastAPI's default handler serialises the offending value back to the
-        caller. For every credential field in this API — ``/login``'s password,
-        create-user's password, ``/me/password``'s current AND new password —
-        that value IS the plaintext secret, and a 422 is exactly what an
-        over-long one produces (the Field(max_length=…) bound fires before the
-        handler's own checks). The echoed plaintext then lands wherever 4xx
-        bodies land: reverse-proxy capture logs, frontend error reporters,
-        browser devtools history.
+        FastAPI's default handler answers with a list of error dicts. The SPA
+        reads ``detail.reason`` and ``detail.hint`` everywhere else, so a
+        validation failure was the one refusal it could not render, and the
+        dogfood saw a bare "422" toast. The hint names the field, says what is
+        wrong with it and quotes the value.
 
-        Nothing in the SPA reads ``input`` — it renders ``detail.hint`` or the
-        status line — so dropping it costs no diagnostics. ``ctx`` goes too: for
-        string-length errors it carries no value, but it is a serialiser of
-        arbitrary validator context and not worth auditing per-error-type.
+        The value is quoted with one exception, and it is the reason this
+        handler exists. For every credential field in this API — ``/login``'s
+        password, create-user's password, ``/me/password``'s current AND new
+        password — the rejected value IS the plaintext secret, and a 422 is
+        exactly what an over-long one produces. The echoed plaintext then lands
+        wherever 4xx bodies land: reverse-proxy capture logs, frontend error
+        reporters, browser devtools history. A field whose name looks like a
+        credential is reported without its value.
         """
-        scrubbed = [
-            {k: v for k, v in err.items() if k not in ("input", "ctx")} for err in exc.errors()
-        ]
-        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(scrubbed)})
+        hints = [_validation_hint(err) for err in exc.errors()]
+        hint = hints[0] if hints else "The request is not valid."
+        if len(hints) > 1:
+            hint = f"{hint} {len(hints) - 1} more fields are not valid."
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder({"reason": "bad_request", "hint": hint})},
+        )
 
     try:
         _demo = get_settings().soc_ai_demo
@@ -1151,7 +1882,13 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
 
         @app.middleware("http")
         async def _rate_limit(request: Any, call_next: Any) -> Response:
-            if request.url.path == "/healthz":  # never throttle health checks
+            # The limiter counts API calls, not page loads. One load of the
+            # SPA pulls a dozen JavaScript chunks and a document, and counting
+            # those spent the minute's budget on the app's own assets. The
+            # browser then rendered a blank screen with 429s in the console.
+            # Health checks are exempt for the same reason they always were.
+            path = request.url.path
+            if path in {"/healthz", "/app"} or path.startswith("/app/"):
                 exempt: Response = await call_next(request)
                 return exempt
             # Proxy-aware: attribute to the real client, not a shared proxy IP,
@@ -1171,10 +1908,14 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
                 if entry[1] > _rl_limit:
                     return JSONResponse(
                         status_code=429,
+                        headers={"Retry-After": "60"},
                         content={
                             "detail": {
                                 "reason": "rate_limited",
-                                "hint": "Too many requests; slow down.",
+                                "hint": (
+                                    f"This address sent more than {_rl_limit} requests in one "
+                                    "minute. Wait 60 s and try again."
+                                ),
                             }
                         },
                     )

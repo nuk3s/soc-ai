@@ -45,11 +45,13 @@ def _inventory(*dataset_names: str) -> GridInventory:
     """A GridInventory whose ``dataset_names()`` returns exactly the given names."""
     return GridInventory(
         datasets=tuple(
-            DatasetInfo(dataset=name, count=1000, last_seen_ms=_now_ms(), categories=("network",))
+            DatasetInfo(
+                dataset=name, live_count=1000, last_seen_ms=_now_ms(), categories=("network",)
+            )
             for name in dataset_names
         ),
         window_minutes=1440,
-        total_events=len(dataset_names) * 1000,
+        live_events=len(dataset_names) * 1000,
     )
 
 
@@ -98,11 +100,11 @@ async def test_create_list_get_update_delete(settings_kratos: Settings) -> None:
 
         # patch only given fields
         upd = await ht_svc.update(
-            db, t.id, name="RDP hunt", required_datasets=["zeek.rdp", "endpoint"]
+            db, t.id, name="RDP hunt", required_datasets=["zeek.rdp", "endpoint.events.process"]
         )
         assert upd is not None
         assert upd.name == "RDP hunt"
-        assert upd.required_datasets == ["zeek.rdp", "endpoint"]
+        assert upd.required_datasets == ["zeek.rdp", "endpoint.events.process"]
         assert upd.default_window_minutes == 720  # untouched
 
         # missing id → None
@@ -113,6 +115,111 @@ async def test_create_list_get_update_delete(settings_kratos: Settings) -> None:
         assert await ht_svc.get(db, t.id) is None
         assert await ht_svc.delete(db, t.id) is False
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Declared dataset names have to be names something actually emits
+# ---------------------------------------------------------------------------
+
+# The vocabulary a template may draw a `required_datasets` entry from.
+#
+# Sourced, not invented. The `zeek.*` and `suricata.*` entries are Security
+# Onion 2.4's own ingest pipeline names, which are the `event.dataset` values it
+# writes (`salt/elasticsearch/files/ingest/` in Security-Onion-Solutions/
+# securityonion); SO ships 130-odd Zeek pipelines and the ones below are the
+# subset this product reads. The `endpoint.events.*` and `endpoint.alerts`
+# entries are Elastic Defend's data streams, which land as `logs-endpoint.*`
+# (Elastic Defend integration reference, "Data collected"). The `system.*` and
+# `network_traffic.*` entries are the Elastic System and Packetbeat integrations.
+#
+# This is deliberately wider than what the builtins use. It is a vocabulary to
+# check names against, not a copy of the answer: a second list of exactly the
+# seven builtins' datasets would agree with a wrong name as readily as a right
+# one.
+_REAL_DATASET_NAMES: frozenset[str] = frozenset(
+    {
+        # Zeek, as Security Onion names it
+        "zeek.conn",
+        "zeek.dce_rpc",
+        "zeek.dhcp",
+        "zeek.dns",
+        "zeek.files",
+        "zeek.ftp",
+        "zeek.http",
+        "zeek.intel",
+        "zeek.kerberos",
+        "zeek.ldap",
+        "zeek.notice",
+        "zeek.ntlm",
+        "zeek.rdp",
+        "zeek.smb_files",
+        "zeek.smb_mapping",
+        "zeek.smtp",
+        "zeek.software",
+        "zeek.ssh",
+        "zeek.ssl",
+        "zeek.x509",
+        # Suricata, as Security Onion names it
+        "suricata.alert",
+        "suricata.dns",
+        "suricata.http",
+        "suricata.tls",
+        # Elastic Defend. There is no bare `endpoint` data stream in any of it.
+        "endpoint.alerts",
+        # Elastic Agent's network sensor, which on a stock Security Onion is the
+        # only plane carrying flow, DNS and TLS for the range VLANs.
+        "network_traffic.flow",
+        "network_traffic.dns",
+        "network_traffic.tls",
+        "network_traffic.http",
+        "endpoint.events.api",
+        "endpoint.events.file",
+        "endpoint.events.library",
+        "endpoint.events.network",
+        "endpoint.events.process",
+        "endpoint.events.registry",
+        "endpoint.events.security",
+        # Windows and Linux host logs, and the network-metadata plane
+        "system.auth",
+        "system.security",
+        "system.syslog",
+    }
+)
+
+
+def test_every_builtin_requires_a_dataset_that_can_exist() -> None:
+    """A template that names a dataset nothing emits is unavailable everywhere.
+
+    "Suspicious PowerShell / LOLBins" required a dataset called `endpoint`.
+    Elastic Defend has no such data stream: process execution lands in
+    `endpoint.events.process`, loaded modules in `endpoint.events.library`, and
+    so on. The availability check compares exact strings against the grid
+    census, so the template reported missing telemetry on every Elastic Defend
+    deployment there has ever been, including a grid carrying 20,760 process
+    documents and 13,719 PowerShell documents in a day.
+    """
+    # Per alternative: a plane nothing emits is just as unavailable inside an
+    # "a|b" requirement as outside one.
+    declared = {
+        alt
+        for b in ht_svc._BUILTINS
+        for ds in b.required_datasets
+        for alt in ht_svc.alternatives(ds)
+    }
+    assert declared <= _REAL_DATASET_NAMES, sorted(declared - _REAL_DATASET_NAMES)
+
+
+def test_the_powershell_builtin_is_available_on_an_elastic_defend_grid() -> None:
+    """The audit above is about spelling; this is about what an analyst sees.
+
+    A grid running Elastic Defend reports `endpoint.events.process` in its
+    census, and the hunt this template starts is process execution.
+    """
+    powershell = next(b for b in ht_svc._BUILTINS if b.name == "Suspicious PowerShell / LOLBins")
+    assert "endpoint.events.process" in powershell.required_datasets
+    inv = _inventory("zeek.conn", "endpoint.events.process")
+    missing = [d for d in powershell.required_datasets if d not in set(inv.dataset_names())]
+    assert missing == []
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +242,7 @@ async def test_seed_builtins_seeds_the_pill_set(settings_kratos: Settings) -> No
         assert all(r.builtin for r in rows)
         # the lateral-movement builtin carries the RDP telemetry requirement
         lat = next(r for r in rows if r.name == "Lateral movement")
-        assert "zeek.rdp" in lat.required_datasets
+        assert "zeek.rdp|system.security" in lat.required_datasets
         # the DCE-RPC builtin carries its telemetry requirement, no env gate
         dcerpc = next(r for r in rows if r.name == "DCE-RPC abuse / DC attacks")
         assert "zeek.dce_rpc" in dcerpc.required_datasets
@@ -212,7 +319,9 @@ def test_list_annotates_availability_missing_rdp(client: TestClient) -> None:
     with zeek.rdp in missingDatasets; a template whose datasets are all present is
     available=True. Builtins are seeded at app startup (lifespan)."""
     # grid has conn/kerberos/smb_files/dns/endpoint but NOT zeek.rdp
-    inv = _inventory("zeek.conn", "zeek.kerberos", "zeek.smb_files", "zeek.dns", "endpoint")
+    inv = _inventory(
+        "zeek.conn", "zeek.kerberos", "zeek.smb_files", "zeek.dns", "endpoint.events.process"
+    )
     with patch(
         "soc_ai.api.webui.routes_hunts.discover_datasets",
         AsyncMock(return_value=inv),
@@ -224,7 +333,9 @@ def test_list_annotates_availability_missing_rdp(client: TestClient) -> None:
     # lateral movement needs zeek.rdp (absent) → FLAGGED, not hidden
     lat = by_name["Lateral movement"]
     assert lat["available"] is False
-    assert lat["missingDatasets"] == ["zeek.rdp"]
+    # The RDP requirement now names its Windows alternative too; this grid has
+    # neither, so the whole requirement is what is missing.
+    assert lat["missingDatasets"] == ["zeek.rdp|system.security"]
     assert lat["builtin"] is True
 
     # beaconing needs only zeek.conn (present) → available
@@ -240,7 +351,9 @@ def test_list_annotates_availability_missing_dcerpc(client: TestClient) -> None:
     """On a grid WITHOUT zeek.dce_rpc, the DCE-RPC builtin is flagged (amber), not
     hidden or demoted — flag-not-demote: a dataset gap is fixable collection, not
     an environment mismatch, so `applicable` stays True while `available` flips."""
-    inv = _inventory("zeek.conn", "zeek.kerberos", "zeek.smb_files", "zeek.dns", "endpoint")
+    inv = _inventory(
+        "zeek.conn", "zeek.kerberos", "zeek.smb_files", "zeek.dns", "endpoint.events.process"
+    )
     with patch(
         "soc_ai.api.webui.routes_hunts.discover_datasets",
         AsyncMock(return_value=inv),
@@ -402,7 +515,7 @@ _FULL_INV = (
     "zeek.smb_files",
     "zeek.rdp",
     "zeek.dns",
-    "endpoint",
+    "endpoint.events.process",
     "zeek.dce_rpc",
 )
 
@@ -582,3 +695,169 @@ def test_mutate_routes_admin_gated(settings_kratos: Settings) -> None:
             assert ok.status_code == 200, ok.text
             assert ok.json()["name"] == "admin tmpl"
             assert ok.json()["builtin"] is False
+
+
+# ---------------------------------------------------------------------------
+# "Any of": one requirement, several planes that satisfy it
+# ---------------------------------------------------------------------------
+
+
+def test_alternatives_splits_and_normalises() -> None:
+    assert ht_svc.alternatives("zeek.rdp|system.security") == ("zeek.rdp", "system.security")
+    assert ht_svc.alternatives(" zeek.rdp | system.security |") == ("zeek.rdp", "system.security")
+    assert ht_svc.alternatives("zeek.conn") == ("zeek.conn",)
+
+
+def test_norm_datasets_canonicalises_alternatives() -> None:
+    """Whitespace and empties inside an element go, and an element that
+    collapses to one plane is stored as that plane, so ``a|`` and ``a`` are
+    the same requirement and compare equal on the wire."""
+    assert ht_svc._norm_datasets([" zeek.rdp | system.security ", "zeek.conn|", "zeek.conn"]) == [
+        "zeek.rdp|system.security",
+        "zeek.conn",
+    ]
+
+
+def test_lateral_movement_is_available_when_windows_logs_stand_in_for_zeek_rdp(
+    client: TestClient,
+) -> None:
+    """The range: 30k live SMB records, 184 Kerberos, zero zeek.rdp anywhere, and
+    RDP sessions plainly visible as Windows logon type 10 in system.security.
+    The template reported unavailable on that grid."""
+    inv = _inventory("zeek.conn", "zeek.smb_files", "system.security", "endpoint.events.process")
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", AsyncMock(return_value=inv)):
+        resp = client.get("/api/v1/hunt-templates")
+    lat = _templates_by_name(resp.json())["Lateral movement"]
+    assert lat["available"] is True
+    assert lat["missingDatasets"] == []
+
+
+def test_a_requirement_no_alternative_satisfies_is_listed_verbatim(client: TestClient) -> None:
+    """NEGATIVE CONTROL. Neither plane present: the whole requirement is what is
+    missing, and the operator sees every plane that would have satisfied it."""
+    inv = _inventory("zeek.conn", "zeek.smb_files", "endpoint.events.process")
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", AsyncMock(return_value=inv)):
+        resp = client.get("/api/v1/hunt-templates")
+    lat = _templates_by_name(resp.json())["Lateral movement"]
+    assert lat["available"] is False
+    assert lat["missingDatasets"] == ["zeek.rdp|system.security", "zeek.kerberos|system.security"]
+
+
+# ---------------------------------------------------------------------------
+# Backfill-only planes are present, queryable, and said so
+# ---------------------------------------------------------------------------
+
+
+def _inventory_with_backfill(
+    live: tuple[str, ...], backfill_only: tuple[str, ...]
+) -> GridInventory:
+    rows = [
+        DatasetInfo(dataset=n, live_count=1000, last_seen_ms=_now_ms(), categories=("network",))
+        for n in live
+    ] + [
+        DatasetInfo(
+            dataset=n,
+            live_count=0,
+            last_seen_ms=None,
+            categories=("network",),
+            imported_count=40000,
+        )
+        for n in backfill_only
+    ]
+    return GridInventory(
+        datasets=tuple(rows),
+        window_minutes=1440,
+        live_events=len(live) * 1000,
+        imported_events=len(backfill_only) * 40000,
+    )
+
+
+def test_a_backfill_only_plane_keeps_the_template_available_and_says_so(
+    client: TestClient,
+) -> None:
+    """Hunting history is legitimate, so the template stays available. But on the
+    range zeek.dns was 88% imports and system.security 98%, and 'available'
+    on its own reads as 'this grid is seeing it'. The label carries the truth."""
+    inv = _inventory_with_backfill(live=("zeek.conn",), backfill_only=("zeek.dns",))
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", AsyncMock(return_value=inv)):
+        resp = client.get("/api/v1/hunt-templates")
+    by_name = _templates_by_name(resp.json())
+    dns = by_name["DNS / C2 exfiltration"]
+    assert dns["available"] is True
+    assert dns["missingDatasets"] == []
+    # The label names the REQUIREMENT, alternatives and all -- the same rule
+    # the next test pins for "zeek.rdp|system.security".
+    assert dns["backfillOnlyDatasets"] == ["zeek.dns|network_traffic.dns"]
+    # NEGATIVE CONTROL in the same response: a live plane is not labelled.
+    assert by_name["Beaconing to rare IPs"]["backfillOnlyDatasets"] == []
+
+
+def test_an_alternative_met_only_by_backfill_is_labelled_by_its_requirement(
+    client: TestClient,
+) -> None:
+    """Alternatives and backfill compose: if the only alternative present is an
+    import, the requirement is met and the label names the requirement."""
+    inv = _inventory_with_backfill(
+        live=("zeek.smb_files", "zeek.kerberos"), backfill_only=("system.security",)
+    )
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", AsyncMock(return_value=inv)):
+        resp = client.get("/api/v1/hunt-templates")
+    lat = _templates_by_name(resp.json())["Lateral movement"]
+    assert lat["available"] is True
+    assert lat["backfillOnlyDatasets"] == ["zeek.rdp|system.security"]
+
+
+def test_backfill_labels_are_absent_when_the_inventory_could_not_be_read(
+    client: TestClient,
+) -> None:
+    """Fail-open must not invent a label either way."""
+    with patch(
+        "soc_ai.api.webui.routes_hunts.discover_datasets",
+        AsyncMock(side_effect=RuntimeError("down")),
+    ):
+        resp = client.get("/api/v1/hunt-templates")
+    for t in resp.json():
+        assert t["backfillOnlyDatasets"] == []
+        assert t["availabilityKnown"] is False
+
+
+# ---------------------------------------------------------------------------
+# Merge 5: a template names the analytics to run first
+# ---------------------------------------------------------------------------
+
+
+async def test_migration_0049_adds_the_analytics_column(settings_kratos: Settings) -> None:
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    async with engine.connect() as conn:
+        cols = {
+            c["name"]
+            for c in await conn.run_sync(lambda sc: inspect(sc).get_columns("hunt_templates"))
+        }
+    assert "analytics_json" in cols
+    await engine.dispose()
+
+
+async def test_a_template_stores_and_updates_its_analytics(settings_kratos: Settings) -> None:
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        t = await ht_svc.create(
+            db,
+            name="Kerberos sweep",
+            objective_template="Hunt for service ticket abuse.",
+            analytics=["identity-4769-rc4-service-ticket", " ", "identity-4769-rc4-service-ticket"],
+        )
+        # Blanks are dropped and duplicates are removed.
+        assert t.analytics == ["identity-4769-rc4-service-ticket"]
+
+        patched = await ht_svc.update(db, t.id, analytics=["identity-4768-preauth-disabled"])
+        assert patched is not None and patched.analytics == ["identity-4768-preauth-disabled"]
+
+        # None leaves the list alone.
+        again = await ht_svc.update(db, t.id, name="Kerberos sweep 2")
+        assert again is not None and again.analytics == ["identity-4768-preauth-disabled"]
+
+        # A template that names none reads as an empty list, never as None.
+        plain = await ht_svc.create(db, name="Plain", objective_template="Hunt.")
+        assert plain.analytics == []
+    await engine.dispose()

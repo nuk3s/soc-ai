@@ -44,6 +44,13 @@ class AutoTriageStatusOut(BaseModel):
     tool_calls: int = 0
     # Inherited-verdict FP alerts this run acknowledged in SO (no LLM involved).
     inherited_acked: int = 0
+    # Every inherited-verdict ack on record, not just this run's. The per-run
+    # number alone is why a path writing six figures of acknowledgements to the
+    # analyst's grid read as a handful per sweep.
+    inherited_acked_total: int = 0
+    # Why inherited acks were held back this run (reason code -> count):
+    # ``no_investigation`` | ``high_stakes``.
+    inherited_refused: dict[str, int] = {}
     # Per-reason breakdown of ``skipped`` (reason code -> count); sums to skipped.
     skipped_reasons: dict[str, int] = {}
     # True when this run could not read part (or all) of the grid. Without it a
@@ -67,6 +74,8 @@ def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
         current=status.current,
         tool_calls=status.tool_calls,
         inherited_acked=getattr(status, "inherited_acked", 0),
+        inherited_acked_total=getattr(status, "inherited_acked_total", 0),
+        inherited_refused=dict(getattr(status, "inherited_refused", {}) or {}),
         skipped_reasons=dict(getattr(status, "skipped_reasons", {}) or {}),
         degraded=bool(getattr(status, "degraded", False)),
         grid_errors=list(getattr(status, "grid_errors", []) or []),
@@ -199,7 +208,13 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
                 targets, skipped = await at.plan_targets_for_ids(state, alert_ids=selected)
             else:
                 # Explicit severities from the caller take precedence over the config floor.
-                chosen = tuple(s for s in body.severities if s in aq.SEVERITIES) or _config_band
+                # SELECTABLE, not SEVERITIES: "unknown" is the alerts that carry
+                # no severity label, and filtering it out here would drop the
+                # part of the band the config sweep depends on.
+                chosen = (
+                    tuple(s for s in body.severities if s in aq.SELECTABLE_SEVERITIES)
+                    or _config_band
+                )
                 time_range = body.range if body.range in aq.TIME_RANGES else aq.DEFAULT_RANGE
                 oql = (body.q or "").strip() or None
                 targets, skipped, inherited_acks = await at.plan_targets(

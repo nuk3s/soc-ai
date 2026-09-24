@@ -1,0 +1,244 @@
+id: s1-dcsync-no-alert
+name: "DCSync with no alert: directory replication by a user account"
+version: 1
+tier: hard
+story: |
+  A non-machine account exercises the directory replication control-access
+  rights against the domain naming context. The domain controller writes a
+  4662 Directory Service Access record for each right it checks and nothing
+  else happens: no signature fires, no rule matches, no document is tagged as
+  an alert. An analyst watching the alert queue sees a quiet morning.
+
+  This scenario exists because the catalogue could not previously express it.
+  Every other scenario opens with a suricata.alert, because the schema required
+  exactly one triage target, so the case proactive hunting is FOR — real
+  telemetry that never becomes an alert — was structurally unrepresentable.
+
+  It is modelled on a real event. On the development range this exact chain ran
+  to completion on 2026-09-04 and produced 4662 documents for the attacking
+  account and zero alert-tagged documents at the time. Security Onion's own
+  Sigma rule for it had been enabled since April; it did not fire, because
+  ElastAlert tails and its cursor had already passed. The rule was not broken.
+  It simply cannot see backwards, which is the structural gap a query does not
+  have.
+
+  The spec as first shipped saw two of those documents, both carrying
+  DS-Replication-Get-Changes. A later reading of the same range found a third
+  from the same account that carried only DS-Replication-Get-Changes-All, the
+  right that releases secrets, and the single `contains` clause could not match
+  it. The candidate still fired off the other two, so the journey score never
+  noticed. The third planted attack document below is that one.
+
+  The discriminator is the machine-account exclusion, and it is the whole
+  detection. Domain controllers replicate with each other constantly and their
+  computer accounts do so legitimately: on the range on 2026-09-04, counted
+  with the clause then matching only DS-Replication-Get-Changes, 36 of the 38
+  documents carrying that right were the DC's own machine account. Excluding
+  machine accounts left 2, both the attack. There is no threshold here and
+  there could not be, because the benign population is a few dozen
+  machine-account documents. The widened clause has not been re-counted.
+attack:
+  - T1003.006  # OS Credential Dumping: DCSync
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - typed_path
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+
+# The declarative half. Scored with no model call: either the spec surfaced
+# `svc-replicator` or it did not, and if it did not there is no point asking
+# why a hunt agent missed the finding.
+spec_journey:
+  spec_id: identity-4662-dcsync-nonmachine
+  expected_scope_keys:
+    - "svc-replicator"
+  expected_candidate_count: 1
+
+events:
+  # The attack. Four documents for one act by one account, so the scorer also
+  # proves one condition groups into one candidate. The DC writes one document
+  # per control-access right it checks; the first two are exactly as the real
+  # DC wrote them.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4662"
+      event.action: object-operation-performed
+      event.category: [iam, configuration]
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.event_id: "4662"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.ObjectServer: DS
+      winlog.event_data.OperationType: Object Access
+      winlog.event_data.SubjectUserName: "svc-replicator"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.AccessMask: ["0x100"]
+      # The real field is a multi-line string carrying the control-access right
+      # GUID; the `contains` clause is what reads it out of the composite.
+      winlog.event_data.Properties: "Control Access\n\t\t{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}\n\t{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      winlog.event_data.ObjectType: "%{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      synth.scenario_id: s1-dcsync-no-alert
+      synth.scenario_version: 1
+
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4662"
+      event.action: object-operation-performed
+      event.category: [iam, configuration]
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.event_id: "4662"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.ObjectServer: DS
+      winlog.event_data.OperationType: Object Access
+      winlog.event_data.SubjectUserName: "svc-replicator"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.AccessMask: ["0x100"]
+      winlog.event_data.Properties: "Control Access\n\t\t{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}\n\t{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      winlog.event_data.ObjectType: "%{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      synth.scenario_id: s1-dcsync-no-alert
+      synth.scenario_version: 1
+
+  # The document the shipped clause could not see. A later reading of the same
+  # range found a third attacking-account 4662 carrying only
+  # DS-Replication-Get-Changes-All and no Get-Changes at all. The two 1131f6a*
+  # GUIDs differ in their last character, so a single `contains` on Get-Changes
+  # missed it while the candidate still fired off the two documents above.
+  # This plant sits on that missed path: the journey score alone cannot fail
+  # on it, the per-document coverage gate does.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4662"
+      event.action: object-operation-performed
+      event.category: [iam, configuration]
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.event_id: "4662"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.ObjectServer: DS
+      winlog.event_data.OperationType: Object Access
+      winlog.event_data.SubjectUserName: "svc-replicator"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.AccessMask: ["0x100"]
+      winlog.event_data.Properties: "Control Access\n\t\t{1131f6ad-9c07-11d1-f79f-00c04fc2dcd2}\n\t{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      winlog.event_data.ObjectType: "%{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      synth.scenario_id: s1-dcsync-no-alert
+      synth.scenario_version: 1
+
+  # The third right, DS-Replication-Get-Changes-In-Filtered-Set, alone. The
+  # range did not produce one of these; the document is modelled on the shape
+  # above so that the clause matching it is load-bearing in CI rather than
+  # deletable with a green suite. The spec says why the right belongs.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4662"
+      event.action: object-operation-performed
+      event.category: [iam, configuration]
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.event_id: "4662"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.ObjectServer: DS
+      winlog.event_data.OperationType: Object Access
+      winlog.event_data.SubjectUserName: "svc-replicator"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.AccessMask: ["0x100"]
+      winlog.event_data.Properties: "Control Access\n\t\t{89e95b76-444d-4c62-991a-0facbeda640c}\n\t{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      winlog.event_data.ObjectType: "%{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      synth.scenario_id: s1-dcsync-no-alert
+      synth.scenario_version: 1
+
+  # The benign twin, and the reason this scenario measures the discriminator
+  # rather than the GUID. The DC's own machine account replicating is how a
+  # domain works. A spec without the machine-account exclusion surfaces this
+  # too, and the expected_candidate_count of 1 is what catches that.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -600
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-600) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4662"
+      event.action: object-operation-performed
+      event.category: [iam, configuration]
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.event_id: "4662"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.ObjectServer: DS
+      winlog.event_data.OperationType: Object Access
+      winlog.event_data.SubjectUserName: "SYNTH-DC02$"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.AccessMask: ["0x100"]
+      winlog.event_data.Properties: "Control Access\n\t\t{1131f6aa-9c07-11d1-f79f-00c04fc2dcd2}\n\t{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      winlog.event_data.ObjectType: "%{19195a5b-6da0-11d0-afd3-00c04fd930c9}"
+      synth.scenario_id: s1-dcsync-no-alert
+      synth.scenario_version: 1
+
+  # The second copy of the attack's own first document. A host running both the
+  # winlog integration and Elastic Defend ships every Windows security event
+  # twice: this copy carries the same event.code and not one leaf of the
+  # winlog.event_data tree. Measured on the development range on 2026-09-05,
+  # event code 4648 arrived 154 times, exactly half from each dataset, and none
+  # of the endpoint copies carried SubjectUserName.
+  #
+  # It is planted here for the DENOMINATOR. The detection rejects it either way,
+  # because a spec's positive clauses cannot match a field that is not there,
+  # but a precondition of the event code alone counts it and reports that the
+  # spec examined twice the documents it could ever read.
+  - index: logs-synth-endpoint-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: endpoint.events.security
+      event.module: endpoint
+      event.kind: event
+      event.code: "4662"
+      event.action: object-operation-performed
+      event.category: [iam, configuration]
+      event.outcome: success
+      host.hostname: "SYNTH-DC01"
+      synth.scenario_id: s1-dcsync-no-alert
+      synth.scenario_version: 1

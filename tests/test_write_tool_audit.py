@@ -17,6 +17,8 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools._registry import ToolSpec
 from soc_ai.tools.write_exec import execute_write_tool
 
+from tests.es_doubles import CreateSemantics
+
 
 class _ES:
     """ES double whose index() raises (simulated audit-index outage)."""
@@ -24,12 +26,24 @@ class _ES:
     def __init__(self, *, index_fails: bool) -> None:
         self.index_fails = index_fails
         self.indexed: list[dict[str, Any]] = []
+        self.created = CreateSemantics()
         self.indices = AsyncMock()
 
-    async def index(self, *, index: str, body: dict[str, Any]) -> None:
+    async def index(
+        self,
+        *,
+        index: str,
+        body: dict[str, Any],
+        id: str | None = None,
+        op_type: str | None = None,
+    ) -> None:
         if self.index_fails:
             raise RuntimeError("audit ES down")
+        self.created.claim(index, id, op_type, body)
         self.indexed.append(body)
+
+    async def mget(self, *, index: str, ids: list[str]) -> dict[str, Any]:
+        return self.created.mget(index, ids)
 
     async def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
         return {"hits": {"hits": []}}  # start from genesis

@@ -97,7 +97,7 @@ describe('HostsSummary — the cards', () => {
     expect(screen.queryByTestId('sum-review')).toBeNull();
     const card = screen.getByTestId('sum-conflicts');
     expect(within(card).queryByRole('link')).toBeNull();
-    expect(card.textContent).toMatch(/lanes agree/i);
+    expect(card.textContent).toMatch(/sources agree/i);
   });
 });
 
@@ -160,7 +160,7 @@ describe('HostsSummary — degraded reads', () => {
     const bar = screen.getByTestId('hosts-summary');
     expect(bar.textContent).toMatch(/could not be read/i);
     // The table below is a separate query and very likely fine — say so.
-    expect(bar.textContent).toMatch(/unaffected/i);
+    expect(bar.textContent).toMatch(/it still works/i);
     expect(bar.textContent).not.toMatch(/\b0\b/);
     // Every card degrades to the shared dash, never a confident number.
     for (const id of ['sum-hosts', 'sum-reporting', 'sum-attention', 'sum-conflicts']) {
@@ -220,5 +220,30 @@ describe('HostsSummary — house style', () => {
     const { container } = mount(SUMMARY);
     expect(container.innerHTML).not.toMatch(/#[0-9a-fA-F]{3}/);
     expect(container.innerHTML).not.toMatch(/rgba?\(/);
+  });
+});
+
+describe('HostsSummary — the population the bar describes', () => {
+  it('says how many of those hosts the table below actually shows', () => {
+    // "43 hosts" and "unknown 37" sat above a table of 31: the default filter
+    // hides hosts with no traffic, and the bar's biggest segment was describing
+    // twelve rows nobody could see. The number that decides whether the
+    // role-gated priors have anything to run against was quietly about a
+    // different population than the list (dogfood, 2026-09-16).
+    render(
+      <MemoryRouter>
+        <HostsSummary summary={SUMMARY} failed={false} queueVisible={false} shown={31} filtered />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('role-bar').textContent).toContain('31 in the list below');
+  });
+
+  it('says nothing extra when the table shows every host', () => {
+    render(
+      <MemoryRouter>
+        <HostsSummary summary={SUMMARY} failed={false} queueVisible={false} shown={SUMMARY.hosts} filtered={false} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('role-bar').textContent).not.toContain('in the list below');
   });
 });

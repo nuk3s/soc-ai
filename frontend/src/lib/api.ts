@@ -12,6 +12,7 @@ import type {
   AdminUser,
   AlertEvent,
   AlertGroup,
+  AlertsEmptyReason,
   AuditChainVerifyResult,
   Backtest,
   ChatMessage,
@@ -33,6 +34,7 @@ import type {
   HostActivityRange,
   HuntBulkDeleteResult,
   HuntDetailData,
+  HuntKind,
   HuntRehuntResult,
   HuntRow,
   HuntStat,
@@ -241,9 +243,9 @@ async function request<T>(path: string, init?: RequestInit & RequestOpts): Promi
     });
   } catch (e) {
     if (e instanceof DOMException && e.name === 'TimeoutError') {
-      throw new Error('Request timed out — the soc-ai API (or Security Onion behind it) is slow or down.');
+      throw new Error('The request timed out. The soc-ai API is slow or down, or Security Onion behind it is.');
     }
-    throw new Error('Network error — is the soc-ai API reachable?');
+    throw new Error('Network error. Check that the soc-ai API is reachable.');
   }
 
   if (res.status === 401 && !init?.skipLoginRedirect) {
@@ -313,9 +315,46 @@ function alertQueryParams(query: AlertQuery, base: Record<string, string> = {}):
   return p.toString();
 }
 
-export function getAlerts(query: AlertQuery = {}): Promise<AlertGroup[]> {
+/** GET /alerts — the grouped queue, plus whether the rows are the whole queue.
+ *
+ *  An envelope rather than a bare array because the grid caps every terms
+ *  aggregation, and this screen renders "N detections · M events in window"
+ *  from the rows it gets. Past the cap both are floors, and a floor rendered
+ *  as a total makes the queue look smaller and calmer than it is. A bare array
+ *  has nowhere to carry a fact about the array. */
+export interface AlertQueue {
+  groups: AlertGroup[];
+  /** The grid could not return every distinct group, or the merge of its two
+   *  source aggregations had to be re-cut. Set by whichever cut fired, never
+   *  inferred from `groups.length` against a copied cap: an exactly-full page
+   *  is not a cut one, and muting removes rows AFTER the cap is applied. */
+  truncated: boolean;
+  /** Documents in groups the grid never returned, from the aggregation's own
+   *  `sum_other_doc_count`. Zero alongside `truncated` is a real state — the
+   *  merge re-cut drops rows that WERE returned, and their documents are
+   *  already inside the queue's totals. */
+  other_docs: number;
+}
+
+export function getAlerts(query: AlertQuery = {}): Promise<AlertQueue> {
   const qs = alertQueryParams(query);
-  return request<AlertGroup[]>('/alerts' + (qs ? `?${qs}` : ''));
+  return request<AlertQueue>('/alerts' + (qs ? `?${qs}` : ''));
+}
+
+/**
+ * Why the queue is empty. Call this ONLY when getAlerts came back with
+ * nothing. It costs four counts against the grid, and the answer is only
+ * meaningful for an empty screen.
+ *
+ * Deliberately sends the WINDOW alone, not the analyst's severity/OQL/hide-acked
+ * narrowing. The backend answers about the configured alerts filter, and its
+ * verdicts compose with any narrowing the analyst added: `not_empty` means the
+ * filter did match events in this window, so an empty screen is the analyst's
+ * own view and the bare sentence is the right thing to say.
+ */
+export function getAlertsEmptyReason(query: AlertQuery = {}): Promise<AlertsEmptyReason> {
+  const qs = alertQueryParams({ range: query.range, from: query.from, to: query.to });
+  return request<AlertsEmptyReason>('/alerts/empty-reason' + (qs ? `?${qs}` : ''));
 }
 
 /**
@@ -350,7 +389,8 @@ export function getRepresentative(
 
 /** Filters for the investigations list — applied by the SERVER, in SQL.
  * `verdict` accepts the stored verdicts plus the synthetic 'pipeline_error'
- * (fallback-marked runs); `status` accepts the display statuses. Both are
+ * (fallback-marked runs, and runs that died reaching no verdict); `status`
+ * accepts the display statuses. Both are
  * multi-value (joined as comma-separated params). */
 export interface InvestigationListQuery {
   since?: string;
@@ -361,6 +401,11 @@ export interface InvestigationListQuery {
    *  Client-side filtering is what made older runs unreachable in the first
    *  place — see the note above. */
   q?: string;
+  /** Which half of a pipeline-error set: 'live' (still needs a retry) or
+   *  'handled' (dismissed, or superseded by a later run that landed a verdict).
+   *  Omitted means the whole set. The Dashboard tile and the list it deep-links
+   *  to send the same value, which is what stops the two disagreeing. */
+  errorState?: string;
   limit?: number;
   offset?: number;
 }
@@ -373,6 +418,7 @@ export function listInvestigations(q: InvestigationListQuery = {}): Promise<Inve
   if (q.verdict?.length) p.set('verdict', q.verdict.join(','));
   if (q.status?.length) p.set('status', q.status.join(','));
   if (q.q?.trim()) p.set('q', q.q.trim());
+  if (q.errorState) p.set('error_state', q.errorState);
   if (q.limit != null) p.set('limit', String(q.limit));
   if (q.offset != null) p.set('offset', String(q.offset));
   const qs = p.toString();
@@ -404,7 +450,7 @@ export async function downloadInvestigationExport(invId: string): Promise<void> 
     signal: AbortSignal.timeout(60_000),
     headers: { Accept: 'application/json' },
   });
-  if (!res.ok) throw new Error(`Export failed (${res.status})`);
+  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -426,12 +472,16 @@ export async function downloadInvestigationExport(invId: string): Promise<void> 
 export interface HuntsQuery {
   since?: string; // ISO datetime — inclusive lower bound on created_at
   until?: string; // ISO datetime — inclusive upper bound on created_at
+  /** Sent only when set. The Hunts screen filters kind client-side over the
+   *  fetched page today; this is the seam for the server to take it over. */
+  kind?: HuntKind;
 }
 
 export function getHunts(query: HuntsQuery = {}): Promise<HuntRow[]> {
   const p = new URLSearchParams();
   if (query.since) p.set('since', query.since);
   if (query.until) p.set('until', query.until);
+  if (query.kind) p.set('kind', query.kind);
   const qs = p.toString();
   return request<HuntRow[]>('/hunts' + (qs ? `?${qs}` : ''));
 }
@@ -516,10 +566,14 @@ export const MAX_OBJECTIVE_CHARS = 12000;
 export function startHuntConsole(
   objective: string,
   priorHuntId?: string,
+  templateId?: number,
 ): Promise<{ hunt_id: string }> {
   return post<{ hunt_id: string }>('/hunts/chat', {
     objective,
     prior_hunt_id: priorHuntId ?? null,
+    // The starter the objective came from. The server reads it for the
+    // analytics that starter names, and renders them into the objective.
+    template_id: templateId ?? null,
   });
 }
 
@@ -820,11 +874,48 @@ export interface QualityPoint {
    * path on the soc-ai host, NOT a URL: no endpoint serves it. Null on rows
    * written before migration 0026. */
   batch_dir: string | null;
+  /** WHAT WAS RUNNING when the point was measured (migration 0040) — the app
+   * version, the build inside it, and the analyst route the batch ran against.
+   * Without these a bend in the trend is weather; with them it can be pinned to
+   * a change. `code_commit` is stamped into the image at build time and is null
+   * on any build nothing stamped; all three are null on pre-0040 rows.
+   *
+   * OPTIONAL, not merely nullable, for the same reason as `alarm_codes` above:
+   * a server older than this release omits them from the JSON entirely. */
+  app_version?: string | null;
+  code_commit?: string | null;
+  analyst_model?: string | null;
+}
+
+/** When the trend last moved, and what the last attempt did. A nightly that
+ * finds no eligible alerts writes no point, so the points alone cannot say
+ * whether it ran. Every field here is durable: the first three come from the
+ * trend table and the live settings, the `last_attempt_*` three from
+ * `quality_eval_attempts`, which records every finished attempt including the
+ * ones that write no point. They used to be the server process's memory of its
+ * run-now/scheduler slot and went null on every restart, so a reader could not
+ * tell "never attempted" from "attempted, and forgotten". */
+export interface QualityFreshness {
+  /** The newest point's timestamp, or null with no points. */
+  latest_ts: string | null;
+  /** The in-app nightly is enabled. */
+  scheduled: boolean;
+  /** `scheduled`, and the newest point is older than two scheduled runs. */
+  stale: boolean;
+  /** When the last attempt finished. Null means no attempt has ever been
+   *  recorded on this deployment — not merely none since the last restart. */
+  last_attempt_at: string | null;
+  /** That attempt's exit code: 0 wrote a point, 2 found no eligible alerts,
+   *  5 failed. */
+  last_exit_code: number | null;
+  /** The run's own one-line reason (the exit-2 "no eligible alerts" text). */
+  last_detail: string | null;
 }
 
 export interface QualityTrend {
   /** Oldest → newest (server-ordered), ready to plot left-to-right. */
   points: QualityPoint[];
+  freshness: QualityFreshness;
 }
 
 /** The last 30 nightly quality snapshots (admin-gated, like the other posture
@@ -963,7 +1054,7 @@ export async function getAnalystRedactionPreview(
     headers,
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`Preview failed (${res.status} ${res.statusText})`);
+  if (!res.ok) throw new Error(`Preview failed: ${res.status} ${res.statusText}`);
   const body = (await res.json()) as AnalystRedactionPreview | AnalystRedactionPreviewUnavailable;
   if (body.status !== 'ok') return { kind: body.status, detail: body.detail };
   return { kind: 'ok', preview: body };
@@ -1107,13 +1198,17 @@ export interface HuntTemplate {
   id: number;
   name: string;
   objectiveTemplate: string;
-  requiredDatasets: string[]; // the event.dataset names this hunt correlates over
+  requiredDatasets: string[]; // one requirement per element; "a|b" means either plane satisfies it
   defaultWindowMinutes: number;
   builtin: boolean; // shipped (code-owned) vs operator-saved custom
   createdBy: string;
   createdAt: string;
   available: boolean; // false iff any requiredDataset is absent from the grid
   missingDatasets: string[]; // exactly which telemetry the grid lacks (for the flag)
+  // Requirements met only by imported documents — present on the grid, and no
+  // sensor here is producing them. The template is still available; the hunt
+  // reads history. Optional: an older server does not send it.
+  backfillOnlyDatasets?: string[];
   // Was `available` MEASURED? When the grid inventory could not be read the
   // server still reports available=true — fail-open, so an unreadable inventory
   // never hides or falsely flags a hunt — and this says so, because on the wire
@@ -1130,6 +1225,10 @@ export interface HuntTemplate {
   // errors and a never-built dossier table all report true.
   applicable: boolean;
   missingEnvironment: string[]; // human phrases, e.g. "a domain-joined host"
+  // The catalog analytics this starter runs BEFORE the investigation, in the
+  // order it runs them. The server renders them into the objective. Optional:
+  // a server predating the field does not send it.
+  analytics?: string[];
 }
 
 /** Create payload for a custom template (always saved builtin=false). */
@@ -1137,6 +1236,7 @@ export interface HuntTemplateInput {
   name: string;
   objective_template: string;
   required_datasets: string[];
+  analytics?: string[];
   default_window_minutes?: number;
 }
 
@@ -1153,6 +1253,105 @@ export function createHuntTemplate(body: HuntTemplateInput): Promise<HuntTemplat
 /** Delete a custom hunt template (admin; a builtin returns 409). */
 export function deleteHuntTemplate(id: number): Promise<{ deleted: boolean }> {
   return del<{ deleted: boolean }>(`/hunt-templates/${id}`);
+}
+
+/** One declarative hunt-catalog spec joined to its sweep trail
+ *  (GET /hunt-catalog, `HuntCatalogSpecOut`). The `last_*` stamps read the
+ *  trail's whole retention and are null only when it has nothing — a
+ *  never-swept spec has null timestamps, `blind: false` and zero counts, and
+ *  `last_swept_at === null` is the one fact that says its eyesight is
+ *  untested. `blind` is the NEWEST sweep's verdict: the precondition matched
+ *  nothing, so the telemetry the spec reads is absent, not clean. The `*_24h`
+ *  fields are a rate. Timestamps end in `Z`, not `+00:00`. */
+export interface PriorCoverage {
+  last_run_at: string | null;
+  measured: number;
+  learning: number;
+  blind: number;
+  not_applicable: number;
+  fired: number;
+  shadow: boolean;
+}
+
+export interface HuntCatalogSpec {
+  id: string;
+  title: string;
+  /** informational | low | medium | high | critical — kept as a string so a
+   *  level a newer backend adds renders (as info) rather than throws. */
+  level: string;
+  scope_kind: string;
+  attack: string[];
+  /** Which loop runs this spec. `match` is swept by the catalog sweep and
+   *  every `last_*`/`*_24h` field below describes that sweep. `profile` is
+   *  answered from stored behavioural baselines by `soc-ai priors` and is NOT
+   *  swept here, so those fields describe a loop that no longer runs it. */
+  evaluator: string;
+  /** The prior sweep's newest verdict for a `profile` spec: (spec, entity)
+   *  evaluations by coverage state. Null for a `match` spec, and for a profile
+   *  spec that has never been run. `measured` is the only state a departure
+   *  can be scored in -- a spec whose measured is 0 was not scored against a
+   *  single entity, and that is not evidence of a clean network. */
+  coverage: PriorCoverage | null;
+  last_swept_at: string | null;
+  last_fired_at: string | null;
+  blind: boolean;
+  last_error: string | null;
+  sweeps_24h: number;
+  fired_24h: number;
+  fresh_24h: number;
+  already_handled_24h: number;
+  /** How many of the window's sweeps were `spec-sweep --shadow` runs. A
+   *  shadow sweep counts what it would have surfaced toward `fresh_24h` and
+   *  never toward `fired_24h`, so this is what lets a row explain "fresh 2,
+   *  fired 0" as the shadow reporting rather than a spec withholding. */
+  shadow_24h: number;
+  /** Documents the NEWEST sweep could not decide, because an exclusion reads
+   *  a field they do not carry: neither matched nor ruled out, so the run is
+   *  not clean. The newest sweep's fact, not a 24h rate, so it clears when the
+   *  condition does. Nothing else on the row can carry it — a run that
+   *  discarded everything matched nothing and bucketed nothing, so every
+   *  counter reads zero, exactly like a healthy quiet spec. */
+  undecided_docs: number;
+  /** Documents the NEWEST sweep matched and could not group into any scope
+   *  bucket. They are inside the sweep's matched count and inside no
+   *  candidate, and the gate then drops the candidates that did surface, so
+   *  the row reads fired 0 · fresh 0 over documents the detection hit. */
+  unattributed_docs: number;
+  /** Documents in scopes the grid never returned to the NEWEST sweep, because
+   *  its bucket ceiling was hit — read from the terms aggregation's own
+   *  `sum_other_doc_count`, never inferred. The one counter here where the
+   *  row is not zeros: `fired`/`fresh` are real numbers that are too small,
+   *  and an under-report is indistinguishable from a full count. */
+  truncated_docs: number;
+  /** Which tier the analytic comes from: `shipped` is a file in the
+   *  repository, `local` is a row. Optional so a response from an older
+   *  backend still parses. */
+  tier?: string;
+  /** Whether the analytic runs, and how: candidate, shadow, live or retired.
+   *  A retired analytic stays in the list with its ledger and its reason, so
+   *  the row has to say that it no longer runs. */
+  status?: string;
+}
+
+/** GET /hunt-catalog — every spec in catalog order plus the sweep loop's
+ *  live settings, which ride along because four rows of zeros mean one thing
+ *  with the loop on and another with it off. `last_sweep_at` is the newest
+ *  row across the whole trail, catalog membership aside. */
+export interface HuntCatalog {
+  specs: HuntCatalogSpec[];
+  sweeps_enabled: boolean;
+  /** The interval and window a sweep actually runs with, after the backend's
+   *  floor (interval, 5m) and clamp (window widened past the interval), not
+   *  the settings as typed. The trail rows record the clamped window, so
+   *  "looks back 61m" here matches them when Config says 60. */
+  sweep_interval_minutes: number;
+  sweep_window_minutes: number;
+  last_sweep_at: string | null;
+}
+
+/** The hunt catalog with each spec's sweep status (analyst-readable). */
+export function getHuntCatalog(): Promise<HuntCatalog> {
+  return request<HuntCatalog>('/hunt-catalog');
 }
 
 // ── API keys (write-only enrichment provider secrets) ──────────────────────
@@ -1231,14 +1430,22 @@ export function getNotifications(): Promise<Notification[]> {
 export interface HealthComponent {
   ok: boolean;
   detail: string;
+  /** Which failure, when `ok` is false: 'partial' | 'overloaded' | 'timeout' |
+   *  'refused'. Absent means the probe did not classify it. */
+  kind?: string;
 }
 export interface Health {
   es: HealthComponent;
   llm: HealthComponent;
+  /** The Security Onion web API: the path every acknowledge, escalate and case
+   *  write travels. Optional in the TYPE only, so a page served by an older
+   *  build degrades to "not reported" instead of throwing on `.ok`. */
+  so?: HealthComponent | null;
   pcap?: HealthComponent | null;
 }
 
-/** Live upstream status (ES / LLM / PCAP) for the header indicator. */
+/** Live upstream status (ES / model gateway / Security Onion API / PCAP) for
+ *  the header indicator. */
 export function getHealth(): Promise<Health> {
   return request<Health>('/health');
 }
@@ -1602,10 +1809,18 @@ export interface AutoTriageStatus {
 
 const _SEV_LADDER = ['critical', 'high', 'medium', 'low'] as const;
 
-/** Return every severity at or above `floor` (e.g. "high" → ["critical","high"]). */
+/** Return every severity at or above `floor`, plus the alerts that carry no
+ *  severity label (e.g. "high" → ["critical","high","unknown"]).
+ *
+ *  'unknown' rides along at every floor for the reason the backend's
+ *  config_severity_band does: a floor is a comparison, and an alert whose
+ *  document has no `event.severity_label` has nothing to compare. Leaving it
+ *  out is how a bulk sweep over a queue of 40 endpoint and honeypot alerts
+ *  came back with zero targets. */
 export function severitiesAtOrAbove(floor: string): string[] {
   const i = _SEV_LADDER.indexOf(floor as typeof _SEV_LADDER[number]);
-  return i < 0 ? ['critical', 'high'] : Array.from(_SEV_LADDER.slice(0, i + 1));
+  const band = i < 0 ? ['critical', 'high'] : Array.from(_SEV_LADDER.slice(0, i + 1));
+  return [...band, 'unknown'];
 }
 
 /** Launch a background auto-triage batch.
@@ -1662,6 +1877,13 @@ export interface AckGroupResult {
   failed: number;
   total: number;
   capped: boolean;
+  /** Skipped because Security Onion already records them acknowledged. Non-zero
+   *  only on an index that cannot hide an acknowledged alert from a query, where
+   *  the group keeps showing events the grid has already been told about. */
+  already_acked?: number;
+  /** Events in the group this press did not write. `> 0` means another press
+   *  has something left to do. */
+  remaining?: number;
 }
 
 export interface EscalateGroupResult {
@@ -1669,6 +1891,59 @@ export interface EscalateGroupResult {
   failed: number;
   total: number;
   capped: boolean;
+  /** Alerts a case was withheld from because one already exists. soc-ai's own
+   *  escalation ledger, Security Onion's case links, or the alert's
+   *  `event.escalated` flag says so. Each one is a duplicate case not opened,
+   *  and nothing else belongs in this count. */
+  already_escalated?: number;
+  /** Alerts skipped because Security Onion already acknowledged them. A
+   *  dismissal, not a case. */
+  already_acked?: number;
+  /** Alerts an earlier escalate claimed and never came back from, whose outcome
+   *  the grid could not confirm either way. Not escalated, and not safe to
+   *  escalate. */
+  unresolved?: number;
+  /** Cases Security Onion created and then attached nothing to, which happens
+   *  when the alert is no longer on the grid. Each is counted in `failed` and
+   *  not in `escalated`, because the alert is on no case, and each is an empty
+   *  case now sitting in the queue for the operator to close or reuse. */
+  empty_cases?: string[];
+  remaining?: number;
+}
+
+/** One escalate the ledger claimed and never got an answer for. The claim is
+ *  written before the case is opened, so the row is normal for a moment and a
+ *  standing fact only when it outlives the settling window. */
+export interface StrandedClaim {
+  alert_id: string;
+  /** The account that pressed escalate: a username, `token:<name>`, or
+   *  "anonymous". */
+  escalated_by: string;
+  /** When the claim was taken, ISO-8601 with a Z. The AGE is the fact: four
+   *  minutes is a request in flight, four days is an alert nobody can
+   *  escalate. */
+  claimed_at: string;
+}
+
+/** GET /escalations/stranded — what the escalation ledger is holding that
+ *  nothing will settle on its own. Reads soc-ai's own table and never the
+ *  grid, so it answers on the deployment that accumulates these: one whose
+ *  case index cannot be read, and whose claims therefore never reconcile. */
+export interface StrandedClaims {
+  claims: StrandedClaim[];
+  /** A count over the whole set, NOT `claims.length` — the list is capped, and
+   *  a panel that showed its rows and called that the total would under-report
+   *  in exactly the way this surface exists to stop. */
+  total: number;
+  /** How old a claim has to be before it counts as stranded. Zero claims mean
+   *  different things with different windows, and the ledger is claim-first,
+   *  so without this "nothing stranded" could just mean "looked too soon". */
+  settling_minutes: number;
+}
+
+/** Escalate claims that never came back with a case id (analyst-readable). */
+export function getStrandedEscalations(): Promise<StrandedClaims> {
+  return request<StrandedClaims>('/escalations/stranded');
 }
 
 export interface AssignResult {
@@ -2091,7 +2366,7 @@ export async function login(username: string, password: string): Promise<LoginRe
       body: JSON.stringify({ username, password }),
     });
   } catch {
-    throw new Error('Network error — is the soc-ai API reachable?');
+    throw new Error('Network error. Check that the soc-ai API is reachable.');
   }
   if (res.status === 401) {
     // Keep generic — don't leak whether the username exists.
@@ -2170,4 +2445,606 @@ export function saveView(
 
 export function deleteSavedView(id: number): Promise<{ ok: boolean }> {
   return del<{ ok: boolean }>(`/me/views/${id}`, { skipLoginRedirect: true });
+}
+
+// ── Leads (hunting release, phase 2) ─────────────────────────────────────────
+
+export interface LeadObservation {
+  kind: string;
+  summary: string | null;
+  occurrences: number;
+  born_at: string | null;
+  first_seen_at: string | null;
+  /** Which source wrote it: profile, catalog, alert, hunt or candidate. */
+  source: string;
+  /** True when the analytic that wrote it is not live. */
+  shadow: boolean;
+  /** The label the server wrote for this kind. The server knows the analytic
+   *  that wrote the row, so its label wins over the table in lib/kinds.ts.
+   *  Absent on a route that sends none. */
+  kind_label?: string | null;
+}
+
+export interface Lead {
+  id: number;
+  status: string;
+  formed_at: string | null;
+  updated_at: string | null;
+  entities: string[][];
+  kinds: string[];
+  /** One label per entry in `kinds`, in the same order. Absent on a route that
+   *  sends none, and the table in lib/kinds.ts answers instead. */
+  kind_labels?: string[];
+  weight_at_formation: number;
+  scope_count: number;
+  hunt_id: string | null;
+  /** Recorded in shadow: never surfaced as an action. Shown WITH the flag,
+   *  because the whole point of the shadow week is to read them. */
+  shadow: boolean;
+  /** True when one kind formed the lead by itself, by repeating until its
+   *  weight reached 1.0. */
+  single_signal: boolean;
+  observations: LeadObservation[];
+  dismissed_reason?: string | null;
+  dismissed_at?: string | null;
+  /** The investigation a promoted lead became. Absent on a route that sends
+   *  none, and the strip then names the promotion without a link. */
+  investigation_id?: string | null;
+  /** Whether that investigation is still in the store. A lead kept the id of a
+   *  row that had gone, so the link promised a page and landed on "No such
+   *  investigation". Absent on a route that sends none, and the surface then
+   *  keeps the link it has always shown. */
+  investigation_exists?: boolean;
+  /** The status of the hunt attached to this lead. A finished hunt is what
+   *  turns the lead from Hunting into Hunted. */
+  hunt_status?: 'running' | 'complete' | 'error' | 'interrupted' | 'cancelled' | null;
+  /** The outcome label of that hunt, in the backend's own words. One example
+   *  is "No threat observed \u00b7 visibility gap". */
+  hunt_outcome_label?: string | null;
+  /** Auto-hunt is on and the loop has not started this lead's hunt yet. The
+   *  lead waits on the loop and not on the analyst, so the pill says so.
+   *  Absent on a route that sends none, and the lead then reads as New. */
+  hunt_queued?: boolean;
+  /** Open leads from the last 7 days that share an analytic, an external
+   *  address or a technique with this one. Absent on a route that sends none,
+   *  and the row then carries no related chip. */
+  related_count?: number;
+}
+
+/** One open lead that relates to the lead on screen. Computed on read, so the
+ *  row carries the reason it was joined rather than a stored edge. */
+export interface RelatedLead {
+  lead_id: number;
+  entities: [string, string][];
+  /** What the two leads share, in the server's words. */
+  reason: string;
+  formed_at: string | null;
+  /** The lead status, for the pill. The related lead is open by definition,
+   *  and the pill reads the word the strip reads. */
+  status: string;
+  /** The status of the hunt on the related lead. The stored status alone
+   *  cannot tell a running hunt from a finished one, so the panel read
+   *  "In progress" over a lead every other surface read as Hunted. Absent on
+   *  a route that sends none. */
+  hunt_status?: 'running' | 'complete' | 'error' | 'interrupted' | 'cancelled' | null;
+  /** The outcome label of that hunt, in the backend's own words. */
+  hunt_outcome_label?: string | null;
+}
+
+/** One observation on the lead detail page, with its live weight. */
+export interface LeadObservationDetail extends LeadObservation {
+  id: number;
+  spec_id: string;
+  /** Whether `spec_id` names an analytic this deployment holds. An alert
+   *  verdict writes an observation and an alert has no analytic, so the id was
+   *  a link to a drawer that could not be read. Absent on a route that sends
+   *  none, and the row then keeps the link it has always shown. */
+  analytic_exists?: boolean;
+  weight_now: number;
+  birth_weight: number;
+  evidence: Record<string, unknown> | null;
+}
+
+/** One lead with its timeline, its live weight and its dismissal. */
+export interface LeadDetail extends Lead {
+  weight_now: number;
+  single_signal: boolean;
+  dismissed_reason: string | null;
+  dismissed_note: string | null;
+  dismissed_by: string | null;
+  dismissed_at: string | null;
+  investigation_id: string | null;
+  dismiss_reasons: string[];
+  observations: LeadObservationDetail[];
+  /** The related leads, newest first. Absent on a route that sends none, and
+   *  the page then shows no Related leads panel at all: an empty panel from a
+   *  backend that computes nothing reads as "no related lead", which is an
+   *  answer the deployment has not given. */
+  related?: RelatedLead[];
+}
+
+/** Open leads, newest first, each with the observations that formed it. */
+/** The status words the leads strip filters on. `closed` covers a dismissal
+ *  and a promotion: both are a lead an analyst has finished with.
+ *
+ *  The spine adds two words that name what the analyst must do rather than
+ *  what the record holds. `needs_decision` is a lead with no hunt, or a lead
+ *  whose hunt has finished. `in_progress` is a lead whose hunt still runs. */
+export type LeadStatusFilter =
+  | 'open'
+  | 'hunting'
+  | 'dismissed'
+  | 'promoted'
+  | 'closed'
+  | 'new'
+  | 'all'
+  | 'needs_decision'
+  | 'in_progress';
+
+export function getLeads(status: LeadStatusFilter = 'open'): Promise<Lead[]> {
+  return request<Lead[]>(`/leads?status=${status}`);
+}
+
+/** One lead with its timeline and its live weight. */
+export function getLead(id: number): Promise<LeadDetail> {
+  return request<LeadDetail>(`/hunts/leads/${id}`);
+}
+
+/** What POST /hunts/leads/{id}/hunt answers. `existing` is "true" when the
+ *  lead already held a hunt and the route returned that hunt unchanged. */
+export interface LeadHuntStarted {
+  hunt_id: string;
+  existing?: string;
+}
+
+/** Start a hunt from the lead. A second call returns the same hunt. */
+export function huntLead(id: number): Promise<LeadHuntStarted> {
+  return post<LeadHuntStarted>(`/hunts/leads/${id}/hunt`, {}).then(leadChanged);
+}
+
+/** Reopen a dismissed or promoted lead. The lead returns to `open`. */
+export function reopenLead(id: number): Promise<LeadDetail> {
+  return post<LeadDetail>(`/hunts/leads/${id}/reopen`, {}).then(leadChanged);
+}
+
+/** Close the lead with a reason. The reason is required. */
+export function dismissLead(id: number, reason: string, note?: string): Promise<LeadDetail> {
+  return post<LeadDetail>(`/hunts/leads/${id}/dismiss`, { reason, note: note ?? null }).then(
+    leadChanged,
+  );
+}
+
+/** Start an investigation of the lead's strongest cited evidence. */
+export function promoteLead(id: number): Promise<{ investigation_id: string }> {
+  return post<{ investigation_id: string }>(`/hunts/leads/${id}/promote`, {}).then(leadChanged);
+}
+
+// ── Lead quality (the rule is instrumented, not moved) ───────────────────────
+//
+// The lead rule is a threshold, and a threshold nobody measures is a guess
+// that hardened into a constant. This block is the measurement: what the rule
+// produced per week, and which observation types produced it.
+//
+// The noise-floor rule the eval work landed applies here too: a threshold
+// moves on a week of data, never on a day. The server sends that sentence in
+// `note`, so the screen states the rule it is measured against.
+
+/** One week of lead outcomes. `dismissed` is keyed by the reason the analyst
+ *  chose, so a week with no dismissal carries an empty object rather than a
+ *  row of zeroes for every reason the deployment knows. */
+export interface LeadQualityWeek {
+  week: string;
+  formed: number;
+  hunted: number;
+  threat: number;
+  promoted: number;
+  dismissed: Record<string, number>;
+}
+
+/** One set of observation types, and what the leads they formed came to. */
+export interface LeadQualityTypes {
+  types: string;
+  formed: number;
+  dismissed: number;
+  threat: number;
+}
+
+/** The lead quality block: the weeks, the type pairs, and the two sentences
+ *  that say what the rule is and how it may be moved. */
+export interface LeadQuality {
+  weeks: LeadQualityWeek[];
+  by_types: LeadQualityTypes[];
+  /** The lead rule in one sentence, from the code that holds the constants. */
+  rule: string;
+  /** The noise-floor rule, in one sentence. */
+  note: string;
+}
+
+/** The lead rule's own report, over the last `weeks` weeks. */
+export function getLeadQuality(weeks = 4): Promise<LeadQuality> {
+  return request<LeadQuality>(`/leads/quality?weeks=${weeks}`);
+}
+
+/** Every write on a lead moves the needs-you count. The emit sits here and not
+ *  in the caller, so the strip, the lead page and the sidebar all get it. */
+function leadChanged<T>(answer: T): T {
+  emitNeedsYouChanged();
+  return answer;
+}
+
+
+// ── Draft an analytic from a threat finding (merge 5) ────────────────────────
+//
+// The drafter writes one catalog analytic from the finding and its evidence.
+// The server validates it, dry runs it over the last 30 days, and stores it in
+// the local tier as a candidate. A candidate never runs until an analyst moves
+// it to shadow.
+
+/** The deterministic "would have fired" evidence attached to a drafted analytic. */
+export interface AnalyticDryRun {
+  ran: boolean;
+  hit_count: number;
+  sample_ids: string[];
+  window_days: number;
+  error: string | null;
+}
+
+/** One drafted analytic, already stored as a candidate. */
+export interface AnalyticDraftResult {
+  analytic_id: string;
+  spec_yaml: string;
+  rationale: string;
+  dry_run: AnalyticDryRun;
+  status: string;
+}
+
+/** Draft a catalog analytic from one threat hunt finding, by ordinal. */
+export function draftAnalytic(huntId: string, ordinal: number): Promise<AnalyticDraftResult> {
+  return post<AnalyticDraftResult>(
+    `/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/draft-analytic`,
+    {},
+  );
+}
+
+// ── Analytics, shadow hits and observations (merge 4) ──────────────────────
+//
+// One analytic is one detection logic. The catalog reads two tiers: a shipped
+// analytic is a file in the repository, and a local analytic is a row. An
+// observation is one thing one analytic noticed about one entity. A shadow hit
+// is an observation an analytic in shadow wrote.
+//
+// These land at the end of the file on purpose. Merge 5 edits the hunt agent
+// and the hunt detail screen at the same time, and a shared tail keeps the two
+// branches apart.
+
+/** What a shadow analytic can prove about its own hit. The band renders the
+ *  summary of this; the drawer renders the parts. `complete` false means the
+ *  hit reads "could not run" and `missing` names the part. */
+export interface ShadowHitReceipts {
+  matched_ids: string[];
+  matched_fields: string[];
+  dry_run: { window_days: number; fires: number; entities: string[] } | null;
+  overlap: Array<{ analytic: string; documents: number }>;
+  baseline: Record<string, unknown> | null;
+  complete: boolean;
+  missing: string[];
+}
+
+/** GET /hunts/shadow-hits — one observation an analytic in shadow wrote.
+ *  `state` is `hit` only when the receipts are complete. Anything else is
+ *  `could_not_run`, which is never hidden and never shown as a hit. */
+export interface ShadowHit {
+  id: number;
+  analytic_id: string;
+  analytic_title: string;
+  entity_kind: string;
+  entity_key: string;
+  born_at: string | null;
+  /** When the analytic first wrote this observation. `born_at` moves with the
+   *  newest sighting, so it answered "how old is this" with the wrong date. */
+  first_seen_at?: string | null;
+  /** How many times the analytic has written it. Absent on a route that sends
+   *  none, and the card then states the time alone. */
+  occurrences?: number;
+  summary: string | null;
+  state: string;
+  missing: string[];
+  receipts: ShadowHitReceipts | null;
+  read: boolean;
+  lead_id: number | null;
+}
+
+export interface ShadowHits {
+  hits: ShadowHit[];
+  unread: number;
+}
+
+/** GET /hunts/hits — every hit an analytic wrote in the window, live and
+ *  shadow, in one list. A live hit is the real signal: its analytic runs, its
+ *  hits count and they form leads. A shadow hit is provisional.
+ *
+ *  `read` is null on a hit recorded live, because such a hit has no read flag.
+ *  `read_at` is optional: a server that does not send it makes the card state
+ *  the read without an hour rather than invent one. */
+export interface AnalyticHit {
+  id: number;
+  analytic_id: string;
+  analytic_title: string;
+  /** The status of the analytic now, from the catalog. A hit the sweep
+   *  recorded in shadow reads `live` here once an analyst approves it. */
+  analytic_status: 'live' | 'shadow' | 'candidate';
+  /** True when the sweep recorded the hit while the analytic was in shadow.
+   *  This is the flag that picks the half the hit lists under. */
+  recorded_in_shadow: boolean;
+  /** `shipped` is a file in the release. `local` is a row in this deployment. */
+  tier: string;
+  entity_kind: string;
+  entity_key: string;
+  born_at: string | null;
+  first_seen_at: string | null;
+  occurrences: number;
+  summary: string | null;
+  /** `hit` only when the receipts are complete. Anything else is
+   *  `could_not_run`, which is never hidden and never shown as a hit. */
+  state: string;
+  missing: string[];
+  receipts: ShadowHitReceipts | null;
+  read: boolean | null;
+  read_at?: string | null;
+  lead_id: number | null;
+  lead_status: string | null;
+  document_count: number;
+}
+
+/** One count per filter chip. A chip states the number it would show. */
+export interface AnalyticHitsCounts {
+  all: number;
+  unread: number;
+  live: number;
+  shadow: number;
+}
+
+export interface AnalyticHits {
+  hits: AnalyticHit[];
+  counts: AnalyticHitsCounts;
+}
+
+/** The four words the hit filter chips read. */
+export type AnalyticHitFilter = 'all' | 'unread' | 'live' | 'shadow';
+
+/** What waits on the analyst: unread shadow hits, and leads with no decision. */
+export interface NeedsYou {
+  unread_shadow_hits: number;
+  leads_needing_decision: number;
+  total: number;
+  /** The live "A lead starts its own hunt" setting. Absent on an older server. */
+  lead_auto_hunt?: boolean;
+}
+
+/** GET /analytics — one analytic with its tier, its status and a week of
+ *  outcomes. `status` is one of candidate, shadow, live, retired. */
+export interface AnalyticRow {
+  id: string;
+  title: string;
+  level: string;
+  evaluator: string;
+  scope_kind: string;
+  tier: string;
+  status: string;
+  no_benign_baseline: boolean;
+  observations_7d: number;
+  leads_7d: number;
+  hunted_7d: number;
+  dismissed_7d: number;
+  shadow_hits_7d: number;
+  unread_shadow_hits: number;
+}
+
+export interface AnalyticsList {
+  analytics: AnalyticRow[];
+  /** One count per status word. A status with no analytics is absent. */
+  counts: Record<string, number>;
+}
+
+/** One status transition. The receipts an approval was taken on ride on the
+ *  row, so "who approved this and why" stays answerable later. */
+export interface AnalyticVersion {
+  from_status: string | null;
+  to_status: string;
+  who: string;
+  at: string;
+  why: string | null;
+  has_receipts: boolean;
+}
+
+/** The outcome ledger of one analytic over one window. Computed on read and
+ *  never stored: a retirement taken on a stale figure retires the wrong
+ *  analytic. */
+export interface AnalyticLedger {
+  analytic_id: string;
+  since: string;
+  observations: number;
+  entities: number;
+  shadow_hits: number;
+  unread_shadow_hits: number;
+  leads: number;
+  hunted: number;
+  promoted: number;
+  dismissed: Record<string, number>;
+  docs_scanned: number;
+  runtime_ms: number;
+  sweeps: number;
+  coverage: Record<string, number>;
+}
+
+/** One entity this analytic observed lately, with the lead it fed. */
+export interface AnalyticRecentEntity {
+  entity: string;
+  count: number;
+  lead_id: number | null;
+  last: string | null;
+}
+
+/** GET /analytics/{id} — the drawer's whole payload. */
+export interface AnalyticDetail extends AnalyticRow {
+  description: string;
+  spec_text: string;
+  reason: string | null;
+  ledger: AnalyticLedger;
+  versions: AnalyticVersion[];
+  recent: AnalyticRecentEntity[];
+}
+
+/** One observation on one entity, from any source. `weight_now` decays with a
+ *  48 h half-life and is computed on read. */
+export interface EntityObservation {
+  id: number;
+  kind: string;
+  spec_id: string;
+  source: string;
+  shadow: boolean;
+  summary: string | null;
+  weight_now: number;
+  lead_id: number | null;
+  born_at: string | null;
+  occurrences: number;
+  read: boolean;
+  /** The label the server wrote for this kind. Absent on a route that sends
+   *  none, and the table in lib/kinds.ts answers instead. */
+  kind_label?: string | null;
+}
+
+export interface EntityObservations {
+  entity: string;
+  days: number;
+  observations: EntityObservation[];
+}
+
+/** Shadow hits, unread first and then newest first. */
+export function getShadowHits(limit = 50): Promise<ShadowHits> {
+  return request<ShadowHits>(`/hunts/shadow-hits?limit=${limit}`);
+}
+
+/** Every analytic hit of the window, live first and then shadow, unread first.
+ *  A parameter the caller leaves out is the server's default. */
+export function getAnalyticHits(
+  opts: { days?: number; filter?: AnalyticHitFilter; limit?: number } = {},
+): Promise<AnalyticHits> {
+  const query = new URLSearchParams();
+  if (opts.days !== undefined) query.set('days', String(opts.days));
+  if (opts.filter !== undefined) query.set('filter', opts.filter);
+  if (opts.limit !== undefined) query.set('limit', String(opts.limit));
+  const tail = query.toString();
+  return request<AnalyticHits>(`/hunts/hits${tail ? `?${tail}` : ''}`);
+}
+
+/** The count the sidebar badge and the Needs-you strip read. */
+export function getNeedsYou(): Promise<NeedsYou> {
+  return request<NeedsYou>('/hunts/needs-you');
+}
+
+/** Mark one shadow hit read. Opening its receipts is what reads it. */
+export function markShadowHitRead(id: number): Promise<{ ok: boolean }> {
+  return post<{ ok: boolean }>(`/hunts/shadow-hits/${id}/read`, {}).then((answer) => {
+    publishShadowHitsChanged();
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Every analytic the app lists, with a week of outcomes on each. */
+export function getAnalytics(): Promise<AnalyticsList> {
+  return request<AnalyticsList>('/analytics');
+}
+
+/** One analytic with its ledger, its versions and its recent observations. */
+export function getAnalytic(id: string): Promise<AnalyticDetail> {
+  return request<AnalyticDetail>(`/analytics/${encodeURIComponent(id)}`);
+}
+
+/** Store one local analytic as a candidate. It runs once it is in shadow. */
+export function createAnalytic(specText: string): Promise<AnalyticRow> {
+  return post<AnalyticRow>('/analytics', { spec_text: specText });
+}
+
+/** Move one analytic to a new status. A retirement needs a reason. An analytic
+ *  that leaves shadow takes its unread hits with it, so the count changes. */
+export function setAnalyticStatus(id: string, to: string, why?: string): Promise<AnalyticRow> {
+  return post<AnalyticRow>(`/analytics/${encodeURIComponent(id)}/status`, {
+    to,
+    why: why ?? null,
+  }).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Every observation on one entity from every source, newest first. */
+export function getObservations(entity: string, days = 7): Promise<EntityObservations> {
+  return request<EntityObservations>(
+    `/hunts/observations?entity=${encodeURIComponent(entity)}&days=${days}`,
+  );
+}
+
+/** GET /events/{id} — one document from the grid, as the sensor wrote it.
+ *  `source` is the raw document body. A 404 carries reason `event_not_found`. */
+export interface EventDocument {
+  id: string;
+  dataset: string | null;
+  timestamp: string | null;
+  source: Record<string, unknown>;
+}
+
+/** One document by its id. The evidence ids on a hit, a lead and a finding all
+ *  read through this, so one id opens the same document everywhere. */
+export function getEvent(id: string): Promise<EventDocument> {
+  return request<EventDocument>(`/events/${encodeURIComponent(id)}`);
+}
+
+// ── Shadow-hit read events ──────────────────────────────────────────────────
+//
+// Four surfaces count one unread flag: the band, the bell, the sidebar badge
+// and the Dashboard KPI. Each surface polls on its own timer. A hit read in
+// the band stayed unread on the other three for up to 60 s, so the app showed
+// two different counts of one number. The band publishes the change and every
+// other surface reads the count again at once.
+
+type ShadowHitsListener = () => void;
+
+const shadowHitsListeners = new Set<ShadowHitsListener>();
+
+/** Tell every surface that counts unread shadow hits to read the count again. */
+export function publishShadowHitsChanged(): void {
+  for (const listener of [...shadowHitsListeners]) listener();
+}
+
+/** Listen for a change to the unread shadow-hit count. Call the result to stop. */
+export function onShadowHitsChanged(listener: ShadowHitsListener): () => void {
+  shadowHitsListeners.add(listener);
+  return () => {
+    shadowHitsListeners.delete(listener);
+  };
+}
+
+// ── Needs-you events ────────────────────────────────────────────────────────
+//
+// The sidebar badge and the Needs-you strip count one number: the unread shadow
+// hits plus the leads that wait on a decision. A read hit, a hunt on a lead, a
+// dismissal, a promotion, a reopen and an analytic that leaves shadow all move
+// it. Each surface polls on its own timer, so without this the badge held the
+// old count beside a page that had already changed.
+
+const needsYouListeners = new Set<ShadowHitsListener>();
+
+/** Tell every surface that counts what needs the analyst to read it again. */
+export function emitNeedsYouChanged(): void {
+  for (const listener of [...needsYouListeners]) listener();
+}
+
+/** Listen for a change to the needs-you count. Call the result to stop. */
+export function onNeedsYouChanged(listener: ShadowHitsListener): () => void {
+  needsYouListeners.add(listener);
+  return () => {
+    needsYouListeners.delete(listener);
+  };
 }

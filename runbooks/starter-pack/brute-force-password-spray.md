@@ -9,58 +9,57 @@ rules:
 
 # Brute force and password spray triage
 
-Credential-access alerts (MITRE ATT&CK **T1110.001** Password Guessing,
-**T1110.003** Password Spraying) come in two shapes with different triage
-paths: **vertical** (many passwords against one account) and **horizontal /
-spray** (one or two passwords against many accounts, deliberately staying
-under lockout thresholds).
+Credential-access alerts come in two shapes. Each shape has its own triage path. The
+MITRE ATT&CK techniques are **T1110.001** Password Guessing and **T1110.003** Password
+Spraying. A **vertical** attempt tries many passwords against one account. A
+**horizontal** attempt, also called a spray, tries 1 or 2 passwords against many
+accounts. A spray stays below the lockout threshold on purpose.
 
 ## Characterize the attempt pattern
 
-Pivot on the source over a 6–24h window and count:
+Pivot on the source over a window of 6 h to 24 h. Count these items:
 
-- **Distinct target accounts** and **attempts per account**. Many accounts ×
-  few attempts = spray. One account × many attempts = brute force.
-- **Timing**: sprays are often slow (one round per 30–60 min) to evade
-  lockout policy. Don't let a low per-hour rate read as benign.
-- **Account name quality**: attempts against *valid* usernames indicate the
-  attacker already enumerated accounts (check for prior LDAP/SMB enumeration
-  from the same source); attempts against generic names (admin, test,
-  backup) look like an untargeted internet-wide campaign.
+- **Distinct target accounts** and **attempts per account**. Many accounts with few
+  attempts each is a spray. One account with many attempts is a brute force attempt.
+- **Timing**. A spray is often slow. It runs one round every 30 min to 60 min to evade
+  the lockout policy. Do not read a low hourly rate as benign.
+- **Account name quality**. Attempts against *valid* usernames show that the attacker
+  enumerated the accounts first. Look for earlier Lightweight Directory Access Protocol
+  (LDAP) or SMB enumeration from the same source. Attempts against generic names such as
+  admin, test and backup indicate an untargeted internet-wide campaign.
 
 ## The one question that decides severity
 
-**Did any attempt succeed?** Correlate the failure burst with authentication
-successes from the same source, for any targeted account, during and shortly
-after the window. A failure storm followed by a success and then *silence*
-from that source is the classic compromise signature — the attacker got in
-and stopped guessing.
+**Did any attempt succeed?** Correlate the burst of failures with authentication
+successes from the same source. Cover every targeted account during the window and
+shortly after it. A failure storm, then a success, then silence from that source indicates a
+compromise. The attacker gets access and stops the guessing.
 
-If a success is found, this is no longer a brute-force alert; treat it as an
-account compromise: escalate, recommend credential reset and session
-invalidation, and pivot to what that account did next (new logins, mail
-rules, lateral movement).
+Treat the alert as an account compromise if you find a success. The alert is no longer a
+brute force alert. Escalate it. Recommend a credential reset and a session invalidation.
+Pivot to the later activity of that account. Look for new logins, new mail rules and
+lateral movement.
 
 ## Source and target context
 
-- External source, internet-facing service (VPN portal, mail, RDP, SSH):
-  expected background noise at low volume, but sprays against valid
-  usernames deserve escalation even with zero successes — they indicate
-  targeting and a username list.
-- **Internal source**: much higher concern. An internal host guessing
-  passwords is either a misconfigured service (stale credentials in a
-  scheduled task or connection pool — usually one account, regular interval,
-  same failure code forever) or a compromised host performing credential
-  access. The stale-credential case fails with the *same* account at the
-  *same* interval; the attacker case rotates accounts.
-- Service accounts and admin accounts as targets raise severity a tier.
+- An external source against an internet-facing service is expected background noise at
+  low volume. These services include the virtual private network portal, mail, Remote
+  Desktop Protocol (RDP) and SSH. Escalate a spray against valid usernames even if no
+  attempt succeeds. That spray shows targeting and a username list.
+- An **internal source** is a much higher concern. An internal host that guesses
+  passwords has two explanations. The first explanation is a misconfigured service with
+  stale credentials in a scheduled task or a connection pool. That case uses the *same*
+  account at the *same* interval and returns the same failure code every time. The second
+  explanation is a compromised host that performs credential access. That case rotates
+  through accounts.
+- A service account or an admin account as the target raises the severity one tier.
 
 ## Verdict guidance
 
-- **Dismiss** the stale-credential pattern (one internal source, one
-  account, metronomic failures, no successes) and name the offending
-  host/service so it gets fixed rather than re-triaged weekly.
-- **Escalate** any success following a failure burst, any spray with valid
-  usernames, and any internal source rotating through accounts.
-- Recommend compensating checks in the rationale: lockout policy status for
-  targeted accounts and MFA coverage for the service in question.
+- **Dismiss** the stale-credential pattern. That pattern has one internal source, one
+  account, failures at a regular interval and no successes. Name the host and the service
+  so that the team repairs them. The alert then stops returning every week.
+- **Escalate** a success that follows a burst of failures. Escalate a spray against valid
+  usernames. Escalate an internal source that rotates through accounts.
+- Recommend compensating checks in the rationale. Ask for the lockout policy status of
+  the targeted accounts. Ask for the multi-factor authentication coverage of the service.

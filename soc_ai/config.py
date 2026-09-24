@@ -30,6 +30,25 @@ from soc_ai.dossier.policy import (
     DEFAULT_STALENESS_HOURS,
 )
 
+# The labels the shipped alerts-feed filter unions, and the filter itself. Named
+# here rather than written as a literal on the field below because two surfaces
+# have to recommend it back to the operator (the doctor's alerts-feed-filter row
+# and the alerts console's empty-queue explanation), and a recommendation that
+# drifts from the shipped default is worse than no recommendation. Lives in the
+# config module, not next to ALERT_LABEL_CANDIDATES in soc_ai.webui.alerts_query,
+# only because that module imports Settings from here.
+#
+# ``tags:alert`` is Security Onion's own convention; ``event.kind:alert`` is the
+# ECS field Elastic Defend endpoint alerts carry instead. Neither is a superset
+# of the other on a measured grid, which is why the default is the union.
+DEFAULT_ALERT_LABELS: tuple[str, ...] = ("tags:alert", "event.kind:alert")
+DEFAULT_ALERTS_QUERY: str = " OR ".join(DEFAULT_ALERT_LABELS)
+
+# The Security Onion login flows soc-ai can run, in display order. Named here
+# because three places must agree on the exact strings: the Settings validator,
+# the Config console option list, and the login client that picks a flow.
+SO_LOGIN_FLOWS: tuple[str, ...] = ("auto", "browser", "api")
+
 
 class Settings(BaseSettings):
     """Top-level configuration for soc-ai."""
@@ -57,6 +76,29 @@ class Settings(BaseSettings):
     # SO 3.0.0 mounts Kratos under /auth/... (the older path is /self-service/...).
     # Default matches SO 3.0.0; older grids can override to "" to skip the prefix.
     so_kratos_path_prefix: str = "/auth"
+
+    so_login_flow: str = "auto"
+    """How soc-ai logs in to Security Onion.
+
+    ``auto`` runs the Kratos browser flow first. It falls back to the Kratos API
+    flow if the browser flow cannot complete. ``browser`` forces the browser
+    flow, which SO 3.3 and later need. ``api`` forces the API flow, which SO 2.4
+    and SO 3.0 to 3.2 accept. soc-ai keeps the flow that works for the life of
+    the process. A change applies at the next restart."""
+
+    @field_validator("so_login_flow", mode="before")
+    @classmethod
+    def _validate_so_login_flow(cls, v: Any) -> Any:
+        """Lowercase + validate so_login_flow in {auto, browser, api}."""
+        if not isinstance(v, str):
+            raise ValueError(f"so_login_flow must be a string, got {type(v).__name__}")
+        lowered = v.strip().lower()
+        if lowered not in SO_LOGIN_FLOWS:
+            raise ValueError(
+                f"so_login_flow must be one of: {', '.join(SO_LOGIN_FLOWS)}; got {v!r}"
+            )
+        return lowered
+
     # Default timezone for ack/escalate calls (matches the SO web UI default).
     so_timezone: str = "America/New_York"
 
@@ -96,6 +138,11 @@ class Settings(BaseSettings):
     # only if you knowingly run with a chronically red shard and prefer partial
     # data to an error: failures are then logged at WARNING and the hits used
     # as-is.
+    # Scope: this governs what a QUERY does about a partial read. It does not
+    # govern whether the operator is told there was one. The health probe reads
+    # with `require_complete=True` and so do the callers whose answer is a claim
+    # about absence, so /health, the degraded banner and the bell keep reporting
+    # a half-read grid whichever way this is set.
     es_fail_on_partial_results: bool = True
     # Orchestrator-level retries around the WHOLE Phase-A prefetch call
     # (`get_enriched_alert_context`), on top of `es_max_retries` above. The ES
@@ -314,6 +361,37 @@ class Settings(BaseSettings):
     read). Set False to revert mutating writes to fail-open (the pre-1.x
     behaviour) if availability matters more than a guaranteed audit record."""
 
+    audit_verify_schedule_enabled: bool = True
+    """Verify the tamper-evident audit chain on a schedule.
+
+    ON by default, unlike every other background job here, and for a reason
+    that is specific to this one. A tamper-evident log nobody verifies is a
+    log: the product's claim is that its record of a decision cannot be edited
+    afterwards, and until 2026-09 the only thing that ever tested that claim
+    was an operator pressing a button nobody presses. Live deployments carried
+    a broken chain for weeks with nothing saying so. The other schedulers
+    default off because they spend money (model calls) or change state (acks);
+    this one is a bounded read of one index, so the case for making the
+    operator opt in to checking their own audit trail is weak. Turn it off if
+    the scan is unwelcome; nothing else depends on it."""
+
+    audit_verify_schedule_interval_hours: int = 24
+    """Hours between scheduled audit-chain verifications. Daily by default: a
+    break is a standing condition rather than a fast-moving one, and the scan
+    reads every record in its window. Only used when the schedule is on."""
+
+    audit_verify_days: int = 7
+    """How many days back a scheduled verification reads.
+
+    A window, not the whole index, for two reasons. The scan cost grows with
+    the trail, and a deployment's OLD history can carry frozen scars that no
+    longer say anything about today — the current epoch is what "am I sound
+    right now" turns on. Set higher to widen the daily check; the full-index
+    scan stays available on demand (``soc-ai audit verify`` with no
+    ``--days``). A windowed scan cannot verify the link across its own start
+    boundary, which the verifier accounts for rather than reporting as a
+    break."""
+
     # --- Local enrichment ----------------------------------------------
     misp_url: AnyHttpUrl | None = None
     misp_api_key: SecretStr | None = None
@@ -436,12 +514,45 @@ class Settings(BaseSettings):
     re-sweep the whole network on every boot."""
 
     dossier_lookback_days: int = 14
-    """ES window (days) each host's observations are aggregated over. Wider than
-    `discovery_lookback_days` (7) on purpose: this window is a BEHAVIORAL
-    BASELINE, and the claim that carries weight in an investigation is "this host
-    has never initiated outbound SSH". Seven days spans one weekend and one
-    patch cycle; fourteen spans two, so a Monday-only backup job or a fortnightly
-    maintenance window reads as routine instead of as a first-ever event."""
+    """ES window (days) each host's dossier observations are aggregated over.
+    Wider than `discovery_lookback_days` (7) on purpose: the claim that carries
+    weight in an investigation is "this host has never initiated outbound SSH",
+    and seven days spans one weekend and one patch cycle; fourteen spans two, so
+    a Monday-only backup job or a fortnightly maintenance window reads as routine
+    instead of as a first-ever event.
+
+    This is the DOSSIER's window, for identity and role. The behavioural
+    BASELINE the hunting layer scores departures against is a separate thing
+    with its own window (`entity_profile_window_days`, 30) -- two knobs that
+    used to share one name, so lowering this one looked like it tightened the
+    baseline and did not."""
+
+    entity_profiles_enabled: bool = False
+    """Whether the dossier sweep builds behavioural profiles.
+
+    OFF by default, and it stays off until a shadow week has been read. The
+    design is explicit that nothing in this layer goes live before the replay
+    gate passes and the observation distribution has been looked at — a
+    baseline that has never been measured against a real network is a source
+    of confident nonsense, not of findings."""
+
+    entity_profile_window_days: int = 30
+    """ES window (days) a behavioural profile is built over.
+
+    Wider than `dossier_lookback_days` (14) because a profile is a claim about
+    what is ORDINARY, and the three time cells it buckets into need enough
+    samples each to have a dispersion at all. Thirty days spans four weekends
+    and a monthly cycle, so a month-end job reads as routine rather than as a
+    first-ever event."""
+
+    entity_profile_lag_hours: int = 24
+    """How far before the present a behavioural baseline stops.
+
+    Must match the prior sweep's recent window. A baseline built right up to
+    now CONTAINS the window it will be compared against, so every member the
+    sweep observes is already in it and novelty is structurally impossible —
+    on the range that produced 656 evaluations, zero findings, and no visible
+    bug anywhere. The window ends where the recent window begins."""
 
     dossier_max_hosts_per_run: int = 200
     """Hosts built per sweep. Each host costs up to seven ES round trips, built
@@ -570,7 +681,24 @@ class Settings(BaseSettings):
     and set ``CONFIG_SECRET_KEY`` in ``.env``. When unset, the Danger Zone can
     still edit connection identity but secret VALUES (passwords/keys/tokens) are
     not editable via the UI — they stay env-managed."""
-    webui_alerts_query: str = "tags:alert"
+    webui_alerts_query: str = DEFAULT_ALERTS_QUERY
+    """OQL filter selecting which documents the alerts feed treats as alerts.
+
+    Two labels, because no single one covers a Security Onion grid. SO's own
+    ingest pipelines derive ``tags:alert`` for Suricata, Sigma/ElastAlert,
+    Wazuh and Strelka detections, and never set ``event.kind`` at all. It is
+    the filter SO's own Alerts page uses, and an ECS-only default would empty
+    the queue on a stock grid. Elastic Defend endpoint alerts are written by
+    Elastic's package pipeline instead, which never reaches SO's tag-deriving
+    pipeline, so they carry ECS ``event.kind:alert`` and no SO tag; the tag
+    alone cannot see them. The union is a superset of both, so no grid loses
+    anything it saw before.
+
+    The queue is only ever as good as this one line: it feeds the alerts
+    console, auto-triage, the host activity panels and every hunt that reads
+    the alert plane. ``soc-ai doctor``'s "alerts feed filter" row measures it
+    against the grid, because a filter that matches nothing looks exactly like
+    a quiet network."""
     webui_inherit_window_days: int = 7
     webui_extra_detections: bool = True
     """Broaden the alerts feed beyond Suricata to SO's other detection outputs:
@@ -617,6 +745,96 @@ class Settings(BaseSettings):
     regardless of the per-row ``enabled``. OFF by default (recurring LLM calls);
     editable live in the config console. Single uvicorn worker only (workers>1
     would double-fire — Epoch 6.2 territory)."""
+
+    hunt_spec_sweeps_enabled: bool = False
+    """Run the declarative hunt catalog on a loop.
+
+    OFF by default, and the switch to flip LAST. A spec sweep writes findings
+    with no human in the loop, so the order that earns the flip is: run it by
+    hand (``soc-ai spec-sweep``), then in shadow for a week
+    (``--shadow``, which counts what each spec WOULD surface without spending
+    the fire-once budget), then read the counts, and only then turn this on.
+
+    Unlike the LLM hunt schedules above, a sweep costs no model call at all —
+    two Elasticsearch queries per spec — so the interval floor is minutes rather
+    than the hour those need."""
+
+    hunt_spec_sweep_interval_minutes: int = 60
+    """Minutes between catalog sweeps. Floor of 5.
+
+    The floor is far below ``hunt_schedules``' 60-minute one because the cost
+    profile is not comparable: a sweep is two bounded aggregations per spec and
+    no inference. It is not zero, though — each sweep is a real query against
+    the analyst's grid — so a floor exists at all."""
+
+    hunt_spec_sweep_window_minutes: int = 1440
+    """How far back each sweep looks.
+
+    Wider than the interval on purpose. A spec that only ever looked back as far
+    as the last sweep would miss anything that landed during an outage, a
+    restart, or an ingest lag — the exact hole that makes a live-tailing rule
+    engine miss an attack whose telemetry arrives while it is not watching. The
+    fire-once gate is what stops the overlap becoming repeat findings."""
+
+    catalog_hunt_rows: bool = False
+    """Record a hunt row for each analytic hit, as the sweep did before 1.5.0.
+
+    OFF by default. A catalog hit is an observation. It used to be a hunt row
+    as well, so one hit made three records: the row, a finding inside its
+    report, and the observation. The hunt list showed those rows beside the
+    hunts an agent ran, and the Hunt Console subtitle counted them as hunts.
+
+    ON restores the old write for one release. The observation is written
+    either way, so nothing downstream of the observation changes. A
+    visibility-gap row is not a hit and is not affected: a gap says the
+    analytic could not see, and silence there is a false all-clear."""
+
+    hunting_prior_sweep_enabled: bool = True
+    """Run the profile sweep in the app, on its own interval.
+
+    ON by default, and the opposite posture to ``hunt_spec_sweeps_enabled``
+    for the opposite reason. A catalog sweep writes findings unattended, so it
+    is opt-in. A profile sweep writes observations: it compares each host with
+    its own baseline, records what departs, and raises nothing. That is the
+    shadow posture the release ships with, and a deployment that records no
+    profile observation has no hunting layer at all.
+
+    The sweep is the code path ``soc-ai priors --record`` runs. On the test
+    range a host timer runs it every hour. A container has no timer, so
+    without this loop the layer shipped and never ran.
+
+    OFF stops the sweep. The profile lane in the host dossier still builds the
+    baselines, and ``soc-ai priors`` still reads them by hand."""
+
+    hunting_prior_sweep_interval_minutes: int = 60
+    """Minutes between profile sweeps. Floor of 15.
+
+    A sweep makes no model call. It makes several Elasticsearch aggregations
+    per dimension, so the cost is query load and the floor exists for the same
+    reason the catalog sweep has one. The default matches the hourly timer the
+    range has run since the profile lane shipped."""
+
+    lead_auto_hunt: bool = True
+    """A lead that has never had a hunt starts one when it forms.
+
+    ON by default. A lead is already the product of several observations that
+    crossed a threshold together, so the answer to "is this worth a look?" is
+    yes by the time the lead exists. Before this the lead waited for a click,
+    and a lead that formed overnight was still waiting in the morning.
+
+    The in-process loop starts the hunt, not the sweep, because leads also form
+    in the timer process that runs the priors, and that process cannot run an
+    agent. OFF restores the older behaviour: a lead waits for an analyst to
+    start the hunt. A dismissed lead is never hunted, and a reopened lead is
+    not hunted again by the loop."""
+
+    lead_auto_hunt_concurrency: int = 2
+    """How many lead hunts the loop runs at once.
+
+    The count is of running hunts the loop itself started, so a hunt an analyst
+    started by hand never blocks the loop and the loop never blocks the
+    analyst. The floor is 1: an operator who wants no lead hunts turns
+    ``lead_auto_hunt`` off, which says so on the Config screen."""
 
     general_chat_enabled: bool = True
     """Master switch for the Dashboard's general chat (the "Ask soc-ai" box).
@@ -838,6 +1056,48 @@ class Settings(BaseSettings):
 
     Flag so we can A/B it on the synth-9 and revert instantly. Set ``False``
     to restore the pure zero-tool synth-first behavior."""
+
+    investigator_emits_report: bool = True
+    """Let the investigation loop write the ``TriageReport`` itself, and skip the
+    round-2 synthesis call.
+
+    Today the loop emits an ``InvestigationTranscript`` (it has no verdict
+    field), and a second model call re-reads that transcript to write the
+    report. The 2026-09-19 turn audit measured what the second call adds: no new
+    evidence in 40 of 41 sampled runs, an empty ``citations`` list in 78% of
+    recent production runs, and two range verdict changes, both wrong (a correct
+    ``true_positive`` 0.72 became ``needs_more_info`` 0.55 with no disconfirming
+    fact). It costs 8 s on production and 52 s on the range.
+
+    With this ON the loop's own output IS the report. Every gate that ran on the
+    round-2 report still runs on it: the citation validation and cap, the
+    confidence floor, the deterministic downgrades, the hard evidence gate, the
+    self-consistency vote and the Oracle escalation. The egress guard sanitizes
+    the prompt and restores the report exactly as before.
+
+    ON by default since 2026-09-19. The accuracy mission measured both paths on
+    eleven range alerts with ground truth: this path landed 31 of 31 correct
+    verdicts against 30 of 31, 42 s faster per investigation. Set it off to
+    restore the round-2 synthesis. The stored ``triage_report`` event carries
+    ``report_path`` (``investigator`` or ``synth_round2``) on both paths, so the
+    two stay comparable in the event stream."""
+
+    synth_round1_always: bool = False
+    """Run the round-1 synthesis even when it cannot settle the alert.
+
+    Round 1 is a no-tools call. Its verdict stands only when a dispositive
+    decision template already cleared the alert ``false_positive``; on every
+    other alert the investigation loop runs and overwrites it. The pipeline
+    therefore skips the call on those alerts and emits
+    ``synth_round1_skipped`` with reason ``cannot_settle``. On production the
+    skipped call cost 18 s and about 8K tokens per alert, and its verdict was
+    discarded on 83% of the runs that made it (2026-09-19 turn audit, W2).
+
+    Set ``True`` to restore that call. The round-1 verdict then reappears in
+    the timeline and in the crash fallback. The older
+    ``definitely_investigate`` skip (a malware or exploit signal) is not
+    affected. This is a revert switch for an A/B, not a quality knob: the loop
+    never reads the round-1 report."""
 
     host_risk_window_hours: int = 24
     """Look-back/forward window (hours, each side) for the host-risk profile.
@@ -1112,6 +1372,14 @@ class Settings(BaseSettings):
     catches silent verdict degradation after an inference-engine swap. Inert
     unless ``notify_enabled`` is on."""
 
+    notify_on_audit_chain_break: bool = True
+    """Notify when the scheduled verification finds the tamper-evident audit
+    chain broken — either a position claimed twice by two writers or a record
+    whose content no longer matches its own hash. This is the only alarm here
+    that can mean someone edited the record of a decision, so it is sent at
+    critical severity. Inert unless ``notify_enabled`` is on; the bell in the
+    app carries it either way."""
+
     # --- crawl4ai (deep page read) ------------------------------------
     crawl4ai_enabled: bool = False
     """Enable the ``crawl_page`` investigator tool (crawl4ai). When False the
@@ -1143,6 +1411,11 @@ class Settings(BaseSettings):
     confirmed hunt finding, validate it (schema + would-have-fired dry run),
     and EXPORT it for the analyst to paste into Security Onion. Export-only —
     never writes to SO. Console-editable, hot."""
+
+    analytic_drafting_enabled: bool = True
+    """Enable "draft an analytic from this finding" on a threat hunt finding.
+    The draft is stored in the local tier as a candidate; a candidate never
+    runs until an analyst moves it to shadow. Console-editable, hot."""
 
     # --- Runbook retrieval (RAG) — opt-in gateway tier -----------------
     # The DEFAULT runbook retrieval is SQLite FTS5 BM25 (migration 0017): zero
@@ -1395,6 +1668,16 @@ class Settings(BaseSettings):
     or malware/exploit-class alert is never auto-acked, whatever the verdict),
     and every unattended write is audited.
 
+    The direct path additionally requires that the investigation RETRIEVED
+    something: a successful tool call, a Phase-D targeted dispatch, or a tool
+    call in the Oracle's own loop. Confidence is a statement about the model's
+    certainty, not about whether anybody checked, and a decision template
+    supplies confidence without supplying evidence. A false positive nothing was
+    looked up for keeps its verdict and waits for a person; the run records
+    ``auto_ack_skipped`` with reason ``no_investigation`` so the console can say
+    why. The inheritance path does not apply this test, because the inherited
+    row does not record whether the original run retrieved anything.
+
     Note the severity interaction: the high-stakes guard never auto-acks a
     critical/high-severity (or malware/exploit-class) alert, while
     ``auto_triage_min_severity`` defaults to "high". If you want auto-ack to
@@ -1426,6 +1709,13 @@ class Settings(BaseSettings):
     above. One of: critical, high, medium, low.
 
     Example: "high" triages critical + high; "medium" adds medium too.
+
+    A sweep additionally covers every alert whose document carries no
+    ``event.severity_label``, at every floor including "critical". A floor is a
+    comparison and an absent label has nothing to compare against, so the choice
+    is between sweeping those alerts and dropping them silently. "unknown" is
+    therefore not a legal value here: it is not a floor, it rides along with
+    every one. See :func:`soc_ai.webui.autotriage.config_severity_band`.
     """
 
     @field_validator("auto_triage_min_severity", mode="before")

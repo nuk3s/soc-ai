@@ -1,6 +1,6 @@
 """Persistence for the model fitness battery (one row per model, newest wins).
 
-See the design spec (docs/superpowers/specs/2026-08-05-model-battery-design.md)
+See the model-battery design of 2026-08-05
 and migration 0022 for the shape rationale.
 """
 

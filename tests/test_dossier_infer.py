@@ -162,7 +162,7 @@ def test_proxmox_hypervisor_is_the_motivating_case() -> None:
     # verdict about tcp/8006 that quotes tcp/22's traffic is quoting a number
     # that had nothing to do with the call.
     assert role.evidence == [
-        "responds on tcp/8006, tcp/8007 — 3,300 zeek.conn records "
+        "responds on tcp/8006, tcp/8007 with 3,300 zeek.conn records "
         "from 4 distinct peers across 19 hours (from behaviour)"
     ]
     assert role.observed_at == LAST_SEEN
@@ -431,7 +431,9 @@ def test_min_events_floor_emits_identity_but_role_unknown() -> None:
     facts = infer_host_facts(obs, min_events=20)
     assert facts["role"].value == "unknown"
     assert facts["role"].confidence == 0.0
-    assert facts["role"].evidence == ["insufficient telemetry: 7 events in window (< 20)"]
+    assert facts["role"].evidence == [
+        "insufficient telemetry: 7 events in window, below the floor of 20"
+    ]
     assert facts["hostname"].value == "pve01"
     assert facts["hostname"].strength == "strong"
 
@@ -1074,7 +1076,7 @@ def test_no_dhcp_dataset_reports_the_signal_as_unavailable() -> None:
     obs = _obs(available_datasets=frozenset({"zeek.conn", "zeek.dns"}))
     fact = infer_host_facts(obs, min_events=20)["is_static_addressed"]
     assert fact.value is None
-    assert fact.evidence == ["signal unavailable on this grid (no zeek.dhcp dataset)"]
+    assert fact.evidence == ["signal unavailable on this grid. The grid has no zeek.dhcp dataset."]
 
 
 def test_below_the_event_floor_static_addressing_is_not_claimed() -> None:
@@ -1827,3 +1829,63 @@ def test_with_every_name_below_the_floor_the_ladder_still_orders_them() -> None:
     assert (fact.value, fact.source) == ("FILES01", "banner")
     assert fact.strength == "weak"
     assert any("stale.lab.internal" in line for line in fact.evidence)
+
+
+def test_ephemeral_ports_are_not_services() -> None:
+    """The DC's services_offered listed twenty ports of which thirteen were
+    dynamic client ports; on a workstation the KPI led with two of them.
+    A dynamic port is the far end of a negotiated channel, not a service,
+    and it is dropped upstream of BOTH the role table and the services fact
+    so the two cannot disagree (dogfood, 2026-09-16)."""
+    from soc_ai.dossier.infer import _responder_ports
+
+    obs = _obs(resp_ports=_ports((445, 900), (88, 400), (49668, 500), (63578, 300), (49151, 7)))
+    ports = [row.port for row in _responder_ports(obs)]
+    assert ports == [445, 88, 49151]
+
+
+def _windows_os(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "family": "windows",
+        "version": "10.0.22621",
+        "kernel": "10.0.22621",
+        "platform": "windows",
+        "type": "windows",
+    }
+
+
+def test_an_agent_reported_client_os_outranks_server_shaped_ports() -> None:
+    """The range's only workstation serves SMB and WinRM to enough peers to
+    classify as `server`, so every workstation-scoped prior declined to apply
+    to it. The agent's own statement of its OS is a first-party claim and
+    outranks port behaviour for the workstation/server split -- and only that
+    split."""
+    server_shaped = dict(
+        resp_ports=_ports((445, 4000)), resp_peer_count=9, resp_hours=20, orig_peer_count=2
+    )
+    obs = _obs(agent_report=_agent(os=_windows_os("Windows 11 Enterprise")), **server_shaped)
+    role = infer_host_facts(obs, min_events=20)["role"]
+    assert role.value == "workstation"
+    assert role.source == "hostlog"
+    assert any("client operating system" in str(e) for e in role.evidence)
+
+    # NEGATIVE CONTROL: a server OS leaves the port verdict alone.
+    obs = _obs(
+        agent_report=_agent(os=_windows_os("Windows Server 2022 Datacenter")), **server_shaped
+    )
+    assert infer_host_facts(obs, min_events=20)["role"].value == "server"
+
+
+def test_a_client_os_never_promotes_or_demotes_a_domain_controller() -> None:
+    # The override is scoped to the server/workstation split. A DC verdict
+    # comes from the port table and a misreported OS must not touch it.
+    obs = _obs(
+        resp_ports=_ports((88, 900), (389, 900), (445, 900), (135, 300)),
+        resp_peer_count=40,
+        resp_hours=24,
+        orig_peer_count=3,
+        agent_report=_agent(os=_windows_os("Windows 11 Enterprise")),
+    )
+    role = infer_host_facts(obs, min_events=20)["role"]
+    assert role.value != "workstation"

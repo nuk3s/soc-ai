@@ -105,6 +105,31 @@ class EsSearchResult(BaseModel):
     """True when ES returned ``relation: "gte"`` — the count is a lower bound
     (capped at 10 000 by default).  Render as ``≥N``, not ``N``."""
 
+    counted: dict[str, Any] | None = None
+    """What ``total`` and any bucket ``doc_count`` actually counted.
+
+    A number handed to a reader with no unit gets the reader's unit. A triage
+    run read ``total: 358`` off a port-22 query as "358 SSH connections" and
+    closed a honeypot alert on it; 348 of the 358 were periodic packetbeat flow
+    records re-emitted per interval, and the documents naming the decoy carried
+    19 distinct source ports. Populated by tools that query the events index
+    superset, where one query spans every sensor shipping to it. ``None`` when
+    the caller did not ask for it.
+    """
+
+    window: dict[str, Any] | None = None
+    """The span ``total`` and every bucket ``doc_count`` were counted over.
+
+    Same reasoning as ``counted``, applied to time instead of unit. An
+    alert-anchored query defaults to a window CENTRED on the alert, so a
+    1440-minute request reaches back only 720 minutes; a published rationale
+    reported 12 events "grid-wide over 24 hours" where the grid held 20, and
+    the half-window reproduces 12 exactly. The descriptor names the mode, the
+    two bounds, and how far the window reaches either side of the anchor, so a
+    number is never handed over without the span it came from. ``None`` when
+    the caller did not ask for it.
+    """
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_display(self) -> str:

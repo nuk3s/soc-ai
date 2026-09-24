@@ -1,17 +1,11 @@
-// Hunts read as the odd one out of the four list screens (dogfood, 2026-08-12):
-// it used the same shared ListToolbar as Alerts, Investigations and Hosts, but
-// landed it ~495px down the page behind a three-card KPI band and a full-height
-// composer, where the other three land theirs at y=133. The family resemblance
-// only appeared once you scrolled — "a console with a list attached rather than
-// a list screen".
+// The Hunts page reads top to bottom as the pipeline: what needs the analyst,
+// what the analytics found (Analytic hits), what is worth pursuing (Leads),
+// what was pursued (Hunts). Each item appears once.
 //
-// The fix keeps the console (the composer IS this screen's primary action) but
-// gives it the family's anatomy: header line → compact composer → list section
-// headed by the toolbar. These tests pin the ANATOMY — DOM order and the two
-// shapes that cost the pixels (a KPI band that is one line, and a composer that
-// is one row until you write in it) — because a pixel offset is not something
-// jsdom can measure.
-import { fireEvent, render, screen, within } from '@testing-library/react';
+// These tests pin the ANATOMY, because a pixel offset is not something the DOM
+// can measure: the order of the blocks, the one-line header, and the composer
+// that is a drawer behind one button rather than a band at the top of the page.
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
@@ -27,8 +21,22 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHuntStats: getHuntStatsMock,
   getHuntTemplates: getHuntTemplatesMock,
   getHuntSchedules: vi.fn().mockResolvedValue({ schedules: [], masterSwitchEnabled: true }),
+  // Quiet state for the two surfaces merge 4 added. With no shadow hits the
+  // band renders nothing, so the band count above the toolbar stays 2.
+  getShadowHits: vi.fn().mockResolvedValue({ hits: [], unread: 0 }),
+  getAnalytics: vi.fn().mockResolvedValue({ analytics: [], counts: {} }),
+  // The three surfaces above the list, in their quiet state.
+  getAnalyticHits: vi.fn().mockResolvedValue({
+    hits: [],
+    counts: { all: 0, unread: 0, live: 0, shadow: 0 },
+  }),
+  getNeedsYou: vi
+    .fn()
+    .mockResolvedValue({ unread_shadow_hits: 0, leads_needing_decision: 0, total: 0 }),
+  getLeads: vi.fn().mockResolvedValue([]),
 }));
 
+import { ShellProvider } from '../shell/ShellContext';
 import { Hunts } from './Hunts';
 
 const ROW: HuntRow = {
@@ -51,16 +59,18 @@ const STATS: HuntStat[] = [
   { label: 'In progress', value: '1', sub: 'running now', tone: 'sigma' },
 ];
 
-function renderHunts() {
+function renderHunts(path = '/hunts') {
   getHuntsMock.mockResolvedValue([ROW]);
   getHuntStatsMock.mockResolvedValue(STATS);
   getHuntTemplatesMock.mockResolvedValue([]);
   return render(
-    <MemoryRouter initialEntries={['/hunts']}>
+    <MemoryRouter initialEntries={[path]}>
       <DemoProvider demo={false}>
-        <Routes>
-          <Route path="/hunts" element={<Hunts />} />
-        </Routes>
+        <ShellProvider>
+          <Routes>
+            <Route path="/hunts" element={<Hunts />} />
+          </Routes>
+        </ShellProvider>
       </DemoProvider>
     </MemoryRouter>,
   );
@@ -69,38 +79,41 @@ function renderHunts() {
 const follows = (a: Element, b: Element) =>
   Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
 
-const composer = () => screen.getByPlaceholderText(/hunt for beaconing to rare external IPs/i);
+const composer = () => screen.queryByPlaceholderText(/hunt for beaconing to rare external IPs/i);
 
-describe('Hunts list-screen anatomy', () => {
-  it('heads the list section with the shared toolbar, below the composer', async () => {
+describe('Hunts page anatomy', () => {
+  it('reads as the pipeline, top to bottom', async () => {
     renderHunts();
     await screen.findByText(ROW.objective);
 
     const stats = screen.getByTestId('hunt-stats-line');
+    const needsYou = screen.getByTestId('needs-you');
+    const hits = document.getElementById('analytic-hits')!;
+    const leads = screen.getByTestId('leads-strip');
+    // The hunt section states what a hunt is, where it used to state that the
+    // list holds agent runs only. One sentence, not two saying one thing.
+    const section = screen.getByTestId('define-hunt');
     const objectiveHeader = screen.getByText('Objective');
-    const page = stats.parentElement!.parentElement!;
+
+    expect(follows(stats, needsYou)).toBe(true);
+    expect(follows(needsYou, hits)).toBe(true);
+    expect(follows(hits, leads)).toBe(true);
+    expect(follows(leads, section)).toBe(true);
+    expect(follows(section, objectiveHeader)).toBe(true);
+  });
+
+  it('heads the hunt list with the shared toolbar', async () => {
+    renderHunts();
+    await screen.findByText(ROW.objective);
+
+    const page = screen.getByTestId('hunt-stats-line').parentElement!.parentElement!;
+    const objectiveHeader = screen.getByText('Objective');
     // The toolbar's own band: walk up from its chip row to the page's child.
     let toolbar = screen.getByTestId('list-toolbar-views') as HTMLElement;
     while (toolbar.parentElement && toolbar.parentElement !== page) {
       toolbar = toolbar.parentElement;
     }
-
-    // header line → composer → toolbar → table: the family's order, and the
-    // toolbar is the list section's top edge (nothing of the list precedes it).
-    expect(follows(stats, composer())).toBe(true);
-    expect(follows(composer(), toolbar)).toBe(true);
     expect(follows(toolbar, objectiveHeader)).toBe(true);
-
-    // Order alone is not the contract — the toolbar was never out of order; it
-    // was ~360px down because of what sat above it. So pin the COUNT: exactly
-    // two bands precede the toolbar, the header and the composer. Re-add a KPI
-    // card band (or any other Panel) above the list and this fails, which the
-    // order assertions above would not.
-    const bands = Array.from(page.children) as HTMLElement[];
-    const above = bands.slice(0, bands.indexOf(toolbar));
-    expect(above).toHaveLength(2);
-    expect(above[0].contains(stats)).toBe(true);
-    expect(above[1].contains(composer())).toBe(true);
   });
 
   it('states the KPI figures on one header line instead of a card band', async () => {
@@ -117,43 +130,70 @@ describe('Hunts list-screen anatomy', () => {
     expect(within(stats).getByText('0')).toBeTruthy();
     expect(stats.textContent).toMatch(/1 hunt.*4 findings.*0 in progress/);
     // The card band's own sub-labels survive as hover context, not as layout.
-    expect(within(stats).getByTitle('surfaced')).toBeTruthy();
+    expect(within(stats).getByTitle('threat findings')).toBeTruthy();
   });
 
-  it('keeps the composer one row until it is being written in', async () => {
+  it('keeps no composer on the page', async () => {
+    renderHunts();
+    await screen.findByText(ROW.objective);
+    expect(composer()).toBeNull();
+    expect(screen.queryByText('Starters')).toBeNull();
+  });
+
+  it('opens the composer in a drawer from the New hunt button', async () => {
     renderHunts();
     await screen.findByText(ROW.objective);
 
-    const box = composer() as HTMLTextAreaElement;
-    expect(Number(box.rows)).toBe(1);
-
-    fireEvent.focus(box);
-    expect(Number(box.rows)).toBeGreaterThan(1);
-    expect(screen.getByText(/Shift\+Enter for a new line/i)).toBeTruthy();
-
-    // Text keeps it open after the focus goes away — a written brief is never
-    // collapsed out from under the analyst.
-    fireEvent.change(box, { target: { value: 'hunt for lateral movement' } });
-    fireEvent.blur(box);
-    expect(Number(box.rows)).toBeGreaterThan(1);
+    fireEvent.click(screen.getByRole('button', { name: 'New hunt' }));
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    expect(composer()).toBeTruthy();
+    expect(screen.getByText('Starters')).toBeTruthy();
   });
 
-  it('forgets a dragged height when it collapses', async () => {
-    // The box was `resize-y`, and an inline height beats `rows`: one drag of the
-    // grip pinned the composer tall for the rest of the page's life, so the
-    // toolbar sat LOWER than the 362px this batch was opened to fix. The drag is
-    // a habit the old always-4-row box taught, so it will happen.
+  it('opens the composer from the address, and closing it takes the address back', async () => {
+    renderHunts('/hunts?new=1');
+    await screen.findByText(ROW.objective);
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(composer()).toBeNull();
+  });
+});
+
+// Below 1100px the objective was the only track with no floor, so it took the
+// whole shortfall and the row read "Hunt for hosts b…" while Findings and
+// Hosts held 100px and 90px for a single digit each. jsdom has no layout
+// engine, so the grid template is the check: the objective has the floor and
+// the two counters are the tracks that yield.
+describe('Hunts list column widths', () => {
+  const gridOf = (el: HTMLElement) => el.style.gridTemplateColumns;
+
+  it('floors the objective at 260px and lets the counters shrink first', async () => {
     renderHunts();
     await screen.findByText(ROW.objective);
+    const header = screen.getByText('Objective').parentElement as HTMLElement;
+    const template = gridOf(header);
+    expect(template).toContain('minmax(260px, 1fr)');
+    // Findings and Hosts carry a floor well under their preferred width, so
+    // they are the tracks the browser takes the shortfall from.
+    expect(template).toMatch(/minmax\(52px, 100px\)/);
+    expect(template).toMatch(/minmax\(48px, 90px\)/);
+    // The row uses the same template as its header. They drifted once.
+    const row = screen.getByText(ROW.objective).closest('.grid') as HTMLElement;
+    expect(gridOf(row)).toBe(template);
+  });
 
-    const box = composer() as HTMLTextAreaElement;
-    fireEvent.focus(box);
-    box.style.height = '220px'; // what the browser writes when you drag the grip
-
-    fireEvent.blur(box);
-    expect(Number(box.rows)).toBe(1);
-    expect(box.style.height).toBe('');
-    // ...and no grip to drag while it is one row.
-    expect(box.className).toContain('resize-none');
+  // The mockup reads Objective, Started by, Findings, Hosts, Status, Started:
+  // who asked comes before what it found, because the first question about a
+  // row is whose question it answers.
+  it('reads the columns in the order the mockup draws them', async () => {
+    renderHunts();
+    await screen.findByText(ROW.objective);
+    const header = screen.getByText('Objective').parentElement as HTMLElement;
+    const words = Array.from(header.children)
+      .map((c) => c.textContent?.trim())
+      .filter(Boolean);
+    expect(words).toEqual(['Objective', 'Started by', 'Findings', 'Hosts', 'Status', 'Started']);
   });
 });

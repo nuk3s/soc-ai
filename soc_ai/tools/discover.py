@@ -19,6 +19,23 @@ default the issued body excludes docs tagged ``synth.scenario_id`` so a live eva
 batch's planted scenarios never inflate a described dataset or a field's top
 values; an eval-mode context opts in per call with ``include_synth=True``
 (mirroring :func:`soc_ai.tools.query_events.query_events_oql`).
+
+**They part company on imported data**, because they answer different kinds of
+question (:mod:`soc_ai.tools._provenance`):
+
+- :func:`field_values` is a distribution with counts — "which rule.names fire
+  and how often", "which host.names exist" — and that is a claim about a
+  network. On a grid where most documents are backfill it ranked an imported
+  corpus's hostnames above every machine on the wire, which is the terrain the
+  agent then reasons over. It counts live telemetry only by default and reports
+  the population it counted.
+- :func:`describe_dataset` is not. It answers "what does a document of this
+  dataset look like", which is a property of the DATA rather than of the
+  network, and its coverage fraction is over its own sample. It is also the
+  tool an agent needs precisely when a plane is import-only: the grid inventory
+  reports such a plane as present and queryable, so a schema read that came
+  back empty for it would contradict the inventory and leave the agent unable
+  to query documents it has been told exist. It stays unfiltered, deliberately.
 """
 
 from __future__ import annotations
@@ -29,6 +46,9 @@ from typing import Any
 
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.fields import dataset_name_filter
+from soc_ai.so_client.oql import _field_suggestion, get_whitelist
+from soc_ai.tools._provenance import LIVE, Provenance, denominator_note, provenance_must_not
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
 _LOGGER = logging.getLogger(__name__)
@@ -101,7 +121,7 @@ async def describe_dataset(
     ds = str(dataset).strip()
     if not ds:
         return {"error": True, "reason": "empty dataset name"}
-    query: dict[str, Any] = {"bool": {"filter": [{"term": {"event.dataset": ds}}]}}
+    query: dict[str, Any] = {"bool": {"filter": [dataset_name_filter(ds)]}}
     if synth_must_not := synth_scope_must_not(include_synth):
         query["bool"]["must_not"] = synth_must_not
     try:
@@ -121,9 +141,9 @@ async def describe_dataset(
             "sampled": 0,
             "fields": [],
             "note": (
-                f"no documents for event.dataset:{ds} — check the exact name against "
-                "the auto-discovered grid inventory (a dataset that isn't listed there "
-                "has no data on this grid)."
+                f"no documents named {ds} under event.dataset or data_stream.dataset "
+                "— check the exact name against the auto-discovered grid inventory (a "
+                "dataset that isn't listed there has no data on this grid)."
             ),
         }
 
@@ -165,14 +185,26 @@ async def field_values(
     size: int = 25,
     window_minutes: int = 1440,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Top values of ``field`` (a terms aggregation), optionally within ``dataset``.
 
-    Returns ``{field, dataset, values:[{value, count}]}`` newest-window, most-common
-    first. Use this to learn what actually populates a field before querying on it.
+    Returns ``{field, dataset, provenance, values:[{value, count}]}``
+    newest-window, most-common first. Use this to learn what actually populates
+    a field before querying on it.
+
     By default the aggregation excludes synthetic-eval docs (``synth.scenario_id``)
     so planted scenarios can't inflate a field's top values; an eval-mode caller
-    opts in with ``include_synth=True``."""
+    opts in with ``include_synth=True``.
+
+    It excludes imported and replayed documents by default too, for the same
+    reason at a much larger scale: these counts are a distribution over a
+    population, so "the top host.names on this grid" was answering with an
+    imported corpus's machines ranked above the ones on the wire. That ranking
+    is what the agent then treats as the terrain. ``provenance="any"`` restores
+    the whole-disk view for a caller enumerating what an import contains.
+    ``provenance`` is echoed in the result so a ranking is never read without
+    knowing whose it is."""
     f = str(field).strip()
     if not f:
         return {"error": True, "reason": "empty field name"}
@@ -183,13 +215,44 @@ async def field_values(
         # values list, no ES round-trip — so the refusal itself is not a tell.
         # Unconditional (not gated on include_synth): the same answer in prod
         # and eval mode carries no signal either way.
-        return {"field": f, "dataset": dataset, "values": []}
+        #
+        # "Exactly" is load-bearing and it is a maintenance hazard: every key
+        # the answered path returns has to appear here too, or the shapes
+        # diverge and the difference IS the tell. That is why the provenance
+        # keys are echoed for a query that was never issued.
+        return {
+            "field": f,
+            "dataset": dataset,
+            "provenance": provenance,
+            "counted_over": denominator_note(provenance),
+            "values": [],
+        }
+    if not get_whitelist().is_allowed(f):
+        # The same field policy the query language enforces. This tool exists
+        # to "learn what actually populates a field BEFORE querying on it", so
+        # enumerating the values of a field that can never be queried is a
+        # disclosure with no legitimate follow-up — and it made the two
+        # surfaces disagree: OQL would refuse `winlog.event_data.Foo` while
+        # this returned its top values.
+        #
+        # A NAMED refusal, not the silent empty list above. The whitelist is
+        # static and public, so unlike the marker guard there is no oracle to
+        # protect, and the reject is the only channel the agent has to
+        # self-correct — the same reasoning as OQL's did-you-mean tail, which
+        # is reused here verbatim.
+        return {
+            "error": True,
+            "field": f,
+            "reason": (f"field {f!r} is not queryable on this deployment{_field_suggestion(f)}"),
+        }
     filters: list[dict[str, Any]] = [{"range": {"@timestamp": {"gte": f"now-{window_minutes}m"}}}]
     if dataset:
-        filters.append({"term": {"event.dataset": str(dataset).strip()}})
+        filters.append(dataset_name_filter(str(dataset).strip()))
     query: dict[str, Any] = {"bool": {"filter": filters}}
-    if synth_must_not := synth_scope_must_not(include_synth):
-        query["bool"]["must_not"] = synth_must_not
+    # Both scopes into one list, since a bool has only one ``must_not`` and
+    # assigning twice would silently drop whichever went first.
+    if must_not := [*synth_scope_must_not(include_synth), *provenance_must_not(provenance)]:
+        query["bool"]["must_not"] = must_not
     aggs: dict[str, Any] = {"vals": {"terms": {"field": f, "size": max(1, min(size, 100))}}}
     try:
         result = await elastic.search(settings.events_index_pattern, query, size=0, aggs=aggs)
@@ -208,6 +271,10 @@ async def field_values(
     return {
         "field": f,
         "dataset": dataset,
+        # Beside the field and the dataset, which is where a reader already
+        # looks to find out what this ranking is a ranking OF.
+        "provenance": provenance,
+        "counted_over": denominator_note(provenance),
         "values": [{"value": b.get("key"), "count": b.get("doc_count")} for b in buckets],
     }
 

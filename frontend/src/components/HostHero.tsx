@@ -78,7 +78,7 @@ export function HostHero({ dossier, adminBlocked }: HostHeroProps) {
             {role && (
               <span
                 data-testid="hero-role"
-                title="What kind of machine this is"
+                title="What type of machine this is"
                 className={cn(
                   'inline-flex flex-none items-center rounded-pill border px-2.5 py-[3px] font-mono text-[11.5px] font-semibold',
                   roleAccent(role),
@@ -102,10 +102,10 @@ export function HostHero({ dossier, adminBlocked }: HostHeroProps) {
                 data-testid="hero-agent"
                 title={
                   selfReported.length > 0
-                    ? `This machine reports on itself: ${selfReported
+                    ? `This machine reports on itself. ${selfReported
                         .map((name) => fieldLabel(name))
-                        .join(', ')} came from logs it ships, so this page can say more than the wire alone shows.`
-                    : 'An agent on this machine ships its own logs, so this page can say more than the wire alone shows.'
+                        .join(', ')} came from logs it ships. This page can say more than network traffic alone shows.`
+                    : 'An agent on this machine ships its own logs. This page can say more than network traffic alone shows.'
                 }
                 className={cn(
                   'inline-flex flex-none items-center rounded-pill border px-2.5 py-[3px] font-mono text-[11.5px] font-semibold',
@@ -117,7 +117,7 @@ export function HostHero({ dossier, adminBlocked }: HostHeroProps) {
             ) : (
               <span
                 data-testid="hero-agent"
-                title="Nothing here came from the machine itself — no agent logs reach the grid from this address, so only its network traffic speaks for it."
+                title="No agent logs reach the grid from this address. Everything here comes from the network traffic of this host."
                 className="inline-flex flex-none items-center rounded-pill border border-border-input bg-surface-3 px-2.5 py-[3px] font-mono text-[11.5px] font-semibold text-dim"
               >
                 network-only view
@@ -162,7 +162,7 @@ export function HostHero({ dossier, adminBlocked }: HostHeroProps) {
 
         {adminBlocked && (
           <div className="mt-2 text-[11.5px] text-faint">
-            Read-only: sign in as an admin to declare values or resolve disagreements.
+            This page is read-only. Sign in as an admin to declare values or resolve disagreements.
           </div>
         )}
       </div>

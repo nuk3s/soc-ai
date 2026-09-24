@@ -135,6 +135,10 @@ def test_ack_group_reports_capped_when_group_exceeds_cap(client: TestClient) -> 
 
     with (
         patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=fake_events)),
+        patch(
+            "soc_ai.api.webui_api.aq.count_group_events",
+            AsyncMock(return_value=aq.MAX_EVENTS),
+        ),
         patch("soc_ai.api.webui.routes_alert_actions.execute_write_tool", fake_write),
     ):
         resp = client.post(
@@ -144,6 +148,8 @@ def test_ack_group_reports_capped_when_group_exceeds_cap(client: TestClient) -> 
     body = resp.json()
     assert body["capped"] is True
     assert body["acked"] == _ACK_CAP  # acked up to the cap, the rest left for a re-run
+    # ...and the re-run has a number attached to it, not just a flag.
+    assert body["remaining"] == aq.MAX_EVENTS - _ACK_CAP
 
 
 def test_ack_cap_below_fetch_clamp_invariant() -> None:

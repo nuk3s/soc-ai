@@ -67,7 +67,7 @@ describe('HuntVisuals — View as table (non-hover path)', () => {
   it('host table lists involvement counts and worst severity per host', () => {
     renderVisuals();
     const table = screen
-      .getByText('Host involvement — findings per host')
+      .getByText('Host involvement · findings per host')
       .closest('table') as HTMLElement;
     const rowA = within(table).getByText('host-a').closest('tr') as HTMLElement;
     // host-a is named by the high threat and the medium gap → 2 findings, worst high
@@ -79,7 +79,7 @@ describe('HuntVisuals — View as table (non-hover path)', () => {
   it('host–finding map table names each finding and its hosts', () => {
     renderVisuals();
     const table = screen
-      .getByText('Host–finding map — each finding and the hosts it names')
+      .getByText('Host–finding map · each finding and the hosts it names')
       .closest('table') as HTMLElement;
     expect(within(table).getByText('F1 — Beacon to C2')).toBeInTheDocument();
     // a finding that names no host renders an em dash, not an empty cell
@@ -102,7 +102,7 @@ describe('HuntVisuals — View as table (non-hover path)', () => {
     ]);
     // 3 deterministic + 1 agent chart
     expect(screen.getAllByText('View as table')).toHaveLength(4);
-    const table = screen.getByText('Beacon interval — data table').closest('table') as HTMLElement;
+    const table = screen.getByText('Beacon interval · data table').closest('table') as HTMLElement;
     expect(within(table).getByText('seconds since prior')).toBeInTheDocument();
     expect(within(table).getByText('events')).toBeInTheDocument();
     expect(within(table).getByText('30')).toBeInTheDocument();
@@ -125,6 +125,6 @@ describe('HuntVisuals — View as table (non-hover path)', () => {
 
   it('host involvement panel carries a legend explaining bar color = worst severity', () => {
     renderVisuals();
-    expect(screen.getByText('bar color = worst severity')).toBeInTheDocument();
+    expect(screen.getByText('bar color is the worst severity')).toBeInTheDocument();
   });
 });

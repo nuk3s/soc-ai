@@ -30,7 +30,7 @@ const WINDOWS = [
 const SAMPLES = [10, 20, 30, 50];
 const SEVERITIES = [
   { label: 'Any severity', value: '' },
-  { label: 'High & up', value: 'high' },
+  { label: 'High and above', value: 'high' },
   { label: 'Critical only', value: 'critical' },
 ];
 
@@ -116,11 +116,11 @@ export function Backtest() {
         // A non-active status means the run never started (no dispositioned
         // alerts in the window, planning failed, already running, …). The POST
         // carries the reason; a follow-up GET drops it, so surface it here.
-        if (!s.active) setStartError(s.note ?? 'Backtest did not start.');
+        if (!s.active) setStartError(s.note ?? 'The backtest did not start.');
         else setReloadKey((k) => k + 1);
       })
       .catch((e: unknown) =>
-        setStartError(e instanceof Error ? e.message : 'Could not start the backtest.'),
+        setStartError(e instanceof Error ? e.message : 'The request to start the backtest failed.'),
       )
       .finally(() => setStarting(false));
   };
@@ -134,10 +134,11 @@ export function Backtest() {
           <div className="text-[20px] font-semibold tracking-[-.015em]">Backtest</div>
         </div>
         <div className="mt-0.5 max-w-[720px] text-[13px] text-dim">
-          Prove it on your own last-N-days alerts. soc-ai replays its triage over a sample of
-          alerts your analysts already dispositioned in Security Onion, then reports how its
-          verdicts compare to your team's real calls — escalated&nbsp;=&nbsp;true positive,
-          acknowledged&nbsp;=&nbsp;false positive. Read-only; nothing is written back to SO.
+          Prove soc-ai on your own alerts. soc-ai replays its triage over a sample of alerts your
+          analysts already closed in Security Onion. soc-ai then reports how its verdicts
+          compare to your analysts' verdicts. An escalated alert is a true positive. An
+          acknowledged alert is a false positive. soc-ai reads Security Onion and writes nothing
+          back.
         </div>
       </div>
 
@@ -173,7 +174,7 @@ export function Backtest() {
               ))}
             </select>
           </Field>
-          <Field label="Min severity">
+          <Field label="Minimum severity">
             <select
               value={minSeverity}
               onChange={(e) => setMinSeverity(e.target.value)}
@@ -201,8 +202,8 @@ export function Backtest() {
           </button>
         </div>
         <div className="mt-2.5 text-[11.5px] text-faint">
-          Each sampled alert is a full LLM investigation — sample size is capped server-side.
-          Only alerts your analysts actually dispositioned are sampled.
+          Each sampled alert is a full LLM investigation. The server caps the sample size. soc-ai
+          samples only the alerts your analysts closed.
         </div>
         {startError && <div className="mt-2 text-[12px] text-danger">{startError}</div>}
       </Panel>
@@ -214,17 +215,17 @@ export function Backtest() {
             <div data-testid="backtest-sampling">
               <div className="mb-1 flex items-center gap-2 text-[13px] font-semibold text-accent">
                 <Loader2 size={15} className="animate-spin" />
-                Reading Security Onion for alerts your analysts dispositioned…
+                soc-ai reads Security Onion for the alerts your analysts closed…
               </div>
               <div className="text-[12px] text-dim">
-                Nothing has been replayed yet — the window is still being sampled.
+                soc-ai has replayed no alert yet. soc-ai still samples the window.
               </div>
             </div>
           ) : (
             <>
               <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-accent">
                 <Loader2 size={15} className="animate-spin" />
-                Replaying {data.total} dispositioned alert{data.total === 1 ? '' : 's'}…
+                soc-ai replays {data.total} closed alert{data.total === 1 ? '' : 's'}…
               </div>
               <ProgressBar done={data.replayed + data.failed} total={data.total} />
               <div className="mt-2 text-[12px] text-dim">
@@ -232,7 +233,7 @@ export function Backtest() {
                 {data.current && (
                   <span className="text-faint">
                     {' '}
-                    · investigating <span className="text-text-2">{data.current}</span>
+                    · soc-ai investigates <span className="text-text-2">{data.current}</span>
                   </span>
                 )}
                 {data.failed > 0 && (
@@ -266,7 +267,7 @@ export function Backtest() {
           <Panel className="p-8 text-center text-[13px] text-faint">
             {data?.note
               ? data.note
-              : 'No backtest yet. Configure a window above and run one to see how soc-ai’s verdicts compare to your analysts’ real dispositions.'}
+              : 'No backtest yet. Select a window above and run a backtest. The report compares soc-ai’s verdicts to the real dispositions your analysts made.'}
           </Panel>
         </div>
       ) : null}
@@ -299,13 +300,12 @@ function InterruptedRun({ data }: { data: BacktestData }) {
     <div data-testid="backtest-interrupted">
       <Panel className="p-6 text-center text-[13px] text-danger">
         {c
-          ? `This backtest was cut short — only ${c.decided} of ${c.total} replays produced a verdict.`
-          : 'The last backtest failed to complete. Check the service logs and try again.'}
+          ? `This backtest stopped early. Only ${c.decided} of ${c.total} replays produced a verdict.`
+          : 'The last backtest did not finish. Check the service logs. Run the backtest again.'}
         {c && (
           <div className="mt-1.5 text-[12px] text-faint">
-            The remaining {c.no_verdict} could not be replayed, so there is no score to report.
-            That is an infrastructure result, not a measurement of soc-ai — check the grid and run
-            it again.
+            soc-ai could not replay the remaining {c.no_verdict}. There is no score to report.
+            This is an infrastructure result. Check the grid. Run the backtest again.
           </div>
         )}
       </Panel>
@@ -344,9 +344,9 @@ function Results({ data }: { data: BacktestData }) {
           data-testid="backtest-partial-coverage"
           className="mb-3 rounded-card border border-border bg-surface-2 px-4 py-2.5 text-[12px] text-warn"
         >
-          {r.completion.decided} of {r.completion.total} sampled alerts were replayed. The other{' '}
-          {r.completion.no_verdict} produced no verdict and are excluded from the rates below —
-          they are missing coverage, not disagreement.
+          soc-ai replayed {r.completion.decided} of {r.completion.total} sampled alerts. The
+          other {r.completion.no_verdict} produced no verdict. The rates below exclude them. They
+          are missing coverage.
         </div>
       )}
 
@@ -361,7 +361,7 @@ function Results({ data }: { data: BacktestData }) {
         <MetricCard
           label="False-positive toil cleared"
           value={pct(m.fp_reduction)}
-          sub={`${m.counts.fp_cleared} of ${m.counts.human_fp_decided ?? m.counts.human_fp} acknowledged alerts soc-ai would auto-clear`}
+          sub={`soc-ai would auto-clear ${m.counts.fp_cleared} of ${m.counts.human_fp_decided ?? m.counts.human_fp} acknowledged alerts`}
           color="#3fb950"
         />
         <MissedTpCard missed={missed} humanTp={m.counts.human_tp} rows={r.missed_tp_rows} />
@@ -373,8 +373,8 @@ function Results({ data }: { data: BacktestData }) {
         <ConfusionTable confusion={r.confusion} />
         {m.n_needs_more_info > 0 && (
           <div className="mt-2 text-[11.5px] text-faint">
-            soc-ai hedged ({VERDICT_LABEL.needs_more_info}) on {m.n_needs_more_info} alert
-            {m.n_needs_more_info === 1 ? '' : 's'} — counted as a non-match.
+            soc-ai returned {VERDICT_LABEL.needs_more_info} on {m.n_needs_more_info} alert
+            {m.n_needs_more_info === 1 ? '' : 's'}. Each one counts as a non-match.
           </div>
         )}
       </Panel>
@@ -393,7 +393,7 @@ function Results({ data }: { data: BacktestData }) {
 
       {/* proxy caveat */}
       <div className="rounded-card border border-border bg-surface-2 px-4 py-3 text-[11.5px] leading-relaxed text-faint">
-        <span className="font-semibold text-dim">How ground truth is derived:</span> {r.caveat}
+        <span className="font-semibold text-dim">How soc-ai derives ground truth:</span> {r.caveat}
       </div>
     </>
   );
@@ -458,7 +458,7 @@ function MissedTpCard({
       <div className="mt-1 text-[11.5px]" style={{ color: safe ? '#7ea88a' : '#e88' }}>
         {safe
           ? `soc-ai agreed on every one of the ${humanTp} escalated incident${humanTp === 1 ? '' : 's'}.`
-          : `real incident${missed === 1 ? '' : 's'} soc-ai called false positive — the critical safety miss.`}
+          : `soc-ai called ${missed} real incident${missed === 1 ? '' : 's'} a false positive. This is the critical safety miss.`}
       </div>
       {!safe && rows.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11.5px]" style={{ color: '#e88' }}>
@@ -520,7 +520,7 @@ function ConfusionTable({ confusion }: { confusion: BacktestConfusion }) {
 
 function RowsTable({ rows }: { rows: BacktestRow[] }) {
   if (rows.length === 0) {
-    return <div className="px-4 py-8 text-center text-[13px] text-faint">No rows.</div>;
+    return <div className="px-4 py-8 text-center text-[13px] text-faint">The table has no rows.</div>;
   }
   return (
     <div className="overflow-x-auto">

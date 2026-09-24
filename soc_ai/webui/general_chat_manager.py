@@ -96,11 +96,12 @@ MAX_PROPOSED_OBJECTIVE_CHARS = 4000
 # resolves its pending row from here instead of building a model, which the demo
 # egress guard refuses.
 DEMO_REPLY = (
-    "This is a recorded demo, so the dashboard assistant isn't available here — "
-    "answering you live would mean querying a real Security Onion grid and calling "
-    "a model. In a real deployment I'd answer this from the grid's own telemetry "
-    "(datasets, hosts, recent verdicts) and propose a hunt when a question needs a "
-    "sweep. The seeded investigations and hunts show that reasoning end to end."
+    "This is a recorded demo. The dashboard assistant does not answer here, "
+    "because a live answer queries a real Security Onion grid and calls a model. "
+    "In a real deployment I answer from the grid's own telemetry. The telemetry "
+    "covers the datasets, the hosts and the recent verdicts. I propose a hunt if a "
+    "question needs a sweep. The seeded investigations and hunts show that "
+    "reasoning in full."
 )
 
 
@@ -361,9 +362,11 @@ async def _top_rules(elastic: Any, settings: Any) -> list[tuple[str, int]] | Non
     header claims.
     """
     try:
-        groups, _total = await aq.fetch_groups(
-            elastic, settings, time_range=f"{POSTURE_WINDOW_HOURS}h", sort="count"
-        )
+        groups = (
+            await aq.fetch_groups(
+                elastic, settings, time_range=f"{POSTURE_WINDOW_HOURS}h", sort="count"
+            )
+        ).groups
     except Exception as exc:
         _LOGGER.warning("general chat: top-rule lookup failed: %s", exc)
         return None
@@ -382,7 +385,7 @@ async def _resolve_if_pending(state: Any, assistant_msg_id: int) -> None:
             await gc_svc.finish_assistant(
                 db,
                 assistant_msg_id,
-                content="The assistant was interrupted — please ask again.",
+                content="The assistant was interrupted. Ask again.",
                 status="error",
                 meta=None,
             )

@@ -87,9 +87,8 @@ export function DemoDisabledState({ what }: { what: string }) {
       </span>
       <div className="text-[13.5px] font-semibold text-text-2">Read-only demo</div>
       <div className="max-w-[460px] text-[12.5px] leading-[1.6] text-faint">
-        {what} is switched off here: this hosted demo replays recorded investigations, and its
-        settings, users and secrets are neither editable nor visible. Run your own soc-ai to see
-        this screen live.
+        {what} is off here. This hosted demo replays recorded investigations. It does not show or
+        change its settings, users and secrets. Run your own soc-ai to see this screen live.
       </div>
     </div>
   );
@@ -124,11 +123,11 @@ export function NotFoundState({
       <div className="max-w-[460px] text-[12.5px] leading-[1.6] text-faint">
         {id ? (
           <>
-            Nothing here answers to <span className="font-mono text-dim">{id}</span>. It may have
-            been deleted, or the link may be mistyped.
+            Nothing here has the id <span className="font-mono text-dim">{id}</span>. The {what} no
+            longer exists, or the link is wrong.
           </>
         ) : (
-          <>It may have been deleted, or the link may be mistyped.</>
+          <>The {what} no longer exists, or the link is wrong.</>
         )}
       </div>
       <Link
@@ -258,8 +257,8 @@ export function StaleNotice({
       <AlertTriangle size={13} className="flex-none" />
       <span>
         {reason === 'refresh-failed'
-          ? `Refresh failed — still showing data from ${t}${retrying ? ' — retrying' : ''}`
-          : `Showing data from ${t} — retrying`}
+          ? `Refresh failed. This data is from ${t}.${retrying ? ' soc-ai retries automatically.' : ''}`
+          : `This data is from ${t}. soc-ai retries automatically.`}
       </span>
       <button
         onClick={onRefresh}

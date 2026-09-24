@@ -693,7 +693,7 @@ def test_hunt_prompt_separates_a_grid_outage_from_an_empty_result() -> None:
     unknowable, not empty, and never grounds an all-clear."""
     p = HUNT_SYSTEM_PROMPT
     assert GRID_UNAVAILABLE_REASON in p
-    assert "UNKNOWABLE, not absent" in p
+    assert "**UNKNOWABLE**. It is not absent." in p
     assert "the network is quiet" in p
     # ...and it is not told to do something the toolset cannot honor: an
     # identical re-send short-circuits on the dedup tracker instead of

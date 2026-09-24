@@ -36,7 +36,7 @@ function SummaryChips({ summary }: { summary: Record<string, number> }) {
         </span>
       ))}
       {Object.keys(summary).length === 0 && (
-        <span className="text-[12px] text-faint">nothing to redact</span>
+        <span className="text-[12px] text-faint">No value needs redaction.</span>
       )}
     </div>
   );
@@ -95,7 +95,10 @@ export function HighlightedText({
             key={i}
             className={side === 'original' ? MARK_VALUE : MARK_LABEL}
             title={
-              pair && (side === 'original' ? `redacted as ${pair.label}` : `replaces ${pair.value}`)
+              pair &&
+              (side === 'original'
+                ? `soc-ai replaces this value with ${pair.label}.`
+                : `This label replaces ${pair.value}.`)
             }
           >
             {part}
@@ -126,7 +129,9 @@ function BeforeAfter({
           <mark className={MARK_VALUE}>internal value</mark>
           {' → '}
           <mark className={MARK_LABEL}>opaque label</mark>
-          {` — ${replacements.length} redacted (hover a highlight for its counterpart)`}
+          {`. soc-ai redacts ${replacements.length} value${
+            replacements.length === 1 ? '' : 's'
+          }. Hover over a highlight to see its counterpart.`}
         </div>
       )}
       <div className="grid gap-3 md:grid-cols-2">
@@ -212,7 +217,7 @@ function AnalystPath() {
                     badge's exact wording appended to the label — a planted run
                     in this picker must never read as real activity. */}
                 {r.id} · {r.name} · {r.verdict} · {r.when}
-                {r.isSynthEval ? ' · Synthetic — evaluation data' : ''}
+                {r.isSynthEval ? ' · Synthetic evaluation data' : ''}
               </option>
             ))}
           </select>
@@ -237,9 +242,9 @@ function AnalystPath() {
             <div className="mb-3 flex items-start gap-2 rounded-control border border-[rgba(245,166,35,.3)] bg-[rgba(245,166,35,.06)] px-3 py-2 text-[12.5px] leading-[1.55] text-[#f5a623]">
               <span className="mt-0.5 flex-none"><ShieldAlert size={15} /></span>
               <span>
-                Analyst-path redaction is currently OFF — this is a simulation of what
-                WOULD be redacted if you enable it. A real analyst call today sends the
-                original text unredacted.
+                Analyst-path redaction is off. This preview shows the redaction that soc-ai
+                applies if you turn the setting on. An analyst call today sends the original
+                text without redaction.
               </span>
             </div>
           )}

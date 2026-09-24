@@ -58,6 +58,39 @@ def test_label_event_shape() -> None:
     assert label_event("usage", {"phase": "synthesizer", "round": 1})["dim"] is True
 
 
+def test_a_hunt_subject_reads_as_a_hunt_subject() -> None:
+    """D2. Two steps kept alert words on a run whose subject is a hunt.
+
+    The context step said "Loaded alert context + enrichments" over the hunt's
+    findings and documents. The template step said a full investigation ran
+    because no pattern matched, while the stored event says the templates
+    never ran: they match an alert rule class and a hunt has none.
+    """
+    context = title_for(
+        "enriched_alert_context",
+        {"subject": "hunt", "subject_findings": 4, "subject_documents": [{}, {}, {}]},
+    )
+    assert context == "Loaded the hunt subject: 4 findings, 3 documents"
+    one = title_for(
+        "enriched_alert_context",
+        {"subject": "hunt", "subject_findings": 1, "subject_documents": [{}]},
+    )
+    assert one == "Loaded the hunt subject: 1 finding, 1 document"
+
+    skipped = title_for("decision_template_match", {"matched": False, "skipped": "hunt_subject"})
+    assert skipped == "Templates do not run on a hunt subject"
+
+
+def test_an_alert_run_keeps_the_alert_words() -> None:
+    """NEGATIVE CONTROL. An alert run reads exactly as it did."""
+    assert title_for("enriched_alert_context", {}) == "Loaded alert context + enrichments"
+    assert title_for("alert_context", {}) == "Loaded alert context + enrichments"
+    assert (
+        title_for("decision_template_match", {"matched": False, "skipped": None})
+        == "No decision-template match"
+    )
+
+
 def test_unknown_kind_and_bad_payloads_never_raise() -> None:
     assert title_for("some_new_kind", {}) == "some new kind"
     assert label_event("tool_result", {"tool_name": "x", "result": None})["title"]
@@ -326,7 +359,7 @@ def test_prior_outcomes_kind() -> None:
         },
     )
     assert t == (
-        "Recalled 3 prior outcome(s) for similar alerts — 2x false positive, 1x true positive"
+        "Recalled 3 prior outcome(s) for similar alerts: 2x false positive, 1x true positive"
     )
     assert title_for("prior_outcomes", {"count": 1}) == (
         "Recalled 1 prior outcome(s) for similar alerts"

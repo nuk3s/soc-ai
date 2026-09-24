@@ -1,0 +1,34 @@
+id: prior-workstation-account-first-logon-to-dc
+title: An account logs on to a domain controller for the first time
+description: >
+  Most accounts never authenticate interactively to a domain controller. The set
+  of accounts that does is small, stable and known. A new account in that set is
+  a new administrator. It can also be an account whose credentials an attacker
+  has taken. An attacker uses stolen credentials where they grant the most
+  access.
+
+  This analytic reads the domain controller's own logon-user history. The known
+  set of accounts is therefore measured.
+
+level: high
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: logon_users
+  test: novel_for
+  roles:
+    - domain_controller
+
+attack:
+  - T1078.002
+
+false_positives:
+  - An operator creates a new administrator account or service account. The
+    account fires this analytic once and then joins the baseline.
+  - A scheduled task or a service runs under an account that authenticates
+    rarely. The account can fall outside a window of 30 days.
+
+references:
+  - https://attack.mitre.org/techniques/T1078/002/

@@ -15,8 +15,6 @@ export function InvestigationPage() {
   // A promoted finding's back-link returns to the hunt it came from — the
   // hunt page is where re-promotion (this slice's sanctioned re-run) lives.
   const fromHunt = from?.startsWith('/hunts/') ? from : null;
-  const backTo = fromHunt ?? (from === '/investigations' ? '/investigations' : '/alerts');
-  const backLabel = fromHunt ? 'Hunt' : from === '/investigations' ? 'Investigations' : 'Alerts';
   const [reloadKey, setReloadKey] = useState(0);
   // useAsync captures pauseWhen at setup and can't see `inv` there, so track the
   // status in a ref and let pauseWhen consult it. Driving the live refresh
@@ -33,6 +31,21 @@ export function InvestigationPage() {
     },
   });
   statusRef.current = inv?.status;
+  // Where the breadcrumb goes, and the word on it. A run whose subject is a
+  // hunt has no alert behind it, so "Alerts" there sent the analyst to a
+  // console that holds nothing the run read. An origin the analyst came from
+  // still wins: it names the page they left.
+  const huntSubject = inv?.subject?.type === 'hunt';
+  const backTo =
+    fromHunt ??
+    (from === '/investigations' ? '/investigations' : huntSubject ? '/hunts' : '/alerts');
+  const backLabel = fromHunt
+    ? 'Hunt'
+    : from === '/investigations'
+      ? 'Investigations'
+      : huntSubject
+        ? 'Hunts'
+        : 'Alerts';
   const [confirmDel, setConfirmDel] = useState(false);
   const [delErr, setDelErr] = useState('');
 
@@ -42,7 +55,7 @@ export function InvestigationPage() {
       await deleteInvestigation(inv?.id ?? id);
       navigate(backTo);
     } catch (e) {
-      setDelErr(e instanceof Error ? e.message : 'Delete failed (admin only)');
+      setDelErr(e instanceof Error ? e.message : 'The delete failed. Only an admin can delete an investigation.');
       setConfirmDel(false);
     }
   };
@@ -52,7 +65,7 @@ export function InvestigationPage() {
     return (
       <div className="px-[22px] pb-[60px] pt-[18px]">
         <div className="mx-auto max-w-workstation">
-          <ErrorState error={new Error('No investigation id provided.')} />
+          <ErrorState error={new Error('The URL has no investigation id.')} />
         </div>
       </div>
     );
@@ -113,7 +126,7 @@ export function InvestigationPage() {
           ) : (
             <button
               onClick={() => setConfirmDel(true)}
-              title="Delete this investigation (admin)"
+              title="This button deletes the investigation. Only an admin can delete an investigation."
               className="flex items-center gap-1.5 rounded-badge border border-border-strong px-2.5 py-[3px] text-[11.5px] font-semibold text-dim hover:border-danger hover:text-danger"
             >
               <Trash2 size={12} /> Delete

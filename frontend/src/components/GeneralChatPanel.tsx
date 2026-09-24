@@ -71,7 +71,7 @@ export function GeneralChatPanel() {
       // thread state and exposes only a re-read. One extra GET on a rare,
       // deliberate action beats a second path that can write that state.
       .then(() => chat.refresh())
-      .catch(() => setClearError('Could not clear the conversation — please try again.'));
+      .catch(() => setClearError('Could not clear the conversation. Try again.'));
   };
 
   return (
@@ -79,7 +79,7 @@ export function GeneralChatPanel() {
       <ChatPanelShell
         title="Ask soc-ai"
         scopeLabel="your environment"
-        placeholder="Ask about your environment… e.g. what datasets do I have?"
+        placeholder="Ask about your environment. For example: what datasets do I have?"
         // No min-height: an untouched assistant must not take a screenful of the
         // landing page before it has said anything.
         listSizeClass="max-h-[360px]"
@@ -87,8 +87,8 @@ export function GeneralChatPanel() {
           <div className="flex flex-col gap-2.5 py-1 text-[12.5px]">
             <div className="flex items-center gap-1.5 text-faint">
               <MessageSquare size={13} />
-              Ask about your grid — answered here. Questions that need a sweep come back as a hunt to
-              confirm.
+              Ask about your grid. soc-ai answers here. A question that needs a sweep comes back as
+              a hunt for you to confirm.
             </div>
             <div className="flex flex-wrap gap-1.5">
               {STARTERS.map((q) => (

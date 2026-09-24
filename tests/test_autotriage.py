@@ -150,6 +150,36 @@ def _seed_investigation(
     return asyncio.run(_go())
 
 
+def _seed_run_events(settings: Settings, inv_id: str, events: list[dict[str, Any]]) -> None:
+    """Append recorded events to an existing investigation.
+
+    The inheritance evidence bar reads a FINISHED run off disk, so a test that
+    wants a grounded (or barren) inheritance source has to leave the same trail
+    a real run leaves.
+    """
+
+    async def _go() -> None:
+        engine = make_engine(settings)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            await inv_svc.append_events(db, inv_id, events)
+        await engine.dispose()
+
+    asyncio.run(_go())
+
+
+def _inherited_ack_total(settings: Settings) -> int:
+    async def _go() -> int:
+        engine = make_engine(settings)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            total = await inv_svc.inherited_ack_total(db)
+        await engine.dispose()
+        return total
+
+    return asyncio.run(_go())
+
+
 def _count_investigations(settings: Settings) -> int:
     async def _go() -> int:
         from soc_ai.store.models import Investigation
@@ -199,6 +229,7 @@ async def _fake_investigate_success(
     deep: bool = False,
     allow_so_writes: bool = True,
     focus_origin: str = "rerun",
+    subject: Any = None,
 ) -> AsyncIterator[StepEvent]:
     sid = "fake-at-sid"
     yield StepEvent(
@@ -430,6 +461,24 @@ class TestInheritedFpAutoAck:
             assert skipped == 1
             assert acks == []
 
+    @staticmethod
+    def _grounded_source(settings: Settings, inv_id: str) -> None:
+        """Give an inheritance source the one thing the bar asks for."""
+        _seed_run_events(
+            settings,
+            inv_id,
+            [
+                {
+                    "sequence": 1,
+                    "kind": "tool_result",
+                    "payload": {
+                        "tool_name": "t_query_events",
+                        "result": {"total": 3, "hits": [{"_id": "x"}]},
+                    },
+                }
+            ],
+        )
+
     def test_ack_inherited_fps_worker_gates(self, at_settings: Settings) -> None:
         """The worker pass skips already-acked and high-stakes candidates and
         acks the rest through the audited write path."""
@@ -465,10 +514,12 @@ class TestInheritedFpAutoAck:
             },
         }
         state = _FakeState(at_settings, es)
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded_source(at_settings, source)
         status = at.AutoTriageStatus()
         acks = [
             at.InheritedAck(
-                alert_es_id=i, rule_name="ET SCAN thing", inherited_from="inv-1", confidence=0.9
+                alert_es_id=i, rule_name="ET SCAN thing", inherited_from=source, confidence=0.9
             )
             for i in ("ev-acked", "ev-high", "ev-low")
         ]
@@ -481,6 +532,346 @@ class TestInheritedFpAutoAck:
         mock_write.assert_awaited_once()
         assert mock_write.await_args.args[1] == {"alert_id": "ev-low"}
         assert status.inherited_acked == 1
+        assert status.inherited_refused == {"high_stakes": 1}
+
+    def test_a_honeypot_hit_is_never_acked_off_a_neighbours_verdict(
+        self, at_settings: Settings
+    ) -> None:
+        """The write path that matters, on the document the guard could not see.
+
+        A honeypot hit clustered with an ordinary alert inherits that alert's
+        false_positive verdict. Its own verdict gate never runs — the verdict
+        was produced for a different document — so the high-stakes guard is the
+        only thing left, and an OpenCanary document carries neither
+        ``severity_label`` nor ``severity`` nor ``classtype`` nor ``rule.name``.
+        An acknowledged honeypot hit is a silenced intrusion: it leaves the
+        analyst's queue looking clear on the one detection that has no false
+        positives to clear.
+        """
+        from types import SimpleNamespace
+
+        from soc_ai.webui import autotriage as at
+
+        honeypot = {
+            "_id": "ev-decoy",
+            "_source": {
+                "@timestamp": "2026-06-12T06:41:00.000Z",
+                "source": {"ip": "10.0.0.254"},
+                "destination": {"ip": "10.0.0.31"},
+                # No rule.name, no event.severity_label, no event.severity, no
+                # classtype. This is the shape measured on the deployed grid.
+                "event": {"dataset": "opencanary.events", "module": "opencanary"},
+            },
+        }
+        ordinary = {
+            "_id": "ev-low",
+            "_source": {
+                "@timestamp": "2026-06-12T06:41:00.000Z",
+                "source": {"ip": "10.0.0.41"},
+                "destination": {"ip": "10.0.0.1"},
+                "rule": {"name": "ET SCAN thing"},
+                "event": {"severity_label": "low"},
+            },
+        }
+
+        es = AsyncMock()
+        es.search.return_value = {
+            "took": 1,
+            "hits": {"total": {"value": 2, "relation": "eq"}, "hits": [honeypot, ordinary]},
+        }
+        state = _FakeState(at_settings, es)
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded_source(at_settings, source)
+        status = at.AutoTriageStatus()
+        acks = [
+            at.InheritedAck(
+                alert_es_id=i, rule_name="ET SCAN thing", inherited_from=source, confidence=0.9
+            )
+            for i in ("ev-decoy", "ev-low")
+        ]
+        ctx = SimpleNamespace(auth=AsyncMock(), settings=at_settings, audit=None)
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.tools.write_exec.execute_write_tool", mock_write):
+            asyncio.run(at._ack_inherited_fps(state, ctx, acks, status))
+
+        # The ordinary alert is still acked — otherwise this test would pass on
+        # a guard that had simply stopped acknowledging anything.
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args.args[1] == {"alert_id": "ev-low"}
+        assert status.inherited_acked == 1
+        assert status.inherited_refused == {"high_stakes": 1}
+
+
+class TestInheritedAckEvidenceBar:
+    """The inheritance path writes to Security Onion off a verdict it did not
+    produce. The bar the direct auto-ack got on 2026-09-05 applies here too, and
+    this is the path with the volume: 110,693 recorded grid writes against 2,768
+    from the direct one."""
+
+    @staticmethod
+    def _grounded(settings: Settings, inv_id: str) -> None:
+        """Give an inheritance source the one thing the bar asks for."""
+        _seed_run_events(
+            settings,
+            inv_id,
+            [
+                {
+                    "sequence": 1,
+                    "kind": "tool_result",
+                    "payload": {
+                        "tool_name": "t_query_events",
+                        "result": {"total": 1, "hits": [{"_id": "a"}]},
+                    },
+                }
+            ],
+        )
+
+    @staticmethod
+    def _one_hit(es_id: str = "ev-low") -> dict[str, Any]:
+        return {
+            "took": 1,
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        "_id": es_id,
+                        "_source": {
+                            "@timestamp": "2026-06-12T06:41:00.000Z",
+                            "source": {"ip": "10.0.0.41"},
+                            "destination": {"ip": "10.0.0.1"},
+                            "rule": {"name": "ET SCAN thing"},
+                            "event": {"severity_label": "low"},
+                        },
+                    }
+                ],
+            },
+        }
+
+    def _run(self, settings: Settings, source_id: str, *, audit: Any = None) -> tuple[Any, Any]:
+        from types import SimpleNamespace
+
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        es.search.return_value = self._one_hit()
+        state = _FakeState(settings, es)
+        status = at.AutoTriageStatus()
+        acks = [
+            at.InheritedAck(
+                alert_es_id="ev-low",
+                rule_name="ET SCAN thing",
+                inherited_from=source_id,
+                confidence=0.9,
+            )
+        ]
+        ctx = SimpleNamespace(auth=AsyncMock(), settings=settings, audit=audit)
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.tools.write_exec.execute_write_tool", mock_write):
+            asyncio.run(at._ack_inherited_fps(state, ctx, acks, status))
+        return mock_write, status
+
+    def test_a_source_that_retrieved_nothing_acks_nothing(self, at_settings: Settings) -> None:
+        """A false positive reached with no tool call, no targeted dispatch and
+        no Oracle retrieval still reads as a confident false positive on the
+        console. It just stops authorizing writes to the analyst's grid."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        write, status = self._run(at_settings, source)
+        write.assert_not_awaited()
+        assert status.inherited_acked == 0
+        assert status.inherited_refused == {"no_investigation": 1}
+
+    def test_a_source_whose_only_call_errored_acks_nothing(self, at_settings: Settings) -> None:
+        """A call that was made and failed retrieved nothing. Counting the
+        attempt would let one throwaway call unlock the whole fan-out."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        _seed_run_events(
+            at_settings,
+            source,
+            [
+                {
+                    "sequence": 1,
+                    "kind": "tool_result",
+                    "payload": {"tool_name": "t_query_events", "result": {"error": "timeout"}},
+                }
+            ],
+        )
+        write, status = self._run(at_settings, source)
+        write.assert_not_awaited()
+        assert status.inherited_refused == {"no_investigation": 1}
+
+    def test_a_zero_hit_query_is_not_retrieval(self, at_settings: Settings) -> None:
+        """Same bar as the live path: an empty-but-non-error result made a call
+        and discovered nothing."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        _seed_run_events(
+            at_settings,
+            source,
+            [
+                {
+                    "sequence": 1,
+                    "kind": "tool_result",
+                    "payload": {"tool_name": "t_query_events", "result": {"total": 0, "hits": []}},
+                }
+            ],
+        )
+        write, _status = self._run(at_settings, source)
+        write.assert_not_awaited()
+
+    def test_an_investigated_source_still_acks(self, at_settings: Settings) -> None:
+        """The control that matters: an acknowledgement that genuinely should
+        happen still happens. Without it the fix is an off switch."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded(at_settings, source)
+        write, status = self._run(at_settings, source)
+        write.assert_awaited_once()
+        assert write.await_args.args[1] == {"alert_id": "ev-low"}
+        assert status.inherited_acked == 1
+        assert status.inherited_refused == {}
+
+    def test_a_targeted_dispatch_grounds_the_inheritance(self, at_settings: Settings) -> None:
+        """Phase D leaves ``targeted_tool_result``, not ``tool_result``. The
+        recorded reading has to count it or the bar is stricter than the live
+        one it copies."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        _seed_run_events(
+            at_settings,
+            source,
+            [
+                {
+                    "sequence": 1,
+                    "kind": "targeted_tool_result",
+                    "payload": {
+                        "tool_name": "t_get_event_raw",
+                        "result": {"total": 1, "hits": [1]},
+                    },
+                }
+            ],
+        )
+        write, _status = self._run(at_settings, source)
+        write.assert_awaited_once()
+
+    def test_an_oracle_tool_loop_grounds_the_inheritance(self, at_settings: Settings) -> None:
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        _seed_run_events(
+            at_settings,
+            source,
+            [
+                {
+                    "sequence": 1,
+                    "kind": "oracle_adjudication",
+                    "payload": {"oracle_verdict": "false_positive", "oracle_tool_calls": 2},
+                }
+            ],
+        )
+        write, _status = self._run(at_settings, source)
+        write.assert_awaited_once()
+
+    def test_a_store_that_cannot_answer_refuses_the_write(self, at_settings: Settings) -> None:
+        """Fail closed. A database that did not answer is not permission to
+        write to the analyst's grid."""
+        from types import SimpleNamespace
+
+        from soc_ai.webui import autotriage as at
+
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded(at_settings, source)
+        es = AsyncMock()
+        es.search.return_value = self._one_hit()
+        state = _FakeState(at_settings, es)
+        status = at.AutoTriageStatus()
+        acks = [
+            at.InheritedAck(
+                alert_es_id="ev-low",
+                rule_name="ET SCAN thing",
+                inherited_from=source,
+                confidence=0.9,
+            )
+        ]
+        ctx = SimpleNamespace(auth=AsyncMock(), settings=at_settings, audit=None)
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        boom = AsyncMock(side_effect=RuntimeError("db down"))
+        with (
+            patch.object(inv_svc, "retrieval_events_for", boom),
+            patch("soc_ai.tools.write_exec.execute_write_tool", mock_write),
+        ):
+            asyncio.run(at._ack_inherited_fps(state, ctx, acks, status))
+        mock_write.assert_not_awaited()
+
+    def test_the_write_records_which_verdict_authorized_it(self, at_settings: Settings) -> None:
+        """``execute_write_tool``'s own records name the alert and the user and
+        nothing else, so 110,693 acks were attributable to a string. The
+        provenance record names the investigation."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded(at_settings, source)
+        audit = AsyncMock()
+        write, _status = self._run(at_settings, source, audit=audit)
+        write.assert_awaited_once()
+        calls = [c for c in audit.log_kind.await_args_list if c.args[1] == "auto_ack_inherited"]
+        assert len(calls) == 1
+        payload = calls[0].args[2]
+        assert payload["inherited_from"] == source
+        assert payload["alert_id"] == "ev-low"
+        assert payload["ok"] is True
+
+    def test_the_running_total_outlives_the_sweep(self, at_settings: Settings) -> None:
+        """A counter on the sweep's status object is how a six-figure write
+        volume stayed invisible. The total is read back out of the store."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded(at_settings, source)
+        _write, status = self._run(at_settings, source)
+        assert status.inherited_acked == 1
+        assert status.inherited_acked_total == 1
+        assert _inherited_ack_total(at_settings) == 1
+
+        # A second sweep adds to the durable total rather than replacing it.
+        _write2, status2 = self._run(at_settings, source)
+        assert status2.inherited_acked == 1  # fresh status object, one write
+        assert status2.inherited_acked_total == 2
+        assert _inherited_ack_total(at_settings) == 2
+
+    def test_the_fanout_lands_on_the_source_investigation(self, at_settings: Settings) -> None:
+        """Answerable in the direction an analyst asks it: what has this closed
+        false positive been acknowledging on my grid since?"""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded(at_settings, source)
+        self._run(at_settings, source)
+
+        async def _read() -> list[Any]:
+            engine = make_engine(at_settings)
+            maker = make_sessionmaker(engine)
+            async with maker() as db:
+                _inv, events = await inv_svc.get_with_events(db, source)
+            await engine.dispose()
+            return list(events)
+
+        fanout = [e for e in asyncio.run(_read()) if e.kind == "inherited_ack"]
+        assert len(fanout) == 1
+        assert fanout[0].payload["acked"] == 1
+        assert fanout[0].payload["alert_ids"] == ["ev-low"]
+
+    def test_the_fanout_stays_one_row_however_many_sweeps_run(self, at_settings: Settings) -> None:
+        """The sweep runs every few minutes and the largest fan-out on record is
+        945 acknowledgements. A row per sweep would bury the investigation's own
+        timeline under its aftermath, so the row is updated in place."""
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        self._grounded(at_settings, source)
+        for _ in range(3):
+            self._run(at_settings, source)
+
+        async def _read() -> list[Any]:
+            engine = make_engine(at_settings)
+            maker = make_sessionmaker(engine)
+            async with maker() as db:
+                _inv, events = await inv_svc.get_with_events(db, source)
+            await engine.dispose()
+            return list(events)
+
+        fanout = [e for e in asyncio.run(_read()) if e.kind == "inherited_ack"]
+        assert len(fanout) == 1
+        assert fanout[0].payload["acked"] == 3
+        assert fanout[0].payload["first_at"] <= fanout[0].payload["last_at"]
+        assert _inherited_ack_total(at_settings) == 3
 
 
 class TestAutoTriageSingleFlight:
@@ -496,6 +887,7 @@ class TestAutoTriageSingleFlight:
             deep: bool = False,
             allow_so_writes: bool = True,
             focus_origin: str = "rerun",
+            subject: Any = None,
         ) -> AsyncIterator[StepEvent]:
             sid = "slow-sid"
             yield StepEvent(
@@ -552,6 +944,7 @@ class TestAutoTriageFailedCountsStreamErrors:
             deep: bool = False,
             allow_so_writes: bool = True,
             focus_origin: str = "rerun",
+            subject: Any = None,
         ) -> AsyncIterator[StepEvent]:
             sid = "err-sid"
             yield StepEvent(
@@ -596,6 +989,7 @@ class TestAutoTriageFailedCountsStreamErrors:
             deep: bool = False,
             allow_so_writes: bool = True,
             focus_origin: str = "rerun",
+            subject: Any = None,
         ) -> AsyncIterator[StepEvent]:
             sid = "hang-sid"
             yield StepEvent(
@@ -683,7 +1077,45 @@ def _severities_from_groups_calls(es: AsyncMock) -> list[str]:
     return seen
 
 
+def _unlabelled_groups_calls(es: AsyncMock) -> int:
+    """How many fetch_groups calls asked for documents with NO severity label."""
+    seen = 0
+    for call in es.search.call_args_list:
+        body = call.kwargs.get("body", {})
+        if body.get("aggs") is None:
+            continue  # this was a fetch_group_events call
+        must_not = body.get("query", {}).get("bool", {}).get("must_not", [])
+        if {"exists": {"field": "event.severity_label"}} in must_not:
+            seen += 1
+    return seen
+
+
 class TestAutoTriageSeveritySelector:
+    def test_a_sweep_reaches_alerts_that_carry_no_severity_label(
+        self, at_settings: Settings
+    ) -> None:
+        """The band's unlabelled selector reaches the grid as an absence test.
+
+        Defect 1: the console half of the alert-queue repair put 40 rows on
+        screen and the sweep half could not act on one of them, because every
+        severity the sweep asked for was a term query on a field these
+        documents do not carry.
+        """
+        from soc_ai.webui import alerts_query as aq
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+
+        asyncio.run(
+            at.plan_targets(
+                state, time_range="24h", oql=None, severities=("high", aq.UNKNOWN_SEVERITY)
+            )
+        )
+        assert _severities_from_groups_calls(es) == ["high"]
+        assert _unlabelled_groups_calls(es) == 1
+
     def test_plan_targets_filters_to_chosen_severity(self, at_settings: Settings) -> None:
         """plan_targets only queries the severities it is given."""
         from soc_ai.webui import autotriage as at
@@ -790,8 +1222,9 @@ class TestAutoTriageSeveritySelector:
             with TestClient(app) as client:
                 resp = client.post("/api/v1/auto-triage", json={"range": "24h"})
                 assert resp.status_code == 200
-                # Default auto_triage_min_severity="high" → band is (critical, high).
-                assert captured["severities"] == ("critical", "high")
+                # Default auto_triage_min_severity="high" → band is
+                # (critical, high) plus the alerts that carry no severity label.
+                assert captured["severities"] == ("critical", "high", "unknown")
 
 
 class TestAutoTriageSingleFlightBlocksBeforePlanning:
@@ -942,6 +1375,7 @@ class TestAutoTriageLiveProgress:
             deep: bool = False,
             allow_so_writes: bool = True,
             focus_origin: str = "rerun",
+            subject: Any = None,
         ) -> AsyncIterator[StepEvent]:
             sid = "tc-sid"
             yield StepEvent(
@@ -1017,6 +1451,7 @@ class TestAutoTriageLiveProgress:
             deep: bool = False,
             allow_so_writes: bool = True,
             focus_origin: str = "rerun",
+            subject: Any = None,
         ) -> AsyncIterator[StepEvent]:
             sid = "gate-sid"
             yield StepEvent(
@@ -1163,7 +1598,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-abc", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-abc",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1201,7 +1642,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-default", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-default",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1223,7 +1670,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-xyz", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-xyz",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1246,7 +1699,13 @@ class TestMaybeAutoAckFp:
             with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
                 result = asyncio.run(
                     maybe_auto_ack_fp(
-                        report, "ev-tp", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                        report,
+                        "ev-tp",
+                        alert=alert,
+                        ctx=ctx,
+                        emit_ev=_ev,
+                        audit_ev=_audit,
+                        investigated=True,
                     )
                 )
 
@@ -1275,7 +1734,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-crit", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-crit",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1309,7 +1774,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-mal", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-mal",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1355,7 +1826,13 @@ class TestMaybeAutoAckFp:
             with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
                 result = asyncio.run(
                     maybe_auto_ack_fp(
-                        report, es_id, alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                        report,
+                        es_id,
+                        alert=alert,
+                        ctx=ctx,
+                        emit_ev=_ev,
+                        audit_ev=_audit,
+                        investigated=True,
                     )
                 )
 
@@ -1363,6 +1840,204 @@ class TestMaybeAutoAckFp:
             assert result is not None, f"classtype={classtype!r}"
             assert result.kind == "auto_ack_skipped", f"classtype={classtype!r}"
             assert result.payload["reason"] == "high_stakes", f"classtype={classtype!r}"
+
+    def test_auto_ack_suppressed_for_the_classtype_security_onion_really_sends(self) -> None:
+        """The high-stakes guard was reading a field that never held what it
+        was matching on.
+
+        SoAlert.classtype comes from Suricata EVE's ``alert.category``, and EVE
+        writes the classification DESCRIPTION, not the shortname. Both the
+        _CLASSTYPE_MAP in classify_alert and the _ATTACK_CLASSTYPES set are
+        keyed on shortnames, so on live Security Onion data neither arm of this
+        guard could ever fire and the only thing left holding it up was SO's own
+        severity. Measured: a "GPL MISC Teardrop attack" alert, category
+        "Attempted Denial of Service", severity low, was auto-acknowledged twice
+        on the production instance.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        cases = [
+            ("Attempted Denial of Service", "GPL MISC Teardrop attack", "ev-teardrop"),
+            ("Attempted Administrator Privilege Gain", "GPL RPC portmap listing", "ev-admin"),
+            ("Attempted Information Leak", "GPL SCAN Enumeration", "ev-recon"),
+            (
+                "Malware Command and Control Activity Detected",
+                "ET INFO Generic Beacon Shape",
+                "ev-c2",
+            ),
+        ]
+        for classtype, rule_name, es_id in cases:
+            ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+            report = self._make_report(verdict="false_positive", confidence=0.95)
+            alert = self._make_alert(
+                classtype=classtype,
+                severity_label="low",
+                severity_score=1,
+                rule_name=rule_name,
+                signature_severity=None,
+            )
+            _ev, _audit, _ = self._make_emit_audit()
+
+            mock_write = AsyncMock(return_value=({"ok": True}, None))
+            with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+                result = asyncio.run(
+                    maybe_auto_ack_fp(
+                        report,
+                        es_id,
+                        alert=alert,
+                        ctx=ctx,
+                        emit_ev=_ev,
+                        audit_ev=_audit,
+                        investigated=True,
+                    )
+                )
+
+            mock_write.assert_not_awaited(), f"should not ack for classtype={classtype!r}"
+            assert result is not None, f"classtype={classtype!r}"
+            assert result.kind == "auto_ack_skipped", f"classtype={classtype!r}"
+            assert result.payload["reason"] == "high_stakes", f"classtype={classtype!r}"
+
+    def test_auto_ack_suppressed_for_the_shellcode_rule_that_slipped_all_four_arms(
+        self,
+    ) -> None:
+        """The measured production alert, field for field.
+
+        Two shellcode rules were acknowledged unattended 156 times between them
+        ("GPL SHELLCODE x86 setuid 0", 81, and "GPL SHELLCODE x86 setgid 0",
+        75), three of them after the classtype description fix went live. All
+        four arms of the guard missed them: the classification they carry, "A
+        system call was detected", normalizes correctly to system-call-detect
+        and neither the routing map nor ``_ATTACK_CLASSTYPES`` had an entry for
+        it; "shellcode" is not a malware signal token; and medium/2 is under the
+        severity arm. The signature declares itself "Minor", which is not one of
+        the three severities the classifier falls back on either.
+
+        The fix is on the classification, not on a token: the routing map now
+        covers every classification the description table can produce.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        cases = [
+            ("GPL SHELLCODE x86 setgid 0", "ev-setgid"),
+            ("GPL SHELLCODE x86 setuid 0", "ev-setuid"),
+        ]
+        for rule_name, es_id in cases:
+            ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+            report = self._make_report(verdict="false_positive", confidence=0.95)
+            alert = self._make_alert(
+                classtype="A system call was detected",
+                severity_label="medium",
+                severity_score=2,
+                rule_name=rule_name,
+                signature_severity="Minor",
+            )
+            _ev, _audit, _ = self._make_emit_audit()
+
+            mock_write = AsyncMock(return_value=({"ok": True}, None))
+            with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+                result = asyncio.run(
+                    maybe_auto_ack_fp(
+                        report,
+                        es_id,
+                        alert=alert,
+                        ctx=ctx,
+                        emit_ev=_ev,
+                        audit_ev=_audit,
+                        investigated=True,
+                    )
+                )
+
+            mock_write.assert_not_awaited(), f"should not ack for rule={rule_name!r}"
+            assert result is not None, f"rule={rule_name!r}"
+            assert result.kind == "auto_ack_skipped", f"rule={rule_name!r}"
+            assert result.payload["reason"] == "high_stakes", f"rule={rule_name!r}"
+
+    def test_auto_ack_still_fires_for_the_classtypes_production_actually_sends(self) -> None:
+        """NEGATIVE CONTROL for widening the routing map.
+
+        These are the classtype values measured on the production grid, in the
+        EVE description form the sensor really writes, and between them they are
+        most of the alert population. If the widening had turned the ordinary
+        false-positive population into high-stakes alerts, auto-ack would be
+        switched off rather than fixed, and this is where that shows up.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        benign = (
+            "Misc activity",
+            "Not Suspicious Traffic",
+            "Potential Corporate Privacy Violation",
+            "Device Retrieving External IP Address Detected",
+            "Potentially Bad Traffic",
+            "Generic Protocol Command Decode",
+        )
+        for classtype in benign:
+            ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+            report = self._make_report(verdict="false_positive", confidence=0.9)
+            alert = self._make_alert(classtype=classtype)
+            _ev, _audit, _ = self._make_emit_audit()
+
+            mock_write = AsyncMock(return_value=({"ok": True}, None))
+            with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+                result = asyncio.run(
+                    maybe_auto_ack_fp(
+                        report,
+                        "ev-benign",
+                        alert=alert,
+                        ctx=ctx,
+                        emit_ev=_ev,
+                        audit_ev=_audit,
+                        investigated=True,
+                    )
+                )
+
+            mock_write.assert_awaited_once(), f"should still ack for classtype={classtype!r}"
+            assert result is not None, f"classtype={classtype!r}"
+            assert result.payload["success"] is True, f"classtype={classtype!r}"
+
+    def test_auto_ack_refuses_a_verdict_nothing_was_retrieved_for(self) -> None:
+        """The production defect, at the write itself.
+
+        Confidence was the only quantitative condition, and a decision template
+        supplies confidence without supplying evidence: 13 alerts were
+        acknowledged in Security Onion at 0.85 to 0.90 having had nothing looked
+        up about them. An unattended write is the last thing that should rest on
+        a verdict the run did no work for, so it needs a retrieval behind it and
+        not just a number.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        ctx = self._make_ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+        report = self._make_report(verdict="false_positive", confidence=0.9)
+        alert = self._make_alert()  # benign defaults; nothing else holds it back
+        _ev, _audit, _ = self._make_emit_audit()
+
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+            result = asyncio.run(
+                maybe_auto_ack_fp(
+                    report,
+                    "ev-zero-tool",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=False,
+                )
+            )
+
+        mock_write.assert_not_awaited()
+        assert result is not None
+        assert result.kind == "auto_ack_skipped"
+        assert result.payload["reason"] == "no_investigation"
 
     def test_auto_ack_fires_for_low_severity_benign_class_fp(self) -> None:
         """The benign low-severity info-class FP still auto-acks (cap doesn't over-block)."""
@@ -1379,7 +2054,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-ok", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-ok",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1402,7 +2083,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-low", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-low",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1428,7 +2115,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-exact", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-exact",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1452,7 +2145,13 @@ class TestMaybeAutoAckFp:
             # Must not raise
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-err", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-err",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1484,7 +2183,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-direct", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-direct",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1516,7 +2221,13 @@ class TestMaybeAutoAckFp:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 maybe_auto_ack_fp(
-                    report, "ev-audit", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-audit",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1525,6 +2236,99 @@ class TestMaybeAutoAckFp:
         assert mock_write.call_args.kwargs.get("audit") is audit_logger
         assert result is not None
         assert result.payload["success"] is True
+
+
+class TestAutoAckNeedsTheReportToSupportItself:
+    """A retrieval behind the verdict is not the same question as grounds under
+    it, and only the first was ever asked on the way to an unattended write. On
+    the deployed instance 1,315 of 3,696 completed runs shipped a report that
+    cited nothing, 834 of them were acknowledged in Security Onion at a mean
+    confidence of 0.77, and 714 of those 834 HAD retrieved something — so the
+    retrieval bar alone lets almost all of them through."""
+
+    _report = staticmethod(TestMaybeAutoAckFp._make_report)
+    _alert = staticmethod(TestMaybeAutoAckFp._make_alert)
+    _ctx = staticmethod(TestMaybeAutoAckFp._make_ctx)
+    _emit = staticmethod(TestMaybeAutoAckFp._make_emit_audit)
+
+    def _ack(
+        self,
+        *,
+        citations: list[str],
+        coverage: float | None,
+        confidence: float = 0.85,
+    ) -> tuple[Any, Any]:
+        from unittest.mock import AsyncMock, patch
+
+        from soc_ai.agent.orchestrator import maybe_auto_ack_fp
+
+        ctx = self._ctx({"auto_ack_fp_enabled": True, "auto_ack_fp_threshold": 0.7})
+        report = self._report(verdict="false_positive", confidence=confidence).model_copy(
+            update={"citations": citations}
+        )
+        _ev, _audit, _captured = self._emit()
+        mock_write = AsyncMock(return_value=({"ok": True}, None))
+        with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
+            result = asyncio.run(
+                maybe_auto_ack_fp(
+                    report,
+                    "ev-abc",
+                    alert=self._alert(),
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
+                    citation_coverage=coverage,
+                )
+            )
+        return mock_write, result
+
+    def test_an_uncited_report_is_not_acknowledged(self) -> None:
+        """The failing case. Confidence is untouched by the citation cap when
+        there is nothing to measure, so nothing else in the chain stops this."""
+        write, result = self._ack(citations=[], coverage=0.0)
+        write.assert_not_awaited()
+        assert result is not None
+        assert result.kind == "auto_ack_skipped"
+        assert result.payload["reason"] == "uncited"
+        assert result.payload["citations"] == 0
+
+    def test_an_uncited_report_that_did_retrieve_is_still_not_acknowledged(self) -> None:
+        """714 of the 834 production cases have exactly this shape: tools ran,
+        the report cited none of what they returned."""
+        write, result = self._ack(citations=[], coverage=None)
+        write.assert_not_awaited()
+        assert result is not None and result.payload["reason"] == "uncited"
+
+    def test_citations_that_all_fail_to_resolve_are_not_acknowledged(self) -> None:
+        """A report that named its grounds and could not resolve one of them is
+        worse than one that named none."""
+        write, result = self._ack(citations=["id NOPE_NOT_A_REAL_DOC"], coverage=0.0)
+        write.assert_not_awaited()
+        assert result is not None and result.payload["reason"] == "uncited"
+
+    def test_a_cited_report_is_still_acknowledged(self) -> None:
+        """The control that matters: an acknowledgement that genuinely should
+        happen still happens. 1,776 of the deployed instance's 2,768 auto-acks
+        retrieved something AND cited something, and all of them still fire."""
+        write, result = self._ack(citations=["ev1"], coverage=1.0)
+        write.assert_awaited_once()
+        assert write.call_args.args[1] == {"alert_id": "ev-abc"}
+        assert result is not None and result.kind == "auto_ack"
+
+    def test_partial_coverage_still_acknowledges(self) -> None:
+        """The gate asks whether the verdict rests on anything, not whether it
+        rests on everything. Half-resolved citations are half-resolved, not
+        unsupported — the confidence cap already prices that in."""
+        write, result = self._ack(citations=["ev1", "id NOPE"], coverage=0.5)
+        write.assert_awaited_once()
+        assert result is not None and result.kind == "auto_ack"
+
+    def test_unknown_coverage_does_not_block_a_cited_report(self) -> None:
+        """``None`` means the number does not describe this report (the Oracle
+        rewrote the verdict after resolution ran). It must not read as zero."""
+        write, _result = self._ack(citations=["ev1"], coverage=None)
+        write.assert_awaited_once()
 
 
 class TestMaybeAutoAckFpGated:
@@ -1596,7 +2400,13 @@ class TestMaybeAutoAckFpGated:
         with patch("soc_ai.agent.orchestrator.execute_write_tool", mock_write):
             result = asyncio.run(
                 _maybe_auto_ack_fp_gated(
-                    report, "ev-normal", alert=alert, ctx=ctx, emit_ev=_ev, audit_ev=_audit
+                    report,
+                    "ev-normal",
+                    alert=alert,
+                    ctx=ctx,
+                    emit_ev=_ev,
+                    audit_ev=_audit,
+                    investigated=True,
                 )
             )
 
@@ -1634,6 +2444,7 @@ class TestAutoTriageProgress:
             deep: bool = False,
             allow_so_writes: bool = True,
             focus_origin: str = "rerun",
+            subject: Any = None,
         ) -> AsyncIterator[StepEvent]:
             sid = "pend-sid"
             yield StepEvent(
@@ -1724,7 +2535,7 @@ class TestAutoTriageConfigFloor:
             client = next(self._make_client_with_floor(at_settings, fake_es, "medium"))
             client.post("/api/v1/auto-triage", json={})
 
-        assert set(captured["severities"]) == {"critical", "high", "medium"}
+        assert set(captured["severities"]) == {"critical", "high", "medium", "unknown"}
 
     def test_critical_floor_plans_only_critical(
         self, at_settings: Settings, fake_es: AsyncMock
@@ -1740,7 +2551,7 @@ class TestAutoTriageConfigFloor:
             client = next(self._make_client_with_floor(at_settings, fake_es, "critical"))
             client.post("/api/v1/auto-triage", json={})
 
-        assert captured["severities"] == ("critical",)
+        assert captured["severities"] == ("critical", "unknown")
 
     def test_explicit_severities_override_config_floor(
         self, at_settings: Settings, fake_es: AsyncMock
@@ -1787,10 +2598,10 @@ class TestConfigSeverityBand:
     @pytest.mark.parametrize(
         ("floor", "expected"),
         [
-            ("low", ("critical", "high", "medium", "low")),
-            ("medium", ("critical", "high", "medium")),
-            ("high", ("critical", "high")),
-            ("critical", ("critical",)),
+            ("low", ("critical", "high", "medium", "low", "unknown")),
+            ("medium", ("critical", "high", "medium", "unknown")),
+            ("high", ("critical", "high", "unknown")),
+            ("critical", ("critical", "unknown")),
         ],
     )
     def test_floor_expands_to_band(self, floor: str, expected: tuple[str, ...]) -> None:
@@ -1801,12 +2612,48 @@ class TestConfigSeverityBand:
         s = types.SimpleNamespace(auto_triage_min_severity=floor)
         assert at.config_severity_band(s) == expected
 
+    def test_every_floor_still_reaches_an_alert_with_no_severity_label(self) -> None:
+        """A floor cannot exclude a document whose severity is absent.
+
+        Measured in-process on the deployed host on 2026-09-06: over 24 hours
+        the critical, high, medium and low queries each returned 0 groups and
+        the no-severity query returned 3 groups over 40 events, which was the
+        whole queue. The console showed those 40 rows and the sweep could not
+        reach one of them, so an operator who turned the scheduler on got zero
+        targets and no reason. A floor is a comparison and there is nothing to
+        compare an absent label against; dropping it is the silent loss, so
+        every band carries the unlabelled selector whatever the floor is.
+        """
+        import types
+
+        from soc_ai.webui import alerts_query as aq
+        from soc_ai.webui import autotriage as at
+
+        for floor in ("critical", "high", "medium", "low"):
+            s = types.SimpleNamespace(auto_triage_min_severity=floor)
+            assert aq.UNKNOWN_SEVERITY in at.config_severity_band(s)
+
+    def test_labelled_band_is_unchanged_below_the_unlabelled_selector(self) -> None:
+        """Negative control: the ladder part of the band, and its order, are
+        exactly what they were. The unlabelled selector is appended, so a
+        labelled alert is planned by the same query in the same position."""
+        import types
+
+        from soc_ai.webui import autotriage as at
+
+        s = types.SimpleNamespace(auto_triage_min_severity="high")
+        assert at.config_severity_band(s)[:2] == ("critical", "high")
+
     def test_unset_floor_defaults_to_high(self) -> None:
         import types
 
         from soc_ai.webui import autotriage as at
 
-        assert at.config_severity_band(types.SimpleNamespace()) == ("critical", "high")
+        assert at.config_severity_band(types.SimpleNamespace()) == (
+            "critical",
+            "high",
+            "unknown",
+        )
 
     def test_bogus_floor_defaults_to_high(self) -> None:
         import types
@@ -1814,7 +2661,7 @@ class TestConfigSeverityBand:
         from soc_ai.webui import autotriage as at
 
         s = types.SimpleNamespace(auto_triage_min_severity="not-a-severity")
-        assert at.config_severity_band(s) == ("critical", "high")
+        assert at.config_severity_band(s) == ("critical", "high", "unknown")
 
 
 class TestStartConfigSweep:
@@ -1847,7 +2694,7 @@ class TestStartConfigSweep:
         state = self._state(floor="high")
 
         async def _empty(_s: Any, *, time_range: str, oql: Any, severities: Any) -> Any:
-            assert severities == ("critical", "high")  # planned the config band
+            assert severities == ("critical", "high", "unknown")  # the config band
             return [], 4, []
 
         with patch("soc_ai.webui.autotriage.plan_targets", _empty):
@@ -1866,7 +2713,7 @@ class TestStartConfigSweep:
         ran: dict[str, Any] = {}
 
         async def _plan(_s: Any, *, time_range: str, oql: Any, severities: Any) -> Any:
-            assert severities == ("critical", "high", "medium", "low")
+            assert severities == ("critical", "high", "medium", "low", "unknown")
             return targets, 2, []
 
         async def _run(
@@ -2201,9 +3048,10 @@ class TestAutoTriageNoIpEvents:
         assert sorted(ev.es_id for ev in clusters.values()) == ["ev-a1", "ev-b1"]
 
     def test_cluster_events_ip_keys_unchanged(self) -> None:
-        """The IP path is byte-for-byte what it was: keyed on the (rule, src,
-        dst) triple ONLY. The host is deliberately NOT part of the key — a
-        multi-sensor grid seeing one flow twice must stay one cluster."""
+        """NEGATIVE CONTROL for the host dimension: a flow's key never carries
+        one. A multi-sensor grid sees one flow twice under two ``host.name``
+        values, and that must stay ONE cluster."""
+        from soc_ai.store import investigations as inv_svc
         from soc_ai.webui import autotriage as at
 
         clusters = at._cluster_events(
@@ -2216,11 +3064,50 @@ class TestAutoTriageNoIpEvents:
             }
         )
         assert set(clusters) == {
-            ("ET SCAN thing", "10.0.0.41", "10.0.0.1"),
-            ("ET SCAN thing", "10.0.0.42", "10.0.0.1"),
+            inv_svc.pair_key("ET SCAN thing", "10.0.0.41", "10.0.0.1"),
+            inv_svc.pair_key("ET SCAN thing", "10.0.0.42", "10.0.0.1"),
         }
         # newest-first wins within a cluster
-        assert clusters[("ET SCAN thing", "10.0.0.41", "10.0.0.1")].es_id == "ev1"
+        assert clusters[inv_svc.pair_key("ET SCAN thing", "10.0.0.41", "10.0.0.1")].es_id == "ev1"
+
+    def test_cluster_events_splits_a_flowless_rule_by_machine(self) -> None:
+        """Two machines tripping one Sigma rule are two clusters, so they get
+        two investigations and two verdicts.
+
+        While they were one, the first verdict covered both, and the alerts it
+        covered were never investigated to disagree with it. Measured on a live
+        grid: one Sigma rule held 27 distinct (host, source, user) combinations
+        under a single key.
+        """
+        from soc_ai.store import investigations as inv_svc
+        from soc_ai.webui import autotriage as at
+
+        rule = "Active Directory Replication from Non Machine Account"
+        clusters = at._cluster_events(
+            {
+                rule: [
+                    self._ev("ev-dc", host="dc-01"),
+                    self._ev("ev-ws", host="ws-01"),
+                    self._ev("ev-dc-2", host="dc-01"),
+                ]
+            }
+        )
+        assert set(clusters) == {
+            inv_svc.pair_key(rule, None, None, "dc-01"),
+            inv_svc.pair_key(rule, None, None, "ws-01"),
+        }
+        assert clusters[inv_svc.pair_key(rule, None, None, "dc-01")].es_id == "ev-dc"
+
+    def test_cluster_events_does_not_key_on_the_display_placeholder(self) -> None:
+        """``AlertEvent.host`` holds an em-dash when the document named no
+        machine. Keying on that string would read as a subject when there is
+        none, and the store would hand a verdict along it."""
+        from soc_ai.store import investigations as inv_svc
+        from soc_ai.webui import autotriage as at
+
+        clusters = at._cluster_events({"R": [self._ev("ev-anon")]})
+        assert set(clusters) == {inv_svc.pair_key("R", None, None, None)}
+        assert not inv_svc.names_a_subject(next(iter(clusters)))
 
     def test_plan_targets_queues_no_ip_event(self, at_settings: Settings) -> None:
         """End to end: a no-IP detection is queued and NOT tallied as skipped."""
@@ -2446,7 +3333,11 @@ class TestAutoTriageDoesNotReportADeadGridAsQuiet:
         # ...and it names the queries it could not read, which is what the tile
         # counts. (A `note != "nothing to hunt"` assertion here would pin
         # nothing: GET always serializes note=None — the note rides on POST.)
-        assert status["grid_errors"] == ["severity critical", "severity high"]
+        assert status["grid_errors"] == [
+            "severity critical",
+            "severity high",
+            "alerts with no severity",
+        ]
 
     def test_es_client_error_is_a_400_not_a_500(self, at_settings: Settings) -> None:
         """An ES 4xx is a bad query, not an outage — the alerts-route split.
@@ -2628,7 +3519,11 @@ class TestASaturatedGridRefusesTheSweepRatherThanEmptyingIt:
         assert status["degraded"] is True
         # ...naming the queries it could not read, never the exception text
         # (which carries the grid's host:port).
-        assert status["grid_errors"] == ["severity critical", "severity high"]
+        assert status["grid_errors"] == [
+            "severity critical",
+            "severity high",
+            "alerts with no severity",
+        ]
         # the slot is released and the batch claims nothing
         assert status["active"] is False
         assert (status["total"], status["hunted"], status["failed"]) == (0, 0, 0)
@@ -2644,7 +3539,11 @@ class TestASaturatedGridRefusesTheSweepRatherThanEmptyingIt:
             asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
         status = at.get_status(state)
         assert status.degraded is True
-        assert status.grid_errors == ["severity critical", "severity high"]
+        assert status.grid_errors == [
+            "severity critical",
+            "severity high",
+            "alerts with no severity",
+        ]
 
     def test_scheduled_sweep_records_the_saturation_instead_of_a_clean_zero(
         self, at_settings: Settings
@@ -2742,7 +3641,11 @@ class TestASaturatedGridRefusesTheSweepRatherThanEmptyingIt:
             asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
         status = at.get_status(state)
         assert status.degraded is True
-        assert status.grid_errors == ["severity critical", "severity high"]
+        assert status.grid_errors == [
+            "severity critical",
+            "severity high",
+            "alerts with no severity",
+        ]
 
 
 class TestASelectionDoesNotEraseWhatTheSweepLearned:
@@ -2777,7 +3680,11 @@ class TestASelectionDoesNotEraseWhatTheSweepLearned:
 
         status = saturated_grid_client.get("/api/v1/auto-triage").json()
         assert status["degraded"] is True
-        assert status["grid_errors"] == ["severity critical", "severity high"]
+        assert status["grid_errors"] == [
+            "severity critical",
+            "severity high",
+            "alerts with no severity",
+        ]
 
     def test_plan_targets_for_ids_keeps_a_mark_it_could_not_disprove(
         self, at_settings: Settings

@@ -1,133 +1,170 @@
 # Safety model
 
-> Status: shipped. Analyst-executed write actions, audit logger, and reasoning-trace
-> plumbing are all live. Reasoning surfacing on the synth-first path depends on the
-> analyst model emitting a `reasoning_content` field (gateway-config dependent).
-> Blocklist license posture below.
+> Status: shipped. The analyst-executed write actions, the audit logger and the
+> reasoning-trace plumbing are all live. The synth-first path shows reasoning
+> only if the analyst model emits a `reasoning_content` field, and that depends
+> on the gateway config. The blocklist license posture is below.
 
 ## Tool classification
 
-- Read tools: auto-executed, registered with `@tool(read_only=True)`.
-- Write tools: registered with `@tool(read_only=False)`; never executed by the
-  agent. The report *recommends* them and the analyst executes each one
-  explicitly through the actions API
-  (`POST /api/v1/investigations/{id}/actions/{index}/execute`), the single
-  write path, running through the audited `execute_write_tool`
-  (`soc_ai/tools/write_exec.py`).
+- A read tool auto-executes. soc-ai registers it with `@tool(read_only=True)`.
+- A write tool is registered with `@tool(read_only=False)`. The agent never
+  executes one. The report *recommends* it, and the analyst executes each one
+  explicitly through the actions API at
+  `POST /api/v1/investigations/{id}/actions/{index}/execute`. That route is the
+  single write path, and it runs through the audited `execute_write_tool` in
+  `soc_ai/tools/write_exec.py`.
 
 ## Audit log hardening
 
-Every LLM I/O and tool invocation is written to a date-stamped ES audit index
-(`soc-ai-audit-YYYY.MM.dd`). Two hardening properties apply:
+soc-ai writes every LLM input, every LLM output and every tool invocation to a
+date-stamped ES audit index, `soc-ai-audit-YYYY.MM.dd`. These hardening
+properties apply:
 
-- **Tamper-evidence (hash chain):** each record carries `seq` (monotonic),
-  `prev_hash`, and `hash` (SHA-256 over the canonicalised record content plus the
-  previous record's hash). Any edit, reorder, insertion, or deletion of a record
-  breaks the recomputed linkage. `soc_ai.audit.verify_chain(records)` recomputes
-  the chain and reports the first broken `seq`. The chain head is held in memory
-  and recovered from the most-recent record on startup, so it continues across
-  restarts. The hash chain provides tamper-*evidence*, not tamper-*prevention*:
-  it lets you detect that records were altered, but does not stop a privileged ES
-  user from altering them.
-- **Epoch-aware verification:** a restart is a legitimate reason the chain
-  can't be linked all the way back — a genesis (`seq=0`) record's `prev_hash`
-  is the all-zero hash by construction, so it never links to whatever epoch
-  came before it. A 2026-06-24→08-16 chain-head recovery bug (fixed
-  2026-08-17) turned that rare case into 134 of them, resetting the head on
-  every restart. `soc-ai audit verify` and the Diagnostics "Verify audit
-  chain" control check each restart boundary as its own epoch rather than
-  reporting every boundary after the first as tamper — but an all-clear
-  spanning more than one epoch is shown as a distinct state (amber, no
-  checkmark), not the same livery as one unbroken chain: cross-epoch linkage
-  can't be proven.
-- **Fail-closed for mutating writes:** with `AUDIT_FAIL_CLOSED=true` (default), an
-  SO-state-changing action (ack/escalate/comment/auto-ack) is aborted if its
-  audit record cannot be written. No acknowledged or escalated alert without an
-  audit trail. Read/triage/enrichment audit writes stay fail-open.
+- **Tamper-evidence through a hash chain.** Each record carries a monotonic
+  `seq`, a `prev_hash` and a `hash`. The `hash` is a SHA-256 over the
+  canonicalised record content and the hash of the previous record. Any edit,
+  reorder, insertion or deletion of a record breaks the recomputed linkage.
+  `soc_ai.audit.verify_chain(records)` recomputes the chain and reports the first
+  broken `seq`. `soc_ai.audit.verify_chain_detail` also reports what TYPE of
+  break it is. A position that two writers claimed reads differently from a
+  record whose content no longer matches its own hash. Read
+  [Reading a broken audit chain](AUDIT-CHAIN.md).
 
-**Deployment recommendation (least-privilege credential):** the audit index
-currently shares soc-ai's read/write ES credential and lives on a cluster soc-ai
-itself can write to and delete from, so a compromised soc-ai (or its credential)
-could rewrite history despite the hash chain. To strengthen the trail, provision a
-**distinct, least-privilege ES credential for the audit index** with `create`/
-`create_doc`/`index` privileges on `soc-ai-audit-*` only (no `delete`, no
-`manage`), and point the audit writer at it. Pair it with an **append-only /
-read-only ILM (or data-stream) policy** on `soc-ai-audit-*` (ideally on a
-separate monitoring cluster soc-ai's main credential cannot reach) so records
-cannot be silently rewritten in place. The hash chain then provides tamper-
-evidence on top of an index the application cannot edit, giving defence in depth.
+    The hash chain gives tamper-*evidence*. It does not give
+    tamper-*prevention*. You can detect that records were altered, and a
+    privileged ES user can still alter them.
+- **The grid claims the position, and memory does not.** soc-ai writes each
+  record with `op_type=create` at a deterministic `_id` that it derives from the
+  `seq`. The first writer to reach a position takes it. Any other writer gets a
+  version conflict and moves to the next position. Allocation and persistence are
+  one atomic operation, and that is what makes the chain safe against three
+  cases: a second process, such as a `soc-ai` command run from cron beside the
+  server, a second logger in the same process, and a write whose acknowledgement
+  never arrived. The in-memory head stays as a cache, and soc-ai recovers it from
+  the most-recent record on startup, so the chain continues across restarts.
+- **Somebody checks the chain.** A scheduled verification re-runs the chain check
+  daily over the last 7 days. `AUDIT_VERIFY_SCHEDULE_ENABLED` controls it, and it
+  is on by default. It puts a break in front of a human 3 ways: an audit record,
+  the notification webhook, and a standing entry on the in-app bell.
+  Tamper-evidence that nobody exercises is only a log, and this schedule
+  exercises it. soc-ai logs a verification that could not run, and it raises no
+  alarm for it.
+- **Epoch-aware verification.** A restart is a legitimate reason the chain cannot
+  be linked all the way back. The `prev_hash` of a genesis record, at `seq=0`, is
+  the all-zero hash by construction, so it never links to the epoch that came
+  before it. A chain-head recovery bug from 2026-06-24 to 2026-08-16 turned that
+  rare case into 134 of them, because it reset the head on every restart. The fix
+  landed on 2026-08-17.
+
+    `soc-ai audit verify` and the Diagnostics "Verify audit chain" control check
+    each restart boundary as its own epoch. They do not report every boundary
+    after the first as tamper. An all-clear that spans more than one epoch shows
+    as a distinct state, amber and with no checkmark. It does not read as one
+    unbroken chain, because nobody can prove cross-epoch linkage.
+- **Fail-closed for mutating writes.** With `AUDIT_FAIL_CLOSED=true`, the
+  default, soc-ai aborts an action that changes SO state if it cannot write the
+  audit record for that action. Those actions are ack, escalate, comment and
+  auto-ack. No alert is acknowledged or escalated without an audit trail. The
+  audit writes for a read, a triage and an enrichment stay fail-open.
+
+**Deployment recommendation: a least-privilege credential.** The audit index
+currently shares the read and write ES credential of soc-ai. It lives on a
+cluster that soc-ai itself can write to and delete from. A compromised soc-ai, or
+a compromised credential, could therefore rewrite history despite the hash chain.
+
+To strengthen the trail, provision a distinct, least-privilege ES credential for
+the audit index. Give it the `create`, `create_doc` and `index` privileges
+on `soc-ai-audit-*` only, with no `delete` and no `manage`. Point the audit
+writer at that credential. Pair it with an append-only or read-only ILM policy,
+or a data-stream policy, on `soc-ai-audit-*`, so nobody can silently
+rewrite a record in place. Put that policy on a separate monitoring cluster that
+the main credential of soc-ai cannot reach. The hash chain then gives
+tamper-evidence on top of an index that the application cannot edit. That is
+defence in depth.
 
 ## Out of scope
 
-- Detection mutation tools (the agent may *suggest* rule tuning; a human applies it).
+- Detection mutation tools. The agent can *suggest* rule tuning, and a human
+  applies it.
 - VirusTotal / AlienVault OTX integrations.
-- Auto-resolution of alerts; auto-creation of cases.
+- Auto-resolution of an alert. Auto-creation of a case.
 
 ### Optional external-intel egress (opt-in, off by default)
 
-The hunt and chat agents can reach a small set of external reputation services
-(Shodan InternetDB, Shodan host with a paid key, GreyNoise, and the CIRCL CVE
-database) plus SearXNG web search and crawl4ai page-fetch. These make outbound
-calls to third parties, so they are an explicit egress surface: an IP / domain /
-CVE the agent looks up leaves your network. Web search and crawl are gated behind
-`WEB_SEARCH_ENABLED` / `CRAWL4AI_ENABLED` (both off by default); the Shodan /
-GreyNoise / CVE lookups hit public endpoints when the agent chooses to call them.
-None of them ever send alert payloads, only the single indicator being enriched.
-Leave them unused on an air-gapped grid; the local vendored blocklists + GeoIP
+The hunt agent and the chat agent can reach a small set of external reputation
+services. The services are Shodan InternetDB, Shodan host with a paid key,
+GreyNoise, and the CIRCL CVE database. They can also reach SearXNG web search and
+crawl4ai page-fetch. These calls go to a third party, so they are an explicit
+egress surface. An IP address, a domain or a CVE that the agent looks up leaves
+your network.
+
+`WEB_SEARCH_ENABLED` and `CRAWL4AI_ENABLED` gate the web search and the crawl,
+and both are off by default. The Shodan, GreyNoise and CVE lookups reach public
+endpoints if the agent chooses to call them. None of them ever sends an alert
+payload. Each one sends only the single indicator under enrichment. Leave them
+unused on an air-gapped grid, because the local vendored blocklists and GeoIP
 cover the offline path.
 
 ## Cloud analyst models: egress redaction (opt-in)
 
-By default soc-ai assumes `ANALYST_MODEL` points at a **local** model and sends
-it the enriched alert context, prompts, and tool results verbatim. If you point
-the analyst model at a cloud provider, set **`ANALYST_CLOUD_REDACTION=true`**
-(also editable live in the config console, section *Agent*).
+By default soc-ai assumes that `ANALYST_MODEL` points at a local model. It
+then sends that model the enriched alert context, the prompts and the tool
+results verbatim. If you point the analyst model at a cloud provider, set
+`ANALYST_CLOUD_REDACTION=true`. The config console can also edit it live, in
+section *Agent*.
 
-How it works: each investigation / hunt / chat turn gets one
-`EgressGuard` (`soc_ai/agent/egress_guard.py`) holding a single reversible
-label map, the same tunnel the Oracle path uses. Outbound, internal IPs,
-hostnames, usernames, MACs, and internal-domain emails are replaced with
-stable opaque labels (`IP_01`, `HOST_02`, …) in everything that crosses the
-gateway: the enriched context JSON, every composed prompt (investigation,
-hunt, chat, including the analyst's own question text), and every tool result
-(each read tool is wrapped at registration). Inbound, tool arguments the model
-sends (e.g. an OQL query citing `HOST_01`) are restored to real values before
-they hit Elasticsearch, and the model's outputs (verdicts, rationales,
-reasoning traces, hunt reports, chat replies) are label-restored before
-storage/display. The identifier set is the same *effective* set the Oracle
-uses: `ORACLE_INTERNAL_SUFFIXES` / `ORACLE_EXTRA_HOSTS` unioned with the
-DB-managed discovered identifiers.
+Each investigation turn, hunt turn and chat turn gets one `EgressGuard` from
+`soc_ai/agent/egress_guard.py`. The guard holds a single reversible label map. It
+is the same tunnel that the Oracle path uses.
 
-What it does NOT cover:
+On the outbound side, soc-ai replaces internal IPs, hostnames, usernames, MACs
+and internal-domain emails with stable opaque labels such as `IP_01` and
+`HOST_02`. The replacement covers everything that crosses the gateway: the
+enriched context JSON, every composed prompt for an investigation, a hunt or a
+chat, and every tool result. A composed prompt includes the analyst's own
+question text. soc-ai wraps each read tool at registration.
 
-- **It is best-effort, not fail-closed.** Unlike the Oracle path there is no
-  independent residue sweep that refuses to transmit; an internal FQDN on a
-  public-looking suffix that you have not enumerated will egress verbatim
-  (same caveat as the Oracle gate; configure your suffixes/hosts).
-- **Verdict quality costs.** The model reasons over opaque labels: it cannot
-  recognise `dc01` as a domain controller. Label cross-references are
-  preserved, so behavioural reasoning still works.
-- The Oracle second-opinion path keeps its own independent (fail-closed)
-  sanitization pipeline; this knob does not change it.
+On the inbound side, soc-ai restores the tool arguments that the model sends to
+their real values before they reach Elasticsearch. An example is an OQL query
+that cites `HOST_01`. soc-ai also restores the labels in the model's outputs
+before it stores or displays them. Those outputs are the verdicts, the
+rationales, the reasoning traces, the hunt reports and the chat replies. The
+identifier set is the same *effective* set that the Oracle uses. It is
+`ORACLE_INTERNAL_SUFFIXES` and `ORACLE_EXTRA_HOSTS`, in union with the DB-managed
+discovered identifiers.
 
-Leave the knob off (the default) for a local analyst model; redaction is pure
-overhead when nothing leaves your network.
+What redaction does NOT cover:
+
+- **It is best-effort.** It does not fail closed. The Oracle path has an
+  independent residue sweep that refuses to transmit, and this path has none. An
+  internal FQDN on a public-looking suffix that you have not enumerated egresses
+  verbatim. The Oracle gate carries the same caveat. Configure your suffixes and
+  hosts.
+- **Verdict quality costs something.** The model reasons over opaque labels, so
+  it cannot recognise `dc01` as a domain controller. soc-ai preserves the
+  cross-references between labels, so behavioural reasoning still works.
+- The Oracle second-opinion path keeps its own independent sanitization pipeline,
+  and that pipeline fails closed. This knob does not change it.
+
+Leave the knob off for a local analyst model. Off is the default. Redaction is
+pure overhead if nothing leaves your network.
 
 ## Vendored blocklist data: license posture
 
-soc-ai's `BlocklistDB` consumes public IOC blocklists by default:
+The `BlocklistDB` of soc-ai consumes public IOC blocklists by default:
 
 | Source | License | Default |
 |---|---|---|
 | abuse.ch URLhaus / ThreatFox / Feodo Tracker | CC0 | ✅ ON |
 | Tor Project exit-node list | Public | ✅ ON |
 | Operator-curated `internal_seed.yaml` | n/a | ✅ ON |
-| Spamhaus DROP / EDROP | Free for **non-commercial** use only; commercial use requires a paid license | ⛔ OFF — opt-in |
+| Spamhaus DROP / EDROP | Free for non-commercial use only; commercial use requires a paid license | ⛔ OFF, opt-in |
 
 **To enable Spamhaus** in your deployment:
 
-1. Read the Spamhaus terms (https://www.spamhaus.org/legal/terms/) and confirm
-   your deployment qualifies for non-commercial use, OR obtain a commercial
+1. Read the Spamhaus terms at https://www.spamhaus.org/legal/terms/. Confirm that
+   your deployment qualifies for non-commercial use, or obtain a commercial
    license.
 2. Set in `.env`:
 
@@ -138,5 +175,5 @@ soc-ai's `BlocklistDB` consumes public IOC blocklists by default:
 
 3. Run `soc-ai blocklists refresh`.
 
-Without `SPAMHAUS_LICENSE_ACKNOWLEDGED=true`, the loader logs a WARNING
-and skips the source (fail-open).
+Without `SPAMHAUS_LICENSE_ACKNOWLEDGED=true`, the loader logs a WARNING and skips
+the source. This path fails open.

@@ -240,22 +240,26 @@ def render_scenario(
     :func:`_stamp_synth_metadata`); ``None`` keeps the scenario's own id.
     """
     triage_idx = next((i for i, e in enumerate(scenario.events) if e.is_triage_target), None)
-    if triage_idx is None:
-        # The Scenario validator already enforces exactly-one triage target,
-        # so this is defensive.
-        raise ValueError(f"scenario {scenario.id!r} has no triage-target event")
 
     docs: list[RenderedDoc | None] = [None] * len(scenario.events)
-    triage_event = scenario.events[triage_idx]
-    triage_doc = _render_event(
-        triage_event,
-        scenario=scenario,
-        run_time=run_time,
-        triage_community_id=None,
-        plant_id=plant_id,
-    )
-    triage_community_id = triage_doc.body.get("network.community_id")
-    docs[triage_idx] = triage_doc
+    triage_community_id: str | None = None
+    if triage_idx is not None:
+        # Rendered FIRST so its community_id is available when supporting
+        # events resolve ``{{ same_as_triage }}``.
+        triage_doc = _render_event(
+            scenario.events[triage_idx],
+            scenario=scenario,
+            run_time=run_time,
+            triage_community_id=None,
+            plant_id=plant_id,
+        )
+        triage_community_id = triage_doc.body.get("network.community_id")
+        docs[triage_idx] = triage_doc
+    # No triage target is legal for a spec_journey scenario: the case the whole
+    # declarative catalog exists for is telemetry that never becomes an alert,
+    # so there is no alert document to anchor on. A scenario in that shape may
+    # not use ``{{ same_as_triage }}``, which the loader rejects at load time;
+    # the guard below stays as the backstop for a directly-constructed Scenario.
 
     for i, event in enumerate(scenario.events):
         if i == triage_idx:

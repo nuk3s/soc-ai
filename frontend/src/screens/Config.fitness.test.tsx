@@ -249,7 +249,7 @@ describe('measured=false is a quiet state, not a verdict', () => {
     // width on WHY. The full note stays in the tooltip.
     expect(detailText()).toBe('quality-eval batch in flight');
     expect(screen.getByTestId('fitness-detail').title).toContain('not measured: quality-eval batch in flight');
-    expect(screen.getByTestId('fitness-stale').textContent).toBe('unfit — last verdict, 3h ago');
+    expect(screen.getByTestId('fitness-stale').textContent).toBe('last unfit verdict, 3h ago');
     // …and NOT also as a bare cache age, which would read as a fresh check.
     expect(screen.queryByText('3h ago')).toBeNull();
   });

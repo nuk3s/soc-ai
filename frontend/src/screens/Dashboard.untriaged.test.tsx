@@ -39,7 +39,7 @@ const GROUPS = vi.hoisted(() => [
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [], truncated: false, other_docs: 0 }),
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   listInvestigations: vi.fn().mockResolvedValue({ rows: [], total: 0, running: 0, truePositives: 0, totalAll: 0, active: false, limit: 100, offset: 0 }),
@@ -57,6 +57,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
 }));
 
+import { queueOf } from '../test/alertQueue';
 import { Dashboard } from './Dashboard';
 import { getAlerts } from '../lib/api';
 
@@ -66,9 +67,9 @@ function Here() {
 }
 
 const mount = async () => {
-  vi.mocked(getAlerts).mockResolvedValue(
+  vi.mocked(getAlerts).mockResolvedValue(queueOf(
     GROUPS.map((g) => group(g.id, g.verdict as Verdict)),
-  );
+  ));
   render(
     <MemoryRouter initialEntries={['/']}>
       <Dashboard />
@@ -173,6 +174,55 @@ describe('Dashboard "Awaiting investigation" subline', () => {
   it('points at the screen where the group can actually be triaged', async () => {
     await mount();
     fireEvent.click(await screen.findByText(/triage from Alerts/i));
-    expect(here()).toContain('/alerts?verdict=untriaged');
+    // Parsed, not substring-matched: query-param ORDER carries no meaning, and
+    // pinning it made an unrelated refactor of the link builder fail here for
+    // no reason a reader could act on.
+    const dest = new URL(here()!, 'http://x');
+    expect(dest.pathname).toBe('/alerts');
+    expect(dest.searchParams.get('verdict')).toBe('untriaged');
+  });
+});
+
+// The severity bars sat directly beneath the Untriaged tile fixed above and
+// carried neither param, so on a 7d dashboard "42 high" opened a 24h Alerts
+// list with acked groups hidden — the same defect, one component down. Both
+// now build their link through one helper.
+describe('Dashboard severity breakdown — where a severity bar lands', () => {
+  it('sends a severity to Alerts carrying range and hide_acked=false', async () => {
+    await mount();
+    fireEvent.click(await tile('High'));
+    const dest = new URL(here()!, 'http://x');
+    expect(dest.pathname).toBe('/alerts');
+    expect(dest.searchParams.get('sev')).toBe('high');
+    expect(dest.searchParams.get('range')).toBe('24h');
+    expect(dest.searchParams.get('hide_acked')).toBe('false');
+  });
+
+  it('carries a non-default Dashboard range to Alerts', async () => {
+    await mount();
+    fireEvent.click(screen.getByText('7d'));
+    fireEvent.click(await tile('High'));
+    const dest = new URL(here()!, 'http://x');
+    expect(dest.searchParams.get('sev')).toBe('high');
+    expect(dest.searchParams.get('range')).toBe('7d');
+  });
+});
+
+// The quiet-grid line named a window it had not been asked about: it said "the
+// last 24 hours" whatever the operator selected, so a 7d dashboard with no
+// alerts made a claim about a day. Same class as the deep links above — a
+// surface describing a window other than the one it counted.
+describe('Dashboard quiet-grid line', () => {
+  it('names the selected window, not a hardcoded day', async () => {
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <Dashboard />
+        <Here />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(/No alerts in the last 24h\./)).toBeTruthy();
+    fireEvent.click(screen.getByText('7d'));
+    expect(await screen.findByText(/No alerts in the last 7d\./)).toBeTruthy();
   });
 });

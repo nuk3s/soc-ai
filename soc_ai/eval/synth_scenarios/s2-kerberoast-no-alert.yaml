@@ -1,0 +1,135 @@
+id: s2-kerberoast-no-alert
+name: "Kerberoasting with no alert: an RC4 service ticket in an AES domain"
+version: 1
+tier: hard
+story: |
+  A service ticket is requested for a service principal and issued with RC4
+  (0x17) encryption in a domain that otherwise issues AES (0x12). The attacker
+  asked for the weaker cipher because it is far cheaper to crack offline. The
+  request itself is ordinary Kerberos traffic: it succeeds, nothing fails, no
+  account locks out, and no signature fires.
+
+  The ratio is what makes a flat predicate work. On the development range this
+  was 1 document of 4,331, the other 4,330 being AES.
+
+  Three benign documents, one per clause the spec relies on, each with a
+  DISTINCT ServiceName so it can surface as its own candidate if the clause
+  guarding it is removed. An earlier version gave the twin the same ServiceName
+  as the attack, so it could never produce a second candidate: the whole
+  `none:` block could be deleted and the scenario still passed. The krbtgt
+  exclusion — the thing that stops every DC's own ticket-granting ticket being
+  reported as Kerberoasting — was droppable in review with a green suite.
+attack:
+  - T1558.003
+sigma_refs: []
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds: [typed_path]
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+spec_journey:
+  spec_id: identity-4769-rc4-service-ticket
+  expected_scope_keys: ["svc_reporting"]
+  expected_candidate_count: 1
+events:
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      event.code: "4769"
+      winlog.event_id: "4769"
+      winlog.event_data.ServiceName: "svc_reporting"
+      winlog.event_data.TargetUserName: "j.hollis@SYNTH.TEST"
+      winlog.event_data.TargetDomainName: "SYNTH.TEST"
+      winlog.event_data.TicketEncryptionType: "0x17"
+      winlog.event_data.TicketOptions: "0x40810000"
+      winlog.event_data.Status: "0x0"
+      synth.scenario_id: s2-kerberoast-no-alert
+      synth.scenario_version: 1
+  # Guards the encryption-type clause: AES, distinct principal.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -45
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-45) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      event.code: "4769"
+      winlog.event_id: "4769"
+      winlog.event_data.ServiceName: "svc_backup"
+      winlog.event_data.TargetUserName: "j.hollis@SYNTH.TEST"
+      winlog.event_data.TargetDomainName: "SYNTH.TEST"
+      winlog.event_data.TicketEncryptionType: "0x12"
+      winlog.event_data.TicketOptions: "0x40810000"
+      winlog.event_data.Status: "0x0"
+      synth.scenario_id: s2-kerberoast-no-alert
+      synth.scenario_version: 1
+
+  # Guards the krbtgt exclusion. RC4 to krbtgt is every domain controller's own
+  # ticket-granting service and is not Kerberoasting.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -90
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-90) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      event.code: "4769"
+      winlog.event_id: "4769"
+      winlog.event_data.ServiceName: "krbtgt"
+      winlog.event_data.TargetUserName: "m.okafor@SYNTH.TEST"
+      winlog.event_data.TargetDomainName: "SYNTH.TEST"
+      winlog.event_data.TicketEncryptionType: "0x17"
+      winlog.event_data.TicketOptions: "0x40810000"
+      winlog.event_data.Status: "0x0"
+      synth.scenario_id: s2-kerberoast-no-alert
+      synth.scenario_version: 1
+
+  # Guards the machine-account exclusion. A computer account requesting its own
+  # RC4 service ticket is ordinary domain traffic.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -130
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-130) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      event.code: "4769"
+      winlog.event_id: "4769"
+      winlog.event_data.ServiceName: "SYNTH-WS07$"
+      winlog.event_data.TargetUserName: "SYNTH-WS07$@SYNTH.TEST"
+      winlog.event_data.TargetDomainName: "SYNTH.TEST"
+      winlog.event_data.TicketEncryptionType: "0x17"
+      winlog.event_data.TicketOptions: "0x40810000"
+      winlog.event_data.Status: "0x0"
+      synth.scenario_id: s2-kerberoast-no-alert
+      synth.scenario_version: 1

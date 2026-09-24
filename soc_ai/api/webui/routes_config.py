@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, SecretStr, ValidationError
+from pydantic import BaseModel, Field, SecretStr, ValidationError
 from sqlalchemy import select
 
 from soc_ai.api import agent_tools as agent_tools_svc
@@ -606,6 +606,32 @@ async def api_model_fitness(
 # (soc_ai.audit.verify.verify_audit_chain).
 
 
+@dataclass
+class _AuditVerifyStatus:
+    """State of the SCHEDULED chain verification, held on ``app.state``.
+
+    ``last_run`` is the in-memory stamp the due-check compares against, so a
+    restart re-verifies rather than waiting out an interval it cannot
+    remember — cheap, and erring toward checking. ``alarm`` holds the last
+    NON-ok outcome so the notification bell can carry it without re-scanning
+    the index on a 15-second poll; it is cleared the moment a verification
+    comes back clean, which is what makes the bell entry disappear on its own
+    once the trail is sound again.
+    """
+
+    last_run: str | None = None
+    alarm: dict[str, Any] | None = None
+
+
+def _get_audit_verify_status(state: Any) -> _AuditVerifyStatus:
+    """The per-process scheduled-verification status slot (created on first use)."""
+    status = getattr(state, "_audit_verify_status", None)
+    if status is None:
+        status = _AuditVerifyStatus()
+        state._audit_verify_status = status
+    return status
+
+
 class AuditChainVerifyOut(BaseModel):
     ok: bool  # True iff every epoch (see soc_ai.audit.verify) is internally intact
     records_verified: int  # number of chained records checked
@@ -639,6 +665,32 @@ class AuditChainVerifyOut(BaseModel):
     epochs_broken: int = 0
     newest_broken_epoch_start: str | None = None  # set iff epochs_broken > 0
     latest_epoch_broken: bool = False
+    # WHAT broke, for the oldest and the newest broken epoch (null iff ok).
+    # "The chain is broken" covers a position claimed twice by two concurrent
+    # writers and a record whose content was edited after the fact; those call
+    # for different responses, so the kind travels with the verdict. `*_detail`
+    # is one printable sentence and names no record content. See
+    # soc_ai.audit.chain.BreakKind for the values.
+    first_break_kind: str | None = None
+    first_break_detail: str | None = None
+    newest_break_kind: str | None = None
+    newest_break_detail: str | None = None
+    # The population behind the break, not just its first instance. Without
+    # these the Config screen read "2 records claim sequence 503" off
+    # first_break_detail while the CLI and the notification bell — fed by the
+    # same ChainVerifyResult — reported six sequences and six extra records.
+    # Two surfaces describing one break at different sizes is worse than
+    # either number alone, so the census travels here too. `blast_radius` is
+    # the same printable sentence those two already render; empty iff ok.
+    duplicate_seqs: int = 0
+    extra_records: int = 0
+    max_claimants: int = 0
+    altered_records: int = 0
+    missing_seqs: int = 0
+    oldest_break_at: str | None = None
+    newest_break_at: str | None = None
+    break_kinds: list[str] = Field(default_factory=list)
+    blast_radius: str = ""
     checked_at: str  # ISO-8601 UTC timestamp of this verification
 
 
@@ -682,7 +734,7 @@ async def api_audit_verify_chain(
     """
     from datetime import UTC, datetime  # noqa: PLC0415
 
-    from soc_ai.audit.verify import verify_audit_chain  # noqa: PLC0415
+    from soc_ai.audit.verify import describe_blast_radius, verify_audit_chain  # noqa: PLC0415
     from soc_ai.so_client.elastic import GridPartialResultsError  # noqa: PLC0415
 
     elastic = getattr(request.app.state, "elastic", None)
@@ -726,6 +778,19 @@ async def api_audit_verify_chain(
         epochs_broken=result.epochs_broken,
         newest_broken_epoch_start=result.newest_broken_epoch_start,
         latest_epoch_broken=result.latest_epoch_broken,
+        first_break_kind=result.first_break_kind,
+        first_break_detail=result.first_break_detail,
+        newest_break_kind=result.newest_break_kind,
+        newest_break_detail=result.newest_break_detail,
+        duplicate_seqs=result.duplicate_seqs,
+        extra_records=result.extra_records,
+        max_claimants=result.max_claimants,
+        altered_records=result.altered_records,
+        missing_seqs=result.missing_seqs,
+        oldest_break_at=result.oldest_break_at,
+        newest_break_at=result.newest_break_at,
+        break_kinds=list(result.break_kinds),
+        blast_radius=describe_blast_radius(result),
         checked_at=datetime.now(UTC).isoformat(),
     )
 
@@ -793,13 +858,13 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
     # fail-closed is also on (independent residue sweep, E5.1).
     if not settings.analyst_cloud_redaction:
         analyst_redaction = (
-            "none — pointed at your gateway; enable analyst_cloud_redaction "
-            "if that gateway routes to a cloud model"
+            "none. The model is pointed at your gateway. Enable "
+            "analyst_cloud_redaction if that gateway routes to a cloud model."
         )
     elif settings.analyst_redaction_fail_closed:
         analyst_redaction = "sanitized + fail-closed"
     else:
-        analyst_redaction = "sanitized (best-effort)"
+        analyst_redaction = "sanitized, best-effort"
 
     return [
         {
@@ -808,8 +873,9 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "enabled": bool(settings.oracle_enabled),
             "redaction": "sanitized + fail-closed residue gate",
             "detail": (
-                f"Frontier adjudicator ({settings.oracle_model}) via the gateway; "
-                "internal identifiers pseudonymized before egress, residue-gated."
+                f"The frontier adjudicator {settings.oracle_model} runs through the "
+                "gateway. soc-ai pseudonymizes internal identifiers before egress. "
+                "A residue gate checks the result."
             ),
         },
         {
@@ -818,21 +884,23 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             # A toggle alone isn't reachable — the tool also needs a SearXNG URL.
             "enabled": bool(settings.web_search_enabled) and bool(settings.searxng_url.strip()),
             "redaction": "refuses internal identifiers",
-            "detail": "Investigator web search; the query refuses internal identifiers.",
+            "detail": "Investigator web search. The query refuses internal identifiers.",
         },
         {
             "id": "crawl",
             "label": "Page fetch (crawl4ai)",
             "enabled": bool(settings.crawl4ai_enabled) and bool(settings.crawl4ai_url.strip()),
             "redaction": "refuses internal URLs",
-            "detail": "Deep page read of a URL; refuses internal/private URLs.",
+            "detail": "Deep page read of a URL. This tool refuses internal and private URLs.",
         },
         {
             "id": "online_enrichment",
             "label": "Online enrichment (Shodan / GreyNoise / CVE)",
             "enabled": bool(settings.allow_online_enrichment),
             "redaction": "external indicators only",
-            "detail": "Third-party reputation/asset lookups; sends external indicators only.",
+            "detail": (
+                "Third-party reputation and asset lookups. soc-ai sends external indicators only."
+            ),
         },
         {
             "id": "analyst_cloud",
@@ -844,8 +912,8 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "enabled": bool(settings.analyst_cloud_redaction),
             "redaction": analyst_redaction,
             "detail": (
-                f"The analyst model ({settings.analyst_model}) itself; "
-                "a real egress only if your gateway routes it to a cloud provider."
+                f"The analyst model {settings.analyst_model} itself. This is a real "
+                "egress only if your gateway routes it to a cloud provider."
             ),
         },
         {
@@ -855,7 +923,10 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "enabled": bool(settings.notify_enabled)
             and _secret_is_set(settings.notify_webhook_url),
             "redaction": "synthetic, no internal data",
-            "detail": "Outbound alert/hunt webhook; synthetic bodies, no internal identifiers.",
+            "detail": (
+                "Outbound alert and hunt webhook. The bodies are synthetic. They carry "
+                "no internal identifier."
+            ),
         },
         {
             "id": "rag_gateway",
@@ -866,12 +937,12 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             # about what leaves the process either way.
             "enabled": bool(settings.rag_embed_model.strip())
             or bool(settings.rag_rerank_model.strip()),
-            "redaction": "none — sends runbook text + agent search queries",
+            "redaction": "none. soc-ai sends runbook text and agent search queries.",
             "detail": (
-                "Opt-in semantic tier for lookup_runbook: runbooks + search "
-                "queries go to your gateway's embeddings/rerank models "
-                f"({settings.rag_embed_model or 'unset'} / "
-                f"{settings.rag_rerank_model or 'unset'}). Off = pure-local FTS5."
+                "Opt-in semantic tier for lookup_runbook. Runbooks and search queries "
+                "go to your gateway's embeddings and rerank models: "
+                f"{settings.rag_embed_model or 'unset'} and "
+                f"{settings.rag_rerank_model or 'unset'}. Off means local FTS5 only."
             ),
         },
     ]
@@ -989,7 +1060,7 @@ async def api_rag_reembed(
             status_code=400,
             detail={
                 "reason": "rag_disabled",
-                "hint": "set rag_embed_model (Retrieval settings) before re-embedding",
+                "hint": "Set rag_embed_model in Retrieval settings before you re-embed.",
             },
         )
     from soc_ai.rag import runbook_embeddings as rag_svc  # noqa: PLC0415
@@ -1053,7 +1124,7 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
                 status_code=400,
                 detail={
                     "reason": "invalid_value",
-                    "hint": f"{body.key} failed validation on apply and was not saved",
+                    "hint": f"{body.key} failed validation on apply. soc-ai did not save it.",
                 },
             ) from exc
     async with request.app.state.db_sessionmaker() as db:
@@ -1195,7 +1266,7 @@ async def api_save_danger_setting(
                 status_code=400,
                 detail={
                     "reason": "invalid_value",
-                    "hint": f"{body.key} failed validation on apply and was not saved",
+                    "hint": f"{body.key} failed validation on apply. soc-ai did not save it.",
                 },
             ) from exc
 
@@ -1445,7 +1516,7 @@ async def api_save_notify_webhook(
     if scheme not in ("http", "https"):
         raise HTTPException(
             status_code=400,
-            detail={"reason": "invalid_value", "hint": "webhook URL must be http(s)"},
+            detail={"reason": "invalid_value", "hint": "The webhook URL must use http or https."},
         )
     user = await current_user(request)
     updated_by: int | None = user.id if user else None
@@ -1509,7 +1580,7 @@ async def api_notify_test(
     if not notify.webhook_configured(settings):
         return ConnTestOut(
             ok=False,
-            detail="No webhook URL configured — set the Notifications webhook URL first.",
+            detail="No webhook URL is configured. Set the Notifications webhook URL first.",
         )
 
     audit = getattr(request.app.state, "audit", None)
@@ -1559,8 +1630,8 @@ async def api_danger_test_connection(
             return ConnTestOut(
                 ok=False,
                 detail=(
-                    f"Security Onion did not answer within {budget}s — treating the grid "
-                    "as down. Check Elasticsearch load and shard health."
+                    f"Security Onion did not answer within {budget} s. soc-ai treats the "
+                    "grid as down. Check Elasticsearch load and shard health."
                 ),
             )
     else:

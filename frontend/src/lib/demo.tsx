@@ -51,7 +51,7 @@ export function useDemo(): boolean {
  *  of firing a doomed write and surfacing a raw error. Reused verbatim by every
  *  guarded handler (ack/escalate/assign, config save, action/override). */
 export const DEMO_ACTION_NOTE =
-  'Not available in the read-only demo — in a live deployment this would run for real.';
+  'Not available in the read-only demo. In a live deployment this action runs for real.';
 
 /** The single demo-guard decision, shared so a handler can't drift: returns the
  *  note to show (and the caller must return WITHOUT its network write) when this
@@ -73,7 +73,7 @@ export function DemoBanner() {
       className="flex items-center justify-center border-b px-4 text-center text-[12.5px] font-medium text-text-2"
       style={{ height: DEMO_BANNER_H, borderColor: 'rgba(75,139,245,.4)', background: '#0e1117' }}
     >
-      Demo — these investigations were run by soc-ai and recorded. Nothing here is live.
+      Demo. soc-ai ran these investigations and recorded them. Nothing here is live.
     </div>
   );
 }

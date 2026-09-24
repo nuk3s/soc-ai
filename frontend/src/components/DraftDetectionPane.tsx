@@ -128,8 +128,8 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
         <div className="min-w-0 flex-1">
           <div className="text-[13px] font-semibold text-text">Draft a Sigma detection</div>
           <p className="mt-1 text-[12px] leading-[1.5] text-dim">
-            Grounded in this finding's evidence — review, edit, and export. Nothing is written to
-            Security Onion.
+            The draft uses the evidence in this finding. Review it, edit it, and export it. soc-ai
+            writes nothing to Security Onion.
           </p>
         </div>
         {!autoRun && (
@@ -184,7 +184,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                 {draft.schema_ok === true && !edited && (
                   <div
                     className="text-[12px] font-semibold text-success"
-                    title="The rule parses, has the required keys, and its fields are recognized. It has not been loaded into Security Onion."
+                    title="The rule parses, has the required keys, and uses recognized fields. soc-ai has not loaded it into Security Onion."
                   >
                     Rule structure valid
                   </div>
@@ -196,8 +196,8 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                 )}
                 {edited && (
                   <div className="text-[12px] text-warn">
-                    Validation and dry-run reflect the original draft — your edits have not been
-                    re-checked.
+                    The check and the dry run describe the original draft. soc-ai has not checked
+                    your edits.
                   </div>
                 )}
 
@@ -208,7 +208,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                   >
                     {dry.ran === false ? (
                       <span className="text-danger">
-                        Dry run couldn't run: {dry.error ?? 'unknown error'}
+                        The dry run did not run: {dry.error ?? 'unknown error'}
                       </span>
                     ) : dry.hit_count === 0 ? (
                       <span>Dry run: 0 matches in {dry.window_days}d</span>
@@ -216,7 +216,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                       <>
                         <span>
                           Would have fired {dry.hit_count}× in {dry.window_days}d
-                          {dry.total_is_lower_bound ? ' (lower bound)' : ''}
+                          {dry.total_is_lower_bound ? ', a lower bound' : ''}
                         </span>
                         {dry.sample_ids.length > 0 && (
                           <div className="mt-1.5 flex flex-wrap gap-1.5 font-mono text-[10.5px]">
@@ -234,9 +234,8 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                     )}
                     {dry.ran !== false && (
                       <p className="mt-1 text-[11px] leading-[1.5] text-faint">
-                        The would-have-fired count comes from the rule's OQL twin — an equivalent
-                        query run against your telemetry, not the Sigma rule loaded into Security
-                        Onion.
+                        The would-have-fired count comes from an equivalent OQL query against your
+                        telemetry. soc-ai did not load the Sigma rule into Security Onion.
                       </p>
                     )}
                   </div>
@@ -249,7 +248,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
                 {draft.oql && (
                   <div className="flex flex-col gap-1.5">
                     <span className="text-[11.5px] font-semibold uppercase tracking-[.05em] text-faint">
-                      Measured by this OQL query (read-only)
+                      Measured by this read-only OQL query
                     </span>
                     <code className="block w-full overflow-x-auto whitespace-pre-wrap break-all rounded-card border border-border bg-surface-2 px-2.5 py-2 font-mono text-[11.5px] leading-[1.5] text-text-2">
                       {draft.oql}
@@ -259,7 +258,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
 
                 <label className="flex flex-col gap-1.5">
                   <span className="text-[11.5px] font-semibold uppercase tracking-[.05em] text-faint">
-                    Sigma rule (YAML) — edit before export
+                    Sigma rule YAML. Edit before export.
                   </span>
                   <textarea
                     value={yamlEdit}

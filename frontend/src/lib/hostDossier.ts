@@ -136,15 +136,15 @@ export function unresolvedPhrase(f: {
   retracted_at: string | null;
   inferred_value?: string | null;
 }): string {
-  if (f.reason === 'stale') return 'last seen too long ago — too old to trust';
+  if (f.reason === 'stale') return 'last seen too long ago, too old to trust';
   if (f.reason === 'low_confidence') {
     return f.inferred_value
       ? `possibly "${f.inferred_value}", but the evidence is too thin to say`
       : 'a faint signal, too thin to say';
   }
-  if (f.retracted_at) return 'the evidence behind it went away';
+  if (f.retracted_at) return 'the evidence behind it has gone';
   if (!f.last_run_at) return 'not checked yet';
-  return 'checked — nothing found';
+  return 'checked, nothing found';
 }
 
 // ---- resolution -------------------------------------------------------------
@@ -155,6 +155,25 @@ export function unresolvedPhrase(f: {
 export function isResolved(f: DossierFieldBrief): boolean {
   if (f.reason != null) return false;
   return (f.value != null && f.value.trim() !== '') || f.value_json != null;
+}
+
+/**
+ * The sweep worked this field out and the resolver withheld the answer.
+ *
+ * The evidence failed the confidence gate, or the value went stale, and no
+ * operator has declared anything over it. That is not "unknown": there IS a
+ * guess, and on a role it is the difference between a host nothing can score
+ * and a host nobody has looked at.
+ *
+ * Same predicate the summary's `roles_low_confidence` bucket counts
+ * (store/host_dossier.py, summarize_dossiers), so the ROLES bar's count and
+ * the rows the ROLE filter lists describe one set. One residue a list row
+ * cannot carry: the summary also drops an inferred value spelled "unknown",
+ * and a brief field ships no inference lane to read.
+ */
+export function isWithheldGuess(f: DossierFieldBrief): boolean {
+  if (f.overridden) return false;
+  return f.reason === 'low_confidence' || f.reason === 'stale';
 }
 
 /** Wire order in, wire order out — the screens must not invent an ordering the
@@ -258,7 +277,7 @@ export interface ActivityProfileView {
  *  shape — an operator can override this field with anything, and a foreign
  *  shape falls back to the generic structured rendering rather than a wrong
  *  chart. */
-export function activityProfileView(payload: unknown): ActivityProfileView | null {
+export function activityProfileView(payload: unknown, scalar?: string | null): ActivityProfileView | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const rec = payload as Record<string, unknown>;
   const histogram = rec.hour_of_day;
@@ -297,7 +316,11 @@ export function activityProfileView(payload: unknown): ActivityProfileView | nul
   // Only the positive is worth a line: the scalar summary above the chart
   // already says "no outbound remote access", and repeating a negative is how
   // the old page said everything twice.
-  if (rec.initiates_remote_access === true) {
+  // The fact's own sentence (rendered directly above these lines) already ends
+  // "initiates remote access on tcp/22, tcp/5985" when it is true, so the same
+  // clause appeared twice on the DC's page, one line apart. Say it once.
+  const scalarSaysSo = /initiates (outbound )?remote access/i.test(scalar ?? '');
+  if (rec.initiates_remote_access === true && !scalarSaysSo) {
     const ports = portStrings(rec.remote_access_ports);
     lines.push(
       ports.length > 0
@@ -447,7 +470,7 @@ export function identitySentence(host: {
   }
 
   if (clauses.length === 0) {
-    parts.push({ text: ' has been seen on the network, but nothing else is known about it yet.' });
+    parts.push({ text: ' has appeared on the network. Nothing else is known about it yet.' });
     return parts;
   }
 

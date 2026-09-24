@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ToolbarView } from '../components/ListToolbar';
-import { ApiError, deleteSavedView, listSavedViews, saveView } from './api';
+import { ApiError, deleteSavedView, getMe, listSavedViews, saveView } from './api';
 import type { SavedView, SavedViewQuery, SavedViewScreen } from './types';
 
 /**
@@ -14,11 +14,16 @@ import type { SavedView, SavedViewQuery, SavedViewScreen } from './types';
  * ref so "Save view" captures what is on screen at the moment of the click
  * rather than whatever was there when the toolbar mounted.
  *
- * A caller with no user row — a bearer-token client, a no-auth dev session —
- * gets `onSaveView: undefined`, so the toolbar simply omits the control instead
- * of offering a button that 401s. That latch is scoped to AUTH failures: a
- * transient 500 used to remove "Save view" for the rest of the mount, which is
- * a working feature deleted by one bad response.
+ * A caller with no user row (a bearer-token client, a deployment with the auth
+ * gate down) gets `onSaveView: undefined`, so the toolbar cannot offer a button
+ * that 401s, AND an `unavailable` reason so it can say why. Omitting the
+ * control silently was the other half of the defect: four list screens rendered
+ * no chips, no save control and no error, and an analyst reads that as a
+ * feature the product does not have (dogfood 2026-09-07, D3).
+ *
+ * The latch is scoped to AUTH failures: a transient 500 used to remove "Save
+ * view" for the rest of the mount, which is a working feature deleted by one
+ * bad response.
  */
 export interface SavedViewsBinding {
   views: SavedView[];
@@ -30,6 +35,10 @@ export interface SavedViewsBinding {
   onSaveView?: (name: string) => Promise<void>;
   /** The last write's failure, for surfaces that show it inline. */
   error: string | null;
+  /** Why this screen has no save control, or null when it has one. Rendered
+   *  beside a disabled control so "unavailable here" cannot be mistaken for
+   *  "does not exist". */
+  unavailable: string | null;
   /** The screen calls this when the operator edits a facet by hand, so a chip
    *  stops claiming to describe filters that have since moved on. */
   clearActive: () => void;
@@ -55,12 +64,15 @@ function readableError(err: unknown, fallback: string): string {
   const msg = err instanceof Error ? err.message : String(err);
   const reason = err instanceof ApiError ? (err.reason ?? '') : '';
   const code = `${reason} ${msg}`;
-  if (/too_many_views/.test(code)) return 'You have reached the saved-view limit — delete one first.';
+  if (/too_many_views/.test(code)) return 'You have reached the saved-view limit. Delete a view first.';
   if (/query_too_large|query_too_deep/.test(code)) return 'These filters are too large to save.';
   if (/empty_name/.test(code)) return 'A view needs a name.';
-  if (isAuthFailure(err)) return 'Saved views need a signed-in session.';
+  if (isAuthFailure(err)) return NO_SESSION;
   return msg || fallback;
 }
+
+/** One sentence for the one state: this deployment has nobody to own a view. */
+const NO_SESSION = 'Saved views need a signed-in session.';
 
 export function useSavedViews(
   screen: SavedViewScreen,
@@ -69,6 +81,13 @@ export function useSavedViews(
 ): SavedViewsBinding {
   const [views, setViews] = useState<SavedView[]>([]);
   const [available, setAvailable] = useState(true);
+  // WHY the control is gone, which decides whether anything is said about it.
+  // 'no_user' is a deployment with nobody to own a view — authentication off,
+  // or a bearer-token caller. There is no session to sign in to, so a line
+  // telling the operator to sign in is advice nobody can take, on every list
+  // screen, forever. 'no_session' is a refused read, where signing in IS the
+  // fix and the line is worth its space.
+  const [absence, setAbsence] = useState<'no_user' | 'no_session' | null>(null);
   const [activeViewId, setActiveViewId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -86,9 +105,27 @@ export function useSavedViews(
 
   useEffect(() => {
     let live = true;
-    listSavedViews(screen)
+    // Ask /me first (cached for the session) and skip the views read outright
+    // when no user row is behind this session. The 401 that read produced was
+    // handled correctly, but the browser still logged it as a console error on
+    // every list screen -- four red lines on a healthy box with auth off, which
+    // is exactly the noise that makes a real error invisible later. An older
+    // backend omits `signed_in`; undefined means "unknown", so the read still
+    // runs and answers for itself.
+    getMe()
+      .then((me) => {
+        if (!live) return null;
+        if (me.signed_in === false) {
+          setViews([]);
+          setAvailable(false);
+          setAbsence('no_user');
+          return null;
+        }
+        return listSavedViews(screen);
+      })
+      .catch(() => (live ? listSavedViews(screen) : null))
       .then((rows) => {
-        if (!live) return;
+        if (!live || rows === null) return;
         setViews(rows);
         setAvailable(true);
       })
@@ -98,7 +135,10 @@ export function useSavedViews(
         // ONLY an auth failure means there is no user to own a view. A 500 or a
         // dropped connection is weather: keep the control, let the next write
         // report its own outcome.
-        if (isAuthFailure(err)) setAvailable(false);
+        if (isAuthFailure(err)) {
+          setAvailable(false);
+          setAbsence('no_session');
+        }
       });
     return () => {
       live = false;
@@ -143,7 +183,7 @@ export function useSavedViews(
         setActiveViewId((prev) => (prev === view.id ? null : prev));
       })
       .catch((err: unknown) => {
-        setError(readableError(err, "That view couldn't be deleted."));
+        setError(readableError(err, 'That view could not be deleted.'));
         // A 404 means the chip is describing a row that is gone — leaving it
         // there makes a permanently dead chip, because the only fetch is keyed
         // on [screen]. Re-read rather than guess.
@@ -166,7 +206,7 @@ export function useSavedViews(
           // typed name) open on a rejection. Swallowing this produced the worst
           // possible outcome for a real `too_many_views` — the name gone, no
           // chip, and no message.
-          setError(readableError(err, "That view couldn't be saved."));
+          setError(readableError(err, 'That view could not be saved.'));
           throw err;
         },
       );
@@ -183,6 +223,7 @@ export function useSavedViews(
     onDeleteView,
     onSaveView: available ? onSaveView : undefined,
     error,
+    unavailable: available || absence !== 'no_session' ? null : NO_SESSION,
     clearActive,
   };
 }

@@ -112,6 +112,19 @@ COPY --chown=soc-ai:soc-ai pyproject.toml /opt/soc-ai/pyproject.toml
 # as the frontend bundle below. Without this COPY the endpoint 404s honestly.
 COPY --chown=soc-ai:soc-ai runbooks/     /opt/soc-ai/runbooks/
 
+# docs/: not documentation for the operator, prompt input. The agent's system
+# prompts are assembled from docs/OQL_PRIMER.md and docs/OQL_HUNT_EXAMPLES.md,
+# resolved as parent-of-package (soc_ai/agent/prompts.py:PROMPT_ASSETS →
+# /opt/soc-ai/docs), the same layout trick as runbooks/ above. Without this COPY
+# the container starts and answers, but every investigator, hunt and chat prompt
+# carries a stub saying the query language is unavailable, which is what shipped
+# until 2026-09-07. Copied WHOLESALE, like soc_ai/ and runbooks/: naming the two
+# files individually is exactly the mistake that produced the defect, because the
+# next asset added under docs/ would silently not ship. The heavy published-only
+# subtrees (docs/img, docs/superpowers) are excluded in .dockerignore, and
+# tests/test_image_layout.py fails if any declared asset stops resolving here.
+COPY --chown=soc-ai:soc-ai docs/         /opt/soc-ai/docs/
+
 # Demo packaging (inert in normal deployments — the default CMD below never
 # touches it). mock_es.py + its demo_dataset import are the bundled loopback
 # Elasticsearch/LLM stand-in that docker/demo-entrypoint.sh starts on
@@ -130,6 +143,15 @@ COPY --from=frontend --chown=soc-ai:soc-ai /fe/dist /opt/soc-ai/frontend/dist
 
 WORKDIR /opt/soc-ai
 
+# ── Build stamp ───────────────────────────────────────────────────────────────
+# The commit this image was built from, baked in so the running process can name
+# it. It cannot work this out for itself: .dockerignore excludes .git, and every
+# build of one release carries the same version string while the deployments run
+# the image as :latest — so without this, "quality dropped after Tuesday" has
+# nothing to attribute itself to. Empty when the builder did not pass one, which
+# soc_ai/__init__.py reads back as None rather than as a guess.
+ARG SOC_AI_COMMIT=""
+
 # ── Environment ───────────────────────────────────────────────────────────────
 # PATH: venv bin dir takes precedence over system Python.
 # PYTHONPATH: makes soc_ai importable without an editable install — hatchling
@@ -137,7 +159,8 @@ WORKDIR /opt/soc-ai
 # pydantic-settings reads .env relative to cwd (/opt/soc-ai) — WORKDIR above.
 # TLS + data-dir defaults match the compose volume mount paths; all can be
 # overridden in .env without rebuilding the image.
-ENV PATH="/opt/soc-ai/.venv/bin:$PATH" \
+ENV SOC_AI_COMMIT="${SOC_AI_COMMIT}" \
+    PATH="/opt/soc-ai/.venv/bin:$PATH" \
     PYTHONPATH="/opt/soc-ai" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -165,7 +188,16 @@ USER soc-ai
 
 EXPOSE 8443
 
-# ── Health check ──────────────────────────────────────────────────────────────
+# ── Liveness check ────────────────────────────────────────────────────────────
+# This is a LIVENESS probe, and the word `healthy` that `docker ps` prints from
+# it means only that this process answered. /healthz probes no dependency: it
+# stays green with an unreachable grid, a dead model gateway and no analyst
+# model at all, and it has to, because a probe that failed on a dependency
+# outage would have Docker restart a container whose dependencies are merely
+# down. The health verdict is `GET /api/v1/health` (live per-dependency probes)
+# or `docker compose exec soc-ai python -m soc_ai doctor`; the response body
+# says so too, so it reads correctly in `docker inspect`'s health log.
+#
 # /healthz is served over HTTPS with a self-signed cert; -k skips verify.
 # Interval is generous (30s) so a slow cold-start (DB migration + bootstrap)
 # doesn't flip the container unhealthy before the server is ready.

@@ -405,7 +405,7 @@ def test_notify_test_route_sends_canned_event(route_client: TestClient) -> None:
     app_state = route_client.app.state  # type: ignore[attr-defined]
     app_state.settings.notify_webhook_url = SecretStr("https://hooks.example.com/xyz")
 
-    fake = AsyncMock(return_value=(True, "Test sent — webhook returned HTTP 200."))
+    fake = AsyncMock(return_value=(True, "soc-ai sent the test. The webhook returned HTTP 200."))
     with patch("soc_ai.notify.send_test", fake):
         resp = route_client.post("/api/v1/config/notify/test")
     assert resp.status_code == 200, resp.text

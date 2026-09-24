@@ -22,6 +22,7 @@ import { ShellProvider } from '../shell/ShellContext';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getAlerts: vi.fn(),
+  getAlertsEmptyReason: vi.fn(),
   getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
   listSavedViews: vi.fn().mockResolvedValue([]),
   getInvestigation: vi.fn(() => new Promise(() => {})),
@@ -29,8 +30,9 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getAutoTriageStatus: vi.fn(() => new Promise(() => {})),
 }));
 
+import { queueOf } from '../test/alertQueue';
 import { Alerts } from './Alerts';
-import { getAlerts, startAutoTriage } from '../lib/api';
+import { getAlerts, getAlertsEmptyReason, startAutoTriage } from '../lib/api';
 
 // The 503 the grid routes actually return, verbatim off the wire: `detail.hint`
 // is the sentence meant for the analyst, and api.ts puts it on ApiError.message.
@@ -80,6 +82,9 @@ const chipTexts = (): string[] =>
 beforeEach(() => {
   vi.mocked(getAlerts).mockReset();
   vi.mocked(startAutoTriage).mockReset();
+  // Default: the backend has nothing to add, which is what every test written
+  // before the zero-state learned to explain itself assumes.
+  vi.mocked(getAlertsEmptyReason).mockReset().mockResolvedValue({ reason: 'not_empty', hint: '' });
 });
 
 describe('Alerts on a grid that refused the query (D2)', () => {
@@ -172,7 +177,7 @@ describe('a Bulk Investigate that never started (D7)', () => {
     );
     await clickBulkInvestigate();
 
-    const notice = await waitFor(() => toaster().getByText(/No answer to Bulk Investigate/));
+    const notice = await waitFor(() => toaster().getByText(/Bulk Investigate gave no answer/));
     expect(notice.textContent).not.toContain('failed to start');
     // …and it names the surface that does know, so the analyst checks there
     // rather than clicking again and running the same sweep twice.
@@ -190,7 +195,7 @@ describe('a Bulk Investigate that never started (D7)', () => {
     );
     await clickBulkInvestigate();
 
-    const notice = await waitFor(() => toaster().getByText(/No answer to Bulk Investigate/));
+    const notice = await waitFor(() => toaster().getByText(/Bulk Investigate gave no answer/));
     expect(notice.textContent).toContain('Network error — is the soc-ai API reachable?');
     expect(notice.textContent).not.toMatch(DOUBLED_STOP);
     expect(notice.textContent?.trimEnd().endsWith('reachable?')).toBe(true);
@@ -202,7 +207,7 @@ describe('a Bulk Investigate that never started (D7)', () => {
     vi.mocked(startAutoTriage).mockRejectedValue(new ApiError('', 503, 'grid_unavailable'));
     await clickBulkInvestigate();
 
-    const notice = await waitFor(() => toaster().getByText(/Bulk Investigate was refused/));
+    const notice = await waitFor(() => toaster().getByText(/The API refused Bulk Investigate/));
     expect(notice.textContent).toContain('The API answered 503.');
     expect(notice.textContent).not.toMatch(DOUBLED_STOP);
   });
@@ -216,7 +221,7 @@ describe('a Bulk Investigate that never started (D7)', () => {
     const strip = await waitFor(() =>
       screen
         .getAllByRole('alert')
-        .find((el) => (el.textContent ?? '').includes('Bulk Investigate was refused')),
+        .find((el) => (el.textContent ?? '').includes('The API refused Bulk Investigate')),
     );
     expect(strip).toBeTruthy();
     expect(strip?.textContent).toContain(GRID_HINT);
@@ -244,7 +249,7 @@ describe('Alerts whose refresh failed on top of rows it already has (D2 control)
       inherited: false,
       events: [],
     };
-    vi.mocked(getAlerts).mockResolvedValueOnce([group]).mockRejectedValue(gridDown());
+    vi.mocked(getAlerts).mockResolvedValueOnce(queueOf([group])).mockRejectedValue(gridDown());
     mount();
     await screen.findByText('ET SCAN Test Detection');
 
@@ -262,16 +267,86 @@ describe('Alerts whose refresh failed on top of rows it already has (D2 control)
 
 describe('Alerts on a healthy grid with nothing in the window (D2 control)', () => {
   beforeEach(() => {
-    vi.mocked(getAlerts).mockResolvedValue([]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
   });
 
   it('still says zero, because a quiet shift is a real answer', async () => {
     mount();
-    await screen.findByText('No detections match this view.');
+    await screen.findByText('No detection matches this view in this window. Widen the time range.');
 
     expect(headerLine()).toBe('0 untriaged · 0 detections · 0 events in window');
     expect(footerLine()).toBe('0 detections · grouped · click a row to expand events');
     expect(chipTexts()).toEqual(['Mine0', 'In review0', 'Critical0', 'Needs decision0', 'All0']);
     expect(screen.queryByText("Couldn't load this view")).toBeNull();
+  });
+});
+
+// An empty queue has two causes and they look identical on screen. On a grid
+// measured 2026-09-05 the configured alerts filter matched 2 documents in 24
+// hours while another alert label matched 25; the 22 in the gap were unreviewed
+// endpoint alerts, and this screen rendered a calm night. The zero-state has to
+// carry the reason the backend now returns for it.
+describe('Alerts telling a quiet grid apart from a filter that matched nothing', () => {
+  const MISMATCH =
+    'The alerts feed matched nothing in this window, but event.kind:alert matches 25 that ' +
+    'the feed cannot see.';
+  const GROUP: AlertGroup = {
+    id: 'g1',
+    name: 'ET DOC TEST Suspicious Beacon',
+    kind: 'suricata',
+    sev: 'high',
+    count: 3,
+    verdict: 'true_positive',
+    conf: 0.9,
+    latest: '2m ago',
+    inherited: false,
+    events: [],
+  };
+
+  beforeEach(() => {
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
+  });
+
+  it('says so when the filter, not the network, emptied the queue', async () => {
+    vi.mocked(getAlertsEmptyReason).mockResolvedValue({
+      reason: 'filter_mismatch',
+      hint: MISMATCH,
+    });
+    mount();
+    expect(await screen.findByText(literal(MISMATCH))).toBeTruthy();
+  });
+
+  it('does not dress a genuinely quiet grid as a misconfiguration', async () => {
+    // The over-correction, and the one that makes the row unreadable: an
+    // explanation shown on every idle night is an explanation nobody sees on
+    // the night it means something.
+    vi.mocked(getAlertsEmptyReason).mockResolvedValue({
+      reason: 'quiet',
+      hint: 'No alert label matches anything in this window. The grid is quiet, not misconfigured.',
+    });
+    mount();
+    await screen.findByText('No detection matches this view in this window. Widen the time range.');
+    expect(screen.queryByText(literal(MISMATCH))).toBeNull();
+  });
+
+  it('keeps the bare sentence when the explanation itself fails', async () => {
+    // An advisory about silence must never replace the silence with an error,
+    // and must never invent a verdict it did not get. The attribute is the
+    // non-vacuous half: a catch that fabricates a reason to have something to
+    // show would still leave the sentence on screen.
+    vi.mocked(getAlertsEmptyReason).mockRejectedValue(gridDown());
+    mount();
+    const zero = await screen.findByText('No detection matches this view in this window. Widen the time range.');
+    expect(screen.queryByText("Couldn't load this view")).toBeNull();
+    expect(zero.parentElement?.getAttribute('data-empty-reason')).toBe('unchecked');
+  });
+
+  it('never asks why while the list still has rows', async () => {
+    // The cost guard, from the client side: the screen polls every ten seconds
+    // and the explanation is four extra counts against the grid.
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([GROUP]));
+    mount();
+    await screen.findByText(GROUP.name);
+    expect(vi.mocked(getAlertsEmptyReason)).not.toHaveBeenCalled();
   });
 });

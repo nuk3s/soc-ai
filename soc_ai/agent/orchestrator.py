@@ -11,10 +11,14 @@ The pipeline (:func:`_run_synth_first_pipeline`) runs:
    the alert into an :class:`EnrichedAlertContext`.
 2. **Phase B** — :func:`match_decision_template` produces an optional
    *candidate verdict* anchor.
-3. **definitely-investigate check** — if the alert carries malware/exploit
-   signal or a threat-context flag, the synth round-1 is skipped entirely
-   (``synth_round1_skipped`` event emitted) and the pipeline goes straight to
-   the investigation loop.
+3. **Round-1 skip checks, before Phase C.** Two of them, each emitting
+   ``synth_round1_skipped`` and routing straight to the investigation loop.
+   ``reason="definitely_investigate"``: the alert carries malware/exploit
+   signal or a threat-context flag.  ``reason="cannot_settle"``: the round-1
+   verdict could not end the run anyway (:func:`_round1_can_settle`), so the
+   loop would overwrite it.  Round 1 settles a case only when a DISPOSITIVE
+   decision template already cleared the alert ``false_positive``.  Set
+   ``synth_round1_always`` to run the call on every alert again.
 4. **Phase C round 1** — the heavy synthesizer model reads materialized
    evidence + candidate and emits a :class:`TriageReport`.  It has no tools;
    it may name one gap via ``gap_for_investigator``.
@@ -62,11 +66,12 @@ from soc_ai.agent._partial_replay import (
     repair_dangling_tool_calls,
     replay_reasoning_context,
 )
-from soc_ai.agent.classifier import AlertClass, classify_alert
+from soc_ai.agent.classifier import AlertClass, classify_alert, normalize_classtype
 
 # Backward-compat re-exports — _DedupTracker, InvestigationContext, StepEvent now
 # live in soc_ai.agent.context; tests and callers reach these via orchestrator.
 from soc_ai.agent.context import (
+    HuntSubject,
     InvestigationContext,
     StepEvent,
     _DedupTracker,
@@ -110,11 +115,13 @@ from soc_ai.agent.gates import (  # noqa: F401
     _is_strong_grounded_template,
     _no_semantic_evidence,
     _pivot_evidence_tokens,
+    _refuse_benign_verdict_without_baseline,
     _resolve_citations,
     _synth_first_post_validate,
     _validate_citations,
     _verdict_cites_decisive_pivot_value,
     _verdict_grounded_in_pivot,
+    enforce_session_verdict_consistency,
 )
 from soc_ai.agent.models import (
     build_investigator_model,
@@ -123,12 +130,16 @@ from soc_ai.agent.models import (
 )
 from soc_ai.agent.prompts import (
     BUDGET_PARTIAL_SYNTH_PROMPT,
+    HUNT_SUBJECT_RULES,
     INVESTIGATOR_PROMPT,
     SYNTHESIZER_PROMPT,
     FocusOrigin,
     _format_investigator_prompt,
     _format_transcript_for_synthesizer,
+    build_investigator_prompt,
+    case_conditions,
     format_endpoint_coverage_block,
+    rule_body_in_alert,
 )
 from soc_ai.agent.reasoning import extract_reasoning_trace
 
@@ -141,6 +152,8 @@ from soc_ai.agent.toolset import (  # noqa: F401
     _clamp_tool_result,
     _dedup_result,
     _tool_error,
+    prefetched_community_ids,
+    prime_playbook_presence,
     register_read_tools,
 )
 from soc_ai.agent.triage import InvestigationTranscript, RecommendedAction, TriageReport
@@ -186,7 +199,8 @@ def build_investigator(
     ctx: InvestigationContext,
     *,
     system_prompt: str | None = None,
-) -> Agent[None, InvestigationTranscript]:
+    emits_report: bool = False,
+) -> Agent[None, Any]:
     """Investigator agent: fast model + read tools + InvestigationTranscript output.
 
     The read-tool surface comes from
@@ -195,6 +209,16 @@ def build_investigator(
     semantic-only (no auth/elastic/etc. parameters in the schema).
 
     ``system_prompt`` overrides the default :data:`INVESTIGATOR_PROMPT`.
+
+    ``emits_report`` (W3, ``Settings.investigator_emits_report``) swaps the
+    output type to :class:`~soc_ai.triage_models.TriageReport`, so the loop's
+    own final output IS the report and the round-2 synthesis call does not run.
+    The tool surface, the retry budget and the system prompt are unchanged; the
+    user message gains
+    :data:`~soc_ai.agent.prompts.INVESTIGATOR_EMITS_REPORT_BLOCK`. Kept as a
+    plain ``TriageReport`` rather than the synthesizer's
+    ``synthesizer_output_mode`` wrappers: this agent interleaves real tool
+    calls, and tool mode is what that path is validated on.
 
     The coverage gate previously lived here as an
     ``output_validator`` raising ``ModelRetry``. Smoke testing surfaced a
@@ -207,10 +231,14 @@ def build_investigator(
     downing confidence below the floor when semantic citation coverage is
     absent. ``retries=5`` gives schema validation room.
     """
-    agent: Agent[None, InvestigationTranscript] = Agent(
+    agent: Agent[None, Any] = Agent(
         model,
-        output_type=InvestigationTranscript,
-        system_prompt=system_prompt or INVESTIGATOR_PROMPT,
+        output_type=TriageReport if emits_report else InvestigationTranscript,
+        # The report-writing loop reads a system prompt that says it writes
+        # the report and carries the verdict policy; the transcript loop keeps
+        # the prompt the synthesizer expects it to have followed.
+        system_prompt=system_prompt
+        or (build_investigator_prompt(emits_report=True) if emits_report else INVESTIGATOR_PROMPT),
         # The default of 10 retries is generous on a per-output basis but
         # Nemotron-30B's schema-format wobble is genuinely stochastic (some
         # runs land in 2 attempts, others need 8+); stronger models may need
@@ -447,7 +475,7 @@ def _synth_failure_fallback_report(
             "provenance": PIPELINE_FALLBACK_PROVENANCE,
             "phase": phase,
             "error_type": type(exc).__name__,
-            "hint": _hint_for(exc),
+            "hint": _hint_for(exc, phase=phase),
             # Only when captured (a schema-retry exhaustion): WHY each attempt
             # failed, so the pipeline-error drilldown is actionable. Old rows /
             # other failure classes keep their exact shape.
@@ -476,6 +504,12 @@ def _round2_failure_fallback(
     round-2 didn't finish) rather than erroring the whole run with no verdict. If
     round-1 was itself inconclusive (skipped / untriaged), fall back to the
     needs_more_info synth-failure report.
+
+    ``round1`` is None when the round-1 call never ran. The pipeline skips that
+    call whenever the loop will overwrite its verdict (:func:`_round1_can_settle`),
+    so most runs now arrive here with nothing to preserve. The caller replays the
+    gathered history through the partial synthesizer BEFORE it comes here; this
+    function is the last resort, and it must stay honest about an empty hand.
     """
     settled = {"true_positive", "false_positive"}
     verdict = getattr(round1, "verdict", None)
@@ -523,9 +557,62 @@ _GATEWAY_BACKEND_HINT = (
     "api_base points at it, then retry."
 )
 
+_GATEWAY_UNREACHABLE_HINT = (
+    "the LLM gateway did not answer: soc-ai could not open a connection to it. "
+    "This phase makes no Elasticsearch call, so the grid is not the problem. "
+    "Check the gateway is running and that litellm_base_url points at it, then "
+    "retry."
+)
 
-def _hint_for(exc: BaseException) -> str | None:
-    """Return a short, actionable hint string for the analyst, or None."""
+_GRID_UNREACHABLE_HINT = (
+    "elasticsearch / Security Onion unreachable. Verify the SO grid is "
+    "online and ES_HOSTS in soc-ai's .env points at the right node."
+)
+
+_GRID_SLOW_HINT = (
+    "the Security Onion grid did not answer in time. Verify the cluster is "
+    "online and not saturated, then retry; raise es_request_timeout_s if it is "
+    "healthy but slow."
+)
+
+# Which dependency a phase can possibly have failed against.
+#
+# Working this out from the exception string is archaeology, and it got the
+# answer wrong: a refused gateway connection raises a bare "Connection error."
+# with no LiteLLM marker in it, so the ambiguous connect arm below fell through
+# to the grid branch and the recorded pipeline error sent the operator off to
+# check Elasticsearch during an LLM outage. The call site already knows.
+#
+# The synthesizer runs (round-1, round-2, the loop synth and its partial-report
+# variant) are model-only: no tool is registered on them. The investigation
+# loop does hold the grid tools, but every tool boundary catches its own
+# exception and hands the model a structured result
+# (:func:`soc_ai.agent.toolset._tool_error`), so no Elasticsearch exception can
+# leave that phase either. Phase-A prefetch is the mirror image: it only ever
+# reads the grid. Anything not listed here stays on the old string matching,
+# which is right for phases that genuinely could be either.
+_GATEWAY = "gateway"
+_GRID = "grid"
+_PHASE_DEPENDENCY: dict[str, str] = {
+    "synth_first_round1": _GATEWAY,
+    "synth_first_round2": _GATEWAY,
+    "investigation_loop": _GATEWAY,
+    "investigation_loop_synth": _GATEWAY,
+    "investigation_loop_partial_synth": _GATEWAY,
+    "prefetch": _GRID,
+}
+
+
+def _hint_for(exc: BaseException, *, phase: str | None = None) -> str | None:
+    """Return a short, actionable hint string for the analyst, or None.
+
+    ``phase`` is the pipeline phase that raised. When it names a dependency in
+    :data:`_PHASE_DEPENDENCY` it decides the ambiguous transport arms (connect
+    failure, timeout) instead of the exception text, because the call site is
+    evidence and the text is a guess. Omitted, every arm behaves exactly as it
+    did before.
+    """
+    dependency = _PHASE_DEPENDENCY.get(phase or "")
     if isinstance(exc, EgressResidueError):
         # Name only the COUNT/CLASS — never the leaked values (that would defect
         # on the fail-closed block). This hint lands in the report summary.
@@ -585,23 +672,34 @@ def _hint_for(exc: BaseException) -> str | None:
             "view of the network. Check Elasticsearch shard health and retry."
         )
     if "timed out" in msg or "timeout" in msg:
+        # Same misdirection, mirrored: an ES ConnectionTimeout raised inside
+        # Phase-A prefetch renders as "Connection timed out" and was reported
+        # as a slow LiteLLM gateway, which prefetch never calls.
+        if dependency == _GRID:
+            return _GRID_SLOW_HINT
         return "LiteLLM gateway slow or unreachable; retry."
     # Markers LiteLLM stamps into its OWN error strings. Their presence means the
     # failure was raised by the gateway about a model call, never by the ES client.
     is_gateway = any(
         m in msg for m in ("litellm", "model_name:", "vllmexception", "openaiexception")
     )
-    # Transport-layer "can't reach the host" is ambiguous: it fires for BOTH a
-    # dead Elasticsearch/SO grid and a dead model backend behind LiteLLM. Getting
-    # this backwards sent operators to debug Security Onion for a dead vLLM engine
-    # on 8 of 15 recorded prod error events (2026-08-03).
+    # Transport-layer "can't reach the host" is ambiguous BY TEXT: it fires for
+    # BOTH a dead Elasticsearch/SO grid and a dead model backend behind LiteLLM.
+    # Getting this backwards sent operators to debug Security Onion for a dead
+    # vLLM engine on 8 of 15 recorded prod error events (2026-08-03). It is not
+    # ambiguous by CALL SITE, so the phase answers first where it can, and only
+    # a phase that could genuinely be either falls back to the markers.
     if "cannot connect to host" in msg or "connection error" in msg or "connection refused" in msg:
+        if dependency == _GATEWAY:
+            # A gateway that never accepted the connection is a different fault
+            # from one that answered and could not reach its own backend, and
+            # the two need different remedies. The marker still separates them.
+            return _GATEWAY_BACKEND_HINT if is_gateway else _GATEWAY_UNREACHABLE_HINT
+        if dependency == _GRID:
+            return _GRID_UNREACHABLE_HINT
         if is_gateway:
             return _GATEWAY_BACKEND_HINT
-        return (
-            "elasticsearch / Security Onion unreachable. Verify the SO grid is "
-            "online and ES_HOSTS in soc-ai's .env points at the right node."
-        )
+        return _GRID_UNREACHABLE_HINT
     # A bare gateway 5xx with no connection text ("status_code: 502, model_name:
     # …, body:" — LiteLLM truncates the body on a proxy-level failure). These
     # previously produced NO hint at all, leaving 5 of 15 prod error events with
@@ -705,7 +803,7 @@ def _error_payload(
         "type": type(exc).__name__,
         "message": str(exc),
     }
-    hint = _hint_for(exc)
+    hint = _hint_for(exc, phase=phase)
     if hint:
         payload["hint"] = hint
     if retry_causes:
@@ -727,14 +825,54 @@ def _is_high_stakes_alert(alert: SoAlert) -> bool:
       malware/exploit token case where ``classtype`` is absent but the rule name
       or ``rule_metadata.metadata_tags`` carry a malware-family signal (the
       BPFDoor-style ET MALWARE label).
+    - :func:`_alert_signals_decoy` (same module) catches a deception sensor,
+      which is the one detection class that carries none of the above.
     - SO's own severity: ``severity_label`` of critical/high, or
       ``severity_score`` >= 3 (SO buckets 3=high, 4=critical).
 
     Any one of these makes the alert high-stakes. The verdict still stands —
     we just refuse to *auto-write* an ack on it.
+
+    What makes a rule high-stakes is the classification its author declared,
+    read through the one classification table this codebase has
+    (:mod:`soc_ai.agent.classifier`). The token list is the fallback for alerts
+    that carry no classification at all, and it is deliberately not where new
+    signals get added: it also drives benign-template routing across the whole
+    decision layer, so a token added here to close an auto-ack hole changes
+    verdicts for every rule whose name happens to contain it, and it would still
+    leave the next unclassified classtype open. "GPL SHELLCODE x86 setgid 0"
+    got past all four arms for exactly that reason: its classification,
+    system-call-detect, had no routing decision. The fix was to make the
+    routing map total over the classification table, not to add "shellcode".
+
+    The decoy arm is the exception to that paragraph, and it is there because
+    the other four are all readings of fields a honeypot document does not
+    have. Measured on the deployed grid on 2026-09-06: OpenCanary writes no
+    ``event.severity_label``, no ``event.severity`` and no ``rule.name``, and it
+    is not a Suricata signature so it has no ``classtype`` either. Arms one and
+    two read the classtype, arm three reads the rule name, arm four reads the
+    severity — every one of them is looking at an absent field, so all four
+    return False and the alert is treated as ordinary. Elastic Defend is only
+    covered because it happens to write a 99 into ``event.severity``; that is an
+    accident of one shipper, not a guard. The decoy arm reads
+    ``event.dataset``/``event.module`` instead, which is the field the honeypot
+    does write, and which the deception-sensor predicate already keys on for the
+    benign-verdict gate (:func:`~soc_ai.agent.gates._refuse_benign_verdict_without_baseline`).
+
+    This is deliberately NOT a restatement of that gate. That one coerces a
+    false_positive verdict on the alert being investigated, so on the direct
+    path it already stops the ack by making the verdict ineligible. The write
+    volume is not on the direct path: 110,693 of the recorded grid writes came
+    out of :func:`soc_ai.webui.autotriage._ack_inherited_fps`, which acks an
+    alert on a verdict produced for a DIFFERENT alert in the same cluster. That
+    alert's own verdict gate never ran, so this guard is the only thing between
+    a honeypot interaction and an unattended acknowledgement — and an
+    acknowledged honeypot hit is a silenced intrusion, since a decoy has no
+    benign population to be a false positive from.
     """
     from soc_ai.agent.decision_templates import (  # noqa: PLC0415 — circular
         _ATTACK_CLASSTYPES,
+        _alert_signals_decoy,
         _alert_signals_malware,
     )
 
@@ -744,9 +882,14 @@ def _is_high_stakes_alert(alert: SoAlert) -> bool:
     # the Oracle-escalation guard treats as attack-signalling but classify_alert's
     # _CLASSTYPE_MAP doesn't map — mirror _rule_signals_attack so the auto-ack cap
     # and the escalation guard never disagree on what's an attack.
-    if (alert.classtype or "").lower() in _ATTACK_CLASSTYPES:
+    if normalize_classtype(alert.classtype) in _ATTACK_CLASSTYPES:
         return True
     if _alert_signals_malware(alert):
+        return True
+    # A deception sensor. Nothing has a legitimate reason to touch a decoy, so
+    # there is no benign population for an ack to be drawn from — and the
+    # document carries none of the fields the four arms above read.
+    if _alert_signals_decoy(alert):
         return True
     sev_label = (alert.severity_label or "").strip().lower()
     if sev_label in ("critical", "high"):
@@ -762,6 +905,8 @@ async def maybe_auto_ack_fp(
     ctx: InvestigationContext,
     emit_ev: Any,
     audit_ev: Any,
+    investigated: bool,
+    citation_coverage: float | None = None,
 ) -> StepEvent | None:
     """Auto-acknowledge a high-confidence FP alert in Security Onion.
 
@@ -772,7 +917,40 @@ async def maybe_auto_ack_fp(
     - ``settings.auto_ack_fp_enabled`` is True
     - ``report.verdict == "false_positive"``
     - ``report.confidence >= settings.auto_ack_fp_threshold``
+    - ``investigated`` — the run retrieved something
+    - the report SUPPORTS ITSELF — it cites something, and what it cites
+      resolved (see ``citation_coverage`` below)
     - the alert is NOT high-stakes (see :func:`_is_high_stakes_alert`)
+
+    ``citation_coverage`` is the resolved share of the report's citations, as
+    :func:`soc_ai.agent.gates._resolve_citations` measured them, or ``None``
+    when it does not describe THIS report (the Oracle rewrote the verdict after
+    the local resolution ran, so the local coverage is about different
+    citations). None means the empty-citation check still applies and the
+    zero-coverage one does not.
+
+    The citation state is a GATE here, not only an input to confidence. Nothing
+    else in the chain refuses an uncited verdict on the way to the grid: the
+    coverage cap deliberately stands down when there are no citations to
+    measure (see :func:`~soc_ai.agent.gates._citation_confidence_cap`), so an
+    uncited report keeps its confidence and sails past the threshold. On the
+    deployed instance 1,315 of 3,696 completed runs shipped a report that cited
+    nothing and 834 of them were acknowledged in Security Onion, at a mean
+    confidence of 0.77. A coverage of exactly zero over a non-empty citation
+    list is refused for the stronger reason: the report named its grounds and
+    not one of them could be resolved to anything the run retrieved.
+
+    ``investigated`` is True when the run made at least one successful tool
+    call, dispatched a Phase-D targeted tool, or the Oracle's own loop called a
+    tool. Confidence was previously the only quantitative condition, and a
+    decision template supplies confidence without supplying evidence: on the
+    production instance 13 alerts were acknowledged in Security Onion at 0.85 to
+    0.90 with nothing looked up about them, nine of them the same exploitation-
+    attempt signature, repeating daily. An unattended write to the analyst's
+    grid is the last thing that should rest on a verdict the run did no work
+    for. The verdict itself is unaffected: a template-settled false positive
+    still reads as a confident false positive on the console, it just waits for
+    a person to press the button.
 
     The high-stakes guard is a blast-radius cap: a prompt-injected confident
     ``false_positive`` must never auto-ack a critical/high-severity or
@@ -795,10 +973,11 @@ async def maybe_auto_ack_fp(
 
     Returns the ``auto_ack`` StepEvent (for the caller to yield into the stream)
     when the write was attempted; an ``auto_ack_skipped`` StepEvent (with
-    ``reason`` = ``below_threshold`` | ``high_stakes``) when auto-ack was armed
-    for this FP but a guard held it back — recorded so the drawer can explain
-    why the pending ack needs a human; or ``None`` when auto-ack simply doesn't
-    apply (disabled, or a non-FP verdict).
+    ``reason`` = ``below_threshold`` | ``no_investigation`` | ``uncited`` |
+    ``high_stakes``)
+    when auto-ack was armed for this FP but a guard held it back — recorded so
+    the drawer can explain why the pending ack needs a human; or ``None`` when
+    auto-ack simply doesn't apply (disabled, or a non-FP verdict).
     """
     settings = ctx.settings
     if not settings.auto_ack_fp_enabled:
@@ -819,6 +998,59 @@ async def maybe_auto_ack_fp(
             },
         )
         return skipped_ev
+    if not investigated:
+        # Nothing was retrieved this run. The verdict may well be right, and it
+        # stands, but it is not something to write back to the analyst's grid
+        # unattended.
+        _LOGGER.info(
+            "auto-ack suppressed for alert %s: no tool call, targeted dispatch "
+            "or Oracle retrieval behind the verdict (conf=%.2f)",
+            es_id,
+            report.confidence or 0.0,
+        )
+        uninvestigated_ev: StepEvent = emit_ev(
+            "auto_ack_skipped",
+            {
+                "es_id": es_id,
+                "reason": "no_investigation",
+                "confidence": report.confidence,
+                "threshold": settings.auto_ack_fp_threshold,
+            },
+        )
+        return uninvestigated_ev
+    n_citations = len(report.citations or [])
+    uncited_reason = None
+    if n_citations == 0:
+        uncited_reason = "the report cited nothing"
+    elif citation_coverage is not None and citation_coverage <= 0.0:
+        uncited_reason = "none of the report's citations resolved"
+    if uncited_reason is not None:
+        # Retrieval and support are different questions and this one has never
+        # been asked on the way to an unattended write. A run can call tools and
+        # still hand the analyst a verdict with nothing under it; on the
+        # deployed instance 714 of the 834 acknowledged uncited verdicts had
+        # retrieved something, so the retrieval bar alone lets almost all of
+        # them through. The verdict stands and still reads as a confident false
+        # positive — the write waits for a person.
+        _LOGGER.info(
+            "auto-ack suppressed for alert %s: %s (conf=%.2f, citations=%d)",
+            es_id,
+            uncited_reason,
+            report.confidence or 0.0,
+            n_citations,
+        )
+        uncited_ev: StepEvent = emit_ev(
+            "auto_ack_skipped",
+            {
+                "es_id": es_id,
+                "reason": "uncited",
+                "confidence": report.confidence,
+                "threshold": settings.auto_ack_fp_threshold,
+                "citations": n_citations,
+                "coverage_ratio": citation_coverage,
+            },
+        )
+        return uncited_ev
     if _is_high_stakes_alert(alert):
         # Blast-radius cap: never auto-write an ack on a high-stakes alert, even
         # on a confident FP. The verdict stands; a human must ack it.
@@ -895,6 +1127,8 @@ async def _maybe_auto_ack_fp_gated(
     ctx: InvestigationContext,
     emit_ev: Any,
     audit_ev: Any,
+    investigated: bool = False,
+    citation_coverage: float | None = None,
     allow_so_writes: bool = True,
 ) -> StepEvent | None:
     """Call-site guard in front of :func:`maybe_auto_ack_fp` (Task 6, finding
@@ -904,8 +1138,14 @@ async def _maybe_auto_ack_fp_gated(
     False, the write is skipped BEFORE ``maybe_auto_ack_fp`` (and therefore
     ``execute_write_tool``) is ever reached, and an ``auto_ack_skipped`` event
     with reason ``promoted_finding`` records why — mirroring the
-    ``below_threshold`` / ``high_stakes`` skip events maybe_auto_ack_fp itself
-    emits for its own held-back cases.
+    ``below_threshold`` / ``no_investigation`` / ``uncited`` / ``high_stakes``
+    skip events maybe_auto_ack_fp itself emits for its own held-back cases.
+
+    ``investigated`` defaults False so a caller that has not worked out whether
+    the run retrieved anything cannot write to Security Onion by omission.
+    ``citation_coverage`` defaults None, which is the safe default for the other
+    reason: the empty-citation refusal applies regardless, and only the
+    stricter zero-coverage refusal needs a number to stand on.
     """
     if not allow_so_writes:
         # emit_ev is Any-typed at this seam; annotate so --strict sees StepEvent.
@@ -914,7 +1154,14 @@ async def _maybe_auto_ack_fp_gated(
         )
         return skipped
     return await maybe_auto_ack_fp(
-        report, es_id, alert=alert, ctx=ctx, emit_ev=emit_ev, audit_ev=audit_ev
+        report,
+        es_id,
+        alert=alert,
+        ctx=ctx,
+        emit_ev=emit_ev,
+        audit_ev=audit_ev,
+        investigated=investigated,
+        citation_coverage=citation_coverage,
     )
 
 
@@ -926,10 +1173,18 @@ async def investigate(
     deep: bool = False,
     allow_so_writes: bool = True,
     focus_origin: FocusOrigin = "rerun",
+    subject: HuntSubject | None = None,
 ) -> AsyncIterator[StepEvent]:
     """Public entry point for the synth-first triage pipeline.
 
     Async-yields :class:`StepEvent` items throughout the run.
+
+    ``subject`` (optional, D2): a HUNT subject. The run then investigates the
+    hunt as a whole: its objective, its findings and every document they cite.
+    ``alert_id`` stays the anchor document the prefetch reads, so the tools
+    keep their time anchor, but the subject block replaces the alert block in
+    the investigator prompt and the verdict answers the hunt's objective.
+    ``None`` is the ordinary alert subject and nothing changes.
 
     ``deep`` (optional): force the full tool-driven investigation loop for THIS
     run regardless of ``fast_triage_enabled`` — the analyst's "deep re-run" of
@@ -985,8 +1240,13 @@ async def investigate(
         ctx=ctx,
         focus_hint=focus_hint,
         deep=deep,
-        allow_so_writes=allow_so_writes,
+        # One source of truth for the unattended write on a hunt subject:
+        # nothing in Security Onion holds a hunt, so there is never anything to
+        # ack. Forced here rather than trusted from the caller, the same rule
+        # the hunt manager applies to ``kind='hunt'``.
+        allow_so_writes=allow_so_writes and subject is None,
         focus_origin=focus_origin,
+        subject=subject,
     ):
         yield ev
 
@@ -997,12 +1257,20 @@ async def investigate(
 # restates the alert rather than investigating it. The QVOD beacon false-FP
 # cited 5 `alert.*` paths (rule_name, payload_printable, classtype,
 # rule_metadata.*) and called a Cobalt Strike beacon benign on that basis.
-_EVIDENCE_PATH_PREFIXES: tuple[str, ...] = (
+#
+# The document lists come first and ``_GATHERED_DOCUMENT_ATTRS`` names them, so
+# a list added here is read for ids too.
+_GATHERED_DOCUMENT_ATTRS: tuple[str, ...] = (
     "community_id_events",
     "host_events",
     "user_events",
     "process_events",
     "file_events",
+    # The documents a hunt subject cites (D2). Empty on every alert run.
+    "subject_documents",
+)
+_EVIDENCE_PATH_PREFIXES: tuple[str, ...] = (
+    *_GATHERED_DOCUMENT_ATTRS,
     "enrichments",
     "typed_zeek",
 )
@@ -1017,7 +1285,7 @@ def _pivot_event_ids(alert_ctx: Any) -> set[str]:
     :func:`_classify_citation`'s id branch.
     """
     ids: set[str] = set()
-    for pivot_attr in _EVIDENCE_PATH_PREFIXES[:5]:  # the *_events pivot lists
+    for pivot_attr in _GATHERED_DOCUMENT_ATTRS:
         for ev in getattr(alert_ctx, pivot_attr, None) or []:
             ev_id = getattr(ev, "id", None)
             if isinstance(ev_id, str) and ev_id:
@@ -1096,15 +1364,22 @@ def _definitely_investigate(enriched: Any, candidate: Any) -> bool:
     True when the case will run the investigation loop REGARDLESS of the round-1
     verdict — a malware/exploit-signalled rule (the QVOD/beacon/BPFDoor failure
     mode: a zero-tool synth citing prefetched pivots is not evidence of
-    benignness), or an external-reputation decision template (e.g.
-    pushplanet settled FP on an unknown external host with zero tools).
+    benignness), or a PROVISIONAL benign decision template.
+
+    A provisional template proposes a benign verdict it is not entitled to
+    settle: its grounds are properties of the endpoints or the absence of a
+    reputation hit, never what the rule detected. The case therefore needs
+    evidence before it can close, and the cheapest way to get it is to skip
+    round 1 and go straight to the loop. This subsumes the older
+    EXTERNAL_REPUTATION_TEMPLATES trigger (pushplanet settled FP on an unknown
+    external host with zero tools) and adds ``clean_internal_traffic``, which
+    settled nine ET HUNTING OGNL exploitation-attempt alerts the same way.
 
     Because these don't depend on the round-1 report, the pipeline pre-checks
     this BEFORE Phase C and skips the ~10-15s round-1 synth call when True — that
     verdict would be discarded the moment the loop runs.
     """
     from soc_ai.agent.decision_templates import (  # noqa: PLC0415
-        EXTERNAL_REPUTATION_TEMPLATES,
         _host_has_concurrent_threat,
         _rule_signals_malware,
     )
@@ -1119,7 +1394,37 @@ def _definitely_investigate(enriched: Any, candidate: Any) -> bool:
         return True
     return (
         candidate is not None
-        and getattr(candidate, "template_id", None) in EXTERNAL_REPUTATION_TEMPLATES
+        and getattr(candidate, "verdict", None) == "false_positive"
+        and getattr(candidate, "authority", "provisional") != "dispositive"
+    )
+
+
+def _round1_can_settle(enriched: Any, candidate: Any) -> bool:
+    """True when a round-1 verdict is allowed to end the run.
+
+    W2. The pipeline reads this BEFORE the round-1 call and
+    :func:`_should_investigate` reads it after, so the two cannot disagree.
+
+    Round 1 has no tools and no message history, so
+    :func:`_is_evidence_backed` rejects every round-1 report: a zero-tool
+    citation proves nothing. One case is left. A DISPOSITIVE decision
+    template already cleared the alert ``false_positive`` on grounds that
+    read what the rule detected, and round 1 only has to agree with it.
+    Every other alert runs the loop, and the loop overwrites the round-1
+    verdict, so the call before it is pure cost: 18 s on production and 67 s
+    on the range, for 83% of the runs that made it.
+
+    This predicate is report-independent. The caller adds the one part that
+    needs the report itself: round 1 must also say ``false_positive``.
+    """
+    # A malware or exploit signal, a concurrent threat on the host, or a
+    # PROVISIONAL benign template all force the loop whatever round 1 says.
+    if _definitely_investigate(enriched, candidate):
+        return False
+    return (
+        candidate is not None
+        and getattr(candidate, "verdict", None) == "false_positive"
+        and getattr(candidate, "authority", "provisional") == "dispositive"
     )
 
 
@@ -1132,15 +1437,15 @@ def _should_investigate(report: Any, enriched: Any, candidate: Any) -> bool:
       caller, passed positionally via ``report``'s pipeline — see below),
     - the round-1 verdict is NOT evidence-backed
       (:func:`_is_evidence_backed`), AND
-    - the alert is non-trivial — i.e. NOT a clean-internal benign that a
+    - the alert is non-trivial — i.e. NOT a routine benign that a DISPOSITIVE
       decision template already cleared without any malware signal.
 
     "Trivially benign" = a non-malware-signalling alert whose decision
-    template landed a benign verdict (``false_positive`` /
-    ``needs_more_info`` is treated as non-benign; only ``false_positive``
-    from a template on a non-malware rule short-circuits). Such alerts keep
-    the fast zero-tool path; everything else that lacks evidence gets the
-    loop.
+    template landed a benign verdict AND was entitled to settle it
+    (``needs_more_info`` is treated as non-benign; only ``false_positive``
+    from a dispositive template on a non-malware rule short-circuits). Such
+    alerts keep the fast zero-tool path; everything else that lacks evidence
+    gets the loop.
 
     Note: the ``investigate_when_unsure`` flag check lives at the call site
     (it needs ``ctx.settings``); this helper assumes it has already passed
@@ -1156,12 +1461,13 @@ def _should_investigate(report: Any, enriched: Any, candidate: Any) -> bool:
 
     if _is_evidence_backed(report, enriched):
         return False
-    # Clean-internal benign: a decision template cleared it false_positive on
-    # a rule with no malware signal → keep the fast path. Everything else that
-    # lacks evidence gets the loop.
+    # Routine benign: a DISPOSITIVE decision template cleared it false_positive
+    # on a rule with no malware signal → keep the fast path. Everything else
+    # that lacks evidence gets the loop. _round1_can_settle holds that test and
+    # the pipeline reads the SAME function before the round-1 call, so the rule
+    # that skips the call and the rule that accepts its answer are one rule.
     return not (
-        candidate is not None
-        and getattr(candidate, "verdict", None) == "false_positive"
+        _round1_can_settle(enriched, candidate)
         and getattr(report, "verdict", None) == "false_positive"
     )
 
@@ -1540,6 +1846,54 @@ def _self_consistency_vote(reports: list[Any]) -> tuple[str, float, str]:
     )
 
 
+# How many same-session verdicts reach the prompt. One is nearly always all
+# there is, and the gate only ever reads the true positive out of the list.
+_SESSION_MAX_ITEMS = 3
+
+# Header framing the same-session constraint. Deliberately the opposite framing
+# to the prior-outcomes header below: that block is a RESEMBLANCE the current
+# evidence may overrule, and this one is the SAME conversation, already read.
+# Two alerts on one session that settle opposite ways are not two opinions, they
+# are one contradiction, and the range produced exactly that.
+_SESSION_PRIOR_HEADER = (
+    "## Same network session, already investigated (BINDING — read before you decide)"
+)
+
+_SESSION_PRIOR_INSTRUCTION = (
+    "This is the SAME conversation as the alert above: same source, same "
+    "destination, same ports, same protocol (the community id matches), inside "
+    "the session window. It is not a similar alert. You may not settle this "
+    "alert `false_positive` while a `true_positive` verdict stands on the same "
+    "session. If the evidence in front of you genuinely contradicts that "
+    "verdict, say so in the summary and emit `needs_more_info` naming the "
+    "disagreement — do not close it quietly."
+)
+
+
+def _format_session_prior_block(digests: list[dict[str, Any]]) -> str:
+    """Render same-session verdicts into the binding constraint block.
+
+    Same line shape and the same fail-soft age phrasing as
+    :func:`_format_prior_outcomes_block`, and composed at the same point in the
+    message so it rides the caller's sanitize sweep and ``_guard_egress``: a
+    prior rationale is redacted on the cloud-analyst path like everything else.
+    """
+    from soc_ai.store.auth import utcnow  # noqa: PLC0415 - lazy: store dep only when a DB exists
+
+    now = utcnow()
+    lines = [_SESSION_PRIOR_HEADER, ""]
+    for d in digests:
+        conf = d.get("confidence")
+        conf_part = f" ({conf:.2f})" if isinstance(conf, int | float) else ""
+        digest = d.get("rationale_digest") or "(no rationale recorded)"
+        lines.append(
+            f"- {_prior_age_phrase(d.get('created_at'), now)} · investigation "
+            f"{d.get('id')} · {d.get('verdict')}{conf_part} — {digest}"
+        )
+    lines.extend(["", _SESSION_PRIOR_INSTRUCTION])
+    return "\n".join(lines)
+
+
 # Header framing the E4.2 prior-outcome memory block. The anti-anchoring
 # instruction lives HERE (read before any verdict line), because the whole
 # point of the default-off flag is that prior verdicts can bias the model —
@@ -1760,6 +2114,36 @@ def _inject_dossier_block(message: str, block: str) -> str:
     return f"{message}{block}"
 
 
+def _inject_session_constraint(message: str, block: str) -> str:
+    """Weave the same-session constraint into a composed *message*.
+
+    Same anchoring and the same before-the-sanitize-sweep rule as
+    :func:`_inject_dossier_block`, and injected at every site the dossier is,
+    including the loop and round-2 prompts the memory blocks deliberately skip.
+    The memory blocks stay out of those prompts because a resemblance would
+    compete with the evidence the loop just gathered. This is not a resemblance:
+    it is the same session, and a verdict that contradicts it has to say so
+    rather than arrive by not being told.
+
+    Runs after the dossier at each site, so the constraint ends up between the
+    dossier and the enriched context: the last thing read before the evidence.
+    """
+    return _inject_dossier_block(message, block)
+
+
+def _inject_subject_block(message: str, block: str) -> str:
+    """Weave the hunt-subject block into a composed *message*.
+
+    D2. The investigator prompt renders the subject itself; this is for the
+    message that has no room for it, the loop synthesis over the transcript.
+    That call writes the verdict and it sees only the transcript, so without
+    the block it would score the hunt as an alert. Same anchoring and the same
+    before-the-sanitize-sweep rule as :func:`_inject_dossier_block`. Empty
+    block, no change, which is every alert run.
+    """
+    return _inject_dossier_block(message, block)
+
+
 async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pipeline is inherently long
     *,
     alert_id: str,
@@ -1768,6 +2152,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     deep: bool = False,
     allow_so_writes: bool = True,
     focus_origin: FocusOrigin = "rerun",
+    subject: HuntSubject | None = None,
 ) -> AsyncGenerator[StepEvent, None]:
     """Phase A → B → C → optional D → C round 2 → done.
 
@@ -1780,7 +2165,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     ``needs_more_info`` investigation, woven into the round-1 seed + the
     investigation-loop investigator prompt so this run targets those gaps.
 
-    ``allow_so_writes`` / ``focus_origin``: see :func:`investigate`.
+    ``allow_so_writes`` / ``focus_origin`` / ``subject``: see :func:`investigate`.
+
+    A HUNT subject changes four things and nothing else. The cited documents
+    join the prefetch bundle, so every id resolver reads them. The decision
+    templates do not run: they match alert rule classes and a hunt has none.
+    The same-session prior does not run: a hunt has no community id of its own.
+    Round 1 does not run: it is a tool-less synthesis over one alert, and the
+    hunt has to be read with the tools. Every gate still runs.
     """
     from soc_ai.agent._prefetch_retry import retry_prefetch  # noqa: PLC0415
     from soc_ai.agent.decision_templates import match_decision_template  # noqa: PLC0415
@@ -1881,7 +2273,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(err_ev)
         yield err_ev
 
-    yield _ev("session_start", {"alert_id": alert_id, "pipeline": "synth_first"})
+    # D2. `alert_id` is the anchor document, which a hunt-subject run needs for
+    # its time windows. `subject` says what the run is about, so a reader of
+    # the trail cannot take the anchor for the subject.
+    start_payload: dict[str, Any] = {"alert_id": alert_id, "pipeline": "synth_first"}
+    if subject is not None:
+        start_payload["subject"] = "hunt"
+    yield _ev("session_start", start_payload)
 
     # Resolve the effective internal-identifier set ONCE per investigation
     # (env-config union active detected/manual identifiers, minus muted). Used
@@ -1963,7 +2361,25 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(err_ev)
         yield err_ev
         return
-    enriched_ev = _ev("enriched_alert_context", enriched.model_dump(mode="json"))
+    # ----- The hunt subject joins the prefetch -----
+    # D2. The subject's cited documents ARE prefetched evidence: the promotion
+    # fetched them by id before this run started. They go into the bundle here,
+    # BEFORE the enriched event and before the budget trim, so the stored
+    # record shows what the run held and every id resolver
+    # (gates._retrieved_evidence_tokens, _pivot_event_ids) reads them beside
+    # the pivots. Empty on every alert run.
+    subject_block = ""
+    if subject is not None:
+        enriched.subject_documents = list(subject.documents)
+        subject_block = subject.render_block()
+    enriched_payload = enriched.model_dump(mode="json")
+    if subject is not None:
+        # What this step loaded. The timeline titles the step from these two
+        # keys plus the document list, so a hunt subject does not read
+        # "Loaded alert context + enrichments".
+        enriched_payload["subject"] = "hunt"
+        enriched_payload["subject_findings"] = len(subject.findings)
+    enriched_ev = _ev("enriched_alert_context", enriched_payload)
     await _audit(enriched_ev)
     yield enriched_ev
 
@@ -2017,11 +2433,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         yield dossier_ev
 
     # ----- Phase B: decision template -----
-    candidate = match_decision_template(enriched)
+    # A hunt subject runs no template. Every template matches an alert RULE
+    # class (a classtype, a signature severity, a rule name) and a hunt has no
+    # rule. A template that fired here would settle a hunt on the rule class of
+    # whichever document the prefetch happened to anchor on.
+    candidate = None if subject is not None else match_decision_template(enriched)
     template_ev = _ev(
         "decision_template_match",
         {
             "matched": candidate is not None,
+            "skipped": "hunt_subject" if subject is not None else None,
             "template_id": candidate.template_id if candidate else None,
             "verdict": candidate.verdict if candidate else None,
             "confidence": candidate.confidence if candidate else None,
@@ -2064,8 +2485,99 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         trim_ev = _ev("context_trimmed", _trim_note)
         await _audit(trim_ev)
         yield trim_ev
+
+    # ----- Same-session verdicts (BEFORE the template fast path) -----------
+    # Has this exact conversation already been read? Keyed on the community id,
+    # which is the hashed five-tuple, so unlike the rule-keyed memory below it
+    # relates two DIFFERENT rules firing on one session, and does not relate two
+    # different sessions between the same pair. Resolved here, ahead of Phase C,
+    # because a benign decision template can close a case with no tools at all
+    # and a constraint arriving after that has arrived too late: on the range,
+    # the second alert's own prefetch matched a benign template and shut the
+    # case while the first alert's true positive was already on the board.
+    #
+    # Deliberately NOT behind ``memory_enabled``. That flag governs whether the
+    # model is shown resemblances it may weigh; this is a contradiction inside
+    # one session, and a product that ships with it switched off ships the
+    # defect. Fail-soft everywhere else: no DB (CLI / eval / tests), no session
+    # on the alert, or a store error all leave the constraint absent.
+    #
+    # A hunt subject skips it. A hunt has no session of its own: the community
+    # id here belongs to whichever document the prefetch anchored on, and a
+    # verdict about a hunt is not a verdict about that one conversation.
+    session_digests: list[dict[str, Any]] = []
+    session_window_minutes = 0
+    session_community_id = (
+        None if subject is not None else getattr(enriched.alert, "network_community_id", None)
+    )
+    if ctx.db_sessionmaker is not None and session_community_id:
+        from soc_ai.store.investigations import (  # noqa: PLC0415
+            SESSION_WINDOW_MINUTES,
+            session_verdicts,
+        )
+
+        try:
+            async with ctx.db_sessionmaker() as sess_db:
+                session_digests = await session_verdicts(
+                    sess_db,
+                    community_id=str(session_community_id),
+                    # This run's own row is still ``running`` and the lookup is
+                    # complete-only, so it cannot self-match — the same reason
+                    # prior_outcomes passes no id from inside the pipeline.
+                    exclude_id=None,
+                    limit=_SESSION_MAX_ITEMS,
+                )
+            session_window_minutes = SESSION_WINDOW_MINUTES
+        except Exception as e:
+            _LOGGER.warning("same-session verdict lookup failed (skipping constraint): %s", e)
+            session_digests = []
+    session_block = _format_session_prior_block(session_digests) if session_digests else ""
+    # A true positive on this session is the case that must not be closed
+    # quietly, so it also forces the investigation loop: a fast-path close is
+    # exactly the outcome being prevented.
+    session_conflict_possible = any(d.get("verdict") == "true_positive" for d in session_digests)
+    if session_digests:
+        # The analyst is told the two are related whether or not the verdicts
+        # end up disagreeing. Light payload, same rule as the memory events:
+        # ids and verdicts, never rationale text.
+        session_ev = _ev(
+            "session_prior",
+            {
+                "count": len(session_digests),
+                "window_minutes": session_window_minutes,
+                "forces_investigation": session_conflict_possible,
+                "items": [
+                    {"id": d.get("id"), "verdict": d.get("verdict")} for d in session_digests
+                ],
+            },
+        )
+        await _audit(session_ev)
+        yield session_ev
+
     definitely_investigate = ctx.settings.investigate_when_unsure and _definitely_investigate(
         enriched, candidate
+    )
+    # fast_triage_enabled=False forces the tool-driven loop regardless of how
+    # confident round-1 was ("agent does agent things"): deeper but slower.
+    # `deep` is the same override scoped to THIS run (the analyst's deep re-run).
+    force_investigate = deep or not ctx.settings.fast_triage_enabled
+    # W2. Round 1 settles a case only when _round1_can_settle holds; on every
+    # other alert the loop runs and overwrites the verdict, so the call is pure
+    # cost (18 s and ~8K tokens on production, discarded on 83% of runs). Skip
+    # it. The second conjunct is the safety rail: with the loop switched off,
+    # round 1 is the only verdict there is, so it always runs.
+    loop_runs_anyway = (
+        force_investigate or session_conflict_possible or ctx.settings.investigate_when_unsure
+    )
+    # A hunt subject never settles at round 1. Round 1 is a tool-less synthesis
+    # over one alert's prefetch, and a hunt is read with the tools over many
+    # documents. Skipping it also keeps Phase D out of the run: the skipped
+    # report names no gap, so the loop is the only path to a verdict.
+    round1_cannot_settle = subject is not None or (
+        not definitely_investigate
+        and loop_runs_anyway
+        and not getattr(ctx.settings, "synth_round1_always", False)
+        and not _round1_can_settle(enriched, candidate)
     )
     round1_ok = False
     # (agent, user_message, usage_limits|None) describing how to RE-RUN the
@@ -2074,9 +2586,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # cleared (None) on every fallback path so a vote never re-runs a call
     # that just failed.
     final_synth_rerun: tuple[Any, str, Any] | None = None
-    if definitely_investigate:
+    if definitely_investigate or round1_cannot_settle:
         triage_round1 = _round1_skipped_report(alert_id)
-        skip_ev = _ev("synth_round1_skipped", {"reason": "definitely_investigate"})
+        if subject is not None:
+            skip_reason = "hunt_subject"
+        elif definitely_investigate:
+            skip_reason = "definitely_investigate"
+        else:
+            skip_reason = "cannot_settle"
+        skip_ev = _ev("synth_round1_skipped", {"reason": skip_reason})
         await _audit(skip_ev)
         yield skip_ev
     else:
@@ -2222,6 +2740,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # evidence still arrives last. Composed here, one statement before the
         # sanitize sweep below — never after it.
         user_msg_round1 = _inject_dossier_block(user_msg_round1, dossier_block)
+        user_msg_round1 = _inject_session_constraint(user_msg_round1, session_block)
         if guard is not None:
             # Final sweep over the COMPOSED message — catches the decision-
             # template candidate block (rationale/cited_evidence carry real
@@ -2325,15 +2844,34 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # for the Oracle escalation payload. Set only on the completed-loop path;
     # the budget-cut partial path has no InvestigationTranscript to read.
     loop_evidence_bullets: list[str] | None = None
-    # fast_triage_enabled=False forces the tool-driven loop regardless of how
-    # confident round-1 was ("agent does agent things"): deeper but slower.
-    # `deep` is the same override scoped to THIS run (the analyst's deep re-run).
-    force_investigate = deep or not ctx.settings.fast_triage_enabled
-    if force_investigate or (
-        ctx.settings.investigate_when_unsure
-        and (
-            definitely_investigate
-            or (round1_ok and _should_investigate(triage_round1, enriched, candidate))
+    # The same bullets in REAL-VALUE space, for the report's citations. Separate
+    # from the list above because that one is kept in whatever space the loop ran
+    # in (label space under an egress guard) for the Oracle.
+    loop_evidence_for_report: list[str] | None = None
+    # W3 A/B marker: which call wrote the report the run lands. ``investigator``
+    # = the loop's own output (investigator_emits_report ON); ``synth_round2`` =
+    # the round-2 synthesis over the transcript. Stays None on every other path
+    # (a fallback, a budget-cut partial, a round-1-settled or Phase-D run), so
+    # the marker never claims a path that did not run. Read back off the stored
+    # ``triage_report`` event to compare the two arms.
+    report_path: str | None = None
+    # A true positive already stands on this session, so a fast-path close is
+    # the exact outcome being prevented and the loop runs whatever the flags
+    # say. Deliberately outside the ``investigate_when_unsure`` conjunct: the
+    # contradiction does not stop being one because that flag is off.
+    # ``round1_cannot_settle`` sits at the top level for the same reason it was
+    # safe to skip the call: the alert has no settling verdict of any kind, so
+    # the loop is the only path to one.
+    if (
+        force_investigate
+        or session_conflict_possible
+        or round1_cannot_settle
+        or (
+            ctx.settings.investigate_when_unsure
+            and (
+                definitely_investigate
+                or (round1_ok and _should_investigate(triage_round1, enriched, candidate))
+            )
         )
     ):
         ran_investigation_loop = True
@@ -2343,14 +2881,20 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             loop_reason = "deep_rerun"
         elif force_investigate:
             loop_reason = "fast_triage_disabled"
+        elif session_conflict_possible:
+            loop_reason = "session_true_positive_stands"
+        elif round1_cannot_settle:
+            loop_reason = "round1_cannot_settle"
         else:
             loop_reason = "verdict_not_evidence_backed"
         loop_ev = _ev(
             "investigation_loop_entered",
             {
                 "reason": loop_reason,
-                "round1_verdict": None if definitely_investigate else triage_round1.verdict,
-                "round1_confidence": None if definitely_investigate else triage_round1.confidence,
+                # Round 1 did not run on the skip paths, so there is no verdict
+                # to report. ``round1_ok`` is the one honest test for that.
+                "round1_verdict": triage_round1.verdict if round1_ok else None,
+                "round1_confidence": triage_round1.confidence if round1_ok else None,
             },
         )
         await _audit(loop_ev)
@@ -2361,14 +2905,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # block): time anchor, dedup tracker, prefetched community_ids.
         ctx.default_time_anchor = enriched.alert.timestamp
         ctx.dedup = _DedupTracker()
-        ctx.prefetched_community_ids = {
-            cid
-            for cid in (
-                getattr(enriched.alert, "network_community_id", None),
-                *(getattr(e, "network_community_id", None) for e in enriched.community_id_events),
-            )
-            if isinstance(cid, str) and cid
-        }
+        ctx.prefetched_community_ids = prefetched_community_ids(enriched)
+        # The alert message carries the rule body on some sensors. The loop then
+        # reads the rule in its prompt instead of spending a turn on it.
+        ctx.rule_body_in_prompt = rule_body_in_alert(enriched.alert)
 
         loop_usage_limits = UsageLimits(
             request_limit=ctx.settings.agent_request_limit,
@@ -2379,11 +2919,23 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # profile on the heavy builder already carries the tool_choice
         # workaround so tool-calling works. Moderate temperature: keep some
         # pivot exploration while staying broadly reproducible.
+        #
+        # W3: with investigator_emits_report ON the loop writes the TriageReport
+        # itself and the round-2 synthesis below never runs. Read once here so
+        # the agent, the prompt and the convergence all see one value even if an
+        # admin hot-applies the setting mid-run.
+        emits_report = bool(getattr(ctx.settings, "investigator_emits_report", False))
+        # W1: ask the grid once an hour whether it holds any playbook. It
+        # answers which tools get registered below: a deployment with no
+        # playbook must not be offered t_get_playbooks, because the model spends
+        # a turn on it and reads back `[]`.
+        have_playbooks = await prime_playbook_presence(ctx)
         investigator = build_investigator(
             build_synthesizer_model(
                 ctx.settings, temperature=ctx.settings.investigator_temperature
             ),
             ctx,
+            emits_report=emits_report,
         )
         # Injection 2 of 4, beside the grid inventory: the two blocks are the
         # same class of ambient ground truth, and rubric step 5 already tells the
@@ -2397,12 +2949,32 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # no endpoint agent. Empty string when covered/unknown.
         inv_user_msg = (
             _format_investigator_prompt(
-                alert_id, enriched_json, focus_hint=focus_hint, focus_origin=focus_origin
+                alert_id,
+                enriched_json,
+                focus_hint=focus_hint,
+                focus_origin=focus_origin,
+                # Which conditional tool can still change THIS verdict. A tool
+                # whose condition is not met is not named, so the loop is not
+                # invited to spend a turn on it.
+                conditions=case_conditions(
+                    enriched,
+                    playbooks_available=have_playbooks,
+                    web_search_available=bool(ctx.settings.web_search_enabled),
+                ),
+                emits_report=emits_report,
+                # D2. Non-empty only for a hunt subject, where it replaces the
+                # alert block: the hunt, its findings and its cited documents
+                # are the subject, so the enriched alert JSON is not rendered.
+                subject_block=subject_block or None,
             )
             + await inventory_prompt_block(ctx.elastic, ctx.settings)
             + format_endpoint_coverage_block(enriched.prefetch_gaps.get(ENDPOINT_COVERAGE_GAP_KEY))
             + dossier_block
         )
+        # The investigator chooses what to retrieve, so it is the one place the
+        # constraint can change what gets looked at rather than only how the
+        # result is read.
+        inv_user_msg = _inject_session_constraint(inv_user_msg, session_block)
         if guard is not None:
             # enriched_json/focus_hint are already labeled; this sweep covers
             # the dataset-inventory and host-dossier blocks (grid host/dataset
@@ -2424,6 +2996,86 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # sink (see capture_backend_attribution): filled per response, read after
         # the loop for the usage event, valid even if a later turn raised.
         loop_attr: dict[str, Any] = {}
+
+        async def _land_cut_short_verdict(
+            exc: BaseException,
+            *,
+            note: str,
+            retry_causes: list[str] | None = None,
+            served_backend: dict[str, Any] | None = None,
+        ) -> AsyncGenerator[StepEvent, None]:
+            """Land a verdict when the loop stopped before it could conclude.
+
+            Audit R10: a fallback must never state a verdict that no evidence
+            supports. The order is fixed. A round-1 verdict stands only when
+            round 1 RAN and settled. Otherwise the gathered history is replayed
+            through the partial synthesizer, which reads the tool results that
+            did land. With no history at all, the honest failure report is the
+            answer, and the run stays retryable.
+
+            The budget cut and the loop-synth crash both come here, so the two
+            cannot drift apart. Sets ``triage_final`` and, on a partial
+            synthesis, ``loop_messages`` (the repaired history the citation
+            gates read).
+            """
+            nonlocal triage_final, loop_messages, final_synth_rerun
+            partial_report: Any = None
+            repaired_history: list[Any] = []
+            # ``round1_ok`` is the honest test: the skip paths leave a
+            # placeholder report behind, and a crashed round 1 leaves a
+            # fallback one. Neither is a verdict anybody reached.
+            settled_r1 = round1_ok and getattr(triage_round1, "verdict", None) in (
+                "true_positive",
+                "false_positive",
+            )
+            if not settled_r1 and loop_gathered:
+                try:
+                    partial_report, repaired_history = await _synthesize_partial_triage(
+                        ctx.settings, guard, loop_gathered
+                    )
+                except asyncio.CancelledError:
+                    raise  # cooperative cancel — propagate, never swallow
+                except EgressResidueError as e:
+                    async for ev in _emit_egress_blocked("investigation_loop_partial_synth", e):
+                        yield ev
+                except BaseException as e:
+                    err_ev = _ev(
+                        "error",
+                        _error_payload(e, phase="investigation_loop_partial_synth", round_num=1),
+                    )
+                    await _audit(err_ev)
+                    yield err_ev
+            final_synth_rerun = None  # a cut-short verdict — never vote on it
+            if partial_report is not None:
+                triage_final = partial_report.model_copy(
+                    update={
+                        # A cut-short investigation must not assert high
+                        # confidence (mirrors the hunt humility clamp).
+                        "confidence": min(partial_report.confidence, 0.6),
+                        "summary": (partial_report.summary or "") + note,
+                        # Never recurse into Phase D off a cut-short synthesis.
+                        "gap_for_investigator": None,
+                    }
+                )
+                if guard is not None:
+                    # Assignment-source restore — the gates below compare this
+                    # report's text against RAW enriched/pivot values.
+                    triage_final = _desanitize_report(triage_final, guard)
+                # The repaired history feeds the downstream evidence/citation
+                # gates: the partial verdict earns the loop exemption only from
+                # tool results that actually landed (synthetic closures are
+                # error-shaped and never counted).
+                loop_messages = repaired_history
+                return
+            triage_final = _round2_failure_fallback(
+                alert_id,
+                triage_round1 if round1_ok else None,
+                exc,
+                retry_causes,
+                served_backend,
+            )
+            await metrics.get_metrics().record_event("fallback_verdict", {})
+
         try:
             # Fail-closed residue sweep on the FINAL composed investigator prompt
             # BEFORE the loop's first model call — if an internal identifier
@@ -2541,63 +3193,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         elif budget_exc is not None:
             # A settled round-1 verdict stands (evidence gathered pre-budget is
             # preserved in the streamed timeline). With NO settled round-1
-            # (definitely_investigate skipped it, or round-1 was itself NMI)
-            # the old path discarded every gathered tool result into a generic
-            # 0.3 fallback — the 2026-07-18 prod BPFDoor run burned 25 tool
-            # calls and landed nothing. Now: synthesize a PARTIAL verdict from
-            # the gathered history (mirrors the hunt runner's budget path);
-            # the honest fallback remains the last resort.
-            partial_report: Any = None
-            repaired_history: list[Any] = []
-            settled_r1 = getattr(triage_round1, "verdict", None) in (
-                "true_positive",
-                "false_positive",
-            )
-            if not settled_r1 and loop_gathered:
-                try:
-                    partial_report, repaired_history = await _synthesize_partial_triage(
-                        ctx.settings, guard, loop_gathered
-                    )
-                except asyncio.CancelledError:
-                    raise  # cooperative cancel — propagate, never swallow
-                except EgressResidueError as e:
-                    async for ev in _emit_egress_blocked("investigation_loop_partial_synth", e):
-                        yield ev
-                except BaseException as e:
-                    err_ev = _ev(
-                        "error",
-                        _error_payload(e, phase="investigation_loop_partial_synth", round_num=1),
-                    )
-                    await _audit(err_ev)
-                    yield err_ev
-            if partial_report is not None:
-                triage_final = partial_report.model_copy(
-                    update={
-                        # A cut-short investigation must not assert high
-                        # confidence (mirrors the hunt humility clamp).
-                        "confidence": min(partial_report.confidence, 0.6),
-                        "summary": (partial_report.summary or "")
-                        + " (Investigation stopped at the tool-call budget; "
-                        "verdict synthesized from the evidence gathered before "
-                        "the cutoff.)",
-                        # Never recurse into Phase D off a budget-cut synthesis.
-                        "gap_for_investigator": None,
-                    }
-                )
-                if guard is not None:
-                    # Assignment-source restore — the gates below compare this
-                    # report's text against RAW enriched/pivot values.
-                    triage_final = _desanitize_report(triage_final, guard)
-                # The repaired history feeds the downstream evidence/citation
-                # gates: the partial verdict earns the loop exemption only from
-                # tool results that actually landed (synthetic closures are
-                # error-shaped and never counted).
-                loop_messages = repaired_history
-                final_synth_rerun = None  # budget-cut verdict — never vote on it
-            else:
-                triage_final = _round2_failure_fallback(alert_id, triage_round1, budget_exc)
-                final_synth_rerun = None  # fallback verdict — never vote on it
-                await metrics.get_metrics().record_event("fallback_verdict", {})
+            # (the round-1 call was skipped, or round-1 was itself NMI) the old
+            # path discarded every gathered tool result into a generic 0.3
+            # fallback — the 2026-07-18 prod BPFDoor run burned 25 tool calls
+            # and landed nothing. Now: synthesize a PARTIAL verdict from the
+            # gathered history (mirrors the hunt runner's budget path); the
+            # honest fallback remains the last resort.
+            async for ev in _land_cut_short_verdict(
+                budget_exc,
+                note=(
+                    " (Investigation stopped at the tool-call budget; "
+                    "verdict synthesized from the evidence gathered before "
+                    "the cutoff.)"
+                ),
+            ):
+                yield ev
         elif inv_result is None:
             # The agent run ended without a final result (no End node reached, and
             # no exception raised). Emit an honest error instead of crashing with an
@@ -2613,6 +3223,55 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(err_ev)
             yield err_ev
             return
+        elif emits_report:
+            # ----- W3: the loop wrote the report -----
+            # The investigator's output type IS TriageReport here, so the run
+            # that gathered the evidence is the run that concludes on it. No
+            # second model call: the 2026-09-19 turn audit measured round 2
+            # adding no new evidence in 40 of 41 runs and reversing two correct
+            # range verdicts. Everything BELOW this block is shared with the
+            # round-2 path — the self-consistency vote, every post-synth
+            # validator, the Oracle, the session gate and the auto-ack all read
+            # ``triage_final`` / ``loop_messages`` and cannot tell the two apart.
+            report_path = "investigator"
+            loop_messages = inv_result.all_messages()
+            inv_usage_ev = _usage_ev(1, inv_result, _served_backend(loop_attr))
+            if inv_usage_ev is not None:
+                await _audit(inv_usage_ev)
+                yield inv_usage_ev
+
+            loop_report = inv_result.output
+            # ``resolution`` is the pipeline-FAILURE marker. It suppresses Oracle
+            # escalation, drops the run out of the Needs-info KPI and renders the
+            # row as an infrastructure error, and only the orchestrator's own
+            # fallback builder may set it (see the field's note in
+            # triage_models). On the round-2 path the synthesizer could set it
+            # too, but this path hands the privileged field to a tool-using model
+            # reading attacker-influenceable text, so strip it here.
+            if loop_report.resolution is not None:
+                loop_report = loop_report.model_copy(update={"resolution": None})
+            # The Oracle payload stays in the space the loop ran in (label space
+            # under a guard), exactly like the transcript bullets it replaces.
+            loop_evidence_bullets = [
+                str(c).strip() for c in (loop_report.citations or []) if str(c).strip()
+            ]
+            triage_final = loop_report
+            if guard is not None:
+                # Assignment-source restore — the gates below compare this
+                # report's text against RAW enriched/pivot values.
+                triage_final = _desanitize_report(triage_final, guard)
+            # No separate transcript exists to lend citations to an uncited
+            # report: this report IS the loop's own words, and an empty citation
+            # list on it is a real finding for the A/B, not a handoff loss.
+            loop_evidence_for_report = None
+            # The self-consistency vote (OFF by default) re-runs the SAME call
+            # that wrote the report. Here that call is the loop itself, tools
+            # and all.
+            final_synth_rerun = (investigator, inv_user_msg, loop_usage_limits)
+            # The loop replaces Phase D — strip any gap so we don't also
+            # dispatch a single-tool targeted round on top of it.
+            if triage_final.gap_for_investigator is not None:
+                triage_final = triage_final.model_copy(update={"gap_for_investigator": None})
         else:
             # Events already streamed live above; land the transcript + usage, and
             # keep the full message history for the downstream citation/evidence
@@ -2637,6 +3296,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # itself stays in label space — it feeds the loop-synth
                 # message below, which crosses the egress boundary.
                 transcript_payload = guard.desanitize_obj(transcript_payload)
+            # The REAL-VALUE copy of the same bullets. The citation gates below
+            # compare against raw enriched/pivot values and the analyst reads
+            # what they resolve to, so a label-space bullet would neither
+            # resolve nor be readable. Taken from the desanitized payload rather
+            # than desanitized a second time, so the stored transcript and the
+            # citations carried out of it can never disagree.
+            loop_evidence_for_report = [
+                str(e) for e in (transcript_payload.get("evidence") or []) if str(e).strip()
+            ]
             transcript_ev = _ev("investigation_transcript", transcript_payload)
             await _audit(transcript_ev)
             yield transcript_ev
@@ -2660,6 +3328,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     alert_id, [loop_transcript], candidate=candidate
                 ),
                 dossier_block,
+            )
+            loop_synth_msg = _inject_session_constraint(loop_synth_msg, session_block)
+            # D2. The verdict writer has to know the subject is a hunt, or it
+            # scores the transcript as an alert and the summary answers the
+            # wrong question. Empty on every alert run.
+            loop_synth_msg = _inject_subject_block(
+                loop_synth_msg,
+                f"{subject_block}\n\n{HUNT_SUBJECT_RULES}" if subject_block else "",
             )
             if guard is not None:
                 # The transcript is already in label space (the loop ran over
@@ -2698,7 +3374,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # A BaseException here (e.g. a gateway timeout/cancel that escaped
                 # the client retries) previously propagated past the recorder,
                 # landing status=error with NO verdict + no recorded error event.
-                # Catch it, record the error, and DON'T discard the round-1 verdict.
+                # Catch it, record the error, and DON'T discard the evidence: a
+                # settled round-1 verdict stands, and with none the gathered
+                # history is replayed (same rule as the budget cut).
                 ls_causes = _retry_causes_from_messages(ls_captured)
                 ls_served = _served_backend(ls_attr)
                 err_ev = _ev(
@@ -2713,12 +3391,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 )
                 await _audit(err_ev)
                 yield err_ev
-                triage_final = _round2_failure_fallback(
-                    alert_id, triage_round1, e, ls_causes, ls_served
-                )
-                final_synth_rerun = None  # fallback verdict — never vote on it
-                await metrics.get_metrics().record_event("fallback_verdict", {})
+                async for ev in _land_cut_short_verdict(
+                    e,
+                    note=(
+                        " (The concluding synthesis did not complete; verdict "
+                        "synthesized from the evidence gathered before it failed.)"
+                    ),
+                    retry_causes=ls_causes,
+                    served_backend=ls_served,
+                ):
+                    yield ev
             else:
+                report_path = "synth_round2"
                 triage_final = loop_synth_result.output
                 if guard is not None:
                     # Assignment-source restore — the gates below compare this
@@ -2827,6 +3511,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # asset facts describe the hosts the targeted result is about, and
             # this round is a verdict site.
             user_msg_round2 = _inject_dossier_block(user_msg_round2, dossier_block)
+            user_msg_round2 = _inject_session_constraint(user_msg_round2, session_block)
             if guard is not None:
                 # The Phase-D dispatch ran with REAL args (the round-1 report
                 # was desanitized at its assignment source) and returned a RAW
@@ -2946,6 +3631,11 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 _LOGGER.warning("self-consistency sample failed (dropped): %s", e)
                 continue
             extra_report = extra_result.output
+            # Same privileged-field strip as the W3 primary report above: on the
+            # investigator path a sample comes from a tool-using model, and a
+            # winning sample's ``resolution`` would be the one the run stores.
+            if report_path == "investigator" and extra_report.resolution is not None:
+                extra_report = extra_report.model_copy(update={"resolution": None})
             if guard is not None:
                 # Samples re-ran the SAME already-sanitized message, so their
                 # outputs are labeled too; restore before the vote so a winning
@@ -3013,10 +3703,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # the bounded loop above — errored or empty dispatches never set it, so
         # they can't exempt the hard evidence gate).
         targeted_tool = targeted_tool_with_data
+    # Did this run RETRIEVE anything? The same question the hard evidence gate
+    # asks, kept as a separate value because auto-acknowledge needs it after the
+    # Oracle has had its turn, and the Oracle can add retrieval of its own.
+    run_retrieved_evidence = (
+        count_successful_tool_calls(targeted_messages) >= 1 or targeted_tool is not None
+    )
     triage_final, validation_audit = _synth_first_post_validate(
         triage_final,
         enriched,
         candidate,
+        investigator_evidence=loop_evidence_for_report,
         targeted_messages=targeted_messages,
         targeted_tool_called=targeted_tool,
         targeted_tool_results=targeted_results_all,
@@ -3026,6 +3723,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     )
 
     # Emit validator events in order.
+    if "investigator_evidence_carried" in validation_audit:
+        ev = _ev("investigator_evidence_carried", validation_audit["investigator_evidence_carried"])
+        await _audit(ev)
+        yield ev
+    if "template_grounds_adopted" in validation_audit:
+        ev = _ev("template_grounds_adopted", validation_audit["template_grounds_adopted"])
+        await _audit(ev)
+        yield ev
     if "citation_validation" in validation_audit:
         ev = _ev("citation_validation", {"round": 1, **validation_audit["citation_validation"]})
         await _audit(ev)
@@ -3206,6 +3911,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 blocklist=ctx.blocklist,
                 internal_cidrs=classification_cidrs,
             )
+            # No-benign-baseline guard (decoy and every flagged catalog spec) —
+            # Oracle path parity. A decoy alert
+            # reaches the Oracle by the local gate's own hand: refusing the
+            # local false_positive drops confidence to 0.4, under
+            # oracle_escalate_below_confidence, so the Oracle is asked exactly
+            # the question the local path just declined to answer benign. An
+            # Oracle false_positive would land unrefused. Same deterministic,
+            # zero-egress shape as the two guards around it.
+            oracle_report = _refuse_benign_verdict_without_baseline(
+                oracle_report, enriched, oracle_audit
+            )
             # I2: ungrounded host-anchored TP guard — Oracle path parity.
             # Prevents the Oracle from re-escalating to TP solely on host_alert_profile
             # context that the local path already downgraded. enriched is an
@@ -3272,6 +3988,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # Mark the Oracle report so UI/audit shows it was adjudicated.
                 adjudicated_summary = f"[Oracle adjudicated] {oracle_report.summary}"
                 triage_final = oracle_report.model_copy(update={"summary": adjudicated_summary})
+                # The Oracle's own loop is retrieval too, and the verdict below
+                # is now the Oracle's. A single-shot adjudication reports 0 and
+                # adds nothing.
+                run_retrieved_evidence = run_retrieved_evidence or (
+                    (oracle_result.oracle_tool_calls or 0) >= 1
+                )
         else:
             # Refusal or failure: triage_final stays unchanged and the local
             # verdict stands — but say so ON THE RECORD. An escalation whose
@@ -3289,7 +4011,31 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(fail_ev)
             yield fail_ev
 
+    # ----- Same-session consistency (last word on the verdict) -----
+    # After the Oracle, not before: an adjudicated false positive on a session a
+    # completed run already called malicious is the same contradiction as a
+    # local one, and this has to run downstream of everything that can still set
+    # the verdict. Downstream of the auto-acknowledge too, which reads
+    # ``triage_final`` below and must never see the false positive this holds.
+    triage_final, session_gate_audit = enforce_session_verdict_consistency(
+        triage_final, session_digests
+    )
+    if session_gate_audit is not None:
+        session_gate_ev = _ev("session_verdict_conflict", session_gate_audit)
+        await _audit(session_gate_ev)
+        yield session_gate_ev
+
     # ----- Final triage emit -----
+    # W3 A/B provenance on the report itself, so a stored run answers "which
+    # call wrote this verdict" without a join back across the event stream. The
+    # report dict only ever carries a ``resolution`` here on the pipeline-
+    # fallback path, where ``report_path`` is None, so the stamp below is a
+    # no-op today; it is here so the marker travels with the dict if a future
+    # path sets both.
+    if report_path is not None and isinstance(triage_final.resolution, dict):
+        triage_final = triage_final.model_copy(
+            update={"resolution": {**triage_final.resolution, "report_path": report_path}}
+        )
     triage_ev = _ev(
         "triage_report",
         {
@@ -3316,6 +4062,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 if triage_final.resolution is not None
                 else {}
             ),
+            # W3 A/B marker: which call wrote this report — ``investigator``
+            # (the loop's own output, investigator_emits_report ON) or
+            # ``synth_round2`` (the round-2 synthesis over the transcript). Key
+            # ABSENT, not null, on every other path (a fallback, a budget-cut
+            # partial, a round-1-settled or Phase-D run), so "no loop report"
+            # and "a path that did not record itself" never look alike.
+            **({"report_path": report_path} if report_path is not None else {}),
             # Preserve local verdict in the audit when Oracle overrode it.
             "local_verdict": local_triage_final.verdict
             if triage_final is not local_triage_final
@@ -3326,6 +4079,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     yield triage_ev
 
     # ----- Auto-acknowledge high-confidence false positives (opt-in) -----
+    # Coverage is only passed on when it describes the report being acked. The
+    # resolver ran over the LOCAL report's citations; if the Oracle then rewrote
+    # the verdict, the number is about a different set of citations and would be
+    # a lie either way it fell. None keeps the empty-citation refusal, which
+    # reads the final report directly.
+    ack_coverage: float | None = None
+    if triage_final is local_triage_final:
+        cv = validation_audit.get("citation_validation") or {}
+        raw_coverage = cv.get("coverage_ratio")
+        if isinstance(raw_coverage, int | float):
+            ack_coverage = float(raw_coverage)
     auto_ack_ev = await _maybe_auto_ack_fp_gated(
         triage_final,
         alert_id,
@@ -3333,6 +4097,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         ctx=ctx,
         emit_ev=_ev,
         audit_ev=_audit,
+        investigated=run_retrieved_evidence,
+        citation_coverage=ack_coverage,
         allow_so_writes=allow_so_writes,
     )
     if auto_ack_ev is not None:

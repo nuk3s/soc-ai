@@ -1,0 +1,78 @@
+id: s4-decoy-touched-no-alert
+name: "Decoy touched with no alert: an OpenCanary interaction"
+version: 1
+tier: easy
+story: |
+  Something connected to a honeypot service and tried a password. The decoy
+  records it; nothing else does. There is no signature because there is no
+  attack pattern to match — the whole point of a decoy is that contact with it
+  is the finding.
+
+  This is the cheapest correct detection in the catalog and the only one with
+  no benign population to separate from, so it needs no threshold and stays
+  correct on a grid with three weeks of history or three years.
+
+  The benign twin is not a different actor; it is the decoy STARTING UP.
+  OpenCanary writes a record every time the service boots, and on the
+  development range 8 of the 14 documents in the dataset are exactly that. A
+  spec matching the dataset alone would have been 57% boot messages while
+  advertising perfect precision, so the discriminator is the presence of a
+  source address, which the boot record does not carry.
+attack:
+  - T1046
+sigma_refs: []
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds: [typed_path]
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+spec_journey:
+  spec_id: decoy-opencanary-interaction
+  expected_scope_keys: ["10.0.0.66"]
+  expected_candidate_count: 1  # two documents, one actor
+events:
+  - index: logs-synth-opencanary-events
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: opencanary.events
+      event.module: opencanary
+      event.kind: event
+      source.ip: "10.0.0.66"
+      source.port: 51122
+      destination.ip: "10.0.0.30"
+      destination.port: 23
+      agent.name: "SYNTH-LINUX01"
+      synth.scenario_id: s4-decoy-touched-no-alert
+      synth.scenario_version: 1
+  - index: logs-synth-opencanary-events
+    time_offset_seconds: -30
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-30) }}"
+      event.dataset: opencanary.events
+      event.module: opencanary
+      event.kind: event
+      source.ip: "10.0.0.66"
+      source.port: 51120
+      destination.ip: "10.0.0.30"
+      destination.port: 23
+      agent.name: "SYNTH-LINUX01"
+      synth.scenario_id: s4-decoy-touched-no-alert
+      synth.scenario_version: 1
+  # The decoy booting. No source address: nobody connected, the service simply
+  # started. This is the document that must NOT become a finding.
+  - index: logs-synth-opencanary-events
+    time_offset_seconds: -3600
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-3600) }}"
+      event.dataset: opencanary.events
+      event.module: opencanary
+      event.kind: event
+      agent.name: "SYNTH-LINUX01"
+      synth.scenario_id: s4-decoy-touched-no-alert
+      synth.scenario_version: 1

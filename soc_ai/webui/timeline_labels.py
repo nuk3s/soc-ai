@@ -79,6 +79,10 @@ _ICON: dict[str, str] = {
     "decision_template_match": "🧩",
     "prior_outcomes": "📚",
     "chat_memory": "💬",
+    "session_prior": "🔗",
+    "session_verdict_conflict": "⚖️",
+    "template_grounds_adopted": "🧩",
+    "investigator_evidence_carried": "📝",
     "citation_validation": "✅",
     "citation_cap": "📉",
     "confidence_floor_raise": "📈",
@@ -105,6 +109,7 @@ _ICON: dict[str, str] = {
     "oracle_adjudication_failed": "🔮",
     "investigation_transcript": "📝",
     "auto_ack": "☑",
+    "inherited_ack": "☑",
     "triage_report": "📋",
     "approval_request": "⏸",
     "approval_required": "⏸",
@@ -345,8 +350,36 @@ def _t_retask(p: dict[str, Any]) -> str:
 
 
 def _t_template_match(p: dict[str, Any]) -> str:
+    # D2. A decision template matches an alert RULE class and a hunt has none,
+    # so the step is skipped rather than unmatched. "No pattern matched" read
+    # as a search that came back empty.
+    if p.get("skipped") == "hunt_subject":
+        return "Templates do not run on a hunt subject"
     tid = p.get("template_id")
     return f"Matched pattern: {_humanize(tid)}" if tid else "No decision-template match"
+
+
+def _count(n: int, noun: str) -> str:
+    """``1 finding`` / ``4 findings``. One plural rule for the titles below."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _t_alert_context(p: dict[str, Any]) -> str:
+    """What the prefetch step loaded.
+
+    D2. On a hunt subject it loaded the hunt: its findings and every document
+    they cite. The step kept the alert words over that, and the page reading
+    "Subject: hunt" said "Loaded alert context + enrichments" one row below.
+    """
+    if p.get("subject") != "hunt":
+        return "Loaded alert context + enrichments"
+    findings = p.get("subject_findings")
+    documents = p.get("subject_documents")
+    return (
+        f"Loaded the hunt subject: "
+        f"{_count(int(findings) if isinstance(findings, int) else 0, 'finding')}, "
+        f"{_count(len(documents) if isinstance(documents, list) else 0, 'document')}"
+    )
 
 
 def _t_prior_outcomes(p: dict[str, Any]) -> str:
@@ -368,8 +401,36 @@ def _t_prior_outcomes(p: dict[str, Any]) -> str:
             chips = ", ".join(
                 f"{c}x {v}" for v, c in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
             )
-            return f"{base} — {chips}"
+            return f"{base}: {chips}"
     return base
+
+
+def _t_session_prior(p: dict[str, Any]) -> str:
+    """The same conversation, already read. Names the ids, never tallies them.
+
+    A prior outcome is a resemblance and a count of them is enough. This is the
+    same session, and the analyst's next move is to open the other
+    investigation, so the row has to carry its id.
+    """
+    items = p.get("items")
+    ids = (
+        [
+            f"{_humanize(it.get('verdict'))} ({it.get('id')})"
+            for it in items
+            if isinstance(it, dict) and it.get("id")
+        ]
+        if isinstance(items, list)
+        else []
+    )
+    if not ids:
+        return "Same network session already investigated"
+    return f"Same network session already investigated: {', '.join(ids)}"
+
+
+def _t_session_verdict_conflict(p: dict[str, Any]) -> str:
+    """A false positive refused because a true positive holds the same session."""
+    prior = p.get("prior_investigation_id") or "an earlier run"
+    return f"Held at needs more info: {prior} already reached true positive on this same session"
 
 
 def _t_chat_memory(p: dict[str, Any]) -> str:
@@ -396,13 +457,31 @@ def _t_chat_memory(p: dict[str, Any]) -> str:
             chips = ", ".join(
                 f"{c}x {s}" for s, c in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
             )
-            return f"{base} ({chips}) — context only"
-    return f"{base} — context only"
+            return f"{base}: {chips}. Context only."
+    return f"{base}. Context only."
 
 
 def _t_citation_validation(p: dict[str, Any]) -> str:
+    if p.get("vacuous") or p.get("total") == 0:
+        return "No evidence citations were offered"
     valid = (p.get("counts") or {}).get("valid")
     return "Validated evidence citations" + (f" — {valid} valid" if valid is not None else "")
+
+
+def _t_template_grounds_adopted(p: dict[str, Any]) -> str:
+    n = len(p.get("citations") or [])
+    return (
+        f"Recorded the {p.get('template_id') or 'template'} template's own grounds "
+        f"as the citations ({n})"
+    )
+
+
+def _t_investigator_evidence_carried(p: dict[str, Any]) -> str:
+    n = p.get("count")
+    if not isinstance(n, int) or n <= 0:
+        n = len(p.get("citations") or [])
+    noun = "finding" if n == 1 else "findings"
+    return f"Recorded the investigation's own {n} {noun} as the citations"
 
 
 def _t_citation_cap(p: dict[str, Any]) -> str:
@@ -415,7 +494,7 @@ def _t_citation_cap(p: dict[str, Any]) -> str:
 def _t_confidence_floor_raise(p: dict[str, Any]) -> str:
     ground = _humanize(p.get("grounded_by") or "decisive evidence")
     return (
-        f"Raised confidence to the escalation floor — grounded by {ground} "
+        f"Raised confidence to the escalation floor. {ground} grounds it "
         f"({p.get('original_confidence')}→{p.get('floored_confidence')})"
     )
 
@@ -482,6 +561,21 @@ def _t_auto_ack(p: dict[str, Any]) -> str:
     return "Auto-acknowledged in Security Onion"
 
 
+def _t_inherited_ack(p: dict[str, Any]) -> str:
+    """This verdict's fan-out: sibling alerts acked off it, without a re-run.
+
+    Written after the run finished, so it lands at the end of the timeline and
+    keeps landing there. That is the point — the row is the only place an
+    analyst can see that a false positive they closed weeks ago is still
+    acknowledging alerts on the grid today.
+    """
+    n = p.get("acked")
+    if not isinstance(n, int) or n <= 0:
+        return "Acknowledged sibling alerts from this verdict"
+    plural = "alert" if n == 1 else "alerts"
+    return f"Acknowledged {n} sibling {plural} from this verdict"
+
+
 def _t_triage_report(p: dict[str, Any]) -> str:
     c = p.get("confidence")
     return f"Verdict: {_humanize(p.get('verdict') or '?')}" + (f" ({c})" if c is not None else "")
@@ -505,7 +599,7 @@ def _t_approval_decision(p: dict[str, Any]) -> str:
 
 def _t_done(p: dict[str, Any]) -> str:
     n = p.get("recommended_count")
-    return "Done" + (f" — {n} recommended action(s)" if n else "")
+    return "Done" + (f": {n} recommended action(s)" if n else "")
 
 
 def _t_error(p: dict[str, Any]) -> str:
@@ -523,10 +617,8 @@ def _t_usage(p: dict[str, Any]) -> str:
 _STATIC_TITLES: dict[str, str] = {
     "session_start": "Investigation started",
     "session_end": "Investigation finished",
-    "enriched_alert_context": "Loaded alert context + enrichments",
-    "alert_context": "Loaded alert context + enrichments",
     "investigation_loop_entered": "Started a deeper investigation",
-    "synth_round1_skipped": "Skipped first-pass synthesis — investigating first",
+    "synth_round1_skipped": "Skipped the first-pass synthesis: the investigation ran first",
     "context_trimmed": "Trimmed oldest related events to fit the model's context window",
     "retask_skipped_no_closeable_gap": "No re-task: no closeable evidence gap",
     "rubric_derivation": "Derived the evidence checklist for this alert type",
@@ -543,13 +635,13 @@ _STATIC_TITLES: dict[str, str] = {
     "unsupported_decisive_value_downgrade": (
         "Verdict downgraded: the decisive indicator appears in no retrieved document"
     ),
-    "icmp_solicited_downgrade": "Verdict downgraded: ICMP replies were solicited (normal ping)",
+    "icmp_solicited_downgrade": "Verdict downgraded: the ICMP replies answered a normal ping",
     "evidence_gate_pivot_exemption": (
         "Evidence gate passed: verdict grounded in cited pivot evidence"
     ),
     "fast_path_escalation": "Fast path escalated to a full investigation",
     "oracle_escalation": "Asked the Oracle for a second opinion",
-    "oracle_adjudication_failed": ("Oracle second opinion failed — the local verdict stands"),
+    "oracle_adjudication_failed": ("Oracle second opinion failed. The local verdict stands"),
     "investigation_transcript": "Investigation notes compiled",
     "model_response": "Model reasoning",
     "llm_request": "Model prompt sent",
@@ -565,8 +657,14 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "targeted_tool_result": _t_targeted_tool_result,
     "retask": _t_retask,
     "decision_template_match": _t_template_match,
+    "enriched_alert_context": _t_alert_context,
+    "alert_context": _t_alert_context,
     "prior_outcomes": _t_prior_outcomes,
     "chat_memory": _t_chat_memory,
+    "session_prior": _t_session_prior,
+    "session_verdict_conflict": _t_session_verdict_conflict,
+    "template_grounds_adopted": _t_template_grounds_adopted,
+    "investigator_evidence_carried": _t_investigator_evidence_carried,
     "citation_validation": _t_citation_validation,
     "citation_cap": _t_citation_cap,
     "confidence_floor_raise": _t_confidence_floor_raise,
@@ -579,6 +677,7 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "recommended_actions_blocked": _t_actions_blocked,
     "oracle_adjudication": _t_oracle_adjudication,
     "auto_ack": _t_auto_ack,
+    "inherited_ack": _t_inherited_ack,
     "triage_report": _t_triage_report,
     "approval_request": _t_awaiting_approval,
     "approval_required": _t_awaiting_approval,

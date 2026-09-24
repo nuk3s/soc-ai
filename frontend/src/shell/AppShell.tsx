@@ -28,7 +28,9 @@ export function AppShell() {
         <Sidebar />
         <div className="flex min-w-0 flex-1 flex-col">
           <Topbar />
-          <div className="relative flex-1 overflow-y-auto">
+          {/* Bottom padding clears the chat button, which floats over the last
+              row of every screen otherwise. */}
+          <div className="relative flex-1 overflow-y-auto pb-20">
             {/* Boundary inside the shell so lazily-loaded screens don't unmount
                 the sidebar/topbar while their chunk loads; the ErrorBoundary
                 keeps a crashing screen (render error, dead chunk after a deploy)

@@ -354,7 +354,10 @@ if [[ $RECFG == y ]]; then
 
   echo
   info "Grid-specific tuning:"
-  ask WEBUI_ALERTS_QUERY "  Alerts OQL filter" "${WEBUI_ALERTS_QUERY:-tags:alert}"
+  # Unions SO's own tag with the ECS field Elastic Defend endpoint alerts carry
+  # instead. Neither label alone covers a grid. See .env.example.
+  ask WEBUI_ALERTS_QUERY "  Alerts OQL filter" \
+    "${WEBUI_ALERTS_QUERY:-tags:alert OR event.kind:alert}"
   # Auto-detect the events index pattern unless the operator pinned one. `logs-*`
   # for a single-node grid; `*:logs-*` when the data is only reachable
   # cross-cluster (multi-node). Either way the alerts console + agent searches
@@ -543,15 +546,15 @@ else
   info "Building and starting the stack (first build pulls deps — ~3 min)…"
   $DC up -d --build
 fi
-info "Waiting for the service to report healthy…"
+info "Waiting for the service to answer…"
 healthy=0
 for _ in $(seq 1 60); do
   out=$(curl -fsk -m5 "https://localhost:8443/healthz" 2>/dev/null || true)
-  if [[ -n $out ]]; then ok "Healthy — ${out}"; healthy=1; break; fi
+  if [[ -n $out ]]; then ok "Up — ${out}"; healthy=1; break; fi
   sleep 3
 done
 if [[ $healthy -ne 1 ]]; then
-  warn "Health check timed out. Two things to try, in order:"
+  warn "Liveness check timed out — the server never answered. Two things to try, in order:"
   warn "  1. The doctor runs next — read its FAIL lines, each carries a fix."
   warn "  2. Read the container logs:"
   printf '          %s\n' "${B}${DC} logs soc-ai${N}"

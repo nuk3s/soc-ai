@@ -28,8 +28,27 @@ What it derives for one IP over a lookback window:
 - ``role_guess`` — server vs workstation, inferred from whether the host appears
   as a *responder* on well-known service ports (it offers services → server) vs
   only as an *originator* (it consumes services → workstation).
-- ``first_seen`` / ``last_seen`` within the window; ``top_peers``; ``top_ports``;
-  ``top_dns`` — small terms aggregations, capped tight.
+- ``first_seen`` / ``last_seen`` within the window; ``top_peers`` and
+  ``top_ports`` — small terms aggregations over the FULL match set, capped tight.
+- ``top_dns`` — counted over the ``_SAMPLE_SIZE``-document sample instead, since
+  query names are read off the projected hits rather than a second aggregation.
+  Its counts therefore describe a different population from ``top_peers`` and
+  ``top_ports``, so they carry the key ``count_in_sample`` and the sample size
+  travels beside them as ``top_dns_sample_size``. Two counts in the same dict
+  under the same key name are read as the same quantity, and these are not.
+
+**Whose 10.0.0.5?** Every answer above is drawn from a population of documents
+matching one IP, and an imported capture supplies those too. RFC1918 space
+collides across networks by construction — the address in somebody else's
+``so-import-pcap`` is very often an address in use here — so an import gave the
+local host a foreign hostname, a foreign peer list, a foreign role and a
+first-seen belonging to a capture file. Nothing in the output distinguished
+that from an observation. So the query counts live telemetry only
+(:mod:`soc_ai.tools._provenance`) and says so, and when there is nothing live
+it reports how many imported documents name the address rather than answering
+"no observations", which for a host under triage is the answer most likely to
+be believed and least likely to be true. A caller reading an import on purpose
+passes ``provenance="any"``.
 
 Robustness contract (mirrors the other read tools):
 
@@ -55,7 +74,23 @@ from typing import Any
 from soc_ai.config import Settings
 from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.so_client.fields import first_present, get_dotted
+from soc_ai.so_client.fields import (
+    DATASET_NAME_FIELDS,
+    FLOW_DATASETS,
+    first_present,
+    flow_dataset_filter,
+    get_dotted,
+    is_peer_address,
+)
+from soc_ai.tools._provenance import (
+    ANY,
+    LIVE,
+    Provenance,
+    count_imports,
+    denominator_note,
+    imports_note,
+    provenance_must_not,
+)
 from soc_ai.tools._registry import tool
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.os_hint import OsHint, os_hint_from_domains
@@ -186,8 +221,9 @@ def _base_host_query(
     time_range_minutes: int,
     time_anchor: datetime | None,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
-    """Events in the window where ``ip`` is either endpoint, synth scope applied."""
+    """Events in the window where ``ip`` is either endpoint, both scopes applied."""
     return {
         "bool": {
             "must": [
@@ -201,21 +237,48 @@ def _base_host_query(
                     }
                 }
             ],
-            "filter": [_build_time_filter(time_range_minutes, time_anchor)],
+            # Around-the-alert, deliberately: this tool answers "what is this
+            # host", so first/last seen and the peer profile want both sides of
+            # the alert. It takes no window mode. NOTE the parameter feeding it
+            # is still called `lookback_hours`, which the window is not.
+            "filter": [_build_time_filter(time_range_minutes, time_anchor)[0]],
             # Synth scope, threaded (not a hardcoded blanket exclude): prod never
             # shows a planted fixture in a real host summary; a batch eval scopes
             # to its own scenario so the tool can characterise the host it grades.
-            "must_not": synth_scope_must_not(include_synth),
+            #
+            # Provenance scope beside it, and the argument for it is sharper here
+            # than anywhere else in the toolset: RFC1918 addresses collide across
+            # networks by construction, so an imported capture's 10.0.0.5 is
+            # routinely a different machine from this grid's 10.0.0.5, and every
+            # identity signal below would happily be read off it.
+            "must_not": [
+                *synth_scope_must_not(include_synth),
+                *provenance_must_not(provenance),
+            ],
         }
     }
 
 
-def _empty_result(ip: str) -> dict[str, Any]:
-    """The clean no-data result (NOT an error — absence is a real answer)."""
+def _empty_result(ip: str, provenance: Provenance, imported: int | None) -> dict[str, Any]:
+    """The clean no-data result (NOT an error — absence is a real answer).
+
+    Two different absences reach here and they lead an analyst opposite ways.
+    "This grid has never watched that address" is a coverage gap. "This grid
+    holds 12,000 documents naming that address, all of them from an imported
+    capture" is a host that is not on this network at all, and it is the more
+    likely one for an IP an import and a live range both use. ``imported``
+    carries the number that tells them apart; ``None`` means it could not be
+    measured, which is neither.
+    """
     return {
         "ip": ip,
         "observations": False,
-        "summary": f"no observations for {ip} in the lookback window",
+        "provenance": provenance,
+        "imported_matches": imported,
+        "summary": (
+            f"no observations for {ip} in the lookback window "
+            f"({denominator_note(provenance)})" + imports_note(imported)
+        ),
         "hostname": None,
         "device_os_guess": None,
         "os_hint": None,
@@ -225,6 +288,7 @@ def _empty_result(ip: str) -> dict[str, Any]:
         "top_peers": [],
         "top_ports": [],
         "top_dns": [],
+        "top_dns_sample_size": 0,
         "evidence": {},
     }
 
@@ -243,8 +307,15 @@ def _guess_role(ip: str, hits: list[dict[str, Any]]) -> tuple[str, list[str]]:
         # CONNECTION-direction signal only — Suricata alert docs also carry
         # source/destination.ip + destination.port, so an inbound IDS alert
         # against a workstation (host == destination.ip on 443/445/3389) would
-        # otherwise flip its role to "server". Restrict to Zeek conn records.
-        if get_dotted(hit, "event.dataset") != "zeek.conn":
+        # otherwise flip its role to "server". Restricted to flow records from
+        # ANY sensor: pinning this to zeek.conn made role inference impossible
+        # on a grid without Zeek, and on the measured range pinned it to the one
+        # plane whose documents were empty.
+        # DATASET_NAME_FIELDS, not dataset_of: the latter falls back to
+        # event.module, which is coarser than the dataset ("network_traffic"
+        # where the dataset is "network_traffic.flow") and so would never match
+        # this list — silently dropping every flow record again.
+        if first_present(hit, DATASET_NAME_FIELDS) not in FLOW_DATASETS:
             continue
         src = get_dotted(hit, "source.ip")
         dst = get_dotted(hit, "destination.ip")
@@ -336,7 +407,9 @@ def _collect_top_peers(ip: str, aggregations: dict[str, Any]) -> list[dict[str, 
     for agg_name in ("peers_src", "peers_dst"):
         for pair in _bucket_pairs(aggregations.get(agg_name)):
             peer = str(pair["value"])
-            if peer and peer != ip:
+            # Multicast and link-local are the host addressing the segment,
+            # not a peer: 224.0.0.251/252 were the DC's top "external" peers.
+            if peer and peer != ip and is_peer_address(peer):
                 peer_counts[peer] += int(pair["count"])
     return [{"value": peer, "count": count} for peer, count in peer_counts.most_common(_AGG_SIZE)]
 
@@ -357,6 +430,7 @@ async def host_summary(
     lookback_hours: int = 24,
     time_anchor: datetime | None = None,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Summarise what host an IP is, from Zeek/ECS observations in the window.
 
@@ -370,18 +444,33 @@ async def host_summary(
         time_anchor: when set, center the window on this timestamp instead of the
             now-relative default. The chat/investigator threads ``alert.timestamp``
             here so it finds evidence for an old alert.
+        include_synth: synth-doc visibility (``SynthScope``).
+        provenance: which population the host is characterised from
+            (:mod:`soc_ai.tools._provenance`). ``"live"`` (the default) uses
+            only this grid's own observations, because an imported capture
+            reusing the same RFC1918 address describes a different machine and
+            every field below would be read off it. ``"any"`` includes
+            backfill, for reading an import deliberately — which is what the
+            empty result points a caller at when the address is import-only.
 
     Returns:
         A dict with ``hostname`` / ``device_os_guess`` / ``os_hint`` /
         ``role_guess`` / ``first_seen`` / ``last_seen`` / ``top_peers`` /
-        ``top_ports`` / ``top_dns`` and an ``evidence`` sub-dict holding the raw
-        strings backing each guess. ``os_hint`` (additive) is the telemetry-domain
+        ``top_ports`` / ``top_dns`` / ``top_dns_sample_size`` and an ``evidence``
+        sub-dict holding the raw strings backing each guess. ``top_peers`` and
+        ``top_ports`` count every matching document; ``top_dns`` counts only the
+        sampled hits, which is why its key is ``count_in_sample``.
+        ``os_hint`` (additive) is the telemetry-domain
         OS inference — ``{os, confidence, signals, basis}`` with the matched
         vendor domains in ``signals`` — or ``None`` when no telemetry named an OS;
         it backfills ``device_os_guess`` for a TLS-only host with no User-Agent.
-        On no data: a clean ``observations: False`` result. On an ES error or bad
-        IP: a clean ``{"error": True, "message": ...}`` dict. NEVER raises — the
-        caller is an LLM tool boundary.
+        ``provenance`` names the population every field was derived from.
+        On no data: a clean ``observations: False`` result carrying
+        ``imported_matches`` — how many imported documents name this address —
+        so "we have never seen this host" and "this host is only in a capture
+        somebody loaded" do not arrive as the same sentence. On an ES error or
+        bad IP: a clean ``{"error": True, "message": ...}`` dict. NEVER raises —
+        the caller is an LLM tool boundary.
     """
     try:
         ipaddress.ip_address(ip)
@@ -404,7 +493,7 @@ async def host_summary(
 
     index = settings.events_index_pattern
     time_range_minutes = lookback_hours * 60
-    query = _base_host_query(ip, time_range_minutes, time_anchor, include_synth)
+    query = _base_host_query(ip, time_range_minutes, time_anchor, include_synth, provenance)
 
     # Aggregations: peers (the OTHER endpoint), service ports the host responds
     # on, and DNS names it queried. Built as a single search so it's one round
@@ -413,13 +502,15 @@ async def host_summary(
         "peers_src": _terms_agg("source.ip"),
         "peers_dst": _terms_agg("destination.ip"),
         "resp_ports": {
-            # Only Zeek conn records — alert docs carry destination.port too and
-            # would inflate "ports this host serves" with IDS-targeted ports.
+            # Connection records only — alert docs carry destination.port too
+            # and would inflate "ports this host serves" with IDS-targeted
+            # ports. Every flow sensor, not just Zeek: see FLOW_DATASETS for
+            # what scoping this to one plane cost.
             "filter": {
                 "bool": {
                     "must": [
                         {"term": {"destination.ip": ip}},
-                        {"term": {"event.dataset": "zeek.conn"}},
+                        flow_dataset_filter(),
                     ]
                 }
             },
@@ -473,11 +564,24 @@ async def host_summary(
         return {"error": True, "type": type(e).__name__, "message": str(e)}
 
     if result.total == 0 and not result.hits:
-        return _empty_result(ip)
+        # The branch the live scope can newly reach, and the one an analyst
+        # holding an alert about this address is most likely to misread. ``ANY``
+        # rebuilds the identical query minus its provenance clauses, so the
+        # number is about this host and this window rather than about the grid.
+        imported = await count_imports(
+            elastic,
+            index,
+            _base_host_query(ip, time_range_minutes, time_anchor, include_synth, ANY),
+        )
+        return _empty_result(ip, provenance, imported)
 
     hits = [h.get("_source", {}) for h in result.hits]
     aggregations = result.aggregations or {}
-    evidence: dict[str, Any] = {}
+    # This tool has no summary sentence to carry the denominator, so it goes in
+    # the evidence block, which is the part of the return that already exists to
+    # say what each answer rests on. A hostname is an answer about a machine,
+    # and which machine depends on which documents were allowed to describe it.
+    evidence: dict[str, Any] = {"population": denominator_note(provenance)}
 
     # --- hostname (DHCP host_name > SMB/DCE-RPC announcement > host.name > PTR) ---
     hostname, hostname_evidence = _resolve_hostname(hits, ip)
@@ -524,6 +628,7 @@ async def host_summary(
     return {
         "ip": ip,
         "observations": True,
+        "provenance": provenance,
         "event_count": result.total,
         "hostname": hostname,
         "device_os_guess": device_os_guess,
@@ -537,6 +642,7 @@ async def host_summary(
         "top_peers": top_peers,
         "top_ports": top_ports,
         "top_dns": top_dns,
+        "top_dns_sample_size": len(hits),
         "evidence": evidence,
     }
 
@@ -590,7 +696,13 @@ def _collect_top_dns(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if low.endswith((".in-addr.arpa", ".ip6.arpa")):
             continue
         counts[qname] += 1
-    return [{"value": name, "count": count} for name, count in counts.most_common(_AGG_SIZE)]
+    # ``count_in_sample``, not ``count``: this is a tally over the sampled hits,
+    # while the sibling top_peers / top_ports counts are terms aggregations over
+    # every matching document. Same shape, same neighbourhood, different
+    # denominator by three orders of magnitude on a busy host.
+    return [
+        {"value": name, "count_in_sample": count} for name, count in counts.most_common(_AGG_SIZE)
+    ]
 
 
 def _collect_telemetry_domains(hits: list[dict[str, Any]]) -> list[str]:

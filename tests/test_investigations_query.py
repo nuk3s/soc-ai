@@ -54,8 +54,14 @@ def _mk(
     rule: str = "GPL ICMP Large ICMP Packet",
     src: str = "192.168.50.10",
     dst: str = "192.168.50.99",
+    subject: dict[str, Any] | None = None,
 ) -> Investigation:
-    """One seeded run. Ids are zero-padded so the id-desc tiebreak is deterministic."""
+    """One seeded run. Ids are zero-padded so the id-desc tiebreak is deterministic.
+
+    ``subject`` is migration 0050's record of what the run investigated. A
+    hunt subject makes the row a run of the hunt, not of the document it
+    anchors on.
+    """
     return Investigation(
         id=f"{seq:026d}",
         alert_es_id=alert or f"ev-{seq}",
@@ -71,6 +77,7 @@ def _mk(
         # directly-constructed row matches a production one — query_page reads
         # this column, not the report JSON.
         is_fallback=is_pipeline_fallback(report),
+        subject_json=subject,
     )
 
 
@@ -814,6 +821,54 @@ def test_route_leaves_an_uncontested_run_reporting_only_itself(client: TestClien
     assert newest_error["latestRunStatus"] == "error"
 
 
+def test_route_keeps_a_promoted_hunt_out_of_its_anchor_alerts_group(
+    client: TestClient,
+) -> None:
+    """D2. A hunt-subject run stands alone. It is not the alert's newest run.
+
+    The promotion anchors on the first cited document, so the row carries that
+    document in ``alert_es_id``. The list grouped it under the alert: the
+    alert's own investigation arrived isPrimary false with latestRunId naming
+    the promotion, and a false positive on the hunt's hypothesis read as the
+    alert's verdict.
+    """
+    now = utcnow()
+    _seed_route(
+        client,
+        [
+            _mk(
+                1,
+                status="complete",
+                verdict="true_positive",
+                alert="ev-anchor",
+                created_at=now - timedelta(hours=2),
+            ),
+            _mk(
+                2,
+                status="complete",
+                verdict="false_positive",
+                alert="ev-anchor",
+                created_at=now - timedelta(minutes=5),
+                rule="Lead 10 on 10.1.2.3",
+                subject={"type": "hunt", "hunt_id": "01HUNT", "lead_id": 10},
+            ),
+        ],
+    )
+    rows = {r["id"]: r for r in client.get("/api/v1/investigations").json()["rows"]}
+    alert_run = rows[f"{1:026d}"]
+    hunt_run = rows[f"{2:026d}"]
+
+    assert alert_run["isPrimary"] is True
+    assert alert_run["latestRunId"] == alert_run["id"]
+    assert alert_run["latestRunStatus"] == "complete"
+
+    assert hunt_run["subjectType"] == "hunt"
+    assert hunt_run["isPrimary"] is True
+    assert hunt_run["latestRunId"] == hunt_run["id"]
+    # The row groups under itself, so the screen cannot nest it under the alert.
+    assert hunt_run["alertId"] == hunt_run["id"]
+
+
 def test_route_since_until_pass_through(client: TestClient) -> None:
     now = utcnow().replace(microsecond=0)
     _seed_route(
@@ -1014,3 +1069,131 @@ def test_an_over_long_search_is_refused_not_truncated(client: TestClient) -> Non
     # The bound itself is still usable.
     ok = client.get("/api/v1/investigations", params={"q": "x" * 200})
     assert ok.status_code == 200, ok.text
+
+
+# ── The tile's count and the list it opens (dogfood 2026-09-07, D2) ───────────
+#
+# The dashboard's pipeline-error tile counted runs after excluding the dismissed
+# and the superseded. The list it deep-linked to applied neither exclusion and
+# offered no filter or marker for them, so the tile went nine, eight, seven
+# while the list sat at twenty and a run dismissed seconds earlier rendered
+# exactly like a counted one. The exclusions now live behind a filter the list
+# can ask for, which is what lets both surfaces read the same number off the
+# same code path.
+
+
+def _pipeline_error_fixture(client: TestClient) -> None:
+    """Four pipeline errors: two still needing a retry, two already handled."""
+    now = utcnow()
+    live_fallback = _mk(
+        1, status="complete", verdict="needs_more_info", created_at=now, report=_FALLBACK_REPORT
+    )
+    dismissed = _mk(
+        2,
+        status="complete",
+        verdict="needs_more_info",
+        created_at=now - timedelta(minutes=1),
+        report=_FALLBACK_REPORT,
+    )
+    dismissed.error_dismissed_at = now
+    superseded = _mk(
+        3,
+        status="complete",
+        verdict="needs_more_info",
+        created_at=now - timedelta(minutes=5),
+        alert="ev-shared",
+        report=_FALLBACK_REPORT,
+    )
+    retry_that_worked = _mk(
+        4,
+        status="complete",
+        verdict="true_positive",
+        created_at=now - timedelta(minutes=2),
+        alert="ev-shared",
+    )
+    died_outright = _mk(5, status="error", created_at=now - timedelta(minutes=9))
+    _seed_route(client, [live_fallback, dismissed, superseded, retry_that_worked, died_outright])
+
+
+def test_error_state_live_excludes_dismissed_and_superseded_runs(client: TestClient) -> None:
+    """error_state=live is the tile's predicate, served by the list's own query.
+
+    Unfiltered the list still shows every pipeline error, dismissed and
+    superseded included: the ack silences a nag, it does not delete history.
+    """
+    _pipeline_error_fixture(client)
+
+    everything = client.get("/api/v1/investigations?verdict=pipeline_error").json()
+    assert everything["total"] == 4
+
+    live = client.get("/api/v1/investigations?verdict=pipeline_error&error_state=live").json()
+    assert live["total"] == 2
+    assert {r["id"] for r in live["rows"]} == {f"{1:026d}", f"{5:026d}"}
+    # The header figure describes the rows beneath it, not the wider query.
+    assert len(live["rows"]) == live["total"]
+
+
+def test_error_state_handled_is_the_complement(client: TestClient) -> None:
+    """live + handled partitions the filter set: nothing is dropped or counted twice."""
+    _pipeline_error_fixture(client)
+
+    handled = client.get("/api/v1/investigations?verdict=pipeline_error&error_state=handled").json()
+    assert handled["total"] == 2
+    assert {r["id"] for r in handled["rows"]} == {f"{2:026d}", f"{3:026d}"}
+    # Each row says WHY it is handled, so neither renders like a counted one.
+    by_id = {r["id"]: r for r in handled["rows"]}
+    assert by_id[f"{2:026d}"]["errorDismissed"] is True
+    assert by_id[f"{3:026d}"]["isPrimary"] is False
+
+
+def test_error_state_pages_the_partition_not_the_query(client: TestClient) -> None:
+    """Paging walks the partition, so page two of "live" is not page two of
+    the unfiltered query with the handled rows punched out of it."""
+    _pipeline_error_fixture(client)
+
+    p1 = client.get(
+        "/api/v1/investigations?verdict=pipeline_error&error_state=live&limit=1&offset=0"
+    ).json()
+    p2 = client.get(
+        "/api/v1/investigations?verdict=pipeline_error&error_state=live&limit=1&offset=1"
+    ).json()
+    assert len(p1["rows"]) == len(p2["rows"]) == 1
+    assert p1["total"] == p2["total"] == 2
+    assert p1["rows"][0]["id"] != p2["rows"][0]["id"]
+
+
+def test_error_state_says_so_when_the_set_outgrew_one_page(client: TestClient, monkeypatch) -> None:
+    """The partition is decided in Python over one capped read, so past the cap
+    the count is a FLOOR. Saying so is the difference between a number and a
+    guess."""
+    _pipeline_error_fixture(client)
+    monkeypatch.setattr(inv_svc, "MAX_PAGE_LIMIT", 2)
+
+    body = client.get("/api/v1/investigations?verdict=pipeline_error&error_state=live").json()
+    assert body["partial"] is True
+
+    monkeypatch.setattr(inv_svc, "MAX_PAGE_LIMIT", 500)
+    whole = client.get("/api/v1/investigations?verdict=pipeline_error&error_state=live").json()
+    assert whole["partial"] is False
+
+
+def test_unknown_error_state_is_dropped_not_rejected(client: TestClient) -> None:
+    """A mangled deep link degrades to the broader query, the way an unknown
+    verdict member already does. It must never wedge the list behind a 4xx."""
+    _pipeline_error_fixture(client)
+
+    resp = client.get("/api/v1/investigations?verdict=pipeline_error&error_state=bogus")
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 4
+
+
+def test_error_state_leaves_an_ordinary_list_query_alone(client: TestClient) -> None:
+    """Negative control: no error_state, no change. The list keeps showing the
+    dismissed and superseded rows it always showed."""
+    _pipeline_error_fixture(client)
+
+    body = client.get("/api/v1/investigations?verdict=pipeline_error").json()
+    assert body["partial"] is False
+    ids = {r["id"] for r in body["rows"]}
+    assert f"{2:026d}" in ids  # dismissed
+    assert f"{3:026d}" in ids  # superseded

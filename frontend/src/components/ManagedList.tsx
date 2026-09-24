@@ -282,7 +282,7 @@ export function ManagedList({
                   ) : (
                     <button
                       className={bulkBtn}
-                      title="Dismiss — remove these suggestions for good (re-add manually to restore)"
+                      title="Dismiss removes these suggestions permanently. Add them again by hand to restore them."
                       onClick={() => setPendingBulkDismiss(true)}
                     >
                       Dismiss ({selectedCount})
@@ -383,7 +383,7 @@ export function ManagedList({
                     ) : (
                       <button
                         onClick={() => setPendingDismiss(row.id as number)}
-                        title="Dismiss — remove this suggestion for good (re-add manually to restore)"
+                        title="Dismiss removes this suggestion permanently. Add it again by hand to restore it."
                         className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:border-accent hover:text-text"
                       >
                         Dismiss

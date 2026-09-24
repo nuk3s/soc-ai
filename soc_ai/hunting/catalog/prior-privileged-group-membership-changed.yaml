@@ -1,0 +1,39 @@
+id: prior-privileged-group-membership-changed
+title: An account changes the membership of a privileged group
+description: >
+  Domain Admins, Enterprise Admins, Schema Admins and their local equivalents
+  give full control of an estate. A membership change in these groups is rare
+  and deliberate. A membership change is also the most common persistence step
+  after a domain compromise.
+
+  This analytic is single-shot. It reports the change on its own. It never waits
+  for a second signal to form a lead.
+
+level: critical
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+# "How often does privileged group membership change here" is not a question
+# whose answer makes any given change benign. A shop that reorganises its
+# admins monthly has a high rate and every one of those changes still matters.
+no_benign_baseline: true
+
+profile:
+  dimension: logon_users
+  test: novel_for
+  roles:
+    - domain_controller
+
+attack:
+  - T1098.007
+  - T1078.002
+
+false_positives:
+  - An operator onboards or offboards an administrator as planned. The change
+    record holds this fact. The telemetry does not show it. This analytic
+    reports the change, and the analyst confirms it.
+  - A directory synchronisation tool rewrites group membership on a schedule.
+
+references:
+  - https://attack.mitre.org/techniques/T1098/007/

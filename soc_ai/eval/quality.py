@@ -205,6 +205,10 @@ class TrendPoint:
     # back to the median rule instead of silently pooling absent evidence.
     n_yes: int | None = None
     n_classified: int | None = None
+    # Whether THIS point already alarmed for agreement. See _pool_baseline: a
+    # night the detector called a regression is not evidence of the normal rate,
+    # and pooling it teaches the baseline to accept it.
+    agreement_alarmed: bool = False
 
 
 def compute_snapshot_metrics(
@@ -328,16 +332,25 @@ def _pool_baseline(history: list[TrendPoint]) -> _PooledBaseline | None:
     evidence, so neither contributes to the pool OR to the history quorum —
     otherwise three empty nights and two real ones would look like a baseline.
     """
-    counted = [
-        (p.n_yes, p.n_classified)
-        for p in history[:BASELINE_WINDOW]
-        if p.n_yes is not None and p.n_classified
-    ]
+    window = [p for p in history[:BASELINE_WINDOW] if p.n_yes is not None and p.n_classified]
+    # Nights this detector already called a regression are not evidence of the
+    # normal rate. Pooling them is how a sustained decline becomes the new
+    # baseline and the alarm goes quiet without anything improving: on the home
+    # deployment the baseline slid 0.75 → 0.73 → 0.70 → 0.68 → 0.61 across the
+    # bad nights, and two identical 1-of-5 measurements five days apart got
+    # opposite answers — the first paged, the second was unremarkable against a
+    # baseline the first had helped lower.
+    #
+    # Deliberately conservative: if dropping them leaves too little history the
+    # old pool is used unchanged, so this can only ever make the detector harder
+    # to erode, never blinder than it was.
+    clean = [p for p in window if not p.agreement_alarmed]
+    counted = [(p.n_yes, p.n_classified) for p in (clean if len(clean) >= MIN_HISTORY else window)]
     if len(counted) < MIN_HISTORY:
         return None
     return _PooledBaseline(
-        n_yes=sum(yes for yes, _ in counted),
-        n_classified=sum(n for _, n in counted),
+        n_yes=sum(yes for yes, _ in counted if yes is not None),
+        n_classified=sum(n for _, n in counted if n),
         n_points=len(counted),
     )
 
@@ -361,11 +374,85 @@ def _agreement_drop_by_counts(
 
     return AlarmReason(
         CODE_AGREEMENT_DROP,
-        f"agreement_rate {rate:.2f} ({new.n_yes}/{new.n_classified} grades agreed) "
+        f"agreement_rate {rate:.2f} ({_grade_split(new)}) "
         f"is a real drop from the pooled baseline {baseline.rate:.2f} "
         f"({baseline.n_yes}/{baseline.n_classified} over {baseline.n_points} runs) — "
-        f"a night this bad happens by chance {tail * 100:.1f}% of the time",
+        f"a night this bad happens by chance {tail * 100:.1f}% of the time"
+        f"{_what_kind_of_bad(new)}{_what_this_cannot_tell_you(new)}",
     )
+
+
+# Verdicts that mean the run called something a threat. A batch with none of
+# these observed no positive at all, whatever its agreement rate says.
+_POSITIVE_VERDICTS = ("true_positive", "escalate")
+
+
+def _what_this_cannot_tell_you(new: SnapshotMetrics) -> str:
+    """Bound the claim when the batch contained no positive verdict.
+
+    The nightly batch is drawn from the live alert queue and plants no ground
+    truth — there is no synth injection anywhere in soc_ai/eval/nightly.py. On a
+    quiet grid every alert in it is benign, so the rate measures the grader's
+    opinion of benign traffic. That is worth watching and it is not what the
+    label "quality" is read as.
+
+    It matters most in the direction nobody checks: if the analyst model started
+    calling real intrusions benign, the grader would agree that benign things
+    are benign and this number would go UP. An alarm that cannot move on the
+    failure that matters should say so rather than let its silence imply cover.
+    """
+    counts = new.verdict_counts or {}
+    if any(counts.get(v) for v in _POSITIVE_VERDICTS):
+        return ""
+    return (
+        ". Every verdict in this batch was benign and the batch plants no known "
+        "positive, so this measures agreement on benign traffic only — it is not "
+        "evidence either way about whether a real detection would be caught"
+    )
+
+
+def _grade_split(new: SnapshotMetrics) -> str:
+    """The three counts behind the rate, never just the numerator.
+
+    "0/5 grades agreed" is false when all five were partial: the oracle agreed
+    with every verdict and declined to fully stand behind the reasoning. Five
+    partials and five flat contradictions produce the identical rate and call
+    for opposite responses, and the operator was reading the first as the
+    second. `partial` sits in the denominator but not the numerator by design
+    (see soc_ai/eval/report.py) — that is defensible arithmetic and indefensible
+    prose, so the prose now carries the split the dataclass already holds.
+    """
+    whole = f"{new.n_yes} of {new.n_classified} fully agreed"
+    # Only break it down when the three parts actually account for the
+    # denominator. They always do in real snapshots (report.py derives
+    # n_classified as their sum), but a caller that supplied only n_yes would
+    # otherwise be shown a fabricated "0 partial, 0 disagreed".
+    if new.n_yes + new.n_partial + new.n_no != new.n_classified:
+        return whole
+    return f"{whole}: {new.n_partial} partial, {new.n_no} disagreed"
+
+
+def _what_kind_of_bad(new: SnapshotMetrics) -> str:
+    """Name the shape of the drop when it is unambiguous, else say nothing.
+
+    The two shapes want different work — thin reasoning is prompt and citation
+    work, wrong verdicts are model and logic work — so an alarm that cannot
+    distinguish them sends its reader looking in the wrong place.
+    """
+    if not new.n_classified:
+        return ""
+    if new.n_no == 0 and new.n_partial:
+        return (
+            ". Every grade was partial: the oracle contradicted no verdict, it declined to "
+            "fully stand behind the reasoning, which points at thin grounds or missing "
+            "citations rather than wrong calls"
+        )
+    if new.n_partial == 0 and new.n_no:
+        return (
+            ". Every grade was a flat disagreement, not thin reasoning — the verdicts "
+            "themselves are what the oracle rejected"
+        )
+    return ""
 
 
 def _agreement_drop_by_median(

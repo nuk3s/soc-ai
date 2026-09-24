@@ -52,7 +52,7 @@ export function useHuntLaunch(): HuntLaunch {
       .catch((e: unknown) => {
         setStartError((s) => ({
           ...s,
-          [idx]: e instanceof Error ? e.message : 'Could not start the hunt — please try again.',
+          [idx]: e instanceof Error ? e.message : 'Could not start the hunt. Try again.',
         }));
         setStarting(null); // stays on the page; the card is still confirmable
       });

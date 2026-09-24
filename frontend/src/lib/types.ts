@@ -10,9 +10,25 @@ export type Verdict =
   | 'inconclusive'
   | 'untriaged';
 
-export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+/** 'unknown' is what the backend reports for an alert whose document carries no
+ *  `event.severity_label`. It is not a rung on the ladder and must not be
+ *  rendered as one: on the measured grid every alert in the 24 hour queue was
+ *  unlabelled, and folding them into 'low' put the highest-signal detections on
+ *  the range at the bottom of the screen. */
+export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info' | 'unknown';
 
-export type DetectionKind = 'suricata' | 'sigma' | 'notice' | 'hunt';
+/** How a detection group is scoped. The first four name a detector; 'unnamed'
+ * is the group of alerts that carry no `rule.name` at all (OpenCanary honeypot
+ * events, on the range this was measured on), named by their `event.dataset`
+ * instead. It travels with the group because expanding or acknowledging one
+ * posts the kind back, and only 'unnamed' resolves the group's name against
+ * the dataset rather than a rule name.
+ *
+ * 'alert' names no detector on purpose: it is an alert-labelled document from a
+ * dataset the feed does not map, which on the measured grid was every Elastic
+ * Defend endpoint alert. Rendering those as 'suricata' claimed a sensor that
+ * produced none of them. */
+export type DetectionKind = 'suricata' | 'sigma' | 'notice' | 'hunt' | 'unnamed' | 'alert';
 
 /** Human triage state on an alert assignment (E2.3). "unassigned" (no owner) is
  * modelled as the ABSENCE of state (null), so a set state is always one of these. */
@@ -98,10 +114,14 @@ export interface AlertGroup {
   dst?: string | null;
   /** true while the rule's latest investigation is still running — show "Triaging…" pill. */
   triaging?: boolean;
-  /** number of acknowledged events in this group (from ES aggs). */
-  ackedCount?: number;
-  /** number of escalated events in this group (from ES aggs). */
-  escalatedCount?: number;
+  /** number of acknowledged events in this group (from ES aggs), or null when the
+   * grid cannot answer — Elastic Defend's endpoint alert index does not map the
+   * flag, so its aggregation reads 0 for a cleared group and an untouched one
+   * alike. null renders an "unknown" chip; 0 renders nothing. */
+  ackedCount?: number | null;
+  /** number of escalated events in this group (from ES aggs), or null on the same
+   * indices and for the same reason as {@link ackedCount}. */
+  escalatedCount?: number | null;
   /** true when the rule's standing verdict is a pipeline-failure fallback (E1.2) —
    * the badge renders a "pipeline error — retry" chip and the Dashboard excludes it
    * from the Needs-info KPI. */
@@ -111,6 +131,18 @@ export interface AlertGroup {
    * small red "· last retry failed {ago}" hint next to the verdict chip and a
    * retry affordance on the row. None when the newest run IS the standing verdict. */
   lastAttempt?: LastAttempt | null;
+}
+
+/** Returned by GET /api/v1/alerts/empty-reason: why the queue is showing nothing.
+ *
+ * Fetched only when the list came back empty. An empty queue has two causes
+ * that look identical on screen: the grid is quiet, or the configured alerts
+ * filter does not match how this grid labels an alert. `unknown` is the third
+ * answer and it is never folded into `quiet`, because a read that failed is not a
+ * calm network. */
+export interface AlertsEmptyReason {
+  reason: 'not_empty' | 'quiet' | 'filter_mismatch' | 'bad_filter' | 'unknown';
+  hint: string;
 }
 
 // ---- Representative-event picker -------------------------------------------
@@ -278,6 +310,35 @@ export interface GraphEdge {
   label?: string;
 }
 
+/**
+ * What an investigation investigated, when the subject is a whole hunt.
+ *
+ * An alert investigation has one rule and one event. A hunt investigation has
+ * an objective, a set of findings and every document those findings cite, so
+ * there is no rule to name and no single event to show. The page reads this
+ * block where an alert page reads `alert`.
+ *
+ * Absent on an alert investigation and on a backend that predates the subject
+ * column, so every consumer treats absence as "an alert subject".
+ */
+export interface InvestigationSubject {
+  type: 'hunt';
+  hunt_id: string;
+  objective: string;
+  /** The findings the investigation read, by their ordinal on the hunt. */
+  finding_ordinals: number[];
+  /** The title of each of those findings, in the order of the ordinals.
+   *  Absent on a backend that sends the ordinals alone, and the page then
+   *  names the ordinals. */
+  finding_titles?: string[];
+  /** The lead the hunt started from, or null when an analyst started it. */
+  lead_id: number | null;
+  /** Every document the findings cite, by id. */
+  document_ids: string[];
+  /** The lead's observations, by id. */
+  observation_ids: number[];
+}
+
 export interface Investigation {
   id: string;
   /** alert-group id this investigation was opened from (drawer routing). */
@@ -334,6 +395,9 @@ export interface Investigation {
    *  (no FK server-side — the link may dangle). */
   huntId?: string | null;
   huntObjective?: string | null;
+  /** What this run investigated, when the subject is a whole hunt rather than
+   *  one alert. Absent on an alert investigation. */
+  subject?: InvestigationSubject;
   /** synthetic-evaluation marker (migration 0032): this run investigated PLANTED
    * synthetic attack scenarios — badged so it can never be read as real activity. */
   isSynthEval?: boolean;
@@ -404,12 +468,21 @@ export interface InvestigationRow {
   /** true when this run's needs_more_info is a pipeline-failure fallback (E1.2) —
    * rendered as a "pipeline error — retry" chip, filterable, excluded from the NMI KPI. */
   fallback?: boolean;
-  /** operator ack of a fallback run (dismiss-error) — the Dashboard's pipeline-error
-   * KPI counts only `fallback && !errorDismissed`; the row itself stays a fallback. */
+  /** true when this run ended in a failure state having reached NO verdict. The other
+   * half of "produced nothing usable": a fallback at least wrote a report to be marked,
+   * these wrote nothing, so a count keyed on `fallback` alone never saw them. */
+  noVerdict?: boolean;
+  /** operator ack of a failed run (dismiss-error): the Dashboard's pipeline-error KPI
+   * counts only `(fallback || noVerdict) && !errorDismissed`; the row itself is unchanged. */
   errorDismissed?: boolean;
   /** synthetic-evaluation marker (migration 0032): this run investigated PLANTED
    * synthetic attack scenarios — badged so it can never be read as real activity. */
   isSynthEval?: boolean;
+  /** What the run investigated: one alert, or a whole hunt. The row carries a
+   *  type chip for a hunt subject, beside the detection type. Absent on a
+   *  backend that predates the subject column, and the row then reads as an
+   *  alert, which is what every row before this release was. */
+  subjectType?: 'alert' | 'hunt';
 }
 
 /** One SQL page of GET /api/v1/investigations — the /dossiers list shape.
@@ -429,6 +502,9 @@ export interface InvestigationList {
   /** The clamped values the server actually used — page by these. */
   limit: number;
   offset: number;
+  /** Set when an `errorState` partition was decided over a capped read the
+   *  filter set outgrew, which makes `total` a FLOOR rather than a count. */
+  partial?: boolean;
 }
 
 // ---- Hunts -----------------------------------------------------------------
@@ -437,7 +513,7 @@ export interface InvestigationList {
 // single-alert verdict. These mirror the /api/v1/hunts* JSON shapes.
 
 export type HuntStatus = 'running' | 'complete' | 'error' | 'cancelled' | 'interrupted';
-export type HuntKind = 'chat' | 'scheduled' | 'triggered';
+export type HuntKind = 'chat' | 'scheduled' | 'triggered' | 'lead';
 
 /** One row in the Hunts list. */
 export interface HuntRow {
@@ -446,9 +522,21 @@ export interface HuntRow {
   kind: HuntKind;
   status: HuntStatus;
   findingCount: number;
+  /** Findings that claim a threat (visibility gaps and observations excluded). */
+  threatFindingCount?: number;
+  /** How a complete hunt ended: threats | clean | gap (no telemetry) | failed (could not run). */
+  outcome?: 'threats' | 'clean' | 'gap' | 'failed' | '';
+  /** The status word the backend wrote for a complete hunt. The client derived
+   *  its own from `outcome`, and the two disagreed on the hunt page. The
+   *  backend's word wins. Absent on a row an older backend answered. */
+  outcome_label?: string;
   affectedHosts: number;
   confidence: number | null;
   startedBy: string;
+  /** The class that started the hunt. startedBy keeps the actor name. */
+  starter?: 'analyst' | 'schedule' | 'lead' | 'catalog';
+  /** The lead a lead-started hunt came from. */
+  leadId?: number | null;
   when: string;
   ts: string;
   /** Follow-up chat messages on this hunt (0 = no chat log). */
@@ -478,6 +566,15 @@ export interface HuntFinding {
   /** Set by the deterministic post-hunt citation gate when it stripped
    *  non-resolving citations or capped severity (mirrors Investigation). */
   validatorNote?: string | null;
+  /** A CATALOG finding's detail is the spec's authoring-time prose followed by
+   *  this run's result. This is that first half, sent by the composer that
+   *  joined them, and it is always the head of `detail`. Absent on a model's
+   *  finding and on catalog hunts recorded before the field existed. */
+  specRationale?: string | null;
+  /** Documents this candidate matched, for the "3 of 4 matching documents"
+   *  note beside the citation chips (a bucket cites at most three ids).
+   *  Absent on a gap finding, which counted no candidate documents. */
+  matchedDocs?: number | null;
   /** The newest investigation promoted from this finding, or null/absent when
    *  never promoted. An errored/cancelled/interrupted promotion frees the
    *  re-promote slot server-side, so the card falls back to Investigate even
@@ -576,12 +673,21 @@ export interface HuntDetailData {
   affectedHosts: string[];
   mitreTechniques: string[];
   recommendedActions: HuntAction[];
-  confidence: number;
+  /** null when nothing scored the hunt: a catalog hunt is one query from a
+   *  written spec and its report carries no confidence at all. 0 is a
+   *  measurement (a model that landed on zero) and renders as 0.00. */
+  confidence: number | null;
   startedBy: string;
   elapsedLabel: string;
   elapsedSec: number;
   ts: string;
   timeline: TimelineStep[];
+  /** The class that started the hunt. startedBy keeps the actor name. Absent
+   *  on a route that sends none, and `kind` answers instead. */
+  starter?: 'analyst' | 'schedule' | 'lead' | 'catalog';
+  /** The lead a lead-started hunt came from. Absent on a route that sends
+   *  none, and the hunts list answers instead. */
+  leadId?: number | null;
   /** "vs last run" finding diff — null/absent on the first run of an objective. */
   diff?: HuntDiff | null;
   /** synthetic-evaluation marker (migration 0032): this hunt ran against PLANTED
@@ -686,6 +792,11 @@ export interface Me {
   username: string;
   role: string;
   status: string;
+  /** Whether a real user ROW is behind this session. False for a bearer-token
+   *  caller and for a deployment running with authentication off: both are
+   *  states where per-user features cannot mean what they say. Optional so a
+   *  page served by an older build reads as "unknown" rather than "no". */
+  signed_in?: boolean;
 }
 
 export interface Config {
@@ -796,6 +907,13 @@ export interface Notification {
    * planted attack as real activity. Absent on non-run entries (dep outages,
    * dossier conflicts). */
   isSynthEval?: boolean;
+  /** Whether the operator may silence this entry. Absent or true for every
+   * ordinary notification, because dismissal on a stable id is the mechanism the
+   * whole bell runs on. False is for a finding that must not be silenceable
+   * from local storage: an audit record whose content no longer matches its
+   * own hash. Those rows carry no dismiss control and "Clear all" steps over
+   * them, because a tamper alarm that one click can sweep away is not one. */
+  dismissible?: boolean;
 }
 
 // ── Backtest ("prove it on my last N days") ─────────────────────────────────
@@ -1060,8 +1178,27 @@ export interface DossierRow {
 
 /** One host's full dossier. Narrows `fields` the way the backend's DossierOut
  *  narrows DossierRowOut's — same rows, with the paper trail attached. */
+/** One dimension of a host's behavioural profile. `coverage` is the
+ *  load-bearing field: `measured` over an empty set means the host genuinely
+ *  does none of this, `blind` means no plane on the grid can answer for it,
+ *  `learning` means under seven days of history. Rendered identically those
+ *  are the most dangerous three words in the app. */
+export interface ProfileDimension {
+  dimension: string;
+  shape: 'categorical' | 'numeric' | 'active_hours' | string;
+  coverage: 'measured' | 'learning' | 'blind' | 'behind_proxy' | string;
+  support_days: number;
+  window_days: number;
+  summary: string;
+  top: [string, number][];
+}
+
 export interface Dossier extends DossierRow {
   fields: DossierField[];
+  /** Served on the same read as the fields, so the two cannot describe
+   *  different builds of the same host. Empty for a host never profiled;
+   *  absent from an older backend, which the page reads as empty. */
+  profile?: ProfileDimension[];
 }
 
 export interface DossierList {
@@ -1129,6 +1266,9 @@ export interface DossierSummary {
    *  no bucket, so the values need not sum to `hosts`: the difference is the
    *  unresolved remainder the distribution bar draws in gray. */
   roles: Record<string, number>;
+  /** Hosts whose inferred role is below the confidence gate (or stale) with no
+   *  operator value — 'possibly …' on the host page, unscored by role-scoped hunts. */
+  roles_low_confidence?: number;
   /** The newest build stamp in the table; null when nothing has ever been swept. */
   last_built_at: string | null;
   /** Whether sweeps run on a schedule. Off by default, in which case these
@@ -1329,5 +1469,28 @@ export interface AuditChainVerifyResult {
   epochs_broken: number;
   newest_broken_epoch_start: string | null;
   latest_epoch_broken: boolean;
+  // WHAT broke, for the oldest and the newest broken epoch (null iff ok). A
+  // position claimed twice by two concurrent writers and a record whose
+  // content was edited after the fact are different emergencies, and the
+  // verdict used to read the same for both. `*_detail` is one printable
+  // sentence; `*_kind` is one of duplicate_seq / missing_seq / orphan_head /
+  // relinked / content_altered.
+  first_break_kind: string | null;
+  first_break_detail: string | null;
+  newest_break_kind: string | null;
+  newest_break_detail: string | null;
+  // The population behind the break rather than its first instance, and the
+  // one printable sentence the CLI and the notification bell already render.
+  // `blast_radius` is '' iff `ok`. Optional so a response from an older
+  // backend still parses.
+  duplicate_seqs?: number;
+  extra_records?: number;
+  max_claimants?: number;
+  altered_records?: number;
+  missing_seqs?: number;
+  oldest_break_at?: string | null;
+  newest_break_at?: string | null;
+  break_kinds?: string[];
+  blast_radius?: string;
   checked_at: string;
 }

@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
+import { ChatDockShell, ChatPanelShell, DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { Markdown } from '../components/Markdown';
@@ -50,6 +50,17 @@ import {
   resolveInvestigation,
   startHunt,
 } from '../lib/api';
+import { ackMessage, escalateMessage } from '../lib/groupWriteMessages';
+import { plural } from '../lib/plural';
+import { firstSentence } from '../lib/text';
+import {
+  CHIP_SUBJECT_HUNT,
+  SUBJECT_DOCUMENTS,
+  SUBJECT_FINDINGS,
+  SUBJECT_HUNT_LINK,
+  SUBJECT_LEAD,
+  SUBJECT_OBJECTIVE,
+} from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { useChatThread } from '../lib/useChatThread';
 import { demoBlocked, useDemo } from '../lib/demo';
@@ -62,6 +73,7 @@ import type {
   DetectionKind,
   HostSignal,
   Investigation as Inv,
+  InvestigationSubject,
   InvMeta,
   OracleAdjudication,
   RecommendedAction,
@@ -181,6 +193,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const cancelled = inv.status === 'cancelled';
   const interrupted = inv.status === 'interrupted';
   const failed = inv.status === 'error' || cancelled || interrupted || (investigating && stuck);
+  // A triage that DIED: the run ended in a failure state having reached no
+  // verdict. Narrower than `failed` on purpose: a cancel was asked for and a
+  // restart orphan is re-huntable by design, so neither is an unattended hole,
+  // and neither belongs in the count the Dismiss button clears. This is the
+  // client's read of the server's `noVerdict` predicate, on the drawer shape
+  // (which carries status and verdict, not the list row's flag).
+  const diedWithNoVerdict = inv.status === 'error' && inv.verdict === 'untriaged';
   // Only spin while genuinely in-flight (not once we've decided it's stuck).
   const running = investigating && !stuck;
 
@@ -264,6 +283,26 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       });
   };
 
+  // One control, two panels. The E1.2 fallback panel below has always carried
+  // it; the terminal-failure panel had no way to clear anything, which is how a
+  // deployed instance reached 188 unacknowledged dead runs: the Dashboard could
+  // not have counted them down even if it had counted them.
+  const dismissControl = errorDismissed ? (
+    <span className="flex items-center gap-1.5 text-[12.5px] text-dim">
+      <Check size={13} /> Dismissed. The Dashboard does not count this run.
+    </span>
+  ) : (
+    <button
+      onClick={dismissError}
+      disabled={errDismiss === 'busy'}
+      title="This button acknowledges the failed run. The Dashboard stops counting the run. The run stays under the Investigations 'Pipeline error' filter, and you can still re-run it."
+      className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[12.5px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
+    >
+      {errDismiss === 'busy' ? <Spinner size={13} /> : <X size={13} />}
+      {errDismiss === 'busy' ? 'Dismissing…' : 'Dismiss'}
+    </button>
+  );
+
   // Why a start that never landed is reported the way it is.
   //
   // Both of this screen's start buttons used to end in an empty catch, so a
@@ -299,11 +338,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const startFailure = (err: unknown, action: string): string => {
     const detail = err instanceof Error ? err.message.trim() : '';
     if (err instanceof ApiError) {
-      return `${action} was refused. ${endSentence(detail || `The API answered ${err.status}`)}`;
+      return `The API refused ${action}. ${endSentence(detail || `The API answered ${err.status}`)}`;
     }
     return (
-      `No answer to ${action} — the run may have started anyway, so check the ` +
-      `Investigations list for a newer run of this alert before starting another. ${endSentence(
+      `The API gave no answer to ${action}. The run may have started anyway. ` +
+      `Check the Investigations list for a newer run of this alert before you start another. ${endSentence(
         detail || 'The request did not complete',
       )}`
     );
@@ -374,6 +413,14 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const graphInteresting =
     inv.edges.some((e) => e.kind === 'lateral') || inv.nodes.some((n) => n.kind === 'compromised');
 
+  // What this run investigated.
+  //
+  // A hunt subject replaces the alert panel rather than joining it: the rail
+  // answers "what did this run investigate", and a hunt investigation has an
+  // objective and a set of findings where an alert run has a rule and an
+  // event. Two panels there would give one run two subjects.
+  const huntSubject = inv.subject?.type === 'hunt' ? inv.subject : null;
+
   // ── composable section blocks (arranged differently per layout) ──────────
   const toolbarEl = (
     <div className="mb-3.5 flex items-center gap-2.5">
@@ -406,7 +453,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <button
           onClick={reRunDeep}
           disabled={reHunting}
-          title="This verdict came from the zero-tool fast path — re-run with the full tool-driven investigation loop instead"
+          title="This verdict came from the zero-tool fast path. Re-run it with the tool-driven investigation loop."
           className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
         >
           {reHunting ? <Spinner size={13} /> : <Crosshair size={13} />}
@@ -418,7 +465,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           "Export" beside it reads as the same download. */}
       <button
         onClick={() => { void downloadInvestigationExport(inv.id); }}
-        title="Download the decision record (tools, cited events, verdict — JSON with a sha256 integrity checksum)"
+        title="Download the decision record. The JSON file holds the tools, the cited events, the verdict and a sha256 integrity checksum."
         className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
       >
         <Download size={13} />
@@ -521,10 +568,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {stuck && inv.status === 'investigating'
             ? 'This investigation seems stuck'
             : interrupted
-              ? 'This investigation was interrupted by a restart'
+              ? 'A restart interrupted this investigation'
               : cancelled
-                ? 'This investigation was cancelled before it finished'
-                : 'This investigation failed or was interrupted'}
+                ? 'This investigation stopped before it finished'
+                : 'This investigation did not finish'}
         </div>
         {/* The verdict card carries this badge too, but a failed run renders
             THIS panel instead — the marker must survive every terminal state,
@@ -541,17 +588,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             instructions would mean different things at the same spot. */}
         {interrupted
           ? inv.kind === 'hunt'
-            ? 'No verdict yet — the service restarted while this was running. It will be re-investigated automatically if Auto-Investigate is on — or re-promote it from its hunt to try again.'
-            : 'No verdict yet — the service restarted while this was running. It will be re-investigated automatically if Auto-Investigate is on, or re-run it now.'
+            ? 'There is no verdict. The service restarted during the run. soc·ai re-investigates this finding if Auto-Investigate is on. Re-promote it from its hunt to try again.'
+            : 'There is no verdict. The service restarted during the run. soc·ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
           : cancelled
             ? inv.kind === 'hunt'
-              ? 'No verdict was reached — the run was stopped (an operator cancel, or the service restarting) before it finished — re-promote it from its hunt to try again.'
-              : 'No verdict was reached — the run was stopped (an operator cancel, or the service restarting) before it finished. Re-run it to get a verdict.'
+              ? 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-promote it from its hunt to try again.'
+              : 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-run it to get a verdict.'
             : inv.kind === 'hunt'
-              ? 'No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-promote it from its hunt to try again.'
-              : 'No verdict was reached. The run may have stalled or the agent crashed mid-flight — re-run it to try again.'}
+              ? 'The run reached no verdict. The run may have stalled. The agent may have crashed. Re-promote it from its hunt to try again.'
+              : 'The run reached no verdict. The run may have stalled. The agent may have crashed. Re-run it to try again.'}
       </div>
-      <div className="mt-[14px]">
+      <div className="mt-[14px] flex flex-wrap items-center gap-2">
         {inv.kind === 'hunt' ? (
           reRunOrPromoteLine('text-[13px] leading-[1.5] text-dim')
         ) : (
@@ -564,7 +611,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             {reHunting ? 'Re-running…' : 'Re-run investigation'}
           </button>
         )}
+        {/* Only where there is something to clear. A cancel was asked for and a
+            restart orphan is re-huntable, so neither is counted and neither can
+            be dismissed. Offering the button there would invite an ack on a run
+            that never needed one. */}
+        {diedWithNoVerdict && dismissControl}
       </div>
+      {diedWithNoVerdict && errDismissMsg && (
+        <div className="mt-2 text-[12px]" style={{ color: '#f04438' }}>
+          {errDismissMsg}
+        </div>
+      )}
     </div>
   );
 
@@ -584,18 +641,48 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             real one — badged right beside the verdict. */}
         {inv.isSynthEval && <SyntheticEvalBadge />}
         {demo && <RecordedRunChip />}
-        {inv.sev && <SeverityTag sev={inv.sev} />}
-        {/* min-w-0 + max-w-full + break-all: the badge may use the whole header
-            row and wraps internally when genuinely out of space — the FULL
-            destination is always visible, never clipped to a fragment. */}
-        <span
-          className="min-w-0 max-w-full rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
-          title={`source ${inv.host} → destination ${inv.ip}`}
-        >
-          <span className="break-all text-mono-amber">{inv.host}</span>
-          <span className="text-faint"> → </span>
-          <span className="break-all text-mono-green">{inv.ip}</span>
-        </span>
+        {/* What this run read, in one line. A hunt subject has no severity
+            and no pair of endpoints: the severity and the two addresses on
+            the header belonged to the first cited document, which is one of
+            many the run read. The objective and the lead are the subject. */}
+        {huntSubject ? (
+          <>
+            <span
+              data-testid="verdict-subject"
+              className="min-w-0 max-w-full text-[12.5px] text-dim"
+              title={SUBJECT_OBJECTIVE}
+            >
+              {firstSentence(huntSubject.objective)}
+            </span>
+            {huntSubject.lead_id != null && (
+              <Link
+                data-testid="verdict-lead"
+                to={`/leads/${huntSubject.lead_id}`}
+                title={SUBJECT_LEAD}
+                className="rounded-badge border border-border-input px-2 py-[3px] text-[12px] text-accent hover:underline"
+              >
+                Lead {huntSubject.lead_id}
+              </Link>
+            )}
+          </>
+        ) : (
+          <>
+            {inv.sev && <SeverityTag sev={inv.sev} />}
+            {/* min-w-0 + max-w-full + break-all: the badge may use the whole
+                header row and wraps internally when genuinely out of space —
+                the FULL destination is always visible, never clipped to a
+                fragment. */}
+            <span
+              data-testid="verdict-endpoints"
+              className="min-w-0 max-w-full rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
+              title={`source ${inv.host} → destination ${inv.ip}`}
+            >
+              <span className="break-all text-mono-amber">{inv.host}</span>
+              <span className="text-faint"> → </span>
+              <span className="break-all text-mono-green">{inv.ip}</span>
+            </span>
+          </>
+        )}
         {inv.oracle?.escalated && (
           <OracleBadge oracle={inv.oracle} />
         )}
@@ -649,16 +736,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           <Wrench size={13} /> Pipeline error
         </div>
         <div className="mb-2.5 text-[13px] leading-[1.55] text-text-2" style={{ textWrap: 'pretty' }}>
-          This run failed before reaching a verdict
+          This run failed before it reached a verdict
           {inv.fallback.hint ? <>: {inv.fallback.hint}</> : '.'}
-          {' '}It was recorded as needs_more_info as a placeholder
+          {' '}soc·ai recorded it as needs_more_info as a placeholder.
           {/* Same re-run/re-promote split as failedEl above: the button (or
               the re-promote pointer) right below already says how to get a
               real verdict, so this sentence must agree with it instead of
               also instructing "re-run" for a row the API refuses to re-run. */}
           {inv.kind === 'hunt'
-            ? ' — re-promote it from its hunt to try again.'
-            : ' — re-run it to get a real verdict.'}
+            ? ' Re-promote it from its hunt to try again.'
+            : ' Re-run it to get a real verdict.'}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {inv.kind === 'hunt' ? (
@@ -673,21 +760,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               {reHunting ? 'Re-running…' : 'Re-run investigation'}
             </button>
           )}
-          {errorDismissed ? (
-            <span className="flex items-center gap-1.5 text-[12.5px] text-dim">
-              <Check size={13} /> Dismissed — no longer counted on the Dashboard
-            </span>
-          ) : (
-            <button
-              onClick={dismissError}
-              disabled={errDismiss === 'busy'}
-              title="Acknowledge this pipeline error — the Dashboard stops counting it; the run stays under the Investigations 'Pipeline error' filter"
-              className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[12.5px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
-            >
-              {errDismiss === 'busy' ? <Spinner size={13} /> : <X size={13} />}
-              {errDismiss === 'busy' ? 'Dismissing…' : 'Dismiss'}
-            </button>
-          )}
+          {dismissControl}
         </div>
         {errDismissMsg && (
           <div className="mt-2 text-[12px]" style={{ color: '#f04438' }}>
@@ -717,8 +790,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           </ul>
         ) : inv.kind !== 'hunt' ? (
           <div className="mb-2.5 text-[13px] text-text-2">
-            The model could not converge on a verdict — dig deeper with a focused
-            re-investigation, or resolve it in chat.
+            The model could not converge on a verdict. Start a focused
+            re-investigation. You can also resolve it in chat.
           </div>
         ) : null}
         {/* Honest wayfinding for a promoted finding: every re-run affordance
@@ -728,8 +801,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             screen. Say what actually refines a promoted finding instead. */}
         {inv.kind === 'hunt' && (
           <div className="mb-2.5 text-[13px] text-text-2">
-            Promoted findings are refined by re-promoting from the hunt or asking a follow-up
-            below — not by re-running here.
+            Re-promote this finding from its hunt to refine it. You can also ask a follow-up
+            below. This screen cannot re-run a promoted finding.
           </div>
         )}
         <div className="flex flex-wrap items-center gap-2">
@@ -740,7 +813,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             <button
               onClick={requestInfo}
               disabled={requestingInfo}
-              title="Launch a fresh investigation focused on the open questions above"
+              title="This button starts a new investigation. The new investigation targets the open questions above."
               className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#0b0f16] disabled:opacity-60"
               style={{ background: '#f5a623', borderColor: '#f5a623' }}
             >
@@ -768,7 +841,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         style={{ borderColor: 'rgba(244,114,182,.35)', background: 'rgba(244,114,182,.06)' }}
       >
         <span style={{ color: '#f472b6' }}>Promoted from hunt</span>
-        {' — '}
+        {': '}
         <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
           {inv.huntObjective || inv.huntId}
         </Link>
@@ -781,7 +854,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       >
         <span style={{ color: '#f5a623' }}>Manually overridden</span> by{' '}
         <span className="font-mono text-text-2">{inv.resolution.resolved_by}</span>
-        {' '}— was:{' '}
+        {'. Previous verdict: '}
         <span className="font-mono text-text-2">{inv.resolution.original_verdict}</span>
       </div>
     )}
@@ -791,7 +864,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         style={{ borderColor: 'rgba(107,135,168,.3)', background: 'rgba(107,135,168,.05)' }}
       >
         <span className="font-semibold" style={{ color: '#8fa3bf' }}>Post-validator override</span>
-        {' — '}
+        {': '}
         {inv.validatorNote}
       </div>
     )}
@@ -803,7 +876,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // collapsed bar carries a one-line narrative so it's useful without expanding.
   const blastNarrative =
     inv.graphNote ??
-    `${inv.nodes.length} entities, ${inv.edges.length} relationships${graphInteresting ? ' — lateral movement detected' : ''}`;
+    `The graph has ${inv.nodes.length} entities and ${inv.edges.length} relationships.${graphInteresting ? ' The graph shows lateral movement.' : ''}`;
   const graphHeight = layout === 'page' ? 320 : 240;
   const entityEl = (
     <Panel>
@@ -815,7 +888,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <span className="flex pt-px text-accent"><Crosshair size={15} /></span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <div className="text-[13px] font-semibold">Entity scope — blast radius</div>
+            <div className="text-[13px] font-semibold">Entity scope</div>
             <span className="font-mono text-[11px] text-faint">
               {inv.nodes.length} entities
               {!graphOpen && graphInteresting ? ' · lateral movement' : ''}
@@ -902,16 +975,26 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // an escalate (open a case) through the same group write path the Alerts
   // console uses — writing to the live Security Onion grid. The labeled button
   // click is the consent; no extra popup.
+  //
+  // The message is the Alerts console's, not a second one written here. These
+  // buttons call the same two endpoints, and those endpoints learned to
+  // distinguish their outcomes — a case withheld from a duplicate, an alert
+  // Security Onion had only acknowledged, a claim from an earlier escalate
+  // whose outcome is unknown, a case created with nothing attached — while
+  // this bar went on reading `escalated` and `total` and discarding the rest.
+  //
+  // So the drawer called an empty case a successful escalate ("Escalated 1 of
+  // 1 event to a case") and never named the case id somebody has to close, and
+  // an ack that changed nothing visible because Security Onion had already
+  // recorded it read as a button that did not work.
   const runSettled = (kind: 'ack' | 'escalate') => {
     setSettledAction(kind);
     setSettledMsg(null);
     const group = { name: inv.name, kind: inv.kind };
     const call =
       kind === 'ack'
-        ? ackGroup(group).then((r) => `Acknowledged ${r.acked} of ${r.total} event${r.total === 1 ? '' : 's'}.`)
-        : escalateGroup(group).then(
-            (r) => `Escalated ${r.escalated} of ${r.total} event${r.total === 1 ? '' : 's'} to a case.`,
-          );
+        ? ackGroup(group).then((r) => ackMessage(r, inv.name))
+        : escalateGroup(group).then((r) => escalateMessage(r, inv.name));
     call
       .then((text) => {
         setSettledMsg({ tone: 'ok', text });
@@ -933,16 +1016,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
       >
         <div className="mb-1.5 text-[12px] font-semibold uppercase tracking-[.05em]" style={{ color: '#f5a623' }}>
-          Verdict settled — take action
+          Verdict settled. Take action.
         </div>
         <p className="mb-2.5 text-[13px] leading-[1.5] text-text-2">
-          The investigation recommended no automatic actions. Acknowledge to close out
-          this detection, or escalate it to a Security Onion case.
+          The investigation recommended no automatic actions. Acknowledge this detection to
+          close it out. Escalate this detection to open a Security Onion case.
         </p>
         {inv.alertAcked && (
           <p className="mb-2.5 text-[12px] leading-[1.5] text-dim">
-            <span style={{ color: '#7ba893' }}>✓ This alert is already acknowledged in Security Onion</span>
-            {' '}— acknowledging here re-acks the whole detection group.
+            <span style={{ color: '#7ba893' }}>✓ Security Onion records this alert as acknowledged.</span>
+            {' '}The Acknowledge button acknowledges the whole detection group again.
           </p>
         )}
         <div className="flex flex-wrap items-center gap-2">
@@ -996,7 +1079,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       provenance={
         inv.huntId ? (
           <div className="text-[12px] text-dim">
-            Drafted from the finding promoted from{' '}
+            This detection comes from a promoted finding. The hunt is{' '}
             <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
               {inv.huntObjective || inv.huntId}
             </Link>
@@ -1009,13 +1092,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     // off: a quiet pointer at the switch instead of rendering nothing — the
     // flag is hot-editable, so this is a live path, not a dead end.
     <div className="text-[12px] text-faint">
-      Detection authoring is off —{' '}
+      Detection authoring is off.{' '}
       <Link
         to="/config#triage-automation"
         state={{ highlightKey: 'sigma_authoring_enabled' }}
         className="underline hover:text-dim"
       >
-        enable it in Config
+        Enable it in Config
       </Link>
     </div>
   ) : null;
@@ -1107,8 +1190,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.07)', color: '#fca5a5' }}
         >
           <AlertTriangle size={13} className="mt-px flex-none" />
-          <span><span className="font-semibold">WARNING:</span> You are manually overriding the AI's verdict. This replaces the current verdict
-          and is permanently recorded with your name.</span>
+          <span><span className="font-semibold">WARNING:</span> This override replaces the current verdict.
+          soc·ai records the override permanently with your name.</span>
         </div>
         <div className="mb-3">
           <label className="mb-1.5 block text-[12px] font-semibold text-dim">New verdict</label>
@@ -1124,13 +1207,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </div>
         <div className="mb-5">
           <label className="mb-1.5 block text-[12px] font-semibold text-dim">
-            Rationale <span className="text-faint font-normal">(optional — recorded)</span>
+            Rationale <span className="text-faint font-normal">optional · recorded</span>
           </label>
           <textarea
             value={overrideRationale}
             onChange={(e) => setOverrideRationale(e.target.value)}
             rows={3}
-            placeholder="Why are you overriding? e.g. analyst confirmed via manual PCAP review."
+            placeholder="Give your reason. Example: analyst confirmed the activity in a manual PCAP review."
             className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
           />
         </div>
@@ -1156,7 +1239,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               submitOverride(inv.id, overrideVerdictVal, overrideRationale || undefined)
                 .then(() => { setOverrideOpen(false); onVerdictApplied?.(); })
                 .catch((err: unknown) => {
-                  const msg = err instanceof Error ? err.message : 'Override failed — please try again.';
+                  const msg = err instanceof Error ? err.message : 'The override failed. Try again.';
                   setOverrideError(msg);
                 })
                 .finally(() => setOverriding(false));
@@ -1171,8 +1254,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </div>
   ) : null;
 
-  // analyst-context rail panels (only render when the data is present)
-  const alertEl = inv.alert ? <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} /> : null;
+  // analyst-context rail panels (only render when the data is present).
+  const alertEl = huntSubject ? (
+    <HuntSubjectPanel subject={huntSubject} />
+  ) : inv.alert ? (
+    <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} />
+  ) : null;
   const hostEl = inv.hostContext?.length ? <HostContextPanel host={inv.host} signals={inv.hostContext} /> : null;
   const metaEl = inv.meta ? <InvMetaPanel meta={inv.meta} id={inv.id} /> : null;
 
@@ -1184,7 +1271,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // layout space and stays reachable however far you've scrolled.
   if (layout === 'page') {
     return (
-      <div className="mx-auto max-w-workstation font-sans text-text">
+      // The reservation at the foot keeps the floating dock off the action
+      // controls at the right edge, the same way the host page does it.
+      <div className={`mx-auto max-w-workstation font-sans text-text ${DOCK_SAFE_AREA_CLASS}`}>
         {toolbarEl}
         {reRunErrorEl}
         {failed ? (
@@ -1296,7 +1385,7 @@ function ChatPanel({
       .catch((err: unknown) => {
         setApplyError((e) => ({
           ...e,
-          [idx]: err instanceof Error ? err.message : 'Could not apply — please try again.',
+          [idx]: err instanceof Error ? err.message : 'soc·ai could not apply the verdict. Try again.',
         }));
       })
       .finally(() => setApplyingIdx(null));
@@ -1309,12 +1398,12 @@ function ChatPanel({
       <ChatPanelShell
         title="Chat about this investigation"
         scopeLabel="scoped to this investigation"
-        placeholder="Ask a follow-up… e.g. why not a false positive?"
+        placeholder="Ask a follow-up. Example: why not a false positive?"
         emptyHint={
           <div className="flex flex-col gap-2.5 py-2 text-[12.5px]">
             <div className="flex items-center gap-1.5 text-faint">
               <MessageSquare size={13} />
-              Ask a follow-up about this investigation.
+              No messages yet. Ask a follow-up about this investigation.
             </div>
             <div className="flex flex-wrap gap-1.5">
               {[
@@ -1375,7 +1464,7 @@ function ChatPanel({
               ) : m.applied ? (
                 <div className="text-[12px] font-semibold text-success">✓ Applied</div>
               ) : (
-                <div className="text-[12px] text-warn">Not evidence-backed{m.objection ? ` — ${m.objection}` : ''}</div>
+                <div className="text-[12px] text-warn">Not evidence-backed{m.objection ? `. ${m.objection}` : ''}</div>
               )}
             </div>
           ) : null
@@ -1400,6 +1489,86 @@ function ChatDock(props: Omit<ChatPanelProps, 'fill' | 'onClose'>) {
 }
 
 // ── analyst-context rail panels (page layout) ──────────────────────────────
+
+/**
+ * What a hunt investigation investigated.
+ *
+ * The alert panel below answers the same question for an alert run: which rule
+ * fired, on which event. A hunt has neither. It has an objective, the findings
+ * the investigation read, the documents those findings cite, and the lead the
+ * hunt started from. The panel states all four, and every one of them is a
+ * link or a count the analyst can check.
+ */
+function HuntSubjectPanel({ subject }: { subject: InvestigationSubject }) {
+  const findings = subject.finding_ordinals.map((ordinal, i) => {
+    // The title is what an analyst reads. A backend that sends the ordinals
+    // alone still says which findings were read, and a made-up title would be
+    // worse than the number.
+    //
+    // The ordinal is an identifier and it counts from zero. A person counts
+    // from one, so the first finding of the hunt reads "Finding 1" and the
+    // stored ordinal stays as it is.
+    const title = subject.finding_titles?.[i];
+    const number = ordinal + 1;
+    return { ordinal, label: title ? `Finding ${number} · ${title}` : `Finding ${number}` };
+  });
+  return (
+    <CollapsiblePanel
+      icon={<GitBranch size={15} />}
+      title={<span title={CHIP_SUBJECT_HUNT}>Subject: hunt</span>}
+      summary={subject.objective}
+    >
+      <div data-testid="investigation-subject" className="flex flex-col">
+        <div className="border-b border-border-faint px-[15px] py-[9px]">
+          <div className="text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
+            objective
+          </div>
+          <div
+            className="mt-1 text-[12.5px] leading-[1.5] text-text-2"
+            title={SUBJECT_OBJECTIVE}
+          >
+            {subject.objective}
+          </div>
+        </div>
+        <div className="border-b border-border-faint px-[15px] py-[9px]">
+          <div className="text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
+            findings
+          </div>
+          <ul
+            data-testid="subject-findings"
+            title={SUBJECT_FINDINGS}
+            className="mt-1 flex flex-col gap-1 text-[12.5px] leading-[1.5] text-text-2"
+          >
+            {findings.map((f) => (
+              <li key={f.ordinal}>{f.label}</li>
+            ))}
+          </ul>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-[15px] py-[9px] text-[12px]">
+          <Link
+            to={`/hunts/${subject.hunt_id}`}
+            title={SUBJECT_HUNT_LINK}
+            className="font-mono text-[11.5px] text-accent underline hover:opacity-80"
+          >
+            {subject.hunt_id}
+          </Link>
+          {subject.lead_id != null && (
+            <Link
+              to={`/leads/${subject.lead_id}`}
+              title={SUBJECT_LEAD}
+              className="text-accent underline hover:opacity-80"
+            >
+              Lead {subject.lead_id}
+            </Link>
+          )}
+          <span data-testid="subject-documents" className="text-dim" title={SUBJECT_DOCUMENTS}>
+            {plural(subject.document_ids.length, 'document')}
+          </span>
+        </div>
+      </div>
+    </CollapsiblePanel>
+  );
+}
 
 function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Severity; kind: DetectionKind }) {
   const [copied, setCopied] = useState(false);
@@ -1501,7 +1670,7 @@ function HostContextPanel({ host, signals }: { host: string; signals: HostSignal
 function HeuristicBadge() {
   return (
     <span
-      title="This verdict was reached from prefetched context without running investigation tools — it may be shallower. Disable 'Fast verdict' in Config to always investigate."
+      title="This verdict came from prefetched context, with no investigation tools. Disable 'Fast verdict' in Config to always investigate."
       className="flex cursor-help items-center gap-1.5 rounded-badge border border-border-input px-2 py-[3px] text-[11.5px] font-semibold text-faint"
       style={{ background: 'rgba(148,163,184,.07)' }}
     >
@@ -1619,7 +1788,7 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
       {/* redaction notice */}
       {oracle.redacted && (
         <div className="mt-1 text-[11.5px] text-faint">
-          🔒 {oracle.redactionNote || 'credentials redacted before cloud egress'}
+          🔒 {oracle.redactionNote || 'soc·ai redacted the credentials before cloud egress.'}
         </div>
       )}
     </div>

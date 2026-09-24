@@ -35,8 +35,8 @@ const sigmaDraft = (over: Partial<SigmaDraft> = {}): SigmaDraft => ({
   ...over,
 });
 
-const EXPLAINER = /nothing is written to security onion/i;
-const STALE_NOTICE = /your edits have not been re-checked/i;
+const EXPLAINER = /writes nothing to security onion/i;
+const STALE_NOTICE = /has not checked\s+your edits/i;
 
 describe('DraftDetectionPane — autoRun explainer (F20)', () => {
   it('shows the explainer and a loading state while the one-click draft runs, and keeps the explainer above the result', async () => {
@@ -67,7 +67,7 @@ describe('DraftDetectionPane — the measured OQL is shown (2026-08-25 security 
     // The one artifact that exposes Sigma/OQL divergence: the query itself.
     expect(screen.getByText(draft.oql)).toBeTruthy();
     // Labelled so the analyst knows THIS produced the count.
-    expect(screen.getByText(/measured by this oql/i)).toBeTruthy();
+    expect(screen.getByText(/measured by this read-only oql query/i)).toBeTruthy();
   });
 
   it('still shows the OQL when the dry run could not run — the analyst sees what WOULD have been measured', async () => {
@@ -83,7 +83,7 @@ describe('DraftDetectionPane — the measured OQL is shown (2026-08-25 security 
     });
     render(<DraftDetectionPane autoRun onDraft={() => Promise.resolve(draft)} />);
 
-    expect(await screen.findByText(/dry run couldn't run/i)).toBeTruthy();
+    expect(await screen.findByText(/the dry run did not run/i)).toBeTruthy();
     expect(screen.getByText(draft.oql)).toBeTruthy();
   });
 });
@@ -97,11 +97,11 @@ describe('DraftDetectionPane — stale-edit honesty (F4) + structure label (F6)'
     expect(await screen.findByText('Rule structure valid')).toBeTruthy();
     expect(screen.queryByText('Schema valid')).toBeNull();
     expect(screen.getByText(/would have fired 4×/i)).toBeTruthy();
-    expect(screen.getByText(/oql twin/i)).toBeTruthy();
+    expect(screen.getByText(/an equivalent OQL query/i)).toBeTruthy();
     expect(screen.queryByText(STALE_NOTICE)).toBeNull();
 
     // Edit the textarea → the badge no longer vouches for text nobody checked.
-    const textarea = screen.getByLabelText(/sigma rule \(yaml\)/i) as HTMLTextAreaElement;
+    const textarea = screen.getByLabelText(/sigma rule yaml/i) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'title: EDITED BY ANALYST\n' } });
 
     expect(screen.getByText(STALE_NOTICE)).toBeTruthy();
@@ -133,7 +133,7 @@ describe('DraftDetectionPane — stale-edit honesty (F4) + structure label (F6)'
       await screen.findByText('Sigma rule missing required keys (title/logsource/detection).'),
     ).toBeTruthy();
 
-    const textarea = screen.getByLabelText(/sigma rule \(yaml\)/i) as HTMLTextAreaElement;
+    const textarea = screen.getByLabelText(/sigma rule yaml/i) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'title: now fixed by hand\n' } });
 
     expect(screen.getByText(STALE_NOTICE)).toBeTruthy();

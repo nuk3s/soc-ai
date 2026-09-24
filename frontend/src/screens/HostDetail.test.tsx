@@ -27,6 +27,7 @@ import type {
   DossierField,
   DossierFieldName,
   DossierRefreshStatus,
+  ProfileDimension,
 } from '../lib/types';
 
 vi.mock('../lib/api', async (importOriginal) => ({
@@ -51,6 +52,11 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHostChat: vi.fn(),
   postHostChat: vi.fn(),
   clearHostChat: vi.fn(),
+  // The observations panel and the leads strip ride on this page too. Both
+  // read on mount, and the shared setup rejects any unmocked fetch. These
+  // tests are not about either, so both resolve empty.
+  getObservations: vi.fn().mockResolvedValue({ entity: '', days: 7, observations: [] }),
+  getLeads: vi.fn().mockResolvedValue([]),
 }));
 
 import {
@@ -60,6 +66,7 @@ import {
   getDossierRefreshStatus,
   getHostActivity,
   getHostChat,
+  getLeads,
   getMe,
   setDossierOverride,
   snoozeDossierConflict,
@@ -68,6 +75,7 @@ import {
 import { roleAccent, roleRail } from '../lib/hostColors';
 import type { HostActivity } from '../lib/types';
 import { peerGraph } from '../components/HostActivityRow';
+import { DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
 import { alertsHref } from '../components/HostKpis';
 import { HostDetail } from './HostDetail';
 
@@ -484,7 +492,7 @@ describe('HostDetail — a sweep that came back blind does not report an address
   // a negative assertion whose selector matches nothing in either state is not
   // evidence of anything.
   const NEVER_SEEN = /has never seen this address/i;
-  const NEXT_SWEEP = /the next sweep will pick it up/i;
+  const NEXT_SWEEP = /the next sweep records/i;
 
   /** What the sweep stores when it could not read the grid at all. */
   const BLIND = {
@@ -636,7 +644,7 @@ describe('HostDetail — a sweep that came back blind does not report an address
     expect(screen.queryByText(NEXT_SWEEP)).toBeNull();
     // The kickoff receipt has been superseded by the outcome, not left sitting
     // over it telling the analyst to give it a minute.
-    expect(screen.queryByText(/sweeping in the background/i)).toBeNull();
+    expect(screen.queryByText(/sweep runs in the background/i)).toBeNull();
   });
 
   it('discloses a dead sweep to a role that may not read the full record', async () => {
@@ -866,7 +874,7 @@ describe('HostDetail — a sweep that came back blind does not report an address
     // Why it cannot say more, and the words the failure came with — an
     // operator told the page gave up wants to know on what.
     const hedge = screen.getByTestId('host-sweep-unreadable').textContent ?? '';
-    expect(hedge).toMatch(/could not check how the last sweep went/i);
+    expect(hedge).toMatch(/could not check the last sweep/i);
     expect(hedge).toMatch(/The sweep status could not be read/);
   });
 
@@ -1082,7 +1090,7 @@ describe('HostDetail — the why-care strip', () => {
     vi.mocked(getDossier).mockResolvedValue(sparse());
     mount();
     const briefing = await screen.findByTestId('host-briefing');
-    expect(briefing.textContent).toMatch(/processes, users and local logs/i);
+    expect(briefing.textContent).toMatch(/processes, its users or/i);
     expect(briefing.textContent).toMatch(/network traffic/i);
     expect((await screen.findByTestId('hero-agent')).textContent).toMatch(/network-only view/i);
   });
@@ -1091,7 +1099,7 @@ describe('HostDetail — the why-care strip', () => {
     vi.mocked(getDossier).mockResolvedValue(rich());
     mount();
     const briefing = await screen.findByTestId('host-briefing');
-    expect(briefing.textContent).not.toMatch(/processes, users and local logs/i);
+    expect(briefing.textContent).not.toMatch(/processes, its users or/i);
   });
 });
 
@@ -1264,7 +1272,7 @@ describe('HostDetail — the fact rows', () => {
     );
     mount();
     const admin = await row('management_plane');
-    expect(within(admin).getByText(/no admin interface answering/i)).toBeTruthy();
+    expect(within(admin).getByText(/no admin interface answers/i)).toBeTruthy();
     expect(visibleText(admin)).not.toContain('{"answers"');
   });
 
@@ -1410,10 +1418,50 @@ describe('HostDetail — the unknown line tells the truth about why', () => {
     mount();
     const unknowns = await screen.findByTestId('host-unknowns');
     fireEvent.click(within(unknowns).getByText(/unknown/i));
-    expect(unknowns.textContent).toMatch(/checked — nothing found/i);
+    expect(unknowns.textContent).toMatch(/checked, nothing found/i);
     expect(unknowns.textContent).toMatch(/not checked yet/i);
     expect(unknowns.textContent).toMatch(/too old to trust/i);
     expect(unknowns.textContent).toMatch(/possibly "CORP"/i);
+  });
+
+  // A role the sweep guessed and the resolver withheld used to live in the
+  // collapsed unknown line, so the ROLES bar counted the host under "low
+  // confidence" while its own page said nothing (dogfood 2026-09-17).
+  it('names a withheld role guess in What we know, with the confidence', async () => {
+    vi.mocked(getDossier).mockResolvedValue(
+      dossier({
+        role: {
+          reason: 'low_confidence',
+          inferred_value: 'security_appliance',
+          inferred_confidence: 0.55,
+          inferred_source: 'behaviour',
+          last_run_at: '2026-08-07T06:00:00Z',
+        },
+      }),
+    );
+    mount();
+    const facts = await screen.findByTestId('host-facts');
+    const roleRow = within(facts).getByTestId('field-role');
+    expect(roleRow.textContent).toContain('possibly security appliance');
+    expect(roleRow.textContent).toContain('0.55');
+  });
+
+  it('states a withheld role guess once, not twice', async () => {
+    vi.mocked(getDossier).mockResolvedValue(
+      dossier({
+        role: {
+          reason: 'low_confidence',
+          inferred_value: 'security_appliance',
+          inferred_confidence: 0.55,
+          last_run_at: '2026-08-07T06:00:00Z',
+        },
+      }),
+    );
+    mount();
+    await screen.findByTestId('host-facts');
+    const unknowns = await screen.findByTestId('host-unknowns');
+    expect(unknowns.textContent).not.toMatch(/role/i);
+    expect(document.querySelectorAll('[data-testid="field-role"]').length).toBe(1);
   });
 
   it('declares a value from the unknown line and re-renders from the response', async () => {
@@ -1655,7 +1703,7 @@ describe('HostDetail — an open disagreement leads the page', () => {
     const card = await screen.findByTestId('conflict-role');
     fireEvent.click(within(card).getByRole('button', { name: /keep mine/i }));
     await waitFor(() => expect(snoozeDossierConflict).toHaveBeenCalledWith(IP, 'role'));
-    const line = await screen.findByText(/asking again/i);
+    const line = await screen.findByText(/sweep asks again/i);
     expect(line.textContent).toContain(absTime('2026-10-01T06:00:00Z'));
   });
 
@@ -1718,7 +1766,7 @@ describe('HostDetail — a failed build is a red banner, not an invisible shrug'
     const banner = banners.find((b) => /ConnectionTimeout/.test(b.textContent ?? ''))!;
     fireEvent.click(within(banner).getByRole('button', { name: /sweep again/i }));
     await waitFor(() => expect(startDossierRefresh).toHaveBeenCalled());
-    expect(await screen.findByText(/sweeping in the background/i)).toBeTruthy();
+    expect(await screen.findByText(/sweep runs in the background/i)).toBeTruthy();
   });
 
   it('does not claim a build it never completed', async () => {
@@ -1761,7 +1809,7 @@ describe('HostDetail — deep link', () => {
 // ---------------------------------------------------------------------------
 
 describe('HostDetail — a failed foreground refresh is marked, not swallowed', () => {
-  const REFRESH_FAILED = /Refresh failed — still showing data from/i;
+  const REFRESH_FAILED = /Refresh failed\. This data is from/i;
 
   /** The page's own Refresh, which re-reads THIS host. Driving the marker from
    *  a same-host refresh is deliberate: an earlier version of these tests
@@ -2156,5 +2204,130 @@ describe('HostDetail — the activity window', () => {
     mount();
     await screen.findByText(/Couldn't load this host/i);
     expect(screen.queryByRole('button', { name: /refresh host/i })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The services the host answers on
+// ---------------------------------------------------------------------------
+
+describe('HostDetail — the Services card', () => {
+  const servedPorts = (ports: string[]): ProfileDimension => ({
+    dimension: 'served_ports',
+    shape: 'categorical',
+    coverage: 'measured',
+    support_days: 21,
+    window_days: 30,
+    summary: `${ports.length} ports · ${ports.join(', ')}`,
+    top: ports.map((p, i) => [p, 900 - i] as [string, number]),
+  });
+
+  // The card read the sweep's services fact and the panel below it read the
+  // profile, so one page said 7 ports and 8 (dogfood 2026-09-17). The profile
+  // is the fuller read: it is built from up to 30 days, the fact from one
+  // sweep.
+  it('counts the profile served ports, not the sweep fact, when both exist', async () => {
+    vi.mocked(getDossier).mockResolvedValue(
+      rich({ profile: [servedPorts(['445', '135', '88', '5986', '389', '5985', '53', '636'])] }),
+    );
+    mount();
+    const card = await screen.findByTestId('kpi-services');
+    expect(within(card).getByText('8')).toBeTruthy();
+    expect(card.textContent).toContain('from the profile');
+    // The dossier fact holds two ports. Neither the count nor the label may
+    // still claim it.
+    expect(card.textContent).not.toContain('dossier');
+  });
+
+  it('falls back to the sweep fact when no plane can profile the host', async () => {
+    vi.mocked(getDossier).mockResolvedValue(
+      rich({
+        profile: [
+          { ...servedPorts([]), coverage: 'blind', support_days: 0, summary: '', top: [] },
+        ],
+      }),
+    );
+    mount();
+    const card = await screen.findByTestId('kpi-services');
+    expect(within(card).getByText('2')).toBeTruthy();
+    expect(card.textContent).toContain('dossier');
+    expect(card.textContent).not.toContain('from the profile');
+  });
+
+  it('reads a measured empty profile as nothing answering, not as no answer', async () => {
+    vi.mocked(getDossier).mockResolvedValue(rich({ profile: [servedPorts([])] }));
+    mount();
+    const card = await screen.findByTestId('kpi-services');
+    expect(within(card).getByText('0')).toBeTruthy();
+    expect(card.textContent).toContain('nothing answers inbound');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The floating chat dock and the controls underneath it
+// ---------------------------------------------------------------------------
+
+describe('HostDetail — room under the floating chat dock', () => {
+  // The dock is fixed to the bottom-right corner of the VIEWPORT, so it lands
+  // on whatever is drawn there. At 1024 and at 1280 that was an Edit control
+  // on the facts panel: the page stopped 60px below its last row while the
+  // dock needs 68px, so the control could never be scrolled clear of it
+  // (dogfood 2026-09-17). The page now reserves the dock's own height.
+  it('reserves the dock height at the foot of the page', async () => {
+    vi.mocked(getDossier).mockResolvedValue(rich());
+    const { container } = mount();
+    await screen.findByTestId('host-facts');
+
+    // The CLASS, not a measurement: jsdom loads no stylesheet, so what the
+    // page asks the browser for is the only thing a unit test can read.
+    const root = container.firstElementChild as HTMLElement;
+    for (const cls of DOCK_SAFE_AREA_CLASS.split(' ')) {
+      expect(root.classList.contains(cls)).toBe(true);
+    }
+    // The reservation only earns its place on a page that mounts the dock.
+    expect(screen.getByText('Chat about this host')).toBeTruthy();
+  });
+});
+
+
+// The host page opened the leads strip on New. A lead under a hunt on this
+// host, and a lead an analyst closed yesterday, were both absent from the
+// page that lists the host.
+describe('HostDetail — the leads on this host', () => {
+  beforeEach(() => {
+    vi.mocked(getDossier).mockResolvedValue(rich());
+    vi.mocked(getLeads).mockClear();
+  });
+
+  it('reads every lead on the host, whatever its status', async () => {
+    mount();
+    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all'));
+  });
+
+  it('offers the status filter on the strip', async () => {
+    vi.mocked(getLeads).mockResolvedValue([
+      {
+        id: 31,
+        status: 'hunting',
+        formed_at: new Date().toISOString(),
+        updated_at: null,
+        entities: [['host', IP]],
+        kinds: ['off_hours'],
+        weight_at_formation: 0.9,
+        scope_count: 1,
+        hunt_id: 'H-1',
+        shadow: false,
+        single_signal: false,
+        observations: [],
+      },
+    ] as never);
+    mount();
+    const row = await screen.findByTestId('lead-31');
+    const strip = screen.getByTestId('leads-strip');
+    expect(strip.contains(row)).toBe(true);
+    expect(within(strip).getByRole('button', { name: 'All' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    );
+    expect(within(strip).getByRole('button', { name: 'Closed' })).toBeTruthy();
   });
 });

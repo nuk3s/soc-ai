@@ -24,9 +24,10 @@
 
 import { Activity, Copy, X } from 'lucide-react';
 import { useState } from 'react';
-import type { QualityPoint } from '../lib/api';
+import type { QualityFreshness, QualityPoint } from '../lib/api';
 import { dismissNotification, getDismissed } from '../lib/notifications';
-import { absTime } from '../lib/timeRange';
+import { absTime, ago } from '../lib/timeRange';
+import { tint } from '../lib/tokens';
 import { LoadingState } from './States';
 
 // ---- pure seams (unit-tested in QualityCard.test.tsx) -----------------------
@@ -132,6 +133,30 @@ export function gradeBreakdown(p: QualityPoint): string | null {
   if (p.n_partial) parts.push(`${p.n_partial} partial`);
   if (p.n_no) parts.push(`${p.n_no} disagree`);
   return parts.join(' · ');
+}
+
+/**
+ * What was running when this point was measured (migration 0040).
+ *
+ * A regression on this card used to be unattributable: the trend recorded the
+ * numbers and nothing about the instrument, and the image both deployments run
+ * is tagged `:latest`, so "quality dropped after Tuesday" had nothing to point
+ * at. The row now carries the version, the build inside it, and the analyst
+ * route the batch actually ran against — the third one because a gateway
+ * repointing a route at a different backend moves the numbers with the code
+ * unchanged, which is the exact failure this subsystem was built for.
+ *
+ * The commit is truncated to 12 characters, the length everything else that
+ * shows one uses; the full value is in the title attribute at the call site.
+ * Null when the row carries none of the three, so a pre-0040 point keeps
+ * exactly the layout it had, rather than gaining a line of em-dashes.
+ */
+export function measuredOn(p: QualityPoint): string | null {
+  const parts: string[] = [];
+  if (p.app_version) parts.push(`v${p.app_version}`);
+  if (p.code_commit) parts.push(p.code_commit.slice(0, 12));
+  if (p.analyst_model) parts.push(p.analyst_model);
+  return parts.length > 0 ? parts.join(' · ') : null;
 }
 
 // ---- alarm identity (migration 0027) ---------------------------------------
@@ -245,14 +270,14 @@ export function alarmBanner(points: QualityPoint[]): AlarmBanner | null {
 
   const errored = latest.n_error;
   const total = latest.n_ok + latest.n_error;
-  const ongoingClause = `ongoing since ${absTime(since)} (${runs} run${runs === 1 ? '' : 's'})`;
+  const ongoingClause = `ongoing since ${absTime(since)}, ${runs} run${runs === 1 ? '' : 's'}`;
 
   if (pipelineOnly) {
     return {
       kind: 'pipeline',
       headline: ongoing
-        ? `Eval pipeline failing — ${ongoingClause}`
-        : `Eval pipeline failing — ${errored} of ${total} eval runs errored`,
+        ? `The eval pipeline is failing, ${ongoingClause}`
+        : `The eval pipeline is failing. ${errored} of ${total} eval runs errored.`,
       pipelineNote: null, // the headline is already the pipeline sentence
       ongoing,
       runs,
@@ -263,15 +288,82 @@ export function alarmBanner(points: QualityPoint[]): AlarmBanner | null {
   return {
     kind: 'quality',
     headline: ongoing
-      ? `Regression alarm — ${ongoingClause}`
-      : 'Last run tripped the regression alarm',
+      ? `Regression alarm, ${ongoingClause}`
+      : 'The last run tripped the regression alarm.',
     pipelineNote: hasPipeline
-      ? `Eval pipeline also failing — ${errored} of ${total} eval runs errored.`
+      ? `The eval pipeline is also failing. ${errored} of ${total} eval runs errored.`
       : null,
     ongoing,
     runs,
     dismissId: dismissIdFor(latest),
   };
+}
+
+// ---- freshness (issue #56) --------------------------------------------------
+//
+// A nightly that finds no eligible alerts writes no point, so the newest
+// point's age is the only thing that says the trend has stopped moving, and
+// the last attempt's detail is the only thing that says why. The card used to
+// take the last row as current: a month-old point looked like last night's,
+// and on a grid with no alerts the empty state never said the eval had tried.
+// The server owns the `stale` call (nightly on, newest point older than two
+// scheduled runs); the card renders it and does not re-derive one from the
+// age alone, because an old point under host cron or a one-off Run now is
+// old, not overdue.
+
+/**
+ * "3d" from "3d ago": the marker names the length of the gap, not when it
+ * started. Only reached for a stale trend, where `ago` is always in days
+ * (stale starts at 48h and `ago` switches to days there), so the strip never
+ * meets "now" or "never".
+ */
+export function gapLabel(iso: string | null): string {
+  return ago(iso).replace(/ ago$/, '');
+}
+
+// Amber, the caution tone the hunt catalog's overdue tag and this card's
+// pipeline alarm wear: a true fact the operator would otherwise read as clean.
+const AMBER = '#f5a623';
+
+const STALE_TITLE =
+  'The nightly eval is on and has not written a point in two scheduled runs. The last attempt line says what it did instead.';
+
+/** The clause after the point's age: absent until an attempt has been recorded.
+ *
+ *  That absence used to be ambiguous. The fields came from a status slot in
+ *  process memory, so they were also null after every restart, and this early
+ *  return rendered "never tried" and "tried, but this process was not here for
+ *  it" identically. They now come from `quality_eval_attempts`, so a null means
+ *  the nightly has genuinely never run on this deployment — a fact worth
+ *  stating, and the empty-trend branch below states it. */
+function attemptClause(f: QualityFreshness): string {
+  if (!f.last_attempt_at) return '';
+  const reason = f.last_detail ? `: ${f.last_detail}` : '';
+  return ` · last attempt ${ago(f.last_attempt_at)}${reason}`;
+}
+
+function FreshnessLine({ freshness }: { freshness: QualityFreshness }) {
+  return (
+    <div
+      data-testid="quality-freshness"
+      className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-faint"
+    >
+      {freshness.stale && (
+        <span
+          data-testid="quality-stale"
+          className="inline-flex flex-none items-center whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
+          style={{ color: AMBER, borderColor: tint(AMBER, 0.4), background: tint(AMBER, 0.09) }}
+          title={STALE_TITLE}
+        >
+          no point in {gapLabel(freshness.latest_ts)}
+        </span>
+      )}
+      <span>
+        latest point {ago(freshness.latest_ts)}
+        {attemptClause(freshness)}
+      </span>
+    </div>
+  );
 }
 
 // ---- presentation -----------------------------------------------------------
@@ -348,7 +440,7 @@ function EvidencePath({ path }: { path: string }) {
       style={{ borderColor: 'rgba(240,68,56,.2)' }}
     >
       <div className="text-[10.5px] text-faint">
-        Oracle critiques behind this alarm — a path on the soc-ai host, not a link:
+        Oracle critiques behind this alarm. This is a path on the soc-ai host.
       </div>
       <div className="mt-0.5 flex items-start gap-1.5">
         <code className="min-w-0 flex-1 break-all font-mono text-[11px] text-mono-amber">
@@ -385,6 +477,7 @@ export function QualityCard({
   error,
   loading,
   demo = false,
+  freshness = null,
 }: {
   points: QualityPoint[];
   error: Error | null;
@@ -392,6 +485,9 @@ export function QualityCard({
   /** True on the public demo, where admin reads are 403 by design — degrade to a
    * neutral line rather than an admin-login prompt that can't be followed. */
   demo?: boolean;
+  /** The trend's freshness block. Null until the trend has loaded; the card
+   * then says nothing about age rather than guessing at one. */
+  freshness?: QualityFreshness | null;
 }) {
   // The bell's dismissal mechanism, reused rather than re-implemented: one
   // localStorage set of ids in lib/notifications, read at mount and written
@@ -404,7 +500,7 @@ export function QualityCard({
     return (
       <div className="px-[15px] py-3.5 text-[12px] leading-[1.5] text-faint">
         {demo
-          ? 'Quality history is an admin-only view — not shown in the demo.'
+          ? 'Quality history is an admin-only view. The demo does not show it.'
           : 'Sign in as an admin to view quality history.'}
       </div>
     );
@@ -414,15 +510,47 @@ export function QualityCard({
       <LoadingState label="Loading…" />
     ) : (
       <div className="px-[15px] py-3.5 text-[12.5px] leading-[1.6] text-dim">
-        No quality history yet — use <span className="font-semibold text-text-2">Run now</span>{' '}
-        above, or enable the nightly eval in Config → Quality.{' '}
+        {/* With the nightly already on, "enable it" sends the operator to a
+            switch that is set; the line below says what the runs did instead. */}
+        {freshness?.scheduled ? (
+          <>
+            No quality history yet. The nightly eval is on and has written no point. Use{' '}
+            <span className="font-semibold text-text-2">Run now</span> above to try one.{' '}
+          </>
+        ) : (
+          <>
+            No quality history yet. Use <span className="font-semibold text-text-2">Run now</span>{' '}
+            above, or turn the nightly eval on in Config → Quality.{' '}
+          </>
+        )}
         <span className="text-faint">
-          (Host cron via{' '}
+          Host cron with{' '}
           <code className="rounded bg-surface-3 px-1 font-mono text-[11px]">
             soc-ai eval-nightly
           </code>{' '}
-          still works — see docs/DOCKER.md.)
+          still works. See docs/DOCKER.md.
         </span>
+        {/* The one fact an empty trend cannot carry: whether anything has
+            tried. A run that finds no eligible alerts exits 2 and a run that
+            fails exits 5, and neither writes a point — so an empty trend is
+            the normal shape of both "nothing has ever run here" and "it ran
+            last night, and here is why it wrote nothing".
+
+            Both branches are stated now, because the attempt is durable. It
+            used to live in process memory, so the absence could not be
+            trusted: after a restart this rendered nothing at all rather than
+            saying what it knew, which is the empty-reads-as-an-all-clear
+            failure the whole card exists to avoid. */}
+        <div data-testid="quality-freshness" className="mt-1.5 text-[11.5px] text-faint">
+          {freshness?.last_attempt_at ? (
+            <>
+              Last attempt {ago(freshness.last_attempt_at)}
+              {freshness.last_detail ? `: ${freshness.last_detail}` : ''}
+            </>
+          ) : (
+            'No eval has run on this deployment yet.'
+          )}
+        </div>
       </div>
     );
   }
@@ -432,6 +560,7 @@ export function QualityCard({
   const headline = latest.mode === 'graded' ? latest.agreement_rate : latest.fallback_rate;
   const headlineLabel = latest.mode === 'graded' ? 'agreement' : 'fallback rate';
   const breakdown = gradeBreakdown(latest);
+  const measured = measuredOn(latest);
   const alarm = alarmBanner(points);
   // Hoisted to a const so it narrows inside the click handler below (a property
   // read would not).
@@ -449,7 +578,7 @@ export function QualityCard({
   // repair, while a verdict-quality regression is a finding to adjudicate.
   const tone =
     alarm?.kind === 'pipeline'
-      ? { fg: '#f5a623', border: 'rgba(245,166,35,.35)', bg: 'rgba(245,166,35,.08)' }
+      ? { fg: AMBER, border: 'rgba(245,166,35,.35)', bg: 'rgba(245,166,35,.08)' }
       : { fg: '#f04438', border: 'rgba(240,68,56,.35)', bg: 'rgba(240,68,56,.08)' };
 
   return (
@@ -461,6 +590,7 @@ export function QualityCard({
           {points.length} run{points.length === 1 ? '' : 's'}
         </span>
       </div>
+      {freshness && <FreshnessLine freshness={freshness} />}
 
       <div className="mt-2.5 flex items-baseline gap-2">
         <span
@@ -477,7 +607,7 @@ export function QualityCard({
         <div
           data-testid="quality-grade-counts"
           className="mt-1 text-[11.5px] text-dim"
-          title="A partial critique — right verdict, thin reasoning — counts against the rate exactly as hard as a disagreement."
+          title="A partial critique means a right verdict with thin reasoning. It counts against the rate as hard as a disagreement."
         >
           {breakdown}
         </div>
@@ -486,6 +616,18 @@ export function QualityCard({
         {latest.n_ok} ok · {latest.n_error} err · error {pct(latest.error_rate)}
         {latest.mode === 'graded' && <> · fallback {pct(latest.fallback_rate)}</>}
       </div>
+      {/* Absent, not blank, on a pre-0040 row — see `measuredOn`. Faint, because
+          it is provenance rather than a number: nobody reads it until something
+          moves, and then it is the first thing they need. */}
+      {measured && (
+        <div
+          data-testid="quality-measured-on"
+          className="mt-1 truncate text-[11px] text-faint"
+          title={`Measured on: ${[latest.app_version && `soc-ai ${latest.app_version}`, latest.code_commit && `commit ${latest.code_commit}`, latest.analyst_model && `analyst model ${latest.analyst_model}`].filter(Boolean).join(', ')}`}
+        >
+          {measured}
+        </div>
+      )}
 
       {series && series.values.length > 0 && (
         <>
@@ -523,8 +665,8 @@ export function QualityCard({
           </div>
           {alarm.kind === 'pipeline' && (
             <div className="mt-0.5 text-dim">
-              The eval errored before it produced verdicts to judge — pipeline health, not verdict
-              quality.
+              The eval errored before it produced verdicts to judge. This is a fault in the
+              pipeline.
             </div>
           )}
           {latest.alarm_reasons.map((r) => (
@@ -538,7 +680,7 @@ export function QualityCard({
             <div
               data-testid="quality-pipeline-note"
               className="mt-1.5 border-t pt-1.5 font-semibold"
-              style={{ borderColor: tone.border, color: '#f5a623' }}
+              style={{ borderColor: tone.border, color: AMBER }}
             >
               {alarm.pipelineNote}
             </div>

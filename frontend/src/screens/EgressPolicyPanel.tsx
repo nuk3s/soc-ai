@@ -38,10 +38,11 @@ export function EgressPolicyPanel({
           {data && (
             <>
               <div className="mb-3 text-[12.5px] leading-[1.55] text-dim">
-                Every path by which data can leave this network — with its enable state, what
-                redaction it applies, and how many times it actually fired in the last 7 days (from
-                the audit trail). Counts are best-effort: <span className="font-mono">—</span> means
-                the destination has no dedicated audit kind, or the audit index was unreachable.
+                The table lists every path that can send data out of this network. Each row gives
+                the enable state and the redaction. Each row counts the calls of the last 7 days
+                from the audit trail. A count of <span className="font-mono">—</span> has two
+                causes. The destination has no audit type of its own. The audit index did not
+                answer.
               </div>
 
               {data.zero_egress ? (
@@ -50,8 +51,8 @@ export function EgressPolicyPanel({
                     <ShieldCheck size={15} />
                   </span>
                   <span>
-                    <strong>Zero egress.</strong> Every destination below is disabled — nothing
-                    leaves this network.
+                    <strong>Zero egress.</strong> Every destination below is off. No data leaves
+                    this network.
                   </span>
                 </div>
               ) : (
@@ -61,8 +62,8 @@ export function EgressPolicyPanel({
                     <strong>
                       {data.destinations.filter((d) => d.enabled).length} of {data.destinations.length}
                     </strong>{' '}
-                    egress destinations are enabled — data can leave this network. Review the posture
-                    of each enabled row below.
+                    egress destinations are on. Data can leave this network. Review each
+                    destination that is on.
                   </span>
                 </div>
               )}
@@ -100,7 +101,7 @@ export function EgressPolicyPanel({
                       <div className="font-mono text-[15px] font-semibold text-text">
                         {d.count_7d == null ? '—' : d.count_7d}
                       </div>
-                      <div className="text-[10.5px] uppercase tracking-[.05em] text-faint">7-day</div>
+                      <div className="text-[10.5px] uppercase tracking-[.05em] text-faint">last 7 days</div>
                     </div>
                   </div>
                 ))}

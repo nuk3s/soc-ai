@@ -1,7 +1,8 @@
-import { Suspense } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RouteFallback } from './components/States';
+import { getMe } from './lib/api';
 import { isIpKey, isPrivateIp } from './lib/ip';
 import { lazyWithReload } from './lib/lazyWithReload';
 import { AppShell } from './shell/AppShell';
@@ -26,6 +27,7 @@ const HuntDetail = lazyWithReload(() => import('./screens/HuntDetail').then((m) 
 const Hunts = lazyWithReload(() => import('./screens/Hunts').then((m) => ({ default: m.Hunts })));
 const Investigations = lazyWithReload(() => import('./screens/Investigations').then((m) => ({ default: m.Investigations })));
 const InvestigationPage = lazyWithReload(() => import('./screens/InvestigationPage').then((m) => ({ default: m.InvestigationPage })));
+const LeadDetail = lazyWithReload(() => import('./screens/LeadDetail').then((m) => ({ default: m.LeadDetail })));
 const Login = lazyWithReload(() => import('./screens/Login').then((m) => ({ default: m.Login })));
 const Notifications = lazyWithReload(() => import('./screens/Notifications').then((m) => ({ default: m.Notifications })));
 const Operate = lazyWithReload(() => import('./screens/Operate').then((m) => ({ default: m.Operate })));
@@ -63,6 +65,29 @@ function EntityRoute() {
   return <Entity />;
 }
 
+/**
+ * The bare root. With auth on, `/me` is a 401 and the login screen is the
+ * right place to land. With auth off (the lab default) `/me` answers with
+ * the anonymous admin, and sending that reader to a login form they cannot
+ * use is a dead end: the first thing the range tester saw was a password
+ * prompt on an instance that has no passwords.
+ */
+function RootRoute() {
+  const [to, setTo] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    getMe().then(
+      () => live && setTo('/dashboard'),
+      () => live && setTo('/login'),
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
+  if (to === null) return <RouteFallback />;
+  return <Navigate to={to} replace />;
+}
+
 export function App() {
   return (
     <Suspense fallback={<RouteFallback />}>
@@ -81,6 +106,7 @@ export function App() {
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/hunts" element={<Hunts />} />
             <Route path="/hunts/:id" element={<HuntDetail />} />
+            <Route path="/leads/:id" element={<LeadDetail />} />
             <Route path="/entity/:value" element={<EntityRoute />} />
             <Route path="/hosts" element={<Hosts />} />
             <Route path="/hosts/:ip" element={<HostDetail />} />
@@ -89,7 +115,7 @@ export function App() {
             <Route path="/runbooks" element={<Runbooks />} />
             <Route path="/config" element={<Config />} />
           </Route>
-          <Route path="/" element={<Navigate to="/login" replace />} />
+          <Route path="/" element={<RootRoute />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </ErrorBoundary>

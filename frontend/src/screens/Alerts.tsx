@@ -24,6 +24,7 @@ import {
   escalateGroup,
   getAlertGroupEvents,
   getAlerts,
+  getAlertsEmptyReason,
   getAutoTriageStatus,
   getInvestigation,
   getMe,
@@ -33,6 +34,7 @@ import {
   stopAutoTriage,
 } from '../lib/api';
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
+import { ackMessage, ackTail, escalateMessage } from '../lib/groupWriteMessages';
 import { plural } from '../lib/plural';
 import { middleEllipsis } from '../lib/text';
 import { useToast } from '../lib/toast';
@@ -42,6 +44,7 @@ import { type SortDir, useSort } from '../lib/useSort';
 import type {
   AlertEvent,
   AlertGroup,
+  AlertsEmptyReason,
   Investigation as Inv,
   SavedViewQuery,
   Severity,
@@ -87,7 +90,7 @@ const EVENTS_PAGE_SIZE = 50;
 // is character-for-character what the fallback already produces.
 const TRIAGE_SKIP_REASONS: Record<string, string> = {
   already_triaged: 'already triaged',
-  running: 'in-flight',
+  running: 'in progress',
   inherited: 'covered by a prior verdict',
 };
 
@@ -108,6 +111,12 @@ function triageSkipDetail(s: AutoTriageStatus): string {
 }
 
 const SEV_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+// 'unknown' is not in SEV_RANK and must not be: it is the absence of a
+// severity, so it has no place among the four. The severity sort groups those
+// rows at the END in either direction, the same convention the confidence sort
+// already uses for a null. Ranking them 0 would have sunk them below Low on a
+// descending sort, which is where they were hiding in the first place.
+const isRanked = (sev: string): boolean => sev in SEV_RANK;
 // inconclusive sorts with needs_more_info: both are terminal non-committed
 // verdicts that still need an analyst decision.
 const VERDICT_RANK: Record<string, number> = { true_positive: 6, false_positive: 5, needs_more_info: 4, inconclusive: 3, untriaged: 1 };
@@ -122,7 +131,7 @@ const verdictRank = (g: AlertGroup): number => (g.triaging ? TRIAGING_RANK : VER
 // not applied: a filter the on-screen control can't display is one the operator
 // can't clear, so a mangled or stale bookmark would silently hide rows with no
 // visible way back.
-const SEV_LINK_VALUES = new Set(['critical', 'high', 'medium', 'low']);
+const SEV_LINK_VALUES = new Set(['critical', 'high', 'medium', 'low', 'unknown']);
 /** Exactly the Verdict MultiSelect's options below. 'pipeline_error' is
  * deliberately absent even though matchesVerdict() understands it — this
  * screen's MultiSelect offers no such option, so a link carrying it would set a
@@ -208,6 +217,55 @@ function seedFromLink(params: URLSearchParams): {
  * `g.id` is kept only as the representative-event payload for a new hunt. */
 const groupKey = (g: AlertGroup): string => `${g.kind}:${g.name}`;
 
+/** The count chip for a group's already-handled events — or the absence of one.
+ *
+ * Three states, because there are three: a number the grid stands behind, a
+ * zero that needs no chip at all, and `null`, which is the grid saying it
+ * cannot count. Elastic Defend's endpoint alert index does not map
+ * `event.acknowledged` or `event.escalated` as searchable fields, so the
+ * aggregation these come from answers 0 for a group an analyst cleared this
+ * morning exactly as it does for one nobody has opened. Drawing a green check
+ * from that 0 — or, worse, drawing nothing and letting the row read as
+ * untouched — is the console asserting something it does not know.
+ *
+ * So `null` gets its own faint chip with the question in the tooltip, and it
+ * points at the one place the answer does exist: each event carries the flag in
+ * its own document, which the expanded group shows. */
+function HandledChip({
+  count,
+  icon,
+  colour,
+  known,
+  unknown,
+}: {
+  count: number | null | undefined;
+  icon: React.ReactNode;
+  colour: { borderColor: string; background: string; color: string };
+  known: (n: number) => string;
+  unknown: string;
+}) {
+  const cls =
+    'inline-flex flex-shrink-0 items-center gap-[3px] rounded-chip border px-[5px] py-[2px] font-mono text-[10px] font-semibold';
+  if (count === null) {
+    return (
+      <span
+        title={unknown}
+        className={cls}
+        style={{ borderColor: 'rgba(148,163,184,.32)', background: 'rgba(148,163,184,.08)', color: '#94a3b8' }}
+      >
+        {icon}?
+      </span>
+    );
+  }
+  if (!count || count <= 0) return null;
+  return (
+    <span title={known(count)} className={cls} style={colour}>
+      {icon}
+      {count}
+    </span>
+  );
+}
+
 /** Derive 1-2 char avatar initials from a username or token:<name> string. */
 function toInitials(owner: string): string {
   const name = owner.startsWith('token:') ? owner.slice(6) : owner;
@@ -292,7 +350,7 @@ function ProvenanceBadge({ ev, onOpen }: { ev: AlertEvent; onOpen: (id: string) 
   const tone = green
     ? { borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }
     : { borderColor: 'rgba(148,163,184,.25)', background: 'rgba(148,163,184,.07)', color: '#94a3b8' };
-  const title = ev.inheritedReason ?? 'This exact event was investigated — open the report';
+  const title = ev.inheritedReason ?? 'The investigation covers this exact event. Open the report.';
   const cls =
     'inline-flex min-w-0 max-w-full items-center gap-0.5 truncate rounded-chip border px-[6px] py-[2px] font-mono text-[9.5px] font-semibold';
   if (ev.invId) {
@@ -324,9 +382,10 @@ function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttem
   // "fallback" reads as "failed" for the operator; the other statuses name the
   // terminal state directly ("error"/"cancelled"/"interrupted").
   const label = attempt.status === 'fallback' ? 'failed' : attempt.status;
+  const outcome = attempt.status === 'fallback' ? 'failed with a pipeline fallback' : `ended in ${attempt.status}`;
   return (
     <span
-      title={`The last re-run of this detection ${attempt.status === 'fallback' ? 'failed (pipeline fallback)' : `ended in ${attempt.status}`} ${attempt.ago} ago — the standing verdict is from an earlier run. Retry it.`}
+      title={`The last re-run of this detection ${outcome} ${attempt.ago} ago. The standing verdict comes from an earlier run.`}
       className="flex min-w-0 items-center truncate font-mono text-[10.5px] font-semibold text-danger"
     >
       <span className="truncate">· last retry {label} {attempt.ago} ago</span>
@@ -365,7 +424,12 @@ function cmpGroups(a: AlertGroup, b: AlertGroup, key: SortKey, dir: SortDir): nu
       result = a.name.localeCompare(b.name);
       break;
     case 'sev':
-      result = (SEV_RANK[a.sev] ?? 0) - (SEV_RANK[b.sev] ?? 0);
+      // Unranked (no severity on the document) sorts last in either direction.
+      if (!isRanked(a.sev) || !isRanked(b.sev)) {
+        if (isRanked(a.sev) === isRanked(b.sev)) return 0;
+        return isRanked(a.sev) ? -1 : 1;
+      }
+      result = SEV_RANK[a.sev] - SEV_RANK[b.sev];
       break;
     case 'verdict':
       result = verdictRank(a) - verdictRank(b);
@@ -440,7 +504,7 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
         {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
       </div>
       {/* severity */}
-      <div><SeverityTag sev={(ev.sev ?? 'low') as Severity} /></div>
+      <div><SeverityTag sev={(ev.sev ?? 'unknown') as Severity} /></div>
       {/* src → dst:port — each endpoint pivots to its entity page.
           The backend sends BARE endpoints (the pivot value); the
           destination port renders exactly once here, hugging the
@@ -586,7 +650,7 @@ export function Alerts() {
   // that instead — same gotcha/pattern as Investigations.tsx, Hunts.tsx, etc.
   const drawerOpenRef = useRef(false);
   drawerOpenRef.current = !!drawerId;
-  const { data: groups, loading, error, lastUpdated, refetch } = useAsync(
+  const { data: queue, loading, error, lastUpdated, refetch } = useAsync(
     () => getAlerts(alertQuery),
     [filterTime, customRange?.from, customRange?.to, hideAcked, filterQ, reloadKey],
     {
@@ -596,6 +660,10 @@ export function Alerts() {
       pauseWhen: () => drawerOpenRef.current,
     }
   );
+
+  // The rows, and separately whether they are all the rows. The grid caps every
+  // terms aggregation, so past the cap these are a floor — see `truncated`.
+  const groups = queue?.groups;
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Events live behind a lazy fetch — pulled the first time a group is expanded.
@@ -694,15 +762,15 @@ export function Alerts() {
     // The server's sentence, or the transport's.
     const detail = err instanceof Error ? err.message.trim() : '';
     if (err instanceof ApiError) {
-      return `Bulk Investigate was refused. ${endSentence(
+      return `The API refused Bulk Investigate. ${endSentence(
         detail || `The API answered ${err.status}`,
       )}`;
     }
     // The next step leads here, because it is the part that stops a duplicate
     // sweep; the transport's own words follow it.
     return (
-      'No answer to Bulk Investigate — the sweep may have started anyway, so check the ' +
-      `Auto-Investigate tile on the Dashboard before starting another. ${endSentence(
+      'Bulk Investigate gave no answer. The sweep may have started. Check the ' +
+      `Auto-Investigate tile on the Dashboard before you start another sweep. ${endSentence(
         detail || 'The request did not complete',
       )}`
     );
@@ -750,7 +818,7 @@ export function Alerts() {
           setTriageStatus(s);
           if (!s.active) finish(triageSummary(s));
         })
-        .catch(() => finish('Bulk Investigate status check failed'));
+        .catch(() => finish('The status check for Bulk Investigate failed'));
     };
     startAutoTriage(alertIds?.length ? { alertIds } : { minSeverity })
       .then((s) => {
@@ -834,7 +902,7 @@ export function Alerts() {
     // its only filter and blanked a live search term, so the guarantee is made
     // here instead: change a filter and the selection is dropped, out loud.
     if (selectedRef.current > 0) {
-      showAckMsg('Filter changed — selection cleared');
+      showAckMsg('The filter changed. The screen cleared the selection.');
     }
     sel.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -918,7 +986,7 @@ export function Alerts() {
     setHuntGroupPending((s) => ({ ...s, [gk]: true }));
     getRepresentative(g, alertQuery)
       .then((rep) => {
-        showHuntReason(`Investigating representative: ${rep.reason}`);
+        showHuntReason(`The investigation uses the representative event: ${rep.reason}`);
         setStarting(g);
         return startHunt(rep.alert_id);
       })
@@ -937,9 +1005,7 @@ export function Alerts() {
     setAcking(true);
     ackGroup(g, alertQuery)
       .then((r) => {
-        const parts = [`Acknowledged ${r.acked} alert${r.acked !== 1 ? 's' : ''} in ${g.name}`];
-        if (r.failed) parts.push(`${r.failed} event${r.failed !== 1 ? 's' : ''} failed`);
-        showAckMsg(parts.join(' · ') + (r.capped ? ' — group exceeded the 200-event cap, press a again to finish.' : ''));
+        showAckMsg(ackMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
       .catch(() => showAckMsg(`Failed to acknowledge ${g.name}`))
@@ -953,7 +1019,7 @@ export function Alerts() {
     if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
     escalateGroup(g, alertQuery)
       .then((r) => {
-        showAckMsg(`Escalated ${r.escalated} of ${r.total} event${r.total !== 1 ? 's' : ''} in ${g.name} to a case`);
+        showAckMsg(escalateMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
       .catch(() => showAckMsg(`Failed to escalate ${g.name}`));
@@ -1049,16 +1115,52 @@ export function Alerts() {
     if (g.fallback) return false;
     return filterVerdicts.includes(g.verdict);
   };
-  const visible = useMemo(
+  // Every facet the analyst set EXCEPT the preset itself. Split out so the
+  // preset chips can be counted against it: a chip badge answers "how many rows
+  // would I get if I clicked this", which is only true when it is measured under
+  // the same facets the list is already under. Counted off the raw fetch, the
+  // chips described a list nobody was looking at, and the All chip disagreed
+  // with the footer directly below it.
+  const faceted = useMemo(
     () =>
       hideOptimisticallyAcked(groups ?? [], optimisticAcked, hideAcked)
-        .filter((g) => matchView(g, view, me))
         .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
-        .filter(matchesVerdict)
-        .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir)),
+        .filter(matchesVerdict),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [groups, view, me, filterSevs, filterVerdicts, sort, optimisticAcked, hideAcked],
+    [groups, filterSevs, filterVerdicts, optimisticAcked, hideAcked],
   );
+  const visible = useMemo(
+    () =>
+      faceted
+        .filter((g) => matchView(g, view, me))
+        .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir)),
+    [faceted, view, me, sort],
+  );
+
+  // Which empty this is. An alerts filter that matches nothing looks exactly
+  // like a quiet network, and on a measured grid it hid 22 unreviewed endpoint
+  // alerts behind a screen that read as a calm night. Fetched only when the
+  // list came back empty. It costs four counts against the grid, and the
+  // answer means nothing for a screen that has rows on it. Failures are
+  // swallowed: this is an explanation of silence, and it must never replace
+  // the silence with an error.
+  const isEmpty = !loading && !error && visible.length === 0;
+  const [emptyReason, setEmptyReason] = useState<AlertsEmptyReason | null>(null);
+  useEffect(() => {
+    if (!isEmpty) {
+      setEmptyReason(null);
+      return;
+    }
+    let cancelled = false;
+    getAlertsEmptyReason(alertQuery)
+      .then((r) => !cancelled && setEmptyReason(r))
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+    // alertQuery is rebuilt every render; depend on the window it is built from.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEmpty, filterTime, customRange?.from, customRange?.to, reloadKey]);
 
   const visIds = visible.map(groupKey);
   // The shared selection hook. Keyed by the STABLE group key, not the list
@@ -1183,22 +1285,30 @@ export function Alerts() {
 
   const toggleSelectAll = () => sel.toggleAll();
 
-  const { counts, untriaged, totalEvents } = useMemo(() => {
-    const gs = groups ?? [];
-    return {
-      counts: {
-        // "Mine" = owned by the current user (falls back to "any owner" until
-        // getMe resolves, matching matchView's fallback so the count is honest).
-        mine: gs.filter((g) => (me ? g.owner === me : !!g.owner && g.owner !== '')).length,
-        inreview: gs.filter((g) => g.state === 'in_review').length,
-        critical: gs.filter((g) => g.sev === 'critical').length,
-        decision: gs.filter((g) => g.verdict === 'needs_more_info' || g.verdict === 'inconclusive' || g.verdict === 'untriaged').length,
-        all: gs.length,
-      },
-      untriaged: gs.filter((g) => g.verdict === 'untriaged').length,
-      totalEvents: gs.reduce((a, g) => a + g.count, 0),
-    };
-  }, [groups, me]);
+  // A chip badge is a promise about the list clicking it produces, so each one
+  // is the preset's own predicate run over the FACETED rows — the same
+  // `matchView` the list itself uses, not a second copy of it that can drift.
+  const counts = useMemo(
+    () => ({
+      mine: faceted.filter((g) => matchView(g, 'mine', me)).length,
+      inreview: faceted.filter((g) => matchView(g, 'inreview', me)).length,
+      critical: faceted.filter((g) => matchView(g, 'critical', me)).length,
+      decision: faceted.filter((g) => matchView(g, 'decision', me)).length,
+      all: faceted.length,
+    }),
+    [faceted, me],
+  );
+  // The header and footer caption the rows on screen, which means the preset
+  // counts too. Measured off the raw fetch, a list showing one row was captioned
+  // "59 detections": a claim about a list the analyst had already narrowed away.
+  const { shown, untriaged, totalEvents } = useMemo(
+    () => ({
+      shown: visible.length,
+      untriaged: visible.filter((g) => g.verdict === 'untriaged').length,
+      totalEvents: visible.reduce((a, g) => a + g.count, 0),
+    }),
+    [visible],
+  );
 
   // Unknown is not zero. Every number on this screen is derived from `groups`,
   // which is an empty array both before the first load lands and after a failed
@@ -1219,6 +1329,28 @@ export function Alerts() {
   // A chip badge is one glyph wide with no room for that distinction, so an
   // uncounted view carries NO badge rather than a confident "0" one.
   const chipCount = (n: number): number | undefined => (groups ? n : undefined);
+
+  // The OTHER way every number on this line can be wrong, and the harder one to
+  // notice. The grid caps each terms aggregation at a fixed number of distinct
+  // groups; past that it returns the biggest ones and a lump sum for the rest.
+  // So "212 detections · 41,908 events in window" was a true count of what came
+  // back and a false count of what is there, and it reads as a total because
+  // nothing about it looks uncertain. The em-dash convention above covers "I
+  // could not tell"; this covers "I could tell, partly", which needs its own
+  // mark rather than borrowing that one.
+  //
+  // The flag is the server's, from whichever cut fired. Inferring it here by
+  // comparing `groups.length` against a copied cap would read an exactly-full
+  // page as a cut one, and would go quietly false the day the cap moves or a
+  // muted rule is dropped after the cap is applied — both of which are true of
+  // this route.
+  const truncated = queue?.truncated ?? false;
+  const floorOf = (n: number, one: string, many = `${one}s`): string =>
+    groups && truncated ? `${n.toLocaleString()}+ ${many}` : countOf(n, one, many);
+  const FLOOR_TITLE =
+    'The grid returned the biggest detections. The grid stopped at its group ceiling. These ' +
+    'numbers are floors. This window holds more detections than the queue can show. Narrow ' +
+    'the window, the severity, or the query until the queue fits.';
 
   const TABS: Array<{ id: ViewId; label: string; count: number | undefined }> = [
     { id: 'mine', label: 'Mine', count: chipCount(counts.mine) },
@@ -1264,9 +1396,18 @@ export function Alerts() {
             <div className="text-title">Alerts</div>
             <Freshness at={lastUpdated} />
           </div>
-          <div className="mt-0.5 text-[13px] text-dim">
-            {num(untriaged)} untriaged · {countOf(counts.all, 'detection')} ·{' '}
-            {countOf(totalEvents, 'event')} in window
+          <div className="mt-0.5 text-[13px] text-dim" title={truncated ? FLOOR_TITLE : undefined}>
+            {num(untriaged)} untriaged · {floorOf(shown, 'detection')} ·{' '}
+            {floorOf(totalEvents, 'event')} in window
+            {/* The "+" alone is a mark somebody has to already know how to
+                read. This says what it means, once, on the line it modifies —
+                the numbers stay scannable and the sentence is there for the
+                analyst who wonders why the queue will not add up. */}
+            {truncated && (
+              <span className="ml-1.5" style={{ color: '#f5a623' }}>
+                · more than the queue can show
+              </span>
+            )}
           </div>
         </div>
         <div className="flex-1" />
@@ -1276,7 +1417,7 @@ export function Alerts() {
             onChange={(e) => setTriageFloor(e.target.value)}
             disabled={triaging}
             className="rounded-l-control border border-r-0 border-border-strong bg-surface-3 px-2.5 py-2 text-[12.5px] text-dim focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
-            title="Bulk investigate severity floor"
+            title="The severity floor for Bulk Investigate. Select the lowest severity to investigate."
           >
             <option value="critical">Critical only</option>
             <option value="high">High and up</option>
@@ -1331,8 +1472,8 @@ export function Alerts() {
             <div className="flex items-center gap-[13px]">
               <Spinner size={15} />
               <div className="text-[13px] font-semibold">
-                Bulk investigating
-                {triageStatus?.severities?.length ? ` ${triageStatus.severities.join(', ')}` : ''}
+                Bulk Investigate runs
+                {triageStatus?.severities?.length ? ` on ${triageStatus.severities.join(', ')}` : ''}
                 …
               </div>
               <div className="font-mono text-[12px] text-dim">
@@ -1364,7 +1505,7 @@ export function Alerts() {
           {acking && (
             <div className="flex items-center gap-2.5 text-[13px]">
               <Spinner size={14} />
-              <span className="font-semibold text-text-2">Acknowledging {ackingCount} group{ackingCount !== 1 ? 's' : ''} ({ackingAlertTotal} alert{ackingAlertTotal !== 1 ? 's' : ''}) in Security Onion…</span>
+              <span className="font-semibold text-text-2">Security Onion acknowledges {ackingCount} group{ackingCount !== 1 ? 's' : ''}. The groups hold {ackingAlertTotal} alert{ackingAlertTotal !== 1 ? 's' : ''}.</span>
             </div>
           )}
         </div>
@@ -1387,6 +1528,7 @@ export function Alerts() {
         onDeleteView={views.onDeleteView}
         onSaveView={views.onSaveView}
         viewError={views.error}
+        saveViewUnavailable={views.unavailable}
         trailing={
           <>
             {/* density toggle */}
@@ -1434,7 +1576,7 @@ export function Alerts() {
                         <span className="font-mono text-accent">{selCount}</span> group{selCount !== 1 ? 's' : ''}
                         <span
                           className="ml-1 text-[11.5px] font-normal text-faint"
-                          title="How many times the selected detections fired in the current window. Acknowledging a group covers all of them."
+                          title="The selected detections fired this many times in the current window. Acknowledge a group to cover every alert in it."
                         >
                           ({alertsInWindow.toLocaleString()} alert{alertsInWindow !== 1 ? 's' : ''} in window)
                         </span>
@@ -1487,7 +1629,7 @@ export function Alerts() {
                           const ok = n - failedIds.length;
                           sel.select(failedIds);
                           if (failedIds.length) {
-                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed — still selected, click Assign to me to retry`);
+                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed. The failed groups stay selected. Click Assign to me to retry.`);
                           } else {
                             showAckMsg(`Assigned ${ok} group${ok !== 1 ? 's' : ''} to you`);
                           }
@@ -1517,11 +1659,15 @@ export function Alerts() {
                           let totalFailed = 0;
                           let okGroups = 0;
                           let anyCapped = false;
+                          let totalRemaining = 0;
+                          let totalAlready = 0;
                           outcomes.forEach((o, i) => {
                             if (o.status === 'fulfilled') {
                               okGroups += 1;
                               totalAcked += o.value.acked;
                               totalFailed += o.value.failed;
+                              totalRemaining += o.value.remaining ?? 0;
+                              totalAlready += o.value.already_acked ?? 0;
                               if (o.value.capped) anyCapped = true;
                             } else {
                               failedIds.push(groupKey(selectedGroups[i]));
@@ -1530,10 +1676,10 @@ export function Alerts() {
                           const failedGroups = failedIds.length;
                           // Clear only the groups that succeeded; retain failed ones for retry.
                           sel.select(failedIds);
-                          const parts = [`Acknowledged ${totalAcked} alert${totalAcked !== 1 ? 's' : ''} across ${okGroups} group${okGroups !== 1 ? 's' : ''}`];
-                          if (totalFailed) parts.push(`${totalFailed} event${totalFailed !== 1 ? 's' : ''} failed`);
-                          if (failedGroups) parts.push(`${failedGroups} group${failedGroups !== 1 ? 's' : ''} failed — still selected, click Acknowledge to retry`);
-                          showAckMsg(parts.join(' · ') + (anyCapped ? ' — some groups exceeded the 200-event cap, click Acknowledge again to finish.' : ''));
+                          const parts = [`Acknowledged ${plural(totalAcked, 'alert')} across ${plural(okGroups, 'group')}`];
+                          if (totalFailed) parts.push(`${plural(totalFailed, 'event')} failed`);
+                          if (failedGroups) parts.push(`${plural(failedGroups, 'group')} failed. The failed groups stay selected. Click Acknowledge to retry.`);
+                          showAckMsg(parts.join(' · ') + ackTail({ capped: anyCapped, remaining: totalRemaining, already_acked: totalAlready }));
                           setReloadKey((k) => k + 1);
                         })
                         .finally(() => setAcking(false));
@@ -1561,7 +1707,7 @@ export function Alerts() {
                       }}
                       className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success disabled:opacity-50"
                     >
-                      {ackingEvents ? 'Acking…' : `Ack ${looseEventIds.length} event${looseEventIds.length !== 1 ? 's' : ''}`}
+                      {ackingEvents ? 'Acknowledging…' : `Acknowledge ${looseEventIds.length} event${looseEventIds.length !== 1 ? 's' : ''}`}
                     </button>
                   )}
                   </>
@@ -1587,6 +1733,10 @@ export function Alerts() {
             { value: 'high', label: 'High' },
             { value: 'medium', label: 'Medium' },
             { value: 'low', label: 'Low' },
+            // Alerts whose document carries no severity label. Offered as its
+            // own option because the badge names it: a filter the screen can
+            // display a value for but not select by is the same disagreement.
+            { value: 'unknown', label: 'Unknown' },
           ]}
           value={filterSevs}
           onChange={(v) => {
@@ -1632,7 +1782,7 @@ export function Alerts() {
         {filterQ && (
           <span
             data-testid="alerts-q-chip"
-            title="Only detections matching this filter (a host page deep-link). The backend validates the clause; clear it to see every detection."
+            title="The list shows only the detections that match this filter. Clear the filter to see every detection."
             className="flex max-w-[420px] items-center gap-1.5 rounded-control border border-accent/40 bg-accent/10 px-[10px] py-[7px] text-[12px] text-accent"
           >
             <Filter size={12} className="flex-none" />
@@ -1706,8 +1856,19 @@ export function Alerts() {
             whole page, while the Dashboard's card for the same outage has had a
             Retry button all along. */}
         {error && <div className="p-3"><ErrorState error={error} onRetry={refetch} /></div>}
-        {!loading && !error && visible.length === 0 && (
-          <div className="px-4 py-10 text-center text-[13px] text-faint">No detections match this view.</div>
+        {isEmpty && (
+          <div
+            className="px-4 py-10 text-center text-[13px] text-faint"
+            data-empty-reason={emptyReason?.reason ?? 'unchecked'}
+          >
+            <div>No detection matches this view in this window. Widen the time range.</div>
+            {/* Only when the backend has something to add. `not_empty` means the
+                feed did match events in this window, so the screen is empty
+                because of the filters above it, which the sentence already says. */}
+            {emptyReason && emptyReason.reason !== 'not_empty' && emptyReason.hint ? (
+              <div className="mx-auto mt-2 max-w-xl">{emptyReason.hint}</div>
+            ) : null}
+          </div>
         )}
 
         {visible.map((g, rowIdx) => {
@@ -1771,7 +1932,7 @@ export function Alerts() {
                       {g.count > 1 && (
                         <span
                           className="flex-shrink-0 font-mono text-[10.5px] text-faint"
-                          title={`Fired ${g.count.toLocaleString()} times in window — expand to see each event`}
+                          title={`This detection fired ${g.count.toLocaleString()} times in the window. Expand the row to see each event.`}
                         >
                           ×{g.count.toLocaleString()}
                         </span>
@@ -1783,26 +1944,20 @@ export function Alerts() {
                       </div>
                     )}
                   </div>
-                  {(g.ackedCount ?? 0) > 0 && (
-                    <span
-                      title={`${g.ackedCount} acknowledged`}
-                      className="inline-flex flex-shrink-0 items-center gap-[3px] rounded-chip border px-[5px] py-[2px] font-mono text-[10px] font-semibold"
-                      style={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
-                    >
-                      <Check size={9} strokeWidth={2.5} />
-                      {g.ackedCount}
-                    </span>
-                  )}
-                  {(g.escalatedCount ?? 0) > 0 && (
-                    <span
-                      title={`${g.escalatedCount} escalated`}
-                      className="inline-flex flex-shrink-0 items-center gap-[3px] rounded-chip border px-[5px] py-[2px] font-mono text-[10px] font-semibold"
-                      style={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
-                    >
-                      <ArrowUpRight size={9} strokeWidth={2.5} />
-                      {g.escalatedCount}
-                    </span>
-                  )}
+                  <HandledChip
+                    count={g.ackedCount}
+                    icon={<Check size={9} strokeWidth={2.5} />}
+                    colour={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
+                    known={(n) => `${n} acknowledged`}
+                    unknown="The acknowledged count is unknown. This detector's index cannot search the flag. Security Onion cannot count it. Expand the group to see what each event says."
+                  />
+                  <HandledChip
+                    count={g.escalatedCount}
+                    icon={<ArrowUpRight size={9} strokeWidth={2.5} />}
+                    colour={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
+                    known={(n) => `${n} escalated`}
+                    unknown="The escalated count is unknown. This detector's index cannot search the flag. Security Onion cannot count it. Expand the group to see what each event says."
+                  />
                 </div>
                 <div><SeverityTag sev={g.sev} /></div>
                 {/* flex-wrap (not overflow-hidden): the E2.3 StateChip drops to
@@ -1837,7 +1992,7 @@ export function Alerts() {
                         e.stopPropagation();
                         if (g.invId) openDrawer(g.invId);
                       }}
-                      title="Standing verdict is a pipeline error — open the run to re-run it"
+                      title="The standing verdict is a pipeline error. Open the investigation and run it again."
                       className="flex min-w-0 items-center rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
                     >
                       <PipelineErrorChip />
@@ -1853,7 +2008,7 @@ export function Alerts() {
                         e.stopPropagation();
                         if (g.invId) openDrawer(g.invId);
                       }}
-                      title={g.inheritedReason ?? 'Verdict inherited from a prior investigation of this detection'}
+                      title={g.inheritedReason ?? 'This verdict comes from an earlier investigation of this detection.'}
                       className="group/inh flex min-w-0 items-center gap-1.5 rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
                     >
                       <VerdictPill verdict={g.verdict} conf={g.conf} inherited showConf={false} showInherited={false} />
@@ -1886,7 +2041,7 @@ export function Alerts() {
                         e.stopPropagation();
                         release(g);
                       }}
-                      title={`Assigned to ${owner} — click to release`}
+                      title={`Assigned to ${owner}. Click to release it.`}
                       className="flex h-[25px] w-[25px] items-center justify-center rounded-full border border-border-strong bg-[#1a2330] text-[9.5px] font-bold text-[#b9c2cf] hover:border-danger hover:text-danger"
                     >
                       {toInitials(owner)}
@@ -1977,7 +2132,7 @@ export function Alerts() {
                       }}
                       disabled={!!huntGroupPending[gk]}
                       aria-label="Retry investigation"
-                      title="Last re-run failed — re-investigate the representative event"
+                      title="The last re-run failed. Investigate the representative event again."
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                       style={{ borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)', color: '#f87171' }}
                     >
@@ -2075,14 +2230,14 @@ export function Alerts() {
                           {b.head.ago && <span className="text-[10px] text-faint">newest {b.head.ago} ago</span>}
                         </div>
                         {/* severity */}
-                        <div><SeverityTag sev={(b.head.sev ?? 'low') as Severity} /></div>
+                        <div><SeverityTag sev={(b.head.sev ?? 'unknown') as Severity} /></div>
                         {/* src → dst:port, plus the collapsed count */}
                         <div className="flex min-w-0 items-center gap-1.5 truncate">
                           <span className="text-mono-green">{b.head.src}</span>
                           <span className="text-ghost">→</span>
                           <span className="truncate text-mono-amber">{b.head.dst}</span>
                           {b.head.port != null && <span className="text-faint">:{b.head.port}</span>}
-                          <span className="flex-shrink-0 text-faint" title={`${b.events.length} identical events collapsed`}>
+                          <span className="flex-shrink-0 text-faint" title={`This row holds ${b.events.length} identical events.`}>
                             ×{b.events.length}
                           </span>
                         </div>
@@ -2134,7 +2289,7 @@ export function Alerts() {
       </div>
 
       <div className="mt-2.5 font-mono text-[12px] text-faint">
-        {countOf(counts.all, 'detection')} · grouped · click a row to expand events
+        {countOf(shown, 'detection')} · grouped · click a row to expand events
       </div>
 
       {/* keyboard cheatsheet (E2.5) — `?` opens; Esc / backdrop closes */}
@@ -2167,7 +2322,7 @@ const KEY_HELP: Array<{ keys: string; label: string }> = [
   { keys: 'e', label: 'Escalate the focused group to a case' },
   { keys: 'i', label: 'Investigate the focused group' },
   { keys: 'x', label: 'Select / deselect the focused group' },
-  { keys: '/', label: 'Search — open the command palette' },
+  { keys: '/', label: 'Open the command palette to search' },
   { keys: '⌘K', label: 'Toggle the command palette' },
   { keys: '?', label: 'Show this shortcut help' },
   { keys: 'esc', label: 'Close help / palette / drawer' },
@@ -2201,7 +2356,7 @@ function KeyHelpOverlay({ onClose }: { onClose: () => void }) {
           ))}
         </div>
         <div className="border-t border-border-2 px-4 py-[9px] font-mono text-[10.5px] text-faint">
-          Row shortcuts act on the highlighted detection · typing in a filter never triggers them
+          Row shortcuts act on the highlighted detection. The shortcuts do not fire while you type in a filter.
         </div>
       </div>
     </>
@@ -2262,9 +2417,10 @@ function AlertDrawer({
       onClose={onClose}
       header={
         <>
-          <span className="rounded-chip border px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase" style={{ color: '#4b8bf5', background: 'rgba(75,139,245,.1)', borderColor: 'rgba(75,139,245,.3)' }}>
-            {inv?.kind ?? starting?.kind ?? 'suricata'}
-          </span>
+          {/* KindBadge, not a hand-rolled chip: this one hardcoded Suricata's
+              blue whatever kind it printed, so a hunt-promoted or generic-alert
+              investigation still opened wearing a Suricata colour. */}
+          <KindBadge kind={inv?.kind ?? starting?.kind ?? 'alert'} />
           <div className="flex-1 truncate text-[14px] font-semibold" title={inv?.name ?? starting?.name ?? 'Investigation'}>
             {middleEllipsis(inv?.name ?? starting?.name ?? 'Investigation')}
           </div>

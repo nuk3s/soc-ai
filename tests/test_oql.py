@@ -712,7 +712,9 @@ def test_field_scoped_group_accepts_quoted_and_wildcard_members() -> None:
 # form; the leading-wildcard reject taught `foo*`, which on a keyword-mapped
 # field only matches value-initial text and misses mid-string occurrences — a
 # confident false negative. The explicit `:~` form compiles to a full-text
-# `match` (bounded scope, no per-field mapping-type table needed).
+# match over the field and its `.text` sibling (bounded scope, no per-field
+# mapping-type table needed). See tests/test_oql_contains_analyzed.py for why
+# the sibling is in the clause and the grid counts behind it.
 
 
 def test_contains_parses_to_contains_value() -> None:
@@ -720,23 +722,35 @@ def test_contains_parses_to_contains_value() -> None:
     assert ast.filter_ == Term(field="message", value=ContainsValue(text="beacon", phrase=False))
 
 
-def test_contains_bare_compiles_to_match() -> None:
-    """`field:~value` compiles to an ES `match` (analyzed full-text)."""
+def test_contains_bare_compiles_to_a_full_text_match() -> None:
+    """`field:~value` compiles to an analyzed full-text match.
+
+    Over the field AND its `.text` sibling: a plain `match` on a keyword-mapped
+    field runs the keyword analyzer and degenerates into an exact full-value
+    comparison, which is how a contains query for a known command returned zero
+    against 405 matching documents.
+    """
     ast = parse_oql("message:~beacon")
     validate_oql(ast)
     dsl = filter_to_dsl(ast.filter_)
-    assert dsl == {"match": {"message": "beacon"}}
+    assert dsl == {"multi_match": {"query": "beacon", "fields": ["message", "message.text"]}}
 
 
-def test_contains_quoted_compiles_to_match_phrase() -> None:
-    """A quoted contains value is a phrase — compiled to `match_phrase` so the
-    words must be adjacent, the natural reading of a quoted substring."""
+def test_contains_quoted_compiles_to_a_phrase_match() -> None:
+    """A quoted contains value is a phrase — phrase-typed so the words must be
+    adjacent, the natural reading of a quoted substring."""
     ast = parse_oql('message:~"powershell -enc"')
     assert ast.filter_ == Term(
         field="message", value=ContainsValue(text="powershell -enc", phrase=True)
     )
     dsl = filter_to_dsl(ast.filter_)
-    assert dsl == {"match_phrase": {"message": "powershell -enc"}}
+    assert dsl == {
+        "multi_match": {
+            "query": "powershell -enc",
+            "type": "phrase",
+            "fields": ["message", "message.text"],
+        }
+    }
 
 
 def test_contains_composes_with_boolean() -> None:

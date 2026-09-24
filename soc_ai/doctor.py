@@ -7,6 +7,12 @@ grant, index-pattern dataset coverage, the LiteLLM gateway, and the analyst
 model's actual fitness) and returns structured pass/fail results. Pure logic
 lives here; ``soc_ai.cli`` owns argparse and the table/JSON printing.
 
+One check looks inward instead of upstream: ``check_prompt_assets`` grades the
+files this deployment's own system prompts are built from. It is here because
+a doctor that only ever probes upstreams cannot see a packaging fault, and one
+of those shipped an image whose prompts told the model the query language was
+unavailable while every other row passed.
+
 Design rules (mirrors ``soc_ai.webui.probes``):
 
 - Every check is ISOLATED — it never raises, and one failing upstream never
@@ -46,11 +52,12 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from soc_ai.config import Settings
-from soc_ai.errors import SoAuthError
+from soc_ai.config import DEFAULT_ALERTS_QUERY, Settings
+from soc_ai.errors import OqlValidationError, SoAuthError
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 from soc_ai.store.db import _migration_config, make_engine
+from soc_ai.webui import alerts_query as aq
 from soc_ai.webui.probes import _safe_reason, _scrub, list_gateway_models, probe_model_fitness
 
 CheckStatus = Literal["PASS", "WARN", "FAIL", "INFO"]
@@ -74,9 +81,21 @@ class CheckResult:
         return {"name": self.name, "status": self.status, "detail": self.detail, "hint": self.hint}
 
 
-def exit_code(results: list[CheckResult]) -> int:
-    """Process exit code: 0 iff no REQUIRED check failed (WARN/INFO pass)."""
-    return 1 if any(r.status == "FAIL" for r in results) else 0
+def exit_code(results: list[CheckResult], *, strict: bool = False) -> int:
+    """Process exit code: 0 iff no REQUIRED check failed (WARN/INFO pass).
+
+    ``strict`` additionally fails on WARN. It is opt-in and stays that way: a
+    monitor keyed on this exit status has been reading 0-with-warnings as
+    success for the life of the tool, and silently starting to page it would be
+    a worse defect than the one it fixes. But the reverse — a deployment warning
+    that thirty-three alerts a day never reach the queue, on a doctor that exits
+    0 — is exactly how a WARN band becomes decorative. So the strict answer is
+    available to anyone who wants their automation to see it, without changing
+    what anyone's existing automation sees.
+    """
+    if any(r.status == "FAIL" for r in results):
+        return 1
+    return 1 if strict and any(r.status == "WARN" for r in results) else 0
 
 
 # Per-check wall-clock bounds (seconds). Each check is wrapped in
@@ -98,6 +117,7 @@ _SO_TIMEOUT_S = 8.0
 _ES_TIMEOUT_S = 8.0
 _AUDIT_TIMEOUT_S = 8.0  # one _has_privileges call — same cost profile as the ES check
 _COVERAGE_TIMEOUT_S = 8.0  # 3 CONCURRENT searches — worst case is ~one 5s round trip, not 3x
+_ALERT_FILTER_TIMEOUT_S = 8.0  # same shape: 4 CONCURRENT size=0 counts, one round trip
 _GATEWAY_TIMEOUT_S = 12.0  # list_gateway_models carries its own 10s HTTP timeout
 _FITNESS_TIMEOUT_S = 150.0  # probes._FITNESS_TOTAL_TIMEOUT_S (130s) + headroom
 
@@ -130,24 +150,68 @@ def check_config() -> tuple[Settings | None, CheckResult]:
     try:
         settings = Settings()  # type: ignore[call-arg]  # required fields come from env/.env
     except ValidationError as exc:
-        problems = "; ".join(
+        problems = ". ".join(
             f"{'.'.join(str(p) for p in err['loc']) or 'settings'}: {err['msg']}"
             for err in exc.errors()[:5]
         )
         return None, CheckResult(
             "config",
             "FAIL",
-            _scrub(f"settings failed validation — {problems}")[:300],
-            hint="fix the named field(s) in .env (see .env.example for the full surface)",
+            _scrub(f"the settings failed validation. {problems}")[:300],
+            hint="Fix the named fields in .env. See .env.example for the full surface.",
         )
     except Exception as exc:  # unreadable .env, bad encoding, … — still a graded FAIL
         return None, CheckResult(
             "config",
             "FAIL",
             _safe_reason(exc),
-            hint="check that .env exists, is readable, and parses as KEY=value lines",
+            hint="Check that .env exists and is readable. Every line must parse as KEY=value.",
         )
     return settings, CheckResult("config", "PASS", "settings loaded from env/.env")
+
+
+async def apply_persisted_overrides(settings: Settings) -> list[str]:
+    """Lay the config console's saved overrides onto *settings*. Returns the keys applied.
+
+    The doctor's whole value is grading what the app is actually running, and
+    until this ran it graded the environment file alone. The two diverge in
+    normal use: on a deployed instance ``ORACLE_MODEL`` was one model in the
+    file and another in ``config_overrides``, and the running app used the
+    second. Without this the doctor probes the gateway for a model nothing
+    asks for, and keeps warning about an alerts filter the operator has already
+    fixed in the console, which is the one place its own hint sends them.
+
+    Same order the app uses at startup (``soc_ai.main._init_store``): the
+    environment builds the singleton, saved overrides are set over it.
+
+    Fail-soft in every direction. A fresh install has no store yet, and
+    ``check_store`` is the row that reports a missing or broken one; a read
+    failure here must not take the doctor down or turn a config PASS into a
+    FAIL. Secrets are skipped (no ``secret_box``), leaving the environment
+    value standing, which is what ``apply_to_settings`` already does.
+    """
+    # Local imports: the store layer pulls in the whole ORM, and `soc-ai doctor`
+    # should not pay for it before check 1 has established there is a config.
+    from soc_ai.store.config_overrides import (  # noqa: PLC0415
+        apply_to_settings,
+        load_overrides,
+    )
+    from soc_ai.store.db import make_sessionmaker  # noqa: PLC0415
+
+    if not (settings.soc_ai_data_dir / "soc-ai.db").exists():
+        return []
+    engine = None
+    try:
+        engine = make_engine(settings)
+        async with make_sessionmaker(engine)() as db:
+            overrides = await load_overrides(db)
+        return apply_to_settings(settings, overrides, secret_box=None)
+    except Exception:
+        return []
+    finally:
+        if engine is not None:
+            with contextlib.suppress(Exception):
+                await engine.dispose()
 
 
 # ── Check 1b: upstream reachability (DNS vs TCP/firewall vs TLS trust) ───────
@@ -171,14 +235,15 @@ def check_config() -> tuple[Settings | None, CheckResult]:
 # Settings, would send them nowhere. Keyed by (target slug, failure kind) so
 # each FAIL line's hint names the fix that actually applies to that target.
 _REACH_DNS_HINT = (
-    "This container can't resolve the hostname. Use an IP address in .env, or add "
-    "an extra_hosts entry for it in docker-compose.yml."
+    "This container cannot resolve the hostname. Use an IP address in .env. You can "
+    "also add an extra_hosts entry for it in docker-compose.yml."
 )
 _REACH_SO_ES_FIREWALL_HINT = (
-    "No route or refused. Pinhole this host's IP through the SO firewall "
-    "(Elasticsearch is TCP 9200) — docs/SECURITY-ONION-SETUP.md, section 0."
+    "There is no route, or the upstream refused the connection. Pinhole this host's "
+    "IP through the SO firewall. Elasticsearch uses TCP 9200. See "
+    "docs/SECURITY-ONION-SETUP.md, section 0."
 )
-_REACH_TLS_FALLBACK_NOTE = "If the endpoint isn't serving TLS on this port, use http:// instead."
+_REACH_TLS_FALLBACK_NOTE = "If the endpoint does not serve TLS on this port, use http://."
 _REACH_HINTS: dict[tuple[str, str], str] = {
     ("so", "dns"): _REACH_DNS_HINT,
     ("so", "tls"): (
@@ -198,8 +263,9 @@ _REACH_HINTS: dict[tuple[str, str], str] = {
         "accept unverified TLS to the gateway. " + _REACH_TLS_FALLBACK_NOTE
     ),
     ("gateway", "reach"): (
-        "No route or refused. Check the gateway URL and port, and that the gateway "
-        "process/container is up and reachable from inside this container (Docker network)."
+        "There is no route, or the gateway refused the connection. Check the gateway "
+        "URL and port. Check that the gateway container is up. It must answer from "
+        "inside this container on the Docker network."
     ),
 }
 
@@ -236,7 +302,7 @@ def _classify_endpoint(url: str, *, verify_tls: bool, timeout_s: float = 5.0) ->
         # one such URL falls through to the generic OSError arm below and
         # collapses all three rows into a single undifferentiated FAIL
         # instead of naming it a DNS problem.
-        return "dns", f"{host}: DNS resolution failed inside the container ({exc})"
+        return "dns", f"{host}: DNS resolution failed inside the container: {exc}"
     try:
         # Connect by HOSTNAME, not a resolved address pinned to whichever
         # entry getaddrinfo happened to sort first: create_connection does
@@ -248,14 +314,14 @@ def _classify_endpoint(url: str, *, verify_tls: bool, timeout_s: float = 5.0) ->
             if parsed.scheme == "https" and verify_tls:
                 _tls_handshake(sock, host)
     except ssl.SSLCertVerificationError as exc:
-        return "tls", f"{host}:{port}: TLS verification failed ({exc})"
+        return "tls", f"{host}:{port}: TLS verification failed: {exc}"
     except ssl.SSLError as exc:
         # Broader than a cert-trust failure: the TCP connection succeeded but
         # the peer didn't speak TLS at all (e.g. an http-only service sitting
         # behind an https:// URL). Order matters — SSLCertVerificationError
         # is an SSLError subclass, so this arm MUST come after it, and both
         # MUST come before the OSError arm (SSLError is also an OSError).
-        return "tls", f"{host}:{port}: TLS handshake failed ({exc})"
+        return "tls", f"{host}:{port}: TLS handshake failed: {exc}"
     except TimeoutError:  # socket.timeout is TimeoutError as of Python 3.10
         return "reach", f"{host}:{port}: connection timed out"
     except OSError as exc:
@@ -300,7 +366,7 @@ async def check_upstream_reachability(settings: Settings) -> list[CheckResult]:
         # it only ever checked one member of it.
         es_note = ""
         if slug == "es" and es_host_count > 1:
-            es_note = f" (first of {es_host_count} es_hosts)"
+            es_note = f". This is the first of {es_host_count} es_hosts"
         if kind:
             results.append(
                 CheckResult(name, "FAIL", f"{detail}{es_note}", hint=_REACH_HINTS[(slug, kind)])
@@ -308,7 +374,7 @@ async def check_upstream_reachability(settings: Settings) -> list[CheckResult]:
             continue
         first = url.split(",", maxsplit=1)[0].strip()
         scheme = urlparse(first if "//" in first else f"//{first}").scheme
-        tls_note = ", TLS verifies" if verify and scheme == "https" else ""
+        tls_note = ". TLS verifies" if verify and scheme == "https" else ""
         results.append(CheckResult(name, "PASS", f"{detail}{tls_note}{es_note}"))
     return results
 
@@ -334,8 +400,8 @@ async def check_store(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 "store",
                 "FAIL",
-                f"cannot open the store at {db_path}: {_safe_reason(exc)}",
-                hint="check that SOC_AI_DATA_DIR exists and is writable by this user",
+                f"soc-ai cannot open the store at {db_path}. {_safe_reason(exc)}",
+                hint="Check that SOC_AI_DATA_DIR exists. This user must be able to write to it.",
             )
         ]
     results: list[CheckResult] = []
@@ -351,9 +417,9 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                     CheckResult(
                         "store",
                         "PASS",
-                        f"store creatable at {db_path} — fresh (no migrations applied yet; "
-                        f"code head {code_head})",
-                        hint="migrations run automatically on `soc-ai serve` startup",
+                        f"the store is creatable at {db_path} and is fresh. No migration "
+                        f"is applied yet. The code head is {code_head}.",
+                        hint="Migrations run at `soc-ai serve` startup.",
                     )
                 )
             elif str(db_head) == code_head:
@@ -365,9 +431,10 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                     CheckResult(
                         "store",
                         "FAIL",
-                        f"migration head mismatch — DB at {db_head}, code expects {code_head}",
-                        hint="restart the server (`soc-ai serve` migrates to head on startup); "
-                        "a DB AHEAD of the code means this checkout is older than the store",
+                        f"migration head mismatch. The DB is at {db_head}. The code "
+                        f"expects {code_head}.",
+                        hint="Restart the server. `soc-ai serve` migrates to head at startup. "
+                        "A DB ahead of the code means this checkout is older than the store.",
                     )
                 )
             # FTS5 availability — informational: the app falls back without it.
@@ -384,23 +451,23 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                     CheckResult(
                         "store fts5",
                         "INFO",
-                        "SQLite FTS5 available — BM25 runbook/chat retrieval active",
+                        "SQLite FTS5 is available. BM25 runbook and chat retrieval is on.",
                     )
                 )
             else:
                 detail = (
-                    "SQLite lacks FTS5 — runbook/chat retrieval falls back to the "
-                    "legacy keyword ranker"
+                    "SQLite has no FTS5. Runbook and chat retrieval falls back to the "
+                    "legacy keyword ranker."
                     if has_fts5 is False
-                    else "could not determine FTS5 availability"
+                    else "soc-ai could not read whether SQLite has FTS5."
                 )
                 results.append(
                     CheckResult(
                         "store fts5",
                         "WARN",
                         detail,
-                        hint="the app still works; use a Python whose SQLite is built with "
-                        "FTS5 to get BM25 retrieval",
+                        hint="The app still works. Use a Python whose SQLite is built with "
+                        "FTS5 to get BM25 retrieval.",
                     )
                 )
     except Exception as exc:
@@ -409,7 +476,8 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                 "store",
                 "FAIL",
                 _safe_reason(exc),
-                hint=f"check the store DB file at {db_path} (permissions / corruption)",
+                hint=f"Check the permissions on the store DB file at {db_path}. The file "
+                "can also be corrupt.",
             )
         )
     finally:
@@ -418,6 +486,14 @@ async def check_store(settings: Settings) -> list[CheckResult]:
 
 
 # ── Check 3a: Security Onion API auth ────────────────────────────────────────
+
+# The remedy when the login works and SOC then refuses the session. The old
+# hint sent the operator to the user's role grants, which were correct.
+_SOC_REFUSED_HINT = (
+    "SOC refused the session. Check the SO version and the login flow. "
+    "soc-ai logs in with the Kratos browser flow and sends the session cookie. "
+    "See docs/SECURITY-ONION-SETUP.md."
+)
 
 
 async def check_so_api(settings: Settings) -> list[CheckResult]:
@@ -429,19 +505,38 @@ async def check_so_api(settings: Settings) -> list[CheckResult]:
         auth = make_auth(settings)
     except Exception as exc:
         return [
-            CheckResult(name, "FAIL", _safe_reason(exc), hint="check the SO_* settings in .env")
+            CheckResult(name, "FAIL", _safe_reason(exc), hint="Check the SO_* settings in .env.")
         ]
     try:
         resp = await auth.request("GET", "/api/info")
         if resp.status_code == 200:
-            return [CheckResult(name, "PASS", f"authenticated to {settings.so_host} ({mode})")]
+            # Name the flow that worked. An SO upgrade can take one flow away,
+            # and the operator needs to read which one is carrying the writes.
+            flow = getattr(auth, "login_flow", None)
+            how = f"{mode} ({flow} flow)" if flow else mode
+            return [
+                CheckResult(name, "PASS", f"soc-ai authenticated to {settings.so_host} with {how}.")
+            ]
+        if resp.status_code == 401:
+            # The login worked and SOC then refused the session it issued.
+            # That is an auth-mechanism mismatch, not a missing role grant.
+            # SO 3.3 stopped accepting the Kratos API-flow session token and
+            # takes the browser session cookie or an API key instead.
+            return [
+                CheckResult(
+                    name,
+                    "FAIL",
+                    f"the login to {settings.so_host} worked. GET /api/info answered HTTP 401.",
+                    hint=_SOC_REFUSED_HINT,
+                )
+            ]
         return [
             CheckResult(
                 name,
                 "FAIL",
-                f"authenticated but GET /api/info answered HTTP {resp.status_code}",
-                hint="the SO web API is up but unhappy — check the SO user's role grants "
-                "(docs/SECURITY-ONION-SETUP.md)",
+                f"soc-ai authenticated. GET /api/info answered HTTP {resp.status_code}.",
+                hint="The SO web API is up and it refused the call. Check the SO user's "
+                "role grants. See docs/SECURITY-ONION-SETUP.md.",
             )
         ]
     except SoAuthError as exc:
@@ -451,8 +546,21 @@ async def check_so_api(settings: Settings) -> list[CheckResult]:
                 CheckResult(
                     name,
                     "FAIL",
-                    f"auth failed: {msg}",
-                    hint="check SO_USERNAME / SO_PASSWORD (and that the account isn't locked)",
+                    f"authentication failed: {msg}",
+                    hint="Check SO_USERNAME and SO_PASSWORD. Check also that the account "
+                    "is not locked.",
+                )
+            ]
+        if "SOC refused" in msg or "set no session cookie" in msg:
+            return [CheckResult(name, "FAIL", msg, hint=_SOC_REFUSED_HINT)]
+        if "throttled the login" in msg:
+            return [
+                CheckResult(
+                    name,
+                    "FAIL",
+                    msg,
+                    hint="SO limits repeated logins from one client. Wait, then run the "
+                    "check again. A login loop in soc-ai can cause this.",
                 )
             ]
         return [
@@ -460,8 +568,9 @@ async def check_so_api(settings: Settings) -> list[CheckResult]:
                 name,
                 "FAIL",
                 f"unreachable: {msg}",
-                hint="check SO_HOST, DNS, TLS (SO_VERIFY_SSL / SO_CA_BUNDLE), and SO's "
-                "firewall pinhole for this host (docs/SECURITY-ONION-SETUP.md)",
+                hint="Check SO_HOST and DNS. Check TLS with SO_VERIFY_SSL and "
+                "SO_CA_BUNDLE. Check the SO firewall pinhole for this host. See "
+                "docs/SECURITY-ONION-SETUP.md.",
             )
         ]
     except Exception as exc:
@@ -470,7 +579,8 @@ async def check_so_api(settings: Settings) -> list[CheckResult]:
                 name,
                 "FAIL",
                 f"unreachable: {_safe_reason(exc)}",
-                hint="check SO_HOST, network reach, and TLS (SO_VERIFY_SSL / SO_CA_BUNDLE)",
+                hint="Check SO_HOST and the network route. Check TLS with SO_VERIFY_SSL "
+                "and SO_CA_BUNDLE.",
             )
         ]
     finally:
@@ -484,7 +594,14 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
     """ES auth + a trivial search against the events index pattern.
 
     Distinguishes UNREACHABLE (transport error) from AUTH FAILED (401) from a
-    pattern that matches nothing (WARN — the console would render empty).
+    HALF-READ grid (FAIL, and not the pattern's fault) from a pattern that
+    matches nothing (WARN: the console would render empty).
+
+    The read is ``require_complete=True``. ``es_fail_on_partial_results`` is an
+    opt-out for the operator's queries; it used to reach this check too, and a
+    half-read grid then arrived here as a zero count and was diagnosed as a
+    narrowed ``EVENTS_INDEX_PATTERN``. That is a config remedy for a shard
+    fault, which is the wrong building.
     """
     name = "elasticsearch"
     pattern = settings.events_index_pattern
@@ -493,23 +610,25 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
         info = await elastic.ping()
         cluster = str(info.get("cluster") or "") or "(unknown cluster)"
         version = str(info.get("version") or "") or "?"
-        result = await elastic.search(pattern, {"match_all": {}}, size=0, track_total_hits=True)
+        result = await elastic.search(
+            pattern, {"match_all": {}}, size=0, track_total_hits=True, require_complete=True
+        )
         if result.total == 0:
             return [
                 CheckResult(
                     name,
                     "WARN",
-                    f"auth OK ({cluster}, ES {version}) but the events pattern {pattern!r} "
-                    "matched no documents",
-                    hint="check EVENTS_INDEX_PATTERN — a distributed grid needs the "
-                    "cross-cluster prefix (`*:logs-*`); setup.sh auto-detects the right shape",
+                    f"the ES identity authenticated to {cluster} on ES {version}. The "
+                    f"events pattern {pattern!r} matched no documents.",
+                    hint="Check EVENTS_INDEX_PATTERN. A distributed grid needs the "
+                    "cross-cluster prefix `*:logs-*`. setup.sh detects the right shape.",
                 )
             ]
         return [
             CheckResult(
                 name,
                 "PASS",
-                f"{cluster} — ES {version}; {result.total_display} docs match {pattern!r}",
+                f"{cluster} on ES {version}. {result.total_display} docs match {pattern!r}.",
             )
         ]
     except AuthenticationException as exc:
@@ -518,9 +637,21 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 name,
                 "FAIL",
-                f"authentication failed (401){': ' + msg if msg else ''}",
-                hint="check ES_USERNAME / ES_PASSWORD (see docs/SECURITY-ONION-SETUP.md "
-                "for the SO role grant)",
+                f"authentication failed with HTTP 401{': ' + msg if msg else ''}",
+                hint="Check ES_USERNAME and ES_PASSWORD. See docs/SECURITY-ONION-SETUP.md "
+                "for the SO role grant.",
+            )
+        ]
+    except GridPartialResultsError as exc:
+        # Must precede the ApiError/Exception arms: this grid ANSWERED, so
+        # "unreachable" and the connectivity remedy below are both false of it.
+        return [
+            CheckResult(
+                name,
+                "FAIL",
+                f"the grid answered and read only part of itself: {_safe_reason(exc)}",
+                hint="Shards failed, or the search stopped part-way. Check Elasticsearch "
+                "shard health. The index pattern is not the problem.",
             )
         ]
     except ApiError as exc:
@@ -530,8 +661,9 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 name,
                 "FAIL",
-                f"ES refused the request (HTTP {status}): {msg}",
-                hint="ES is up but rejected the call — check the ES user's role/privileges",
+                f"ES refused the request with HTTP {status}: {msg}",
+                hint="ES is up and it rejected the call. Check the role and the privileges "
+                "of the ES user.",
             )
         ]
     except Exception as exc:
@@ -540,8 +672,8 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
                 name,
                 "FAIL",
                 f"unreachable: {_safe_reason(exc)}",
-                hint="check ES_HOSTS, network reach, TLS (ES_VERIFY_SSL), and SO's "
-                "firewall pinhole for this host",
+                hint="Check ES_HOSTS and the network route. Check TLS with ES_VERIFY_SSL. "
+                "Check the SO firewall pinhole for this host.",
             )
         ]
     finally:
@@ -590,9 +722,9 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
     """
     name = "audit write grant"
     fix = (
-        "Run on the SO manager: "
-        "ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh "
-        "(docs/SECURITY-ONION-SETUP.md, section 3)"
+        "Run this on the SO manager: "
+        "ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh . "
+        "See docs/SECURITY-ONION-SETUP.md, section 3."
     )
     index_name = f"{settings.audit_index_alias}-{datetime.now(tz=UTC).strftime('%Y.%m.%d')}"
     elastic = _probe_client(settings)
@@ -604,11 +736,11 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
         return CheckResult(
             name,
             "WARN",
-            f"couldn't query _has_privileges: {_safe_reason(exc)}",
+            f"soc-ai could not query _has_privileges: {_safe_reason(exc)}",
             hint=(
-                "Fix Elasticsearch connectivity first, then re-run the doctor. "
-                f"If ack/escalate/comment fail silently once ES is reachable, the "
-                f"grant may be missing. {fix}"
+                "Fix Elasticsearch connectivity first. Then run the doctor again. "
+                "If ack, escalate or comment fail silently once ES answers, the "
+                f"grant can be missing. {fix}"
             ),
         )
     finally:
@@ -629,15 +761,15 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
         return CheckResult(
             name,
             "WARN",
-            "unexpected _has_privileges response shape — couldn't determine whether "
-            "the audit grant is present",
-            hint="Not a confirmed problem — verify the grant manually "
-            "(docs/SECURITY-ONION-SETUP.md, section 3) if ack/escalate/comment ever "
-            "fail silently.",
+            "the _has_privileges response has an unexpected shape. soc-ai cannot tell "
+            "whether the audit grant is present.",
+            hint="This is not a confirmed problem. If ack, escalate or comment ever fail "
+            "silently, check the grant by hand. See docs/SECURITY-ONION-SETUP.md, "
+            "section 3.",
         )
     if bool(body["has_all_requested"]):
         return CheckResult(
-            name, "PASS", f"{settings.audit_index_alias}-* is writable by the ES identity"
+            name, "PASS", f"the ES identity can write to {settings.audit_index_alias}-*."
         )
 
     index_block = body.get("index")
@@ -652,31 +784,31 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
 
     if write_missing:
         consequence = (
-            "every ack/escalate/comment will abort (fail-closed audit), with no UI error"
+            "Every ack, escalate and comment aborts. The audit is fail-closed. The UI "
+            "shows no error."
             if settings.audit_fail_closed
-            else "the forensic audit trail is being dropped "
-            "(audit_fail_closed=false: actions still succeed)"
+            else "soc-ai drops the forensic audit trail. audit_fail_closed is false, so "
+            "the actions still succeed."
         )
         return CheckResult(
             name,
             "FAIL",
-            f"the ES identity is missing {', '.join(write_missing)} on {index_name} — "
-            f"{consequence}",
+            f"the ES identity is missing {', '.join(write_missing)} on {index_name}. {consequence}",
             hint=fix,
         )
     if read_missing:
         return CheckResult(
             name,
             "WARN",
-            f"the ES identity is missing {', '.join(read_missing)} on {index_name} — "
-            "audit chain verification and chain-head recovery will fail",
+            f"the ES identity is missing {', '.join(read_missing)} on {index_name}. "
+            "Audit chain verification and chain-head recovery fail.",
             hint=fix,
         )
     return CheckResult(
         name,
         "WARN",
-        f"_has_privileges reported {index_name} as not fully granted but named no "
-        "specific missing privilege — unexpected response shape",
+        f"_has_privileges reported {index_name} as not fully granted. It named no "
+        "missing privilege. The response shape is unexpected.",
         hint=fix,
     )
 
@@ -712,10 +844,15 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
     (failed/unassigned shards) raises :class:`GridPartialResultsError`
     instead of quietly answering with an undercount that this check would
     otherwise misdiagnose as a narrowed pattern.
+
+    ``require_complete=True`` is what makes that true unconditionally. Without
+    it the guard was subject to ``es_fail_on_partial_results``, so an operator
+    who had opted into partial QUERY results also made the arm below dead code
+    and got "matches no suricata/auth/syslog events" for a shard fault.
     """
     name = "index pattern coverage"
     pattern = settings.events_index_pattern
-    hint_connectivity = "Fix Elasticsearch connectivity first, then re-run the doctor."
+    hint_connectivity = "Fix Elasticsearch connectivity first. Then run the doctor again."
     elastic = _probe_client(settings)
     try:
         results = await asyncio.gather(
@@ -725,6 +862,7 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
                     {"term": {"event.dataset": dataset}},
                     size=0,
                     track_total_hits=True,
+                    require_complete=True,
                 )
                 for dataset in _COVERAGE_DATASETS
             )
@@ -733,15 +871,16 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
         return CheckResult(
             name,
             "WARN",
-            f"the grid returned partial results counting datasets under {pattern!r} — "
-            f"some shards failed; counts are unreliable ({_safe_reason(exc)})",
-            hint=hint_connectivity,
+            f"the grid returned partial results for the datasets under {pattern!r}. "
+            f"Some shards failed. The counts are unreliable: {_safe_reason(exc)}",
+            hint="Check Elasticsearch shard health. Then run the doctor again. The counts "
+            "above are undercounts. Do not narrow or widen the pattern on them.",
         )
     except Exception as exc:
         return CheckResult(
             name,
             "WARN",
-            f"couldn't count datasets under {pattern!r}: {_safe_reason(exc)}",
+            f"soc-ai could not count the datasets under {pattern!r}: {_safe_reason(exc)}",
             hint=hint_connectivity,
         )
     finally:
@@ -758,18 +897,18 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
         return CheckResult(
             name,
             "WARN",
-            f"{pattern!r} sees alerts but zero auth/syslog events ({detail_counts}) — "
-            "the pattern is likely narrowed to backing indices",
-            hint="Set EVENTS_INDEX_PATTERN=logs-* (multi-node: *:logs-*). Never list "
-            ".ds-* backing indices — see the warning block in .env.example.",
+            f"{pattern!r} sees alerts and zero auth/syslog events. The counts are "
+            f"{detail_counts}. The pattern is probably narrowed to backing indices.",
+            hint="Set EVENTS_INDEX_PATTERN=logs-*. A multi-node grid uses *:logs-*. Never "
+            "list .ds-* backing indices. See the warning block in .env.example.",
         )
     if alerts == 0 and auth == 0 and syslog == 0:
         return CheckResult(
             name,
             "WARN",
             f"{pattern!r} matches no suricata/auth/syslog events",
-            hint="Wrong pattern or an idle grid. Single-node grids use logs-*, "
-            "multi-node *:logs-*.",
+            hint="The pattern is wrong, or the grid is idle. A single-node grid uses "
+            "logs-*. A multi-node grid uses *:logs-*.",
         )
     if alerts == 0:
         # auth and/or syslog are present, so the pattern itself is fine — just
@@ -777,10 +916,248 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
         return CheckResult(
             name,
             "PASS",
-            f"{pattern!r}: {detail_counts} — no suricata.alert events; "
-            "the triage queue will be empty",
+            f"{pattern!r}: {detail_counts}. There are no suricata.alert events. "
+            "The triage queue will be empty.",
         )
     return CheckResult(name, "PASS", f"{pattern!r}: {detail_counts}")
+
+
+# ── Check 3e: the alerts-feed filter against how the grid labels alerts ──────
+#
+# ``WEBUI_ALERTS_QUERY`` decides what the triage queue contains, and until this
+# check nothing compared it with the grid. On a Security Onion grid measured on
+# 2026-09-05 the default ``tags:alert`` matched 2 documents in 24 hours while
+# ``event.kind:alert`` matched 25: 22 Elastic Defend endpoint alerts, naming
+# hosts and accounts nobody had reviewed, were invisible to the console and to
+# every hunt that consults the alert plane. The filter being wrong for one
+# deployment is a tuning problem and it is documented as tunable. The defect is
+# that an empty queue caused by a filter that does not match how the grid labels
+# an alert is indistinguishable from a quiet network: a false all-clear, which
+# this project ranks above any 500.
+
+# An alternative label has to beat the configured filter by BOTH of these before
+# the check calls it a mismatch rather than ordinary spread between labels. The
+# measured mismatch was 2 against 25.
+_ALERT_FILTER_RATIO = 5
+_ALERT_FILTER_MARGIN = 10
+
+
+def _alert_filter_hint(recommended: str) -> str:
+    """Name one exact filter to paste, say why it is a widening, and where it goes.
+
+    ``recommended`` is always a superset of what the operator has configured
+    (see :func:`~soc_ai.webui.alerts_query.widen_alert_filter`), so the
+    sentence can promise that following it costs them nothing. It says so out
+    loud: the version that just named the better label read as an instruction
+    to swap, and on the measured grid swapping would have dropped the two
+    DCSync detections that only the configured label found.
+
+    It names both places the value can live, and which one wins, because on the
+    deployed instance the value is set in an environment file and the sentence
+    sends the operator to the console. That is sound, because the console writes a
+    ``config_overrides`` row and ``apply_to_settings`` sets those over the
+    environment-loaded singleton at startup and again on save. It is only sound
+    because of that precedence, so the precedence is stated rather than relied
+    on. An operator who edits the file while an override exists changes nothing,
+    and would have no way to know it from a sentence that offered two
+    equal-looking options.
+    """
+    return (
+        f"Set WEBUI_ALERTS_QUERY={recommended}. In the config console it is Queries, "
+        "then Web-UI alerts feed query. The console saves at once and overrides any "
+        "value in the environment file. This filter keeps every alert the current one "
+        "finds and adds the ones it misses. A replacement filter can hide alerts that "
+        "only the current one matches. One filter feeds the alerts console, auto-triage "
+        "and every hunt that reads the alert plane."
+    )
+
+
+def _class_name(dataset: str) -> str:
+    """How to say one ``event.dataset`` in a sentence.
+
+    The aggregation's missing-value bucket is a placeholder, not a value, so it
+    must not be printed as though the operator could search for it.
+    """
+    return "alerts carrying no event.dataset" if dataset == aq.UNKNOWN_DATASET else dataset
+
+
+def _invisible_classes(
+    configured: aq.AlertLabelCount, alternatives: dict[str, aq.AlertLabelCount]
+) -> dict[str, tuple[str, int]]:
+    """Alert classes an alternative label finds and the configured filter finds NONE of.
+
+    Returns ``{event.dataset: (label that finds it, how many it finds)}``, best
+    label per class (most documents; ties go to the earliest candidate, which is
+    the order :data:`~soc_ai.webui.alerts_query.ALERT_LABEL_CANDIDATES` declares).
+
+    Zero coverage of a class is a different failure from a filter that is merely
+    narrower, and no ratio between two totals can express it: on the deployed
+    instance the configured filter matched 1,441 documents against an
+    alternative's 1,442 and matched none at all of that grid's Sigma engine
+    output. A ratio reads that as a rounding difference.
+
+    A truncated class list on the configured side proves nothing, because a class
+    missing from a list the grid cut short may simply have fallen off the end, so
+    the comparison stands down rather than raising a false alarm.
+    """
+    if configured.classes_truncated:
+        return {}
+    found: dict[str, tuple[str, int]] = {}
+    for label, count in alternatives.items():
+        for dataset, n in count.classes.items():
+            if n <= 0 or configured.classes.get(dataset, 0) > 0:
+                continue
+            best = found.get(dataset)
+            if best is None or n > best[1]:
+                found[dataset] = (label, n)
+    return found
+
+
+async def check_alerts_feed_filter(settings: Settings) -> CheckResult:
+    """Compare ``WEBUI_ALERTS_QUERY`` with the other ways the grid labels alerts.
+
+    Counts what the configured filter matches over the last 24 hours and what
+    each of :data:`~soc_ai.webui.alerts_query.ALERT_LABEL_CANDIDATES` would have
+    matched over the same window, through the feed's own query builder so the
+    numbers are the feed's numbers. WARNs when the configured filter finds
+    nothing an alternative finds, or finds far less than one, and hands back
+    the configured filter WIDENED with the alternative that would find more,
+    never the alternative on its own.
+
+    It also WARNs, whatever the totals say, when an alternative finds a whole
+    class of alert (:func:`_invisible_classes`) the configured filter finds none
+    of. That is a different failure and the totals cannot express it: the
+    deployed instance's filter matched 1,441 documents against 1,442, passing
+    every ratio, while matching zero of the grid's Sigma detections.
+
+    When whole classes are invisible, EVERY label needed to cover them is added
+    at once rather than the best one — a hint that has to be followed twice is
+    a warning that comes back after you did what it said. It never recommends a
+    label this grid has no alerts under, so the pasted filter only ever names
+    labels that recover something real.
+
+    The totals branch still adds a single alternative: there the complaint is
+    about volume rather than a class nobody can see, and one label is the whole
+    of the recommendation.
+
+    A grid where no label finds anything is quiet, not misconfigured, and PASSes
+    with that said out loud. Reporting a problem on every idle grid is how a
+    real mismatch gets scrolled past.
+    """
+    name = "alerts feed filter"
+    hint_connectivity = "Fix Elasticsearch connectivity first, then re-run the doctor."
+    elastic = _probe_client(settings)
+    try:
+        counts = await aq.count_alert_labels(elastic, settings)
+    except OqlValidationError as exc:
+        return CheckResult(
+            name,
+            "WARN",
+            f"the configured alerts filter is not valid OQL: {_safe_reason(exc)}. The "
+            "alerts console rejects every request. The queue stays empty.",
+            # Nothing to widen: a filter the builder rejects matches nothing
+            # anywhere, and ORing the broken text in would hand back something
+            # that still does not parse. Recommend the shipped default.
+            hint=_alert_filter_hint(DEFAULT_ALERTS_QUERY),
+        )
+    except GridPartialResultsError as exc:
+        return CheckResult(
+            name,
+            "WARN",
+            "the grid returned partial results for the alert labels. Some shards "
+            f"failed. The counts are unreliable: {_safe_reason(exc)}",
+            hint=hint_connectivity,
+        )
+    except Exception as exc:
+        return CheckResult(
+            name,
+            "WARN",
+            f"soc-ai could not count the alert labels: {_safe_reason(exc)}",
+            hint=hint_connectivity,
+        )
+    finally:
+        with contextlib.suppress(Exception):  # best-effort cleanup on a probe path
+            await elastic.aclose()
+
+    detail_counts = ", ".join(f"{label}={count.total}" for label, count in counts.items())
+    configured, configured_count_row = next(iter(counts.items()))
+    configured_count = configured_count_row.total
+    alternatives = {k: v for k, v in counts.items() if k != configured}
+    # Ties go to the earliest candidate, which is the order ALERT_LABEL_CANDIDATES
+    # declares, SO's own convention before ECS's. ``default`` covers the state
+    # where the configured filter IS every candidate: there is then nothing to
+    # compare against, and a zero best falls into the quiet branch below rather
+    # than taking out the row with a ValueError.
+    better, better_count = max(
+        ((label, c.total) for label, c in alternatives.items()),
+        key=lambda kv: kv[1],
+        default=("", 0),
+    )
+
+    window = f"in the last {aq.DEFAULT_RANGE}"
+    if configured_count == 0 and better_count == 0:
+        return CheckResult(
+            name,
+            "PASS",
+            f"{detail_counts}. No label found an alert {window}. The triage queue will be empty.",
+        )
+    if configured_count == 0:
+        return CheckResult(
+            name,
+            "WARN",
+            f"{configured!r} matched nothing {window}. {better!r} matched "
+            f"{better_count}. The counts are {detail_counts}. The filter empties the "
+            "queue. The grid is not quiet.",
+            hint=_alert_filter_hint(aq.widen_alert_filter(configured, better)),
+        )
+    # Zero coverage of a class, before the ratio: the two can hold at once, and
+    # naming the class the queue has never seen is the more useful of the two
+    # sentences. This branch is the whole reason the check reads the per-class
+    # breakdown: the ratio below passed on the deployed instance at 1,441 against
+    # 1,442 while an entire alert class was invisible.
+    invisible = _invisible_classes(configured_count_row, alternatives)
+    if invisible:
+        # Every label needed to cover every blind class, in one recommendation.
+        #
+        # This used to hand back only the label covering the most documents, on
+        # the argument that a second run would catch the rest and the thing
+        # converges. It does converge — and from the operator's seat it is a
+        # warning that comes back after you did exactly what it said. The home
+        # deployment followed this hint on 2026-09-07 and the warning returned
+        # naming the next label. The check already holds every label it needs
+        # here, so making the reader discover them one per day buys nothing and
+        # costs the credibility of the row.
+        by_label: dict[str, int] = {}
+        for label, n in invisible.values():
+            by_label[label] = by_label.get(label, 0) + n
+        # Widest first, so the pasted filter reads in order of what it recovers.
+        needed = [label for label, _ in sorted(by_label.items(), key=lambda kv: (-kv[1], kv[0]))]
+        best_label = " OR ".join(needed)
+        named = ", ".join(
+            f"{_class_name(ds)} at {n} under {label!r}"
+            for ds, (label, n) in sorted(invisible.items(), key=lambda kv: -kv[1][1])
+        )
+        return CheckResult(
+            name,
+            "WARN",
+            f"{configured!r} matches none of these alert classes {window}: {named}. "
+            f"The counts are {detail_counts}. A class with zero coverage never reaches "
+            "the queue. The totals can still look close.",
+            hint=_alert_filter_hint(aq.widen_alert_filter(configured, best_label)),
+        )
+    if (
+        better_count >= configured_count + _ALERT_FILTER_MARGIN
+        and better_count >= configured_count * _ALERT_FILTER_RATIO
+    ):
+        return CheckResult(
+            name,
+            "WARN",
+            f"{configured!r} matched {configured_count} {window}. {better!r} matched "
+            f"{better_count}. The counts are {detail_counts}. Most of what this grid "
+            "labels an alert never reaches the queue.",
+            hint=_alert_filter_hint(aq.widen_alert_filter(configured, better)),
+        )
+    return CheckResult(name, "PASS", detail_counts)
 
 
 # ── Check 4: gateway (/v1/models + configured model ids) ─────────────────────
@@ -798,9 +1175,9 @@ async def check_gateway(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 "gateway",
                 "FAIL",
-                f"cannot list models: {err}",
-                hint="check LITELLM_BASE_URL / LITELLM_API_KEY (and LITELLM_VERIFY_SSL "
-                "for a self-signed gateway)",
+                f"soc-ai cannot list the models: {err}",
+                hint="Check LITELLM_BASE_URL and LITELLM_API_KEY. For a self-signed "
+                "gateway, check LITELLM_VERIFY_SSL.",
             )
         ]
     results = [
@@ -817,8 +1194,8 @@ async def check_gateway(settings: Settings) -> list[CheckResult]:
                 "analyst model",
                 "WARN",
                 f"{analyst!r} is not in the gateway's /v1/models list",
-                hint="it may still resolve via a gateway alias — if completions 400, set "
-                "ANALYST_MODEL to a listed id",
+                hint="The id can still resolve through a gateway alias. If completions "
+                "answer HTTP 400, set ANALYST_MODEL to a listed id.",
             )
         )
     for label, model_id in (
@@ -836,8 +1213,32 @@ async def check_gateway(settings: Settings) -> list[CheckResult]:
                     label,
                     "WARN",
                     f"{configured!r} is not in the gateway's /v1/models list",
-                    hint="the RAG tier is fail-soft (retrieval degrades to local FTS5) — "
-                    "fix the model id or clear it to silence this",
+                    hint="The RAG tier is fail-soft. Retrieval degrades to local FTS5. "
+                    "Fix the model id, or clear it to silence this row.",
+                )
+            )
+    # The Oracle, when it is on. It grades every nightly batch, and its verdict
+    # is what the quality alarm is computed from — so an Oracle that stopped
+    # resolving would show up as the ANALYST model's agreement collapsing, on a
+    # doctor reporting all-PASS. The one model whose failure is attributed to a
+    # different component had no row here at all.
+    if settings.oracle_enabled:
+        oracle = settings.oracle_model.strip()
+        if oracle in ids:
+            results.append(
+                CheckResult("oracle model", "PASS", f"{oracle!r} is served by the gateway")
+            )
+        else:
+            results.append(
+                CheckResult(
+                    "oracle model",
+                    "WARN",
+                    f"{oracle!r} is not in the gateway's /v1/models list. This model "
+                    "grades the nightly quality batch.",
+                    hint="The id can still resolve through a gateway alias. If grading "
+                    "answers HTTP 400, the nightly agreement_rate reads as an analyst "
+                    "regression. The grader is the missing part. Set ORACLE_MODEL to a "
+                    "listed id.",
                 )
             )
     return results
@@ -864,8 +1265,8 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
                 "model fitness",
                 "WARN",
                 detail,
-                hint="usable but degraded — the config console's fitness probe shows "
-                "per-leg detail",
+                hint="The model is usable and degraded. The config console's fitness "
+                "probe shows the detail for each leg.",
             )
         ]
     return [
@@ -873,8 +1274,8 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
             "model fitness",
             "FAIL",
             detail,
-            hint="an unfit analyst model silently lands all-fallback needs_more_info "
-            "verdicts — point ANALYST_MODEL at a model that passes structured output",
+            hint="An unfit analyst model lands all-fallback needs_more_info verdicts. "
+            "Point ANALYST_MODEL at a model that passes structured output.",
         )
     ]
 
@@ -897,14 +1298,15 @@ def check_egress_posture(settings: Settings) -> list[CheckResult]:
     try:
         rows = _egress_destinations(settings)
     except Exception as exc:
-        return [CheckResult("egress", "INFO", f"posture unavailable: {_safe_reason(exc)}")]
+        return [
+            CheckResult("egress", "INFO", f"the egress posture is unavailable: {_safe_reason(exc)}")
+        ]
     zero_egress = not any(row["enabled"] for row in rows)
     results = [
         CheckResult(
             "egress",
             "INFO",
-            "zero egress: "
-            + ("yes — every egress destination is disabled" if zero_egress else "no"),
+            "zero egress: " + ("yes. Every egress destination is off." if zero_egress else "no."),
         )
     ]
     for row in rows:
@@ -915,7 +1317,7 @@ def check_egress_posture(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 f"egress: {row['id']}",
                 "INFO",
-                f"{state} — {row['label']}; redaction: {row['redaction']}",
+                f"{state}. {row['label']}. Redaction: {row['redaction']}.",
             )
         )
     return results
@@ -936,6 +1338,44 @@ _BLOCKLIST_FEED_FILES: dict[str, str] = {
     "spamhaus_drop": "spamhaus_drop.txt",
 }
 
+# The feeds abuse.ch gates behind a free Auth-Key (2024 policy). Without the key
+# `blocklists refresh` skips them, so these three can never become fresh and the
+# warning about them can never clear — see _blocklist_hint.
+_ABUSE_CH_FEEDS = frozenset({"urlhaus", "threatfox", "feodo"})
+
+
+def _blocklist_hint(settings: Settings, missing: list[str], stale: list[str]) -> str:
+    """What would actually clear this warning, in THIS configuration.
+
+    The hint used to say "run `soc-ai blocklists refresh`" unconditionally. On a
+    deployment with no Auth-Key that command cannot fix the three abuse.ch feeds
+    — it skips them by design — so the warning returned every day with the same
+    unusable advice, and the only two things that would clear it (get a key, or
+    stop asking for those feeds) went unmentioned. A warning nobody can act on
+    teaches its reader to stop reading the doctor, which costs more than the
+    feeds do.
+    """
+    unrefreshable = sorted(
+        _ABUSE_CH_FEEDS.intersection(
+            # `stale` entries carry an age suffix; the source is the first token.
+            set(missing) | {s.split(" ", 1)[0] for s in stale}
+        )
+    )
+    if unrefreshable and settings.abuse_ch_auth_key is None:
+        joined = ", ".join(unrefreshable)
+        return (
+            f"{joined} need a free abuse.ch Auth-Key. ABUSE_CH_AUTH_KEY is not set, so "
+            f"`soc-ai blocklists refresh` skips them. This warning cannot clear. Register "
+            f"at https://auth.abuse.ch/ and set the key. You can instead drop {joined} "
+            f"from blocklist_sources. Triage is fail-open either way. See "
+            f"docs/BLOCKLISTS.md."
+        )
+    return (
+        "run `soc-ai blocklists refresh`. The abuse.ch feeds need ABUSE_CH_AUTH_KEY. "
+        "See docs/BLOCKLISTS.md. Triage keeps working with stale feeds and with "
+        "absent feeds."
+    )
+
 
 def check_blocklists(settings: Settings) -> list[CheckResult]:
     """Blocklist feed freshness — file mtime vs ``blocklist_stale_threshold_days``
@@ -944,7 +1384,7 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
     name = "blocklists"
     configured = [s for s in settings.blocklist_sources if s in _BLOCKLIST_FEED_FILES]
     if not configured:
-        return [CheckResult(name, "INFO", "no refreshable blocklist feeds configured")]
+        return [CheckResult(name, "INFO", "no refreshable blocklist feed is configured.")]
     threshold_days = settings.blocklist_stale_threshold_days
     now = datetime.now(UTC)
     missing: list[str] = []
@@ -959,7 +1399,7 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
             continue
         age_days = (now - mtime).total_seconds() / 86400.0
         if age_days > threshold_days:
-            stale.append(f"{source} ({age_days:.0f}d old)")
+            stale.append(f"{source} at {age_days:.0f} days old")
         else:
             fresh += 1
     if not missing and not stale:
@@ -967,22 +1407,84 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 name,
                 "PASS",
-                f"{fresh} feed(s) fresh (refreshed within {threshold_days}d) in "
-                f"{settings.blocklist_data_dir}",
+                f"{fresh} feed(s) are fresh in {settings.blocklist_data_dir}. soc-ai "
+                f"refreshed each one within {threshold_days} days.",
             )
         ]
     parts = []
     if missing:
         parts.append("never refreshed: " + ", ".join(missing))
     if stale:
-        parts.append(f"stale (>{threshold_days}d): " + ", ".join(stale))
+        parts.append(f"stale after {threshold_days} days: " + ", ".join(stale))
     return [
         CheckResult(
             name,
             "WARN",
-            "; ".join(parts),
-            hint="run `soc-ai blocklists refresh` (abuse.ch feeds need ABUSE_CH_AUTH_KEY; "
-            "docs/BLOCKLISTS.md) — triage keeps working with stale/absent feeds (fail-open)",
+            ". ".join(parts),
+            hint=_blocklist_hint(settings, missing, stale),
+        )
+    ]
+
+
+# ── Check 8: prompt assets (FAIL: absence is invisible in the output) ────────
+
+
+def check_prompt_assets() -> list[CheckResult]:
+    """Prompt assets present on disk, per ``soc_ai.agent.prompts.PROMPT_ASSETS``.
+
+    The one doctor row about this deployment's own files rather than an
+    upstream. It exists because the doctor reported fifteen passed and zero
+    failures on an image whose agent prompts had carried a stub saying the
+    query language was unavailable since the day it was built: nothing here
+    looked at what the prompts are assembled from, so nothing could say so.
+
+    FAIL, not WARN. The WARN band is for things that degrade gracefully, and a
+    missing prompt asset does the opposite: the verdicts keep coming and keep
+    looking like verdicts. The app also refuses to start on this condition
+    (``soc_ai.main._require_prompt_assets``), so on a normally started instance
+    the row is a PASS by construction; it earns its place on the installs that
+    reach the doctor another way, which is the CLI inside a container that is
+    crash-looping for exactly this reason.
+    """
+    name = "prompt assets"
+    # Deferred: importing the prompts module builds every system prompt (and
+    # reads these files) as a side effect of import, and the doctor should pay
+    # that only when this check runs. Same pattern as check_egress_posture.
+    try:
+        from soc_ai.agent.prompts import PROMPT_ASSETS, missing_prompt_assets  # noqa: PLC0415
+    except Exception as exc:
+        return [
+            CheckResult(
+                name,
+                "FAIL",
+                f"the prompt module did not import: {_safe_reason(exc)}",
+                hint="The install is broken beyond a missing asset. Run the doctor again "
+                "with --json and report it.",
+            )
+        ]
+
+    missing = missing_prompt_assets()
+    present = [asset.name for asset in PROMPT_ASSETS if asset not in missing]
+    if not missing:
+        root = PROMPT_ASSETS[0].path.parent if PROMPT_ASSETS else "(none declared)"
+        return [
+            CheckResult(
+                name,
+                "PASS",
+                f"{len(present)} assets are present in {root}: " + ", ".join(present),
+            )
+        ]
+    parts = ["missing: " + ". ".join(f"{a.name} at {a.path} costs: {a.cost}" for a in missing)]
+    if present:
+        parts.append("present: " + ", ".join(present))
+    return [
+        CheckResult(
+            name,
+            "FAIL",
+            ". ".join(parts),
+            hint="The deployment is incomplete. Redeploy from a build that ships the "
+            "docs/ directory. The image copies that directory whole. Until then the "
+            "prompts carry a stub. The model writes queries that return nothing.",
         )
     ]
 
@@ -1007,9 +1509,9 @@ async def _isolated(
             CheckResult(
                 name,
                 "FAIL",
-                f"check timed out after {timeout_s:.0f}s",
-                hint="the service accepted the connection but hung — check its health "
-                "and the network path",
+                f"the check timed out after {timeout_s:.0f} s",
+                hint="The service accepted the connection and then stopped answering. "
+                "Check its health and the network path.",
             )
         ]
     except Exception as exc:
@@ -1018,7 +1520,7 @@ async def _isolated(
                 name,
                 "FAIL",
                 _safe_reason(exc),
-                hint="unexpected doctor error — rerun with --json and report it",
+                hint="The doctor met an unexpected error. Run it again with --json and report it.",
             )
         ]
 
@@ -1048,11 +1550,20 @@ async def run_doctor(
                 CheckResult(
                     "checks",
                     "INFO",
-                    "store / security onion / elasticsearch / gateway / model checks "
-                    "skipped — settings did not load",
+                    "the settings did not load. soc-ai skipped the store, security "
+                    "onion, elasticsearch, gateway and model checks.",
                 )
             )
             return results
+        # Grade what the app runs, not just what the file says. A caller that
+        # passed its own Settings (the in-app preflight) already holds the live
+        # singleton with these applied.
+        applied = await apply_persisted_overrides(settings)
+        if applied:
+            cfg.detail += (
+                f" The config console holds {len(applied)} saved setting(s): "
+                f"{', '.join(sorted(applied))}."
+            )
     else:
         results.append(CheckResult("config", "PASS", "settings loaded"))
 
@@ -1077,6 +1588,11 @@ async def run_doctor(
             _solo(check_index_pattern_coverage(settings)),
             _COVERAGE_TIMEOUT_S,
         ),
+        _isolated(
+            "alerts feed filter",
+            _solo(check_alerts_feed_filter(settings)),
+            _ALERT_FILTER_TIMEOUT_S,
+        ),
         _isolated("gateway", check_gateway(settings), _GATEWAY_TIMEOUT_S),
     ]
     if include_fitness:
@@ -1086,4 +1602,5 @@ async def run_doctor(
         results.extend(batch)
     results.extend(check_egress_posture(settings))
     results.extend(check_blocklists(settings))
+    results.extend(check_prompt_assets())
     return results

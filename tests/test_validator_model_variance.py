@@ -199,14 +199,27 @@ class TestSemanticCitationResolution:
         assert len(unresolved) == 1
         assert "Atlantis" in unresolved[0]["citation"]
 
-    def test_empty_citations_returns_full_coverage(self) -> None:
-        """Vacuous-truth: no citations → no missing evidence to penalize → coverage=1."""
+    def test_empty_citations_is_not_full_coverage(self) -> None:
+        """No citations is a vacuous answer, not a complete one.
+
+        This test used to assert the opposite, on the reasoning that with no
+        citations there is no missing evidence to penalise, so coverage is 1.
+        That reasoning is how a verdict with no evidence at all passed a gate
+        written to require evidence: on production, thirteen of sixty runs
+        reached a confident false positive with zero tool calls and zero
+        citations, and every one of them was acknowledged in Security Onion
+        unattended. The coverage number was reported as 1.0 the whole time.
+
+        A ratio of nothing over nothing is not full coverage. It is a question
+        that was never asked, and it is flagged rather than scored.
+        """
         from soc_ai.agent.orchestrator import _resolve_citations
 
         ctx = _benign_internal_bundle()
         result = _resolve_citations([], ctx, transcripts=[])
-        assert result["coverage_ratio"] == 1.0
+        assert result["coverage_ratio"] == 0.0
         assert result["total"] == 0
+        assert result["vacuous"] is True
 
     def test_short_token_does_not_falsely_resolve(self) -> None:
         """Very short citations (<3 chars of substantive token) must NOT

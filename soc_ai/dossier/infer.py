@@ -84,6 +84,7 @@ from soc_ai.dossier.types import (
     Strength,
     provenance_rank,
 )
+from soc_ai.so_client.fields import EPHEMERAL_PORT_FLOOR
 from soc_ai.tools.host_summary import (
     _first_str,
     _looks_like_ip,
@@ -304,7 +305,9 @@ def infer_host_facts(
     os_family, os_detail = _infer_os(obs)
     facts["os_family"] = os_family
     facts["os_detail"] = os_detail
-    facts["role"] = _infer_role(obs, ports=ports, qualified=qualified, floor=min_events)
+    facts["role"] = _infer_role(
+        obs, ports=ports, qualified=qualified, floor=min_events, os_detail=os_detail
+    )
     facts["services_offered"] = _infer_services(obs, ports=ports)
     facts["management_plane"] = _infer_management_plane(obs, qualified=qualified, floor=min_events)
     facts["domain_membership"] = _infer_domain_membership(obs)
@@ -409,13 +412,15 @@ def _contention_note(obs: HostObservations) -> str | None:
     if len(claimants) < 2:
         return None
     return (
-        f"{len(claimants)} host-log agents claim {obs.ip} ({', '.join(sorted(claimants))}) — "
-        "no self-reported identity can be attributed to a shared address"
+        f"{len(claimants)} host-log agents claim {obs.ip}: {', '.join(sorted(claimants))}. "
+        "A shared address has no self-reported identity."
     )
 
 
 def _floor_evidence(obs: HostObservations, floor: int) -> str:
-    return f"insufficient telemetry: {obs.total_events} events in window (< {floor})"
+    return (
+        f"insufficient telemetry: {obs.total_events} events in window, below the floor of {floor}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +525,13 @@ def _responder_ports(obs: HostObservations) -> list[_PortObservation]:
         if parsed is None:
             continue
         port, count = parsed
+        if port >= EPHEMERAL_PORT_FLOOR:
+            # A dynamic port is the far end of a negotiated channel, not a
+            # service. The DC's services_offered listed twenty ports of which
+            # thirteen were these, and on a workstation the KPI led with two
+            # of them (dogfood, 2026-09-16). Dropped here, upstream of both the
+            # role table and the services fact, so neither can disagree.
+            continue
         measured = _bucket_int(bucket, "answered")
         if measured is not None:
             answered = max(0, min(measured, count))
@@ -891,7 +903,7 @@ def _infer_hostname(obs: HostObservations, *, min_confidence: float) -> Fact:
         # The sources are enumerated, so one missing from the list reads as one
         # that was never consulted — and a host whose only signal was a withheld
         # DNS name reported "no signal" while a note below said otherwise.
-        evidence = ["no hostname signal in window (no DHCP, NTLM, SMB, DNS, host.name or PTR)"]
+        evidence = ["no hostname signal in window from DHCP, NTLM, SMB, DNS, host.name or PTR"]
         evidence.extend(notes)
         return _fact("hostname", strength="none", source="banner", evidence=evidence)
     winner = candidates[0]
@@ -973,7 +985,7 @@ def _infer_mac(obs: HostObservations) -> Fact:
         mac = _normalize_mac(record.get("mac"))
         if mac:
             return _mac_fact(mac, observed_at=_record_time(record, obs.last_seen), label="host.mac")
-    evidence = ["no hardware address in window (no DHCP lease, no host.mac)"]
+    evidence = ["no hardware address in window from a DHCP lease or host.mac"]
     if ambiguity is not None:
         evidence.append(ambiguity)
     return _fact("mac", strength="none", source="banner", evidence=evidence)
@@ -1282,7 +1294,7 @@ def _infer_os(obs: HostObservations) -> tuple[Fact, Fact]:
                 "os_detail",
                 strength="none",
                 source=winner.source,
-                evidence=["OS family is mixed — no version detail can be claimed"],
+                evidence=["OS family is mixed. No version detail applies."],
                 observed_at=winner.observed_at,
             ),
         )
@@ -1298,7 +1310,7 @@ def _infer_os(obs: HostObservations) -> tuple[Fact, Fact]:
             strength="none",
             source="telemetry",
             evidence=evidence
-            or ["no OS signal in window (no SSH banner, no User-Agent, no vendor telemetry)"],
+            or ["no OS signal in window from an SSH banner, a User-Agent or vendor telemetry"],
         )
         if detailed is None:
             return family_fact, _fact(
@@ -1331,7 +1343,7 @@ def _infer_os(obs: HostObservations) -> tuple[Fact, Fact]:
             "os_detail",
             strength="none",
             source=winner.source,
-            evidence=[f"OS family {winner.family} identified, but no version detail in the signal"],
+            evidence=[f"OS family {winner.family} identified. The signal has no version detail."],
             observed_at=winner.observed_at,
         )
     else:
@@ -1377,8 +1389,34 @@ def _truncate(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Client operating systems, as an agent names them. A machine running one of
+# these is a workstation whatever it happens to serve: on the range, a Windows
+# 11 desktop with SMB and WinRM answering enough peers to look like a fleet
+# classified as ``server``, and every workstation-scoped prior then declined
+# to apply to the estate's only workstation. The agent's own statement of its
+# OS is a first-party claim, and it outranks port behaviour for THIS split --
+# and only this one: it never promotes a box to domain controller or
+# hypervisor, which the port table owns.
+_CLIENT_OS_RE = re.compile(
+    r"\bwindows\s+(?:10|11)\b|\bmacos\b|\bmac os x\b|\bos x\b", re.IGNORECASE
+)
+
+
+def _client_os_reported(os_detail: Fact | None) -> str | None:
+    """The agent-reported client OS name, or None. Hostlog source only."""
+    if os_detail is None or os_detail.source != "hostlog":
+        return None
+    value = os_detail.value or ""
+    return value if _CLIENT_OS_RE.search(value) else None
+
+
 def _infer_role(
-    obs: HostObservations, *, ports: Sequence[_PortObservation], qualified: set[int], floor: int
+    obs: HostObservations,
+    *,
+    ports: Sequence[_PortObservation],
+    qualified: set[int],
+    floor: int,
+    os_detail: Fact | None = None,
 ) -> Fact:
     """The ordered role table: first match wins.
 
@@ -1408,6 +1446,23 @@ def _infer_role(
             observed_at=obs.last_seen,
         )
     role, strength, evidence = matched
+    client_os = _client_os_reported(os_detail)
+    if role == "server" and client_os:
+        return _fact(
+            "role",
+            value="workstation",
+            strength="strong",
+            source="hostlog",
+            evidence=[
+                _evidence(
+                    f"the agent on this machine reports {client_os}, a client operating "
+                    "system. The answered ports alone read as a server",
+                    "hostlog",
+                ),
+                *evidence,
+            ],
+            observed_at=obs.last_seen,
+        )
     return _fact(
         "role",
         value=role,
@@ -1593,16 +1648,16 @@ def _match_workstation(
     if qualified:
         evidence = [
             _evidence(
-                f"answers only {_render_ports(qualified)} ({answered.conns:,} zeek.conn "
-                f"records from {answered.peers} distinct peers) while initiating "
-                f"connections to {obs.orig_peer_count} distinct peers",
+                f"answers only {_render_ports(qualified)} with {answered.conns:,} "
+                f"zeek.conn records from {answered.peers} distinct peers. The host "
+                f"initiates connections to {obs.orig_peer_count} distinct peers",
                 "behaviour",
             )
         ]
     else:
         evidence = [
             _evidence(
-                "no qualifying responder ports; initiated connections to "
+                "no qualifying responder ports. The host initiated connections to "
                 f"{obs.orig_peer_count} distinct peers",
                 "behaviour",
             )
@@ -1626,15 +1681,15 @@ def _role_evidence(ports: Iterable[int], traffic: _Traffic) -> str:
     When the spread could not be attributed to these ports the line says so
     rather than borrowing the host's totals silently.
     """
-    head = f"responds on {_render_ports(ports)} — {traffic.conns:,} zeek.conn records"
+    head = f"responds on {_render_ports(ports)} with {traffic.conns:,} zeek.conn records"
     if traffic.attributed:
         return _evidence(
             f"{head} from {traffic.peers} distinct peers across {traffic.hours} hours",
             "behaviour",
         )
     return _evidence(
-        f"{head}; the host's {traffic.peers} responder peers across "
-        f"{traffic.hours} hours are mostly other ports",
+        f"{head}. The host has {traffic.peers} responder peers across "
+        f"{traffic.hours} hours, mostly on other ports",
         "behaviour",
     )
 
@@ -1643,12 +1698,12 @@ def _unknown_role_evidence(obs: HostObservations, qualified: set[int]) -> str:
     """Absence is a real answer — say which absence."""
     if qualified:
         return _evidence(
-            f"responds on {_render_ports(qualified)} — no role rule matches this port set",
+            f"responds on {_render_ports(qualified)}. No role rule matches this port set",
             "behaviour",
         )
     return _evidence(
         "no qualifying responder ports and only "
-        f"{obs.orig_peer_count} outbound peers — not enough to classify",
+        f"{obs.orig_peer_count} outbound peers. This is too little to classify the host",
         "behaviour",
     )
 
@@ -1779,14 +1834,14 @@ def _infer_activity_profile(obs: HostObservations, *, floor: int) -> Fact:
             evidence=[_evidence("no events in window", "behaviour")],
         )
     parts = [
-        f"busiest hours {', '.join(f'{hour:02d}:00' for hour in busiest)} UTC"
+        f"Busiest hours {', '.join(f'{hour:02d}:00' for hour in busiest)} UTC"
         if busiest
-        else "no hourly activity recorded"
+        else "No hourly activity recorded"
     ]
     parts.append(
-        f"initiates remote access on {_render_ports(remote)}"
+        f"Initiates remote access on {_render_ports(remote)}"
         if remote
-        else "no outbound remote access"
+        else "No outbound remote access"
     )
     evidence = [
         _evidence(
@@ -1801,7 +1856,7 @@ def _infer_activity_profile(obs: HostObservations, *, floor: int) -> Fact:
         )
     return _fact(
         "activity_profile",
-        value="; ".join(parts),
+        value=". ".join(parts),
         value_json=profile,
         strength="strong" if obs.total_events >= floor else "weak",
         source="behaviour",
@@ -1891,7 +1946,7 @@ def _infer_static_addressing(obs: HostObservations, *, floor: int) -> Fact:
             "is_static_addressed",
             strength="none",
             source="behaviour",
-            evidence=["signal unavailable on this grid (no zeek.dhcp dataset)"],
+            evidence=["signal unavailable on this grid. The grid has no zeek.dhcp dataset."],
         )
     if obs.total_events < floor:
         return _fact(

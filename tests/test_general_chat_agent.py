@@ -71,13 +71,13 @@ def _identifiers() -> EffectiveIdentifiers:
 # wall-of-prose answer (answer shape), and "I can't do that" from an agent that
 # never called a tool (behaviour rule).
 _SHARED_MARKERS = (
-    "## HARD RULE — never invent per-event facts (this is non-negotiable)",
-    "are HALLUCINATIONS, not answers, even if",
+    "## HARD RULE: never invent a per-event fact. This is non-negotiable.",
+    "are HALLUCINATIONS. Do not offer them as answers, even if",
     "For web_search / crawl_page use \
-EXTERNAL indicators ONLY — never put an internal IP/hostname in a web query.",
+EXTERNAL indicators ONLY. Never put an internal IP or hostname in a web query.",
     "**A one-line bottom line in bold**",
     "An empty result is still an answer",
-    '**Behaviour rule** — Do NOT tell the analyst "I can\'t do X" until you have actually \
+    '**Behaviour rule.** Do NOT tell the analyst "I can\'t do X" until you have actually \
 tried the relevant tool.',
 )
 
@@ -295,15 +295,21 @@ def test_default_window_override_does_not_change_the_tool_surface(
 @pytest.mark.parametrize("tool", _WINDOWED_TOOLS)
 def test_overridden_window_docs_drop_the_alert_anchor(settings_kratos: Settings, tool: str) -> None:
     """The LLM reads the docstring as the tool description. A general chat has no
-    alert, so "the window is centered on the alert's @timestamp" is a false
-    statement about its own behaviour (with no anchor the window is now-relative)
-    AND contradicts the 1440 default sitting next to it."""
+    alert, so "the window sits on the alert's @timestamp" is a false statement
+    about its own behaviour (with no anchor the window is now-relative) AND
+    contradicts the 1440 default sitting next to it.
+
+    Matched on the anchor claim rather than the word "centred": the event query
+    tool's window can now sit either side of the anchor, so centring is a mode
+    it offers, while sitting on the anchor at all is the claim that is false
+    here.
+    """
     doc = _tool(_register("chat", settings_kratos, default_window=1440), tool).__doc__ or ""
-    assert "centered on the alert" not in doc
+    assert "on the alert's `@timestamp`" not in doc
     assert "1440" in doc
     # Un-overridden roles keep the alert-anchored wording verbatim.
     anchored = _tool(_register("chat", settings_kratos), tool).__doc__ or ""
-    assert "centered on the alert" in anchored
+    assert "on the alert's `@timestamp`" in anchored
 
 
 def test_build_chat_agent_forwards_the_window(settings_kratos: Settings) -> None:

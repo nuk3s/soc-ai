@@ -482,7 +482,7 @@ def test_seed_context_carries_the_grid_and_grounds_an_answer_about_it(
 
     from soc_ai.agent.narrative_grounding import check_narrative_grounding
     from soc_ai.oracle.identifiers import EffectiveIdentifiers
-    from soc_ai.webui.alerts_query import AlertGroup
+    from soc_ai.webui.alerts_query import AlertGroup, GroupPage
     from soc_ai.webui.general_chat_manager import _general_spec
 
     state = _state(client)
@@ -509,7 +509,7 @@ def test_seed_context_carries_the_grid_and_grounds_an_answer_about_it(
             ),
             patch(
                 "soc_ai.webui.general_chat_manager.aq.fetch_groups",
-                AsyncMock(return_value=(groups, 415)),
+                AsyncMock(return_value=GroupPage(groups, 415)),
             ),
         ):
             inputs = await _general_spec(state, "t4", row.id).prepare()
@@ -620,6 +620,7 @@ def _seed_host_dossier(client: TestClient, ip: str = GC_HOST) -> None:
 
 
 def _general_seed_for(client: TestClient, thread: str, question: str) -> str:
+    from soc_ai.webui.alerts_query import GroupPage
     from soc_ai.webui.general_chat_manager import _general_spec
 
     state = _state(client)
@@ -635,7 +636,7 @@ def _general_seed_for(client: TestClient, thread: str, question: str) -> str:
             ),
             patch(
                 "soc_ai.webui.general_chat_manager.aq.fetch_groups",
-                AsyncMock(return_value=([], 0)),
+                AsyncMock(return_value=GroupPage([], 0)),
             ),
         ):
             inputs = await _general_spec(state, thread, row.id).prepare()

@@ -188,7 +188,7 @@ def test_block_is_framed_as_context_and_not_as_evidence() -> None:
     block = format_host_dossier_block([_hypervisor()])
     head = block.split("\n\n", 1)[0]
     assert head.startswith("## Host dossier")
-    assert "NOT evidence" in head
+    assert "not evidence" in head
     # The citable route has to be named, or "don't cite this" is a dead end.
     assert "t_host_dossier" in block
     assert "Operator-set values are authoritative" in block

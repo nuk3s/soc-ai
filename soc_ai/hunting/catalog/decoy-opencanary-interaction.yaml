@@ -1,0 +1,72 @@
+id: decoy-opencanary-interaction
+title: A host connects to a decoy service
+description: >
+  An OpenCanary decoy records an inbound interaction. Nothing has a legitimate
+  reason to reach a decoy. The decoy advertises services that exist only to be
+  touched. It is not in DNS. No real workload routes to it.
+
+  A decoy has no benign population, so this analytic has no threshold, no
+  baseline and no tuning. That property makes the analytic worth shipping even
+  though the range holds only 14 documents. The analytic costs one term and one
+  exists clause. It stays correct on a grid with 3 weeks of history or 3 years.
+
+  The analytic has to define what counts as an interaction. OpenCanary writes a
+  logtype 1001 start record every time the service starts. On this range 8 of
+  the 14 documents are start records. An analytic that matched the dataset alone
+  would report 57 % start records and claim perfect precision.
+
+  An interaction carries a source address. A start record does not. Measured
+  here, 6 documents hold `source.ip` and 8 do not. No document holds both
+  logtype 1001 and a source address.
+
+  The analytic tests `source.ip`. The query language already admits that field.
+  The analytic therefore adds no new Oracle egress surface.
+
+  A decoy writes only the start record while nobody touches it. The decoy sends
+  no heartbeat. A short precondition window would measure recent contact. It
+  would report a coverage gap on every quiet hour of a healthy decoy. The
+  precondition looks back 90 days.
+
+level: high
+scope_field: source.ip
+scope_kind: ip
+
+precondition:
+  all:
+    - field: event.dataset
+      value: opencanary.events
+
+# Ninety days, in minutes. The evidence a honeypot is alive is a boot record,
+# written when its service starts and at no other time, so the look-back has to
+# outlast the reboot cadence of a machine that is deliberately left alone. A
+# quarter does that with room to spare and still bounds the staleness: a decoy
+# whose shipper dies goes blind three months later rather than never. Longer
+# would stop being a liveness question, and on most grids retention answers
+# first anyway. Nothing here switches the precondition off: a honeypot that has
+# never reported holds no document in any window and still reads blind, which
+# is the truth on a grid where nobody deployed one.
+precondition_lookback_minutes: 129600
+
+detection:
+  all:
+    - field: event.dataset
+      value: opencanary.events
+    - field: source.ip
+      op: exists
+
+attack:
+  - T1046
+  - T1110
+
+false_positives:
+  - A vulnerability scanner that sweeps the subnet touches the decoy. This is
+    still worth seeing. The scanner's scope includes a host nobody told it
+    about.
+  - An operator validates the decoy. Two of the 6 interactions on the
+    development range come from the loopback address. This analytic does not
+    exclude loopback. A process on the decoy host that probes the decoy is a
+    finding.
+
+references:
+  - https://opencanary.readthedocs.io/
+  - https://attack.mitre.org/techniques/T1046/

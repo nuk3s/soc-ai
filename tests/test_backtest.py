@@ -14,6 +14,7 @@ that verdict back and scores it against the sampled alert's disposition.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -304,6 +305,7 @@ async def _fake_investigate(
     deep: bool = False,
     allow_so_writes: bool = True,
     focus_origin: str = "rerun",
+    subject: Any = None,
 ) -> AsyncIterator[StepEvent]:
     sid = "fake-bt-sid"
     yield StepEvent(
@@ -854,3 +856,239 @@ class TestBacktestInterruptedMidRunIsNotComplete:
         assert data["status"] == "complete"
         assert data["results"]["completion"]["degraded"] is False
         assert data["results"]["completion"]["no_verdict"] == 0
+
+
+# ── the agent must not be graded against its own answer key ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_samples_drops_alerts_soc_ai_escalated_itself(
+    bt_settings: Settings,
+) -> None:
+    """A group escalate stamps `event.escalated` on every member of the group.
+
+    This planner reads that flag back as the ANALYST's true-positive label, so
+    without the exclusion soc-ai is scored against dispositions soc-ai wrote —
+    which is not a measurement of anything. The escalation ledger holds exactly
+    those alerts and holds nothing else, so the exclusion is precise rather than
+    a heuristic about who acted.
+    """
+    from types import SimpleNamespace
+
+    from soc_ai.so_client.elastic import EsSearchResult
+    from soc_ai.webui import backtest as backtest_svc
+
+    hits = [
+        {"_id": "human-tp", "_source": {"event": {"escalated": True}, "rule": {"name": "R1"}}},
+        {"_id": "socai-tp", "_source": {"event": {"escalated": True}, "rule": {"name": "R2"}}},
+        {"_id": "human-fp", "_source": {"event": {"acknowledged": True}, "rule": {"name": "R3"}}},
+    ]
+
+    class _Elastic:
+        async def search(self, *_a: Any, **_k: Any) -> EsSearchResult:
+            return EsSearchResult(total=len(hits), took_ms=1, hits=hits)
+
+    async def _ids(_state: Any, _alert_ids: list[str]) -> set[str]:
+        return {"socai-tp"}
+
+    state = SimpleNamespace(settings=bt_settings, elastic=_Elastic(), db_sessionmaker=None)
+    with patch.object(backtest_svc, "_soc_ai_escalated_ids", _ids):
+        samples = await backtest_svc.plan_samples(
+            state, window_days=30, sample_size=10, min_severity=None
+        )
+
+    ids = {s.alert_es_id for s in samples}
+    assert ids == {"human-tp", "human-fp"}, "soc-ai's own escalation was scored as the analyst's"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_ledger_is_loud_rather_than_silently_permissive(
+    bt_settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Falling back to an empty set restores the exact self-grading the exclusion
+    prevents. That is not a degraded measurement, it is an invalid one, so the
+    failure has to reach a log rather than pass for a clean read."""
+    from types import SimpleNamespace
+
+    from soc_ai.webui import backtest as backtest_svc
+
+    class _Boom:
+        def __call__(self) -> Any:
+            raise RuntimeError("store unavailable")
+
+    state = SimpleNamespace(db_sessionmaker=_Boom())
+    with caplog.at_level(logging.WARNING):
+        got = await backtest_svc._soc_ai_escalated_ids(state, ["a", "b"])
+
+    assert got == set()
+    assert "own answer key" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_no_ledger_configured_is_not_an_error(bt_settings: Settings) -> None:
+    """A caller with no store (the planner's own unit tests, and any future
+    embedding) gets an empty set without a warning — absent is not broken."""
+    from types import SimpleNamespace
+
+    from soc_ai.webui import backtest as backtest_svc
+
+    got = await backtest_svc._soc_ai_escalated_ids(SimpleNamespace(db_sessionmaker=None), ["a"])
+    assert got == set()
+
+
+# ---------------------------------------------------------------------------
+# The severity floor and the alerts that carry no severity
+#
+# The floor compiled to a terms query over event.severity_label, and a terms
+# query cannot select a document that has no such field. So no floor could reach
+# an unlabelled alert — not even "low", which is the operator asking to exclude
+# nothing. Those are not a rung and there is no number to put in their place:
+# measured on one grid on 2026-09-06, Security Onion's Suricata pipeline writes
+# 1/2/3 alongside low/medium/high, Elastic Defend writes 99 and no label, and
+# OpenCanary writes no severity at all.
+#
+# This matters more here than on a queue filter. The backtest samples the
+# operator's own dispositioned history to score soc-ai against it, so a class of
+# alert silently absent from the sample is a measurement taken over a different
+# population than the one being reported on.
+# ---------------------------------------------------------------------------
+
+
+_UNLABELLED = {"bool": {"must_not": [{"exists": {"field": "event.severity_label"}}]}}
+
+
+@pytest.mark.parametrize("floor", ["critical", "high", "medium", "low"])
+def test_every_severity_floor_can_still_reach_an_unlabelled_alert(floor: str) -> None:
+    """The defect, at each rung. `low` is the sharpest: it is the operator
+    asking for everything, and it returned a filter that excluded a whole
+    shipper."""
+    clause = backtest_svc._severity_filter(floor)
+
+    assert clause is not None
+    assert _UNLABELLED in clause["bool"]["should"], (
+        f"a floor of {floor!r} cannot select an alert that carries no severity label, "
+        "so Elastic Defend endpoint alerts and honeypot hits leave the sample without "
+        "anything saying they did"
+    )
+    assert clause["bool"]["minimum_should_match"] == 1
+
+
+def _labels_anywhere_in(clause: Any) -> list[str]:
+    """Every ``event.severity_label`` terms value in ``clause``, at any depth.
+
+    Written shape-independently on purpose: the control below has to say
+    something about the floor's MEANING that holds whatever the clause is built
+    out of, or it is only a restatement of the fix and passes for the wrong
+    reason.
+    """
+    found: list[str] = []
+    if isinstance(clause, dict):
+        terms = clause.get("terms")
+        if isinstance(terms, dict) and "event.severity_label" in terms:
+            found += list(terms["event.severity_label"])
+        for value in clause.values():
+            found += _labels_anywhere_in(value)
+    elif isinstance(clause, list):
+        for item in clause:
+            found += _labels_anywhere_in(item)
+    return found
+
+
+def test_the_floor_still_excludes_the_severities_below_it() -> None:
+    """NEGATIVE CONTROL. Admitting the unlabelled must not admit everything: a
+    floor that filtered nothing would satisfy the test above and delete the
+    feature."""
+    labels = _labels_anywhere_in(backtest_svc._severity_filter("high"))
+
+    assert sorted(labels) == ["critical", "high"]
+
+
+def test_no_floor_asks_no_severity_question_at_all() -> None:
+    """NEGATIVE CONTROL. An absent floor already reached every alert; it must
+    not acquire a clause it did not have."""
+    assert backtest_svc._severity_filter(None) is None
+    assert backtest_svc._severity_filter("not-a-rung") is None
+
+
+class _CapturingElastic:
+    """Records the query it was handed and answers with fixed hits."""
+
+    def __init__(self, hits: list[dict[str, Any]]) -> None:
+        self.query: dict[str, Any] | None = None
+        self._hits = hits
+
+    async def search(self, _index: str, query: dict[str, Any], **_kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        self.query = query
+        return SimpleNamespace(hits=self._hits)
+
+
+def test_the_sampler_asks_the_grid_a_question_an_unlabelled_alert_can_answer(
+    bt_settings: Settings,
+) -> None:
+    """The filter as the sampler actually assembles it, plus what happens to the
+    document after it arrives.
+
+    The fake grid does not evaluate the query, so the assertion about reaching
+    an unlabelled alert is made against the query the sampler HANDED it. The
+    rest of the test is about the second half of the same blind spot: an
+    OpenCanary hit carries no ``rule.name`` either, and the diversity key is
+    built from it, so every unlabelled alert would otherwise collapse into one
+    empty-named bucket and the sample would hold exactly one of them.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    honeypot = {
+        "_id": "hp-1",
+        "_source": {
+            "@timestamp": "2026-09-06T06:41:00.000Z",
+            "event": {
+                "dataset": "opencanary.events",
+                "acknowledged": True,
+            },
+            "source": {"ip": "10.0.0.254"},
+        },
+    }
+    labelled = {
+        "_id": "a1",
+        "_source": {
+            "@timestamp": "2026-09-06T06:42:00.000Z",
+            "rule": {"name": "ET SCAN thing"},
+            "event": {"severity_label": "high", "acknowledged": True},
+        },
+    }
+    elastic = _CapturingElastic([honeypot, labelled])
+    state = SimpleNamespace(settings=bt_settings, elastic=elastic)
+
+    samples = asyncio.run(
+        backtest_svc.plan_samples(state, window_days=30, sample_size=10, min_severity="high")
+    )
+
+    assert elastic.query is not None
+    assert _UNLABELLED in _severity_clauses_of(elastic.query), (
+        "the sampling query cannot select an alert that carries no severity label, "
+        "so the backtest scores soc-ai over a population that excludes an entire "
+        "shipper and says nothing about it"
+    )
+
+    ids = [s.alert_es_id for s in samples]
+    assert "hp-1" in ids
+    assert "a1" in ids, "the labelled alert must still be sampled"
+    # No rule.name, so the diversity key falls back to the dataset.
+    assert next(s.rule_name for s in samples if s.alert_es_id == "hp-1") == "opencanary.events"
+
+
+def _severity_clauses_of(query: Any) -> list[Any]:
+    """Every sub-clause of ``query`` that mentions ``event.severity_label``."""
+    found: list[Any] = []
+    if isinstance(query, dict):
+        if "event.severity_label" in str(query):
+            found.append(query)
+        for value in query.values():
+            found += _severity_clauses_of(value)
+    elif isinstance(query, list):
+        for item in query:
+            found += _severity_clauses_of(item)
+    return found

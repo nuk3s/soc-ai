@@ -36,8 +36,9 @@ export function AgentToolsPanel({
       {!collapsed && (
       <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-        Every tool the triage & chat agent can call, and what each needs turned on. Greyed tools are
-        unavailable until their requirement (○) is met.
+        The list holds every tool the triage agent and the chat agent can call. Each row names what
+        the tool needs. A grey row is unavailable. The ○ mark names a requirement this deployment
+        does not meet.
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         {loading && !data && <LoadingState />}

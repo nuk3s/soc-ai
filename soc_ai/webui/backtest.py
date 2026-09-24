@@ -37,6 +37,7 @@ from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import backtests as bt_svc
+from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import alerts_query as aq
 
@@ -275,7 +276,8 @@ async def plan_samples(
 
     Queries ES for alerts within the last ``window_days`` that carry a
     disposition (``event.escalated`` OR ``event.acknowledged``), honouring
-    ``min_severity`` (a floor: that severity and above) and the configured alert
+    ``min_severity`` (a floor: that severity and above, plus the alerts that
+    carry no label — see :func:`_severity_filter`) and the configured alert
     source scope. Diversity: one alert per (rule.name, human_disposition) key,
     so a single noisy escalated/acked rule can't saturate the sample — every
     distinct disposed rule gets a representative, escalated alerts preferred
@@ -298,7 +300,7 @@ async def plan_samples(
         dataset_oqls.append(aq.SIGMA_SOURCE_OQL)
 
     time_range = _window_range(window_days)
-    severity_floor = _severity_band(min_severity)
+    severity_floor = _severity_filter(min_severity)
 
     # Fetch a generous page (up to 500) of dispositioned alerts newest-first,
     # then diversify down to sample_size. 500 is plenty at this lab's scale to
@@ -322,8 +324,8 @@ async def plan_samples(
             }
         }
     )
-    if severity_floor:
-        query["bool"]["filter"].append({"terms": {"event.severity_label": list(severity_floor)}})
+    if severity_floor is not None:
+        query["bool"]["filter"].append(severity_floor)
 
     result = await elastic.search(
         settings.events_index_pattern,
@@ -332,13 +334,27 @@ async def plan_samples(
         sort=[{"@timestamp": {"order": "desc"}}],
     )
 
+    # Alerts soc-ai itself escalated. Grading the agent against a disposition
+    # the agent wrote is not a measurement — a group escalate stamps
+    # `event.escalated` on every member, and this planner would then read those
+    # back as the analyst's own true-positive labels and score soc-ai against
+    # its own answer key. The ledger holds exactly which alerts those are, and
+    # holds nothing else, so the exclusion is precise rather than heuristic.
+    self_escalated = await _soc_ai_escalated_ids(
+        state, [str(h.get("_id", "")) for h in result.hits]
+    )
+
     seen: set[tuple[str, str]] = set()
     samples: list[BacktestSample] = []
+    excluded_self = 0
     for hit in result.hits:
         if len(samples) >= sample_size:
             break
         alert_id = str(hit.get("_id", ""))
         if not alert_id:
+            continue
+        if alert_id in self_escalated:
+            excluded_self += 1
             continue
         source = hit.get("_source", {}) or {}
         disposition = _disposition_of(source)
@@ -361,14 +377,46 @@ async def plan_samples(
                 human_disposition=disposition,
             )
         )
+    # Say how many were dropped. A denominator that quietly shrinks is the same
+    # defect in a different place: an operator comparing two backtests needs to
+    # know whether the sample got smaller because their grid went quiet or
+    # because soc-ai had escalated more of it since last time.
     _LOGGER.info(
-        "backtest: sampled %d dispositioned alerts (scanned %d hits, window=%dd, floor=%s)",
+        "backtest: sampled %d dispositioned alerts (scanned %d hits, excluded %d "
+        "soc-ai escalated, window=%dd, floor=%s)",
         len(samples),
         len(result.hits),
+        excluded_self,
         window_days,
         min_severity or "none",
     )
     return samples
+
+
+async def _soc_ai_escalated_ids(state: Any, alert_ids: list[str]) -> set[str]:
+    """Alert ids soc-ai put on a case itself, per the escalation ledger.
+
+    Best-effort by design: this planner's job is to sample, and a store it could
+    not read must not take the backtest down. But the failure is LOGGED loudly,
+    because falling back to an empty set silently restores the exact
+    self-grading this exists to prevent — a quiet failure here does not degrade
+    the measurement, it invalidates it.
+    """
+    maker = getattr(state, "db_sessionmaker", None)
+    ids = [i for i in alert_ids if i]
+    if maker is None or not ids:
+        return set()
+    try:
+        async with maker() as db:
+            return set(await esc_svc.cases_for_alerts(db, ids))
+    except Exception:
+        _LOGGER.warning(
+            "backtest: could not read the escalation ledger; alerts soc-ai escalated "
+            "itself will be scored as the analyst's own calls, which grades the agent "
+            "against its own answer key",
+            exc_info=True,
+        )
+        return set()
 
 
 def _window_range(window_days: int) -> str:
@@ -387,7 +435,12 @@ def _window_range(window_days: int) -> str:
 
 
 def _severity_band(min_severity: str | None) -> tuple[str, ...]:
-    """The severity band at/above ``min_severity`` (empty ⇒ all severities)."""
+    """The severity band at/above ``min_severity`` (empty ⇒ all severities).
+
+    The four labels only. The alerts that carry no label are not on the ladder
+    and are handled by :func:`_severity_filter`, which is what turns this into a
+    query.
+    """
     if not min_severity:
         return ()
     ladder = list(aq.SEVERITIES)  # ("critical", "high", "medium", "low")
@@ -395,6 +448,40 @@ def _severity_band(min_severity: str | None) -> tuple[str, ...]:
         return ()
     idx = ladder.index(min_severity)
     return tuple(ladder[: idx + 1])
+
+
+def _severity_filter(min_severity: str | None) -> dict[str, Any] | None:
+    """The floor as one query clause, or ``None`` when no floor was asked for.
+
+    A ``terms`` query over ``event.severity_label`` cannot select a document
+    that has no such field, so the band on its own could not reach an
+    unlabelled alert at any floor — including ``low``, which is the operator
+    asking to exclude nothing. Those alerts are not a rung and there is no
+    number to put in their place: measured on one grid on 2026-09-06, Security
+    Onion's Suricata pipeline writes 1/2/3 alongside low/medium/high, Elastic
+    Defend writes 99 and no label, and OpenCanary writes no severity at all.
+
+    So the clause is the band OR the absence of a label, which is the same
+    answer :func:`soc_ai.webui.autotriage.config_severity_band` reaches for the
+    sweep and :data:`soc_ai.webui.alerts_query.UNKNOWN_SEVERITY` for the queue.
+    Silently dropping the unlabelled here is worse than in either of those,
+    because this samples the operator's own dispositioned history to score
+    soc-ai against it: a whole class of alert absent from the sample is a
+    measurement taken over a population that is not the one being measured, and
+    nothing in the report would say so.
+    """
+    band = _severity_band(min_severity)
+    if not band:
+        return None
+    return {
+        "bool": {
+            "should": [
+                {"terms": {"event.severity_label": list(band)}},
+                {"bool": {"must_not": [{"exists": {"field": "event.severity_label"}}]}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
 
 
 # ---------------------------------------------------------------------------

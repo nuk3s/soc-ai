@@ -1,107 +1,115 @@
 # What the soc-ai agent can do
 
-The complete capability surface of the triage agent: the tools it can
-call, the enrichments applied to every alert before the agent runs, and the
-guardrails.
+This page states the complete capability of the triage agent. It names the tools the
+agent can call, the enrichments that run on every alert before the agent runs, and the
+guardrails. SO means Security Onion.
 
-> **Trust boundary:** every **read** tool is exposed read-only. Every **write**
-> tool (anything that changes Security Onion state) runs only when a human
-> explicitly executes it from the report's recommended actions in the UI (the
-> actions API — the single write path). The agent can *recommend* a write but
-> never executes one on its own. The third class, **proposal** tools, changes
-> nothing at all — it puts a control on screen for you to press. See
-> `docs/SAFETY_MODEL.md`.
+> **Trust boundary:** every read tool is read-only. A write tool changes Security Onion
+> state. A write tool runs only if a person executes it from the report's recommended
+> actions in the UI. The actions API is the single write path. The agent recommends a
+> write. The agent never executes a write on its own.
+>
+> The third class is the proposal tool. A proposal tool changes nothing. It puts a control
+> on the screen for you to press. See `docs/SAFETY_MODEL.md`.
 
-## Read tools (run without a human in the loop)
+## Read tools
+
+A read tool runs without human approval.
 
 | Tool | What it does | Backing system |
 |------|--------------|----------------|
-| `query_events` | Run a **validated OQL** query against the SO events index (field-whitelisted; pipes/aggregations supported). General-purpose pivot. | Elasticsearch events index |
-| `query_zeek_logs` | Pivot into Zeek/connection logs by `network.community_id` to see the underlying flow (duration, bytes, conn state). | Elasticsearch (Zeek datasets) |
-| `query_cases` | Search existing SOC cases by free-text query (has this been seen/escalated before?). | SO cases index |
-| `query_detections` | Search SOC detection rules by free-text query (what does this rule actually look for?). | SO detections index |
-| `get_rule_content` / `t_get_rule_content` | Fetch a detection rule's **full text** by SID/`publicId` or exact title — what the signature actually matches (content strings, ports, dsize, PCRE), so a verdict rests on the rule body, not its name. | SO detections index |
-| `decode_payload` / `t_decode_payload` | Decode payload bytes already in evidence (Suricata base64 `payload`, hex, or `payload_printable` text) into printable strings, embedded domains/URLs/IPs, Shannon entropy, and DNS/HTTP/TLS protocol hints. **Local compute, no egress** — works even after the PCAP ring has rotated. | In-process (dpkt decode helpers) |
-| `get_playbooks` | Pull response playbooks, optionally scoped to a given alert. | SO playbooks index |
-| `lookup_runbook` | Search operator-authored runbooks (procedures / "what normal looks like on *this* network") so a verdict can cite the org's own guidance. Default ranking is local BM25 with rule-link > tag > keyword boosts; setting `RAG_EMBED_MODEL` adds an opt-in semantic tier via your gateway. Either way there is no external index and nothing leaves your network. | Local store (`soc_ai/store/runbooks`) |
-| `enrich_ip` | Enrich an IP locally: vendored blocklist hits, GeoIP/ASN (MaxMind), cloud-prefix tag, internal-vs-external classification (`INTERNAL_CIDRS`), + optional MISP. Internal IPs short-circuit the external-only lookups. | Vendored blocklists / MaxMind / MISP |
-| `enrich_domain` | Enrich a domain via local blocklist lookup + optional MISP. | Vendored blocklists / MISP |
-| `enrich_hash` | Enrich a file hash via local blocklist lookup + optional MISP. | Vendored blocklists / MISP |
-| `get_event_raw` / `t_get_event_raw` | Fetch the full raw JSON of a single event by id when the summarized context isn't enough. | Elasticsearch events index |
-| `t_describe_dataset` / `t_field_values` | On-demand discovery: describe a dataset's shape, or list the observed values of a field. Lets the agent learn what's actually in *this* grid instead of assuming a fixed schema. | Elasticsearch (terms aggregations) |
-| `t_host_summary` | Summarize a host's recent activity (datasets seen, top peers, notable events) for the internal side of a flow. | Elasticsearch |
-| `t_origin_chain` | **Who was driving this host?** Remote-access sessions (SSH/RDP/WinRM/SMB) *inbound* to an internal host in the window before the activity, time-ordered, with the closest-preceding session flagged as the likely driver. Call before attributing hostile behavior to an internal host: a host with an inbound session is a **waypoint**, not the origin — attribute upstream. An empty result is equally decisive (the host acted autonomously). | Elasticsearch |
-| `t_host_dossier` | **What IS this host, and is this normal for it?** The durable asset record kept for an internal IP by the network sweep: hostname, OS, inferred role (hypervisor / domain controller / security appliance / server / workstation / network device / IoT), the services it offers, its behavioural baseline, and any operator-set criticality and site policy. Every field carries its provenance — an **operator** value outranks an inferred one — plus the evidence behind it and when it was last confirmed. Unlike `t_host_summary` (a fresh 24h snapshot) this is the stored record built over a much wider window. A field with no value says *why* (`no_signal` / `low_confidence` / `stale`), and "no dossier" means the sweep has no record of the address, not that it is benign. | Local store (built from Elasticsearch by the dossier sweep) |
-| `t_prevalence` / `t_rule_prevalence` | How common is this indicator / this rule across the grid and window? Rare-vs-noisy is decisive for FP calls. | Elasticsearch (aggregations) |
-| `t_suggest_rule_tuning` | *Suggest* a tuning for a noisy detection (the analyst applies it in Detection Tuning; the agent never mutates a rule). | Local store + Elasticsearch |
-| `t_shodan_internetdb` / `t_shodan_host` / `t_greynoise` / `t_cve_lookup` | **External** reputation lookups on a single indicator — Shodan InternetDB (free), Shodan host (paid key), GreyNoise, CIRCL CVE DB. Outbound egress; used in the **hunt** and **chat** agents. Only the indicator leaves the network, never alert payloads. See `docs/SAFETY_MODEL.md` → external-intel egress. | Public Shodan / GreyNoise / CIRCL APIs |
-| `get_pcap` / `t_get_pcap` | Fetch + decode the raw packets for a bidirectional flow (five-tuples, SNI, DNS qnames, HTTP hosts, inter-arrival beacon stats). SSHes into the SO sensor's Suricata pcap-log ring and runs a BPF-filtered tcpdump. **Heavier than Elastic** — used only when packet/protocol confirmation is the deciding evidence (C2 beacon, exfil, kerberoast, ET MALWARE/EXPLOIT rules). **Disabled by default** (`PCAP_ENABLED=false`); requires provisioning the sensor SSH key. | SSH + Suricata `/nsm/suripcap` |
-| `web_search` / `t_web_search` | Search a self-hosted **SearXNG** instance to research an **external** indicator — domain reputation, what a host/service is, known-abuse reports — so a verdict rests on outside evidence, not a guess. **Privacy-guarded:** the query goes to public engines via SearXNG, so it must contain only external indicators; a query referencing an internal IP is refused. **Disabled by default** (`WEB_SEARCH_ENABLED=false`); needs `SEARXNG_URL` (and SearXNG's JSON API enabled). Configurable in the admin config console. | SearXNG |
-| `crawl_page` / `t_crawl_page` | Deep-read the full content of an **external** web page via a self-hosted **crawl4ai** instance — used *after* `web_search` to read a promising result (a reputation/abuse/threat-intel page) in full instead of a snippet. Returns the page's readable markdown + title. **SSRF-guarded:** fetches server-side, so internal IPs/hosts/localhost are refused. **Disabled by default** (`CRAWL4AI_ENABLED=false`); needs `CRAWL4AI_URL`. Configurable in the admin config console. | crawl4ai |
-| `beacon_profile` / `t_beacon_profile` | Beacon-cadence sweep over `zeek.conn`: measures inter-arrival coefficient of variation per src→dst pair so a hunt reports a *measured* cadence instead of an eyeballed "looks periodic". **Hunt-only** (1.3 slice 2) — no alert-anchored equivalent on triage. | Elasticsearch (aggregations) |
-| `dns_entropy_scan` / `t_dns_entropy_scan` | DNS-entropy sweep over `zeek.dns`: groups qnames by parent domain and flags DGA/tunnel candidates by mean subdomain-label Shannon entropy plus query volume. **Hunt-only** (1.3 slice 2). | Elasticsearch (aggregations) |
-| `dcerpc_histogram` / `t_dcerpc_histogram` | Operation histogram over `zeek.dce_rpc`: flags individually-dangerous operations (Zerologon-style `NetrServerAuthenticate*`, DCSync's `DRSGetNCChanges`/`DsGetNCChanges`, remote service creation) and operations rare against a busy baseline. **Hunt-only** (1.3 slice 2). | Elasticsearch (aggregations) |
-| `first_seen` / `t_first_seen` | Novelty sweep: diffs external destinations seen in a recent window against a trailing baseline window that ends exactly where the recent window begins, surfacing destinations with no prior baseline sighting. **Hunt-only** (1.3 slice 2). | Elasticsearch (aggregations) |
+| `query_events` | Run a validated OQL query against the SO events index. The fields are whitelisted. Pipes and aggregations are supported. This is the general-purpose pivot. | Elasticsearch events index |
+| `query_zeek_logs` | Pivot into the Zeek connection logs by `network.community_id`. The result shows the flow duration, the bytes and the conn state. | Elasticsearch (Zeek datasets) |
+| `run_analytic` | Run one catalog analytic over a window. The result lists the entities that matched and the document ids the agent can cite. Hunt role only. | Elasticsearch events index |
+| `query_cases` | Search the existing SOC cases with a free-text query. Use it to find out if someone saw or escalated this before. | SO cases index |
+| `query_detections` | Search the SOC detection rules with a free-text query. The result shows what a rule looks for. | SO detections index |
+| `get_rule_content` / `t_get_rule_content` | Fetch the full text of a detection rule by SID, by `publicId` or by exact title. The text states what the signature matches: content strings, ports, dsize and PCRE. A verdict then rests on the rule body. | SO detections index |
+| `decode_payload` / `t_decode_payload` | Decode the payload bytes that are already in the evidence. The input is a Suricata base64 `payload`, hex, or `payload_printable` text. The output is printable strings, embedded domains, URLs and IPs, Shannon entropy, and DNS, HTTP and TLS protocol hints. The decode runs locally, and there is no egress. The tool works after the PCAP ring rotates. | In-process (dpkt decode helpers) |
+| `get_playbooks` | Pull the response playbooks. You can scope the result to one alert. | SO playbooks index |
+| `lookup_runbook` | Search the runbooks that the operator wrote. A runbook records a procedure and the normal behaviour of this network, so a verdict can cite the guidance of your own organization. The default ranking is local BM25 with a rule-link boost, a tag boost and a keyword boost, in that order of weight. `RAG_EMBED_MODEL` adds an optional semantic tier through your gateway. There is no external index, and nothing leaves your network. | Local store (`soc_ai/store/runbooks`) |
+| `enrich_ip` | Enrich an IP address locally. The result gives the vendored blocklist hits, the MaxMind GeoIP and ASN data, a cloud-prefix tag, and an internal or external classification from `INTERNAL_CIDRS`. MISP is optional. An internal IP address skips the external-only lookups. | Vendored blocklists / MaxMind / MISP |
+| `enrich_domain` | Enrich a domain with a local blocklist lookup. MISP is optional. | Vendored blocklists / MISP |
+| `enrich_hash` | Enrich a file hash with a local blocklist lookup. MISP is optional. | Vendored blocklists / MISP |
+| `get_event_raw` / `t_get_event_raw` | Fetch the full raw JSON of one event by id. Use it if the summarized context is not enough. | Elasticsearch events index |
+| `t_describe_dataset` / `t_field_values` | Discover the telemetry on demand. One tool describes the shape of a dataset. The other lists the observed values of a field. The agent learns what *this* grid holds, and it does not assume a fixed schema. | Elasticsearch (terms aggregations) |
+| `t_host_summary` | Summarize the recent activity of a host on the internal side of a flow. The summary names the datasets seen, the top peers and the notable events. | Elasticsearch |
+| `t_origin_chain` | Who controlled this host? The tool lists the inbound remote-access sessions over SSH, RDP, WinRM and SMB to an internal host in the window before the activity. The list is time-ordered, and it flags the closest preceding session as the likely driver. Call this tool before you attribute hostile behaviour to an internal host. A host with an inbound session is a waypoint, so attribute the behaviour upstream. An empty result is also decisive, because the host acted on its own. | Elasticsearch |
+| `t_host_dossier` | What is this host, and is this normal for it? The dossier is the durable asset record that the network sweep keeps for an internal IP address. It holds the hostname, the OS, the inferred role, the services the host offers, the behavioural baseline, the operator-set criticality and the site policy. The inferred role is hypervisor, domain controller, security appliance, server, workstation, network device or IoT. Every field carries its provenance, its evidence and the date of its last confirmation, and an operator value outranks an inferred value. `t_host_summary` returns a fresh 24 h snapshot, and the dossier is the stored record that the sweep builds over a much wider window. A field with no value states why: `no_signal`, `low_confidence` or `stale`. A missing dossier means the sweep has no record of the address, and it is not evidence that the address is benign. | Local store (built from Elasticsearch by the dossier sweep) |
+| `t_prevalence` / `t_rule_prevalence` | Measure how common one indicator or one rule is across the grid and the window. A rare indicator and a noisy indicator lead to different false-positive calls. Both tools separate a spread-out baseline from a single burst, and neither averages one into the other. | Elasticsearch (aggregations) |
+| `t_suggest_rule_tuning` | Suggest a tuning for a noisy detection. The analyst applies the tuning in Detection Tuning. The agent never changes a rule. | Local store + Elasticsearch |
+| `t_shodan_internetdb` / `t_shodan_host` / `t_greynoise` / `t_cve_lookup` | Look up the external reputation of one indicator. The sources are Shodan InternetDB, the Shodan host API, GreyNoise and the CIRCL CVE DB. Shodan InternetDB is free, and the Shodan host API needs a paid key. These tools send traffic out of the network, and the hunt and chat agents use them. Only the indicator leaves the network, and an alert payload never does. See `docs/SAFETY_MODEL.md` → external-intel egress. | Public Shodan / GreyNoise / CIRCL APIs |
+| `get_pcap` / `t_get_pcap` | Fetch and decode the raw packets of a bidirectional flow. The result gives the five-tuples, the SNI, the DNS qnames, the HTTP hosts and the inter-arrival beacon statistics. The tool connects over SSH to the Suricata pcap-log ring on the SO sensor and runs a BPF-filtered tcpdump. This costs more than an Elasticsearch query. Use it only if packet or protocol confirmation is the deciding evidence, such as a C2 beacon, exfiltration, kerberoasting, or an ET MALWARE or ET EXPLOIT rule. The tool is disabled by default with `PCAP_ENABLED=false`, and it needs the sensor SSH key. | SSH + Suricata `/nsm/suripcap` |
+| `web_search` / `t_web_search` | Search a self-hosted SearXNG instance to research an external indicator: domain reputation, the identity of a host or a service, and known-abuse reports. A verdict then rests on outside evidence. The tool is privacy-guarded. The query reaches public engines through SearXNG, so it must hold external indicators only, and the tool refuses a query that names an internal IP address. The tool is disabled by default with `WEB_SEARCH_ENABLED=false`, and it needs `SEARXNG_URL` and the SearXNG JSON API. Configure it in the admin config console. | SearXNG |
+| `crawl_page` / `t_crawl_page` | Read the full content of an external web page through a self-hosted crawl4ai instance. Use it after `web_search` to read a promising reputation, abuse or threat-intelligence page in full. The tool returns the readable markdown of the page and its title. The tool has a server-side request forgery guard. It fetches server-side, so it refuses an internal IP address, an internal host and localhost. The tool is disabled by default with `CRAWL4AI_ENABLED=false`, and it needs `CRAWL4AI_URL`. Configure it in the admin config console. | crawl4ai |
+| `beacon_profile` / `t_beacon_profile` | Sweep `zeek.conn` for beacon cadence. The tool measures the inter-arrival coefficient of variation for each source-to-destination pair, so a hunt reports a *measured* cadence. The tool is hunt-only from 1.3 slice 2, and triage has no alert-anchored equivalent. | Elasticsearch (aggregations) |
+| `dns_entropy_scan` / `t_dns_entropy_scan` | Sweep `zeek.dns` for DNS entropy. The tool groups the qnames by parent domain. It flags DGA and tunnel candidates by the mean Shannon entropy of the subdomain labels and by the query volume. The tool is hunt-only from 1.3 slice 2. | Elasticsearch (aggregations) |
+| `dcerpc_histogram` / `t_dcerpc_histogram` | Build an operation histogram over `zeek.dce_rpc`. The tool flags the dangerous operations: the Zerologon-style `NetrServerAuthenticate*`, the DCSync `DRSGetNCChanges` and `DsGetNCChanges`, and remote service creation. It also flags an operation that is rare against a busy baseline. The tool is hunt-only from 1.3 slice 2. | Elasticsearch (aggregations) |
+| `first_seen` / `t_first_seen` | Sweep for novelty. The tool compares the external destinations of a recent window against a trailing baseline window. The baseline window ends where the recent window begins. The tool reports every destination with no earlier sighting in the baseline. The tool is hunt-only from 1.3 slice 2. | Elasticsearch (aggregations) |
 
-> **Not a callable tool:** `get_alert_context` (fan-out across the 5 typed
-> pivots: community_id flow, host, user, process, file) is **not** registered
-> for the agent to call. It runs deterministically in the **prefetch** stage and
-> its result is embedded directly in the agent's prompt, so the agent never has
-> to pull the alert picture itself (and cannot accidentally skip it). See the
-> prefetch enrichments below.
+> **Not a callable tool:** `get_alert_context` is not registered for the agent to call. It
+> fans out across the 5 typed pivots: the community_id flow, the host, the user, the
+> process and the file. It runs in the prefetch stage, and it runs the same way every
+> time. The prefetch embeds its result in the agent's prompt. The agent never pulls
+> the alert picture itself, and the agent cannot skip it. See the prefetch enrichments
+> below.
 
-## Proposal tools (chat only — the agent asks, you decide)
+## Proposal tools
 
-Neither read nor write: a proposal tool changes nothing anywhere, it puts a
-control in front of you. The agent has already looked at the evidence, so it
-writes a better proposal than a blank form would get from you — and you still
-press the button.
+A proposal tool is available in chat only. It is neither a read tool nor a write tool. It
+changes nothing anywhere. It puts a control in front of you. The agent has already read
+the evidence, so the proposal arrives filled in. You still press the button.
 
-Each one is offered only on the surface it belongs to, so the model cannot
-reach for the wrong one: the investigation chat can propose a verdict but not a
-hunt, the Dashboard assistant the reverse.
+Each tool appears only on the screen it belongs to, so the model cannot select the wrong
+one. The investigation chat can propose a verdict, and it cannot propose a hunt. The
+Dashboard assistant can propose a hunt, and it cannot propose a verdict.
 
 | Tool | Where | What happens |
 |------|-------|--------------|
-| `propose_verdict` | Investigation chat | The agent proposes `true_positive` / `false_positive` with confidence, rationale and citations. The stored verdict does **not** change; an **Apply** control appears, and it only appears if the proposal is evidence-backed. |
-| `propose_hunt` | Dashboard assistant | For a question that genuinely needs a sweep across many hosts or a long window, the agent writes the hunt objective — sharpened by what it just looked at — and says what the sweep would settle. Nothing starts: a **Start hunt** control appears, and you confirm. |
+| `propose_verdict` | Investigation chat | The agent proposes `true_positive` or `false_positive` with a confidence, a rationale and citations. The stored verdict does not change. An Apply control appears, and it appears only if evidence backs the proposal. |
+| `propose_hunt` | Dashboard assistant | Some questions need a sweep across many hosts or a long window. The agent writes the hunt objective from the evidence it has read, and it states what the sweep settles. Nothing starts. A Start hunt control appears, and you confirm it. |
 
-## Write tools (analyst-executed from the report in the UI)
+## Write tools
+
+The analyst executes a write tool from the report in the UI.
 
 | Tool | What it does |
 |------|--------------|
-| `ack_alert` | Acknowledge a SOC alert (optional comment). |
-| `escalate_to_case` | Create a SOC case from an alert (title + description required). |
-| `add_case_comment` | Append a comment to an existing SOC case. |
+| `ack_alert` | Acknowledge a SOC alert. The comment is optional. |
+| `escalate_to_case` | Create a SOC case from an alert. The title and the description are required. |
+| `add_case_comment` | Add a comment to an existing SOC case. |
 
-## Enrichments applied to every alert (before the agent runs)
+## Enrichments on every alert
 
-These run locally in the **prefetch** stage (no LLM, no runtime egress) and
-their results are handed to the agent as part of the alert context:
+These enrichments run before the agent runs. They run locally in the prefetch stage, with
+no LLM and no runtime egress. The prefetch gives the results to the agent as part of
+the alert context.
 
-- **Blocklist match:** vendored threat feeds (URLhaus, ThreatFox, Feodo Tracker,
-  Tor exit nodes, + optional internal seed list). Flags src/dst IPs, domains, hashes.
-- **GeoIP + ASN:** MaxMind lookup on external IPs (country, ASN, org).
-- **Cloud-prefix tagging:** marks IPs belonging to known cloud providers.
-- **Internal-CIDR classification:** labels each endpoint internal vs external
-  using `INTERNAL_CIDRS`.
-- **MISP IOC match:** if a MISP instance is configured (`MISP_URL`), indicators
-  are checked against it.
+- **Blocklist match:** the vendored threat feeds are URLhaus, ThreatFox, Feodo Tracker
+  and the Tor exit nodes. The internal seed list is optional. The match flags the source
+  and destination IP addresses, the domains and the hashes.
+- **GeoIP and ASN:** MaxMind returns the country, the ASN and the organization of an
+  external IP address.
+- **Cloud-prefix tag:** the tag marks an IP address that belongs to a known cloud
+  provider.
+- **Internal-CIDR classification:** `INTERNAL_CIDRS` labels each endpoint as internal or
+  external.
+- **MISP IOC match:** if you configure a MISP instance with `MISP_URL`, soc-ai checks the
+  indicators against it.
 
-The UI surfaces these on the alert context / investigation timeline so an analyst
-can see exactly which enrichments fired.
+The UI shows these enrichments on the alert context and on the investigation timeline, so
+an analyst can see which enrichments fired.
 
-## What the agent CANNOT do today (known gaps)
+## Known gaps
 
-Known gaps, in rough roadmap order:
+The agent cannot do these things today. The list follows the roadmap order.
 
-- **PCAP retrieval is disabled by default.** The `get_pcap` / `t_get_pcap` tool
-  is wired but gated behind `PCAP_ENABLED=true` + a provisioned SSH key
-  (`SO_SSH_KEY`). When disabled the tool returns a descriptive error dict without
-  any network I/O. Once enabled the agent can fetch and decode the Suricata
-  pcap-log ring buffer for bidirectional flows (SNI, DNS, HTTP hosts,
-  inter-arrival timing, five-tuple stats).
-- **No active host/network actions** beyond the three SO write tools (no isolate,
-  no block, no firewall change).
-- Read tools run against whatever indices the deployment's index-pattern settings
-  point at; off-pattern data is invisible to the agent.
+- **PCAP retrieval is disabled by default.** The `get_pcap` and `t_get_pcap` tool is
+  wired. It needs `PCAP_ENABLED=true` and a provisioned SSH key in `SO_SSH_KEY`. If the
+  tool is disabled, it returns an error dict that says so, and it performs no network
+  I/O. If the tool is enabled, the agent fetches and decodes the Suricata pcap-log ring
+  buffer for a bidirectional flow. The result gives the SNI, the DNS names, the HTTP
+  hosts, the inter-arrival timing and the five-tuple statistics.
+- **No active host or network actions.** The three SO write tools are the limit. The
+  agent cannot isolate a host, block traffic or change a firewall.
+- A read tool runs against the indices that the deployment's index-pattern settings name.
+  The agent cannot see data outside that pattern.

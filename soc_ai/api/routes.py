@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from sse_starlette.sse import EventSourceResponse
 
-from soc_ai import __version__, metrics
+from soc_ai import __commit__, __version__, metrics
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
     investigate,
@@ -28,8 +28,8 @@ from soc_ai.api.runner import recorded_run, sse_encode
 from soc_ai.api.schemas import (
     FindAlertRequest,
     FindAlertResponse,
-    HealthResponse,
     InvestigateRequest,
+    LivenessResponse,
 )
 from soc_ai.api.security import identify_caller, require_api_auth, require_csrf_safe
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
@@ -62,14 +62,28 @@ def _parse_so_timestamp(s: str) -> datetime:
 router = APIRouter(dependencies=[Depends(require_csrf_safe)])
 
 
-@router.get("/healthz", response_model=HealthResponse)
+@router.get("/healthz", response_model=LivenessResponse)
 async def healthz(
     settings: Settings = Depends(get_settings_dep),
-) -> HealthResponse:
-    """Liveness + minimal config-snapshot endpoint."""
-    return HealthResponse(
-        status="ok",
+) -> LivenessResponse:
+    """Liveness, plus the config snapshot a bug report needs. NOT a health verdict.
+
+    The path keeps its conventional name because the container healthcheck,
+    ``render.yaml`` and every deploy script poll it, and a liveness probe is
+    exactly what those want. What it must not do is let the word ``healthy``
+    that Docker prints beside a container be mistaken for a statement about the
+    grid, the model gateway or the store — see
+    :class:`~soc_ai.api.schemas.LivenessResponse` for why the answer is
+    unconditional and where the real verdict lives (``GET /api/v1/health``,
+    ``soc-ai doctor``).
+
+    Unauthenticated on purpose: a probe that needed a token would fail closed
+    the day the token rotated, and there is nothing here worth gating — a
+    version string and two booleans an operator pastes into a bug report.
+    """
+    return LivenessResponse(
         version=__version__,
+        commit=__commit__,
         so_auth="connect" if settings.use_connect_api else "kratos",
         misp_configured=settings.misp_url is not None,
     )

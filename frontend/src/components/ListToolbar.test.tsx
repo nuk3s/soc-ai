@@ -167,6 +167,23 @@ describe('ListToolbar', () => {
     expect(screen.queryByTestId('list-toolbar-views')).toBeNull();
   });
 
+  // A deployment with the auth gate down cannot own saved views, and the
+  // toolbar's answer was to render nothing at all: no chips, no save control,
+  // no message, on four list screens. An analyst reads that as "this product
+  // has no saved views" (dogfood 2026-09-07, D3).
+  it('offers a disabled save control with the reason, rather than nothing', () => {
+    render(<ListToolbar saveViewUnavailable="Saved views need a signed-in session." />);
+    const control = screen.getByRole('button', { name: /Save view/ });
+    expect(control).toBeDisabled();
+    expect(screen.getByText(/Saved views need a signed-in session/i)).toBeInTheDocument();
+  });
+
+  it('does not offer the disabled control once views actually work', () => {
+    render(<ListToolbar onSaveView={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /Save view/ })).toBeEnabled();
+    expect(screen.queryByText(/signed-in session/i)).toBeNull();
+  });
+
   it('shows the selection count and the screen\'s bulk actions when rows are picked', () => {
     render(
       <ListToolbar

@@ -37,6 +37,7 @@ from typing import Any
 
 from soc_ai.agent.evidence import _classify_citation, _collect_evidence_values
 from soc_ai.agent.gates import _CITATION_STOP_WORDS, _FUZZY_TOKEN_RE
+from soc_ai.so_client import fields
 
 # Severity ordinal — "cap at X" == min(current, X). Only ever LOWERS a severity.
 _SEV_ORDER: tuple[str, ...] = ("info", "low", "medium", "high", "critical")
@@ -126,13 +127,35 @@ def _clamp_title(title: str) -> str:
     return f"{head or cut.rstrip()}…"
 
 
+def _severity_rank(severity: str) -> int:
+    """``severity``'s rank on the ladder; an unknown value ranks as ``critical``.
+
+    The one answer this module gives about a severity it does not recognise, and
+    it is the loudest one on purpose. Every read of the ladder here is asking a
+    safety question — is this claim loud enough to need a cap, and where does
+    the cap land — so an unrecognised value has to be treated as the loudest
+    thing it could be, or a malformed severity walks past the gate.
+
+    It used to be two answers in one module. :func:`_cap_severity` resolved an
+    unknown to ``critical``, which is the safe direction: the cap applies and
+    the finding is lowered to the ceiling. The two gate tests resolved it to
+    rank 0 — ``info`` — so a finding carrying anything the ladder does not hold
+    (``"sev:high"``, ``"urgent"``, ``"HIGH!"``) ranked below ``high``, skipped
+    the high/critical branch, and kept both its severity string and its
+    citations. The permissive default decided whether a cap ran at all and the
+    conservative one only decided where it landed, so the conservative one never
+    got the chance. The schema is a free-form ``str`` with the ladder in its
+    description, which is a request to the model, not a constraint on it.
+    """
+    return _SEV_RANK.get((severity or "").strip().lower(), _SEV_RANK["critical"])
+
+
 def _cap_severity(severity: str, ceiling: str) -> str:
     """Lower ``severity`` to at most ``ceiling`` (never raises). Unknown severities
-    are treated as their lowest safe rank so a malformed value can't dodge the cap.
+    are treated as their loudest rank so a malformed value can't dodge the cap.
     """
-    cur = _SEV_RANK.get((severity or "").strip().lower(), _SEV_RANK["critical"])
     cap = _SEV_RANK[ceiling]
-    return _SEV_ORDER[min(cur, cap)]
+    return _SEV_ORDER[min(_severity_rank(severity), cap)]
 
 
 def _gathered_evidence_text(tool_results: list[Any]) -> str:
@@ -242,10 +265,16 @@ def _oql_telemetry_docs(result: Any) -> list[Any]:
             src = hit.get("fields")
         if not isinstance(src, dict):
             continue
-        dataset = _one(src, "event.dataset")
+        # ECS-first with a fallback, because a plane that lives only in
+        # ``data_stream.dataset`` is still positively identified. Reading
+        # ``event.dataset`` alone dropped 632,523 documents on the development
+        # grid — every network_traffic plane, from the one sensor watching the
+        # live VLANs — as "unidentifiable", so a hunt that found real traffic
+        # there had its evidence discarded by this gate.
+        dataset = fields.dataset_of(src)
         kind = _one(src, "event.kind")
-        if not isinstance(dataset, str) or not dataset:
-            continue  # cannot positively identify → not corroborating
+        if not dataset:
+            continue  # genuinely no identity → still not corroborating
         if dataset == "suricata.alert" or kind == "alert":
             continue  # the detector's claim cannot corroborate itself
         telemetry.append(hit)
@@ -452,7 +481,7 @@ def _validate_hunt_findings(
         if not citations:
             # No citations: fine for an observation, but a high/critical claim
             # with nothing behind it is capped to medium.
-            if _SEV_RANK.get(severity.lower(), 0) >= _SEV_RANK["high"]:
+            if _severity_rank(severity) >= _SEV_RANK["high"]:
                 validated.append(
                     finding.model_copy(
                         update={
@@ -527,7 +556,7 @@ def _apply_corroboration_cap(
     """
     category = str(getattr(finding, "category", None) or "").strip().lower()
     severity = str(getattr(finding, "severity", None) or "info")
-    if category in _NON_THREAT_CATEGORIES or _SEV_RANK.get(severity.lower(), 0) < _SEV_RANK["high"]:
+    if category in _NON_THREAT_CATEGORIES or _severity_rank(severity) < _SEV_RANK["high"]:
         return finding
     if _has_corroborating_citation(resolved_citations, corroborating_text, corroborating_ids):
         return finding  # grounded in evidence beyond the detector alert

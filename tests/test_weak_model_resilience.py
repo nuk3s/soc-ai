@@ -137,6 +137,107 @@ def test_genuine_elasticsearch_outage_still_hints_elasticsearch():
 
 
 # --------------------------------------------------------------------------
+# Attribute the failed dependency by CALL SITE, not by reading the error string
+#
+# A gateway that refuses the connection raises "Connection error." with nothing
+# in it naming LiteLLM, so the string-matching arm fell through to the grid
+# branch and the recorded pipeline error told the operator to go and check
+# Elasticsearch. The phase already answers the question without guessing: the
+# synthesis and analysis phases only ever call the gateway (every tool catches
+# its own grid failure and hands the model a result, so no ES exception can
+# leave them), and prefetch only ever calls the grid.
+# --------------------------------------------------------------------------
+
+
+def _fallback_hint(phase: str, exc: BaseException) -> str:
+    from soc_ai.agent.orchestrator import _synth_failure_fallback_report
+
+    return (
+        _synth_failure_fallback_report("alert-1", phase, exc).resolution.get("hint") or ""
+    ).lower()
+
+
+def _event_hint(phase: str, exc: BaseException) -> str:
+    from soc_ai.agent.orchestrator import _error_payload
+
+    return (_error_payload(exc, phase=phase, round_num=1).get("hint") or "").lower()
+
+
+def _blames_the_grid(hint: str) -> bool:
+    """Does the hint send the operator to Elasticsearch?
+
+    Keyed on the REMEDY, not on the word: a gateway hint is allowed to say the
+    grid is not the problem, and the existing gateway assertions in this file
+    read the same way.
+    """
+    return any(
+        m in hint
+        for m in ("es_hosts", "so grid", "shard health", "check elasticsearch", "grid is online")
+    )
+
+
+def test_an_unreachable_gateway_in_synthesis_is_not_blamed_on_elasticsearch():
+    """The reported defect. A refused gateway connection carries no LiteLLM
+    marker, and the round-1 synth makes no grid call at all, so nothing about
+    this failure is Elasticsearch's."""
+    hint = _fallback_hint("synth_first_round1", ConnectionError("Connection error."))
+    assert not _blames_the_grid(hint)
+    assert "gateway" in hint
+
+
+def test_every_gateway_only_phase_names_the_gateway():
+    """Round 2 and the loop synth fail the same way and must read the same."""
+    for phase in (
+        "synth_first_round2",
+        "investigation_loop_synth",
+        "investigation_loop_partial_synth",
+    ):
+        hint = _fallback_hint(phase, ConnectionError("Cannot connect to host 192.0.2.10:4000"))
+        assert not _blames_the_grid(hint), phase
+        assert "gateway" in hint, phase
+
+
+def test_the_error_event_hint_agrees_with_the_fallback_report():
+    """Both surfaces read the same function; the operator must not see one of
+    each during the same outage."""
+    exc = ConnectionError("Connection error.")
+    assert _event_hint("synth_first_round1", exc) == _fallback_hint("synth_first_round1", exc)
+
+
+def test_a_refused_grid_in_prefetch_still_names_elasticsearch():
+    """The mirror control: prefetch only talks to the grid, so the swap must
+    not run the other way."""
+    hint = _event_hint("prefetch", ConnectionError("Cannot connect to host 192.0.2.53:9200"))
+    assert "elasticsearch" in hint
+    assert "gateway" not in hint
+
+
+def test_a_grid_timeout_in_prefetch_is_not_blamed_on_the_gateway():
+    """The same bug, mirrored: an ES connect timeout matched the generic
+    "timeout" arm and was reported as "LiteLLM gateway slow or unreachable"."""
+    hint = _event_hint("prefetch", TimeoutError("Connection timed out"))
+    assert "litellm" not in hint
+    assert "gateway" not in hint
+    assert "grid" in hint or "elasticsearch" in hint
+
+
+def test_a_partial_read_in_prefetch_keeps_the_shard_story():
+    """Call-site attribution must not overwrite a diagnosis already in hand."""
+    hint = _event_hint(
+        "prefetch", RuntimeError("partial search results from logs-*: 2 of 4 shards failed")
+    )
+    assert "shard" in hint
+
+
+def test_an_unphased_connection_failure_is_unchanged():
+    """The negative control: with no phase to attribute by, the old string
+    archaeology still runs and still answers exactly as it did."""
+    from soc_ai.agent.orchestrator import _hint_for
+
+    hint = _hint_for(RuntimeError("Cannot connect to host 192.0.2.53:9200 ssl:default")) or ""
+    assert "elasticsearch" in hint.lower()
+
+
 # Fix A — the auto-triage cap must never pre-empt the graceful inner backstop
 # --------------------------------------------------------------------------
 

@@ -1,8 +1,9 @@
 """Read-only connectivity probes for the admin config console.
 
 Each probe targets one upstream (the LiteLLM gateway, the Security Onion
-Elasticsearch cluster), is bounded by a timeout so a hung upstream cannot wedge
-the request, and returns a small ``{"ok": bool, "detail": str}`` dict.
+Elasticsearch cluster, the Security Onion web API), is bounded by a timeout so a
+hung upstream cannot wedge the request, and returns a small
+``{"ok": bool, "detail": str}`` dict.
 
 SECURITY: the ``detail`` string is rendered verbatim in an HTTP response and is
 NEVER allowed to contain a secret — no API key, no ES/SO password, no
@@ -23,6 +24,7 @@ from typing import Any
 import httpx
 
 from soc_ai.demo.guard import assert_egress_allowed, is_demo
+from soc_ai.errors import SoAuthError
 
 # Default timeout (seconds) for every outbound probe. Kept short so the admin
 # UI stays responsive when an upstream is down or hanging.
@@ -104,7 +106,7 @@ def _breaker_sizes(exc: BaseException) -> str:
     sizes = _ES_BYTES_RE.findall(str(body) if body else str(exc))
     if len(sizes) < 2:
         return ""
-    return f" — the query needed {sizes[0].strip()} against a {sizes[1].strip()} limit"
+    return f" The query needed {sizes[0].strip()} against a {sizes[1].strip()} limit."
 
 
 def _cause_text(exc: BaseException) -> str:
@@ -146,31 +148,32 @@ def _grid_failure(exc: BaseException) -> tuple[str, str]:
             timed_out = " and the search timed out" if exc.timed_out else ""
             return (
                 KIND_PARTIAL,
-                f"the grid {read}{timed_out}{because} — these results are incomplete, "
-                "so check Elasticsearch shard health rather than retrying",
+                f"the grid {read}{timed_out}{because}. These results are incomplete. "
+                "A retry does not help. To find the cause, check Elasticsearch "
+                "shard health.",
             )
         if exc.timed_out:
             return (
                 KIND_PARTIAL,
-                f"the search timed out before all shards answered{because} — these "
-                "results are incomplete; retry, or narrow the time window",
+                f"the search timed out before all shards answered{because}. These "
+                "results are incomplete. You can retry, or narrow the time window.",
             )
         return (
             KIND_PARTIAL,
-            f"the grid did not read the whole index{because} — these results are incomplete",
+            f"the grid did not read the whole index{because}. These results are incomplete.",
         )
     status = _status_code(exc)
     if status == 429 or "circuit_breaking_exception" in str(exc):
         return (
             KIND_OVERLOADED,
-            f"the grid is up but shedding load — HTTP {status or 429} circuit "
-            f"breaker tripped{_breaker_sizes(exc)}; retryable once load drops",
+            f"the grid is up and shedding load. HTTP {status or 429} tripped the "
+            f"circuit breaker.{_breaker_sizes(exc)} Retry once the load drops.",
         )
     name = type(exc).__name__
     if isinstance(exc, TimeoutError) or "timeout" in name.lower():
-        return KIND_TIMEOUT, f"the grid took the query but did not answer in time ({name})"
+        return KIND_TIMEOUT, f"the grid took the query and did not answer in time ({name})"
     if isinstance(exc, ConnectionError | OSError) or "connection" in name.lower():
-        return KIND_REFUSED, f"the grid could not be reached — {_scrub(_cause_text(exc))[:120]}"
+        return KIND_REFUSED, f"the grid could not be reached: {_scrub(_cause_text(exc))[:120]}"
     return "", _safe_reason(exc)
 
 
@@ -206,7 +209,7 @@ async def list_gateway_models(settings: Any) -> tuple[list[str], str | None]:
         try:
             data = resp.json()
         except ValueError:
-            return [], "200 OK but response was not JSON"
+            return [], "the gateway answered 200 OK with a body that is not JSON"
         models = data.get("data") if isinstance(data, dict) else None
         ids = (
             [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
@@ -230,7 +233,10 @@ async def probe_llm(settings: Any) -> dict[str, Any]:
     # upstream lights up a false "AI gateway not reachable" banner on a demo
     # that is working exactly as designed. Report healthy-by-replay instead.
     if is_demo(settings):
-        return {"ok": True, "detail": "demo mode — replayed responses (no live gateway)"}
+        return {
+            "ok": True,
+            "detail": "demo mode. soc-ai replays the responses. There is no live gateway.",
+        }
     ids, err = await list_gateway_models(settings)
     if err is not None:
         return {"ok": False, "detail": err}
@@ -243,12 +249,15 @@ async def probe_llm(settings: Any) -> dict[str, Any]:
         return {
             "ok": False,
             "detail": _scrub(
-                f"gateway reachable ({count} models) but ANALYST_MODEL "
-                f"'{analyst}' is not configured on it — set ANALYST_MODEL to a "
-                f"model the gateway serves"
+                f"the gateway is reachable and serves {count} models. ANALYST_MODEL "
+                f"'{analyst}' is not one of them. Set ANALYST_MODEL to a model the "
+                f"gateway serves."
             ),
         }
-    return {"ok": True, "detail": f"200 OK — {count} models (analyst: {analyst})"}
+    return {
+        "ok": True,
+        "detail": f"200 OK. {count} models. The analyst model is {analyst}.",
+    }
 
 
 # The read leg's query. ``ping()`` asks the cluster-info endpoint, which a
@@ -294,6 +303,14 @@ async def probe_es(elastic: Any, settings: Any | None = None) -> dict[str, Any]:
     ``GridPartialResultsError`` when a search did not read the whole grid, so
     this needs no shard parsing of its own.
 
+    The read leg is ``require_complete=True``. ``es_fail_on_partial_results``
+    is an opt-out an operator sets so their QUERIES keep working off a
+    chronically red shard; it used to reach this probe too, so turning it on
+    also turned off the one surface whose job is to say the grid is half-read
+    (and with it the topbar banner and the bell's dependency-down entry). What
+    a query does about a partial read is the operator's call. Whether they are
+    told there was one is not.
+
     Never raises; returns ``ok``/``detail``/``kind`` — ``kind`` names the failure
     class (see :func:`_grid_failure`) for the surfaces that describe it. No
     password ever reaches ``detail``.
@@ -305,31 +322,148 @@ async def probe_es(elastic: Any, settings: Any | None = None) -> dict[str, Any]:
         return {"ok": False, "kind": kind, "detail": _scrub(reason)}
     cluster = str(info.get("cluster", "")) or "(unknown cluster)"
     version = str(info.get("version", "")) or "?"
-    banner = f"{cluster} — ES {version}"
+    banner = f"{cluster}, ES {version}"
     index = _probe_index_pattern(elastic, settings)
     if index is None:
-        # Nothing to read against — say what was actually checked instead of
-        # letting a cluster-info tick stand in for a working grid.
+        # Nothing to read against. This is NOT ok: this probe's contract is
+        # reachable AND readable, and with no events index pattern the second
+        # leg was never attempted, let alone passed. soc-ai cannot answer a
+        # single question about the grid in that state.
+        #
+        # The detail said so all along; the boolean did not, and the boolean is
+        # what drives the green pill. An operator whose index pattern went
+        # missing got a healthy-looking header over a product that could read
+        # nothing — a false all-clear, which costs more than any error page.
         return {
-            "ok": True,
-            "kind": "",
-            "detail": _scrub(f"{banner} — cluster info only (no index pattern)"),
+            "ok": False,
+            "kind": "unreadable",
+            "detail": _scrub(
+                f"{banner}. The grid is reachable. No events index pattern is "
+                "configured. Nothing can be read."
+            ),
         }
     try:
-        await elastic.search(index, _PROBE_SEARCH_QUERY, size=1, track_total_hits=False)
+        await elastic.search(
+            index,
+            _PROBE_SEARCH_QUERY,
+            size=1,
+            track_total_hits=False,
+            require_complete=True,
+        )
     except Exception as exc:
         kind, reason = _grid_failure(exc)
-        detail = _scrub(f"{banner} — reading {index}: {reason}")
+        detail = _scrub(f"{banner}. Reading {index}: {reason}")
         return {"ok": False, "kind": kind, "detail": detail}
-    return {"ok": True, "kind": "", "detail": _scrub(f"{banner} — {index} readable")}
+    return {"ok": True, "kind": "", "detail": _scrub(f"{banner}. {index} is readable.")}
+
+
+# The read-only endpoint the SO probe calls. It is the SAME first call the app
+# itself makes (soc_ai.doctor.check_so_api uses it too), so a probe that passes
+# means the credential, the session and the route an acknowledge travels are all
+# working, not merely that a TCP port answered.
+_SO_PROBE_PATH = "/api/info"
+
+
+def _so_failure(exc: BaseException) -> tuple[str, str]:
+    """``(kind, operator-facing reason)`` for a failed Security Onion API call.
+
+    Mirrors :func:`_grid_failure`: the probe is the only layer that sees the
+    exception, so it classifies and the surfaces render the classification.
+    Rejected credentials are called out separately because waiting does not help
+    and the remedy is a setting, not the network.
+    """
+    if isinstance(exc, SoAuthError):
+        msg = _scrub(str(exc))[:160]
+        if "rejected credentials" in msg:
+            return "", f"the API rejected the configured credentials: {msg}"
+        # The login works and SOC then refuses the session it issued. The API
+        # is up, so "could not be reached" would be a false statement.
+        if "SOC refused" in msg or "set no session cookie" in msg:
+            return "", f"the API refused the session: {msg}"
+        if "throttled the login" in msg:
+            return "", f"the API throttled the login: {msg}"
+        return KIND_REFUSED, f"the API could not be reached: {msg}"
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError | httpx.TimeoutException) or "timeout" in name.lower():
+        return KIND_TIMEOUT, f"the API took the request and did not answer in time ({name})"
+    if isinstance(exc, ConnectionError | OSError) or "connect" in name.lower():
+        return KIND_REFUSED, f"the API could not be reached: {_scrub(_cause_text(exc))[:120]}"
+    return "", _safe_reason(exc)
+
+
+async def probe_so_api(auth: Any, settings: Any) -> dict[str, Any]:
+    """Probe the Security Onion web API, the path every WRITE travels.
+
+    Acknowledge, escalate and case-create all go through this API, and until
+    2026-09-07 nothing on the always-on header pill covered it: the pill read
+    "connected" off Elasticsearch and the model gateway while the setup-health
+    card on the same page reported a Security Onion timeout. A trust indicator
+    that omits a whole upstream is worse than no indicator, because it is read
+    as a statement about all of them.
+
+    Takes the SHARED :class:`~soc_ai.so_client.auth.SoAuthClient` off app state,
+    the same object the write endpoints use, so the probe exercises the live
+    session rather than logging in again every fifteen seconds. Never raises;
+    returns ``ok``/``detail``/``kind`` (see :func:`_so_failure`). No password
+    ever reaches ``detail``.
+    """
+    if is_demo(settings):
+        return {
+            "ok": True,
+            "detail": ("demo mode. soc-ai replays the responses. There is no live Security Onion."),
+        }
+    if auth is None:
+        return {
+            "ok": False,
+            "kind": KIND_REFUSED,
+            "detail": "no Security Onion client is configured. Check the SO_* settings.",
+        }
+    host = _scrub(str(getattr(settings, "so_host", "") or "")) or "(unknown host)"
+    try:
+        assert_egress_allowed(settings, "security onion probe")
+        resp = await auth.request("GET", _SO_PROBE_PATH)
+    except Exception as exc:  # a probe failure is a normal ✗ result, never a raise
+        kind, reason = _so_failure(exc)
+        return {"ok": False, "kind": kind, "detail": _scrub(f"{host}: {reason}")}
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status == 200:
+        return {"ok": True, "kind": "", "detail": _scrub(f"{host}: {_SO_PROBE_PATH} 200 OK")}
+    if status == 429:
+        return {
+            "ok": False,
+            "kind": KIND_OVERLOADED,
+            "detail": _scrub(
+                f"{host}: the API is up and shedding load. HTTP 429. Retry once the load drops."
+            ),
+        }
+    if status == 401:
+        return {
+            "ok": False,
+            "kind": "",
+            "detail": _scrub(
+                f"{host}: the login worked and SOC refused the session. "
+                f"{_SO_PROBE_PATH} answered HTTP 401. Check the SO version and the "
+                "login flow. Acknowledges and escalates fail the same way."
+            ),
+        }
+    # Answering is not the same as working. A 403/5xx here is exactly what
+    # every acknowledge and escalate will get, so it is a down verdict.
+    return {
+        "ok": False,
+        "kind": "",
+        "detail": _scrub(
+            f"{host}: {_SO_PROBE_PATH} answered HTTP {status}. Acknowledges and "
+            "escalates fail the same way."
+        ),
+    }
 
 
 # The re-creation hint shown when the PCAP path is broken — the publish-blocker
 # requirement: tell the operator the sensor user/key/sudo is gone and how to fix.
 _PCAP_BROKEN_HINT = (
-    "sensor PCAP path is down — the socpcap user, its SSH key, or its NOPASSWD "
-    "tcpdump sudo rule is missing/broken. Re-run the sensor setup "
-    "(docs/SENSOR_PCAP_SETUP.md)."
+    "The sensor PCAP path is down. The socpcap user, its SSH key, or its NOPASSWD "
+    "tcpdump sudo rule is missing. Run the sensor setup again. See "
+    "docs/SENSOR_PCAP_SETUP.md."
 )
 
 
@@ -486,12 +620,12 @@ def _teardown_artifact(exc: BaseException, *, depth: int = 0) -> str | None:
 
 def _timeout_detail(name: str, elapsed_s: float, artifact: str | None = None) -> str:
     """The one-line "how slow, against what budget" story for a cut-off leg."""
-    budget = f"budget {_FITNESS_LEG_TIMEOUT_S:.0f}s"
+    budget = f"budget {_FITNESS_LEG_TIMEOUT_S:.0f} s"
     if artifact is None:
-        return f"{name} timed out after {elapsed_s:.1f}s ({budget})"
+        return f"{name} timed out after {elapsed_s:.1f} s ({budget})"
     return (
-        f"{name} cut off after {elapsed_s:.1f}s ({budget}) — {artifact} "
-        "(client teardown, not a model capability failure)"
+        f"{name} cut off after {elapsed_s:.1f} s ({budget}). {artifact} is a client "
+        "teardown. It is not a model capability failure."
     )
 
 
@@ -754,8 +888,8 @@ async def _leg_reasoning_budget(settings: Any) -> dict[str, Any]:
             # THE target signal: thinking exhausted the budget before any JSON.
             return (
                 "degraded",
-                f"reasoning truncated at {budget} tokens before emitting output — "
-                "raise synthesizer_max_response_tokens or pick a lighter-reasoning model",
+                f"reasoning truncated at {budget} tokens before any output. Raise "
+                "synthesizer_max_response_tokens, or pick a model with lighter reasoning.",
                 True,
             )
         return (
@@ -836,7 +970,7 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
             "grade": "pass",
             "model": model_id,
             "legs": [],
-            "detail": "demo mode — replayed responses (no live gateway)",
+            "detail": "demo mode. soc-ai replays the responses. There is no live gateway.",
             "served_backend": None,
         }
 
@@ -869,7 +1003,7 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
         marker = _fitness_leg(
             "probe_timeout",
             "fail",
-            f"probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)}s during the {in_flight[0]} leg",
+            f"the probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)} s during the {in_flight[0]} leg",
             elapsed_s=time.monotonic() - started,
         )
         return {
@@ -877,8 +1011,8 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
             "model": model_id,
             "legs": [*completed, marker],
             "detail": _scrub(
-                f"model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)}s "
-                f"(stopped during {in_flight[0]})"
+                f"the model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)} s. "
+                f"It stopped during {in_flight[0]}."
             ),
             "served_backend": _served_backend(completed),
         }
@@ -910,9 +1044,12 @@ async def probe_pcap(settings: Any) -> dict[str, Any]:
     Never raises; returns ``ok``/``detail``. Secret-free.
     """
     if not getattr(settings, "pcap_enabled", False):
-        return {"ok": True, "detail": "PCAP disabled (pcap_enabled=false)"}
+        return {"ok": True, "detail": "PCAP is off (pcap_enabled=false)"}
     if settings.so_ssh_key is None:
-        return {"ok": False, "detail": "no SO_SSH_KEY configured — set it to the sensor pcap key"}
+        return {
+            "ok": False,
+            "detail": "no SO_SSH_KEY is configured. Set it to the sensor pcap key.",
+        }
 
     from soc_ai.tools.get_pcap import _ssh_base_args  # noqa: PLC0415  (avoid import cycle)
 
@@ -935,14 +1072,20 @@ async def probe_pcap(settings: Any) -> dict[str, Any]:
         except TimeoutError:
             proc.kill()
             host = getattr(settings, "so_ssh_host", "?")
-            return {"ok": False, "detail": f"timed out reaching {host} — sensor unreachable?"}
+            return {
+                "ok": False,
+                "detail": f"timed out on the connection to {host}. The sensor may be down.",
+            }
         text = _scrub((out_b or b"").decode("utf-8", "replace")).strip()
         # Skip the benign ssh "Permanently added ... known hosts" warning
         # (UserKnownHostsFile=/dev/null + accept-new) when choosing the detail.
         lines = [ln for ln in text.splitlines() if "permanently added" not in ln.lower()]
         if proc.returncode == 0 and "tcpdump version" in text.lower():
             ver = next((ln for ln in lines if "tcpdump version" in ln.lower()), "")
-            return {"ok": True, "detail": f"sensor reachable — {ver.strip()[:120] or 'tcpdump ok'}"}
+            return {
+                "ok": True,
+                "detail": f"the sensor is reachable: {ver.strip()[:120] or 'tcpdump ok'}",
+            }
         why = (lines[0].strip() if lines else "") or f"exit {proc.returncode}"
         return {"ok": False, "detail": f"{_PCAP_BROKEN_HINT} [{why[:120]}]"}
     except Exception as exc:  # a probe failure is a normal ✗ result, never a raise

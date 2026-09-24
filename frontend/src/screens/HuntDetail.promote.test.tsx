@@ -4,7 +4,7 @@
 // a re-click on an already-promoted finding lands on the same investigation).
 // A finding the citation gate stripped down to zero citations has nothing to
 // promote, so its button is disabled rather than firing a doomed 422.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AboutInfo, HuntDetailData } from '../lib/types';
@@ -27,9 +27,20 @@ vi.mock('../lib/api', async (importOriginal) => ({
   postHuntChat: vi.fn(),
   getAbout: vi.fn(),
   draftFindingDetection: vi.fn(),
+  getHunts: vi.fn(),
+  getLead: vi.fn(),
+  getEvent: vi.fn(),
 }));
 
-import { draftFindingDetection, getAbout, getHunt, promoteFinding } from '../lib/api';
+import {
+  draftFindingDetection,
+  getAbout,
+  getHunt,
+  getHunts,
+  getLead,
+  promoteFinding,
+} from '../lib/api';
+import { CHIP_LEAD, DISPOSITION, STATUS_COMPLETE } from '../lib/tooltips';
 import { HuntDetail } from './HuntDetail';
 
 const about = (sigmaOn: boolean): AboutInfo => ({
@@ -208,32 +219,26 @@ describe('HuntDetail — Investigate a finding', () => {
   // findings also renders a lazy-loaded Host–finding map (HuntVisuals) whose
   // SVG repeats each finding's title as a node label, so a bare title-text
   // query is ambiguous once that chart has mounted. Button names are unique.
+  // The investigation is a page, so Open is a link. It was a button that
+  // navigated, and the address could not be read before the click.
   it('shows Open + a verdict chip for an already-promoted, complete finding, and does not re-promote on click', async () => {
     mount();
-    const openBtn = await screen.findByRole('button', { name: /^open$/i });
-    fireEvent.click(openBtn);
-
-    expect(promoteFinding).not.toHaveBeenCalled();
-    await waitFor(() =>
-      expect(navigate).toHaveBeenCalledWith('/investigation/inv-9', {
-        state: { from: `/hunts/${HUNT_ID}` },
-      }),
-    );
+    const openLink = await screen.findByRole('link', { name: /^open$/i });
+    expect(openLink.getAttribute('href')).toBe('/investigation/inv-9');
     expect(screen.getByText(/false positive/i)).toBeInTheDocument();
     expect(screen.getByText('0.81')).toBeInTheDocument();
+    // A link never re-promotes. The button under it did that on a double
+    // click, and the server answered with the same investigation.
+    fireEvent.click(openLink);
+    expect(promoteFinding).not.toHaveBeenCalled();
   });
 
-  it('shows "Investigating…" for an already-promoted, running finding, and navigates without re-promoting', async () => {
+  it('shows "Investigating…" for an already-promoted, running finding, and links to it', async () => {
     mount();
-    const investigatingBtn = await screen.findByRole('button', { name: /Investigating…/i });
-    fireEvent.click(investigatingBtn);
-
+    const investigatingLink = await screen.findByRole('link', { name: /Investigating…/i });
+    expect(investigatingLink.getAttribute('href')).toBe('/investigation/inv-10');
+    fireEvent.click(investigatingLink);
     expect(promoteFinding).not.toHaveBeenCalled();
-    await waitFor(() =>
-      expect(navigate).toHaveBeenCalledWith('/investigation/inv-10', {
-        state: { from: `/hunts/${HUNT_ID}` },
-      }),
-    );
   });
 
   it('leaves an unpromoted finding free to promote as before, even alongside promoted siblings', async () => {
@@ -361,7 +366,7 @@ describe('HuntDetail — journey wayfinding line', () => {
     await screen.findByText(f0.title);
     expect(
       screen.getByText(
-        /Promote a finding to investigate it; a confirmed true positive can then be drafted into a detection\./i,
+        /Promote a finding to investigate it\. Draft a detection from a confirmed true positive\./i,
       ),
     ).toBeInTheDocument();
   });
@@ -369,7 +374,151 @@ describe('HuntDetail — journey wayfinding line', () => {
   it('does not render the line when the hunt completed with no findings', async () => {
     vi.mocked(getHunt).mockResolvedValue(huntFixture([]));
     mount();
-    await screen.findByText(/No findings — a clean hunt/i);
+    await screen.findByText(/No findings\. The hunt found nothing notable/i);
     expect(screen.queryByText(/Promote a finding to investigate it/i)).toBeNull();
+  });
+});
+
+
+// A hunt started from a lead named the kind and not the lead, and its
+// objective is a paragraph of generated prose that pushed the findings below
+// the fold on every lead hunt.
+describe('HuntDetail — a hunt started from a lead', () => {
+  const LEAD_HUNT: HuntDetailData = {
+    ...huntFixture([f0]),
+    kind: 'lead',
+    objective: '[lead 12] Investigate 10.1.2.3. The lead formed from a finding and off hours.',
+  };
+
+  const LEAD = {
+    id: 12,
+    status: 'hunting',
+    formed_at: '2026-09-18T10:00:00Z',
+    updated_at: null,
+    entities: [['host', '10.1.2.3']],
+    kinds: ['prior_no_baseline'],
+    weight_at_formation: 1.3,
+    weight_now: 1.28,
+    scope_count: 1,
+    hunt_id: HUNT_ID,
+    shadow: false,
+    single_signal: false,
+    dismissed_reason: null,
+    dismissed_note: null,
+    dismissed_by: null,
+    dismissed_at: null,
+    investigation_id: null,
+    dismiss_reasons: ['other'],
+    observations: [
+      {
+        id: 1,
+        kind: 'prior_no_baseline',
+        spec_id: 'identity-4662-dcsync-nonmachine',
+        summary: 'Directory replication requested by localuser, not a machine account',
+        occurrences: 1,
+        born_at: '2026-09-18T10:00:00Z',
+        first_seen_at: '2026-09-18T10:00:00Z',
+        source: 'catalog',
+        shadow: false,
+        weight_now: 1.0,
+        birth_weight: 1.0,
+        evidence: null,
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(getAbout).mockReset().mockResolvedValue(about(false));
+    vi.mocked(getHunt).mockReset().mockResolvedValue(LEAD_HUNT);
+    vi.mocked(getHunts)
+      .mockReset()
+      .mockResolvedValue([
+        { id: HUNT_ID, starter: 'lead', leadId: 12 } as never,
+      ]);
+    vi.mocked(getLead).mockReset().mockResolvedValue(LEAD as never);
+  });
+
+  it('names the lead at the top and links to it', async () => {
+    mount();
+    const chip = await screen.findByTestId('hunt-lead-chip');
+    expect(chip.textContent).toBe('Lead 12');
+    expect(chip.getAttribute('href')).toBe('/leads/12');
+    expect(chip.getAttribute('title')).toBe(CHIP_LEAD);
+  });
+
+  // The status word and the disposition were the two loudest words on the
+  // page, and neither said what it meant.
+  it('states the status word and the disposition', async () => {
+    mount();
+    await screen.findByTestId('hunt-lead-chip');
+    expect(screen.getByText('Complete').getAttribute('title')).toBe(STATUS_COMPLETE);
+    expect(screen.getByTestId('hunt-disposition').getAttribute('title')).toBe(DISPOSITION);
+  });
+
+  it('reads the lead id from the detail route when it sends one', async () => {
+    vi.mocked(getHunt).mockResolvedValue({ ...LEAD_HUNT, leadId: 12, starter: 'lead' });
+    mount();
+    await screen.findByTestId('hunt-lead-chip');
+    expect(getHunts).not.toHaveBeenCalled();
+    expect(getLead).toHaveBeenCalledWith(12);
+  });
+
+  it('shows the observations the lead is made of', async () => {
+    mount();
+    const panel = await screen.findByTestId('hunt-lead-timeline');
+    expect(within(panel).getByText('Lead timeline · 1 observation')).toBeTruthy();
+    expect(
+      within(panel).getByText('Directory replication requested by localuser, not a machine account'),
+    ).toBeTruthy();
+  });
+
+  // The dismissal is a decision on the record, and a reopen is the next one.
+  // The lead page ended the entry with "Reopened." and the hunt page did not,
+  // so one entry read two ways.
+  it('names a reopen on the dismissal, as the lead page does', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'open',
+      dismissed_reason: 'benign_repeat',
+      dismissed_note: null,
+      dismissed_by: 'alice',
+      dismissed_at: '2026-09-18T12:00:00Z',
+    } as never);
+    mount();
+    const panel = await screen.findByTestId('hunt-lead-timeline');
+    expect(within(panel).getByTestId('lead-dismissal').textContent).toContain('Reopened.');
+  });
+
+  it('claims no reopen while the lead is still dismissed', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'dismissed',
+      dismissed_reason: 'benign_repeat',
+      dismissed_note: null,
+      dismissed_by: 'alice',
+      dismissed_at: '2026-09-18T12:00:00Z',
+    } as never);
+    mount();
+    const panel = await screen.findByTestId('hunt-lead-timeline');
+    expect(within(panel).getByTestId('lead-dismissal').textContent).not.toContain('Reopened.');
+  });
+
+  it('puts the raw objective behind a toggle', async () => {
+    mount();
+    const toggle = await screen.findByTestId('hunt-objective-toggle');
+    expect(toggle.textContent).toBe('Show objective');
+    expect(screen.queryByTestId('hunt-objective')).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByTestId('hunt-objective').textContent).toBe(LEAD_HUNT.objective);
+    expect(screen.getByTestId('hunt-objective-toggle').textContent).toBe('Hide objective');
+  });
+
+  it('names no lead on a hunt an analyst typed', async () => {
+    vi.mocked(getHunt).mockResolvedValue(huntFixture([f0]));
+    mount();
+    await screen.findByTestId('hunt-objective-toggle');
+    expect(screen.queryByTestId('hunt-lead-chip')).toBeNull();
+    expect(screen.queryByTestId('hunt-lead-timeline')).toBeNull();
+    expect(getLead).not.toHaveBeenCalled();
   });
 });

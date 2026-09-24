@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, NamedTuple
 
@@ -18,6 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
+from soc_ai.hunting.findings import threat_finding_count
 from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Hunt, HuntEvent
@@ -49,8 +51,15 @@ async def create(
     started_by: str,
     kind: str = "chat",
     is_synth_eval: bool = False,
+    starter: str = "analyst",
+    lead_id: int | None = None,
 ) -> Hunt:
-    """``is_synth_eval`` marks a synthetic-evaluation run (the hunt could see
+    """Create the hunt row.
+
+    ``starter`` names the class that started it: analyst, schedule or lead.
+    ``lead_id`` links a lead-started hunt to its lead.
+
+    ``is_synth_eval`` marks a synthetic-evaluation run (the hunt could see
     planted synth scenarios) — set only from an explicit eval context by the
     hunt recorder, never from a request body."""
     hunt = Hunt(
@@ -60,6 +69,8 @@ async def create(
         started_by=started_by,
         kind=kind[:16],
         is_synth_eval=is_synth_eval,
+        starter=starter[:16],
+        lead_id=lead_id,
     )
     db.add(hunt)
     await db.commit()
@@ -132,6 +143,7 @@ async def finalize(
         # deserializes the report blob to answer "N findings" (migration 0028).
         findings = report.get("findings")
         hunt.findings_count = len(findings) if isinstance(findings, list) else 0
+        hunt.threat_findings_count = threat_finding_count(findings)
     hunt.finished_at = utcnow()
     await db.commit()
 
@@ -154,11 +166,13 @@ async def list_recent(
     db: AsyncSession,
     *,
     status: str | None = None,
+    kind: str | None = None,
+    exclude_kinds: Sequence[str] = (),
     limit: int = 100,
     since: datetime | None = None,
     until: datetime | None = None,
 ) -> list[Hunt]:
-    """Return hunts ordered by created_at desc, with optional status filter.
+    """Return hunts ordered by created_at desc, with optional status/kind filters.
 
     ``since``/``until`` bound ``created_at`` INCLUSIVELY on both ends
     (``since <= created_at <= until``) — matching the frontend's ``inRange``
@@ -166,10 +180,19 @@ async def list_recent(
     lower-bound convention (``created_at >= cutoff``). Bounds must be naive
     UTC, like every stored timestamp (:func:`soc_ai.store.auth.utcnow`).
     Absent bounds keep the original unbounded behavior.
+
+    ``exclude_kinds`` drops rows of those kinds. The hunt list uses it to leave
+    out the catalog runs recorded before 1.5.0. It is a SQL clause rather than
+    a filter over the page, because dropping rows AFTER a LIMIT is how a
+    bounded query comes back short while matching rows sit past the cut.
     """
     q = select(Hunt).order_by(Hunt.created_at.desc(), Hunt.id.desc())
     if status is not None:
         q = q.where(Hunt.status == status)
+    if kind is not None:
+        q = q.where(Hunt.kind == kind)
+    if exclude_kinds:
+        q = q.where(Hunt.kind.not_in(tuple(exclude_kinds)))
     if since is not None:
         q = q.where(Hunt.created_at >= since)
     if until is not None:
@@ -192,6 +215,7 @@ class HuntNotifRow(NamedTuple):
     created_at: datetime
     finished_at: datetime | None
     findings_count: int | None
+    threat_findings_count: int | None
     is_synth_eval: bool
 
 
@@ -221,6 +245,7 @@ async def list_recent_notifications(
         Hunt.created_at,
         Hunt.finished_at,
         Hunt.findings_count,
+        Hunt.threat_findings_count,
         Hunt.is_synth_eval,
     )
     if status is not None:

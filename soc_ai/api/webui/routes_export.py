@@ -99,11 +99,11 @@ async def oracle_redaction_preview(
             if r.label in sanitized_json
         ],
         note=(
-            "Internal identifiers are replaced with stable opaque labels (IP_01, "
-            "HOST_01, …) before any Oracle call — the same real value always maps to "
-            "the same label so the model's reasoning stays coherent. Public/external "
-            "addresses pass through so the Oracle can reason about real infrastructure. "
-            "Nothing is sent at all unless you enable the Oracle."
+            "soc-ai replaces internal identifiers with stable opaque labels before any "
+            "Oracle call. The labels look like IP_01 and HOST_01. The same real value "
+            "always maps to the same label. The model's reasoning stays coherent. "
+            "Public addresses pass through, so the Oracle can reason about real "
+            "infrastructure. soc-ai sends nothing unless you enable the Oracle."
         ),
     )
 
@@ -165,38 +165,41 @@ def _analyst_preview_note(
     caveat that doesn't apply to THIS investigation's stored events.
     """
     parts = [
-        "Rebuilt from this investigation's stored events and redacted with the "
-        "CURRENT identifier configuration — a simulation of the analyst-path "
-        "egress, not a byte-replay of the original run.",
-        "The stored enriched context is written before any redaction (local "
-        "storage never egresses), so the original side is the true raw prompt "
-        "material even for runs that executed with redaction on.",
+        "soc-ai rebuilt this preview from the investigation's stored events. It "
+        "redacted them with the CURRENT identifier configuration. This is a "
+        "simulation of the analyst-path egress. It is not a byte-replay of the "
+        "original run.",
+        "soc-ai writes the stored enriched context before any redaction. Local "
+        "storage never egresses. The original side is the true raw prompt "
+        "material. This holds even for runs that executed with redaction on.",
     ]
     if not redaction_enabled:
         parts.append(
-            "analyst_cloud_redaction is currently OFF — a real analyst call "
-            "would send the original text unredacted; the sanitized side shows "
-            "what WOULD be sent if you enable it."
+            "analyst_cloud_redaction is currently OFF. A real analyst call sends "
+            "the original text with no redaction. The sanitized side shows what "
+            "soc-ai WOULD send if you enable it."
         )
     if "synth_round1_skipped" in event_kinds:
         parts.append(
-            "This run skipped the round-1 synthesis (routed straight to the "
-            "investigation loop); shown is the message round 1 WOULD have received."
+            "This run skipped the round-1 synthesis. It went straight to the "
+            "investigation loop. The preview shows the message round 1 WOULD have "
+            "received."
         )
     if "context_trimmed" in event_kinds:
         parts.append(
-            "The original run trimmed the enriched context to the model window; "
-            "the trim is not replayed here (window discovery would call the gateway)."
+            "The original run trimmed the enriched context to the model window. "
+            "This preview does not replay the trim. Window discovery would call "
+            "the gateway."
         )
     if prior_block_present:
         parts.append(
-            "Prior-outcome rationale digests are not stored in events; the "
+            "Prior-outcome rationale digests are not stored in events. The "
             "rebuilt memory block carries placeholders for them."
         )
     if cited_dropped:
         parts.append(
-            "The candidate's cited-evidence lines could not be reproduced "
-            "(template logic changed since this run) and are omitted."
+            "soc-ai could not reproduce the candidate's cited-evidence lines. The "
+            "template logic changed after this run. The preview omits those lines."
         )
     return " ".join(parts)
 
@@ -277,8 +280,8 @@ async def analyst_redaction_preview(
             status="events_missing",
             missing=missing,
             detail=(
-                "This investigation predates the stored events needed to "
-                "rebuild the analyst prompt — only newer runs can be previewed."
+                "This investigation predates the stored events needed to rebuild the "
+                "analyst prompt. Only newer runs can be previewed."
             ),
         )
 
@@ -291,8 +294,8 @@ async def analyst_redaction_preview(
         return AnalystRedactionPreviewUnavailableOut(
             status="context_unparseable",
             detail=(
-                "The stored enriched context no longer parses against the "
-                "current schema, so the analyst prompt cannot be rebuilt honestly."
+                "The stored enriched context no longer parses against the current "
+                "schema. soc-ai cannot rebuild the analyst prompt honestly."
             ),
         )
 
@@ -456,9 +459,9 @@ def _decision_record(
         "algo": "sha256",
         "hash": digest,
         "note": (
-            "sha256 checksum over the canonical JSON of this record with the "
-            "'integrity' field removed — detects accidental corruption in "
-            "transit/storage."
+            "sha256 checksum over the canonical JSON of this record, with the "
+            "'integrity' field removed. It detects accidental corruption in transit "
+            "and in storage."
         ),
     }
     if signer is not None:
@@ -472,8 +475,9 @@ def _decision_record(
                 "value": signer.sign_hex(canonical.encode("utf-8")),
                 "public_key": signer.public_key_hex(),
                 "note": (
-                    "detached Ed25519 signature over the canonical JSON (integrity "
-                    "field removed); verify with the public_key — no server secret needed."
+                    "detached Ed25519 signature over the canonical JSON, with the "
+                    "integrity field removed. Verify it with the public_key. No server "
+                    "secret is needed."
                 ),
             }
         except Exception:  # pragma: no cover - signing must never break the export

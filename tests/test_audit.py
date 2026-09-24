@@ -15,6 +15,8 @@ from soc_ai.audit.schemas import AuditEvent
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 
+from tests.es_doubles import CreateSemantics
+
 
 def _es9_shard_failure_if_id_sort(sort: Any) -> dict[str, Any] | None:
     """Mirror real ES 9's refusal to sort on ``_id`` — see the twin helper (and its
@@ -63,19 +65,34 @@ class _CapturingES:
     Captures every indexed body (so we can recover the stored records) and
     serves them back via ``search`` so a fresh :class:`AuditLogger` can recover
     the chain head on restart. ``index`` may be told to raise to simulate an ES
-    outage. ``search`` enforces the ES 9 ``_id``-sort restriction (see
+    outage, and otherwise honours ``op_type=create`` against the deterministic
+    ``_id`` the logger claims each seq under (:mod:`tests.es_doubles`), because
+    a double that accepts a duplicate the real cluster refuses is testing a
+    grid nobody runs. ``search`` enforces the ES 9 ``_id``-sort restriction (see
     :func:`_es9_shard_failure_if_id_sort`) exactly where a real cluster would.
     """
 
     def __init__(self, *, fail: bool = False) -> None:
         self.docs: list[dict[str, Any]] = []
         self.fail = fail
+        self.created = CreateSemantics()
         self.indices = AsyncMock()  # put_index_template etc. are no-ops
 
-    async def index(self, *, index: str, body: dict[str, Any]) -> None:
+    async def index(
+        self,
+        *,
+        index: str,
+        body: dict[str, Any],
+        id: str | None = None,
+        op_type: str | None = None,
+    ) -> None:
         if self.fail:
             raise RuntimeError("ES down")
+        self.created.claim(index, id, op_type, body)
         self.docs.append(body)
+
+    async def mget(self, *, index: str, ids: list[str]) -> dict[str, Any]:
+        return self.created.mget(index, ids)
 
     async def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
         failure = _es9_shard_failure_if_id_sort(body.get("sort"))
@@ -311,6 +328,11 @@ async def test_audit_logger_installs_flattened_template_once(settings_kratos: Se
     assert kw["name"] == "soc-ai-audit-template"
     assert kw["index_patterns"] == ["soc-ai-audit-*"]
     assert kw["template"]["mappings"]["properties"]["payload"]["type"] == "flattened"
+    # Replicas pinned to 0: the target is a single-node Security Onion ES. Left
+    # unset, ES defaults to 1, the replica can never allocate (`same_shard`
+    # decider), and every daily index holds the cluster yellow — which blocks
+    # `soup` on its green-cluster precondition.
+    assert kw["template"]["settings"]["index"]["number_of_replicas"] == 0
     assert fake_es.index.await_count == 2  # both events still indexed
 
 

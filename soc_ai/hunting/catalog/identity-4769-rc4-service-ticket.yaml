@@ -1,0 +1,45 @@
+id: identity-4769-rc4-service-ticket
+title: 'A domain controller issues an RC4 service ticket in an AES domain: Kerberoasting'
+description: >
+  A 4769 service-ticket request carries the RC4 encryption type 0x17. A modern
+  domain issues the AES types 0x11 and 0x12. An attacker asks for RC4 because
+  RC4 is far cheaper to crack offline. The request is ordinary Kerberos traffic.
+  The request produces no failure.
+
+  Measured on the range, 1 document of 4,331 carried RC4. The other 4,330
+  carried AES. That ratio makes the flat predicate work here. The flat predicate
+  fails on a domain with genuine legacy clients. Add a tuning filter for those
+  clients.
+
+level: high
+scope_field: winlog.event_data.ServiceName
+scope_kind: user
+
+precondition:
+  all:
+    - field: event.code
+      value: "4769"
+
+detection:
+  all:
+    - field: event.code
+      value: "4769"
+    - field: winlog.event_data.TicketEncryptionType
+      value: "0x17"
+  none:
+    - field: winlog.event_data.ServiceName
+      op: wildcard
+      value: "*$"
+    - field: winlog.event_data.ServiceName
+      value: krbtgt
+
+attack:
+  - T1558.003
+
+false_positives:
+  - Windows 7 and Server 2008 R2 clients negotiate RC4 legitimately.
+  - A domain can still hold msDS-SupportedEncryptionTypes at its default on
+    some accounts. The domain issues RC4 for those accounts only.
+
+references:
+  - https://attack.mitre.org/techniques/T1558/003/

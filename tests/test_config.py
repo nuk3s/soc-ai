@@ -282,7 +282,7 @@ def test_events_index_pattern_single_node_default(monkeypatch: pytest.MonkeyPatc
 
 
 def test_webui_alerts_query_default(settings_kratos: Settings) -> None:
-    assert settings_kratos.webui_alerts_query == "tags:alert"
+    assert settings_kratos.webui_alerts_query == "tags:alert OR event.kind:alert"
 
 
 def test_inherit_window_default(settings_kratos: Settings) -> None:
@@ -707,6 +707,74 @@ def test_apply_to_settings_returns_only_applied_keys(monkeypatch: pytest.MonkeyP
     assert s.oracle_enabled is True
 
 
+def test_a_rejected_override_leaves_the_previous_value_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected override was written onto the live settings anyway.
+
+    ``validate_assignment`` runs the model validators AFTER the field has been
+    set, and pydantic does not put the old value back when one of them raises.
+    So the assignment "failed", the key was correctly reported as not applied,
+    and the bad value was sitting on the singleton all the same.
+    """
+    from soc_ai.store.config_overrides import apply_to_settings
+
+    _setenv_required(monkeypatch)
+    monkeypatch.delenv("SO_SSH_HOST", raising=False)
+    s = Settings()
+    assert s.pcap_enabled is False, "fixture assumption"
+
+    # Cross-field: PCAP without a sensor host is rejected by a model validator.
+    applied = apply_to_settings(s, {"pcap_enabled": True})
+
+    assert applied == []
+    assert s.pcap_enabled is False, "the rejected value was written onto the live settings"
+
+
+def test_a_rejected_override_does_not_brick_every_later_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The consequence, and the reason this was worth chasing.
+
+    Every ``setattr`` re-runs every model validator, so once a rejected value is
+    stuck on the object, the NEXT setting an operator saves is rejected too, and
+    the message names the setting that is stuck rather than the one they were
+    changing. One bad value bricked configuration on that instance and
+    misdirected whoever tried to work out why.
+    """
+    from soc_ai.store.config_overrides import apply_to_settings
+
+    _setenv_required(monkeypatch)
+    monkeypatch.delenv("SO_SSH_HOST", raising=False)
+    s = Settings()
+
+    apply_to_settings(s, {"pcap_enabled": True})
+    applied = apply_to_settings(s, {"oracle_enabled": True})
+
+    assert applied == ["oracle_enabled"]
+    assert s.oracle_enabled is True
+
+
+def test_a_valid_override_still_applies_after_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control. The guard proves the assignment on a copy and then makes
+    it for real, so a value that a cross-field validator ACCEPTS still lands. A
+    guard that refused everything would satisfy both tests above and turn the
+    console read-only.
+    """
+    from soc_ai.store.config_overrides import apply_to_settings
+
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("SO_SSH_HOST", "sensor.example.test")
+    s = Settings()
+
+    applied = apply_to_settings(s, {"pcap_enabled": True})
+
+    assert applied == ["pcap_enabled"]
+    assert s.pcap_enabled is True
+
+
 # ---------------------------------------------------------------------------
 # Self-consistency vote flag — verdict_consistency_samples
 # ---------------------------------------------------------------------------
@@ -756,6 +824,42 @@ def test_verdict_consistency_samples_is_hot_whitelisted() -> None:
     assert spec.max_value == 5
     assert spec.secret is False
     assert spec.danger is False
+
+
+def test_investigator_emits_report_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The investigator writes the report by default. The environment can turn it off."""
+    _setenv_required(monkeypatch)
+    assert Settings().investigator_emits_report is True
+    monkeypatch.setenv("INVESTIGATOR_EMITS_REPORT", "false")
+    assert Settings().investigator_emits_report is False
+
+
+def test_investigator_emits_report_is_hot_whitelisted() -> None:
+    """The config console can hot-apply the flag, and the help says what it does."""
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY
+
+    spec = WHITELIST_BY_KEY["investigator_emits_report"]
+    assert spec.hot is True
+    assert spec.type == "bool"
+    assert spec.section == "Agent"
+    assert spec.secret is False
+    assert spec.danger is False
+    assert spec.day1 is False
+    assert "second synthesis call" in spec.help.lower()
+
+
+def test_investigator_emits_report_hot_applies_through_the_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored override reaches the live Settings object."""
+    from soc_ai.store.config_overrides import apply_to_settings
+
+    _setenv_required(monkeypatch)
+    s = Settings()
+    assert s.investigator_emits_report is True
+    applied = apply_to_settings(s, {"investigator_emits_report": False})
+    assert "investigator_emits_report" in applied
+    assert s.investigator_emits_report is False
 
 
 def test_synth_first_flag_is_gone(settings_kratos: Settings) -> None:
@@ -1032,3 +1136,164 @@ async def test_about_reports_general_chat_enabled(settings_kratos: Settings) -> 
 
     settings_kratos.general_chat_enabled = True
     assert (await about(settings=settings_kratos)).general_chat_enabled is True
+
+
+def test_catalog_hunt_rows_is_a_hot_bool_in_its_own_hunting_section(
+    settings_kratos: Settings,
+) -> None:
+    """The setting restores the pre-1.5.0 hunt row for one release.
+
+    Hot: the sweep reads it on each run, so a change takes effect on the next
+    sweep with no restart. Off by default, so a new deployment gets the new
+    behaviour and an old one opts back in.
+    """
+    from soc_ai.store.config_overrides import (
+        SECTION_ORDER,
+        SECTION_PARENTS,
+        WHITELIST_BY_KEY,
+        apply_to_settings,
+        coerce,
+    )
+
+    spec = WHITELIST_BY_KEY["catalog_hunt_rows"]
+    assert spec.type == "bool"
+    assert spec.hot is True
+    assert spec.secret is False and spec.danger is False
+    assert spec.section == "Hunting"
+    assert spec.label == "Record a hunt row for each analytic hit"
+    assert spec.help.startswith("The catalog sweep writes a hunt row for each hit")
+    assert "Hunting" in SECTION_ORDER
+    assert SECTION_PARENTS["Hunting"] == "Triage & Workflow"
+
+    assert settings_kratos.catalog_hunt_rows is False
+    assert "catalog_hunt_rows" in apply_to_settings(
+        settings_kratos, {"catalog_hunt_rows": coerce("catalog_hunt_rows", "true")}
+    )
+    assert settings_kratos.catalog_hunt_rows is True
+
+
+def test_lead_auto_hunt_is_on_and_hot(settings_kratos: Settings) -> None:
+    """A lead that forms starts its own hunt, unless an operator turns it off.
+
+    On by default. The design answers "should a lead not always be hunted?"
+    with yes, so the default carries that answer. Hot, because the loop reads
+    the setting on every wake.
+    """
+    from soc_ai.store.config_overrides import (
+        SECTION_ORDER,
+        WHITELIST_BY_KEY,
+        apply_to_settings,
+        coerce,
+    )
+
+    assert settings_kratos.lead_auto_hunt is True
+
+    spec = WHITELIST_BY_KEY["lead_auto_hunt"]
+    assert spec.type == "bool"
+    assert spec.hot is True
+    assert spec.secret is False and spec.danger is False
+    assert spec.section == "Hunting" and "Hunting" in SECTION_ORDER
+    assert spec.label == "A lead starts its own hunt"
+    assert spec.help.startswith("A lead that has never had a hunt starts one when it forms")
+    # The loop leaves four leads alone. The help named one of the four, so an
+    # operator read a rule with three holes in it.
+    for left_alone in ("dismissed", "reopened", "shadow", "no document"):
+        assert left_alone in spec.help
+
+    assert "lead_auto_hunt" in apply_to_settings(
+        settings_kratos, {"lead_auto_hunt": coerce("lead_auto_hunt", "false")}
+    )
+    assert settings_kratos.lead_auto_hunt is False
+
+
+def test_lead_auto_hunt_concurrency_defaults_to_two(settings_kratos: Settings) -> None:
+    """How many lead hunts the loop runs at once. One is the floor, not zero.
+
+    Zero stops every lead hunt through a number while the switch above still
+    reads on. An operator who wants no lead hunts turns the switch off.
+    """
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY, apply_to_settings, coerce
+
+    assert settings_kratos.lead_auto_hunt_concurrency == 2
+
+    spec = WHITELIST_BY_KEY["lead_auto_hunt_concurrency"]
+    assert spec.type == "int"
+    assert spec.hot is True
+    assert spec.section == "Hunting"
+    assert spec.min_value == 1
+    assert spec.max_value is not None
+
+    assert "lead_auto_hunt_concurrency" in apply_to_settings(
+        settings_kratos,
+        {"lead_auto_hunt_concurrency": coerce("lead_auto_hunt_concurrency", "4")},
+    )
+    assert settings_kratos.lead_auto_hunt_concurrency == 4
+    with pytest.raises(ValueError):
+        coerce("lead_auto_hunt_concurrency", "0")
+
+
+def test_the_profile_sweep_is_on_and_hot(settings_kratos: Settings) -> None:
+    """The profile sweep runs in the app, and it runs by default.
+
+    The catalog sweep is off by default because it writes findings unattended.
+    The profile sweep writes observations and raises nothing, and a deployment
+    that records none has no hunting layer, so the default is the other way.
+    Hot, because the loop reads the setting on every wake.
+    """
+    from soc_ai.store.config_overrides import (
+        SECTION_ORDER,
+        WHITELIST_BY_KEY,
+        apply_to_settings,
+        coerce,
+    )
+
+    assert settings_kratos.hunting_prior_sweep_enabled is True
+
+    spec = WHITELIST_BY_KEY["hunting_prior_sweep_enabled"]
+    assert spec.type == "bool"
+    assert spec.hot is True
+    assert spec.secret is False and spec.danger is False
+    assert spec.section == "Hunting" and "Hunting" in SECTION_ORDER
+    assert spec.label == "Run the profile sweep"
+    assert spec.help.startswith("soc-ai compares each host with its own baseline")
+
+    assert "hunting_prior_sweep_enabled" in apply_to_settings(
+        settings_kratos,
+        {"hunting_prior_sweep_enabled": coerce("hunting_prior_sweep_enabled", "false")},
+    )
+    assert settings_kratos.hunting_prior_sweep_enabled is False
+
+
+def test_the_profile_sweep_interval_defaults_to_an_hour(settings_kratos: Settings) -> None:
+    """One hour, the cadence the range timer has run since the lane shipped.
+
+    The floor is 15 minutes. A sweep makes no model call, so the floor is far
+    below the hour a scheduled hunt needs, and it is not zero: each sweep is
+    several real aggregations per dimension against the analyst's grid.
+    """
+    from soc_ai.main import PRIOR_SWEEP_MIN_INTERVAL_MINUTES
+    from soc_ai.store.config_overrides import WHITELIST_BY_KEY, apply_to_settings, coerce
+
+    assert settings_kratos.hunting_prior_sweep_interval_minutes == 60
+
+    spec = WHITELIST_BY_KEY["hunting_prior_sweep_interval_minutes"]
+    assert spec.type == "int"
+    assert spec.hot is True
+    assert spec.section == "Hunting"
+    assert spec.min_value == 15
+    assert spec.max_value is not None
+    # One floor, stated in two places, so the console and the loop cannot
+    # disagree about the smallest interval the product accepts.
+    assert spec.min_value == PRIOR_SWEEP_MIN_INTERVAL_MINUTES
+
+    assert "hunting_prior_sweep_interval_minutes" in apply_to_settings(
+        settings_kratos,
+        {
+            "hunting_prior_sweep_interval_minutes": coerce(
+                "hunting_prior_sweep_interval_minutes", "240"
+            )
+        },
+    )
+    assert settings_kratos.hunting_prior_sweep_interval_minutes == 240
+    with pytest.raises(ValueError):
+        coerce("hunting_prior_sweep_interval_minutes", "5")

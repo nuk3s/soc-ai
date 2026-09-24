@@ -12,9 +12,10 @@ import { INV_STATUS as STATUS } from '../lib/statusMeta';
 import { Checkbox } from '../components/Controls';
 import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { deleteInvestigation, listInvestigations, rehuntInvestigations } from '../lib/api';
-import { verdictFilterFromSearch } from '../lib/investigationFilters';
+import { errorStateFromSearch, verdictFilterFromSearch } from '../lib/investigationFilters';
 import { plural } from '../lib/plural';
 import { middleEllipsis } from '../lib/text';
+import { CHIP_SUBJECT_HUNT } from '../lib/tooltips';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { useAsync } from '../lib/useAsync';
 import { useListSelection } from '../lib/useListSelection';
@@ -28,11 +29,11 @@ import type { InvestigationRow, RehuntResult, SavedViewQuery, Verdict } from '..
 const REHUNT_SKIP_REASONS: Record<string, string> = {
   not_found: 'not found',
   no_alert: 'no alert to hunt',
-  could_not_start: "couldn't start",
+  could_not_start: 'could not start',
   // Defense in depth — the checkbox for a promoted finding is disabled, so
   // this code should be unreachable from the UI, but a server refusal still
   // deserves a readable reason if it ever fires (e.g. a stale selection).
-  hunt_kind: 'promoted finding — re-promote from its hunt instead',
+  hunt_kind: 'promoted finding. Re-promote it from the hunt page',
 };
 const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
 
@@ -142,6 +143,48 @@ function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: So
   return dir === 'asc' ? result : -result;
 }
 
+// ---------------------------------------------------------------------------
+// The landing window
+// ---------------------------------------------------------------------------
+
+/** The windows the screen may land on, narrowest first, with their spans. */
+const LANDING_WINDOWS: ReadonlyArray<readonly [string, number]> = [
+  ['24h', 24 * 3_600_000],
+  ['7d', 7 * 24 * 3_600_000],
+  ['30d', 30 * 24 * 3_600_000],
+];
+
+/**
+ * The narrowest landing window that still holds the newest run.
+ *
+ * A real deployment's investigations are days old, so a screen that opens on
+ * an empty 24h reads as an empty product on the first click (dogfood
+ * 2026-09-17). Null when there is no run to hold: an empty store keeps the
+ * default, and its own empty state explains that in different words.
+ *
+ * A run older than every window gets the widest one. The list is then empty
+ * and says "widen the time range", which is true and reachable, where 24h
+ * would say the same thing about a window nobody chose.
+ */
+export function landingWindow(newest: string | null | undefined, now = Date.now()): string | null {
+  if (!newest) return null;
+  const age = now - new Date(newest).getTime();
+  if (!Number.isFinite(age)) return null;
+  for (const [preset, span] of LANDING_WINDOWS) if (age <= span) return preset;
+  return LANDING_WINDOWS[LANDING_WINDOWS.length - 1][0];
+}
+
+/** The active window in words, for the count line. A count with no window
+ *  beside it is read as a count of everything. */
+export function windowPhrase(range: string): string {
+  if (range === 'custom') return 'the window you chose';
+  const parsed = range.match(/^(\d+)([mhd])$/);
+  if (!parsed) return 'this window';
+  const n = Number(parsed[1]);
+  const unit = parsed[2] === 'm' ? 'minute' : parsed[2] === 'h' ? 'hour' : 'day';
+  return `the last ${n} ${unit}${n === 1 ? '' : 's'}`;
+}
+
 export function Investigations() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -159,19 +202,44 @@ export function Investigations() {
     verdictFilterFromSearch(location.search),
   );
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
+  // Which half of a pipeline-error set is on screen. The Dashboard tile counts
+  // the runs that still need a retry and links here saying so, so the list can
+  // reproduce its number instead of sitting at twenty beside a tile reading
+  // seven, with a run dismissed seconds earlier rendered identically to a
+  // counted one (dogfood 2026-09-07, D2). null means the whole set.
+  const [errorState, setErrorState] = useState<string | null>(() =>
+    errorStateFromSearch(location.search),
+  );
   // Free text, matched SERVER-side against rule name, source and destination.
   // Alerts had a search box and this screen did not, which is half of why the
   // two never read as the same product (dogfood A3). Client-side filtering was
   // never an option here: it is the exact defect the server-side query
   // replaced.
-  const [q, setQ] = useState('');
-  const [debouncedQ, setDebouncedQ] = useState('');
+  const [q, setQ] = useState(() => new URLSearchParams(location.search).get('q') ?? '');
+  const [debouncedQ, setDebouncedQ] = useState(() => new URLSearchParams(location.search).get('q') ?? '');
   // A deep link widens the window to the widest preset: the Dashboard KPI counts
   // its 100 most recent runs with NO time filter, so landing on the default 24h
   // could show an empty list for the very rows the link promised.
-  const [range, setRange] = useState(() => (verdictFilterFromSearch(location.search).length ? '30d' : '24h'));
+  const [range, setRange] = useState(() => {
+    // A link may name the window it counted over (`?range=30d`), so the page
+    // opens on the rows the link promised instead of an empty 24h.
+    const wanted = new URLSearchParams(location.search).get('range');
+    if (wanted && /^\d+[mhd]$/.test(wanted)) return wanted;
+    return verdictFilterFromSearch(location.search).length ? '30d' : '24h';
+  });
+  // True while the landing window is still the screen's own guess. A link that
+  // named a window, and every later pick, owns it instead.
+  const [autoWindow] = useState(() => {
+    const wanted = new URLSearchParams(location.search).get('range');
+    if (wanted && /^\d+[mhd]$/.test(wanted)) return false;
+    return verdictFilterFromSearch(location.search).length === 0;
+  });
+  const windowChosen = useRef(false);
   useEffect(() => {
-    if (demo) setRange('30d');
+    if (demo) {
+      windowChosen.current = true;
+      setRange('30d');
+    }
   }, [demo]);
   const [custom, setCustom] = useState<CustomRange | null>(null);
   // SQL paging offset. Every filter change resets it: page 3 of the old query
@@ -194,6 +262,8 @@ export function Investigations() {
     const fromUrl = verdictFilterFromSearch(location.search);
     if (fromUrl.length) {
       setFilterVerdicts(fromUrl);
+      setErrorState(errorStateFromSearch(location.search));
+      windowChosen.current = true;
       setRange('30d');
       setOffset(0);
     }
@@ -217,15 +287,54 @@ export function Investigations() {
         verdict: filterVerdicts,
         status: filterStatuses,
         q: debouncedQ || undefined,
+        errorState: errorState ?? undefined,
         limit: PAGE_SIZE,
         offset,
       }),
-    [range, custom, filterVerdicts.join(','), filterStatuses.join(','), debouncedQ, offset],
+    [
+      range,
+      custom,
+      filterVerdicts.join(','),
+      filterStatuses.join(','),
+      debouncedQ,
+      errorState ?? '',
+      offset,
+    ],
     {
       refetchInterval: 10000, // live status (running → complete) without a reload
       pauseWhen: () => !activeRef.current,
     },
   );
+
+  // The landing window, decided once and only when the default came back
+  // empty over a store that is not. ONE extra read, for the newest run's
+  // timestamp, which is all it takes to name the narrowest window holding it.
+  // Nothing is probed when the list already has rows, when the store is
+  // empty, or when a link or the operator named the window.
+  const probed = useRef(false);
+  useEffect(() => {
+    if (!autoWindow || windowChosen.current || probed.current) return;
+    if (loading || error || !data) return;
+    probed.current = true;
+    if (data.total > 0 || data.totalAll === 0) return;
+    let alive = true;
+    listInvestigations({ limit: 1, offset: 0 })
+      .then((newest) => {
+        if (!alive || windowChosen.current) return;
+        const wider = landingWindow(newest.rows[0]?.ts ?? null);
+        if (wider && wider !== range) {
+          setRange(wider);
+          setOffset(0);
+        }
+      })
+      .catch(() => {
+        // The list's own request reports a failed read. A second error line
+        // about a window probe would describe machinery, not the outage.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [autoWindow, data, loading, error, range]);
 
   // A run started elsewhere (another tab, auto-triage) won't be reflected while
   // this list is idle — so force one refetch when the tab regains focus.
@@ -375,6 +484,7 @@ export function Investigations() {
     setFilterStatuses(Array.isArray(saved.status) ? (saved.status as string[]) : []);
     // Same widening the demo gets at mount: the seeded runs span a couple of
     // hours, so resetting the demo to a flat 24h would empty the list.
+    windowChosen.current = true;
     setRange(typeof saved.range === 'string' ? saved.range : demo ? '30d' : '24h');
     setCustom((saved.custom as CustomRange | null) ?? null);
     setQ(typeof saved.q === 'string' ? saved.q : '');
@@ -414,7 +524,7 @@ export function Investigations() {
       await deleteInvestigation(id);
       setRehuntMsg('Investigation deleted');
     } catch {
-      setRehuntMsg('Delete failed — cancel a running investigation first, or admin only');
+      setRehuntMsg('Delete failed. Cancel a running investigation first. Only an admin can delete.');
     }
     setPendingDelete(null);
     refetch();
@@ -439,7 +549,9 @@ export function Investigations() {
     }
     setRehuntMsg(
       `Deleted ${ok} investigation${ok !== 1 ? 's' : ''}` +
-        (failed ? ` · ${failed} failed (cancel a running one first, or admin only)` : '')
+        (failed
+          ? ` · ${failed} failed. Cancel a running investigation first. Only an admin can delete.`
+          : '')
     );
     sel.clear();
     setConfirmDelete(false);
@@ -453,10 +565,12 @@ export function Investigations() {
         <div className="text-title">Investigations</div>
         <Freshness at={lastUpdated} />
       </div>
-      {/* Server-side counts over the active filter set — never the page's. */}
+      {/* Server-side counts over the active filter set — never the page's.
+          The window rides with the count, because the screen may have chosen
+          it and a number read as the store's is how "5" becomes "5 ever". */}
       <div className="mb-4 mt-0.5 text-[13px] text-dim">
-        {plural(total, 'investigation')} · {running.toLocaleString()} in progress ·{' '}
-        {plural(tps, 'true positive')}
+        {plural(total, 'investigation')} in {windowPhrase(range)} ·{' '}
+        {running.toLocaleString()} in progress · {plural(tps, 'true positive')}
       </div>
       {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
 
@@ -470,6 +584,7 @@ export function Investigations() {
         onDeleteView={views.onDeleteView}
         onSaveView={views.onSaveView}
         viewError={views.error}
+        saveViewUnavailable={views.unavailable}
         search={{
           value: q,
           onChange: (v) => {
@@ -516,7 +631,7 @@ export function Investigations() {
               ) : (
                 <button
                   onClick={() => setConfirmDelete(true)}
-                  title="Delete the selected investigations (admin)"
+                  title="Delete the selected investigations. Only an admin can delete."
                   className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
                 >
                   <Trash2 size={12} /> Delete
@@ -530,6 +645,7 @@ export function Investigations() {
           value={range}
           custom={custom}
           onChange={(v, r) => {
+            windowChosen.current = true;
             setRange(v);
             if (r) setCustom(r);
             setOffset(0);
@@ -570,6 +686,39 @@ export function Investigations() {
             views.clearActive();
           }}
         />
+        {/* Which half of a pipeline-error set is on screen. Only shown when the
+            list IS about pipeline errors, because that is the only query where
+            "handled" means anything. The Dashboard tile links straight to
+            "Needs retry", so its number and this list's header now come off the
+            same server query (dogfood 2026-09-07, D2). */}
+        {filterVerdicts.includes('pipeline_error') && (
+          <div className="flex items-center gap-1 rounded-[7px] border border-border-strong p-[2px]">
+            {([
+              ['live', 'Needs retry', 'These runs produced no usable verdict. No operator has handled them. The Dashboard tile counts these runs.'],
+              ['handled', 'Handled', 'An operator dismissed the run, or a later run reached a verdict.'],
+              [null, 'All errors', 'Every run that produced no usable verdict. The list includes the handled runs.'],
+            ] as const).map(([value, label, hint]) => (
+              <button
+                key={label}
+                aria-pressed={errorState === value}
+                title={hint}
+                onClick={() => {
+                  setErrorState(value);
+                  setOffset(0);
+                  views.clearActive();
+                }}
+                className={
+                  'rounded-[5px] px-[9px] py-[3px] text-[12px] font-semibold ' +
+                  (errorState === value
+                    ? 'bg-surface-3 text-text'
+                    : 'text-dim hover:text-text')
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
         <button
           onClick={() => {
             setGroupBy((g) => (g === 'detection' ? 'none' : 'detection'));
@@ -661,7 +810,7 @@ export function Investigations() {
               disabled={bulkEligible.length === 0}
               title={
                 bulkEligible.length === 0
-                  ? "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead"
+                  ? 'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.'
                   : 'Select all visible'
               }
             />
@@ -703,13 +852,13 @@ export function Investigations() {
               </Link>
             }
           >
-            An investigation is what soc-ai does to a detection — it pulls the evidence,
-            reasons over it and lands a verdict. Pick a detection on the Alerts screen, or
-            let auto-triage work the backlog for you.
+            soc-ai runs an investigation on a detection. The investigation pulls the evidence,
+            reasons over the evidence and reaches a verdict. Pick a detection on the Alerts
+            screen. Auto-triage can also work the backlog.
           </EmptyState>
         )}
         {!loading && !error && displayRows.length === 0 && totalAll > 0 && (
-          <EmptyState>No investigations match the selected filters.</EmptyState>
+          <EmptyState>No investigations in this time range. Widen the time range above. Clear the filters.</EmptyState>
         )}
         {displayRows.map((r, i) => {
           const st = STATUS[r.status] ?? STATUS.error;
@@ -748,19 +897,54 @@ export function Investigations() {
                   disabled={r.kind === 'hunt'}
                   title={
                     r.kind === 'hunt'
-                      ? "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead"
+                      ? 'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.'
                       : 'Select'
                   }
                 />
               </div>
               <div className="flex min-w-0 items-center gap-[9px]">
                 <KindBadge kind={r.kind} />
+                {/* What the run read, beside what raised it. A hunt
+                    investigation has no detector and no single event: its
+                    subject is the hunt's findings, and the row read as an
+                    ordinary alert run without this. */}
+                {r.subjectType === 'hunt' && (
+                  <span
+                    data-testid={`subject-type-${r.id}`}
+                    title={CHIP_SUBJECT_HUNT}
+                    className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-dim"
+                  >
+                    hunt
+                  </span>
+                )}
                 {/* A run against planted synthetic scenarios must never read
                     as a real one — badge it wherever the row appears. */}
                 {r.isSynthEval && <SyntheticEvalBadge />}
                 <span title={r.name} className="min-w-0 flex-1 truncate text-[13px] font-medium">
                   {middleEllipsis(r.name)}
                 </span>
+                {/* Why this row is NOT one the Dashboard tile counts. Without
+                    it a run dismissed seconds earlier rendered exactly like a
+                    live one, so the tile went nine, eight, seven while the list
+                    sat at twenty (dogfood 2026-09-07, D2). Both markers are
+                    unconditional: a row's history is true whatever filter is
+                    set. */}
+                {r.errorDismissed && (
+                  <span
+                    title="An operator dismissed this failure. The Dashboard does not count it."
+                    className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint"
+                  >
+                    Dismissed
+                  </span>
+                )}
+                {r.isPrimary === false && (
+                  <span
+                    title="A later run of this alert reached a verdict. A re-run already fixed this run."
+                    className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint"
+                  >
+                    Superseded
+                  </span>
+                )}
                 {/* The row is representative but not current. Says so on the
                     row itself, because the "N earlier" chip beside it does not
                     — and on a filtered page the failed run may not be here to
@@ -773,7 +957,7 @@ export function Investigations() {
                         state: { from: '/investigations' },
                       });
                     }}
-                    title="A newer run of this alert reached no verdict — open it"
+                    title="A newer run of this alert reached no verdict. Open the newer run."
                     className="flex flex-none items-center gap-[4px] rounded-badge border px-[6px] py-[2px] text-[10.5px] font-semibold"
                     style={{
                       borderColor: 'rgba(240,68,56,.45)',

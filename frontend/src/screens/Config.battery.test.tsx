@@ -116,13 +116,13 @@ describe('the empty-result marker is a quiet state, not a crash', () => {
 
     // The buttons anchor the panel and appear at mount; wait for the poll to land
     // its empty result and re-render — that re-render is where the crash lived.
-    await screen.findByText('Run full battery');
+    await screen.findByText('Run the full check');
     await waitFor(() => expect(vi.mocked(getModelBattery)).toHaveBeenCalled());
 
     // Did NOT fall into the boundary…
     expect(screen.queryByText('Something went wrong loading this page')).toBeNull();
     // …renders the same quiet state as "no result at all": buttons, no table.
-    expect(screen.getByText('Run full battery')).toBeTruthy();
+    expect(screen.getByText('Run the full check')).toBeTruthy();
     expect(screen.getByText('Run all checks')).toBeTruthy();
     expect(screen.queryByRole('table')).toBeNull();
   });

@@ -101,7 +101,9 @@ describe('Investigations server-side query', () => {
     );
     const { container } = mount('/investigations');
     await screen.findAllByText('GPL ICMP Large ICMP Packet');
-    expect(container.textContent).toContain('500 investigations · 3 in progress · 7 true positives');
+    expect(container.textContent).toContain(
+      '500 investigations in the last 24 hours · 3 in progress · 7 true positives',
+    );
   });
 
   it('counts to one without saying "1 investigations"', async () => {
@@ -113,7 +115,9 @@ describe('Investigations server-side query', () => {
     );
     const { container } = mount('/investigations');
     await screen.findAllByText('GPL ICMP Large ICMP Packet');
-    expect(container.textContent).toContain('1 investigation · 1 in progress · 1 true positive');
+    expect(container.textContent).toContain(
+      '1 investigation in the last 24 hours · 1 in progress · 1 true positive',
+    );
     expect(container.textContent).not.toContain('1 investigations');
   });
 
@@ -164,10 +168,85 @@ describe('Investigations pipeline_error deep link', () => {
     expect(screen.getAllByText('GPL ICMP Large ICMP Packet')).toHaveLength(1);
   });
 
+  // The tile counted runs after excluding the dismissed and the superseded; the
+  // list applied neither exclusion and offered no filter or marker for them, so
+  // a run dismissed seconds earlier rendered exactly like a counted one
+  // (dogfood 2026-09-07, D2).
+  it('asks the server for the same partition the tile counted', async () => {
+    mount('/investigations?verdict=pipeline_error&errors=live');
+    await screen.findByText(/No investigations/);
+    const q = listInvestigations.mock.calls[0][0];
+    expect(q.verdict).toEqual(['pipeline_error']);
+    expect(q.errorState).toBe('live');
+  });
+
+  it('shows which partition is on screen and lets the operator widen it', async () => {
+    mount('/investigations?verdict=pipeline_error&errors=live');
+    const needsRetry = await screen.findByRole('button', { name: 'Needs retry' });
+    expect(needsRetry.getAttribute('aria-pressed')).toBe('true');
+
+    fireEvent.click(screen.getByRole('button', { name: 'All errors' }));
+    await waitFor(() => {
+      const q = listInvestigations.mock.calls[listInvestigations.mock.calls.length - 1][0];
+      expect(q.errorState).toBeUndefined();
+    });
+  });
+
+  it('hides the partition control on a list that is not about pipeline errors', async () => {
+    mount('/investigations?verdict=true_positive');
+    await screen.findByText(/No investigations/);
+    expect(screen.queryByRole('button', { name: 'Needs retry' })).toBeNull();
+  });
+
+  it('marks a dismissed run and a superseded one so neither reads as counted', async () => {
+    listInvestigations.mockResolvedValue(
+      list([
+        row({ id: 'INV-ACKED', alertId: 'ev-acked', fallback: true, errorDismissed: true }),
+        row({ id: 'INV-OLD', alertId: 'ev-old', fallback: true, isPrimary: false }),
+        row({ id: 'INV-LIVE', alertId: 'ev-live', fallback: true }),
+      ]),
+    );
+    mount('/investigations?verdict=pipeline_error');
+    expect(await screen.findByText('Dismissed')).toBeTruthy();
+    expect(screen.getByText('Superseded')).toBeTruthy();
+    // The counted row carries neither marker, which is the whole point.
+    expect(screen.getAllByText('Dismissed')).toHaveLength(1);
+    expect(screen.getAllByText('Superseded')).toHaveLength(1);
+  });
+
   it('says so when the active filter matches nothing', async () => {
     listInvestigations.mockResolvedValue(list([], { total: 0, totalAll: 42 }));
     mount('/investigations?verdict=inconclusive');
-    expect(await screen.findByText(/No investigations match the selected filters/i)).toBeTruthy();
+    expect(await screen.findByText(/No investigations in this time range/i)).toBeTruthy();
+  });
+
+  // The product's runs are days old, so the first click on a 24h default read
+  // as an empty product (dogfood 2026-09-17).
+  it('lands on the narrowest window that holds a run', async () => {
+    const nineDaysAgo = new Date(Date.now() - 9 * 86_400_000).toISOString();
+    listInvestigations
+      .mockResolvedValueOnce(list([], { total: 0, totalAll: 4 })) // the 24h default
+      .mockResolvedValueOnce(list([row({ ts: nineDaysAgo })], { total: 1, totalAll: 4 })) // the probe
+      .mockResolvedValue(list([row({ ts: nineDaysAgo })], { total: 1, totalAll: 4 }));
+    mount('/investigations');
+    expect(
+      await screen.findByText(/1 investigation in the last 30 days/),
+    ).toBeTruthy();
+  });
+
+  it('stays on the default window when the default window holds runs', async () => {
+    listInvestigations.mockResolvedValue(list([row({})], { total: 1, totalAll: 4 }));
+    mount('/investigations');
+    expect(await screen.findByText(/1 investigation in the last 24 hours/)).toBeTruthy();
+    // No probe: the list already answered the question.
+    expect(listInvestigations).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the window alone when a link named one', async () => {
+    listInvestigations.mockResolvedValue(list([], { total: 0, totalAll: 4 }));
+    mount('/investigations?range=4h');
+    expect(await screen.findByText(/0 investigations in the last 4 hours/)).toBeTruthy();
+    expect(listInvestigations).toHaveBeenCalledTimes(1);
   });
 
   it('distinguishes an empty store from an empty match', async () => {
@@ -179,7 +258,7 @@ describe('Investigations pipeline_error deep link', () => {
     mount('/investigations');
     expect(await screen.findByText('No investigations yet')).toBeTruthy();
     expect(screen.getByRole('link', { name: /start from alerts/i })).toBeTruthy();
-    expect(screen.queryByText(/No investigations match/i)).toBeNull();
+    expect(screen.queryByText(/No investigations in this time range/i)).toBeNull();
   });
 });
 
@@ -308,7 +387,7 @@ describe('Investigations bulk re-investigate excludes promoted findings', () => 
     expect(boxes[2]).toBeDisabled();
     expect(boxes[2]).toHaveAttribute(
       'title',
-      "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead",
+      'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.',
     );
 
     fireEvent.click(boxes[2]);
@@ -340,7 +419,7 @@ describe('Investigations bulk re-investigate excludes promoted findings', () => 
     expect(headerBox).toBeDisabled();
     expect(headerBox).toHaveAttribute(
       'title',
-      "Promoted findings can't be bulk re-investigated — re-promote from the hunt page instead",
+      'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.',
     );
 
     fireEvent.click(headerBox);

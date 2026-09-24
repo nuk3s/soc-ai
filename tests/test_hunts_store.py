@@ -62,11 +62,20 @@ async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     # model_battery_results → 0023 model_fitness_cache → 0024 host_dossier →
     # 0025 general_chat → 0026 quality_counts → 0027 alarm_identity → 0028
     # status_created_index_denorm → 0029 dossier_run_notes → 0030 saved_view →
-    # 0031 investigation_kind_provenance → 0032 synth_eval_marker → …).
+    # 0031 investigation_kind_provenance → 0032 synth_eval_marker →
+    # 0033 hunt_spec_state → 0034 hunt_spec_sweeps → 0035 → 0036
+    # hunt_spec_state_retired → 0037 alert_escalations → 0038
+    # investigation_community_id → 0039 investigation_host_name → 0040
+    # quality_eval_attempts → 0041 json_null_and_snapshot_provenance → 0042
+    # entity_profiles → …).
+    #
+    # This is NOT the only head canary any more, whatever
+    # tests/test_migration_0028_indexes.py still says: bump
+    # tests/test_escalations_store.py::test_migration_creates_the_ledger with it.
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0032"
+        assert row.scalar_one() == "0050"
     await engine.dispose()
 
 
@@ -185,6 +194,34 @@ async def test_list_recent_and_status_filter(settings_kratos: Settings) -> None:
         assert [h.id for h in complete] == [h1.id]
         running = await hunt_svc.list_recent(db, status="running")
         assert [h.id for h in running] == [h2.id]
+    await engine.dispose()
+
+
+async def test_list_recent_kind_filter(settings_kratos: Settings) -> None:
+    """``kind`` is an exact ``where`` like ``status``: it narrows to one of
+    chat | scheduled | triggered, ANDs with ``status``, and absent keeps the
+    original everything-behavior. Validation of the value is the route's job."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        chat = await hunt_svc.create(db, objective="chat", started_by="a")
+        sched = await hunt_svc.create(db, objective="sched", started_by="a", kind="scheduled")
+        trig_done = await hunt_svc.create(db, objective="trig1", started_by="a", kind="triggered")
+        trig_live = await hunt_svc.create(db, objective="trig2", started_by="a", kind="triggered")
+        await hunt_svc.finalize(db, trig_done.id, status="complete", report=REPORT)
+
+        got = await hunt_svc.list_recent(db, kind="triggered")
+        assert {h.id for h in got} == {trig_done.id, trig_live.id}
+        assert all(h.kind == "triggered" for h in got)
+        got = await hunt_svc.list_recent(db, kind="scheduled")
+        assert [h.id for h in got] == [sched.id]
+        got = await hunt_svc.list_recent(db, kind="chat")
+        assert [h.id for h in got] == [chat.id]
+        # kind ANDs with status
+        got = await hunt_svc.list_recent(db, kind="triggered", status="complete")
+        assert [h.id for h in got] == [trig_done.id]
+        # no kind → default behavior unchanged (every row)
+        got = await hunt_svc.list_recent(db)
+        assert {h.id for h in got} == {chat.id, sched.id, trig_done.id, trig_live.id}
     await engine.dispose()
 
 
@@ -309,3 +346,16 @@ async def test_hunt_chat_thread_round_trips(settings_kratos: Settings) -> None:
         assert "hunt_started" in kinds
         assert "chat_user" in kinds and "chat_assistant" in kinds
     await engine.dispose()
+
+
+async def test_create_records_the_starter_and_the_lead(settings_kratos: Settings) -> None:
+    from soc_ai.store import hunts as hunts_store
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        hunt = await hunts_store.create(
+            db, objective="o", started_by="analyst", kind="lead", starter="lead", lead_id=12
+        )
+        default = await hunts_store.create(db, objective="p", started_by="analyst")
+    assert hunt.starter == "lead" and hunt.lead_id == 12
+    assert default.starter == "analyst" and default.lead_id is None

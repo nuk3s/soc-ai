@@ -41,6 +41,11 @@ What it seeds
     - (untriaged)          stream-retransmission run interrupted by a restart.
 * 2 completed hunts with the SAME objective (E3.4 "vs last run" diff strip:
   1 new / 3 persisting / 1 resolved finding) + a daily hunt schedule row.
+* a week of hunt catalog sweeps (soc_ai/demo/catalog_trail.py, the same
+  generator the product demo seeds at startup): one row per spec every six
+  hours, the decoy spec blind throughout, one DCSync firing two days back
+  recorded as a triggered hunt, so the Operate hub's catalog panel and the
+  Hunts "Catalog" preset render as they do on a grid the loop has swept.
 * 3 starter-pack runbooks (via the shipped loader) so /app/runbooks and the
   lookup_runbook tool demo non-empty.
 * alert assignments in every state: Emotet owned, dnstop in_review,
@@ -66,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import demo_dataset as dd  # noqa: E402
 from soc_ai.config import Settings  # noqa: E402
+from soc_ai.demo.catalog_trail import CATALOG_HUNT_ID, seed_catalog_trail  # noqa: E402
 from soc_ai.enrichment.blocklists import BlocklistHit  # noqa: E402
 from soc_ai.so_client.models import RuleMetadata, SoAlert  # noqa: E402
 from soc_ai.store import chat as chat_svc  # noqa: E402
@@ -1694,6 +1700,10 @@ async def seed(data_dir: Path) -> dict:
                 created_by="admin",
             )
 
+    # A week of catalog sweeps, the same generator the product demo runs at
+    # startup, so the Operate hub's catalog panel has a trail to read.
+    await seed_catalog_trail(sm)
+
     await engine.dispose()
 
     manifest = {
@@ -1705,6 +1715,7 @@ async def seed(data_dir: Path) -> dict:
         "hunt": ids["hunt"],
         "hunt_prev": ids["hunt_prev"],
         "hunt_error": ids["hunt_error"],
+        "hunt_catalog": CATALOG_HUNT_ID,
         "admin_user": dd.DEMO_ADMIN_USER,
         "admin_password": dd.DEMO_ADMIN_PASSWORD,
     }

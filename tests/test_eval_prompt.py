@@ -205,10 +205,12 @@ def test_user_message_does_not_leak_raw_internal_strings() -> None:
 
     # Match private-IP-shaped octets only when they're actually IP-like
     # (followed by another digit-dot-digit). `### 10. Total alerts`
-    # is a section heading, not a leak.
+    # is a section heading, not a leak. The loopback range is not in the
+    # pattern: the doctrine names the WMIExec idiom, an output redirect to
+    # ADMIN$ on 127.0.0.1, and a loopback address identifies no network.
     private_ip_re = re.compile(
         r"\b(?:"
-        r"10|192\.168|172\.(?:1[6-9]|2\d|3[01])|127|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])"
+        r"10|192\.168|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])"
         r")\.\d+\.\d+"
     )
     assert not private_ip_re.search(msg), f"raw private IP leaked: {msg[:200]!r}"

@@ -70,6 +70,7 @@ import {
   getWorkspaces,
   startAutoTriage,
 } from '../lib/api';
+import { queueOf } from '../test/alertQueue';
 import { Alerts } from './Alerts';
 import { CommandPalette } from '../shell/CommandPalette';
 import { Sidebar } from '../shell/Sidebar';
@@ -97,7 +98,7 @@ const mkEvent = (o: Partial<AlertEvent> & Pick<AlertEvent, 'id'>): AlertEvent =>
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(getAlerts).mockResolvedValue([]);
+  vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
   vi.mocked(getAlertGroupEvents).mockResolvedValue([]);
   vi.mocked(getMe).mockResolvedValue({ username: 'me', role: 'analyst', status: '' });
   vi.mocked(getInvestigations).mockResolvedValue([]);
@@ -138,7 +139,7 @@ describe('F11 — selection survives the ES-id churn of a background poll', () =
     // backend hands back a new representative `id` and a higher count.
     const before = mkGroup({ id: 'es-1', name: 'ET SCAN Noisy', count: 2000 });
     const after = mkGroup({ id: 'es-2', name: 'ET SCAN Noisy', count: 2001 });
-    vi.mocked(getAlerts).mockResolvedValueOnce([before]).mockResolvedValue([after]);
+    vi.mocked(getAlerts).mockResolvedValueOnce(queueOf([before])).mockResolvedValue(queueOf([after]));
     const intervalSpy = vi.spyOn(window, 'setInterval');
     try {
       renderAlerts();
@@ -175,7 +176,7 @@ describe('F12 — keyboard focus follows the group, not the row index', () => {
     const c = mkGroup({ id: 'c1', name: 'CCC', sev: 'critical' });
     // First render: [AAA, BBB]. After the poll a new CRITICAL group sorts to the
     // top, pushing AAA from index 0 to index 1.
-    vi.mocked(getAlerts).mockResolvedValueOnce([a, b]).mockResolvedValue([c, a, b]);
+    vi.mocked(getAlerts).mockResolvedValueOnce(queueOf([a, b])).mockResolvedValue(queueOf([c, a, b]));
     const intervalSpy = vi.spyOn(window, 'setInterval');
     try {
       renderAlerts();
@@ -216,7 +217,7 @@ describe('F59 / context-row morph — a selection cannot be stranded by a filter
     // same guarantee is made a different way: the filters stay, and changing one
     // clears the selection and says so.
     const g = mkGroup({ id: 'es-1', name: 'ET SCAN Noisy', count: 3 });
-    vi.mocked(getAlerts).mockResolvedValue([g]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([g]));
     vi.mocked(getAlertGroupEvents).mockResolvedValue([mkEvent({ id: 'ev-1', ts: '2026-07-30T00:00:00Z' })]);
     renderAlerts({ toasts: true });
     await screen.findByText('ET SCAN Noisy');
@@ -228,8 +229,8 @@ describe('F59 / context-row morph — a selection cannot be stranded by a filter
     fireEvent.click(screen.getByText('ET SCAN Noisy'));
     await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
     // CALLED is not RENDERED. Without this wait the last checkbox is still the
-    // GROUP's, so the click selects all 3 events and the bar reads "Ack 3
-    // events" — which `findByText('Ack 1 event')` then waits out and fails on,
+    // GROUP's, so the click selects all 3 events and the bar reads "Acknowledge 3
+    // events" — which `findByText('Acknowledge 1 event')` then waits out and fails on,
     // with a message that blames the label rather than the selection. Passed on
     // an idle box, failed the loaded CI runner.
     await waitFor(() =>
@@ -237,7 +238,7 @@ describe('F59 / context-row morph — a selection cannot be stranded by a filter
     );
     const boxes = screen.getAllByRole('checkbox');
     fireEvent.click(boxes[boxes.length - 1]);
-    await screen.findByText('Ack 1 event');
+    await screen.findByText('Acknowledge 1 event');
 
     // The filter is STILL there and still operable while the selection stands.
     const hideAcked = screen.getByRole('button', { name: /Hide acknowledged/ });
@@ -245,8 +246,8 @@ describe('F59 / context-row morph — a selection cannot be stranded by a filter
 
     // Using it discards the selection rather than stranding it — and says so.
     fireEvent.click(hideAcked);
-    await waitFor(() => expect(screen.queryByText('Ack 1 event')).toBeNull());
-    expect(await screen.findByText(/selection cleared/i)).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('Acknowledge 1 event')).toBeNull());
+    expect(await screen.findByText(/cleared the selection/i)).toBeTruthy();
   });
 });
 
@@ -257,9 +258,9 @@ describe('selection counts are a true partition, not a double count', () => {
   // "1 group · 3 events" for one group of three loaded events, and four ids
   // sent for one group's worth of work.
   const groupWithEvents = () => {
-    vi.mocked(getAlerts).mockResolvedValue([
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([
       mkGroup({ id: 'es-1', name: 'ET SCAN Noisy', count: 2000 }),
-    ]);
+    ]));
     vi.mocked(getAlertGroupEvents).mockResolvedValue([
       // Distinct dst per event: three DIFFERENT events under one group, not a
       // ≥3-identical flood — bucketing must not collapse these into one row.
@@ -313,7 +314,7 @@ describe('selection counts are a true partition, not a double count', () => {
     const boxes = screen.getAllByRole('checkbox');
     fireEvent.click(boxes[boxes.length - 1]);
     const strip = await screen.findByTestId('list-toolbar-selection');
-    expect(within(strip).getByText(/Ack 1 event/)).toBeTruthy();
+    expect(within(strip).getByText(/Acknowledge 1 event/)).toBeTruthy();
     // No group is selected, so nothing claims one.
     expect(within(strip).queryByText(/group/)).toBeNull();
   });
@@ -335,7 +336,7 @@ describe('saved views on Alerts', () => {
     // omitted the key. A saved view that silently unhides acknowledged alerts
     // is worse than no saved views at all.
     vi.mocked(listSavedViews).mockResolvedValue([VIEW]);
-    vi.mocked(getAlerts).mockResolvedValue([mkGroup({ id: 'es-1', name: 'ET SCAN Noisy' })]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([mkGroup({ id: 'es-1', name: 'ET SCAN Noisy' })]));
     renderAlerts();
     await screen.findByText('ET SCAN Noisy');
 
@@ -348,7 +349,7 @@ describe('saved views on Alerts', () => {
 
   it('un-lights the chip once a facet moves on from what it described', async () => {
     vi.mocked(listSavedViews).mockResolvedValue([VIEW]);
-    vi.mocked(getAlerts).mockResolvedValue([mkGroup({ id: 'es-1', name: 'ET SCAN Noisy' })]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([mkGroup({ id: 'es-1', name: 'ET SCAN Noisy' })]));
     renderAlerts();
     await screen.findByText('ET SCAN Noisy');
 

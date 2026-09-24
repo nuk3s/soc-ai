@@ -73,7 +73,7 @@ function EventsSparkline({ volume, range }: { volume: VolumePoint[]; range: Host
   return (
     <div
       data-testid="kpi-events-spark"
-      title={`Connection volume over the last ${range}, scaled to its busiest bucket (peak ${peak.toLocaleString()}).`}
+      title={`Connection volume over the last ${range}. The chart is scaled to its busiest bucket, which is ${peak.toLocaleString()}.`}
       className="mt-2"
     >
       <svg
@@ -106,7 +106,7 @@ function peerSub(peers: number, truncated: boolean): { text: string; title: stri
   if (truncated) {
     return {
       text: `${peers}+ peers`,
-      title: `The grid returned its ${peers} busiest peers and cut the rest, so this is a floor rather than a total — the peer graph below says the same.`,
+      title: `The grid returned its ${peers} busiest peers and cut the rest. The host has ${peers} peers or more.`,
     };
   }
   return {
@@ -118,11 +118,16 @@ function peerSub(peers: number, truncated: boolean): { text: string; title: stri
 export interface HostKpisProps {
   /** The host the strip describes — the Alerts card deep-links on it. */
   ip: string;
-  /** Ports this host offers, per the sweep, already spelled the house way
-   *  ("tcp/8006") and in the payload's own busiest-first order. Null when the
-   *  field never resolved — "we do not know" is not "none", and they send an
-   *  operator to different places. */
+  /** Ports this host offers, busiest first. Null when nothing could answer —
+   *  "we do not know" is not "none", and they send an operator to different
+   *  places. The sweep's own fact spells them the house way ("tcp/8006"); the
+   *  profile knows no protocol and gives bare port numbers. */
   services: string[] | null;
+  /** Which read the list came from. The profile is built from up to 30 days
+   *  and the sweep fact from one run, so they can disagree by a port, and a
+   *  card that named the wrong one sent readers hunting for a defect that was
+   *  really two honest answers. */
+  servicesSource?: 'dossier' | 'profile';
   activity: HostActivity | null;
   /** The one discriminant, shared with the activity row so the strip and the row
    *  can never describe the live half differently. */
@@ -130,7 +135,14 @@ export interface HostKpisProps {
   range: HostActivityRange;
 }
 
-export function HostKpis({ ip, services, activity, state, range }: HostKpisProps) {
+export function HostKpis({
+  ip,
+  services,
+  servicesSource = 'dossier',
+  activity,
+  state,
+  range,
+}: HostKpisProps) {
   // One sentence for the state the live numbers are in, reused by all three so
   // they cannot drift apart. `stale` keeps its numbers: an error WITH data behind
   // it is a failed refresh, not an absence, and blanking them would throw away a
@@ -139,7 +151,7 @@ export function HostKpis({ ip, services, activity, state, range }: HostKpisProps
     state === 'down'
       ? 'the grid could not be read'
       : state === 'stale'
-        ? 'could not refresh — last good read'
+        ? 'could not refresh · last good read'
         : state === 'loading'
           ? 'reading the grid…'
           : null;
@@ -158,7 +170,7 @@ export function HostKpis({ ip, services, activity, state, range }: HostKpisProps
     <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Kpi
         testId="kpi-services"
-        label="Services"
+        label={servicesSource === 'profile' ? 'Services' : 'Services · dossier'}
         value={services == null ? UNKNOWN : services.length.toLocaleString()}
         sub={
           services == null ? (
@@ -169,9 +181,10 @@ export function HostKpis({ ip, services, activity, state, range }: HostKpisProps
             // WHICH ports, not "ports": tcp/8006 answers "is this the Proxmox
             // box?" from the strip, which is the question the count alone
             // sends a reader down the page to answer.
-            <span title="The ports this host answers on, in the order the dossier holds them — the sweep ranks by connection count, so the busiest lead.">
+            <span title="The ports this host answers on, ranked by connection count.">
               {services.slice(0, PORTS_SHOWN).join(', ')}
               {rest > 0 ? ` +${rest} more` : ''}
+              {servicesSource === 'profile' ? ' · from the profile' : ''}
             </span>
           )
         }
@@ -197,7 +210,7 @@ export function HostKpis({ ip, services, activity, state, range }: HostKpisProps
       />
       <Kpi
         testId="kpi-events"
-        label={`Events · ${range}`}
+        label={`Connections · ${range}`}
         value={events == null ? UNKNOWN : events.toLocaleString()}
         sub={
           liveSub ??
@@ -237,7 +250,7 @@ export function HostKpis({ ip, services, activity, state, range }: HostKpisProps
             {activity != null && (
               <Link
                 to={alertsHref(ip)}
-                title="Opens the alerts console narrowed to detections naming this host as a flow endpoint, over the same seven days with acknowledged detections included. Detections from this machine's own agent (no flow) are in the count but carry no address the filter can match."
+                title="This link opens the alerts console for this host over the same 7 days. It includes acknowledged detections. Detections from the agent on this machine carry no address the filter can match."
                 className="mt-0.5 inline-block underline decoration-dim/50 underline-offset-2 hover:text-text hover:decoration-dim"
               >
                 alerts for this host · 7d

@@ -10,7 +10,11 @@ and funnel routing AROUND the model, not the model's quality.
 
 Scenario coverage (initial rock-solid set):
 
-* ``clean_internal_fp`` — clean-internal decision-template FP (zero-tool).
+* ``clean_internal_provisional_downgrade`` — a provisional (locality) template
+  proposes FP, nothing is retrieved, the hard evidence gate coerces it to
+  needs_more_info.
+* ``dnssec_dispositive_fp`` — a dispositive (rule-grounded) template settles FP
+  with zero tool calls; the negative control for the one above.
 * ``external_info_fp`` — external-reputation template FP, funnel loop entry.
 * ``cobalt_beacon_definitely_investigate`` — malware-class rule → round-1
   skipped → investigation loop → grounded TP.
@@ -190,12 +194,15 @@ _ICMP_CID = "1:icmpgolden0000000000000000000000="
 
 
 SCENARIOS: list[GoldenScenario] = [
-    # (a) Clean-internal decision-template FP. Both endpoints internal, benign
-    #     rule, non-attack classtype → clean_internal_traffic (FP @ 0.85). The
-    #     strong benign template exempts the zero-tool FP from the hard evidence
-    #     gate. Zero-tool path (investigate_when_unsure off).
+    # (a) Clean-internal decision-template FP, with the loop switched off so the
+    #     verdict has to stand on the template alone. clean_internal_traffic is
+    #     PROVISIONAL: its grounds are that both endpoints are private and no
+    #     blocklist named either of them, which is true of every east-west flow
+    #     including an exploit landing on an internal service. Nothing was
+    #     retrieved, so the hard evidence gate coerces the FP to needs_more_info
+    #     rather than letting locality close the case.
     GoldenScenario(
-        id="clean_internal_fp",
+        id="clean_internal_provisional_downgrade",
         alert_source=_suricata_source(
             rule_name="GPL ICMP_INFO PING *NIX",
             src_ip="10.0.0.10",
@@ -218,12 +225,41 @@ SCENARIOS: list[GoldenScenario] = [
             ]
         ),
         expected=Expected(
+            verdict="needs_more_info",
+            gates_fired=["decision_template_match", "evidence_gate_downgrade"],
+            gates_absent=["auto_ack"],
+        ),
+        note="provisional template + nothing retrieved → needs_more_info.",
+    ),
+    # (a2) NEGATIVE CONTROL for (a). A dispositive template reads what the rule
+    #      detected, so routine traffic still settles with zero tool calls and
+    #      routine triage stays cheap.
+    GoldenScenario(
+        id="dnssec_dispositive_fp",
+        alert_source=_suricata_source(
+            rule_name="ET INFO DNS Query for DNSKEY Record",
+            src_ip="10.0.0.10",
+            dest_ip="10.0.0.20",
+            classtype="misc-activity",
+        ),
+        settings_overrides={"investigate_when_unsure": False},
+        model_script=ModelScript(
+            synth_reports=[
+                TriageReport(
+                    verdict="false_positive",
+                    confidence=0.85,
+                    summary="DNSSEC record query; routine resolver housekeeping.",
+                    citations=["alert.rule_name=ET INFO DNS Query for DNSKEY Record"],
+                )
+            ]
+        ),
+        expected=Expected(
             verdict="false_positive",
             min_confidence=0.6,
             gates_fired=["decision_template_match"],
             gates_absent=["evidence_gate_downgrade", "synth_round1_skipped"],
         ),
-        note="clean_internal_traffic template + FP settle.",
+        note="dns_dnssec_housekeeping template + FP settle, zero tools.",
     ),
     # (b) External-reputation template FP. Informational + allowed + external
     #     unknown-ASN dest → informational_external_unknown_asn (FP @ 0.7), which
@@ -386,7 +422,10 @@ SCENARIOS: list[GoldenScenario] = [
     GoldenScenario(
         id="partial_citation_cap",
         alert_source=_suricata_source(
-            rule_name="GPL SNMP public access udp",
+            # A DNSSEC housekeeping rule so a DISPOSITIVE template grounds the
+            # zero-tool FP and this scenario isolates the citation cap. It used
+            # to ride clean_internal_traffic, which no longer settles anything.
+            rule_name="ET INFO Outbound RRSIG DNS Query Observed",
             src_ip="10.0.0.15",
             dest_ip="10.0.0.25",
             classtype="misc-activity",

@@ -1,7 +1,7 @@
 """First-run honesty: a stack with dead upstreams must SAY so, not present as broken.
 
-Wave-2 acceptance scenario (docs/superpowers/specs/2026-08-18-fresh-view-refit-
-design.md): "boot unconfigured, confirm the UI says unconfigured and lists what
+Wave-2 acceptance scenario (the fresh-view refit design of 2026-08-18):
+ "boot unconfigured, confirm the UI says unconfigured and lists what
 is missing rather than presenting as broken." This drives the Dashboard's
 persistent setup-health card (Task 4) against the preflight API (Task 3) and
 asserts it renders a named degraded state instead of crashing or claiming green.

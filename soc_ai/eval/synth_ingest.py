@@ -156,6 +156,25 @@ async def _refresh(elastic: ElasticClient, indices: set[str]) -> None:
             return
 
 
+def _no_triage_target(scenario_id: str) -> RuntimeError:
+    """The refusal for a scenario with nothing to triage, raised before any write.
+
+    A scenario with no triage target is legal since the catalogue gained its
+    second population (see Scenario._at_most_one_triage_target), but it belongs
+    to the DECLARATIVE instrument and cannot be triaged: there is no alert for
+    the harness to sample. Callers are expected to reject it before planting;
+    this is the ingester's own check, made before its first write so a caller
+    that did not still leaves nothing on the grid. The message says which
+    population the scenario is in rather than implying the render is broken.
+    """
+    return RuntimeError(
+        f"scenario {scenario_id!r} has no triage target, so it cannot be triaged. "
+        "It declares a spec_journey and belongs to the declarative population: "
+        "score it with `soc-ai spec-run` / the spec_journey coverage gate, not the "
+        "triage batch. Nothing was planted."
+    )
+
+
 def plant_id_for(scenario_id: str, repeat: int) -> str:
     """The ``synth.scenario_id`` scope key for one planted copy of a scenario.
 
@@ -179,31 +198,27 @@ async def ingest_scenario(
     plant_id = plant_id_for(scenario.id, repeat)
     docs = render_scenario(scenario, run_time=run_time, plant_id=plant_id)
     _check_synth_prefix(docs, scenario.id)
+    # Decided from the rendered docs, before the first write: the check is
+    # cheap, and finding out after the loop would leave the whole plant on the
+    # grid with an error saying so.
+    target_pos = next((i for i, doc in enumerate(docs) if doc.is_triage_target), None)
+    if target_pos is None:
+        raise _no_triage_target(scenario.id)
 
-    triage_doc_id: str | None = None
-    triage_index: str | None = None
     touched: set[str] = set()
+    doc_ids: list[str] = []
     doc_ids_by_event: dict[str, list[str]] = {}
     for doc in docs:
         doc_id = await _index_one(elastic, doc)
+        doc_ids.append(doc_id)
         touched.add(doc.index)
         doc_ids_by_event.setdefault(doc.index, []).append(doc_id)
-        if doc.is_triage_target:
-            triage_doc_id = doc_id
-            triage_index = doc.index
-
-    if triage_doc_id is None or triage_index is None:
-        # Defensive — render_scenario enforces exactly-one triage target,
-        # but we should still fail loudly if somehow none was indexed.
-        raise RuntimeError(
-            f"scenario {scenario.id!r} ingested {len(docs)} docs but no triage target was tagged"
-        )
 
     await _refresh(elastic, touched)
     return IngestResult(
         scenario_id=scenario.id,
-        triage_doc_id=triage_doc_id,
-        triage_index=triage_index,
+        triage_doc_id=doc_ids[target_pos],
+        triage_index=docs[target_pos].index,
         doc_count=len(docs),
         doc_ids_by_event=doc_ids_by_event,
         plant_id=plant_id,
@@ -256,9 +271,11 @@ async def ingest_scenarios(
 ) -> list[IngestResult]:
     """Render + ingest each scenario sequentially, ``repeats`` copies apiece.
 
-    Runs the production-containment check first: if a synthetic document is
-    already sitting outside ``logs-synth-*``, the whole batch refuses before
-    a single write.
+    Two checks run before a single write, and both refuse the whole batch: the
+    production-containment check (a synthetic document already sitting outside
+    ``logs-synth-*``), and the triage-target check every scenario would fail on
+    its own turn. Refusing a no-alert scenario only when its turn came would
+    leave every scenario before it planted.
 
     Each of a scenario's ``repeats`` plants is stamped with its own
     :func:`plant_id_for` scope key (repeat 0 = the bare id), so repeated runs
@@ -272,6 +289,11 @@ async def ingest_scenarios(
     """
     if repeats < 1:
         raise ValueError(f"repeats must be >= 1, got {repeats}")
+    # The same decision ingest_scenario makes from its rendered docs, made here
+    # from the events, which carry the flag the render copies one to one.
+    for scenario in scenarios:
+        if not any(event.is_triage_target for event in scenario.events):
+            raise _no_triage_target(scenario.id)
     await assert_no_synth_in_production(elastic, elastic._settings)
     return [
         await ingest_scenario(s, elastic=elastic, run_time=run_time, repeat=k)

@@ -8,7 +8,7 @@
 // reachable" directly above its own circuit-breaker detail line, sending the
 // analyst to check connectivity and firewalls when the grid was up and shedding
 // load.
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AlertGroup, Verdict } from '../lib/types';
@@ -16,7 +16,7 @@ import type { Health } from '../lib/api';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [], truncated: false, other_docs: 0 }),
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   listInvestigations: vi.fn().mockResolvedValue({
@@ -36,6 +36,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
 }));
 
+import { queueOf } from '../test/alertQueue';
 import { Dashboard } from './Dashboard';
 import { getAlerts, getHealth } from '../lib/api';
 
@@ -74,7 +75,7 @@ const untriagedGroup: AlertGroup = {
 };
 
 beforeEach(() => {
-  vi.mocked(getAlerts).mockResolvedValue([]);
+  vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
   vi.mocked(getHealth).mockResolvedValue(null as unknown as Health);
 });
 
@@ -97,7 +98,7 @@ describe('Dashboard awaiting-investigation tile — unknown is not zero', () => 
   });
 
   it('still offers the hand-triage link when a group really is waiting', async () => {
-    vi.mocked(getAlerts).mockResolvedValue([untriagedGroup]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([untriagedGroup]));
     await mount();
     expect(await screen.findByText(/triage from Alerts/i)).toBeTruthy();
   });
@@ -116,7 +117,7 @@ describe('Dashboard awaiting-investigation tile — unknown is not zero', () => 
     vi.mocked(getHealth).mockResolvedValue(
       health({ ok: false, kind: 'partial', detail: 'the grid read only 2 of 4 shards' }),
     );
-    vi.mocked(getAlerts).mockResolvedValue([]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
     await mount();
     expect((await awaitingTile()).textContent).toContain('queue clear');
   });
@@ -163,6 +164,30 @@ describe('Dashboard connection banner — the headline names the failure', () =>
     const banner = await screen.findByRole('alert');
     expect(banner.textContent).toContain('not reachable');
   });
+
+  // The Security Onion web API carries every acknowledge, escalate and case
+  // write. It was absent from /health entirely, so a hung API left both the
+  // header pill and this banner silent (dogfood 2026-09-07, D1).
+  it('names the Security Onion API when it is the upstream that is down', async () => {
+    vi.mocked(getHealth).mockResolvedValue({
+      es: { ok: true, detail: 'up' },
+      llm: { ok: true, detail: 'up' },
+      so: { ok: false, kind: 'timeout', detail: 'took the request, never answered' },
+    } as Health);
+    await mount();
+    const banner = await screen.findByRole('alert');
+    expect(banner.textContent).toContain('Security Onion API');
+  });
+
+  it('raises no banner for a payload with no Security Onion component at all', async () => {
+    // An older server never sends `so`. "Not reported" is not "down".
+    vi.mocked(getHealth).mockResolvedValue({
+      es: { ok: true, detail: 'up' },
+      llm: { ok: true, detail: 'up' },
+    } as Health);
+    await mount();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
 });
 
 // The fix above keys off `alerts.error`, which is a FOREGROUND load failure —
@@ -176,7 +201,7 @@ describe('Dashboard connection banner — the headline names the failure', () =>
 describe('Dashboard KPI row — a grid that dies with the tab open', () => {
   const outageAfterFirstLoad = () => {
     vi.mocked(getAlerts)
-      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(queueOf([]))
       .mockRejectedValue(new Error('grid_unavailable'));
     vi.mocked(getHealth).mockResolvedValue(
       health({ ok: false, kind: 'overloaded', detail: 'the grid is up but shedding load' }),
@@ -214,12 +239,12 @@ describe('Dashboard KPI row — a grid that dies with the tab open', () => {
   it('dates the counts it is still showing instead of passing them off as current', async () => {
     outageAfterFirstLoad();
     await mountAndSettle();
-    expect(screen.queryByText(/Showing data from/)).toBeNull(); // healthy: no marker
+    expect(screen.queryByText(/This data is from/)).toBeNull(); // healthy: no marker
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(65_000);
     });
-    expect(screen.getByText(/Showing data from/)).toBeTruthy();
+    expect(screen.getByText(/This data is from/)).toBeTruthy();
   });
 
   it('rides out a single missed poll without crying stale', async () => {
@@ -229,15 +254,39 @@ describe('Dashboard KPI row — a grid that dies with the tab open', () => {
     // ignore. `failCount >= 2` is the house threshold (Hosts, Hunts,
     // Notifications, Investigations all use it) and this screen keeps it.
     vi.mocked(getAlerts)
-      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(queueOf([]))
       .mockRejectedValueOnce(new Error('grid_unavailable'))
-      .mockResolvedValue([]);
+      .mockResolvedValue(queueOf([]));
     await mountAndSettle();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(35_000);
     });
-    expect(screen.queryByText(/Showing data from/)).toBeNull();
+    expect(screen.queryByText(/This data is from/)).toBeNull();
     expect(awaitingTileNow().textContent).toContain('queue clear');
+  });
+
+  it('answers a Refresh clicked from the stale line, even when that refresh fails too', async () => {
+    // The stale line's own button is this row's only foreground refetch.
+    // useAsync keeps the fail count through a foreground failure and sets
+    // `error`; with the stale branch checked first the click landed on the
+    // same "This data is from" line and the failure was silent. The hunt
+    // catalog panel checks `error` first for the same reason.
+    outageAfterFirstLoad();
+    await mountAndSettle();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(65_000);
+    });
+    const stale = screen.getByText(/This data is from/).closest<HTMLElement>('[role="status"]')!;
+
+    await act(async () => {
+      fireEvent.click(within(stale).getByText('Refresh'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.getByText(/Refresh failed/)).toBeTruthy();
+    // One notice, not a lingering plain stale line beside the failure one —
+    // "Refresh failed. This data is from…" replaces it in place.
+    expect(screen.getAllByText(/This data is from/)).toHaveLength(1);
   });
 });
 
@@ -248,7 +297,7 @@ describe('Dashboard KPI row — a grid that dies with the tab open', () => {
 // under a header now reading "last 1h" as if it had been read for it.
 describe('Dashboard KPI row — a refresh the analyst asked for and did not get', () => {
   it('says the counts are from the earlier read, and keeps them', async () => {
-    vi.mocked(getAlerts).mockResolvedValue([untriagedGroup]);
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([untriagedGroup]));
     await mount();
     // `mount` waits for the outcomes chart, which renders off a DIFFERENT fetch —
     // so it can return while the alerts read is still in flight and the tile is

@@ -99,3 +99,40 @@ CRED_VALUE_STOPSET: frozenset[str] = frozenset(
         "self",
     }
 )
+
+
+# A credential value learned from FREE TEXT must look like an account name.
+# Two production refusals on 2026-09-17 came from values the KV net accepted
+# but no account could be: ``n`` (the ``n`` of ``user: n/a``) and
+# ``r...v....W`` (a printable dump of shellcode after an ``account`` token).
+# Each was learned by the redacter, then found again by the residue net in a
+# field the redacter does not rewrite, and every escalation was refused. Both
+# nets apply this ONE rule, so a value one net will not learn is a value the
+# other will not flag.
+CRED_VALUE_MIN_LEN: int = 3
+CRED_VALUE_MIN_ALNUM: int = 3
+CRED_VALUE_MIN_ALNUM_RATIO: float = 0.6
+
+
+def plausible_credential_value(val: str) -> bool:
+    """True if *val* has the shape of an account name."""
+    if len(val) < CRED_VALUE_MIN_LEN:
+        return False
+    alnum = sum(1 for c in val if c.isalnum())
+    if alnum < CRED_VALUE_MIN_ALNUM:
+        return False
+    return alnum / len(val) >= CRED_VALUE_MIN_ALNUM_RATIO
+
+
+def plausible_netbios_domain(val: str) -> bool:
+    """True if *val* has the shape of a NetBIOS domain or a host name.
+
+    A printable dump of shellcode (``c.w.....w.0..TO.....vU..S.``) matched the
+    domain half of the ``DOMAIN\\user`` rule on 2026-09-17 and was learned as a
+    host. A name never has two dots in a row, never starts or ends with a dot,
+    and is mostly letters and digits.
+    """
+    if ".." in val or val.startswith(".") or val.endswith("."):
+        return False
+    alnum = sum(1 for c in val if c.isalnum())
+    return alnum >= 2 and alnum / len(val) >= CRED_VALUE_MIN_ALNUM_RATIO

@@ -198,7 +198,7 @@ async def test_f18_rejected_spawn_leaves_schedule_unstamped(
             self.calls = 0
 
         async def start(
-            self, _state: Any, *, objective: str, started_by: str, kind: str
+            self, _state: Any, *, objective: str, started_by: str, kind: str, **_kwargs: Any
         ) -> str | None:
             self.calls += 1
             return "H1" if self.calls == 1 else None  # second rejected at ceiling

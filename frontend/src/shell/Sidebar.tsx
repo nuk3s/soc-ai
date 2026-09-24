@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { type ReactNode, useEffect, useState } from 'react';
-import { getAbout, getMe } from '../lib/api';
+import { getAbout, getMe, getNeedsYou, onNeedsYouChanged } from '../lib/api';
 import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { AccountMenu } from './AccountMenu';
@@ -104,9 +104,37 @@ export function Sidebar() {
   // since there's no SSR concern for this value).
   const [operateStoredCollapsed, setOperateStoredCollapsed] = useState<boolean>(readStoredOperateCollapsed);
 
+  // What waits on the analyst: the unread shadow hits plus the leads that wait
+  // on a decision. The Needs-you strip at the top of the Hunts page states the
+  // same number, so the nav and the page cannot disagree.
+  // A failed read is not a zero. The badge went away on a 503, and the nav then
+  // read exactly like a quiet day.
+  const [needsYou, setNeedsYou] = useState(0);
+  const [needsYouFailed, setNeedsYouFailed] = useState(false);
+
   useEffect(() => {
     getMe().then(setMe).catch(() => {/* keep placeholder */});
     getAbout().then(setAbout).catch(() => {/* version line just stays hidden */});
+  }, []);
+
+  useEffect(() => {
+    const read = () =>
+      getNeedsYou()
+        .then((r) => {
+          setNeedsYou(r.total);
+          setNeedsYouFailed(false);
+        })
+        .catch(() => setNeedsYouFailed(true));
+    read();
+    const timer = window.setInterval(read, 60_000);
+    // The API emits the change the moment a hit is read or a lead moves.
+    // Without this the badge held the old count for up to 60 s beside a page
+    // that had already cleared it.
+    const stop = onNeedsYouChanged(read);
+    return () => {
+      window.clearInterval(timer);
+      stop();
+    };
   }, []);
 
   // Force-expand: while the active route lives inside the Operate group, it
@@ -198,6 +226,24 @@ export function Sidebar() {
                           {n.label}
                         </span>
                       )}
+                      {!collapsed && n.to === '/hunts' && (needsYou > 0 || needsYouFailed) && (
+                        <span
+                          data-testid="sidebar-needs-you"
+                          className="rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums"
+                          style={
+                            needsYouFailed
+                              ? { color: '#8b949e', borderColor: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.1)' }
+                              : { color: '#d29922', borderColor: 'rgba(210,153,34,.45)', background: 'rgba(210,153,34,.1)' }
+                          }
+                          title={
+                            needsYouFailed
+                              ? 'Could not read what needs you. Open Hunts to try again.'
+                              : 'Unread shadow hits, plus leads that wait on a decision. Open Hunts to read them.'
+                          }
+                        >
+                          {needsYouFailed ? '?' : needsYou}
+                        </span>
+                      )}
                       {!collapsed && n.dev && (
                         <span
                           className="rounded-chip border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-[.04em]"
@@ -234,7 +280,7 @@ export function Sidebar() {
       {about && (
         <NavLink
           to="/config#about"
-          title={`soc-ai v${about.version} — About`}
+          title={`About soc-ai v${about.version}`}
           aria-label={`About soc-ai, version ${about.version}`}
           className="mb-1.5 flex items-center gap-2.5 rounded-control px-[9px] py-[6px] text-faint hover:bg-surface-3 hover:text-text"
           style={{ justifyContent: collapsed ? 'center' : 'flex-start' }}

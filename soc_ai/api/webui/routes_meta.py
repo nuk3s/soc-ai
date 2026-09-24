@@ -10,17 +10,21 @@ from typing import Any, Literal
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from sqlalchemy import select
 
 from soc_ai import __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
+from soc_ai.api.webui import routes_hunts
 from soc_ai.api.webui._shared import (
     _ago,
+    _iso_utc,
     client_ip,
     open_router,
     require_admin_api,
     router,
 )
+from soc_ai.api.webui.kind_labels import kind_label
 from soc_ai.bootstrap_credential import clear_bootstrap_credential
 from soc_ai.config import Settings
 from soc_ai.demo.guard import is_demo
@@ -29,6 +33,7 @@ from soc_ai.store import auth as auth_svc
 from soc_ai.store import host_dossier as dossier_svc
 from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store import quality as quality_svc
 from soc_ai.store import saved_views as views_svc
 from soc_ai.webui import (
     probes,
@@ -97,6 +102,18 @@ class NotificationOut(BaseModel):
     # with nothing beside it reads as real activity. Defaults False for the
     # entries minted from non-run state (dep outages, dossier conflicts).
     isSynthEval: bool = False
+    # Whether the client may silence this entry. Defaults True: every standing
+    # bell entry is client-dismissible on a stable id, and that is the whole
+    # mechanism. False is for the one finding that must not be silenceable from
+    # a browser's local storage: an audit record whose content no longer
+    # matches its own hash, which "Clear all" would otherwise sweep away in a
+    # click (see soc_ai.audit.verify.finding_is_dismissible).
+    dismissible: bool = True
+    # Which section of the Notifications screen this entry belongs to. The
+    # screen grouped on the title text, so a lead and a shadow hit landed in
+    # different sections and a renamed title moved an entry. "hunting" is the
+    # leads and the shadow hits. Everything else is "system".
+    group: str = "system"
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -117,6 +134,13 @@ _NOTIF_WINDOW = timedelta(hours=24)
 # investigation and hunt off it.
 _DOSSIER_NOTIF_CAP = 3
 
+# Failed triages shown at once. A gateway outage can fail dozens of runs in a
+# window, and the bell holds 12 items total, so an outage must not be the whole
+# panel. The Dashboard's pipeline-error tile carries the full standing count and
+# the list behind it is the complete set; this is the "it is happening now"
+# signal, not the ledger.
+_FAILED_NOTIF_CAP = 3
+
 # What to call the trouble, per probe classification (soc_ai.webui.probes). The
 # bell said "unreachable" for every one of them, including a grid answering 429
 # in the same second (dogfood 2026-08-14, D9). An unclassified failure keeps
@@ -125,6 +149,10 @@ _DEP_TROUBLE = {
     "partial": "reading only part of the grid",
     "overloaded": "overloaded and shedding load",
     "timeout": "not answering",
+    # Reachable but with no events index pattern configured: the connection is
+    # fine and nothing can be read through it, which "unreachable" would
+    # misdescribe and send the reader at the network.
+    "unreadable": "reachable but not readable, with no events index pattern",
 }
 
 
@@ -138,7 +166,76 @@ def _conflict_line(host: Any, field: Any) -> str:
         inferred = (field.inferred_value or "?")[:40]
         operator = (field.operator_value or "?")[:40]
         detail = f'telemetry says "{inferred}", yours says "{operator}"'
-    return f"Dossier conflict on {host.ip} — {field.field}: {detail}"
+    return f"Dossier conflict on {host.ip}, {field.field}: {detail}"
+
+
+def _audit_chain_notifications(request: Request) -> list[NotificationOut]:
+    """A standing bell entry while the tamper-evident audit chain is broken.
+
+    Read straight off the scheduled verification's in-memory alarm slot (see
+    :func:`soc_ai.main._audit_verify_loop`) — this endpoint is polled every 15
+    seconds and must never scan the audit index itself. The notification
+    webhook is off by default, so on a stock install this is the ONLY path a
+    tamper finding has to a human; that is why it is here and not only there.
+
+    The id is the identity of the FINDING (see
+    :func:`~soc_ai.audit.verify.finding_key`), so a dismissal holds for that
+    finding and anything that breaks afterwards arrives undismissed. It used to
+    be keyed on the moment of detection, which every run moves, so the entry
+    could not be cleared at all: on the deployed instance that was an
+    undismissable danger notification every day until a forked stretch of
+    history aged out of the seven-day window. A finding that includes a record
+    whose content no longer matches its own hash is not dismissible at any
+    price (``dismissible=False``). See
+    :func:`~soc_ai.audit.verify.finding_is_dismissible`.
+
+    Clearing is still automatic as well: the loop empties the slot as soon as a
+    verification comes back clean.
+    """
+    alarm = getattr(getattr(request.app.state, "_audit_verify_status", None), "alarm", None)
+    if not isinstance(alarm, dict):
+        return []
+    detected = str(alarm.get("detected_at") or "")
+    # Fall back to the detection stamp only for an alarm raised by an older
+    # process that had no finding key; the entry is still shown either way.
+    key = str(alarm.get("alarm_key") or detected)
+    since = str(alarm.get("alarm_since") or detected)
+    kind = str(alarm.get("break_kind") or "unknown")
+    detail = str(
+        alarm.get("blast_radius")
+        or alarm.get("break_detail")
+        or "the audit hash chain does not verify"
+    )
+    # Say WHEN this was measured and OVER WHAT. On the range the bell read four
+    # duplicated positions while `soc-ai audit verify` reported six, and neither
+    # surface said why: the scheduled check scans `audit_verify_days` (7 here)
+    # and the CLI defaults to the whole retained chain, so they were answering
+    # different questions with the same-shaped sentence. Both numbers were right.
+    #
+    # Two integrity surfaces disagreeing about the size of an integrity problem
+    # is its own finding. The fix is not to pick one — it is to make each say
+    # what it looked at, so an operator can see they are not in conflict.
+    measured = _ago(detected) if detected else ""
+    window = alarm.get("window_days")
+    scope = f"the last {window} days" if isinstance(window, int) and window > 0 else ""
+    covered = f" The check covered {scope}." if scope else ""
+    if not measured:
+        ran = ""
+    elif measured == "now":
+        ran = " The check ran just now."
+    else:
+        ran = f" The check ran {measured} ago."
+    dated = f"{detail}{covered}{ran}"
+    return [
+        NotificationOut(
+            id=f"audit-chain-break:{key}",
+            tone="danger",
+            title=f"Audit trail broken ({kind}): {dated}",
+            when=_ago(since) if since else "just now",
+            href="/config",
+            dismissible=alarm.get("dismissible") is not False,
+        )
+    ]
 
 
 async def _dossier_conflict_notifications(request: Request) -> list[NotificationOut]:
@@ -192,6 +289,211 @@ async def _dossier_conflict_notifications(request: Request) -> list[Notification
     return out
 
 
+# The bell id prefix the Quality card ALREADY mints for its own dismiss control
+# (frontend/src/components/QualityCard.tsx::DISMISS_PREFIX). Reused verbatim, and
+# with the same `<alarm_key>@<alarm_since>` body, so the card and the bell are two
+# views of one finding and one dismissal silences both. Two prefixes would have
+# meant clearing the same alarm twice, in two places, forever.
+_QUALITY_ALARM_PREFIX = "quality-alarm:"
+
+# The one alarm code that is NOT about verdict quality: the eval errored, so
+# nothing was graded. Mirrors QualityCard's CODE_ERROR_CEILING — "the grader
+# could not run" and "the verdicts got worse" need different responses from an
+# operator, so they must not share a headline here either.
+_CODE_ERROR_CEILING = "error_ceiling"
+
+
+async def _quality_alarm_notifications(request: Request) -> list[NotificationOut]:
+    """A standing bell entry while the nightly quality alarm is up.
+
+    The alarm had two channels and neither reached a human on a stock install:
+    an audit record, which nobody reads unprompted, and a webhook that is off by
+    default and stays off on any deployment that has not opted into egress. That
+    left the Quality card on the dashboard as the only surface where a verdict
+    regression could be learned about — a card you have to already suspect
+    something to go and look at. Every other standing condition in this product
+    (dependency down, audit chain broken, dossier conflict) has a bell entry;
+    this is the same class of fact and now has one too.
+
+    Read from the newest snapshot only, because the alarm is a statement about
+    the CURRENT state of the trend and an older alarmed point is history the card
+    already plots. One indexed `ORDER BY id DESC LIMIT 1` — this endpoint is
+    polled every 15 seconds by every open tab and must stay DB-fast.
+
+    **The id is the identity of the CONDITION, not the moment it was noticed.**
+    ``alarm_key`` (the sorted rule codes) says which condition, ``alarm_since``
+    says which instance of it, and the writer holds ``alarm_since`` steady for as
+    long as the condition persists. So a dismissal lasts exactly as long as the
+    operator's judgement does: it survives every re-observation of the same
+    condition, and a genuinely new alarm — a different code, or the same code
+    raised again after a clean night — arrives undismissed. Keying on the run
+    that observed it would produce an entry that cannot be cleared, which is the
+    bug the audit-chain entry had and was fixed for.
+
+    A pre-0027 row carries no key, so there is no identity to dismiss against and
+    no entry is minted: an undismissable danger notification is worse than a
+    quiet one, and the card still shows it.
+
+    Fail-soft like every other read here — a broken store must not take the whole
+    bell down with it.
+    """
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            rows = await quality_svc.recent_snapshots(db, limit=1)
+    except Exception:
+        _LOGGER.warning("notifications: quality alarm read failed (continuing)", exc_info=True)
+        return []
+    if not rows:
+        return []
+    latest = rows[0]
+    if not latest.alarmed or not latest.alarm_key:
+        return []
+
+    codes = [c for c in str(latest.alarm_key).split("+") if c]
+    pipeline_only = codes == [_CODE_ERROR_CEILING]
+    if pipeline_only:
+        # Naming it accurately matters more than the fright: an operator who
+        # reads "verdict quality regressed" when the eval simply crashed goes
+        # looking for a model problem that is not there.
+        title = f"Nightly quality eval failing: {latest.n_error} of "
+        title += f"{latest.n_ok + latest.n_error} runs errored. Nothing was graded."
+        tone = "warn"
+    else:
+        title = f"Verdict quality alarm ({'+'.join(codes)})"
+        # The detector's own first reason, which carries the live numbers the
+        # codes cannot. Absent on a row written before the reasons were stored,
+        # and the codes alone are still a usable sentence, so it is appended
+        # rather than depended on.
+        reasons = latest.alarm_reasons or []
+        if reasons:
+            title += f": {reasons[0]}"
+        # Danger, matching the audit-chain entry: a regression in the verdicts
+        # this product exists to produce is not an operational nuisance.
+        tone = "danger"
+
+    since = _iso_utc(latest.alarm_since) if latest.alarm_since else _iso_utc(latest.created_at)
+    return [
+        NotificationOut(
+            id=f"{_QUALITY_ALARM_PREFIX}{latest.alarm_key}@{since}",
+            tone=tone,
+            title=title,
+            when=_ago(since),
+            href="/dashboard",
+        )
+    ]
+
+
+# Shadow hits and leads shown in the bell at once. The panel scrolls and the
+# Notifications screen holds the full list, so these caps only stop one noisy
+# night from pushing every investigation and hunt off the panel.
+_SHADOW_HIT_NOTIF_CAP = 20
+_LEAD_NOTIF_CAP = 20
+
+
+async def _shadow_hit_notifications(request: Request) -> list[NotificationOut]:
+    """One bell entry per unread shadow hit.
+
+    The unread flag is the transition gate: opening the receipts on Hunts sets
+    ``read_at`` and the entry goes. The entry is not client-dismissible for the
+    same reason the audit-chain entry is not. A shadow analytic that found a
+    true positive and was cleared from a browser is the failure this layer
+    exists to prevent.
+
+    The rows are the ones ``GET /hunts/needs-you`` counts. The clause lives in
+    one place, so the bell cannot announce a hit the hits surface hides. It
+    announced a hit from a retired analytic, and the analyst could neither find
+    the card nor read the row away.
+
+    DB-only and fail-soft, like everything else on this endpoint. It is polled
+    every 15 s and has to keep working when a part of the system is broken.
+    """
+    from soc_ai.api.webui.routes_analytics import (  # noqa: PLC0415 - lazy
+        unread_shadow_hits_where,
+    )
+    from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import EntityObservation  # noqa: PLC0415 - lazy
+
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            cat = await effective_catalog(db)
+            rows = (
+                await db.scalars(
+                    select(EntityObservation)
+                    .where(*unread_shadow_hits_where(cat))
+                    .order_by(EntityObservation.born_at.desc())
+                    .limit(_SHADOW_HIT_NOTIF_CAP)
+                )
+            ).all()
+    except Exception:
+        _LOGGER.warning("notifications: shadow-hit read failed (continuing)", exc_info=True)
+        return []
+
+    out: list[NotificationOut] = []
+    for observation in rows:
+        spec = cat.listed.get(observation.spec_id)
+        title = spec.title if spec is not None else observation.spec_id
+        out.append(
+            NotificationOut(
+                id=f"shadow-hit:{observation.id}",
+                tone="warn",
+                title=f"Shadow hit: {title} on {observation.entity_key}",
+                when=_ago(observation.born_at.replace(tzinfo=UTC).isoformat()),
+                # The filter that holds the hit, not a bare anchor. The anchor
+                # scrolled the block into view on filter All, where the card
+                # the bell named was one of many.
+                href="/hunts?hits=unread",
+                dismissible=False,
+                group="hunting",
+            )
+        )
+    return out
+
+
+async def _lead_notifications(request: Request) -> list[NotificationOut]:
+    """One bell entry per lead formed in the window.
+
+    The id carries the lead id, so a client-side dismissal holds for that lead
+    and the bell announces one lead once. A shadow lead reads warn because it
+    still needs a read. A shadow lead starts nothing by itself.
+    """
+    from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
+
+    cutoff = auth_svc.utcnow() - _NOTIF_WINDOW
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            rows = (
+                await db.scalars(
+                    select(Lead)
+                    .where(Lead.formed_at >= cutoff, Lead.status.in_(("open", "hunting")))
+                    .order_by(Lead.formed_at.desc())
+                    .limit(_LEAD_NOTIF_CAP)
+                )
+            ).all()
+    except Exception:
+        _LOGGER.warning("notifications: lead read failed (continuing)", exc_info=True)
+        return []
+
+    out: list[NotificationOut] = []
+    for lead in rows:
+        entities = [
+            str(entity[1])
+            for entity in (lead.entities_json or [])
+            if isinstance(entity, list | tuple) and len(entity) == 2
+        ]
+        kinds = ", ".join(kind_label(kind) for kind in (lead.kinds_json or []))
+        out.append(
+            NotificationOut(
+                id=f"lead:{lead.id}",
+                tone="warn" if lead.shadow else "accent",
+                title=f"Lead {lead.id} formed on {', '.join(entities) or 'an entity'}: {kinds}",
+                when=_ago(lead.formed_at.replace(tzinfo=UTC).isoformat()),
+                href=f"/leads/{lead.id}",
+                group="hunting",
+            )
+        )
+    return out
+
+
 @router.get("/notifications", response_model=list[NotificationOut])
 async def list_notifications(request: Request) -> list[NotificationOut]:
     """In-flight runs + last-24h completions (investigations and hunts).
@@ -209,7 +511,11 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
     # DB-fast and never probe ES itself (it is polled every 15s and must keep
     # working precisely when ES is down). Id is stable per outage (keyed on the
     # flip time) so a client-side dismissal holds for the outage's duration.
-    _DEP_LABEL = {"es": "Security Onion / Elasticsearch", "llm": "LLM gateway"}
+    _DEP_LABEL = {
+        "es": "Security Onion / Elasticsearch",
+        "llm": "LLM gateway",
+        "so": "Security Onion API",
+    }
     down_since = getattr(request.app.state, "_dep_down_since", None) or {}
     down_kind = getattr(request.app.state, "_dep_down_kind", None) or {}
     for dep, since in down_since.items():
@@ -218,12 +524,16 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             NotificationOut(
                 id=f"dep-down:{dep}:{since.strftime('%Y%m%d%H%M%S')}",
                 tone="danger",
-                title=f"{_DEP_LABEL.get(dep, dep)} {trouble} — investigations degraded",
+                title=f"{_DEP_LABEL.get(dep, dep)} {trouble}. Investigations are degraded.",
                 when=_ago(since.isoformat()),
                 href=None,
             )
         )
+    out.extend(_audit_chain_notifications(request))
+    out.extend(await _quality_alarm_notifications(request))
     out.extend(await _dossier_conflict_notifications(request))
+    out.extend(await _shadow_hit_notifications(request))
+    out.extend(await _lead_notifications(request))
     # Column-scoped reads (never the report JSON blob): the bell reads ~5 scalar
     # fields from investigations and a denormalized findings_count from hunts, and
     # this endpoint is polled every 15s by every open tab. Both completed-runs
@@ -235,8 +545,32 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
         completed = await inv_svc.list_recent_notifications(
             db, status="complete", limit=20, finished_since=cutoff
         )
+        failed = await inv_svc.list_recent_notifications(
+            db,
+            status="error",
+            limit=_FAILED_NOTIF_CAP,
+            finished_since=cutoff,
+            no_verdict=True,
+            exclude_dismissed=True,
+        )
         hunts_done = await hunts_svc.list_recent_notifications(
             db, status="complete", limit=10, finished_since=cutoff
+        )
+    # A triage that died goes with the standing entries, not the completions:
+    # it is the same class of fact as a dependency being down, and putting it
+    # behind a busy hour's verdicts is how it stays unseen. Ten weeks of these
+    # accumulated on the deployed instance without one surface saying so.
+    for inv in failed:
+        stamp = inv.finished_at or inv.created_at
+        out.append(
+            NotificationOut(
+                id=f"inv-failed:{inv.id}",
+                tone="danger",
+                title=f"Triage failed, no verdict: {inv.rule_name or inv.id}",
+                when=_ago(stamp.isoformat()),
+                href=f"/investigation/{inv.id}",
+                isSynthEval=bool(inv.is_synth_eval),
+            )
         )
     for inv in running:
         out.append(
@@ -273,13 +607,27 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             )
         )
     for h in hunts_done:
-        # Denormalized count (migration 0028) — no report blob deserialized here.
+        # Denormalized counts (migrations 0028, 0044) — no report blob here.
         n = h.findings_count or 0
+        threats = h.threat_findings_count
+        if n and threats == 0:
+            # Every finding is a gap or an observation. "1 finding" over a
+            # timed-out query was the most alarming line the app can print,
+            # meaning nothing; the count is dropped because counting gaps as
+            # findings is how it got there.
+            # One phrase for this outcome, from routes_hunts. The list, the
+            # bell and the hunt page must not each invent their own words.
+            title = f"{routes_hunts.GAP_NOTIFICATION_TITLE}. {h.objective[:80]}"
+            tone = "accent"
+        else:
+            shown = threats if threats is not None else n
+            title = f"Hunt finished, {shown} finding{'' if shown == 1 else 's'}: {h.objective[:80]}"
+            tone = "warn" if shown else "accent"
         done.append(
             NotificationOut(
                 id=f"hunt-done:{h.id}",
-                tone="warn" if n else "accent",
-                title=f"Hunt finished — {n} finding{'' if n == 1 else 's'}: {h.objective[:80]}",
+                tone=tone,
+                title=title,
                 when=_ago((h.finished_at or h.created_at).isoformat()),
                 href=f"/hunts/{h.id}",
                 isSynthEval=bool(h.is_synth_eval),
@@ -387,31 +735,52 @@ class MeOut(BaseModel):
     username: str
     role: str
     status: str
+    # Whether a real user ROW is behind this request, which is a different
+    # question from "did this request get through". A bearer token is
+    # authenticated and has no user row; a deployment with the gate down has
+    # neither. Both are the states where per-user features (saved views,
+    # ownership as a way of telling analysts apart) cannot mean what they say,
+    # and the SPA had no way to find out: it rendered a Save-view control that
+    # 401s, or none at all, with nothing to tell an analyst which
+    # (dogfood 2026-09-07, D3).
+    signed_in: bool = False
 
 
 class SetStatusIn(BaseModel):
     status: str = Field(default="", max_length=120)
 
 
-_DEV_ME = MeOut(username="analyst", role="admin", status="")
+# The identity an unauthenticated deployment answers with. The name is the one
+# ``identify_caller`` already records on every write, and that agreement is the
+# whole point: it used to say "analyst" while the store said "anonymous", so
+# claiming an alert group grew an avatar and an owned chip while the Mine filter
+# stayed at zero forever. Both names render "AN" as initials, so nothing on
+# screen gave it away. The role stays admin because the admin surfaces genuinely
+# ARE open when ``api_auth_required`` is off.
+_DEV_ME = MeOut(username="anonymous", role="admin", status="", signed_in=False)
 
 
 @router.get("/me", response_model=MeOut)
 async def get_me(request: Request) -> MeOut:
-    """Return the current user's username, role, and status.
+    """Return the current user's username, role, status, and whether they are
+    actually signed in.
 
     A session-cookie user reports their own identity. With no session:
 
-    - ``api_auth_required`` False (dev / lab default): a stable dev fallback so
-      the SPA always has a user to render.
+    - ``api_auth_required`` False (dev / lab default): a stable fallback so the
+      SPA always has a user to render, carrying the same name every write on
+      this deployment is recorded under.
     - ``api_auth_required`` True: the caller reached here on a valid bearer token
       (``require_api_auth`` 401s otherwise, and it does NOT resolve a session),
       so report the TOKEN's identity — never the dev admin fallback, which would
       advertise an ``admin`` role the token cannot exercise.
+
+    ``signed_in`` is true only in the first case. It is what lets a surface that
+    needs a user row say so plainly instead of failing quietly.
     """
     user = await current_user(request)
     if user is not None:
-        return MeOut(username=user.username, role=user.role, status=user.status)
+        return MeOut(username=user.username, role=user.role, status=user.status, signed_in=True)
     settings = request.app.state.settings
     if not settings.api_auth_required:
         return _DEV_ME
@@ -420,7 +789,7 @@ async def get_me(request: Request) -> MeOut:
         async with request.app.state.db_sessionmaker() as db:
             token = await auth_svc.check_api_token(db, authz[7:].strip())
         if token is not None:
-            return MeOut(username=f"token:{token.name}", role="token", status="")
+            return MeOut(username=f"token:{token.name}", role="token", status="", signed_in=False)
     raise HTTPException(status_code=401, detail={"reason": "no_session"})
 
 
@@ -485,7 +854,7 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
             status_code=401,
             detail={
                 "reason": "no_session",
-                "hint": "Changing your password requires a signed-in session.",
+                "hint": "A password change requires a signed-in session.",
             },
         )
     settings = request.app.state.settings
@@ -502,7 +871,7 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
             status_code=429,
             detail={
                 "reason": "too_many_attempts",
-                "hint": "Too many incorrect attempts; try again later.",
+                "hint": "Too many incorrect attempts. Try again later.",
             },
         )
     if not await auth_svc.verify_password(body.current_password, user.password_hash):
@@ -522,7 +891,9 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
             status_code=400,
             detail={
                 "reason": "password_too_short",
-                "hint": (f"Password must be at least {auth_svc.MIN_PASSWORD_LENGTH} characters."),
+                "hint": (
+                    f"The password must be at least {auth_svc.MIN_PASSWORD_LENGTH} characters."
+                ),
             },
         )
     async with request.app.state.db_sessionmaker() as db:
@@ -539,7 +910,7 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
                 status_code=400,
                 detail={
                     "reason": "password_too_long",
-                    "hint": "Password must be at most 72 bytes (bcrypt's limit).",
+                    "hint": "The password must be at most 72 bytes. That is the bcrypt limit.",
                 },
             ) from exc
     # Only after the change actually landed: the startup log tells the operator
@@ -624,7 +995,7 @@ async def save_my_view(request: Request, body: SaveViewIn) -> SavedViewOut:
     if not name:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "empty_name", "hint": "A view needs a name to be a chip."},
+            detail={"reason": "empty_name", "hint": "A view needs a name."},
         )
     try:
         views_svc.validate_query(body.query)
@@ -643,8 +1014,8 @@ async def save_my_view(request: Request, body: SaveViewIn) -> SavedViewOut:
                 detail={
                     "reason": "too_many_views",
                     "hint": (
-                        f"You can keep {views_svc.MAX_VIEWS_PER_USER} saved views; "
-                        "delete one first."
+                        f"You can keep {views_svc.MAX_VIEWS_PER_USER} saved views. "
+                        "Delete one first."
                     ),
                 },
             ) from exc
@@ -702,6 +1073,11 @@ class HealthComponentOut(BaseModel):
 class HealthOut(BaseModel):
     es: HealthComponentOut
     llm: HealthComponentOut
+    # The Security Onion web API. Not optional: it is the path every
+    # acknowledge, escalate and case write travels, and the header pill it feeds
+    # is the product's one always-on trust indicator. Leaving it out is what let
+    # the pill say "connected" beside a card reporting a Security Onion timeout.
+    so: HealthComponentOut
     pcap: HealthComponentOut | None = None  # only when pcap_enabled
 
 
@@ -731,12 +1107,15 @@ async def _bounded_probe(coro: Any, dep: str) -> dict[str, Any]:
         return {
             "ok": False,
             "kind": "timeout",
-            "detail": f"{dep} probe exceeded {_HEALTH_PROBE_LEG_TIMEOUT_S:.0f}s — treating as down",
+            "detail": (
+                f"the {dep} probe exceeded {_HEALTH_PROBE_LEG_TIMEOUT_S:.0f} s. "
+                "soc-ai treats it as down."
+            ),
         }
 
 
 async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dict[str, Any]]:
-    """The ES + LLM probe results, TTL-cached on app state (single-flight).
+    """The ES + LLM + Security Onion probe results, TTL-cached (single-flight).
 
     Both are cheap when healthy, but a 30s dashboard poll across several tabs
     would otherwise hit ES + the gateway every time; the short TTL collapses
@@ -744,7 +1123,11 @@ async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dic
     a down grid, N concurrent polls against a cold cache used to launch N
     parallel hanging probes (result-only caching has no single-flight), which
     ate the browser's connection budget exactly when the UI most needed
-    /health to answer. Returns ``{"es": {...}, "llm": {...}}``.
+    /health to answer. Returns ``{"es": {...}, "llm": {...}, "so": {...}}``.
+
+    The three legs run under one lock and one TTL on purpose: they feed a single
+    indicator, so probing them on different clocks would let the pill's colour
+    disagree with its own dropdown.
     """
     lock = getattr(state, "_health_probe_lock", None)
     if lock is None:
@@ -758,6 +1141,10 @@ async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dic
         result = {
             "es": await _bounded_probe(probes.probe_es(state.elastic, settings), "elasticsearch"),
             "llm": await _bounded_probe(probes.probe_llm(settings), "llm gateway"),
+            "so": await _bounded_probe(
+                probes.probe_so_api(getattr(state, "auth", None), settings),
+                "security onion api",
+            ),
         }
         state._health_probe_cache = (now, result)
         _note_dep_transitions(state, result)
@@ -801,12 +1188,14 @@ async def health(
     request: Request,
     settings: Settings = Depends(get_settings_dep),
 ) -> HealthOut:
-    """Live status of the upstreams the UI depends on. ES + LLM are cheap HTTP
-    probes (short-TTL cached); PCAP (heavy SSH) is cached longer. Secret-free."""
+    """Live status of the upstreams the UI depends on. ES, the model gateway and
+    the Security Onion web API are cheap HTTP probes (short-TTL cached); PCAP
+    (heavy SSH) is cached longer. Secret-free."""
     probed = await _cached_health_probes(request.app.state, settings)
     out = HealthOut(
         es=HealthComponentOut(**probed["es"]),
         llm=HealthComponentOut(**probed["llm"]),
+        so=HealthComponentOut(**probed["so"]),
     )
     if settings.pcap_enabled:
         out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))

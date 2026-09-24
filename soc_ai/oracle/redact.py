@@ -86,7 +86,12 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from soc_ai.oracle._cred_data import CRED_KEYS, CRED_VALUE_STOPSET
+from soc_ai.oracle._cred_data import (
+    CRED_KEYS,
+    CRED_VALUE_STOPSET,
+    plausible_credential_value,
+    plausible_netbios_domain,
+)
 from soc_ai.oracle.sanitize import (
     Mapping,
     _is_private_ipv4,
@@ -133,7 +138,12 @@ _USER_FIELDS: frozenset[str] = frozenset(
 # stopset still applies, so a universal built-in (``SYSTEM`` / ``-`` / ``ANONYMOUS
 # LOGON``) is not tokenised — matching the free-text credential rule's discipline.
 _WINLOG_USER_LEAF_KEYS: frozenset[str] = frozenset(
-    {"targetusername", "subjectusername", "samaccountname", "accountname"}
+    # ``servicename`` joins the account leaves because on 4768/4769 its value is
+    # a service-principal name, which IS an account (``svc_sql``, ``MSSQLSvc/...``).
+    # Left unclassified it reached the backstop and came back an opaque mask, which
+    # is safe but loses Kerberoast attribution entirely; harvested as USER it
+    # tokenises, correlates with the same account elsewhere, and desanitises back.
+    {"targetusername", "subjectusername", "samaccountname", "accountname", "servicename"}
 )
 
 # Winlog/EVTX HOST LEAF keys — the parallel of ``_WINLOG_USER_LEAF_KEYS`` for
@@ -204,6 +214,18 @@ _DOMAIN_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+# Winlog/EVTX DOMAIN LEAF keys. Matched case-insensitively against the last path
+# segment, the same shape as the USER and HOST leaf sets above. Their value is
+# the AD domain or NetBIOS realm (``RANGE.LAB`` / ``RANGE``), which names the
+# organisation as plainly as a hostname does. These became reachable when the
+# OQL whitelist gained the Windows Security leaves the identity detections turn
+# on, so they are classified here in the same change rather than left to the
+# allow-known-safe backstop: the backstop would mask them, which is safe but
+# costs the Oracle the ability to tell two realms apart.
+_WINLOG_DOMAIN_LEAF_KEYS: frozenset[str] = frozenset(
+    {"subjectdomainname", "targetdomainname", "domainname", "dnsdomainname"}
+)
+
 # List-valued HOST fields: every element of the list is tokenised.
 _HOST_LIST_FIELDS: frozenset[str] = frozenset({"related.hosts"})
 
@@ -232,7 +254,7 @@ _DOMAIN_LIKE_FIELDS: frozenset[str] = frozenset(
         "dns_qname",
         "http_host",
         "tls_sni",
-        # t_host_summary's top-DNS aggregate leaf: ``top_dns: [{value, count}]``.
+        # t_host_summary's top-DNS leaf: ``top_dns: [{value, count_in_sample}]``.
         # A single-label / internal-suffix query name the host reached for is an
         # internal identifier under a generic ``value`` key the harvest could not
         # otherwise classify.
@@ -361,7 +383,7 @@ _CRED_KV_RE = re.compile(
     r"(?P<key>(?<![\w.])(?:" + _CRED_KEYS + r"))"
     r"(?P<sep>\s*\"?\s*[:=]\s*\"?)"
     r"(?P<val>" + _CRED_VALUE + r")"
-    r"(?![\w@-])",
+    r"(?![\w@/-])",
     re.IGNORECASE,
 )
 
@@ -369,11 +391,11 @@ _CRED_KV_RE = re.compile(
 # two space-joined words, matching no key alternation) and its domain sibling
 # ``Account Domain:  <DOMAIN>``.  The value runs after the ``:`` + whitespace.
 _CRED_ACCOUNT_NAME_RE = re.compile(
-    r"(?P<key>Account Name\s*:\s+)(?P<val>" + _CRED_VALUE + r")(?![\w@-])",
+    r"(?P<key>Account Name\s*:\s+)(?P<val>" + _CRED_VALUE + r")(?![\w@/-])",
     re.IGNORECASE,
 )
 _CRED_ACCOUNT_DOMAIN_RE = re.compile(
-    r"(?P<key>Account Domain\s*:\s+)(?P<val>" + _CRED_VALUE + r")(?![\w@-])",
+    r"(?P<key>Account Domain\s*:\s+)(?P<val>" + _CRED_VALUE + r")(?![\w@/-])",
     re.IGNORECASE,
 )
 
@@ -435,6 +457,8 @@ def _is_nonusername_token(val: str) -> bool:
         return True
     if val.isdigit():
         return True
+    if not plausible_credential_value(val):
+        return True
     return not any(c.isalpha() for c in val)
 
 
@@ -489,6 +513,12 @@ def _redact_credentials(text: str, mapping: Mapping) -> str:
         # A registry-hive / drive-shaped left token means this is a PATH
         # (``HKLM\Software``), not a logon name — leave it wholly untouched.
         if _is_nondomain_prefix(dom):
+            return m.group(0)
+        # A logon name has a name on BOTH sides of the backslash. A dump of
+        # shellcode has a backslash too, and its left half was learned as a
+        # host and then refused as residue. If either side fails the shape
+        # rule, this is not a logon and nothing here is learned.
+        if not plausible_netbios_domain(dom) or not plausible_credential_value(usr):
             return m.group(0)
         out_dom = dom
         if dom.lower() not in _NT_DOMAIN_STOPSET and not _OPAQUE_LABEL_FULL_RE.match(dom):
@@ -691,6 +721,52 @@ def _try_harvest_scalar(
         # still has an alnum char and is routed, so the prior fix's leak stays shut.
         if any(c.isalnum() for c in host_val):
             mapping.label_for(host_val, "HOST")
+        return
+
+    # Winlog/EVTX DOMAIN leaf keys (SubjectDomainName / TargetDomainName / …) —
+    # case-insensitive LEAF match, the parallel of the two routes above. Their
+    # value is the AD realm or its NetBIOS short form (``RANGE.LAB`` / ``RANGE``),
+    # which names the organisation as plainly as a hostname does. Unconditional
+    # like the HOST route and unlike the USER one: a realm is legitimately a
+    # dictionary word (``CORP``, ``LAB``, ``HOME``), so a credential-style stopset
+    # gate would re-open exactly the leak the HOST comment above describes.
+    #
+    # Reachable since the OQL whitelist gained the Windows Security leaves the
+    # identity detections turn on. Classified here in the same change rather than
+    # left to the allow-known-safe backstop: the backstop WOULD mask these, which
+    # is safe, but it costs the Oracle the ability to correlate a realm across
+    # fields or to match a realm-qualified account against its bare form.
+    #
+    # Deliberately harvested as HOST, not as a DOMAIN label. ``DOMAIN`` is a dead
+    # label kind: nothing in the sanitiser has ever minted one, and BOTH the
+    # backstop's ``_LABEL_ANY_RE`` and this module's ``_OPAQUE_LABEL_FULL_RE``
+    # enumerate only USER/HOST/IP/MAC/EMAIL. A ``DOMAIN_01`` token would be masked
+    # by the backstop on the way out and would not desanitise on the way back, so
+    # minting one costs the round-trip and buys only a nicer label. Reviving the
+    # kind is a three-regex change and its own decision.
+    if path.rsplit(".", maxsplit=1)[-1].lower() in _WINLOG_DOMAIN_LEAF_KEYS:
+        # Same degenerate-value guard as the HOST route, for the same reason: an
+        # absent domain is logged as ``-``, and tokenising that would propagate a
+        # label into every hyphen in free text.
+        if any(c.isalnum() for c in value):
+            mapping.label_for(value, "HOST")
+            # ALWAYS no-propagate, at any length, unlike the ≤3-char carve-out
+            # the DOMAIN_LIKE route uses. An AD realm is a dictionary word by
+            # nature — CORP, RANGE, LAB, HOME — and Pass 2's alternation
+            # boundary ``(?<!\w)…(?!\w)`` does not reject a leading ``.`` or
+            # ``-``. Without this, a realm of ``CORP`` rewrote the attacker's own
+            # ``corp-cdn.evil.com`` to ``HOST_01-cdn.evil.com`` and
+            # ``corp.evil.com`` to ``HOST_01.evil.com``, presenting a public C2
+            # domain to the Oracle as an internal asset — consistently across
+            # narrative and evidence, so the Oracle had no way to notice, and
+            # desanitize restored it on the way back so neither did the operator.
+            #
+            # Leaving the leaf unclassified was strictly SAFER than classifying
+            # it wrong: the backstop would simply have masked it in place. The
+            # value still round-trips, because ``direct_replace`` substitutes it
+            # wherever the whole string equals the realm.
+            no_propagate.add(value)
+            no_propagate.add(value.lower())
         return
 
     # IP fields — private only.

@@ -13,7 +13,8 @@ from datetime import datetime
 from soc_ai.config import Settings
 from soc_ai.store import quality as quality_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from sqlalchemy import inspect
+from soc_ai.store.models import QualityEvalAttempt
+from sqlalchemy import inspect, select
 
 
 async def _db(settings: Settings):  # type: ignore[no-untyped-def]
@@ -199,3 +200,95 @@ async def test_insert_prunes_to_keep_last(settings_kratos: Settings) -> None:
 async def test_default_keep_last_is_90(settings_kratos: Settings) -> None:
     """~3 months of nightlies; a silent constant change should fail a test."""
     assert quality_svc.KEEP_LAST == 90
+
+
+# ---------------------------------------------------------------------------
+# quality_eval_attempts — the nightly ran, on the nights it wrote nothing too.
+#
+# Exit 2 (no eligible alerts) and exit 5 (failed) deliberately write no
+# snapshot, so the trend is silent on exactly the nights an operator needs to
+# know what happened. That fact used to live in a status slot on ``app.state``.
+
+
+async def test_migration_creates_the_attempt_trail(settings_kratos: Settings) -> None:
+    engine, _maker = await _db(settings_kratos)
+    async with engine.connect() as conn:
+        tables = await conn.run_sync(lambda sc: inspect(sc).get_table_names())
+        assert "quality_eval_attempts" in tables
+        cols = await conn.run_sync(
+            lambda sc: {c["name"] for c in inspect(sc).get_columns("quality_eval_attempts")}
+        )
+        assert {"attempted_at", "trigger", "exit_code", "detail"} <= cols
+        indexes = await conn.run_sync(
+            lambda sc: {ix["name"] for ix in inspect(sc).get_indexes("quality_eval_attempts")}
+        )
+        assert "ix_quality_eval_attempts_attempted_at" in indexes
+    await engine.dispose()
+
+
+async def test_no_attempt_recorded_reads_as_none(settings_kratos: Settings) -> None:
+    """The distinction persistence buys. ``None`` now means "this deployment
+    has never run one", where the in-memory slot also said None after every
+    restart — so a reader could not tell that from "ran last night, forgot"."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        assert await quality_svc.latest_attempt(db) is None
+    await engine.dispose()
+
+
+async def test_an_attempt_that_wrote_no_snapshot_is_still_recorded(
+    settings_kratos: Settings,
+) -> None:
+    """The whole point: no snapshot, and the run is still on the record with
+    its own exit code and reason."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await quality_svc.record_attempt(
+            db,
+            trigger="schedule",
+            exit_code=2,
+            detail="no eligible alerts for 'x' — no snapshot written",
+        )
+        assert await quality_svc.recent_snapshots(db) == []
+        row = await quality_svc.latest_attempt(db)
+        assert row is not None
+        assert (row.exit_code, row.trigger) == (2, "schedule")
+        assert "no eligible alerts" in row.detail
+    await engine.dispose()
+
+
+async def test_the_newest_attempt_is_the_one_returned(settings_kratos: Settings) -> None:
+    """A trail, and the reader wants its head. The run-now button and the
+    scheduler share the table, so "the last attempt" has to be the last one and
+    not the last SCHEDULED one."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await quality_svc.record_attempt(db, trigger="schedule", exit_code=2, detail="quiet")
+        await quality_svc.record_attempt(db, trigger="manual", exit_code=0, detail="")
+        row = await quality_svc.latest_attempt(db)
+        assert row is not None
+        assert (row.trigger, row.exit_code, row.detail) == ("manual", 0, "")
+    await engine.dispose()
+
+
+async def test_recording_an_attempt_prunes_in_the_same_transaction(
+    settings_kratos: Settings,
+) -> None:
+    """Insert + prune in one commit, the trend table's own idiom: the table can
+    never be observed over capacity, and a crash between the two cannot lose
+    the new row while keeping stale ones."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        ids = [
+            (
+                await quality_svc.record_attempt(
+                    db, trigger="schedule", exit_code=0, detail="", keep_last=3
+                )
+            ).id
+            for _ in range(7)
+        ]
+        rows = (
+            await db.execute(select(QualityEvalAttempt).order_by(QualityEvalAttempt.id.desc()))
+        ).scalars()
+        assert [r.id for r in rows] == list(reversed(ids[-3:]))
+    await engine.dispose()

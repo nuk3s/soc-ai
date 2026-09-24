@@ -72,7 +72,7 @@ async def _run_discovery_task(state: Any) -> None:
         status.last_summary = asdict(summary)
     except Exception:
         _LOGGER.exception("discovery: scan-now task failed")
-        status.last_summary = {"errors": ["scan failed; see server logs"]}
+        status.last_summary = {"errors": ["the scan failed. See the server logs."]}
     finally:
         status.running = False
         status.last_scan = datetime.now(UTC).isoformat()

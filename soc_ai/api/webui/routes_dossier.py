@@ -52,6 +52,7 @@ from soc_ai.dossier.resolve import (
 from soc_ai.dossier.types import DOSSIER_FIELDS
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.store import entity_profiles
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import host_activity as activity_query
@@ -170,10 +171,35 @@ class DossierRowOut(BaseModel):
     reporting: bool = False
 
 
+class ProfileDimensionOut(BaseModel):
+    """One dimension of a host's behavioural profile, for the host page.
+
+    ``coverage`` is the load-bearing part. ``measured`` over an empty set means
+    "this host genuinely does none of this"; ``blind`` means no plane on the
+    grid can answer for it; ``learning`` means under seven days of history.
+    Rendered identically, those are the most dangerous three words in the app.
+    """
+
+    dimension: str
+    shape: str  # categorical | numeric | active_hours
+    coverage: str
+    support_days: int
+    window_days: int
+    # A short, per-shape sentence the row can print without a client-side
+    # interpreter: "8 ports · 445, 135, 88, …" or "work 42/h · off 3/h".
+    summary: str
+    # For categorical dimensions, the members most often seen (name, count).
+    top: list[tuple[str, int]] = Field(default_factory=list)
+
+
 class DossierOut(DossierRowOut):
     """One host's full dossier: every field, both lanes, all evidence."""
 
     fields: list[DossierFieldOut] = Field(default_factory=list)  # type: ignore[assignment]
+    # The behavioural profile the hunting layer scores departures against.
+    # Served on the SAME read as the dossier so the two cannot describe
+    # different builds of the same host.
+    profile: list[ProfileDimensionOut] = Field(default_factory=list)
 
 
 class DossierListOut(BaseModel):
@@ -262,6 +288,14 @@ class DossierSummaryOut(BaseModel):
             "(confidence floor + staleness window). Hosts with no resolved role "
             "are in no bucket, so the values need not sum to `hosts`; the "
             "difference is the unresolved remainder."
+        ),
+    )
+    roles_low_confidence: int = Field(
+        default=0,
+        description=(
+            "Hosts whose inferred role sits below the confidence floor (or is "
+            "stale) and carries no operator value: named on the host page as "
+            "'possibly …', unscored by role-scoped hunts."
         ),
     )
     last_built_at: str | None = Field(
@@ -462,6 +496,17 @@ class HostActivityOut(BaseModel):
             "`users` is null — an absent list is not a cut one."
         ),
     )
+    conn_datasets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Flow datasets that produced at least one conversation record for "
+            "this host, busiest first. Empty means the host had no conversation "
+            "records in the window — which is the only way a client can tell a "
+            "genuinely quiet host from a grid whose sensor this build does not "
+            "read. More than one entry means the same conversation may be "
+            "counted by two sensors, so the totals are an upper bound."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -549,10 +594,94 @@ def _row_out(resolved: ResolvedDossier) -> DossierRowOut:
     )
 
 
-def _dossier_out(resolved: ResolvedDossier) -> DossierOut:
+from soc_ai.dossier.profile import (  # noqa: E402 - imported after the router is built
+    _MAX_MEMBERS as _PROFILE_MEMBER_CAP,
+)
+
+# "197 members" is the data model's word. The row names what it counted.
+_PROFILE_NOUN: dict[str, tuple[str, str]] = {
+    "served_ports": ("port", "ports"),
+    "consumed_ports": ("port", "ports"),
+    "peers_out": ("peer", "peers"),
+    "dns_names": ("name", "names"),
+    "process_names": ("process", "processes"),
+    "process_parents": ("pair", "pairs"),
+    "logon_users": ("user", "users"),
+}
+
+
+def _profile_summary(row: Any) -> tuple[str, list[tuple[str, int]]]:
+    """A one-line sentence per shape, plus the top members for a set."""
+    vec = row.vector if isinstance(row.vector, dict) else {}
+    if row.coverage != "measured" and not vec:
+        return ("", [])
+    if row.shape == "numeric":
+        parts = []
+        for cell in ("work", "off", "weekend"):
+            c = vec.get(cell) or {}
+            med = c.get("median")
+            parts.append(f"{cell} {int(med)}/h" if isinstance(med, (int, float)) else f"{cell} —")
+        return (" · ".join(parts), [])
+    if row.shape == "active_hours":
+        hours = sorted(int(h) for h in vec if str(h).lstrip("-").isdigit())
+        if not hours:
+            return ("no active hours observed", [])
+        return (
+            f"active in {len(hours)} of 24 hours",
+            [(str(h), int((vec[str(h)] or {}).get("count", 0))) for h in hours],
+        )
+    members = sorted(
+        ((str(k), int((v or {}).get("count", 0))) for k, v in vec.items()),
+        key=lambda kv: -kv[1],
+    )
+    preview = ", ".join(k for k, _ in members[:8])
+    more = f" +{len(members) - 8} more" if len(members) > 8 else ""
+    one, many = _PROFILE_NOUN.get(str(row.dimension), ("member", "members"))
+    noun = many if len(members) != 1 else one
+    # The lane keeps at most _MAX_MEMBERS per entity. At the cap the number is
+    # a floor, and "200 members" reads as a count that happens to be round.
+    count = f"{len(members)}+" if len(members) >= _PROFILE_MEMBER_CAP else str(len(members))
+    # Every member goes on the wire (the lane caps the set), so the page can
+    # open "+189 more" instead of naming 189 things it cannot show.
+    return (f"{count} {noun} · {preview}{more}" if members else "none observed", members)
+
+
+def _profile_out(rows: dict[str, Any]) -> list[ProfileDimensionOut]:
+    out: list[ProfileDimensionOut] = []
+    for dim in (
+        "served_ports",
+        "consumed_ports",
+        "peers_out",
+        "dns_names",
+        "process_names",
+        "process_parents",
+        "logon_users",
+        "active_hours",
+        "connection_rate",
+    ):
+        row = rows.get(dim)
+        if row is None:
+            continue
+        summary, top = _profile_summary(row)
+        out.append(
+            ProfileDimensionOut(
+                dimension=dim,
+                shape=row.shape,
+                coverage=row.coverage,
+                support_days=int(row.support_days or 0),
+                window_days=int(row.window_days or 0),
+                summary=summary,
+                top=top,
+            )
+        )
+    return out
+
+
+def _dossier_out(resolved: ResolvedDossier, profile: dict[str, Any] | None = None) -> DossierOut:
     return DossierOut(
         **_header(resolved),
         fields=[_field_out(f) for f in resolved.fields.values()],
+        profile=_profile_out(profile or {}),
     )
 
 
@@ -677,7 +806,7 @@ async def _run_dossier_task(state: Any) -> None:
         status.last_summary = asdict(summary)
     except Exception:
         _LOGGER.exception("host dossier: refresh task failed")
-        status.last_summary = {"errors": ["refresh failed; see server logs"]}
+        status.last_summary = {"errors": ["the refresh failed. See the server logs."]}
     finally:
         status.running = False
         status.last_run = datetime.now(UTC).isoformat()
@@ -898,6 +1027,7 @@ async def dossier_summary(
         reporting=summary.reporting,
         conflicts=summary.conflicts,
         roles=summary.roles,
+        roles_low_confidence=int(getattr(summary, "roles_low_confidence", 0) or 0),
         last_built_at=_ts(summary.last_built_at),
         schedule_enabled=bool(getattr(settings, "dossier_schedule_enabled", False)),
         role_vocabulary=list(ROLE_VOCABULARY),
@@ -1009,7 +1139,10 @@ async def get_dossier(
             if found is not None
             else unknown_dossier(key)
         )
-    return _dossier_out(resolved)
+        # No fingerprint passed: this is a RENDER, not a scoring, and the
+        # operator must see a stale profile to know it is stale.
+        profile = await entity_profiles.load_profiles(db, entity_kind="host", entity_key=key)
+    return _dossier_out(resolved, profile)
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1289,7 @@ async def get_dossier_activity(
         ),
         peers_truncated=activity.peers_truncated,
         users_truncated=activity.users_truncated,
+        conn_datasets=list(activity.conn_datasets),
     )
 
 
@@ -1180,7 +1314,10 @@ async def _current_dossier(request: Request, key: str, settings: Settings) -> Do
             if found is not None
             else unknown_dossier(key)
         )
-    return _dossier_out(resolved)
+        # No fingerprint passed: this is a RENDER, not a scoring, and the
+        # operator must see a stale profile to know it is stale.
+        profile = await entity_profiles.load_profiles(db, entity_kind="host", entity_key=key)
+    return _dossier_out(resolved, profile)
 
 
 @router.post(
@@ -1223,7 +1360,7 @@ async def set_dossier_override(
             status_code=400,
             detail={
                 "reason": "empty_override",
-                "hint": "an override needs a value; DELETE it to accept the inference",
+                "hint": "An override needs a value. DELETE it to accept the inference.",
             },
         )
     actor = await identify_caller(request)
@@ -1300,7 +1437,7 @@ async def bulk_set_dossier_override(
             status_code=400,
             detail={
                 "reason": "empty_override",
-                "hint": "an override needs a value; DELETE it per host to accept the inference",
+                "hint": ("An override needs a value. DELETE it per host to accept the inference."),
             },
         )
     if field in _SCALAR_VOCABULARY_FIELDS and body.value_json is not None:
@@ -1322,8 +1459,8 @@ async def bulk_set_dossier_override(
             detail={
                 "reason": "not_a_json_field",
                 "hint": (
-                    f"{field} is a single word — send it as `value`; `value_json` is for "
-                    "services_offered, activity_profile and management_plane"
+                    f"{field} is a single word. Send it as `value`. `value_json` is for "
+                    "services_offered, activity_profile and management_plane."
                 ),
             },
         )
@@ -1344,8 +1481,8 @@ async def bulk_set_dossier_override(
             detail={
                 "reason": "unknown_role",
                 "hint": (
-                    "a bulk role declaration must be one of: "
-                    f"{', '.join(ROLE_VOCABULARY)} — declare a novel role one host at a time"
+                    "A bulk role declaration must be one of: "
+                    f"{', '.join(ROLE_VOCABULARY)}. Declare a novel role one host at a time."
                 ),
             },
         )
@@ -1376,9 +1513,9 @@ async def bulk_set_dossier_override(
             detail={
                 "reason": "unknown_criticality",
                 "hint": (
-                    "a bulk criticality declaration must be one of: "
-                    f"{', '.join(dossier_store.CRITICALITY_VOCABULARY)} — these are the "
-                    "grades the importance order ranks on"
+                    "A bulk criticality declaration must be one of: "
+                    f"{', '.join(dossier_store.CRITICALITY_VOCABULARY)}. The importance "
+                    "order ranks on these grades."
                 ),
             },
         )
@@ -1391,7 +1528,7 @@ async def bulk_set_dossier_override(
                 status_code=400,
                 detail={
                     "reason": "not_an_ip",
-                    "hint": f"the dossier is keyed on IP addresses; got {raw!r}",
+                    "hint": f"the dossier is keyed on IP addresses. soc-ai got {raw!r}.",
                 },
             ) from None
         if key not in keys:
@@ -1399,14 +1536,14 @@ async def bulk_set_dossier_override(
     if not keys:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "no_hosts", "hint": "select at least one host"},
+            detail={"reason": "no_hosts", "hint": "Select at least one host."},
         )
     if len(keys) > MAX_BULK_HOSTS:
         raise HTTPException(
             status_code=400,
             detail={
                 "reason": "too_many_hosts",
-                "hint": f"declare at most {MAX_BULK_HOSTS} hosts at a time",
+                "hint": f"Declare at most {MAX_BULK_HOSTS} hosts at a time.",
             },
         )
 
@@ -1488,8 +1625,8 @@ async def clear_dossier_override(
                 detail={
                     "reason": "no_operator_override",
                     "hint": (
-                        f"no operator override on '{field}' — inferred values cannot be "
-                        "deleted, they are recomputed on every build"
+                        f"no operator override is on '{field}'. You cannot delete an "
+                        "inferred value. Every build recomputes it."
                     ),
                 },
             )

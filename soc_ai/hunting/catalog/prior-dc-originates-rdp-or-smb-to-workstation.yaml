@@ -1,0 +1,35 @@
+id: prior-dc-originates-rdp-or-smb-to-workstation
+title: A domain controller opens RDP or SMB to a workstation
+description: >
+  Direction is the whole signal. Workstations connect to domain controllers
+  constantly. A domain controller does not open an interactive session or a
+  file-sharing session to a workstation in any normal directory workflow.
+
+  Several intrusion workflows open such a session. An operator who has taken
+  the domain controller uses it to reach a workstation. An attacker also abuses
+  a backup-and-restore path to stage tooling.
+
+level: high
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: consumed_ports
+  test: novel_for
+  roles:
+    - domain_controller
+
+attack:
+  - T1021.001
+  - T1021.002
+
+false_positives:
+  - Some remote-management and patch-deployment suites run from the domain
+    controller. These tools build a baseline quickly. A legitimate tool stops
+    firing this analytic.
+  - A backup agent pulls from workstations on SMB. Declare the role exception
+    for that agent.
+
+references:
+  - https://attack.mitre.org/techniques/T1021/001/

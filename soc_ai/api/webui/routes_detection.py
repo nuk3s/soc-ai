@@ -66,16 +66,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.agent.egress_guard import EgressGuard, EgressResidueError
 from soc_ai.api.deps import get_elastic, get_settings_dep
+from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._shared import router
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.api.webui.routes_hunts import _ID_SHAPED, _hunt_report
 from soc_ai.config import Settings
+from soc_ai.detection.analytic_drafter import draft_analytic
+from soc_ai.detection.analytic_models import AnalyticDraftOut
 from soc_ai.detection.drafter import draft_detection
-from soc_ai.detection.models import SigmaDraft
+from soc_ai.detection.models import DryRunResult, SigmaDraft
 from soc_ai.detection.untrusted import neutralize_untrusted
 from soc_ai.detection.validators import dry_run_detection, validate_sigma_yaml
+from soc_ai.hunting.catalog_tiers import effective_catalog
+from soc_ai.hunting.execute import run_spec
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
+from soc_ai.store import analytics as analytics_store
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Hunt, Investigation
 from soc_ai.webui.runbook_promotion import _build_guard
@@ -548,4 +554,156 @@ async def draft_investigation_detection(
         hunt_id=hunt.id,
         ordinal=ordinal,
         investigation_id=inv_id,
+    )
+
+
+async def _threat_finding_for_draft(
+    request: Request, settings: Settings, hunt_id: str, ordinal: int
+) -> tuple[dict[str, Any], EgressGuard | None, list[str]]:
+    """The finding, the guard and the taken analytic ids, in one session.
+
+    Refuses anything that cannot become an analytic: a hunt that is still
+    running, an ordinal the report does not hold, and a finding that is not a
+    threat finding. A visibility gap reports telemetry this grid does not
+    have, and an analytic written from one would fire on nothing.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        hunt = await db.get(Hunt, hunt_id)
+        if hunt is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        if hunt.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "still_running",
+                    "hint": "The hunt is still running. Draft after it lands its report.",
+                },
+            )
+        findings = _hunt_report(hunt).get("findings") or []
+        if not (0 <= ordinal < len(findings)) or not isinstance(findings[ordinal], dict):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "reason": "finding_not_found",
+                    "hint": "That finding is not in this hunt's report.",
+                },
+            )
+        finding = findings[ordinal]
+        if (finding.get("category") or "threat") != "threat":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "not_a_threat_finding",
+                    "hint": "Only a threat finding can become an analytic.",
+                },
+            )
+        guard = await _guard_for(db, settings)
+        cat = await effective_catalog(db)
+    return finding, guard, list(cat.listed)
+
+
+@router.post("/hunts/{hunt_id}/findings/{ordinal}/draft-analytic")
+async def draft_hunt_finding_analytic(
+    request: Request,
+    hunt_id: str,
+    ordinal: int,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> AnalyticDraftOut:
+    """Draft a catalog analytic from one threat finding and store it as a candidate.
+
+    The finding must be a threat finding. It does not need a promotion: the
+    candidate never runs until an analyst moves it to shadow. The dry run over
+    the last 30 days is what an analyst reads before that move.
+    """
+    if not settings.analytic_drafting_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "analytic_drafting_disabled",
+                "hint": "Turn on 'Draft analytics from findings' in the config console.",
+            },
+        )
+    by = await identify_caller(request)
+    finding, guard, catalog_ids = await _threat_finding_for_draft(
+        request, settings, hunt_id, ordinal
+    )
+
+    # The evidence is built from the SAME resolved citations the Sigma route
+    # uses, so the two drafters ground on one set of observed values.
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            cited_docs = await _resolve_cited_docs(elastic, settings, _citation_ids(finding))
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
+    evidence = _build_evidence(finding, cited_docs)
+
+    try:
+        async with asyncio.timeout(settings.sigma_draft_timeout_s):
+            draft, spec = await draft_analytic(
+                settings,
+                finding=finding,
+                evidence=evidence,
+                catalog_ids=catalog_ids,
+                guard=guard,
+            )
+    except EgressResidueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"reason": "egress_blocked", "leaked_count": len(exc.leaked)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail={"reason": "bad_draft", "hint": str(exc)}
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "reason": "draft_timeout",
+                "hint": "Drafting the analytic ran out of time. Try again.",
+            },
+        ) from exc
+    except (httpx.HTTPError, AgentRunError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "draft_model_unavailable",
+                "hint": "The analyst model could not be reached or did not answer. Try again.",
+            },
+        ) from exc
+
+    # The dry run is the receipt an analyst reads before the move to shadow. A
+    # run that errored is reported as a run that did not run, never as zero.
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            run = await run_spec(
+                spec, elastic=elastic, settings=settings, since="now-30d", until="now"
+            )
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
+    dry = DryRunResult(
+        ran=run.error is None,
+        hit_count=run.matched_docs,
+        sample_ids=[c.anchor_id for c in run.candidates if c.anchor_id][:5],
+        window_days=30,
+        error=run.error,
+    )
+
+    async with request.app.state.db_sessionmaker() as db:
+        try:
+            state = await analytics_store.create_local(db, spec_text=draft.spec_yaml, by=by)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409, detail={"reason": "analytic_exists", "hint": str(exc)}
+            ) from exc
+    return AnalyticDraftOut(
+        analytic_id=state.analytic_id,
+        spec_yaml=draft.spec_yaml,
+        rationale=draft.rationale,
+        dry_run=dry,
     )

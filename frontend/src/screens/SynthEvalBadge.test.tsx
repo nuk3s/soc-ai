@@ -3,7 +3,7 @@
 // investigation promoted from it) carries is_synth_eval in the store since
 // migration 0032; these tests pin that the flag reaches every surface a hunt
 // or investigation is listed or opened on, as a plain-English badge an analyst
-// cannot mistake ("Synthetic — evaluation data" — never internal vocabulary).
+// cannot mistake ("Synthetic evaluation data" — never internal vocabulary).
 // Both directions are pinned per surface: flag true renders the badge, flag
 // false renders no badge at all.
 import { fireEvent, render, screen } from '@testing-library/react';
@@ -48,7 +48,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getWorkspaces: vi.fn().mockResolvedValue([]),
   getHealth: vi.fn().mockResolvedValue(null),
   // Dashboard
-  getAlerts: vi.fn().mockResolvedValue([]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [], truncated: false, other_docs: 0 }),
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   getAutoTriageStatus: vi.fn().mockResolvedValue({ active: false, hunted: 0, total: 0 }),
@@ -86,7 +86,7 @@ import { Investigations } from './Investigations';
 import { Notifications } from './Notifications';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
 
-const BADGE = 'Synthetic — evaluation data';
+const BADGE = 'Synthetic evaluation data';
 
 const huntRow = (over: Partial<HuntRow>): HuntRow => ({
   id: 'H-1',
@@ -347,25 +347,25 @@ describe('Investigation failed states — synthetic-evaluation badge', () => {
   // proves it is exercising the failed branch, not the verdict card.
   it('keeps the badge on an errored run', () => {
     mountInvestigation(invDetail({ isSynthEval: true, status: 'error' }));
-    screen.getByText('This investigation failed or was interrupted');
+    screen.getByText('This investigation did not finish');
     expect(screen.getByText(BADGE)).toBeInTheDocument();
   });
 
   it('keeps the badge on a cancelled run', () => {
     mountInvestigation(invDetail({ isSynthEval: true, status: 'cancelled' }));
-    screen.getByText('This investigation was cancelled before it finished');
+    screen.getByText('This investigation stopped before it finished');
     expect(screen.getByText(BADGE)).toBeInTheDocument();
   });
 
   it('keeps the badge on an interrupted run', () => {
     mountInvestigation(invDetail({ isSynthEval: true, status: 'interrupted' }));
-    screen.getByText('This investigation was interrupted by a restart');
+    screen.getByText('A restart interrupted this investigation');
     expect(screen.getByText(BADGE)).toBeInTheDocument();
   });
 
   it('shows no badge on an ordinary errored run', () => {
     mountInvestigation(invDetail({ isSynthEval: false, status: 'error' }));
-    screen.getByText('This investigation failed or was interrupted');
+    screen.getByText('This investigation did not finish');
     expect(screen.queryByText(BADGE)).toBeNull();
   });
 });
@@ -394,14 +394,18 @@ describe('Dashboard recent investigations — synthetic-evaluation badge', () =>
 });
 
 describe('Redaction preview picker — synthetic-evaluation badge', () => {
-  // <option> can hold text only, so the marker is the badge's exact wording
-  // appended to the label rather than the component.
+  // <option> can hold text only, so the marker is appended as a string here
+  // rather than rendered by the <SyntheticEvalBadge> component — this literal
+  // lives in RedactionPreviewPanel.tsx and still reads "Synthetic — evaluation
+  // data" (em dash), unlike Badges.tsx's "Synthetic evaluation data". Pinned
+  // to the panel's own current wording, not the shared BADGE constant above.
+  const OPTION_BADGE = 'Synthetic evaluation data';
   it('marks a synth-eval run in the option label', async () => {
     vi.mocked(getInvestigations).mockResolvedValue([invRow({ isSynthEval: true })]);
     render(<RedactionPreviewPanel />);
     fireEvent.click(screen.getByRole('tab', { name: 'Analyst path' }));
     const option = await screen.findByRole('option', { name: /Planted C2 beacon/ });
-    expect(option.textContent).toContain(BADGE);
+    expect(option.textContent).toContain(OPTION_BADGE);
   });
 
   it('adds no marker to an ordinary run', async () => {

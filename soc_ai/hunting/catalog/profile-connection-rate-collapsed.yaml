@@ -1,0 +1,32 @@
+id: profile-connection-rate-collapsed
+title: A host's connection rate falls far below its own baseline
+description: >
+  A shipper stops. A backup does not run. An attacker kills an agent. Every
+  analytic that looks only for more activity misses these cases. An intruder
+  silences telemetry early in an intrusion.
+
+  This analytic measures the host against its own median for the same
+  time-of-week cell. A server that is quiet every weekend is therefore not
+  reported every weekend.
+
+level: medium
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: connection_rate
+  test: below
+  threshold: 3.0
+
+attack:
+  - T1562.001
+
+false_positives:
+  - Planned maintenance, a decommission and a holiday all cut a host's
+    connection rate. The telemetry alone cannot separate any of them from a
+    silenced host.
+  - A host moves networks. It then reports through a different path.
+
+references:
+  - https://attack.mitre.org/techniques/T1562/001/

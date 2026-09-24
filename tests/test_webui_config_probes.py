@@ -158,13 +158,37 @@ async def test_probe_llm_demo_mode_reports_healthy_without_egress() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_probe_es_success() -> None:
+async def test_probe_es_reachable_with_no_index_pattern_is_not_ok() -> None:
+    """A ping alone is not a working grid, and the boolean has to say so.
+
+    This probe's contract is reachable AND readable. With no events index
+    pattern the read leg is never attempted, so nothing about readability was
+    established — yet it used to return ok=True with an honest detail string
+    beside it. The detail is not what drives the topbar: an operator whose index
+    pattern went missing got a green pill over a product that could not answer a
+    single question about the grid.
+    """
     fake = AsyncMock()
     fake.ping.return_value = {"cluster": "so-cluster", "version": "8.13.0"}
+    result = await probes.probe_es(fake)
+    assert result["ok"] is False
+    assert result["kind"] == "unreadable"
+    # Still says the connection itself was fine, so nobody goes at the network.
+    assert "so-cluster" in result["detail"]
+    assert "8.13.0" in result["detail"]
+    assert "No events index pattern is configured" in result["detail"]
+
+
+async def test_probe_es_success() -> None:
+    """The control: reachable AND readable, which is what ok=True means."""
+    fake = AsyncMock()
+    fake.ping.return_value = {"cluster": "so-cluster", "version": "8.13.0"}
+    fake._settings = SimpleNamespace(events_index_pattern="logs-*")
     result = await probes.probe_es(fake)
     assert result["ok"] is True
     assert "so-cluster" in result["detail"]
     assert "8.13.0" in result["detail"]
+    assert "logs-*" in result["detail"]
 
 
 async def test_probe_es_failure_hides_password() -> None:
@@ -318,6 +342,84 @@ async def test_probe_es_keeps_the_breaker_limit_an_admin_could_act_on() -> None:
     assert "6.7gb" in detail
     # …and it is prose, not a doubled exception chain.
     assert "ApiError: ApiError(" not in detail
+
+
+# The opt-out governs the query, not whether anyone is told
+#
+# `es_fail_on_partial_results=False` is a reasonable thing for an operator with
+# a chronically red shard to want from their QUERIES. It was also wired to the
+# probe, so setting it turned the grid's only honest reporter green. The tests
+# below hold both halves of the contract at once, against one client.
+
+
+def _client_over(settings: Settings, response: dict[str, Any]) -> ElasticClient:
+    """A real :class:`ElasticClient` whose transport answers with *response*."""
+    raw = AsyncMock()
+    raw.info.return_value = {"cluster_name": "demo-grid", "version": {"number": "8.14.3"}}
+    raw.search.return_value = response
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=raw):
+        return ElasticClient(settings)
+
+
+_HALF_READ_RESPONSE: dict[str, Any] = {
+    "took": 3,
+    "timed_out": False,
+    "_shards": {"total": 4, "successful": 2, "failed": 2},
+    "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+}
+
+
+def _tolerant(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={"es_fail_on_partial_results": False, "events_index_pattern": "logs-*"}
+    )
+
+
+async def test_probe_es_reports_a_partial_read_even_under_the_opt_out(
+    settings_kratos: Settings,
+) -> None:
+    """The operator who accepted partial answers did not ask to stop being told."""
+    settings = _tolerant(settings_kratos)
+    result = await probes.probe_es(_client_over(settings, _HALF_READ_RESPONSE), settings)
+    assert result["ok"] is False
+    assert result["kind"] == probes.KIND_PARTIAL
+
+
+async def test_the_opt_out_still_lets_an_ordinary_query_read_partially(
+    settings_kratos: Settings,
+) -> None:
+    """The other half, and the reason the fix is scoped to the probe: the same
+    settings that keep the probe honest must still let a query take the hits."""
+    client = _client_over(_tolerant(settings_kratos), _HALF_READ_RESPONSE)
+    assert (await client.search("logs-*", {"match_all": {}})).total == 0
+
+
+async def test_probe_es_with_the_opt_out_off_is_unchanged(settings_kratos: Settings) -> None:
+    """The negative control the fix is judged on: at the DEFAULT setting the
+    payload is what it has always been, pinned literally rather than compared
+    against the other setting (which is the thing under test).
+    """
+    strict = settings_kratos.model_copy(update={"events_index_pattern": "logs-*"})
+    assert await probes.probe_es(_client_over(strict, _HALF_READ_RESPONSE), strict) == {
+        "ok": False,
+        "kind": "partial",
+        "detail": (
+            "demo-grid, ES 8.14.3. Reading logs-*: the grid read only 2 of 4 shards. "
+            "These results are incomplete. A retry does not help. To find the cause, "
+            "check Elasticsearch shard health."
+        ),
+    }
+
+
+async def test_the_two_settings_now_agree_about_a_half_read_grid(
+    settings_kratos: Settings,
+) -> None:
+    """The opt-out is invisible to the probe: same grid, same answer, either way."""
+    strict = settings_kratos.model_copy(update={"events_index_pattern": "logs-*"})
+    tolerant = _tolerant(settings_kratos)
+    assert await probes.probe_es(
+        _client_over(strict, _HALF_READ_RESPONSE), strict
+    ) == await probes.probe_es(_client_over(tolerant, _HALF_READ_RESPONSE), tolerant)
 
 
 async def test_probe_es_classifies_a_partial_read() -> None:

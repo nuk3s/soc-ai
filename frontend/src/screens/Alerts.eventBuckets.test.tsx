@@ -27,7 +27,7 @@ const GROUP = vi.hoisted(() => ({
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([GROUP]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [GROUP], truncated: false, other_docs: 0 }),
   getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
   getAlertGroupEvents: vi.fn(),
 }));

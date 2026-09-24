@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -534,13 +534,15 @@ def client(settings_kratos: Settings) -> Iterator[TestClient]:
     yield from _client(settings_kratos)
 
 
-def _seed_complete_hunt(client: TestClient) -> str:
+def _seed_complete_hunt(client: TestClient, *, kind: str = "chat") -> str:
     """Insert a completed hunt (with events + a report) into the client's DB."""
 
     async def _go() -> str:
         maker = client.app.state.db_sessionmaker
         async with maker() as db:
-            hunt = await hunt_svc.create(db, objective="hunt for beaconing", started_by="admin")
+            hunt = await hunt_svc.create(
+                db, objective="hunt for beaconing", started_by="admin", kind=kind
+            )
             await hunt_svc.append_events(
                 db,
                 hunt.id,
@@ -649,6 +651,55 @@ def test_list_and_get_hunt(client: TestClient) -> None:
     assert all(s["id"] != "h3" for s in body["timeline"])
 
 
+def _seed_hunt_with_report(client: TestClient, report: dict[str, Any], **create: Any) -> str:
+    """Insert a complete hunt carrying exactly ``report``, as stored."""
+
+    async def _go() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(
+                db, objective=create.pop("objective", "hunt for beaconing"), **create
+            )
+            await hunt_svc.finalize(
+                db, hunt.id, status="complete", narrative="seeded", report=report
+            )
+            return hunt.id
+
+    return asyncio.run(_go())
+
+
+def test_a_report_with_no_confidence_reads_null_on_the_detail_as_on_the_list(
+    client: TestClient,
+) -> None:
+    """``spec_report`` omits ``confidence`` on purpose: a predicate matched or
+    it did not, and a number there would be invented. The list preserved that
+    absence and the detail coerced it to 0.0, so the page had to infer "no
+    model ran" from the actor instead of reading it off the field."""
+    hunt_id = _seed_hunt_with_report(
+        client,
+        {"narrative": "seeded", "findings": [], "affected_hosts": []},
+        started_by="hunt-catalog",
+        kind="triggered",
+    )
+    assert client.get(f"/api/v1/hunts/{hunt_id}").json()["confidence"] is None
+    # A catalog run is off the default list, so the list read names its kind.
+    rows = client.get("/api/v1/hunts", params={"kind": "triggered"}).json()
+    assert rows[0]["confidence"] is None
+
+
+def test_a_model_verdict_of_zero_confidence_is_still_zero_not_null(client: TestClient) -> None:
+    """The negative control: 0.0 is a measurement. A hunt the model scored at
+    zero must keep its number on both surfaces, or hiding the dial on null
+    would swallow exactly the run that earned one."""
+    hunt_id = _seed_hunt_with_report(
+        client,
+        {"narrative": "seeded", "findings": [], "affected_hosts": [], "confidence": 0.0},
+        started_by="admin",
+    )
+    assert client.get(f"/api/v1/hunts/{hunt_id}").json()["confidence"] == 0.0
+    assert client.get("/api/v1/hunts").json()[0]["confidence"] == 0.0
+
+
 def test_get_hunt_not_found(client: TestClient) -> None:
     resp = client.get("/api/v1/hunts/does-not-exist")
     assert resp.status_code == 404
@@ -709,6 +760,62 @@ def test_list_hunts_since_until_filters(client: TestClient) -> None:
     # … and a Z-suffixed bound works too
     rows = client.get("/api/v1/hunts", params={"since": "2026-07-02T00:00:00Z"}).json()
     assert [r["id"] for r in rows] == [late]
+
+
+def test_list_hunts_kind_filter(client: TestClient) -> None:
+    """``kind`` narrows to chat | scheduled | triggered. An unknown value is
+    ignored (no filter), the same treatment an unknown ``status`` gets.
+
+    No param lists the agent runs. It leaves out the catalog runs: a hit is an
+    observation, and the Analytic hits section shows it."""
+    chat = _seed_complete_hunt(client)
+    triggered = _seed_complete_hunt(client, kind="triggered")
+    scheduled = _seed_complete_hunt(client, kind="scheduled")
+
+    # no param → agent runs only
+    rows = client.get("/api/v1/hunts").json()
+    assert {r["id"] for r in rows} == {chat, scheduled}
+
+    rows = client.get("/api/v1/hunts", params={"kind": "triggered"}).json()
+    assert [r["id"] for r in rows] == [triggered]
+    assert rows[0]["kind"] == "triggered"
+    rows = client.get("/api/v1/hunts", params={"kind": "scheduled"}).json()
+    assert [r["id"] for r in rows] == [scheduled]
+    rows = client.get("/api/v1/hunts", params={"kind": "chat"}).json()
+    assert [r["id"] for r in rows] == [chat]
+
+    # unknown kind → no kind filter, exactly as an unknown status is treated,
+    # and the catalog runs stay out.
+    rows = client.get("/api/v1/hunts", params={"kind": "bogus"}).json()
+    assert {r["id"] for r in rows} == {chat, scheduled}
+    rows = client.get("/api/v1/hunts", params={"kind": "bogus", "status": "nonsense"}).json()
+    assert {r["id"] for r in rows} == {chat, scheduled}
+
+    # kind combines with status
+    rows = client.get("/api/v1/hunts", params={"kind": "triggered", "status": "complete"}).json()
+    assert [r["id"] for r in rows] == [triggered]
+    rows = client.get("/api/v1/hunts", params={"kind": "triggered", "status": "running"}).json()
+    assert rows == []
+
+
+def test_a_catalog_run_is_left_out_of_the_list_and_the_counts(client: TestClient) -> None:
+    """The subtitle counts agent runs. A catalog run is a recorded analytic hit.
+
+    The exclusion is a SQL clause, so a page of agent runs is never short
+    because catalog runs filled the limit ahead of them.
+    """
+    chat = _seed_complete_hunt(client)
+    triggered = _seed_complete_hunt(client, kind="triggered")
+
+    rows = client.get("/api/v1/hunts").json()
+    assert [r["id"] for r in rows] == [chat]
+    assert [r["id"] for r in client.get("/api/v1/hunts", params={"kind": "triggered"}).json()] == [
+        triggered
+    ]
+
+    labels = {s["label"]: s["value"] for s in client.get("/api/v1/hunts/stats").json()}
+    assert labels["Hunts"] == "1"
+    assert labels["Findings"] == "1"
 
 
 def test_list_hunts_invalid_datetime_is_422(client: TestClient) -> None:
@@ -1310,6 +1417,113 @@ def test_validate_hunt_findings_high_sev_no_citations_capped() -> None:
     assert counts["findings_capped"] == 1
 
 
+# ── One answer about a severity the ladder does not hold ─────────────────────
+#
+# The module resolved an unrecognised severity two opposite ways. _cap_severity
+# ranked it `critical`, so the cap applied and landed on the ceiling; the two
+# reads that decide WHETHER to cap ranked it 0 — `info` — so it never reached
+# the high/critical branch and the conservative default never got the chance.
+# `severity` on HuntFinding is a free-form str with the ladder in its
+# description, which is a request to the model rather than a constraint on it.
+
+
+@pytest.mark.parametrize("spelling", ["sev:high", "urgent", "HIGH!", "severe"])
+def test_a_severity_the_ladder_does_not_hold_is_still_capped(spelling: str) -> None:
+    """The defect. An uncited claim carrying an unrecognised severity walked
+    past the gate that exists to cap uncited claims."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Lateral movement across the estate",
+            detail="Cross-host SMB writes observed.",
+            severity=spelling,
+            citations=[],
+        )
+    ]
+    validated, counts = _validate_hunt_findings(findings, [])
+
+    assert validated[0].severity == "medium"
+    assert validated[0].validator_note is not None
+    assert counts["findings_capped"] == 1
+
+
+def test_an_unrecognised_severity_faces_the_corroboration_cap_too() -> None:
+    """The second read, on the arm that matters more: a threat asserted purely
+    from the detector alert that raised it. The finding is fully grounded — its
+    citation resolves — so only the severity rank stands between it and an
+    uncorroborated high-severity claim."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Host compromised",
+            detail="The signature fired.",
+            severity="sev:critical",
+            category="threat",
+            citations=["sALERT_DOC_ID_77"],
+        )
+    ]
+    # The only thing gathered is the detector's own alert query, so nothing
+    # corroborates beyond the alert.
+    tool_results = [
+        {
+            "tool_name": "t_query_detections",
+            "result": {"total": 1, "hits": [{"_id": "sALERT_DOC_ID_77"}]},
+        }
+    ]
+
+    validated, counts = _validate_hunt_findings(findings, tool_results)
+
+    assert validated[0].severity == "medium"
+    assert counts["findings_capped"] == 1
+
+
+def test_a_recognised_low_severity_is_still_left_alone() -> None:
+    """NEGATIVE CONTROL. Ranking the unknown as loudest must not drag the rest
+    of the ladder up with it: a genuine low/info finding is not a high claim and
+    is not capped."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(
+            title="Benign context",
+            detail="An informational observation.",
+            severity="low",
+            citations=[],
+        )
+    ]
+    validated, counts = _validate_hunt_findings(findings, [])
+
+    assert validated[0].severity == "low"
+    assert validated[0].validator_note is None
+    assert counts["findings_capped"] == 0
+
+
+def test_the_partial_hunt_clamp_ranks_an_unknown_severity_the_same_way() -> None:
+    """The third read of the ladder lives outside the module and imported its
+    own default. Two answers in two files is the same defect one file down."""
+    from soc_ai.api.hunt_runner import _apply_partial_humility
+
+    report = HuntReport(
+        narrative="A hunt the clock cut short.",
+        confidence=0.9,
+        findings=[
+            HuntFinding(
+                title="Host compromised",
+                detail="The signature fired.",
+                severity="sev:critical",
+                category="threat",
+                citations=["x"],
+            )
+        ],
+    )
+    clamped = _apply_partial_humility(report)
+
+    assert clamped.findings[0].severity == "medium"
+    assert clamped.confidence <= 0.5
+
+
 def test_validate_hunt_findings_clamps_overlong_title() -> None:
     """An overlong machine-generated title (> 90 chars) is word-boundary truncated
     with a trailing ellipsis; a compliant title passes through untouched."""
@@ -1492,6 +1706,80 @@ def test_hunt_detail_serializes_validator_note(client: TestClient) -> None:
     assert body["findings"][0]["severity"] == "low"
     assert body["findings"][0]["validatorNote"]
     assert "did not resolve" in body["findings"][0]["validatorNote"].lower()
+
+
+def test_hunt_detail_serializes_a_catalog_findings_two_halves(client: TestClient) -> None:
+    """A catalog finding's detail is the spec's authoring-time prose followed by
+    this run's result. The page sets the two apart so the author's measurements
+    are never read as fresh ones, and it did that by matching the sentence a
+    candidate finding ends with, which no visibility-gap finding contains. The
+    seam is carried on the wire instead: the composer already knows where it is.
+    """
+    from pathlib import Path
+
+    from soc_ai.hunting.execute import SpecRun
+    from soc_ai.hunting.findings import spec_report
+    from soc_ai.hunting.spec import load_catalog
+
+    catalog = load_catalog(Path(__file__).resolve().parents[1] / "soc_ai/hunting/catalog")
+    spec = catalog["identity-4662-dcsync-nonmachine"]
+    report = spec_report(
+        spec,
+        SpecRun(
+            spec_id=spec.id,
+            since="2026-09-05T00:00:00Z",
+            until="2026-09-06T00:00:00Z",
+            blind=True,
+            precondition_docs=0,
+            matched_docs=0,
+        ),
+    )
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(
+                db, objective=f"[catalog] {spec.id}", started_by="hunt-catalog"
+            )
+            await hunt_svc.finalize(
+                db, hunt.id, status="complete", narrative=report["narrative"], report=report
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    finding = client.get(f"/api/v1/hunts/{hunt_id}").json()["findings"][0]
+    assert finding["category"] == "visibility_gap"
+    # The spec's description as the composer writes it: collapsed to one line.
+    assert finding["specRationale"] == " ".join(spec.description.split())
+    assert finding["detail"].startswith(finding["specRationale"])
+    # The gap finding counted no candidate documents, so there is no number to
+    # report and the card must not invent one.
+    assert finding["matchedDocs"] is None
+
+
+def test_hunt_detail_leaves_a_model_finding_without_the_catalog_fields(
+    client: TestClient,
+) -> None:
+    """The negative control: a model's detail has no authored half, so nothing
+    on the wire may invite the page to carve one out of it."""
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective="hunt for beaconing", started_by="admin")
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                narrative=FAKE_REPORT.narrative,
+                report=FAKE_REPORT.model_dump(mode="json"),
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    finding = client.get(f"/api/v1/hunts/{hunt_id}").json()["findings"][0]
+    assert finding["specRationale"] is None
+    assert finding["matchedDocs"] is None
 
 
 # ── E3.3: agent-authored charts (post-hunt chart gate) ───────────────────────
@@ -2058,6 +2346,103 @@ def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) ->
     assert hunt_id
     assert "hunt_report" in names
     asyncio.run(engine.dispose())  # type: ignore[union-attr]
+
+
+def test_every_outcome_carries_one_label_the_screen_can_print(client: TestClient) -> None:
+    """The list had its own words for an outcome. The backend names it once."""
+    import asyncio as _asyncio
+
+    async def seed() -> dict[str, str]:
+        reports = {
+            "threats": {"findings": [{"title": "beacon to 1.2.3.4", "category": "threat"}]},
+            "clean": {"findings": []},
+            "gap": {
+                "findings": [{"title": "no DNS logs for the window", "category": "visibility_gap"}]
+            },
+            "failed": {
+                "findings": [
+                    {"title": "Kerberoasting: could not run", "category": "visibility_gap"}
+                ]
+            },
+        }
+        ids: dict[str, str] = {}
+        async with client.app.state.db_sessionmaker() as db:
+            for name, report in reports.items():
+                hunt = await hunt_svc.create(db, objective=f"hunt {name}", started_by="t")
+                await hunt_svc.finalize(db, hunt.id, status="complete", report=report)
+                ids[name] = hunt.id
+            errored = await hunt_svc.create(db, objective="hunt that broke", started_by="t")
+            await hunt_svc.finalize(db, errored.id, status="error", narrative="The hunt failed.")
+            ids["error"] = errored.id
+        return ids
+
+    ids = _asyncio.run(seed())
+    rows = {h["id"]: h for h in client.get("/api/v1/hunts").json()}
+    assert rows[ids["threats"]]["outcome_label"] == "Threat findings"
+    assert rows[ids["clean"]]["outcome_label"] == "No threat observed"
+    assert rows[ids["gap"]]["outcome_label"] == "No threat observed · visibility gap"
+    assert rows[ids["failed"]]["outcome_label"] == "Could not run"
+    assert rows[ids["error"]]["outcome"] == "" and rows[ids["error"]]["outcome_label"] == ""
+
+
+def test_an_errored_hunt_stores_why_it_failed(settings_kratos: Settings) -> None:
+    """An errored hunt read "error" and nothing else. Store the sentence."""
+    engine = None
+
+    async def _go() -> tuple[str, str, str]:
+        nonlocal engine
+        from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+        engine = make_engine(settings_kratos)
+        await run_migrations(engine)
+        maker = make_sessionmaker(engine)
+        state = type("S", (), {"db_sessionmaker": maker})()
+        hunt_id = ""
+        with patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            side_effect=RuntimeError("the model gateway refused the connection"),
+        ):
+            async for name, data in hunt_recorded_run(
+                state, ctx=_ctx(settings_kratos), objective="beaconing", started_by="admin"
+            ):
+                if name == "hunt_created":
+                    hunt_id = data["hunt_id"]
+        async with maker() as db:
+            got = await hunt_svc.get_with_events(db, hunt_id)
+        assert got is not None
+        return hunt_id, got[0].status, got[0].narrative or ""
+
+    _hunt_id, status, narrative = asyncio.run(_go())
+    assert status == "error"
+    # A known shape reads as the plain sentence. This one is not known, so it
+    # names the exception and keeps the message.
+    assert narrative.startswith("The hunt failed: RuntimeError.")
+    assert "refused the connection" in narrative
+    asyncio.run(engine.dispose())  # type: ignore[union-attr]
+
+
+def test_an_errored_hunt_shows_its_reason_and_keeps_an_empty_outcome(client: TestClient) -> None:
+    """The detail page reads the narrative. The list row's outcome stays empty."""
+
+    async def seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(db, objective="beaconing", started_by="admin")
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="error",
+                narrative="The data source did not answer in time during the precondition query.",
+            )
+            return hunt.id
+
+    import asyncio as _asyncio
+
+    hunt_id = _asyncio.run(seed())
+    detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    assert detail["status"] == "error"
+    assert detail["narrative"].startswith("The data source did not answer in time")
+    row = next(h for h in client.get("/api/v1/hunts").json() if h["id"] == hunt_id)
+    assert row["outcome"] == ""
 
 
 # ── Corroboration gate: a high threat citing ONLY detector alerts is capped ──
@@ -2745,7 +3130,7 @@ def test_hunt_system_prompt_softens_title_upgrade_pressure() -> None:
     assert "ONCE CORROBORATED" in p
     # the reframed guidance ties decisiveness to the measured pattern, not the title
     low = p.lower()
-    assert "not from the alert title" in low or "not\nfrom the alert title" in low
+    assert "do not take it from the alert title" in low
 
 
 # ── Bulk hunt actions: re-hunt (clean re-run) + bulk delete ──────────────────
@@ -3260,3 +3645,1570 @@ def test_hunt_chat_seed_block_is_composed_before_the_egress_sanitize(
     assert HEADING in built_with
     assert "role: hypervisor" in built_with
     assert DOSSIER_HOST not in built_with
+
+
+def test_oql_telemetry_docs_accepts_a_data_stream_only_document() -> None:
+    """A plane that lives only in `data_stream.dataset` is positively identified.
+
+    Reading `event.dataset` alone dropped 632,523 documents on the development
+    grid as "cannot positively identify" — every network_traffic plane, from the
+    one sensor watching the live VLANs — so a hunt that found real traffic there
+    had its evidence discarded by the corroboration gate and its severity capped.
+    """
+    from soc_ai.agent.hunt_gates import _oql_telemetry_docs
+
+    hits = [
+        {"_id": "streamDOC", "_source": {"data_stream": {"dataset": "network_traffic.dns"}}},
+        {"_id": "moduleDOC", "_source": {"event": {"module": "network_traffic"}}},
+        {"_id": "bareDOC", "_source": {}},
+    ]
+    kept = [h["_id"] for h in _oql_telemetry_docs({"hits": hits})]
+
+    assert "streamDOC" in kept
+    assert "moduleDOC" in kept
+    assert "bareDOC" not in kept, "a document with no identity at all is still not corroborating"
+
+
+def test_the_alert_exclusion_survives_the_dataset_fallback() -> None:
+    """Widening identification must not let a detector corroborate itself."""
+    from soc_ai.agent.hunt_gates import _oql_telemetry_docs
+
+    hits = [
+        {"_id": "alertDOC", "_source": {"data_stream": {"dataset": "suricata.alert"}}},
+        {
+            "_id": "kindDOC",
+            "_source": {"data_stream": {"dataset": "x.y"}, "event": {"kind": "alert"}},
+        },
+    ]
+    assert _oql_telemetry_docs({"hits": hits}) == []
+
+
+def test_leads_are_listed_with_the_observations_that_formed_them(client) -> None:
+    """A lead is several observations that together are worth looking at, so
+    the strip has to show WHICH ones. Two kinds on one entity is the whole
+    point of the design and belongs on the chip, not behind a click."""
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    now = datetime(2026, 9, 16, 12, tzinfo=UTC)
+    host = ("host", "10.1.10.21")
+
+    async def _seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind=host[0],
+                entity_key=host[1],
+                kind=Kind.NOVEL_DESTINATION,
+                spec_id="p1",
+                fingerprint=content_fingerprint("peers_out", "140.82.121.4"),
+                summary="first connection to 140.82.121.4",
+                now=now - timedelta(hours=20),
+            )
+            await record_observation(
+                db,
+                entity_kind=host[0],
+                entity_key=host[1],
+                kind=Kind.OFF_HOURS,
+                spec_id="p2",
+                fingerprint=content_fingerprint("hour", "19"),
+                summary="active at 19:00",
+                now=now - timedelta(hours=20),
+            )
+            await record_observation(
+                db,
+                entity_kind=host[0],
+                entity_key=host[1],
+                kind=Kind.NOVEL_CONSUMED_PORT,
+                spec_id="p3",
+                fingerprint=content_fingerprint("consumed_ports", "1234"),
+                summary="first outbound on tcp/1234",
+                now=now,
+            )
+            await form_leads(db, entity_keys=[host], now=now)
+
+    asyncio.run(_seed())
+    leads = client.get("/api/v1/leads").json()
+    assert len(leads) == 1
+    lead = leads[0]
+    assert lead["status"] == "open" and lead["shadow"] is False
+    assert lead["entities"] == [["host", "10.1.10.21"]]
+    assert set(lead["kinds"]) == {"novel_destination", "off_hours", "novel_consumed_port"}
+    assert lead["weight_at_formation"] > 0.85
+    assert {o["kind"] for o in lead["observations"]} == set(lead["kinds"])
+    assert any("tcp/1234" in (o["summary"] or "") for o in lead["observations"])
+
+    assert client.get("/api/v1/leads?status=dismissed").json() == []
+
+
+def test_promoting_a_finding_records_an_observation_on_its_hosts(client: TestClient) -> None:
+    """An analyst's promotion counts toward leads on the hosts it names.
+
+    The analyst read the finding and acted on it. That judgement is worth as
+    much as a catalog hit, so it joins the same observations table.
+    """
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+    from soc_ai.store.models import EntityObservation
+    from sqlalchemy import select
+
+    finding = {
+        "title": "RC4 ticket for svc_sql",
+        "detail": "One host requested an RC4 service ticket.",
+        "severity": "high",
+        "hosts": ["10.1.2.3"],
+        "citations": ["tel-doc-000001"],
+    }
+
+    async def _seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(db, objective="hunt for kerberoasting", started_by="admin")
+            await hunt_svc.finalize(db, hunt.id, status="complete", report={"findings": [finding]})
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="01INVESTIGATION00000000000")
+    hit = {"_id": "tel-doc-000001", "_source": {"event": {"dataset": "zeek.conn"}}}
+    with (
+        patch("soc_ai.api.webui.routes_hunts.hunt_manager.get_manager", return_value=fake_mgr),
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=1, took_ms=1, hits=[hit])),
+        ),
+    ):
+        resp = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/investigate")
+    assert resp.status_code == 200
+
+    async def _read() -> list[Any]:
+        async with client.app.state.db_sessionmaker() as db:
+            return list((await db.execute(select(EntityObservation))).scalars())
+
+    rows = asyncio.run(_read())
+    assert [r.entity_key for r in rows] == ["10.1.2.3"]
+    assert rows[0].kind == "hunt_finding"
+    assert rows[0].source == "hunt"
+
+
+def _seed_lead(client: TestClient) -> int:
+    """One lead on one host, from a new destination and off-hours activity.
+
+    A new destination is worth 0.5 and off-hours activity is worth 0.3. The
+    pair is worth 0.8, below the 0.85 default. The seed names its own
+    threshold so the two kinds form one lead.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    async def go() -> int:
+        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.1.2.3",
+                kind=Kind.NOVEL_DESTINATION,
+                spec_id="s",
+                fingerprint=content_fingerprint("peers_out", "203.0.113.9"),
+                summary="new outbound peer for this host: 203.0.113.9 (seen once)",
+                evidence={"sample_ids": ["tel-doc-000003"]},
+                now=now,
+            )
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.1.2.3",
+                kind=Kind.OFF_HOURS,
+                spec_id="p",
+                fingerprint=content_fingerprint("active_hours", "3"),
+                summary="active around 03:00 UTC, outside the hours this host is normally active",
+                now=now,
+            )
+            outcome = await form_leads(
+                db, entity_keys=[("host", "10.1.2.3")], now=now, threshold=0.7
+            )
+            return outcome.formed[0]
+
+    return asyncio.run(go())
+
+
+def test_lead_detail_carries_the_timeline_and_the_live_weight(client: TestClient) -> None:
+    lead_id = _seed_lead(client)
+    res = client.get(f"/api/v1/hunts/leads/{lead_id}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["id"] == lead_id and body["status"] == "open"
+    assert {o["kind"] for o in body["observations"]} == {"novel_destination", "off_hours"}
+    assert (
+        body["observations"][0]["evidence"] is not None
+        or body["observations"][1]["evidence"] is not None
+    )
+    assert 0 < body["weight_now"] <= body["weight_at_formation"] + 1e-9
+    assert body["dismiss_reasons"] == [
+        "expected_for_role",
+        "known_change",
+        "benign_repeat",
+        "bad_baseline",
+        "other",
+    ]
+    assert client.get("/api/v1/hunts/leads/999999").status_code == 404
+
+
+def test_dismissing_a_lead_needs_a_reason(client: TestClient) -> None:
+    lead_id = _seed_lead(client)
+    bad = client.post(f"/api/v1/hunts/leads/{lead_id}/dismiss", json={"reason": "meh"})
+    assert bad.status_code == 422
+    res = client.post(
+        f"/api/v1/hunts/leads/{lead_id}/dismiss",
+        json={"reason": "known_change", "note": "patch window"},
+    )
+    assert res.status_code == 200
+    assert res.json()["status"] == "dismissed"
+    assert res.json()["dismissed_reason"] == "known_change"
+
+
+def test_hunting_a_lead_starts_a_lead_hunt_and_marks_the_lead(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    import time
+
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    lead_id = _seed_lead(client)
+    with (
+        patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            return_value=TestModel(
+                call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+            ),
+        ),
+        patch(
+            "soc_ai.agent.toolset.query_events_oql",
+            AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+        assert res.status_code == 200
+        hunt_id = res.json()["hunt_id"]
+        out = None
+        for _ in range(50):
+            out = _read_hunt(settings_kratos, hunt_id)
+            if out is not None and out["status"] in ("complete", "error"):
+                break
+            time.sleep(0.1)
+    assert out is not None and out["status"] == "complete"
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["status"] == "hunting" and detail["hunt_id"] == hunt_id
+    # The detail page reads Hunted from the same fields as the list.
+    assert detail["hunt_status"] == "complete"
+    assert detail["hunt_outcome_label"]
+    listed = next(
+        lead for lead in client.get("/api/v1/leads?status=hunting").json() if lead["id"] == lead_id
+    )
+    assert listed["hunt_status"] == "complete"
+    assert listed["hunt_outcome_label"] == detail["hunt_outcome_label"]
+    row = next(h for h in client.get("/api/v1/hunts?kind=lead").json() if h["id"] == hunt_id)
+    assert row["starter"] == "lead" and row["leadId"] == lead_id
+    assert row["objective"].startswith(f"[lead {lead_id}] ")
+    # A second click does not start a second hunt.
+    again = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+    assert again.status_code == 200 and again.json()["hunt_id"] == hunt_id
+
+
+def test_every_kind_has_analyst_words() -> None:
+    """A column name is not a label. Every kind the app records has one."""
+    from soc_ai.api.webui.kind_labels import KIND_LABEL, kind_label
+    from soc_ai.hunting.weight import Kind
+
+    assert kind_label("novel_served_port") == "new served port"
+    assert kind_label("novel_binding") == "first logon here"
+    for kind in Kind:
+        assert str(kind.value) in KIND_LABEL, kind
+    # A kind with no entry still reads. The gap shows in the product.
+    assert kind_label("some_new_kind") == "some new kind"
+    assert kind_label(None) == ""
+
+
+def test_a_lead_carries_the_analyst_words_for_its_kinds(client: TestClient) -> None:
+    lead_id = _seed_lead(client)
+    row = next(lead for lead in client.get("/api/v1/leads").json() if lead["id"] == lead_id)
+    assert set(row["kinds"]) == {"novel_destination", "off_hours"}
+    assert set(row["kind_labels"]) == {"new destination", "off hours"}
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert set(detail["kind_labels"]) == {"new destination", "off hours"}
+    assert {o["kind_label"] for o in detail["observations"]} == {"new destination", "off hours"}
+
+
+def _seed_profile_lead(client: TestClient) -> int:
+    """A lead of profile departures. They carry no document ids."""
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    async def go() -> int:
+        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.9.9.9",
+                kind=Kind.NOVEL_PROCESS,
+                spec_id="s",
+                fingerprint=content_fingerprint("process", "rundll32.exe"),
+                summary="a process this host has not run before: rundll32.exe",
+                now=now,
+            )
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.9.9.9",
+                kind=Kind.OFF_HOURS,
+                spec_id="p",
+                fingerprint=content_fingerprint("active_hours", "3"),
+                summary="active around 03:00 UTC, outside the hours this host is normally active",
+                now=now,
+            )
+            outcome = await form_leads(
+                db, entity_keys=[("host", "10.9.9.9")], now=now, threshold=0.7
+            )
+            return outcome.formed[0]
+
+    return asyncio.run(go())
+
+
+def _attach_complete_hunt(
+    client: TestClient,
+    lead_id: int,
+    *,
+    objective: str = "read 10.1.2.3 after a new peer and off-hours work",
+    narrative: str = "The host reached a new peer outside the hours it works.",
+    findings: list[dict[str, Any]] | None = None,
+) -> str:
+    """Give the lead a finished hunt, the way the auto-hunt loop does."""
+
+    async def go() -> str:
+        from soc_ai.store import leads as leads_store
+
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(
+                db, objective=objective, started_by="loop", kind="lead", starter="lead"
+            )
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                narrative=narrative,
+                report={"findings": list(findings or [])},
+            )
+            await leads_store.mark_hunting(db, lead_id, hunt_id=hunt.id)
+            return hunt.id
+
+    return asyncio.run(go())
+
+
+def test_promoting_a_lead_with_no_finished_hunt_is_refused(client: TestClient) -> None:
+    """The investigation reads the hunt's findings. With no hunt there are none.
+
+    The auto-hunt loop starts a hunt as a lead forms, so this is the rare path:
+    the loop is off, or behind.
+    """
+    lead_id = _seed_lead(client)
+    start = AsyncMock(return_value="01INVNEVER")
+    with patch("soc_ai.api.webui.routes_hunts._start_promotion", start):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["reason"] == "lead_not_hunted"
+    assert detail["hint"] == ("Hunt this lead first. The investigation reads the hunt's findings.")
+    start.assert_not_awaited()
+    assert client.get(f"/api/v1/hunts/leads/{lead_id}").json()["status"] == "open"
+
+
+def test_promoting_a_lead_whose_hunt_still_runs_says_so(client: TestClient) -> None:
+    """A running hunt has no report yet. The refusal names the running hunt."""
+    lead_id = _seed_lead(client)
+
+    async def go() -> None:
+        from soc_ai.store import leads as leads_store
+
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(
+                db, objective="still going", started_by="loop", kind="lead", starter="lead"
+            )
+            await leads_store.mark_hunting(db, lead_id, hunt_id=hunt.id)
+
+    asyncio.run(go())
+    res = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["reason"] == "lead_not_hunted"
+    assert "still running" in detail["hint"]
+
+
+def test_promoting_a_lead_with_no_cited_documents_is_refused_before_the_grid(
+    client: TestClient,
+) -> None:
+    """An investigation of nothing burns a model call and lands an empty verdict."""
+    lead_id = _seed_profile_lead(client)
+    _attach_complete_hunt(client, lead_id, findings=[])
+    start = AsyncMock(return_value="01INVNEVER")
+    with patch("soc_ai.api.webui.routes_hunts._start_promotion", start):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+    assert res.status_code == 422, res.text
+    detail = res.json()["detail"]
+    assert detail["reason"] == "no_citations"
+    assert "no documents" in detail["hint"]
+    start.assert_not_awaited()
+    assert client.get(f"/api/v1/hunts/leads/{lead_id}").json()["status"] == "hunting"
+
+
+def test_a_closed_lead_refuses_a_hunt_and_a_promotion(client: TestClient) -> None:
+    """A dismissed lead starts nothing. The refusal names the dismissal."""
+    lead_id = _seed_lead(client)
+    client.post(
+        f"/api/v1/hunts/leads/{lead_id}/dismiss",
+        json={"reason": "known_change", "note": "patch window"},
+    )
+    for route in ("hunt", "promote"):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/{route}")
+        assert res.status_code == 409, (route, res.text)
+        detail = res.json()["detail"]
+        assert detail["reason"] == "lead_is_closed"
+        assert f"Lead {lead_id}" in detail["hint"]
+        assert "known_change" in detail["hint"] and "Reopen" in detail["hint"]
+
+
+def test_a_second_dismissal_answers_200_and_changes_nothing(client: TestClient) -> None:
+    lead_id = _seed_lead(client)
+    first = client.post(
+        f"/api/v1/hunts/leads/{lead_id}/dismiss",
+        json={"reason": "known_change", "note": "patch window"},
+    ).json()
+    second = client.post(
+        f"/api/v1/hunts/leads/{lead_id}/dismiss",
+        json={"reason": "bad_baseline", "note": "changed my mind"},
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["dismissed_reason"] == first["dismissed_reason"] == "known_change"
+    assert body["dismissed_note"] == "patch window"
+    assert body["dismissed_at"] == first["dismissed_at"]
+
+
+def test_reopening_a_lead_keeps_the_dismissal_as_history(client: TestClient) -> None:
+    # The dismissal stays on the row so the page can show it as a timeline event.
+    lead_id = _seed_lead(client)
+    client.post(
+        f"/api/v1/hunts/leads/{lead_id}/dismiss",
+        json={"reason": "benign_repeat", "note": "seen before"},
+    )
+    res = client.post(f"/api/v1/hunts/leads/{lead_id}/reopen")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "open"
+    assert body["dismissed_reason"] is not None and body["dismissed_at"] is not None
+    assert client.post("/api/v1/hunts/leads/999999/reopen").status_code == 404
+
+
+def test_hunting_a_lead_that_is_already_hunting_says_the_hunt_exists(client: TestClient) -> None:
+    """The second click must not start a second hunt, and must say so."""
+    import asyncio
+
+    lead_id = _seed_lead(client)
+
+    async def attach() -> None:
+        from soc_ai.store import leads as leads_store
+
+        async with client.app.state.db_sessionmaker() as db:
+            await leads_store.mark_hunting(db, lead_id, hunt_id="01HUNTEXISTING")
+
+    asyncio.run(attach())
+    res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+    assert res.status_code == 200
+    assert res.json() == {"hunt_id": "01HUNTEXISTING", "existing": "true"}
+
+
+def test_promoting_a_lead_investigates_its_hunt(client: TestClient) -> None:
+    """The subject is the hunt, not the one document the lead cited hardest."""
+    from types import SimpleNamespace
+
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+
+    lead_id = _seed_lead(client)
+    hunt_id = _attach_complete_hunt(
+        client,
+        lead_id,
+        objective="read 10.1.2.3 after a new peer and off-hours work",
+        findings=[
+            {
+                "title": "Outbound to a host this one has never reached",
+                "detail": "One long connection to 203.0.113.9.",
+                "hosts": ["10.1.2.3"],
+                "citations": ["tel-doc-000002"],
+            }
+        ],
+    )
+    hits = [
+        {"_id": "tel-doc-000002", "_source": {"event": {"dataset": "zeek.conn"}}},
+        {"_id": "tel-doc-000003", "_source": {"event": {"dataset": "zeek.conn"}}},
+    ]
+    start = AsyncMock(return_value="01INVLEAD")
+    with (
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=2, took_ms=1, hits=hits)),
+        ),
+        patch(
+            "soc_ai.api.webui.routes_hunts.hunt_manager.get_manager",
+            return_value=SimpleNamespace(start=start),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+    assert res.status_code == 200, res.text
+    assert res.json()["investigation_id"] == "01INVLEAD"
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["status"] == "promoted" and detail["investigation_id"] == "01INVLEAD"
+
+    subject = start.await_args.kwargs["subject"]
+    assert subject is not None
+    assert subject.hunt_id == hunt_id
+    assert subject.lead_id == lead_id
+    assert subject.objective.startswith("read 10.1.2.3")
+    # The hunt's finding leads the document order, and the lead's own cited
+    # document is in the subject too.
+    assert subject.document_ids[0] == "tel-doc-000002"
+    assert "tel-doc-000003" in subject.document_ids
+    assert {o.kind for o in subject.observations} == {"novel_destination", "off_hours"}
+    record = subject.as_record()
+    assert record["type"] == "hunt" and record["hunt_id"] == hunt_id
+    assert record["lead_id"] == lead_id
+    assert record["finding_ordinals"] == [0]
+
+
+def test_promoting_a_lead_twice_returns_the_same_investigation(client: TestClient) -> None:
+    """The second click must not start a second investigation."""
+    from types import SimpleNamespace
+
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+
+    lead_id = _seed_lead(client)
+    _attach_complete_hunt(
+        client,
+        lead_id,
+        findings=[{"title": "A new peer", "citations": ["tel-doc-000002"]}],
+    )
+    hits = [{"_id": "tel-doc-000002", "_source": {"event": {"dataset": "zeek.conn"}}}]
+    start = AsyncMock(return_value="01INVLEAD")
+    with (
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=1, took_ms=1, hits=hits)),
+        ),
+        patch(
+            "soc_ai.api.webui.routes_hunts.hunt_manager.get_manager",
+            return_value=SimpleNamespace(start=start),
+        ),
+    ):
+        first = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+        second = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+    assert first.status_code == 200 and second.status_code == 200
+    assert second.json() == {"investigation_id": "01INVLEAD", "existing": "true"}
+    assert start.await_count == 1
+
+
+def test_promoting_a_finding_investigates_the_whole_hunt(client: TestClient) -> None:
+    """The finding is the reason. The hunt is the subject.
+
+    The promoted finding's documents come first, the other findings' documents
+    follow, and the record the row stores names all of them.
+    """
+    from types import SimpleNamespace
+
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+
+    findings = [
+        {
+            "title": "RC4 ticket for svc_sql",
+            "detail": "One host requested an RC4 service ticket.",
+            "severity": "high",
+            "hosts": ["10.1.2.3"],
+            "citations": ["tel-doc-000001"],
+        },
+        {
+            "title": "The same host read the SYSVOL share",
+            "hosts": ["10.1.2.3"],
+            "citations": ["tel-doc-000002", "not an id"],
+        },
+    ]
+
+    async def _seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(db, objective="hunt for kerberoasting", started_by="admin")
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                narrative="One host asked for an RC4 ticket and then read SYSVOL.",
+                report={"findings": findings},
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    hits = [
+        {"_id": "tel-doc-000002", "_source": {"event": {"dataset": "zeek.files"}}},
+        {"_id": "tel-doc-000001", "_source": {"event": {"dataset": "zeek.kerberos"}}},
+    ]
+    start = AsyncMock(return_value="01INVHUNT")
+    with (
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=2, took_ms=1, hits=hits)),
+        ),
+        patch(
+            "soc_ai.api.webui.routes_hunts.hunt_manager.get_manager",
+            return_value=SimpleNamespace(start=start),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/{hunt_id}/findings/1/investigate")
+    assert res.status_code == 200, res.text
+    assert res.json() == {"investigation_id": "01INVHUNT"}
+
+    kwargs = start.await_args.kwargs
+    subject = kwargs["subject"]
+    assert subject.hunt_id == hunt_id
+    assert subject.objective == "hunt for kerberoasting"
+    assert subject.narrative is not None
+    assert subject.lead_id is None
+    assert subject.finding_ordinals == [0, 1]
+    # Finding 1 was promoted, so its document is read first.
+    assert subject.document_ids == ["tel-doc-000002", "tel-doc-000001"]
+    assert [f.promoted for f in subject.findings] == [False, True]
+    # The anchor comes from the subject's own documents. No second grid read.
+    assert kwargs["alert_id"] == "tel-doc-000002"
+    record = subject.as_record()
+    assert record["finding_titles"] == [f["title"] for f in findings]
+    assert record["document_ids"] == ["tel-doc-000002", "tel-doc-000001"]
+
+
+def test_promoting_the_same_finding_twice_returns_the_first_investigation(
+    client: TestClient,
+) -> None:
+    from types import SimpleNamespace
+
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+
+    async def _seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(db, objective="hunt for beacons", started_by="admin")
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                report={"findings": [{"title": "A beacon", "citations": ["tel-doc-000001"]}]},
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+
+    async def _record_the_row() -> str:
+        """The manager is mocked here, so write the row it would have written."""
+        from soc_ai.store import investigations as inv_svc
+
+        async with client.app.state.db_sessionmaker() as db:
+            inv = await inv_svc.create(
+                db,
+                alert_es_id="tel-doc-000001",
+                started_by="admin",
+                kind="hunt",
+                hunt_id=hunt_id,
+                finding_ordinal=0,
+                subject={"type": "hunt", "hunt_id": hunt_id},
+            )
+            return inv.id
+
+    hits = [{"_id": "tel-doc-000001", "_source": {"event": {"dataset": "zeek.conn"}}}]
+    start = AsyncMock(return_value="01INVHUNT")
+    with (
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=1, took_ms=1, hits=hits)),
+        ),
+        patch(
+            "soc_ai.api.webui.routes_hunts.hunt_manager.get_manager",
+            return_value=SimpleNamespace(start=start),
+        ),
+    ):
+        first = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/investigate")
+        row_id = asyncio.run(_record_the_row())
+        second = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/investigate")
+    assert first.json() == {"investigation_id": "01INVHUNT"}
+    assert second.status_code == 200
+    assert second.json() == {"investigation_id": row_id, "existing": True}
+    assert start.await_count == 1, "a second promotion must reuse the first investigation"
+
+
+# ---------------------------------------------------------------------------
+# Merge 5: a starter names the analytics to run first
+# ---------------------------------------------------------------------------
+
+
+def test_a_template_with_analytics_renders_them_into_the_objective(client: TestClient) -> None:
+    from soc_ai.so_client.inventory import GridInventory
+
+    with patch(
+        "soc_ai.api.webui.routes_hunts.discover_datasets",
+        AsyncMock(return_value=GridInventory(datasets=(), window_minutes=1440, live_events=0)),
+    ):
+        res = client.post(
+            "/api/v1/hunt-templates",
+            json={
+                "name": "Kerberos sweep",
+                "objective_template": "Hunt for service ticket abuse.",
+                "analytics": [
+                    "identity-4769-rc4-service-ticket",
+                    "identity-4768-preauth-disabled",
+                ],
+            },
+        )
+    assert res.status_code == 200, res.text
+    tpl = res.json()
+    assert tpl["analytics"] == [
+        "identity-4769-rc4-service-ticket",
+        "identity-4768-preauth-disabled",
+    ]
+
+    with patch("soc_ai.webui.hunt_console_manager.get_manager") as gm:
+        gm.return_value.start = AsyncMock(return_value="01HUNT")
+        res = client.post(
+            "/api/v1/hunts/chat",
+            json={"objective": tpl["objectiveTemplate"], "template_id": tpl["id"]},
+        )
+        assert res.status_code == 200, res.text
+        objective = gm.return_value.start.call_args.kwargs["objective"]
+    assert objective.startswith(
+        "First run these analytics with t_run_analytic over the last 7 days: "
+        "identity-4769-rc4-service-ticket, identity-4768-preauth-disabled."
+    )
+    assert "Hunt for service ticket abuse." in objective
+
+
+def test_a_template_without_analytics_leaves_the_objective_alone(client: TestClient) -> None:
+    """The prefix appears only if the starter names an analytic."""
+    from soc_ai.so_client.inventory import GridInventory
+
+    with patch(
+        "soc_ai.api.webui.routes_hunts.discover_datasets",
+        AsyncMock(return_value=GridInventory(datasets=(), window_minutes=1440, live_events=0)),
+    ):
+        tpl = client.post(
+            "/api/v1/hunt-templates",
+            json={"name": "Plain sweep", "objective_template": "Hunt for lateral movement."},
+        ).json()
+    assert tpl["analytics"] == []
+    with patch("soc_ai.webui.hunt_console_manager.get_manager") as gm:
+        gm.return_value.start = AsyncMock(return_value="01HUNT2")
+        res = client.post(
+            "/api/v1/hunts/chat",
+            json={"objective": "Hunt for lateral movement.", "template_id": tpl["id"]},
+        )
+        assert res.status_code == 200, res.text
+        objective = gm.return_value.start.call_args.kwargs["objective"]
+    assert objective == "Hunt for lateral movement."
+
+
+# ---------------------------------------------------------------------------
+# Merge 5: draft an analytic from a threat finding
+# ---------------------------------------------------------------------------
+
+
+def test_draft_analytic_from_a_threat_finding_writes_a_candidate(client: TestClient) -> None:
+    from soc_ai.detection.analytic_models import AnalyticDraft
+    from soc_ai.hunting.execute import SpecRun
+    from soc_ai.hunting.spec import parse_spec
+
+    from tests.test_analytic_drafter import GOOD_YAML
+
+    hunt_id = _seed_complete_hunt(client)
+    with (
+        patch(
+            "soc_ai.api.webui.routes_detection.draft_analytic",
+            AsyncMock(
+                return_value=(
+                    AnalyticDraft(spec_yaml=GOOD_YAML, rationale="r"),
+                    parse_spec(GOOD_YAML),
+                )
+            ),
+        ),
+        patch(
+            "soc_ai.api.webui.routes_detection.run_spec",
+            AsyncMock(
+                return_value=SpecRun(
+                    spec_id="local-rc4-ticket-from-workstation",
+                    since="now-30d",
+                    until="now",
+                    blind=False,
+                    precondition_docs=1,
+                    matched_docs=3,
+                    candidates=[],
+                )
+            ),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["analytic_id"] == "local-rc4-ticket-from-workstation"
+    assert body["status"] == "candidate"
+    assert body["dry_run"]["hit_count"] == 3
+    listed = client.get("/api/v1/analytics").json()["analytics"]
+    assert any(a["id"] == body["analytic_id"] and a["status"] == "candidate" for a in listed)
+
+
+def test_draft_analytic_refuses_a_visibility_gap(client: TestClient) -> None:
+    """Only a threat finding can become an analytic."""
+    hunt_id = _seed_complete_hunt(client)
+
+    async def _mark_gap() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await db.get(Hunt, hunt_id)
+            report = dict(hunt.report or {})
+            findings = [dict(f) for f in report.get("findings") or []]
+            findings[0]["category"] = "visibility_gap"
+            report["findings"] = findings
+            hunt.report = report
+            await db.commit()
+
+    asyncio.run(_mark_gap())
+    res = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic")
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["reason"] == "not_a_threat_finding"
+
+
+def test_draft_analytic_is_refused_when_the_setting_is_off(settings_kratos: Settings) -> None:
+    off = settings_kratos.model_copy(update={"analytic_drafting_enabled": False})
+    for c in _client(off):
+        hunt_id = _seed_complete_hunt(c)
+        res = c.post(f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic")
+        assert res.status_code == 403, res.text
+        assert res.json()["detail"]["reason"] == "analytic_drafting_disabled"
+
+
+def test_draft_analytic_reports_a_bad_draft_as_422(client: TestClient) -> None:
+    """A draft the catalog schema refuses never reaches the store."""
+    hunt_id = _seed_complete_hunt(client)
+    with patch(
+        "soc_ai.api.webui.routes_detection.draft_analytic",
+        AsyncMock(side_effect=ValueError("a drafted analytic id must start with local-")),
+    ):
+        res = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic")
+    assert res.status_code == 422, res.text
+    assert res.json()["detail"]["reason"] == "bad_draft"
+    assert client.get("/api/v1/analytics").json()["counts"].get("candidate", 0) == 0
+
+
+def test_observations_for_an_entity_list_every_source(client: TestClient) -> None:
+    """The host page reads one list of observations from every source.
+
+    A repeated single signal is visible here before it forms a lead. The
+    profile layer, the catalog and the alert layer each wrote to their own
+    table before this, so one host had three partial stories and no list.
+    """
+    lead_id = _seed_lead(client)
+    res = client.get("/api/v1/hunts/observations", params={"entity": "10.1.2.3", "days": 7})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["entity"] == "10.1.2.3" and body["days"] == 7
+    assert len(body["observations"]) == 2
+    observation = body["observations"][0]
+    assert {
+        "id",
+        "kind",
+        "spec_id",
+        "source",
+        "shadow",
+        "summary",
+        "weight_now",
+        "lead_id",
+        "born_at",
+        "occurrences",
+        "read",
+    } <= set(observation)
+    assert all(o["lead_id"] == lead_id for o in body["observations"])
+    assert all(o["source"] == "profile" for o in body["observations"])
+    assert all(o["weight_now"] > 0 for o in body["observations"])
+
+
+def test_observations_for_an_entity_leave_out_another_host(client: TestClient) -> None:
+    """A negative control on the path a filter would miss.
+
+    The route keys on the entity. A route that read every recent observation
+    would pass the test above and report a second host's activity on this
+    host's page.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    _seed_lead(client)
+
+    async def other() -> None:
+        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.1.2.9",
+                kind=Kind.CATALOG_MATCH,
+                spec_id="s",
+                fingerprint=content_fingerprint("s", "10.1.2.9"),
+                summary="a match on another host",
+                source="catalog",
+                now=now,
+            )
+
+    asyncio.run(other())
+    body = client.get("/api/v1/hunts/observations", params={"entity": "10.1.2.3"}).json()
+    assert len(body["observations"]) == 2
+    assert all("10.1.2.9" not in (o["summary"] or "") for o in body["observations"])
+
+
+# ---------------------------------------------------------------------------
+# GET /leads: the tabs are named by what the analyst must do
+# ---------------------------------------------------------------------------
+
+
+def _seed_lead_row(
+    client: TestClient,
+    *,
+    status: str,
+    hunt_status: str | None = None,
+    investigation_id: str | None = None,
+    reopened: bool = False,
+    shadow: bool = False,
+) -> int:
+    """One lead row, with a hunt attached when ``hunt_status`` names one.
+
+    Written at the row level. These tests pin how the route SELECTS a lead,
+    and the formation rules have their own tests.
+
+    ``reopened`` leaves the dismissal on an open lead, which is what a reopen
+    does: the reason, the note and the hand stay as history.
+    """
+    import asyncio
+
+    from soc_ai.store.models import Hunt, Lead
+
+    async def go() -> int:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt_id = None
+            if hunt_status is not None:
+                hunt = Hunt(
+                    id=f"lead-hunt-{status}-{hunt_status}",
+                    objective="look at this lead",
+                    objective_hash="x",
+                    started_by="admin",
+                    kind="lead",
+                    status=hunt_status,
+                )
+                db.add(hunt)
+                await db.flush()
+                hunt_id = hunt.id
+            lead = Lead(
+                status=status,
+                entities_json=[["host", "10.1.2.3"]],
+                kinds_json=["catalog_match"],
+                hunt_id=hunt_id,
+                investigation_id=investigation_id,
+                shadow=shadow,
+                dismissed_reason="benign_repeat" if reopened else None,
+                dismissed_at=datetime(2026, 9, 20, 9, 0) if reopened else None,
+            )
+            db.add(lead)
+            await db.commit()
+            return int(lead.id)
+
+    return asyncio.run(go())
+
+
+def _auto_hunt_off(client: TestClient) -> None:
+    """Turn the loop off, live, as the Config console does."""
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"lead_auto_hunt": False}
+    )
+
+
+def _seed_investigation(client: TestClient, investigation_id: str) -> None:
+    """One investigation row, so a promoted lead can point at a record that exists."""
+    import asyncio
+
+    from soc_ai.store.models import Investigation
+
+    async def go() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            db.add(Investigation(id=investigation_id, alert_es_id="es-1", kind="lead"))
+            await db.commit()
+
+    asyncio.run(go())
+
+
+def test_a_promoted_lead_says_whether_its_investigation_is_there(client: TestClient) -> None:
+    """The column carries no foreign key on purpose, so the id can dangle.
+
+    A harness deleted the investigations by alert and left the lead pointing at
+    a record that is gone. The lead offered Open investigation and the link
+    answered 404. The surfaces need the fact, so they can say the record is
+    missing instead of promising it.
+
+    The lead keeps its status. An analyst promoted it, and that decision holds
+    whatever happened to the record it made.
+    """
+    _seed_investigation(client, "01M2SBGNMS0ZFY3HRE6693DZP5")
+    kept = _seed_lead_row(client, status="promoted", investigation_id="01M2SBGNMS0ZFY3HRE6693DZP5")
+    dangling = _seed_lead_row(
+        client, status="promoted", investigation_id="01GONE0000000000000000000"
+    )
+    open_lead = _seed_lead_row(client, status="open")
+
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[kept]["investigation_exists"] is True
+    assert rows[dangling]["investigation_exists"] is False
+    assert rows[dangling]["status"] == "promoted"
+    # A lead that was never promoted names no investigation, so there is none
+    # to be missing.
+    assert rows[open_lead]["investigation_exists"] is False
+
+    detail = client.get(f"/api/v1/hunts/leads/{dangling}").json()
+    assert detail["investigation_id"] == "01GONE0000000000000000000"
+    assert detail["investigation_exists"] is False
+    assert client.get(f"/api/v1/hunts/leads/{kept}").json()["investigation_exists"] is True
+
+
+def test_a_lead_observation_says_whether_its_analytic_can_be_opened(
+    client: TestClient,
+) -> None:
+    """The timeline links each observation to its analytic. Two sources have none.
+
+    An alert verdict and a promoted hunt finding are recorded under a spec id
+    that names the adapter. Six of thirteen leads on the range linked to
+    ``?open=alert``, which opened a drawer that read "Could not read the
+    analytic."
+    """
+    import asyncio
+
+    from soc_ai.store.models import EntityObservation
+
+    lead_id = _seed_lead_row(client, status="open")
+
+    async def attach() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            for spec_id, source, fingerprint in (
+                ("identity-4662-dcsync-nonmachine", "catalog", "fp-analytic"),
+                ("alert", "alert", "fp-alert"),
+            ):
+                db.add(
+                    EntityObservation(
+                        entity_kind="host",
+                        entity_key="10.1.2.3",
+                        kind="catalog_match",
+                        spec_id=spec_id,
+                        fingerprint=fingerprint,
+                        birth_weight=0.7,
+                        born_at=datetime(2026, 9, 18, 12, 0),
+                        first_seen_at=datetime(2026, 9, 18, 12, 0),
+                        occurrences=1,
+                        source=source,
+                        lead_id=lead_id,
+                    )
+                )
+            await db.commit()
+
+    asyncio.run(attach())
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    by_spec = {o["spec_id"]: o for o in detail["observations"]}
+    assert by_spec["identity-4662-dcsync-nonmachine"]["analytic_exists"] is True
+    assert by_spec["alert"]["analytic_exists"] is False
+
+
+def _lead_set(client: TestClient, status: str) -> set[int]:
+    return {int(lead["id"]) for lead in client.get(f"/api/v1/leads?status={status}").json()}
+
+
+def test_needs_decision_lists_the_leads_that_wait_on_the_analyst(client: TestClient) -> None:
+    """A lead waits when its hunt finished, or when the loop will not hunt it.
+
+    With the loop on, a new lead waits on soc-ai and not on the analyst: its
+    hunt is queued. A reopened lead is the exception, because the loop leaves
+    a reopened lead to the analyst who reopened it.
+    """
+    untouched = _seed_lead_row(client, status="open")
+    reopened = _seed_lead_row(client, status="open", reopened=True)
+    hunted = _seed_lead_row(client, status="hunting", hunt_status="complete")
+    failed = _seed_lead_row(client, status="hunting", hunt_status="error")
+    running = _seed_lead_row(client, status="hunting", hunt_status="running")
+    dismissed = _seed_lead_row(client, status="dismissed")
+    promoted = _seed_lead_row(client, status="promoted")
+
+    waiting = _lead_set(client, "needs_decision")
+    assert waiting == {reopened, hunted, failed}
+    assert untouched not in waiting
+    assert running not in waiting
+    assert dismissed not in waiting and promoted not in waiting
+
+
+def test_with_the_loop_off_a_new_lead_waits_on_the_analyst(client: TestClient) -> None:
+    """The older rule, restored by the setting. Nobody will start the hunt."""
+    untouched = _seed_lead_row(client, status="open")
+    reopened = _seed_lead_row(client, status="open", reopened=True)
+    hunted = _seed_lead_row(client, status="hunting", hunt_status="complete")
+    _seed_lead_row(client, status="hunting", hunt_status="running")
+
+    _auto_hunt_off(client)
+    assert _lead_set(client, "needs_decision") == {untouched, reopened, hunted}
+
+
+def test_a_shadow_lead_waits_on_the_analyst_even_with_the_loop_on(client: TestClient) -> None:
+    """Shadow records and never acts. The loop leaves a shadow lead alone.
+
+    So the lead carries no queue flag, and it waits on the analyst like a
+    reopened one: read the hit, judge the analytic, then hunt by hand.
+    """
+    shadow = _seed_lead_row(client, status="open", shadow=True)
+    plain = _seed_lead_row(client, status="open")
+
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[shadow]["hunt_queued"] is False
+    assert rows[plain]["hunt_queued"] is True
+    waiting = _lead_set(client, "needs_decision")
+    assert shadow in waiting and plain not in waiting
+
+
+def test_a_new_lead_says_its_hunt_is_queued(client: TestClient) -> None:
+    """The pill on the row reads "New · hunt queued" from this field.
+
+    A lead whose hunt the loop will not start must not carry it. The analyst
+    would read a queue that holds nothing.
+    """
+    untouched = _seed_lead_row(client, status="open")
+    reopened = _seed_lead_row(client, status="open", reopened=True)
+    hunting = _seed_lead_row(client, status="hunting", hunt_status="running")
+    dismissed = _seed_lead_row(client, status="dismissed")
+
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[untouched]["hunt_queued"] is True
+    assert rows[reopened]["hunt_queued"] is False
+    assert rows[hunting]["hunt_queued"] is False
+    assert rows[dismissed]["hunt_queued"] is False
+    assert client.get(f"/api/v1/hunts/leads/{untouched}").json()["hunt_queued"] is True
+    assert client.get(f"/api/v1/hunts/leads/{reopened}").json()["hunt_queued"] is False
+
+
+def test_with_the_loop_off_no_lead_says_its_hunt_is_queued(client: TestClient) -> None:
+    """NEGATIVE CONTROL. Off, nothing is queued, so the pill must not claim it."""
+    untouched = _seed_lead_row(client, status="open")
+    _auto_hunt_off(client)
+
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[untouched]["hunt_queued"] is False
+    assert client.get(f"/api/v1/hunts/leads/{untouched}").json()["hunt_queued"] is False
+
+
+def test_a_reopened_lead_that_kept_its_hunt_waits_under_both_settings(
+    client: TestClient,
+) -> None:
+    """A reopen keeps the hunt. The lead is open again with a finished hunt.
+
+    That lead matched no tab: it is not new, because it has a hunt, and it is
+    not hunting, because the analyst reopened it. On the range lead 9 read
+    "Hunted . Threat findings", the loop left it alone and no count held it.
+    """
+    reopened = _seed_lead_row(client, status="open", hunt_status="complete", reopened=True)
+
+    assert reopened in _lead_set(client, "needs_decision")
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[reopened]["hunt_queued"] is False
+    assert rows[reopened]["hunt_status"] == "complete"
+
+    _auto_hunt_off(client)
+    assert reopened in _lead_set(client, "needs_decision")
+
+
+def test_an_open_lead_whose_hunt_runs_is_in_progress_not_waiting(
+    client: TestClient,
+) -> None:
+    """The other half of a reopen: Hunt again on a reopened lead.
+
+    The lead is open and its hunt runs. Nothing waits on the analyst while a
+    hunt runs, on any status.
+    """
+    running = _seed_lead_row(client, status="open", hunt_status="running")
+
+    assert running in _lead_set(client, "in_progress")
+    assert running not in _lead_set(client, "needs_decision")
+
+
+def test_in_progress_lists_only_the_leads_with_a_hunt_running(client: TestClient) -> None:
+    _seed_lead_row(client, status="open")
+    _seed_lead_row(client, status="hunting", hunt_status="complete")
+    running = _seed_lead_row(client, status="hunting", hunt_status="running")
+    assert _lead_set(client, "in_progress") == {running}
+
+
+def test_the_lead_aliases_that_already_shipped_still_answer(client: TestClient) -> None:
+    """The four older values keep their meaning. A tab a bookmark names still works."""
+    untouched = _seed_lead_row(client, status="open")
+    hunting = _seed_lead_row(client, status="hunting", hunt_status="running")
+    dismissed = _seed_lead_row(client, status="dismissed")
+    promoted = _seed_lead_row(client, status="promoted")
+
+    assert _lead_set(client, "open") == {untouched}
+    assert _lead_set(client, "new") == {untouched}
+    assert _lead_set(client, "hunting") == {hunting}
+    assert _lead_set(client, "closed") == {dismissed, promoted}
+    assert _lead_set(client, "all") == {untouched, hunting, dismissed, promoted}
+
+
+def test_a_lead_hunt_that_was_cancelled_still_waits_on_a_decision(client: TestClient) -> None:
+    """The negative control for the two tabs: a terminal hunt is not a running one.
+
+    A cancelled hunt and an interrupted hunt are finished. Read as running,
+    the lead behind one would sit in In progress for ever and appear on no
+    tab the analyst reads.
+    """
+    cancelled = _seed_lead_row(client, status="hunting", hunt_status="cancelled")
+    interrupted = _seed_lead_row(client, status="hunting", hunt_status="interrupted")
+    assert _lead_set(client, "needs_decision") == {cancelled, interrupted}
+    assert _lead_set(client, "in_progress") == set()
+
+
+# ---------------------------------------------------------------------------
+# Related leads on the API, and the lead quality block
+# ---------------------------------------------------------------------------
+
+
+def _seed_related_lead(
+    client: TestClient,
+    *,
+    host: str,
+    spec_id: str,
+    born_at: datetime,
+    evidence: dict[str, Any] | None = None,
+    hunt_status: str | None = None,
+    hunt_findings: list[dict[str, Any]] | None = None,
+) -> int:
+    """One open lead on one host, with one observation under one analytic.
+
+    ``hunt_status`` attaches a hunt, so the row can read Hunted.
+    """
+    import asyncio
+
+    from soc_ai.store.models import EntityObservation, Hunt, Lead
+
+    async def go() -> int:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt_id = None
+            if hunt_status is not None:
+                hunt = Hunt(
+                    id=f"related-hunt-{host}",
+                    objective="look at this lead",
+                    objective_hash="x",
+                    started_by="auto-hunt",
+                    kind="lead",
+                    status=hunt_status,
+                    report={"findings": hunt_findings or []},
+                )
+                db.add(hunt)
+                await db.flush()
+                hunt_id = hunt.id
+            lead = Lead(
+                status="open",
+                entities_json=[["host", host]],
+                kinds_json=["catalog_match"],
+                hunt_id=hunt_id,
+                shadow=False,
+            )
+            db.add(lead)
+            await db.flush()
+            db.add(
+                EntityObservation(
+                    entity_kind="host",
+                    entity_key=host,
+                    kind="catalog_match",
+                    spec_id=spec_id,
+                    fingerprint=f"{spec_id}:{host}",
+                    birth_weight=0.6,
+                    born_at=born_at,
+                    first_seen_at=born_at,
+                    summary=f"{spec_id} on {host}",
+                    evidence_json=evidence,
+                    source="catalog",
+                    lead_id=lead.id,
+                )
+            )
+            await db.commit()
+            return int(lead.id)
+
+    return asyncio.run(go())
+
+
+def test_the_lead_page_names_the_leads_it_relates_to(client: TestClient) -> None:
+    """A lead spans the entities one hit names. The page names the rest of the story."""
+    born = datetime.now(UTC).replace(tzinfo=None)
+    first = _seed_related_lead(client, host="10.1.1.5", spec_id="s", born_at=born)
+    second = _seed_related_lead(
+        client, host="10.1.1.6", spec_id="s", born_at=born - timedelta(hours=6)
+    )
+
+    detail = client.get(f"/api/v1/hunts/leads/{first}").json()
+    assert [r["lead_id"] for r in detail["related"]] == [second]
+    assert detail["related"][0]["reason"] == "same analytic within 24 h"
+    assert detail["related"][0]["entities"] == [["host", "10.1.1.6"]]
+    assert detail["related"][0]["status"] == "open"
+    assert detail["related"][0]["formed_at"] is not None
+    assert detail["related_count"] == 1
+
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[first]["related_count"] == 1
+    assert rows[second]["related_count"] == 1
+
+
+def test_a_related_row_carries_the_state_of_its_own_hunt(client: TestClient) -> None:
+    """The panel reads the same state as the strip, the lead page and the host page.
+
+    The row carried the stored status alone. A lead whose hunt finished is
+    still ``hunting`` in the table, so lead 11 read "In progress" in the panel
+    and "Hunted . Threat findings" everywhere else.
+    """
+    born = datetime.now(UTC).replace(tzinfo=None)
+    mine = _seed_related_lead(client, host="10.1.1.5", spec_id="s", born_at=born)
+    hunted = _seed_related_lead(
+        client,
+        host="10.1.1.6",
+        spec_id="s",
+        born_at=born - timedelta(hours=6),
+        hunt_status="complete",
+        hunt_findings=[{"title": "root id to a Tor exit", "category": "threat"}],
+    )
+
+    row = client.get(f"/api/v1/hunts/leads/{mine}").json()["related"][0]
+    assert row["lead_id"] == hunted
+    assert row["hunt_status"] == "complete"
+    assert row["hunt_outcome_label"] == "Threat findings"
+
+    # The other side of the pair has no hunt, so it claims none.
+    back = client.get(f"/api/v1/hunts/leads/{hunted}").json()["related"][0]
+    assert back["lead_id"] == mine
+    assert back["hunt_status"] is None
+    assert back["hunt_outcome_label"] is None
+
+
+def test_an_unrelated_lead_carries_an_empty_list_and_a_zero_count(client: TestClient) -> None:
+    born = datetime.now(UTC).replace(tzinfo=None)
+    alone = _seed_related_lead(client, host="10.1.1.5", spec_id="s", born_at=born)
+    _seed_related_lead(client, host="10.1.1.6", spec_id="q", born_at=born)
+    detail = client.get(f"/api/v1/hunts/leads/{alone}").json()
+    assert detail["related"] == []
+    assert detail["related_count"] == 0
+
+
+def test_the_lead_page_relates_by_an_external_address_and_by_a_technique(
+    client: TestClient,
+) -> None:
+    """The other two reasons, each on its own pair, in the analyst's words."""
+    born = datetime.now(UTC).replace(tzinfo=None)
+    address = _seed_related_lead(
+        client,
+        host="10.2.2.5",
+        spec_id="s",
+        born_at=born,
+        evidence={"baseline": {"member": "203.0.113.9"}},
+    )
+    _seed_related_lead(
+        client,
+        host="10.2.2.6",
+        spec_id="p",
+        born_at=born,
+        evidence={"baseline": {"member": "203.0.113.44"}},
+    )
+    reasons = {r["reason"] for r in client.get(f"/api/v1/hunts/leads/{address}").json()["related"]}
+    assert reasons == {"same external address 203.0.113.0/24"}
+
+    technique = _seed_related_lead(
+        client,
+        host="10.3.3.5",
+        spec_id="prior-workstation-account-first-logon-to-dc",
+        born_at=born - timedelta(days=2),
+    )
+    _seed_related_lead(
+        client,
+        host="10.3.3.6",
+        spec_id="prior-privileged-group-membership-changed",
+        born_at=born - timedelta(days=4),
+    )
+    detail = client.get(f"/api/v1/hunts/leads/{technique}").json()
+    assert "same technique T1078.002" in {r["reason"] for r in detail["related"]}
+
+
+def _seed_quality_lead(
+    client: TestClient,
+    *,
+    formed_at: datetime,
+    kinds: list[str],
+    status: str = "open",
+    dismissed_reason: str | None = None,
+    hunt_id: str | None = None,
+    threat: bool = False,
+) -> int:
+    """One lead row in one week, with the hunt that decides its outcome."""
+    import asyncio
+
+    from soc_ai.store.models import Hunt, Lead
+
+    async def go() -> int:
+        async with client.app.state.db_sessionmaker() as db:
+            if hunt_id is not None:
+                findings = (
+                    [
+                        {
+                            "title": "Beaconing to a rare external address",
+                            "severity": "high",
+                            "hosts": ["10.1.2.3"],
+                            "citations": ["es-1"],
+                        }
+                    ]
+                    if threat
+                    else []
+                )
+                db.add(
+                    Hunt(
+                        id=hunt_id,
+                        objective="look at this lead",
+                        objective_hash="x",
+                        started_by="admin",
+                        kind="lead",
+                        status="complete",
+                        report={"findings": findings, "narrative": "n"},
+                    )
+                )
+                await db.flush()
+            lead = Lead(
+                status=status,
+                entities_json=[["host", "10.1.2.3"]],
+                kinds_json=kinds,
+                formed_at=formed_at,
+                updated_at=formed_at,
+                hunt_id=hunt_id,
+                dismissed_reason=dismissed_reason,
+                dismissed_at=formed_at if status == "dismissed" else None,
+                shadow=False,
+            )
+            db.add(lead)
+            await db.commit()
+            return int(lead.id)
+
+    return asyncio.run(go())
+
+
+def test_the_lead_quality_block_counts_two_weeks_and_two_type_pairs(
+    client: TestClient,
+) -> None:
+    """The numbers, against seeded rows, per ISO week and per type pair.
+
+    A threat is the hunt outcome the Hunts page paints as "Threat findings",
+    so a hunt that completed with nothing in it counts as hunted and not as a
+    threat.
+    """
+    now = datetime.now(UTC).replace(tzinfo=None)
+    this_week = now - timedelta(hours=1)
+    last_week = now - timedelta(days=7, hours=1)
+
+    def label(at: datetime) -> str:
+        year, week, _day = at.isocalendar()
+        return f"{year}-W{week:02d}"
+
+    _seed_quality_lead(
+        client,
+        formed_at=this_week,
+        kinds=["catalog_match", "off_hours"],
+        hunt_id="01HUNTTHREAT",
+        threat=True,
+    )
+    _seed_quality_lead(
+        client,
+        formed_at=this_week,
+        kinds=["off_hours", "catalog_match"],
+        status="dismissed",
+        dismissed_reason="expected_for_role",
+        hunt_id="01HUNTCLEAN",
+    )
+    _seed_quality_lead(
+        client,
+        formed_at=last_week,
+        kinds=["novel_destination"],
+        status="promoted",
+    )
+    _seed_quality_lead(
+        client,
+        formed_at=last_week,
+        kinds=["novel_destination"],
+        status="dismissed",
+        dismissed_reason="known_change",
+    )
+
+    body = client.get("/api/v1/leads/quality?weeks=4").json()
+    weeks = {w["week"]: w for w in body["weeks"]}
+    assert len(body["weeks"]) == 4
+    assert weeks[label(this_week)] == {
+        "week": label(this_week),
+        "formed": 2,
+        "hunted": 2,
+        "threat": 1,
+        "promoted": 0,
+        "dismissed": {"expected_for_role": 1},
+    }
+    assert weeks[label(last_week)] == {
+        "week": label(last_week),
+        "formed": 2,
+        "hunted": 0,
+        "threat": 0,
+        "promoted": 1,
+        "dismissed": {"known_change": 1},
+    }
+    # The two leads written with the same two types in a different order are
+    # one pair, because the label is sorted.
+    assert body["by_types"] == [
+        {"types": "catalog_match+off_hours", "formed": 2, "dismissed": 1, "threat": 1},
+        {"types": "novel_destination", "formed": 2, "dismissed": 1, "threat": 0},
+    ]
+    assert body["rule"] == (
+        "A lead forms at 0.85 over two or more types, on a finding with no benign "
+        "baseline, or on one type repeated to 1.5."
+    )
+    assert body["note"] == "A threshold moves on a week of data, never on a day."
+
+
+def test_the_lead_quality_block_reads_a_quiet_week_as_a_measurement(
+    client: TestClient,
+) -> None:
+    """An empty week is a row. Dropped, a quiet week reads as a week never swept."""
+    body = client.get("/api/v1/leads/quality?weeks=2").json()
+    assert [w["formed"] for w in body["weeks"]] == [0, 0]
+    assert body["by_types"] == []
+    # Newest first, so the current week is the first row.
+    year, week, _day = datetime.now(UTC).isocalendar()
+    assert body["weeks"][0]["week"] == f"{year}-W{week:02d}"

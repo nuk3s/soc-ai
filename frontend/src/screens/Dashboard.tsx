@@ -1,6 +1,6 @@
-import { Activity, ArrowUpRight, Crosshair, Database, Gauge, RotateCw, Server, ShieldAlert, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Ghost, RotateCw, Server, ShieldAlert, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, StatusTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { GeneralChatPanel } from '../components/GeneralChatPanel';
@@ -28,15 +28,25 @@ import {
   getPreflightDetail,
   getQualityEvalStatus,
   getQualityTrend,
+  getShadowHits,
   listInvestigations,
+  onShadowHitsChanged,
   refreshPreflight,
   startQualityEval,
 } from '../lib/api';
 import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFilters';
 import { formatSkipReasons } from '../lib/skipReasons';
 import { rangeToSinceUntil } from '../lib/timeRange';
-import { middleEllipsis } from '../lib/text';
 import { VERDICT } from '../lib/tokens';
+import {
+  COUNT_AGE,
+  COUNT_ALERT_EVENTS,
+  COUNT_AWAITING,
+  COUNT_RUNNING,
+  COUNT_TRUE_POSITIVES,
+  COUNT_UNREAD_SHADOW_HITS,
+  STATUS_INVESTIGATION,
+} from '../lib/tooltips';
 import type {
   AlertGroup,
   InvestigationRow,
@@ -57,12 +67,43 @@ const SEV_META: Record<Severity, { label: string; color: string }> = {
   medium: { label: 'Medium', color: '#eab308' },
   low: { label: 'Low', color: '#6b87a8' },
   info: { label: 'Info', color: '#8b949e' },
+  unknown: { label: 'Unknown', color: '#9a8fb0' },
 };
-// info is intentionally omitted from the display order — the Dashboard breakdown
-// shows the four actionable severities; info exists only to satisfy the ramp.
-const SEV_ORDER: Severity[] = ['critical', 'high', 'medium', 'low'];
+// info is intentionally omitted from the display order — it exists only to
+// satisfy the ramp. 'unknown' is NOT omitted: it is the alerts whose documents
+// carry no severity label, and on the measured grid that was the whole 24 hour
+// queue. Leaving it out of the order counted those groups in the total and drew
+// no bar for them, so the four bars under-read and the numbers beside them
+// stopped adding up to the group count above.
+const SEV_ORDER: Severity[] = ['critical', 'high', 'medium', 'low', 'unknown'];
 // Outcome order: most-actionable first.
 const VERDICT_ORDER: Verdict[] = ['true_positive', 'needs_more_info', 'inconclusive', 'false_positive', 'untriaged'];
+
+/**
+ * The window + acked posture this screen counted under, as query params.
+ *
+ * Every link from a tile to /alerts has to carry both, because Alerts defaults
+ * to range=24h with hide_acked ON while this screen counts the operator's chosen
+ * range with acked groups INCLUDED. Drop either and the destination is a
+ * different question from the tile that opened it.
+ *
+ * It is a shared helper rather than a repeated literal because the severity bars
+ * sat directly beneath a tile where this was already fixed and carried neither
+ * param, so a 7d dashboard's "42 high" opened a 24h list with acked groups
+ * hidden. One place decides, or the next tile added gets it wrong too.
+ */
+function alertsWindowParams(range: string, custom: CustomRange | null): URLSearchParams {
+  const p = new URLSearchParams();
+  if (range === 'custom' && custom) {
+    p.set('range', 'custom');
+    p.set('from', custom.from);
+    p.set('to', custom.to);
+  } else {
+    p.set('range', range);
+  }
+  p.set('hide_acked', 'false');
+  return p;
+}
 
 /**
  * Where a verdict tile lands. Four settled verdicts are investigation OUTCOMES,
@@ -74,22 +115,18 @@ const VERDICT_ORDER: Verdict[] = ['true_positive', 'needs_more_info', 'inconclus
  *
  * It goes to /alerts instead — same endpoint (GET /alerts), same unit, so the
  * destination count is provably the tile's count — and it is where the operator
- * can start the investigation. Both carried params are load-bearing: Alerts
- * defaults to range=24h with hide_acked ON, while this screen counts the
- * operator's chosen range with acked groups INCLUDED. Drop either and a 7d
- * dashboard, or a fully-acked untriaged group, still lands on an empty list.
+ * can start the investigation.
  */
 function verdictDestination(v: Verdict, range: string, custom: CustomRange | null): string {
   if (v !== 'untriaged') return `/investigations?verdict=${v}`;
-  const p = new URLSearchParams({ verdict: 'untriaged' });
-  if (range === 'custom' && custom) {
-    p.set('range', 'custom');
-    p.set('from', custom.from);
-    p.set('to', custom.to);
-  } else {
-    p.set('range', range);
-  }
-  p.set('hide_acked', 'false');
+  const p = alertsWindowParams(range, custom);
+  p.set('verdict', 'untriaged');
+  return `/alerts?${p}`;
+}
+
+function severityDestination(sev: string, range: string, custom: CustomRange | null): string {
+  const p = alertsWindowParams(range, custom);
+  p.set('sev', sev);
   return `/alerts?${p}`;
 }
 
@@ -109,7 +146,14 @@ function computeMetrics(groups: AlertGroup[]): Metrics {
     inconclusive: 0,
     untriaged: 0,
   };
-  const sev: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  const sev: Record<Severity, number> = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    info: 0,
+    unknown: 0,
+  };
   let events = 0;
   let triaging = 0;
   for (const g of groups) {
@@ -140,12 +184,16 @@ function StatCard({
   sub,
   color = '#e6e9ef',
   icon,
+  title,
 }: {
   label: string;
   value: ReactNode;
   sub?: ReactNode;
   color?: string;
   icon?: ReactNode;
+  /** One sentence stating what the number counts, and over what. A tile that
+   *  disagrees with a list is the first thing an analyst asks about. */
+  title?: string;
 }) {
   return (
     <Panel className="px-4 py-3.5">
@@ -157,7 +205,11 @@ function StatCard({
           </span>
         )}
       </div>
-      <div className="mt-2 text-[27px] font-semibold leading-none tabular-nums" style={{ color }}>
+      <div
+        className="mt-2 text-[27px] font-semibold leading-none tabular-nums"
+        style={{ color }}
+        title={title}
+      >
         {value}
       </div>
       {sub && <div className="mt-1.5 text-[11.5px] leading-[1.4] text-dim">{sub}</div>}
@@ -197,7 +249,7 @@ function VerdictBreakdown({
             // goes, so the tooltip stops promising a list that can't exist.
             title={
               v === 'untriaged'
-                ? 'Show these detections on the Alerts list — where you can start the investigation'
+                ? 'The Alerts list holds these detections. Open it to start an investigation.'
                 : `Show ${VERDICT[v].label} investigations`
             }
             className="flex items-center justify-between gap-2 rounded-card border border-border-faint px-2.5 py-2 text-left transition-colors hover:border-accent"
@@ -277,8 +329,8 @@ function AutoTriageDegradedNote({ s }: { s: AutoTriageStatus }) {
     <div data-testid="autotriage-degraded" className="mb-2">
       <StatusTag color="#d29922" label="Sweep degraded" />
       <div className="mt-1 text-[12.5px] leading-[1.5] text-dim">
-        The Security Onion grid could not be read
-        {n ? ` for ${n} of this sweep's queries` : ''} — the backlog is unknown, not clear.
+        The sweep could not read the Security Onion grid
+        {n ? ` for ${n} of its queries` : ''}. The backlog is unknown.
       </div>
     </div>
   );
@@ -334,7 +386,7 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
           )}
         </>
       ) : (
-        'Idle — no auto-investigate batch has run yet.'
+        'The sweep is idle. No auto-investigate batch has run yet.'
       )}
     </div>
   );
@@ -359,7 +411,7 @@ function EnrichmentPanel({
     return (
       <div className="px-[15px] py-3.5 text-[12px] leading-[1.5] text-faint">
         {demo
-          ? 'Enrichment posture is an admin-only view — not shown in the demo.'
+          ? 'Enrichment posture is an admin-only view. The demo does not show it.'
           : 'Sign in as an admin to view enrichment posture.'}
       </div>
     );
@@ -423,6 +475,14 @@ function EnrichmentPanel({
  * (a persistently rejecting `getPreflight`), and — once a summary lands —
  * green or degraded. The errored state is distinct so a dead read reads as
  * "couldn't tell", not as a "Checking…" that never resolves.
+ *
+ * "Green" means BOTH counts are zero, not `status === 'green'`. The summary's
+ * status is FAIL-driven server-side (the same exit_code semantics the CLI
+ * doctor uses), so a grid whose only problems are WARNs reports green with a
+ * non-zero `warned` — and this card printed "All checks passing." over the
+ * top of it. Measured on a live deployment on 2026-09-06:
+ * {"status":"green","failing":0,"warned":2}, one of those two warning that 34
+ * alerts never reach the triage queue.
  */
 function SetupHealthCard({
   summary,
@@ -449,7 +509,9 @@ function SetupHealthCard({
   // a 600s TTL behind a 300s poll, that gap is exactly what the freshness
   // marker (and the Re-check affordance below) exist to make visible.
   const checkedAtMs = summary ? new Date(summary.checked_at).getTime() : null;
-  const degraded = summary?.status === 'degraded';
+  const failing = summary?.failing ?? 0;
+  const warned = summary?.warned ?? 0;
+  const clean = failing === 0 && warned === 0;
   const failingRows = detailRows.filter((r) => r.status === 'FAIL' || r.status === 'WARN');
   return (
     <Panel>
@@ -467,20 +529,27 @@ function SetupHealthCard({
           // `recheckFailed` below: say what isn't known rather than look
           // calm. Quiet styling (not danger-red), same as "Checking…" — this
           // is "couldn't tell", not a confirmed degraded state.
-          <div className="px-[15px] py-3 text-[13px] text-dim">Couldn't check setup health.</div>
+          <div className="px-[15px] py-3 text-[13px] text-dim">The setup health read failed. The result is unknown.</div>
         ) : (
           <div className="px-[15px] py-3 text-[13px] text-dim">Checking setup health…</div>
         )
-      ) : !degraded ? (
-        <div className="px-[15px] py-3 text-[13px] text-text-2">All checks passing.</div>
+      ) : clean ? (
+        <div className="px-[15px] py-3 text-[13px] text-text-2">All checks pass.</div>
       ) : isAdmin ? (
         <div className="px-[15px] py-3">
           <div className="text-[13px] text-text-2">
-            <span className="font-semibold" style={{ color: '#f04438' }}>
-              {summary.failing} check{summary.failing === 1 ? '' : 's'} failing
-            </span>
-            {summary.warned > 0 && (
-              <span className="text-dim"> · {summary.warned} warned</span>
+            {failing > 0 && (
+              <span className="font-semibold" style={{ color: '#f04438' }}>
+                {failing} check{failing === 1 ? '' : 's'} failing
+              </span>
+            )}
+            {warned > 0 && (
+              // Amber, not the failing red and not the dim aside it used to
+              // be: a WARN is neither a crisis nor a footnote. Said in FAIL's
+              // words it gets discounted; said in grey it gets skipped.
+              <span className="font-semibold text-warn">
+                {failing > 0 ? ` · ${warned} warning` : `${warned} check${warned === 1 ? '' : 's'} warning`}
+              </span>
             )}
           </div>
           {detailLoading && !detailRows.length ? (
@@ -489,7 +558,7 @@ function SetupHealthCard({
             failingRows.map((r) => (
               <div key={r.name} className="mt-2.5 text-[12.5px] leading-[1.5]">
                 <span className="font-semibold text-text-2">{r.name}</span>
-                <span className="text-dim"> — {r.detail}</span>
+                <span className="text-dim">: {r.detail}</span>
                 {r.hint && <div className="mt-0.5 text-faint">{r.hint}</div>}
               </div>
             ))
@@ -505,32 +574,47 @@ function SetupHealthCard({
             <button
               onClick={onRecheck}
               disabled={rechecking}
-              title="Force a fresh check now, past the 10-minute cache — for when the problem is already fixed"
+              title="Re-check runs the checks now and ignores the 10 min cache. Use it if the problem is already fixed."
               className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
             >
               <RotateCw size={11} />
               {rechecking ? 'Re-checking…' : 'Re-check'}
             </button>
             {recheckFailed && !rechecking && (
-              <span className="text-[11.5px] text-faint">Re-check failed — try again</span>
+              <span className="text-[11.5px] text-faint">The re-check failed. Try again.</span>
             )}
           </div>
         </div>
       ) : (
         <div className="px-[15px] py-3 text-[13px] text-text-2">
-          {summary.failing} check{summary.failing === 1 ? '' : 's'} failing — an admin can see
-          the details in Config → Diagnostics.
+          {checkCountLabel(failing, warned)}. An admin can see the details in Config →
+          Diagnostics.
         </div>
       )}
     </Panel>
   );
 }
 
+/** "1 check failing", "2 checks warning", "1 check failing, 2 warning".
+ *
+ * The analyst-side phrasing, where the two counts share one sentence and
+ * cannot be told apart by color. Warnings are named rather than folded into
+ * the failing count: an analyst who reads "3 checks failing" and finds one
+ * genuine failure in Diagnostics stops believing the number. */
+function checkCountLabel(failing: number, warned: number): string {
+  const parts: string[] = [];
+  if (failing > 0) parts.push(`${failing} check${failing === 1 ? '' : 's'} failing`);
+  if (warned > 0) {
+    parts.push(failing > 0 ? `${warned} warning` : `${warned} check${warned === 1 ? '' : 's'} warning`);
+  }
+  return parts.join(', ');
+}
+
 // A dependency that's down, in operator terms. The `detail` comes verbatim from
 // the (secret-free) backend probe; `label` humanizes which upstream it is, and
 // `headline` says which kind of trouble it is in.
 interface DownDep {
-  key: 'es' | 'llm';
+  key: 'es' | 'llm' | 'so';
   label: string;
   detail: string;
   headline: string;
@@ -551,17 +635,21 @@ function depKind(c: HealthComponent): string {
 // once it recovers. "Not reachable" sends a 3am analyst to check connectivity,
 // firewalls and whether the manager is down, none of which is the fault.
 function depHeadline(label: string, kind: string): string {
-  if (kind === 'overloaded') return `${label} overloaded — retryable`;
-  if (kind === 'partial') return `${label} reads are incomplete`;
-  return `${label} not reachable`;
+  if (kind === 'overloaded') return `${label} is overloaded. Retry later.`;
+  if (kind === 'partial') return `${label} reads are incomplete.`;
+  return `${label} is not reachable.`;
 }
 
 // Which of the health components are unreachable — drives the connection banner.
-// Only ES + LLM are treated as blocking dependencies (PCAP is optional/advisory).
+// ES, the model gateway and the Security Onion API are blocking dependencies;
+// PCAP is optional/advisory. The Security Onion API is here for the reason the
+// header pill now covers it too: it carries every acknowledge, escalate and
+// case write, so a banner that omits it describes a working app that cannot
+// actually act on anything (dogfood 2026-09-07, D1).
 function downDeps(h: Health | null): DownDep[] {
   if (!h) return [];
   const out: DownDep[] = [];
-  const dep = (key: 'es' | 'llm', label: string, c: HealthComponent): DownDep => ({
+  const dep = (key: 'es' | 'llm' | 'so', label: string, c: HealthComponent): DownDep => ({
     key,
     label,
     detail: c.detail,
@@ -569,6 +657,9 @@ function downDeps(h: Health | null): DownDep[] {
   });
   if (!h.es.ok) out.push(dep('es', 'Security Onion (Elasticsearch)', h.es));
   if (!h.llm.ok) out.push(dep('llm', 'AI gateway (LLM)', h.llm));
+  // Read defensively: a page served by an older build has no `so` field, and
+  // "not reported" must not read as "down".
+  if (h.so && !h.so.ok) out.push(dep('so', 'Security Onion API', h.so));
   return out;
 }
 
@@ -621,22 +712,27 @@ export function Dashboard() {
   // nudges below): the count changes a few times a day, so refetching up to 500
   // rows on the 10s overview cadence was ~100 KB transferred-and-discarded every
   // idle poll — the class the review flagged (id dashboard-pipeline-kpi-500-rows).
-  // The KPI must be THE SAME QUERY its deep link opens (?verdict=pipeline_error,
-  // widened to 30d by the Investigations screen — rangeToSinceUntil('30d') is
-  // that widening's own code path). It counts ROWS, not `total`, because its two
-  // exclusions (dismissed, superseded) are per-row facts the SQL count does not
-  // carry — so it can only count as far as one page (limit 500, the server cap)
-  // reaches, and `total` tells it when it has run out of page.
-  // TODO(backend): a server-side count_pipeline_errors applying the
-  // errorDismissed/superseded exclusions in SQL would drop the 500-row page
-  // entirely — a separate MR, out of scope for this frontend batch.
-  const fetchPipelineErrors = async (): Promise<{ rows: InvestigationRow[]; total: number }> => {
+  // The KPI must be THE SAME QUERY its deep link opens (?verdict=pipeline_error
+  // &errors=live, widened to 30d by the Investigations screen, where
+  // rangeToSinceUntil('30d') is that widening's own code path). The two
+  // exclusions the tile applies, dismissed and superseded, now travel as
+  // `errorState` so the server applies them to the rows AND to the header count
+  // the list renders. Before that they existed only here, so the tile went
+  // nine, eight, seven while the list it opened sat at twenty (dogfood
+  // 2026-09-07, D2). The client-side predicate stays as a second pair of eyes:
+  // over an already-partitioned page it is a no-op.
+  const fetchPipelineErrors = async (): Promise<{
+    rows: InvestigationRow[];
+    total: number;
+    partial: boolean;
+  }> => {
     const pipeErr = await listInvestigations({
       verdict: ['pipeline_error'],
+      errorState: 'live',
       ...rangeToSinceUntil('30d'),
       limit: 500,
     });
-    return { rows: pipeErr.rows, total: pipeErr.total };
+    return { rows: pipeErr.rows, total: pipeErr.total, partial: pipeErr.partial === true };
   };
   const pipeErr = useAsync(fetchPipelineErrors, [], { refetchInterval: 300_000 });
   const triageActiveRef = useRef(false);
@@ -657,6 +753,18 @@ export function Dashboard() {
   // whole queue's count either way, and the rows themselves belong on /hosts.
   const dossier = useAsync(() => getDossierConflicts(1), [], { refetchInterval: 300_000 });
   const dossierPending = dossier.data?.pending ?? 0;
+  // Unread shadow hits — the fourth of the five surfaces that make one hit
+  // obvious. Ask for one row: `unread` is the whole count either way, and the
+  // hits themselves belong on Hunts.
+  const shadowHits = useAsync(() => getShadowHits(1), [], { refetchInterval: 60_000 });
+  const unreadShadowHits = shadowHits.data?.unread ?? 0;
+  // A failed read is not a zero. The tile vanished on a 503 and the screen read
+  // exactly like a clean shadow week.
+  const shadowHitsFailed = Boolean(shadowHits.error) && !shadowHits.data;
+  const refetchShadowHits = shadowHits.refetch;
+  // The band publishes a read the moment it lands. Without this the tile held
+  // the old count for up to 60 s beside a band that had already cleared.
+  useEffect(() => onShadowHitsChanged(refetchShadowHits), [refetchShadowHits]);
   // Quality trend — one point per NIGHTLY run, so a slow cadence is plenty;
   // 60s only exists to catch a manually-triggered eval-nightly without a
   // hard page refresh.
@@ -722,7 +830,12 @@ export function Dashboard() {
   }, []);
   const isAdmin = me?.role === 'admin';
   const preflight = useAsync(getPreflight, [], { refetchInterval: 300_000 });
-  const preflightDegraded = preflight.data?.status === 'degraded';
+  // Counts, not `status`: the summary's status is FAIL-driven server-side, so
+  // a WARNing check leaves it 'green' and gating the detail read on it meant
+  // the rows behind a warning were never fetched — the card could only ever
+  // have shown a warning as a bare number.
+  const preflightIssues = (preflight.data?.failing ?? 0) + (preflight.data?.warned ?? 0);
+  const preflightNeedsReview = preflightIssues > 0;
   // The detail read carries per-check names, detail strings and hints —
   // admin-only server-side (require_admin_api) — and must never be REQUESTED
   // for a non-admin session, not merely hidden client-side once it lands.
@@ -733,13 +846,13 @@ export function Dashboard() {
   // sweep-status read.
   //
   // Demo mode needs no special case here: the API already short-circuits
-  // preflight to green in demo (Task 3), so `preflightDegraded` is false, and
-  // /health/preflight/detail 403s for everyone in demo even if this somehow
-  // fired — the server contract makes a client-side demo branch redundant,
-  // not merely unnecessary.
+  // preflight to an empty check list in demo (Task 3), so both counts are
+  // zero, and /health/preflight/detail 403s for everyone in demo even if this
+  // somehow fired — the server contract makes a client-side demo branch
+  // redundant, not merely unnecessary.
   const preflightDetail = useAsync<PreflightDetail | null>(
-    () => (preflightDegraded && isAdmin ? getPreflightDetail() : Promise.resolve(null)),
-    [preflightDegraded, isAdmin],
+    () => (preflightNeedsReview && isAdmin ? getPreflightDetail() : Promise.resolve(null)),
+    [preflightNeedsReview, isAdmin],
   );
   const [rechecking, setRechecking] = useState(false);
   // Say what we don't know rather than look calm: a rejected refreshPreflight
@@ -760,12 +873,13 @@ export function Dashboard() {
     // poll reads correctly — without this affordance, a problem fixed a
     // minute ago could still read degraded for up to 10 minutes with nothing
     // on screen to force a look. Both reads are refetched, not just the
-    // summary: a PARTIAL fix (still degraded, but a different set of checks
-    // failing) leaves `preflightDegraded` unchanged, so preflightDetail's own
-    // dep array never moves and its loader never re-runs on its own — the
-    // row list would otherwise go on showing an already-fixed check under a
-    // freshly-correct count. A full fix masks this (status flips to green,
-    // hiding the stale rows along with it), which is why it's easy to miss.
+    // summary: a PARTIAL fix (still something to review, but a different set
+    // of checks flagged) leaves `preflightNeedsReview` unchanged, so
+    // preflightDetail's own dep array never moves and its loader never
+    // re-runs on its own — the row list would otherwise go on showing an
+    // already-fixed check under a freshly-correct count. A full fix masks
+    // this (both counts drop to zero, hiding the stale rows along with them),
+    // which is why it's easy to miss.
     refreshPreflight()
       .then(() => setRecheckFailed(false))
       .catch(() => setRecheckFailed(true))
@@ -801,7 +915,10 @@ export function Dashboard() {
     });
   }, [downKeys]);
 
-  const groups = useMemo(() => alerts.data ?? [], [alerts.data]);
+  // The KPI cards want the rows only. Truncation is the Alerts console's to
+  // report: these counts are already explicitly scoped to a window and the
+  // console is where an analyst acts on the queue's size.
+  const groups = useMemo(() => alerts.data?.groups ?? [], [alerts.data]);
   const rows = useMemo(() => invs.data?.recent ?? [], [invs.data]);
   // Server truth over the whole store, not the fetched sample: a run outside
   // the newest 100 must still keep the fast poll cadence alive.
@@ -818,24 +935,27 @@ export function Dashboard() {
     [rows],
   );
   const running = rows.filter((r) => r.status === 'running').length;
-  // Pipeline errors (E1.2): runs whose needs_more_info is a failure fallback
-  // (model truncation / gateway 5xx), excluded from the NMI KPI above. Counted
-  // over the DEEP LINK'S OWN QUERY (fetchDashboardInvestigations), so the tile
-  // counts the same query the list runs; livePipelineErrors then applies the
-  // KPI's documented exclusions — dismissed errors (the Dismiss button's whole
-  // effect) and superseded runs (re-running IS the fix). The clicked list still
-  // SHOWS those excluded rows, as history; the tile counts what needs acting on.
+  // Pipeline errors: runs that produced no usable verdict. Two shapes. One is the
+  // E1.2 fallback (a needs_more_info the pipeline never reasoned to, excluded from
+  // the NMI KPI above); the other is a run that died outright, leaving no verdict
+  // and no report at all. The second was invisible here until 2026-09-06, which is
+  // how 188 dead runs sat on a deployed instance for ten weeks, uncounted.
+  // Counted over the DEEP LINK'S OWN QUERY (fetchPipelineErrors), which now
+  // names the partition too, so the tile and the list it opens apply the same
+  // two exclusions: dismissed errors (the Dismiss button's whole effect) and
+  // superseded runs (re-running IS the fix). The clicked list still REACHES
+  // those excluded rows, under Handled, and marks them on the row.
   const pipelineErrorRows = pipeErr.data?.rows ?? [];
   const pipelineErrors = livePipelineErrors(pipelineErrorRows).length;
-  // Those exclusions are why the tile counts rows rather than reading `total`,
-  // and why it can only count as far as the page reaches. `total` is the whole
-  // match set, so total > rows.length means the server truncated and the count
-  // below is a FLOOR — rendered "N+" rather than left to read as exact. A
-  // multi-hour gateway outage against auto-triage puts hundreds of fallbacks in
-  // a 30-day window, so 500 is reachable, and an unmarked 500 beside a list
-  // header reading "1–500 of 812" is the same tile-vs-list disagreement this
-  // KPI was just moved onto the shared query to end.
-  const pipelineErrorsTruncated = (pipeErr.data?.total ?? 0) > pipelineErrorRows.length;
+  // The count is a FLOOR, rendered "N+", in either of the two ways it can stop
+  // being exact: the partition itself overflowed the page, or the server says
+  // the set it partitioned outgrew its own capped read. A multi-hour gateway
+  // outage against auto-triage puts hundreds of fallbacks in a 30-day window,
+  // so 500 is reachable, and an unmarked 500 beside a list header reading
+  // "1–500 of 812" is the same tile-vs-list disagreement this KPI was moved
+  // onto the shared query to end.
+  const pipelineErrorsTruncated =
+    pipeErr.data?.partial === true || (pipeErr.data?.total ?? 0) > pipelineErrorRows.length;
 
   const a = (n: number): string => (alerts.data ? n.toLocaleString() : alerts.error ? '—' : '…');
   const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : '…');
@@ -919,10 +1039,14 @@ export function Dashboard() {
           the last 24h sitting under a header that now says 1h). Same marker the
           list screens use, so it says WHEN the numbers are from and offers the
           retry, without blanking a row that is still the best account of the
-          network anyone has. */}
-      {alertsStale ? (
-        <StaleNotice since={alerts.lastUpdated} onRefresh={alerts.refetch} className="mb-3" />
-      ) : alerts.error && alerts.data ? (
+          network anyone has.
+
+          The error branch comes first on purpose (the hunt catalog panel does
+          the same): the stale line's own Refresh is a foreground refetch,
+          which keeps the fail count through a failure and sets `error`. With
+          the stale branch first, a Refresh that failed re-rendered the same
+          "Showing data from" line, and the click was silent. */}
+      {alerts.error && alerts.data ? (
         <StaleNotice
           since={alerts.lastUpdated}
           onRefresh={alerts.refetch}
@@ -930,6 +1054,8 @@ export function Dashboard() {
           retrying
           className="mb-3"
         />
+      ) : alertsStale ? (
+        <StaleNotice since={alerts.lastUpdated} onRefresh={alerts.refetch} className="mb-3" />
       ) : null}
 
       {/* KPI row — the landing screen's headline. It used to open below the
@@ -939,11 +1065,12 @@ export function Dashboard() {
           opened the app for. The chat now leads the right-hand rail. */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
-          label={`Events · ${range}`}
+          label={`Alert events · ${range}`}
           value={a(m.events)}
           sub={`${a(m.groups)} detection groups`}
           color="#4b8bf5"
           icon={<Activity size={16} />}
+          title={COUNT_ALERT_EVENTS}
         />
         <StatCard
           label="Awaiting investigation"
@@ -964,11 +1091,11 @@ export function Dashboard() {
             // last read minutes ago, under a red banner saying the grid was
             // down. Last-known is not current, and "clear" is a claim about now.
             alerts.error
-              ? 'backlog unknown — the grid read failed'
+              ? 'The backlog is unknown. The grid read failed.'
               : alertsStale
-                ? 'backlog unknown — the grid stopped answering'
+                ? 'The backlog is unknown. The grid stopped answering.'
                 : triage.data?.active
-                  ? `auto-investigate running · ${triage.data.hunted}/${triage.data.total}`
+                  ? `auto-investigate active · ${triage.data.hunted}/${triage.data.total}`
                   : !alerts.data
                     ? 'checking the queue…'
                     : m.verdict.untriaged > 0
@@ -992,22 +1119,32 @@ export function Dashboard() {
           }
           color="#f5a623"
           icon={<ShieldAlert size={16} />}
+          title={COUNT_AWAITING}
         />
+        {/* Three numbers used to sit in this tile answering three different
+            questions under one heading: a count of DETECTION GROUPS, a second
+            count over the same groups, and a count of INVESTIGATION RUNS over a
+            fixed thirty days. Read against the investigations list at the same
+            minute, the tile said one and the list said three, and nothing here
+            said the two were counting different things (dogfood 2026-09-07, D4).
+            Now the group figures name their unit and their denominator, and the
+            run figure carries its own window and unit on its own line. */}
         <StatCard
           label={`True positives · ${range}`}
           value={a(m.verdict.true_positive)}
           sub={
             <>
-              {a(m.verdict.needs_more_info)} need more info
+              <div>
+                of {a(m.groups)} detection groups · {a(m.verdict.needs_more_info)} need more info
+              </div>
               {pipelineErrors > 0 && (
-                <>
-                  {' · '}
+                <div>
                   <button
                     onClick={() => navigate(PIPELINE_ERRORS_URL)}
                     title={
                       pipelineErrorsTruncated
-                        ? `at least ${pipelineErrors.toLocaleString()} runs to retry — more matched than one page holds, so open the list for the full set`
-                        : 'Show these runs on the Investigations list — open one to see the error and dismiss it'
+                        ? `At least ${pipelineErrors.toLocaleString()} runs need a retry. Open the list for the full set.`
+                        : 'The Investigations list holds these runs. Open a run to see the error and dismiss it.'
                     }
                     className="cursor-pointer underline decoration-[rgba(252,165,165,.45)] underline-offset-2 hover:decoration-[#fca5a5]"
                     style={{ color: '#fca5a5' }}
@@ -1016,20 +1153,58 @@ export function Dashboard() {
                     {pipelineErrorsTruncated ? '+' : ''} pipeline error
                     {pipelineErrors === 1 && !pipelineErrorsTruncated ? '' : 's'}
                   </button>
-                </>
+                  <span className="text-faint"> · runs, last 30 days</span>
+                </div>
               )}
             </>
           }
           color={m.verdict.true_positive > 0 ? '#f04438' : '#8b949e'}
           icon={<ShieldCheck size={16} />}
+          title={COUNT_TRUE_POSITIVES}
         />
         <StatCard
           label="Investigations running"
           value={i(running)}
-          sub={triage.data?.active ? 'auto-investigate active' : `of ${i(rows.length)} recent investigations`}
+          sub={triage.data?.active ? 'auto-investigate active' : `of the ${i(rows.length)} most recent, any time`}
           color="#2dd4bf"
           icon={<Crosshair size={16} />}
+          title={COUNT_RUNNING}
         />
+        {/* The fifth surface for a shadow hit, and the only KPI on this screen
+            that comes and goes. A standing "0" would teach the eye to skip the
+            tile, and this number matters on the day it moves off zero. */}
+        {(unreadShadowHits > 0 || shadowHitsFailed) && (
+          // The whole card was a button that navigated. A link goes to a page,
+          // so the words that name the destination carry the click and the
+          // address can be read, copied and opened in a tab.
+          <div data-testid="kpi-shadow-hits">
+            <StatCard
+              label="Shadow hits · unread"
+              value={
+                shadowHitsFailed ? (
+                  '?'
+                ) : (
+                  <span title={COUNT_UNREAD_SHADOW_HITS}>{a(unreadShadowHits)}</span>
+                )
+              }
+              sub={
+                shadowHitsFailed ? (
+                  'Could not read the shadow hits.'
+                ) : (
+                  <>
+                    from analytics in shadow.{' '}
+                    <Link to="/hunts?hits=unread" className="text-accent hover:underline">
+                      Read them on Hunts
+                    </Link>
+                    .
+                  </>
+                )
+              }
+              color={shadowHitsFailed ? '#8b949e' : '#d29922'}
+              icon={<Ghost size={16} />}
+            />
+          </div>
+        )}
       </div>
 
       {/* main grid */}
@@ -1049,7 +1224,7 @@ export function Dashboard() {
                 <ErrorState error={alerts.error} onRetry={alerts.refetch} label="the dashboard" />
               </div>
             ) : m.groups === 0 ? (
-              <EmptyState>All quiet — no alerts in the last 24 hours.</EmptyState>
+              <EmptyState>No alerts in the {rangeLabel}. Select a different time range to look further back.</EmptyState>
             ) : (
               <>
                 <VerdictBreakdown
@@ -1060,7 +1235,7 @@ export function Dashboard() {
                 <SeverityBreakdown
                   sev={m.sev}
                   total={m.groups}
-                  onSelect={(sv) => navigate(`/alerts?sev=${sv}`)}
+                  onSelect={(sv) => navigate(severityDestination(sv, range, custom))}
                 />
               </>
             )}
@@ -1071,13 +1246,13 @@ export function Dashboard() {
               icon={<Crosshair size={15} />}
               title="Recent investigations"
               right={
-                <button
-                  onClick={() => navigate('/investigations')}
+                <Link
+                  to="/investigations?range=30d"
                   className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline"
                 >
                   View all
                   <ArrowUpRight size={13} />
-                </button>
+                </Link>
               }
             />
             {invs.loading && !invs.data ? (
@@ -1087,15 +1262,18 @@ export function Dashboard() {
                 <ErrorState error={invs.error} />
               </div>
             ) : recent.length === 0 ? (
-              <EmptyState>No investigations yet — investigate an alert to start one.</EmptyState>
+              <EmptyState>No investigations yet. Investigate an alert to start one.</EmptyState>
             ) : (
               <div>
                 {recent.map((r) => {
                   const st = INV_STATUS[r.status];
                   return (
-                    <button
+                    // The row was one button that navigated. No row is
+                    // clickable as a whole: the name is the link, and the
+                    // chips beside it are facts, not controls.
+                    <div
                       key={r.id}
-                      onClick={() => navigate(`/investigation/${r.id}`)}
+                      data-testid="recent-investigation"
                       className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-2.5 text-left last:border-0 hover:bg-surface-3"
                     >
                       <KindBadge kind={r.kind} />
@@ -1117,12 +1295,13 @@ export function Dashboard() {
                           wrapper's 2.4 is their sum), so the wide layout is
                           byte-for-byte the one that shipped. */}
                       <span className="flex min-w-0 flex-[2.4] flex-col gap-0.5 lg:flex-row lg:items-center lg:gap-3">
-                        <span
+                        <Link
+                          to={`/investigation/${r.id}`}
                           title={r.name}
-                          className="min-w-0 truncate text-[13px] font-medium lg:flex-[1.4]"
+                          className="min-w-0 truncate text-[13px] font-medium text-accent hover:underline lg:min-w-[180px] lg:flex-[1.4]"
                         >
-                          {middleEllipsis(r.name)}
-                        </span>
+                          {r.name}
+                        </Link>
                         {/* Still dropped below `sm`, as before: on a phone-width
                             column the second line is itself too narrow to hold
                             two IPv4s, and the name wants the whole row. */}
@@ -1142,13 +1321,30 @@ export function Dashboard() {
                           r.verdict !== 'untriaged' && <VerdictPill verdict={r.verdict} conf={r.conf} />
                         )}
                       </span>
-                      <span className="hidden w-[120px] flex-none md:block">
+                      {/* Status and age are the two lowest-value columns on the
+                          row and the first to yield. At 1280 this panel sits in
+                          two of three grid columns (~630px of row); the badge,
+                          verdict, these two and their gaps came to ~407px, the
+                          flow badge's 230px floor took the rest, and the
+                          detection name — the one column that says WHAT fired
+                          — rendered at 0px (dogfood, 2026-09-16). Five rows
+                          read "SURICATA │ — │ Needs info 0.55 │ Complete │ 1d",
+                          indistinguishable from one another, on the landing
+                          screen. The name now has a floor of its own, and
+                          these two show only once there is room for all of it. */}
+                      <span
+                        className="hidden w-[120px] flex-none 2xl:block"
+                        title={STATUS_INVESTIGATION}
+                      >
                         <StatusTag color={st.color} label={st.label} pulse={st.pulse} />
                       </span>
-                      <span className="hidden w-[64px] flex-none text-right font-mono text-[10.5px] text-faint lg:block">
+                      <span
+                        className="hidden w-[64px] flex-none text-right font-mono text-[10.5px] text-faint 2xl:block"
+                        title={COUNT_AGE}
+                      >
                         {r.when}
                       </span>
-                    </button>
+                    </div>
                   );
                 })}
               </div>
@@ -1212,7 +1408,7 @@ export function Dashboard() {
                   <button
                     onClick={runEvalNow}
                     disabled={evalRunning}
-                    title="Run the quality micro-eval now — the same run the nightly schedule performs (real investigations; takes minutes)"
+                    title="Run the quality micro-eval now. The run uses real investigations and takes minutes."
                     className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
                   >
                     {evalRunning ? 'Evaluating…' : 'Run now'}
@@ -1222,6 +1418,7 @@ export function Dashboard() {
             />
             <QualityCard
               points={quality.data?.points ?? []}
+              freshness={quality.data?.freshness ?? null}
               error={quality.error}
               loading={quality.loading && !quality.data}
               demo={demo}
@@ -1256,7 +1453,7 @@ export function Dashboard() {
                   <span className="font-semibold" style={{ color: '#f5a623' }}>
                     {tuning.data!.pending} mute suggestion{tuning.data!.pending === 1 ? '' : 's'}
                   </span>{' '}
-                  pending — noisy rules with zero true positives keep consuming
+                  pending. Noisy rules with zero true positives consume
                   investigations.
                 </div>
                 <button
@@ -1283,8 +1480,8 @@ export function Dashboard() {
                   <span className="font-semibold" style={{ color: '#f5a623' }}>
                     {dossierPending} disagreement{dossierPending === 1 ? '' : 's'}
                   </span>{' '}
-                  need{dossierPending === 1 ? 's' : ''} review — the sweep keeps observing something
-                  other than what was declared.
+                  need{dossierPending === 1 ? 's' : ''} review. The sweep observes something
+                  different from the operator declaration.
                 </div>
                 <button
                   onClick={() => navigate('/hosts?conflicts=1')}

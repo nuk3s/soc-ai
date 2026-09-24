@@ -407,3 +407,56 @@ def test_host_ip_outranks_a_wire_dataset() -> None:
     """A sensor's own document about itself still names itself."""
     doc = {"event.dataset": "zeek.conn", "host.ip": "10.1.10.254"}
     assert fields.names_the_shipper(doc, "SR-router", "10.1.10.254") is False
+
+
+# ---------------------------------------------------------------------------
+# dataset_of — a plane that lives only in data_stream.dataset is still a plane
+# ---------------------------------------------------------------------------
+
+
+def test_ecs_event_dataset_wins() -> None:
+    assert fields.dataset_of({"event": {"dataset": "zeek.conn"}}) == "zeek.conn"
+
+
+def test_a_data_stream_only_document_is_still_identified() -> None:
+    """The shape that made 632,523 documents invisible.
+
+    Elastic Agent integrations shipping through a data stream may carry the
+    plane ONLY here. On the development grid every one of those documents has
+    `data_stream.dataset` and none has `event.dataset`, including the flow, DNS,
+    TLS and HTTP telemetry from the only sensor watching the live range VLANs.
+    """
+    doc = {
+        "data_stream": {"dataset": "network_traffic.dns", "namespace": "default"},
+        "event": {"module": "network_traffic", "kind": "event"},
+        "agent": {"name": "SR-router", "type": "packetbeat"},
+    }
+    assert fields.dataset_of(doc) == "network_traffic.dns"
+
+
+def test_the_module_is_a_last_resort_not_a_peer() -> None:
+    """Coarser (`network_traffic`, not `network_traffic.dns`) but better than nothing.
+
+    134 documents on the development grid carry a module and no data stream.
+    """
+    assert fields.dataset_of({"event": {"module": "network_traffic"}}) == "network_traffic"
+    assert (
+        fields.dataset_of(
+            {"data_stream": {"dataset": "network_traffic.tls"}, "event": {"module": "x"}}
+        )
+        == "network_traffic.tls"
+    )
+
+
+def test_a_document_with_no_identity_returns_none_not_a_placeholder() -> None:
+    """The corroboration gate makes a real decision on this; a stand-in would remove it."""
+    assert fields.dataset_of({"source": {"ip": "10.0.0.1"}}) is None
+    assert fields.dataset_of({"event": {"kind": "event"}}) is None
+    assert fields.dataset_of({}) is None
+
+
+def test_it_reads_a_flat_dotted_document_too() -> None:
+    """A rendered fixture spells the path flat; a document read back nests it."""
+    assert fields.dataset_of({"data_stream.dataset": "network_traffic.flow"}) == (
+        "network_traffic.flow"
+    )

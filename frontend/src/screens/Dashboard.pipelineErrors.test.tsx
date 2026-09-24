@@ -60,7 +60,7 @@ const listInvestigations = vi.hoisted(() => vi.fn());
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [], truncated: false, other_docs: 0 }),
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   listInvestigations,
@@ -153,5 +153,103 @@ describe('Dashboard pipeline-error KPI', () => {
     );
     expect(await screen.findByRole('button', { name: '2 pipeline errors' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /\+ pipeline error/ })).toBeNull();
+  });
+
+  // The tile's exclusions used to exist only in the browser, so the list it
+  // opens could not reproduce its number: nine, eight, seven on the tile beside
+  // a list of twenty (dogfood 2026-09-07, D2). Both surfaces now name the same
+  // partition in the same query.
+  it('names the partition it counts, so the deep link can reproduce it', async () => {
+    listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
+      q.verdict?.length ? envelope(FALLBACKS) : envelope(RECENT),
+    );
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByRole('button', { name: '2 pipeline errors' });
+    const call = listInvestigations.mock.calls.find((c) => c[0]?.verdict?.length)?.[0];
+    expect(call.errorState).toBe('live');
+  });
+
+  it('marks the count as a floor when the SERVER says the set outgrew its cap', async () => {
+    // `partial` is the server's own signal: the partition is decided in Python
+    // over one capped read, so past the cap `total` stops being a count. The
+    // page-length comparison cannot see this, because the partition fits.
+    listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
+      q.verdict?.length
+        ? { ...envelope(FALLBACKS), partial: true }
+        : envelope(RECENT),
+    );
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('button', { name: '2+ pipeline errors' })).toBeTruthy();
+  });
+});
+
+describe('Dashboard pipeline-error KPI, runs that died without a verdict', () => {
+  // A run that ended in 'error' with no verdict wrote no report, so it never
+  // carried the E1.2 fallback marker and the tile that counted only `fallback`
+  // saw none of them. 188 stood on a deployed instance for ten weeks.
+  const DEAD = (id: string, over: Partial<InvestigationRow> = {}) =>
+    inv(id, {
+      verdict: 'untriaged',
+      conf: null,
+      status: 'error',
+      fallback: false,
+      noVerdict: true,
+      ts: '2026-07-20T10:00:00+00:00',
+      ...over,
+    });
+
+  it('counts a failed run alongside a fallback', async () => {
+    listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
+      q.verdict?.length ? envelope([FB('fb1'), DEAD('d1'), DEAD('d2')]) : envelope(RECENT),
+    );
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('button', { name: '3 pipeline errors' })).toBeTruthy();
+  });
+
+  it('stops counting a failed run once it is dismissed', async () => {
+    listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
+      q.verdict?.length
+        ? envelope([DEAD('d1', { errorDismissed: true }), DEAD('d2')])
+        : envelope(RECENT),
+    );
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('button', { name: '1 pipeline error' })).toBeTruthy();
+  });
+
+  // Negative control: a healthy instance grows no tile. Cancelled and
+  // interrupted runs reach no verdict either, and neither is a failure the
+  // owner has to act on.
+  it('shows nothing when every run either landed or was stopped on purpose', async () => {
+    listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
+      q.verdict?.length
+        ? envelope([
+            inv('c1', { status: 'cancelled', verdict: 'untriaged', conf: null }),
+            inv('i1', { status: 'interrupted', verdict: 'untriaged', conf: null }),
+          ])
+        : envelope(RECENT),
+    );
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByText('Run r1');
+    expect(screen.queryByText(/pipeline error/)).toBeNull();
   });
 });

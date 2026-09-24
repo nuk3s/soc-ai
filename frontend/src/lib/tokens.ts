@@ -4,7 +4,8 @@
 // classes still come from tailwind.config tokens elsewhere.
 // ---------------------------------------------------------------------------
 
-import type { DetectionKind, Severity, Verdict } from './types';
+import { CHIP_CATALOG_RUN, TYPE_LEAD, TYPE_MANUAL, TYPE_SCHEDULE } from './tooltips';
+import type { DetectionKind, HuntKind, Severity, Verdict } from './types';
 
 export interface SevMeta {
   label: string;
@@ -22,6 +23,11 @@ export const SEVERITY: Record<Severity, SevMeta> = {
   medium: { label: 'Medium', color: '#eab308', glow: 'rgba(234,179,8,.45)' },
   low: { label: 'Low', color: '#6b87a8', glow: 'rgba(107,135,168,.4)' },
   info: { label: 'Info', color: '#8b949e', glow: 'rgba(139,148,158,.35)' },
+  // No severity on the document. Off the ramp on purpose — a muted violet-grey
+  // that belongs to none of the four rungs, so a colour scan cannot read it as
+  // a position between them. SeverityTag draws its dot hollow for the same
+  // reason. See the Severity union in lib/types.ts.
+  unknown: { label: 'Unknown', color: '#9a8fb0', glow: 'rgba(154,143,176,.3)' },
 };
 
 export interface VerdictMeta {
@@ -55,6 +61,51 @@ export const KIND: Record<DetectionKind, KindMeta> = {
   sigma: { color: '#a472f0', bg: 'rgba(164,114,240,.1)', border: 'rgba(164,114,240,.3)' },
   notice: { color: '#2dd4bf', bg: 'rgba(45,212,191,.1)', border: 'rgba(45,212,191,.3)' },
   hunt: { color: '#f472b6', bg: 'rgba(244,114,182,.1)', border: 'rgba(244,114,182,.3)' },
+  // Alerts with no rule name, grouped by dataset. Slate: the badge says what
+  // the row is missing, and dressing that in a detector's colour would imply a
+  // detector produced it.
+  unnamed: { color: '#94a3b8', bg: 'rgba(148,163,184,.1)', border: 'rgba(148,163,184,.3)' },
+  // An alert from a dataset the feed does not map to a detector. Amber-slate:
+  // adjacent to 'unnamed' because both say what the row is missing, and a
+  // shade of no detector's colour because none of them made it.
+  alert: { color: '#b0a08a', bg: 'rgba(176,160,138,.1)', border: 'rgba(176,160,138,.3)' },
+};
+
+// How a hunt came to exist. 'chat' is the storage kind for anything an analyst
+// typed and 'manual' is what they read (HuntDetail already renders it so);
+// 'triggered' reads as 'catalog' because the declarative hunt catalog is the
+// only thing that triggers one today. Teal for the clock-driven kind, purple
+// for the rule-driven one — the same hues notice/sigma wear on the alert list,
+// which is what each kind most resembles.
+export interface HuntKindMeta extends KindMeta {
+  label: string;
+  /** Tooltip: the one line an analyst needs to know what produced the row. */
+  title: string;
+}
+// The sentences are the ones in lib/tooltips.ts, not copies of them. The badge
+// and the type chip each held their own wording, so one type read "Started from
+// a lead" on the row and "Hunts started from a lead" on the chip above it.
+export const HUNT_KIND: Record<HuntKind, HuntKindMeta> = {
+  chat: {
+    label: 'manual',
+    title: TYPE_MANUAL,
+    color: '#94a3b8', bg: 'rgba(148,163,184,.1)', border: 'rgba(148,163,184,.3)',
+  },
+  scheduled: {
+    label: 'scheduled',
+    title: TYPE_SCHEDULE,
+    color: '#2dd4bf', bg: 'rgba(45,212,191,.1)', border: 'rgba(45,212,191,.3)',
+  },
+  triggered: {
+    label: 'catalog',
+    title: CHIP_CATALOG_RUN,
+    color: '#a472f0', bg: 'rgba(164,114,240,.1)', border: 'rgba(164,114,240,.3)',
+  },
+  lead: {
+    label: 'lead',
+    title: TYPE_LEAD,
+    color: '#f79009', bg: 'rgba(247,144,9,.1)', border: 'rgba(247,144,9,.3)',
+  },
 };
 
 // Timeline-group colors for the investigation steps.

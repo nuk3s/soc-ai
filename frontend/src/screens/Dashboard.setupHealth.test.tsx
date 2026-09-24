@@ -27,7 +27,7 @@ import type { PreflightDetail, PreflightSummary } from '../lib/types';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [], truncated: false, other_docs: 0 }),
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   listInvestigations: vi.fn().mockResolvedValue({
@@ -61,9 +61,33 @@ const DEGRADED: PreflightSummary = {
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
+// Warnings only: `status` is FAIL-driven server-side (the same exit_code
+// semantics `soc-ai doctor` uses), so a grid with two WARNing checks and no
+// FAILing one reports green with a non-zero `warned`. Measured on a live
+// deployment on 2026-09-06: {"status":"green","failing":0,"warned":2}.
+const WARNED: PreflightSummary = {
+  status: 'green',
+  failing: 0,
+  warned: 2,
+  checked_at: '2026-08-19T10:00:00+00:00',
+};
+
 const DETAIL: PreflightDetail = {
   rows: [
     { name: 'audit write grant', status: 'FAIL', detail: 'missing write', hint: 'run the script' },
+  ],
+  checked_at: '2026-08-19T10:00:00+00:00',
+};
+
+const WARN_DETAIL: PreflightDetail = {
+  rows: [
+    {
+      name: 'alerts feed filter',
+      status: 'WARN',
+      detail: "'tags:alert' matched 2 in the last 24h while 'event.kind:alert' matched 34",
+      hint: 'Set WEBUI_ALERTS_QUERY=tags:alert OR event.kind:alert',
+    },
+    { name: 'index pattern', status: 'WARN', detail: 'no suricata.alert events', hint: '' },
   ],
   checked_at: '2026-08-19T10:00:00+00:00',
 };
@@ -89,7 +113,7 @@ describe('Dashboard setup-health card', () => {
   it('renders the green compact row when preflight is clean', async () => {
     mount();
     expect(await screen.findByText(/setup health/i)).toBeTruthy();
-    expect(screen.getByText(/all checks passing/i)).toBeTruthy();
+    expect(screen.getByText(/all checks pass/i)).toBeTruthy();
   });
 
   it('shows a distinct errored state on a persistently rejecting preflight read, not an endless "Checking…"', async () => {
@@ -100,9 +124,64 @@ describe('Dashboard setup-health card', () => {
     // preflight.error was computed by useAsync and simply never read.
     vi.mocked(getPreflight).mockRejectedValue(new Error('500'));
     mount();
-    expect(await screen.findByText(/couldn't check setup health/i)).toBeTruthy();
+    expect(await screen.findByText(/setup health read failed/i)).toBeTruthy();
     expect(screen.queryByText(/checking setup health/i)).toBeNull();
-    expect(screen.queryByText(/all checks passing/i)).toBeNull();
+    expect(screen.queryByText(/all checks pass/i)).toBeNull();
+  });
+
+  it('never calls a warning an all-clear', async () => {
+    // The measured failure: on 2026-09-06 a live deployment answered
+    // {"status":"green","failing":0,"warned":2} while the alerts-feed-filter
+    // check was warning that 34 alerts never reach the triage queue. The one
+    // surface that could have shown that asserted there was nothing to show.
+    // `status` alone was the whole summary; `warned` was on the wire, sent by
+    // the same response, and never read. A false all-clear outranks any 500,
+    // and this is the card whose entire job is to not be one.
+    vi.mocked(getMe).mockResolvedValue(ADMIN);
+    vi.mocked(getPreflight).mockResolvedValue(WARNED);
+    vi.mocked(getPreflightDetail).mockResolvedValue(WARN_DETAIL);
+    mount();
+    expect(await screen.findByText(/2 checks warning/i)).toBeTruthy();
+    expect(screen.queryByText(/all checks pass/i)).toBeNull();
+    // Not reported as failures either: a WARN said in FAIL's words is the
+    // opposite over-correction, and it is the one that gets the row ignored.
+    expect(screen.queryByText(/checks? failing/i)).toBeNull();
+  });
+
+  it('warning + admin fetches and shows the warning rows', async () => {
+    // The detail read was gated on `degraded`, so even after the summary
+    // learned to count warnings the rows behind them would never be
+    // requested: an admin would see "2 checks warning" and no way to learn
+    // which two without opening Diagnostics.
+    vi.mocked(getMe).mockResolvedValue(ADMIN);
+    vi.mocked(getPreflight).mockResolvedValue(WARNED);
+    vi.mocked(getPreflightDetail).mockResolvedValue(WARN_DETAIL);
+    mount();
+    expect(await screen.findByText(/alerts feed filter/i)).toBeTruthy();
+    expect(screen.getByText(/WEBUI_ALERTS_QUERY=tags:alert OR event.kind:alert/i)).toBeTruthy();
+  });
+
+  it('warning + analyst shows the count, never the internals', async () => {
+    vi.mocked(getPreflight).mockResolvedValue(WARNED);
+    mount();
+    expect(await screen.findByText(/2 checks warning/i)).toBeTruthy();
+    expect(screen.queryByText(/alerts feed filter/i)).toBeNull();
+    // Same privilege boundary the failing path already holds: per-check
+    // detail is admin-only server-side, so an analyst session must not ask.
+    expect(getPreflightDetail).not.toHaveBeenCalled();
+  });
+
+  it('still reads as green when nothing is failing AND nothing is warning', async () => {
+    // The negative control for the three tests above. A card that can no
+    // longer say "all checks passing" is not a fix, it is the same defect
+    // pointing the other way: an operator who is warned about a clean grid
+    // stops reading the card, and the next real warning goes unread with it.
+    vi.mocked(getMe).mockResolvedValue(ADMIN);
+    vi.mocked(getPreflight).mockResolvedValue(GREEN);
+    mount();
+    expect(await screen.findByText(/all checks pass/i)).toBeTruthy();
+    expect(screen.queryByText(/warning/i)).toBeNull();
+    expect(getPreflightDetail).not.toHaveBeenCalled();
   });
 
   it('degraded + admin shows rows with hints', async () => {
@@ -196,7 +275,7 @@ describe('Dashboard setup-health card — live transition', () => {
     });
     // The control: it really did mount green, with no rows yet to find —
     // otherwise the assertions below would pass even without a live poll.
-    expect(screen.getByText(/all checks passing/i)).toBeTruthy();
+    expect(screen.getByText(/all checks pass/i)).toBeTruthy();
     expect(screen.queryByText(/audit write grant/i)).toBeNull();
 
     // The summary's own 300s poll interval ticks; the answer is now degraded.

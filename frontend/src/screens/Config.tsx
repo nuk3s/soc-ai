@@ -200,7 +200,7 @@ function _fitnessView(f: ModelFitness): FitnessView | null {
     return {
       label: 'not measured',
       detail: reason,
-      stale: graded ? `${graded.label} — last verdict${age ? `, ${age}` : ''}` : '',
+      stale: graded ? `last ${graded.label} verdict${age ? `, ${age}` : ''}` : '',
       age: '',
       title: f.note || title,
     };
@@ -265,13 +265,13 @@ function ModelFitnessChip({
         <span
           data-testid="fitness-stale"
           className="text-[11px] text-faint"
-          title="The last measured verdict — no probe ran this time"
+          title="This is the last measured verdict. No probe ran this time."
         >
           {view.stale}
         </span>
       )}
       {!loading && view && view.age && (
-        <span className="text-[11px] text-faint" title="Served from the daily cache — Check fitness re-measures">
+        <span className="text-[11px] text-faint" title="This fitness result comes from the daily cache. Select Check fitness to measure the model again.">
           {view.age}
         </span>
       )}
@@ -325,8 +325,8 @@ function ModelBatteryPanel({
       <div className="flex items-center gap-2">
         {running && (
           <span className="text-[11px] text-faint">
-            Battery: {battery?.current_config ?? '…'} ({(battery?.completed ?? 0) + 1}/
-            {battery?.total ?? 4})…
+            Full check: {battery?.current_config ?? '…'} · {(battery?.completed ?? 0) + 1} of{' '}
+            {battery?.total ?? 4}…
           </span>
         )}
         {!running && result?.configs && battery?.stored_at && (
@@ -339,11 +339,11 @@ function ModelBatteryPanel({
           disabled={running || demo}
           title={
             demo
-              ? 'Unavailable in the demo (no model egress)'
-              : 'Probe this model under every structured-output configuration (tool / native / prompted / tool+required). Minutes on a slow backend.'
+              ? 'The demo blocks this action. The demo has no model egress.'
+              : 'The full check probes this model under every structured output configuration. The configurations are tool, native, prompted and tool+required. The full check takes minutes on a slow backend.'
           }
         >
-          Run full battery
+          Run the full check
         </button>
         <button
           type="button"
@@ -352,8 +352,8 @@ function ModelBatteryPanel({
           disabled={running || demo}
           title={
             demo
-              ? 'Unavailable in the demo (no model egress)'
-              : 'Re-measure fitness AND run the full battery in one go'
+              ? 'The demo blocks this action. The demo has no model egress.'
+              : 'This button starts both checks. It measures fitness again and runs the full check.'
           }
         >
           Run all checks
@@ -382,7 +382,7 @@ function ModelBatteryPanel({
           className="text-[11px] text-success"
           title={result.recommendation.reason}
         >
-          ✓ Already on the recommended settings ({result.recommendation.config})
+          ✓ The current settings match the {result.recommendation.config} recommendation
         </span>
       )}
       {!running && result?.recommendation && !recApplied && (
@@ -394,7 +394,7 @@ function ModelBatteryPanel({
             type="button"
             className="rounded border border-accent px-2 py-0.5 text-[11px] font-semibold text-accent hover:bg-accent/10 transition-colors"
             onClick={() => onApply(result.recommendation!)}
-            title="Stage these knob values into the pending config edits (Apply below saves them)"
+            title="Apply stages these values into the pending config edits. Select Apply changes below to save them."
           >
             Apply
           </button>
@@ -402,7 +402,7 @@ function ModelBatteryPanel({
       )}
       {!running && battery?.error && (
         <span className="max-w-[280px] truncate text-[11px] text-danger" title={battery.error}>
-          battery failed: {battery.error}
+          The full check failed: {battery.error}
         </span>
       )}
     </div>
@@ -453,7 +453,7 @@ export function Config() {
   useEffect(() => {
     listUsers()
       .then((r) => setUsers(r.users))
-      .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Failed to load users'));
+      .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'The user list did not load.'));
   }, [nonce]);
 
   useEffect(() => {
@@ -462,7 +462,7 @@ export function Config() {
     setDangerError('');
     listDangerSettings()
       .then((r) => { if (active) setDangerSettings(r); })
-      .catch(() => { if (active) setDangerError('Danger Zone unavailable (admin only).'); })
+      .catch(() => { if (active) setDangerError('The Danger Zone is not available. Only an admin can read it.'); })
       .finally(() => { if (active) setDangerLoading(false); });
     return () => { active = false; };
   }, []);
@@ -683,7 +683,7 @@ export function Config() {
     reembedRunbooks()
       .then((r) => setReembedResult(r))
       .catch((e: unknown) =>
-        setReembedError(e instanceof Error ? e.message : 'Re-embed failed'),
+        setReembedError(e instanceof Error ? e.message : 'The re-embed failed.'),
       )
       .finally(() => setReembedding(false));
   };
@@ -698,7 +698,7 @@ export function Config() {
     let active = true;
     getInternalIdentifiers()
       .then((r) => { if (active) { setIdents(r); setIdentError(''); } })
-      .catch((e: unknown) => { if (active) setIdentError(e instanceof Error ? e.message : 'Failed to load identifiers'); });
+      .catch((e: unknown) => { if (active) setIdentError(e instanceof Error ? e.message : 'The identifier list did not load.'); });
     return () => { active = false; };
   }, [identNonce]);
 
@@ -960,7 +960,7 @@ export function Config() {
     if (blocked) { setIdentError(blocked); return; } // demo: no doomed write
     setIdentError('');
     makeP().then(refetchIdents).catch((e: unknown) =>
-      setIdentError(e instanceof Error ? e.message : 'Action failed'),
+      setIdentError(e instanceof Error ? e.message : 'The action failed.'),
     );
   };
 
@@ -988,7 +988,7 @@ export function Config() {
     try {
       const start = await startDiscoveryScan();
       if (start.note === 'discovery disabled') {
-        setIdentError('Discovery is disabled — enable it in settings to scan.');
+        setIdentError('Discovery is disabled. Enable discovery in settings to run a scan.');
         setScanning(false);
         return;
       }
@@ -1003,10 +1003,10 @@ export function Config() {
         running = (await getDiscoveryScan()).running;
       }
       if (running) {
-        setIdentError('Scan is taking longer than expected — check back shortly.');
+        setIdentError('The scan still runs. Check this section again in a few minutes.');
       }
     } catch (e: unknown) {
-      setIdentError(e instanceof Error ? e.message : 'Scan failed');
+      setIdentError(e instanceof Error ? e.message : 'The scan failed.');
     } finally {
       setScanning(false);
       refetchIdents();
@@ -1124,15 +1124,15 @@ export function Config() {
       setApplyResult({
         ok: true,
         msg: restartRequired
-          ? `Applied ${saved} change${saved === 1 ? '' : 's'} — service restart required for some to take effect`
-          : `Applied ${saved} change${saved === 1 ? '' : 's'}`,
+          ? `Applied ${saved} change${saved === 1 ? '' : 's'}. Some changes need a service restart.`
+          : `Applied ${saved} change${saved === 1 ? '' : 's'}.`,
       });
       setFormNonce((n) => n + 1);
       setNonce((n) => n + 1); // refetch config → re-sync source badges / values
     } else {
       setApplyResult({
         ok: false,
-        msg: `${saved} applied, ${failed} failed — see the highlighted field${failed === 1 ? '' : 's'}`,
+        msg: `${saved} applied, ${failed} failed. Check the highlighted field${failed === 1 ? '' : 's'}.`,
       });
     }
     setApplying(false);
@@ -1167,7 +1167,7 @@ export function Config() {
             onChange={(v) => stage(s.key, String(v), serverStr)}
           />
           {isAutoAckThreshold && !thresholdEnabled && (
-            <div className="text-[11px] text-faint mt-1">Applies when auto-acknowledge is on</div>
+            <div className="text-[11px] text-faint mt-1">This value applies if auto-acknowledge is on</div>
           )}
         </div>
       );
@@ -1336,7 +1336,7 @@ export function Config() {
       const res = await saveDangerSetting(key, dangerEditValue, dangerConfirm);
       setDangerSaveMsg({
         key,
-        msg: res.restart_required ? 'Saved — restart required to apply' : 'Saved and applied',
+        msg: res.restart_required ? 'Saved. Restart the service to apply the change.' : 'Saved and applied',
         ok: true,
       });
       setDangerEditKey(null);
@@ -1344,7 +1344,7 @@ export function Config() {
       setDangerConfirm('');
       listDangerSettings().then(setDangerSettings).catch(() => {});
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Save failed';
+      const msg = e instanceof Error ? e.message : 'The save failed.';
       setDangerSaveMsg({ key, msg, ok: false });
     } finally {
       setDangerSaving(false);
@@ -1359,7 +1359,7 @@ export function Config() {
       const result = await testConnection(target);
       setConnTestResults(prev => ({ ...prev, [target]: { ...result, loading: false } }));
     } catch (e: unknown) {
-      const detail = e instanceof Error ? e.message : 'Connection test failed';
+      const detail = e instanceof Error ? e.message : 'The connection test failed.';
       setConnTestResults(prev => ({ ...prev, [target]: { ok: false, detail, loading: false } }));
     }
   };
@@ -1460,11 +1460,11 @@ export function Config() {
       // broken epoch would be true but redundant.
       const tally =
         result.epochs_broken === 1
-          ? `1 of ${result.epochs} epochs broken — break at seq ${result.first_broken_seq} ` +
-            `(epoch ${result.first_broken_epoch_start})`
-          : `${result.epochs_broken} of ${result.epochs} epochs broken — oldest break seq ` +
-            `${result.first_broken_seq} (epoch ${result.first_broken_epoch_start}), newest ` +
-            `broken epoch ${result.newest_broken_epoch_start}`;
+          ? `1 of ${result.epochs} epochs broken. The break is at seq ${result.first_broken_seq} ` +
+            `in epoch ${result.first_broken_epoch_start}.`
+          : `${result.epochs_broken} of ${result.epochs} epochs broken. The oldest break is at seq ` +
+            `${result.first_broken_seq} in epoch ${result.first_broken_epoch_start}. The newest ` +
+            `broken epoch is ${result.newest_broken_epoch_start}.`;
       // Neither claim below is honest under `capped`: the cap always
       // truncates the NEWEST end of the chain (the fetch is oldest-first),
       // so a capped scan cannot vouch for anything past its own prefix —
@@ -1475,26 +1475,37 @@ export function Config() {
       if (!result.capped) {
         trailing = result.latest_epoch_broken
           ? ' The latest epoch is broken.'
-          : ` Every epoch after ${result.newest_broken_epoch_start} verified intact.`;
+          : ` Every epoch after ${result.newest_broken_epoch_start} is intact.`;
       }
-      const cappedNote = result.capped ? ' (capped — not the full chain)' : '';
-      return `Chain tampered — ${tally}${cappedNote}.${trailing}`;
+      const cappedNote = result.capped ? ' The scan was capped. It did not cover the full chain.' : '';
+      // What kind of break, not just that there is one. Two writers claiming
+      // one position leaves records that each still match their own hash; an
+      // edit does not. Reading the same sentence for both is how a known
+      // concurrency defect and someone rewriting a decision look identical.
+      // Prefer the blast radius over the first break's own sentence. Those
+      // two describe the same break at different sizes — the detail names one
+      // position, the radius counts every one — and this screen used to show
+      // the smaller number while the CLI and the bell showed the larger.
+      const what =
+        result.blast_radius || result.newest_break_detail || result.first_break_detail;
+      const kindNote = what ? ` ${what.replace(/\.$/, '')}.` : '';
+      return `Chain tampered. ${tally}${cappedNote}${trailing}${kindNote}`;
     }
     if (result.capped) {
       // A fragmented chain's capped read is still just a prefix — but an
       // un-composed "intact from the start of the chain" overstates it when
       // that prefix itself already spans more than one restart: say so.
       const epochNote = result.epochs > 1 ? ` within ${result.epochs} epochs` : '';
-      return `Partial verification — ${verified} intact${epochNote} from the start of the chain (capped; the full chain was not checked).`;
+      return `Partial verification. ${verified} intact${epochNote} from the start of the chain. The scan was capped. It did not check the full chain.`;
     }
     if (result.epochs > 1) {
       return (
-        `Chain intact within ${result.epochs} epochs (${verified}). Epoch boundaries are ` +
-        `process restarts — a chain-head recovery bug fixed 2026-08-17 — and cross-epoch ` +
-        `linkage is not provable.`
+        `Chain intact within ${result.epochs} epochs. ${verified} verified. An epoch boundary ` +
+        `is a process restart. soc-ai fixed a chain-head recovery bug on 2026-08-17. soc-ai ` +
+        `cannot prove the linkage between two epochs.`
       );
     }
-    return `Chain intact — ${verified} verified.`;
+    return `Chain intact. ${verified} verified.`;
   };
 
   // What the last scan could not read. The lists below are the scan's OUTPUT,
@@ -1543,12 +1554,15 @@ export function Config() {
       }
     >
       <div className="mb-2.5 text-[12px] text-dim">
-        Redaction identifiers learned from your data and confirmed here — internal domain suffixes
-        and bare hostnames are stripped from payloads before any cloud second opinion. On = soc-ai
-        uses this to redact and classify; off = ignored. Reserved defaults are always on. Suggestions
-        you don't want can be <strong>dismissed</strong> (removed for good) — distinct from turning
-        one off, which keeps it in the list but unused. Dismissed suggestions are hidden; re-add one
-        manually to restore it.
+        soc-ai learns these redaction identifiers from your data. You confirm them here. soc-ai
+        strips an internal domain suffix and a bare hostname from a payload before any cloud second
+        opinion. On means soc-ai uses the identifier to redact and classify. Off means soc-ai
+        ignores the identifier. Reserved defaults stay on.
+      </div>
+      <div className="mb-2.5 text-[12px] text-dim">
+        <strong>Dismiss</strong> a suggestion you do not want. soc-ai removes a dismissed suggestion
+        from the list for good. An identifier that is off stays in the list and stays unused. Add a
+        dismissed identifier again by hand to restore it.
       </div>
 
       {scanDegraded && (
@@ -1559,9 +1573,9 @@ export function Config() {
           <StatusTag color="#d29922" label="Scan degraded" />
           <div className="mt-1 text-[12px] leading-[1.5] text-text-2">
             The last scan hit {plural(scanErrors.length, 'error')} and could not read all of your
-            data, so the lists below are incomplete. A suffix, hostname or subnet missing here may
-            be one the scan never got to see rather than one your network does not have. Scanning
-            again runs the same queries, so start with what failed:
+            data. The lists below are incomplete. A suffix, hostname or subnet that is missing here
+            may be one the scan never saw. A second scan runs the same queries. Start with the
+            errors below:
           </div>
           {/* The strings, not just how many. This channel carries local faults
               as well as grid ones ("no internal CIDRs configured; cannot scope
@@ -1596,13 +1610,13 @@ export function Config() {
             suffix: { title: 'Domain suffixes', placeholder: '.corp.acme.com' },
             host: { title: 'Bare hostnames', placeholder: 'WIN11-01' },
             cidr: {
-              title: 'Internal subnets (CIDRs)',
+              title: 'Internal subnets',
               placeholder: '10.50.0.0/24',
               // Suggest-first: a CIDR flips hosts internal↔external (changing
               // triage/enrichment), so detected subnets land off and never
               // auto-activate — the operator turns one on to apply it. Manual
               // adds are active immediately.
-              hint: 'Detected subnets are suggestions — turn one on to treat it as internal. A subnet flips hosts internal↔external, so it is never activated automatically. Subnets you add manually apply right away.',
+              hint: 'A detected subnet is a suggestion. Turn a subnet on to treat it as internal. A subnet moves hosts between internal and external. soc-ai never turns a detected subnet on automatically. A subnet that you add by hand applies at once.',
             },
           };
           return (
@@ -1645,9 +1659,10 @@ export function Config() {
           <div className="min-w-0 flex-1">
             <div className="text-[13px] font-semibold text-text">Re-embed runbooks</div>
             <div className="mt-1 text-[12px] text-dim">
-              Embeds every runbook whose vector is missing (the gateway was down during a save) or
-              stale (the embeddings model changed). Runbooks embed automatically on save; this is
-              the catch-up pass. Requires an applied embeddings model above.
+              This action embeds every runbook with a missing vector or a stale vector. A vector is
+              missing if the gateway was down during a save. A vector is stale if the embeddings
+              model changed. A runbook embeds automatically on save. This action is the catch-up
+              pass. It needs an applied embeddings model above.
             </div>
           </div>
           <div className="flex-none">
@@ -1669,7 +1684,7 @@ export function Config() {
           >
             {reembedResult.embedded} embedded · {reembedResult.skipped} already current ·{' '}
             {reembedResult.failed} failed · {reembedResult.total} total
-            {reembedResult.failed > 0 && ' — gateway trouble? Check the embeddings model + Diagnostics.'}
+            {reembedResult.failed > 0 && ' · Check the embeddings model and Diagnostics.'}
           </div>
         )}
         {reembedError && <div className="mt-2 text-[12px] text-danger">{reembedError}</div>}
@@ -1726,11 +1741,11 @@ export function Config() {
         >
           <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
           <span>
-            Auto-ack only acks false positives that get investigated — it does nothing on its own.
-            {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off, so nothing is being investigated automatically.'}
-            {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”, but high/critical are never auto-acked — so it can never fire.`}
-            {' '}To clear a backlog, run a sweep or enable continuous auto-investigate (in this group) and set its
-            severity floor to medium or low.
+            Auto-ack acks only a false positive that soc-ai investigates.
+            {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off. soc-ai investigates nothing automatically.'}
+            {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”. Auto-ack never acks a high or critical alert.`}
+            {' '}Run a sweep to clear a backlog. You can also enable continuous auto-investigate in
+            this group. Set its severity floor to medium or low.
           </span>
         </div>
       )}
@@ -1825,7 +1840,7 @@ export function Config() {
             <span className="text-warn"><Key size={15} /></span>
             <div className="flex-1">
               <div className="text-[12px] font-semibold text-warn">
-                New password for <span className="font-mono">{users.find((u) => u.id === resetPw.id)?.username ?? `user #${resetPw.id}`}</span> — save it now, it won't be shown again
+                New password for <span className="font-mono">{users.find((u) => u.id === resetPw.id)?.username ?? `user #${resetPw.id}`}</span>. Save it now. soc-ai does not show it again.
               </div>
               <div className="mt-0.5 font-mono text-[12px] text-text">{resetPw.password}</div>
             </div>
@@ -1873,7 +1888,7 @@ export function Config() {
                       setUserError('');
                       setUserRole(u.id, e.target.value)
                         .then(() => setNonce((n) => n + 1))
-                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Failed to set role'));
+                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Could not set the role.'));
                     }}
                     className="rounded-control border border-border-input bg-bg px-2 py-1 text-[11.5px] text-text outline-none focus:border-accent"
                   >
@@ -1888,7 +1903,7 @@ export function Config() {
                       setUserError('');
                       toggleUserDisabled(u.id)
                         .then(() => setNonce((n) => n + 1))
-                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Failed to toggle'));
+                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Could not enable or disable the user.'));
                     }}
                     disabled={isLastEnabledAdmin}
                     className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1904,13 +1919,13 @@ export function Config() {
                           setResetPw({ id: u.id, password: r.password });
                           setNonce((n) => n + 1);
                         })
-                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Failed to reset password'));
+                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Could not reset the password.'));
                     }}
                     disabled={resetPw?.id === u.id}
                     className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-40 disabled:cursor-not-allowed"
                     style={{ borderColor: 'rgba(240,68,56,.3)' }}
                   >
-                    Reset pw
+                    Reset password
                   </button>
                 </div>
               </div>
@@ -1952,7 +1967,7 @@ export function Config() {
                   setNewUser({ username: '', password: '', role: 'analyst' });
                 })
                 .catch((e: unknown) => {
-                  setUserError(e instanceof Error ? e.message : 'Error');
+                  setUserError(e instanceof Error ? e.message : 'Could not create the user.');
                 });
             }}
             className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
@@ -1980,7 +1995,7 @@ export function Config() {
                 if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
                 mintToken()
                   .then((t) => { setMinted(t); setNonce((n) => n + 1); })
-                  .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Failed to mint token'));
+                  .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Could not mint the token.'));
               }}
               className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
             >
@@ -2004,7 +2019,7 @@ export function Config() {
           <div className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3" style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}>
             <span className="text-warn"><Key size={15} /></span>
             <div className="flex-1">
-              <div className="text-[12px] font-semibold text-warn">Copy this token now — it won't be shown again</div>
+              <div className="text-[12px] font-semibold text-warn">Copy this token now. soc-ai does not show it again.</div>
               <div className="mt-0.5 font-mono text-[12px] text-text">{minted}</div>
             </div>
             <button
@@ -2032,7 +2047,7 @@ export function Config() {
                   if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
                   revokeToken(tk.id)
                     .then(() => setNonce((n) => n + 1))
-                    .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Failed to revoke token'));
+                    .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Could not revoke the token.'));
                 }}
                 className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
                 style={{ borderColor: 'rgba(240,68,56,.3)' }}
@@ -2052,7 +2067,7 @@ export function Config() {
         collapsed={!!collapsed['Diagnostics']}
         onToggle={() => toggleSection('Diagnostics')}
       >
-        <div className="text-[12px] text-dim mb-2">Read-only connectivity checks — safe to run anytime.</div>
+        <div className="text-[12px] text-dim mb-2">These checks are read-only. They are safe to run at any time.</div>
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
           <div className="flex gap-3 px-4 py-3">
             {(['es', 'llm'] as const).map(target => {
@@ -2133,7 +2148,7 @@ export function Config() {
         >
           <ShieldAlert size={15} className="text-[#f04438]" />
           <span className="text-[13px] font-semibold text-[#f04438]">Danger Zone</span>
-          <span className="ml-auto text-[11px] text-text-muted">Connection changes may need a restart</span>
+          <span className="ml-auto text-[11px] text-text-muted">A connection change may need a restart</span>
           <ChevronRight
             size={15}
             className="text-[#f04438] transition-transform"
@@ -2194,7 +2209,7 @@ export function Config() {
                     <div className="mt-2.5 space-y-2">
                       <div>
                         <label className="block text-[11px] text-text-muted mb-1">
-                          {s.type === 'secret' ? 'New value (write-only)' : 'Value'}
+                          {s.type === 'secret' ? 'New write-only value' : 'Value'}
                         </label>
                         <input
                           type={s.type === 'secret' ? 'password' : 'text'}
@@ -2221,7 +2236,7 @@ export function Config() {
                       {!s.hot && (
                         <div className="flex items-center gap-1.5 text-[11px] text-[#f79009]">
                           <span>⚠</span>
-                          <span>Service restart required for this change to take effect</span>
+                          <span>Restart the service to apply this change</span>
                         </div>
                       )}
                       {saveMsg && (
@@ -2371,7 +2386,7 @@ export function Config() {
     <div className="overflow-hidden rounded-card border border-border bg-surface-1">
       {searchHits.length === 0 ? (
         <div className="px-4 py-6 text-[12.5px] text-faint">
-          No settings match “{query.trim()}”.
+          No settings match “{query.trim()}”. Check the spelling, or search for the setting key.
         </div>
       ) : (
         searchHits.map((h) => (
@@ -2424,8 +2439,8 @@ export function Config() {
       <ConfigNavSelect groups={layout} activeId={effectiveId} onNavigate={navigateToSection} />
       <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
       <div className="mb-[14px] mt-0.5 text-[13px] text-dim">
-        Runtime settings · users · API tokens. Source badges show whether a value is set in the database or pinned by an
-        environment variable.
+        Runtime settings · users · API tokens. A source badge names the origin of a value. The
+        origin is the database or an environment variable.
       </div>
       {searchInput('mb-[14px] w-full lg:hidden')}
 

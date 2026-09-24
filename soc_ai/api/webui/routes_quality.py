@@ -13,16 +13,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import Depends, Request
 from pydantic import BaseModel
 
-from soc_ai.api.webui._shared import _iso_utc, require_admin_api, router
+from soc_ai.api.webui._shared import _iso_utc, _iso_z, require_admin_api, router
 from soc_ai.eval.nightly import run_eval_nightly
 from soc_ai.eval.quality import alarm_codes_from_key
 from soc_ai.store import quality as quality_svc
+from soc_ai.store.models import QualityEvalAttempt
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,10 +76,59 @@ class QualityPointOut(BaseModel):
     # critiques, report.md) were written. The only way to adjudicate an alarm
     # is to read the critiques behind it, so the card links this.
     batch_dir: str | None
+    # WHAT WAS RUNNING when the point was measured (migration 0040), so a bend
+    # in the trend can be pinned to a change rather than left as weather. All
+    # three are null on pre-0040 rows, and ``code_commit`` is also null on any
+    # build that was never stamped with one — the honest answer, since the
+    # question these fields exist for is precisely where the build changed.
+    app_version: str | None
+    code_commit: str | None
+    analyst_model: str | None
+
+
+STALE_AFTER = timedelta(hours=48)
+"""How old the newest point may be before the trend reads as stale.
+
+The nightly runs once a day, so a point older than two scheduled runs means
+at least one run wrote nothing (no eligible alerts, an error) or never
+started. One missed night is not called out on purpose: a run that lands late,
+or host cron an hour off the in-app schedule, would trip a 24h line most
+mornings, and a marker that fires that often is one nobody reads.
+"""
+
+
+class QualityFreshnessOut(BaseModel):
+    """When the trend last moved, and what the last attempt did.
+
+    A nightly that finds no eligible alerts writes no row (exit 2), so the
+    points alone cannot say whether it ran, and a month-old point looked
+    exactly like last night's. No zero row is written for that case: it would
+    plot as quality 0, count toward the regression detector's history and
+    push a real point out of the 90-row prune. This block carries the fact
+    instead.
+
+    Every field here survives a restart. The ``last_attempt_*`` three used to
+    read the run-now / scheduler status slot, which lives in process memory:
+    null until THIS process had attempted a run, and gone on the next restart.
+    Both surfaces that render them test the timestamp for truthiness, so "the
+    nightly has never run here" and "it ran last night, exited 2, and I have
+    forgotten" resolved to the same silence — beside an empty trend, which is
+    an absence being read as an all-clear. They now come from
+    ``quality_eval_attempts``, where a null genuinely means no attempt has ever
+    been recorded.
+    """
+
+    latest_ts: str | None  # the newest row's created_at, ISO-8601 with a Z
+    scheduled: bool  # the in-app nightly is enabled
+    stale: bool  # scheduled, and the newest row is older than STALE_AFTER
+    last_attempt_at: str | None
+    last_exit_code: int | None
+    last_detail: str | None  # the run's own one-line reason; null on a clean run
 
 
 class QualityTrendOut(BaseModel):
     points: list[QualityPointOut]  # oldest → newest, ready to plot left-to-right
+    freshness: QualityFreshnessOut
 
 
 @router.get(
@@ -93,14 +143,27 @@ async def get_quality_trend(request: Request) -> QualityTrendOut:
     Feeds the dashboard's Quality card. Admin-gated like the other posture
     read-models (config, egress policy): the trend names the batch artifact
     paths and exposes operational health an analyst role doesn't need.
-    Empty list = the nightly has never run — the card renders its
+    Empty list = the nightly has never written a point; the card renders its
     "schedule soc-ai eval-nightly" empty state from that, not from an error.
+    ``freshness`` says whether it has TRIED since this process started, and
+    how old the newest point is against the schedule.
     """
-    async with request.app.state.db_sessionmaker() as db:
+    state = request.app.state
+    async with state.db_sessionmaker() as db:
         rows = await quality_svc.recent_snapshots(db, limit=30)
+        # Same session: the two answer one question together — "has it run, and
+        # did it produce anything" — and reading them apart could show a point
+        # from after the attempt that wrote it.
+        attempt = await quality_svc.latest_attempt(db)
     # The store returns newest-first (its natural "recent" order); the chart
     # wants chronological so a plain reversed() keeps both callers simple.
     return QualityTrendOut(
+        freshness=_freshness_out(
+            newest=rows[0].created_at if rows else None,
+            scheduled=bool(state.settings.eval_nightly_enabled),
+            attempt=attempt,
+            now=datetime.now(UTC),
+        ),
         points=[
             QualityPointOut(
                 id=r.id,
@@ -126,9 +189,12 @@ async def get_quality_trend(request: Request) -> QualityTrendOut:
                 # parse. Null is the honest answer for a point with no alarm.
                 alarm_since=_iso_utc(r.alarm_since) if r.alarm_since else None,
                 batch_dir=r.batch_dir,
+                app_version=r.app_version,
+                code_commit=r.code_commit,
+                analyst_model=r.analyst_model,
             )
             for r in reversed(rows)
-        ]
+        ],
     )
 
 
@@ -156,24 +222,98 @@ def _get_quality_eval_status(state: Any) -> _QualityEvalStatus:
     return state._quality_eval_status  # type: ignore[no-any-return]
 
 
-async def _quality_eval_worker(state: Any) -> None:
+def _freshness_out(
+    *,
+    newest: datetime | None,
+    scheduled: bool,
+    attempt: QualityEvalAttempt | None,
+    now: datetime,
+) -> QualityFreshnessOut:
+    """Reduce the newest point, the schedule flag and the newest attempt to the block.
+
+    ``stale`` needs both a schedule and a row: with the nightly off there is no
+    run to have missed, and with no row there is no point to be old (the card's
+    empty state covers that, and the attempt fields say why it is empty).
+
+    ``attempt`` is the durable row, not the process's status slot. The slot
+    still exists — it is what makes run-now single-flight — but it is no longer
+    the source of anything an operator reads, because it forgets on restart and
+    the reader cannot tell that apart from never having run.
+    """
+    stale = False
+    if scheduled and newest is not None:
+        # Store timestamps are naive UTC; the clock passed in is aware.
+        newest_aware = newest if newest.tzinfo else newest.replace(tzinfo=UTC)
+        stale = now - newest_aware > STALE_AFTER
+    return QualityFreshnessOut(
+        latest_ts=_iso_z(newest),
+        scheduled=scheduled,
+        stale=stale,
+        # The store keeps naive UTC, like every other timestamp here; the block
+        # keeps one convention, so it is re-rendered with a Z.
+        last_attempt_at=_iso_z(attempt.attempted_at) if attempt else None,
+        last_exit_code=attempt.exit_code if attempt else None,
+        # Empty means a clean run had nothing to add, which is not the same as
+        # a run that said nothing — null is what the card tests.
+        last_detail=(attempt.detail or None) if attempt else None,
+    )
+
+
+async def _quality_eval_worker(state: Any, *, trigger: str = "manual") -> None:
     """Background worker for run-now and the scheduler. Never raises; always
-    releases the single-flight slot and records the outcome for the status GET."""
+    releases the single-flight slot and records the outcome.
+
+    ``trigger`` separates the two callers on the durable row, because they
+    answer different questions: an operator asking "did last night's nightly
+    run" must not be reassured by their own click on the run-now button.
+    """
     status = _get_quality_eval_status(state)
     try:
+        # Bind the server's own audit logger into the alarm: a second logger in
+        # this process would be a second chain head competing for the same
+        # sequence numbers (soc_ai.audit.logger).
+        app_audit = getattr(state, "audit", None)
+
+        async def fire_alarm(settings: Any, **kw: Any) -> None:
+            await _fire_alarm_lazily(settings, audit=app_audit, **kw)
+
         result = await run_eval_nightly(
             state.settings,
             emit=lambda line: _LOGGER.info("quality eval: %s", line),
-            fire_alarm=_fire_alarm_lazily,
+            fire_alarm=fire_alarm,
         )
         status.last_exit_code = result.exit_code
         status.last_detail = result.detail
+        if result.exit_code != 0:
+            # A run that wrote nothing (exit 2: no eligible alerts; exit 5:
+            # failed) raises nothing, and the status slot above is process
+            # memory. This line is the only record of the attempt that
+            # survives a restart, once per attempt, with the run's own reason.
+            _LOGGER.warning("quality eval: exit %d: %s", result.exit_code, result.detail)
     except Exception as e:  # the eval must never take the app down
         _LOGGER.exception("quality eval run failed")
         status.last_exit_code = 5
         status.last_detail = f"{type(e).__name__}: {e}"
     finally:
-        status.last_run = datetime.now(tz=UTC).isoformat()
+        now = datetime.now(tz=UTC)
+        status.last_run = now.isoformat()
+        # The durable half, and the one every surface reads. Written HERE, in
+        # the finally, so an attempt that raised is recorded exactly like one
+        # that returned — a failure that leaves no trace is the case this table
+        # exists for. Best-effort: the eval must never take the app down, and
+        # that has to include its own bookkeeping. The log line below is what
+        # is left if even this fails.
+        try:
+            async with state.db_sessionmaker() as db:
+                await quality_svc.record_attempt(
+                    db,
+                    trigger=trigger,
+                    exit_code=status.last_exit_code if status.last_exit_code is not None else 5,
+                    detail=status.last_detail,
+                    now=now.replace(tzinfo=None),
+                )
+        except Exception:
+            _LOGGER.warning("quality eval: could not record the attempt", exc_info=True)
         status.running = False
 
 
@@ -221,7 +361,7 @@ async def start_quality_eval_run(request: Request) -> QualityEvalStatusOut:
     if status.running:
         return _status_out(status, note="already running")
     status.running = True  # claim the single-flight slot before scheduling
-    status._task = asyncio.create_task(_quality_eval_worker(state))
+    status._task = asyncio.create_task(_quality_eval_worker(state, trigger="manual"))
     return _status_out(status)
 
 

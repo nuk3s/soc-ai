@@ -201,7 +201,14 @@ async def test_loop_fires_due_schedule_once(
 
     calls: list[dict[str, Any]] = []
 
-    async def _start(_state: Any, *, objective: str, started_by: str, kind: str = "chat") -> str:
+    async def _start(
+        _state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        kind: str = "chat",
+        starter: str = "analyst",
+    ) -> str:
         calls.append({"objective": objective, "started_by": started_by, "kind": kind})
         return "HUNT123"
 
@@ -235,7 +242,14 @@ async def test_loop_single_flights_just_ran_schedule(
 
     calls: list[str] = []
 
-    async def _start(_state: Any, *, objective: str, started_by: str, kind: str = "chat") -> str:
+    async def _start(
+        _state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        kind: str = "chat",
+        starter: str = "analyst",
+    ) -> str:
         calls.append(objective)
         return "HUNT-X"
 
@@ -263,7 +277,14 @@ async def test_loop_skips_when_master_switch_off(
 
     calls: list[str] = []
 
-    async def _start(_state: Any, *, objective: str, started_by: str, kind: str = "chat") -> str:
+    async def _start(
+        _state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        kind: str = "chat",
+        starter: str = "analyst",
+    ) -> str:
         calls.append(objective)
         return "HUNT-Y"
 
@@ -291,7 +312,14 @@ async def test_loop_survives_a_bad_schedule(
 
     fired: list[str] = []
 
-    async def _start(_state: Any, *, objective: str, started_by: str, kind: str = "chat") -> str:
+    async def _start(
+        _state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        kind: str = "chat",
+        starter: str = "analyst",
+    ) -> str:
         if objective == "BAD":
             raise RuntimeError("spawn boom")
         fired.append(objective)

@@ -167,7 +167,11 @@ async def query_zeek_logs(
                 {"term": {"event.module": "zeek"}},
                 {"terms": {"event.dataset": datasets}},
             ],
-            "filter": [_build_time_filter(time_range_minutes, time_anchor)],
+            # Around-the-alert, deliberately: this tool pivots on ONE flow's
+            # community_id, so the setup before it and what followed after are
+            # both wanted. It answers no prevalence question, so it takes no
+            # window_mode.
+            "filter": [_build_time_filter(time_range_minutes, time_anchor)[0]],
         }
     }
     # Synthetic-eval kill-switch: by default the pivot excludes docs tagged

@@ -32,11 +32,14 @@ built from a runtime tuple without losing the static schema);
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
+import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from elastic_transport import TransportError
@@ -49,6 +52,8 @@ from soc_ai.dossier.resolve import (
     resolve_dossier_from_settings,
     unknown_dossier,
 )
+from soc_ai.hunting.catalog_tiers import effective_catalog
+from soc_ai.hunting.execute import run_spec
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.oracle.sanitize import OracleUnknownLabelError
 from soc_ai.store import host_dossier as dossier_store
@@ -69,7 +74,7 @@ from soc_ai.tools.origin_chain import origin_chain
 from soc_ai.tools.prevalence import prevalence
 from soc_ai.tools.query_cases import query_cases
 from soc_ai.tools.query_detections import query_detections
-from soc_ai.tools.query_events import query_events_oql
+from soc_ai.tools.query_events import WindowMode, query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
 from soc_ai.tools.rule_prevalence import rule_prevalence
 from soc_ai.tools.rule_tuning import suggest_rule_tuning
@@ -132,7 +137,16 @@ NOT_ON_HUNT = frozenset({"t_suggest_rule_tuning"})
 # (t_prevalence, pcap-derived cadence); registering four sweep schemas on
 # every role widens each agent's tool prompt for nothing.
 HUNT_ONLY = frozenset(
-    {"t_beacon_profile", "t_dns_entropy_scan", "t_dcerpc_histogram", "t_first_seen"}
+    {
+        "t_beacon_profile",
+        "t_dns_entropy_scan",
+        "t_dcerpc_histogram",
+        "t_first_seen",
+        # Runs one catalog analytic over a window. Hunt-only for the same
+        # reason as the four above: it asks a network-wide question, and
+        # triage pivots around one alert.
+        "t_run_analytic",
+    }
 )
 
 # The Phase-D targeted-dispatch surface: the tools a synth round-1
@@ -187,6 +201,7 @@ GRID_BACKED_TOOLS = frozenset(
         "t_dns_entropy_scan",
         "t_dcerpc_histogram",
         "t_first_seen",
+        "t_run_analytic",
     }
 )
 
@@ -805,17 +820,26 @@ _OQL_DOC_BASE = (
     "with `AND event.dataset:...`. "
 )
 _OQL_ALERT_WINDOW_NOTE = (
-    "The window is centered on the alert's `@timestamp` automatically "
+    "The window is anchored on the alert's `@timestamp` automatically "
     "(without this, tools default to now-1h, return empty for batch "
     "alerts, and burn a wasted round). `time_range_minutes` is the total "
-    "window width around that anchor (60 = ±30 min). Pass a larger value "
-    "if you need wider context (e.g. 360 = ±3h, 1440 = ±12h)."
+    "window width. `window_mode` decides WHICH QUESTION you are asking:\n"
+    "- `around` (default): centred, half before the alert and half after "
+    "(60 = ±30 min, 1440 = ±12h). Use it for 'what happened around this "
+    "alert' — the setup before it and what followed after.\n"
+    "- `before`: the whole width sits BEHIND the alert (1440 = the 24 hours "
+    "up to it). Use it for EVERY how-often / how-many / is-this-normal "
+    "question. Asking one of those with `around` answers it over half the "
+    "span you named, so a day's prevalence comes back as half a day's.\n"
+    "The result carries a `window` block naming the span it counted over. "
+    "Read it before quoting any number as 'in the last N hours'."
 )
 _OQL_HUNT_WINDOW_NOTE = (
     "The default window is WIDE (1440 = 24h) because a hunt looks across "
     "time rather than pivoting around one alert. `time_range_minutes` is "
     "the total window width; pass a larger value for a broader sweep or a "
-    "smaller one to focus on a burst."
+    "smaller one to focus on a burst. A hunt has no alert to anchor on, so "
+    "the window is counted back from now and `window_mode` changes nothing."
 )
 _ZEEK_DOC_BASE = "Pivot into Zeek logs by network.community_id (conn/dns/http/ssl/files/ssh).\n\n"
 _ZEEK_ALERT_WINDOW_NOTE = (
@@ -838,13 +862,165 @@ _OQL_WIDE_WINDOW_NOTE = (
     "The default window is WIDE ({minutes} minutes) and is counted BACK FROM "
     "NOW: this agent is not anchored to a single alert. `time_range_minutes` "
     "is the total window width; pass a larger value to look further back or a "
-    "smaller one to focus on a burst."
+    "smaller one to focus on a burst. With no alert to anchor on, "
+    "`window_mode` changes nothing."
 )
 _ZEEK_WIDE_WINDOW_NOTE = (
     "The default window is wide ({minutes} minutes), counted back from now — "
     "there is no alert to center on. `time_range_minutes` is the total width; "
     "narrow it when you only need the immediate surroundings of one flow."
 )
+
+
+_ANALYTIC_WINDOW_MAX_DAYS = 90
+_ANALYTIC_CANDIDATES_MAX = 25
+
+
+async def run_analytic_for_agent(*, ctx: Any, analytic_id: str, window_days: int) -> dict[str, Any]:
+    """Run one live or shadow analytic over the last ``window_days`` days.
+
+    Returns the candidates with live provenance. A candidate's sample ids are
+    document ids the agent can cite. A retired or unknown analytic returns the
+    list of analytics it can run instead, so the model corrects itself rather
+    than reading an empty result as "nothing is there".
+    """
+    days = max(1, min(int(window_days or 1), _ANALYTIC_WINDOW_MAX_DAYS))
+    maker = getattr(ctx, "db_sessionmaker", None)
+    if maker is not None:
+        async with maker() as db:
+            cat = await effective_catalog(db)
+    else:
+        # CLI / eval callers with no store: the catalog is the shipped tier.
+        cat = await effective_catalog(None)
+    spec = cat.specs.get(analytic_id)
+    if spec is None:
+        listed = getattr(cat, "listed", cat.specs)
+        return {
+            "error": "unknown_analytic",
+            "hint": "This analytic is not live or in shadow. Choose one from the list.",
+            "available": [f"{sid}: {s.title}" for sid, s in listed.items()][:40],
+        }
+    tier, status = cat.status_of(analytic_id)
+    run = await run_spec(
+        spec,
+        elastic=ctx.elastic,
+        settings=ctx.settings,
+        since=f"now-{days}d",
+        until="now",
+        include_synth=getattr(ctx, "include_synth", False),
+    )
+    if run.error is not None:
+        # An errored run is reported as an error, never as an empty candidate
+        # list. The two must not look the same to the model.
+        return {
+            "analytic": analytic_id,
+            "status": status,
+            "error": "could_not_run",
+            "detail": run.error,
+            "provenance": "live",
+        }
+    return {
+        "analytic": analytic_id,
+        "title": spec.title,
+        "tier": tier,
+        "status": status,
+        "window_days": days,
+        "blind": run.blind,
+        "precondition_docs": run.precondition_docs,
+        "matched_docs": run.matched_docs,
+        "candidates": [
+            {
+                "entity": c.scope_key,
+                "entity_kind": c.scope_kind,
+                "doc_count": c.doc_count,
+                "sample_ids": list(c.sample_ids),
+                "anchor_id": c.anchor_id,
+                "first_seen": c.first_seen,
+                "last_seen": c.last_seen,
+            }
+            for c in run.candidates[:_ANALYTIC_CANDIDATES_MAX]
+        ],
+        "provenance": "live",
+    }
+
+
+# ---------------------------------------------------------------------------
+# A tool that cannot answer is not offered.
+#
+# Every registered tool is a turn the model can spend: 18 s on production, 30 s
+# on the range, plus the whole prompt re-sent. The 2026-09-19 reasoning-turn
+# audit counted 75 of 233 production tool calls returning nothing, and
+# `t_get_playbooks` returning `[]` on all 24 of its calls, because the
+# deployment links no playbook to any rule.
+#
+# The probe is one `size=1` search per grid per hour, cached against the
+# ElasticClient itself (one client is one grid; a weak key lets a retired client
+# and its answer go together). It FAILS OPEN in both directions: an unprobed run
+# and a grid that did not answer both keep the tool, because "the grid did not
+# say" is not "there are none". `require_complete=True` makes a partial read
+# raise rather than read as empty.
+# ---------------------------------------------------------------------------
+
+_PLAYBOOK_PRESENCE_TTL_S = 3600.0
+_playbook_presence: weakref.WeakKeyDictionary[Any, tuple[float, bool]] = weakref.WeakKeyDictionary()
+
+
+def reset_playbook_presence_cache() -> None:
+    """Forget every probed answer. For tests and for a settings hot-apply."""
+    _playbook_presence.clear()
+
+
+def _playbooks_known_absent(ctx: InvestigationContext) -> bool:
+    cached = _playbook_presence.get(ctx.elastic)
+    if cached is None:
+        return False
+    deadline, present = cached
+    return monotonic() <= deadline and not present
+
+
+async def prime_playbook_presence(ctx: InvestigationContext) -> bool:
+    """Does this deployment hold any playbook at all? Probe once per hour.
+
+    Returns True unless the grid answered and answered empty. Call it before
+    the investigator agent is built: :func:`register_read_tools` reads the
+    cached answer, and an unprimed cache registers ``t_get_playbooks`` exactly
+    as before.
+    """
+    cached = _playbook_presence.get(ctx.elastic)
+    if cached is not None and monotonic() <= cached[0]:
+        return cached[1]
+    try:
+        result = await ctx.elastic.search(
+            ctx.settings.playbooks_index_pattern,
+            {"match_all": {}},
+            size=1,
+            require_complete=True,
+        )
+        present = bool(getattr(result, "hits", None))
+    except Exception as e:
+        _LOGGER.info("playbook probe did not answer (%s); the tool stays registered", e)
+        return True
+    # A client that holds no weak reference simply goes uncached.
+    with contextlib.suppress(TypeError):
+        _playbook_presence[ctx.elastic] = (monotonic() + _PLAYBOOK_PRESENCE_TTL_S, present)
+    return present
+
+
+def prefetched_community_ids(enriched: Any) -> set[str]:
+    """The community_ids the prefetch holds RECORDS for.
+
+    ``t_query_zeek_logs`` answers "prefetch already has this" from this set, so
+    membership has to mean the record is in the user message. It used to include
+    the alert's own community_id whether or not the pivot returned anything:
+    01M2WG06 asked for a flow the prefetch had missed and was told to read a
+    block that was empty. Only an id carried by a prefetched event joins the set.
+    """
+    events = getattr(enriched, "community_id_events", None) or []
+    return {
+        cid
+        for cid in (getattr(event, "network_community_id", None) for event in events)
+        if isinstance(cid, str) and cid
+    }
 
 
 def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently long
@@ -899,6 +1075,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         query: str,
         time_range_minutes: int = window,
         max_results: int = 25,
+        window_mode: WindowMode = "around",
     ) -> dict[str, Any]:
         # Hard ceiling BEFORE the dedup key — defends the 64K window, and
         # makes max_results=100 and max_results=25 dedup to the same call.
@@ -906,7 +1083,16 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         if dup := _dedup_result(
             ctx,
             "t_query_events_oql",
-            {"query": query, "time_range_minutes": time_range_minutes, "max_results": max_results},
+            {
+                "query": query,
+                "time_range_minutes": time_range_minutes,
+                "max_results": max_results,
+                # In the dedup key: the same OQL over two different spans is
+                # two different questions, and answering the second from the
+                # first's cache is how a prevalence count inherits a pivot's
+                # half-window.
+                "window_mode": window_mode,
+            },
         ):
             return dup
         try:
@@ -917,6 +1103,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 time_range_minutes=time_range_minutes,
                 max_results=max_results,
                 time_anchor=ctx.default_time_anchor,
+                window_mode=window_mode,
                 include_synth=ctx.include_synth,
             )
         except Exception as e:
@@ -942,8 +1129,11 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         time_range_minutes: int = window,
         max_results: int = 25,
     ) -> list[dict[str, Any]] | dict[str, Any]:
-        # Read-prefetch-first rule: if this community_id is
-        # already in the prefetched community_id_events, don't re-query.
+        # Read-prefetch-first rule: answer from the prefetch only when the
+        # prefetch HOLDS a record for this community_id. The set is built by
+        # prefetched_community_ids() from the events themselves, so membership
+        # means the block above is not empty. A pivot that ran and returned
+        # nothing leaves the id out, and the query below runs (audit R6).
         if community_id in ctx.prefetched_community_ids:
             return {
                 "prefetch_already_has_this": True,
@@ -994,6 +1184,33 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
     t_query_zeek_logs.__doc__ = _ZEEK_DOC_BASE + zeek_window_note
     _register(t_query_zeek_logs)
 
+    if role == "hunt":
+
+        async def t_run_analytic(analytic_id: str, window_days: int = 7) -> dict[str, Any]:
+            """Run one analytic from the catalog over the last window_days days.
+
+            Use it to test a hypothesis with a query the product already
+            trusts. The result lists the entities that matched and the
+            document ids you can cite. Ask for the list with an unknown id.
+            """
+            window_days = max(1, min(int(window_days), _ANALYTIC_WINDOW_MAX_DAYS))
+            if dup := _dedup_result(
+                ctx,
+                "t_run_analytic",
+                {"analytic_id": analytic_id, "window_days": window_days},
+            ):
+                return dup
+            try:
+                out = await run_analytic_for_agent(
+                    ctx=ctx, analytic_id=analytic_id, window_days=window_days
+                )
+            except Exception as e:  # a tool never raises into the loop
+                _LOGGER.warning("t_run_analytic failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(out)
+
+        _register(t_run_analytic)
+
     @_register
     async def t_describe_dataset(dataset: str) -> dict[str, Any]:
         """Discover the fields POPULATED on a dataset (e.g. `zeek.ssh`, `endpoint`,
@@ -1020,7 +1237,8 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
     ) -> dict[str, Any]:
         """List the top VALUES a field takes (a terms aggregation), optionally within
         one dataset. E.g. what `rule.name`s fire, what `host.name`s exist, what
-        `event.dataset`s are present. Use it to see what actually populates a field."""
+        `event.dataset`s (and `data_stream.dataset`s) are present. Use it to see what
+        actually populates a field. A `dataset` name matches under either field."""
         # Clamp before the dedup key so over-asked sizes dedup to the same call.
         size = min(size, 50)
         if dup := _dedup_result(
@@ -1092,21 +1310,27 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 return _tool_error(e)
             return _clamp_tool_result([d.model_dump(mode="json") for d in dets])
 
-    @_register
-    async def t_get_rule_content(rule_id: str) -> dict[str, Any]:
-        """Fetch the FULL RULE TEXT of a detection — what the signature actually
-        matches (content strings, ports, dsize, PCRE), not just its name. Pass
-        the alert's `rule.uuid` (Suricata SID) or the exact `rule.name`. Read
-        this BEFORE trusting a rule label: a loose generic content match is weak
-        corroboration; a tight family-specific token match is strong."""
-        if dup := _dedup_result(ctx, "t_get_rule_content", {"rule_id": rule_id}):
-            return dup
-        try:
-            rule = await get_rule_content(rule_id, elastic=ctx.elastic, settings=ctx.settings)
-        except Exception as e:
-            _LOGGER.warning("t_get_rule_content failed: %s", e)
-            return _tool_error(e)
-        return _clamp_tool_result(rule)
+    # Skipped for the investigation loop when the alert message already carries
+    # this rule's body (soc_ai.agent.prompts.rule_body_in_alert sets the flag).
+    # Production spent 11 turns fetching text the prompt was already holding.
+    # Every other role keeps the tool: only the loop has the alert in its prompt.
+    if not (role == "investigator" and getattr(ctx, "rule_body_in_prompt", False)):
+
+        @_register
+        async def t_get_rule_content(rule_id: str) -> dict[str, Any]:
+            """Fetch the FULL RULE TEXT of a detection — what the signature actually
+            matches (content strings, ports, dsize, PCRE), not just its name. Pass
+            the alert's `rule.uuid` (Suricata SID) or the exact `rule.name`. Read
+            this BEFORE trusting a rule label: a loose generic content match is weak
+            corroboration; a tight family-specific token match is strong."""
+            if dup := _dedup_result(ctx, "t_get_rule_content", {"rule_id": rule_id}):
+                return dup
+            try:
+                rule = await get_rule_content(rule_id, elastic=ctx.elastic, settings=ctx.settings)
+            except Exception as e:
+                _LOGGER.warning("t_get_rule_content failed: %s", e)
+                return _tool_error(e)
+            return _clamp_tool_result(rule)
 
     @_register
     async def t_decode_payload(data: str, encoding: str = "auto") -> dict[str, Any]:
@@ -1313,15 +1537,27 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
 
     @_register
     async def t_rule_prevalence(rule_name: str, lookback_days: int = 30) -> dict[str, Any]:
-        """Base-rate / noisiness of a Suricata detection rule across the network.
+        """Base-rate / burstiness of a detection rule across the network.
 
-        Answers whether this rule is NOISY (fires constantly across many hosts —
-        so its next firing is likely benign HERE and is weak evidence) or RARE /
-        FIRST-SEEN (a firing is notable). Call this whenever the verdict leans on
-        a rule label: before trusting the signature name, check whether that
-        signature is a constant-firing nuisance on this grid. Returns
-        total_fires, distinct src/dest hosts, first/last seen, fires_per_day, and
-        a noisiness bucket. READ-ONLY and zero-egress.
+        Covers every dataset that carries detections (Suricata alerts, Sigma
+        alerts, Zeek notices, endpoint alerts) and says in `searched_datasets`
+        which ones it looked in, so a `first-seen` answer can be read for what it
+        is. Answers whether this rule is NOISY (fires constantly across many
+        hosts — so its next firing is likely benign HERE and is weak evidence),
+        RARE / FIRST-SEEN (a firing is notable), or a BURST (every fire packed
+        into one short episode — that is not a background rate, and if the alert
+        you are triaging sits inside the burst, the burst may BE the incident).
+        Call this whenever the verdict leans on a rule label: before trusting the
+        signature name, check whether that signature is a constant-firing
+        nuisance on this grid. Read `summary` as the headline, not any single
+        number. Returns
+        total_fires, distinct src/dest hosts and source ports, first/last seen,
+        the observed span, active_days, is_burst, a noisiness bucket,
+        fires_per_day measured over the span actually observed — which is null
+        for a burst, because a per-day rate is meaningless for one episode. It
+        also returns fires_per_active_day, measured over the days the rule fired
+        on, which is the larger number when the rule was quiet inside its span.
+        READ-ONLY and zero-egress.
         """
         if dup := _dedup_result(
             ctx, "t_rule_prevalence", {"rule_name": rule_name, "lookback_days": lookback_days}
@@ -1757,7 +1993,9 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 return _tool_error(e)
             return _clamp_tool_result(result)
 
-    if _in_role("t_get_playbooks", role):
+    # Registered only when this deployment actually holds a playbook (see
+    # prime_playbook_presence). An unprimed or unanswered probe keeps the tool.
+    if _in_role("t_get_playbooks", role) and not _playbooks_known_absent(ctx):
 
         @_register
         async def t_get_playbooks(

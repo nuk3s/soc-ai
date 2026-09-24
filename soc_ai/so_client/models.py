@@ -31,6 +31,7 @@ obvious" failures surfaced in the Phase 3 v3 meta-analysis.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -42,7 +43,12 @@ from pydantic import BaseModel, ConfigDict, Field
 # keep working. `first_present` + the candidate tables drive ECS-first reads with
 # a zeek.* fallback (see `_extract_zeek_typed`).
 from soc_ai.so_client import fields
-from soc_ai.so_client.fields import first_present, get_dotted
+from soc_ai.so_client.fields import (
+    envelope,
+    get_dotted,
+    unwrapped,
+    unwrapped_first_present,
+)
 
 __all__ = [
     "RuleMetadata",
@@ -79,9 +85,26 @@ def _parse_iso(value: Any) -> datetime | None:
 
 
 def _first(value: Any) -> Any:
-    """Suricata stuffs single-string scalars into single-element lists in
-    ``rule.metadata.*``. This helper returns ``v[0]`` when ``v`` is a list,
-    ``v`` otherwise, ``None`` when missing/empty."""
+    """Narrow a possibly-multi-valued document field to one scalar.
+
+    Returns ``v[0]`` when ``v`` is a list, ``v`` otherwise, ``None`` when
+    missing or empty.
+
+    This is not a Suricata quirk, which is how it was first written. It is the
+    Elasticsearch data model: there is no array type, every field may hold zero,
+    one or many values, and ECS documents several of the ones read here as
+    arrays outright. Elastic Defend writes ``event.action``, ``event.type`` and
+    ``event.category`` as lists on every ``endpoint.events.*`` document, which
+    on the deployed grid is over half of everything indexed in a day. A scalar
+    annotation on such a field is stricter than the data, and pydantic enforces
+    the annotation by refusing the WHOLE document, so one array field costs the
+    reader every other field on it.
+
+    Narrowing loses the tail of a genuinely multi-valued field. That is a real
+    cost and it is the smaller one: the untouched document stays on
+    :attr:`SoAlert.raw`, so nothing is unreachable, whereas a refused document
+    is unreadable in full.
+    """
     if value is None:
         return None
     if isinstance(value, list):
@@ -89,7 +112,43 @@ def _first(value: Any) -> Any:
     return value
 
 
-def _extract_zeek_typed(source: dict[str, Any], parse_errors: list[str]) -> dict[str, Any]:
+def _as_str_list(value: Any) -> list[str]:
+    """Read a list-typed document field that may arrive as a bare scalar.
+
+    The same asymmetry as :func:`_first`, inverted. ``list("alert")`` is
+    ``["a", "l", "e", "r", "t"]``, so a grid writing ``tags`` as a string
+    produced one tag per character rather than a validation error. Both
+    measured grids hold documents in each shape.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value.decode() if isinstance(value, bytes) else value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _one(source: dict[str, Any], env: Mapping[str, Any], candidates: tuple[str, ...]) -> Any:
+    """First candidate present in ``source`` or its envelope, narrowed to a scalar.
+
+    ``first_present`` returns whatever the document holds, list included.
+    Every attribute fed from here is annotated as a scalar, so the narrow
+    belongs at the read rather than at each of the thirty call sites. It also
+    fixes the booleans outright: ``bool([False])`` is True, so a list-wrapped
+    failed SSH authentication used to read as a success.
+    """
+    return _first(unwrapped_first_present(source, env, candidates))
+
+
+def _ev(source: dict[str, Any], env: Mapping[str, Any], path: str) -> Any:
+    """One evidence field, top level first and the envelope second, narrowed."""
+    return _first(unwrapped(source, env, path))
+
+
+def _extract_zeek_typed(
+    source: dict[str, Any], env: Mapping[str, Any], parse_errors: list[str]
+) -> dict[str, Any]:
     """Pull typed Zeek protocol fields off a Zeek/ECS event _source.
 
     Issue #20 — surfaces dns/ssl/conn/http details the investigator
@@ -122,10 +181,10 @@ def _extract_zeek_typed(source: dict[str, Any], parse_errors: list[str]) -> dict
             return None
 
     # conn state/history/duration — ECS connection.* / event.duration first.
-    out["zeek_conn_state"] = first_present(source, fields.CONN_STATE)
-    out["zeek_conn_history"] = first_present(source, fields.CONN_HISTORY)
+    out["zeek_conn_state"] = _one(source, env, fields.CONN_STATE)
+    out["zeek_conn_history"] = _one(source, env, fields.CONN_HISTORY)
     out["zeek_conn_duration"] = _coerce(
-        "conn.duration", first_present(source, fields.CONN_DURATION), float
+        "conn.duration", _one(source, env, fields.CONN_DURATION), float
     )
     # conn byte volumes — the exfil-asymmetry signal. A long-lived connection
     # with orig_bytes >> resp_bytes (e.g. 4.2 GB out / 4.1 MB in) is the
@@ -134,83 +193,81 @@ def _extract_zeek_typed(source: dict[str, Any], parse_errors: list[str]) -> dict
     # them, blinding the agent to large outbound transfers). first_present
     # preserves a literal 0 byte-count (not treated as missing).
     out["zeek_conn_orig_bytes"] = _coerce(
-        "conn.orig_bytes", first_present(source, fields.CONN_ORIG_BYTES), int
+        "conn.orig_bytes", _one(source, env, fields.CONN_ORIG_BYTES), int
     )
     out["zeek_conn_resp_bytes"] = _coerce(
-        "conn.resp_bytes", first_present(source, fields.CONN_RESP_BYTES), int
+        "conn.resp_bytes", _one(source, env, fields.CONN_RESP_BYTES), int
     )
     # dns.* — ECS dns.query.name / dns.response.code_name first; zeek.dns.query
     # is list-wrapped so keep the `_first` unwrap (harmless on ECS scalars).
-    out["zeek_dns_query"] = _first(first_present(source, fields.DNS_QUERY))
-    out["zeek_dns_rcode_name"] = first_present(source, fields.DNS_RCODE)
+    out["zeek_dns_query"] = _one(source, env, fields.DNS_QUERY)
+    out["zeek_dns_rcode_name"] = _one(source, env, fields.DNS_RCODE)
     # rejected has no ECS equivalent — read the zeek.* field directly.
-    rejected = get_dotted(source, "zeek.dns.rejected")
+    rejected = _ev(source, env, "zeek.dns.rejected")
     out["zeek_dns_rejected"] = bool(rejected) if rejected is not None else None
     # ssl/tls.* — ECS ssl.server_name / hash.ja3 / hash.ja3s first. Keep the
     # legacy zeek.ssl.*_hash fallback (not in the candidate tables) so older
     # ingest layouts that wrote *_hash still resolve.
-    out["zeek_ssl_server_name"] = first_present(source, fields.SSL_SNI)
-    out["zeek_ssl_ja3"] = first_present(source, fields.SSL_JA3) or get_dotted(
-        source, "zeek.ssl.ja3_hash"
-    )
+    out["zeek_ssl_server_name"] = _one(source, env, fields.SSL_SNI)
+    out["zeek_ssl_ja3"] = _one(source, env, fields.SSL_JA3) or _ev(source, env, "zeek.ssl.ja3_hash")
     # ja3s is the SERVER-side TLS fingerprint — complements ja3 (client) for
     # identifying C2/beacon frameworks (e.g. a Cobalt Strike team-server ja3s).
-    out["zeek_ssl_ja3s"] = first_present(source, fields.SSL_JA3S) or get_dotted(
-        source, "zeek.ssl.ja3s_hash"
+    out["zeek_ssl_ja3s"] = _one(source, env, fields.SSL_JA3S) or _ev(
+        source, env, "zeek.ssl.ja3s_hash"
     )
     # files.* — transferred-file metadata (MIME + hashes + size). A PE
     # (`application/x-dosexec`) pulled over HTTP, with a hash to pivot on, is
     # the single strongest malware-delivery signal; on modern SO these live at
     # file.mime_type / file.hash.* / file.size. Surface it on the prefetch so
     # the agent sees WHAT was downloaded without calling t_query_zeek_logs.
-    out["zeek_files_mime_type"] = first_present(source, fields.FILE_MIME)
-    out["zeek_files_md5"] = first_present(source, fields.FILE_MD5)
-    out["zeek_files_sha256"] = first_present(source, fields.FILE_SHA256)
+    out["zeek_files_mime_type"] = _one(source, env, fields.FILE_MIME)
+    out["zeek_files_md5"] = _one(source, env, fields.FILE_MD5)
+    out["zeek_files_sha256"] = _one(source, env, fields.FILE_SHA256)
     out["zeek_files_total_bytes"] = _coerce(
-        "files.total_bytes", first_present(source, fields.FILE_SIZE), int
+        "files.total_bytes", _one(source, env, fields.FILE_SIZE), int
     )
     # http.* — ECS http.method / http.virtual_host / http.uri / http.status_code
     # / user_agent.original first.
-    out["zeek_http_method"] = first_present(source, fields.HTTP_METHOD)
-    out["zeek_http_host"] = first_present(source, fields.HTTP_HOST)
-    out["zeek_http_uri"] = first_present(source, fields.HTTP_URI)
+    out["zeek_http_method"] = _one(source, env, fields.HTTP_METHOD)
+    out["zeek_http_host"] = _one(source, env, fields.HTTP_HOST)
+    out["zeek_http_uri"] = _one(source, env, fields.HTTP_URI)
     out["zeek_http_status"] = _coerce(
-        "http.status_code", first_present(source, fields.HTTP_STATUS), int
+        "http.status_code", _one(source, env, fields.HTTP_STATUS), int
     )
-    out["zeek_http_user_agent"] = first_present(source, fields.HTTP_USER_AGENT)
+    out["zeek_http_user_agent"] = _one(source, env, fields.HTTP_USER_AGENT)
     # dns qtype / ssl established / conn service — candidate tables existed but
     # were never surfaced. qtype (e.g. TXT-heavy) is the DNS-tunnel corroborator;
     # ssl established distinguishes a completed TLS session from a scan.
-    out["zeek_dns_qtype"] = first_present(source, fields.DNS_QTYPE)
-    established = first_present(source, fields.SSL_ESTABLISHED)
+    out["zeek_dns_qtype"] = _one(source, env, fields.DNS_QTYPE)
+    established = _one(source, env, fields.SSL_ESTABLISHED)
     out["zeek_ssl_established"] = bool(established) if established is not None else None
-    out["zeek_conn_service"] = first_present(source, fields.CONN_SERVICE)
+    out["zeek_conn_service"] = _one(source, env, fields.CONN_SERVICE)
     # kerberos (Kerberoasting): cipher carries the ticket encryption — RC4-HMAC is
     # the decisive roast signature; service is the requested SPN.
-    out["zeek_kerberos_cipher"] = first_present(source, fields.KERBEROS_CIPHER)
-    out["zeek_kerberos_service"] = first_present(source, fields.KERBEROS_SERVICE)
-    out["zeek_kerberos_request_type"] = first_present(source, fields.KERBEROS_REQUEST_TYPE)
+    out["zeek_kerberos_cipher"] = _one(source, env, fields.KERBEROS_CIPHER)
+    out["zeek_kerberos_service"] = _one(source, env, fields.KERBEROS_SERVICE)
+    out["zeek_kerberos_request_type"] = _one(source, env, fields.KERBEROS_REQUEST_TYPE)
     # smb / dce-rpc (PsExec-style lateral): a file write of a service binary to
     # ADMIN$, then an svcctl CreateServiceW — the classic remote-exec chain.
-    out["zeek_smb_action"] = first_present(source, fields.SMB_FILE_ACTION)
-    out["zeek_smb_name"] = first_present(source, fields.SMB_FILE_NAME)
-    out["zeek_smb_mapping_service"] = first_present(source, fields.SMB_MAPPING_SERVICE)
-    out["zeek_dce_rpc_endpoint"] = first_present(source, fields.DCE_RPC_ENDPOINT)
-    out["zeek_dce_rpc_operation"] = first_present(source, fields.DCE_RPC_OPERATION)
+    out["zeek_smb_action"] = _one(source, env, fields.SMB_FILE_ACTION)
+    out["zeek_smb_name"] = _one(source, env, fields.SMB_FILE_NAME)
+    out["zeek_smb_mapping_service"] = _one(source, env, fields.SMB_MAPPING_SERVICE)
+    out["zeek_dce_rpc_endpoint"] = _one(source, env, fields.DCE_RPC_ENDPOINT)
+    out["zeek_dce_rpc_operation"] = _one(source, env, fields.DCE_RPC_OPERATION)
     # ssh — a COMPLETED authentication (auth_success) is the decisive lateral /
     # intrusion signal; combined with a bad-reputation source it's a confirmed login.
-    ssh_auth = first_present(source, fields.SSH_AUTH_SUCCESS)
+    ssh_auth = _one(source, env, fields.SSH_AUTH_SUCCESS)
     out["zeek_ssh_auth_success"] = bool(ssh_auth) if ssh_auth is not None else None
     out["zeek_ssh_auth_attempts"] = _coerce(
-        "ssh.auth_attempts", first_present(source, fields.SSH_AUTH_ATTEMPTS), int
+        "ssh.auth_attempts", _one(source, env, fields.SSH_AUTH_ATTEMPTS), int
     )
-    out["zeek_ssh_client"] = first_present(source, fields.SSH_CLIENT)
-    out["zeek_ssh_server"] = first_present(source, fields.SSH_SERVER)
+    out["zeek_ssh_client"] = _one(source, env, fields.SSH_CLIENT)
+    out["zeek_ssh_server"] = _one(source, env, fields.SSH_SERVER)
     # behavioral-summary pivots — read the whole profile object (a nested dict)
     # when a derived beacon/DNS-tunnel summary doc is present; None otherwise.
-    beacon = first_present(source, fields.BEACON_PROFILE)
+    beacon = _one(source, env, fields.BEACON_PROFILE)
     out["zeek_beacon_profile"] = beacon if isinstance(beacon, dict) else None
-    dns_profile = first_present(source, fields.DNS_TUNNEL_PROFILE)
+    dns_profile = _one(source, env, fields.DNS_TUNNEL_PROFILE)
     out["zeek_dns_profile"] = dns_profile if isinstance(dns_profile, dict) else None
     return out
 
@@ -411,26 +468,57 @@ class SoAlert(BaseModel):
 
     @classmethod
     def from_es_hit(cls, hit: dict[str, Any]) -> SoAlert:
-        """Construct a typed :class:`SoAlert` from a raw ``hits.hits[i]`` entry."""
+        """Construct a typed :class:`SoAlert` from a raw ``hits.hits[i]`` entry.
+
+        Every scalar attribute is read through :func:`_first`. Elasticsearch
+        makes no scalar guarantee about any field, so a strict annotation
+        without that narrow refuses whole documents: ``event.action`` alone,
+        arriving as ``["start", "end"]`` off Elastic Defend, made every
+        ``endpoint.events.*`` document unreadable and every hunt finding
+        anchored on endpoint telemetry unpromotable.
+
+        **The ``event_data`` envelope.** Security Onion's Sigma pipeline writes
+        the detection's identity at the top level and nests the whole document
+        the rule matched under ``event_data`` (see :func:`fields.envelope`).
+        Fields are therefore read in two groups:
+
+        - *Evidence* — what happened, and to whom: the endpoints, the host, the
+          user, the process, the hash, the community id, the action, the
+          category, the message and every typed Zeek field. Read top level
+          first, envelope second.
+        - *Identity* — which detection fired: ``@timestamp``, ``rule.*``,
+          ``event.module``, ``event.dataset``, ``event.severity*`` and ``tags``.
+          NOT unwrapped. On a nested document these disagree between the two
+          levels by design, and the top level is the one that names the alert
+          in front of the analyst. Unwrapping ``rule.metadata`` without
+          ``rule.name`` would be worse still: it would attach a wrapped
+          Suricata signature's metadata to the Sigma rule's name.
+        """
         source = hit.get("_source", {}) or {}
+        env = envelope(source)
         parse_errors: list[str] = []
-        host_ip_raw = get_dotted(source, "host.ip") or []
-        if isinstance(host_ip_raw, str):
-            host_ip_raw = [host_ip_raw]
-        # rule.metadata is a nested dict of single-element lists.
+        # rule.metadata is a nested dict of single-element lists. Identity, so
+        # read at the top level only.
         rule_metadata = RuleMetadata.from_rule_metadata_block(get_dotted(source, "rule.metadata"))
         # message is a JSON string with alert/flow/event_type details. We pull
         # action from inside it as a fallback when ECS event.action is absent.
-        message_raw = source.get("message")
+        message_raw = _first(unwrapped(source, env, "message"))
         message_parsed = _parse_message_json(message_raw)
         if isinstance(message_raw, str) and message_raw and not message_parsed:
             # message looked like JSON but failed to parse — surface so the
             # agent knows to fall back to raw `message` instead of the
             # typed fields below.
             parse_errors.append("message: failed to parse as JSON")
-        # event.category is sometimes a list; flatten to first.
-        event_category = _first(get_dotted(source, "event.category"))
-        event_dataset = get_dotted(source, "event.dataset")
+        event_category = _ev(source, env, "event.category")
+        # Identity: the DETECTION's dataset, never the envelope's. On a Sigma
+        # alert the envelope says `system.auth` while this says `sigma.alert`,
+        # and every reader that routes on this field means the latter.
+        event_dataset = _first(get_dotted(source, "event.dataset"))
+        # What KIND of document the evidence is, which is a different question
+        # and the one the Zeek gates below are asking. On an unwrapped document
+        # it is the envelope's dataset; on every other document it is the same
+        # value as `event_dataset`.
+        evidence_dataset = _first(get_dotted(env, "event.dataset")) or event_dataset
 
         # ---- DNS extraction with the polluted-source guard (issue #20) ----
         # Suricata's SO ingest pipeline pollutes the top-level `dns` block
@@ -439,16 +527,16 @@ class SoAlert(BaseModel):
         # documents that are actually Zeek DNS records.
         dns_query: str | None = None
         dns_rcode_name: str | None = None
-        is_zeek_dns = isinstance(event_dataset, str) and event_dataset == "zeek.dns"
+        is_zeek_dns = isinstance(evidence_dataset, str) and evidence_dataset == "zeek.dns"
         if is_zeek_dns:
             # ECS-first (dns.query.name / dns.response.code_name on modern SO),
             # then the legacy dns.query_name / zeek.dns.* names. zeek.dns.query
             # is list-wrapped, so unwrap with `_first` (harmless on scalars).
-            dns_query = _first(get_dotted(source, "dns.query_name")) or _first(
-                first_present(source, fields.DNS_QUERY)
+            dns_query = _ev(source, env, "dns.query_name") or _first(
+                unwrapped_first_present(source, env, fields.DNS_QUERY)
             )
-            dns_rcode_name = get_dotted(source, "dns.rcode_name") or first_present(
-                source, fields.DNS_RCODE
+            dns_rcode_name = _ev(source, env, "dns.rcode_name") or _first(
+                unwrapped_first_present(source, env, fields.DNS_RCODE)
             )
         # For Suricata + other event types: leave dns_query/dns_rcode_name
         # as None. The agent should consult `payload_printable` instead.
@@ -458,41 +546,41 @@ class SoAlert(BaseModel):
         # bogus zero values. Wrapped in try/except to keep prefetch
         # robust to schema drift (note added to prefetch_parse_errors).
         zeek_typed: dict[str, Any] = {}
-        if isinstance(event_dataset, str) and event_dataset.startswith("zeek."):
-            zeek_typed = _extract_zeek_typed(source, parse_errors)
+        if isinstance(evidence_dataset, str) and evidence_dataset.startswith("zeek."):
+            zeek_typed = _extract_zeek_typed(source, env, parse_errors)
 
         return cls(
             id=hit["_id"],
             timestamp=_parse_iso(source.get("@timestamp")),
-            rule_name=get_dotted(source, "rule.name"),
-            rule_uuid=get_dotted(source, "rule.uuid"),
-            severity_label=get_dotted(source, "event.severity_label")
-            or get_dotted(source, "rule.severity"),
-            severity_score=get_dotted(source, "event.severity"),
-            network_community_id=get_dotted(source, "network.community_id"),
-            source_ip=get_dotted(source, "source.ip"),
-            source_port=get_dotted(source, "source.port"),
-            destination_ip=get_dotted(source, "destination.ip"),
-            destination_port=get_dotted(source, "destination.port"),
-            host_name=get_dotted(source, "host.name"),
-            host_ip=list(host_ip_raw),
-            user_name=get_dotted(source, "user.name"),
-            process_entity_id=get_dotted(source, "process.entity_id"),
-            file_hash_sha256=get_dotted(source, "file.hash.sha256"),
+            rule_name=_first(get_dotted(source, "rule.name")),
+            rule_uuid=_first(get_dotted(source, "rule.uuid")),
+            severity_label=_first(get_dotted(source, "event.severity_label"))
+            or _first(get_dotted(source, "rule.severity")),
+            severity_score=_first(get_dotted(source, "event.severity")),
+            network_community_id=_ev(source, env, "network.community_id"),
+            source_ip=_ev(source, env, "source.ip"),
+            source_port=_ev(source, env, "source.port"),
+            destination_ip=_ev(source, env, "destination.ip"),
+            destination_port=_ev(source, env, "destination.port"),
+            host_name=_ev(source, env, "host.name"),
+            host_ip=_as_str_list(unwrapped(source, env, "host.ip")),
+            user_name=_ev(source, env, "user.name"),
+            process_entity_id=_ev(source, env, "process.entity_id"),
+            file_hash_sha256=_ev(source, env, "file.hash.sha256"),
             message=message_raw if isinstance(message_raw, str) else None,
-            tags=list(source.get("tags") or []),
+            tags=_as_str_list(source.get("tags")),
             rule_metadata=rule_metadata,
             dns_query=dns_query,
             dns_rcode_name=dns_rcode_name,
-            event_action=get_dotted(source, "event.action"),
-            alert_action=get_dotted(message_parsed, "alert.action"),
+            event_action=_ev(source, env, "event.action"),
+            alert_action=_first(get_dotted(message_parsed, "alert.action")),
             # Suricata writes the classtype (e.g. ``trojan-activity``,
             # ``misc-activity``) as ``alert.category`` inside the
             # message JSON. We surface it as ``classtype`` because
             # that's the upstream Suricata terminology and avoids
             # collision with ECS ``event.category``.
-            classtype=get_dotted(message_parsed, "alert.category"),
-            event_module=get_dotted(source, "event.module"),
+            classtype=_first(get_dotted(message_parsed, "alert.category")),
+            event_module=_first(get_dotted(source, "event.module")),
             event_dataset=event_dataset,
             event_category=event_category,
             # Suricata writes the actual matched packet bytes here. For
@@ -500,8 +588,8 @@ class SoAlert(BaseModel):
             # `a-us.storyblok.com`); for SSL the SNI; for HTTP the
             # request line + headers. Most useful single field on the
             # alert payload, full stop.
-            payload_printable=get_dotted(message_parsed, "payload_printable")
-            or source.get("payload_printable"),
+            payload_printable=_first(get_dotted(message_parsed, "payload_printable"))
+            or _ev(source, env, "payload_printable"),
             **zeek_typed,
             prefetch_parse_errors=parse_errors,
             raw=source,
@@ -509,7 +597,11 @@ class SoAlert(BaseModel):
 
 
 class SoCase(BaseModel):
-    """A SOC case document from the ``/connect/case/*`` endpoints."""
+    """A SOC case document.
+
+    Read from the grid's own ``so-case`` index (see ``query_cases``) and
+    written through ``POST /api/case/``; both carry the same field names.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -527,18 +619,23 @@ class SoCase(BaseModel):
 
     @classmethod
     def from_so_doc(cls, doc: dict[str, Any]) -> SoCase:
-        """Construct from a raw SOC API case JSON object."""
+        """Construct from a raw SOC API case JSON object.
+
+        Read through :func:`_first` for the same reason
+        :meth:`SoAlert.from_es_hit` is: ``query_cases`` reads these off the
+        grid's own ``so-case*`` index, which carries no scalar guarantee.
+        """
         return cls(
-            id=doc["id"],
-            title=doc.get("title", ""),
-            description=doc.get("description"),
-            status=doc.get("status", "unknown"),
-            severity=doc.get("severity"),
-            priority=doc.get("priority"),
-            assignee_id=doc.get("assigneeId"),
-            tags=list(doc.get("tags") or []),
-            created=_parse_iso(doc.get("createTime")),
-            updated=_parse_iso(doc.get("updateTime")),
+            id=_first(doc["id"]),
+            title=_first(doc.get("title")) or "",
+            description=_first(doc.get("description")),
+            status=_first(doc.get("status")) or "unknown",
+            severity=_first(doc.get("severity")),
+            priority=_first(doc.get("priority")),
+            assignee_id=_first(doc.get("assigneeId")),
+            tags=_as_str_list(doc.get("tags")),
+            created=_parse_iso(_first(doc.get("createTime"))),
+            updated=_parse_iso(_first(doc.get("updateTime"))),
             raw=doc,
         )
 
@@ -566,14 +663,16 @@ class SoDetection(BaseModel):
         if not isinstance(det, dict):
             det = doc
         return cls(
-            id=str(det.get("id") or det.get("publicId") or ""),
-            title=det.get("title", ""),
-            publicId=det.get("publicId"),
-            severity=det.get("severity"),
-            engine=det.get("engine"),
-            is_enabled=bool(det.get("isEnabled", True)),
-            author=det.get("author"),
-            tags=list(det.get("tags") or []),
+            id=str(_first(det.get("id")) or _first(det.get("publicId")) or ""),
+            title=_first(det.get("title")) or "",
+            publicId=_first(det.get("publicId")),
+            severity=_first(det.get("severity")),
+            engine=_first(det.get("engine")),
+            is_enabled=bool(_first(det.get("isEnabled", True))),
+            # A Sigma rule may name several authors, so this one is genuinely
+            # multi-valued rather than incidentally list-wrapped.
+            author=_first(det.get("author")),
+            tags=_as_str_list(det.get("tags")),
             raw=doc,
         )
 
@@ -604,17 +703,17 @@ class SoPlaybook(BaseModel):
     def from_so_doc(cls, doc: dict[str, Any]) -> SoPlaybook:
         questions = [
             SoPlaybookQuestion(
-                id=q["id"],
-                question=q.get("question", ""),
-                answer=q.get("answer"),
-                is_required=bool(q.get("isRequired", False)),
+                id=_first(q["id"]),
+                question=_first(q.get("question")) or "",
+                answer=_first(q.get("answer")),
+                is_required=bool(_first(q.get("isRequired", False))),
             )
             for q in (doc.get("questions") or [])
         ]
         return cls(
-            id=doc["id"],
-            title=doc.get("title", ""),
-            description=doc.get("description"),
+            id=_first(doc["id"]),
+            title=_first(doc.get("title")) or "",
+            description=_first(doc.get("description")),
             questions=questions,
             raw=doc,
         )

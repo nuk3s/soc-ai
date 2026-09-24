@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from elastic_transport import TransportError
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._shared import (
+    _iso_z,
     router,
 )
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
@@ -21,18 +23,30 @@ from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import assignments as assign_svc
+from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.write_exec import execute_write_tool
 from soc_ai.webui import alerts_query as aq
+from soc_ai.webui.case_links import case_ids_for_alerts
 
 _LOGGER = logging.getLogger(__name__)
 
-# One BELOW ``aq.MAX_EVENTS`` so ``ack_group`` can fetch ``_ACK_CAP + 1`` and
-# actually observe the overflow: ``fetch_group_events`` clamps ``size`` to
-# ``MAX_EVENTS``, so a cap EQUAL to the clamp made ``capped`` unreachable (a
-# >200-event group was silently part-acked with ``capped=false``, F21).
+# One BELOW ``aq.MAX_EVENTS`` so ``ack_group`` can collect ``_ACK_CAP + 1``
+# unacknowledged events and actually observe the overflow: a cap EQUAL to the
+# page size made ``capped`` unreachable (a >200-event group was silently
+# part-acked with ``capped=false``, F21).
 _ACK_CAP = 199  # maximum events acknowledged per ack-group call
 _ACK_CONCURRENCY = 8  # bounded fan-out for bulk ack to keep ES/SO round-trips parallel-but-capped
+
+# How far :func:`_scan_group` will page looking for events that still
+# need the write. It only pages at all on a grid that cannot hide an
+# acknowledged event from a query, where every press would otherwise re-read
+# the same first page forever; each page is a size-200 search costing
+# milliseconds, so the bound is about refusing to scan an unbounded backlog
+# inside one HTTP request, not about cost per page. A group holding more than
+# this many already-acknowledged events reports what is outstanding rather than
+# a false all-clear.
+_ACK_MAX_SCAN = 2000
 
 
 async def _ack_many(
@@ -99,10 +113,15 @@ _OQL_Q = Annotated[str, Field(max_length=2048)]
 # returns it for any ``tags:alert`` document without a mapped ``event.dataset``,
 # ``fetch_groups`` renders it, and the SPA posts the group's kind back verbatim —
 # so refusing it 422s Acknowledge/Escalate on a group the analyst can SEE.
-# ``fetch_group_events`` treats every non-"notice" kind identically (the default
-# rule.name-scoped source query), so accepting it is not a coercion: the write
-# lands on exactly the document set the group view showed.
-_VALID_GROUP_KINDS = ("suricata", "sigma", "notice", "alert")
+# ``fetch_group_events`` treats every non-"notice", non-"unnamed" kind
+# identically (the default rule.name-scoped source query), so accepting it is
+# not a coercion: the write lands on exactly the document set the group view
+# showed.
+# ``unnamed`` is the group of alerts carrying no rule.name, named by their
+# dataset; refusing it would 422 Acknowledge/Escalate on a group the analyst can
+# see, and silently mapping it to the default would resolve a dataset name
+# against rule.name and acknowledge nothing while reporting success.
+_VALID_GROUP_KINDS = ("suricata", "sigma", "notice", "alert", "unnamed")
 
 
 class AckGroupIn(BaseModel):
@@ -154,11 +173,129 @@ class AckGroupIn(BaseModel):
         low = v.strip().lower()
         if not low:
             return None  # empty ≡ absent — "no severity filter", not a bad value
-        if low not in aq.SEVERITIES:
+        # SELECTABLE, not SEVERITIES: "unknown" narrows the write to the alerts
+        # that carry no severity label, which the console can now filter to.
+        # Rejecting it would leave the analyst looking at a filtered queue they
+        # cannot acknowledge, which is the screen disagreeing with its own
+        # controls one level along from the badge this batch fixed.
+        if low not in aq.SELECTABLE_SEVERITIES:
             raise ValueError(
-                f"unrecognized severity {v!r}; expected one of: {', '.join(aq.SEVERITIES)}"
+                f"unrecognized severity {v!r}; "
+                f"expected one of: {', '.join(aq.SELECTABLE_SEVERITIES)}"
             )
         return low
+
+
+async def _count_group(
+    elastic: ElasticClient,
+    settings: Settings,
+    body: AckGroupIn,
+) -> int:
+    """How many events the group holds, under the filters the write will use."""
+    return await aq.count_group_events(
+        elastic,
+        settings,
+        rule_name=body.rule_name,
+        kind=body.kind,
+        time_range=body.range,
+        severity=body.severity,
+        oql=body.q,
+        abs_from=body.from_,
+        abs_to=body.to,
+        time_zone=settings.so_timezone,
+        hide_acked=True,
+    )
+
+
+def _remaining(matched: int, handled: int, *, more: bool) -> int:
+    """Events left in the group after this call handled ``handled`` of them.
+
+    ``more`` is what the paging actually saw and it decides the answer. When the
+    scan ran off the end of the group there is nothing left by construction, no
+    matter what a count says, so no count is taken at all. When it stopped at
+    the cap the count is the only way to put a number on the rest, and the
+    answer can never be zero: the scan already proved otherwise.
+
+    ``matched`` is counted under ``hide_acked``, so on a grid that hides an
+    acknowledged event it excludes earlier presses and ``handled`` is just this
+    call's writes. On a grid that does not, it still counts them and ``handled``
+    includes the ones skipped as already done. The subtraction holds either way.
+    """
+    if not more:
+        return 0
+    return max(1, matched - handled)
+
+
+async def _scan_group(
+    elastic: ElasticClient,
+    settings: Settings,
+    body: AckGroupIn,
+    *,
+    cap: int,
+) -> tuple[list[Any], list[Any], bool]:
+    """Page a group, splitting it into the events still worth writing to and the
+    events Security Onion says it has already handled.
+
+    Returns ``(writable, handled, more)``, capped at ``cap`` writable events.
+    ``more`` says at least one further writable event was seen beyond the cap,
+    or that the scan hit its bound without reaching the end of the group.
+
+    ``handled`` is returned as the events themselves, not a count, because the
+    two flags on them do not mean the same thing to every caller: acknowledged
+    is a dismissal and escalated is a case, and only the escalate route has to
+    tell them apart.
+
+    The skip cannot be done in the query. ``hide_acked`` filters on
+    ``event.acknowledged``, and Elastic Defend's endpoint alert index is mapped
+    ``dynamic: false`` without that field, so Security Onion's own ack lands in
+    ``_source`` where no query reaches it. Measured on a live SO 3.2.0 grid on
+    2026-09-06: a 16-event endpoint group acknowledged cleanly, and the next
+    fetch with ``hide_acked=True`` returned the same 16 ids. Reading the flag
+    off the hit and paging past it is what makes a second press advance instead
+    of rewriting the same events and reporting success.
+
+    What the flags CANNOT tell anyone is whether an alert is on a case. The
+    attach soc-ai performs writes a related document on the case and nothing on
+    the alert, so an alert this returns as writable may already have a case.
+    Deciding that is the escalate route's job, against the ledger and the grid's
+    own case links.
+    """
+    writable: list[Any] = []
+    handled: list[Any] = []
+    scanned = 0
+    offset = 0
+    while scanned < _ACK_MAX_SCAN:
+        page = await aq.fetch_group_events(
+            elastic,
+            settings,
+            rule_name=body.rule_name,
+            kind=body.kind,
+            time_range=body.range,
+            severity=body.severity,
+            oql=body.q,
+            size=aq.MAX_EVENTS,
+            offset=offset,
+            abs_from=body.from_,
+            abs_to=body.to,
+            time_zone=settings.so_timezone,
+            hide_acked=True,
+        )
+        if not page:
+            return writable, handled, False
+        scanned += len(page)
+        for event in page:
+            if event.acknowledged or event.escalated:
+                handled.append(event)
+            elif len(writable) < cap:
+                writable.append(event)
+            else:
+                return writable, handled, True
+        if len(page) < aq.MAX_EVENTS:
+            return writable, handled, False
+        offset += len(page)
+    # Stopped at the scan bound. Whether anything writable is left is unknown,
+    # and claiming "nothing" would be the false all-clear this exists to avoid.
+    return writable, handled, True
 
 
 class AckGroupOut(BaseModel):
@@ -166,6 +303,13 @@ class AckGroupOut(BaseModel):
     failed: int
     total: int
     capped: bool = False
+    # Events skipped because Security Onion already records the write. Non-zero
+    # only where an acknowledged event stays visible to a query, which is the
+    # difference between a button that looks inert and one that explains itself.
+    already_acked: int = 0
+    # Events in the group this call did not write. Counted against the same
+    # filters the write used, so it is the group's own number, not an estimate.
+    remaining: int = 0
 
 
 @router.post("/alerts/ack-group", response_model=AckGroupOut)
@@ -175,11 +319,17 @@ async def ack_group(
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> AckGroupOut:
-    """Acknowledge all events for a detection group in Security Onion.
+    """Acknowledge the events of a detection group in Security Onion.
 
-    Fetches up to ``_ACK_CAP`` events matching the rule+filters and calls
-    ``ack_alert`` for each via the write-tool path.  Returns counts of
-    successes, failures, and whether the cap was hit.
+    Collects up to ``_ACK_CAP`` events the grid does not already record as
+    acknowledged (see :func:`_scan_group`) and calls ``ack_alert`` for
+    each via the write-tool path. Returns how many were acknowledged, how many
+    were skipped as already done, and how many are left.
+
+    ``remaining`` is what makes a second press worth making. Before this the
+    route acknowledged the same first page every time and reported success every
+    time, so a group larger than the cap never emptied and nothing in the answer
+    said so.
 
     The grid read is guarded and bounded like its sibling ``GET /alerts/events``,
     and it runs BEFORE any write: a failed fetch acknowledges nothing, so the
@@ -188,23 +338,12 @@ async def ack_group(
     caller = await identify_caller(request)
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
-            events = await aq.fetch_group_events(
-                elastic,
-                settings,
-                rule_name=body.rule_name,
-                kind=body.kind,
-                time_range=body.range,
-                severity=body.severity,
-                oql=body.q,
-                # Fetch one past the cap to detect overflow, but never above the
-                # fetch clamp (aq.MAX_EVENTS) — else the extra hit is dropped and
-                # ``capped`` can never trip (F21).
-                size=min(_ACK_CAP + 1, aq.MAX_EVENTS),
-                abs_from=body.from_,
-                abs_to=body.to,
-                time_zone=settings.so_timezone,
-                hide_acked=True,
-            )
+            events, handled, more = await _scan_group(elastic, settings, body, cap=_ACK_CAP)
+            already_acked = len(handled)
+            # Only worth a query when the scan stopped short; a drained group
+            # already knows its answer. Still a read, and still before the
+            # first write, so a grid failure here acknowledges nothing.
+            matched = await _count_group(elastic, settings, body) if more else 0
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
@@ -216,29 +355,34 @@ async def ack_group(
         # still escapes the tuple above as an unhandled 500.
         raise _es_api_error_http(exc) from exc
 
-    capped = len(events) > _ACK_CAP
-    events = events[:_ACK_CAP]
+    acked = 0
+    failed = 0
+    if events:
+        acked, failed = await _ack_many(
+            request,
+            [ev.es_id for ev in events],
+            session_id=f"ack-group:{body.rule_name}",
+            caller=caller,
+        )
 
-    if not events:
-        return AckGroupOut(acked=0, failed=0, total=0)
-
-    acked, failed = await _ack_many(
-        request,
-        [ev.es_id for ev in events],
-        session_id=f"ack-group:{body.rule_name}",
-        caller=caller,
-    )
-
-    total = acked + failed
-    if capped:
+    remaining = _remaining(matched, already_acked + len(events), more=more)
+    if more:
         logging.getLogger(__name__).warning(
-            "ack-group capped at %d events for rule %r (caller=%s)",
+            "ack-group capped at %d events for rule %r, %d left (caller=%s)",
             _ACK_CAP,
             body.rule_name,
+            remaining,
             caller,
         )
 
-    return AckGroupOut(acked=acked, failed=failed, total=total, capped=capped)
+    return AckGroupOut(
+        acked=acked,
+        failed=failed,
+        total=acked + failed,
+        capped=more,
+        already_acked=already_acked,
+        remaining=remaining,
+    )
 
 
 # Escalate is capped far tighter than ack: each escalate opens a SOC case, so a
@@ -254,7 +398,7 @@ async def _escalate_many(
     rule_name: str,
     session_id: str,
     caller: str,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[str, str], list[str]]:
     """Escalate ``events`` to Security Onion cases under a bounded semaphore.
 
     Each event goes through the same ``execute_write_tool`` write path as the
@@ -262,14 +406,27 @@ async def _escalate_many(
     ``asyncio.gather`` capped at ``_ACK_CONCURRENCY``. The escalate tool needs a
     title + description, which the model supplies for the single-alert action;
     here we synthesize a compact, secret-free case title/description from the
-    rule name and the event's endpoints. Returns ``(escalated, failed)``.
+    rule name and the event's endpoints.
+
+    Returns ``(escalated, failed, case_ids, empty_cases)``. ``case_ids`` maps
+    each alert to the case that was opened for it, so the caller can write the
+    answer onto the ledger claim it took out before the write. An alert missing
+    from it either failed or came back without an id, and its claim stays open
+    rather than being resolved either way.
+
+    A write that created a case and attached nothing to it counts as a failure,
+    not an escalate: the alert is on no case. Its case id goes in
+    ``empty_cases`` rather than onto the claim, because an empty case with an
+    incident's title is now sitting in Security Onion's queue and only the
+    operator can close or reuse it.
     """
     sem = asyncio.Semaphore(_ACK_CONCURRENCY)
 
-    async def _one(ev: Any) -> bool:
+    # (alert_id, case_id, alert_linked), or None when the write itself failed.
+    async def _one(ev: Any) -> tuple[str, str | None, bool] | None:
         async with sem:
             endpoints = f"{ev.src} → {ev.dst}" if getattr(ev, "src", None) else ""
-            _result, error = await execute_write_tool(
+            result, error = await execute_write_tool(
                 "escalate_to_case",
                 {
                     "alert_id": ev.es_id,
@@ -285,7 +442,15 @@ async def _escalate_many(
                 session_id=session_id,
                 user=caller,
             )
-            return error is None
+            if error is not None:
+                return None
+            body = result if isinstance(result, dict) else {}
+            case_id = body.get("case_id")
+            return (
+                str(ev.es_id),
+                str(case_id) if case_id else None,
+                bool(body.get("alert_linked")),
+            )
 
     results = await asyncio.gather(
         *(_one(ev) for ev in events),
@@ -293,14 +458,33 @@ async def _escalate_many(
     )
     escalated = 0
     failed = 0
+    case_ids: dict[str, str] = {}
+    empty_cases: list[str] = []
     for r in results:
-        if r is True:
-            escalated += 1
+        if isinstance(r, tuple):
+            alert_id, case_id, linked = r
+            if linked:
+                escalated += 1
+                if case_id:
+                    case_ids[alert_id] = case_id
+                continue
+            # A case with nothing on it. The claim stays open so the next press
+            # can ask the grid and settle it, and the case id is handed back so
+            # the operator hears about the case they now have to deal with.
+            failed += 1
+            if case_id:
+                empty_cases.append(case_id)
+            _LOGGER.warning(
+                "escalate attached nothing for alert %s (case=%s, session=%s)",
+                alert_id,
+                case_id or "none",
+                session_id,
+            )
         else:
             failed += 1
             if isinstance(r, BaseException):
                 _LOGGER.warning("bulk-escalate write raised (session=%s): %r", session_id, r)
-    return escalated, failed
+    return escalated, failed, case_ids, empty_cases
 
 
 class EscalateGroupOut(BaseModel):
@@ -308,6 +492,135 @@ class EscalateGroupOut(BaseModel):
     failed: int
     total: int
     capped: bool = False
+    # Alerts a case was WITHHELD from because one already exists for them.
+    # soc-ai's own ledger, Security Onion's case links, or the alert's own
+    # ``event.escalated`` flag says so. This is the count of duplicate cases not
+    # opened, and nothing else belongs in it: it used to also carry every
+    # acknowledged alert in the group, which claimed duplicates were prevented
+    # where no case had ever existed.
+    already_escalated: int = 0
+    # Alerts skipped because Security Onion already acknowledged them. A
+    # dismissal, not a case, and a different sentence to the operator.
+    already_acked: int = 0
+    # Alerts an earlier escalate left in an unknown state: it claimed them and
+    # never came back with a case id, and the grid could not be asked whether
+    # one exists. Neither escalated nor safe to escalate, so they are named
+    # rather than folded into a count that would be wrong either way.
+    unresolved: int = 0
+    # Cases Security Onion created and then attached nothing to, which happens
+    # when the alert is no longer on the grid. Each one is an empty case now
+    # sitting in the queue under a title that reads like an incident, and each
+    # one is counted in ``failed`` rather than ``escalated``: the alert is on no
+    # case. Named so the operator can close or reuse them.
+    empty_cases: list[str] = []
+    remaining: int = 0
+
+
+async def _existing_case_links(
+    elastic: ElasticClient,
+    settings: Settings,
+    alert_ids: list[str],
+) -> dict[str, str] | None:
+    """Ask Security Onion which of ``alert_ids`` are already on a case.
+
+    ``None`` means the question could not be answered: a degraded or failing
+    read, which is "could not see", never "no case exists". Best-effort by
+    design: the ledger is what makes a repeated press safe, and this is the
+    wider check that also covers cases opened from Security Onion's own console
+    or by another instance. Letting it fail the escalate would trade a
+    recoverable gap for an outage.
+    """
+    if not alert_ids:
+        return {}
+    try:
+        return await case_ids_for_alerts(elastic, settings, alert_ids)
+    except Exception:
+        _LOGGER.warning("case-link lookup failed; falling back to the ledger", exc_info=True)
+        return None
+
+
+class _Reservation(BaseModel):
+    """Which of a press's candidate alerts may actually be escalated."""
+
+    claimed: list[str] = []
+    # Alerts a case already exists for: ledger, grid links, or a claim another
+    # request took out first.
+    already_escalated: int = 0
+    # Alerts an earlier escalate claimed and never resolved, that the grid could
+    # not be asked about. Left alone rather than escalated or written off.
+    unresolved: int = 0
+
+
+async def _reserve(
+    request: Request,
+    elastic: ElasticClient,
+    settings: Settings,
+    candidate_ids: list[str],
+    *,
+    caller: str,
+) -> _Reservation:
+    """Reserve the alerts of this press that nothing has a case for yet.
+
+    Three sources answer "is this alert already on a case", in order of how much
+    they can be trusted about a press happening right now:
+
+    1. soc-ai's escalation ledger, claimed in the same transaction that reserves
+       the alert. It cannot lag and it cannot race, so it is what makes a
+       repeated press, or two operators pressing overlapping groups, safe.
+    2. Security Onion's case links, which see cases this instance did not open
+       but are a refreshed read and so lag by up to a second.
+    3. ``event.escalated`` on the alert, handled by the caller before this runs.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        claims = await esc_svc.cases_for_alerts(db, candidate_ids)
+    # Ask the grid only about what the ledger cannot settle: alerts never
+    # claimed, and claims whose outcome is still open.
+    open_claims = set(esc_svc.unresolved(claims))
+    links = await _existing_case_links(
+        elastic,
+        settings,
+        [i for i in candidate_ids if i not in claims or i in open_claims],
+    )
+
+    unresolved = 0
+    already = 0
+    stale: list[str] = []  # claims the grid proves never became a case
+    resolved: dict[str, str] = {}  # claims the grid can put a case id on
+    to_claim: list[str] = []
+    for alert_id in candidate_ids:
+        if claims.get(alert_id):
+            already += 1  # our own ledger already holds a case for it
+        elif alert_id in open_claims:
+            if links is None:
+                unresolved += 1  # outcome unknown and unknowable right now
+            elif alert_id in links:
+                resolved[alert_id] = links[alert_id]
+                already += 1
+            else:
+                stale.append(alert_id)  # no case was ever opened; free it
+                to_claim.append(alert_id)
+        elif links is not None and alert_id in links:
+            # A case somebody else opened. Not written to the ledger, which
+            # holds soc-ai's own escalations, and the grid answers for it on
+            # every press anyway.
+            already += 1
+        else:
+            to_claim.append(alert_id)
+
+    # Claiming is a write, and the session must not stay open across the
+    # Security Onion round-trips the caller makes next: a SQLite write lock
+    # spanning network calls is how the sweep deadlocked the store.
+    async with request.app.state.db_sessionmaker() as db:
+        for alert_id, case_id in resolved.items():
+            await esc_svc.record_case(db, alert_id, case_id)
+        if stale:
+            await esc_svc.release(db, stale)
+        claimed, already_held = await esc_svc.claim(db, to_claim, actor=caller)
+    return _Reservation(
+        claimed=claimed,
+        already_escalated=already + len(already_held),
+        unresolved=unresolved,
+    )
 
 
 @router.post("/alerts/escalate-group", response_model=EscalateGroupOut)
@@ -319,10 +632,18 @@ async def escalate_group(
 ) -> EscalateGroupOut:
     """Escalate a detection group to Security Onion cases.
 
-    Sibling of :func:`ack_group` — same auth/CSRF/signature and the same
-    ``fetch_group_events`` filters. Each matching event opens a case via the
-    ``escalate_to_case`` write tool; ``_ESCALATE_CAP`` bounds the number of
+    Sibling of :func:`ack_group` — same auth/CSRF/signature, the same filters,
+    the same :func:`_scan_group` paging. Each matching alert opens a case via
+    the ``escalate_to_case`` write tool; ``_ESCALATE_CAP`` bounds the number of
     cases so a group escalate can never spray hundreds.
+
+    Where the ack sibling can decide everything from the alert document, this
+    route cannot. Attaching an alert to a case writes a related document on the
+    case and nothing on the alert, so the alert's own flags never learn about
+    it, and a second press used to open a second case for every alert in the
+    group. What may be escalated is decided by :func:`_reserve` against soc-ai's
+    own ledger and Security Onion's case links, plus the ``event.escalated``
+    flag Security Onion's console stamps when an analyst escalates there.
 
     Same guarded, bounded, read-before-write shape as :func:`ack_group`: a failed
     fetch opens no cases, so the 503 is never a report on a half-done escalate.
@@ -330,20 +651,8 @@ async def escalate_group(
     caller = await identify_caller(request)
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
-            events = await aq.fetch_group_events(
-                elastic,
-                settings,
-                rule_name=body.rule_name,
-                kind=body.kind,
-                time_range=body.range,
-                severity=body.severity,
-                oql=body.q,
-                size=_ESCALATE_CAP + 1,  # fetch one extra to detect capping
-                abs_from=body.from_,
-                abs_to=body.to,
-                time_zone=settings.so_timezone,
-                hide_acked=True,
-            )
+            events, handled, more = await _scan_group(elastic, settings, body, cap=_ESCALATE_CAP)
+            matched = await _count_group(elastic, settings, body) if more else 0
     except OqlValidationError as exc:
         raise HTTPException(
             status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
@@ -353,30 +662,52 @@ async def escalate_group(
     except ApiError as exc:
         raise _es_api_error_http(exc) from exc
 
-    capped = len(events) > _ESCALATE_CAP
-    events = events[:_ESCALATE_CAP]
+    # Security Onion's own record of the two skips, kept apart. An escalated
+    # alert is on a case; an acknowledged one was dismissed.
+    from_flag = sum(1 for ev in handled if ev.escalated)
+    already_acked = len(handled) - from_flag
 
-    if not events:
-        return EscalateGroupOut(escalated=0, failed=0, total=0)
-
-    escalated, failed = await _escalate_many(
-        request,
-        events,
-        rule_name=body.rule_name,
-        session_id=f"escalate-group:{body.rule_name}",
-        caller=caller,
+    reserved = await _reserve(
+        request, elastic, settings, [ev.es_id for ev in events], caller=caller
     )
+    already_escalated = from_flag + reserved.already_escalated
+    writable = [ev for ev in events if ev.es_id in set(reserved.claimed)]
+    escalated = 0
+    failed = 0
+    case_ids: dict[str, str] = {}
+    empty_cases: list[str] = []
+    if writable:
+        escalated, failed, case_ids, empty_cases = await _escalate_many(
+            request,
+            writable,
+            rule_name=body.rule_name,
+            session_id=f"escalate-group:{body.rule_name}",
+            caller=caller,
+        )
+        async with request.app.state.db_sessionmaker() as db:
+            for alert_id, case_id in case_ids.items():
+                await esc_svc.record_case(db, alert_id, case_id)
 
-    if capped:
+    remaining = _remaining(matched, len(handled) + len(events), more=more)
+    if more:
         logging.getLogger(__name__).warning(
-            "escalate-group capped at %d events for rule %r (caller=%s)",
+            "escalate-group capped at %d events for rule %r, %d left (caller=%s)",
             _ESCALATE_CAP,
             body.rule_name,
+            remaining,
             caller,
         )
 
     return EscalateGroupOut(
-        escalated=escalated, failed=failed, total=escalated + failed, capped=capped
+        escalated=escalated,
+        failed=failed,
+        total=escalated + failed,
+        capped=more,
+        already_escalated=already_escalated,
+        already_acked=already_acked,
+        unresolved=reserved.unresolved,
+        empty_cases=empty_cases,
+        remaining=remaining,
     )
 
 
@@ -551,3 +882,78 @@ async def assign_alert(
         request, rule_name=body.rule_name, action="assign", owner=owner, state="owned"
     )
     return AssignOut(rule_name=body.rule_name, owner=owner, state="owned")
+
+
+class StrandedClaimOut(BaseModel):
+    """One escalate whose outcome nobody ever learned.
+
+    The ledger claims an alert BEFORE opening the case, so the row exists for
+    the moment between the claim and the answer. A row that never got its
+    answer means the request either created a case and failed on the attach, or
+    failed before Security Onion wrote anything — and this deployment cannot
+    tell which, which is the whole point of not guessing.
+    """
+
+    alert_id: str
+    # ``identify_caller`` output: a username, ``token:<name>``, or "anonymous".
+    escalated_by: str
+    # When the claim was taken, ISO-8601 with a Z. The age is the fact that
+    # matters: a claim from four minutes ago is a request in flight, and one
+    # from four days ago is an alert nobody can escalate.
+    claimed_at: str
+
+
+class StrandedClaimsOut(BaseModel):
+    """What the ledger is holding that nothing will settle on its own.
+
+    ``total`` is a COUNT over the whole matching set, not ``len(claims)``. The
+    list is capped, and a surface that showed fifty rows and called it fifty
+    would under-report a ledger holding two hundred — the same silent
+    truncation this page exists to end.
+
+    ``settling_minutes`` rides along because zero claims mean different things
+    with different windows, and because the number is what makes the list
+    defensible: without it, "nothing stranded" could be read as a claim-first
+    ledger that simply has not been looked at quickly enough.
+    """
+
+    claims: list[StrandedClaimOut]
+    total: int
+    settling_minutes: int
+
+
+@router.get("/escalations/stranded", response_model=StrandedClaimsOut)
+async def list_stranded_escalations(request: Request) -> StrandedClaimsOut:
+    """Escalate claims that never came back with a case id.
+
+    Reads soc-ai's own ledger and nothing else — no grid call, so this answers
+    on a deployment whose case index is unreadable, which is exactly the
+    deployment that accumulates these.
+
+    Analyst-readable rather than admin-gated, on the same argument as the hunt
+    catalog: it names alerts the analyst already sees and the account that
+    pressed escalate, and the person who needs to know an alert cannot be
+    escalated is the person trying to escalate it.
+
+    Reconciliation stays where it is — the next group escalate covering the
+    alert settles the claim against the grid's own case links. This route is
+    the surface, not a second write path: an operator-facing "release" button
+    would drop a claim on somebody's opinion rather than on evidence, and a
+    request can fail after Security Onion has already created the case.
+    """
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with request.app.state.db_sessionmaker() as db:
+        rows, total = await esc_svc.stranded(db, now=now)
+    return StrandedClaimsOut(
+        claims=[
+            StrandedClaimOut(
+                alert_id=row.alert_id,
+                escalated_by=row.escalated_by,
+                # Never None: the column is NOT NULL with a server default.
+                claimed_at=_iso_z(row.created_at) or "",
+            )
+            for row in rows
+        ],
+        total=total,
+        settling_minutes=int(esc_svc.SETTLING.total_seconds() // 60),
+    )

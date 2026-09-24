@@ -52,7 +52,7 @@ describe('hunt-kind settled bar', () => {
         <Investigation inv={baseInv({ kind: 'hunt', huntId: '01HUNT0000000000000000000000' })} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.queryByText(/Verdict settled — take action/i)).toBeNull();
+    expect(screen.queryByText(/Verdict settled\. Take action\./i)).toBeNull();
   });
 
   it('keeps the settled bar for a suricata-kind run', () => {
@@ -61,7 +61,7 @@ describe('hunt-kind settled bar', () => {
         <Investigation inv={baseInv({ kind: 'suricata' })} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.getByText(/Verdict settled — take action/i)).toBeTruthy();
+    expect(screen.getByText(/Verdict settled\. Take action\./i)).toBeTruthy();
   });
 });
 
@@ -193,9 +193,9 @@ describe('hunt-kind error-state re-run', () => {
     // two different meanings ("click a button" vs "go re-promote from the
     // hunt") stacked at the same spot is the bug under test here.
     expect(container.textContent).toContain(
-      'The run may have stalled or the agent crashed mid-flight — re-promote it from its hunt to try again.',
+      'The run may have stalled. The agent may have crashed. Re-promote it from its hunt to try again.',
     );
-    expect(container.textContent).not.toContain('crashed mid-flight — re-run it to try again.');
+    expect(container.textContent).not.toContain('The agent may have crashed. Re-run it to try again.');
     const link = screen.getByRole('link', { name: 'Sweep for beaconing to rare external IPs' });
     expect(link).toHaveAttribute('href', '/hunts/01HUNTERR00000000000000000');
   });
@@ -212,7 +212,7 @@ describe('hunt-kind error-state re-run', () => {
     expect(container.textContent).not.toContain('Re-promote this finding');
     // Suricata prose is byte-identical to before this polish pass.
     expect(container.textContent).toContain(
-      'The run may have stalled or the agent crashed mid-flight — re-run it to try again.',
+      'The run may have stalled. The agent may have crashed. Re-run it to try again.',
     );
   });
 });
@@ -240,9 +240,9 @@ describe('hunt-kind pipeline-fallback re-run', () => {
     // Same copy-tension fix as failedEl: the sentence above the pointer must
     // agree with it instead of also saying "re-run it".
     expect(container.textContent).toContain(
-      'It was recorded as needs_more_info as a placeholder — re-promote it from its hunt to try again.',
+      'soc·ai recorded it as needs_more_info as a placeholder. Re-promote it from its hunt to try again.',
     );
-    expect(container.textContent).not.toContain('placeholder — re-run it to get a real verdict.');
+    expect(container.textContent).not.toContain('placeholder. Re-run it to get a real verdict.');
     // Two identical links here by design: the fallback panel's own pointer AND
     // the always-present provenance strip both target the same hunt — assert
     // on the href existing rather than a single unique match.
@@ -271,7 +271,7 @@ describe('hunt-kind pipeline-fallback re-run', () => {
     expect(screen.getAllByRole('button', { name: /Re-run investigation/i }).length).toBeGreaterThan(0);
     // Suricata prose is byte-identical to before this polish pass.
     expect(container.textContent).toContain(
-      'It was recorded as needs_more_info as a placeholder — re-run it to get a real verdict.',
+      'soc·ai recorded it as needs_more_info as a placeholder. Re-run it to get a real verdict.',
     );
   });
 });
@@ -299,7 +299,7 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
       </MemoryRouter>,
     );
     expect(container.textContent).toContain(
-      'Promoted findings are refined by re-promoting from the hunt or asking a follow-up below — not by re-running here.',
+      'Re-promote this finding from its hunt to refine it. You can also ask a follow-up below. This screen cannot re-run a promoted finding.',
     );
     expect(container.textContent).not.toContain('focused re-investigation');
     // No re-run affordance anywhere on this shape — the copy and the buttons
@@ -318,9 +318,9 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
       </MemoryRouter>,
     );
     expect(container.textContent).toContain(
-      'The model could not converge on a verdict — dig deeper with a focused re-investigation, or resolve it in chat.',
+      'The model could not converge on a verdict. Start a focused re-investigation. You can also resolve it in chat.',
     );
-    expect(container.textContent).not.toContain('Promoted findings are refined');
+    expect(container.textContent).not.toContain('This screen cannot re-run a promoted finding');
   });
 
   it('adds the wayfinding line beside the open questions on a hunt-kind needs_more_info run', () => {
@@ -340,7 +340,7 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
     );
     expect(screen.getByText(/Is this host normally this chatty at night\?/i)).toBeTruthy();
     expect(container.textContent).toContain(
-      'Promoted findings are refined by re-promoting from the hunt or asking a follow-up below — not by re-running here.',
+      'Re-promote this finding from its hunt to refine it. You can also ask a follow-up below. This screen cannot re-run a promoted finding.',
     );
     expect(screen.queryByRole('button', { name: /Request more info/i })).toBeNull();
   });

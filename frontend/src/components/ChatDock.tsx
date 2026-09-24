@@ -67,7 +67,7 @@ const TOOL_LABELS: Record<string, string> = {
   t_enrich_domain: 'Enriching domain',
   t_enrich_hash: 'Enriching hash',
   t_host_summary: 'Profiling host',
-  t_origin_chain: 'Checking who was driving the host',
+  t_origin_chain: 'Checking who used the host',
   t_prevalence: 'Checking prevalence',
   t_rule_prevalence: 'Checking rule prevalence',
   t_get_pcap: 'Fetching PCAP',
@@ -267,10 +267,28 @@ export function ChatPanelShell<M extends ChatDockMessage>({
 }
 
 /**
+ * The bottom padding a screen that mounts the dock owes its own content.
+ *
+ * The launcher is fixed to the viewport, so it draws over whatever the scroll
+ * position puts under it. On the host page that was an Edit control at the
+ * right edge of the facts panel, at 1024 and at 1280: the page ended 60px
+ * below its last row, the launcher stands 44px tall 24px above the viewport
+ * floor, and no amount of scrolling could free the control (dogfood
+ * 2026-09-17). 84px is that 68px plus 16px of clearance.
+ *
+ * The reservation lifts at 1440px. Above it the content column stops short of
+ * the launcher, so the padding would only add dead space.
+ */
+export const DOCK_SAFE_AREA_CLASS = 'pb-[84px] [@media(min-width:1440px)]:pb-[60px]';
+
+/**
  * Floating "Chat about this" dock: a launcher pinned bottom-right of the
  * viewport that opens the chat as a docked overlay panel. Costs no layout
  * space and stays reachable however far the evidence has been scrolled.
  * `children` renders the opened panel and receives a close callback.
+ *
+ * A screen that mounts this owes its content {@link DOCK_SAFE_AREA_CLASS}, or
+ * the launcher sits on whatever the page ends with.
  */
 export function ChatDockShell({
   label,

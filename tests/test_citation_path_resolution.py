@@ -159,3 +159,62 @@ def test_null_leaf_does_not_resolve() -> None:
     ctx = AlertContext(alert=SoAlert(id="a1", rule_name="ET POLICY Example"))
     # dns_query is declared on SoAlert, present in the dump, and null here.
     assert _path_exists_in_alert(ctx, "alert.dns_query") is False
+
+
+# ---------------------------------------------------------------------------
+# Coverage over an empty citation set
+# ---------------------------------------------------------------------------
+#
+# `_resolve_citations` returned coverage_ratio 1.0 when there were no citations
+# at all, on a vacuous-truth reading: nothing failed to resolve, so nothing is
+# missing. What it produced was an audit record saying `total: 0, valid: 0,
+# coverage_ratio: 1.0, invalid_ratio: 0.0` on a verdict that had cited nothing,
+# which reads as full coverage to a human and passes any threshold test a
+# consumer might write. This is the empty-list gate bypass the 2026-07-30
+# review found in the evidence gate, in a second place.
+#
+# A ratio over an empty set is undefined, not one. It is reported as 0.0 with an
+# explicit `vacuous` marker, so a coverage threshold can never be satisfied by
+# citing nothing, and the marker tells the confidence cap that there is no
+# citation SHAPE problem to shave for. Whether an uncited verdict may stand at
+# all is the hard evidence gate's question, not the cap's.
+
+
+def test_empty_citation_set_is_zero_coverage_and_marked_vacuous() -> None:
+    from soc_ai.agent.gates import _resolve_citations
+
+    out = _resolve_citations([], _enriched_ctx(), [])
+    assert out["total"] == 0
+    assert out["coverage_ratio"] == 0.0
+    assert out["vacuous"] is True
+
+
+def test_a_coverage_threshold_cannot_be_satisfied_by_citing_nothing() -> None:
+    """The property the fix is for, stated as a property."""
+    from soc_ai.agent.gates import _resolve_citations
+
+    out = _resolve_citations([], _enriched_ctx(), [])
+    for threshold in (0.25, 0.5, 0.75, 1.0):
+        assert not out["coverage_ratio"] >= threshold
+
+
+def test_a_resolving_citation_set_is_not_vacuous() -> None:
+    """NEGATIVE CONTROL. Real citations keep their real coverage."""
+    from soc_ai.agent.gates import _resolve_citations
+
+    out = _resolve_citations(["alert.rule_name"], _enriched_ctx(), [])
+    assert out["total"] == 1
+    assert out["coverage_ratio"] == 1.0
+    assert out["vacuous"] is False
+
+
+def test_the_confidence_cap_does_not_shave_a_vacuous_set() -> None:
+    """An uncited report is not a report with badly shaped citations. Shaving it
+    here would coerce almost every verdict on the grid: 41 of the 47 production
+    runs that DID call tools also emitted no citations. The absence is handled
+    categorically by the evidence gate instead."""
+    from soc_ai.agent.gates import _citation_confidence_cap
+
+    assert _citation_confidence_cap(0.85, coverage_ratio=0.0, vacuous=True) == 0.85
+    # A non-vacuous zero coverage still takes the full banded shave.
+    assert _citation_confidence_cap(0.85, coverage_ratio=0.0) < 0.85

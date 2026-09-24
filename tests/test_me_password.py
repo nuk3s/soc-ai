@@ -291,7 +291,9 @@ def test_over_long_password_does_not_echo_the_plaintext(auth_client: TestClient)
     assert resp.status_code == 422
     assert "S3CRET-PLAINTEXT" not in resp.text
     assert secret[:40] not in resp.text
-    assert "input" not in resp.json()["detail"][0]
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "bad_request"
+    assert "new_password" in detail["hint"] and "got" not in detail["hint"]
 
 
 def test_over_long_login_password_does_not_echo_either(auth_client: TestClient) -> None:

@@ -70,7 +70,7 @@ describe('searchEntities — synthetic-evaluation marker', () => {
   // marker rides it — the badge's exact wording, never internal vocabulary.
   it('marks a synth-eval run in its label', () => {
     const hits = searchEntities('teardrop', [inv({ isSynthEval: true })], []);
-    expect(hits[0].label).toContain('Synthetic — evaluation data');
+    expect(hits[0].label).toContain('Synthetic evaluation data');
   });
 
   it('adds no marker to an ordinary run', () => {

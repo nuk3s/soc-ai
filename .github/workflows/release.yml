@@ -70,6 +70,12 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # Bakes the commit into the image (soc_ai.__commit__). The published
+          # tags include `latest`, so the version string alone cannot tell two
+          # builds apart, and the quality trend records this to attribute a
+          # regression to a change.
+          build-args: |
+            SOC_AI_COMMIT=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

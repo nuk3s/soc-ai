@@ -41,6 +41,7 @@ from soc_ai.store import host_dossier as store
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.internal_identifiers import list_identifiers, set_state
 from soc_ai.store.models import DossierRun, HostDossier, HostDossierField
+from soc_ai.tools._synth_scope import synth_scope_must_not
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
@@ -178,7 +179,12 @@ def _call_kind(query: dict[str, Any], aggs: dict[str, Any] | None) -> str:
         return "probe"
     if aggs and "responder" in aggs:
         return "main"
-    if aggs and set(aggs) == {"datasets"}:
+    # Matched by PRESENCE, not by an exact key set. An exact set makes this
+    # router a de-facto schema lock on the real inventory query: when
+    # `discover_datasets` gained a second census (over documents that carry no
+    # `event.dataset`), the call stopped matching, fell through to "targeted",
+    # and the dossier concluded the host-log datasets existed after all.
+    if aggs and "datasets" in aggs:
         return "inventory"
     return "targeted"
 
@@ -341,10 +347,20 @@ class _FakeES:
                 aggregations={
                     "datasets": {
                         "buckets": [
-                            {"key": d, "doc_count": 10, "categories": {"buckets": []}}
+                            {
+                                "key": d,
+                                "doc_count": 10,
+                                "categories": {"buckets": []},
+                                # The live/imported split the census reads. All
+                                # ten documents are live: this grid holds no
+                                # backfill, so the dossier sees the same
+                                # datasets it always did.
+                                "live": {"doc_count": 10, "last_seen": {"value": None}},
+                            }
                             for d in self.grid_datasets
                         ]
-                    }
+                    },
+                    "live_events": {"doc_count": 100},
                 },
             )
         if kind == "main":
@@ -442,7 +458,7 @@ async def test_the_census_pass_is_size_zero_aggregations_only(settings_kratos: S
     assert call["aggs"]["dst"]["terms"]["field"] == "destination.ip"
     # The synthetic-eval kill-switch: an eval fixture must never become a
     # durable asset record.
-    assert call["query"]["bool"]["must_not"] == [{"exists": {"field": "synth.scenario_id"}}]
+    assert call["query"]["bool"]["must_not"] == synth_scope_must_not(False)
     ranges = [c for c in call["query"]["bool"]["filter"] if "range" in c]
     assert ranges[0]["range"]["@timestamp"]["gte"] == "now-14d"
     await engine.dispose()
@@ -544,7 +560,7 @@ async def test_a_sweep_that_cannot_stamp_its_run_never_touches_es(
     summary = await job.run_dossier_refresh(es, maker, settings)
 
     assert es.calls == []
-    assert summary.errors == ["could not open a dossier_run row; sweep abandoned"]
+    assert summary.errors == ["could not open a dossier_run row. The sweep did not run."]
     await engine.dispose()
 
 
@@ -1460,7 +1476,13 @@ async def test_a_network_the_cadence_cannot_keep_fresh_says_so(
 _QUIET_VM = "192.168.60.226"  # a handful of auth events, no services, no chatter
 _BRIDGE = "172.17.0.1"  # every container host reports this one as its own
 
-_HOSTLOG_DATASETS = ("system.auth", "system.syslog")
+_HOSTLOG_DATASETS = (
+    "system.auth",
+    "system.syslog",
+    "system.security",
+    "elastic_agent",
+    "windows.sysmon_operational",
+)
 _GRID_WITH_HOST_LOGS = (*_GRID_DATASETS, *_HOSTLOG_DATASETS)
 
 _AGENT_FIRST = datetime(2026, 7, 25, 6, 0, tzinfo=UTC)
@@ -1868,4 +1890,244 @@ async def test_a_first_party_name_still_beats_the_dns_name_into_the_store(
     async with maker() as db:
         named = {r.value for r in await list_identifiers(db) if r.evidence.get("ip") == _HYPERVISOR}
     assert named == {"pve-a"}
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Behavioural profiles
+# ---------------------------------------------------------------------------
+
+
+async def test_profiles_are_not_built_unless_the_deployment_opts_in(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off by default, and the lane is not even called.
+
+    The design does not let this layer influence anything before a shadow week
+    has been read. A default-on baseline is a confident claim about a network
+    nobody has checked it against.
+    """
+    settings = _settings(settings_kratos)
+    assert settings.entity_profiles_enabled is False
+    engine, maker = await _db(settings)
+
+    called: list[int] = []
+
+    async def _spy(**kwargs: Any) -> Any:
+        called.append(1)
+        raise AssertionError("the profile lane ran with the gate off")
+
+    monkeypatch.setattr(job, "collect_entity_profiles", _spy)
+    await job.run_dossier_refresh(_FakeES(), maker, settings)
+    assert called == []
+    await engine.dispose()
+
+
+async def test_a_profile_failure_does_not_abort_the_sweep(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dossier run that dies building a baseline has traded a working
+    feature for a new one."""
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+
+    async def _explode(**kwargs: Any) -> Any:
+        raise RuntimeError("the grid is gone")
+
+    monkeypatch.setattr(job, "collect_entity_profiles", _explode)
+    summary = await job.run_dossier_refresh(_FakeES(src={"192.168.10.5": 40}), maker, settings)
+
+    assert any("entity profiles" in e for e in summary.errors)
+    # The sweep still did its actual job.
+    assert summary.hosts_seen == 1
+    await engine.dispose()
+
+
+async def test_built_profiles_are_persisted_and_the_grid_placeholder_is_not(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The blind placeholder says the GRID cannot answer a dimension.
+
+    It is keyed '*', which is not an entity. Writing it would create a row that
+    every entity lookup for a host literally named '*' would find, and no host
+    is named that — so it is a note on the run, not a row about a machine.
+    """
+    from soc_ai.dossier.profile import BuiltProfile, ProfileSweep
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+
+    async def _fake(**kwargs: Any) -> ProfileSweep:
+        return ProfileSweep(
+            profiles=(
+                BuiltProfile(
+                    entity_kind="host",
+                    entity_key="192.168.10.5",
+                    dimension="served_ports",
+                    shape="categorical",
+                    vector={"443": {"count": 9}},
+                    coverage="measured",
+                    support_days=30,
+                ),
+                BuiltProfile(
+                    entity_kind="host",
+                    entity_key="*",
+                    dimension="process_names",
+                    shape="categorical",
+                    vector=None,
+                    coverage="blind",
+                ),
+            ),
+            planes={"flow": ("network_traffic.flow",)},
+            notes=("process_names: no plane carries process.name",),
+        )
+
+    monkeypatch.setattr(job, "collect_entity_profiles", _fake)
+    summary = await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        kept = await ep.load_profiles(db, entity_kind="host", entity_key="192.168.10.5")
+        placeholder = await ep.load_profiles(db, entity_kind="host", entity_key="*")
+
+    # The real row is there, untouched. Its siblings are filled in by the
+    # coverage rule -- this host is in no agent inventory, so its agent
+    # dimensions read BLIND -- which is the fill working, not a leak.
+    assert kept["served_ports"].vector["443"]["count"] == 9
+    assert kept["served_ports"].coverage == "measured"
+    assert kept["process_names"].coverage == "blind"
+    assert placeholder == {}
+    # The grid-level gap is still reported, just not as an entity.
+    assert any("no plane carries process.name" in n for n in summary.notes)
+    assert any("profile planes" in n for n in summary.notes)
+    await engine.dispose()
+
+
+async def test_an_agent_dimension_is_blind_unless_its_plane_answered(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DC ships security logs and runs no Sysmon.
+
+    The agent inventory listed it, so its process, process-pair and logon-user
+    dimensions all read "measured, none observed" while nothing on that host
+    could produce a process document. An agent that ships one kind of log says
+    nothing about the kinds it does not ship. The plane that feeds each
+    dimension is what decides.
+    """
+    from soc_ai.dossier.profile import BuiltProfile, ProfileSweep
+    from soc_ai.dossier.types import AgentInventory
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+
+    def _row(key: str, dim: str, kind: str = "host") -> BuiltProfile:
+        return BuiltProfile(
+            entity_kind=kind,
+            entity_key=key,
+            dimension=dim,
+            shape="categorical",
+            vector={"x": {"count": 2}},
+            coverage="measured",
+            support_days=12,
+        )
+
+    async def _fake_profiles(**kwargs: Any) -> ProfileSweep:
+        return ProfileSweep(
+            profiles=(
+                # The DC: flow and security logs, no process telemetry.
+                _row("10.0.0.7", "peers_out"),
+                _row("10.0.0.7", "logon_users", kind="user"),
+                # A workstation with Sysmon and no logon documents.
+                _row("10.0.0.8", "peers_out"),
+                _row("10.0.0.8", "process_names"),
+            )
+        )
+
+    async def _fake_agents(**kwargs: Any) -> AgentInventory:
+        return AgentInventory(claims={"10.0.0.7": ("dc01",), "10.0.0.8": ("ws08",)})
+
+    monkeypatch.setattr(job, "collect_entity_profiles", _fake_profiles)
+    monkeypatch.setattr(job, "collect_agent_inventory", _fake_agents)
+    await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        dc = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.7")
+        ws = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.8")
+
+    # The agent is listed and ships no process documents. Both process
+    # dimensions are blind, whatever the inventory says.
+    assert dc["process_names"].coverage == "blind"
+    assert dc["process_parents"].coverage == "blind"
+    # The logon plane answered for this host, so an empty logon set is a fact.
+    assert dc["logon_users"].coverage == "measured"
+
+    # The process plane answered, so the pair dimension is measured and empty.
+    assert ws["process_parents"].coverage == "measured"
+    assert ws["process_parents"].vector == {}
+    # No logon document reached the grid for this host.
+    assert ws["logon_users"].coverage == "blind"
+    assert ws["logon_users"].vector is None
+    await engine.dispose()
+
+
+async def test_a_host_without_an_agent_gets_blind_rows_not_missing_ones(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DC has no agent. Its profile showed no processes row at all, so
+    "we could not measure this" was indistinguishable from "we never tried" --
+    the exact failure the coverage chip exists to prevent. The plane that feeds
+    each dimension decides: no row from that plane means blind."""
+    from soc_ai.dossier.profile import BuiltProfile, ProfileSweep
+    from soc_ai.dossier.types import AgentInventory
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+
+    async def _fake_profiles(**kwargs: Any) -> ProfileSweep:
+        row = lambda key, dim, vec: BuiltProfile(  # noqa: E731
+            entity_kind="host",
+            entity_key=key,
+            dimension=dim,
+            shape="categorical",
+            vector=vec,
+            coverage="measured",
+            support_days=12,
+        )
+        return ProfileSweep(
+            profiles=(
+                row("10.0.0.5", "peers_out", {"1.1.1.1": {"count": 3}}),  # no agent
+                row("10.0.0.6", "peers_out", {"1.1.1.1": {"count": 3}}),  # has agent
+                row("10.0.0.6", "process_names", {"chrome.exe": {"count": 9}}),
+            )
+        )
+
+    async def _fake_agents(**kwargs: Any) -> AgentInventory:
+        return AgentInventory(claims={"10.0.0.6": ("ws06",)})
+
+    monkeypatch.setattr(job, "collect_entity_profiles", _fake_profiles)
+    monkeypatch.setattr(job, "collect_agent_inventory", _fake_agents)
+    await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        no_agent = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.5")
+        with_agent = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.6")
+
+    # No agent: every agent dimension is BLIND, and vector is None, not {}.
+    for dim in ("process_names", "process_parents", "logon_users"):
+        assert no_agent[dim].coverage == "blind", dim
+        assert no_agent[dim].vector is None, dim
+    # Has flow, no served ports: measured and empty, which is a fact.
+    assert no_agent["served_ports"].coverage == "measured"
+    assert no_agent["served_ports"].vector == {}
+    assert no_agent["served_ports"].support_days == 12
+
+    # Agent present: the lane's real row is untouched, and the sibling
+    # dimension of the SAME plane is measured-empty.
+    assert with_agent["process_names"].vector == {"chrome.exe": {"count": 9}}
+    assert with_agent["process_parents"].coverage == "measured"
+    assert with_agent["process_parents"].vector == {}
+    # The logon plane answered for neither host, so it is blind on both.
+    assert with_agent["logon_users"].coverage == "blind"
     await engine.dispose()

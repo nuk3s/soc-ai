@@ -25,11 +25,11 @@ from typing import Any
 
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.fields import EPHEMERAL_PORT_FLOOR, is_peer_address
 from soc_ai.webui.alerts_query import (
-    # Module-private on the sibling, imported anyway: it is the ONE spelling of
-    # where Security Onion nests an endpoint detection's agent address, and a
-    # second copy here would drift the moment that path changes.
-    _NESTED_HOST_IP,
+    # The ONE spelling of where Security Onion nests an endpoint detection's own
+    # address; a second copy here would drift the moment that path changes.
+    NESTED_HOST_IP_FIELD,
     NOTICE_SOURCE_OQL,
     SIGMA_SOURCE_OQL,
     TIME_RANGES,
@@ -200,6 +200,17 @@ class HostActivity:
     # The folded account list held more than MAX_USERS names. Always False when
     # ``users`` is None: an absent list is not a cut one.
     users_truncated: bool = False
+    # Which flow datasets actually contributed, busiest first. Two jobs: name
+    # the sensor a count came FROM, and expose two sensors counting the same
+    # conversation (more than one entry means the totals are an upper bound —
+    # see CONN_DATASETS).
+    #
+    # What it does NOT do, because it is folded from the same windowed query as
+    # the counts: tell a quiet host apart from a grid whose sensor is absent
+    # entirely. Empty means "no conversation records in this window" and nothing
+    # more. Answering the other question needs a grid-wide dataset probe that
+    # this pass deliberately does not make.
+    conn_datasets: list[str] = field(default_factory=list)
 
 
 # Both lookups are INJECTED rather than imported. This module sits in the query
@@ -287,14 +298,44 @@ def _either_endpoint(ip: str) -> dict[str, Any]:
     }
 
 
+# The flow datasets a connection can arrive under. Deliberately NOT "anything
+# with source.ip": an alert document carries source/destination.ip too, and
+# counting one would inflate a peer's connection total with the detections that
+# describe those same connections. These are conversation records only.
+#
+# zeek.conn alone is what this used to read. On a grid whose sensor is Elastic
+# Agent rather than Zeek that matched nothing, and the host page said "silent on
+# the wire" over 2,149 real flow records for an actively exploited machine — an
+# absence claim from a query that never covered the data. The dataset a grid
+# happens to use is not something the operator should have to know to be told
+# the truth about their own host.
+CONN_DATASETS: tuple[str, ...] = (
+    "zeek.conn",
+    "network_traffic.flow",
+    "suricata.flow",
+    "endpoint.events.network",
+)
+
+
 def _conn_query(ip: str, window: str) -> dict[str, Any]:
-    """zeek.conn only: an alert document also carries source/destination.ip, and
-    counting one would inflate a peer's connection total with the detections that
-    describe those same connections."""
+    """Conversation records for this host, from whichever sensor carries them.
+
+    See :data:`CONN_DATASETS`. Both the ECS field and the data-stream field are
+    matched, because a grid labels the same dataset in either place depending on
+    how it was ingested.
+    """
     return {
         "bool": {
             "filter": [
-                {"term": {"event.dataset": "zeek.conn"}},
+                {
+                    "bool": {
+                        "should": [
+                            {"terms": {"event.dataset": list(CONN_DATASETS)}},
+                            {"terms": {"data_stream.dataset": list(CONN_DATASETS)}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
                 {"range": {"@timestamp": {"gte": window}}},
                 _either_endpoint(ip),
             ],
@@ -314,8 +355,44 @@ def _peer_aggs(peer_field: str) -> dict[str, Any]:
     }
 
 
+def _fold_conn_datasets(aggregations: dict[str, Any]) -> list[str]:
+    """Dataset names that produced at least one conversation record, busiest first.
+
+    Merged across both spellings by MAX rather than sum: a document carrying the
+    dataset in both fields is one document, and adding the two buckets would
+    report a host as twice as busy as it is.
+    """
+    counts: dict[str, int] = {}
+    for agg in ("by_dataset", "by_stream_dataset"):
+        for bucket in ((aggregations or {}).get(agg) or {}).get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            name, docs = bucket.get("key"), bucket.get("doc_count") or 0
+            if not name or docs <= 0:
+                continue
+            counts[str(name)] = max(counts.get(str(name), 0), int(docs))
+    return [name for name, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 def _conn_aggs(ip: str, interval: str) -> dict[str, Any]:
     return {
+        # Which sensor(s) the count came from. Two reasons it is not optional:
+        # a count is only meaningful next to what it counted, and on a grid
+        # running both Zeek and Elastic Agent the same conversation appears in
+        # both datasets, so the total can double-count and the reader needs to
+        # be able to see that rather than infer it.
+        #
+        # BOTH fields, and this is not belt-and-braces. Measured on the range:
+        # of 2,152 matching documents, 4 carry `event.dataset` and 2,148 carry
+        # only `data_stream.dataset`. Aggregating the ECS field alone named the
+        # sensor behind 4 documents and said nothing about the one behind the
+        # other 2,148 — a provenance label pointing at the wrong sensor is worse
+        # than none, because it invites the reader to go and check the wrong
+        # index. The two are merged by name in _fold_conn_datasets.
+        "by_dataset": {"terms": {"field": "event.dataset", "size": len(CONN_DATASETS) + 1}},
+        "by_stream_dataset": {
+            "terms": {"field": "data_stream.dataset", "size": len(CONN_DATASETS) + 1}
+        },
         # "out" keys on destination.ip because the OTHER endpoint is the peer;
         # "in" mirrors it. Both read destination.port, which is the service port
         # of the conversation whichever side this host was on.
@@ -387,7 +464,10 @@ def _fold_peers(aggregations: dict[str, Any], host_ip: str) -> tuple[list[HostPe
             # itself in BOTH sub-aggs. Dropped for the same reason the alert
             # lane discards it: "this host talks to this host" is not a peer
             # relationship, and as the busiest bucket it would open the table.
-            if not ip or ip == host_ip:
+            if not ip or ip == host_ip or not is_peer_address(ip):
+                # Multicast and link-local are the host addressing the
+                # segment, not a peer. 224.0.0.251 and 224.0.0.252 sat in the
+                # DC's peer graph as external peers (dogfood, 2026-09-16).
                 continue
             peer = merged.get(ip)
             if peer is None:
@@ -406,7 +486,13 @@ def _fold_peers(aggregations: dict[str, Any], host_ip: str) -> tuple[list[HostPe
                 counts[int(port)] = counts.get(int(port), 0) + seen
 
     for ip, peer in merged.items():
-        ranked = sorted(port_counts[ip].items(), key=lambda kv: (-kv[1], kv[0]))
+        # Destination ports above the ephemeral floor are the other side's
+        # source ports seen from the reply leg; listed under a heading of IPs
+        # and ports they read as services this peer runs.
+        ranked = sorted(
+            ((p, c) for p, c in port_counts[ip].items() if p < EPHEMERAL_PORT_FLOOR),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
         peer.ports = [port for port, _count in ranked[:_PORTS_PER_PEER]]
     # Busiest first, then by address so a tie is stable across reloads.
     ordered = sorted(merged.values(), key=lambda p: (-p.events, p.ip))
@@ -440,7 +526,7 @@ def _detection_scope(ip: str) -> dict[str, Any]:
             "should": [
                 {"term": {"source.ip": ip}},
                 {"term": {"destination.ip": ip}},
-                {"term": {_NESTED_HOST_IP: ip}},
+                {"term": {NESTED_HOST_IP_FIELD: ip}},
             ],
             "minimum_should_match": 1,
         }
@@ -711,4 +797,5 @@ async def fetch_host_activity(
         latest_investigation=latest,
         peers_truncated=peers_truncated,
         users_truncated=users_truncated,
+        conn_datasets=_fold_conn_datasets(aggregations),
     )

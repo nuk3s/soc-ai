@@ -71,11 +71,11 @@ _STATE_ATTR = "_host_chat_manager"
 # stores nothing; the _prepare short-circuit below is the backstop for any
 # caller that does spawn a turn (a turn that reached the gateway would raise).
 DEMO_REPLY = (
-    "This is a recorded demo, so the host assistant isn't available here — "
-    "answering you live would mean querying a real Security Onion grid and "
-    "calling a model. In a real deployment I'd answer from this host's dossier "
-    "and its live telemetry (peers, DNS, services), and propose a hunt when a "
-    "question needs a sweep."
+    "This is a recorded demo. The host assistant does not answer here, because "
+    "a live answer queries a real Security Onion grid and calls a model. In a "
+    "real deployment I answer from this host's dossier and its live telemetry. "
+    "The telemetry covers the peers, the DNS answers and the services. I propose "
+    "a hunt if a question needs a sweep."
 )
 
 

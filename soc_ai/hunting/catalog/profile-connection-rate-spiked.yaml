@@ -1,0 +1,30 @@
+id: profile-connection-rate-spiked
+title: A host's connection rate rises far above its own baseline
+description: >
+  Scanning, password spraying, staging and exfiltration all raise a host's own
+  traffic volume. This analytic measures the host against its own median for the
+  same time-of-week cell. A fleet-wide number does not work here. A busy proxy
+  and a quiet workstation say nothing about each other's volume.
+
+level: medium
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: connection_rate
+  test: above
+  threshold: 3.0
+
+attack:
+  - T1046
+  - T1041
+
+false_positives:
+  - Patch days, backup windows and software rollouts move volume on many hosts
+    at once. A spike across a peer group is a fleet condition. The lead layer
+    caps entity span for that reason.
+  - Monitoring tools and vulnerability scanners generate volume by design.
+
+references:
+  - https://attack.mitre.org/techniques/T1046/

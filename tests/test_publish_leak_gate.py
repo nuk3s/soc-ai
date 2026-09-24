@@ -69,12 +69,18 @@ def _publishable_files() -> list[str]:
     Listing only tracked files leaves a new file invisible to this gate until
     after it is committed, which is one commit too late.
     """
-    tracked = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files", "--cached", "--others", "--exclude-standard"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.splitlines()
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "--cached", "--others", "--exclude-standard"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+    except FileNotFoundError:
+        # Fail, never skip: a gate that quietly stands down when its tool is
+        # missing is the false all-clear it exists to prevent. The CI image
+        # lacked git for a run of pipelines and this was the only symptom.
+        pytest.fail("git is not installed, so the leak gate cannot enumerate the tree")
     dirs, files = _excluded_paths()
     excluded_files = set(files)
     return [

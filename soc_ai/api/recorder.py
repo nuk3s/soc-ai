@@ -63,6 +63,7 @@ class InvestigationRecorder:
         hunt_id: str | None = None,
         finding_ordinal: int | None = None,
         is_synth_eval: bool = False,
+        subject: dict[str, Any] | None = None,
     ) -> None:
         self._maker = maker
         self._alert_id = alert_id
@@ -75,6 +76,11 @@ class InvestigationRecorder:
         self._rule_name: str | None = rule_name or None
         self._src_ip: str | None = None
         self._dest_ip: str | None = None
+        self._community_id: str | None = None
+        # The machine the alert fired on. It is what the inheritance key uses in
+        # place of the endpoints when a detection observed no flow, so a row
+        # missing it can only ever inherit from another row missing it too.
+        self._host_name: str | None = None
         self._finished = False
         self.investigation_id: str | None = None
         # Promotion provenance (finding-promotion slice 1): kind='hunt' plus the
@@ -89,6 +95,11 @@ class InvestigationRecorder:
         # be mistaken for real activity. Threaded from recorded_run; no API
         # request body can supply it.
         self._is_synth_eval = is_synth_eval
+        # What the run investigates (migration 0050). None on an alert run.
+        # A hunt run carries the subject record the promotion built, written
+        # at birth so the row says what it was about even if the run dies
+        # before its first event.
+        self._subject = subject
 
     async def start(self) -> str | None:
         try:
@@ -102,6 +113,7 @@ class InvestigationRecorder:
                     hunt_id=self._hunt_id,
                     finding_ordinal=self._finding_ordinal,
                     is_synth_eval=self._is_synth_eval,
+                    subject=self._subject,
                 )
         except Exception:
             _LOGGER.exception(
@@ -136,6 +148,15 @@ class InvestigationRecorder:
             if self._src_ip is None:
                 self._src_ip = _dig(payload, "alert.source_ip")
                 self._dest_ip = _dig(payload, "alert.destination_ip")
+            if self._host_name is None:
+                self._host_name = _dig(payload, "alert.host_name")
+            if self._community_id is None:
+                # The hashed five-tuple. Stamped so a later alert from the
+                # SAME session can find what this run concluded: two alerts
+                # on one session that settle opposite ways are a
+                # contradiction, not two opinions. Absent on anything with
+                # no network session behind it, which stays NULL.
+                self._community_id = _dig(payload, "alert.network_community_id")
         if kind == "triage_report":
             self._report = payload
         if len(self._buffer) >= FLUSH_EVERY:
@@ -148,13 +169,21 @@ class InvestigationRecorder:
         try:
             async with self._maker() as db:
                 await inv_svc.append_events(db, self.investigation_id, batch)
-                if self._rule_name or self._src_ip or self._dest_ip:
+                if (
+                    self._rule_name
+                    or self._src_ip
+                    or self._dest_ip
+                    or self._community_id
+                    or self._host_name
+                ):
                     await inv_svc.set_alert_fields(
                         db,
                         self.investigation_id,
                         rule_name=self._rule_name,
                         src_ip=self._src_ip,
                         dest_ip=self._dest_ip,
+                        community_id=self._community_id,
+                        host_name=self._host_name,
                     )
         except Exception:
             _LOGGER.exception("investigation recorder flush failed")

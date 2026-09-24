@@ -289,6 +289,12 @@ class TestUnknownTemplateAvailabilityIsLabelledUnknown:
             def dataset_names(self) -> set[str]:
                 return {"zeek.conn", "zeek.dns"}
 
+            def live_dataset_names(self) -> tuple[str, ...]:
+                # A readable inventory whose planes are all live: the template
+                # rows must keep reporting availability KNOWN, and nothing here is
+                # backfill, so the disclosure list stays empty.
+                return tuple(self.dataset_names())
+
         with patch(
             "soc_ai.api.webui.routes_hunts.discover_datasets",
             AsyncMock(return_value=_Inv()),

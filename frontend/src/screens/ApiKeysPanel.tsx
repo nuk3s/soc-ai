@@ -35,11 +35,12 @@ export function ApiKeysPanel({
     setMsg(null);
     try {
       await saveApiKey(k, value.trim());
-      setMsg({ key: k, text: 'Saved — applied live', ok: true });
+      setMsg({ key: k, text: 'soc-ai saved the key. The key applies live.', ok: true });
       cancel();
       setReload((n) => n + 1);
     } catch (e) {
-      setMsg({ key: k, text: e instanceof Error ? e.message : 'Save failed', ok: false });
+      const text = e instanceof Error ? e.message : 'soc-ai could not save the key.';
+      setMsg({ key: k, text, ok: false });
     } finally {
       setBusy(false);
     }
@@ -50,11 +51,12 @@ export function ApiKeysPanel({
     setMsg(null);
     try {
       await clearApiKey(k);
-      setMsg({ key: k, text: 'Cleared', ok: true });
+      setMsg({ key: k, text: 'soc-ai cleared the key.', ok: true });
       cancel();
       setReload((n) => n + 1);
     } catch (e) {
-      setMsg({ key: k, text: e instanceof Error ? e.message : 'Clear failed', ok: false });
+      const text = e instanceof Error ? e.message : 'soc-ai could not clear the key.';
+      setMsg({ key: k, text, ok: false });
     } finally {
       setBusy(false);
     }
@@ -71,9 +73,9 @@ export function ApiKeysPanel({
       {!collapsed && (
       <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-        Provider keys for the opt-in online enrichment tools. Stored encrypted, write-only (never
-        shown again) and applied live — no restart. Turn on the master switch under "Online
-        enrichment" to actually use them.
+        The list holds the provider keys for the opt-in online enrichment tools. soc-ai stores each
+        key encrypted. soc-ai never shows a key again. A new key applies live without a restart.
+        Turn on the master switch under "Online enrichment" to use the keys.
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         {loading && !data && <LoadingState />}
@@ -138,7 +140,7 @@ export function ApiKeysPanel({
                     autoComplete="new-password"
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
-                    placeholder="Paste key — write-only"
+                    placeholder="Paste the key here"
                     className="w-[260px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
                   />
                   <button

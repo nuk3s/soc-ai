@@ -1,0 +1,34 @@
+id: prior-workstation-to-network-device-novel-port
+title: A workstation reaches a network device on a port the device has never served
+description: >
+  Workstations connect to switches, routers and firewalls for a small, stable
+  set of reasons. A connection to a port the device has never served is a
+  management session from an unexpected source. It can also be a scan. It can
+  also be the first step of a pivot through the network infrastructure.
+
+  This analytic reads the device's own served-port history. A fixed list of
+  management ports is wrong on every network. The device already holds the
+  answer.
+
+level: medium
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: served_ports
+  test: novel_for
+  roles:
+    - network_device
+
+attack:
+  - T1021
+
+false_positives:
+  - An operator enables a new management service on the device. The service
+    appears once. It joins the baseline within the support window.
+  - Vulnerability scanners and asset-discovery tools touch every port on every
+    device by design. Declare the scanner's host as an exception.
+
+references:
+  - https://attack.mitre.org/techniques/T1021/

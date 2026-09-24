@@ -275,7 +275,7 @@ describe('HostChatDock — the send flow', () => {
     fireEvent.click(screen.getByRole('button', { name: /clear conversation/i }));
 
     await waitFor(() => expect(clearHostChat).toHaveBeenCalledWith(IP));
-    expect(await screen.findByText(/answered here from its dossier/i)).toBeTruthy();
+    expect(await screen.findByText(/answers from its dossier/i)).toBeTruthy();
   });
 });
 

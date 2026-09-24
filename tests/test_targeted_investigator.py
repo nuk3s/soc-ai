@@ -10,6 +10,7 @@ from soc_ai.agent.targeted_investigator import (
     run_targeted_investigation,
 )
 from soc_ai.agent.triage import TargetedGap
+from soc_ai.so_client.elastic import EsSearchResult
 
 
 def test_build_targeted_investigator_prompt_includes_args() -> None:
@@ -389,8 +390,12 @@ async def test_dispatch_es_query_tools_bind_without_auth_typeerror(
     from soc_ai.agent.targeted_investigator import _dispatch_named_tool
 
     class _StubElastic:
-        async def search(self, *a: Any, **k: Any) -> dict[str, Any]:
-            return {"hits": {"hits": [], "total": {"value": 0}}, "aggregations": {}}
+        # Returns what ElasticClient.search is declared to return, not the raw
+        # ES body it parses. A stub that hands back the wrong type passes for as
+        # long as nothing downstream reads the result, and then fails a caller
+        # that does — which is a defect in the stub, not in the caller.
+        async def search(self, *a: Any, **k: Any) -> EsSearchResult:
+            return EsSearchResult(total=0, took_ms=0, hits=[], aggregations={})
 
     class _Settings:
         events_index_pattern = "logs-*"

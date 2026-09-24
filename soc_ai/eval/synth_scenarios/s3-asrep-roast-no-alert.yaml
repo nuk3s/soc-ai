@@ -1,0 +1,73 @@
+id: s3-asrep-roast-no-alert
+name: "AS-REP roasting with no alert: pre-authentication disabled"
+version: 1
+tier: hard
+story: |
+  An authentication ticket is requested for an account whose Kerberos
+  pre-authentication is disabled, so the KDC returns encrypted material any
+  unauthenticated principal can ask for and crack offline. There is no failed
+  logon, no lockout, and nothing for a signature to match.
+
+  Disabling pre-authentication is a deliberate account setting rather than an
+  anomaly, so the detection is an inventory of a weakness plus the moment
+  somebody used it. Measured on the range: 1 document of 3,913. The benign twin
+  is an ordinary pre-authenticated request for the same service.
+attack:
+  - T1558.004
+sigma_refs: []
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds: [typed_path]
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+spec_journey:
+  spec_id: identity-4768-preauth-disabled
+  expected_scope_keys: ["legacy.batchsvc"]
+  expected_candidate_count: 1
+events:
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      event.code: "4768"
+      winlog.event_id: "4768"
+      winlog.event_data.TargetUserName: "legacy.batchsvc"
+      winlog.event_data.TargetDomainName: "SYNTH.TEST"
+      winlog.event_data.PreAuthType: "0"
+      winlog.event_data.TicketEncryptionType: "0x17"
+      winlog.event_data.Status: "0x0"
+      synth.scenario_id: s3-asrep-roast-no-alert
+      synth.scenario_version: 1
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -120
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-120) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.outcome: success
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.hostname: "SYNTH-DC01"
+      winlog.channel: Security
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      event.code: "4768"
+      winlog.event_id: "4768"
+      winlog.event_data.TargetUserName: "m.okafor"
+      winlog.event_data.TargetDomainName: "SYNTH.TEST"
+      winlog.event_data.PreAuthType: "2"
+      winlog.event_data.TicketEncryptionType: "0x12"
+      winlog.event_data.Status: "0x0"
+      synth.scenario_id: s3-asrep-roast-no-alert
+      synth.scenario_version: 1

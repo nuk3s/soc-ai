@@ -41,7 +41,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from soc_ai.config import Settings
-from soc_ai.eval.synth_loader import Scenario, load_all_scenarios
+from soc_ai.eval.synth_loader import Scenario, load_all_scenarios, triage_scenarios
 from soc_ai.eval.synth_render import render_scenario
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 from soc_ai.so_client.models import SoAlert
@@ -105,7 +105,7 @@ _IP_LIST_FIELDS = ("zeek.dns.answers", "zeek.files.tx_hosts", "zeek.files.rx_hos
 
 @pytest.fixture(scope="module")
 def scenarios() -> list[Scenario]:
-    return load_all_scenarios(SCENARIOS_DIR)
+    return triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
 
 
 @pytest.fixture(scope="module")
@@ -146,11 +146,17 @@ def _addresses(body: dict[str, object]) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_every_scenario_file_loads_through_the_real_loader(scenarios: list[Scenario]) -> None:
-    """Every ``*.yaml`` in the directory parses, and none was skipped."""
+def test_every_scenario_file_loads_through_the_real_loader() -> None:
+    """Every ``*.yaml`` in the directory parses, and none was skipped.
+
+    Deliberately NOT using the ``scenarios`` fixture, which is scoped to the
+    triage population. This test is about files on disk, so it must see both
+    populations or a broken spec_journey scenario would go unnoticed.
+    """
     yaml_files = sorted(p.stem for p in SCENARIOS_DIR.glob("*.yaml"))
     assert yaml_files, "scenario catalogue is empty"
-    assert sorted(s.id for s in scenarios) == yaml_files
+    everything = load_all_scenarios(SCENARIOS_DIR)
+    assert sorted(s.id for s in everything) == yaml_files
 
 
 def test_catalogue_counts_match_the_declared_shape(scenarios: list[Scenario]) -> None:

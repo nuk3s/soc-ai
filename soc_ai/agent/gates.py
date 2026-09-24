@@ -227,16 +227,26 @@ def _resolve_citations(
        must appear (case-insensitive) in the bundle's JSON dump.
 
     Resolutions through (4) count as valid; the per_citation entry
-    records `kind="semantic"` so audit can distinguish them. Empty
-    citation lists return coverage_ratio=1.0 (vacuous truth — no
-    missing evidence to penalize).
+    records `kind="semantic"` so audit can distinguish them.
+
+    An EMPTY citation list is reported as ``coverage_ratio=0.0`` with
+    ``vacuous=True``. It used to be 1.0 on a vacuous-truth reading (nothing
+    failed to resolve, so nothing is missing), which produced the audit line
+    ``total: 0, valid: 0, coverage_ratio: 1.0`` on verdicts that had cited
+    nothing at all. That reads as full coverage, and it satisfies any
+    ``coverage_ratio >= threshold`` test a consumer writes: the same empty-list
+    bypass the 2026-07-30 review found in the evidence gate, in a second place.
+    A ratio over an empty set is undefined rather than one, so the number is
+    reported as zero and the ``vacuous`` flag says why. Whether an uncited
+    verdict may stand at all is the hard evidence gate's question; see
+    :func:`_citation_confidence_cap` for why the cap does not answer it.
 
     Returns:
         ``{counts, total, invalid_examples, valid_citations,
-        coverage_ratio, invalid_ratio, per_citation}``. ``invalid_ratio``
-        is preserved (= 1.0 - coverage_ratio) for downstream-consumer
-        backward compat. ``valid_citations`` retains ALL citations
-        (resolved or not) so the published TriageReport doesn't lose
+        coverage_ratio, invalid_ratio, vacuous, per_citation}``.
+        ``invalid_ratio`` is preserved (= 1.0 - coverage_ratio) for
+        downstream-consumer backward compat. ``valid_citations`` retains ALL
+        citations (resolved or not) so the published TriageReport doesn't lose
         the model's narrative — the cap reflects coverage instead.
     """
     counts = {"valid": 0, "strict": 0, "semantic": 0, "unresolved": 0}
@@ -304,7 +314,8 @@ def _resolve_citations(
         )
 
     total = len(citations)
-    coverage_ratio = counts["valid"] / total if total > 0 else 1.0
+    vacuous = total == 0
+    coverage_ratio = counts["valid"] / total if total > 0 else 0.0
     invalid_ratio = 1.0 - coverage_ratio
     return {
         "counts": counts,
@@ -314,6 +325,9 @@ def _resolve_citations(
         "valid_citations": list(citations),
         "coverage_ratio": coverage_ratio,
         "invalid_ratio": invalid_ratio,
+        # True iff there were no citations to measure. Consumers that want
+        # "did the report support itself?" must read this, not the ratio.
+        "vacuous": vacuous,
         "per_citation": per_citation,
     }
 
@@ -334,6 +348,7 @@ def _citation_confidence_cap(
     floor: float = 0.4,
     *,
     invalid_ratio: float | None = None,
+    vacuous: bool = False,
 ) -> float:
     """Banded-penalty confidence cap based on citation coverage.
 
@@ -357,9 +372,22 @@ def _citation_confidence_cap(
     floor, default 0.6) is a separate concept handled by the floor
     rewrite, which is now evidence-conditional.
 
+    ``vacuous`` says there were no citations to measure, which
+    :func:`_resolve_citations` reports alongside a coverage_ratio of 0.0. The
+    cap is a NO-OP in that case, deliberately. This band answers "of what the
+    report cited, how much resolved?", and a report that cited nothing has no
+    answer rather than the worst one. Shaving it here would also be
+    indiscriminate: on the production instance 41 of the 47 runs that DID call
+    tools emitted no citations either, so the shave plus the verdict floor
+    would have coerced most of the grid to needs_more_info without telling
+    anyone anything. Whether an uncited verdict may stand is the hard evidence
+    gate's question, and it asks it about retrieval rather than about wording.
+
     Backward compatibility: callers passing the legacy ``invalid_ratio``
     kwarg get auto-converted (coverage = 1 - invalid_ratio).
     """
+    if vacuous:
+        return confidence
     if coverage_ratio is None:
         coverage_ratio = 1.0 - invalid_ratio if invalid_ratio is not None else 1.0
 
@@ -454,11 +482,115 @@ def _apply_confidence_floor_raise(
     return report.model_copy(update={"confidence": _ESCALATION_CONF_FLOOR})
 
 
+def _adopt_template_grounds(
+    report: Any,  # TriageReport
+    candidate: Any,  # CandidateVerdict | None
+    audit: dict[str, Any],
+) -> Any:
+    """Lend a DISPOSITIVE template's own grounds to a report that cited nothing.
+
+    The synthesizer emits no citations on most runs: 41 of the 47 production
+    runs that DID call tools emitted none either, so an empty citation list says
+    nothing about whether the case was investigated. That leaves a
+    template-settled alert closing with an empty "why", which the analyst reads
+    in the drawer and the hard evidence gate reads as a report with nothing on
+    the record.
+
+    A dispositive template's ``cited_evidence`` is the honest answer to that: it
+    is code-set, it names fields of the alert the run actually retrieved, and it
+    is exactly what the verdict rests on. Adopted only when the report cited
+    NOTHING (never overwriting the model's own citations) and only when the
+    report AGREES with the template, so a synthesizer that escalated past a
+    benign template cannot inherit its grounds.
+
+    Provisional templates lend nothing. Their grounds are the thing in dispute:
+    letting ``clean_internal_traffic`` write "both endpoints internal" into a
+    citation list would launder locality into evidence.
+    """
+    if candidate is None:
+        return report
+    if getattr(candidate, "authority", "provisional") != "dispositive":
+        return report
+    if report.verdict not in ("true_positive", "false_positive"):
+        return report
+    if getattr(candidate, "verdict", None) != report.verdict:
+        return report
+    if report.citations:
+        return report
+    grounds = list(getattr(candidate, "cited_evidence", None) or [])
+    if not grounds:
+        return report
+    audit["template_grounds_adopted"] = {
+        "template_id": getattr(candidate, "template_id", None),
+        "citations": grounds,
+        "reason": (
+            "the report settled on a dispositive template and cited nothing, so "
+            "the template's own grounds are recorded as the citations"
+        ),
+    }
+    return report.model_copy(update={"citations": grounds})
+
+
+def _carry_investigator_evidence(
+    report: Any,  # TriageReport
+    investigator_evidence: Sequence[str] | None,
+    messages: list[Any] | None,
+    audit: dict[str, Any],
+) -> Any:
+    """Carry the investigator's own evidence bullets into a report that cited nothing.
+
+    The investigator gathers evidence with the read tools and hands the
+    synthesizer a transcript of it. The synthesizer writes the verdict, and its
+    citation list comes out empty on a third of runs even though the transcript
+    it was written from listed eight or nine grounded bullets. Measured on the
+    deployed instance: 1,187 of the 3,379 runs that produced both a transcript
+    and a report dropped between six and thirteen evidence strings on the way
+    (median eight), and 713 of those reports were then acknowledged in Security
+    Onion as verdicts resting on nothing. The evidence was never missing. The
+    handoff lost it.
+
+    This is a CARRY, not a manufacture, and the difference is load-bearing:
+
+    * it only fires when the report cited NOTHING, so the model's own citations
+      are never overwritten or padded;
+    * every bullet is handed to :func:`_resolve_citations` unfiltered, so an
+      unresolvable one lowers coverage exactly as a fabricated citation would.
+      Nothing is dropped to flatter the number;
+    * it requires the loop's real message history. Without it
+      :func:`~soc_ai.agent.evidence._tool_was_invoked` falls back to a substring
+      match against the transcript's own evidence text, and a ``(tool X)``
+      bullet carried out of that same transcript would resolve itself. That is
+      a citation gate grading its own homework, and it is the one way this
+      change could have made things worse than the bug.
+
+    Measured against 400 of the affected production runs, the carried bullets
+    resolve at a mean coverage of 0.996 — 3,075 strict resolutions against 15
+    that fail — so the grounds were real and structurally checkable all along.
+    """
+    if report.citations:
+        return report
+    if messages is None:
+        return report
+    bullets = [str(e).strip() for e in (investigator_evidence or []) if str(e).strip()]
+    if not bullets:
+        return report
+    audit["investigator_evidence_carried"] = {
+        "count": len(bullets),
+        "citations": bullets,
+        "reason": (
+            "the report cited nothing and the investigation loop's own transcript "
+            "carried evidence, so the evidence is recorded as the citations"
+        ),
+    }
+    return report.model_copy(update={"citations": bullets})
+
+
 def _synth_first_post_validate(
     report: Any,  # TriageReport
     enriched_ctx: Any,  # EnrichedAlertContext
     candidate: Any,  # CandidateVerdict | None — from decision_templates.match_decision_template
     *,
+    investigator_evidence: Sequence[str] | None = None,
     targeted_messages: list[Any] | None = None,
     targeted_tool_called: str | None = None,
     targeted_tool_results: Sequence[Any] | None = None,
@@ -506,6 +638,17 @@ def _synth_first_post_validate(
 
     audit: dict[str, Any] = {}
 
+    # Both run BEFORE the resolver, so the coverage measured below is measured
+    # over the grounds the verdict actually rests on.
+    #
+    # The investigator's own evidence goes first and a template's canned grounds
+    # second. Ordering matters only where both are available — a dispositive
+    # template that matched AND a loop that ran — and there the run's own
+    # retrieval is the better answer to "what is this verdict resting on" than
+    # two code-set sentences about the alert's shape.
+    report = _carry_investigator_evidence(report, investigator_evidence, targeted_messages, audit)
+    report = _adopt_template_grounds(report, candidate, audit)
+
     # Citation resolution. No investigator transcripts exist
     # for synth-first; tool refs only valid for the Phase-D targeted call.
     synthetic_transcripts: list[Any] = []
@@ -526,8 +669,11 @@ def _synth_first_post_validate(
     # is full); never zero-out. Preserves all citations — we don't
     # strip in v2; the cap reflects coverage instead.
     coverage_ratio = citation_validation["coverage_ratio"]
+    citations_vacuous = bool(citation_validation["vacuous"])
     original_conf = report.confidence
-    new_conf = _citation_confidence_cap(original_conf, coverage_ratio=coverage_ratio)
+    new_conf = _citation_confidence_cap(
+        original_conf, coverage_ratio=coverage_ratio, vacuous=citations_vacuous
+    )
     if new_conf != original_conf:
         report = report.model_copy(update={"confidence": new_conf})
         audit["citation_cap"] = {
@@ -680,6 +826,9 @@ def _synth_first_post_validate(
                 }
             )
 
+    # ----- No-benign-baseline gate (decoy first, then every flagged spec) -----
+    report = _refuse_benign_verdict_without_baseline(report, enriched_ctx, audit)
+
     # ----- Ungrounded host-anchored TP downgrade -----
     # Catches the defect where the LLM escalates to TP solely because the
     # host_alert_profile lists malware/C2 rules (which may themselves be FPs)
@@ -715,6 +864,7 @@ def _synth_first_post_validate(
         audit,
         targeted_messages=targeted_messages,
         targeted_tool_called=targeted_tool_called,
+        resolved_citations=int(citation_validation["counts"]["valid"]),
     )
 
     return report, audit
@@ -749,6 +899,166 @@ _GROUNDED_EVIDENCE_TOKENS: frozenset[str] = frozenset(
         "timed",
     }
 )
+
+
+_DECOY_REFUSAL_NOTE = (
+    "A decoy has no benign population, so nothing about how often this source "
+    "talks to this destination can clear the interaction. Answer instead what "
+    "the decoy's own log recorded, whether the source was authorised to reach a "
+    "host that is in no DNS zone and serves no workload, and what drove the "
+    "source at that moment."
+)
+
+
+def _refuse_benign_decoy_verdict(
+    report: Any,  # TriageReport
+    enriched_ctx: Any,  # EnrichedAlertContext | AlertContext
+    audit: dict[str, Any],
+) -> Any:
+    """Refuse to close a decoy interaction benign.
+
+    Measured defect. An OpenCanary decoy logged an inbound SSH interaction and
+    triage returned false_positive at 0.9 because "over the prior 72h the router
+    made 358 SSH connections to internal hosts (111 to one host)". Checked
+    against the grid, 348 of the 358 documents were periodic flow records, the
+    106 naming the decoy carried 19 distinct source ports in two hourly buckets
+    across three days, and the decoy's own log — the authoritative record of
+    what touched it — held two documents from that source, ever, both of them
+    this interaction.
+
+    The number being wrong is a separate fix (``t_query_events_oql`` now reports
+    what it counted). This gate is about the route. The catalog spec for this
+    detection says nothing has a legitimate reason to talk to a decoy, so unlike
+    every other detection there is no benign population to separate from and
+    therefore no threshold, no baseline and no tuning. A volume baseline reasons
+    in the opposite direction, and "the router talks to this host a lot, so a
+    decoy hit from the router is routine" auto-closes an intruder pivoting
+    through the router — which is the case the decoy exists to catch. Reaching a
+    defensible answer by a route that also produces the wrong answer is not
+    triage.
+
+    So the refusal is on the verdict class, not on the prose. Pattern-matching
+    the summary for baseline language would pass the next run that phrases it
+    differently, and a second measured run did exactly that: it named the decoy,
+    cited the absence of a credential attempt, and still called it routine
+    east-west traffic. What is unsafe here is closure itself, whatever argument
+    carries it.
+
+    The gate refuses closure only. A ``true_positive`` passes untouched, and so
+    does anything already unsettled. The spec's own false-positive list — an
+    authorised scanner, the operator's own validation — is explicit that both
+    are still worth seeing, so ``needs_more_info`` is the right landing place
+    for them rather than an automatic close.
+
+    Fails OPEN on a context it cannot read: a gate that raises takes the
+    investigation with it.
+    """
+    if report.verdict != "false_positive":
+        return report
+    try:
+        from soc_ai.agent.decision_templates import _alert_signals_decoy  # noqa: PLC0415
+
+        alert = getattr(enriched_ctx, "alert", None)
+        if alert is None or not _alert_signals_decoy(alert):
+            return report
+    except Exception:
+        return report
+
+    audit["decoy_benign_verdict_refused"] = {
+        "original_verdict": report.verdict,
+        "capped_verdict": "needs_more_info",
+        "original_confidence": report.confidence,
+        "reason": (
+            "false_positive on a decoy interaction. A decoy has no benign "
+            "population to separate from, so no baseline, threshold or volume "
+            "argument can clear one; coerced to needs_more_info"
+        ),
+    }
+    note = (
+        f"{report.validator_note}\n{_DECOY_REFUSAL_NOTE}"
+        if report.validator_note
+        else _DECOY_REFUSAL_NOTE
+    )
+    return report.model_copy(
+        update={
+            "verdict": "needs_more_info",
+            "confidence": min(report.confidence, 0.4),
+            "recommended_actions": [],
+            "validator_note": note,
+        }
+    )
+
+
+def _refuse_benign_verdict_without_baseline(
+    report: Any,  # TriageReport
+    enriched_ctx: Any,  # EnrichedAlertContext | AlertContext
+    audit: dict[str, Any],
+) -> Any:
+    """Refuse to close benign any detection the catalog says has no baseline.
+
+    The decoy gate above hard-codes one case of a general property: some
+    detections have no benign population, so a baseline, a threshold or a
+    volume argument runs backwards on them. DCSync by a non-machine account
+    and an account without Kerberos pre-authentication share it, and until
+    this gate nothing on the triage path could know that — the catalog held
+    the doctrine and triage never read the catalog. Measured on the range: the
+    same real DCSync alert closed false_positive 0.62 one day and escalated
+    true_positive 0.75 the next, both runs grounded, the answer depending on
+    which way the model leaned that run.
+
+    The decoy gate runs first and unchanged, so its audit key and note are
+    exactly what its own tests assert. Then the alert's raw document is put to
+    every flagged spec through the same evaluator the coverage gate uses (see
+    :mod:`soc_ai.agent.doctrine`), so "does this alert fall under that spec"
+    has one answer in the codebase.
+
+    Same shape as the decoy gate in every respect that matters: refusal is on
+    the verdict class, not the prose; only closure is refused, a true_positive
+    or an unsettled verdict passes untouched; and it fails OPEN on anything it
+    cannot read. The note hands the reader the spec's own false-positive list,
+    because those are exceptions by identity — the sync appliance's account,
+    the one legacy account — and only a human can confirm one.
+    """
+    report = _refuse_benign_decoy_verdict(report, enriched_ctx, audit)
+    if report.verdict != "false_positive":
+        return report
+    try:
+        from soc_ai.agent.doctrine import spec_declaring_no_baseline_for  # noqa: PLC0415
+
+        alert = getattr(enriched_ctx, "alert", None)
+        spec = spec_declaring_no_baseline_for(getattr(alert, "raw", None))
+    except Exception:
+        return report
+    if spec is None:
+        return report
+
+    exceptions = "; ".join(" ".join(fp.split()) for fp in spec.false_positives) or "none listed"
+    note = (
+        f"{spec.title}: the catalog spec {spec.id} declares this detection has no benign "
+        "population, so no baseline, threshold or volume argument can clear it. Answer "
+        f"instead whether the principal is one of the spec's own exceptions ({exceptions}), "
+        "and what drove it at that moment."
+    )
+    audit["no_baseline_verdict_refused"] = {
+        "spec_id": spec.id,
+        "spec_title": spec.title,
+        "spec_level": spec.level,
+        "original_verdict": report.verdict,
+        "capped_verdict": "needs_more_info",
+        "original_confidence": report.confidence,
+        "reason": (
+            f"false_positive on a detection {spec.id} declares has no benign population; "
+            "coerced to needs_more_info"
+        ),
+    }
+    return report.model_copy(
+        update={
+            "verdict": "needs_more_info",
+            "confidence": min(report.confidence, 0.4),
+            "recommended_actions": [],
+            "validator_note": f"{report.validator_note}\n{note}" if report.validator_note else note,
+        }
+    )
 
 
 def _downgrade_ungrounded_host_anchored_tp(
@@ -804,6 +1114,7 @@ def _downgrade_ungrounded_host_anchored_tp(
     # Gate 3b: focus alert is itself a malware/exploit/attack-class signature
     # (i.e. the TP rests on THIS alert's own malware signal, not just context).
     try:
+        from soc_ai.agent.classifier import normalize_classtype  # noqa: PLC0415
         from soc_ai.agent.decision_templates import (  # noqa: PLC0415
             _ATTACK_CLASSTYPES,
             _alert_signals_malware,
@@ -813,8 +1124,13 @@ def _downgrade_ungrounded_host_anchored_tp(
         if alert_obj is not None:
             if _alert_signals_malware(alert_obj):
                 return report  # this alert IS malware-class — leave the TP
-            classtype = (getattr(alert_obj, "classtype", None) or "").lower()
-            if classtype in _ATTACK_CLASSTYPES:
+            # Through the normalizer, not a bare .lower(): the field carries
+            # Suricata EVE's classification DESCRIPTION and the set holds
+            # shortnames, so the raw comparison this call site used could never
+            # match anything a sensor writes. It failed in the direction that
+            # costs recall: the exemption never fired, so attack-class true
+            # positives were downgraded to needs-more-info.
+            if normalize_classtype(getattr(alert_obj, "classtype", None)) in _ATTACK_CLASSTYPES:
                 return report  # attack-class classtype — leave the TP
     except Exception:
         return report  # import or attribute failure → conservatively leave TP
@@ -969,24 +1285,31 @@ def _apply_targeted_downgrades(
 
 
 def _is_strong_grounded_template(candidate: Any, enriched_ctx: Any) -> bool:
-    """True iff *candidate* is a STRONG, rule-grounded BENIGN template match that
-    is safe to settle WITHOUT an investigation.
+    """True iff *candidate* is a DISPOSITIVE benign template match that is safe
+    to settle WITHOUT an investigation.
 
-    A strong benign template (clean-internal / STUN-QUIC / NTP / DNSSEC / benign-
-    cloud, confidence ≥ 0.8) is a deterministic verdict grounded in the rule +
-    locality — not the model's reading of prefetch — so it is an acceptable
-    evidence-substitute for the hard evidence gate. Explicitly excluded:
-    EXTERNAL-reputation templates (which force investigation), and any
-    malware/attack-class rule (a dangerous rule is never fast-settled benign).
-    The 0.8 floor keeps the weaker TP templates (e.g. C2-classtype @ 0.65) out —
-    those rules also signal malware/attack and are force-investigated anyway.
+    A dispositive benign template (STUN-QUIC / NTP / DNSSEC) reads what the RULE
+    DETECTED: the signature names a protocol whose ordinary operation is the
+    whole content of the alert. That is a deterministic verdict, not the model's
+    reading of prefetch, so it is an acceptable evidence substitute for the hard
+    evidence gate.
 
-    NOTE: ``informational_external_clean_benign_cloud`` is confidence exactly 0.8
-    and PASSES this threshold — its exclusion relies entirely on the
-    ``EXTERNAL_REPUTATION_TEMPLATES`` guard below. Do not remove that guard
-    without also tightening this threshold to ``> 0.8``.
+    A PROVISIONAL template is not, however sure it sounds. This test used to be
+    "confidence >= 0.8 and not an external-reputation template", which
+    ``clean_internal_traffic`` passed at 0.85 on the sole ground that both
+    endpoints were private. Measured on the production instance over nine days:
+    13 alerts settled false_positive at 0.85 to 0.90 with zero tool calls, nine
+    of them the same ET HUNTING OGNL exploitation-attempt signature, and every
+    one auto-acknowledged in Security Onion. Blocklists never name an RFC1918
+    address, so that template's other ground was vacuous too.
+
+    Kept on top of the authority test as defence in depth: the 0.8 confidence
+    floor, the EXTERNAL-reputation exclusion, and the malware/attack-class rule
+    exclusion (a dangerous rule is never fast-settled benign).
     """
     if candidate is None:
+        return False
+    if getattr(candidate, "authority", "provisional") != "dispositive":
         return False
     if getattr(candidate, "confidence", 0.0) < 0.8:
         return False
@@ -1032,6 +1355,9 @@ _PIVOT_ATTRS: tuple[str, ...] = (
     "user_events",
     "process_events",
     "file_events",
+    # A hunt subject's cited documents (D2). Empty on every alert run. They are
+    # gathered evidence like the pivots, so a citation of one resolves here.
+    "subject_documents",
 )
 
 
@@ -1629,6 +1955,7 @@ def _downgrade_unevidenced_verdict(
     *,
     targeted_messages: list[Any] | None,
     targeted_tool_called: str | None,
+    resolved_citations: int | None = None,
 ) -> Any:
     """HARD evidence gate — the zero-tool-verdict defense.
 
@@ -1638,13 +1965,23 @@ def _downgrade_unevidenced_verdict(
     * at least one SUCCESSFUL tool call from the investigation loop
       (``count_successful_tool_calls(targeted_messages) >= 1``), OR
     * a Phase-D targeted-tool dispatch (``targeted_tool_called is not None``), OR
-    * a strong, rule-grounded benign template (:func:`_is_strong_grounded_template`).
+    * a DISPOSITIVE benign template (:func:`_is_strong_grounded_template`) whose
+      verdict the report agrees with AND at least one citation that resolves.
 
     Otherwise the verdict is a rationalization of prefetched alert fields with no
     investigation behind it (the QVOD / zero-tool-TP defect) and is coerced to
     ``needs_more_info`` — the honest "not yet investigated" state — with
     confidence capped and recommended actions cleared. Records ``audit
     ['evidence_gate_downgrade']`` when it fires.
+
+    ``resolved_citations`` is the count from :func:`_resolve_citations`, threaded
+    by :func:`_synth_first_post_validate`. The template exemption exists so a
+    template can settle a case on ITS OWN grounds, so those grounds have to be on
+    the record: zero retrieval plus zero citations is a state with nothing in it,
+    whatever matched. In practice the report is rarely uncited by the time it
+    gets here, because :func:`_adopt_template_grounds` has already lent it the
+    template's cited_evidence. ``None`` falls back to the raw citation count for
+    direct callers that never ran the resolver.
 
     Runs LAST in the validator chain so the deterministic, prefetch-grounded
     downgrades that PRODUCE a settled verdict (the solicited-ICMP-echo TP→FP) are
@@ -1659,11 +1996,17 @@ def _downgrade_unevidenced_verdict(
         return report
     tool_calls = count_successful_tool_calls(targeted_messages)
     has_tool_evidence = tool_calls >= 1 or targeted_tool_called is not None
-    # A strong template only grounds a verdict that AGREES with it — a synth that
-    # OVERRODE a strong benign template (e.g. escalated a clean-internal alert to
-    # TP) is not grounded by that template and must still be gated.
-    strong_template = _is_strong_grounded_template(candidate, enriched_ctx) and (
-        getattr(candidate, "verdict", None) == report.verdict
+    if resolved_citations is None:
+        resolved_citations = len(getattr(report, "citations", None) or [])
+    # A dispositive template only grounds a verdict that AGREES with it — a synth
+    # that OVERRODE a benign template (e.g. escalated a clean-internal alert to
+    # TP) is not grounded by that template and must still be gated. It also has
+    # to have left its grounds on the record: an exemption for "the template
+    # knows" cannot cover a report that says nothing about why.
+    strong_template = (
+        _is_strong_grounded_template(candidate, enriched_ctx)
+        and getattr(candidate, "verdict", None) == report.verdict
+        and resolved_citations >= 1
     )
     grounded_in_pivot = _verdict_grounded_in_pivot(report, enriched_ctx)
     # An IOC hit is evidence FOR escalation, never for CLEARING. It only grounds a
@@ -1694,10 +2037,13 @@ def _downgrade_unevidenced_verdict(
         "capped_confidence": capped_conf,
         "successful_tool_calls": tool_calls,
         "targeted_tool_called": targeted_tool_called,
+        "resolved_citations": resolved_citations,
+        "template_id": getattr(candidate, "template_id", None),
+        "template_authority": getattr(candidate, "authority", None),
         "reason": (
             "settled verdict with no investigation evidence — no successful tool "
-            "call and no strong rule-grounded template; a prefetch-only "
-            "rationalization, coerced to needs_more_info"
+            "call and no dispositive template with grounds on the record; a "
+            "prefetch-only rationalization, coerced to needs_more_info"
         ),
     }
     note = (
@@ -1826,3 +2172,83 @@ def _is_solicited_internal_icmp_echo(
     except Exception:
         return None
     return "explicit_blocklist_lookup"
+
+
+# ---------------------------------------------------------------------------
+# Same-session verdict consistency
+# ---------------------------------------------------------------------------
+
+
+def _session_true_positive(
+    session_digests: Sequence[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """The most recent completed TRUE POSITIVE already reached on this session."""
+    for digest in session_digests or []:
+        if isinstance(digest, dict) and digest.get("verdict") == "true_positive":
+            return digest
+    return None
+
+
+def enforce_session_verdict_consistency(
+    report: Any,  # TriageReport
+    session_digests: Sequence[dict[str, Any]] | None,
+) -> tuple[Any, dict[str, Any] | None]:
+    """A false positive may not stand while a true positive holds the same session.
+
+    Two alerts from one TCP session, twenty-eight minutes apart, settled
+    opposite ways on the range: one true positive recommending escalation, one
+    false positive recommending acknowledgement. Same source, same destination,
+    same port, same community id. An analyst working the queue top down meets
+    the false positive first, acknowledges on the product's recommendation, and
+    never reaches the row saying the same session was lateral movement.
+
+    The two are not two opinions about a resemblance, they are one conversation
+    read twice, so one of the readings is wrong. This gate does not decide which.
+    Adopting the prior verdict would make an older run authoritative over the
+    evidence in front of this one, and a gate that can promote a verdict is a
+    gate that can invent one. It refuses the CLOSE instead: the verdict becomes
+    ``needs_more_info``, the recommended actions go (the acknowledge
+    recommendation is the whole harm), and the note names the prior
+    investigation so the analyst reads both.
+
+    Returns ``(report, audit)``. ``audit`` is ``None`` when nothing fired, which
+    is every run with no true positive on its session and every run that did not
+    settle false positive: a true positive agreeing with a true positive needs no
+    correction, and neither does a needs_more_info already asking for help.
+    """
+    prior = _session_true_positive(session_digests)
+    if prior is None or getattr(report, "verdict", None) != "false_positive":
+        return report, None
+    prior_id = str(prior.get("id") or "unknown")
+    note = (
+        "Verdict held at needs_more_info by the same-session gate. This alert was "
+        f"settled false positive, but investigation {prior_id} already reached true "
+        "positive on the SAME network session (matching community id). One session "
+        "cannot be both, so the false positive does not stand and the alert is not "
+        "recommended for acknowledgement. Read both before deciding. Original "
+        f"summary: {getattr(report, 'summary', '')}"
+    )
+    audit = {
+        "original_verdict": "false_positive",
+        "held_verdict": "needs_more_info",
+        "prior_investigation_id": prior_id,
+        "prior_confidence": prior.get("confidence"),
+        "dropped_actions": [
+            getattr(a, "tool_name", "") for a in getattr(report, "recommended_actions", [])
+        ],
+        "reason": (
+            "a completed true positive holds the same network session; a false "
+            "positive on it would close an alert the product has already called "
+            "malicious"
+        ),
+    }
+    return (
+        report.model_copy(
+            update={
+                "verdict": "needs_more_info",
+                "recommended_actions": [],
+                "validator_note": note,
+            }
+        ),
+        audit,
+    )

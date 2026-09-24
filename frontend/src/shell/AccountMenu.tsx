@@ -100,7 +100,7 @@ export function AccountMenu({ me, onMe }: Props) {
         onClick={toggle}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={`Account menu — signed in as ${me.username}`}
+        aria-label={`Account menu. You are signed in as ${me.username}.`}
         className="flex w-full items-center gap-[9px] rounded-control border-t border-border px-1 pb-1 pt-2.5 text-left outline-none hover:bg-surface-3 focus-visible:ring-1 focus-visible:ring-accent"
         style={{ justifyContent: collapsed ? 'center' : 'flex-start' }}
       >

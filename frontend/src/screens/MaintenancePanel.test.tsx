@@ -44,7 +44,7 @@ describe('MaintenancePanel', () => {
       blocklist_files: 0,
     };
     render(<MaintenancePanel />);
-    expect(await screen.findByText(/backup cron has not run/i)).toBeTruthy();
-    expect(screen.getByText(/refresh cron has not run/i)).toBeTruthy();
+    expect(await screen.findByText(/backup cron job did not run/i)).toBeTruthy();
+    expect(screen.getByText(/refresh cron job did not run/i)).toBeTruthy();
   });
 });

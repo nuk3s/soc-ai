@@ -267,6 +267,76 @@ async def test_check_so_api_bad_credentials(tmp_path: Path) -> None:
     assert "SO_USERNAME" in so.hint
 
 
+async def test_check_so_api_pass_names_the_login_flow(tmp_path: Path) -> None:
+    """The PASS line names the flow that carried the call.
+
+    An SO upgrade can take one flow away. The operator has to be able to read
+    which flow is carrying the writes today, without reading the log.
+    """
+    stub = _StubAuth(status=200)
+    stub.login_flow = "browser"  # type: ignore[attr-defined]
+    with patch("soc_ai.doctor.make_auth", return_value=stub):
+        results = await doctor.check_so_api(_settings(tmp_path))
+    so = _by_name(results, "security onion")
+    assert so.status == "PASS"
+    assert "(browser flow)" in so.detail
+
+    stub = _StubAuth(status=200)
+    stub.login_flow = "api"  # type: ignore[attr-defined]
+    with patch("soc_ai.doctor.make_auth", return_value=stub):
+        results = await doctor.check_so_api(_settings(tmp_path))
+    assert "(api flow)" in _by_name(results, "security onion").detail
+
+
+async def test_check_so_api_401_names_the_session_refusal(tmp_path: Path) -> None:
+    """A 401 after a successful login is an auth-mechanism mismatch.
+
+    The old hint sent the operator to the SO user's role grants. On the SO 3.3
+    outage those grants were correct (analyst and superuser); SOC had stopped
+    accepting the session soc-ai presented.
+    """
+    stub = _StubAuth(status=401)
+    with patch("soc_ai.doctor.make_auth", return_value=stub):
+        results = await doctor.check_so_api(_settings(tmp_path))
+    so = _by_name(results, "security onion")
+    assert so.status == "FAIL"
+    assert "401" in so.detail
+    assert "SOC refused the session" in so.hint
+    assert "Check the SO version and the login flow" in so.hint
+    assert "role grants" not in so.hint
+
+
+async def test_check_so_api_throttled_login(tmp_path: Path) -> None:
+    stub = _StubAuth(
+        exc=SoAuthError(
+            "SO throttled the login. The login endpoint answered HTTP 302 and sent no login flow."
+        )
+    )
+    with patch("soc_ai.doctor.make_auth", return_value=stub):
+        results = await doctor.check_so_api(_settings(tmp_path))
+    so = _by_name(results, "security onion")
+    assert so.status == "FAIL"
+    assert "throttled the login" in so.detail
+    assert "repeated logins" in so.hint
+    assert "unreachable" not in so.detail
+
+
+async def test_check_so_api_held_login_names_the_refusal(tmp_path: Path) -> None:
+    """The backoff error must not read as an unreachable grid."""
+    stub = _StubAuth(
+        exc=SoAuthError(
+            "SOC refused the last session. soc-ai holds the login for 30 more "
+            "seconds. Check the SO version and the login flow."
+        )
+    )
+    with patch("soc_ai.doctor.make_auth", return_value=stub):
+        results = await doctor.check_so_api(_settings(tmp_path))
+    so = _by_name(results, "security onion")
+    assert so.status == "FAIL"
+    assert "SOC refused the session" in so.hint
+    assert "unreachable" not in so.detail
+
+
 async def test_check_so_api_unreachable(tmp_path: Path) -> None:
     stub = _StubAuth(exc=SoAuthError("Kratos login flow init failed: connect timeout"))
     with patch("soc_ai.doctor.make_auth", return_value=stub):
@@ -318,6 +388,91 @@ async def test_check_elasticsearch_zero_match_pattern_warns(tmp_path: Path) -> N
     assert "EVENTS_INDEX_PATTERN" in es.hint
 
 
+# The partial-read opt-out must not reach the doctor either
+#
+# `es_fail_on_partial_results=False` is an operator's answer for their QUERIES.
+# It reached both of these checks through the shared ElasticClient, so setting
+# it turned a half-read grid into a config diagnosis: "the events pattern
+# matched no documents", "wrong pattern or an idle grid". Both send the admin
+# to edit EVENTS_INDEX_PATTERN while a shard is down. The coverage check even
+# documented the guarantee and kept a GridPartialResultsError arm that the
+# opt-out had made unreachable.
+#
+# These ride a REAL ElasticClient over a stubbed transport, because the thing
+# under test is the interaction with `_check_complete`, which a hand-rolled
+# double would define away.
+
+
+def _half_read_grid(settings: Settings) -> Any:
+    """A real client whose every search reads 2 of 4 shards."""
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from soc_ai.so_client.elastic import ElasticClient as _RealElasticClient
+
+    raw = _AsyncMock()
+    raw.info.return_value = {"cluster_name": "so-grid", "version": {"number": "8.14.3"}}
+    raw.search.return_value = {
+        "took": 5,
+        "timed_out": False,
+        "_shards": {"total": 4, "successful": 2, "failed": 2},
+        "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+    }
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=raw):
+        return _RealElasticClient(settings)
+
+
+async def test_check_elasticsearch_does_not_call_a_half_read_grid_a_wrong_pattern(
+    tmp_path: Path,
+) -> None:
+    """Opt-out on, 2 of 4 shards down: the pattern is not the finding."""
+    settings = _settings(tmp_path, es_fail_on_partial_results=False)
+    with patch("soc_ai.doctor.ElasticClient", return_value=_half_read_grid(settings)):
+        results = await doctor.check_elasticsearch(settings)
+    es = _by_name(results, "elasticsearch")
+    assert es.status == "FAIL"
+    assert "matched no documents" not in es.detail
+    assert "EVENTS_INDEX_PATTERN" not in es.hint
+    assert "shard" in es.detail
+
+
+async def test_check_elasticsearch_says_answered_rather_than_unreachable(
+    tmp_path: Path,
+) -> None:
+    """A grid that replied in 5ms off half its shards is not unreachable, and
+    the connectivity remedy would send the admin to the wrong system."""
+    settings = _settings(tmp_path)
+    with patch("soc_ai.doctor.ElasticClient", return_value=_half_read_grid(settings)):
+        results = await doctor.check_elasticsearch(settings)
+    es = _by_name(results, "elasticsearch")
+    assert "unreachable" not in es.detail
+    assert "firewall" not in es.hint
+
+
+async def test_coverage_check_reaches_its_partial_arm_under_the_opt_out(
+    tmp_path: Path,
+) -> None:
+    """The arm was written for this and the opt-out made it dead code."""
+    settings = _settings(tmp_path, es_fail_on_partial_results=False)
+    with patch("soc_ai.doctor.ElasticClient", return_value=_half_read_grid(settings)):
+        result = await doctor.check_index_pattern_coverage(settings)
+    assert result.status == "WARN"
+    assert "partial results" in result.detail
+    assert "no suricata/auth/syslog events" not in result.detail
+
+
+async def test_the_doctor_checks_are_unchanged_on_a_whole_read_grid(tmp_path: Path) -> None:
+    """The over-correction control: with every shard answering, both checks
+    read exactly as they did, at either setting."""
+    for opt_out in (True, False):
+        settings = _settings(tmp_path, es_fail_on_partial_results=not opt_out)
+        with patch("soc_ai.doctor.ElasticClient", return_value=_StubElastic(total=42)):
+            es = _by_name(await doctor.check_elasticsearch(settings), "elasticsearch")
+            coverage = await doctor.check_index_pattern_coverage(settings)
+        assert es.status == "PASS", opt_out
+        assert "so-grid" in es.detail
+        assert coverage.status == "PASS", opt_out
+
+
 # ── check 4: gateway ─────────────────────────────────────────────────────────
 
 
@@ -360,6 +515,42 @@ async def test_check_gateway_unset_rag_models_skipped(tmp_path: Path) -> None:
     names = [r.name for r in results]
     assert "rag embed model" not in names
     assert "rag rerank model" not in names
+
+
+async def test_check_gateway_oracle_model_missing_warns(tmp_path: Path) -> None:
+    """The grader gets a row, because its failure is attributed to the analyst.
+
+    The Oracle grades every nightly batch and the quality alarm is computed from
+    its verdicts. An Oracle that stopped resolving would surface as the analyst
+    model's agreement collapsing, on a doctor printing all-PASS — so the hint
+    names that misattribution rather than just the missing id.
+    """
+    settings = _settings(tmp_path, oracle_enabled=True, oracle_model="grader-z")
+    listing = AsyncMock(return_value=([settings.analyst_model], None))
+    with patch("soc_ai.doctor.list_gateway_models", listing):
+        results = await doctor.check_gateway(settings)
+    row = _by_name(results, "oracle model")
+    assert row.status == "WARN"
+    assert "grades the nightly quality batch" in row.detail
+    assert "analyst regression" in row.hint
+
+
+async def test_check_gateway_oracle_model_served_passes(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, oracle_enabled=True, oracle_model="grader-z")
+    listing = AsyncMock(return_value=([settings.analyst_model, "grader-z"], None))
+    with patch("soc_ai.doctor.list_gateway_models", listing):
+        results = await doctor.check_gateway(settings)
+    assert _by_name(results, "oracle model").status == "PASS"
+
+
+async def test_check_gateway_oracle_row_absent_when_oracle_is_off(tmp_path: Path) -> None:
+    """No egress, no grader, no row. A WARN about a model nobody calls is noise
+    of exactly the kind that teaches operators to skip the doctor."""
+    settings = _settings(tmp_path, oracle_enabled=False, oracle_model="grader-z")
+    listing = AsyncMock(return_value=([settings.analyst_model], None))
+    with patch("soc_ai.doctor.list_gateway_models", listing):
+        results = await doctor.check_gateway(settings)
+    assert "oracle model" not in [r.name for r in results]
 
 
 # ── check 5: model fitness ───────────────────────────────────────────────────
@@ -436,7 +627,101 @@ def test_check_blocklists_missing_and_stale_warn(tmp_path: Path) -> None:
     assert "stale" in bl.detail
     assert "urlhaus" in bl.detail
     assert "never refreshed" in bl.detail  # the other feeds have no file at all
-    assert "blocklists refresh" in bl.hint
+    # No Auth-Key here, so the hint must not send the operator at a command that
+    # skips these three feeds by design — see the pair of tests below.
+    assert "ABUSE_CH_AUTH_KEY is not set" in bl.hint
+
+
+def test_blocklist_hint_names_what_would_actually_clear_it(tmp_path: Path) -> None:
+    """The recurring, unclearable prod warning.
+
+    Three abuse.ch feeds were missing and the hint said "run `soc-ai blocklists
+    refresh`". Without an Auth-Key that command skips exactly those three, so the
+    warning came back every day with advice that could not work, and neither of
+    the two things that WOULD clear it was mentioned. A warning nobody can act on
+    teaches its reader to stop reading the doctor.
+    """
+    settings = _settings(tmp_path)
+    assert settings.abuse_ch_auth_key is None
+    settings.blocklist_data_dir.mkdir(parents=True, exist_ok=True)
+    hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
+
+    assert "ABUSE_CH_AUTH_KEY is not set" in hint
+    assert "cannot clear" in hint
+    # Both real options, not just the one that needs a third party.
+    assert "auth.abuse.ch" in hint
+    assert "blocklist_sources" in hint
+    # And it must not repeat the advice that does not work here.
+    assert "run `soc-ai blocklists refresh`" not in hint
+
+
+def test_blocklist_hint_is_the_ordinary_one_when_the_key_is_set(tmp_path: Path) -> None:
+    """With a key, refreshing IS the fix, so the hint says so. The special case
+    is the missing key, not the abuse.ch feeds."""
+    settings = _settings(tmp_path)
+    settings.abuse_ch_auth_key = SecretStr("not-a-real-key")
+    settings.blocklist_data_dir.mkdir(parents=True, exist_ok=True)
+    hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
+
+    assert "run `soc-ai blocklists refresh`" in hint
+    assert "cannot clear" not in hint
+
+
+def test_blocklist_hint_ignores_a_missing_feed_that_needs_no_key(tmp_path: Path) -> None:
+    """Tor needs no key. If it is the only thing missing, refreshing fixes it and
+    the hint must not blame a key that is irrelevant to it."""
+    settings = _settings(tmp_path)
+    settings.blocklist_sources = ["tor"]
+    settings.blocklist_data_dir.mkdir(parents=True, exist_ok=True)
+    hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
+
+    assert "run `soc-ai blocklists refresh`" in hint
+    assert "ABUSE_CH_AUTH_KEY is not set" not in hint
+
+
+# ── check 8: prompt assets ───────────────────────────────────────────────────
+
+
+def test_check_prompt_assets_present_passes() -> None:
+    """A checkout has every declared asset, so this is the control: the row is
+    a PASS that names what it found rather than a bare 'ok'."""
+    results = doctor.check_prompt_assets()
+    row = _by_name(results, "prompt assets")
+    assert row.status == "PASS"
+    assert "oql primer" in row.detail
+    assert "oql hunt examples" in row.detail
+    assert row.hint == ""
+
+
+def test_check_prompt_assets_missing_fails_and_names_the_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state the deployed image was in: the primer absent, everything else
+    present. FAIL, not WARN, because nothing about it degrades gracefully."""
+    from soc_ai.agent import prompts
+
+    kept = prompts.PROMPT_ASSETS[-1]
+    monkeypatch.setattr(
+        prompts,
+        "PROMPT_ASSETS",
+        (
+            prompts.PromptAsset(
+                name="oql primer",
+                path=tmp_path / "docs" / "OQL_PRIMER.md",
+                cost="every investigator, hunt and chat prompt tells the model OQL is unavailable",
+            ),
+            kept,
+        ),
+    )
+    results = doctor.check_prompt_assets()
+    row = _by_name(results, "prompt assets")
+    assert row.status == "FAIL"
+    assert "missing: oql primer" in row.detail
+    assert "OQL_PRIMER.md" in row.detail  # the path, so the operator can look
+    assert "OQL is unavailable" in row.detail  # what it costs, not just that it's gone
+    assert f"present: {kept.name}" in row.detail
+    assert "docs/" in row.hint
+    assert exit_code(results) == 1
 
 
 # ── run_doctor end to end (all mocked upstreams) ─────────────────────────────
@@ -470,11 +755,13 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
         "elasticsearch",
         "audit write grant",
         "index pattern coverage",
+        "alerts feed filter",
         "gateway",
         "analyst model",
         "model fitness",
         "egress",
         "blocklists",
+        "prompt assets",
     } <= names
     assert exit_code(results) == 0
 
@@ -551,3 +838,40 @@ def test_cli_doctor_warn_only_exits_zero(capsys: pytest.CaptureFixture[str]) -> 
         rc = _doctor(Namespace(json=False))
     assert rc == 0
     assert "1 warning(s)" in capsys.readouterr().out
+
+
+# ── exit code: lenient by default, strict on request ─────────────────────────
+
+
+def test_exit_code_is_lenient_about_warnings_by_default() -> None:
+    """The default must not change. A monitor keyed on this exit status has read
+    0-with-warnings as success for the life of the tool, and silently starting to
+    page it would be a worse defect than the one strictness fixes."""
+    results = [
+        doctor.CheckResult("a", "PASS", "fine"),
+        doctor.CheckResult("b", "WARN", "not fine, but not fatal"),
+    ]
+    assert doctor.exit_code(results) == 0
+
+
+def test_strict_exit_code_fails_on_a_warning() -> None:
+    """A WARN nobody's automation can see is how the band becomes decorative.
+    One of the two standing warnings on the home deployment means 33 alerts a
+    day never reach the queue."""
+    results = [
+        doctor.CheckResult("a", "PASS", "fine"),
+        doctor.CheckResult("b", "WARN", "33 alerts a day never reach the queue"),
+    ]
+    assert doctor.exit_code(results, strict=True) == 1
+
+
+def test_strict_still_exits_zero_on_a_clean_run() -> None:
+    """Strictness must not invent a failure — otherwise nobody will use it."""
+    results = [doctor.CheckResult("a", "PASS", "fine"), doctor.CheckResult("b", "INFO", "fyi")]
+    assert doctor.exit_code(results, strict=True) == 0
+
+
+def test_a_failure_exits_one_in_both_modes() -> None:
+    results = [doctor.CheckResult("a", "FAIL", "broken")]
+    assert doctor.exit_code(results) == 1
+    assert doctor.exit_code(results, strict=True) == 1

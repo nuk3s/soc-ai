@@ -39,6 +39,7 @@ from soc_ai.eval.quality import (
     AlarmReason,
     SnapshotMetrics,
     TrendPoint,
+    _pool_baseline,
     alarm_codes_from_key,
     alarm_key_for,
     compute_snapshot_metrics,
@@ -395,8 +396,11 @@ def test_counts_rule_still_fires_on_a_real_drop() -> None:
     # The message must carry the counts and the baseline, not just two rates —
     # an operator adjudicating an alarm needs the denominator.
     assert "agreement_rate 0.40" in agreement[0]
-    assert "2/5" in agreement[0]
+    assert "2 of 5 fully agreed" in agreement[0]
     assert "107/120" in agreement[0]
+    # This point carries only n_yes, so the three parts do not account for the
+    # denominator and the breakdown is withheld rather than invented.
+    assert "partial" not in agreement[0]
 
 
 def test_counts_rule_ignores_a_single_flipped_grade() -> None:
@@ -614,7 +618,7 @@ def test_event_builder_labels_the_measurement_mode() -> None:
     ev = notify.event_for_quality_regression(mode="local", reasons=["fallback jumped"], settings=s)
     assert ev is not None
     assert ev.kind == "quality_regression"
-    assert "locally measured" in ev.body
+    assert "soc-ai measured this run locally" in ev.body
     assert "fallback jumped" in ev.body
 
 
@@ -1343,3 +1347,214 @@ def test_cli_eval_nightly_leaves_the_bundle_dir_to_the_resolver(
     with pytest.raises(SystemExit):
         cli.main()
     assert captured["out_dir"] is None
+
+
+# =====================================================================
+# One audit logger per process
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_in_app_nightly_alarm_uses_the_servers_own_audit_logger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-app nightly must not build a second AuditLogger.
+
+    A second logger in one process is a second chain head with its own lock,
+    and the two heads hand the same sequence number to two records. The grid
+    now refuses the duplicate rather than storing it, but a refusal costs a
+    conflict and a retry inside the write budget; not creating the collision
+    is cheaper and is the whole reason this alarm takes a logger.
+    """
+    from soc_ai.api.webui import routes_quality
+
+    server_audit = object()
+    state = SimpleNamespace(
+        settings=Namespace(),
+        audit=server_audit,
+        _quality_eval_status=routes_quality._QualityEvalStatus(),
+    )
+    seen: dict[str, Any] = {}
+
+    async def _fake_alarm(_settings: Any, **kw: Any) -> None:
+        seen.update(kw)
+
+    async def _fake_nightly(_settings: Any, **kw: Any) -> Any:
+        await kw["fire_alarm"](_settings, elastic=None, mode="local", reasons=["r"], metrics=None)
+        return SimpleNamespace(exit_code=0, detail="")
+
+    monkeypatch.setattr(cli, "_fire_quality_alarm", _fake_alarm)
+    monkeypatch.setattr(routes_quality, "run_eval_nightly", _fake_nightly)
+
+    await routes_quality._quality_eval_worker(state)
+
+    assert seen["audit"] is server_audit
+
+
+def test_an_all_partial_night_is_not_reported_as_nobody_agreeing() -> None:
+    """The home deployment's 2026-09-09 snapshot, verbatim.
+
+    n_yes=0, n_partial=5, n_no=0 over 5 classified critiques. The oracle
+    contradicted no verdict; it declined to fully stand behind the reasoning on
+    all five. The alarm read "0/5 grades agreed", which is a different and much
+    worse thing than what happened, and it is what the owner had been reading
+    every night.
+
+    `partial` sitting in the denominator but not the numerator is deliberate and
+    stays. The rate is not the problem; describing it as nobody agreeing was.
+    """
+    new = _metrics(agreement_rate=0.0, n_ok=5, n_yes=0, n_partial=5, n_no=0, n_classified=5)
+    reasons = detect_regression(new, _prod_history(), alarm_drop=0.15)
+    agreement = [r for r in reasons if "agreement_rate" in r]
+    assert len(agreement) == 1
+    text = str(agreement[0])
+
+    assert "0 of 5 fully agreed: 5 partial, 0 disagreed" in text
+    # The claim that started this must not survive anywhere in the sentence.
+    assert "0/5 grades agreed" not in text
+    # And it names which of the two shapes this is, because they want opposite
+    # work: thin grounds is prompt and citation work, wrong verdicts are not.
+    assert "contradicted no verdict" in text
+    assert "thin grounds or missing citations" in text
+
+
+def test_an_all_disagreement_night_says_the_verdicts_were_rejected() -> None:
+    """The opposite shape must not be described as thin reasoning."""
+    new = _metrics(agreement_rate=0.0, n_ok=5, n_yes=0, n_partial=0, n_no=5, n_classified=5)
+    reasons = detect_regression(new, _prod_history(), alarm_drop=0.15)
+    text = str(next(r for r in reasons if "agreement_rate" in r))
+
+    assert "0 of 5 fully agreed: 0 partial, 5 disagreed" in text
+    assert "flat disagreement" in text
+    assert "thin grounds" not in text
+
+
+def test_a_mixed_night_names_no_shape_rather_than_guessing() -> None:
+    """Both kinds present: report the split and stop. An alarm that guesses a
+    cause it cannot see sends its reader to the wrong place."""
+    new = _metrics(agreement_rate=0.0, n_ok=5, n_yes=0, n_partial=2, n_no=3, n_classified=5)
+    reasons = detect_regression(new, _prod_history(), alarm_drop=0.15)
+    text = str(next(r for r in reasons if "agreement_rate" in r))
+
+    assert "0 of 5 fully agreed: 2 partial, 3 disagreed" in text
+    assert "Every grade was" not in text
+
+
+def test_baseline_does_not_pool_the_nights_it_already_alarmed_on() -> None:
+    """A sustained decline must not become the new normal.
+
+    The home deployment's baseline slid 0.75 → 0.73 → 0.70 → 0.68 → 0.61 across
+    a run of bad nights, and two identical 1-of-5 measurements five days apart
+    got opposite answers: the first paged, the second was unremarkable against a
+    baseline the first had helped lower. The detector was normalising the decline
+    it exists to catch.
+    """
+    good = [_graded(1.0) for _ in range(20)]
+    bad = [
+        TrendPoint(
+            agreement_rate=0.0,
+            fallback_rate=0.0,
+            n_yes=0,
+            n_classified=5,
+            agreement_alarmed=True,
+        )
+        for _ in range(10)
+    ]
+    # Newest first: ten alarmed nights in front of twenty clean ones.
+    history = bad + good
+    new = _point(0.20)
+
+    fired = [r for r in detect_regression(new, history, alarm_drop=0.15) if "agreement_rate" in r]
+    assert len(fired) == 1, "a 1-of-5 night must still page after ten bad ones"
+    # The baseline it reports is the clean one, not the eroded one.
+    assert "100/100" in str(fired[0])
+
+
+def test_alarmed_nights_are_pooled_again_when_dropping_them_leaves_too_little() -> None:
+    """Conservative by construction: the exclusion can make the detector harder
+    to erode, never blinder than it was. With too little clean history the old
+    pool is used unchanged rather than the check going silent."""
+    history = [
+        TrendPoint(
+            agreement_rate=0.6,
+            fallback_rate=0.0,
+            n_yes=3,
+            n_classified=5,
+            agreement_alarmed=True,
+        )
+        for _ in range(6)
+    ]
+    baseline = _pool_baseline(history)
+    assert baseline is not None, "must not go silent for want of clean history"
+    assert baseline.n_points == 6
+    assert baseline.n_yes == 18 and baseline.n_classified == 30
+
+
+def test_a_fallback_alarm_does_not_disqualify_a_night_from_the_agreement_pool() -> None:
+    """Only an agreement alarm says that night's GRADES were unrepresentative."""
+    history = [_graded(1.0) for _ in range(5)]
+    assert _pool_baseline(history) is not None
+    same_but_fallback_alarmed = [
+        TrendPoint(
+            agreement_rate=p.agreement_rate,
+            fallback_rate=p.fallback_rate,
+            n_yes=p.n_yes,
+            n_classified=p.n_classified,
+            agreement_alarmed=False,
+        )
+        for p in history
+    ]
+    a, b = _pool_baseline(history), _pool_baseline(same_but_fallback_alarmed)
+    assert a is not None and b is not None
+    assert (a.n_yes, a.n_classified) == (b.n_yes, b.n_classified)
+
+
+def test_alarm_says_what_a_benign_only_batch_cannot_tell_you() -> None:
+    """The home deployment's every-night shape: five benign verdicts, no ground truth.
+
+    330 graded alerts across 40 nights contained not one true_positive. The
+    nightly draws from the live queue and plants nothing, so on a quiet grid the
+    rate measures the grader's opinion of benign traffic. The direction nobody
+    checks is the one that matters: if the analyst started calling real
+    intrusions benign, the grader would agree, and this number would go UP.
+    """
+    new = _metrics(
+        agreement_rate=0.0,
+        n_ok=5,
+        n_yes=0,
+        n_partial=5,
+        n_no=0,
+        n_classified=5,
+        verdict_counts={"false_positive": 4, "needs_more_info": 1},
+    )
+    text = str(
+        next(
+            r
+            for r in detect_regression(new, _prod_history(), alarm_drop=0.15)
+            if "agreement_rate" in r
+        )
+    )
+    assert "measures agreement on benign traffic only" in text
+    assert "not\n" not in text  # sanity: one sentence, not a wrapped fragment
+
+
+def test_alarm_drops_the_caveat_once_the_batch_holds_a_positive() -> None:
+    """A batch that called something a threat HAS tested the direction that
+    matters, so the bound does not apply and must not be printed anyway."""
+    new = _metrics(
+        agreement_rate=0.0,
+        n_ok=5,
+        n_yes=0,
+        n_partial=5,
+        n_no=0,
+        n_classified=5,
+        verdict_counts={"false_positive": 4, "true_positive": 1},
+    )
+    text = str(
+        next(
+            r
+            for r in detect_regression(new, _prod_history(), alarm_drop=0.15)
+            if "agreement_rate" in r
+        )
+    )
+    assert "benign traffic only" not in text

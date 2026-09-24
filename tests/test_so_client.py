@@ -7,6 +7,7 @@ by patching :class:`elasticsearch.AsyncElasticsearch`. No live grid is touched.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -25,8 +26,52 @@ from soc_ai.so_client.auth import _SRV_TOKEN_TTL_S, ConnectAuth, KratosAuth, mak
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult, GridPartialResultsError
 
 # =====================================================================
-# KratosAuth
+# KratosAuth — the Kratos BROWSER login flow
+#
+# SO 3.3 refuses a Kratos API-flow session token in an X-Session-Token
+# header: SOC resolves no identity and answers 401 on every call, which
+# breaks every write (ack, escalate, case comment). The browser flow sets
+# the ory_kratos_session cookie that SOC accepts, on 3.3 and on earlier
+# releases. These tests pin the request sequence, the cookie and the
+# absence of the old header.
 # =====================================================================
+
+_SESSION_COOKIE_HEADERS = {"set-cookie": "ory_kratos_session=session-abc; Path=/; HttpOnly"}
+
+
+def _forced(settings: Settings, flow: str) -> Settings:
+    """Settings that pin one login flow, so no fallback runs."""
+    return settings.model_copy(update={"so_login_flow": flow})
+
+
+_CSRF_COOKIE_HEADERS = {"set-cookie": "csrf_token_deadbeef=csrf-value-abc; Path=/; HttpOnly"}
+
+
+def _mock_browser_login(
+    mock: respx.MockRouter,
+    flow: dict[str, Any],
+    *,
+    info_status: int = 200,
+) -> dict[str, Any]:
+    """Route the three calls a browser login makes. Returns the routes by name."""
+    return {
+        "init": mock.get("/auth/self-service/login/browser").mock(
+            return_value=httpx.Response(200, json=flow, headers=_CSRF_COOKIE_HEADERS)
+        ),
+        "submit": mock.post("/auth/self-service/login").mock(
+            return_value=httpx.Response(
+                200, json={"session": {"id": "s1"}}, headers=_SESSION_COOKIE_HEADERS
+            )
+        ),
+        "info": mock.get("/api/info").mock(
+            return_value=httpx.Response(
+                info_status,
+                json={"srvToken": "srv-1", "version": "3.3.0"}
+                if info_status == 200
+                else {"error": "unauthorized"},
+            )
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -36,18 +81,152 @@ async def test_kratos_login_happy_path(
     auth = KratosAuth(settings_kratos)
     try:
         with respx.mock(base_url="https://so.example.com", assert_all_called=True) as mock:
-            mock.get("/auth/self-service/login/api").mock(
-                return_value=httpx.Response(200, json=kratos_init)
+            _mock_browser_login(mock, kratos_init)
+            await auth.login()
+        assert auth._logged_in is True
+        assert auth._has_session_cookie() is True
+        assert auth._srv_token == "srv-1"
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_login_request_sequence(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """The exact sequence a login makes, and the form the credentials travel in."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            _mock_browser_login(mock, kratos_init)
+            await auth.login()
+
+            calls = [(c.request.method, c.request.url.path) for c in mock.calls]
+            assert calls == [
+                ("GET", "/auth/self-service/login/browser"),
+                ("POST", "/auth/self-service/login"),
+                ("GET", "/api/info"),
+            ]
+            init_req = mock.calls[0].request
+            assert init_req.headers["accept"] == "application/json"
+            submit_req = mock.calls[1].request
+            assert submit_req.url.params["flow"] == kratos_init["id"]
+            body = json.loads(submit_req.content)
+            assert body["method"] == "password"
+            assert body["identifier"] == settings_kratos.so_username
+            assert body["csrf_token"] == "csrf-value-abc"
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_never_sends_the_session_token_header(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """The header SO 3.3 refuses must not appear on any call, login or read."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            _mock_browser_login(mock, kratos_init)
+            mock.get("/connect/case").mock(return_value=httpx.Response(200, json=[]))
+            await auth.request("GET", "/connect/case")
+
+            for call in mock.calls:
+                assert "x-session-token" not in {k.lower() for k in call.request.headers}
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_session_cookie_is_carried_on_the_next_request(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """The cookie jar, not a header, carries the session to /api/... ."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            _mock_browser_login(mock, kratos_init)
+            data_call = mock.get("/connect/case").mock(return_value=httpx.Response(200, json=[]))
+            await auth.request("GET", "/connect/case")
+
+            cookie_header = data_call.calls[0].request.headers.get("cookie", "")
+        assert "ory_kratos_session=" in cookie_header
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_login_follows_a_redirect_to_the_flow(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """Kratos may answer the init with a redirect. The flow id is in Location."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(
+                    303,
+                    headers={"location": "https://so.example.com/login/?flow=flow-abc-123"},
+                )
+            )
+            flow_route = mock.get("/auth/self-service/login/flows").mock(
+                return_value=httpx.Response(200, json=kratos_init, headers=_CSRF_COOKIE_HEADERS)
             )
             mock.post("/auth/self-service/login").mock(
                 return_value=httpx.Response(
-                    200,
-                    json={"session": {"id": "s1"}},
-                    headers={"set-cookie": "ory_kratos_session=abc; Path=/"},
+                    200, json={"session": {"id": "s1"}}, headers=_SESSION_COOKIE_HEADERS
                 )
             )
+            mock.get("/api/info").mock(return_value=httpx.Response(200, json={"srvToken": "s"}))
             await auth.login()
+
+            assert flow_route.calls[0].request.url.params["id"] == "flow-abc-123"
         assert auth._logged_in is True
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_throttled_login_reads_as_throttled(settings_kratos: Settings) -> None:
+    """A redirect with no flow id is SO shedding repeated logins.
+
+    The old client parsed that page as JSON and raised "Expecting value: line 1
+    column 1 (char 0)". That message dominated the log of the SO 3.3 outage and
+    described a login that never started, not the session refusal behind it.
+    """
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(302, headers={"location": "/login/?thr=6"})
+            )
+            with pytest.raises(SoAuthError) as excinfo:
+                await auth.login()
+        msg = str(excinfo.value)
+        assert "SO throttled the login" in msg
+        assert "302" in msg
+        assert "Expecting value" not in msg
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_html_login_page_reads_as_throttled(settings_kratos: Settings) -> None:
+    """A 200 that carries a page, not the flow document, reads the same way."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(
+                    200, text="<html>login</html>", headers={"content-type": "text/html"}
+                )
+            )
+            with pytest.raises(SoAuthError) as excinfo:
+                await auth.login()
+        msg = str(excinfo.value)
+        assert "SO throttled the login" in msg
+        assert "200" in msg
+        assert "Expecting value" not in msg
     finally:
         await auth.aclose()
 
@@ -59,8 +238,8 @@ async def test_kratos_login_bad_credentials(
     auth = KratosAuth(settings_kratos)
     try:
         with respx.mock(base_url="https://so.example.com") as mock:
-            mock.get("/auth/self-service/login/api").mock(
-                return_value=httpx.Response(200, json=kratos_init)
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(200, json=kratos_init, headers=_CSRF_COOKIE_HEADERS)
             )
             mock.post("/auth/self-service/login").mock(
                 return_value=httpx.Response(400, json={"error": "credentials_invalid"})
@@ -73,11 +252,32 @@ async def test_kratos_login_bad_credentials(
 
 
 @pytest.mark.asyncio
+async def test_kratos_login_without_a_session_cookie_fails(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """A 200 that sets no session cookie is not a session. Say so."""
+    auth = KratosAuth(_forced(settings_kratos, "browser"))
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(200, json=kratos_init, headers=_CSRF_COOKIE_HEADERS)
+            )
+            mock.post("/auth/self-service/login").mock(
+                return_value=httpx.Response(200, json={"session": {"id": "s1"}})
+            )
+            with pytest.raises(SoAuthError, match="set no session cookie"):
+                await auth.login()
+        assert auth._logged_in is False
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
 async def test_kratos_login_init_error(settings_kratos: Settings) -> None:
     auth = KratosAuth(settings_kratos)
     try:
         with respx.mock(base_url="https://so.example.com") as mock:
-            mock.get("/auth/self-service/login/api").mock(
+            mock.get("/auth/self-service/login/browser").mock(
                 return_value=httpx.Response(500, text="internal error")
             )
             with pytest.raises(SoAuthError, match="login flow init"):
@@ -93,18 +293,13 @@ async def test_kratos_request_triggers_login(
     auth = KratosAuth(settings_kratos)
     try:
         with respx.mock(base_url="https://so.example.com") as mock:
-            login_init = mock.get("/auth/self-service/login/api").mock(
-                return_value=httpx.Response(200, json=kratos_init)
-            )
-            login_post = mock.post("/auth/self-service/login").mock(
-                return_value=httpx.Response(200, json={})
-            )
+            routes = _mock_browser_login(mock, kratos_init)
             data_call = mock.get("/connect/case").mock(return_value=httpx.Response(200, json=[]))
 
             resp = await auth.request("GET", "/connect/case")
         assert resp.status_code == 200
-        assert login_init.called
-        assert login_post.called
+        assert routes["init"].called
+        assert routes["submit"].called
         assert data_call.called
     finally:
         await auth.aclose()
@@ -124,13 +319,11 @@ async def test_kratos_401_triggers_relogin(
                     httpx.Response(200, json=[]),
                 ]
             )
-            mock.get("/auth/self-service/login/api").mock(
-                return_value=httpx.Response(200, json=kratos_init)
-            )
-            mock.post("/auth/self-service/login").mock(return_value=httpx.Response(200, json={}))
+            _mock_browser_login(mock, kratos_init)
 
             resp = await auth.request("GET", "/connect/case")
         assert resp.status_code == 200
+        assert auth._refusal_count == 0  # the new session was accepted
     finally:
         await auth.aclose()
 
@@ -143,15 +336,138 @@ async def test_kratos_login_idempotent_under_concurrency(
     auth = KratosAuth(settings_kratos)
     try:
         with respx.mock(base_url="https://so.example.com") as mock:
-            init_route = mock.get("/auth/self-service/login/api").mock(
-                return_value=httpx.Response(200, json=kratos_init)
+            routes = _mock_browser_login(mock, kratos_init)
+            await asyncio.gather(auth.login(), auth.login(), auth.login())
+        assert routes["init"].call_count == 1
+        assert routes["submit"].call_count == 1
+    finally:
+        await auth.aclose()
+
+
+# =====================================================================
+# The ceiling on the login loop
+#
+# SO 3.3 answered 401 to every call on a session Kratos had just issued.
+# The client re-logged in on every 401 with no ceiling: 32,420 throttled
+# logins in three days, 75,800 SO warnings, and a SO audit index sixteen
+# times its normal size. A refused session must stop the loop, not feed it.
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_kratos_refused_session_stops_the_login_loop(
+    settings_kratos: Settings, kratos_init: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """SOC refuses the fresh session. soc-ai logs in ONCE, then holds."""
+    auth = KratosAuth(_forced(settings_kratos, "browser"))
+    try:
+        with (
+            respx.mock(base_url="https://so.example.com") as mock,
+            caplog.at_level(logging.ERROR, logger="soc_ai.so_client.auth"),
+        ):
+            routes = _mock_browser_login(mock, kratos_init, info_status=401)
+            data_call = mock.get("/connect/case").mock(
+                return_value=httpx.Response(401, text="The request could not be processed.")
             )
-            post_route = mock.post("/auth/self-service/login").mock(
+
+            first = await auth.request("GET", "/connect/case")
+            second = await auth.request("GET", "/connect/case")
+            third = await auth.request("GET", "/connect/case")
+
+            assert first.status_code == 401
+            assert second.status_code == 401
+            assert third.status_code == 401
+            # One login for three refused calls, not one login per call.
+            assert routes["init"].call_count == 1
+            assert routes["submit"].call_count == 1
+            assert data_call.call_count == 3
+        assert auth._refusal_count == 1
+        assert auth._session_is_held() is True
+        assert any(
+            "SOC refused the Security Onion session" in r.getMessage() for r in caplog.records
+        ), caplog.text
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_held_write_makes_one_request(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """During the hold a write costs ONE request, not a login and a probe.
+
+    The proactive srv-token refresh would otherwise ask /api/info on every
+    write, get the same 401, and extend the hold for a fault already reported.
+    """
+    auth = KratosAuth(_forced(settings_kratos, "browser"))
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            routes = _mock_browser_login(mock, kratos_init, info_status=401)
+            ack = mock.post("/api/events/ack").mock(
+                return_value=httpx.Response(401, text="The request could not be processed.")
+            )
+
+            await auth.request("POST", "/api/events/ack", json={})
+            calls_after_first = len(mock.calls)
+            await auth.request("POST", "/api/events/ack", json={})
+
+            assert len(mock.calls) - calls_after_first == 1
+            assert ack.call_count == 2
+            assert routes["info"].call_count == 1  # the login probe only
+        assert auth._refusal_count == 1
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kratos_login_is_held_while_the_backoff_runs(settings_kratos: Settings) -> None:
+    """Inside the hold, login() names the cause and makes no HTTP call."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        auth._session_refused("test")
+        with respx.mock(base_url="https://so.example.com", assert_all_called=False) as mock:
+            init = mock.get("/auth/self-service/login/browser").mock(
                 return_value=httpx.Response(200, json={})
             )
-            await asyncio.gather(auth.login(), auth.login(), auth.login())
-        assert init_route.call_count == 1
-        assert post_route.call_count == 1
+            with pytest.raises(SoAuthError) as excinfo:
+                await auth.login()
+            assert init.call_count == 0
+        msg = str(excinfo.value)
+        assert "SOC refused the last session" in msg
+        assert "Check the SO version and the login flow" in msg
+    finally:
+        await auth.aclose()
+
+
+def test_kratos_backoff_doubles_to_a_ceiling(settings_kratos: Settings) -> None:
+    """30s, doubling, capped at ten minutes."""
+    auth = KratosAuth(settings_kratos)
+    delays = []
+    for _ in range(8):
+        before = time.monotonic()
+        auth._session_refused("test")
+        delays.append(round(auth._refusal_until - before))
+    assert delays == [30, 60, 120, 240, 480, 600, 600, 600]
+
+
+@pytest.mark.asyncio
+async def test_kratos_accepted_call_clears_the_hold(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """When SOC accepts a call again, the counter and the hold reset."""
+    auth = KratosAuth(settings_kratos)
+    auth._logged_in = True
+    auth._srv_token = "srv-old"
+    auth._srv_token_at = time.monotonic()
+    auth._session_refused("test")
+    assert auth._session_is_held() is True
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            mock.get("/connect/case").mock(return_value=httpx.Response(200, json=[]))
+            resp = await auth.request("GET", "/connect/case")
+        assert resp.status_code == 200
+        assert auth._refusal_count == 0
+        assert auth._session_is_held() is False
     finally:
         await auth.aclose()
 
@@ -678,8 +994,8 @@ async def test_kratos_writes_are_serialized(settings_kratos: Settings) -> None:
     auth = KratosAuth(settings_kratos)
     # Bypass login — inject tokens directly so request() skips the login path.
     auth._logged_in = True
-    auth._session_token = "test-session-token"
     auth._srv_token = "test-srv-token"
+    auth._srv_token_at = time.monotonic()
 
     in_flight = 0
     max_in_flight = 0
@@ -710,8 +1026,8 @@ async def test_kratos_reads_are_concurrent(settings_kratos: Settings) -> None:
     """
     auth = KratosAuth(settings_kratos)
     auth._logged_in = True
-    auth._session_token = "test-session-token"
     auth._srv_token = "test-srv-token"
+    auth._srv_token_at = time.monotonic()
 
     in_flight = 0
     max_in_flight = 0
@@ -746,7 +1062,6 @@ def _primed_kratos(settings: Settings) -> KratosAuth:
     """KratosAuth with an established fake session (login bypassed)."""
     auth = KratosAuth(settings)
     auth._logged_in = True
-    auth._session_token = "test-session-token"
     auth._srv_token = "srv-old"
     auth._srv_token_at = time.monotonic()  # fresh by default
     return auth
@@ -944,3 +1259,289 @@ async def test_so_auth_loopback_only_in_demo(settings_kratos: Settings) -> None:
         )
     )
     await ok.aclose()
+
+
+# =====================================================================
+# Picking a login flow: so_login_flow = auto | browser | api
+#
+# SO 3.3 refuses the API-flow session token. SO 2.4 and SO 3.0 to 3.2
+# accept both flows, and an older grid can serve no browser flow at all.
+# One build must work on every release, so "auto" runs the browser flow
+# and falls back. A wrong password is not a reason to fall back: the same
+# password fails on both flows.
+# =====================================================================
+
+_API_FLOW: dict[str, Any] = {
+    "id": "flow-api-9",
+    "type": "api",
+    "ui": {
+        "action": "https://so.example.com/auth/self-service/login?flow=flow-api-9",
+        "method": "POST",
+        "nodes": [
+            {"attributes": {"name": "identifier", "type": "text"}},
+            {"attributes": {"name": "password", "type": "password"}},
+            {"attributes": {"name": "method", "type": "submit", "value": "password"}},
+        ],
+    },
+}
+_API_TOKEN = "api-session-token-1"
+
+
+def _mock_api_login(mock: respx.MockRouter, *, info_status: int = 200) -> dict[str, Any]:
+    """Route the three calls an API-flow login makes."""
+    return {
+        "init": mock.get("/auth/self-service/login/api").mock(
+            return_value=httpx.Response(200, json=_API_FLOW)
+        ),
+        "submit": mock.post("/auth/self-service/login", params={"flow": _API_FLOW["id"]}).mock(
+            return_value=httpx.Response(
+                200, json={"session_token": _API_TOKEN, "session": {"id": "s2"}}
+            )
+        ),
+        "info": mock.get("/api/info", headers={"X-Session-Token": _API_TOKEN}).mock(
+            return_value=httpx.Response(
+                info_status,
+                json={"srvToken": "srv-api", "version": "3.0.0"}
+                if info_status == 200
+                else {"error": "unauthorized"},
+            )
+        ),
+    }
+
+
+def _mock_browser_only(
+    mock: respx.MockRouter, flow: dict[str, Any], *, info_status: int = 200
+) -> dict[str, Any]:
+    """The browser half of a two-flow grid, keyed on its own flow id."""
+    return {
+        "init": mock.get("/auth/self-service/login/browser").mock(
+            return_value=httpx.Response(200, json=flow, headers=_CSRF_COOKIE_HEADERS)
+        ),
+        "submit": mock.post("/auth/self-service/login", params={"flow": flow["id"]}).mock(
+            return_value=httpx.Response(
+                200, json={"session": {"id": "s1"}}, headers=_SESSION_COOKIE_HEADERS
+            )
+        ),
+        "info": mock.get("/api/info").mock(
+            return_value=httpx.Response(
+                info_status,
+                json={"srvToken": "srv-browser", "version": "3.3.0"}
+                if info_status == 200
+                else {"error": "unauthorized"},
+            )
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_picks_the_browser_flow_on_a_modern_grid(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """An SO 3.3-shaped Kratos completes the browser flow. Nothing else runs."""
+    auth = KratosAuth(settings_kratos)  # the default is auto
+    try:
+        with respx.mock(base_url="https://so.example.com", assert_all_called=False) as mock:
+            api = _mock_api_login(mock)
+            _mock_browser_only(mock, kratos_init)
+
+            await auth.login()
+
+            assert api["init"].call_count == 0
+            assert api["submit"].call_count == 0
+        assert auth.login_flow == "browser"
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_falls_back_when_the_browser_endpoint_is_absent(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An older grid serves no browser flow. soc-ai runs the API flow."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with (
+            respx.mock(base_url="https://so.example.com") as mock,
+            caplog.at_level(logging.INFO, logger="soc_ai.so_client.auth"),
+        ):
+            browser = mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(404, text="not found")
+            )
+            api = _mock_api_login(mock)
+
+            await auth.login()
+
+            assert browser.call_count == 1
+            assert api["init"].call_count == 1
+        assert auth.login_flow == "api"
+        assert auth._srv_token == "srv-api"
+        assert any("SO login strategy: api" in r.getMessage() for r in caplog.records), caplog.text
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_falls_back_when_the_flow_has_no_csrf_token(
+    settings_kratos: Settings,
+) -> None:
+    """A flow document with no csrf_token node cannot be submitted."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"id": "flow-nocsrf", "type": "browser", "ui": {"nodes": []}},
+                )
+            )
+            _mock_api_login(mock)
+
+            await auth.login()
+        assert auth.login_flow == "api"
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_falls_back_when_soc_refuses_the_cookie_session(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """The decisive case on SO 2.4 and 3.0 to 3.2.
+
+    The browser login completes and SOC answers 401 to the cookie session,
+    while the same account's API-flow session answers 200. The fallback is
+    decided on /api/info, which is the read every write path depends on.
+    """
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            api = _mock_api_login(mock)  # first: matches on the token header
+            browser = _mock_browser_only(mock, kratos_init, info_status=401)
+
+            await auth.login()
+
+            assert browser["init"].call_count == 1
+            assert browser["submit"].call_count == 1
+            assert api["submit"].call_count == 1
+        assert auth.login_flow == "api"
+        assert auth._srv_token == "srv-api"
+        assert auth._refusal_count == 0  # a fallback is not a refusal
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_does_not_fall_back_on_a_wrong_password(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """The same password fails on both flows. A second login proves nothing."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with respx.mock(base_url="https://so.example.com", assert_all_called=False) as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(200, json=kratos_init, headers=_CSRF_COOKIE_HEADERS)
+            )
+            mock.post("/auth/self-service/login", params={"flow": kratos_init["id"]}).mock(
+                return_value=httpx.Response(400, json={"error": "credentials_invalid"})
+            )
+            api = _mock_api_login(mock)
+
+            with pytest.raises(SoAuthError, match="rejected credentials"):
+                await auth.login()
+
+            assert api["init"].call_count == 0
+            assert api["submit"].call_count == 0
+        assert auth.login_flow is None
+        assert auth._logged_in is False
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_browser_flow_forced_never_calls_the_api_endpoint(
+    settings_kratos: Settings,
+) -> None:
+    auth = KratosAuth(_forced(settings_kratos, "browser"))
+    try:
+        with respx.mock(base_url="https://so.example.com", assert_all_called=False) as mock:
+            mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(404, text="not found")
+            )
+            api = _mock_api_login(mock)
+
+            with pytest.raises(SoAuthError) as excinfo:
+                await auth.login()
+
+            assert api["init"].call_count == 0
+        assert "browser flow could not complete" in str(excinfo.value)
+        assert "404" in str(excinfo.value)
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_api_flow_forced_never_calls_the_browser_endpoint(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    auth = KratosAuth(_forced(settings_kratos, "api"))
+    try:
+        with respx.mock(base_url="https://so.example.com", assert_all_called=False) as mock:
+            browser = _mock_browser_only(mock, kratos_init)
+            _mock_api_login(mock)
+
+            await auth.login()
+
+            assert browser["init"].call_count == 0
+            assert browser["submit"].call_count == 0
+        assert auth.login_flow == "api"
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_the_working_flow_is_remembered(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fallback costs one extra login, not one for every request."""
+    auth = KratosAuth(settings_kratos)
+    try:
+        with (
+            respx.mock(base_url="https://so.example.com") as mock,
+            caplog.at_level(logging.INFO, logger="soc_ai.so_client.auth"),
+        ):
+            browser = mock.get("/auth/self-service/login/browser").mock(
+                return_value=httpx.Response(404, text="not found")
+            )
+            api = _mock_api_login(mock)
+
+            await auth.login()
+            auth._clear_session()  # the session dropped; log in again
+            await auth.login()
+
+            assert browser.call_count == 1  # not tried a second time
+            assert api["init"].call_count == 2
+        assert auth.login_flow == "api"
+        # The strategy line names the flow once, at the first login SOC accepts.
+        assert sum("SO login strategy:" in r.getMessage() for r in caplog.records) == 1
+    finally:
+        await auth.aclose()
+
+
+@pytest.mark.asyncio
+async def test_api_flow_sends_the_session_token_header(
+    settings_kratos: Settings,
+) -> None:
+    """The API flow carries the token in a header; the jar holds no session."""
+    auth = KratosAuth(_forced(settings_kratos, "api"))
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            _mock_api_login(mock)
+            data_call = mock.get("/connect/case").mock(return_value=httpx.Response(200, json=[]))
+
+            await auth.request("GET", "/connect/case")
+
+            sent = data_call.calls[0].request
+            assert sent.headers.get("x-session-token") == _API_TOKEN
+        assert auth._has_session_cookie() is False
+    finally:
+        await auth.aclose()

@@ -16,7 +16,14 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from soc_ai.store.models import QualitySnapshot
+from soc_ai.store.models import QualityEvalAttempt, QualitySnapshot
+
+# How many attempt rows survive pruning. Smaller than the trend's cap because
+# the question this table answers is always about the recent past — "did last
+# night run, and what did it do" — and because an attempt with no snapshot
+# behind it has no artifacts on disk to point at. Roughly a fortnight of
+# nightlies plus room for the run-now button being pressed.
+KEEP_LAST_ATTEMPTS = 30
 
 # How many snapshots survive pruning — ~3 months of nightlies. The table is a
 # TREND, not an archive: the full per-run artifacts (bundles, index.jsonl,
@@ -45,6 +52,7 @@ async def insert_snapshot(
     n_partial: int | None = None,
     n_no: int | None = None,
     n_classified: int | None = None,
+    analyst_model: str | None = None,
     keep_last: int = KEEP_LAST,
 ) -> QualitySnapshot:
     """Insert one nightly snapshot and prune history in the SAME transaction.
@@ -68,7 +76,18 @@ async def insert_snapshot(
     :func:`soc_ai.eval.nightly._record_trend_point`) — this module only moves
     rows, and deriving the previous row's key here would hide the one decision
     that governs whether an operator gets paged.
+
+    ``app_version``/``code_commit`` (0040) are NOT parameters, and that is the
+    point: they describe the process performing this write, and the process
+    performing the write is the process that ran the eval. There is no caller
+    who could know them better and no path on which they should differ, so
+    taking them from the caller would only create a way to forget them — which
+    is how ``analyst_model`` differs. That one names a route out of the
+    install's configuration, which this module has no business reading, so it
+    is passed in and is NULL when a caller had nothing to say.
     """
+    from soc_ai import __commit__, __version__  # noqa: PLC0415 - lazy: avoid a cycle
+
     row = QualitySnapshot(
         mode=mode,
         n_ok=n_ok,
@@ -87,6 +106,9 @@ async def insert_snapshot(
         alarm_reasons=alarm_reasons,
         alarm_key=alarm_key,
         alarm_since=alarm_since,
+        app_version=__version__,
+        code_commit=__commit__,
+        analyst_model=analyst_model,
     )
     db.add(row)
     # Flush so the new row has its id and is visible to the prune subquery —
@@ -122,3 +144,56 @@ async def recent_snapshots(
         stmt = stmt.where(QualitySnapshot.mode == mode)
     stmt = stmt.order_by(QualitySnapshot.id.desc()).limit(limit)
     return list((await db.scalars(stmt)).all())
+
+
+async def record_attempt(
+    db: AsyncSession,
+    *,
+    trigger: str,
+    exit_code: int,
+    detail: str,
+    now: datetime | None = None,
+    keep_last: int = KEEP_LAST_ATTEMPTS,
+) -> QualityEvalAttempt:
+    """Record that the nightly ran, whatever it did. Insert + prune, one commit.
+
+    Written for EVERY finished attempt, including the ones that produce no
+    snapshot — which is the whole point. Exit 2 (no eligible alerts) and exit 5
+    (failed) deliberately write no trend row, so before this table the only
+    record of those nights was a status field in process memory and a log line.
+
+    Same shape as :func:`insert_snapshot`: one transaction, so the table can
+    never be observed over capacity and a crash between the two cannot lose the
+    new row while keeping stale ones.
+    """
+    row = QualityEvalAttempt(
+        trigger=trigger,
+        exit_code=exit_code,
+        detail=detail or "",
+        **({"attempted_at": now} if now is not None else {}),
+    )
+    db.add(row)
+    # Flush first, so the new row has its id and the prune subquery can see it;
+    # otherwise a full table prunes everything EXCEPT the newest row.
+    await db.flush()
+    keep_ids = (
+        select(QualityEvalAttempt.id)
+        .order_by(QualityEvalAttempt.id.desc())
+        .limit(keep_last)
+        .scalar_subquery()
+    )
+    await db.execute(delete(QualityEvalAttempt).where(QualityEvalAttempt.id.not_in(keep_ids)))
+    await db.commit()
+    return row
+
+
+async def latest_attempt(db: AsyncSession) -> QualityEvalAttempt | None:
+    """The newest finished attempt, or ``None`` if there has never been one.
+
+    ``None`` here genuinely means "no attempt has ever been recorded on this
+    deployment", which is the distinction the in-memory slot could not draw: it
+    also read as null on every restart. Callers may now render an absence as an
+    absence.
+    """
+    stmt = select(QualityEvalAttempt).order_by(QualityEvalAttempt.id.desc()).limit(1)
+    return (await db.scalars(stmt)).first()

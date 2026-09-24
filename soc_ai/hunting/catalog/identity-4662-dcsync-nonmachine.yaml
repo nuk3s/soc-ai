@@ -1,0 +1,79 @@
+id: identity-4662-dcsync-nonmachine
+title: 'A non-machine account requests directory replication: DCSync'
+description: >
+  A 4662 Directory Service Access event reports that a principal used a
+  directory replication right. This analytic reads the three replication
+  control-access rights. They are DS-Replication-Get-Changes,
+  DS-Replication-Get-Changes-All and DS-Replication-Get-Changes-In-Filtered-Set.
+  An attacker grants these rights to make an account DCSync capable. The domain
+  controller writes one document per right it checks, so one right alone is the
+  act.
+
+  Domain controllers replicate with each other constantly, and their computer
+  accounts do this legitimately. The machine-account exclusion is therefore the
+  whole detection. Without the exclusion the query returns mostly benign
+  replication. With the exclusion every hit is worth reading.
+
+  Measured on the development range on 2026-09-04, the clause matched only
+  DS-Replication-Get-Changes. The range held 38 documents that carried that
+  right. The domain controller's own machine account wrote 36 of them. The
+  exclusion left 2 documents. The live DCSync run produced both.
+
+  This analytic has no threshold, because the benign population is a few dozen
+  machine-account documents. Nobody has re-counted the wider clause. The wider
+  clause admits the same machine-account replication that the exclusion removes.
+
+level: critical
+# No benign population. The two exceptions below are identities — the sync
+# appliance's account, a promoting admin — never a rate: an attacker's
+# persistent DCSync is precisely "this account replicates on a schedule". A
+# triage may not close this false_positive on a volume argument; the gate in
+# soc_ai/agent/doctrine.py lands it needs_more_info and hands the reader the
+# exceptions to check.
+no_benign_baseline: true
+scope_field: winlog.event_data.SubjectUserName
+scope_kind: user
+
+precondition:
+  all:
+    - field: event.code
+      value: "4662"
+
+detection:
+  all:
+    - field: event.code
+      value: "4662"
+  # One document per right checked, so the rights are alternatives, not a
+  # conjunction. DS-Replication-Synchronize is deliberately absent: it reads
+  # nothing and administrators exercise it under human accounts.
+  any:
+    # DS-Replication-Get-Changes
+    - field: winlog.event_data.Properties
+      op: contains
+      value: 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+    # DS-Replication-Get-Changes-All, the right that releases secrets
+    - field: winlog.event_data.Properties
+      op: contains
+      value: 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
+    # DS-Replication-Get-Changes-In-Filtered-Set
+    - field: winlog.event_data.Properties
+      op: contains
+      value: 89e95b76-444d-4c62-991a-0facbeda640c
+  none:
+    - field: winlog.event_data.SubjectUserName
+      op: wildcard
+      value: "*$"
+
+attack:
+  - T1003.006
+
+false_positives:
+  - Azure AD Connect and any directory-sync appliance replicate under a normal
+    user account by design. Put the account your appliance uses in a tuning
+    filter.
+  - A domain controller promotion replicates under the promoting
+    administrator's account. The new machine account does not exist yet.
+
+references:
+  - https://attack.mitre.org/techniques/T1003/006/
+  - https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4662

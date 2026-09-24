@@ -33,6 +33,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Stamps the built image with the commit it came from, so a quality
+        # regression can be attributed to a code change. Empty unless the
+        # builder exports it — `export SOC_AI_COMMIT=$(git rev-parse HEAD)`
+        # before `docker compose build` — and empty is recorded as "unknown",
+        # never guessed.
+        SOC_AI_COMMIT: ${SOC_AI_COMMIT:-}
     container_name: soc-ai
 
     # ── Port ─────────────────────────────────────────────────────────────────
@@ -98,9 +105,14 @@ services:
       # (image update, `docker compose up -d`) deletes them.
       - soc_ai_evals:/var/lib/soc-ai/evals
 
-    # ── Health check ─────────────────────────────────────────────────────────
+    # ── Liveness check ───────────────────────────────────────────────────────
     # Mirrors the HEALTHCHECK in the Dockerfile; compose uses it to gate
     # dependent services (e.g. a future nginx reverse-proxy).
+    #
+    # LIVENESS, not health: a green container here means this process answered,
+    # nothing more. It probes no dependency and must not, or an outage upstream
+    # would become a restart loop down here. For the verdict, run
+    # `docker compose exec soc-ai python -m soc_ai doctor`.
     healthcheck:
       test: ["CMD", "curl", "-fsk", "https://127.0.0.1:8443/healthz"]
       interval: 30s

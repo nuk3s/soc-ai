@@ -9,58 +9,61 @@ rules:
 
 # Lateral movement triage (SMB / PsExec / RDP)
 
-Lateral movement alerts (MITRE ATT&CK **T1021.001** RDP, **T1021.002**
-SMB/Windows Admin Shares, **T1570** Lateral Tool Transfer, **T1569.002**
-Service Execution) are hard because administrators and attackers use the
-*same tools*. The discriminator is almost never the mechanism — it's the
-who/where/when/what-next.
+Lateral movement alerts are hard because administrators and attackers use the *same
+tools*. The MITRE ATT&CK techniques are **T1021.001** Remote Desktop Protocol,
+**T1021.002** SMB/Windows Admin Shares, **T1570** Lateral Tool Transfer and **T1569.002**
+Service Execution. The mechanism almost never decides the verdict. The actor, the source,
+the time and the next action decide the verdict.
 
 ## Establish the actor context
 
-- **Account**: which account authenticated for the SMB session or RDP logon?
-  Is it an admin account expected to touch this target? A *user* workstation
-  account authenticating to another workstation's admin share is abnormal in
-  almost every environment.
-- **Source**: is the source a management host/jump box (expected) or an
-  ordinary workstation/server that has no business administering others?
-  Workstation-to-workstation admin traffic is the classic worm/hands-on-
-  keyboard pattern.
-- **Time**: inside the admin's working pattern, or 03:00 on a weekend?
-  Correlate with the admin's other activity — real admins generate parallel
-  context (ticketing, VPN session, other managed hosts); an attacker using
-  stolen credentials usually doesn't.
+- **Account**. Identify the account that authenticated for the SMB session or the Remote
+  Desktop Protocol (RDP) logon. Check whether an admin account is expected to touch this
+  target. A *user* workstation account that authenticates to the admin share of another
+  workstation is abnormal in almost every environment.
+- **Source**. Check whether the source is a management host or a jump box. Such a source
+  is expected. An ordinary workstation or server has no business that administers other
+  hosts. Workstation-to-workstation admin traffic is the pattern of a worm or a
+  hands-on-keyboard attacker.
+- **Time**. Check whether the time falls inside the working pattern of the administrator.
+  A session at 03:00 on a weekend falls outside that pattern. Correlate the session with
+  the other activity of the administrator. A real administrator generates parallel
+  context such as a ticket, a virtual private network session and other managed hosts. An
+  attacker with stolen credentials usually generates no parallel context.
 
 ## Read the mechanism for intent
 
-- **PsExec-style service execution**: look for a service creation on the
-  target with a random or copied name and an executable dropped to ADMIN$
-  just before. Legitimate software deployment does the same thing but from
-  *deployment servers* with *consistent* service names, on many hosts at
-  once. One-off random-name service from a workstation source = escalate.
-- **SMB executable/script writes**: an .exe/.dll/.ps1/.bat written to an
-  admin share (C$, ADMIN$) outside a deployment window is tool transfer.
-  Capture the filename and hash; pivot the hash across the network.
-- **RDP**: a single interactive session is thin evidence alone. Chained RDP
-  (A→B then B→C within minutes), first-ever source→target pairs, and RDP
-  from a host that just received a suspicious file are the escalating
-  shapes.
+- **Service execution in the style of PsExec**. Look for a service creation on the target
+  with a random or copied name. Look for an executable written to ADMIN$ immediately
+  before the service creation. Legitimate software deployment creates services too.
+  Deployment runs from *deployment servers*, uses *consistent* service names and hits many
+  hosts at once.
+  Escalate a one-off service with a random name from a workstation source.
+- **SMB executable and script writes**. A .exe, .dll, .ps1 or .bat file written to an
+  admin share outside a deployment window is tool transfer. The admin shares are C$ and
+  ADMIN$. Record the filename and the hash. Pivot the hash across the network.
+- **RDP**. A single interactive session is thin evidence alone. Chained RDP escalates the
+  alert. The chain runs from A to B and then from B to C within minutes. A source and
+  target pair seen for the first time escalates the alert. RDP from a host that
+  recently received a suspicious file escalates the alert.
 
 ## Scope before verdict
 
-Lateral movement is by definition ≥2 hosts. Pivot on the source and the
-account: what *else* did they touch in ±2 hours? A source fanning out to
-many targets (especially sequential IP order, or many failures then one
-success) is discovery + movement, not administration. Build the host list —
-the case needs the graph, not one edge.
+Lateral movement covers 2 or more hosts by definition. Pivot on the source and on the
+account. List everything else they touched in the 2 hours before the alert and the 2
+hours after it. A source that reaches many targets performs discovery and movement.
+Sequential IP order, or many failures and then one success, shows the same. Build the
+host list. The investigation needs the graph of the movement.
 
 ## Verdict guidance
 
-- **Escalate** random-name service creation, tool transfer to admin shares,
-  workstation-sourced admin sessions, and any movement chain following
-  another alert on the source (phish, beacon, credential access). Recommend
-  isolating the source and reviewing the account's credentials.
-- **Dismiss** documented deployment/patching activity (name the product and
-  the deployment server), scheduled backup or inventory jobs, and help-desk
-  remote support matching its normal source and hours.
-- When unsure, check the target's next 30 minutes: new outbound connections,
-  new services, or credential dumping artifacts settle the question.
+- **Escalate** a service creation with a random name. Escalate a tool transfer to an
+  admin share. Escalate an admin session from a workstation source. Escalate any movement
+  chain that follows another alert on the source, such as a phish, a beacon or credential
+  access. Recommend isolation of the source. Recommend a review of the credentials of the
+  account.
+- **Dismiss** documented deployment or patching activity. Name the product and the
+  deployment server. Dismiss a scheduled backup job or inventory job. Dismiss help-desk
+  remote support that matches its normal source and hours.
+- Check the next 30 min on the target if you are unsure. New outbound connections, new
+  services or credential dumping artifacts settle the question.

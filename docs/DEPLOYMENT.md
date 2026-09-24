@@ -1,20 +1,19 @@
 # Deployment
 
-> **This is the non-Docker (systemd) path.** Most users want the guided
-> `./setup.sh` installer or the container path in
-> [DOCKER.md](DOCKER.md); start there unless you specifically need a bare
-> rsync + systemd + uv deploy. This guide installs under a system user with a
-> hardened systemd unit and a uv-managed venv.
+> **This page is the systemd path, without Docker.** Most users want the guided
+> `./setup.sh` installer or the container path in [DOCKER.md](DOCKER.md). Start
+> there, unless you need a bare rsync, systemd and uv deploy. This guide installs
+> soc-ai under a system user, with a hardened systemd unit and a uv-managed venv.
 
-End-to-end deployment guide for soc-ai against a real Security Onion 3.0.0
-grid. The procedure should produce a working install in ≤30 minutes against
-a fresh VM.
+This is the end-to-end deployment guide for soc-ai against a real Security Onion
+3.x grid. The procedure produces a working install on a fresh VM in 30 minutes
+or less.
 
-> **Addresses below are example/placeholder values; substitute your own.**
-> The `203.0.113.x` / `198.51.100.x` IPs are RFC 5737 documentation ranges,
-> and `<soc-ai-host>` / `<so-host>` / `<vm-host>` are placeholders.
+> **The addresses below are example values. Substitute your own.** The
+> `203.0.113.x` and `198.51.100.x` addresses are RFC 5737 documentation ranges.
+> `<soc-ai-host>`, `<so-host>` and `<vm-host>` are placeholders.
 
-The shape of the install:
+The shape of the install is:
 
 ```
                     ┌──────────────────────────────────┐
@@ -47,22 +46,23 @@ The shape of the install:
 
 ---
 
-## 1. Prereqs
+## 1. Prerequisites
 
-- **A VM** running Fedora 43 (or any modern Linux) with sudo. v1 lab
-  used 4 vCPU / 8 GB RAM / 20 GB disk; adjust based on concurrent
+- **A VM** that runs Fedora 43, or any modern Linux, with sudo. The v1 lab used
+  4 vCPU, 8 GB RAM and 20 GB disk. Adjust that for your concurrent
   investigation load.
 - **Network reachability** from the soc-ai VM to:
-  - The SO manager's port `:9200` (Elasticsearch)
-  - The SO manager's port `:443` (web UI / Kratos)
-  - The LiteLLM gateway's HTTPS endpoint
-  - (Optional) An embeddings model on the gateway (`RAG_EMBED_MODEL`) if you
-    want semantic runbook search on top of the built-in keyword ranking
-- **Security Onion 3.0.0** with a non-default analyst account whose
-  password you know (the SO grid creates this for you).
-- **A LiteLLM gateway** preconfigured with the analyst model alias
-  `soc-ai-analyst` (or set `ANALYST_MODEL` to any model it serves). Bearer token
-  for the gateway.
+  - Port `:9200` on the SO manager, for Elasticsearch
+  - Port `:443` on the SO manager, for the web UI and Kratos
+  - The HTTPS endpoint of the LiteLLM gateway
+  - An embeddings model on the gateway, `RAG_EMBED_MODEL`. This one is optional.
+    Add it if you want semantic runbook search above the built-in keyword
+    ranking.
+- **Security Onion 3.0.0** with a non-default analyst account whose password you
+  know. The SO grid creates that account for you.
+- **A LiteLLM gateway** with the analyst model alias `soc-ai-analyst`
+  configured. You can also set `ANALYST_MODEL` to any model that the gateway
+  serves. You need a bearer token for the gateway.
 
 ---
 
@@ -91,10 +91,10 @@ rsync -av \
     <repo-checkout>/ soc-ai@<vm-host>:/opt/soc-ai/
 ```
 
-> **SELinux gotcha (Fedora 43):** uv's managed Python lives in
-> `$HOME/.local/share/uv/python/...` which is in an SELinux context
-> systemd refuses to exec from. Use the system `python3.12` from
-> `/usr/bin` instead (Phase 1 finding).
+> **SELinux trap on Fedora 43:** the managed Python of uv lives in
+> `$HOME/.local/share/uv/python/...`. That path has an SELinux context that
+> systemd refuses to exec from. Use the system `python3.12` from `/usr/bin`
+> instead. Phase 1 found this.
 
 ```bash
 # As the soc-ai user on the VM:
@@ -108,7 +108,7 @@ uv sync  # populates /opt/soc-ai/.venv
 
 ## 3. Configuration
 
-Copy `.env.example` to `.env` and populate:
+Copy `.env.example` to `.env`. Then fill it in:
 
 ```ini
 # --- Security Onion grid -----------------------------------------------
@@ -185,7 +185,7 @@ AGENT_REQUEST_LIMIT=18
 SYNTHESIS_CONFIDENCE_FLOOR=0.6
 ```
 
-Lock down perms:
+Lock down the permissions:
 ```bash
 sudo chmod 600 /opt/soc-ai/.env
 sudo chown soc-ai:soc-ai /opt/soc-ai/.env
@@ -193,7 +193,7 @@ sudo chown soc-ai:soc-ai /opt/soc-ai/.env
 
 ---
 
-## 4. TLS cert (self-signed for the lab)
+## 4. TLS certificate, self-signed for the lab
 
 ```bash
 sudo mkdir -p /etc/soc-ai
@@ -206,7 +206,8 @@ sudo chmod 640 key.pem cert.pem
 sudo chgrp soc-ai key.pem cert.pem
 ```
 
-For production, replace with a cert from your internal CA / Let's Encrypt.
+In production, replace it with a certificate from your internal CA or from Let's
+Encrypt.
 
 ---
 
@@ -221,14 +222,13 @@ sudo systemctl enable --now soc-ai
 sudo systemctl status soc-ai
 ```
 
-The unit applies the safe hardening set: `PrivateTmp`,
-`ProtectSystem=full`, `ProtectHome=read-only`, `NoNewPrivileges`,
-restricted address families, `MemoryDenyWriteExecute`, dropped
-capabilities, etc. See `scripts/systemd/soc-ai.service` for the full
-list and rationale.
+The unit applies the safe hardening set: `PrivateTmp`, `ProtectSystem=full`,
+`ProtectHome=read-only`, `NoNewPrivileges`, restricted address families,
+`MemoryDenyWriteExecute`, and dropped capabilities. See
+`scripts/systemd/soc-ai.service` for the full list and the rationale.
 
-> **Don't use `ProtectSystem=strict`**: it makes /opt read-only,
-> which breaks uv's symlink-based venv layout.
+> **Do not use `ProtectSystem=strict`.** It makes /opt read-only. That breaks
+> the symlink-based venv layout of uv.
 
 ---
 
@@ -243,11 +243,11 @@ sudo firewall-cmd --reload
 
 ## 7. Audit-index role grant (one-time, on the SO manager)
 
-The default SO `analyst` role lacks `auto_configure` + `create_index`
-on `soc-ai-audit-*`, so the orchestrator's audit logger silently
-drops every event with a 403 (verifiable in `journalctl -u soc-ai`).
-Audit failures are non-fatal (investigations still complete), but
-you lose the forensic trail.
+The default SO `analyst` role lacks `auto_configure` and `create_index` on
+`soc-ai-audit-*`. The audit logger of the orchestrator therefore drops every
+event silently with a 403. You can verify that in `journalctl -u soc-ai`. An
+audit failure is not fatal, because the investigation still completes. You do
+lose the forensic trail.
 
 To unlock the audit index:
 
@@ -256,27 +256,27 @@ ssh <admin>@<so-manager> 'sudo bash -s' \
   < /opt/soc-ai/scripts/setup-audit-index.sh
 ```
 
-The script grants the `analyst` role the missing privileges and
-bootstraps today's audit index.
+The script grants the missing privileges to the `analyst` role. It also
+bootstraps the audit index for today.
 
 ---
 
 ## 8. Reasoning trace (LiteLLM/vLLM config, optional, model-specific)
 
-**Optional: only relevant if your gateway serves a `<think>`-emitting
-reasoning model.** soc-ai is plumbed to surface a model's `<think>` traces
-into the SSE stream as `model_response.reasoning_trace` payloads. If your
-`ANALYST_MODEL` doesn't emit reasoning, skip this section; nothing breaks.
+**This section applies only if your gateway serves a reasoning model that emits
+`<think>`.** soc-ai carries the `<think>` traces of a model into the SSE stream
+as `model_response.reasoning_trace` payloads. If your `ANALYST_MODEL` emits no
+reasoning, skip this section. Nothing breaks.
 
-To light it up, the LiteLLM/vLLM gateway needs to be configured to split
-`<think>` into the `reasoning_content` field on the response. Specifically:
+To turn it on, configure the LiteLLM and vLLM gateway to split `<think>` into the
+`reasoning_content` field on the response. Set these:
 
-- vLLM serving args: `--enable-reasoning --reasoning-parser <parser>`, where
-  `<parser>` matches the reasoning model you serve (each model family has its
-  own parser; check your vLLM build's `--reasoning-parser` choices).
-- LiteLLM config: `merge_reasoning_content_in_choices: false`.
+- The vLLM serving arguments `--enable-reasoning --reasoning-parser <parser>`.
+  `<parser>` must match the reasoning model that you serve. Each model family has
+  its own parser, so check the `--reasoning-parser` choices in your vLLM build.
+- The LiteLLM config key `merge_reasoning_content_in_choices: false`.
 
-Verify by direct curl:
+Verify it with a direct curl:
 
 ```bash
 curl -ks -X POST "$LITELLM_BASE_URL/v1/chat/completions" \
@@ -288,17 +288,20 @@ curl -ks -X POST "$LITELLM_BASE_URL/v1/chat/completions" \
   | jq '.choices[0].message | {reasoning_content, content}'
 ```
 
-If `reasoning_content` is non-empty, soc-ai will pick it up
-automatically.
+If `reasoning_content` is not empty, soc-ai picks it up automatically.
 
 ---
 
 ## 9. Verification
 
 ```bash
-# Health check from any host that can reach the soc-ai VM:
+# Liveness check from any host that can reach the soc-ai VM. This says the
+# server answered and nothing else — it probes no upstream:
 curl -k https://<soc-ai-host>:8443/healthz
-# → {"status":"ok","version":"1.2.9","so_auth":"kratos",...}
+# → {"status":"alive","version":"1.5.0","so_auth":"kratos",...}
+
+# The health verdict, which does touch every upstream:
+uv run soc-ai doctor
 
 # Or use the CLI:
 uv run soc-ai healthz --url https://<soc-ai-host>:8443
@@ -307,13 +310,14 @@ uv run soc-ai healthz --url https://<soc-ai-host>:8443
 uv run soc-ai triage <alert_id> --url https://<soc-ai-host>:8443
 ```
 
-The shipped default (`API_AUTH_REQUIRED=true`) requires these to authenticate
-too, same as a browser: pass `--token scai_...` or set `SOC_AI_API_TOKEN`
-(mint one in the web UI under Config → API tokens). Without one, `healthz` and
-`triage` get a 401 — the CLI prints a one-line reminder of the fix alongside it.
+The shipped default `API_AUTH_REQUIRED=true` makes these commands authenticate
+too, the same as a browser. Pass `--token scai_...`, or set `SOC_AI_API_TOKEN`.
+Mint a token in the web UI under Config → API tokens. Without a token, `healthz`
+and `triage` get a 401, and the CLI prints a one-line reminder of the fix
+alongside it.
 
-Sample successful SSE transcript (alert KDG7CZ4BVBs3R9hXQbPY,
-verdict=false_positive, confidence=0.7):
+A sample of a successful SSE transcript follows. It comes from alert
+KDG7CZ4BVBs3R9hXQbPY, with verdict=false_positive and confidence=0.7:
 
 ```
 session_start  alert_id='KDG7CZ4BVBs3R9hXQbPY'
@@ -339,10 +343,10 @@ done           recommended_count=1 rounds=1
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | Missing audit-index role grant | Run `scripts/setup-audit-index.sh` on the SO manager. |
-| `ContextWindowExceededError … input_tokens 65537` | Tool result accumulation blew the 64K serving window | Cap `AGENT_TOOL_CALLS_LIMIT` (default 25) lower, or set `SYNTHESIS_CONFIDENCE_FLOOR` higher (so retask happens later). |
-| "writes fail with `Kratos login flow init failed`" | Kratos auth prefix wrong for SO 3.0 | Set `SO_KRATOS_PATH_PREFIX=/auth` (the default). Writes use the SO web API + Kratos session, not the Connect API. |
-| Service won't start after pulling new code | venv out of sync | `cd /opt/soc-ai && uv sync && sudo systemctl restart soc-ai`. |
+| `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | The audit-index role grant is missing. | Run `scripts/setup-audit-index.sh` on the SO manager. |
+| `ContextWindowExceededError … input_tokens 65537` | The accumulated tool results blew the 64K serving window. | Lower `AGENT_TOOL_CALLS_LIMIT`. Its default is 25. Or raise `SYNTHESIS_CONFIDENCE_FLOOR`, so the retask happens later. |
+| "writes fail with `Kratos login flow init failed`" | The Kratos auth prefix is wrong for SO 3.0. | Set `SO_KRATOS_PATH_PREFIX=/auth`. That is the default. A write uses the SO web API and the Kratos session, and not the Connect API. |
+| Service won't start after pulling new code | The venv is out of sync. | `cd /opt/soc-ai && uv sync && sudo systemctl restart soc-ai`. |
 
 ---
 
@@ -372,34 +376,43 @@ ssh soc-ai@<vm-host> '
 
 ## 12. Authentication notes
 
-soc-ai authenticates to ES directly using the analyst basic-auth
-credentials; no separate ES service account is needed.
+soc-ai authenticates to ES directly with the analyst basic-auth credentials. It
+needs no separate ES service account.
 
-The write tools (`ack_alert`, `escalate_to_case`,
-`add_case_comment`) go through Security Onion's **web API** using the
-analyst's Kratos session cookie: `ack_alert` posts to
-`POST /api/events/ack`, the same always-available endpoint the SO web
-UI uses when you click the bell icon on an alert. This path works on
-an OSS grid; it does **not** require the paywalled Connect API. SO
-3.0.0 mounts Kratos under `/auth/...`, which is the default
-(`SO_KRATOS_PATH_PREFIX=/auth`).
+The write tools are `ack_alert`, `escalate_to_case` and `add_case_comment`. They
+go through the Security Onion web API with the analyst's Kratos session
+cookie. They use the same always-available routes that the SO web console itself
+uses:
 
-`SO_CLIENT_ID` + `SO_CLIENT_SECRET` (Connect API OAuth, SO Pro grids
-with Hydra) remain accepted for environments that prefer it, but they
-are **optional**; the default web-API path covers ack/escalate/comment
-without SO Pro. See [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md)
-for the full account/role breakdown (including the `soc-ai-audit-*`
-Elasticsearch write grant that ack/escalate silently depend on under
-`AUDIT_FAIL_CLOSED=true`).
+| Tool | Routes |
+| --- | --- |
+| `ack_alert` | `POST /api/events/ack`. This is the bell icon on an alert row. |
+| `escalate_to_case` | `POST /api/case/` then `POST /api/case/events` |
+| `add_case_comment` | `POST /api/case/comments` |
+
+These routes work on an OSS grid. They do not need the licensed Connect API.
+The `/connect/*` paths of that API are an nginx alias for `/api/*`, and a grid
+without the `api` feature never serves them at all. SO 3.0.0 mounts Kratos under
+`/auth/...`, and that is the default, `SO_KRATOS_PATH_PREFIX=/auth`.
+
+soc-ai still accepts `SO_CLIENT_ID` and `SO_CLIENT_SECRET` for an environment
+that prefers Connect API OAuth on an SO Pro grid with Hydra. They are optional.
+The default web-API path covers ack, escalate and comment without
+SO Pro. See [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md) for the full
+account and role breakdown. It covers the `soc-ai-audit-*` Elasticsearch write
+grant that ack and escalate silently depend on under `AUDIT_FAIL_CLOSED=true`.
 
 ### Behind a reverse proxy: set `PROXY_TRUSTED_IPS`
 
-If you front soc-ai with a reverse proxy (nginx, Caddy, Traefik, …),
-set `PROXY_TRUSTED_IPS` to the proxy's IP(s), e.g.
-`PROXY_TRUSTED_IPS=203.0.113.10`. The login throttle and API rate
-limit are keyed per client IP; without this setting the proxy's own
-socket IP stands in for every client, so all users share one bucket —
-a handful of failed logins across the team can lock everyone out
-until the cooldown expires. `X-Forwarded-For`/`X-Forwarded-Proto` are
-only ever trusted from peers on this list (an arbitrary client could
-forge them), so leave it empty when clients connect directly.
+If you put a reverse proxy in front of soc-ai, set `PROXY_TRUSTED_IPS` to the IP
+addresses of the proxy. nginx, Caddy and Traefik are examples of such a proxy. An
+example value is `PROXY_TRUSTED_IPS=203.0.113.10`.
+
+The login throttle and the API rate limit are keyed per client IP address.
+Without this setting, the proxy's own socket IP address stands in for every
+client, so all users share one bucket. A handful of failed logins across the team
+can then lock everyone out until the cooldown expires.
+
+soc-ai trusts `X-Forwarded-For` and `X-Forwarded-Proto` only from a peer on this
+list, because an arbitrary client could forge them. Leave the list empty if
+clients connect directly.

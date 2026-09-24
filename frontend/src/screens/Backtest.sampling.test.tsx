@@ -102,7 +102,7 @@ describe('Backtest — the sampling phase is not a finished replay', () => {
 
     expect(await screen.findByTestId('backtest-sampling')).toBeTruthy();
     // The specific claim that was wrong: a replay of nothing, reported as done.
-    expect(screen.queryByText(/Replaying 0 dispositioned alerts/)).toBeNull();
+    expect(screen.queryByText(/soc-ai replays 0 dispositioned alerts/)).toBeNull();
     expect(screen.queryByText(/0 \/ 0 replayed/)).toBeNull();
   });
 
@@ -118,7 +118,7 @@ describe('Backtest — the sampling phase is not a finished replay', () => {
       current: 'ET SCAN thing',
     });
 
-    expect(await screen.findByText(/Replaying 20 dispositioned alerts/)).toBeTruthy();
+    expect(await screen.findByText(/soc-ai replays 20 closed alerts/)).toBeTruthy();
     expect(screen.getByText(/3 \/ 20 replayed/)).toBeTruthy();
     expect(screen.queryByTestId('backtest-sampling')).toBeNull();
   });

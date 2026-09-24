@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import ssl
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 from elastic_transport import ObjectApiResponse
 from soc_ai import doctor
-from soc_ai.config import Settings
+from soc_ai.config import DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.so_client.elastic import EsSearchResult, GridPartialResultsError
+from soc_ai.so_client.oql import filter_to_dsl, parse_oql
+from soc_ai.webui import alerts_query as aq
 
 
 class _FakeSecurity:
@@ -301,7 +305,11 @@ async def test_coverage_partial_grid_read_warns(
     # guard) would stay green on the substring checks above alone.
     assert "counts are unreliable" in result.detail
     assert "narrowed" not in result.detail
-    assert result.hint.startswith("Fix Elasticsearch connectivity first")
+    # The remedy names shard health, not connectivity: this grid answered, in
+    # milliseconds, off the shards it still has. Sending the admin to check the
+    # connection is the same wrong-building mistake one line up in the detail.
+    assert "shard health" in result.hint
+    assert "connectivity" not in result.hint
     assert fake.closed
 
 
@@ -631,3 +639,493 @@ def test_reach_hints_cover_every_target_and_failure_kind() -> None:
         (slug, kind) for slug in ("so", "es", "gateway") for kind in ("dns", "tls", "reach")
     }
     assert set(doctor._REACH_HINTS) == expected
+
+
+# ── alerts-feed filter vs how the grid labels alerts ─────────────────────────
+
+
+def _source_dsl(label: str) -> dict[str, Any]:
+    """The clause ``build_filter`` puts in ``must[0]`` for one alert-label OQL."""
+    return filter_to_dsl(parse_oql(label).filter_)
+
+
+class _FakeAlertFilterSearch:
+    """``ElasticClient.search`` double for the alerts-feed-filter check.
+
+    Scripted BY LABEL rather than by call order, because the check issues its
+    probes concurrently and the order is not a contract. Each scripted label is
+    translated through the same ``parse_oql``/``filter_to_dsl`` path the real
+    filter builder uses, and an incoming call is attributed to whichever
+    label's clause it carries in ``must[0]``; an unscripted label answers 0.
+    With ``exc`` set, every call raises it instead.
+    """
+
+    def __init__(
+        self,
+        counts: dict[str, int],
+        *,
+        exc: Exception | None = None,
+        datasets: dict[str, dict[str, int]] | None = None,
+        truncated: set[str] | None = None,
+    ) -> None:
+        self._by_clause = {
+            json.dumps(_source_dsl(label), sort_keys=True): total for label, total in counts.items()
+        }
+        # Per-label ``event.dataset`` breakdown, the class dimension the
+        # zero-coverage half of the check reads. Unscripted labels answer with
+        # no buckets, which is "this label saw nothing" and never a blind spot.
+        self._classes_by_clause = {
+            json.dumps(_source_dsl(label), sort_keys=True): buckets
+            for label, buckets in (datasets or {}).items()
+        }
+        # Labels whose terms aggregation the grid cut short.
+        self._truncated = {
+            json.dumps(_source_dsl(label), sort_keys=True) for label in (truncated or set())
+        }
+        self._exc = exc
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        self.calls.append({"index": index, "query": query, **kwargs})
+        if self._exc is not None:
+            raise self._exc
+        clause = json.dumps(query["bool"]["must"][0], sort_keys=True)
+        buckets = [
+            {"key": ds, "doc_count": n} for ds, n in self._classes_by_clause.get(clause, {}).items()
+        ]
+        return EsSearchResult(
+            total=self._by_clause.get(clause, 0),
+            took_ms=1,
+            aggregations={
+                aq.ALERT_CLASS_AGG: {
+                    "buckets": buckets,
+                    "sum_other_doc_count": 1 if clause in self._truncated else 0,
+                }
+            },
+        )
+
+
+def _alerts_settings(settings: Settings, query: str) -> Settings:
+    return settings.model_copy(update={"webui_alerts_query": query})
+
+
+async def test_alerts_filter_matches_nothing_while_another_label_does(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """The dogfood shape: the configured filter is empty while the grid is not.
+
+    An alerts feed that finds nothing because it is asking the wrong question
+    is indistinguishable from a quiet network, which is the failure this check
+    exists to name. It must say WHICH label would have found the alerts.
+    """
+    search = _FakeAlertFilterSearch({"tags:alerts": 22, "event.kind:alert": 25})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "WARN"
+    assert "tags:alert" in result.detail
+    assert "event.kind:alert" in result.detail
+    assert "25" in result.detail
+    assert "event.kind:alert" in result.hint
+    assert "WEBUI_ALERTS_QUERY" in result.hint
+    # The sentence is the whole point of the row: an empty queue that the
+    # operator can tell apart from a quiet network. Asserting only WARN passes
+    # against the far-behind wording too, which never says the queue is empty.
+    assert "The grid is not quiet" in result.detail
+    assert fake.closed
+
+
+async def test_alerts_filter_matching_nothing_warns_however_few_the_alternative_found(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Zero is a different fact from few, and the margin must not swallow it.
+
+    A single ratio-and-margin rule reads three alerts against zero as ordinary
+    spread and PASSes. Nothing about the queue is ordinary: it is empty, alerts
+    exist, and the analyst sees an all-clear.
+    """
+    search = _FakeAlertFilterSearch({"tags:alerts": 3})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "WARN"
+    assert "tags:alerts" in result.hint
+
+
+async def test_alerts_filter_far_behind_an_alternative_warns(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Two matches is not zero, and it is still the wrong question.
+
+    The over-narrow guard: a check that only fires on an exactly-empty feed
+    would have called the measured grid healthy at 2 of 25.
+    """
+    search = _FakeAlertFilterSearch({"tags:alert": 2, "tags:alerts": 22, "event.kind:alert": 25})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "WARN"
+    assert "event.kind:alert" in result.hint
+
+
+async def test_alerts_filter_ahead_of_every_alternative_passes_and_pins_call_shape(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    union = "tags:alert OR tags:alerts OR event.kind:alert"
+    search = _FakeAlertFilterSearch(
+        {union: 25, "tags:alert": 2, "tags:alerts": 22, "event.kind:alert": 25}
+    )
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    settings = _alerts_settings(settings_kratos, union)
+    result = await doctor.check_alerts_feed_filter(settings)
+    assert result.status == "PASS"
+    assert "25" in result.detail
+    assert fake.closed
+    # Pin the wiring: one size=0/track_total_hits=True search per probed label,
+    # each scoped to the configured index pattern, each carrying the feed's own
+    # synthetic-row exclusion so the counts are the feed's counts and not a
+    # looser approximation of them.
+    assert len(search.calls) == 1 + len(aq.ALERT_LABEL_CANDIDATES)
+    for call in search.calls:
+        assert call["index"] == settings.events_index_pattern
+        assert call["size"] == 0
+        assert call["track_total_hits"] is True
+        assert {"exists": {"field": "synth.scenario_id"}} in call["query"]["bool"]["must_not"]
+
+
+async def test_alerts_filter_on_a_quiet_grid_passes_with_a_note(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """No label finds anything, so nothing is misconfigured. The grid is quiet.
+
+    The over-correction guard. Reporting a problem here would train operators
+    to ignore the row on every idle grid, which is how a real mismatch gets
+    scrolled past.
+    """
+    search = _FakeAlertFilterSearch({})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "PASS"
+    assert "No label found an alert" in result.detail
+    assert "triage queue will be empty" in result.detail
+
+
+async def test_alerts_filter_that_is_not_valid_oql_warns(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """A filter the query builder rejects empties the feed on every request."""
+    search = _FakeAlertFilterSearch({})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(
+        _alerts_settings(settings_kratos, "not_a_whitelisted_field:alert")
+    )
+    assert result.status == "WARN"
+    assert "WEBUI_ALERTS_QUERY" in result.hint
+    assert not search.calls  # rejected before any grid round trip
+
+
+async def test_alerts_filter_count_error_warns(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    search = _FakeAlertFilterSearch({}, exc=RuntimeError("no such index [logs-*]"))
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "WARN"
+    assert result.hint.startswith("Fix Elasticsearch connectivity first")
+    assert fake.closed
+
+
+async def test_alerts_filter_partial_grid_read_warns(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """A half-read grid undercounts the configured filter as easily as an
+    alternative, so it must never be reported as a filter mismatch."""
+    exc = GridPartialResultsError(
+        "partial search results from logs-*: 2 of 5 shards failed",
+        shards_failed=2,
+        shards_total=5,
+    )
+    search = _FakeAlertFilterSearch({}, exc=exc)
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "WARN"
+    assert "counts are unreliable" in result.detail
+    assert "WEBUI_ALERTS_QUERY" not in result.hint
+    assert result.hint.startswith("Fix Elasticsearch connectivity first")
+    assert fake.closed
+
+
+def _hint_filter(hint: str) -> str:
+    """The exact OQL the hint tells the operator to set, lifted verbatim.
+
+    A hint an operator has to interpret is a hint that gets interpreted
+    differently, so this reads the sentence the way a reader would: take what
+    follows ``WEBUI_ALERTS_QUERY=`` up to the end of that sentence (the next
+    ``". "``). Field names carry dots but never a dot-then-space, so this
+    never cuts the filter itself short.
+    """
+    _, _, tail = hint.partition("WEBUI_ALERTS_QUERY=")
+    return tail.split(". ")[0].strip()
+
+
+async def test_alerts_filter_hint_keeps_what_the_configured_filter_already_finds(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """The remedy must not cause the problem the check exists to detect.
+
+    Measured on a live grid on 2026-09-05: ``tags:alert`` matched 2 documents
+    and ``event.kind:alert`` matched 34, and the two sets were DISJOINT: the 2
+    carried no ``event.kind`` at all, and they were that grid's DCSync
+    detections, the highest-value alerts on it. A hint that says "set
+    WEBUI_ALERTS_QUERY=event.kind:alert" gets followed literally, and following
+    it drops those 2. A check that fires on a filter which hides alerts has to
+    recommend a SUPERSET of the filter in place, not a swap.
+    """
+    search = _FakeAlertFilterSearch({"tags:alert": 2, "event.kind:alert": 34})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert result.status == "WARN"
+    recommended = _hint_filter(result.hint)
+    # Pasteable and exact: the sentence names a value, and that value is OQL
+    # the feed's own builder accepts.
+    assert recommended
+    dsl = filter_to_dsl(parse_oql(recommended).filter_)
+    # The superset, proven on the query the recommendation compiles to: the
+    # label in place and the label that finds more are both ORed in, so
+    # nothing the operator can see today disappears when they follow the hint.
+    assert dsl == {
+        "bool": {
+            "should": [{"term": {"tags": "alert"}}, {"term": {"event.kind": "alert"}}],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+async def test_alerts_filter_hint_on_an_unparseable_filter_names_the_shipped_default(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Nothing to widen when the filter in place matches nothing anywhere.
+
+    A filter the query builder rejects empties the feed on every request, so
+    there is no coverage to preserve, and carrying the broken text into an OR
+    would hand back something that still does not parse. The hint still has to
+    name a value the operator can paste, and the product ships the right one.
+    """
+    search = _FakeAlertFilterSearch({})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(
+        _alerts_settings(settings_kratos, "not_a_whitelisted_field:alert")
+    )
+    assert result.status == "WARN"
+    assert _hint_filter(result.hint) == DEFAULT_ALERTS_QUERY
+    assert "not_a_whitelisted_field" not in result.hint
+
+
+async def test_alerts_filter_warns_when_a_class_has_zero_coverage(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """A ratio cannot express an alert class the queue never sees.
+
+    Measured on the deployed instance on 2026-09-06: the configured
+    ``event.dataset:suricata.alert`` matched 1,441 documents in 24 hours and
+    ``tags:alert`` matched 1,442, so every totals test on this row passes. The
+    difference is not spread: it is Security Onion's Sigma engine, whose
+    host-behavioural detections the configured filter matches NONE of. They have
+    never reached the queue and the ratio can never say so.
+    """
+    search = _FakeAlertFilterSearch(
+        {"event.dataset:suricata.alert": 1441, "tags:alert": 1442},
+        datasets={
+            "event.dataset:suricata.alert": {"suricata.alert": 1441},
+            "tags:alert": {"suricata.alert": 1441, "sigma.alert": 1},
+        },
+    )
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(
+        _alerts_settings(settings_kratos, "event.dataset:suricata.alert")
+    )
+    assert result.status == "WARN"
+    # Name the class. "Your filter is narrower" is not actionable; "the queue
+    # has never seen a sigma.alert" is.
+    assert "sigma.alert" in result.detail
+    assert "tags:alert" in result.detail
+    # And the remedy stays a widening, not a swap.
+    assert _hint_filter(result.hint) == "event.dataset:suricata.alert OR tags:alert"
+
+
+async def test_alerts_filter_zero_coverage_names_every_invisible_class(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Two blind spots are two facts, and the operator gets both."""
+    search = _FakeAlertFilterSearch(
+        {"event.dataset:suricata.alert": 500, "tags:alert": 504, "event.kind:alert": 502},
+        datasets={
+            "event.dataset:suricata.alert": {"suricata.alert": 500},
+            "tags:alert": {"suricata.alert": 500, "sigma.alert": 4},
+            "event.kind:alert": {"suricata.alert": 500, "endpoint.alerts": 2},
+        },
+    )
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(
+        _alerts_settings(settings_kratos, "event.dataset:suricata.alert")
+    )
+    assert result.status == "WARN"
+    assert "sigma.alert" in result.detail
+    assert "endpoint.alerts" in result.detail
+    # And ONE paste fixes both. This used to hand back only the label covering
+    # the most documents, so following the hint cleared one blind spot and the
+    # warning came back naming the other — which is what the home deployment
+    # experienced on 2026-09-07. Widest first: tags:alert recovers 4,
+    # event.kind:alert recovers 2.
+    assert (
+        _hint_filter(result.hint)
+        == "event.dataset:suricata.alert OR tags:alert OR event.kind:alert"
+    )
+
+
+async def test_alerts_filter_one_blind_class_still_recommends_one_label(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Negative control for the above: a single blind spot adds a single label.
+
+    Covering every class in one paste must not turn into naming every candidate
+    label the grid has. A label that recovers nothing has no business in a filter
+    the operator is about to paste.
+    """
+    search = _FakeAlertFilterSearch(
+        {"event.dataset:suricata.alert": 500, "tags:alert": 504, "event.kind:alert": 500},
+        datasets={
+            "event.dataset:suricata.alert": {"suricata.alert": 500},
+            "tags:alert": {"suricata.alert": 500, "sigma.alert": 4},
+            "event.kind:alert": {"suricata.alert": 500},
+        },
+    )
+    _patch_elastic(monkeypatch, _FakeElastic(search=search))
+    result = await doctor.check_alerts_feed_filter(
+        _alerts_settings(settings_kratos, "event.dataset:suricata.alert")
+    )
+    assert result.status == "WARN"
+    assert _hint_filter(result.hint) == "event.dataset:suricata.alert OR tags:alert"
+    assert "event.kind:alert" not in _hint_filter(result.hint)
+
+
+async def test_alerts_filter_covering_every_class_passes(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Negative control: a genuinely well-configured filter still passes.
+
+    The shipped default union sees every class an alternative sees, so there is
+    no blind spot to report, and a check that WARNs here would train the operator
+    to scroll past the row that matters.
+    """
+    union = DEFAULT_ALERTS_QUERY
+    search = _FakeAlertFilterSearch(
+        {union: 1442, "tags:alert": 1442, "tags:alerts": 0, "event.kind:alert": 2},
+        datasets={
+            union: {"suricata.alert": 1441, "sigma.alert": 1, "endpoint.alerts": 2},
+            "tags:alert": {"suricata.alert": 1441, "sigma.alert": 1},
+            "event.kind:alert": {"endpoint.alerts": 2},
+        },
+    )
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, union))
+    assert result.status == "PASS"
+
+
+async def test_alerts_filter_zero_coverage_ignores_a_truncated_class_list(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """A class list the grid cut short cannot prove a class is missing.
+
+    ``sum_other_doc_count`` above zero means the terms aggregation dropped
+    buckets, so "the configured filter matches none of X" may only mean "X fell
+    off the end of the list". A check that fires on that is a false alarm on a
+    healthy grid, which is the failure mode this row is least able to afford.
+    """
+    search = _FakeAlertFilterSearch(
+        {"event.dataset:suricata.alert": 1441, "tags:alert": 1442},
+        datasets={
+            "event.dataset:suricata.alert": {"suricata.alert": 1441},
+            "tags:alert": {"suricata.alert": 1441, "sigma.alert": 1},
+        },
+        truncated={"event.dataset:suricata.alert"},
+    )
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(
+        _alerts_settings(settings_kratos, "event.dataset:suricata.alert")
+    )
+    assert result.status == "PASS"
+
+
+async def test_alerts_filter_hint_says_where_the_value_actually_lives(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """The hint names both places the value can live, and which one wins.
+
+    On the deployed instance ``WEBUI_ALERTS_QUERY`` is set in an environment
+    file, and the config console writes a database override that is applied over
+    the environment at startup. Telling the owner to use the console is only
+    true because of that precedence, so the sentence says it: a console save
+    takes effect immediately and outranks the file.
+    """
+    search = _FakeAlertFilterSearch({"tags:alerts": 22, "event.kind:alert": 25})
+    fake = _FakeElastic(search=search)
+    _patch_elastic(monkeypatch, fake)
+    result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
+    assert "WEBUI_ALERTS_QUERY" in result.hint
+    assert "Queries" in result.hint
+    assert "overrides" in result.hint or "outranks" in result.hint
+
+
+async def test_doctor_grades_the_filter_the_app_actually_runs(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings, tmp_path: Path
+) -> None:
+    """``soc-ai doctor`` reads the saved console overrides, not just the env file.
+
+    Measured on the deployed instance: ``ORACLE_MODEL`` is one value in the
+    environment file and another in ``config_overrides``, and the running app
+    uses the database one. A doctor that grades only the file grades a
+    configuration nothing is running, and it would go on reporting the same
+    alerts-filter warning after the owner fixed it in the console, which is the
+    one place the hint sends them.
+    """
+    from soc_ai.store.config_overrides import set_override
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+    settings = settings_kratos.model_copy(
+        update={"soc_ai_data_dir": tmp_path, "webui_alerts_query": "tags:alert"}
+    )
+    engine = make_engine(settings)
+    await run_migrations(engine)
+    async with make_sessionmaker(engine)() as db:
+        await set_override(
+            db, "webui_alerts_query", "tags:alert OR event.kind:alert", updated_by=None
+        )
+    await engine.dispose()
+
+    applied = await doctor.apply_persisted_overrides(settings)
+    assert applied == ["webui_alerts_query"]
+    assert settings.webui_alerts_query == "tags:alert OR event.kind:alert"
+
+
+async def test_doctor_override_read_is_fail_soft_without_a_store(
+    settings_kratos: Settings, tmp_path: Path
+) -> None:
+    """No store yet (a fresh install running the doctor first) is not an error.
+
+    ``check_store`` reports a missing or broken store on its own row; this read
+    must never be the thing that takes the doctor down.
+    """
+    settings = settings_kratos.model_copy(update={"soc_ai_data_dir": tmp_path / "nope"})
+    assert await doctor.apply_persisted_overrides(settings) == []

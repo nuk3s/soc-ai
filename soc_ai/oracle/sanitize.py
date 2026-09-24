@@ -45,7 +45,12 @@ from re import Pattern
 from typing import Any
 
 from soc_ai.config import get_settings
-from soc_ai.oracle._cred_data import CRED_KEYS, CRED_VALUE_STOPSET
+from soc_ai.oracle._cred_data import (
+    CRED_KEYS,
+    CRED_VALUE_STOPSET,
+    plausible_credential_value,
+    plausible_netbios_domain,
+)
 
 # ---------------------------------------------------------------------------
 # Compiled patterns  (module-level — compiled once, reused everywhere)
@@ -839,8 +844,11 @@ _RESIDUE_CRED_VALUE = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?"
 # the json.dumps'd wire form ``\"key\": \"val\"`` is tolerated too.
 _RESIDUE_CRED_KV_RE = re.compile(
     r"(?<![\w.])(?:" + CRED_KEYS + r")"
-    r"\s*\\?\"?\s*[:=]\s*\\?\"?"
-    r"(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@-])",
+    # The backslash is allowed ONLY before a quote (the json.dumps'd ``\"``).
+    # A bare optional backslash swallowed the ``\`` of a ``\n`` and read the
+    # next line's first word as the value (``user:\npaths`` -> ``npaths``).
+    r"\s*(?:\\?\")?\s*[:=]\s*(?:\\?\")?"
+    r"(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@/-])",
     re.IGNORECASE,
 )
 # The 4624/4625 ``Account Name:`` (a username) / ``Account Domain:`` (a NetBIOS
@@ -848,11 +856,11 @@ _RESIDUE_CRED_KV_RE = re.compile(
 # so these are separate nets (mirror redact.py:_CRED_ACCOUNT_NAME_RE /
 # _CRED_ACCOUNT_DOMAIN_RE).
 _RESIDUE_CRED_ACCOUNT_NAME_RE = re.compile(
-    r"Account Name\s*:\s+(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@-])",
+    r"Account Name\s*:\s+(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@/-])",
     re.IGNORECASE,
 )
 _RESIDUE_CRED_ACCOUNT_DOMAIN_RE = re.compile(
-    r"Account Domain\s*:\s+(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@-])",
+    r"Account Domain\s*:\s+(?P<val>" + _RESIDUE_CRED_VALUE + r")(?![\w@/-])",
     re.IGNORECASE,
 )
 # NetBIOS ``DOMAIN\user`` down-level logon — mode-aware separator, because this net
@@ -940,6 +948,8 @@ def _residue_credentials(text: str, allow: set[str], *, wire_escaped: bool = Fal
             return
         if not any(c.isalpha() for c in val):
             return
+        if not plausible_credential_value(val):
+            return
         issues.append(f"residual credential username: {val}")
 
     # KV + Account Name → username context.
@@ -954,6 +964,8 @@ def _residue_credentials(text: str, allow: set[str], *, wire_escaped: bool = Fal
     netbios_re = _RESIDUE_CRED_NETBIOS_RE_WIRE if wire_escaped else _RESIDUE_CRED_NETBIOS_RE_RAW
     for mat in netbios_re.finditer(text):
         if _residue_is_nondomain_prefix(mat.group("dom")):
+            continue
+        if not plausible_netbios_domain(mat.group("dom")):
             continue
         _emit_username(mat.group("val"))
 
@@ -1058,6 +1070,11 @@ def _residue_known_values(
             continue
         # Skip opaque labels (HOST_01, USER_02, etc.) — those are the desired
         # output, not a leak.
+        # A learned value that fails the shared shape rule was learned by an
+        # older build or from a structured field the rule does not gate; a
+        # one-character value matches everywhere and refuses by construction.
+        if len(kv) < 2 or not plausible_netbios_domain(kv):
+            continue
         if _OPAQUE_LABEL_RE.fullmatch(kv):
             continue
         # Word-boundary check — case-insensitive so FINANCE-PC fires on

@@ -24,6 +24,7 @@ def test_investigate_threads_deep_to_pipeline() -> None:
         deep: bool = False,
         allow_so_writes: bool = True,
         focus_origin: str = "rerun",
+        subject: Any = None,
     ):
         captured["deep"] = deep
         return
@@ -51,6 +52,7 @@ def test_run_recorded_threads_deep_to_investigate() -> None:
         deep: bool = False,
         allow_so_writes: bool = True,
         focus_origin: str = "rerun",
+        subject: Any = None,
     ):
         captured["deep"] = deep
 

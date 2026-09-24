@@ -31,7 +31,15 @@ DEFAULT_WINDOW_MINUTES = 1440
 
 @dataclass(frozen=True)
 class _Builtin:
-    """One shipped template: the pill's name + full objective + the telemetry it needs."""
+    """One shipped template: the pill's name + full objective + the telemetry it needs.
+
+    Each ``required_datasets`` element is ONE requirement. An element may name
+    several planes separated by :data:`ALTERNATIVE_SEP`, any one of which
+    satisfies it — ``"zeek.rdp|system.security"`` is "RDP sessions, from either
+    the Zeek log or Windows logon type 10". The wire type stays ``list[str]``
+    so nothing upstream changes shape; the store normalises the element and the
+    availability check splits it.
+    """
 
     name: str
     objective_template: str
@@ -50,60 +58,80 @@ _BUILTINS: tuple[_Builtin, ...] = (
     _Builtin(
         name="Beaconing to rare IPs",
         objective_template=(
-            "Hunt for internal hosts beaconing to rare external IPs in the last 24h — "
-            "regular cadence, low data volume, novel destinations. Use t_beacon_profile "
-            "to measure cadence and t_first_seen for novel destinations before concluding."
+            "Hunt for internal hosts that beacon to rare external IP addresses in "
+            "the last 24 h. Look for a regular cadence, a low data volume and novel "
+            "destinations. Use t_beacon_profile to measure the cadence. Use "
+            "t_first_seen to find the novel destinations. Reach a conclusion after "
+            "both tools run."
         ),
-        required_datasets=("zeek.conn",),
+        required_datasets=("zeek.conn|network_traffic.flow|endpoint.events.network",),
     ),
     _Builtin(
         name="Credential abuse / lockouts",
         objective_template=(
-            "Hunt for credential-abuse signals: account lockouts, failed-auth spikes, "
-            "and Kerberoasting on the domain controllers."
+            "Hunt for credential-abuse signals on the domain controllers. Look for "
+            "account lockouts, failed-authentication spikes and Kerberoasting."
         ),
-        required_datasets=("zeek.kerberos",),
+        # Lockouts (4740) and failed auth (4625) are Windows events; Kerberos
+        # ticket activity is visible from either the Zeek log or 4768/4769.
+        required_datasets=("zeek.kerberos|system.security",),
     ),
     _Builtin(
         name="Lateral movement",
         objective_template=(
-            "Hunt for lateral movement: SMB/admin-share access, PsExec-style service "
-            "creation, and RDP between internal hosts."
+            "Hunt for lateral movement between internal hosts. Look for SMB and "
+            "admin-share access, PsExec-style service creation, and RDP sessions."
         ),
-        required_datasets=("zeek.smb_files", "zeek.rdp", "zeek.kerberos"),
+        # RDP sessions are logon type 10 in system.security on any grid that
+        # ships Windows security logs, whether or not Zeek parses RDP there.
+        required_datasets=(
+            "zeek.smb_files",
+            "zeek.rdp|system.security",
+            "zeek.kerberos|system.security",
+        ),
     ),
     _Builtin(
         name="DNS / C2 exfiltration",
         objective_template=(
-            "Hunt for DNS tunneling and C2 exfiltration: high-entropy or high-volume DNS, "
-            "long TXT records, and beaconing over DNS. Use t_dns_entropy_scan to measure "
-            "qname entropy and volume before concluding."
+            "Hunt for DNS tunneling and C2 exfiltration. Look for high-entropy DNS, "
+            "high-volume DNS, long TXT records and beacons over DNS. Use "
+            "t_dns_entropy_scan to measure the qname entropy and the volume. Reach "
+            "a conclusion after the tool runs."
         ),
-        required_datasets=("zeek.dns",),
+        required_datasets=("zeek.dns|network_traffic.dns",),
     ),
     _Builtin(
         name="New external services",
         objective_template=(
-            "Hunt for internal hosts newly exposing or reaching new external services this "
-            "week that they never used before. Use t_first_seen to diff recent destinations "
-            "against the 30-day baseline."
+            "Hunt for internal hosts that expose or reach a new external service "
+            "this week. The host must never have used that service before. Use "
+            "t_first_seen to compare the recent destinations against its trailing "
+            "baseline. The behavioural profile on the host page holds the same peer "
+            "set. A destination absent from that peer set is the signal."
         ),
-        required_datasets=("zeek.conn",),
+        required_datasets=("zeek.conn|network_traffic.flow|endpoint.events.network",),
     ),
     _Builtin(
         name="Suspicious PowerShell / LOLBins",
         objective_template=(
-            "Hunt for suspicious PowerShell and living-off-the-land binary use across endpoints."
+            "Hunt for suspicious PowerShell and living-off-the-land binary use "
+            "across the endpoints."
         ),
-        required_datasets=("endpoint",),
+        # Elastic Defend has no bare `endpoint` data stream. Process execution,
+        # which is what a PowerShell or LOLBin hunt reads, is
+        # `endpoint.events.process`; loaded modules are
+        # `endpoint.events.library`, and so on. The old value matched nothing,
+        # so this template reported missing telemetry on every Elastic Defend
+        # grid there has ever been.
+        required_datasets=("endpoint.events.process",),
     ),
     _Builtin(
         name="DCE-RPC abuse / DC attacks",
         objective_template=(
-            "Hunt for domain-controller attack patterns in DCE-RPC: Zerologon-style "
-            "NetrServerAuthenticate floods, DCSync (DRSGetNCChanges), and remote service "
-            "creation. Use t_dcerpc_histogram first; investigate any flagged or rare "
-            "dangerous operation."
+            "Hunt for domain-controller attack patterns in DCE-RPC. Look for "
+            "Zerologon-style NetrServerAuthenticate floods, DCSync through "
+            "DRSGetNCChanges, and remote service creation. Run t_dcerpc_histogram "
+            "first. Investigate every flagged or rare dangerous operation."
         ),
         required_datasets=("zeek.dce_rpc",),
     ),
@@ -144,18 +172,69 @@ ENV_REQUIREMENT_PHRASES: dict[str, str] = {
 }
 
 
+# One requirement, several planes that satisfy it. A hunt that three planes
+# could serve used to be able to name only one, and reported itself
+# unavailable everywhere else: on the range, "Lateral movement" required
+# zeek.rdp, which that grid has never produced, while every RDP session sat
+# in system.security as logon type 10.
+ALTERNATIVE_SEP = "|"
+
+
+def alternatives(requirement: str) -> tuple[str, ...]:
+    """The planes that satisfy one ``required_datasets`` element, in order.
+
+    Whitespace around each is dropped and empties are skipped, so a hand-typed
+    ``" zeek.rdp | system.security "`` is the same requirement as the canonical
+    form. A plain name is a one-element tuple.
+    """
+    return tuple(p.strip() for p in requirement.split(ALTERNATIVE_SEP) if p.strip())
+
+
 def _norm_datasets(values: object) -> list[str]:
-    """Coerce ``required_datasets`` into a clean list of non-empty, de-duplicated
-    strings (order-preserving). Anything non-list-like becomes ``[]``."""
+    """Coerce ``required_datasets`` into clean, de-duplicated requirements.
+
+    Each element is re-joined from its :func:`alternatives`, so ``"a|"`` and
+    ``"a"`` store as the same requirement and compare equal on the wire, and an
+    element with no surviving plane is dropped. Anything non-list-like is ``[]``.
+    """
+    if not values or not isinstance(values, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        alts = alternatives(str(v))
+        if not alts:
+            continue
+        s = ALTERNATIVE_SEP.join(dict.fromkeys(alts))
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# The most analytics one starter may name. A starter that runs 30 analytics
+# before it reads anything has spent the hunt's tool budget on the prologue.
+MAX_TEMPLATE_ANALYTICS = 8
+
+
+def _norm_analytics(values: object) -> list[str]:
+    """Coerce ``analytics`` into a clean, de-duplicated, bounded id list.
+
+    Blanks are dropped and order is kept, because the order is the order the
+    objective asks the agent to run them in. Anything non-list-like is ``[]``.
+    """
     if not values or not isinstance(values, (list, tuple, set)):
         return []
     out: list[str] = []
     seen: set[str] = set()
     for v in values:
         s = str(v).strip()
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s[:64])
+        if len(out) >= MAX_TEMPLATE_ANALYTICS:
+            break
     return out
 
 
@@ -168,6 +247,7 @@ async def create(
     name: str,
     objective_template: str = "",
     required_datasets: list[str] | None = None,
+    analytics: list[str] | None = None,
     default_window_minutes: int = DEFAULT_WINDOW_MINUTES,
     builtin: bool = False,
     created_by: str = "anonymous",
@@ -177,6 +257,7 @@ async def create(
         name=name[:256],
         objective_template=objective_template,
         required_datasets=_norm_datasets(required_datasets),
+        analytics_json=_norm_analytics(analytics),
         default_window_minutes=max(int(default_window_minutes), 1),
         builtin=builtin,
         created_by=created_by[:128],
@@ -218,6 +299,7 @@ async def update(
     name: str | None = None,
     objective_template: str | None = None,
     required_datasets: list[str] | None = None,
+    analytics: list[str] | None = None,
     default_window_minutes: int | None = None,
 ) -> HuntTemplate | None:
     """Patch the given fields (``None`` = leave unchanged). Returns the row or None.
@@ -234,6 +316,8 @@ async def update(
         template.objective_template = objective_template
     if required_datasets is not None:
         template.required_datasets = _norm_datasets(required_datasets)
+    if analytics is not None:
+        template.analytics_json = _norm_analytics(analytics)
     if default_window_minutes is not None:
         template.default_window_minutes = max(int(default_window_minutes), 1)
     await db.commit()

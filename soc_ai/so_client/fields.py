@@ -27,6 +27,7 @@ re-exports it for backward compatibility.
 
 from __future__ import annotations
 
+import ipaddress
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -252,6 +253,219 @@ def first_present(source: Mapping[str, Any], candidates: Sequence[str]) -> Any:
         if not _is_absent(value):
             return value
     return None
+
+
+# ---------------------------------------------------------------------------
+# The `event_data` envelope
+#
+# Security Onion's Sigma pipeline does not merge the document a rule matched
+# into the alert it writes. The alert carries the DETECTION's identity at the
+# top level (``rule.*``, ``event.module``, ``event.dataset``, ``event.severity``,
+# ``@timestamp``) and nests the WHOLE originating document under ``event_data``.
+#
+# Measured on 55 ``sigma.alert`` documents from a live grid: zero carried a
+# top-level ``source.ip``, ``destination.ip``, ``host.name``, ``host.ip``,
+# ``user.name``, ``process.entity_id``, ``file.hash.sha256``,
+# ``network.community_id``, ``event.action``, ``event.category`` or ``message``,
+# while 48 carried a nested ``source.ip`` and 53 a nested ``host.name``.
+#
+# PRECEDENCE IS TOP-LEVEL-WINS, and the evidence for it is the three fields that
+# are present at BOTH levels on those documents: ``event.module``,
+# ``event.dataset`` and ``tags`` disagree on every single one, because the top
+# level describes the Sigma detection (``sigma`` / ``sigma.alert`` / ``alert``)
+# and the envelope describes the log it fired on (``system`` / ``system.auth``).
+# Letting the envelope win there would relabel every Sigma alert as the dataset
+# it matched. So the envelope is consulted only as a FALLBACK, and only for the
+# fields that describe what happened; the fields that name the detection are not
+# unwrapped at all (see ``SoAlert.from_es_hit``).
+# ---------------------------------------------------------------------------
+
+ENVELOPE_FIELD = "event_data"
+
+
+def envelope(source: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The originating document nested under ``event_data``, or an empty map.
+
+    Handles both document layouts, exactly as :func:`get_dotted` does: a nested
+    ``{"event_data": {...}}`` object is returned as-is, and a flat-dotted
+    ``{"event_data.source.ip": ...}`` layout is re-keyed with the prefix
+    stripped so the result reads like any other ``_source``.
+
+    Returned once per document and passed around rather than recomputed, because
+    the flat branch walks every key.
+    """
+    nested = source.get(ENVELOPE_FIELD)
+    if isinstance(nested, Mapping):
+        return nested
+    prefix = f"{ENVELOPE_FIELD}."
+    return {key[len(prefix) :]: value for key, value in source.items() if key.startswith(prefix)}
+
+
+def unwrapped(source: Mapping[str, Any], env: Mapping[str, Any], path: str) -> Any:
+    """Read ``path`` from the document, falling back to its envelope.
+
+    Absence is :func:`_is_absent`'s definition, not falsiness: a ``0`` port or a
+    ``False`` flag at the top level is a real reading and must not fall through
+    to the envelope.
+    """
+    value = get_dotted(source, path)
+    if not _is_absent(value):
+        return value
+    return get_dotted(env, path)
+
+
+def unwrapped_first_present(
+    source: Mapping[str, Any], env: Mapping[str, Any], candidates: Sequence[str]
+) -> Any:
+    """:func:`first_present` over the document, then over its envelope.
+
+    The whole candidate list is tried at the top level before the envelope is
+    consulted, so an ECS-vs-``zeek.*`` fallback never outranks a top-level
+    reading of the same logical field.
+    """
+    value = first_present(source, candidates)
+    if value is not None:
+        return value
+    return first_present(env, candidates)
+
+
+# ---------------------------------------------------------------------------
+# Dataset identity
+#
+# A document's telemetry plane, ECS-first with a fallback that is not optional.
+# Elastic Agent integrations that ship through a data stream may carry the plane
+# ONLY in ``data_stream.dataset``: on the development grid, 632,523 documents
+# have no ``event.dataset`` at all, and every single one of them has
+# ``data_stream.dataset``. Eight planes were affected, including the flow, DNS,
+# TLS and HTTP telemetry from the only sensor watching the live range VLANs.
+#
+# The consequence of reading only ``event.dataset`` was not a missing label. The
+# dataset census aggregates on it, so those planes were absent from the "data
+# available on this grid" block the agent is handed — it was told they do not
+# exist while being perfectly able to query them — and the hunt corroboration
+# gate drops a hit with no dataset as "cannot positively identify", so evidence
+# found there could not support a finding.
+#
+# ``event.module`` is last and coarser (``network_traffic`` rather than
+# ``network_traffic.dns``). It is included because 134 documents on that grid
+# carry a module and no data stream, and a coarse plane beats none.
+# ---------------------------------------------------------------------------
+
+DATASET_IDENTITY: tuple[str, ...] = (
+    "event.dataset",
+    "data_stream.dataset",
+    "event.module",
+)
+
+# The two fields that carry a DATASET NAME, in census order. ``event.module``
+# is deliberately absent: it is a coarser value from the same family
+# (``network_traffic`` where the dataset is ``network_traffic.dns``), so a term
+# match on it selects a superset of the plane that was asked for.
+DATASET_NAME_FIELDS: tuple[str, ...] = ("event.dataset", "data_stream.dataset")
+
+
+def dataset_name_filter(dataset: str) -> dict[str, Any]:
+    """An ES filter clause selecting ``dataset`` under either name field.
+
+    A tool that takes a dataset name is handed one by the model, and the model
+    gets its names from the ambient inventory, which lists planes found under
+    both fields. Scoping such a tool to ``event.dataset`` alone answers "no
+    documents" for a plane that is only ever named by ``data_stream.dataset``,
+    which is indistinguishable from the plane not existing.
+    """
+    return {
+        "bool": {
+            "should": [{"term": {f: dataset}} for f in DATASET_NAME_FIELDS],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+# The datasets that carry CONNECTION records — one row per flow, with the
+# responder's port in ``destination.port``.
+#
+# This exists because "ports this host serves" has to exclude alert documents,
+# which also carry ``destination.port`` and would fill the answer with
+# IDS-targeted ports the host never served. The first cut expressed that as
+# ``event.dataset: zeek.conn``, which excludes alerts correctly and also
+# excludes every other flow sensor.
+#
+# The cost of that was not theoretical. Role inference is driven entirely by
+# served ports, so on a Security Onion running Elastic Agent without Zeek NO
+# HOST CAN EVER BE CLASSIFIED — and every role-scoped prior on such a grid is
+# permanently blind. On the measured range it was worse than that: Zeek was
+# present, shipping, and emitting 885,000 documents that carried no
+# ``destination.port`` at all, so the aggregation was scoped to a plane that
+# could not answer while three others could.
+FLOW_DATASETS: tuple[str, ...] = (
+    "zeek.conn",
+    "network_traffic.flow",
+    "endpoint.events.network",
+)
+
+
+# The IANA dynamic/private range. A port at or above this is the far end of a
+# dynamically negotiated channel -- RPC, NFS, passive FTP -- assigned fresh per
+# connection. It is novel by construction and says nothing about what a host
+# does. The DC's "services offered" listed 20 ports of which 13 were these; the
+# profile builder had already learned the same lesson the hard way (its first
+# four findings were all ephemeral ports).
+EPHEMERAL_PORT_FLOOR = 49152
+
+
+def is_peer_address(value: str) -> bool:
+    """Whether an address can be another machine at all.
+
+    Multicast, link-local, loopback, unspecified and the limited broadcast are
+    the host addressing the segment or itself, not a peer. mDNS to 224.0.0.251
+    and LLMNR to 224.0.0.252 appeared as the DC's top "external peers" on the
+    host page, and as members of every host's peer profile — left in, a
+    novel-destination prior fires on the first one a host ever sends.
+
+    A subnet's directed broadcast (10.1.10.255) is deliberately KEPT: it is a
+    real destination the host chose, and dropping it needs a guess at the mask.
+    A value that is not an address at all (a hostname) is not this test's
+    business and passes.
+    """
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return True
+    if addr.is_multicast or addr.is_link_local or addr.is_loopback or addr.is_unspecified:
+        return False
+    return str(addr) != "255.255.255.255"
+
+
+def flow_dataset_filter() -> dict[str, Any]:
+    """An ES clause selecting connection records from any flow sensor.
+
+    Matched under BOTH dataset name fields: ``network_traffic.*`` carries no
+    ``event.dataset`` at all on a stock Security Onion, so a single-field term
+    silently excludes the largest flow plane on the grid.
+    """
+    return {
+        "bool": {
+            "should": [
+                {"term": {name_field: dataset}}
+                for dataset in FLOW_DATASETS
+                for name_field in DATASET_NAME_FIELDS
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+def dataset_of(source: Mapping[str, Any]) -> str | None:
+    """The document's telemetry plane, or None if it genuinely has no identity.
+
+    Returns None rather than a placeholder: a caller that needs to distinguish
+    "this is zeek.conn" from "this document identifies itself as nothing" is
+    making a real decision, and a synthesised value would remove it.
+    """
+    value = first_present(source, DATASET_IDENTITY)
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value if isinstance(value, str) and value else None
 
 
 # ---------------------------------------------------------------------------

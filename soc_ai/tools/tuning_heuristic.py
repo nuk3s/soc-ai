@@ -21,12 +21,17 @@ from __future__ import annotations
 # A rule must clear MIN_ALERTS firings in the window to be "high volume" at all
 # (a rule that fired 4× is not a tuning problem however its triage landed).
 # MUTE_MIN_ALERTS is the higher bar for a confident mute recommendation. A rule
-# is only nominated once it has been investigated MIN_INVESTIGATIONS times with
-# at least MIN_FP false positives and ZERO true positives — we never nominate a
-# rule that has ever caught a real positive, however noisy.
+# is only nominated once it has been TRIAGED MIN_TRIAGED times with at least
+# MIN_FP false positives and ZERO true positives — we never nominate a rule that
+# has ever caught a real positive, however noisy.
+#
+# Both volume floors mean "this rule keeps coming back". They cannot see that on
+# their own: 1531 fires of a lateral-movement signature inside 59 seconds clears
+# MUTE_MIN_ALERTS by 15x and is one episode, not a recurring nuisance, so
+# ``is_burst`` is a separate input rather than something inferred from volume.
 MIN_ALERTS = 25  # floor to be considered "noisy" at all
 MUTE_MIN_ALERTS = 100  # high-volume floor for a confident "mute"
-MIN_INVESTIGATIONS = 3  # need a few data points before trusting the FP trend
+MIN_TRIAGED = 3  # need a few dispositioned data points before trusting the FP trend
 MIN_FP = 3  # at least this many false positives in the trend
 
 # When an analyst repeatedly OVERRIDES a rule's verdict to false-positive (or
@@ -38,7 +43,14 @@ OVERRIDE_FP_SIGNAL = 2
 
 
 def assess(
-    alert_count: int, fp: int, tp: int, nmi: int, override_fp: int = 0
+    alert_count: int,
+    fp: int,
+    tp: int,
+    nmi: int,
+    override_fp: int = 0,
+    *,
+    triaged: int | None = None,
+    is_burst: bool = False,
 ) -> tuple[bool, str, str]:
     """Decide whether a rule is noisy and what to recommend.
 
@@ -51,6 +63,16 @@ def assess(
     positional callers (the ``suggest_rule_tuning`` agent tool + the MCP server)
     are unaffected.
 
+    ``triaged`` (optional) is how many of the rule's alerts actually have a
+    disposition behind them. It defaults to ``fp + tp + nmi``, which is right for
+    the Detection Tuning panel, where all three are completed investigations. The
+    ES-proxy caller folds every UNTRIAGED alert into ``nmi``, so it passes the
+    real figure: without it, ``MIN_TRIAGED`` is satisfied by alert volume alone
+    and the reason claims a rule nobody looked at was examined 1531 times.
+
+    ``is_burst`` (optional) says the alerts arrived as one episode rather than as
+    a recurring rate. A burst is never a mute candidate however large it is.
+
     Returns ``(is_noisy, recommendation, reason)`` where ``recommendation`` is one
     of ``"mute"`` / ``"monitor"`` / ``"none"`` and ``reason`` is a one-line human
     explanation. A rule with ANY true positive is never noisy (it has caught real
@@ -59,7 +81,7 @@ def assess(
     ``none`` — UNLESS the analyst has repeatedly overridden it to FP, which on its
     own surfaces the rule (institutional memory outweighs a thin AI trend).
     """
-    investigations = fp + tp + nmi
+    triaged = fp + tp + nmi if triaged is None else triaged
     strong_override = override_fp >= OVERRIDE_FP_SIGNAL
 
     # A rule that ever caught a real positive is never a mute/monitor candidate —
@@ -72,8 +94,36 @@ def assess(
             False,
             "none",
             (
-                f"fired {alert_count}×, investigated {investigations}× — "
+                f"fired {alert_count}×, {triaged} triaged — "
                 f"{tp} true positive: keep (caught real signal)"
+            ),
+        )
+
+    # One episode is not a recurring nuisance, so the volume floors below do not
+    # apply to it however large the count is. Muting on a burst is the worst
+    # available move: the measured case was 1531 fires of a lateral-movement
+    # signature in 59 seconds, and suppressing that signature would have deleted
+    # the loudest evidence of the intrusion that produced it. Analyst
+    # FP-overrides still surface the rule, because a human saying "benign" is
+    # about the rule rather than about this episode — but only as far as monitor.
+    if is_burst:
+        if strong_override:
+            return (
+                True,
+                "monitor",
+                (
+                    f"fired {alert_count}× but as a single burst rather than a recurring "
+                    f"rate, so volume says nothing about noise; {override_fp} analyst "
+                    "FP-overrides on this rule, so watch it"
+                ),
+            )
+        return (
+            False,
+            "none",
+            (
+                f"fired {alert_count}× but as a single burst rather than a recurring "
+                "rate — one episode is not a tuning problem, and the burst itself may be "
+                "the event worth investigating"
             ),
         )
 
@@ -101,14 +151,14 @@ def assess(
     # → monitor, but repeated analyst FP-overrides upgrade the lean: at high volume
     # a strong analyst benign signal is enough for a confident mute even on a thin
     # AI-FP history (the human corrected it repeatedly).
-    if investigations < MIN_INVESTIGATIONS or fp < MIN_FP:
+    if triaged < MIN_TRIAGED or fp < MIN_FP:
         if strong_override:
             recommendation = "mute" if alert_count >= MUTE_MIN_ALERTS else "monitor"
             return (
                 True,
                 recommendation,
                 (
-                    f"fired {alert_count}×, investigated {investigations}× "
+                    f"fired {alert_count}×, {triaged} triaged "
                     f"({fp} FP / {nmi} NMI, 0 TP) — thin AI trend but "
                     f"{override_fp} analyst FP-overrides (human corrected it to benign)"
                 ),
@@ -117,7 +167,7 @@ def assess(
             False,
             "monitor",
             (
-                f"fired {alert_count}×, investigated {investigations}× "
+                f"fired {alert_count}×, {triaged} triaged "
                 f"({fp} FP / {nmi} NMI, 0 TP) — high volume but thin triage history; "
                 "watch it"
             ),
@@ -130,7 +180,7 @@ def assess(
             True,
             "mute",
             (
-                f"fired {alert_count}×, investigated {investigations}× — "
+                f"fired {alert_count}×, {triaged} triaged — "
                 f"all false positive ({fp} FP / {nmi} NMI), 0 true positive"
                 f"{override_note}"
             ),
@@ -144,7 +194,7 @@ def assess(
             True,
             "mute",
             (
-                f"fired {alert_count}×, investigated {investigations}× — "
+                f"fired {alert_count}×, {triaged} triaged — "
                 f"all false positive ({fp} FP / {nmi} NMI), 0 true positive, "
                 f"and {override_fp} analyst FP-overrides (human corrected it to benign)"
             ),
@@ -153,7 +203,7 @@ def assess(
         True,
         "monitor",
         (
-            f"fired {alert_count}×, investigated {investigations}× — "
+            f"fired {alert_count}×, {triaged} triaged — "
             f"all false positive ({fp} FP / {nmi} NMI), 0 true positive, "
             f"but under the high-volume bar ({MUTE_MIN_ALERTS})"
         ),
@@ -163,7 +213,7 @@ def assess(
 __all__ = [
     "MIN_ALERTS",
     "MIN_FP",
-    "MIN_INVESTIGATIONS",
+    "MIN_TRIAGED",
     "MUTE_MIN_ALERTS",
     "OVERRIDE_FP_SIGNAL",
     "assess",

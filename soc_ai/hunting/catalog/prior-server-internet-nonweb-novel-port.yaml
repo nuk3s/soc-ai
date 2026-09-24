@@ -1,0 +1,41 @@
+id: prior-server-internet-nonweb-novel-port
+title: A server connects to the internet on a port it has never used
+description: >
+  Servers are the most predictable machines on a network. A server answers
+  requests and fetches updates. It does little else. An outbound connection to a
+  destination outside the estate, on a port this server has never used, matches
+  command-and-control, exfiltration and a second-stage download.
+
+  The dimension counts flows to destinations outside the estate only. A server
+  talking to its own domain controller is not a server reaching the internet.
+
+  The dimension also drops the dynamic port range. A port assigned per
+  connection is new on every connection, and the first live run of this
+  analytic reported 4 of them and nothing else.
+
+  Ports 80 and 443 are in scope. A server that already fetches updates holds
+  both in its baseline, so they rarely depart.
+
+level: high
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: consumed_ports
+  test: novel_for
+  roles:
+    - server
+
+attack:
+  - T1571
+  - T1041
+
+false_positives:
+  - An operator enables a new integration or a licence check on the server. The
+    new port joins the baseline within the support window.
+  - A software update mechanism uses a non-standard port. Appliance images do
+    this often. The port appears once per server and then joins the baseline.
+
+references:
+  - https://attack.mitre.org/techniques/T1571/

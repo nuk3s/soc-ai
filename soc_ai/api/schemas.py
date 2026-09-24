@@ -13,9 +13,43 @@ class InvestigateRequest(BaseModel):
     alert_id: str = Field(min_length=1)
 
 
-class HealthResponse(BaseModel):
-    status: Literal["ok"] = "ok"
+class LivenessResponse(BaseModel):
+    """What ``/healthz`` can honestly say: this process answered.
+
+    Named liveness, not health, and it says ``alive`` rather than ``ok``,
+    because the container healthcheck polls this endpoint and Docker renders
+    the result as the single word *healthy*. A deployment with an unreachable
+    grid, a dead model gateway and a green ``docker ps`` is a normal Tuesday
+    here, and "healthy" was read as a verdict on the product by people looking
+    at exactly that.
+
+    **This endpoint probes nothing, on purpose.** A liveness probe that failed
+    on a dependency outage would have the orchestrator restart a container
+    whose dependencies are merely down — turning somebody else's outage into a
+    restart loop, and taking away the one surface that could have explained it.
+    So the status stays unconditional; what changes is that it no longer claims
+    something it never measured.
+
+    ``checks`` carries that sentence on the wire rather than only in this
+    docstring, because the two places this body is actually read are a paste of
+    ``curl .../healthz`` and ``docker inspect``'s health log, and neither of
+    them shows a docstring.
+    """
+
+    # Unconditional by design (see above) — the process cannot answer when it is
+    # not alive, which is the entire signal a liveness probe carries.
+    status: Literal["alive"] = "alive"
+    checks: str = (
+        "none — liveness only, no dependency is probed. "
+        "For a health verdict use GET /api/v1/health or `soc-ai doctor`."
+    )
     version: str
+    # The build inside that version. Both deployments run the image as
+    # `:latest`, so the version string cannot tell two builds of one release
+    # apart — which is what a bug report and the quality trend both need. Baked
+    # in at image build time; null on any build nothing stamped, because a wrong
+    # commit is worse than a missing one.
+    commit: str | None = None
     so_auth: Literal["kratos", "connect"]
     misp_configured: bool
 

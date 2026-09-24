@@ -1,0 +1,31 @@
+id: prior-hypervisor-novel-served-port
+title: A hypervisor serves a port it has never served before
+description: >
+  A hypervisor is the highest-value machine in most estates. A hypervisor is
+  also among the most predictable. It serves a management interface, an API and
+  a console proxy. A new listening port on a hypervisor is always worth a look.
+
+  Hypervisors rarely reach a peer group of 3. This analytic therefore reads the
+  machine's own history.
+
+level: high
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: served_ports
+  test: novel_for
+  roles:
+    - hypervisor
+
+attack:
+  - T1133
+
+false_positives:
+  - An operator enables a new management service or backup service. The service
+    joins the baseline after the support window.
+  - Live-migration ports and clustering ports open only during a migration.
+
+references:
+  - https://attack.mitre.org/techniques/T1133/

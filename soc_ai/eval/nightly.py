@@ -142,6 +142,7 @@ async def _record_trend_point(
     mode: str,
     alarm_drop: float,
     batch_dir: str,
+    analyst_model: str | None = None,
 ) -> AlarmOutcome:
     """Read same-mode history, run the detector, insert + prune — one txn.
 
@@ -166,7 +167,9 @@ async def _record_trend_point(
     """
     from soc_ai.eval.quality import (  # noqa: PLC0415 - lazy: keep module import light
         BASELINE_WINDOW,
+        CODE_AGREEMENT_DROP,
         TrendPoint,
+        alarm_codes_from_key,
         alarm_key_for,
         detect_regression,
     )
@@ -187,6 +190,10 @@ async def _record_trend_point(
                 fallback_rate=h.fallback_rate,
                 n_yes=h.n_yes,
                 n_classified=h.n_classified,
+                # Only an AGREEMENT alarm disqualifies a night from the
+                # agreement baseline. A fallback-jump alarm says nothing about
+                # whether that night's grades were representative.
+                agreement_alarmed=CODE_AGREEMENT_DROP in alarm_codes_from_key(h.alarm_key),
             )
             for h in history
         ],
@@ -231,6 +238,12 @@ async def _record_trend_point(
         n_partial=metrics.n_partial,
         n_no=metrics.n_no,
         n_classified=metrics.n_classified,
+        # Which route these verdicts came out of (0040). The row already records
+        # the running version and build; this is the third thing that can move
+        # under a fixed one, and the class docstring names it as the failure the
+        # trend was built for — a gateway repointing a route at a different
+        # backend regresses the numbers with the code unchanged.
+        analyst_model=analyst_model,
     )
     return AlarmOutcome(
         reasons=messages,
@@ -358,6 +371,7 @@ async def run_eval_nightly(
                     mode=eval_mode,
                     alarm_drop=alarm_drop,
                     batch_dir=str(summary.batch_dir),
+                    analyst_model=getattr(settings, "analyst_model", None),
                 )
         finally:
             with contextlib.suppress(Exception):

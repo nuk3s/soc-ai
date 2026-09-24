@@ -76,6 +76,8 @@ from soc_ai.config import Settings
 from soc_ai.main import create_app
 from soc_ai.so_client.elastic import ElasticClient
 
+from tests.es_doubles import CreateSemantics
+
 # RFC 5737 documentation address — never a real host on anyone's network.
 _HOST_IP = "192.0.2.10"
 
@@ -485,12 +487,24 @@ class _StallsAfterLanding:
     def __init__(self) -> None:
         self.docs: list[dict[str, Any]] = []
         self.stall = False
+        self.created = CreateSemantics()
         self.indices = AsyncMock()  # put_index_template is a no-op here
 
-    async def index(self, *, index: str, body: dict[str, Any]) -> None:
+    async def index(
+        self,
+        *,
+        index: str,
+        body: dict[str, Any],
+        id: str | None = None,
+        op_type: str | None = None,
+    ) -> None:
+        self.created.claim(index, id, op_type, body)  # refuses a seq already taken
         self.docs.append(body)  # it landed...
         if self.stall:
             await anyio.sleep_forever()  # ...and the acknowledgement never arrives
+
+    async def mget(self, *, index: str, ids: list[str]) -> dict[str, Any]:
+        return self.created.mget(index, ids)
 
     async def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]:
         chained = [d for d in self.docs if d.get("seq") is not None]
@@ -833,7 +847,7 @@ def test_the_es_connection_test_states_a_verdict_when_the_grid_goes_quiet(
     assert body["ok"] is False, "a grid that answers nothing is not a passing connection test"
     detail = str(body["detail"])
     assert "down" in detail.lower(), f"no verdict in the Test ES detail: {detail!r}"
-    assert f"{budget}s" in detail, (
+    assert f"{budget} s" in detail, (
         f"the Test ES verdict does not say how long it waited: {detail!r} — an admin cannot "
         "tell a bounded verdict from a guess without it"
     )

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -644,7 +645,10 @@ def test_audit_verify_tampered_names_the_broken_epoch(
         rc = cli._audit_verify(argparse.Namespace(days=None))
     assert rc == 1
     err = _strip_ansi(capsys.readouterr().err)
-    assert "TAMPER DETECTED" in err
+    # No altered record in this fixture, so the honest headline is the weaker
+    # one. Both exit 1; the headline says which of the two to go looking for.
+    assert "CHAIN BROKEN" in err
+    assert "TAMPER DETECTED" not in err
     assert "seq 2" in err
     assert "2026-08-01T00:00:00+00:00" in err
     assert "1 of 2 epochs broken" in err
@@ -716,8 +720,8 @@ def test_audit_verify_two_epochs_broken_reports_the_tally(
     assert rc == 1
     err = _strip_ansi(capsys.readouterr().err)
     assert "2 of 5 epochs broken" in err
-    assert "oldest break seq 1 (epoch 2026-06-26T21:55:52+00:00)" in err
-    assert "newest broken epoch 2026-06-27T02:13:00+00:00" in err
+    assert "oldest break is at seq 1 in epoch 2026-06-26T21:55:52+00:00" in err
+    assert "newest broken epoch is 2026-06-27T02:13:00+00:00" in err
     assert "Every epoch after 2026-06-27T02:13:00+00:00 verified intact" in err
 
 
@@ -883,3 +887,394 @@ def test_validate_batch_wires_repeats_into_batch_config(
     )
     assert cli._validate_batch(args) == 0
     assert captured["cfg"].synth_repeats == 4
+
+
+def test_spec_sweep_runs_the_command_the_console_prints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`soc-ai spec-sweep --shadow` must run as printed.
+
+    The Operate hub's catalog panel and the config console both tell an
+    operator to type exactly that, and `--since` being required meant both
+    hints exited 2 on an argparse error. Caught by dogfooding 1.5.1 against
+    the range, where the first thing anyone types is the string the UI shows.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_spec_sweep(args: argparse.Namespace) -> int:
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_spec_sweep", fake_spec_sweep)
+    monkeypatch.setattr("sys.argv", ["soc-ai", "spec-sweep", "--shadow"])
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 0, "the command the console prints did not parse"
+    assert captured["args"].since is None, "an unset window must reach the handler as None"
+    assert captured["args"].shadow is True
+
+
+def test_spec_sweep_defaults_its_window_to_the_configured_look_back(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The default is the scheduler's own window, widened past the interval.
+
+    A window narrower than the interval examines five minutes in every sixty
+    and calls the other fifty-five clean, which is the gap the loop already
+    clamps. The CLI has to clamp it the same way or the two disagree about
+    what one sweep covers: it used to widen without flooring the interval, so
+    with interval=0 in the environment it compared a 3-minute window against
+    zero, found it wider, and swept three minutes where the loop swept six.
+    And it has to SAY so, as the loop does, or only one of the two paths
+    tells the operator their settings do not fit together.
+    """
+    seen: dict[str, Any] = {}
+
+    async def fake_sweep_catalog(_catalog: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        from soc_ai.hunting.sweep import SweepResult
+
+        return SweepResult()
+
+    def run(window: int, interval: int) -> str:
+        settings = settings_kratos.model_copy(
+            update={
+                "hunt_spec_sweep_window_minutes": window,
+                "hunt_spec_sweep_interval_minutes": interval,
+            }
+        )
+        monkeypatch.setattr(cli, "get_settings", lambda: settings)
+        monkeypatch.setattr("soc_ai.hunting.sweep.sweep_catalog", fake_sweep_catalog)
+        args = argparse.Namespace(
+            since=None, until="now", shadow=True, backfill=False, include_synth=False
+        )
+        cli._spec_sweep(args)
+        return str(seen["since"])
+
+    with caplog.at_level(logging.WARNING):
+        assert run(1440, 60) == "now-1440m"
+        assert not [r for r in caplog.records if "spec sweep" in r.getMessage()], (
+            "nothing to warn about when the window is wider than the interval"
+        )
+        assert run(5, 60) == "now-61m", "a window narrower than the interval left an unexamined gap"
+        assert run(3, 0) == "now-6m", "the interval is floored at 5 before the window is clamped"
+    said = [r.getMessage() for r in caplog.records if "spec sweep" in r.getMessage()]
+    assert len(said) == 2, "the widening is said once per widened sweep, and not otherwise"
+    assert "(5m)" in said[0] and "(60m)" in said[0] and "61m" in said[0]
+    assert "(3m)" in said[1] and "(5m)" in said[1] and "6m" in said[1]
+
+    # An explicit window still wins.
+    monkeypatch.setattr(cli, "get_settings", lambda: settings_kratos)
+    cli._spec_sweep(
+        argparse.Namespace(
+            since="now-7d", until="now", shadow=True, backfill=False, include_synth=False
+        )
+    )
+    assert seen["since"] == "now-7d"
+
+
+def test_spec_run_include_synth_parses_and_reaches_run_spec(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """`--include-synth` has to arrive at run_spec, not stop at the handler.
+
+    The four no-alert fixtures exist because the catalog detects attacks that
+    never become an alert, and run_spec has taken a SynthScope since the
+    catalog landed. Neither shipped command passed it, so documents planted
+    into logs-synth-* were invisible to everything an operator can type and a
+    spec could not be checked against a live grid. Caught by dogfooding 1.5.1
+    against the range. The flag stays off by default: production hunting must
+    never see planted evaluation data.
+    """
+    real_spec_run = cli._spec_run
+    captured: dict[str, Any] = {}
+
+    def fake_spec_run(args: argparse.Namespace) -> int:
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_spec_run", fake_spec_run)
+    monkeypatch.setattr("sys.argv", ["soc-ai", "spec-run", "--since", "now-1d"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["args"].include_synth is False, "the default must be off"
+
+    monkeypatch.setattr(
+        "sys.argv", ["soc-ai", "spec-run", "some-spec", "--since", "now-1d", "--include-synth"]
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["args"].include_synth is True
+    assert captured["args"].spec_id == "some-spec", "the switch must not eat the spec id"
+
+    # The wire: the handler passes the value on to run_spec.
+    seen: list[dict[str, Any]] = []
+
+    async def fake_run_spec(spec: Any, **kwargs: Any) -> Any:
+        from soc_ai.hunting.execute import SpecRun
+
+        seen.append(kwargs)
+        return SpecRun(
+            spec_id=spec.id, since="a", until="b", blind=False, precondition_docs=1, matched_docs=0
+        )
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings_kratos)
+    monkeypatch.setattr("soc_ai.hunting.execute.run_spec", fake_run_spec)
+    for scope in (True, False):
+        args = argparse.Namespace(
+            spec_id="identity-4662-dcsync-nonmachine",
+            since="now-1d",
+            until="now",
+            include_synth=scope,
+        )
+        assert real_spec_run(args) == 0
+        assert seen[-1]["include_synth"] is scope, "the flag never reached run_spec"
+
+
+def test_spec_sweep_include_synth_parses_and_reaches_sweep_catalog(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Same wire, other command: `--include-synth` must reach sweep_catalog."""
+    real_spec_sweep = cli._spec_sweep
+    captured: dict[str, Any] = {}
+
+    def fake_spec_sweep(args: argparse.Namespace) -> int:
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_spec_sweep", fake_spec_sweep)
+    monkeypatch.setattr("sys.argv", ["soc-ai", "spec-sweep", "--shadow"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["args"].include_synth is False, "the default must be off"
+
+    monkeypatch.setattr("sys.argv", ["soc-ai", "spec-sweep", "--shadow", "--include-synth"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["args"].include_synth is True
+
+    seen: dict[str, Any] = {}
+
+    async def fake_sweep_catalog(_catalog: Any, **kwargs: Any) -> Any:
+        from soc_ai.hunting.sweep import SweepResult
+
+        seen.update(kwargs)
+        return SweepResult()
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings_kratos)
+    monkeypatch.setattr("soc_ai.hunting.sweep.sweep_catalog", fake_sweep_catalog)
+    for scope in (True, False):
+        args = argparse.Namespace(
+            since="now-1d", until="now", shadow=True, backfill=False, include_synth=scope
+        )
+        assert real_spec_sweep(args) == 0
+        assert seen["include_synth"] is scope, "the flag never reached sweep_catalog"
+
+
+def test_audit_verify_tamper_names_what_broke(capsys: pytest.CaptureFixture[str]) -> None:
+    """The tamper verdict says which kind of damage, not just that there is some.
+
+    Two writers claiming one position and a record edited after the fact both
+    used to print "a record was edited, reordered, inserted, or deleted". On a
+    deployment carrying the known concurrency fork, that sentence is also what
+    would greet a real alteration.
+    """
+    result = ChainVerifyResult(
+        ok=False,
+        records_verified=15122,
+        first_broken_seq=109667,
+        first_seq=94545,
+        last_seq=109667,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start="2026-09-04T02:32:07Z",
+        epochs_broken=1,
+        newest_broken_epoch_start="2026-09-04T02:32:07Z",
+        latest_epoch_broken=True,
+        first_break_kind="duplicate_seq",
+        first_break_detail=(
+            "2 records claim sequence 109667, and each one still matches its own hash — "
+            "the records were not altered; two writers continued the chain from the same point"
+        ),
+        newest_break_kind="duplicate_seq",
+        newest_break_detail=(
+            "2 records claim sequence 109667, and each one still matches its own hash — "
+            "the records were not altered; two writers continued the chain from the same point"
+        ),
+    )
+    with (
+        patch("soc_ai.cli.get_settings", return_value=_cli_settings()),
+        patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=result)),
+    ):
+        rc = cli._audit_verify(argparse.Namespace(days=3))
+    assert rc == 1
+    err = _strip_ansi(capsys.readouterr().err)
+    # Two writers, every copy still hashing true. This used to print "TAMPER
+    # DETECTED" directly above its own sentence saying the records were not
+    # altered — a headline contradicted by its body, on soc-ai's own concurrency.
+    assert "CHAIN BROKEN" in err
+    assert "TAMPER DETECTED" not in err
+    assert "two writers continued the chain from the same point" in err
+    # And the operator is told how to check it themselves, since this shape is
+    # the one that is usually NOT an intrusion.
+    assert "Compare the timestamps and sessions" in err
+
+
+def test_audit_verify_tamper_on_an_edit_does_not_offer_the_concurrency_reading(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The negative control for the test above.
+
+    An altered record must not be handed the "this is probably two writers"
+    hint — that hint is the one thing that could talk an operator out of
+    treating a real edit as an emergency.
+    """
+    result = ChainVerifyResult(
+        ok=False,
+        records_verified=42,
+        first_broken_seq=17,
+        first_seq=0,
+        last_seq=41,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start="2026-09-04T02:32:07Z",
+        epochs_broken=1,
+        newest_broken_epoch_start="2026-09-04T02:32:07Z",
+        latest_epoch_broken=True,
+        first_break_kind="content_altered",
+        first_break_detail=(
+            "the record at sequence 17 no longer matches its own hash — its content was "
+            "changed after it was written"
+        ),
+        newest_break_kind="content_altered",
+        newest_break_detail=(
+            "the record at sequence 17 no longer matches its own hash — its content was "
+            "changed after it was written"
+        ),
+    )
+    with (
+        patch("soc_ai.cli.get_settings", return_value=_cli_settings()),
+        patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=result)),
+    ):
+        rc = cli._audit_verify(argparse.Namespace(days=None))
+    assert rc == 1
+    err = _strip_ansi(capsys.readouterr().err)
+    assert "content was changed after it was written" in err
+    assert "two writers" not in err
+
+
+def test_audit_verify_says_tamper_when_a_record_no_longer_hashes_true(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The headline that must survive the weaker one being introduced.
+
+    A duplicated position is two writers; a record whose content no longer
+    matches its own hash is someone changing the record of a decision. Softening
+    the first must not soften the second, so this is the control: altered_records
+    non-zero still gets the full word, and still exits 1.
+    """
+    from soc_ai.audit.verify import ChainVerifyResult
+
+    result = ChainVerifyResult(
+        ok=False,
+        records_verified=900,
+        first_broken_seq=7,
+        first_seq=0,
+        last_seq=899,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start="2026-08-01T00:00:00+00:00",
+        epochs_broken=1,
+        newest_broken_epoch_start="2026-08-01T00:00:00+00:00",
+        latest_epoch_broken=True,
+        first_break_kind="content_altered",
+        first_break_detail="1 record no longer matches its own hash",
+        newest_break_kind="content_altered",
+        newest_break_detail="1 record no longer matches its own hash",
+        altered_records=1,
+        break_kinds=("content_altered",),
+    )
+    with (
+        patch("soc_ai.cli.get_settings", return_value=_cli_settings()),
+        patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=result)),
+    ):
+        rc = cli._audit_verify(argparse.Namespace(days=None))
+    assert rc == 1
+    err = _strip_ansi(capsys.readouterr().err)
+    assert "TAMPER DETECTED" in err
+    assert "CHAIN BROKEN" not in err
+
+
+# ── soc-ai leads --report ────────────────────────────────────────────────────
+
+
+def test_leads_report_parses_as_the_docs_print_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`soc-ai leads --report` must run as written, with the default window."""
+    captured: dict[str, Any] = {}
+
+    def fake_leads(args: argparse.Namespace) -> int:
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_leads", fake_leads)
+    monkeypatch.setattr("sys.argv", ["soc-ai", "leads", "--report"])
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 0
+    assert captured["args"].report is True
+    assert captured["args"].weeks == 4
+
+
+def test_leads_without_a_mode_says_so_and_does_not_read_the_store() -> None:
+    """A bare `soc-ai leads` names the mode it needs rather than printing nothing."""
+    assert cli._leads(argparse.Namespace(report=False, weeks=4)) == 2
+
+
+def test_format_lead_quality_prints_the_weeks_the_types_and_the_rule() -> None:
+    """The table carries the same numbers, the rule and the noise floor."""
+    from soc_ai.api.webui.routes_hunts import (
+        LeadQualityOut,
+        LeadQualityTypesOut,
+        LeadQualityWeekOut,
+    )
+
+    report = LeadQualityOut(
+        weeks=[
+            LeadQualityWeekOut(
+                week="2026-W38",
+                formed=2,
+                hunted=2,
+                threat=1,
+                promoted=0,
+                dismissed={"expected_for_role": 1},
+            ),
+            LeadQualityWeekOut(week="2026-W37", formed=0),
+        ],
+        by_types=[
+            LeadQualityTypesOut(types="catalog_match+off_hours", formed=2, dismissed=1, threat=1)
+        ],
+        rule="A lead forms at 0.85 over two or more types.",
+        note="A threshold moves on a week of data, never on a day.",
+    )
+    out = _strip_ansi(cli.format_lead_quality(report))
+    assert "2026-W38" in out and "2026-W37" in out
+    assert "expected_for_role=1" in out
+    assert "catalog_match+off_hours" in out
+    assert "rule: A lead forms at 0.85 over two or more types." in out
+    assert "note: A threshold moves on a week of data, never on a day." in out
+    # A week with nothing in it prints a dash, not an empty column.
+    assert out.splitlines()[2].endswith("-")
+
+
+def test_format_lead_quality_says_so_when_no_lead_formed() -> None:
+    from soc_ai.api.webui.routes_hunts import LeadQualityOut, LeadQualityWeekOut
+
+    out = cli.format_lead_quality(
+        LeadQualityOut(
+            weeks=[LeadQualityWeekOut(week="2026-W38")],
+            by_types=[],
+            rule="r",
+            note="n",
+        )
+    )
+    assert "No lead formed in this window." in out

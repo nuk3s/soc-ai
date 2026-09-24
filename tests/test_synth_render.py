@@ -6,7 +6,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from soc_ai.eval.synth_loader import EventTemplate, GroundTruth, Scenario, load_all_scenarios
+from soc_ai.eval.synth_loader import (
+    EventTemplate,
+    GroundTruth,
+    Scenario,
+    load_all_scenarios,
+)
 
 SCENARIOS_DIR = Path(__file__).parent.parent / "soc_ai" / "eval" / "synth_scenarios"
 RUN_TIME = datetime(2026, 5, 13, 22, 30, 0, tzinfo=UTC)
@@ -330,7 +335,13 @@ def test_render_all_catalogue_scenarios_smoke() -> None:
         docs = render_scenario(scenario, run_time=RUN_TIME)
         assert len(docs) == len(scenario.events)
         triage_targets = [d for d in docs if d.is_triage_target]
-        assert len(triage_targets) == 1, f"{scenario.id}: {len(triage_targets)} targets"
+        # A spec_journey scenario has no triage target on purpose: its whole
+        # premise is telemetry that never becomes an alert. It still has to
+        # RENDER, which is why this loop covers both populations.
+        expected = 0 if scenario.spec_journey is not None else 1
+        assert len(triage_targets) == expected, (
+            f"{scenario.id}: {len(triage_targets)} targets, want {expected}"
+        )
         # No unsubstituted {{ }} markers remain in any doc.
         for doc in docs:
             for key, val in doc.body.items():

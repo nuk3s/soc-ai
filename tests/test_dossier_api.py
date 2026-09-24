@@ -598,7 +598,7 @@ def test_clear_override_with_no_override_is_409(client: TestClient) -> None:
     resp = client.delete("/api/v1/dossiers/192.168.10.202/override/role")
     assert resp.status_code == 409
     assert resp.json()["detail"]["reason"] == "no_operator_override"
-    assert "recomputed on every build" in resp.json()["detail"]["hint"]
+    assert "Every build recomputes it" in resp.json()["detail"]["hint"]
 
 
 # ---------------------------------------------------------------------------
@@ -938,7 +938,7 @@ def test_refresh_worker_never_raises() -> None:
     status = _get_dossier_status(state)
     assert status.running is False
     assert status.last_run is not None
-    assert status.last_summary == {"errors": ["refresh failed; see server logs"]}
+    assert status.last_summary == {"errors": ["the refresh failed. See the server logs."]}
 
 
 # ---------------------------------------------------------------------------
@@ -1721,3 +1721,77 @@ def test_bulk_override_audits_what_landed_even_when_part_of_the_batch_failed(
     assert payload["action"] == "bulk_set"
     assert payload["ips"] == ["10.0.0.71"]
     assert payload["failed"] == ["10.0.0.72"]
+
+
+def test_the_dossier_carries_the_behavioural_profile_with_its_coverage(client) -> None:
+    """Served on the same read as the dossier so the two cannot describe
+    different builds of the same host. The coverage chip is the point: a
+    measured-and-empty dimension and a blind one render as the same empty
+    set without it, and mean opposite things."""
+    import asyncio
+
+    from soc_ai.store import entity_profiles as ep
+
+    ip = "10.1.10.11"
+
+    async def _seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=ip,
+                dimension="served_ports",
+                shape="categorical",
+                vector={"445": {"count": 900}, "88": {"count": 400}, "389": {"count": 300}},
+                coverage="measured",
+                support_days=12,
+                window_days=30,
+            )
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=ip,
+                dimension="process_names",
+                shape="categorical",
+                vector=None,
+                coverage="blind",
+                support_days=0,
+                window_days=30,
+            )
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=ip,
+                dimension="connection_rate",
+                shape="numeric",
+                vector={
+                    "work": {"median": 42.0, "dispersion": 2.0, "samples": 200},
+                    "off": {"median": 3.0, "dispersion": 1.0, "samples": 90},
+                    "weekend": {"median": None, "dispersion": None, "samples": 0},
+                },
+                coverage="measured",
+                support_days=12,
+                window_days=30,
+            )
+
+    asyncio.run(_seed())
+    body = client.get(f"/api/v1/dossiers/{ip}").json()
+    by_dim = {p["dimension"]: p for p in body["profile"]}
+
+    ports = by_dim["served_ports"]
+    assert ports["coverage"] == "measured" and ports["support_days"] == 12
+    assert ports["summary"].startswith("3 ports · 445, 88, 389")
+    assert ports["top"][0] == ["445", 900]
+
+    blind = by_dim["process_names"]
+    assert blind["coverage"] == "blind"
+    assert blind["summary"] == "" and blind["top"] == []
+
+    rate = by_dim["connection_rate"]
+    assert rate["shape"] == "numeric"
+    assert rate["summary"] == "work 42/h · off 3/h · weekend —"
+
+
+def test_a_host_with_no_profile_has_an_empty_list_not_an_error(client) -> None:
+    body = client.get("/api/v1/dossiers/10.1.10.250").json()
+    assert body["profile"] == []

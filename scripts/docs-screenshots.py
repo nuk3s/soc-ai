@@ -279,7 +279,7 @@ def shoot_hunt(page: Page, base: str, manifest: dict, out: Path) -> None:
 
 
 def shoot_operate(page: Page, base: str, manifest: dict, out: Path) -> None:
-    """/app/operate — the six trust-instrument cards, Operate force-expanded.
+    """/app/operate — the hunt catalog panel above the trust-instrument cards, Operate force-expanded.
 
     /operate is itself one of the Sidebar "Operate" group's own routes, so the
     group force-expands automatically (Sidebar.tsx's operateForceExpanded) —

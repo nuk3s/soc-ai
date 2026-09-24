@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { middleEllipsis } from './text';
+import { firstSentence, middleEllipsis } from './text';
 
 describe('middleEllipsis', () => {
   it('returns short strings unchanged', () => {
@@ -24,5 +24,27 @@ describe('middleEllipsis', () => {
     // No lone (unpaired) surrogate — a split pair would render as U+FFFD.
     // eslint-disable-next-line no-misleading-character-class
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out)).toBe(false);
+  });
+});
+
+// A hunt objective runs to several sentences and a header line holds one.
+describe('firstSentence', () => {
+  it('keeps the first sentence and drops the rest', () => {
+    expect(
+      firstSentence('Sweep for directory replication. Say whether the two leads are one campaign.'),
+    ).toBe('Sweep for directory replication.');
+  });
+  it('returns a sentence with no stop unchanged', () => {
+    expect(firstSentence('Sweep for directory replication')).toBe(
+      'Sweep for directory replication',
+    );
+  });
+  it('keeps a question whole', () => {
+    expect(firstSentence('Are the two leads one campaign? Read both.')).toBe(
+      'Are the two leads one campaign?',
+    );
+  });
+  it('trims the line it is given', () => {
+    expect(firstSentence('  Sweep the host.  Then stop. ')).toBe('Sweep the host.');
   });
 });

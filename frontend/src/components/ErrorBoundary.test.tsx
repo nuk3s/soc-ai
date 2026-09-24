@@ -18,7 +18,7 @@ describe('ErrorBoundary', () => {
       </ErrorBoundary>,
     );
     expect(screen.getByText('healthy screen')).toBeInTheDocument();
-    expect(screen.queryByText('Something went wrong loading this page')).toBeNull();
+    expect(screen.queryByText('This page could not load')).toBeNull();
   });
 
   it('shows the reload card with the error message when a child throws; Reload reloads', async () => {
@@ -34,7 +34,7 @@ describe('ErrorBoundary', () => {
         <Bomb />
       </ErrorBoundary>,
     );
-    expect(screen.getByText('Something went wrong loading this page')).toBeInTheDocument();
+    expect(screen.getByText('This page could not load')).toBeInTheDocument();
     expect(screen.getByText('kaboom during render')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Reload' }));
     expect(reload).toHaveBeenCalledTimes(1);

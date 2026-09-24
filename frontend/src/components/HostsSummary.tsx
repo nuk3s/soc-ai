@@ -46,6 +46,8 @@ interface RoleSlice {
   /** The resolved role word, or null for the unresolved remainder. */
   role: string | null;
   count: number;
+  /** Inferred below the confidence gate: not resolved, but not unknown either. */
+  low?: boolean;
 }
 
 /**
@@ -62,14 +64,34 @@ export function roleSlices(summary: DossierSummary): RoleSlice[] {
     .filter(([role, count]) => role.trim().toLowerCase() !== 'unknown' && count > 0)
     .sort(([roleA, a], [roleB, b]) => b - a || roleA.localeCompare(roleB))
     .map(([role, count]) => ({ role, count }));
-  const unresolved = summary.hosts - known.reduce((total, s) => total + s.count, 0);
-  return unresolved > 0 ? [...known, { role: null, count: unresolved }] : known;
+  // The wire names the hosts whose role the resolver withholds. They are not
+  // unknown: the host page says "possibly security appliance" about them, and
+  // they are exactly the hosts a role-scoped hunt cannot score.
+  const low = summary.roles_low_confidence ?? 0;
+  const unresolved = summary.hosts - known.reduce((total, s) => total + s.count, 0) - low;
+  const out: RoleSlice[] = [...known];
+  if (low > 0) out.push({ role: null, count: low, low: true });
+  if (unresolved > 0) out.push({ role: null, count: unresolved });
+  return out;
 }
 
-function RoleBar({ summary }: { summary: DossierSummary }) {
+function RoleBar({
+  summary,
+  shown,
+  filtered,
+}: {
+  summary: DossierSummary;
+  shown?: number;
+  filtered?: boolean;
+}) {
   const slices = roleSlices(summary);
   if (summary.hosts <= 0 || slices.length === 0) return null;
-  const label = (s: RoleSlice) => (s.role == null ? 'unknown' : roleLabel(s.role));
+  const label = (s: RoleSlice) => (s.low ? 'low confidence' : s.role == null ? 'unknown' : roleLabel(s.role));
+  const segId = (s: RoleSlice) => s.role ?? (s.low ? 'low-confidence' : 'unknown');
+  const rail = (s: RoleSlice) => (s.low ? 'bg-warn/55' : roleRail(s.role));
+  const LOW_TITLE =
+    'The sweep inferred this role below the dossier confidence gate. The host page names the inferred role. Role-scoped analytics leave these hosts unscored.';
+  const subset = filtered && shown != null && shown !== summary.hosts;
   return (
     <div data-testid="role-bar" className="mt-3 rounded-panel border border-border bg-surface-1 px-4 py-3">
       <div className="mb-2 flex items-baseline justify-between gap-2">
@@ -78,9 +100,10 @@ function RoleBar({ summary }: { summary: DossierSummary }) {
         </span>
         <span
           className="text-[11px] text-faint"
-          title="Each host's effective role: an operator's declaration where one exists, otherwise what the sweep concluded — the same answer the Role column below shows. Gray is every host whose role is not resolved."
+          title="Each host's effective role: an operator's declaration, or the answer the sweep reached. Gray is every host whose role is not resolved."
         >
           across {plural(summary.hosts, 'host')}
+          {subset && ` · ${shown.toLocaleString()} in the list below`}
         </span>
       </div>
       {/* The segments are proportional; the LEGIBLE labels live in the legend
@@ -88,18 +111,18 @@ function RoleBar({ summary }: { summary: DossierSummary }) {
       <div className="flex h-2.5 w-full overflow-hidden rounded-pill" role="img" aria-label="role distribution">
         {slices.map((s) => (
           <div
-            key={s.role ?? '∅'}
-            data-testid={`role-seg-${s.role ?? 'unknown'}`}
-            title={`${label(s)} — ${s.count.toLocaleString()} host${s.count === 1 ? '' : 's'}`}
-            className={cn('min-w-[6px]', roleRail(s.role))}
+            key={segId(s)}
+            data-testid={`role-seg-${segId(s)}`}
+            title={`${label(s)} · ${s.count.toLocaleString()} host${s.count === 1 ? '' : 's'}${s.low ? `. ${LOW_TITLE}` : ''}`}
+            className={cn('min-w-[6px]', rail(s))}
             style={{ flexGrow: s.count, flexBasis: 0 }}
           />
         ))}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1">
         {slices.map((s) => (
-          <span key={s.role ?? '∅'} className="flex items-center gap-1.5 text-[11.5px] text-dim">
-            <span className={cn('h-2 w-2 flex-none rounded-full', roleRail(s.role))} />
+          <span key={segId(s)} className="flex items-center gap-1.5 text-[11.5px] text-dim" title={s.low ? LOW_TITLE : undefined}>
+            <span className={cn('h-2 w-2 flex-none rounded-full', rail(s))} />
             {label(s)}
             <span className="font-mono text-[11px] font-semibold text-text-2">
               {s.count.toLocaleString()}
@@ -116,6 +139,13 @@ function RoleBar({ summary }: { summary: DossierSummary }) {
 export interface HostsSummaryProps {
   /** The whole-network summary, or null while in flight / after a cold fail. */
   summary: DossierSummary | null;
+  /** How many hosts the table BELOW currently holds, and whether that is a
+   *  filtered subset. The KPI and the roles bar describe every host the sweep
+   *  knows; the default table shows only those with traffic. On the range
+   *  that was "43" and "unknown 37" above a list of 31 -- the bar's biggest
+   *  segment describing twelve rows nobody could see (dogfood, 2026-09-16). */
+  shown?: number;
+  filtered?: boolean;
   /** True once the read has failed. With no summary behind it that is a cold
    *  failure; with one, a refresh that failed over good numbers. */
   failed: boolean;
@@ -125,7 +155,7 @@ export interface HostsSummaryProps {
   queueVisible: boolean;
 }
 
-export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProps) {
+export function HostsSummary({ summary, failed, queueVisible, shown, filtered }: HostsSummaryProps) {
   const attention = summary == null ? null : summary.never_built + summary.conflicts;
   return (
     <div data-testid="hosts-summary" className="mb-3.5">
@@ -140,7 +170,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
             ) : summary.hosts === 0 ? (
               'nothing swept yet'
             ) : (
-              <span title="Hosts whose name will stand — an operator's, or one the sweep is sure enough of. Withheld names are not counted, so this agrees with the Host column below.">
+              <span title="Hosts with a confirmed name. The name comes from an operator or from a high-confidence sweep answer.">
                 {`${summary.named.toLocaleString()} named · ${(summary.hosts - summary.named).toLocaleString()} unnamed`}
               </span>
             )
@@ -163,7 +193,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
           title={
             summary == null
               ? undefined
-              : `An agent on the machine ships its own logs, so those pages can say more than traffic alone shows. No agent data from ${plural(summary.hosts - summary.reporting, 'host')}.`
+              : `An agent on the machine ships its own logs. Those pages can say more than traffic alone shows. No agent data comes from ${plural(summary.hosts - summary.reporting, 'host')}.`
           }
         />
         <Kpi
@@ -183,7 +213,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
                   <Link
                     data-testid="sum-broken"
                     to={BROKEN_BUILDS_HREF}
-                    title="The sweep is not getting through to these hosts — never built, or the last build failed. Click to see which."
+                    title="The sweep is not reaching these hosts. Click to see which hosts."
                     className="font-semibold text-danger hover:underline"
                   >
                     {summary.never_built.toLocaleString()} broken or never built
@@ -198,7 +228,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
                     <Link
                       data-testid="sum-review"
                       to={CONFLICTS_HREF}
-                      title="Declared answers the sweep keeps disagreeing with — each wants a decision."
+                      title="The sweep keeps disagreeing with these declared answers. Each one needs a decision."
                       className="font-semibold text-warn hover:underline"
                     >
                       {summary.conflicts.toLocaleString()} need review
@@ -226,7 +256,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
             summary == null ? (
               UNKNOWN
             ) : summary.conflicts === 0 ? (
-              'the lanes agree'
+              'the two sources agree'
             ) : queueVisible ? (
               // The banner below already carries the action — a second door
               // 40px away is one control that looks like two.
@@ -234,7 +264,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
             ) : (
               <Link
                 to={CONFLICTS_HREF}
-                title="Declared answers the sweep keeps disagreeing with — each wants a decision."
+                title="The sweep keeps disagreeing with these declared answers. Each one needs a decision."
                 className="font-semibold text-warn hover:underline"
               >
                 open the review queue
@@ -249,22 +279,22 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
         />
       </div>
 
-      {summary != null && <RoleBar summary={summary} />}
+      {summary != null && <RoleBar summary={summary} shown={shown} filtered={filtered} />}
 
       {/* The strip's ONE status/freshness line. Degraded states say what
           happened where the numbers would have dated themselves. */}
       {summary == null ? (
         <div className="mt-1.5 text-[12px] text-dim">
           {failed
-            ? 'Counts could not be read — the host list below is a separate query and is unaffected.'
+            ? 'Counts could not be read. The host list below is a separate query, and it still works.'
             : 'Counting the network…'}
         </div>
       ) : (
         <div className="mt-1.5 text-[11.5px] text-faint">
-          {failed && 'Could not refresh — showing the last counts. '}
+          {failed && 'Could not refresh. These are the last counts. '}
           {summary.last_built_at == null ? (
-            <span title="No host in the table carries a build stamp — nothing has swept the network yet.">
-              Never swept — nothing has built these hosts yet
+            <span title="No host in the table carries a build stamp. Nothing has swept the network yet.">
+              Never swept. Nothing has built these hosts yet.
             </span>
           ) : (
             <span title={absTime(summary.last_built_at)}>
@@ -278,7 +308,7 @@ export function HostsSummary({ summary, failed, queueVisible }: HostsSummaryProp
               {' · '}
               <Link
                 to={DOSSIER_CONFIG_HREF}
-                title="These counts only change when the network is swept. With the schedule off, that is whenever somebody presses Rebuild."
+                title="These counts change only after a sweep. If the schedule is off, a sweep runs only if somebody presses Rebuild."
                 className="underline decoration-faint/50 underline-offset-2 hover:text-text hover:decoration-dim"
               >
                 automatic sweeps are off

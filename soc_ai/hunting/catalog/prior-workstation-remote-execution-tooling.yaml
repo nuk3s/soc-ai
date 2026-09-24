@@ -1,0 +1,35 @@
+id: prior-workstation-remote-execution-tooling
+title: A workstation runs remote-execution tooling
+description: >
+  PsExec, WMIC and remote PowerShell are administrative tools. They have
+  legitimate uses on administrative machines. The first run of one of these
+  tools on an ordinary workstation is an administrator working from the wrong
+  machine. It can also be lateral movement. Both cases are worth one look.
+
+  This analytic reads the workstation's own process history. A site that runs
+  one of these tools everywhere stops seeing the analytic after the support
+  window. Nobody has to edit a list.
+
+level: high
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: process_names
+  test: novel_for
+  roles:
+    - workstation
+
+attack:
+  - T1569.002
+  - T1047
+
+false_positives:
+  - An administrator runs this tooling on their own workstation as routine
+    work. The tooling joins the baseline after the support window. Declare the
+    host role as a server before then, or add an exception.
+  - A software deployment agent invokes WMI on its first run.
+
+references:
+  - https://attack.mitre.org/techniques/T1569/002/

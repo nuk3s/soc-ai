@@ -188,7 +188,7 @@ describe('GeneralChatPanel — starting over', () => {
     fireEvent.click(screen.getByRole('button', { name: /clear/i }));
 
     expect(clearGeneralChat).toHaveBeenCalled();
-    expect(await screen.findByText(/answered here/i)).toBeTruthy(); // back to the empty hint
+    expect(await screen.findByText(/soc-ai answers here/i)).toBeTruthy(); // back to the empty hint
   });
 });
 

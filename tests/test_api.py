@@ -79,11 +79,35 @@ def test_healthz_reports_config(app_with_test_model: TestClient) -> None:
     resp = app_with_test_model.get("/healthz")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "ok"
+    assert body["status"] == "alive"
     assert body["so_auth"] == "kratos"
     assert body["misp_configured"] is False
     assert "pending_approvals" not in body  # gate removed; field gone
     assert body["version"]
+
+
+def test_healthz_does_not_claim_to_be_a_health_verdict(
+    app_with_test_model: TestClient,
+) -> None:
+    """The word on the wire has to be the one that is true.
+
+    The container healthcheck polls this endpoint and Docker renders the result
+    as `healthy`, which was read as a verdict on the product by operators whose
+    grid was unreachable at the time. The endpoint cannot start failing on a
+    dependency outage — that would have the orchestrator restart a container
+    whose dependencies are merely down — so what has to change is what it says.
+
+    ``alive``, not ``ok``; and the body itself names what it did not check and
+    where the verdict lives, because the two places this response is read are a
+    paste of ``curl`` and ``docker inspect``'s health log, neither of which
+    shows a docstring.
+    """
+    body = app_with_test_model.get("/healthz").json()
+    assert body["status"] != "ok"
+    checks = body["checks"]
+    assert "no dependency is probed" in checks
+    assert "/api/v1/health" in checks
+    assert "soc-ai doctor" in checks
 
 
 def test_investigate_streams_events(app_with_test_model: TestClient) -> None:

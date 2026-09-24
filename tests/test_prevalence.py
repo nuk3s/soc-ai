@@ -26,6 +26,19 @@ def _make_elastic(settings: Settings, response: dict[str, Any]) -> tuple[Elastic
     return client, fake_es
 
 
+def _tool_body(fake_es: AsyncMock) -> dict[str, Any]:
+    """The body of the tool's OWN query — always the FIRST search it issues.
+
+    On an empty result the tool issues a second one: the import-volume probe
+    that decides whether "no prior events" means the grid is quiet or means
+    every matching document was backfill. ``call_args`` is the LAST call, so
+    reading it would assert against the probe rather than against the query
+    these assertions are about, and would pass or fail for the wrong reason.
+    """
+    body: dict[str, Any] = fake_es.search.call_args_list[0].kwargs["body"]
+    return body
+
+
 def _agg_response(
     *,
     total: int,
@@ -67,7 +80,7 @@ async def test_peer_mode_matches_both_directions(settings_kratos: Settings) -> N
         settings=settings_kratos,
         peer_ip="93.184.216.34",
     )
-    body = fake_es.search.call_args.kwargs["body"]
+    body = _tool_body(fake_es)
     should = body["query"]["bool"]["must"][0]["bool"]["should"]
     # Two directional clauses.
     pairs = [{c["term"][k] for c in clause["bool"]["must"] for k in c["term"]} for clause in should]
@@ -86,7 +99,7 @@ async def test_domain_mode_ecs_first_fields(settings_kratos: Settings) -> None:
         settings=settings_kratos,
         domain="evil.example.com",
     )
-    body = fake_es.search.call_args.kwargs["body"]
+    body = _tool_body(fake_es)
     # The second must-clause is the domain OR.
     domain_should = body["query"]["bool"]["must"][0]["bool"]["must"][1]["bool"]["should"]
     matched_fields = {next(iter(c["term"])) for c in domain_should}
@@ -107,7 +120,7 @@ async def test_host_mode_when_neither_peer_nor_domain(settings_kratos: Settings)
     """No peer_ip / domain -> overall host summary mode (src OR dst)."""
     elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
     out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
-    body = fake_es.search.call_args.kwargs["body"]
+    body = _tool_body(fake_es)
     should = body["query"]["bool"]["must"][0]["bool"]["should"]
     fields_matched = {next(iter(c["term"])) for c in should}
     assert fields_matched == {"source.ip", "destination.ip"}
@@ -118,7 +131,7 @@ async def test_host_mode_when_neither_peer_nor_domain(settings_kratos: Settings)
 async def test_uses_configured_index_pattern(settings_kratos: Settings) -> None:
     elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
     await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
-    assert fake_es.search.call_args.kwargs["index"] == settings_kratos.events_index_pattern
+    assert fake_es.search.call_args_list[0].kwargs["index"] == settings_kratos.events_index_pattern
 
 
 @pytest.mark.asyncio
@@ -126,7 +139,7 @@ async def test_query_is_size_zero_with_aggs(settings_kratos: Settings) -> None:
     """The prevalence query is aggregation-only (size=0) with first/last/by_day."""
     elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
     await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
-    body = fake_es.search.call_args.kwargs["body"]
+    body = _tool_body(fake_es)
     assert body["size"] == 0
     assert body["track_total_hits"] is True
     aggs = body["aggs"]
@@ -144,7 +157,7 @@ async def test_query_is_size_zero_with_aggs(settings_kratos: Settings) -> None:
 async def test_lookback_default_now_relative(settings_kratos: Settings) -> None:
     elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
     await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
-    body = fake_es.search.call_args.kwargs["body"]
+    body = _tool_body(fake_es)
     rng = body["query"]["bool"]["filter"][0]["range"]["@timestamp"]
     assert rng["gte"] == "now-90d"
     assert rng["lte"] == "now"
@@ -161,7 +174,7 @@ async def test_lookback_anchored_window(settings_kratos: Settings) -> None:
         lookback_days=30,
         time_anchor=anchor,
     )
-    body = fake_es.search.call_args.kwargs["body"]
+    body = _tool_body(fake_es)
     rng = body["query"]["bool"]["filter"][0]["range"]["@timestamp"]
     assert rng["gte"] == "2026-04-01T12:00:00+00:00"
     assert rng["lte"] == "2026-05-01T12:00:00+00:00"
@@ -401,4 +414,110 @@ async def test_missing_aggregations_degrades_cleanly(settings_kratos: Settings) 
     assert out["total_events"] == 5
     assert out["distinct_days"] == 0
     assert out["first_seen"] is None
+    assert "error" not in out
+
+
+# =====================================================================
+# Provenance: whose network is the baseline?
+# =====================================================================
+#
+# Measured on the development range on 2026-09-04: 19,604,032 of 23,055,409
+# documents carry ``import.id``, and live telemetry is 15% of the grid. Every
+# field this tool returns is a population statistic over that denominator, so
+# before this scope existed a pairing that appeared only inside a replayed
+# capture came back as an established baseline of this network.
+
+
+@pytest.mark.asyncio
+async def test_the_baseline_excludes_imported_documents(settings_kratos: Settings) -> None:
+    """The default population is what this grid's own sensors observed."""
+    elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
+    await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
+    must_not = _tool_body(fake_es)["query"]["bool"]["must_not"]
+    assert {"exists": {"field": "import.id"}} in must_not
+    assert {"term": {"tags": "replayed-corpus"}} in must_not
+
+
+@pytest.mark.asyncio
+async def test_a_retro_hunt_can_still_reach_full_retention(settings_kratos: Settings) -> None:
+    """Chasing a newly published indicator across everything on disk is a real ask.
+
+    It has to be asked for, which is the point of threading the scope rather
+    than hardcoding it: the caller who wants backfill says so, and every caller
+    who has not thought about it gets the safe population.
+    """
+    elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
+    out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos, provenance="any")
+    must_not = _tool_body(fake_es)["query"]["bool"]["must_not"]
+    assert {"exists": {"field": "import.id"}} not in must_not
+    assert out["provenance"] == "any"
+    assert "imported" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_every_summary_names_the_population_it_counted(settings_kratos: Settings) -> None:
+    """A narrowed denominator that does not announce itself is the same bug again.
+
+    The summary is what gets quoted into a rationale, so the population rides in
+    the prose and not only in a sibling field a quoting reader leaves behind.
+    """
+    common = _agg_response(
+        total=400,
+        first_seen="2026-04-01T00:00:00Z",
+        last_seen="2026-06-28T00:00:00Z",
+        day_keys=[f"2026-06-{d:02d}" for d in range(1, 21)],
+    )
+    elastic, _ = _make_elastic(settings_kratos, common)
+    out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
+    assert out["rarity"] == "common"
+    assert "live telemetry only" in out["summary"]
+    assert out["provenance"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_an_absence_reports_the_backfill_it_hid(settings_kratos: Settings) -> None:
+    """'No prior events, treat as novel' is what the filter can turn into a lie.
+
+    A host with 40,000 imported documents and no live ones is not a novel host.
+    It is a host this grid has never watched, and the two readings drive opposite
+    verdicts — so the empty branch measures what it excluded and says so.
+    """
+    elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
+    fake_es.search.side_effect = [
+        _agg_response(total=0),  # the tool's own live query
+        _agg_response(total=40_000),  # the import-volume probe
+    ]
+    out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
+    assert out["observed"] is False
+    assert out["evidence"]["imported_matches"] == 40_000
+    assert "40000 imported or replayed document(s)" in out["summary"]
+    assert "provenance='any'" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_grid_is_not_accused_of_holding_backfill(
+    settings_kratos: Settings,
+) -> None:
+    """Zero excluded needs no sentence — the denominator note already covered it."""
+    elastic, _ = _make_elastic(settings_kratos, _agg_response(total=0))
+    out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
+    assert out["evidence"]["imported_matches"] == 0
+    assert "imported or replayed document(s) matching it" not in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_an_unmeasurable_import_volume_is_not_reported_as_zero(
+    settings_kratos: Settings,
+) -> None:
+    """A failed probe is a third outcome, and the one that must not read as "none".
+
+    Reporting unmeasured backfill as zero restores exactly the ambiguity the
+    probe exists to remove, and does it while sounding certain.
+    """
+    elastic, fake_es = _make_elastic(settings_kratos, _agg_response(total=0))
+    fake_es.search.side_effect = [_agg_response(total=0), RuntimeError("shard failure")]
+    out = await prevalence("10.0.0.5", elastic=elastic, settings=settings_kratos)
+    assert out["observed"] is False
+    assert out["evidence"]["imported_matches"] is None
+    assert "could not be measured" in out["summary"]
     assert "error" not in out

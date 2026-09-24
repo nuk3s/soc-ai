@@ -7,9 +7,10 @@ most recent investigation per rule / per alert.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
 from sqlalchemy import and_, case, func, literal, or_, select
@@ -23,7 +24,87 @@ from soc_ai.store.auth import utcnow
 from soc_ai.store.models import ChatMessage, Investigation, InvestigationEvent
 from soc_ai.triage_models import is_pipeline_fallback
 
+_LOGGER = logging.getLogger(__name__)
+
 VERDICTS_RUNNING = "running"
+
+# The subject type of a run whose subject is a hunt (migration 0050).
+HUNT_SUBJECT_TYPE = "hunt"
+
+
+def is_hunt_subject(inv: Any) -> bool:
+    """Whether this run investigated a hunt rather than the alert it anchors on.
+
+    D2. A hunt-subject run carries one of the hunt's cited documents in
+    ``alert_es_id``, because the pipeline anchors every time window on one
+    timestamp. The document is a time anchor, not the subject. Read as the
+    alert's run, the promotion of lead 10 made the alert's own investigation
+    a superseded "earlier run" and put a false positive about the HUNT's
+    hypothesis on the alert. Nobody investigated that alert.
+
+    This is the predicate every reader that groups by ``alert_es_id`` asks
+    first. :func:`alert_group_id` is its answer for one row and
+    :func:`not_hunt_subject` is the same rule in SQL. One rule, three shapes,
+    so a hunt run cannot stand alone in the list and join the group in a
+    query.
+    """
+    subject = getattr(inv, "subject_json", None)
+    return isinstance(subject, dict) and subject.get("type") == HUNT_SUBJECT_TYPE
+
+
+def alert_group_id(inv: Any) -> str | None:
+    """The alert this run groups under, or None when the run stands alone.
+
+    The row-level twin of :func:`not_hunt_subject`. A caller that groups runs
+    keys on this, never on ``alert_es_id`` itself.
+    """
+    return None if is_hunt_subject(inv) else getattr(inv, "alert_es_id", None)
+
+
+def not_hunt_subject() -> Any:
+    """The SQL for a run that belongs to the alert it names.
+
+    ``json_extract`` returns NULL for an alert run, whose ``subject_json`` is
+    NULL, and the coalesce keeps that row in the set. A NULL compared to a
+    string is NULL, which is not true, and the filter would have dropped every
+    alert run.
+    """
+    return (
+        func.coalesce(func.json_extract(Investigation.subject_json, "$.type"), "")
+        != HUNT_SUBJECT_TYPE
+    )
+
+
+async def _observe_verdict(db: AsyncSession, inv: Investigation) -> None:
+    """Write the alert observation for this verdict. Never fail the caller.
+
+    The import is inside the function because :mod:`soc_ai.hunting.leads`
+    imports :mod:`soc_ai.store.models`. A module-level import here would make a
+    cycle.
+    """
+    if not inv.alert_es_id:
+        return
+    if is_hunt_subject(inv):
+        # The verdict is on the hunt, not on the anchor document. The hunt's
+        # findings already wrote their observations, and the lead behind the
+        # hunt is the thing the analyst promoted. An alert observation here
+        # would feed a second lead on the same ground.
+        return
+    from soc_ai.hunting.sources import observe_alert_verdict  # noqa: PLC0415 - cycle
+
+    try:
+        await observe_alert_verdict(
+            db,
+            alert_id=str(inv.alert_es_id),
+            rule_name=inv.rule_name,
+            verdict=inv.verdict,
+            confidence=inv.confidence,
+            hosts=[inv.src_ip, inv.dest_ip, inv.host_name],
+            now=datetime.now(UTC),
+        )
+    except Exception:
+        _LOGGER.exception("alert observation failed for investigation %s", inv.id)
+
 
 # The verdict strings the detection-tuning FP-trend tally buckets. Any other
 # verdict value a row carries is ignored, so the three buckets always sum to
@@ -44,6 +125,7 @@ async def create(
     hunt_id: str | None = None,
     finding_ordinal: int | None = None,
     is_synth_eval: bool = False,
+    subject: dict[str, Any] | None = None,
 ) -> Investigation:
     # Seed the display name at birth when the caller already knows it (the alert
     # grid / re-hunt / group sweep all do). Otherwise it stays NULL and the
@@ -64,6 +146,10 @@ async def create(
         # Synth-eval marker: from the eval context (recorded_run) or inherited
         # from a marked hunt at promotion — never from an API request body.
         is_synth_eval=is_synth_eval,
+        # What the run investigates (migration 0050). None on an alert run.
+        # A hunt run passes the subject the promotion built, so the row says
+        # what it was about even if the run dies before its first event.
+        subject_json=subject,
     )
     db.add(inv)
     await db.commit()
@@ -78,6 +164,8 @@ async def set_alert_fields(
     rule_name: str | None = None,
     src_ip: str | None = None,
     dest_ip: str | None = None,
+    community_id: str | None = None,
+    host_name: str | None = None,
 ) -> None:
     """Set investigation fields only if currently unset (only-set-if-unset semantics)."""
     inv = await db.get(Investigation, inv_id)
@@ -92,6 +180,12 @@ async def set_alert_fields(
         changed = True
     if dest_ip is not None and inv.dest_ip is None:
         inv.dest_ip = dest_ip[:64]
+        changed = True
+    if community_id is not None and inv.community_id is None:
+        inv.community_id = community_id[:128]
+        changed = True
+    if host_name is not None and inv.host_name is None:
+        inv.host_name = host_name[:255]
         changed = True
     if changed:
         await db.commit()
@@ -147,6 +241,8 @@ async def finalize(
         inv.is_fallback = is_pipeline_fallback(report)
     inv.finished_at = utcnow()
     await db.commit()
+    if verdict is not None and inv.status == "complete":
+        await _observe_verdict(db, inv)
 
 
 async def resolve(
@@ -212,6 +308,7 @@ async def resolve(
             proposal_msg.meta = {**(proposal_msg.meta or {}), "applied": True}
     await db.commit()
     await db.refresh(inv)
+    await _observe_verdict(db, inv)
     return inv
 
 
@@ -287,7 +384,15 @@ async def get_with_events(
     return inv, list(events)
 
 
-async def _latest_by(db: AsyncSession, column: Any, keys: list[str]) -> dict[str, Investigation]:
+async def _latest_by(
+    db: AsyncSession, column: Any, keys: list[str], *, where: Any = None
+) -> dict[str, Investigation]:
+    """Newest row per key. ``where`` narrows the set BEFORE the ranking.
+
+    The filter has to sit inside the subquery: applied after it, a row the
+    caller does not want would still win its partition and take the key's
+    answer with it.
+    """
     if not keys:
         return {}
     # Newest row PER KEY via a window function. A global ORDER BY … LIMIT is
@@ -304,7 +409,7 @@ async def _latest_by(db: AsyncSession, column: Any, keys: list[str]) -> dict[str
             )
             .label("rn"),
         )
-        .where(column.in_(keys))
+        .where(column.in_(keys) if where is None else and_(column.in_(keys), where))
         .subquery()
     )
     latest = aliased(Investigation, ranked)
@@ -538,8 +643,12 @@ async def override_counts_by_rule(
 
 
 async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str, Investigation]:
-    """Most recent investigation per alert _id (badge on event rows)."""
-    return await _latest_by(db, Investigation.alert_es_id, alert_ids)
+    """Most recent investigation per alert _id (badge on event rows).
+
+    A hunt-subject run is left out: it anchors on a cited document and is not
+    that alert's run (:func:`is_hunt_subject`).
+    """
+    return await _latest_by(db, Investigation.alert_es_id, alert_ids, where=not_hunt_subject())
 
 
 async def complete_for_alert(db: AsyncSession, alert_id: str) -> Investigation | None:
@@ -555,7 +664,13 @@ async def complete_for_alert(db: AsyncSession, alert_id: str) -> Investigation |
     """
     q = (
         select(Investigation)
-        .where(Investigation.alert_es_id == alert_id, Investigation.status == "complete")
+        .where(
+            Investigation.alert_es_id == alert_id,
+            Investigation.status == "complete",
+            # A hunt-subject run anchors on a cited document. It is not a
+            # completed run OF this alert.
+            not_hunt_subject(),
+        )
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         .limit(1)
     )
@@ -647,8 +762,30 @@ def blocks_rehunt(inv: Investigation) -> bool:
     alert. Only an in-flight (``running``) or genuinely finished (``complete``)
     run blocks; an ``error`` or ``cancelled`` run produced no usable verdict and
     must stay re-huntable — otherwise an errored investigation silently locks the
-    alert out of triage forever (the cause of the "selected 2, only 1 ran" bug)."""
-    return inv.status in ("running", "complete")
+    alert out of triage forever (the cause of the "selected 2, only 1 ran" bug).
+
+    A pipeline fallback is that same shape wearing a ``complete`` status. It is
+    written when the synth path raises — model truncation, a gateway 5xx, schema
+    validation exhausted — and it stores a placeholder ``needs_more_info`` the
+    pipeline never reasoned to. So it is a failure by every measure except the
+    status column, and it must not block either.
+
+    This was the "pipeline errors that never heal" report. The two halves of the
+    product disagreed: the investigations list counted a fallback as needing a
+    retry (:func:`_needs_retry`, ``fallback or noVerdict``), while this predicate
+    counted it as finished and the sweep skipped its alert as ``already_triaged``.
+    On the home deployment nine alerts sat in exactly that gap — permanently
+    listed as needing attention, permanently ineligible for the only thing that
+    would clear them. Both halves now read a failure the same way.
+    """
+    if inv.status == "running":
+        return True
+    if inv.status != "complete":
+        return False
+    # Either source of truth: the column is stamped at finalize, the report is
+    # the canonical predicate every other consumer derives from. A row written
+    # before the column existed carries the marker only in the report.
+    return not (inv.is_fallback is True or is_pipeline_fallback(inv.report))
 
 
 async def delete(db: AsyncSession, inv_id: str) -> bool:
@@ -706,6 +843,7 @@ class NotifRow(NamedTuple):
     created_at: datetime
     finished_at: datetime | None
     is_synth_eval: bool
+    error_dismissed_at: datetime | None
 
 
 async def list_recent_notifications(
@@ -714,6 +852,8 @@ async def list_recent_notifications(
     status: str | None = None,
     limit: int = 100,
     finished_since: datetime | None = None,
+    no_verdict: bool = False,
+    exclude_dismissed: bool = False,
 ) -> list[NotifRow]:
     """Lightweight investigation rows for the notifications bell — scalar columns only.
 
@@ -727,6 +867,19 @@ async def list_recent_notifications(
     ``finished_at`` (a running row) is excluded by the ``>=`` bound, which is
     correct: the bound is only ever passed for the completed query, and the
     running query keeps its ``created_at`` order (the stamp it renders).
+
+    ``status`` matches the DISPLAY status (:func:`_display_status_sql`), not the
+    stored column, so the bell grades a row the way every other surface renders
+    it. A 'complete' run with a blank verdict displays as an error, so asking
+    for completions no longer hands back a run that reached no decision and
+    titles it "Verdict untriaged". Asking for errors finds it instead.
+
+    ``no_verdict`` narrows to runs that ended without one, and
+    ``exclude_dismissed`` drops the ones an operator has already acknowledged
+    (``POST /investigations/{id}/dismiss-error``). Together they are the bell's
+    failed-triage half. Both are SQL conditions rather than a Python filter over
+    the page, because dropping rows after a LIMIT is how a bounded query comes
+    back empty while matching rows sit just past the cut.
     """
     q = select(
         Investigation.id,
@@ -736,9 +889,22 @@ async def list_recent_notifications(
         Investigation.created_at,
         Investigation.finished_at,
         Investigation.is_synth_eval,
+        Investigation.error_dismissed_at,
     )
     if status is not None:
-        q = q.where(Investigation.status == status)
+        q = q.where(_display_status_sql() == status)
+        if status != "error":
+            # Redundant, and kept on purpose. 'error' is the only display status
+            # a row can reach from a DIFFERENT stored value, so for every other
+            # one the raw column is an exact restatement of the CASE, and a plain
+            # equality is what the (status, created_at) index can serve.
+            # Without it the bell's two hot queries, polled every 15s by every
+            # open tab, would fall back to scanning the table.
+            q = q.where(Investigation.status == status)
+    if no_verdict:
+        q = q.where(_blank_verdict_sql())
+    if exclude_dismissed:
+        q = q.where(Investigation.error_dismissed_at.is_(None))
     if finished_since is not None:
         q = q.where(Investigation.finished_at >= finished_since).order_by(
             Investigation.finished_at.desc(), Investigation.id.desc()
@@ -756,23 +922,22 @@ async def list_recent_notifications(
 # reach one of the three and leave the other two disagreeing about it.
 DISPLAY_STATUSES = ("running", "complete", "error", "cancelled", "interrupted")
 
-# The synthetic verdict-filter member: not a stored verdict string but "the
-# report carries the E1.2 pipeline-fallback marker". Spelled here because the
-# SQL translation of that marker lives in this module.
+# The synthetic verdict-filter member: not a stored verdict string but "this run
+# produced no usable verdict". Two shapes qualify. One is the E1.2 fallback: the
+# pipeline failed, wrote a placeholder needs_more_info and marked the report. The
+# other is a run that died outright: no verdict, no rationale, no report to mark
+# (:func:`failed_triage_sql`). Only the first was ever in this filter, which is
+# why 188 dead runs on the deployed instance were unreachable from the Dashboard
+# count, its deep link, and the screen's own Verdict filter. Spelled here because
+# the SQL translation of both shapes lives in this module.
 PIPELINE_ERROR_VERDICT = "pipeline_error"
 
 # Cap shared with the route (mirrors list_recent's historical clamp).
 MAX_PAGE_LIMIT = 500
 
 
-def _display_status_sql() -> Any:
-    """The status a row will RENDER with, as a SQL expression.
-
-    Mirrors ``routes_investigations._row_status``: an unknown stored status is
-    'error', and a 'complete' run with no (or blank) verdict is 'error'. The
-    filter must use THIS, not the raw column — filtering on the raw column would
-    let status=complete return rows the table then displays as errors, and
-    status=error miss them: a filter promising a set the screen contradicts.
+def _blank_verdict_sql() -> Any:
+    """ "This run reached no verdict", as a SQL expression.
 
     The trim charset is spelled out because the renderer's blank test is
     ``str.strip()``, which strips ALL whitespace, while SQL ``trim(x)`` with no
@@ -787,12 +952,44 @@ def _display_status_sql() -> Any:
     not portable SQL.
     """
     blank = " \t\n\r\x0b\x0c"
-    no_verdict = or_(Investigation.verdict.is_(None), func.trim(Investigation.verdict, blank) == "")
+    return or_(Investigation.verdict.is_(None), func.trim(Investigation.verdict, blank) == "")
+
+
+def _display_status_sql() -> Any:
+    """The status a row will RENDER with, as a SQL expression.
+
+    Mirrors ``routes_investigations._row_status``: an unknown stored status is
+    'error', and a 'complete' run with no (or blank) verdict is 'error'. The
+    filter must use THIS, not the raw column — filtering on the raw column would
+    let status=complete return rows the table then displays as errors, and
+    status=error miss them: a filter promising a set the screen contradicts.
+    """
     return case(
-        (and_(Investigation.status == "complete", no_verdict), "error"),
+        (and_(Investigation.status == "complete", _blank_verdict_sql()), "error"),
         (Investigation.status.not_in(DISPLAY_STATUSES), "error"),
         else_=Investigation.status,
     )
+
+
+def failed_triage_sql() -> Any:
+    """ "The triage died and left no answer", as a SQL expression.
+
+    A run that displays as an error AND carries no verdict: no disposition, no
+    rationale, nothing for the queue to have learned. Distinct from an errored
+    run that DID reach a verdict, which is reachable under that verdict and is
+    not a hole in the coverage.
+
+    Named, exported and shared because three surfaces have to agree on it or the
+    hole opens again: the Dashboard's count, the notification bell, and the
+    dismiss endpoint that clears one. The deployed instance carried 188 rows in
+    this state over ten weeks: none acknowledged, none re-queued, none mentioned
+    anywhere in the product.
+
+    ``cancelled`` is deliberately outside it: an operator asked for that stop.
+    So is ``interrupted``: a restart cut the run off and the row stays
+    re-huntable (:func:`blocks_rehunt`), so auto-triage picks it up again.
+    """
+    return and_(_display_status_sql() == "error", _blank_verdict_sql())
 
 
 @dataclass(frozen=True)
@@ -843,6 +1040,9 @@ async def query_page(
     a row matches a real verdict only when it is NOT fallback-marked, mirroring
     the screen's matchesVerdict semantics (the ``true_positives`` figure applies
     that same guard, so it never counts a row the verdict filter would exclude).
+    A run that died without a verdict (:func:`failed_triage_sql`) matches that
+    same member; it needs no exclusion from the real-verdict branch because it
+    has no verdict string to match one with.
     Unknown members simply match nothing (the route drops them before calling).
 
     ``q`` is the operator's free text, matched case-insensitively as a substring
@@ -881,7 +1081,7 @@ async def query_page(
         stored = [v for v in verdicts if v != PIPELINE_ERROR_VERDICT]
         terms: list[Any] = []
         if PIPELINE_ERROR_VERDICT in verdicts:
-            terms.append(is_fallback)
+            terms.append(or_(is_fallback, failed_triage_sql()))
         if stored:
             terms.append(and_(not_fallback, Investigation.verdict.in_(stored)))
         conds.append(or_(*terms))
@@ -971,6 +1171,9 @@ class RunRef(NamedTuple):
 async def runs_for_alerts(db: AsyncSession, alert_ids: Sequence[str]) -> list[RunRef]:
     """EVERY run for the given alerts, newest first — the primacy input.
 
+    Every run OF the alert. A hunt-subject run names one of the hunt's
+    documents and is not one of them (:func:`is_hunt_subject`).
+
     The canonical ("primary") run per alert is decided over the alert's WHOLE
     group. Deciding it over a filtered page instead would crown whichever
     sibling happened to match the filter — under status=error an errored retry
@@ -995,7 +1198,7 @@ async def runs_for_alerts(db: AsyncSession, alert_ids: Sequence[str]) -> list[Ru
             Investigation.status,
             Investigation.created_at,
         )
-        .where(Investigation.alert_es_id.in_(list(alert_ids)))
+        .where(Investigation.alert_es_id.in_(list(alert_ids)), not_hunt_subject())
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
     )
     return [RunRef(*row) for row in rows.all()]
@@ -1031,18 +1234,71 @@ async def for_entity(db: AsyncSession, value: str, *, limit: int = 50) -> list[I
     return list((await db.scalars(q)).all())
 
 
+# The key a verdict travels along: rule, then the subject it was about.
+#
+# ``(rule_name, src_ip, dest_ip, host_name)``, and the host component is
+# CONDITIONAL — see :func:`pair_key` for why it is empty whenever a flow is
+# present.
+PairKey = tuple[str, str, str, str]
+
+# The key with a rule and nothing else. It names no subject: not an address,
+# not a machine, nothing but "this detection, somewhere". Verdicts do not
+# travel along it (see :func:`latest_for_pairs`).
+_SUBJECTLESS = ("", "", "")
+
+
+def pair_key(
+    rule_name: str | None,
+    src_ip: str | None,
+    dest_ip: str | None,
+    host_name: str | None = None,
+) -> PairKey:
+    """The inheritance key for one alert or one investigation row.
+
+    Every producer of a key goes through here — the sweep planner's clustering,
+    the alert grid's per-event pill, and the two lookups' re-derivation from DB
+    rows — because a key built two ways is a key that silently misses.
+
+    A missing component degrades to ``""`` rather than dropping the alert: these
+    detections have to be triageable at all, and dropping them is what made the
+    scheduled sweep network-flow-only.
+
+    **The host is conditional.** It joins the key only when BOTH endpoints are
+    empty. On a multi-sensor grid one flow is seen by two sensors under two
+    ``host.name`` values, so keying a flow on the host would split one
+    investigation into two of the same thing. A detection with no flow has no
+    such collision, and the host is the only subject it has: without it, every
+    Sigma host rule collapsed into one cluster covering every machine on the
+    estate, forever.
+    """
+    src = src_ip or ""
+    dest = dest_ip or ""
+    host = "" if (src or dest) else (host_name or "")
+    return (rule_name or "", src, dest, host)
+
+
+def names_a_subject(key: PairKey) -> bool:
+    """Whether a key identifies WHAT a verdict would be about.
+
+    ``(rule, "", "", "")`` does not. It says a detection fired and nothing about
+    where, so a verdict reached under it is a verdict about the rule, not about
+    anything that happened.
+    """
+    return key[1:] != _SUBJECTLESS
+
+
 async def latest_for_pairs(
     db: AsyncSession,
-    pairs: list[tuple[str, str, str]],
+    pairs: list[PairKey],
     *,
     window_days: int,
-) -> dict[tuple[str, str, str], Investigation]:
-    """Most recent COMPLETE investigation per (rule_name, src_ip, dest_ip),
-    no older than the window. Running/error rows never propagate.
+) -> dict[PairKey, Investigation]:
+    """Most recent COMPLETE investigation per :data:`PairKey`, no older than the
+    window. Running/error rows never propagate.
 
     A NULL endpoint is a KEY VALUE, not a reason to skip the row: it coalesces to
     ``""``, the same degrade the sweep planner and the alert grid apply when they
-    build the pairs they ask about. Filtering NULLs out in SQL made every
+    build the keys they ask about. Filtering NULLs out in SQL made every
     endpoint/process-shaped detection (Sigma host rules carry no ``source.*`` /
     ``destination.*``, so the recorder leaves both columns NULL) invisible here —
     the rows were discarded before the coalescing below could key them, so a
@@ -1051,6 +1307,17 @@ async def latest_for_pairs(
     a coalesced key always carries an empty component where the row had a NULL,
     so it can never collide with a flow's key.
 
+    **A key that names no subject inherits nothing.** Admitting the NULL rows
+    fixed the re-investigation, and left ``(rule, "", "")`` matching every
+    address-free alert of that rule on every machine, indefinitely. One benign
+    verdict silenced the rule estate-wide and re-armed itself on each sweep,
+    because the alerts it silenced were never investigated to contradict it. The
+    host now carries these clusters (see :func:`pair_key`); when even that is
+    absent there is nothing left to have been right about, and the key is
+    refused rather than matched. Such an alert is re-investigated, which is the
+    honest outcome for a detection soc-ai cannot tell apart from any other
+    firing of the same rule.
+
     ``kind == "hunt"`` rows are EXCLUDED at the query level: a promoted
     finding's verdict is about its cited evidence, never a license to ack a
     whole detection group. Its ``rule_name`` is the finding's title, which can
@@ -1058,10 +1325,11 @@ async def latest_for_pairs(
     a row would become an inheritance source and ``_ack_inherited_fps`` would
     write unattended acks against real SO alerts it never investigated.
     """
-    if not pairs:
+    wanted = {key for key in pairs if names_a_subject(key)}
+    if not wanted:
         return {}
     cutoff = utcnow() - timedelta(days=window_days)
-    rules = list({p[0] for p in pairs})
+    rules = list({key[0] for key in wanted})
     rows = (
         await db.scalars(
             select(Investigation)
@@ -1074,10 +1342,9 @@ async def latest_for_pairs(
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         )
     ).all()
-    wanted = set(pairs)
-    out: dict[tuple[str, str, str], Investigation] = {}
+    out: dict[PairKey, Investigation] = {}
     for inv in rows:
-        key = (inv.rule_name or "", inv.src_ip or "", inv.dest_ip or "")
+        key = pair_key(inv.rule_name, inv.src_ip, inv.dest_ip, inv.host_name)
         if key in wanted and key not in out:
             out[key] = inv
     return out
@@ -1226,11 +1493,94 @@ async def prior_outcomes(
     ]
 
 
+# How far back a community id still means "the same session". A community id is
+# a hash of the five-tuple, and a five-tuple is reused: the same client port
+# talking to the same service days later is a different conversation wearing the
+# same name. A day is generous for one session and short enough that a reuse
+# rarely lands inside it. The two range alerts that reached opposite verdicts
+# were twenty-eight minutes apart.
+SESSION_WINDOW_MINUTES = 1440
+
+
+async def session_verdicts(
+    db: AsyncSession,
+    *,
+    community_id: str,
+    exclude_id: str | None = None,
+    window_minutes: int = SESSION_WINDOW_MINUTES,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Verdicts already reached on the SAME network session, newest first.
+
+    The community id is the hashed five-tuple, so this is the five-tuple key the
+    row could not carry before migration 0038: same source, same destination,
+    same ports, same protocol. Sibling of :func:`prior_outcomes` and
+    deliberately not a tier of it. A prior outcome is a resemblance and reaches
+    the model as context it may weigh against the evidence in front of it; this
+    is the same conversation, already read, and it reaches the model as a
+    constraint. Two alerts from one session that settle opposite ways are not
+    two opinions, they are one contradiction, and the range produced exactly
+    that: a true positive recommending escalation and a false positive
+    recommending acknowledgement, twenty-eight minutes apart on one TCP session.
+
+    Same candidate filters as :func:`prior_outcomes` and for the same reasons:
+    COMPLETE and verdict-bearing (a running row hands out nothing), inside the
+    window, not a pipeline fallback, and never a promoted hunt finding. Synthetic
+    evaluation rows are excluded too, which the rule-keyed sibling does not need
+    to do: a synth run is allowed to see planted scenarios, so its verdict must
+    never bind a real one.
+
+    An empty ``community_id`` returns nothing rather than matching every row
+    whose session is unknown. NULL is the absence of a session, never a shared
+    one.
+
+    Returns light digests (never full reports)::
+
+        {id, created_at, verdict, confidence, rationale_digest}
+    """
+    if not community_id or limit <= 0:
+        return []
+    cutoff = utcnow() - timedelta(minutes=window_minutes)
+    q = (
+        select(
+            Investigation.id,
+            Investigation.created_at,
+            Investigation.verdict,
+            Investigation.confidence,
+            Investigation.rationale,
+        )
+        .where(
+            Investigation.community_id == community_id,
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+            Investigation.created_at >= cutoff,
+            Investigation.is_fallback.isnot(True),
+            Investigation.kind != "hunt",
+            Investigation.is_synth_eval.isnot(True),
+        )
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .limit(limit)
+    )
+    if exclude_id is not None:
+        q = q.where(Investigation.id != exclude_id)
+    rows = (await db.execute(q)).all()
+    return [
+        {
+            "id": row.id,
+            "created_at": row.created_at,
+            "verdict": row.verdict,
+            "confidence": row.confidence,
+            "rationale_digest": _digest_rationale(row.rationale),
+        }
+        for row in rows
+    ]
+
+
 async def running_for_pairs(
     db: AsyncSession,
-    pairs: list[tuple[str, str, str]],
-) -> set[tuple[str, str, str]]:
-    """The subset of (rule_name, src_ip, dest_ip) pairs with an IN-FLIGHT run.
+    pairs: list[PairKey],
+) -> set[PairKey]:
+    """The subset of :data:`PairKey` keys with an IN-FLIGHT run.
 
     :func:`latest_for_pairs` is complete-only by design (a running run must not
     hand out a verdict) — but a sweep planner that consults only completed runs
@@ -1246,6 +1596,13 @@ async def running_for_pairs(
     and a host-shaped rule can be investigated twice concurrently (a manual run
     in flight would not block the scheduled one).
 
+    Unlike :func:`latest_for_pairs`, a key naming no subject is NOT refused
+    here. The two answer different questions. That one hands out a verdict, so
+    it needs to know the verdict was about this alert; this one only stops the
+    same work being started twice while it is already running, and a coarse
+    stop is safe where a coarse verdict is not. Refusing it would let one sweep
+    launch a run per address-free alert of a rule at once.
+
     ``kind == "hunt"`` rows are excluded exactly as in :func:`latest_for_pairs`:
     a promotion's ``rule_name`` is a finding title that can collide with a live
     rule's name, and an in-flight promotion must not suppress the sweep from
@@ -1253,7 +1610,7 @@ async def running_for_pairs(
     """
     if not pairs:
         return set()
-    rules = list({p[0] for p in pairs})
+    rules = list({key[0] for key in pairs})
     rows = (
         await db.scalars(
             select(Investigation).where(
@@ -1267,5 +1624,149 @@ async def running_for_pairs(
     return {
         key
         for inv in rows
-        if (key := (inv.rule_name or "", inv.src_ip or "", inv.dest_ip or "")) in wanted
+        if (key := pair_key(inv.rule_name, inv.src_ip, inv.dest_ip, inv.host_name)) in wanted
     }
+
+
+# One recorded acknowledgement fan-out, written onto the investigation whose
+# verdict was inherited, so the writes an old verdict is still producing stay
+# attributable to it and outlive the sweep that made them.
+INHERITED_ACK_EVENT_KIND = "inherited_ack"
+
+# Recorded event kinds that can carry a retrieval. Mirrors
+# ``soc_ai.agent.evidence.RETRIEVAL_EVENT_KINDS``, spelled here rather than
+# imported because the store never imports the agent package.
+_RETRIEVAL_EVENT_KINDS = ("tool_result", "targeted_tool_result", "oracle_adjudication")
+
+
+async def retrieval_events_for(
+    db: AsyncSession, inv_ids: Sequence[str]
+) -> dict[str, list[tuple[str, Any]]]:
+    """Recorded retrieval-shaped events, grouped by investigation id.
+
+    Only :data:`_RETRIEVAL_EVENT_KINDS` are read: the rest of a run's event
+    stream is prompt assembly, model text and bookkeeping, and pulling it would
+    load every model response on the box to answer a yes/no question.
+
+    Deliberately dumb — it returns rows, and the caller asks
+    :func:`soc_ai.agent.evidence.recorded_run_retrieved_evidence` what they mean.
+    """
+    if not inv_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                InvestigationEvent.investigation_id,
+                InvestigationEvent.kind,
+                InvestigationEvent.payload,
+            ).where(
+                InvestigationEvent.investigation_id.in_(list(dict.fromkeys(inv_ids))),
+                InvestigationEvent.kind.in_(_RETRIEVAL_EVENT_KINDS),
+            )
+        )
+    ).all()
+    out: dict[str, list[tuple[str, Any]]] = {}
+    for inv_id, kind, payload in rows:
+        out.setdefault(inv_id, []).append((kind, payload))
+    return out
+
+
+# How many acknowledged alert ids one fan-out row keeps. The audit index holds
+# the complete per-alert trail (one ``auto_ack_inherited`` record each, carrying
+# ``inherited_from``); this is a recent sample so the row is readable and the
+# payload cannot grow to the size of the fan-out itself.
+_INHERITED_ACK_SAMPLE = 50
+
+
+async def record_inherited_acks(
+    db: AsyncSession, *, source_id: str, alert_ids: Sequence[str], rule_name: str | None = None
+) -> None:
+    """Record a sweep's fan-out on the investigation the verdict came from.
+
+    The inheritance path acknowledges alerts in Security Onion without creating
+    an investigation of its own, so until now the only trace was a per-sweep
+    counter on :class:`~soc_ai.webui.autotriage.AutoTriageStatus` that died when
+    the sweep ended. On the deployed instance that counter had reached 110,635
+    grid writes against 2,768 from the direct path, and no surface in the
+    product could say so.
+
+    Writing it onto the SOURCE investigation answers the question in the
+    direction an analyst asks it: not "how many acks happened last night" but
+    "what has this one false positive been acknowledging on my grid since I
+    closed it".
+
+    ONE row per source, updated in place. The sweep runs every few minutes and
+    the largest single fan-out on record is 945 acknowledgements, so a row per
+    sweep would bury the investigation's own timeline under its own aftermath
+    and grow without limit. The count is cumulative and the id list keeps the
+    most recent :data:`_INHERITED_ACK_SAMPLE`; the audit trail holds all of them.
+    """
+    ids = [a for a in alert_ids if a]
+    if not ids:
+        return
+    now = utcnow().isoformat()
+    existing = (
+        await db.scalars(
+            select(InvestigationEvent)
+            .where(
+                InvestigationEvent.investigation_id == source_id,
+                InvestigationEvent.kind == INHERITED_ACK_EVENT_KIND,
+            )
+            .order_by(InvestigationEvent.sequence)
+            .limit(1)
+        )
+    ).first()
+    if existing is not None:
+        prior = existing.payload if isinstance(existing.payload, dict) else {}
+        prior_ids = prior.get("alert_ids")
+        prior_ids = list(prior_ids) if isinstance(prior_ids, list) else []
+        prior_count = prior.get("acked")
+        prior_count = prior_count if isinstance(prior_count, int) else len(prior_ids)
+        # Reassigned, not mutated in place: SQLAlchemy's plain JSON column does
+        # not track in-place edits, so an .append() here would commit nothing.
+        existing.payload = {
+            "acked": prior_count + len(ids),
+            "alert_ids": (prior_ids + ids)[-_INHERITED_ACK_SAMPLE:],
+            "rule_name": prior.get("rule_name") or rule_name or "",
+            "first_at": prior.get("first_at") or prior.get("at") or now,
+            "last_at": now,
+        }
+        await db.commit()
+        return
+    next_seq = (
+        await db.scalar(
+            select(func.coalesce(func.max(InvestigationEvent.sequence), 0) + 1).where(
+                InvestigationEvent.investigation_id == source_id
+            )
+        )
+    ) or 1
+    db.add(
+        InvestigationEvent(
+            investigation_id=source_id,
+            sequence=int(next_seq),
+            kind=INHERITED_ACK_EVENT_KIND,
+            payload={
+                "acked": len(ids),
+                "alert_ids": ids[-_INHERITED_ACK_SAMPLE:],
+                "rule_name": rule_name or "",
+                "first_at": now,
+                "last_at": now,
+            },
+        )
+    )
+    await db.commit()
+
+
+async def inherited_ack_total(db: AsyncSession, *, source_id: str | None = None) -> int:
+    """Alerts acknowledged by verdict inheritance — all time, or for one source.
+
+    Summed in SQL over the recorded fan-outs (``json_extract`` on the payload,
+    the expression the fallback-provenance denormalization already uses) so the
+    running total costs one query rather than a scan of every payload in Python.
+    """
+    stmt = select(
+        func.coalesce(func.sum(func.json_extract(InvestigationEvent.payload, "$.acked")), 0)
+    ).where(InvestigationEvent.kind == INHERITED_ACK_EVENT_KIND)
+    if source_id is not None:
+        stmt = stmt.where(InvestigationEvent.investigation_id == source_id)
+    return int(await db.scalar(stmt) or 0)

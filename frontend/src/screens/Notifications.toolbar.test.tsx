@@ -70,6 +70,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getNotifications: vi.fn().mockResolvedValue(ROWS),
 }));
 
+import { TONE_URGENT } from '../lib/tooltips';
 import { Notifications } from './Notifications';
 
 function renderNotifications() {
@@ -238,18 +239,33 @@ describe('Notifications — behaviour the toolbar must not have changed', () => 
   });
   afterEach(() => localStorage.clear());
 
+  // A link goes to a page. The whole row carried the click, so the address of
+  // a hunt could not be read, copied or opened in a tab.
   it('still deep-links a row to its investigation or hunt', async () => {
     renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
-    fireEvent.click(screen.getByText(/Hunt finished — 3 findings/));
-    expect(navigate).toHaveBeenCalledWith('/hunts/HUNT-1');
+    const link = screen.getByRole('link', { name: /Hunt finished — 3 findings/ });
+    expect(link.getAttribute('href')).toBe('/hunts/HUNT-1');
+    const row = link.closest('[data-testid="notification-row"]')!;
+    expect(row.getAttribute('class')).not.toContain('cursor-pointer');
   });
 
   it('does not navigate for a row with no destination', async () => {
     renderNotifications();
     await screen.findByText(/Elasticsearch unreachable/);
+    expect(screen.queryByRole('link', { name: /Elasticsearch unreachable/ })).toBeNull();
     fireEvent.click(screen.getByText(/Elasticsearch unreachable/));
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  // The dot is the one axis that cuts across kinds. It said nothing.
+  it('states what the urgency dot means', async () => {
+    renderNotifications();
+    await screen.findByText(/Elasticsearch unreachable/);
+    const row = screen
+      .getAllByTestId('notification-row')
+      .find((r) => r.textContent?.includes('Elasticsearch unreachable'))!;
+    expect(within(row).getByTestId('notification-tone').getAttribute('title')).toBe(TONE_URGENT);
   });
 
   it('still dismisses one row without dismissing its neighbours', async () => {
@@ -284,6 +300,36 @@ describe('Notifications — behaviour the toolbar must not have changed', () => 
   });
 });
 
+// The header promised investigations only, over a list that also carries
+// shadow hits, leads and finished hunts (dogfood 2026-09-17).
+describe('Notifications — what the header says the list holds', () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => localStorage.clear());
+
+  it('names the real contents and counts them', async () => {
+    const api = await import('../lib/api');
+    vi.mocked(api.getNotifications).mockResolvedValue(ROWS as never);
+    const { container } = renderNotifications();
+    await screen.findByText(/ET SCAN Suspicious inbound/);
+    expect(container.textContent).toContain(
+      '5 items: shadow hits, leads, hunts and investigations from the last 24 h',
+    );
+  });
+
+  it('groups a row under the group the API named for it', async () => {
+    const api = await import('../lib/api');
+    vi.mocked(api.getNotifications).mockResolvedValue([
+      { ...ROWS[0], group: 'hunting', id: 'shadow-hit:1', title: 'Shadow hit on a quiet spec' },
+      ROWS[2],
+    ] as never);
+    renderNotifications();
+    await screen.findByText(/Shadow hit on a quiet spec/);
+    const headers = screen.getAllByTestId('notification-group').map((h) => h.textContent);
+    expect(headers).toContain('Hunting');
+    expect(headers).toContain('Investigations');
+  });
+});
+
 describe('Notifications — row timestamp', () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
@@ -301,5 +347,52 @@ describe('Notifications — row timestamp', () => {
     renderNotifications();
     expect(await screen.findByText('just now')).toBeTruthy();
     expect(screen.queryByText('now ago')).toBeNull();
+  });
+});
+
+describe('Notifications: a finding that must not be silenceable', () => {
+  // A broken audit chain is a standing entry, and it has to be dismissible or
+  // it raises an uncleaable danger notification every day. But a record whose
+  // content no longer matches its own hash is someone changing the record of a
+  // decision, and there is no version of that which should go away because
+  // somebody clicked an X, least of all "Clear all", which would sweep it up
+  // with the routine rows in one pass. The server marks those rows
+  // undismissible; the screen has to honour it.
+  const rows = [
+    {
+      id: 'audit-chain-break:content_altered|2026-09-07T08:00:00Z|1',
+      tone: 'danger',
+      title: 'Audit trail broken (content_altered): 1 record no longer matches its own hash',
+      when: '2h',
+      href: '/config',
+      dismissible: false,
+    },
+    {
+      id: 'inv-done:INV-3',
+      tone: 'danger',
+      title: 'Verdict true_positive: ET MALWARE Beacon Observed',
+      when: '9m',
+      href: '/investigation/INV-3',
+    },
+  ];
+
+  beforeEach(() => localStorage.clear());
+  afterEach(() => localStorage.clear());
+
+  it('renders the row with no dismiss control, and Clear all steps over it', async () => {
+    const api = await import('../lib/api');
+    vi.mocked(api.getNotifications).mockResolvedValue(rows as never);
+    renderNotifications();
+    await screen.findByText(/Audit trail broken/);
+
+    // Two rows, one dismiss control: the ordinary one.
+    expect(visibleTitles()).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: 'Dismiss' })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    await waitFor(() => expect(visibleTitles()).toHaveLength(1));
+    expect(visibleTitles()[0]).toContain('Audit trail broken');
+    const dismissed = JSON.parse(localStorage.getItem('soc-ai:dismissed-notifications')!);
+    expect(dismissed).toEqual(['inv-done:INV-3']);
   });
 });

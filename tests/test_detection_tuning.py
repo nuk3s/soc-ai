@@ -15,7 +15,7 @@ from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.webui import detection_tuning as dt
-from soc_ai.webui.alerts_query import AlertGroup
+from soc_ai.webui.alerts_query import AlertGroup, GroupPage
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 
@@ -90,6 +90,58 @@ def test_assess_threshold_boundary_mute() -> None:
     is_noisy, rec, _ = dt.assess(alert_count=dt.MUTE_MIN_ALERTS, fp=dt.MIN_FP, tp=0, nmi=0)
     assert is_noisy is True
     assert rec == "mute"
+
+
+# ---------------------------------------------------------------------------
+# assess() — a burst is not a tuning problem
+#
+# The volume floors read "this rule keeps coming back". They cannot tell that
+# apart from one episode: 1531 fires of a lateral-movement signature inside 59
+# seconds clear MUTE_MIN_ALERTS by 15x, and muting that signature would suppress
+# the loudest evidence of the intrusion that produced it.
+# ---------------------------------------------------------------------------
+
+
+def test_assess_a_single_burst_is_never_muted() -> None:
+    is_noisy, rec, reason = dt.assess(alert_count=1531, fp=8, tp=0, nmi=0, is_burst=True)
+    assert rec == "none"
+    assert is_noisy is False
+    assert "burst" in reason
+
+
+def test_assess_burst_with_analyst_overrides_only_monitors() -> None:
+    # Human feedback still surfaces the rule, but one episode never justifies mute.
+    is_noisy, rec, reason = dt.assess(
+        alert_count=1531, fp=8, tp=0, nmi=0, override_fp=3, is_burst=True
+    )
+    assert rec == "monitor"
+    assert is_noisy is True
+    assert "burst" in reason
+    assert "analyst FP-overrides" in reason
+
+
+def test_assess_negative_control_steady_high_volume_still_mutes() -> None:
+    # Same volume, same verdict trend, NOT a burst -> the mute recommendation
+    # must survive, or the burst guard has broken the tool's actual job.
+    is_noisy, rec, _ = dt.assess(alert_count=1531, fp=8, tp=0, nmi=0, is_burst=False)
+    assert rec == "mute"
+    assert is_noisy is True
+
+
+def test_assess_counts_triaged_data_points_not_raw_alerts() -> None:
+    # The ES-proxy caller folds every untriaged alert into nmi. Counting those as
+    # data points makes the MIN_TRIAGED floor vacuous and tells the reader a rule
+    # nobody looked at was examined 1531 times.
+    _is_noisy, rec, reason = dt.assess(alert_count=1531, fp=0, tp=0, nmi=1531, triaged=0)
+    assert "0 triaged" in reason
+    assert "1531 triaged" not in reason
+    assert rec == "monitor"
+
+
+def test_assess_triaged_defaults_to_the_verdict_tally() -> None:
+    # The Detection Tuning panel passes real completed investigations, so the
+    # default must stay the sum of the three verdict buckets.
+    assert dt.assess(300, 1, 0, 2) == dt.assess(300, 1, 0, 2, triaged=3)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +314,7 @@ async def test_nominate_joins_volume_and_verdicts(settings_kratos: Settings) -> 
     state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
     with patch(
         "soc_ai.webui.detection_tuning.aq.fetch_groups",
-        AsyncMock(return_value=(groups, 1463)),
+        AsyncMock(return_value=GroupPage(groups, 1463)),
     ):
         noms = await dt.nominate(state)
 
@@ -320,7 +372,7 @@ async def test_nominate_surfaces_analyst_overrides(settings_kratos: Settings) ->
     state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
     with patch(
         "soc_ai.webui.detection_tuning.aq.fetch_groups",
-        AsyncMock(return_value=(groups, 452)),
+        AsyncMock(return_value=GroupPage(groups, 452)),
     ):
         noms = await dt.nominate(state)
 
@@ -345,7 +397,10 @@ async def test_nominate_surfaces_analyst_overrides(settings_kratos: Settings) ->
 async def test_nominate_empty_feed(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
-    with patch("soc_ai.webui.detection_tuning.aq.fetch_groups", AsyncMock(return_value=([], 0))):
+    with patch(
+        "soc_ai.webui.detection_tuning.aq.fetch_groups",
+        AsyncMock(return_value=GroupPage([], 0)),
+    ):
         assert await dt.nominate(state) == []
     await engine.dispose()
 
@@ -525,15 +580,17 @@ def test_muted_rule_excluded_from_alerts_feed(client: TestClient) -> None:
         AlertGroup(rule_name="ET REAL", count=3, severity="high", latest_ts="", latest_id="y"),
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 415))),
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 415))
+        ),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={}),
         ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        default = client.get("/api/v1/alerts").json()
-        with_muted = client.get("/api/v1/alerts?include_muted=true").json()
+        default = client.get("/api/v1/alerts").json()["groups"]
+        with_muted = client.get("/api/v1/alerts?include_muted=true").json()["groups"]
 
     # default feed: ET NOISE suppressed
     assert {g["name"] for g in default} == {"ET REAL"}

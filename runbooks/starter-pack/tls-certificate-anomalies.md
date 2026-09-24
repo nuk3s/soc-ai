@@ -8,58 +8,65 @@ rules:
 
 # TLS and certificate anomaly triage
 
-TLS alerts fire on the *metadata* of encrypted sessions — certificates,
-SNI, fingerprints — because the payload is opaque. That metadata is rich:
-malware authors have to make TLS choices too (MITRE ATT&CK **T1573.002**
-Asymmetric Cryptography, **T1071.001** Web Protocols), and their choices
-differ from the commercial web's.
+TLS alerts fire on the *metadata* of an encrypted session because the payload is opaque.
+The metadata covers certificates, the server name indication (SNI) and fingerprints. That
+metadata is rich. Malware authors must make TLS choices too. Their choices differ from
+the choices of the commercial web. The MITRE ATT&CK techniques are **T1573.002**
+Asymmetric Cryptography and **T1071.001** Web Protocols.
 
 ## Read the certificate
 
-- **Issuer**: self-signed on an *internet* destination is the classic C2
-  tell — virtually all legitimate public services use a real CA. Note that
-  self-signed on *internal* services (appliances, dev boxes) is endemic and
-  usually benign; the same certificate observation means different things by
-  direction.
-- **Subject/SAN quality**: default or gibberish subjects, mismatches between
-  SNI and certificate names, and single-host SANs on supposed CDN traffic
-  all raise the score.
-- **Age and lifetime**: certificates issued *hours* before first contact,
-  with long validity and free-CA issuance, fit freshly stood-up attack
-  infrastructure. Also flag *expired* certificates that clients keep
-  talking to — real browsers refuse; custom implants often don't validate.
+- **Issuer**. A self-signed certificate on an *internet* destination is the classic
+  indicator of command and control. Almost all legitimate public services use a real
+  certificate authority. A self-signed certificate on an *internal* service is endemic
+  and usually benign. Appliances and development hosts use self-signed certificates. The
+  same certificate observation means a different thing in each direction.
+- **Subject and SAN quality**. A default or meaningless subject raises the score. A
+  mismatch between the SNI and the certificate names raises the score. A single-host
+  subject alternative name (SAN) on supposed content delivery network traffic raises the
+  score.
+- **Age and lifetime**. A certificate issued *hours* before the first contact fits freshly
+  built attack infrastructure. A long validity with issuance from a free certificate
+  authority fits the same profile. Flag an *expired* certificate that a client still uses.
+  Real browsers refuse an expired certificate. Many custom implants do not validate it.
 
 ## Read the connection around the certificate
 
-- **Fingerprint rarity** (JA3/JA3S or equivalent client/server hello
-  hashes, where available): a TLS client stack seen on exactly one host in
-  the network — while the fleet's browsers share a handful of common
-  fingerprints — indicates a custom client. Match known-malware fingerprint
-  lists but treat them as hints; fingerprints collide.
-- **SNI anomalies**: missing SNI from a modern host, SNI that is a bare IP,
-  or SNI/certificate/DNS disagreement (possible domain fronting, **T1090**
-  Proxy).
-- **Behavior**: combine with the beaconing checks — a self-signed cert
-  destination visited every 60 seconds is a C2 call; the same cert on a
-  one-time visit might be a misconfigured web host.
+- **Fingerprint rarity**. Use the JA3 and JA3S hashes of the client hello and the server
+  hello where they are available. A TLS client stack seen on exactly one host in the
+  network indicates a custom client. The browsers of the fleet share a handful of common
+  fingerprints. Match the fingerprint against known-malware lists. Treat a match as a
+  hint because fingerprints collide.
+- **SNI anomalies**. A modern host with no SNI is an anomaly. An SNI that is a bare IP
+  address is an anomaly. Disagreement between the SNI, the certificate and the DNS record
+  is an anomaly. That disagreement can indicate domain fronting. The MITRE ATT&CK
+  technique is **T1090** Proxy.
+- **Behavior**. Combine these checks with the beaconing checks. A destination with a
+  self-signed certificate that the host visits every 60 s is a command and control
+  channel. The same certificate on a one-time visit can be a misconfigured web host.
 
 ## Rule out the benign bulk
 
-Most TLS-anomaly volume is: internal appliances and dev services
-(self-signed by default), security products doing TLS inspection (their
-resigning CA appears everywhere — learn its issuer string), VPN clients,
-and IoT devices with vendor default certs. Fleet prevalence is the fastest
-filter: a certificate seen from fifty hosts is infrastructure; from one
-host, it's a lead.
+Most TLS-anomaly volume comes from 4 sources:
+
+- Internal appliances and development services. They are self-signed by default.
+- Security products that inspect TLS. Their resigning certificate authority appears
+  everywhere. Learn its issuer string.
+- Virtual private network clients.
+- Internet-of-things devices with the default certificate of the vendor.
+
+Fleet prevalence is the fastest filter. A certificate seen from 50 hosts is
+infrastructure. A certificate seen from one host is a lead.
 
 ## Verdict guidance
 
-- **Escalate** self-signed/young/known-bad certificates on outbound
-  connections that also show beacon cadence or rare-destination character.
-  Include the certificate hash and destination in the case for blocking and
+- **Escalate** a self-signed, young or known-bad certificate on an outbound connection.
+  Escalate it if the connection also shows beacon cadence or a rare destination. Add the
+  certificate hash and the destination to the investigation for blocking and
   retro-hunting.
-- **Dismiss** internal appliance certs, inspection-CA artifacts, and
-  documented dev systems — name the system, and prefer a scoped tuning rule
-  over repeated dismissals.
-- An *inbound* TLS anomaly (strange client fingerprint hitting your
-  services) is reconnaissance/exploitation triage, not this runbook.
+- **Dismiss** an internal appliance certificate, an inspection-authority artifact or a
+  documented development system. Name the system. Create a scoped tuning rule. Repeated
+  dismissals are then unnecessary.
+- An *inbound* TLS anomaly needs reconnaissance and exploitation triage. A strange client
+  fingerprint that reaches your services is an inbound anomaly. This runbook does not
+  cover it.

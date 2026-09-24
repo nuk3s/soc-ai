@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from soc_ai.config import Settings
 from soc_ai.main import create_app
-from soc_ai.webui.alerts_query import AlertEvent, AlertGroup
+from soc_ai.webui.alerts_query import AlertEvent, AlertGroup, GroupPage
 
 
 def _client(settings: Settings) -> Iterator[TestClient]:
@@ -56,12 +56,14 @@ def test_alerts_maps_and_coerces(client: TestClient) -> None:
         ),
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 14))),
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 14))
+        ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
         resp = client.get("/api/v1/alerts")
     assert resp.status_code == 200
-    body = resp.json()
+    body = resp.json()["groups"]
     assert body[0]["name"] == "ET MALWARE X"
     assert body[0]["sev"] == "high"
     assert body[0]["id"] == "es-1"
@@ -69,9 +71,207 @@ def test_alerts_maps_and_coerces(client: TestClient) -> None:
     assert body[0]["conf"] is None
     assert body[0]["events"] == []
     # coercion into the frontend's narrower unions
-    assert body[1]["sev"] == "low"  # unknown -> low
-    assert body[1]["kind"] == "suricata"  # alert -> suricata
+    assert body[1]["sev"] == "unknown"  # absent stays absent, it is not a Low
+    assert body[1]["kind"] == "alert"  # the generic kind is not a detector name
     assert body[1]["id"] == "weird"  # no latest_id -> falls back to rule name
+
+
+def test_the_queue_says_when_the_grid_could_not_return_every_group(
+    client: TestClient,
+) -> None:
+    """The cap was silent all the way to the wire.
+
+    Elasticsearch caps every terms aggregation and reports the remainder as a
+    lump sum. The route returned a bare list, so there was nowhere to put a
+    fact about the list, and the console rendered "N detections · M events in
+    window" off the rows it got. Past the cap both are floors, and a floor
+    rendered as a total makes the queue look smaller and calmer than it is.
+    """
+    groups = [
+        AlertGroup(
+            rule_name="ET MALWARE X",
+            count=12,
+            severity="high",
+            latest_ts="",
+            latest_id="es-1",
+        )
+    ]
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups",
+            AsyncMock(return_value=GroupPage(groups, 41908, truncated=True, other_docs=1408)),
+        ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        body = client.get("/api/v1/alerts").json()
+    assert body["truncated"] is True
+    assert body["other_docs"] == 1408
+    assert [g["name"] for g in body["groups"]] == ["ET MALWARE X"]
+
+
+def test_an_uncapped_queue_claims_nothing(client: TestClient) -> None:
+    """NEGATIVE CONTROL, and the one that keeps the marker worth reading.
+
+    Every ordinary queue is smaller than the ceiling. A route that reported
+    truncation on those would put the warning on every screen, which is the
+    same as not having it.
+    """
+    groups = [
+        AlertGroup(
+            rule_name="ET MALWARE X",
+            count=12,
+            severity="high",
+            latest_ts="",
+            latest_id="es-1",
+        )
+    ]
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups",
+            AsyncMock(return_value=GroupPage(groups, 12)),
+        ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        body = client.get("/api/v1/alerts").json()
+    assert (body["truncated"], body["other_docs"]) == (False, 0)
+
+
+def test_alerts_does_not_dress_a_missing_severity_up_as_low(client: TestClient) -> None:
+    """An alert with no ``event.severity_label`` is reported as unknown.
+
+    Defect 2: the shared coercion turned every severity outside the four-value
+    ladder into "low", so the 37 Elastic Defend endpoint alerts and 3 OpenCanary
+    honeypot hits that were the whole 24 hour queue on the measured grid came
+    back at the lowest severity the product has. The screen then disagreed with
+    its own filter, because a Severity=Low filter is a term query on the field
+    those documents do not carry and matched none of them. The console and the
+    filter now name the same thing.
+    """
+    groups = [
+        AlertGroup(
+            rule_name="Ingress Tool Transfer via CURL",
+            count=20,
+            severity="unknown",
+            latest_ts="2026-09-06T18:45:26Z",
+            latest_id="es-endpoint",
+            kind="suricata",
+        )
+    ]
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 20))
+        ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    assert resp.json()["groups"][0]["sev"] == "unknown"
+
+
+def test_alerts_still_reports_a_labelled_severity_verbatim(client: TestClient) -> None:
+    """Negative control for the unknown badge: the four ladder values are
+    unchanged, case-normalized as before. Most of the grid's history carries a
+    label and none of those rows may move."""
+    groups = [
+        AlertGroup(
+            rule_name=f"rule {sev}",
+            count=1,
+            severity=sev.upper(),
+            latest_ts="2026-09-06T18:45:26Z",
+            latest_id=f"es-{sev}",
+            kind="suricata",
+        )
+        for sev in ("critical", "high", "medium", "low")
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 4))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    assert [g["sev"] for g in resp.json()["groups"]] == ["critical", "high", "medium", "low"]
+
+
+def test_alerts_does_not_badge_a_generic_alert_as_suricata(client: TestClient) -> None:
+    """An alert from a dataset the kind map does not name is not a Suricata hit.
+
+    Defect 3: ``_kind_for`` returns the generic ``alert`` for any alert-labelled
+    document whose ``event.dataset`` is unmapped, and the frontend coercion then
+    turned that into ``suricata`` because it was not in the SPA's union. On the
+    measured grid that put a SURICATA badge on 37 Elastic Defend endpoint
+    alerts, which no Suricata sensor produced and which carry no network flow at
+    all. The badge now says what the feed actually knows.
+    """
+    groups = [
+        AlertGroup(
+            rule_name="Ingress Tool Transfer via CURL",
+            count=20,
+            severity="unknown",
+            latest_ts="2026-09-06T18:45:26Z",
+            latest_id="es-endpoint",
+            kind="alert",
+        )
+    ]
+    with (
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 20))
+        ),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    assert resp.json()["groups"][0]["kind"] == "alert"
+
+
+def test_alerts_still_badges_a_real_detector_kind(client: TestClient) -> None:
+    """Negative control for the generic kind: the detector kinds are verbatim."""
+    groups = [
+        AlertGroup(
+            rule_name=f"rule {kind}",
+            count=1,
+            severity="high",
+            latest_ts="2026-09-06T18:45:26Z",
+            latest_id=f"es-{kind}",
+            kind=kind,
+        )
+        for kind in ("suricata", "sigma", "notice", "unnamed")
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 4))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    assert [g["kind"] for g in resp.json()["groups"]] == ["suricata", "sigma", "notice", "unnamed"]
+
+
+def test_alerts_keeps_the_unnamed_kind_through_coercion(client: TestClient) -> None:
+    """An unnamed group's kind is a routing decision, not a badge.
+
+    Groups for alerts with no ``rule.name`` are named by their dataset, and the
+    SPA posts a group's kind back verbatim to expand it or acknowledge it.
+    Coercing ``unnamed`` to ``suricata`` (what an unrecognized kind gets) would
+    send that dataset name to be resolved against ``rule.name``, which is the
+    field these documents do not have: the row would count 3 and expand to
+    nothing, and a group ack would land on an empty set.
+    """
+    groups = [
+        AlertGroup(
+            rule_name="opencanary.events",
+            count=3,
+            severity="unknown",
+            latest_ts="2026-09-06T07:00:00Z",
+            latest_id="es-oc",
+            kind="unnamed",
+        )
+    ]
+    with (
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 3))),
+        patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
+    ):
+        resp = client.get("/api/v1/alerts")
+    assert resp.status_code == 200
+    assert resp.json()["groups"][0]["kind"] == "unnamed"
 
 
 def test_alerts_verdict_badge_inherited(client: TestClient) -> None:
@@ -97,14 +297,14 @@ def test_alerts_verdict_badge_inherited(client: TestClient) -> None:
         created_at=datetime(2026, 6, 17, 9, 0, 0),
     )
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 3))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 3))),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={"ET X": inv}),
         ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        body = client.get("/api/v1/alerts").json()
+        body = client.get("/api/v1/alerts").json()["groups"]
     assert body[0]["verdict"] == "true_positive"
     assert body[0]["conf"] == 0.91
     assert body[0]["inherited"] is True  # verdict came from a different alert id
@@ -135,14 +335,16 @@ def test_alerts_coverage_note(client: TestClient) -> None:
         dest_ip="2.2.2.2",
     )
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 264))),
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 264))
+        ),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={"ET X": inv}),
         ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        body = client.get("/api/v1/alerts").json()
+        body = client.get("/api/v1/alerts").json()["groups"]
     assert body[0]["inherited"] is False
     assert "1 of 264 events" in body[0]["inheritedReason"]
 
@@ -193,8 +395,10 @@ def test_alerts_badge_survives_later_interrupted_run(client: TestClient) -> None
             kind="suricata",
         )
     ]
-    with patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 9))):
-        body = client.get("/api/v1/alerts").json()
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 9))
+    ):
+        body = client.get("/api/v1/alerts").json()["groups"]
 
     g = body[0]
     assert g["verdict"] == "false_positive"  # the standing verdict, NOT untriaged
@@ -467,14 +671,14 @@ def test_alerts_badge_marks_pipeline_fallback(client: TestClient) -> None:
         report=_FALLBACK_REPORT,
     )
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 4))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 4))),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={"ET Truncated": inv}),
         ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        body = client.get("/api/v1/alerts").json()
+        body = client.get("/api/v1/alerts").json()["groups"]
     assert body[0]["verdict"] == "needs_more_info"  # verdict unchanged
     assert body[0]["fallback"] is True
 
@@ -482,14 +686,14 @@ def test_alerts_badge_marks_pipeline_fallback(client: TestClient) -> None:
     inv.report = {"verdict": "false_positive", "citations": ["ev-1"]}
     inv.verdict = "false_positive"
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 4))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 4))),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_complete_for_rules",
             AsyncMock(return_value={"ET Truncated": inv}),
         ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        body2 = client.get("/api/v1/alerts").json()
+        body2 = client.get("/api/v1/alerts").json()["groups"]
     assert body2[0]["fallback"] is False
 
 
@@ -543,8 +747,10 @@ def _alerts_for_rule(client: TestClient, rule: str) -> dict[str, Any]:
             kind="suricata",
         )
     ]
-    with patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 5))):
-        body = client.get("/api/v1/alerts").json()
+    with patch(
+        "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 5))
+    ):
+        body = client.get("/api/v1/alerts").json()["groups"]
     return body[0]
 
 
@@ -943,6 +1149,82 @@ def test_group_events_rerun_clears_inherited_pill(client: TestClient) -> None:
     assert "Inherited" in ev["ev-sibling"]["inheritedReason"]
 
 
+def test_group_events_ignore_a_promoted_hunt_anchored_on_the_alert(
+    client: TestClient,
+) -> None:
+    """D2. A promotion anchors on a cited document. That alert keeps its verdict.
+
+    The promoted run holds the hunt as its subject and one of the hunt's
+    documents as its time anchor. Read as a run of that alert, its verdict
+    replaced the alert's own on the Alerts page: a benign explanation for the
+    hunt's hypothesis would have cleared an alert nobody investigated.
+    """
+    from soc_ai.store import investigations as inv_svc
+
+    RULE = "ET HUNT ANCHOR"
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            own = await inv_svc.create(db, alert_es_id="ev-anchor", started_by="t")
+            await inv_svc.finalize(
+                db,
+                own.id,
+                status="complete",
+                verdict="true_positive",
+                confidence=0.9,
+                rationale="the alert is real",
+            )
+            own.rule_name = RULE
+            own.src_ip = "10.0.0.1"
+            own.dest_ip = "1.2.3.4"
+            await db.commit()
+
+            promoted = await inv_svc.create(
+                db,
+                alert_es_id="ev-anchor",
+                started_by="t",
+                kind="lead",
+                rule_name="Lead 10 on 10.0.0.1",
+                subject={"type": "hunt", "hunt_id": "01HUNT", "lead_id": 10},
+            )
+            await inv_svc.finalize(
+                db,
+                promoted.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.7,
+                rationale="the hunt hypothesis has a benign explanation",
+            )
+            await db.commit()
+            return own.id
+
+    own_id = asyncio.run(_seed())
+
+    events = [
+        AlertEvent(
+            es_id="ev-anchor",
+            timestamp="2026-09-22T10:00:00Z",
+            src="10.0.0.1:5001",
+            dst="1.2.3.4:443",
+            severity="high",
+            host="wks-1",
+            src_ip="10.0.0.1",
+            dst_ip="1.2.3.4",
+            dst_port=443,
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        body = client.get(
+            "/api/v1/alerts/events", params={"rule_name": RULE, "kind": "suricata"}
+        ).json()
+
+    row = {e["id"]: e for e in body}["ev-anchor"]
+    assert row["investigated"] is True
+    assert row["invId"] == own_id
+    assert row["inheritedReason"] is None
+
+
 def _seed_pair_and_rule_verdicts(
     client: TestClient,
     *,
@@ -950,6 +1232,7 @@ def _seed_pair_and_rule_verdicts(
     pair_alert_id: str,
     pair_src: str | None,
     pair_dest: str | None,
+    pair_host: str | None = None,
 ) -> tuple[str, str]:
     """Seed two complete verdicts for *rule*: an OLDER one on (pair_src, pair_dest)
     and a NEWER one on an unrelated flow.
@@ -978,6 +1261,7 @@ def _seed_pair_and_rule_verdicts(
             pair_inv.rule_name = rule
             pair_inv.src_ip = pair_src
             pair_inv.dest_ip = pair_dest
+            pair_inv.host_name = pair_host
             pair_inv.created_at = now - timedelta(minutes=30)
             await db.commit()
 
@@ -1008,16 +1292,22 @@ def test_group_events_no_ip_event_resolves_through_the_pair_tier(
     The pair lookup used to be built only from events with BOTH endpoints, so a
     host/process detection could never match the pair tier and fell through to the
     rule-level standing verdict — which, on a rule that also fires on network
-    flows, attributed the host detection's verdict to an unrelated flow. Coalescing
-    a missing endpoint to "" is the same degrade the sweep planner applies, and it
-    keeps the store's 3-tuple pair key intact.
+    flows, attributed the host detection's verdict to an unrelated flow.
+
+    The cluster is now the rule plus the MACHINE, since these detections have no
+    endpoints to be about. Same machine, so the same cluster.
     """
     RULE = "Potential Exploitation of CVE-2024-3094"
     # The no-flow run carries NULL endpoints — what the recorder actually writes
     # for a host-shaped alert, since the alert has no source.ip/destination.ip to
     # extract at all.
     pair_id, rule_id = _seed_pair_and_rule_verdicts(
-        client, rule=RULE, pair_alert_id="ev-host-old", pair_src=None, pair_dest=None
+        client,
+        rule=RULE,
+        pair_alert_id="ev-host-old",
+        pair_src=None,
+        pair_dest=None,
+        pair_host="test-ubuntu24",
     )
 
     events = [
@@ -1048,6 +1338,46 @@ def test_group_events_no_ip_event_resolves_through_the_pair_tier(
     # The source run observed no flow, so the reason must not manufacture one.
     assert "? → ?" not in ev["inheritedReason"]
     assert "10.0.0.9" not in ev["inheritedReason"]
+
+
+def test_group_events_no_ip_verdict_does_not_reach_another_machine(
+    client: TestClient,
+) -> None:
+    """A verdict reached on one machine is not the pair-tier answer for another.
+
+    The pair tier is the one that says "this exact thing was investigated". A
+    Sigma host rule fires on many machines and every firing used to key the
+    same, so one machine's verdict answered for all of them.
+    """
+    RULE = "Active Directory Replication from Non Machine Account"
+    pair_id, rule_id = _seed_pair_and_rule_verdicts(
+        client,
+        rule=RULE,
+        pair_alert_id="ev-dc-old",
+        pair_src=None,
+        pair_dest=None,
+        pair_host="dc-01",
+    )
+
+    events = [
+        AlertEvent(
+            es_id="ev-ws-new",
+            timestamp="2026-08-07T01:10:37Z",
+            src="—",
+            dst="—",
+            severity="high",
+            host="ws-01",
+        )
+    ]
+    with patch("soc_ai.api.webui_api.aq.fetch_group_events", AsyncMock(return_value=events)):
+        body = client.get(
+            "/api/v1/alerts/events", params={"rule_name": RULE, "kind": "sigma"}
+        ).json()
+
+    assert body[0]["invId"] != pair_id
+    # It falls through to the rule-level standing verdict, which is a separate,
+    # explicitly-labelled tier and applies to flow alerts just the same.
+    assert body[0]["invId"] == rule_id
 
 
 def test_group_events_ip_pair_tier_unchanged(client: TestClient) -> None:
@@ -1210,12 +1540,14 @@ def test_alerts_acked_escalated_counts(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 10))),
+        patch(
+            "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 10))
+        ),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
         resp = client.get("/api/v1/alerts")
     assert resp.status_code == 200
-    body = resp.json()
+    body = resp.json()["groups"]
     assert body[0]["ackedCount"] == 3
     assert body[0]["escalatedCount"] == 1
 
@@ -1223,7 +1555,7 @@ def test_alerts_acked_escalated_counts(client: TestClient) -> None:
 def test_alerts_hide_acked_param_forwarded(client: TestClient) -> None:
     """GET /alerts?hide_acked=true passes hide_acked=True into fetch_groups."""
     groups: list[AlertGroup] = []
-    mock_fetch = AsyncMock(return_value=(groups, 0))
+    mock_fetch = AsyncMock(return_value=GroupPage(groups, 0))
     with (
         patch("soc_ai.api.webui_api.aq.fetch_groups", mock_fetch),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
@@ -1260,7 +1592,9 @@ def test_alerts_triaging_when_investigation_running(settings_kratos: Settings) -
 
     for c in _client(settings_kratos):
         with (
-            patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 7))),
+            patch(
+                "soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 7))
+            ),
             patch(
                 "soc_ai.api.webui_api.inv_svc.latest_for_rules",
                 AsyncMock(return_value={"ET RULE RUNNING": running_inv}),
@@ -1268,7 +1602,7 @@ def test_alerts_triaging_when_investigation_running(settings_kratos: Settings) -
         ):
             resp = c.get("/api/v1/alerts")
         assert resp.status_code == 200
-        body = {g["name"]: g for g in resp.json()}
+        body = {g["name"]: g for g in resp.json()["groups"]}
         # Running group: triaging + links to the live run.
         assert body["ET RULE RUNNING"]["triaging"] is True
         assert body["ET RULE RUNNING"]["invId"] == "INV-RUN"
@@ -1709,7 +2043,7 @@ def test_probe_pcap_disabled(settings_kratos: Settings) -> None:
 
     r = asyncio.run(probes.probe_pcap(settings_kratos))
     assert r["ok"] is True
-    assert "disabled" in r["detail"]
+    assert "PCAP is off" in r["detail"]
 
 
 def test_probe_pcap_blocked_in_demo(settings_kratos: Settings) -> None:
@@ -1906,7 +2240,7 @@ def test_auto_triage_sweep_uses_config_floor_medium(settings_kratos: Settings) -
             s = c.post("/api/v1/auto-triage", json={}).json()
 
     assert s["active"] is False
-    assert set(captured["severities"]) == {"critical", "high", "medium"}
+    assert set(captured["severities"]) == {"critical", "high", "medium", "unknown"}
 
 
 def test_auto_triage_sweep_uses_config_floor_critical(settings_kratos: Settings) -> None:
@@ -1930,7 +2264,7 @@ def test_auto_triage_sweep_uses_config_floor_critical(settings_kratos: Settings)
         with TestClient(app) as c:
             c.post("/api/v1/auto-triage", json={})
 
-    assert captured["severities"] == ("critical",)
+    assert captured["severities"] == ("critical", "unknown")
 
 
 def test_auto_triage_explicit_severities_override_config_floor(settings_kratos: Settings) -> None:
@@ -2358,7 +2692,7 @@ def test_execute_action_binds_write_target_to_investigation(client: TestClient) 
     escs: list[dict] = []
     with patch(
         "soc_ai.tools.write_exec.get_tool",
-        return_value=_fake_write_tool(escs, {"id": "CASE-9"}),
+        return_value=_fake_write_tool(escs, {"id": "CASE-9", "alert_linked": True}),
     ):
         body = client.post(f"/api/v1/investigations/{inv_esc}/actions/0/execute").json()
     assert body["status"] == "executed"
@@ -2391,7 +2725,7 @@ def test_execute_add_case_comment_binds_to_own_case(client: TestClient) -> None:
     esc_calls: list[dict] = []
     with patch(
         "soc_ai.tools.write_exec.get_tool",
-        return_value=_fake_write_tool(esc_calls, {"id": "CASE-REAL"}),
+        return_value=_fake_write_tool(esc_calls, {"id": "CASE-REAL", "alert_linked": True}),
     ):
         assert (
             client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()["status"]
@@ -2638,7 +2972,7 @@ def test_execute_action_persists_and_suppresses_reoffer(client: TestClient) -> N
     calls: list[dict] = []
     with patch(
         "soc_ai.tools.write_exec.get_tool",
-        return_value=_fake_write_tool(calls, {"id": "CASE-1"}),
+        return_value=_fake_write_tool(calls, {"id": "CASE-1", "alert_linked": True}),
     ):
         first = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
         assert first["status"] == "executed"
@@ -2698,7 +3032,7 @@ async def test_execute_action_serializes_concurrent_escalate(settings_kratos: Se
         calls.append(alert_id)
         started.set()
         await release.wait()  # hold the (first) request inside the write
-        return {"id": "CASE-1"}
+        return {"id": "CASE-1", "alert_linked": True}
 
     spec = ToolSpec(name="escalate_to_case", read_only=False, description="", func=escalate)
 
@@ -3526,7 +3860,9 @@ def test_escalate_group_calls_write_tool_per_event(client: TestClient) -> None:
         **_kwargs,
     ):
         write_tool_calls.append({"tool_name": tool_name, "tool_args": tool_args})
-        return {"id": "case-1"}, None
+        # alert_linked is what makes an escalate an escalate: a case Security
+        # Onion attached nothing to is counted as a failure, not a case opened.
+        return {"id": "case-1", "case_id": "case-1", "alert_linked": True}, None
 
     with (
         patch(
@@ -3834,10 +4170,10 @@ def test_assign_persists_and_surfaces_in_list(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 1))),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        alerts = client.get("/api/v1/alerts").json()
+        alerts = client.get("/api/v1/alerts").json()["groups"]
 
     assert len(alerts) == 1
     assert alerts[0]["name"] == "ET X"
@@ -3865,10 +4201,10 @@ def test_assign_unassign_clears_owner(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 1))),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        alerts = client.get("/api/v1/alerts").json()
+        alerts = client.get("/api/v1/alerts").json()["groups"]
 
     assert alerts[0]["owner"] is None
 
@@ -3897,10 +4233,10 @@ def test_assign_defaults_to_owned_state(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 1))),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        alerts = client.get("/api/v1/alerts").json()
+        alerts = client.get("/api/v1/alerts").json()["groups"]
     assert alerts[0]["owner"] == "anonymous"
     assert alerts[0]["state"] == "owned"
 
@@ -3940,10 +4276,10 @@ def test_set_state_persists_and_surfaces(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 1))),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        alerts = client.get("/api/v1/alerts").json()
+        alerts = client.get("/api/v1/alerts").json()["groups"]
     assert alerts[0]["state"] == "in_review"
 
 
@@ -3983,10 +4319,10 @@ def test_unassign_clears_state(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 1))),
         patch("soc_ai.api.webui_api.inv_svc.latest_for_rules", AsyncMock(return_value={})),
     ):
-        alerts = client.get("/api/v1/alerts").json()
+        alerts = client.get("/api/v1/alerts").json()["groups"]
     assert alerts[0]["owner"] is None
     assert alerts[0]["state"] is None
 
@@ -4022,13 +4358,13 @@ def test_ownership_survives_reinvestigation(client: TestClient) -> None:
         )
     ]
     with (
-        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=(groups, 1))),
+        patch("soc_ai.api.webui_api.aq.fetch_groups", AsyncMock(return_value=GroupPage(groups, 1))),
         patch(
             "soc_ai.api.webui_api.inv_svc.latest_for_rules",
             AsyncMock(return_value={"ET SURVIVE": running_inv}),
         ),
     ):
-        alerts = client.get("/api/v1/alerts").json()
+        alerts = client.get("/api/v1/alerts").json()["groups"]
     assert alerts[0]["owner"] == "anonymous"
     assert alerts[0]["state"] == "in_review"
 
@@ -6230,6 +6566,55 @@ def test_final_result_pseudo_tool_excluded_from_timeline() -> None:
     assert tool_calls == 1  # final_result not counted
 
 
+def test_timeline_reads_a_hunt_subject_as_a_hunt_subject() -> None:
+    """D2. The investigation page kept alert words on a run about a hunt.
+
+    The page reads "Subject: hunt" at the top. One row below, the timeline
+    said "Loaded alert context + enrichments" and "No pattern matched: a full
+    investigation ran", while the stored event says the templates were skipped
+    on a hunt subject.
+    """
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui_api import _build_timeline
+
+    events = [
+        SimpleNamespace(
+            kind="enriched_alert_context",
+            sequence=1,
+            payload={
+                "subject": "hunt",
+                "subject_findings": 4,
+                "subject_documents": [{}, {}, {}, {}, {}],
+                "enrichments": {},
+            },
+        ),
+        SimpleNamespace(
+            kind="decision_template_match",
+            sequence=2,
+            payload={"matched": False, "skipped": "hunt_subject", "template_id": None},
+        ),
+    ]
+    steps = {s.id: s for s in _build_timeline(events)[0]}
+    assert steps["e1"].title == "Loaded the hunt subject: 4 findings, 5 documents"
+    assert "alert" not in steps["e1"].detail.lower()
+    assert steps["e2"].title == "Templates do not run on a hunt subject"
+    assert "A decision template matches an alert rule class" in steps["e2"].detail
+
+    # NEGATIVE CONTROL. An alert run reads as it did.
+    alert_events = [
+        SimpleNamespace(kind="enriched_alert_context", sequence=1, payload={"enrichments": {}}),
+        SimpleNamespace(
+            kind="decision_template_match",
+            sequence=2,
+            payload={"matched": False, "template_id": None},
+        ),
+    ]
+    alert_steps = {s.id: s for s in _build_timeline(alert_events)[0]}
+    assert alert_steps["e1"].title == "Loaded alert context + enrichments"
+    assert alert_steps["e2"].title == "No pattern matched: a full investigation ran"
+
+
 def test_tool_outcome_no_double_failed_prefix() -> None:
     """U8: an error message that already reads as a failure ("failed to parse
     filter…") must not get a second "failed: " prefix stuttered onto it."""
@@ -6366,7 +6751,7 @@ def test_entity_graph_carries_enrichment_facts() -> None:
     assert by_edge["198.51.100.20"]["label"] == "observed"
     # graphNote keeps its shape but names the flagged peers (bounded)
     assert note == (
-        "ws-finance-07 contacted 3 peer(s); 1 flagged malicious by enrichment (203.0.113.9)"
+        "ws-finance-07 contacted 3 peer(s). Enrichment flagged 1 of them as malicious: 203.0.113.9."
     )
 
 
@@ -6554,3 +6939,308 @@ def test_sweep_health_readable_by_an_analyst_while_the_full_status_stays_admin(
         full = client.get("/api/v1/dossiers/refresh", headers=headers)
         assert full.status_code == 403
         assert full.json()["detail"]["reason"] == "admin_required"
+
+
+def _seed_failed_run(client: TestClient, *, alert_es_id: str, rule_name: str) -> str:
+    """Persist a run that died before reaching a verdict: the production shape.
+
+    No verdict, no rationale, no summary, no report: the 188 rows on the
+    deployed instance that no surface has ever mentioned.
+    """
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db, alert_es_id=alert_es_id, started_by="tester", rule_name=rule_name
+            )
+            await inv_svc.finalize(db, inv.id, status="error")
+            return inv.id
+
+    return asyncio.run(_seed())
+
+
+def test_notifications_announce_a_triage_that_died(client: TestClient) -> None:
+    """A run that ended with no verdict reaches the bell.
+
+    188 of these accumulated on the deployed instance over ten weeks with no
+    surface mentioning any of them. The bell is where the product says
+    something just happened, and a triage dying is something that happened.
+    """
+    inv_id = _seed_failed_run(client, alert_es_id="ev-dead", rule_name="ET DEAD")
+
+    by_id = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    entry = by_id.get(f"inv-failed:{inv_id}")
+    assert entry is not None, "a failed triage must be announced"
+    assert entry["tone"] == "danger"
+    assert "ET DEAD" in entry["title"]
+    assert "no verdict" in entry["title"].lower()
+    assert entry["href"] == f"/investigation/{inv_id}"
+
+    # It must not ALSO be reported as a completion reading "Verdict untriaged".
+    assert f"inv-done:{inv_id}" not in by_id
+
+
+def test_notifications_stay_quiet_on_a_healthy_grid(client: TestClient) -> None:
+    """Negative control: nothing failed, so no failure entry appears.
+
+    A surface that cries wolf on a healthy instance is worse than one that
+    stays silent, because the owner learns to scroll past it.
+    """
+    from soc_ai.store import investigations as inv_svc
+
+    async def _seed() -> None:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            for i, verdict in enumerate(("false_positive", "true_positive", "needs_more_info")):
+                inv = await inv_svc.create(
+                    db, alert_es_id=f"ev-h{i}", started_by="t", rule_name=f"ET Healthy {i}"
+                )
+                await inv_svc.finalize(db, inv.id, status="complete", verdict=verdict)
+            # An operator cancel and a restart orphan are not failures either:
+            # one was asked for, the other is re-huntable by design.
+            stopped = await inv_svc.create(db, alert_es_id="ev-hc", started_by="t")
+            await inv_svc.finalize(db, stopped.id, status="cancelled")
+            orphan = await inv_svc.create(db, alert_es_id="ev-hi", started_by="t")
+            await inv_svc.finalize(db, orphan.id, status="interrupted")
+
+    asyncio.run(_seed())
+    ids = [n["id"] for n in client.get("/api/v1/notifications").json()]
+    assert not [i for i in ids if i.startswith("inv-failed:")]
+
+
+def test_notifications_drop_a_dismissed_failure(client: TestClient) -> None:
+    """A dismissed failure stays dismissed, so the bell stops repeating it."""
+    inv_id = _seed_failed_run(client, alert_es_id="ev-dead2", rule_name="ET DEAD TWO")
+    assert f"inv-failed:{inv_id}" in {n["id"] for n in client.get("/api/v1/notifications").json()}
+
+    assert client.post(f"/api/v1/investigations/{inv_id}/dismiss-error").status_code == 200
+
+    assert f"inv-failed:{inv_id}" not in {
+        n["id"] for n in client.get("/api/v1/notifications").json()
+    }
+
+
+def test_failed_run_is_countable_and_clearable(client: TestClient) -> None:
+    """The Dashboard's count reaches a failed run, and the operator can clear it.
+
+    The count and its deep link are one query (``?verdict=pipeline_error``), and
+    the row carries ``noVerdict`` so the tile can apply the same dismissed /
+    superseded exclusions it applies to an E1.2 fallback.
+    """
+    inv_id = _seed_failed_run(client, alert_es_id="ev-dead3", rule_name="ET DEAD THREE")
+
+    page = client.get("/api/v1/investigations?verdict=pipeline_error").json()
+    row = {r["id"]: r for r in page["rows"]}[inv_id]
+    assert row["noVerdict"] is True
+    assert row["fallback"] is False  # not an E1.2 fallback; it wrote no report
+    assert row["errorDismissed"] is False
+    assert row["status"] == "error"
+
+    assert client.post(f"/api/v1/investigations/{inv_id}/dismiss-error").status_code == 200
+
+    page = client.get("/api/v1/investigations?verdict=pipeline_error").json()
+    row = {r["id"]: r for r in page["rows"]}[inv_id]
+    assert row["errorDismissed"] is True  # still listed as history, no longer nagging
+    detail = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert detail["errorDismissed"] is True
+
+
+def test_the_bell_does_not_call_a_visibility_gap_a_finding(client: TestClient) -> None:
+    """ "Hunt finished — 1 finding: RC4 service ticket…" led to a banner reading
+    NO THREAT OBSERVED and a finding titled "could not run". The most alarming
+    line the app can print, meaning a timed-out query (dogfood 2026-09-16)."""
+    import asyncio
+
+    from soc_ai.store import hunts as hunts_svc
+
+    async def _seed() -> tuple[str, str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            gap = await hunts_svc.create(db, objective="RC4 service ticket", started_by="t")
+            await hunts_svc.finalize(
+                db,
+                gap.id,
+                status="complete",
+                report={
+                    "findings": [
+                        {"title": "Kerberoasting: could not run", "category": "visibility_gap"}
+                    ]
+                },
+            )
+            threat = await hunts_svc.create(db, objective="find beacons", started_by="t")
+            await hunts_svc.finalize(
+                db,
+                threat.id,
+                status="complete",
+                report={
+                    "findings": [
+                        {"title": "beacon to 1.2.3.4", "category": "threat"},
+                        {"title": "no DNS logs for the window", "category": "visibility_gap"},
+                    ]
+                },
+            )
+            legacy = await hunts_svc.create(db, objective="old report", started_by="t")
+            await hunts_svc.finalize(
+                db,
+                legacy.id,
+                status="complete",
+                # No category field at all: the title heuristic decides.
+                report={"findings": [{"title": "visibility gap: no zeek.dns in window"}]},
+            )
+            return gap.id, threat.id, legacy.id
+
+    gap_id, threat_id, legacy_id = asyncio.run(_seed())
+    by_id = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+
+    gap = by_id[f"hunt-done:{gap_id}"]
+    assert "finding" not in gap["title"], gap["title"]
+    # One phrase for this outcome, on every surface that names it.
+    assert gap["title"].startswith("Hunt finished: no threat observed · visibility gap")
+    assert gap["tone"] == "accent"
+
+    # A threat alongside a gap is announced by the THREAT count, not the total.
+    assert "1 finding" in by_id[f"hunt-done:{threat_id}"]["title"]
+    assert by_id[f"hunt-done:{threat_id}"]["tone"] == "warn"
+
+    # Legacy shape, classified by title.
+    assert "no threat observed" in by_id[f"hunt-done:{legacy_id}"]["title"]
+
+    # A hunt completion is not a hunting-section entry. The default holds.
+    assert gap["group"] == "system"
+
+
+def test_the_bell_carries_unread_shadow_hits_and_new_leads(client: TestClient) -> None:
+    """A shadow hit and a new lead each get one bell entry.
+
+    Five surfaces have to show a shadow hit, and the bell is the one an analyst
+    watches while working on something else. A hit that only the Hunts page
+    carries is a hit nobody reads.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    async def seed() -> None:
+        now = datetime.now(UTC)
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.1.2.3",
+                kind=Kind.CATALOG_MATCH,
+                spec_id="local-x",
+                fingerprint=content_fingerprint("local-x", "10.1.2.3"),
+                summary="x",
+                evidence={"receipts": {"complete": True, "missing": []}},
+                source="candidate",
+                shadow=True,
+                now=now,
+            )
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="10.1.2.4",
+                kind=Kind.PRIOR_NO_BASELINE,
+                spec_id="identity-4662-dcsync-nonmachine",
+                fingerprint=content_fingerprint("identity-4662-dcsync-nonmachine", "10.1.2.4"),
+                summary="DCSync",
+                source="catalog",
+                now=now,
+            )
+            await form_leads(db, entity_keys=[("host", "10.1.2.4")], now=now)
+
+    asyncio.run(seed())
+    items = client.get("/api/v1/notifications").json()
+    titles = [i["title"] for i in items]
+    assert any(t.startswith("Shadow hit: ") and "10.1.2.3" in t for t in titles)
+    assert any(t.startswith("Lead ") and "10.1.2.4" in t for t in titles)
+    hit = next(i for i in items if i["title"].startswith("Shadow hit: "))
+    # The link sets the filter that holds the hit. The bare anchor scrolled the
+    # hits block into view on filter All, where the card was one of many.
+    assert hit["tone"] == "warn" and hit["href"] == "/hunts?hits=unread"
+    assert hit["dismissible"] is False
+    lead = next(i for i in items if i["title"].startswith("Lead "))
+    assert lead["href"].startswith("/leads/")
+    # The bell names the kinds in the analyst's words. "prior no baseline" is
+    # a column name with the underscores removed, and it is not English.
+    assert "finding with no benign baseline" in lead["title"]
+    assert "prior" not in lead["title"]
+    # Both belong to the same section of the Notifications screen.
+    assert hit["group"] == "hunting" and lead["group"] == "hunting"
+    assert all(item["group"] in {"hunting", "system"} for item in items)
+
+
+def test_the_bell_counts_the_shadow_hits_the_hits_surface_counts(client: TestClient) -> None:
+    """One rule for the count, so the surfaces cannot disagree.
+
+    A hit from a retired analytic is off the hits surface and out of the
+    Needs-you count. The bell counted it, sent the analyst to a block that did
+    not hold it, and kept the row after every listed hit had been read.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    retirable = "prior-hypervisor-novel-served-port"
+    retired = client.post(
+        f"/api/v1/analytics/{retirable}/status",
+        json={"to": "retired", "why": "the dogfood found it noisy"},
+    )
+    assert retired.status_code == 200, retired.text
+
+    async def seed() -> None:
+        now = datetime.now(UTC)
+        async with client.app.state.db_sessionmaker() as db:
+            for spec_id, key in ((retirable, "10.1.2.5"), ("local-x", "10.1.2.6")):
+                await record_observation(
+                    db,
+                    entity_kind="host",
+                    entity_key=key,
+                    kind=Kind.CATALOG_MATCH,
+                    spec_id=spec_id,
+                    fingerprint=content_fingerprint(spec_id, key),
+                    summary="x",
+                    source="catalog",
+                    shadow=True,
+                    now=now,
+                )
+
+    asyncio.run(seed())
+    hits = [
+        i
+        for i in client.get("/api/v1/notifications").json()
+        if i["title"].startswith("Shadow hit: ")
+    ]
+    assert [i["id"] for i in hits] and all("10.1.2.5" not in i["title"] for i in hits)
+    assert len(hits) == client.get("/api/v1/hunts/needs-you").json()["unread_shadow_hits"]
+
+
+# ---------------------------------------------------------------------------
+# The rate limiter must not throttle a page load
+# ---------------------------------------------------------------------------
+
+
+def test_the_rate_limiter_skips_the_app_and_health_and_says_when_to_retry(
+    settings_kratos: Settings,
+) -> None:
+    """A page load pulls a dozen chunks. Counting them threw 429 at the chunks."""
+    settings = settings_kratos.model_copy(update={"api_rate_limit_per_min": 2})
+    for client in _client(settings):
+        assert client.get("/api/v1/no-such-route").status_code == 404
+        assert client.get("/api/v1/no-such-route").status_code == 404
+        throttled = client.get("/api/v1/no-such-route")
+        assert throttled.status_code == 429
+        assert throttled.headers["retry-after"] == "60"
+        assert throttled.json()["detail"]["reason"] == "rate_limited"
+        # The bucket is now spent. Neither the app shell nor the health check
+        # may be refused by it.
+        for _ in range(5):
+            assert client.get("/healthz").status_code == 200
+            assert client.get("/app/assets/index.js").status_code != 429
+            assert client.get("/app/hunts").status_code != 429

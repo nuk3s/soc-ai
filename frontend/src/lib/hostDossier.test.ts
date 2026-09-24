@@ -107,7 +107,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
 
   it('says honestly when nothing at all is known', () => {
     expect(sentenceText(identitySentence(host()))).toBe(
-      '192.0.2.44 has been seen on the network, but nothing else is known about it yet.',
+      '192.0.2.44 has appeared on the network. Nothing else is known about it yet.',
     );
   });
 
@@ -120,7 +120,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
   it('treats a role of "unknown" as unclassified, not as a kind of machine', () => {
     // "x is an unknown" would be the classifier's shrug read out as a noun.
     expect(sentenceText(identitySentence(host({ role: val('unknown') })))).toBe(
-      '192.0.2.44 has been seen on the network, but nothing else is known about it yet.',
+      '192.0.2.44 has appeared on the network. Nothing else is known about it yet.',
     );
   });
 
@@ -157,7 +157,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
       identitySentence(host({ role: { value: null, reason: 'low_confidence' } })),
     );
     expect(text).not.toContain('null');
-    expect(text).toContain('nothing else is known');
+    expect(text).toContain('Nothing else is known');
   });
 
   it('renders os_family tokens as human labels, not internal vocabulary', () => {
@@ -250,7 +250,7 @@ describe('unresolvedPhrase — why a field is unknown, without blaming machinery
     );
     expect(
       unresolvedPhrase({ reason: 'no_signal', last_run_at: '2026-08-07T06:00:00Z', retracted_at: null }),
-    ).toBe('checked — nothing found');
+    ).toBe('checked, nothing found');
   });
   it('says a stale fact is old, not absent', () => {
     expect(
@@ -270,7 +270,7 @@ describe('unresolvedPhrase — why a field is unknown, without blaming machinery
   it('says when the evidence behind a fact went away', () => {
     expect(
       unresolvedPhrase({ reason: 'no_signal', last_run_at: '2026-08-07T06:00:00Z', retracted_at: '2026-08-05T06:00:00Z' }),
-    ).toMatch(/went away/i);
+    ).toMatch(/has gone/i);
   });
 });
 
@@ -431,5 +431,18 @@ describe('relativeAge — freshness a reader can feel', () => {
   });
   it('says never for a thing that has not happened', () => {
     expect(relativeAge(null, now)).toBe('never');
+  });
+});
+
+describe('activityProfileView — no repeating the fact sentence', () => {
+  it('drops the remote-access line when the scalar already says it', async () => {
+    // The DC's page read "…initiates remote access on tcp/22, tcp/5985" and,
+    // one line down, "initiates outbound remote access on tcp/22, tcp/5985".
+    const { activityProfileView } = await import('./hostDossier');
+    const payload = { hour_of_day: { '9': 40 }, initiates_remote_access: true, remote_access_ports: [22, 5985] };
+    const withScalar = activityProfileView(payload, 'busy in working hours · initiates remote access on tcp/22, tcp/5985');
+    expect(withScalar?.lines.join(' ')).not.toMatch(/remote access/);
+    const without = activityProfileView(payload, null);
+    expect(without?.lines.join(' ')).toMatch(/initiates outbound remote access on tcp\/22, tcp\/5985/);
   });
 });

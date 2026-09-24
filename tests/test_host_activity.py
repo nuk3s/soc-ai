@@ -817,3 +817,140 @@ async def test_a_cancelled_peer_name_lookup_is_not_swallowed(
         await fetch_host_activity(  # type: ignore[arg-type]
             es, settings_kratos, _IP, range="24h", dossier_lookup=_names
         )
+
+
+@pytest.mark.asyncio
+async def test_the_conn_pass_is_not_blind_to_a_non_zeek_sensor(
+    settings_kratos: Settings,
+) -> None:
+    """A grid whose sensor is not Zeek must not read as a silent host.
+
+    This pass matched ``event.dataset: zeek.conn`` and nothing else. On the range
+    — Elastic Agent, so ``network_traffic.flow`` — it matched nothing, and the
+    host page said "silent on the wire" over 2,149 real flow records for a machine
+    that was being actively exploited. An absence claim from a query that never
+    covered the data, which is the failure mode this codebase keeps paying for.
+
+    The dataset a grid happens to use is not something an operator should have to
+    know in order to be told the truth about their own host.
+    """
+    es = _FakeConnElastic({"out": {"peers": {"buckets": []}}, "in": {"peers": {"buckets": []}}})
+    await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    body = es.searches[0]["query"]
+    should = next(
+        clause["bool"]["should"]
+        for clause in body["bool"]["filter"]
+        if isinstance(clause, dict) and "bool" in clause
+    )
+    matched = {ds for term in should for values in term["terms"].values() for ds in values}
+    assert "zeek.conn" in matched
+    assert "network_traffic.flow" in matched
+    # Both spellings of the dataset field, since a grid labels it in either
+    # place depending on how it was ingested.
+    fields = {next(iter(term["terms"])) for term in should}
+    assert fields == {"event.dataset", "data_stream.dataset"}
+
+
+@pytest.mark.asyncio
+async def test_the_panel_reports_which_sensor_the_count_came_from(
+    settings_kratos: Settings,
+) -> None:
+    """A count is only meaningful next to what it counted — and with two sensors
+    running, the same conversation is in both datasets, so the total is an upper
+    bound the reader has to be able to see."""
+    es = _FakeConnElastic(
+        {
+            "out": {"peers": {"buckets": []}},
+            "in": {"peers": {"buckets": []}},
+            # Measured shape from the range: the ECS field names the sensor
+            # behind 4 documents while data_stream.dataset carries the 2,148
+            # the host was actually busy with. Aggregating only the first named
+            # the wrong sensor — a provenance label pointing at the wrong index
+            # is worse than none.
+            "by_dataset": {
+                "buckets": [
+                    {"key": "endpoint.events.network", "doc_count": 4},
+                    {"key": "suricata.flow", "doc_count": 0},
+                ]
+            },
+            "by_stream_dataset": {
+                "buckets": [
+                    {"key": "network_traffic.flow", "doc_count": 2148},
+                    {"key": "zeek.conn", "doc_count": 12},
+                ]
+            },
+        }
+    )
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    # Busiest first, across BOTH spellings; zero-count buckets are not
+    # "contributed".
+    assert act.conn_datasets == ["network_traffic.flow", "zeek.conn", "endpoint.events.network"]
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_host_reports_no_contributing_dataset(
+    settings_kratos: Settings,
+) -> None:
+    """No records, no dataset names — and be clear about what that does NOT prove.
+
+    `conn_datasets` is folded from the same windowed query as the counts, so an
+    empty list means only "zero conversation records in this window". It does
+    not distinguish a quiet host from a grid whose sensor is absent entirely;
+    answering that needs a grid-wide dataset probe this pass does not make. The
+    honest reach of this field is naming the sensor when there IS one, and
+    exposing two sensors counting the same conversation.
+    """
+    es = _FakeConnElastic({"out": {"peers": {"buckets": []}}, "in": {"peers": {"buckets": []}}})
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.conn_datasets == []
+
+
+@pytest.mark.asyncio
+async def test_a_dataset_named_in_both_fields_is_not_counted_twice(
+    settings_kratos: Settings,
+) -> None:
+    """One document carrying its dataset in both spellings is one document.
+
+    The two buckets are merged by MAX, not sum — adding them would report a host
+    as twice as busy as it is, which is the arithmetic this whole pass exists to
+    stop getting wrong.
+    """
+    es = _FakeConnElastic(
+        {
+            "out": {"peers": {"buckets": []}},
+            "in": {"peers": {"buckets": []}},
+            "by_dataset": {"buckets": [{"key": "zeek.conn", "doc_count": 500}]},
+            "by_stream_dataset": {"buckets": [{"key": "zeek.conn", "doc_count": 500}]},
+        }
+    )
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.conn_datasets == ["zeek.conn"]
+
+
+def test_the_peer_table_excludes_multicast_and_link_local() -> None:
+    """The host page's peer graph drew 224.0.0.251/252 as external peers."""
+    from soc_ai.webui.host_activity import _fold_peers
+
+    aggs = {
+        "out": {
+            "peers": {
+                "buckets": [
+                    {"key": "224.0.0.251", "doc_count": 900, "ports": {"buckets": []}},
+                    {"key": "10.1.10.21", "doc_count": 5, "ports": {"buckets": []}},
+                ]
+            }
+        },
+        "in": {
+            "peers": {
+                "buckets": [
+                    {"key": "169.254.169.254", "doc_count": 3, "ports": {"buckets": []}},
+                ]
+            }
+        },
+    }
+    peers, _truncated = _fold_peers(aggs, "10.1.10.11")
+    assert [p.ip for p in peers] == ["10.1.10.21"]

@@ -47,7 +47,7 @@ vi.mock('react-router-dom', async (importOriginal) => ({
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([GROUP_A, GROUP_B]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [GROUP_A, GROUP_B], truncated: false, other_docs: 0 }),
   getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
   getAlertGroupEvents: vi.fn().mockResolvedValue([
     { id: 'ev1', src: '—', dst: '—', host: '—', sev: 'high', ts: '2026-08-18T00:00:00Z', ago: '2m' },

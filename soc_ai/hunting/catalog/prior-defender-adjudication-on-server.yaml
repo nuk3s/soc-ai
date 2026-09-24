@@ -1,0 +1,40 @@
+id: prior-defender-adjudication-on-server
+title: Endpoint antivirus finds a threat on a server or a domain controller
+description: >
+  Microsoft Defender events 1116 and 1117 report that the endpoint agent found a
+  threat and acted on it. This is routine and high-volume on a workstation. This
+  is rare on a server or a domain controller. Those machines do not browse the
+  web. They do not open mail. They do not receive files from users.
+
+  This analytic is single-shot. It never accumulates toward a lead. The event is
+  one of the highest-impact events a grid emits. The chain-building layers would
+  otherwise never reach the event.
+
+level: critical
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+# There is no benign population to measure this against. A server does not have
+# a normal rate of malware detections; the first one is the finding. A triage
+# may not close this on how often it fires.
+no_benign_baseline: true
+
+profile:
+  dimension: process_names
+  test: novel_for
+  roles:
+    - server
+    - domain_controller
+
+attack:
+  - T1204
+
+false_positives:
+  - A tester deploys security-test files and EICAR validation files
+    deliberately. This is the only benign case. The tester announces the test
+    in advance.
+  - A scanner writes test artefacts to a file share on the server.
+
+references:
+  - https://attack.mitre.org/techniques/T1204/

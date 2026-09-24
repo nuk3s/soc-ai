@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_egress_allowed
@@ -76,6 +76,24 @@ class IndicatorEnrichment(BaseModel):
     indicator_type: str  # "ip" | "domain" | "sha256"
     internal: bool = False
     blocklist_hits: list[BlocklistHit] = Field(default_factory=list)
+    blocklist_sources: list[str] | None = None
+    """The blocklist feeds that actually answered this lookup.
+
+    An empty ``blocklist_hits`` says nothing on its own. The feeds have never
+    been refreshed on either deployment and the data directory does not exist,
+    so ``BlocklistDB`` loads nothing and every lookup misses; the only signal
+    was a warning in the process log, and the timeline rendered the miss as
+    "no blocklist/MISP match". Three triages leaned on that phrasing.
+
+    Three states, because there are three:
+
+    - ``None`` — the result does not say. Records written before this field
+      existed, and hand-built contexts. Nothing may be concluded either way.
+    - ``[]`` — a lookup ran against a database with nothing loaded. An empty
+      hit list here is an absence of data.
+    - non-empty — these feeds answered. An empty hit list is a clean result,
+      as far as they reach.
+    """
     asn: AsnInfo | None = None
     geoip: GeoIpInfo | None = None
     cloud_provider: str | None = None
@@ -83,6 +101,18 @@ class IndicatorEnrichment(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def blocklist_checked(self) -> bool | None:
+        """Whether a reputation lookup actually ran, or ``None`` if unrecorded.
+
+        Computed so it lands in ``model_dump`` and reaches the model and every
+        renderer without each of them re-deriving it from a list length.
+        """
+        if self.blocklist_sources is None:
+            return None
+        return bool(self.blocklist_sources)
 
 
 @dataclass
@@ -195,6 +225,26 @@ class MispClient:
         await self._client.aclose()
 
 
+_NO_FEEDS_LOADED = (
+    "blocklist: no sources loaded, so no reputation lookup ran. An empty "
+    "blocklist_hits here is an absence of data, NOT a clean result. Refresh the "
+    "feeds with `soc-ai blocklists refresh`."
+)
+
+
+def _record_blocklist_scope(enrichment: IndicatorEnrichment, blocklist: BlocklistDB | None) -> None:
+    """Record which feeds answered, and say so in ``errors`` when none did.
+
+    Same reasoning as the cloud-tag IPv6 note above: silence is not a negative
+    signal, and the only way the model learns the difference is if the result
+    says it. The list is the structured form every renderer reads; the errors
+    line is the one the model reads in prose.
+    """
+    enrichment.blocklist_sources = list(blocklist.loaded_sources) if blocklist else []
+    if not enrichment.blocklist_sources:
+        enrichment.errors.append(_NO_FEEDS_LOADED)
+
+
 def _finding_from_misp(m: dict[str, Any]) -> Finding:
     return Finding(
         source="misp",
@@ -258,6 +308,7 @@ async def enrich_ip(
             enrichment.blocklist_hits = blocklist.lookup_ip(ip)
         except Exception as e:  # fail-open
             enrichment.errors.append(f"blocklist lookup failed: {e}")
+    _record_blocklist_scope(enrichment, blocklist)
 
     if maxmind is not None and not enrichment.internal:
         try:
@@ -323,6 +374,7 @@ async def enrich_domain(
             enrichment.blocklist_hits = blocklist.lookup_domain(domain)
         except Exception as e:  # fail-open
             enrichment.errors.append(f"blocklist lookup failed: {e}")
+    _record_blocklist_scope(enrichment, blocklist)
     if misp is not None:
         try:
             misp_results = await misp.search_ioc(domain, ioc_type=["domain", "hostname"])
@@ -361,6 +413,7 @@ async def enrich_hash(
             enrichment.blocklist_hits = blocklist.lookup_hash(hash_value)
         except Exception as e:  # fail-open
             enrichment.errors.append(f"blocklist lookup failed: {e}")
+    _record_blocklist_scope(enrichment, blocklist)
     misp_type = _HASH_TYPES.get(algo.lower())
     if misp is not None and misp_type is not None:
         try:

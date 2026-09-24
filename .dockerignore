@@ -49,6 +49,16 @@ __pycache__/
 
 # ── Internal docs (all internal material lives under docs/dev/) ───────────────
 docs/dev/
+
+# ── Published-site-only doc assets ────────────────────────────────────────────
+# The rest of docs/ IS copied into the image (the agent's system prompts are
+# built from docs/OQL_PRIMER.md and docs/OQL_HUNT_EXAMPLES.md). These two
+# subtrees are ~10 MB of screenshots and vendored guides that only the docs
+# site renders and nothing reads at runtime. Anything a prompt reads must NOT
+# live here; tests/test_image_layout.py replays these exclusions and fails if a
+# declared prompt asset lands inside one.
+docs/img/
+docs/superpowers/
 HANDOVER.md
 FUTURE_IDEAS.md
 ROADMAP.md

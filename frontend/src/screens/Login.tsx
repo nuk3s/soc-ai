@@ -67,7 +67,7 @@ export function Login() {
             onSubmit={signIn}
             className="rounded-panel-lg border border-border-2 bg-surface-card p-7 shadow-login-card"
           >
-            <div className="text-[19px] font-semibold tracking-[-.01em]">Sign in to console</div>
+            <div className="text-[19px] font-semibold tracking-[-.01em]">Sign in to the console</div>
             <div className="mb-[22px] mt-[5px] text-[13px] text-dim">
               Self-hosted · Security Onion integration
             </div>

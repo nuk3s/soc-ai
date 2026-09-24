@@ -92,6 +92,10 @@ const INTACT: AuditChainVerifyResult = {
   epochs_broken: 0,
   newest_broken_epoch_start: null,
   latest_epoch_broken: false,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -111,6 +115,10 @@ const CAPPED_INTACT: AuditChainVerifyResult = {
   epochs_broken: 0,
   newest_broken_epoch_start: null,
   latest_epoch_broken: false,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -134,6 +142,10 @@ const EPOCHED: AuditChainVerifyResult = {
   epochs_broken: 0,
   newest_broken_epoch_start: null,
   latest_epoch_broken: false,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -157,6 +169,10 @@ const CAPPED_AND_EPOCHED: AuditChainVerifyResult = {
   epochs_broken: 0,
   newest_broken_epoch_start: null,
   latest_epoch_broken: false,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -176,6 +192,13 @@ const TAMPERED: AuditChainVerifyResult = {
   epochs_broken: 1,
   newest_broken_epoch_start: '2026-08-01T00:00:00+00:00',
   latest_epoch_broken: false,
+  // A real break carries WHAT it was. Two writers claiming one position
+  // leaves records that each still match their own hash; an edit does not,
+  // and the panel used to read identically for both.
+  first_break_kind: 'duplicate_seq',
+  first_break_detail: '2 records claim sequence 17, and each one still matches its own hash',
+  newest_break_kind: 'duplicate_seq',
+  newest_break_detail: '2 records claim sequence 17, and each one still matches its own hash',
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -193,6 +216,10 @@ const TWO_EPOCHS_BROKEN: AuditChainVerifyResult = {
   epochs_broken: 2,
   newest_broken_epoch_start: '2026-06-27T02:13:00+00:00',
   latest_epoch_broken: false,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -210,6 +237,10 @@ const LATEST_EPOCH_BROKEN: AuditChainVerifyResult = {
   epochs_broken: 1,
   newest_broken_epoch_start: '2026-08-19T00:00:00+00:00',
   latest_epoch_broken: true,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -230,6 +261,10 @@ const CAPPED_AND_TAMPERED: AuditChainVerifyResult = {
   epochs_broken: 1,
   newest_broken_epoch_start: '2026-06-26T21:55:52+00:00',
   latest_epoch_broken: false,
+  first_break_kind: null,
+  first_break_detail: null,
+  newest_break_kind: null,
+  newest_break_detail: null,
   checked_at: '2026-08-19T10:00:00+00:00',
 };
 
@@ -239,12 +274,12 @@ const LINE_PATTERN: Record<Outcome, RegExp> = {
   // Tightened from a bare /chain intact/i: the epoched line below also opens
   // with "Chain intact" (honestly — the chain IS intact, just not provably
   // as ONE chain), so the pattern that must uniquely pick out the full-success
-  // line needs the em dash that only follows it. LOAD-BEARING: the composed
+  // line needs the full stop that only follows it. LOAD-BEARING: the composed
   // capped+epoched line ("...records intact within N epochs from the start
   // of the chain...") never has the word "chain" immediately before "intact",
   // so it stays clear of this pattern too — don't loosen either half without
   // re-checking that composed line.
-  intact: /chain intact —/i,
+  intact: /chain intact\./i,
   partial: /partial verification/i,
   // Anchored on "chain intact within", not a bare "intact within \d+ epochs":
   // the capped+epoched composed line also contains "intact within N epochs"
@@ -336,10 +371,48 @@ describe('Diagnostics — Verify audit chain', () => {
     expect(await screen.findByText(/chain tampered/i)).toBeTruthy();
     expect(screen.getByText(/1 of 2 epochs broken/i)).toBeTruthy();
     // Locates WHICH epoch broke, not just the locally-renumbered seq.
-    expect(screen.getByText(/seq 17 \(epoch 2026-08-01/i)).toBeTruthy();
+    expect(screen.getByText(/seq 17 in epoch 2026-08-01/i)).toBeTruthy();
     // Every epoch after the newest (and only) break verified intact — the
     // actionable answer to "am I sound now".
-    expect(screen.getByText(/every epoch after 2026-08-01.*verified intact/i)).toBeTruthy();
+    expect(screen.getByText(/every epoch after 2026-08-01.*is intact/i)).toBeTruthy();
+    // WHAT broke, not just that something did: a duplicated position whose
+    // copies each still match their own hash is two writers, not an edit.
+    expect(screen.getByText(/2 records claim sequence 17/i)).toBeTruthy();
+    expectOnlyOutcome('tampered');
+  });
+
+  it('the panel reports the blast radius, not just the first position that broke', async () => {
+    // The range showed this endpoint's consumer reading "2 records claim
+    // sequence 503" off first_break_detail while the CLI and the notification
+    // bell — same ChainVerifyResult — reported six sequences and six extra
+    // records. One break, two surfaces, two sizes.
+    vi.mocked(verifyAuditChain).mockResolvedValue({
+      ...TAMPERED,
+      duplicate_seqs: 6,
+      extra_records: 6,
+      max_claimants: 2,
+      altered_records: 0,
+      missing_seqs: 0,
+      oldest_break_at: '2026-09-02T00:29:51.171220+00:00',
+      newest_break_at: '2026-09-07T02:36:46.347817+00:00',
+      break_kinds: ['duplicate_seq'],
+      blast_radius:
+        '6 sequence numbers claimed by more than one record, across 6 extra records. ' +
+        'No record was altered: every copy still matches its own hash. ' +
+        'Newest affected record 2026-09-07T02:36:46.347817+00:00, ' +
+        'oldest 2026-09-02T00:29:51.171220+00:00.',
+    });
+    renderDiagnostics();
+
+    fireEvent.click(await screen.findByRole('button', { name: /verify audit chain/i }));
+
+    expect(await screen.findByText(/6 sequence numbers/i)).toBeTruthy();
+    expect(screen.getByText(/6 extra records/i)).toBeTruthy();
+    expect(screen.getByText(/no record was altered/i)).toBeTruthy();
+    // The smaller, first-instance sentence must not be what the operator reads.
+    expect(screen.queryByText(/2 records claim sequence 17/i)).toBeNull();
+    // No doubled full stop where the radius already ends in one.
+    expect(screen.queryByText(/\.\./)).toBeNull();
     expectOnlyOutcome('tampered');
   });
 
@@ -351,11 +424,11 @@ describe('Diagnostics — Verify audit chain', () => {
 
     expect(await screen.findByText(/2 of 5 epochs broken/i)).toBeTruthy();
     expect(
-      screen.getByText(/oldest break seq 1 \(epoch 2026-06-26T21:55:52/i),
+      screen.getByText(/oldest break is at seq 1 in epoch 2026-06-26T21:55:52/i),
     ).toBeTruthy();
-    expect(screen.getByText(/newest broken epoch 2026-06-27T02:13:00/i)).toBeTruthy();
+    expect(screen.getByText(/newest broken epoch is 2026-06-27T02:13:00/i)).toBeTruthy();
     expect(
-      screen.getByText(/every epoch after 2026-06-27T02:13:00.*verified intact/i),
+      screen.getByText(/every epoch after 2026-06-27T02:13:00.*is intact/i),
     ).toBeTruthy();
     expectOnlyOutcome('tampered');
   });
@@ -369,7 +442,7 @@ describe('Diagnostics — Verify audit chain', () => {
     expect(await screen.findByText(/1 of 3 epochs broken/i)).toBeTruthy();
     expect(screen.getByText(/the latest epoch is broken/i)).toBeTruthy();
     // Nothing intact to point to — the reassurance sentence must not appear.
-    expect(screen.queryByText(/verified intact/i)).toBeNull();
+    expect(screen.queryByText(/epoch after .* is intact/i)).toBeNull();
     expectOnlyOutcome('tampered');
   });
 
@@ -383,7 +456,7 @@ describe('Diagnostics — Verify audit chain', () => {
     expect(screen.getByText(/capped/i)).toBeTruthy();
     // The cap truncates the NEWEST end of the chain — this scan cannot vouch
     // for what it never fetched, in either direction.
-    expect(screen.queryByText(/verified intact/i)).toBeNull();
+    expect(screen.queryByText(/epoch after .* is intact/i)).toBeNull();
     expect(screen.queryByText(/the latest epoch is broken/i)).toBeNull();
     expectOnlyOutcome('tampered');
   });
@@ -401,7 +474,7 @@ describe('Diagnostics — Verify audit chain', () => {
     // and asserting the exact full-success line's absence is the whole point
     // (a bare /chain intact/i probe would also match this line's own opening
     // words, which is exactly why LINE_PATTERN.intact was tightened).
-    expect(screen.queryByText(/chain intact —/i)).toBeNull();
+    expect(screen.queryByText(/chain intact\./i)).toBeNull();
     expectOnlyOutcome('epoched');
   });
 

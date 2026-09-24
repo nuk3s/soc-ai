@@ -38,7 +38,7 @@ export function searchEntities(
       // The palette renders a plain-text label, so the synth-eval marker rides
       // it as the badge's exact wording — a planted run surfaced by ⌘K must
       // never read as real activity.
-      label: `${r.name} — ${r.verdict}${conf} · ${r.when}${r.isSynthEval ? ' · Synthetic — evaluation data' : ''}`,
+      label: `${r.name} — ${r.verdict}${conf} · ${r.when}${r.isSynthEval ? ' · Synthetic evaluation data' : ''}`,
       to: `/investigation/${r.id}`,
     });
   }

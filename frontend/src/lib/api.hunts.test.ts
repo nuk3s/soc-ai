@@ -3,7 +3,7 @@
 // Pinned here — same style as api.dossier.test.ts — so a mistyped path segment
 // or a swapped verb reads as a failing test, not a 404 an analyst hits later.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { promoteFinding } from './api';
+import { getHunts, promoteFinding } from './api';
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -37,5 +37,21 @@ describe('promoteFinding', () => {
   it('URL-encodes a hostile hunt id rather than forging a path', async () => {
     await promoteFinding('a/b', 0);
     expect(url()).toBe('/api/v1/hunts/a%2Fb/findings/0/investigate');
+  });
+});
+
+// The Hunts screen sends `kind` when a chip other than All is active, so the
+// table is the server's answer rather than a slice of the capped page. The
+// default request must not change shape — an unrequested param is the kind of
+// thing an older backend rejects with a 422.
+describe('getHunts kind param', () => {
+  it('sends no kind param unless one is given', async () => {
+    await getHunts({ since: '2026-09-05T00:00:00Z' });
+    expect(url()).toBe('/api/v1/hunts?since=2026-09-05T00%3A00%3A00Z');
+  });
+
+  it('threads kind into the query string when given', async () => {
+    await getHunts({ kind: 'triggered' });
+    expect(url()).toBe('/api/v1/hunts?kind=triggered');
   });
 });

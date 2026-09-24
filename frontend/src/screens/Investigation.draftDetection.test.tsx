@@ -188,7 +188,7 @@ describe('draft-detection review pane', () => {
     mount(baseInv({}));
 
     fireEvent.click(await screen.findByRole('button', { name: /draft detection/i }));
-    const textarea = (await screen.findByLabelText(/sigma rule \(yaml\)/i)) as HTMLTextAreaElement;
+    const textarea = (await screen.findByLabelText(/sigma rule yaml/i)) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'title: EDITED BY ANALYST\n' } });
 
     fireEvent.click(screen.getByRole('button', { name: /copy rule/i }));
@@ -213,7 +213,7 @@ describe('draft-detection review pane', () => {
     fireEvent.click(await screen.findByRole('button', { name: /draft detection/i }));
 
     expect(
-      await screen.findByText(/Dry run couldn't run: The Security Onion grid is slow or unreachable/i),
+      await screen.findByText(/The dry run did not run: The Security Onion grid is slow or unreachable/i),
     ).toBeTruthy();
     expect(screen.queryByText(/would have fired/i)).toBeNull();
   });

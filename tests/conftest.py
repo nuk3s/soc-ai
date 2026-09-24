@@ -166,6 +166,11 @@ def _base_settings_kwargs() -> dict[str, Any]:
         # Tests opt into dev-open mode explicitly; the production default
         # (soc_ai.config.Settings) is True (secure-by-default).
         "api_auth_required": False,
+        # The product default is True (the investigator writes the report). The
+        # shared fixture pins the round-2 path so the tests that mock the
+        # synthesizer keep their meaning. A test of the report-writing path sets
+        # this True itself. The default itself is pinned in test_config.py.
+        "investigator_emits_report": False,
     }
 
 

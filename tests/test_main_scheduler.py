@@ -677,6 +677,37 @@ def test_eval_nightly_due_helper() -> None:
     )
 
 
+def test_a_failed_night_is_not_retried_after_a_restart() -> None:
+    """The gap between the two original guards, and it was a real one.
+
+    A run that finds no eligible alerts or fails writes no snapshot, so the
+    durable ``latest_snapshot_date`` guard cannot see it — which means on
+    exactly the nights something had already gone wrong, the only thing
+    stopping a retry was ``last_scheduled_date`` in process memory. A restart
+    cleared it, and a restart loop would re-run the nightly on every wake past
+    the hour. ``last_attempt_date`` is the durable record of the same fact.
+    """
+    now = datetime(2026, 7, 16, 4, 30, tzinfo=UTC)
+    # The state after a restart: memory empty, no snapshot today (exit 2 wrote
+    # none), and an attempt that did happen.
+    assert not _eval_nightly_due(
+        now,
+        hour_utc=3,
+        last_scheduled_date=None,
+        latest_snapshot_date=None,
+        last_attempt_date="2026-07-16",
+    )
+    # The control: yesterday's attempt does not hold today's run, or a single
+    # failed night would silence the nightly forever.
+    assert _eval_nightly_due(
+        now,
+        hour_utc=3,
+        last_scheduled_date=None,
+        latest_snapshot_date=None,
+        last_attempt_date="2026-07-15",
+    )
+
+
 def _eval_settings(*, enabled: bool = True, hour: int = 0) -> SimpleNamespace:
     return SimpleNamespace(eval_nightly_enabled=enabled, eval_nightly_hour_utc=hour)
 
@@ -723,12 +754,16 @@ async def test_eval_loop_runs_when_enabled_and_hour_reached(
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
+        # The loop tags its own runs, so an operator reading the attempt trail
+        # can tell last night's nightly from their own click on Run now.
+        assert trigger == "schedule"
         status.running = False
 
     monkeypatch.setattr("soc_ai.api.webui_api._quality_eval_worker", _stub_worker)
     monkeypatch.setattr("soc_ai.store.quality.recent_snapshots", AsyncMock(return_value=[]))
+    monkeypatch.setattr("soc_ai.store.quality.latest_attempt", AsyncMock(return_value=None))
 
     await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=True, hour=0))
     if status._task is not None:
@@ -747,11 +782,12 @@ async def test_eval_loop_skips_when_disabled_or_early_or_already_ran(
     app = _eval_app(status)
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
 
     monkeypatch.setattr("soc_ai.api.webui_api._quality_eval_worker", _stub_worker)
     monkeypatch.setattr("soc_ai.store.quality.recent_snapshots", AsyncMock(return_value=[]))
+    monkeypatch.setattr("soc_ai.store.quality.latest_attempt", AsyncMock(return_value=None))
 
     # disabled
     await _run_eval_iterations(monkeypatch, app, _eval_settings(enabled=False, hour=0))

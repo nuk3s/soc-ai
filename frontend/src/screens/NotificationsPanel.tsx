@@ -64,11 +64,11 @@ export function NotificationsPanel({
     setMsg(null);
     try {
       await saveNotifyWebhook(value.trim());
-      setMsg({ text: 'Saved — applied live', ok: true });
+      setMsg({ text: 'soc-ai saved the webhook URL. The URL applies live.', ok: true });
       cancel();
       setReload((n) => n + 1);
     } catch (e) {
-      setMsg({ text: e instanceof Error ? e.message : 'Save failed', ok: false });
+      setMsg({ text: e instanceof Error ? e.message : 'soc-ai could not save the webhook URL.', ok: false });
     } finally {
       setBusy(false);
     }
@@ -79,12 +79,12 @@ export function NotificationsPanel({
     setMsg(null);
     try {
       await clearNotifyWebhook();
-      setMsg({ text: 'Cleared', ok: true });
+      setMsg({ text: 'soc-ai cleared the webhook URL.', ok: true });
       cancel();
       setTestResult(null);
       setReload((n) => n + 1);
     } catch (e) {
-      setMsg({ text: e instanceof Error ? e.message : 'Clear failed', ok: false });
+      setMsg({ text: e instanceof Error ? e.message : 'soc-ai could not clear the webhook URL.', ok: false });
     } finally {
       setBusy(false);
     }
@@ -97,7 +97,7 @@ export function NotificationsPanel({
       const r = await testNotifyWebhook();
       setTestResult({ ok: r.ok, detail: r.detail });
     } catch (e) {
-      setTestResult({ ok: false, detail: e instanceof Error ? e.message : 'Test failed' });
+      setTestResult({ ok: false, detail: e instanceof Error ? e.message : 'soc-ai could not send the test message.' });
     } finally {
       setTesting(false);
     }
@@ -121,11 +121,11 @@ export function NotificationsPanel({
       {!collapsed && (
         <>
           <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-            The one outbound egress path in soc-ai. Stored encrypted, write-only (never shown again)
-            and applied live. Nothing is sent until you set this URL <strong>and</strong> turn on
-            "Notifications enabled" above. Use <strong>Send test</strong> to validate the destination
-            first — it sends a synthetic message (no internal data) and does not require the master
-            toggle.
+            This webhook is the one outbound egress path in soc-ai. soc-ai stores the URL
+            encrypted, applies it live and never shows it again. soc-ai sends nothing until you set
+            this URL <strong>and</strong> turn on "Notifications enabled" above. Use{' '}
+            <strong>Send test</strong> to check the destination first. The test sends a synthetic
+            message with no internal data. The test does not need the master toggle.
           </div>
           <div className="overflow-hidden rounded-card border border-border bg-surface-1">
             <div className="border-b border-border-faint px-[15px] py-3 last:border-0">
@@ -133,8 +133,8 @@ export function NotificationsPanel({
                 <div className="min-w-0 flex-1">
                   <div className="text-[13px] font-medium">Webhook URL</div>
                   <div className="mt-0.5 text-[11.5px] leading-[1.4] text-faint">
-                    Destination for notifications (generic JSON, Slack, or Matrix — pick the format
-                    above).
+                    soc-ai sends notifications to this destination. Pick the generic JSON, Slack
+                    or Matrix format above.
                   </div>
                 </div>
                 <span
@@ -194,7 +194,7 @@ export function NotificationsPanel({
                     autoComplete="new-password"
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
-                    placeholder="https://hooks.example.com/… — write-only"
+                    placeholder="https://hooks.example.com/…"
                     className="w-[300px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
                   />
                   <button

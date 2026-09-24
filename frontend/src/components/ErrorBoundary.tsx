@@ -34,7 +34,7 @@ export class ErrorBoundary extends Component<Props, State> {
             <AlertTriangle size={20} />
           </span>
           <div className="text-[13.5px] font-semibold text-text">
-            Something went wrong loading this page
+            This page could not load
           </div>
           <div className="break-words font-mono text-[11.5px] text-faint">
             {this.state.error.message}

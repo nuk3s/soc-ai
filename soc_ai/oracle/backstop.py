@@ -176,8 +176,56 @@ _SAFE_ORACLE_ENVELOPE_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+# Windows Security schema constants. These are PUBLIC Microsoft identifiers —
+# AD control-access-right and schema-class GUIDs, published in the protocol
+# documentation and identical in every Active Directory forest on earth. They
+# carry no organisational information whatever.
+#
+# They need an explicit entry because they are the only class of value where
+# masking is actively harmful rather than merely lossy: the whole DCSync
+# detection IS the presence of one of the three directory replication rights
+# in ``Properties`` (DS-Replication-Get-Changes 1131f6aa-..., Get-Changes-All
+# 1131f6ad-..., Get-Changes-In-Filtered-Set 89e95b76-...). An Oracle handed
+# ``<redacted:unclassified>`` there cannot adjudicate the finding at all — it
+# would be asked to second-guess a verdict while blind to the single field the
+# verdict rests on.
+#
+# The entry is the FIELD PATH, not a list of GUID values, so every right the
+# DC can write into ``Properties`` passes and widening the detection needs no
+# change here. ``test_winlog_identity_surface`` checks each right alone.
+#
+# DOTTED paths, not bare leaf keys: ``properties`` and ``objecttype`` are
+# generic words that a vendor tool result could use for anything, and the leaf
+# allowlist is documented as the softest tier. Requiring the winlog path keeps
+# this precise.
+_SAFE_WINLOG_SCHEMA_FIELDS: frozenset[str] = frozenset(
+    {
+        "winlog.event_data.properties",
+        "winlog.event_data.objecttype",
+        "winlog.event_data.accesslist",
+        "winlog.event_data.operationtype",
+        "winlog.event_data.ticketoptions",
+        "winlog.event_data.ticketencryptiontypedescription",
+        "winlog.event_data.statusdescription",
+        "winlog.event_data.accessmaskdescription",
+        "winlog.channel",
+        # The authentication package and the process that presented it: which
+        # of Kerberos / NTLM / Negotiate ran, and under which logon type. These
+        # are public Windows constants ("NTLM", "NtLmSsp", "NTLM V2",
+        # "Network"), identical on every Windows host, but unlike the GUIDs and
+        # hex masks above they are WORD-shaped, so the value check does not pass
+        # them and without an entry here they reach the Oracle masked. Kerberos
+        # versus NTLM is the first question Windows triage asks; an Oracle
+        # cannot adjudicate that answer while blind to it.
+        "winlog.event_data.authenticationpackagename",
+        "winlog.event_data.logonprocessname",
+        "winlog.event_data.lmpackagename",
+        "winlog.logon.type",
+    }
+)
+
 _SAFE_DOTTED_FIELDS: frozenset[str] = (
-    _SAFE_ENUM_FIELDS | _SAFE_ID_FIELDS | _SAFE_ORACLE_ENVELOPE_FIELDS
+    _SAFE_ENUM_FIELDS | _SAFE_ID_FIELDS | _SAFE_ORACLE_ENVELOPE_FIELDS | _SAFE_WINLOG_SCHEMA_FIELDS
 )
 
 # Generic bare-leaf keys whose values are categorical / enumerated / numeric

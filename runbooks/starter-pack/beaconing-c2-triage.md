@@ -8,60 +8,70 @@ rules:
 
 # Beaconing / C2 callback triage
 
-Suspected command-and-control (MITRE ATT&CK **T1071** Application Layer
-Protocol, **T1573** Encrypted Channel). The core question: is this host
-talking to infrastructure an attacker controls, on a schedule that software
-chose rather than a human?
+This runbook covers suspected command and control (C2) traffic. The MITRE ATT&CK
+techniques are **T1071** Application Layer Protocol and **T1573** Encrypted Channel.
+Answer two questions. Does the host talk to infrastructure that an attacker controls?
+Does software choose the schedule of the connections? A person makes an irregular
+schedule.
 
 ## Confirm the periodicity first
 
-A beacon is defined by cadence, not by any single connection. Pull all
-connections from the source host to the destination over the last 24 hours
-and look at the inter-arrival times:
+The cadence defines a beacon. A single connection does not define a beacon. Collect all
+connections from the source host to the destination over the last 24 h. Measure the
+inter-arrival times. Read the times against these patterns:
 
-- **Fixed interval with low jitter** (e.g. every 60s ±5%) is the strongest
-  signal. Commodity frameworks default to sleep+jitter timers.
-- Human browsing is bursty: clusters of requests, then long silence.
-- Watch for interval changes after a reboot — an implant restarting resets
-  its timer phase but keeps the interval.
+- A **fixed interval with low jitter** is the strongest indicator. For example, the host
+  connects every 60 s with a jitter of 5 %. Commodity frameworks use sleep timers and
+  jitter timers by default.
+- Human browsing is irregular. It produces clusters of requests and then long silence.
+- Look for a change of interval after a reboot. An implant that restarts resets the phase
+  of its timer. The implant keeps the interval.
 
-If there are only one or two connections, this is not yet beaconing —
-re-check with a longer window before escalating.
+The traffic is not yet a beacon if the host made only 1 or 2 connections. Repeat the
+check with a longer window before you escalate.
 
 ## Assess the destination
 
-- Reputation: blocklists, passive DNS, ASN. Newly registered domains and
-  hosting ASNs with no business relationship to the org raise the score.
-- Rarity: how many *other* hosts in the network talk to this destination?
-  A destination unique to one workstation is far more suspicious than one
-  the whole fleet uses (that pattern is usually telemetry or an update CDN).
-- Port/protocol mismatch: TLS on a non-standard port, HTTP with an empty or
-  generic User-Agent, or raw TCP with small fixed-size payloads.
+- Check the reputation of the destination. Use blocklists, passive DNS and the autonomous
+  system number (ASN). A newly registered domain raises the score. A hosting ASN with no
+  business relationship to the organization raises the score.
+- Check the rarity of the destination. Count the other hosts in the network that talk to
+  it. A destination unique to one workstation is more suspicious than a fleet-wide
+  destination. A fleet-wide destination is usually telemetry or an update content
+  delivery network (CDN).
+- Look for a port mismatch or a protocol mismatch. TLS on a non-standard port is a
+  mismatch. HTTP with an empty or generic User-Agent is a mismatch. Raw TCP with small
+  fixed-size payloads is a mismatch.
 
 ## Assess the payload shape
 
-Byte counts matter more than content when the channel is encrypted: a
-heartbeat beacon sends small, similar-sized requests and receives small
-responses; a tasking event shows one anomalously large download. Consistent
-tiny uploads with occasional large pulls is the classic check-in/tasking
-shape.
+Byte counts matter more than content if the channel is encrypted. A heartbeat beacon
+sends small requests of similar size. It receives small responses. A tasking event shows
+one download that is much larger than the others. Small consistent uploads with
+occasional large downloads are the check-in and tasking shape.
 
 ## Common benign explanations
 
-Rule out before escalating: NTP and monitoring agents (fixed-interval by
-design), antivirus/EDR cloud lookups, software update checks, SaaS client
-keepalives (chat, mail sync), and smart devices phoning home. These are
-periodic but go to well-known, fleet-wide destinations. Record confirmed
-benign destinations as a tag or note so the next analyst doesn't redo the
-work.
+Rule out these sources before you escalate:
+
+- Network Time Protocol (NTP) clients and monitoring agents. They use a fixed interval by
+  design.
+- Antivirus and endpoint detection and response (EDR) cloud lookups.
+- Software update checks.
+- Keepalive traffic from software-as-a-service clients such as chat and mail sync.
+- Smart devices that connect to the servers of their vendor.
+
+These sources are periodic. They reach well-known destinations that the whole fleet uses.
+Record a confirmed benign destination as a tag or a note. The next analyst then does not
+repeat the work.
 
 ## Verdict guidance
 
-- **Escalate** when periodicity + rare destination + payload shape agree, or
-  when the destination is on a current threat-intel list. Recommend isolating
-  the host and capturing PCAP before any remediation that would tip off the
-  operator of the implant.
-- **Dismiss** when the destination is fleet-common and attributable to a
-  known product, and note the product so the detection can be tuned.
-- **Stay suspicious** of single-connection alerts to rare destinations:
-  mark for re-check rather than closing as FP.
+- **Escalate** if the periodicity, the rare destination and the payload shape agree.
+  Escalate if the destination is on a current threat-intelligence list. Recommend
+  isolation of the host. Remediation can alert the operator of the implant. Recommend a
+  packet capture before any remediation.
+- **Dismiss** if the destination is fleet-common and belongs to a known product. Name the
+  product so that the team can tune the detection.
+- Mark a single-connection alert to a rare destination for a re-check. Stay suspicious of
+  that alert. Do not close it as a false positive.

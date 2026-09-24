@@ -30,10 +30,9 @@ function analystSignal(n: DetectionNomination): string {
   }
   const resolved = n.chat_resolved + n.manual_resolved;
   if (resolved > 0) {
-    const detail: string[] = [];
-    if (n.chat_resolved > 0) detail.push(`${n.chat_resolved} chat`);
-    if (n.manual_resolved > 0) detail.push(`${n.manual_resolved} manual`);
-    parts.push(`${resolved} analyst-resolved (${detail.join(' · ')})`);
+    parts.push(`${resolved} analyst-resolved`);
+    if (n.chat_resolved > 0) parts.push(`${n.chat_resolved} in chat`);
+    if (n.manual_resolved > 0) parts.push(`${n.manual_resolved} manual`);
   }
   return parts.join(' · ');
 }
@@ -72,7 +71,7 @@ export function DetectionTuningPanel({
     setBusy(true);
     p.then(() => setNonce((n) => n + 1))
       .catch((e: unknown) =>
-        setActionError(e instanceof Error ? e.message : 'Action failed'),
+        setActionError(e instanceof Error ? e.message : 'The action failed.'),
       )
       .finally(() => setBusy(false));
   };
@@ -88,10 +87,10 @@ export function DetectionTuningPanel({
       {!collapsed && (
       <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-        Rules that fire a lot and keep coming back false-positive are nominated here. Muting a
-        rule hides its alerts from the default feed — a soft, reversible suppression that{' '}
-        <strong>never changes Security Onion</strong>. A rule that has ever caught a true
-        positive is never nominated.
+        soc-ai nominates a rule that fires often and returns a false positive each time. A mute
+        hides the alerts of that rule from the default feed. A mute is reversible. A mute{' '}
+        <strong>never changes Security Onion</strong>. soc-ai never nominates a rule that caught a
+        true positive.
       </div>
 
       {actionError && (
@@ -118,7 +117,7 @@ export function DetectionTuningPanel({
         )}
         {!loading && !error && nominations.length === 0 && (
           <div className="px-3.5 py-4 text-[12.5px] text-faint">
-            No noisy rules nominated — the feed looks healthy.
+            No rule is nominated. No rule reached the nomination thresholds.
           </div>
         )}
         {!loading &&
@@ -136,7 +135,10 @@ export function DetectionTuningPanel({
                   </div>
                   <div className="mt-0.5 text-[11px] leading-[1.4] text-faint">{n.reason}</div>
                   {analystSignal(n) && (
-                    <div className="mt-0.5 text-[11px] leading-[1.4] text-accent" title="Analyst feedback on this rule">
+                    <div
+                      className="mt-0.5 text-[11px] leading-[1.4] text-accent"
+                      title="This line counts the analyst corrections on this rule. The counts drive the nomination."
+                    >
                       {analystSignal(n)}
                     </div>
                   )}
@@ -194,7 +196,7 @@ export function DetectionTuningPanel({
             left rows on screen: they are stale, not absent. */}
         {error && !data && (
           <div className="px-3.5 py-4 text-[12.5px] text-faint">
-            Muted rules couldn&apos;t be loaded — this is not a claim that none are muted.
+            soc-ai could not load the muted rules. This is not a claim that none are muted.
           </div>
         )}
         {overrides.map((o: DetectionOverride) => (

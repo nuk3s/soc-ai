@@ -4,12 +4,14 @@
 // the detector's own reasons + the bundle path behind them).
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { QualityPoint } from '../lib/api';
+import type { QualityFreshness, QualityPoint } from '../lib/api';
 import { absTime } from '../lib/timeRange';
 import {
   QualityCard,
   alarmBanner,
+  gapLabel,
   gradeBreakdown,
+  measuredOn,
   pct,
   seriesFor,
   sparklinePoints,
@@ -40,6 +42,35 @@ function point(overrides: Partial<QualityPoint> = {}): QualityPoint {
     ...overrides,
   };
 }
+
+describe('measuredOn', () => {
+  it('names the version, the build and the route that produced the point', () => {
+    // The whole reason these columns exist: a bend in the trend has to be
+    // attributable to something. `:latest` on both deployments means the
+    // version alone cannot tell two builds of one release apart.
+    expect(
+      measuredOn(
+        point({
+          app_version: '1.5.0',
+          code_commit: '0123456789abcdef0123',
+          analyst_model: 'soc-ai-analyst',
+        }),
+      ),
+    ).toBe('v1.5.0 · 0123456789ab · soc-ai-analyst');
+  });
+
+  it('drops what was not recorded rather than printing a placeholder', () => {
+    // An unstamped build has no commit, and saying so with an em-dash would
+    // read as a value.
+    expect(measuredOn(point({ app_version: '1.5.0', analyst_model: 'qwen' }))).toBe(
+      'v1.5.0 · qwen',
+    );
+  });
+
+  it('is absent on a pre-0040 row, so that layout is unchanged', () => {
+    expect(measuredOn(point())).toBeNull();
+  });
+});
 
 describe('sparklinePoints', () => {
   it('maps a 0..1 series onto the fixed-domain box (0 = bottom, 1 = top)', () => {
@@ -194,7 +225,7 @@ describe('alarmBanner', () => {
     // guess one — and with no identity there is nothing to key a dismissal on.
     const b = alarmBanner([point({ ts: T1 }), alarmed({ id: 2, ts: T2 })]);
     expect(b?.kind).toBe('quality');
-    expect(b?.headline).toBe('Last run tripped the regression alarm');
+    expect(b?.headline).toBe('The last run tripped the regression alarm.');
     expect(b?.pipelineNote).toBeNull();
     expect(b?.dismissId).toBeNull();
   });
@@ -214,7 +245,7 @@ describe('alarmBanner', () => {
       }),
     ]);
     expect(b?.kind).toBe('pipeline');
-    expect(b?.headline).toBe('Eval pipeline failing — 5 of 5 eval runs errored');
+    expect(b?.headline).toBe('The eval pipeline is failing. 5 of 5 eval runs errored.');
     expect(b?.pipelineNote).toBeNull(); // the headline already says it
   });
 
@@ -222,7 +253,7 @@ describe('alarmBanner', () => {
     for (const code of ['agreement_drop', 'fallback_jump']) {
       const b = alarmBanner([point({ ts: T1 }), condition([code], T2, { id: 2, ts: T2 })]);
       expect(b?.kind).toBe('quality');
-      expect(b?.headline).toBe('Last run tripped the regression alarm');
+      expect(b?.headline).toBe('The last run tripped the regression alarm.');
       expect(b?.pipelineNote).toBeNull();
     }
   });
@@ -241,8 +272,8 @@ describe('alarmBanner', () => {
       }),
     ]);
     expect(b?.kind).toBe('quality');
-    expect(b?.headline).toBe('Last run tripped the regression alarm');
-    expect(b?.pipelineNote).toBe('Eval pipeline also failing — 2 of 5 eval runs errored.');
+    expect(b?.headline).toBe('The last run tripped the regression alarm.');
+    expect(b?.pipelineNote).toBe('The eval pipeline is also failing. 2 of 5 eval runs errored.');
   });
 
   it('reads ONGOING when alarm_since predates the latest run, and counts the runs', () => {
@@ -253,14 +284,14 @@ describe('alarmBanner', () => {
     ]);
     expect(b?.ongoing).toBe(true);
     expect(b?.runs).toBe(2);
-    expect(b?.headline).toBe(`Regression alarm — ongoing since ${absTime(T2)} (2 runs)`);
+    expect(b?.headline).toBe(`Regression alarm, ongoing since ${absTime(T2)}, 2 runs`);
   });
 
   it('reads NEW on the run that raised the alarm (alarm_since === ts)', () => {
     const b = alarmBanner([point({ ts: T1 }), condition(['agreement_drop'], T2, { id: 2, ts: T2 })]);
     expect(b?.ongoing).toBe(false);
     expect(b?.runs).toBe(1);
-    expect(b?.headline).toBe('Last run tripped the regression alarm');
+    expect(b?.headline).toBe('The last run tripped the regression alarm.');
   });
 
   it('restarts the count after a clean night — a re-raise is not the old condition', () => {
@@ -315,7 +346,7 @@ describe('QualityCard', () => {
     // On the public demo admin reads are 403 by design and there is no admin to
     // sign in as, so the card must not show the admin prompt or a scary error.
     render(<QualityCard points={[]} error={new Error('403 Forbidden')} loading={false} demo />);
-    expect(screen.getByText(/not shown in the demo/i)).toBeInTheDocument();
+    expect(screen.getByText(/the demo does not show it/i)).toBeInTheDocument();
     expect(screen.queryByText(/Sign in as an admin/)).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
   });
@@ -360,7 +391,7 @@ describe('QualityCard', () => {
       />,
     );
     expect(screen.getByRole('alert')).toBeInTheDocument();
-    expect(screen.getByText('Last run tripped the regression alarm')).toBeInTheDocument();
+    expect(screen.getByText('The last run tripped the regression alarm.')).toBeInTheDocument();
     expect(screen.getByText(reason)).toBeInTheDocument();
   });
 
@@ -488,8 +519,8 @@ describe('QualityCard', () => {
         loading={false}
       />,
     );
-    expect(screen.getByText('Eval pipeline failing — 5 of 5 eval runs errored')).toBeInTheDocument();
-    expect(screen.queryByText('Last run tripped the regression alarm')).toBeNull();
+    expect(screen.getByText('The eval pipeline is failing. 5 of 5 eval runs errored.')).toBeInTheDocument();
+    expect(screen.queryByText('The last run tripped the regression alarm.')).toBeNull();
     // The detector's own words still show — this replaces the headline, not the evidence.
     expect(screen.getByText('error_rate 1.00 exceeds the 0.30 ceiling')).toBeInTheDocument();
   });
@@ -507,9 +538,9 @@ describe('QualityCard', () => {
       />,
     );
     expect(
-      screen.getByText(`Regression alarm — ongoing since ${absTime(T2)} (2 runs)`),
+      screen.getByText(`Regression alarm, ongoing since ${absTime(T2)}, 2 runs`),
     ).toBeInTheDocument();
-    expect(screen.queryByText('Last run tripped the regression alarm')).toBeNull();
+    expect(screen.queryByText('The last run tripped the regression alarm.')).toBeNull();
   });
 
   it('shows the pipeline line under the quality banner on mixed codes', () => {
@@ -529,9 +560,9 @@ describe('QualityCard', () => {
         loading={false}
       />,
     );
-    expect(screen.getByText('Last run tripped the regression alarm')).toBeInTheDocument();
+    expect(screen.getByText('The last run tripped the regression alarm.')).toBeInTheDocument();
     expect(screen.getByTestId('quality-pipeline-note')).toHaveTextContent(
-      'Eval pipeline also failing — 2 of 5 eval runs errored.',
+      'The eval pipeline is also failing. 2 of 5 eval runs errored.',
     );
   });
 
@@ -662,5 +693,165 @@ describe('QualityCard', () => {
       expect(screen.queryByRole('button', { name: /copy path/i })).toBeNull();
       expect(screen.getByTestId('quality-evidence')).toBeInTheDocument();
     });
+  });
+});
+
+// A nightly that finds no eligible alerts writes no point (issue #56), so the
+// card took whatever row was newest as current and, on a grid with no alerts,
+// sat in its empty state with nothing saying why. The server's freshness block
+// dates the newest point, says whether the schedule is on and overdue, and
+// carries the last attempt's own reason.
+describe('QualityCard freshness (issue #56)', () => {
+  const NOW = '2026-07-13T08:17:00Z';
+  const LATEST = '2026-07-10T02:17:00+00:00'; // point()'s default ts, 3 days back
+  const ATTEMPT = '2026-07-13T02:17:00Z'; // 6h back
+  const DETAIL = "no eligible alerts for 'event.severity:high' — no snapshot written";
+
+  function freshness(overrides: Partial<QualityFreshness> = {}): QualityFreshness {
+    return {
+      latest_ts: null,
+      scheduled: false,
+      stale: false,
+      last_attempt_at: null,
+      last_exit_code: null,
+      last_detail: null,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('gapLabel says how long the gap is, not when it started', () => {
+    expect(gapLabel(LATEST)).toBe('3d');
+  });
+
+  it('dates the newest point and the last attempt, with the attempt\'s own reason', () => {
+    render(
+      <QualityCard
+        points={[point()]}
+        error={null}
+        loading={false}
+        freshness={freshness({
+          latest_ts: LATEST,
+          last_attempt_at: ATTEMPT,
+          last_exit_code: 2,
+          last_detail: DETAIL,
+        })}
+      />,
+    );
+    expect(screen.getByTestId('quality-freshness')).toHaveTextContent(
+      `latest point 3d ago · last attempt 6h ago: ${DETAIL}`,
+    );
+  });
+
+  it('renders no attempt clause when nothing has ever attempted a run', () => {
+    render(
+      <QualityCard
+        points={[point()]}
+        error={null}
+        loading={false}
+        freshness={freshness({ latest_ts: LATEST })}
+      />,
+    );
+    const line = screen.getByTestId('quality-freshness');
+    expect(line).toHaveTextContent('latest point 3d ago');
+    expect(line.textContent).not.toContain('last attempt');
+  });
+
+  it('marks a stale trend in amber so an old point cannot read as current', () => {
+    render(
+      <QualityCard
+        points={[point()]}
+        error={null}
+        loading={false}
+        freshness={freshness({ latest_ts: LATEST, scheduled: true, stale: true })}
+      />,
+    );
+    const marker = screen.getByTestId('quality-stale');
+    expect(marker).toHaveTextContent('no point in 3d');
+    expect(marker.style.color).toBe('#f5a623'); // the hunt catalog's overdue amber
+  });
+
+  it('keeps the marker off an old point the schedule never promised to replace', () => {
+    // Same 3-day-old point, nightly off: old, not overdue. The server owns the
+    // call, and the card must not re-derive one from the age alone.
+    render(
+      <QualityCard
+        points={[point()]}
+        error={null}
+        loading={false}
+        freshness={freshness({ latest_ts: LATEST })}
+      />,
+    );
+    expect(screen.queryByTestId('quality-stale')).toBeNull();
+  });
+
+  it('renders nothing about freshness when the parent has none to give', () => {
+    render(<QualityCard points={[point()]} error={null} loading={false} />);
+    expect(screen.queryByTestId('quality-freshness')).toBeNull();
+  });
+
+  it('says why the empty state is empty once a run has tried and written nothing', () => {
+    render(
+      <QualityCard
+        points={[]}
+        error={null}
+        loading={false}
+        freshness={freshness({
+          scheduled: true,
+          last_attempt_at: ATTEMPT,
+          last_exit_code: 2,
+          last_detail: DETAIL,
+        })}
+      />,
+    );
+    expect(screen.getByText(/No quality history yet/)).toBeInTheDocument();
+    expect(screen.getByTestId('quality-freshness')).toHaveTextContent(
+      `Last attempt 6h ago: ${DETAIL}`,
+    );
+    // The nightly is on: the copy must not send the operator off to enable it.
+    expect(screen.queryByText(/enable the nightly eval/)).toBeNull();
+    expect(screen.getByText(/nightly eval is on/)).toBeInTheDocument();
+  });
+
+  it('keeps the schedule-it copy when nothing has tried yet', () => {
+    render(<QualityCard points={[]} error={null} loading={false} freshness={freshness()} />);
+    expect(screen.getByText(/turn the nightly eval on/)).toBeInTheDocument();
+  });
+
+  // An empty trend is the normal shape of two different situations, and the
+  // card used to render the second one as blank space. The attempt fields were
+  // process memory, so after a restart "it ran last night and exited 2" came
+  // back null and the line disappeared — indistinguishable from a deployment
+  // that has never run the eval at all. They are durable now, so the absence
+  // means one thing and the card is allowed to say it.
+  it('says an empty trend has never been attempted, rather than saying nothing', () => {
+    render(<QualityCard points={[]} error={null} loading={false} freshness={freshness()} />);
+    expect(screen.getByTestId('quality-freshness')).toHaveTextContent(
+      /No eval has run on this deployment yet/i,
+    );
+  });
+
+  it('does not claim "never attempted" over an attempt that happened', () => {
+    // NEGATIVE CONTROL for the line above. The two empty-trend branches are
+    // opposite claims, so a card that printed the reassuring one whenever the
+    // trend was empty would be worse than the blank it replaced.
+    render(
+      <QualityCard
+        points={[]}
+        error={null}
+        loading={false}
+        freshness={freshness({ last_attempt_at: ATTEMPT, last_exit_code: 2, last_detail: DETAIL })}
+      />,
+    );
+    const line = screen.getByTestId('quality-freshness');
+    expect(line).toHaveTextContent(`Last attempt 6h ago: ${DETAIL}`);
+    expect(line.textContent).not.toMatch(/never been attempted|No eval has run on this deployment/i);
   });
 });

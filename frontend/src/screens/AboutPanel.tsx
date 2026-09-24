@@ -40,7 +40,7 @@ export function AboutPanel({
           current_version: data?.version ?? '',
           latest_version: null,
           update_available: false,
-          detail: e instanceof Error ? e.message : 'Update check failed',
+          detail: e instanceof Error ? e.message : 'The update check failed.',
         }),
       )
       .finally(() => setChecking(false));
@@ -76,7 +76,7 @@ export function AboutPanel({
                 </span>
               </div>
               <div className="mt-2 text-[12.5px] leading-[1.6] text-dim">
-                Open, self-hosted LLM triage for Security Onion. Licensed under{' '}
+                soc-ai is open, self-hosted LLM triage for Security Onion. The license is{' '}
                 <span className="text-text-2">{data.license}</span>.
               </div>
               <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12.5px]">
@@ -112,7 +112,7 @@ export function AboutPanel({
                   </div>
                 ) : (
                   <div className="text-[12px] leading-[1.5] text-faint">
-                    Update checks are off — soc-ai makes no outbound calls. An admin can enable a
+                    Update checks are off. soc-ai makes no outbound calls. An admin can turn on a
                     manual GitHub release check under Privacy &amp; Egress → Updates.
                   </div>
                 )}

@@ -32,7 +32,7 @@ const GROUP = vi.hoisted(() => ({
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([GROUP]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [GROUP], truncated: false, other_docs: 0 }),
   getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
   startAutoTriage: vi.fn(),
   getAutoTriageStatus: vi.fn(),
@@ -109,7 +109,7 @@ describe('auto-triage skip-reason labels', () => {
     await sweep();
 
     await screen.findByText(
-      '2 investigated · 4 skipped (2 already triaged, 1 in-flight, 1 covered by a prior verdict)',
+      '2 investigated · 4 skipped (2 already triaged, 1 in progress, 1 covered by a prior verdict)',
     );
   });
 });

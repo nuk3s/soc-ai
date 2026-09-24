@@ -78,6 +78,7 @@ from soc_ai.dossier.types import (
 from soc_ai.so_client import fields, inventory
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import first_present, get_dotted
+from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.host_summary import (
     _agg_time,
     _base_host_query,
@@ -179,7 +180,21 @@ _ENDPOINT_DATASETS = ("zeek.http", "zeek.ssl")
 # `agent.*` envelope on every document, which is the whole point: a machine
 # that ships its auth log also tells us its name, its OS, its kernel, its MACs
 # and the addresses it holds — the fields no amount of wire telemetry can give.
-_HOSTLOG_DATASETS: tuple[str, ...] = ("system.auth", "system.syslog")
+# Every dataset an agent on the machine ships that names the machine. The
+# first two are Linux-only, and for as long as the list was just those two,
+# every Windows host on a grid was "network-only": the range's domain
+# controller and workstation ship system.security and elastic_agent with
+# host.name, host.ip and host.os on every document, and the identity lane
+# never read either -- so neither host had a hostname, an OS, or an agent, and
+# the role table had nothing but ports to go on. Same defect as pinning flow
+# to zeek.conn, one lane over.
+_HOSTLOG_DATASETS: tuple[str, ...] = (
+    "system.auth",
+    "system.syslog",
+    "system.security",
+    "elastic_agent",
+    "windows.sysmon_operational",
+)
 
 # Machines per network, and addresses per machine. The host cap is generous
 # because an agent-shipping network is bounded by installs, not by traffic; the
@@ -426,13 +441,13 @@ async def collect_agent_inventory(
     query: dict[str, Any] = {
         "bool": {
             "filter": [
-                _build_time_filter(minutes, time_anchor),
+                _build_time_filter(minutes, time_anchor)[0],
                 {"terms": {"event.dataset": list(present)}},
             ],
             # Same kill-switch as every other dossier query: a synthetic-eval
             # fixture that reached an asset record would be durable,
             # prompt-injected context about a real machine.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            "must_not": list(synth_scope_must_not(False)),
         }
     }
     try:
@@ -583,14 +598,14 @@ async def collect_dns_names(
     query: dict[str, Any] = {
         "bool": {
             "filter": [
-                _build_time_filter(minutes, time_anchor),
+                _build_time_filter(minutes, time_anchor)[0],
                 {"terms": {"event.dataset": list(present)}},
                 _internal_answer_clause(answer_field, nets),
             ],
             # The same kill-switch as every other dossier query: a synthetic-eval
             # fixture that reached an asset record would be durable,
             # prompt-injected context about a real machine.
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            "must_not": list(synth_scope_must_not(False)),
         }
     }
     try:
@@ -736,20 +751,20 @@ def _dns_truncation(
         # A run-row warning that is always on stops being read, so the wide path
         # says what it actually knows instead of claiming an impact it cannot see.
         notes.append(
-            f"the DNS name pass truncated at {_DNS_NAME_AGG_SIZE} name buckets "
-            f"({dropped_names} answer(s) in names that did not fit); the names "
-            "dropped are the least-queried ones"
+            f"the DNS name pass truncated at {_DNS_NAME_AGG_SIZE} name buckets. "
+            f"{dropped_names} answer(s) sit in names that did not fit. The dropped "
+            "names are the least-queried ones."
             if narrowed
-            else f"the DNS name pass ran wide (this grid's answer field cannot be "
-            f"narrowed to internal answers) and truncated at {_DNS_NAME_AGG_SIZE} "
-            f"name buckets; {dropped_names} answer(s) did not fit, mostly public "
-            "names — internal impact unknown"
+            else "the DNS name pass ran wide, because this grid's answer field "
+            "cannot be narrowed to internal answers. It truncated at "
+            f"{_DNS_NAME_AGG_SIZE} name buckets. {dropped_names} answer(s) did not "
+            "fit, and most of them are public names. The internal impact is unknown."
         )
     if dropped_answers:
         notes.append(
             f"the DNS name pass truncated at {_DNS_ANSWER_AGG_SIZE} addresses per "
-            f"name ({dropped_answers} answer(s) in addresses that did not fit); "
-            "an internal address can be crowded out by a name's public answers"
+            f"name. {dropped_answers} answer(s) sit in addresses that did not fit. "
+            "A name's public answers can push out an internal address."
         )
     return tuple(notes)
 
@@ -779,18 +794,27 @@ async def _resolve_agg_fields(elastic: ElasticClient, index: str) -> _AggFields:
 async def _available_datasets(
     elastic: ElasticClient, settings: Settings, minutes: int
 ) -> frozenset[str]:
-    """The ``event.dataset`` values this grid carries over the dossier window.
+    """The datasets this grid's own sensors produce over the dossier window.
 
     Uses the dossier's own window rather than the inventory's 24h default: a
     dataset that last appeared four days ago is present on this grid, and
     gating a 14-day build on a 24h inventory would skip it.
+
+    LIVE datasets only. Widening the window is what makes that matter: at 24h
+    the measured grid held no imported documents at all, at 72h it was 89%
+    backfill, and the dossier reasons over a population rather than about one
+    document an analyst is holding. Resolving a host's identity out of an
+    imported event log names that host after whatever the import contains.
+    A grid whose planes are ALL backfill returns the empty set, which
+    :func:`_present_datasets` reads as "unknown" and searches everything, the
+    same fail-open it applies to a discovery error.
     """
     try:
         inv = await inventory.discover_datasets(elastic, settings, window_minutes=minutes)
     except Exception as exc:  # pragma: no cover - discover_datasets swallows its own
         _LOGGER.warning("dossier dataset inventory failed: %s", exc)
         return frozenset()
-    return frozenset(inv.dataset_names())
+    return frozenset(inv.live_dataset_names())
 
 
 def _present_datasets(datasets: Sequence[str], available: frozenset[str]) -> tuple[str, ...]:
@@ -846,14 +870,14 @@ def _build_aggs(ip: str, f: _AggFields, *, optional: bool = True) -> dict[str, A
         "datasets": {"terms": {"field": "event.dataset", "size": _DATASET_AGG_SIZE}},
         # Direction matters more than anything else here: a port this host
         # ANSWERS on is a service it offers; the same port outbound is a service
-        # it consumes. Restricted to zeek.conn because a Suricata alert doc also
+        # it consumes. Restricted to FLOW datasets because a Suricata alert doc also
         # carries destination.port and would inflate "ports this host serves".
         "responder": {
             "filter": {
                 "bool": {
                     "must": [
                         {"term": {"destination.ip": ip}},
-                        {"term": {"event.dataset": "zeek.conn"}},
+                        fields.flow_dataset_filter(),
                     ]
                 }
             },
@@ -864,7 +888,7 @@ def _build_aggs(ip: str, f: _AggFields, *, optional: bool = True) -> dict[str, A
                 "bool": {
                     "must": [
                         {"term": {"source.ip": ip}},
-                        {"term": {"event.dataset": "zeek.conn"}},
+                        fields.flow_dataset_filter(),
                     ]
                 }
             },
@@ -1052,8 +1076,8 @@ async def _resolve_ptr_name(
     query: dict[str, Any] = {
         "bool": {
             "must": [{"term": {dns_query_field: zone}}],
-            "filter": [_build_time_filter(minutes, anchor)],
-            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+            "filter": [_build_time_filter(minutes, anchor)[0]],
+            "must_not": list(synth_scope_must_not(False)),
         }
     }
     try:

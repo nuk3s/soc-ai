@@ -861,3 +861,89 @@ class TestCredNetBehaviouralParity:
     def test_residue_silent_on_redacter_output(self, case: dict[str, Any]) -> None:
         out, mapping = _redact(case)
         assert _residue(out, mapping) == [], (case, out)
+
+
+class TestCredentialValueShape:
+    """Two production refusals on 2026-09-17, reproduced from stored events.
+
+    The KV net learned ``n`` from ``user: n/a`` and ``r...v....W`` from a
+    printable shellcode dump after an ``account`` token. Each learned value was
+    then found by the residue net in a field the redacter does not rewrite, and
+    every Oracle escalation was refused. One shape rule now gates both nets.
+    """
+
+    def test_n_slash_a_is_not_a_username(self) -> None:
+        from soc_ai.oracle.redact import _redact_credentials
+
+        m = Mapping()
+        out = _redact_credentials("logon user: n/a after 3 tries", m)
+        assert out == "logon user: n/a after 3 tries"
+        assert m.reverse == {}
+        assert unsafe_residue(out) == []
+
+    def test_a_shellcode_dump_is_not_a_username(self) -> None:
+        from soc_ai.oracle.redact import _redact_credentials
+
+        m = Mapping()
+        text = "payload printable: account=r...v....W ...PexFstEnvMov"
+        out = _redact_credentials(text, m)
+        assert out == text
+        assert m.reverse == {}
+        assert unsafe_residue(out) == []
+
+    def test_a_learned_one_character_value_cannot_refuse_by_itself(self) -> None:
+        # An older build may have learned it; the sweep must not match every
+        # standalone letter in the payload.
+        assert unsafe_residue('{"note": "n paths and n more"}', known_values=("n",)) == []
+
+    def test_an_escaped_newline_after_a_key_is_not_a_separator(self) -> None:
+        wire = json.dumps({"result": "the user:\npaths under /home were listed\nafter"})
+        assert [i for i in unsafe_residue(wire, wire_escaped=True) if "credential" in i] == []
+
+    def test_a_real_username_is_still_learned_and_still_caught(self) -> None:
+        from soc_ai.oracle.redact import _redact_credentials
+
+        m = Mapping()
+        out = _redact_credentials("user=jdoe logged on; account: svc-bak", m)
+        assert "jdoe" not in out and "svc-bak" not in out
+        assert set(m.reverse.values()) == {"jdoe", "svc-bak"}
+        leaks = unsafe_residue(
+            "later text says user=jdoe again", known_values=tuple(m.reverse.values())
+        )
+        assert any("jdoe" in leak for leak in leaks)
+
+    def test_both_nets_share_the_shape_rule(self) -> None:
+        from soc_ai.oracle import _cred_data, redact, sanitize
+
+        assert redact.plausible_credential_value is _cred_data.plausible_credential_value
+        assert sanitize.plausible_credential_value is _cred_data.plausible_credential_value
+        assert not _cred_data.plausible_credential_value("n")
+        assert not _cred_data.plausible_credential_value("r...v....W")
+        assert not _cred_data.plausible_credential_value("a.b")
+        assert _cred_data.plausible_credential_value("jd0")
+        assert _cred_data.plausible_credential_value("svc-bak")
+        assert _cred_data.plausible_credential_value("j.doe")
+
+    def test_a_shellcode_dump_with_a_backslash_is_not_a_logon_name(self) -> None:
+        # The production case: printable bytes around a backslash matched the
+        # DOMAIN\\user rule, the left half was learned as a host, and the
+        # residue net found it again in the payload dump.
+        from soc_ai.oracle.redact import _redact_credentials
+
+        text = "..,m.<c.w.....w.0..TO.....vU..S.\\r...v....W*&....$.mc..#.m,q..naq"
+        m = Mapping()
+        out = _redact_credentials(text, m)
+        assert out == text
+        assert m.reverse == {}
+        assert unsafe_residue(json.dumps({"payload": text}), wire_escaped=True) == []
+
+    def test_a_real_down_level_logon_is_still_learned(self) -> None:
+        from soc_ai.oracle.redact import _redact_credentials
+
+        m = Mapping()
+        out = _redact_credentials("logon CORP\\jdoe succeeded", m)
+        assert "CORP" not in out and "jdoe" not in out
+        assert set(m.reverse.values()) == {"CORP", "jdoe"}
+
+    def test_a_learned_value_with_two_dots_cannot_refuse(self) -> None:
+        assert unsafe_residue('{"x": "a..b"}', known_values=("a..b",)) == []

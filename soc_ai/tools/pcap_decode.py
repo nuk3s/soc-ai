@@ -56,7 +56,14 @@ class InterArrival(BaseModel):
 
     mean_s: float
     stdev_s: float
-    cv: float  # stdev / mean; 0 ⟹ perfectly periodic, >1 ⟹ very bursty
+    cv: float | None
+    """stdev / mean; near 0 ⟹ perfectly periodic, >1 ⟹ very bursty.
+
+    ``None`` when the mean gap is not positive, which happens when every packet
+    in the flow shares a timestamp. There is no cadence to measure there, and
+    reporting 0.0 would hand the reader the strongest possible beacon claim
+    about a flood.
+    """
     count: int  # number of gaps measured (= packets_in_flow - 1)
 
 
@@ -303,6 +310,10 @@ def _compute_inter_arrival(timestamps: list[float]) -> InterArrival | None:
     The coefficient of variation (``cv = stdev / mean``) is the key signal:
     * ``cv ≈ 0`` ⟹ perfectly periodic (likely a beacon).
     * ``cv > 1`` ⟹ highly bursty / human-driven.
+    * ``cv is None`` ⟹ no measurable cadence (every packet shares a timestamp).
+      Zero cadence is not a cadence: a burst of identically stamped packets used
+      to come back as ``cv = 0.0``, the single most beacon-looking answer the
+      scale can produce, about traffic that is the opposite of a beacon.
     """
     if len(timestamps) < 2:
         return None
@@ -310,7 +321,7 @@ def _compute_inter_arrival(timestamps: list[float]) -> InterArrival | None:
     n = len(gaps)
     mean = sum(gaps) / n
     stdev = 0.0 if n == 1 else math.sqrt(sum((g - mean) ** 2 for g in gaps) / (n - 1))
-    cv = stdev / mean if mean > 0 else 0.0
+    cv = stdev / mean if mean > 0 else None
     return InterArrival(mean_s=mean, stdev_s=stdev, cv=cv, count=n)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, get_args
 from unittest.mock import AsyncMock
 
@@ -341,3 +342,182 @@ async def test_web_search_closure_threads_effective_idents(
     await fn("some query")
     assert captured["suffixes"] == (".disc.example",)
     assert captured["extra_hosts"] == ("jumpbox",)
+
+
+# ---------------------------------------------------------------------------
+# Tools that cannot answer are not offered (reasoning-turn audit 2026-09-19,
+# W1/W4). An offered tool costs one model turn when the model calls it: 18 s on
+# production. ``t_get_playbooks`` returned ``[]`` on all 24 production calls,
+# and ``t_get_rule_content`` was called 11 times for text the prompt carried.
+# ---------------------------------------------------------------------------
+
+
+class _PlaybookEs:
+    """Minimal ES double: counts searches, answers with a fixed hit list."""
+
+    def __init__(self, hits: list[dict[str, Any]]) -> None:
+        self.hits = hits
+        self.calls = 0
+
+    async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> Any:
+        self.calls += 1
+        return SimpleNamespace(hits=list(self.hits))
+
+
+@pytest.fixture(autouse=True)
+def _clean_playbook_cache() -> Any:
+    from soc_ai.agent.toolset import reset_playbook_presence_cache
+
+    reset_playbook_presence_cache()
+    yield
+    reset_playbook_presence_cache()
+
+
+def _ctx_with(settings: Settings, elastic: Any, **kwargs: Any) -> InvestigationContext:
+    return InvestigationContext(settings=settings, auth=AsyncMock(), elastic=elastic, **kwargs)
+
+
+def _registered(ctx: InvestigationContext, role: str = "investigator") -> set[str]:
+    agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+    register_read_tools(agent, ctx, role=role)  # type: ignore[arg-type]
+    return _names(agent)
+
+
+@pytest.mark.asyncio
+async def test_playbook_tool_is_not_offered_when_the_instance_has_none(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.agent.toolset import prime_playbook_presence
+
+    ctx = _ctx_with(settings_kratos, _PlaybookEs([]))
+    assert await prime_playbook_presence(ctx) is False
+    assert "t_get_playbooks" not in _registered(ctx)
+
+
+@pytest.mark.asyncio
+async def test_playbook_tool_is_offered_when_the_instance_has_one(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.agent.toolset import prime_playbook_presence
+
+    ctx = _ctx_with(settings_kratos, _PlaybookEs([{"_source": {"name": "phishing"}}]))
+    assert await prime_playbook_presence(ctx) is True
+    assert "t_get_playbooks" in _registered(ctx)
+
+
+@pytest.mark.asyncio
+async def test_an_unprobed_or_failing_grid_still_offers_the_playbook_tool(
+    settings_kratos: Settings,
+) -> None:
+    """FAIL OPEN, twice over. A grid that did not answer says nothing about
+    whether playbooks exist, and a run that never probed must behave as it
+    always did."""
+
+    class _Broken:
+        async def search(self, *a: Any, **k: Any) -> Any:
+            raise RuntimeError("grid unreachable")
+
+    from soc_ai.agent.toolset import prime_playbook_presence
+
+    unprobed = _ctx_with(settings_kratos, _PlaybookEs([]))
+    assert "t_get_playbooks" in _registered(unprobed)
+
+    broken = _ctx_with(settings_kratos, _Broken())
+    assert await prime_playbook_presence(broken) is True
+    assert "t_get_playbooks" in _registered(broken)
+
+
+@pytest.mark.asyncio
+async def test_the_playbook_probe_answers_from_cache_within_the_hour(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.agent.toolset import prime_playbook_presence
+
+    es = _PlaybookEs([])
+    ctx = _ctx_with(settings_kratos, es)
+    assert await prime_playbook_presence(ctx) is False
+    assert await prime_playbook_presence(ctx) is False
+    assert es.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_the_playbook_probe_reads_the_playbook_index(
+    settings_kratos: Settings,
+) -> None:
+    class _Recorder(_PlaybookEs):
+        index: str = ""
+
+        async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> Any:
+            self.index = index
+            return await super().search(index, query, **kwargs)
+
+    from soc_ai.agent.toolset import prime_playbook_presence
+
+    es = _Recorder([])
+    await prime_playbook_presence(_ctx_with(settings_kratos, es))
+    assert es.index == settings_kratos.playbooks_index_pattern
+
+
+def test_rule_content_tool_is_not_offered_when_the_prompt_carries_the_rule(
+    settings_kratos: Settings,
+) -> None:
+    ctx = _ctx_with(settings_kratos, AsyncMock(), rule_body_in_prompt=True)
+    assert "t_get_rule_content" not in _registered(ctx)
+    # The flag belongs to the investigation loop. Every other role keeps the tool.
+    assert "t_get_rule_content" in _registered(ctx, role="chat")
+    assert "t_get_rule_content" in _registered(_ctx_with(settings_kratos, AsyncMock()))
+
+
+# ---------------------------------------------------------------------------
+# R6: "the prefetch already has this" must mean the record is there
+# ---------------------------------------------------------------------------
+
+
+def _enriched_with(events: list[Any]) -> Any:
+    from soc_ai.so_client.models import SoAlert
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext
+
+    return EnrichedAlertContext(
+        alert=SoAlert(id="alert-001", network_community_id="1:abc=="),
+        community_id_events=events,
+    )
+
+
+def test_a_pivot_that_returned_nothing_is_not_a_prefetched_record() -> None:
+    """01M2WG06 seq 7: the stub answered "prefetch already has this" while
+    ``community_id_events`` was empty. The model recovered with OQL and found
+    the WireGuard record that decided the case."""
+    from soc_ai.agent.toolset import prefetched_community_ids
+
+    assert prefetched_community_ids(_enriched_with([])) == set()
+
+
+def test_a_prefetched_record_puts_its_community_id_on_the_list() -> None:
+    from soc_ai.agent.toolset import prefetched_community_ids
+    from soc_ai.so_client.models import SoAlert
+
+    events = [SoAlert(id="zeek-1", network_community_id="1:abc==")]
+    assert prefetched_community_ids(_enriched_with(events)) == {"1:abc=="}
+
+
+@pytest.mark.asyncio
+async def test_zeek_query_runs_when_the_prefetch_holds_no_record(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stub short-circuits on presence, so an absent record means a query."""
+    ran: list[str] = []
+
+    async def _query(community_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        ran.append(community_id)
+        return [{"_id": "zeek-1"}]
+
+    monkeypatch.setattr("soc_ai.agent.toolset.query_zeek_logs", _query)
+    ctx = _ctx_with(settings_kratos, AsyncMock())
+    ctx.prefetched_community_ids = set()
+    agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+    register_read_tools(agent, ctx, role="investigator")
+    result = await agent._function_toolset.tools["t_query_zeek_logs"].function(
+        community_id="1:abc=="
+    )
+    assert ran == ["1:abc=="]
+    assert result == [{"_id": "zeek-1"}]

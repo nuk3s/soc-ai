@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +13,7 @@ from soc_ai.eval.synth_loader import EventTemplate, GroundTruth, Scenario
 from soc_ai.so_client.elastic import ElasticClient
 
 RUN_TIME = datetime(2026, 5, 13, 22, 30, 0, tzinfo=UTC)
+SCENARIOS_DIR = Path(__file__).resolve().parents[1] / "soc_ai" / "eval" / "synth_scenarios"
 
 
 def _make_elastic(
@@ -583,14 +585,83 @@ def test_synth_scope_of_one_repeat_excludes_sibling_plants() -> None:
     plant id; docs stamped with the bare id or another repeat's id carry
     synth.scenario_id (the exists arm) without matching the term — so a
     repeat's queries exclude every sibling plant's documents."""
-    from soc_ai.tools._synth_scope import synth_scope_must_not
+    from soc_ai.tools._synth_scope import MARKER_PATHS, synth_scope_must_not
 
     clauses = synth_scope_must_not("test-ingest::r1")
-    assert len(clauses) == 1
-    inner = clauses[0]["bool"]
-    assert inner["must"] == [{"exists": {"field": "synth.scenario_id"}}]
-    assert {"term": {"synth.scenario_id": "test-ingest::r1"}} in inner["must_not"]
-    assert {"term": {"synth.scenario_id.keyword": "test-ingest::r1"}} in inner["must_not"]
-    # Neither the bare id nor another repeat's id is exempted.
-    for other in ("test-ingest", "test-ingest::r2"):
-        assert {"term": {"synth.scenario_id": other}} not in inner["must_not"]
+    # One clause per position the marker can occupy — the top level of the
+    # document, and under a detection pipeline's envelope. Every position
+    # carries the same term exemption, so a repeat's own plants stay readable
+    # whichever shape the pipeline hands them back in.
+    assert len(clauses) == len(MARKER_PATHS)
+    for path, clause in zip(MARKER_PATHS, clauses, strict=True):
+        inner = clause["bool"]
+        assert inner["must"] == [{"exists": {"field": path}}]
+        assert {"term": {path: "test-ingest::r1"}} in inner["must_not"]
+        assert {"term": {f"{path}.keyword": "test-ingest::r1"}} in inner["must_not"]
+        # Neither the bare id nor another repeat's id is exempted.
+        for other in ("test-ingest", "test-ingest::r2"):
+            assert {"term": {path: other}} not in inner["must_not"]
+
+
+# --------------------------------------------------------------------
+# A scenario with nothing to triage is refused before the first write.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_scenario_with_no_triage_target_is_refused_before_any_write(
+    settings_kratos: Settings,
+) -> None:
+    """The refusal has to come before the first write, not after the last.
+
+    The ingester planted every document and only then noticed there was
+    nothing to triage, so a no-alert scenario handed to the wrong caller left
+    its whole plant on the grid and an error saying so. The decision needs only
+    the rendered docs, which exist before anything is indexed. Caught by
+    dogfooding 1.5.1 against the range.
+    """
+    from soc_ai.eval.synth_ingest import ingest_scenario
+    from soc_ai.eval.synth_loader import load_scenario_file
+
+    scenario = load_scenario_file(SCENARIOS_DIR / "s1-dcsync-no-alert.yaml")
+    assert not any(e.is_triage_target for e in scenario.events), "the fixture grew a target"
+    elastic, fake_es = _make_elastic(settings_kratos)
+
+    with (
+        patch("soc_ai.eval.synth_ingest._index_one", new_callable=AsyncMock) as index_one,
+        pytest.raises(RuntimeError, match="no triage target") as excinfo,
+    ):
+        await ingest_scenario(scenario, elastic=elastic, run_time=RUN_TIME)
+
+    index_one.assert_not_awaited()
+    fake_es.indices.refresh.assert_not_awaited()
+    message = str(excinfo.value)
+    assert "declarative population" in message
+    assert "spec-run" in message
+    assert "already planted" not in message, "that clause is false once nothing is written"
+
+
+@pytest.mark.asyncio
+async def test_a_batch_holding_a_no_alert_scenario_plants_nothing_at_all(
+    settings_kratos: Settings,
+) -> None:
+    """One untriageable scenario refuses the whole batch before its first write.
+
+    Refusing it only when its own turn comes leaves every scenario before it
+    planted, which is the same litter one scenario at a time.
+    """
+    from soc_ai.eval.synth_ingest import ingest_scenarios
+    from soc_ai.eval.synth_loader import load_scenario_file
+
+    good = _two_event_scenario()
+    bad = load_scenario_file(SCENARIOS_DIR / "s2-kerberoast-no-alert.yaml")
+    elastic, fake_es = _make_elastic(settings_kratos)
+
+    with (
+        patch("soc_ai.eval.synth_ingest._index_one", new_callable=AsyncMock) as index_one,
+        pytest.raises(RuntimeError, match="s2-kerberoast-no-alert"),
+    ):
+        await ingest_scenarios([good, bad], elastic=elastic, run_time=RUN_TIME)
+
+    index_one.assert_not_awaited()
+    fake_es.indices.refresh.assert_not_awaited()

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from soc_ai.api.security import require_api_auth, require_csrf_safe
 from soc_ai.demo.guard import is_demo
+from soc_ai.webui import alerts_query as aq
 from soc_ai.webui.deps import current_user
 
 _LOGGER = logging.getLogger(__name__)
@@ -108,20 +109,46 @@ async def require_admin_api(request: Request) -> None:
 
 # The React unions are narrower than what the backend can emit; coerce to them
 # so the client never sees a value outside its TypeScript types.
-_FE_SEV = {"critical", "high", "medium", "low"}
+#
+# ``unknown`` is in the set because it is a real answer, not a fallback: it is
+# what the alerts query reports for a document with no ``event.severity_label``.
+# Folding it into ``low`` put a Low badge on 37 Elastic Defend endpoint alerts
+# and 3 OpenCanary honeypot hits, which were the entire 24 hour queue on the
+# measured grid, and the Severity=Low filter then matched none of them because
+# that filter is a term query on the field they do not carry. The badge and the
+# filter have to be able to name the same thing.
+_FE_SEV = {"critical", "high", "medium", "low", aq.UNKNOWN_SEVERITY}
 # 'suricata' | 'sigma' | 'notice' are detector-flag kinds (the alert feed's
 # vocabulary); 'hunt' marks a promoted hunt finding (migration 0031).
-_FE_KIND = {"suricata", "sigma", "notice", "hunt"}
+# 'unnamed' is not a detector: it is the group of alerts that carry no
+# rule.name, named by their dataset instead. It has to survive coercion because
+# the SPA posts a group's kind back to expand or acknowledge the group, and
+# every other kind resolves the group's name against a name field these
+# documents do not have.
+# 'alert' is not a detector either: it is what ``_kind_for`` returns for an
+# alert-labelled document whose ``event.dataset`` is none of the three it maps.
+# Coercing it to 'suricata' put a SURICATA badge on 37 Elastic Defend endpoint
+# alerts, 37 of the 40 in the measured 24 hour queue. No Suricata sensor
+# produced them, they carry no network flow, and the badge named both the wrong
+# tool and the wrong shape of evidence.
+_FE_KIND = {"suricata", "sigma", "notice", "hunt", "unnamed", "alert"}
 
 
 def _sev(value: str | None) -> str:
+    """Normalize a severity for the client. Anything unrecognized, absent or
+    empty is reported as unknown, never as a severity the document does not
+    claim. "Low" is a finding; "we were not told" is a different one."""
     v = (value or "").lower()
-    return v if v in _FE_SEV else "low"
+    return v if v in _FE_SEV else aq.UNKNOWN_SEVERITY
 
 
 def _kind(value: str | None) -> str:
+    """Normalize a detection kind for the client. An unrecognized or absent kind
+    falls back to the generic 'alert', never to a detector's name: naming a
+    detector is a claim about where the detection came from, and this is the
+    branch that has no idea."""
     v = (value or "").lower()
-    return v if v in _FE_KIND else "suricata"
+    return v if v in _FE_KIND else "alert"
 
 
 def _verdict(value: str | None) -> str:
@@ -167,3 +194,36 @@ def _iso_utc(dt: datetime | None) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.isoformat()
+
+
+# The source value the first shadow sweep wrote. It named the analytic's
+# lifecycle status, which now lives on the analytic itself, and it duplicated
+# the observation's own ``shadow`` flag. Rows written under it stay in the
+# table, so every route that shows a source has to translate it.
+LEGACY_OBSERVATION_SOURCE = "candidate"
+
+
+def observation_source(stored: str | None) -> str:
+    """The source one observation shows. A retired 'candidate' reads as 'catalog'.
+
+    A candidate analytic is a query analytic that an analyst has not approved.
+    Its observations come from the catalog. Whether it was live is the
+    ``shadow`` flag, and whether it is live now is the analytic's status.
+    """
+    value = str(stored or "profile")
+    return "catalog" if value == LEGACY_OBSERVATION_SOURCE else value
+
+
+def _iso_z(dt: datetime | None) -> str | None:
+    """A stored (naive UTC) timestamp as ISO-8601 with an explicit ``Z``.
+
+    Naive means a browser parses it as local time; :func:`_iso_utc` solves the
+    same problem with ``+00:00`` and renders ``None`` as ``""``, which a
+    nullable field must not become. The hunt-catalog and quality-freshness
+    read-models use this one.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")

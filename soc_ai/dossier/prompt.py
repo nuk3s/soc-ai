@@ -80,6 +80,20 @@ def estimate_tokens(text: str) -> int:
     return _estimate(text)
 
 
+def _writing_style_rule() -> str:
+    """The house style for the sentences a reader gets back, as shared text.
+
+    Imported lazily for the same layering reason :func:`estimate_tokens` gives:
+    this package sits BELOW ``soc_ai.agent``, and the rule's one definition is
+    ``soc_ai.agent.prompts.WRITING_STYLE_RULE``. A second copy here would drift
+    the day the first one is fixed, which is the failure the shared prompt
+    blocks already exist to prevent.
+    """
+    from soc_ai.agent.prompts import WRITING_STYLE_RULE  # noqa: PLC0415
+
+    return WRITING_STYLE_RULE
+
+
 # Per-host and whole-block ceilings, in `context_budget.estimate_tokens` units.
 # Public because the orchestrator subtracts the block's cost from the enriched
 # context's budget, and a test pins both against a pathological host.
@@ -126,14 +140,14 @@ _L_NO_EVIDENCE = 3
 _L_NO_DETAIL = 4
 _LEVELS = range(_L_FULL, _L_NO_DETAIL + 1)
 
-HEADING = "## Host dossier (system-inferred asset context — provenance-tagged, NOT evidence)"
+HEADING = "## Host dossier: system-inferred asset context, provenance-tagged, not evidence"
 
 _INTRO = (
-    "Deterministic rules over telemetry, not a model. Operator-set values are "
-    "authoritative. Do not cite these as evidence; if a claim rests on one, call "
-    "`t_host_dossier` and cite the tool result. An `unknown` field states why it "
-    "is unknown, and a host with no dossier is one the network sweep has no record "
-    "of — neither is evidence that anything here is fine."
+    "Deterministic rules over telemetry build this block. No model writes it. "
+    "Operator-set values are authoritative. Do not cite these lines as evidence.\n\n"
+    "If a claim rests on one, call `t_host_dossier` and cite the tool result. An "
+    "`unknown` field says why. A host with no dossier is one the network sweep "
+    "has no record of. Neither line is evidence that anything here is fine."
 )
 
 # Ports the classifier calls remote-access initiation, spelled out for the
@@ -434,7 +448,7 @@ def _parsed_address(token: str) -> str | None:
 
 
 def _assemble(host_blocks: list[str]) -> str:
-    return "\n".join([HEADING, "", _INTRO, "", *host_blocks])
+    return "\n".join([HEADING, "", _INTRO, "", _writing_style_rule().strip(), "", *host_blocks])
 
 
 def _fit_host(entry: ResolvedDossier, label: str | None, *, floor: int, now: datetime) -> str:
@@ -463,7 +477,7 @@ def _drop_hosts(rendered: list[str], *, extra: int = 0) -> str:
 
 def _omitted_line(count: int) -> str:
     plural = "host" if count == 1 else "hosts"
-    return f"- (+{count} more {plural} omitted for space — call `t_host_dossier` for them)"
+    return f"- (+{count} more {plural} omitted for space. Call `t_host_dossier` for them.)"
 
 
 # ---------------------------------------------------------------------------
@@ -477,8 +491,9 @@ def _host_lines(
     head = f"{entry.ip} ({label})" if label else entry.ip
     if not entry.found:
         return [
-            f"- {head} — no dossier: the network sweep has no record of this address "
-            "(external, or never observed). That is not evidence it is benign."
+            f"- {head} — no dossier: the network sweep has no record of this "
+            "address. It is external, or never observed. That is not evidence it "
+            "is benign."
         ]
 
     lines = [f"- {head} — role: {_role_text(entry, level=level)}"]
@@ -491,8 +506,8 @@ def _host_lines(
         # weighing one has to know that before trusting it.
         lines.append(
             "  note: a different machine appears to hold this address since "
-            f"{_date(rebound_at)} — any operator value set before "
-            "then may no longer apply."
+            f"{_date(rebound_at)}. Any operator value set before that date "
+            "may no longer apply."
         )
     if level < _L_NO_BASELINE and (baseline := _baseline_text(entry)):
         lines.append(f"  baseline: {baseline}")
@@ -583,7 +598,7 @@ def _baseline_text(entry: ResolvedDossier) -> str:
         bits.extend(_activity_bits(activity))
     if (static := _known(entry, "is_static_addressed")) is not None:
         bits.append("statically addressed" if static.value == "yes" else "DHCP-leased")
-    return "; ".join(bits)
+    return " · ".join(bits)
 
 
 def _activity_bits(activity: dict[str, Any]) -> list[str]:
@@ -595,7 +610,7 @@ def _activity_bits(activity: dict[str, Any]) -> list[str]:
         bits.append(f"initiates outbound remote access{detail}")
     elif initiates is False:
         bits.append(
-            f"has not initiated outbound remote access ({_REMOTE_ACCESS_LABEL}) "
+            f"has not initiated outbound remote access over {_REMOTE_ACCESS_LABEL} "
             "in the observed window"
         )
     hours = activity.get("busiest_hours")
@@ -673,7 +688,7 @@ def _evidence_text(field: ResolvedField) -> str:
         text = "; ".join(str(item) for item in strings[:2] if item)
     conflict = entry.get("conflict")
     if conflict:
-        text = f"{text} — conflict: {conflict}" if text else f"conflict: {conflict}"
+        text = f"{text} · conflict: {conflict}" if text else f"conflict: {conflict}"
     return _clip(text, _EVIDENCE_CHARS)
 
 
@@ -681,12 +696,12 @@ def _unknown_text(field: ResolvedField) -> str:
     """Why a field did not resolve. Three reasons, three different answers."""
     if field.reason == "stale":
         if field.last_run_at is None:
-            return "stale — never confirmed by a build"
-        return f"stale — not re-confirmed since {_date(field.last_run_at)}"
+            return "stale. No build has confirmed it."
+        return f"stale. No build has re-confirmed it since {_date(field.last_run_at)}."
     if field.reason == "low_confidence":
-        return "signal too weak to assert — below the confidence floor"
+        return "signal too weak to assert. It is below the confidence floor."
     if field.last_run_at is None:
-        return "not evaluated yet — no build has looked"
+        return "not evaluated yet. No build has looked."
     return "no signal in the observed window"
 
 

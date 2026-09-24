@@ -2,7 +2,13 @@ import { Bell, Check, ChevronDown, HelpCircle, Search, Settings, X } from 'lucid
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { DevBadge, SyntheticEvalBadge } from '../components/Badges';
-import { type Health, getHealth, getNotifications, getWorkspaces } from '../lib/api';
+import {
+  type Health,
+  getHealth,
+  getNotifications,
+  getWorkspaces,
+  onNeedsYouChanged,
+} from '../lib/api';
 import {
   NOTIFICATIONS_DISMISSED_EVENT,
   dismissNotification,
@@ -83,11 +89,16 @@ export function Topbar() {
     // A dismiss from anywhere (this bell, the Notifications pane, "Clear all")
     // re-reads immediately so the badge count can't lag its 15s poll.
     window.addEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
+    // The bell holds a notice per unread shadow hit. An analyst who reads a hit
+    // on the Hunts page watched the strip and the sidebar move while the bell
+    // stood still for up to 15 s, so one number read two ways on one screen.
+    const stopNeedsYou = onNeedsYouChanged(load);
     return () => {
       alive = false;
       clearInterval(t);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
+      stopNeedsYou();
     };
   }, []);
 
@@ -102,7 +113,8 @@ export function Topbar() {
     }
   };
 
-  // Poll upstream health (ES / LLM / PCAP) for the status indicator.
+  // Poll upstream health (ES / model gateway / Security Onion API / PCAP) for
+  // the status indicator.
   useEffect(() => {
     let alive = true;
     const tick = () =>
@@ -135,7 +147,15 @@ export function Topbar() {
     };
   }, []);
 
-  const healthList = health ? [health.es, health.llm, ...(health.pcap ? [health.pcap] : [])] : [];
+  // Every component the pill's one word speaks for. `so` covers the Security
+  // Onion web API, the path every acknowledge, escalate and case write takes.
+  // Leaving it out is what let the pill read "connected" beside a setup-health
+  // card reporting a Security Onion timeout (dogfood 2026-09-07, D1). It is
+  // read defensively so a page served by an older build shows "connected" for
+  // what it CAN see rather than crashing on an absent field.
+  const healthList = health
+    ? [health.es, health.llm, ...(health.so ? [health.so] : []), ...(health.pcap ? [health.pcap] : [])]
+    : [];
   const healthDown = healthList.filter((c) => !c.ok).length;
   const healthOk = health !== null && !healthFailed && healthDown === 0;
   // grey = initial load; amber = fetch failed or components down; green = all ok
@@ -210,7 +230,7 @@ export function Topbar() {
       {/* command palette trigger */}
       <button
         onClick={openPalette}
-        title="Search — ⌘K"
+        title="Search or jump to. The shortcut is ⌘K."
         className="flex flex-none cursor-text items-center gap-2 rounded-control border border-border-2 bg-surface-1 px-2.5 py-1.5 text-faint hover:border-border-strong"
         style={{ width: 'clamp(170px,22vw,300px)' }}
       >
@@ -356,16 +376,21 @@ export function Topbar() {
                   </div>
                 )}
               </div>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDismiss(nt.id);
-                }}
-                aria-label="Dismiss"
-                className="flex flex-none self-start p-0.5 text-faint hover:text-text"
-              >
-                <X size={13} />
-              </button>
+              {/* No dismiss control on a finding the server says must not be
+                  silenceable from local storage: an audit record whose content no
+                  longer matches its own hash. */}
+              {nt.dismissible !== false && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDismiss(nt.id);
+                  }}
+                  aria-label="Dismiss"
+                  className="flex flex-none self-start p-0.5 text-faint hover:text-text"
+                >
+                  <X size={13} />
+                </button>
+              )}
             </div>
           ))}
           <button
@@ -380,14 +405,14 @@ export function Topbar() {
         </div>
       )}
 
-      {/* health dropdown — ES / LLM / PCAP, with the PCAP re-creation hint */}
+      {/* health dropdown: ES / LLM / Security Onion / PCAP, with the PCAP hint */}
       {healthOpen && (
         <div className="absolute right-[150px] top-12 z-[33] w-[360px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
           <div className="border-b border-border-2 px-3.5 py-3 text-[13px] font-semibold">
             Upstream health
           </div>
           {healthFailed && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-warn">API unreachable — retrying…</div>
+            <div className="px-3.5 py-6 text-center text-[12px] text-warn">The API is unreachable. Retrying…</div>
           )}
           {!healthFailed && health === null && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint">Checking…</div>
@@ -395,6 +420,7 @@ export function Topbar() {
           {([
             ['Elasticsearch', health?.es],
             ['LLM gateway', health?.llm],
+            ['Security Onion API', health?.so],
             ['PCAP (sensor)', health?.pcap],
           ] as const).map(([label, c]) =>
             c == null ? null : (
@@ -416,7 +442,7 @@ export function Topbar() {
           )}
           {health?.pcap == null && health !== null && (
             <div className="px-3.5 py-2.5 font-mono text-[10.5px] text-faint">
-              PCAP fetch is disabled (pcap_enabled=false).
+              PCAP fetch is off. The setting pcap_enabled is false.
             </div>
           )}
         </div>

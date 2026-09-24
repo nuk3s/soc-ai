@@ -67,12 +67,12 @@ from pydantic import BaseModel, Field
 
 from soc_ai.config import Settings
 from soc_ai.enrichment.zeek_parser import TypedZeekFields, parse_typed_zeek_fields
-from soc_ai.errors import SoNotFoundError
+from soc_ai.errors import SoNotFoundError, SyntheticAnchorError
 from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.models import SoAlert
 from soc_ai.tools._registry import tool
-from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
+from soc_ai.tools._synth_scope import SynthScope, scope_hidden_scenario, synth_scope_must_not
 from soc_ai.tools.enrichment import (
     EnrichmentContext,
     IndicatorEnrichment,
@@ -93,6 +93,13 @@ class AlertContext(BaseModel):
     user_events: list[SoAlert] = Field(default_factory=list)
     process_events: list[SoAlert] = Field(default_factory=list)
     file_events: list[SoAlert] = Field(default_factory=list)
+    # The documents a HUNT SUBJECT cites (D2). Empty on every alert run, and
+    # on a hunt run it holds the documents the hunt's findings cite, fetched by
+    # id before the loop starts. They sit here, beside the pivots, because they
+    # are the same thing: evidence the orchestrator gathered on the agent's
+    # behalf. Every id-citation resolver reads this list with the pivots, so a
+    # verdict that cites one of these documents resolves.
+    subject_documents: list[SoAlert] = Field(default_factory=list)
     pivot_summary: dict[str, int] = Field(default_factory=dict)
     # Histogram of rule_name → count of alerts that fired on this IP recently
     # (wide ±host_risk_window_hours window). DATA ONLY, not a verdict — each
@@ -173,6 +180,9 @@ async def get_alert_context(
 
     Raises:
         SoNotFoundError: if no document with ``alert_id`` exists.
+        SyntheticAnchorError: if the alert is a planted evaluation fixture that
+            ``include_synth`` hides, so every pivot below would be empty by
+            construction and none of those empties would mean anything.
         ValueError: on non-positive ``window_seconds`` or ``max_per_pivot``.
     """
     if window_seconds <= 0:
@@ -188,6 +198,23 @@ async def get_alert_context(
     if not lookup.hits:
         raise SoNotFoundError(f"alert not found: {alert_id}")
     alert = SoAlert.from_es_hit(lookup.hits[0])
+
+    # The anchor is fetched by document id, so it is the one read in the whole
+    # run that does not pass the scope's exclusion clauses. When the scope would
+    # have hidden it, every pivot below is guaranteed to come back empty and
+    # none of those empties mean anything about the network. Refuse here rather
+    # than hand the loop a subject it cannot corroborate: an absence the guard
+    # manufactured reads exactly like an absence the network did, and the run
+    # that could not tell them apart returned false positive at 0.60.
+    if scenario_id := scope_hidden_scenario(include_synth, alert.raw):
+        raise SyntheticAnchorError(
+            f"alert {alert_id} is a planted evaluation fixture "
+            f"(scenario {scenario_id}) that this run is not scoped to read; "
+            "refusing to investigate rather than reporting the guard's own "
+            "exclusions as an absence of evidence",
+            alert_id=alert_id,
+            scenario_id=scenario_id,
+        )
 
     # The host pivot's structural guard: pivot on host.name only when it can
     # plausibly name an ENDPOINT. Skipping resolves the pivot to [] without

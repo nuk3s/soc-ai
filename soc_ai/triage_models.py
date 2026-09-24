@@ -23,7 +23,7 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 WriteToolName = Literal["ack_alert", "escalate_to_case", "add_case_comment"]
 # ``inconclusive`` is a TERMINAL non-committed verdict produced ONLY by the
@@ -166,76 +166,6 @@ class RecommendedAction(BaseModel):
     _decode_tool_args = field_validator("tool_args", mode="before")(_decode_stringified_json)
 
 
-class RubricCoverage(BaseModel):
-    """Per-investigation coverage rubric.
-
-    The investigator MUST emit this alongside its evidence so the
-    synthesizer can confidence-cap when required coverage was missed.
-    Each field is "did the investigator do this thing?" — not "is the
-    finding positive?". An empty MISP enrichment with
-    ``enrichment_called=True`` reflects a real check that turned up
-    no signal; it does NOT count as positive evidence of benignness.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    related_alerts_checked: bool = Field(
-        default=False,
-        description=(
-            "True if the investigator queried for related alerts on the "
-            "same host / community_id / user (typically via "
-            "`t_query_events_oql` or relied on the prefetched pivots)."
-        ),
-    )
-    playbook_consulted: bool = Field(
-        default=False,
-        description=(
-            "True if a playbook was consulted (auto-prefetched, or the "
-            "investigator called `t_get_playbooks`/`t_lookup_runbook`)."
-        ),
-    )
-    enrichment_called: bool = Field(
-        default=False,
-        description=(
-            "True if at least one `t_enrich_*` tool (IP / domain / hash) "
-            "was invoked. Empty MISP results count as 'called' — they're "
-            "absence of evidence, not positive findings."
-        ),
-    )
-    dns_or_sni_pivoted: bool = Field(
-        default=False,
-        description=(
-            "True if the agent looked at the domain context (DNS query or "
-            "SSL SNI from `payload_printable` or the DNS/SSL name fields — "
-            "`dns.query.name`/`ssl.server_name` on a modern grid, "
-            "`zeek.dns.query`/`zeek.ssl.server_name` on older SO) for any "
-            "external IOC referenced in the alert. False when the alert "
-            "involves an external indicator and the agent didn't pivot on it."
-        ),
-    )
-    payload_inspected_if_banner_rule: bool = Field(
-        default=False,
-        description=(
-            "True if the rule is banner/content-class (matches packet "
-            "bytes — most ET INFO/POLICY rules) AND the agent actually "
-            "read `alert.payload_printable`. Set to True automatically "
-            "when the rule isn't banner-class."
-        ),
-    )
-    enrichment_skipped_reason: str | None = Field(
-        default=None,
-        description=(
-            "Escape hatch. When the alert has an external IOC "
-            "but `enrichment_called=False`, the investigator MUST set "
-            "this to a short justification (e.g. 'MISP rate-limited', "
-            "'indicator is a private DNS suffix, no provider would "
-            "have it'). The orchestrator's coverage gate uses this to "
-            "decide whether to retry the investigator turn — a non-empty "
-            "reason satisfies the gate."
-        ),
-    )
-
-
 class InvestigationTranscript(BaseModel):
     """Output of the investigator (fast model) phase.
 
@@ -266,20 +196,22 @@ class InvestigationTranscript(BaseModel):
             "investigator if the synthesizer comes back low-confidence."
         ),
     )
-    rubric_coverage: RubricCoverage = Field(
-        default_factory=RubricCoverage,
-        description=(
-            "Coverage rubric. The synthesizer caps confidence "
-            "at 0.6 when any required-for-class field is False. Be honest: "
-            "marking a field True without doing the work hides the gap "
-            "from the synthesizer's confidence calc."
-        ),
-    )
-
-    # Accept a JSON string for `rubric_coverage` and auto-parse to object —
-    # Phase 2 smoke against Nemotron-30B showed the model recurrently emits it
-    # stringified (e.g. ``"rubric_coverage": "{\"enrichment_called\": true}"``).
-    _decode_rubric = field_validator("rubric_coverage", mode="before")(_decode_stringified_json)
+    # ``rubric_coverage`` used to live here. It was removed on 2026-09-05
+    # because nothing read it: the coverage cap it described was deleted from
+    # the gates, and the prompt went on promising the model that confidence
+    # would be capped at 0.6 if it answered honestly. That is worse than dead
+    # code — the model was being told a consequence existed, and anyone
+    # auditing the prompt would have believed soc-ai enforced coverage
+    # discipline it had stopped enforcing.
+    #
+    # Safe to drop from the schema: this model does not set ``extra="forbid"``,
+    # so a model still emitting the field from a cached prompt has it ignored
+    # rather than rejected (verified before removal).
+    #
+    # The evidence gates took over the job and do it better, on evidence the
+    # run actually RETRIEVED rather than on the model's self-report of what it
+    # had done. The ``coverage_cap`` audit kind and its timeline label are
+    # deliberately KEPT so historical audit records still render.
 
 
 class TargetedGap(BaseModel):
@@ -477,7 +409,6 @@ __all__ = [
     "PIPELINE_FALLBACK_PROVENANCE",
     "InvestigationTranscript",
     "RecommendedAction",
-    "RubricCoverage",
     "TargetedGap",
     "TriageReport",
     "Verdict",

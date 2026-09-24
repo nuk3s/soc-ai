@@ -17,9 +17,14 @@ SCENARIOS_DIR = Path(__file__).parent.parent / "soc_ai" / "eval" / "synth_scenar
 
 
 def test_load_all_scenarios_returns_every_validated_object() -> None:
-    from soc_ai.eval.synth_loader import load_all_scenarios
+    """The TRIAGE population's shape. The spec population is counted separately.
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    Scoped deliberately: pooling the two would let a no-alert scenario move a
+    recall number it can never be triaged for.
+    """
+    from soc_ai.eval.synth_loader import load_all_scenarios, triage_scenarios
+
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
 
     # 17 malicious (e/m/h) + 8 benign (b) for the precision stratum. The
     # catalogue was widened from 9+4 on 2026-08-26: at n=9 a single scenario
@@ -70,9 +75,10 @@ def test_load_all_scenarios_returns_every_validated_object() -> None:
 
 
 def test_easy_tier_filter_returns_the_easy_stratum() -> None:
-    from soc_ai.eval.synth_loader import load_all_scenarios
+    """Scoped to the triage population: tiers describe the alert-driven catalogue."""
+    from soc_ai.eval.synth_loader import load_all_scenarios, triage_scenarios
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     easy = [s for s in scenarios if s.tier == "easy"]
     assert len(easy) == 6
     assert {s.id for s in easy} == {
@@ -108,13 +114,30 @@ def test_e1_emotet_fields_parsed_correctly() -> None:
     assert targets[0].fields["event.dataset"] == "suricata.alert"
 
 
-def test_every_scenario_has_exactly_one_triage_target() -> None:
+def test_a_triage_scenario_has_exactly_one_target_and_a_spec_scenario_has_none() -> None:
+    """The catalogue holds two populations measuring different things.
+
+    An alert-driven scenario is the triage instrument: it opens with one
+    suricata.alert, which is the document the harness samples. A spec_journey
+    scenario is the declarative instrument, and its entire premise is telemetry
+    that never became an alert — so it must have no target at all, or it would
+    be measuring the thing the alert queue already catches.
+
+    Was "every scenario has exactly one", which made the second population
+    unrepresentable.
+    """
     from soc_ai.eval.synth_loader import load_all_scenarios
 
     scenarios = load_all_scenarios(SCENARIOS_DIR)
     for s in scenarios:
         targets = [e for e in s.events if e.is_triage_target]
-        assert len(targets) == 1, f"{s.id} has {len(targets)} triage targets, want 1"
+        if s.spec_journey is None:
+            assert len(targets) == 1, f"{s.id} has {len(targets)} triage targets, want 1"
+        else:
+            assert not targets, (
+                f"{s.id} declares a spec_journey but plants a triage target; the point "
+                "of that population is that the telemetry never becomes an alert"
+            )
 
 
 def test_load_rejects_scenario_with_two_triage_targets(tmp_path: Path) -> None:
@@ -149,7 +172,7 @@ def test_load_rejects_scenario_with_two_triage_targets(tmp_path: Path) -> None:
         ).strip()
     )
 
-    with pytest.raises(ValidationError, match="exactly one triage target"):
+    with pytest.raises(ValidationError, match="at most one triage target"):
         load_scenario_file(bad)
 
 

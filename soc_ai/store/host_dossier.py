@@ -171,6 +171,12 @@ _NO_SIGNAL = "no_signal"
 
 # Columns whose absence must be written as SQL NULL rather than as the JSON
 # literal 'null'. See :func:`_update_values` / :func:`_insert_values`.
+#
+# These three now carry :data:`~soc_ai.store.models.NULLABLE_JSON`, so the column
+# type enforces this for every statement in the process, not only the ones routed
+# through the two helpers below. Kept anyway: this lane's correctness should not
+# depend on a keyword argument three files away, and the tests that pin it
+# (``test_clear_override_writes_sql_null_not_the_json_string_null``) are cheap.
 _JSON_COLUMNS = frozenset({"inferred_value_json", "operator_value_json", "inferred_evidence"})
 
 
@@ -1413,6 +1419,9 @@ async def conflicts_due(
     return [(host, field) for host, field in rows], total
 
 
+_LOW_CONFIDENCE_BUCKET = "__low_confidence__"
+
+
 @dataclass(frozen=True)
 class DossierSummary:
     """Network-wide dossier counts — the whole table, never a page.
@@ -1441,6 +1450,11 @@ class DossierSummary:
     # to ``hosts``: the difference IS the unresolved remainder.
     roles: dict[str, int]
     last_built_at: datetime | None
+    # Hosts with an inferred role the resolver withholds (below the confidence
+    # floor or stale) and no operator value. Folded into the unresolved
+    # remainder, the bar relabelled ten hosts as unknown and hid why seven of
+    # twelve profile specs were unscored.
+    roles_low_confidence: int = 0
 
 
 async def summarize_dossiers(
@@ -1569,9 +1583,21 @@ async def summarize_dossiers(
     # bucket never claims a host whose own row renders a dash. At most one
     # role row per host (the (dossier, field) unique constraint), so COUNT(id)
     # counts hosts.
+    # A third arm, so the withheld roles are counted in the SAME pass rather
+    # than a fifth query: a host with an inferred role the resolver will not
+    # assert (and no operator value) groups under a sentinel bucket.
     effective_role = func.coalesce(
         HostDossierField.operator_value,
         case((assertable, HostDossierField.inferred_value)),
+        case(
+            (
+                and_(
+                    HostDossierField.inferred_value.is_not(None),
+                    func.lower(HostDossierField.inferred_value) != "unknown",
+                ),
+                _LOW_CONFIDENCE_BUCKET,
+            )
+        ),
     )
     role_rows = (
         await db.execute(
@@ -1583,8 +1609,11 @@ async def summarize_dossiers(
     roles = {
         str(value): int(count or 0)
         for value, count in role_rows
-        if value is not None and str(value).strip()
+        if value is not None and str(value).strip() and value != _LOW_CONFIDENCE_BUCKET
     }
+    low_confidence = sum(
+        int(count or 0) for value, count in role_rows if value == _LOW_CONFIDENCE_BUCKET
+    )
 
     return DossierSummary(
         hosts=hosts,
@@ -1594,6 +1623,7 @@ async def summarize_dossiers(
         conflicts=int(conflicts),
         roles=roles,
         last_built_at=last_built_at,
+        roles_low_confidence=low_confidence,
     )
 
 

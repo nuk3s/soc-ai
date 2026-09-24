@@ -392,6 +392,7 @@ async def _fake_start_creates_row(
     finding_ordinal: int | None = None,
     allow_so_writes: bool = True,
     focus_origin: str = "rerun",
+    subject: Any = None,
     is_synth_eval: bool = False,
 ) -> str:
     """Stand-in for HuntManager.start that mirrors just enough of its contract
@@ -455,7 +456,7 @@ def test_promote_finding_409_still_running(kind_client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "still_running"
     assert (
         resp.json()["detail"]["hint"]
-        == "The hunt is still running — findings promote once it lands its report."
+        == "The hunt is still running. Findings promote after it lands its report."
     )
 
 
@@ -1125,7 +1126,7 @@ def test_start_hunt_refuses_when_latest_investigation_for_alert_is_hunt_kind(
     body = resp.json()["detail"]
     assert body["reason"] == "hunt_kind_no_rerun"
     assert body["hint"] == (
-        "This event is a promoted finding's anchor — re-promote the finding from its hunt instead."
+        "This event is a promoted finding's anchor. Re-promote the finding from its hunt."
     )
     # The blocked row is already settled (complete) — no running deep-link to carry.
     assert "running_inv_id" not in body

@@ -1,18 +1,27 @@
 import { ChevronLeft, Crosshair, Server, ShieldAlert } from 'lucide-react';
 import { Link, useParams } from 'react-router-dom';
 import { SeverityTag, VerdictPill } from '../components/Badges';
+import { HostObservations } from '../components/HostObservations';
+import { LeadsStrip } from '../components/LeadsStrip';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { getEntity } from '../lib/api';
+import { isIpKey } from '../lib/ip';
 import { absTime } from '../lib/timeRange';
+import { ENTITY_ADDRESS, ENTITY_NAME } from '../lib/tooltips';
 import type { EntityTimelineItem, Severity, Verdict } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 
 // The narrow frontend severity union the pill understands; a hunt finding can
 // carry "info" (or an odd value) — coerce so the chip never sees an off-union sev.
-const FE_SEV: Severity[] = ['critical', 'high', 'medium', 'low'];
+// An unrecognized or absent severity lands on 'unknown', not 'low': the SPA-side
+// twin of the backend's _sev, and for the same reason. Calling something Low is
+// a claim about it; this is the absence of one.
+// 'info' is on the list because a hunt finding that says "info" told us
+// something; relabelling it would be the same invention one rung down.
+const FE_SEV: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
 function feSev(sev?: string | null): Severity {
   const v = (sev ?? '').toLowerCase() as Severity;
-  return FE_SEV.includes(v) ? v : 'low';
+  return FE_SEV.includes(v) ? v : 'unknown';
 }
 
 /** One card in the entity timeline — an investigation or a hunt finding — a link
@@ -59,6 +68,10 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
 export function Entity() {
   const { value = '' } = useParams();
   const { data, loading, error, refetch } = useAsync(() => getEntity(value), [value]);
+  // A user account reaches this page and nothing else on it. The observations
+  // and the leads on the account were written, and the page that names the
+  // account did not list them. An address keeps the host page for both.
+  const account = value.trim() !== '' && !isIpKey(value.trim());
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
@@ -89,8 +102,15 @@ export function Entity() {
                   <Server size={18} />
                 </span>
                 <span className="font-mono text-[17px] font-semibold text-white">{data.value}</span>
-                <span className="rounded-chip border border-border-input bg-surface-3 px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em] text-dim">
-                  {data.kind}
+                {/* The server calls anything that is not an address a host, so
+                    this chip read "host" over a user account. It states what
+                    the page knows: an address, or a name of some sort. */}
+                <span
+                  data-testid="entity-type"
+                  title={data.kind === 'ip' ? ENTITY_ADDRESS : ENTITY_NAME}
+                  className="rounded-chip border border-border-input bg-surface-3 px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em] text-dim"
+                >
+                  {data.kind === 'ip' ? 'address' : 'name'}
                 </span>
                 {/* No "host dossier →" chip: the only IPs that still reach this
                     screen are EXTERNAL ones (App's EntityRoute redirects internal
@@ -121,14 +141,24 @@ export function Entity() {
             {/* Timeline: merged investigations + hunt findings, newest first. */}
             {data.timeline.length === 0 ? (
               <EmptyState>
-                Nothing recorded for <span className="font-mono text-dim">{data.value}</span> yet — no
-                investigations or hunt findings name this entity.
+                The timeline for <span className="font-mono text-dim">{data.value}</span> is empty.
+                No investigation or hunt finding names this entity.
               </EmptyState>
             ) : (
               <div className="flex flex-col gap-2">
                 {data.timeline.map((item, i) => (
                   <TimelineCard key={`${item.kind}-${item.link}-${i}`} item={item} />
                 ))}
+              </div>
+            )}
+
+            {/* The observations and the leads on this account. Both were
+                written against the account and neither was readable from the
+                page that names it. */}
+            {account && (
+              <div data-testid="entity-hunting">
+                <HostObservations entityKey={value} noun="entity" />
+                <LeadsStrip entityKey={value} status="all" noun="entity" className="mt-4" />
               </div>
             )}
           </>

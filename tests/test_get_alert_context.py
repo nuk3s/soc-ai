@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from soc_ai.config import Settings
-from soc_ai.errors import SoNotFoundError
+from soc_ai.errors import SoNotFoundError, SyntheticAnchorError
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools.get_alert_context import AlertContext, get_alert_context
 
@@ -274,6 +274,147 @@ async def test_alert_not_found_raises(settings_kratos: Settings) -> None:
         await get_alert_context("nonexistent", elastic=elastic, settings=settings_kratos)
 
     assert fake_es.search.call_count == 1  # no pivots fired
+
+
+# =====================================================================
+# An investigation that cannot see its own subject
+#
+# The anchor is fetched by document id, so it arrives without passing any of
+# the scope's exclusion clauses while every pivot the run makes afterwards
+# does. On the range that combination produced a triage of a planted DCSync
+# fixture that made fifteen tool calls, got zero results from every
+# corroborating query, said the account's purpose could not be independently
+# verified, and returned false positive at 0.60 anyway. The zeros were the
+# guard, not the network.
+# =====================================================================
+
+# The real shape: Security Onion's Sigma pipeline nests the whole originating
+# document under ``event_data``, and the source document's dotted field names
+# are written flat inside it.
+_PLANTED_SIGMA_ALERT = {
+    "_id": "planted-dcsync-1",
+    "_index": ".ds-logs-detections.alerts-so-000001",
+    "_source": {
+        "@timestamp": "2026-09-05T17:32:18.000Z",
+        "sigma_level": "critical",
+        "rule": {"name": "Active Directory Replication from Non Machine Account"},
+        "event": {"dataset": "sigma.alert", "severity_label": "critical"},
+        "tags": "alert",
+        "event_data": {
+            "synth.scenario_id": "s1-dcsync-no-alert",
+            "host.hostname": "SYNTH-DC01",
+            "winlog.event_data.SubjectUserName": "svc-replicator",
+        },
+    },
+}
+
+
+def _planted_as(scenario_id: str) -> dict[str, Any]:
+    doc = copy.deepcopy(_PLANTED_SIGMA_ALERT)
+    doc["_source"]["event_data"]["synth.scenario_id"] = scenario_id  # type: ignore[index]
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_a_planted_anchor_is_refused_rather_than_investigated(
+    settings_kratos: Settings,
+) -> None:
+    """A run whose subject its own scope forbids must refuse, not report zeros.
+
+    Every corroborating query this run could make already excludes the plant, so
+    what it would gather is not evidence of anything. Refusing costs a triage;
+    continuing costs a false-positive badge on whatever the group also holds.
+    """
+    elastic, fake_es = _make_elastic(
+        settings_kratos, [_alert_lookup_response(_PLANTED_SIGMA_ALERT)]
+    )
+
+    with pytest.raises(SyntheticAnchorError) as excinfo:
+        await get_alert_context("planted-dcsync-1", elastic=elastic, settings=settings_kratos)
+
+    assert excinfo.value.scenario_id == "s1-dcsync-no-alert"
+    assert excinfo.value.alert_id == "planted-dcsync-1"
+    # No pivot fired: the budget is not spent manufacturing an absence.
+    assert fake_es.search.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_scenario_scoped_run_reads_its_own_planted_anchor(
+    settings_kratos: Settings,
+) -> None:
+    """The batch eval is the case this whole mechanism exists to serve: the run
+    is scoped to the scenario, so the plant is its subject by design."""
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(_PLANTED_SIGMA_ALERT), *[_EMPTY_HITS] * 6],
+    )
+
+    ctx = await get_alert_context(
+        "planted-dcsync-1",
+        elastic=elastic,
+        settings=settings_kratos,
+        include_synth="s1-dcsync-no-alert",
+    )
+
+    assert ctx.alert.rule_name == "Active Directory Replication from Non Machine Account"
+
+
+@pytest.mark.asyncio
+async def test_a_scenario_scoped_run_refuses_a_sibling_scenarios_anchor(
+    settings_kratos: Settings,
+) -> None:
+    """Same failure, one step subtler: the catalogue is ingested as one batch, so
+    a scoped run can be handed a sibling's alert id and would investigate it with
+    every pivot excluding the sibling's own plants."""
+    elastic, _ = _make_elastic(
+        settings_kratos, [_alert_lookup_response(_planted_as("s2-other-scenario"))]
+    )
+
+    with pytest.raises(SyntheticAnchorError):
+        await get_alert_context(
+            "planted-dcsync-1",
+            elastic=elastic,
+            settings=settings_kratos,
+            include_synth="s1-dcsync-no-alert",
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_sigma_alert_anchor_is_investigated_as_before(
+    settings_kratos: Settings,
+) -> None:
+    """The negative control. Same rule, same envelope, same critical severity, no
+    marker in either position — the three real detections on the range's domain
+    controller look like this, and a guard that refused them would be worse than
+    the leak it closed."""
+    genuine = copy.deepcopy(_PLANTED_SIGMA_ALERT)
+    del genuine["_source"]["event_data"]["synth.scenario_id"]  # type: ignore[attr-defined]
+    genuine["_source"]["event_data"]["host.name"] = "sr-dc01"  # type: ignore[index]
+    elastic, _ = _make_elastic(
+        settings_kratos, [_alert_lookup_response(genuine), *[_EMPTY_HITS] * 6]
+    )
+
+    ctx = await get_alert_context("real-dcsync-1", elastic=elastic, settings=settings_kratos)
+
+    assert ctx.alert.rule_name == "Active Directory Replication from Non Machine Account"
+
+
+@pytest.mark.asyncio
+async def test_the_hunt_journey_scope_reads_any_planted_anchor(
+    settings_kratos: Settings,
+) -> None:
+    """``True`` means every plant is visible, so nothing about the anchor is
+    unreadable and there is nothing to refuse."""
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(_PLANTED_SIGMA_ALERT), *[_EMPTY_HITS] * 6],
+    )
+
+    ctx = await get_alert_context(
+        "planted-dcsync-1", elastic=elastic, settings=settings_kratos, include_synth=True
+    )
+
+    assert ctx.alert.rule_name == "Active Directory Replication from Non Machine Account"
 
 
 @pytest.mark.asyncio
@@ -578,9 +719,14 @@ async def test_behavioral_summary_malformed_hit_does_not_poison_prefetch(
         "_source": {
             "event.dataset": "zeek.conn_summary",
             "source.ip": "10.0.0.115",
-            # schema drift: user.name arrives as a list, not a scalar string,
-            # so SoAlert.from_es_hit raises pydantic.ValidationError.
-            "user.name": ["svc-a", "svc-b"],
+            # Schema drift that still fails validation: a port written as a
+            # label. The original example here was a LIST where a scalar was
+            # expected, which no longer raises: every scalar attribute is now
+            # narrowed with `_first`, because arrays are what Elastic Defend
+            # actually writes and refusing those documents cost the product an
+            # entire evidence source. That made this guard's needle land on a
+            # path the guard no longer has to catch, so the needle moved.
+            "source.port": "not-a-port",
         },
     }
     elastic, _ = _make_elastic(

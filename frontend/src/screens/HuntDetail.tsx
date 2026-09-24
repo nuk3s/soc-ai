@@ -15,10 +15,13 @@ import {
 } from 'lucide-react';
 import { type ReactNode, Suspense, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { RecordedRunChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
+import { HuntKindBadge, RecordedRunChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
+import { Definition } from '../components/Definition';
+import { DocumentChip } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
+import { LeadTimeline } from '../components/LeadTimeline';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
 import {
@@ -30,22 +33,43 @@ import {
   StaleNotice,
 } from '../components/States';
 import {
+  type AnalyticDraftResult,
   type ChatThread,
   type HuntChatThread,
   cancelHuntConsole,
   deleteHunt,
+  draftAnalytic,
   draftFindingDetection,
   getAbout,
   getHunt,
   getHuntChat,
+  getHunts,
+  getLead,
   isNotFound,
   postHuntChat,
   promoteFinding,
   startHuntConsole,
 } from '../lib/api';
 import { useDemo } from '../lib/demo';
+import { entityPath } from '../lib/entityPath';
 import { HUNT_STATUS } from '../lib/statusMeta';
-import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
+import { HUNT_KIND, SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
+import {
+  CHIP_LEAD,
+  CHIP_MITRE,
+  CHIP_SEVERITY,
+  COUNT_AFFECTED_HOSTS,
+  COUNT_FINDINGS,
+  COUNT_MITRE,
+  COUNT_STEPS,
+  DIFF_NEW,
+  DIFF_PERSISTING,
+  DIFF_RESOLVED,
+  DIFF_STRIP,
+  DISPOSITION,
+  STEP_DETAIL,
+  huntStatusTitle,
+} from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { lazyWithReload } from '../lib/lazyWithReload';
 import { useChatThread } from '../lib/useChatThread';
@@ -92,6 +116,7 @@ function StatusPill({ status }: { status: HuntStatus }) {
   const m = HUNT_STATUS[status] ?? HUNT_STATUS.error;
   return (
     <span
+      title={huntStatusTitle(status)}
       className="flex items-center gap-1.5 rounded-chip border px-2 py-0.5 text-[11.5px] font-semibold"
       style={{ color: m.color, borderColor: `${m.color}55`, background: `${m.color}14` }}
     >
@@ -115,6 +140,79 @@ function huntTitle(objective: string): string {
   let s = raw.replace(HUNT_TITLE_STRIP, '').replace(/^(for|into|at|the)\s+/i, '').trim() || raw;
   s = s.charAt(0).toUpperCase() + s.slice(1);
   return s.length > 80 ? `${s.slice(0, 79).trimEnd()}…` : s;
+}
+
+// The actor the catalog sweep loop stamps on every hunt it records
+// (`SWEEP_ACTOR` in soc_ai/hunting/sweep.py). A hunt carrying it was produced
+// by a declarative spec: one Elasticsearch query, no model call at any point,
+// and every word of its findings lifted from the spec's own reviewed YAML.
+//
+// What it decides: the rendering that is specific to a SPEC-authored hunt.
+// The finding detail is split at the seam findings.py composes (a model's
+// prose has no such seam, so the split must never run on it), the timeline
+// says "no steps by construction" rather than "no steps yet", and the hero
+// explains why there is no confidence to score. `kind` cannot carry any of
+// that: a catalog hunt is 'triggered', and so is every scheduled hunt the
+// model runs. Every other hunt-creating path stamps `identify_caller()`,
+// which returns a username, `token:<name>`, or 'anonymous', never this literal.
+//
+// What it does NOT decide: whether the confidence dial renders. That reads
+// `confidence === null` off the field itself; the API preserves the absence
+// (spec_report() omits the key, and the detail no longer coerces it to 0.0),
+// so a model that genuinely scored zero keeps its 0.00 and a hunt nothing
+// scored shows no number at all, whoever started it.
+const CATALOG_ACTOR = 'hunt-catalog';
+
+// A catalog finding's detail arrives as ONE string: the spec's own prose,
+// written and reviewed when the detection was authored, and then this run's
+// result. Read as one paragraph the author's measurements ("the range
+// currently holds only 14 documents") pass for fresh measurement and go
+// quietly false as the grid grows, so the card sets the two apart.
+//
+// The seam is now DATA. soc_ai/hunting/findings.py appended the second half,
+// so it knows where the first one ends, and it sends that half as
+// `specRationale` with the document count as `matchedDocs`. The previous
+// version matched the sentence a CANDIDATE finding ends with ("Matched N
+// documents for …"), which no visibility-gap finding contains, so it never
+// fired on one — and on a quiet grid every catalog finding is a gap. That is
+// also the case where the spec's prose misleads most: the run saw nothing, so
+// every number on screen was measured by the author, once, on a grid that has
+// moved since.
+//
+// The prefix is CHECKED, not trusted: two fields of one stored record can
+// disagree, and cutting on a prefix the detail does not start with would drop
+// text. A mismatch renders whole, like a model's detail.
+//
+// The tail match survives for hunts recorded before the fields existed, and
+// only for them: those rows still carry the composed string and nothing else.
+// It stays greedy, so a description that itself contains "Matched N documents
+// for" splits at the LAST occurrence, which is always the composed tail.
+const CATALOG_RUN_TAIL = /^([\s\S]*\S)\s+(Matched (\d+) documents? for [\s\S]+)$/;
+
+interface CatalogDetail {
+  /** The spec's own prose. Authoring-time, not measured on this run. */
+  rationale: string;
+  /** What this run produced, and only that. */
+  run: string;
+  /** Documents this candidate matched, or null when the finding counted none
+   *  (a visibility gap) or the row predates the field. */
+  matched: number | null;
+}
+
+function splitCatalogDetail(f: HuntFinding): CatalogDetail | null {
+  const detail = f.detail.trim();
+  const rationale = (f.specRationale ?? '').trim();
+  if (rationale && detail.startsWith(rationale) && detail !== rationale) {
+    return {
+      rationale,
+      run: detail.slice(rationale.length).trim(),
+      matched: typeof f.matchedDocs === 'number' ? f.matchedDocs : null,
+    };
+  }
+  if (rationale) return null; // carried and mismatched: render whole, cut nothing.
+  const m = detail.match(CATALOG_RUN_TAIL);
+  if (m == null) return null;
+  return { rationale: m[1], run: m[2], matched: Number(m[3]) };
 }
 
 // A hunt has no true/false-positive verdict — it has findings. Derive a
@@ -142,13 +240,17 @@ function huntDisposition(
   if (worst === 1) return { label: 'Low-severity findings', color: '#d29922' }; // low
   // No threat evidence. Gaps mean the objective couldn't be fully tested —
   // an honest grey "couldn't see", never a green all-clear.
-  if (gaps.length > 0) return { label: 'No threat observed — visibility gaps', color: '#8b949e' };
+  // One phrase for a gap, here and on the hunts list. The two read differently
+  // and an analyst had to decide whether they meant the same thing.
+  if (gaps.length > 0) return { label: 'No threat observed · visibility gap', color: '#8b949e' };
   return { label: 'No malicious activity found', color: '#3fb950' }; // observations-only or clean
 }
 
 function DispositionBadge({ label, color }: { label: string; color: string }) {
   return (
     <span
+      data-testid="hunt-disposition"
+      title={DISPOSITION}
       className="inline-flex items-center gap-2 rounded-pill border px-3 py-1 text-[13px] font-bold uppercase tracking-[.02em]"
       style={{ color, borderColor: `${color}66`, background: `${color}1a` }}
     >
@@ -175,9 +277,19 @@ const STEP_ICON: Record<string, ReactNode> = {
 // list the new/resolved finding titles (persisting is the boring bucket — it's
 // the count that matters, so it stays collapsed). Only rendered when a previous
 // run exists (data.diff present).
-function DiffCount({ n, label, color }: { n: number; label: string; color: string }) {
+function DiffCount({
+  n,
+  label,
+  color,
+  title,
+}: {
+  n: number;
+  label: string;
+  color: string;
+  title: string;
+}) {
   return (
-    <span className="inline-flex items-baseline gap-1">
+    <span className="inline-flex items-baseline gap-1" title={title}>
       <span className="font-mono text-[13px] font-bold" style={{ color }}>
         {n}
       </span>
@@ -226,15 +338,28 @@ function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
         aria-expanded={open}
       >
         <GitBranch size={14} className="flex-none text-dim" />
-        <span className="text-[11px] font-semibold uppercase tracking-[.05em] text-text-2">
+        <span
+          className="text-[11px] font-semibold uppercase tracking-[.05em] text-text-2"
+          title={DIFF_STRIP}
+        >
           vs last run
         </span>
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <DiffCount n={diff.new.length} label="new" color="#f0883e" />
+          <DiffCount n={diff.new.length} label="new" color="#f0883e" title={DIFF_NEW} />
           <span className="text-ghost">·</span>
-          <DiffCount n={diff.persisting.length} label="persisting" color="#8b949e" />
+          <DiffCount
+            n={diff.persisting.length}
+            label="persisting"
+            color="#8b949e"
+            title={DIFF_PERSISTING}
+          />
           <span className="text-ghost">·</span>
-          <DiffCount n={diff.resolved.length} label="resolved" color="#3fb950" />
+          <DiffCount
+            n={diff.resolved.length}
+            label="resolved"
+            color="#3fb950"
+            title={DIFF_RESOLVED}
+          />
         </div>
         <div className="flex-1" />
         {diff.previousWhen && (
@@ -265,12 +390,16 @@ function FindingCard({
   f,
   huntId,
   ordinal,
+  catalog,
   sigmaOn,
   sigmaOff,
 }: {
   f: HuntFinding;
   huntId: string;
   ordinal: number;
+  /** This finding came from a declarative spec, not a model (CATALOG_ACTOR).
+   *  Its detail is a composed string whose halves have different provenance. */
+  catalog: boolean;
   /** `sigma_authoring_enabled` (detection-bridge kill switch) — off by
    *  default, so the Draft-detection badge stays hidden until an operator
    *  opts in (see `HuntDetail`'s `about` fetch). */
@@ -282,9 +411,21 @@ function FindingCard({
   sigmaOff: boolean;
 }) {
   const color = SEV_COLOR[f.severity] ?? SEV_COLOR.info;
+  // Only a catalog finding's detail is a composed string with a known seam.
+  const spec = catalog ? splitCatalogDetail(f) : null;
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
   const [promoteErr, setPromoteErr] = useState<string | null>(null);
+  // Draft an analytic (merge 5): the finding becomes one catalog analytic in
+  // the local tier, as a candidate. A candidate does not run. The analyst
+  // moves it to shadow from the Analytics tab, which is why the result line
+  // links there.
+  const [analyticBusy, setAnalyticBusy] = useState(false);
+  const [analyticDraft, setAnalyticDraft] = useState<AnalyticDraftResult | null>(null);
+  const [analyticErr, setAnalyticErr] = useState<string | null>(null);
+  // Only a threat finding can become an analytic. A visibility gap reports
+  // telemetry this grid does not have, and an observation is benign context.
+  const isThreat = (f.category ?? 'threat') === 'threat';
   // Draft detection (1.3 slice 3): one-way open, like Investigate — once the
   // analyst has drafted a rule for this finding, the pane stays put rather
   // than unmounting on a toggle (which would silently re-draft on reopen).
@@ -305,10 +446,7 @@ function FindingCard({
   // unpromoted, running, or non-TP finding gets no draft affordance — the
   // Investigate/Open flow is how the analyst confirms first.
   const confirmedTP = invComplete && inv?.verdict === 'true_positive';
-  const openInvestigation = () => {
-    if (inv == null) return;
-    navigate(`/investigation/${inv.id}`, { state: { from: `/hunts/${huntId}` } });
-  };
+
   return (
     <div
       className="relative overflow-hidden rounded-card border bg-surface-2 p-[14px_15px]"
@@ -323,7 +461,7 @@ function FindingCard({
         {f.category === 'visibility_gap' && (
           <span
             className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
-            title="A coverage statement — telemetry this grid doesn't have. Not observed malicious activity."
+            title="A visibility gap reports telemetry that this grid does not have. The hunt observed no malicious activity here."
           >
             visibility gap
           </span>
@@ -331,31 +469,27 @@ function FindingCard({
         {f.category === 'observation' && (
           <span
             className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
-            title="Benign/informational context — not a threat finding."
+            title="An observation records benign context. The hunt does not report it as a threat."
           >
             observation
           </span>
         )}
-        {invRunning || invComplete ? (
-          // Already promoted: Investigating… (running) or Open (complete) —
-          // both just navigate to the existing investigation, never re-promote.
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              openInvestigation();
-            }}
+        {(invRunning || invComplete) && inv ? (
+          // Already promoted. The investigation is a page, so this is a link:
+          // it never re-promotes, and the address can be read before the click.
+          <Link
+            to={`/investigation/${inv.id}`}
+            state={{ from: `/hunts/${huntId}` }}
             title={
               invRunning
-                ? 'This finding is already being investigated'
-                : 'Open the investigation this finding was promoted to'
+                ? 'An investigation of this finding already runs. Open it to watch the progress.'
+                : 'This finding has an investigation. Open it to read the verdict.'
             }
-            className="ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
-            style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+            className="ml-auto inline-flex items-center gap-1.5 font-sans text-[11px] font-semibold text-accent hover:underline"
           >
             <Sparkles size={12} />
             {invRunning ? 'Investigating…' : 'Open'}
-          </button>
+          </Link>
         ) : (
           // Investigate: promotes this finding's cited evidence into a full
           // investigation (E1.3 authoring bridge). Idempotent server-side — a
@@ -373,14 +507,14 @@ function FindingCard({
               setPromoteErr(null);
               promoteFinding(huntId, ordinal)
                 .then((r) => navigate(`/investigation/${r.investigation_id}`, { state: { from: `/hunts/${huntId}` } }))
-                .catch((err) => setPromoteErr(err instanceof Error ? err.message : 'could not start'))
+                .catch((err) => setPromoteErr(err instanceof Error ? err.message : 'The investigation did not start.'))
                 .finally(() => setBusy(false));
             }}
             disabled={f.citations.length === 0}
             title={
               f.citations.length === 0
-                ? 'This finding has no linked evidence events, so there is nothing to open an investigation on.'
-                : "Run a full investigation of this finding's cited evidence"
+                ? 'This finding has no linked evidence events. An investigation needs at least one event.'
+                : 'Run a full investigation of the evidence that this finding cites.'
             }
             className="ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
             style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
@@ -402,7 +536,7 @@ function FindingCard({
               e.stopPropagation();
               setDraftOpen(true);
             }}
-            title="Draft a Sigma detection rule from this confirmed finding's evidence — review, edit, and export"
+            title="Draft a Sigma detection rule from the evidence of this confirmed finding. Review the rule, edit it, and export it."
             className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
             style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
           >
@@ -410,23 +544,53 @@ function FindingCard({
             Draft detection
           </button>
         )}
+        {isThreat && analyticDraft == null && (
+          // Draft an analytic (merge 5). No confirm-first gate here: the
+          // candidate never runs until an analyst moves it to shadow, so the
+          // cost of a weak draft is a row the analyst rejects.
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (analyticBusy) return;
+              setAnalyticBusy(true);
+              setAnalyticErr(null);
+              draftAnalytic(huntId, ordinal)
+                .then((r) => setAnalyticDraft(r))
+                .catch((err) =>
+                  setAnalyticErr(
+                    err instanceof Error ? err.message : 'The analytic was not drafted.',
+                  ),
+                )
+                .finally(() => setAnalyticBusy(false));
+            }}
+            disabled={analyticBusy}
+            title="Draft a catalog analytic from this finding. soc-ai stores it as a candidate. A candidate does not run until you move it to shadow."
+            className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
+            style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+          >
+            <Crosshair size={12} />
+            {analyticBusy ? 'Drafting…' : 'Draft an analytic'}
+          </button>
+        )}
         {sigmaOff && confirmedTP && (
           // The one card that COULD draft a detection, with the flag off:
           // point at the switch instead of rendering nothing — the flag is
           // hot-editable, so this is a live path, not a dead end.
           <span className="flex-none font-sans text-[10.5px] text-faint">
-            Detection authoring is off —{' '}
+            Detection authoring is off.{' '}
             <Link
               to="/config#triage-automation"
               state={{ highlightKey: 'sigma_authoring_enabled' }}
               className="underline hover:text-dim"
             >
-              enable it in Config
+              Enable it in Config
             </Link>
           </span>
         )}
         {chipVerdict && <VerdictPill verdict={chipVerdict} conf={inv?.conf} />}
         <span
+          title={CHIP_SEVERITY}
           className="flex-none rounded-chip border px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em]"
           style={{ color, borderColor: `${color}55`, background: `${color}14` }}
         >
@@ -436,9 +600,48 @@ function FindingCard({
       {promoteErr && (
         <div className="mb-1.5 font-mono text-[11px] text-danger">{promoteErr}</div>
       )}
-      <div className="text-[12.5px] leading-[1.6] text-text-2" style={{ textWrap: 'pretty' }}>
-        {f.detail}
-      </div>
+      {analyticErr && (
+        <div className="mb-1.5 font-mono text-[11px] text-danger">{analyticErr}</div>
+      )}
+      {analyticDraft && (
+        // One line, and the number an analyst reads before the move to shadow.
+        // A dry run that could not run says so; it never reads as zero.
+        <div className="mb-1.5 font-sans text-[11.5px] text-dim">
+          {`Candidate ${analyticDraft.analytic_id} written. `}
+          {analyticDraft.dry_run.ran
+            ? `Dry run over ${analyticDraft.dry_run.window_days} days: ${analyticDraft.dry_run.hit_count} matches. `
+            : 'The dry run did not run. The result is unknown. '}
+          <Link to="/hunts?tab=analytics" className="underline hover:text-text-2">
+            Open the Analytics tab
+          </Link>
+        </div>
+      )}
+      {spec ? (
+        <>
+          {/* What this run actually matched. */}
+          <div className="text-[12.5px] leading-[1.6] text-text-2" style={{ textWrap: 'pretty' }}>
+            {spec.run}
+          </div>
+          {/* Why the analytic exists, in the author's words. Set apart and
+              dated to its authoring, so its measurements are never read as this
+              run's. The noun is the taxonomy's: "spec" is the older word. */}
+          <div className="mt-2 rounded-card border border-border-2 bg-surface-3 px-3 py-2">
+            <div className="text-[10px] font-semibold uppercase tracking-[.05em] text-faint">
+              Why this analytic exists · the author wrote this text before this run
+            </div>
+            <div
+              className="mt-1 text-[11.5px] leading-[1.55] text-dim"
+              style={{ textWrap: 'pretty' }}
+            >
+              {spec.rationale}
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="text-[12.5px] leading-[1.6] text-text-2" style={{ textWrap: 'pretty' }}>
+          {f.detail}
+        </div>
+      )}
       {f.validatorNote && (
         <div
           className="mt-2 rounded-card border px-3 py-2 text-[11.5px] leading-[1.5] text-dim"
@@ -447,27 +650,45 @@ function FindingCard({
           <span className="font-semibold" style={{ color: '#8fa3bf' }}>
             Post-validator
           </span>
-          {' — '}
+          {': '}
           {f.validatorNote}
         </div>
       )}
       {(f.hosts.length > 0 || f.citations.length > 0) && (
         <div className="mt-2 flex flex-wrap gap-1.5 font-mono text-[10.5px]">
           {f.hosts.map((h) => (
-            // Host chip → the entity pivot page ("what do we know about this box").
+            // Host chip → the page that holds what this grid knows about the
+            // entity. `entityPath` picks it: an address has a host page, a name
+            // has the entity page. The chip linked every host to /entity/, so
+            // one address had two pages and neither knew about the other.
             <Link
               key={h}
-              to={`/entity/${encodeURIComponent(h)}`}
+              to={entityPath('host', h)}
+              title={`Pivot to ${h}`}
               className="rounded-chip bg-surface-3 px-1.5 py-px text-mono-amber hover:brightness-125"
             >
               {h}
             </Link>
           ))}
+          {/* Document ids. They were dashed muted chips that did nothing,
+              because the app had no document viewer to open an Elasticsearch
+              _id in. A citation is the proof the finding is real, so each one
+              opens its document in the drawer. */}
           {f.citations.map((c) => (
-            <span key={c} className="rounded-chip bg-surface-3 px-1.5 py-px text-accent">
-              {c}
-            </span>
+            <DocumentChip key={c} id={c} />
           ))}
+          {/* Three ids beside a narrative saying four documents matched, with
+              nothing accounting for the fourth. execute.py caps top_hits at
+              MAX_SAMPLE_IDS = 3 per bucket, so a candidate over three
+              documents always cites a sample. Say which. */}
+          {spec?.matched != null && spec.matched > f.citations.length && (
+            <span
+              className="px-0.5 py-px font-sans text-[11px] text-faint"
+              title="A spec cites 3 sample documents for each match at most. These ids are a sample of the matching documents."
+            >
+              {`${f.citations.length} of ${spec.matched} matching documents`}
+            </span>
+          )}
         </div>
       )}
       {draftOpen && (
@@ -487,6 +708,8 @@ function TimelineRow({ step, last }: { step: TimelineStep; last: boolean }) {
   return (
     <button
       onClick={() => step.detail && setOpen((o) => !o)}
+      aria-expanded={step.detail ? open : undefined}
+      title={step.detail ? STEP_DETAIL : undefined}
       className="flex w-full gap-3 border-b border-border-faint px-[15px] py-3 text-left transition-colors last:border-0 hover:bg-surface-hover"
     >
       <div className="flex flex-none flex-col items-center">
@@ -575,6 +798,7 @@ export function HuntDetail() {
   const [reloadKey, setReloadKey] = useState(0);
   const [cancelling, setCancelling] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [objectiveOpen, setObjectiveOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [rehunting, setRehunting] = useState(false);
@@ -624,7 +848,7 @@ export function HuntDetail() {
     deleteHunt(id)
       .then(() => navigate('/hunts'))
       .catch((e: unknown) => {
-        setDeleteError(e instanceof Error ? e.message : 'Delete failed — please try again.');
+        setDeleteError(e instanceof Error ? e.message : 'The delete request failed. Try again.');
         setDeleting(false);
       });
   };
@@ -640,10 +864,26 @@ export function HuntDetail() {
     startHuntConsole(data.objective)
       .then((r) => navigate(`/hunts/${r.hunt_id}`))
       .catch((e: unknown) => {
-        setRehuntError(e instanceof Error ? e.message : 'Could not re-hunt — please try again.');
+        setRehuntError(e instanceof Error ? e.message : 'The re-hunt did not start. Try again.');
         setRehunting(false);
       });
   };
+
+  // The lead a lead hunt came from. The detail route may name it. A route
+  // that does not is answered by the lead-hunt list, which carries the lead id
+  // on every row. The page named no lead at all before this, so the hunt and
+  // the lead that asked for it were two pages with nothing between them.
+  const leadHunt = data?.kind === 'lead' || data?.starter === 'lead';
+  const leadRows = useAsync(
+    () => (leadHunt && data?.leadId == null ? getHunts({ kind: 'lead' }) : Promise.resolve(null)),
+    [leadHunt, data?.leadId, id],
+  );
+  const leadId =
+    data?.leadId ?? leadRows.data?.find((h) => h.id === id)?.leadId ?? null;
+  const lead = useAsync(
+    () => (leadId != null ? getLead(leadId) : Promise.resolve(null)),
+    [leadId],
+  );
 
   const status = data?.status;
   const running = status === 'running';
@@ -655,6 +895,8 @@ export function HuntDetail() {
   const statusColor = status ? (HUNT_STATUS[status]?.color ?? '#8b949e') : '#8b949e';
   const disp = data ? huntDisposition(data.status, data.findings) : null;
   const title = data ? huntTitle(data.objective) : '';
+  // Declarative-spec run: no model touched this hunt at any point.
+  const catalog = data?.startedBy === CATALOG_ACTOR;
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
@@ -669,6 +911,10 @@ export function HuntDetail() {
         <span className="text-ghost">/</span>
         <div className="text-[15px] font-semibold">Hunt detail</div>
       </div>
+
+      {/* What a hunt is, under the title. An analyst who lands here from a link
+          never saw the line the Hunt Console carries. */}
+      <Definition of="hunt" className="mb-3.5" />
 
       {loading && !data ? (
         <LoadingState label="Loading hunt…" />
@@ -738,12 +984,39 @@ export function HuntDetail() {
                 <div className="mb-2.5 flex flex-wrap items-center gap-2.5">
                   {disp && <DispositionBadge label={disp.label} color={disp.color} />}
                   <StatusPill status={data.status} />
+                  <HuntKindBadge kind={data.kind} />
+                  {/* The lead that asked for this hunt. The page named the
+                      kind and not the lead, so the hunt and the lead were two
+                      pages with nothing between them. */}
+                  {leadId != null && (
+                    <Link
+                      data-testid="hunt-lead-chip"
+                      to={`/leads/${leadId}`}
+                      title={CHIP_LEAD}
+                      className="rounded-chip border border-border-strong bg-surface-3 px-1.5 py-px text-[10.5px] font-semibold text-accent hover:underline"
+                    >
+                      Lead {leadId}
+                    </Link>
+                  )}
                   {/* A hunt run against planted synthetic scenarios must never
                       read as a real one — badged right beside the disposition. */}
                   {data.isSynthEval && <SyntheticEvalBadge />}
                   {demo && <RecordedRunChip />}
                   <Freshness at={lastUpdated} className="ml-auto" />
                 </div>
+                {/* The verdict said INCONCLUSIVE and the reason sat below the
+                    objective in a banner that named no cause. The backend
+                    stores the sentence that names the failure, so it goes
+                    directly under the word it explains. */}
+                {failed && (
+                  <div
+                    data-testid="hunt-failure-reason"
+                    className="mb-2.5 text-[13px] leading-[1.55] text-warn"
+                    style={{ textWrap: 'pretty' }}
+                  >
+                    {data.narrative?.trim() || 'The hunt failed. No reason was recorded.'}
+                  </div>
+                )}
                 {/* generated title (from the objective) as the hero headline */}
                 <div
                   className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]"
@@ -752,10 +1025,24 @@ export function HuntDetail() {
                 >
                   {title}
                 </div>
-                {/* the analyst's original objective, de-emphasized */}
-                <div className="mt-1.5 flex items-start gap-1.5 text-[12.5px] text-dim" style={{ textWrap: 'pretty' }}>
-                  <Crosshair size={13} className="mt-0.5 flex-none text-faint" />
-                  <span><span className="text-faint">objective:</span> {data.objective}</span>
+                {/* The objective a lead hunt carries is a paragraph of
+                    generated prose. It pushed the findings below the fold on
+                    every lead hunt, so it opens on a click. */}
+                <div className="mt-1.5 text-[12.5px] text-dim" style={{ textWrap: 'pretty' }}>
+                  <button
+                    type="button"
+                    data-testid="hunt-objective-toggle"
+                    onClick={() => setObjectiveOpen((v) => !v)}
+                    className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-dim hover:text-text"
+                  >
+                    <Crosshair size={13} className="flex-none text-faint" />
+                    {objectiveOpen ? 'Hide objective' : 'Show objective'}
+                  </button>
+                  {objectiveOpen && (
+                    <div data-testid="hunt-objective" className="mt-1.5">
+                      {data.objective}
+                    </div>
+                  )}
                 </div>
                 {/* meta strip */}
                 <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[12px] text-dim">
@@ -765,12 +1052,19 @@ export function HuntDetail() {
                   <span className="text-faint">elapsed</span>
                   <span className="text-text-2">{data.elapsedLabel}</span>
                   <span className="text-ghost">·</span>
-                  <span className="text-faint">kind</span>
-                  <span className="text-text-2">{/* 'chat' is the storage kind for any operator-started hunt — 'manual' is what an analyst reads */}{data.kind === 'chat' ? 'manual' : data.kind}</span>
+                  <span className="text-faint">type</span>
+                  <span className="text-text-2">{/* the analyst-facing name for the storage kind ('chat' → manual, 'triggered' → catalog), the same one the badge above wears */}{HUNT_KIND[data.kind]?.label ?? data.kind}</span>
                 </div>
               </div>
-              {/* confidence ring — only meaningful once the hunt concludes */}
-              {complete && (
+              {/* Confidence ring — only meaningful once the hunt concludes,
+                  and only when something actually scored it. A null
+                  confidence is a report that carries none (the catalog path:
+                  one query from a written spec, nothing to score), and the
+                  dial used to render that absence as 0.00 in 18px type beside
+                  the disposition, which reads as "the system has zero
+                  confidence in this" rather than "nothing scored this". A
+                  zero is a measurement and keeps its dial. */}
+              {complete && data.confidence !== null && (
                 <div className="flex flex-none items-center gap-[9px]">
                   <ConfidenceRing conf={data.confidence} color={statusColor} />
                   <div>
@@ -780,6 +1074,23 @@ export function HuntDetail() {
                     <div className="text-[10.5px] uppercase tracking-[.05em] text-faint">
                       confidence
                     </div>
+                  </div>
+                </div>
+              )}
+              {/* The explanation is the catalog's, so it keys on the actor:
+                  "ran one query from a written spec" is only true of a
+                  spec-authored hunt, and a model hunt whose report somehow
+                  lost its confidence should show a gap, not this sentence. */}
+              {complete && data.confidence === null && catalog && (
+                <div className="max-w-[190px] flex-none text-right">
+                  <div className="text-[10.5px] font-semibold uppercase tracking-[.05em] text-text-2">
+                    no model call
+                  </div>
+                  <div
+                    className="mt-1 text-[11px] leading-[1.45] text-faint"
+                    style={{ textWrap: 'pretty' }}
+                  >
+                    This hunt ran one query from a written analytic. No model scored it.
                   </div>
                 </div>
               )}
@@ -863,8 +1174,8 @@ export function HuntDetail() {
           {running && (
             <Panel className="mt-[18px] flex items-center gap-2 px-4 py-3 text-[13px] text-dim">
               <Loader2 size={15} className="animate-spin text-accent" />
-              Hunting… correlating events, enriching indicators, mapping to MITRE. This view updates
-              live.
+              The hunt runs. It correlates events, enriches indicators, and maps them to MITRE. This
+              view updates live.
             </Panel>
           )}
 
@@ -882,10 +1193,10 @@ export function HuntDetail() {
               </span>
               <div className="text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
                 {status === 'cancelled'
-                  ? 'This hunt was cancelled before it finished. Any partial findings and trace below are still shown.'
+                  ? 'A cancel request stopped this hunt before it finished. The page still shows the partial findings and the trace below.'
                   : status === 'interrupted'
-                    ? 'This hunt was interrupted by a service restart. Any partial findings and trace below are still shown.'
-                    : 'This hunt ended in an error. Any partial findings and trace below are still shown.'}
+                    ? 'A service restart interrupted this hunt. The page still shows the partial findings and the trace below.'
+                    : 'This hunt ended in an error. The page still shows the partial findings and the trace below.'}
               </div>
             </div>
           )}
@@ -894,7 +1205,24 @@ export function HuntDetail() {
           <div className="mt-[18px] grid grid-cols-1 items-start gap-[18px] lg:grid-cols-[minmax(0,1fr)_360px]">
             {/* main column: narrative, findings, timeline */}
             <div className="flex min-w-0 flex-col gap-[18px]">
-              {data.narrative && (
+              {/* What the lead is made of. The hunt page named the lead and
+                  showed nothing of it, so an analyst reading the hunt had to
+                  leave it to learn what the hunt was about. */}
+              {lead.data && (
+                <div data-testid="hunt-lead-timeline">
+                  <LeadTimeline
+                    lead={lead.data}
+                    title={`Lead timeline · ${lead.data.observations.length} observation${
+                      lead.data.observations.length === 1 ? '' : 's'
+                    }`}
+                    className=""
+                  />
+                </div>
+              )}
+              {/* An errored hunt's narrative IS the failure sentence, and it
+                  already sits under the verdict. One sentence twice on one
+                  page reads as two facts. */}
+              {data.narrative && !failed && (
                 <CollapsibleSection title="Narrative">
                   <Panel>
                     <div
@@ -928,12 +1256,16 @@ export function HuntDetail() {
 
               <CollapsibleSection
                 title="Findings"
-                meta={`${data.findings.length} finding${data.findings.length === 1 ? '' : 's'}`}
+                meta={
+                  <span title={COUNT_FINDINGS}>
+                    {`${data.findings.length} finding${data.findings.length === 1 ? '' : 's'}`}
+                  </span>
+                }
               >
                 {data.findings.length === 0 ? (
                   <Panel className="px-4 py-3.5 text-[13px] text-dim">
                     {complete
-                      ? 'No findings — a clean hunt. Nothing notable surfaced for this objective.'
+                      ? 'No findings. The hunt found nothing notable for this objective.'
                       : 'No findings yet.'}
                   </Panel>
                 ) : (
@@ -942,8 +1274,8 @@ export function HuntDetail() {
                         line, only once the hunt has concluded with findings. */}
                     {complete && (
                       <div className="text-[12px] leading-[1.5] text-faint" style={{ textWrap: 'pretty' }}>
-                        Promote a finding to investigate it; a confirmed true positive can then be
-                        drafted into a detection.
+                        Promote a finding to investigate it. Draft a detection from a confirmed true
+                        positive.
                       </div>
                     )}
                     {data.findings.map((f, i) => (
@@ -952,6 +1284,7 @@ export function HuntDetail() {
                         f={f}
                         huntId={data.id}
                         ordinal={i}
+                        catalog={catalog}
                         sigmaOn={sigmaOn}
                         sigmaOff={sigmaOff}
                       />
@@ -960,14 +1293,28 @@ export function HuntDetail() {
                 )}
               </CollapsibleSection>
 
+              {/* A catalog hunt has no steps BY CONSTRUCTION — it is one query
+                  from a spec, not an agent loop — so "0 steps" and "No steps
+                  yet." promised a second act that never arrives on a hunt
+                  already marked Complete. Say what it actually did instead. */}
               <CollapsibleSection
                 title="Hunt timeline"
-                meta={`${data.timeline.length} step${data.timeline.length === 1 ? '' : 's'} · ${data.elapsedLabel}`}
+                meta={
+                  <span title={COUNT_STEPS}>
+                    {catalog && data.timeline.length === 0
+                      ? `single query · ${data.elapsedLabel}`
+                      : `${data.timeline.length} step${data.timeline.length === 1 ? '' : 's'} · ${data.elapsedLabel}`}
+                  </span>
+                }
                 defaultOpen
               >
                 <Panel>
                   {data.timeline.length === 0 ? (
-                    <div className="px-[15px] py-3.5 text-[12.5px] text-dim">No steps yet.</div>
+                    <div className="px-[15px] py-3.5 text-[12.5px] text-dim">
+                      {catalog
+                        ? 'This hunt has no steps. A catalog hunt runs its spec as a single Elasticsearch query.'
+                        : 'No steps yet.'}
+                    </div>
                   ) : (
                     data.timeline.map((step, i) => (
                       <TimelineRow
@@ -990,17 +1337,20 @@ export function HuntDetail() {
                     icon={<Crosshair size={15} />}
                     title="Affected hosts"
                     right={
-                      <span className="font-mono text-[11px] text-accent">
+                      <span className="font-mono text-[11px] text-accent" title={COUNT_AFFECTED_HOSTS}>
                         {data.affectedHosts.length}
                       </span>
                     }
                   />
                   <div className="flex flex-wrap gap-1.5 p-4">
                     {data.affectedHosts.map((h) => (
-                      // Host chip → the entity pivot page ("what do we know about this box").
+                      // Host chip → the page that holds what this grid knows about the
+            // entity. `entityPath` picks it: an address has a host page, a name
+            // has the entity page. The chip linked every host to /entity/, so
+            // one address had two pages and neither knew about the other.
                       <Link
                         key={h}
-                        to={`/entity/${encodeURIComponent(h)}`}
+                        to={entityPath('host', h)}
                         title={`Pivot to ${h}`}
                         className="rounded-chip bg-surface-3 px-2 py-0.5 font-mono text-[11.5px] text-mono-amber hover:brightness-125"
                       >
@@ -1017,7 +1367,7 @@ export function HuntDetail() {
                     icon={<ShieldAlert size={15} />}
                     title="MITRE ATT&CK"
                     right={
-                      <span className="font-mono text-[11px] text-accent">
+                      <span className="font-mono text-[11px] text-accent" title={COUNT_MITRE}>
                         {data.mitreTechniques.length}
                       </span>
                     }
@@ -1026,6 +1376,7 @@ export function HuntDetail() {
                     {data.mitreTechniques.map((m) => (
                       <span
                         key={m}
+                        title={CHIP_MITRE}
                         className="rounded-chip border border-accent/40 bg-accent/10 px-2 py-0.5 font-mono text-[11.5px] text-accent"
                       >
                         {m}
@@ -1112,12 +1463,13 @@ export function HuntChatPanel({
     <ChatPanelShell
       title="Chat about this hunt"
       scopeLabel="read-only"
-      placeholder="Ask a follow-up… e.g. which host was worst?"
+      placeholder="Ask a follow-up question. Example: which host was worst?"
       listSizeClass={fill ? 'flex-1' : 'max-h-[460px] min-h-[180px]'}
       emptyHint={
         <div className="text-[12.5px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
-          Ask a follow-up about this hunt — e.g. “which host was worst?” or “show me the DNS for
-          host X”. The assistant answers from the hunt's evidence; it can't change the result.
+          Ask a follow-up question about this hunt. Example: “which host was worst?” or “show me
+          the DNS for host X”. The assistant answers from the evidence of this hunt. The assistant
+          cannot change the result.
         </div>
       }
       messages={chat.messages}
@@ -1137,7 +1489,7 @@ export function HuntChatPanel({
 // so the follow-up-chat UX is identical across investigations and hunts.
 function HuntChatDock({ huntId }: { huntId: string }) {
   return (
-    <ChatDockShell label="Chat about this">
+    <ChatDockShell label="Chat about this hunt">
       {(close) => <HuntChatPanel huntId={huntId} fill onClose={close} />}
     </ChatDockShell>
   );

@@ -29,7 +29,7 @@ const POLL_GROUP = vi.hoisted(() => ({
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([POLL_GROUP]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [POLL_GROUP], truncated: false, other_docs: 0 }),
   getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
   // The drawer's own investigation fetch never needs to resolve for this test —
   // leaving it pending keeps the (heavy) Investigation report out of the tree.
@@ -42,7 +42,7 @@ import { assignAlert, getAlerts } from '../lib/api';
 
 // Pinned literally (not imported) so a copy edit to the note can't self-approve.
 const NOTE =
-  'Not available in the read-only demo — in a live deployment this would run for real.';
+  'Not available in the read-only demo. In a live deployment this action runs for real.';
 
 describe('demoBlocked', () => {
   it('returns the note in demo mode', () => {

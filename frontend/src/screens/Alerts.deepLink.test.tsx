@@ -4,7 +4,7 @@
 // screen's state, a 7d dashboard — or a fully-acked untriaged group — arrives
 // at a list that structurally cannot contain the row it just counted (prod
 // 2026-08-07: 46 groups vs 37, 13,053 events vs 9,930 across that default).
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShellProvider } from '../shell/ShellContext';
@@ -24,7 +24,7 @@ const GROUP = vi.hoisted(() => ({
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  getAlerts: vi.fn().mockResolvedValue([GROUP]),
+  getAlerts: vi.fn().mockResolvedValue({ groups: [GROUP], truncated: false, other_docs: 0 }),
   getMe: vi.fn().mockResolvedValue({ username: 'me', role: 'analyst', status: '' }),
 }));
 
@@ -163,10 +163,19 @@ describe('Alerts deep-link seeding', () => {
 describe('Alerts verdict filter actually filters', () => {
   it('hides a group whose verdict is not selected', async () => {
     mount('/alerts?verdict=true_positive');
-    // The header summary counts the FETCHED groups, so it proves the data
-    // landed before we assert the row was filtered out (rather than never
-    // arriving).
-    await screen.findByText(/1 untriaged · 1 detection ·/);
+    // Every count on this screen describes the rows the analyst can see, so
+    // there is no number left that proves the fetch landed while the list is
+    // empty. The chips carry no badge at all until it does, so wait on that.
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByRole('button')
+          .some((b) => b.hasAttribute('aria-pressed') && /All\d/.test(b.textContent ?? '')),
+      ).toBe(true),
+    );
     expect(screen.queryByText(GROUP.name)).toBeNull();
+    expect(screen.getByText(/untriaged ·/).textContent).toBe(
+      '0 untriaged · 0 detections · 0 events in window',
+    );
   });
 });

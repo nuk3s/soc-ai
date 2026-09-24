@@ -10,12 +10,18 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import utcnow
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import Investigation
+from sqlalchemy import select
 
 
 async def _db(settings: Settings):  # type: ignore[no-untyped-def]
     engine = make_engine(settings)
     await run_migrations(engine)
     return engine, make_sessionmaker(engine)
+
+
+# The inheritance key, always built through its constructor so a test can never
+# assert against a shape the production callers do not produce.
+key = inv_svc.pair_key
 
 
 REPORT = {
@@ -31,6 +37,49 @@ REPORT = {
         }
     ],
 }
+
+
+async def test_a_hunt_subject_verdict_writes_no_alert_observation(
+    settings_kratos: Settings,
+) -> None:
+    """The verdict is on the hunt, not on the anchor document.
+
+    An alert observation on the anchor would feed a second lead on the ground
+    the promoted lead already covered.
+    """
+    from soc_ai.store.models import EntityObservation, Investigation
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        hunt_run = Investigation(
+            id="01HUNTSUBJECT00000000000000",
+            alert_es_id="doc-1",
+            started_by="admin",
+            kind="lead",
+            status="complete",
+            verdict="true_positive",
+            confidence=0.8,
+            src_ip="10.1.2.3",
+            subject_json={"type": "hunt", "hunt_id": "h1", "document_ids": ["doc-1"]},
+        )
+        alert_run = Investigation(
+            id="01ALERTRUN00000000000000000",
+            alert_es_id="doc-2",
+            started_by="admin",
+            kind="suricata",
+            status="complete",
+            verdict="true_positive",
+            confidence=0.8,
+            src_ip="10.1.2.4",
+        )
+        db.add_all([hunt_run, alert_run])
+        await db.flush()
+        await inv_svc._observe_verdict(db, hunt_run)
+        await inv_svc._observe_verdict(db, alert_run)
+        await db.commit()
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+    assert [r.entity_key for r in rows] == ["10.1.2.4"]
+    await engine.dispose()
 
 
 async def test_create_seeds_rule_name_at_birth(settings_kratos: Settings) -> None:
@@ -165,6 +214,46 @@ async def test_latest_for_rules_and_alerts(settings_kratos: Settings) -> None:
     await engine.dispose()
 
 
+async def test_a_hunt_subject_run_is_not_its_anchor_alerts_run(
+    settings_kratos: Settings,
+) -> None:
+    """D2. The subject is the hunt. The anchor document is a time anchor.
+
+    A hunt-subject run carries one cited document in ``alert_es_id``, because
+    the pipeline anchors its time windows on one timestamp. It is not that
+    alert's run. Grouped under the alert, its verdict read as the alert's
+    latest verdict: a benign explanation for a hunt hypothesis would have
+    cleared an alert nobody investigated.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        own = await inv_svc.create(db, alert_es_id="ev-anchor", started_by="admin")
+        await inv_svc.finalize(db, own.id, status="complete", verdict="true_positive")
+
+        promoted = await inv_svc.create(
+            db,
+            alert_es_id="ev-anchor",
+            started_by="admin",
+            kind="lead",
+            subject={"type": "hunt", "hunt_id": "01HUNT", "lead_id": 10},
+        )
+        await inv_svc.finalize(db, promoted.id, status="complete", verdict="false_positive")
+
+        assert inv_svc.is_hunt_subject(promoted) is True
+        assert inv_svc.is_hunt_subject(own) is False
+        assert inv_svc.alert_group_id(promoted) is None
+        assert inv_svc.alert_group_id(own) == "ev-anchor"
+
+        # The alert keeps its own run, newer though the promotion is.
+        by_alert = await inv_svc.latest_for_alerts(db, ["ev-anchor"])
+        assert by_alert["ev-anchor"].id == own.id
+        complete = await inv_svc.complete_for_alert(db, "ev-anchor")
+        assert complete is not None and complete.id == own.id
+        runs = await inv_svc.runs_for_alerts(db, ["ev-anchor"])
+        assert [r.id for r in runs] == [own.id]
+    await engine.dispose()
+
+
 async def test_latest_for_rules_empty_input(settings_kratos: Settings) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
@@ -182,25 +271,25 @@ async def test_latest_for_pairs(settings_kratos: Settings) -> None:
         await inv_svc.set_rule_name(db, a.id, "RULE A")
         await inv_svc.finalize(db, a.id, status="complete", verdict="false_positive")
 
+        hit_key = key("RULE A", "10.0.0.1", "10.0.0.2")
         hits = await inv_svc.latest_for_pairs(
             db,
-            [("RULE A", "10.0.0.1", "10.0.0.2"), ("RULE A", "10.0.0.1", "10.0.0.9")],
+            [hit_key, key("RULE A", "10.0.0.1", "10.0.0.9")],
             window_days=7,
         )
-        assert hits[("RULE A", "10.0.0.1", "10.0.0.2")].id == a.id
-        assert ("RULE A", "10.0.0.1", "10.0.0.9") not in hits
+        assert hits[hit_key].id == a.id
+        assert key("RULE A", "10.0.0.1", "10.0.0.9") not in hits
         # outside the window → not inherited
-        assert (
-            await inv_svc.latest_for_pairs(db, [("RULE A", "10.0.0.1", "10.0.0.2")], window_days=0)
-            == {}
-        )
+        assert await inv_svc.latest_for_pairs(db, [hit_key], window_days=0) == {}
         # running/error rows do not propagate
         b = await inv_svc.create(
             db, alert_es_id="e2", started_by="x", src_ip="10.0.0.3", dest_ip="10.0.0.4"
         )
         await inv_svc.set_rule_name(db, b.id, "RULE B")
         assert (
-            await inv_svc.latest_for_pairs(db, [("RULE B", "10.0.0.3", "10.0.0.4")], window_days=7)
+            await inv_svc.latest_for_pairs(
+                db, [key("RULE B", "10.0.0.3", "10.0.0.4")], window_days=7
+            )
             == {}
         )
     await engine.dispose()
@@ -230,10 +319,10 @@ async def test_latest_for_pairs_excludes_hunt_kind_rows(settings_kratos: Setting
 
         hits = await inv_svc.latest_for_pairs(
             db,
-            [("Beaconing to rare external IP", "10.0.0.1", "10.0.0.2")],
+            [key("Beaconing to rare external IP", "10.0.0.1", "10.0.0.2")],
             window_days=7,
         )
-        assert ("Beaconing to rare external IP", "10.0.0.1", "10.0.0.2") not in hits
+        assert key("Beaconing to rare external IP", "10.0.0.1", "10.0.0.2") not in hits
 
         # Control: an ordinary suricata-kind row with the SAME key still
         # inherits normally — the exclusion is kind-scoped, not a regression.
@@ -248,34 +337,62 @@ async def test_latest_for_pairs_excludes_hunt_kind_rows(settings_kratos: Setting
         await inv_svc.finalize(db, plain.id, status="complete", verdict="true_positive")
         hits2 = await inv_svc.latest_for_pairs(
             db,
-            [("Beaconing to rare external IP", "10.0.0.5", "10.0.0.6")],
+            [key("Beaconing to rare external IP", "10.0.0.5", "10.0.0.6")],
             window_days=7,
         )
-        assert hits2[("Beaconing to rare external IP", "10.0.0.5", "10.0.0.6")].id == plain.id
+        assert hits2[key("Beaconing to rare external IP", "10.0.0.5", "10.0.0.6")].id == plain.id
     await engine.dispose()
 
 
-async def test_latest_for_pairs_finds_no_ip_investigations(settings_kratos: Settings) -> None:
-    """A NULL-endpoint investigation must be reachable under the ('rule','','') key.
+# ---- the key a verdict travels along ------------------------------------
+
+
+def test_pair_key_puts_the_host_in_only_when_there_is_no_flow() -> None:
+    """A flow's key must not carry a host, and a flowless detection's must.
+
+    On a multi-sensor grid one flow is seen twice under two ``host.name``
+    values, so a host in a flow's key splits one investigation into two of the
+    same thing. A detection with no flow has the opposite problem: without the
+    host it has no subject at all, and every machine on the estate shares one
+    key.
+    """
+    assert key("R", "10.0.0.1", "10.0.0.2", "sensor-a") == ("R", "10.0.0.1", "10.0.0.2", "")
+    assert key("R", "10.0.0.1", "10.0.0.2", "sensor-b") == key(
+        "R", "10.0.0.1", "10.0.0.2", "sensor-a"
+    )
+    # One endpoint is still a flow.
+    assert key("R", None, "10.0.0.2", "host-a") == ("R", "", "10.0.0.2", "")
+    # No endpoints: the host is the subject.
+    assert key("R", None, None, "host-a") == ("R", "", "", "host-a")
+    assert key("R", None, None, "host-b") != key("R", None, None, "host-a")
+    # Nothing at all.
+    assert key("R", None, None, None) == ("R", "", "", "")
+    assert not inv_svc.names_a_subject(key("R", None, None, None))
+    assert inv_svc.names_a_subject(key("R", None, None, "host-a"))
+    assert inv_svc.names_a_subject(key("R", "10.0.0.1", None, None))
+
+
+async def test_latest_for_pairs_finds_a_no_ip_investigation_by_its_host(
+    settings_kratos: Settings,
+) -> None:
+    """A NULL-endpoint investigation is reachable under its HOST's key.
 
     Endpoint/process-shaped detections (Sigma host rules, Zeek notices) carry no
-    ``source.ip``/``destination.ip``, so the recorder leaves BOTH columns NULL.
-    The sweep planner clusters them under ``(rule, "", "")`` and asks this
-    function about that key. While the query filtered ``src_ip IS NOT NULL AND
-    dest_ip IS NOT NULL`` those rows were dropped BEFORE the ``or ""`` coalescing
-    below it ran, so a no-IP cluster could never inherit its own prior verdict —
-    it was re-investigated on every sweep that saw a newer event id.
+    ``source.ip``/``destination.ip``, so the recorder leaves both columns NULL.
+    They still have to inherit their own prior verdict or the sweep
+    re-investigates them every time a newer event id turns up.
     """
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        # Exactly what the recorder writes for an alert with no endpoints: a rule
-        # name and NULL for both IPs.
         a = await inv_svc.create(db, alert_es_id="ev-host", started_by="x", rule_name="SIGMA HOST")
         assert a.src_ip is None and a.dest_ip is None
+        await inv_svc.set_alert_fields(db, a.id, host_name="ws-01")
         await inv_svc.finalize(db, a.id, status="complete", verdict="false_positive")
 
-        hits = await inv_svc.latest_for_pairs(db, [("SIGMA HOST", "", "")], window_days=7)
-        assert hits[("SIGMA HOST", "", "")].id == a.id
+        hits = await inv_svc.latest_for_pairs(
+            db, [key("SIGMA HOST", None, None, "ws-01")], window_days=7
+        )
+        assert hits[key("SIGMA HOST", None, None, "ws-01")].id == a.id
 
         # A half-endpoint row is keyed on the endpoint it DOES have, so it can
         # only be inherited by a cluster of the same shape.
@@ -284,10 +401,93 @@ async def test_latest_for_pairs_finds_no_ip_investigations(settings_kratos: Sett
         )
         await inv_svc.finalize(db, b.id, status="complete", verdict="true_positive")
         half = await inv_svc.latest_for_pairs(
-            db, [("HALF RULE", "", "1.2.3.4"), ("HALF RULE", "", "")], window_days=7
+            db,
+            [key("HALF RULE", None, "1.2.3.4"), key("HALF RULE", None, None, "ws-01")],
+            window_days=7,
         )
-        assert half[("HALF RULE", "", "1.2.3.4")].id == b.id
-        assert ("HALF RULE", "", "") not in half
+        assert half[key("HALF RULE", None, "1.2.3.4")].id == b.id
+        assert key("HALF RULE", None, None, "ws-01") not in half
+    await engine.dispose()
+
+
+async def test_a_no_ip_verdict_does_not_travel_to_another_machine(
+    settings_kratos: Settings,
+) -> None:
+    """THE DEFECT. One benign verdict silenced a Sigma rule everywhere.
+
+    Every address-free detection of a rule keyed as ``(rule, "", "")``, so the
+    first verdict reached under it covered every later firing on every machine,
+    and those firings were never investigated to contradict it. Measured on a
+    live grid: 100 of 208 investigations carried that key, and one rule held a
+    false positive and a true positive under it at the same time.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        benign = await inv_svc.create(
+            db, alert_es_id="ev-a", started_by="x", rule_name="SIGMA HOST"
+        )
+        await inv_svc.set_alert_fields(db, benign.id, host_name="ws-01")
+        await inv_svc.finalize(db, benign.id, status="complete", verdict="false_positive")
+
+        hits = await inv_svc.latest_for_pairs(
+            db,
+            [key("SIGMA HOST", None, None, "ws-01"), key("SIGMA HOST", None, None, "dc-01")],
+            window_days=7,
+        )
+        assert hits[key("SIGMA HOST", None, None, "ws-01")].id == benign.id
+        assert key("SIGMA HOST", None, None, "dc-01") not in hits
+    await engine.dispose()
+
+
+async def test_a_key_naming_no_subject_inherits_nothing(settings_kratos: Settings) -> None:
+    """``(rule, "", "", "")`` says a detection fired and nothing about where.
+
+    A verdict reached under it was about the rule, not about anything that
+    happened, so it is not handed to another alert. This is also what retires
+    every legacy row: those runs recorded no host, so they key here, and here
+    nothing matches.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        legacy = await inv_svc.create(
+            db, alert_es_id="ev-legacy", started_by="x", rule_name="SIGMA HOST"
+        )
+        assert legacy.host_name is None
+        await inv_svc.finalize(db, legacy.id, status="complete", verdict="false_positive")
+
+        assert (
+            await inv_svc.latest_for_pairs(db, [key("SIGMA HOST", None, None, None)], window_days=7)
+            == {}
+        )
+        # Nor does it reach a cluster that DOES know its host.
+        assert (
+            await inv_svc.latest_for_pairs(
+                db, [key("SIGMA HOST", None, None, "ws-01")], window_days=7
+            )
+            == {}
+        )
+    await engine.dispose()
+
+
+async def test_running_for_pairs_still_blocks_a_subjectless_duplicate(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL for the refusal above: it must not spread.
+
+    The in-flight guard answers a different question from the verdict lookup.
+    A coarse stop is safe where a coarse verdict is not, and refusing the
+    subjectless key here would let one sweep launch a run per address-free
+    alert of a rule at once.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        running = await inv_svc.create(
+            db, alert_es_id="ev-running", started_by="x", rule_name="SIGMA HOST"
+        )
+        assert running.status == "running" and running.host_name is None
+        assert await inv_svc.running_for_pairs(db, [key("SIGMA HOST", None, None, None)]) == {
+            key("SIGMA HOST", None, None, None)
+        }
     await engine.dispose()
 
 
@@ -313,13 +513,16 @@ async def test_latest_for_pairs_ip_keyed_rows_unchanged(settings_kratos: Setting
         # Same rule, no endpoints, NEWER — the row that would hijack the flow's
         # key if coalescing collapsed the two shapes together.
         noip = await inv_svc.create(db, alert_es_id="ev-noip", started_by="x", rule_name="ET FLOW")
+        await inv_svc.set_alert_fields(db, noip.id, host_name="ws-01")
         await inv_svc.finalize(db, noip.id, status="complete", verdict="false_positive")
 
         hits = await inv_svc.latest_for_pairs(
-            db, [("ET FLOW", "10.0.0.1", "1.2.3.4"), ("ET FLOW", "", "")], window_days=7
+            db,
+            [key("ET FLOW", "10.0.0.1", "1.2.3.4"), key("ET FLOW", None, None, "ws-01")],
+            window_days=7,
         )
-        assert hits[("ET FLOW", "10.0.0.1", "1.2.3.4")].id == flow.id
-        assert hits[("ET FLOW", "", "")].id == noip.id
+        assert hits[key("ET FLOW", "10.0.0.1", "1.2.3.4")].id == flow.id
+        assert hits[key("ET FLOW", None, None, "ws-01")].id == noip.id
     await engine.dispose()
 
 
@@ -356,12 +559,12 @@ async def test_running_for_pairs_blocks_a_no_ip_duplicate(settings_kratos: Setti
         assert await inv_svc.running_for_pairs(
             db,
             [
-                ("SIGMA HOST", "", ""),
-                ("SIGMA DONE", "", ""),
-                ("ET FLOW", "10.0.0.1", "1.2.3.4"),
-                ("ET FLOW", "", ""),
+                key("SIGMA HOST", None, None),
+                key("SIGMA DONE", None, None),
+                key("ET FLOW", "10.0.0.1", "1.2.3.4"),
+                key("ET FLOW", None, None),
             ],
-        ) == {("SIGMA HOST", "", ""), ("ET FLOW", "10.0.0.1", "1.2.3.4")}
+        ) == {key("SIGMA HOST", None, None), key("ET FLOW", "10.0.0.1", "1.2.3.4")}
     await engine.dispose()
 
 
@@ -387,8 +590,8 @@ async def test_running_for_pairs_ignores_hunt_kind_title_collision(
         await inv_svc.create(db, alert_es_id="ev-real", started_by="x", rule_name="ET REAL")
 
         assert await inv_svc.running_for_pairs(
-            db, [("SIGMA HOST", "", ""), ("ET REAL", "", "")]
-        ) == {("ET REAL", "", "")}
+            db, [key("SIGMA HOST", None, None), key("ET REAL", None, None)]
+        ) == {key("ET REAL", None, None)}
     await engine.dispose()
 
 
@@ -840,6 +1043,141 @@ async def _lookup(
     )
 
 
+# ---------------------------------------------------------------------------
+# session_verdicts — what one session has already been called
+# ---------------------------------------------------------------------------
+
+_SESSION = "1:hV6oYm5cQ8mQPWNQdCJvL5cM7YM="
+_OTHER_SESSION = "1:0kZmS0V0mZLZoCk7hjfHVBjLmpQ="
+
+
+async def _seed_session(
+    db,  # type: ignore[no-untyped-def]
+    *,
+    alert_es_id: str,
+    community_id: str | None = _SESSION,
+    verdict: str | None = "true_positive",
+    rule_name: str = _MEM_RULE,
+    rationale: str | None = "smb session carried a service install",
+    age_minutes: int = 0,
+    kind: str = "suricata",
+    is_synth_eval: bool = False,
+    report: dict | None = None,
+) -> Investigation:
+    """One COMPLETE row stamped with a session, optionally backdated."""
+    inv = await inv_svc.create(
+        db,
+        alert_es_id=alert_es_id,
+        started_by="t",
+        rule_name=rule_name,
+        src_ip=_MEM_SRC,
+        dest_ip=_MEM_DST,
+        kind=kind,
+        is_synth_eval=is_synth_eval,
+    )
+    if community_id:
+        await inv_svc.set_alert_fields(db, inv.id, community_id=community_id)
+    await inv_svc.finalize(
+        db,
+        inv.id,
+        status="complete",
+        verdict=verdict,
+        confidence=0.8,
+        rationale=rationale,
+        report=report,
+    )
+    if age_minutes:
+        row = await db.get(Investigation, inv.id)
+        row.created_at = utcnow() - timedelta(minutes=age_minutes)
+        await db.commit()
+    return inv
+
+
+async def test_session_verdicts_finds_the_other_alert_on_one_session(
+    settings_kratos: Settings,
+) -> None:
+    """The defect. Two alerts, one TCP session, twenty-eight minutes apart. The
+    rule-keyed lookup could not relate them (different rules, and no ports on
+    the row at all); the session key can."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        tp = await _seed_session(
+            db, alert_es_id="s1", rule_name="ET LATERAL Service Install", age_minutes=28
+        )
+
+        got = await inv_svc.session_verdicts(db, community_id=_SESSION)
+
+        assert [d["id"] for d in got] == [tp.id]
+        assert got[0]["verdict"] == "true_positive"
+        assert got[0]["rationale_digest"] == "smb session carried a service install"
+    await engine.dispose()
+
+
+async def test_session_verdicts_never_matches_a_different_session(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control, and the one that matters: two unrelated alerts must not
+    be made to agree. A different session, a row with no session at all, and an
+    empty question all return nothing rather than reaching for the nearest
+    verdict."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _seed_session(db, alert_es_id="u1", community_id=_OTHER_SESSION)
+        await _seed_session(db, alert_es_id="u2", community_id=None)
+
+        assert await inv_svc.session_verdicts(db, community_id=_SESSION) == []
+        # No session on the alert being triaged is not a wildcard.
+        assert await inv_svc.session_verdicts(db, community_id="") == []
+    await engine.dispose()
+
+
+async def test_session_verdicts_filters_window_status_and_noise(
+    settings_kratos: Settings,
+) -> None:
+    """Only complete, verdict-bearing, non-fallback, non-hunt, non-synth rows
+    inside the window bind anything. A synthetic evaluation run is allowed to
+    see planted scenarios, so its verdict must never constrain a real one."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        keeper = await _seed_session(db, alert_es_id="f1", age_minutes=10)
+        await _seed_session(db, alert_es_id="f2", age_minutes=60 * 48)  # outside the window
+        await _seed_session(db, alert_es_id="f3", verdict=None)
+        await _seed_session(db, alert_es_id="f4", kind="hunt")
+        await _seed_session(db, alert_es_id="f5", is_synth_eval=True)
+        await _seed_session(
+            db,
+            alert_es_id="f6",
+            report={
+                "verdict": "true_positive",
+                "resolution": {"provenance": "pipeline_fallback"},
+            },
+        )
+        # Still running: no verdict to hand out.
+        running = await inv_svc.create(db, alert_es_id="f7", started_by="t")
+        await inv_svc.set_alert_fields(db, running.id, community_id=_SESSION)
+
+        got = await inv_svc.session_verdicts(db, community_id=_SESSION)
+
+        assert [d["id"] for d in got] == [keeper.id]
+        assert await inv_svc.session_verdicts(db, community_id=_SESSION, exclude_id=keeper.id) == []
+    await engine.dispose()
+
+
+async def test_session_verdicts_returns_the_newest_first(settings_kratos: Settings) -> None:
+    """Newest first, capped at the limit."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        old = await _seed_session(db, alert_es_id="n1", age_minutes=90)
+        mid = await _seed_session(db, alert_es_id="n2", age_minutes=45)
+        new = await _seed_session(db, alert_es_id="n3", age_minutes=1)
+
+        got = await inv_svc.session_verdicts(db, community_id=_SESSION, limit=2)
+
+        assert [d["id"] for d in got] == [new.id, mid.id]
+        assert old.id not in {d["id"] for d in got}
+    await engine.dispose()
+
+
 async def test_prior_outcomes_tier_ordering_beats_recency(settings_kratos: Settings) -> None:
     """Exact triple outranks endpoint-share outranks rule-only, whatever the age;
     WITHIN a tier the newest row wins."""
@@ -1034,4 +1372,158 @@ async def test_for_entity_excludes_synth_eval_rows(settings_kratos: Settings) ->
         # the planted one.
         top = await inv_svc.for_entity(db, "10.0.0.7", limit=1)
         assert [r.id for r in top] == [real.id]
+    await engine.dispose()
+
+
+async def test_failed_triage_reaches_the_pipeline_error_filter(settings_kratos: Settings) -> None:
+    """A run that ended in ``error`` with no verdict is a pipeline error.
+
+    Production carried 188 of these: no verdict, no rationale, no report, and
+    ``is_fallback`` never stamped because nothing ever wrote a report to stamp
+    it from. The Dashboard's count and its deep link both run the
+    ``pipeline_error`` verdict filter, so a row that filter cannot see is a
+    failure no surface in the product mentions.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        died = await inv_svc.create(db, alert_es_id="ev-died", started_by="t", rule_name="ET Died")
+        await inv_svc.finalize(db, died.id, status="error")
+        # A healthy run: reached a verdict, so it is NOT a pipeline error.
+        ok = await inv_svc.create(db, alert_es_id="ev-ok", started_by="t", rule_name="ET Fine")
+        await inv_svc.finalize(db, ok.id, status="complete", verdict="false_positive")
+        # An errored run that DID reach a verdict: it has an answer, so it is
+        # reachable under its own verdict and does not belong here.
+        late = await inv_svc.create(db, alert_es_id="ev-late", started_by="t", rule_name="ET Late")
+        await inv_svc.finalize(db, late.id, status="error", verdict="false_positive")
+
+        page = await inv_svc.query_page(db, verdicts=[inv_svc.PIPELINE_ERROR_VERDICT])
+        assert [r.id for r in page.rows] == [died.id]
+        assert page.total == 1
+
+        # Negative control: the false-positive filter is unchanged by the
+        # widening: a no-verdict row must not leak into a real verdict's set.
+        fps = await inv_svc.query_page(db, verdicts=["false_positive"])
+        assert {r.id for r in fps.rows} == {ok.id, late.id}
+    await engine.dispose()
+
+
+async def test_notifications_query_takes_the_display_status_and_hides_dismissed(
+    settings_kratos: Settings,
+) -> None:
+    """The bell's query grades a row the way the screen renders it, and can be
+    asked for only the failures nobody has acknowledged yet.
+
+    ``complete`` with a blank verdict displays as an error everywhere else in
+    the product (``_display_status_sql``), so asking this query for completions
+    must not hand back a run that reached no decision, and asking it for errors
+    must find it.
+    """
+    engine, maker = await _db(settings_kratos)
+    now = utcnow()
+    async with maker() as db:
+        died = await inv_svc.create(db, alert_es_id="ev-d1", started_by="t", rule_name="ET Died")
+        await inv_svc.finalize(db, died.id, status="error")
+        blank = await inv_svc.create(db, alert_es_id="ev-d2", started_by="t", rule_name="ET Blank")
+        await inv_svc.finalize(db, blank.id, status="complete", verdict="  ")
+        acked = await inv_svc.create(db, alert_es_id="ev-d3", started_by="t", rule_name="ET Acked")
+        await inv_svc.finalize(db, acked.id, status="error")
+        await inv_svc.dismiss_error(db, acked.id)
+        good = await inv_svc.create(db, alert_es_id="ev-d4", started_by="t", rule_name="ET Good")
+        await inv_svc.finalize(db, good.id, status="complete", verdict="true_positive")
+
+        since = now - timedelta(hours=24)
+        failed = await inv_svc.list_recent_notifications(
+            db,
+            status="error",
+            limit=20,
+            finished_since=since,
+            no_verdict=True,
+            exclude_dismissed=True,
+        )
+        assert {r.id for r in failed} == {died.id, blank.id}
+
+        done = await inv_svc.list_recent_notifications(
+            db, status="complete", limit=20, finished_since=since
+        )
+        assert {r.id for r in done} == {good.id}
+    await engine.dispose()
+
+
+async def test_pipeline_fallback_stays_rehuntable(settings_kratos: Settings) -> None:
+    """A fallback is a failure wearing a 'complete' status, so it must not block.
+
+    This is the "pipeline errors that never heal" report. The investigations list
+    counts a fallback as needing a retry; this predicate used to count it as
+    finished, so the sweep skipped its alert as already_triaged. Nine alerts on
+    the home deployment sat in that gap: permanently listed as needing attention,
+    permanently ineligible for the only thing that would clear them.
+
+    Both halves of the pair are asserted here. A future change that makes one of
+    them treat a fallback as settled has to fail this test to do it.
+    """
+    from soc_ai.api.webui.routes_investigations import _needs_retry, _row
+    from soc_ai.triage_models import PIPELINE_FALLBACK_PROVENANCE
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        inv = await inv_svc.create(db, alert_es_id="fell-back", started_by="x")
+        row = await db.get(Investigation, inv.id)
+        row.status = "complete"
+        row.verdict = "needs_more_info"
+        row.is_fallback = True
+        row.report = {"resolution": {"provenance": PIPELINE_FALLBACK_PROVENANCE}}
+        await db.commit()
+        row = await db.get(Investigation, inv.id)
+
+        # The sweep must be willing to run the alert again …
+        assert inv_svc.blocks_rehunt(row) is False
+        # … and the list must still be asking someone to. Both, or the alert is
+        # stuck in the gap between them.
+        assert _needs_retry(_row(row, is_primary=True)) is True
+
+        # The marker alone is enough, without the column — rows finalized before
+        # is_fallback existed carry it only in the report.
+        row.is_fallback = None
+        await db.commit()
+        assert inv_svc.blocks_rehunt(await db.get(Investigation, inv.id)) is False
+
+        # A genuine needs_more_info the pipeline actually reasoned to is settled,
+        # and must keep blocking: re-running it would loop on every sweep.
+        row.is_fallback = None
+        row.report = {"resolution": {"provenance": "analyst"}}
+        await db.commit()
+        settled = await db.get(Investigation, inv.id)
+        assert inv_svc.blocks_rehunt(settled) is True
+        assert _needs_retry(_row(settled, is_primary=True)) is False
+    await engine.dispose()
+
+
+async def test_the_subject_column_holds_a_hunt_subject(settings_kratos: Settings) -> None:
+    """Migration 0050. An alert run leaves the subject NULL. A hunt run stores
+    the hunt, the objective, the finding ordinals, the lead, the documents and
+    the observations, so the row says what it was about."""
+    engine, maker = await _db(settings_kratos)
+    subject = {
+        "type": "hunt",
+        "hunt_id": "01HUNT0000000000000000000",
+        "objective": "hunt for kerberoasting on the domain controllers",
+        "finding_ordinals": [0, 2],
+        "lead_id": 7,
+        "document_ids": ["tel-1", "tel-2"],
+        "observation_ids": [11, 12],
+    }
+    async with maker() as db:
+        alert_run = await inv_svc.create(db, alert_es_id="a1", started_by="admin")
+        assert alert_run.subject_json is None
+
+        hunt_run = await inv_svc.create(
+            db, alert_es_id="tel-1", started_by="admin", kind="hunt", subject=subject
+        )
+        assert hunt_run.subject_json == subject
+        hunt_run_id = hunt_run.id
+
+    async with maker() as db:
+        read_back = await db.get(Investigation, hunt_run_id)
+        assert read_back is not None
+        assert read_back.subject_json == subject
     await engine.dispose()

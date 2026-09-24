@@ -63,7 +63,7 @@ describe('Config admin write paths surface a failure instead of failing silently
         <Config />
       </MemoryRouter>,
     );
-    const resetBtn = await screen.findByText('Reset pw');
+    const resetBtn = await screen.findByText('Reset password');
     fireEvent.click(resetBtn);
     await screen.findByText('reset failed');
   });
@@ -106,7 +106,7 @@ describe('reset-password banner auto-dismiss (F69)', () => {
         <Config />
       </MemoryRouter>,
     );
-      const resetBtn = await screen.findByText('Reset pw');
+      const resetBtn = await screen.findByText('Reset password');
       fireEvent.click(resetBtn);
       await screen.findByText('temp-pw');
 

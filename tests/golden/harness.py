@@ -24,6 +24,7 @@ from pydantic import SecretStr
 from soc_ai.agent.context import InvestigationContext
 from soc_ai.agent.orchestrator import investigate
 from soc_ai.config import Settings
+from soc_ai.enrichment.blocklists import BlocklistDB
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 
 from tests.golden.model_double import patch_models_for_scenario
@@ -50,6 +51,11 @@ def _base_settings() -> Settings:
         litellm_base_url="http://localhost:4000",
         api_auth_required=False,
         auto_ack_fp_enabled=False,
+        # The scenarios fake the round-2 synthesis: the loop returns a
+        # transcript and the synthesizer writes the report. The product
+        # default lets the investigator write the report itself, which these
+        # fakes do not model.
+        investigator_emits_report=False,
     )
 
 
@@ -138,6 +144,13 @@ def _make_ctx(scenario: GoldenScenario) -> InvestigationContext:
         settings=settings,
         auth=AsyncMock(),
         elastic=elastic,
+        # A blocklist with a source loaded and no entries in it. The default is
+        # an EMPTY BlocklistDB, which now means "no feed answered, so no
+        # reputation was checked" — a state the external-reputation templates
+        # deliberately stand down in. Every golden scenario pins what the
+        # deterministic layers do when enrichment WORKED and found nothing, so
+        # the fixture has to say that rather than leave it to a default.
+        blocklist=BlocklistDB(loaded_sources=["fixture"]),
     )
 
 

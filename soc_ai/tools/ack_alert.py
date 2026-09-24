@@ -10,9 +10,9 @@ Body shape (matches the SO web UI's hunt route, ``soc_id`` shortcut):
 
     POST /api/events/ack
     {
-        "searchFilter":    "tags:alert",
+        "searchFilter":    "*",
         "eventFilter":     {"soc_id": "<es-_id>"},
-        "dateRange":       "<wide range, see _wide_date_range>",
+        "dateRange":       "<wide range, see _so_api.wide_date_range>",
         "dateRangeFormat": "YYYY/MM/DD h:mm:ss a",
         "timezone":        "America/New_York",
         "escalate":        false,
@@ -29,7 +29,6 @@ path.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -38,6 +37,7 @@ from soc_ai.config import Settings
 from soc_ai.errors import SoApiError
 from soc_ai.so_client.auth import SoAuthClient
 from soc_ai.tools._registry import tool
+from soc_ai.tools._so_api import DATE_RANGE_FORMAT, DEFAULT_TIMEZONE, wide_date_range
 
 # ES-style document ids are URL-safe alphanumeric tokens, typically 20-char
 # base58 strings or sequential ``alert-NNN`` slugs. Whitespace, braces,
@@ -47,24 +47,29 @@ from soc_ai.tools._registry import tool
 # message shape).
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
-# SO web UI's default i18n.timePickerSample (en-us). The server uses Go's
-# `time.Parse` so the FORMAT itself is the canonical Go reference time
-# (2006-01-02T15:04:05) projected through the chosen layout. Sending a
-# moment.js-style string here returns 400 "could not be processed".
-_DATE_RANGE_FORMAT = "2006/01/02 3:04:05 PM"
-
-
-def _wide_date_range(now: datetime | None = None) -> str:
-    """Build a 365-day-wide date range string in SO's expected format.
-
-    SO's events-ack endpoint takes a date range string the operator's web
-    UI builds from a date picker. We don't have a picker; pick a range
-    wide enough to cover any alert the agent might be triaging.
-    """
-    now = now or datetime.now(UTC)
-    start = now - timedelta(days=365)
-    fmt = "%Y/%m/%d %I:%M:%S %p"
-    return f"{start.strftime(fmt)} - {now.strftime(fmt)}"
+# Scope filter for the ack. Security Onion ANDs this with the ``eventFilter``
+# pin, so anything narrower than "everything" silently excludes alerts that do
+# not match it. This used to be the literal ``tags:alert``, which held only
+# while every alert soc-ai could show carried Security Onion's own tag. Elastic
+# Defend endpoint alerts do not: Elastic's package pipeline writes them, they
+# never reach the tag-deriving pipeline, and they carry ``event.kind:alert``
+# instead.
+#
+# Measured on a live SO 3.x grid on 2026-09-05, one variable changed per probe,
+# same session and same auth:
+#   tags:alert + soc_id=<sigma alert, tagged>    -> 200, updatedCount 1
+#   tags:alert + soc_id=<Defend endpoint alert>  -> 400, still unacknowledged
+#   *          + soc_id=<Defend endpoint alert>  -> 200, updatedCount 1
+# The last probe ran over a window holding roughly fifteen documents and still
+# updated exactly one, which is the evidence that the pin, not the scope, is
+# what narrows the write.
+#
+# Deliberately NOT derived from ``webui_alerts_query``: the feed unions that
+# setting with other sources, so a feed-visible alert can miss it, and a grid
+# whose operator narrowed the setting would get a narrowed ack scope with it.
+# Leaning on the pin is safe because ``_EVENT_ID_RE`` rejects an empty or
+# malformed id before any HTTP call, so an ack can never go out unpinned.
+_ACK_SCOPE_FILTER = "*"
 
 
 @tool(read_only=False, description="Acknowledge a SOC alert. Optional comment.")
@@ -90,12 +95,12 @@ async def ack_alert(
             f"invalid alert_id {alert_id!r}: expected an ES-style id matching "
             r"[A-Za-z0-9_-]{8,128}"
         )
-    timezone = settings.so_timezone if settings is not None else "America/New_York"
+    timezone = settings.so_timezone if settings is not None else DEFAULT_TIMEZONE
     body: dict[str, Any] = {
-        "searchFilter": "tags:alert",
+        "searchFilter": _ACK_SCOPE_FILTER,
         "eventFilter": {"soc_id": alert_id},
-        "dateRange": _wide_date_range(),
-        "dateRangeFormat": _DATE_RANGE_FORMAT,
+        "dateRange": wide_date_range(),
+        "dateRangeFormat": DATE_RANGE_FORMAT,
         "timezone": timezone,
         "escalate": False,
         "acknowledge": True,

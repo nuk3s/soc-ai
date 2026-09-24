@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from soc_ai.eval.synth_loader import load_all_scenarios
+from soc_ai.eval.synth_loader import load_all_scenarios, triage_scenarios
 
 SCENARIOS_DIR = Path(__file__).parent.parent / "soc_ai" / "eval" / "synth_scenarios"
 
@@ -41,7 +41,9 @@ def test_wilson_ci_half_passing_centers_at_half() -> None:
 def test_score_all_correct_yields_recall_one() -> None:
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     rows = [
         SynthRow(
             scenario_id=s.id,
@@ -68,7 +70,9 @@ def test_score_all_correct_yields_recall_one() -> None:
 def test_score_all_missed_yields_recall_zero() -> None:
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     rows = [
         SynthRow(
             scenario_id=s.id,
@@ -90,7 +94,9 @@ def test_score_low_confidence_below_floor_fails_verdict_match() -> None:
     """Right verdict label but confidence below the rubric floor = miss."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     e1 = next(s for s in scenarios if s.id == "e1-emotet-feodo-c2")
     # e1 wants confidence_min=0.75.
     rows = [
@@ -203,7 +209,9 @@ def test_present_required_citation_kind_does_not_add_miss_reason() -> None:
 def test_score_returns_per_scenario_detail() -> None:
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     e1 = next(s for s in scenarios if s.id == "e1-emotet-feodo-c2")
     e2 = next(s for s in scenarios if s.id == "e2-urlhaus-pe-delivery")
 
@@ -293,7 +301,9 @@ def test_score_to_dict_round_trips_with_floats() -> None:
     """The aggregate is JSON-serializable for report.py to merge in."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     rows = [
         SynthRow(
             scenario_id=s.id,
@@ -419,7 +429,9 @@ def test_benign_scenarios_load_and_are_false_positive() -> None:
     """The b* benign scenarios parse via the real loader and carry
     ground_truth.verdict == 'false_positive' (the negative class that makes
     escalation precision meaningful)."""
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     benign = [s for s in scenarios if s.ground_truth.verdict == "false_positive"]
     benign_ids = sorted(s.id for s in benign)
     assert benign_ids == [
@@ -452,7 +464,9 @@ def test_benign_not_escalated_scores_as_true_negative() -> None:
     false negative (recall unaffected)."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     e1 = next(s for s in scenarios if s.id == "e1-emotet-feodo-c2")
     b1 = next(s for s in scenarios if s.id == "b1-cdn-update-beacon")
 
@@ -489,7 +503,9 @@ def test_benign_wrongly_escalated_scores_as_false_positive_and_drops_precision()
     false positive: precision drops, recall is unaffected."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     e1 = next(s for s in scenarios if s.id == "e1-emotet-feodo-c2")
     b1 = next(s for s in scenarios if s.id == "b1-cdn-update-beacon")
 
@@ -528,7 +544,9 @@ def test_benign_escalation_at_low_confidence_still_counts_as_false_positive() ->
     whether the confidence cleared the benign scenario's floor."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     b2 = next(s for s in scenarios if s.id == "b2-authorized-vuln-scanner")
 
     rows = [
@@ -555,7 +573,9 @@ def test_benign_scenario_with_no_row_is_not_counted_as_fn() -> None:
     silently turned into a false negative (it isn't a positive-class miss)."""
     from soc_ai.eval.synth_score import score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     b3 = next(s for s in scenarios if s.id == "b3-rmm-admin-lateral")
 
     # No rows at all — b3 attempted but produced nothing.
@@ -573,7 +593,9 @@ def test_score_per_tier_breakdown() -> None:
     """Per-tier breakdown lets the operator see whether Hard tier is the gap."""
     from soc_ai.eval.synth_score import SynthRow, score_synth_stratum
 
-    scenarios = load_all_scenarios(SCENARIOS_DIR)
+    # Scoped: a no-alert scenario is never triaged, so pooling it here would
+    # depress recall with a case the harness cannot score.
+    scenarios = triage_scenarios(load_all_scenarios(SCENARIOS_DIR))
     rows = []
     # Easy + Medium correct; Hard all wrong (3 false negatives).
     for s in scenarios:

@@ -6,11 +6,12 @@ import asyncio
 import logging
 import re
 from collections import Counter
+from typing import Literal
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.webui._shared import (
@@ -21,7 +22,7 @@ from soc_ai.api.webui._shared import (
     _verdict,
     router,
 )
-from soc_ai.config import Settings
+from soc_ai.config import DEFAULT_ALERT_LABELS, DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 from soc_ai.store import assignments as assign_svc
@@ -169,7 +170,9 @@ class AlertEventOut(BaseModel):
     # endpoints, and a host detection has none. None for flow-shaped alerts.
     hostIp: str | None = None
     proto: str = ""
-    sev: str = "low"  # normalized severity label
+    # Normalized severity label. The default is the honest one: a caller that
+    # sets no severity has not told us it is low.
+    sev: str = "unknown"
     port: int | None = None  # destination port
     ts: str = ""  # raw ISO @timestamp (for sorting / tooltip)
     ago: str = ""  # short relative label ("3m")
@@ -226,9 +229,15 @@ class AlertGroupOut(BaseModel):
     # True when the rule's latest investigation is still running — the badge
     # will show "Triaging…" instead of "untriaged".
     triaging: bool = False
-    # Count of acknowledged / escalated events in this group (from ES aggs).
-    ackedCount: int = 0
-    escalatedCount: int = 0
+    # Count of acknowledged / escalated events in this group (from ES aggs), or
+    # null where the grid cannot answer: Elastic Defend's endpoint alert index
+    # does not map either flag, so its filter aggregation returns 0 for a group
+    # that has been fully cleared exactly as it does for one nobody has touched
+    # (soc_ai.webui.alerts_query.ACK_BLIND_DATASETS). A 0 there is a claim we
+    # cannot support, so the row sends nothing and the chip says "unknown"
+    # instead of drawing a green check that is never right.
+    ackedCount: int | None = 0
+    escalatedCount: int | None = 0
     # True when an operator has muted this rule (detection tuning). Muted groups
     # are EXCLUDED from the default feed; they appear (flagged) only with
     # ?include_muted=true.
@@ -306,7 +315,36 @@ def _inherited_reason(inv: Investigation) -> str:
     )
 
 
-@router.get("/alerts", response_model=list[AlertGroupOut])
+class AlertQueueOut(BaseModel):
+    """The grouped queue, and whether the rows are the whole queue.
+
+    An envelope rather than the bare list this route used to return, for one
+    reason: the grid caps every terms aggregation at
+    :data:`soc_ai.webui.alerts_query.MAX_GROUPS`, and the console rendered
+    "N detections · M events in window" off the rows it got. Past the cap both
+    numbers are floors, and a floor rendered as a total is the one kind of
+    under-report an analyst will act on wrongly — the queue looks smaller and
+    calmer than it is. A bare list has nowhere to put a fact about the list.
+
+    ``truncated`` is the query layer's, set by whichever cut fired. It is never
+    re-derived here from ``len(groups)`` against the cap: an exactly-full page
+    is not a cut one, and muting hides rows AFTER the cap is applied, so the
+    length on the wire is not the length that was cut.
+    """
+
+    groups: list[AlertGroupOut]
+    # Set when the grid could not return every distinct group, or when the
+    # merge of the two source aggregations had to be re-cut. Either way the
+    # rows are a floor.
+    truncated: bool = False
+    # Documents in groups the grid never returned, from the aggregation's own
+    # ``sum_other_doc_count``. Zero alongside ``truncated`` is a real state:
+    # the merge re-cut drops rows that WERE returned, whose documents are
+    # already counted in the queue's totals.
+    other_docs: int = 0
+
+
+@router.get("/alerts", response_model=AlertQueueOut)
 async def list_alerts(
     request: Request,
     range_: str = Query("24h", alias="range"),
@@ -319,7 +357,7 @@ async def list_alerts(
     include_muted: bool = Query(False),
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
-) -> list[AlertGroupOut]:
+) -> AlertQueueOut:
     """Grouped-by-detection rows for the Alerts console (events loaded lazily).
 
     Rules an operator has muted (detection tuning) are EXCLUDED from the default
@@ -327,7 +365,7 @@ async def list_alerts(
     """
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
-            groups, _total = await aq.fetch_groups(
+            page = await aq.fetch_groups(
                 elastic,
                 settings,
                 time_range=range_,
@@ -351,6 +389,7 @@ async def list_alerts(
         # An ES ApiError (e.g. BadRequestError) is NOT a TransportError — map it
         # here so a bad query is a 400, not an unhandled 500.
         raise _es_api_error_http(exc) from exc
+    groups = page.groups
 
     # Verdict badge per rule = the rule's STANDING verdict (its latest COMPLETE,
     # verdict-bearing investigation). A later interrupted run (error/cancelled/
@@ -452,7 +491,158 @@ async def list_alerts(
                 lastAttempt=last_attempt,
             )
         )
-    return out
+    return AlertQueueOut(groups=out, truncated=page.truncated, other_docs=page.other_docs)
+
+
+class AlertsEmptyReasonOut(BaseModel):
+    """Why the alerts feed is showing nothing, in the house ``{reason, hint}`` shape.
+
+    An empty queue has two causes that look identical on screen: the grid is
+    quiet, or the configured filter does not match how this grid labels an
+    alert. The second one measured 2 documents against 25 on a live grid, hid
+    22 unreviewed endpoint alerts, and read to the analyst as a calm night.
+
+    ``reason`` is the machine half:
+
+    * ``not_empty``       the feed is not empty; there is nothing to explain.
+    * ``quiet``           no alert label matches anything in this window.
+    * ``filter_mismatch`` the configured filter matched nothing and another
+      label did. The hint names which, how many, and one exact filter to set:
+      the configured filter widened with that label, never the label on its
+      own, since a grid can label its highest-value alerts one way and
+      everything else another. Most matches wins, and a tie goes to a label
+      the shipped default already unions.
+    * ``bad_filter``      the configured filter is not valid OQL, so the feed
+      is empty on every request whatever the grid holds. Nothing to widen and
+      no counts to compare, so the hint names the shipped default.
+    * ``unknown``         the counts could not be read. Never ``quiet``: an
+      unreadable grid answered as a calm one is the failure this endpoint
+      exists to end, and a half-read index undercounts every label at once,
+      which can manufacture a perfect-looking mismatch out of nothing.
+
+    ``extra="forbid"`` so a refactor cannot quietly widen this past the two
+    fields (the ``PreflightSummaryOut`` precedent): per-label counts and the
+    operator's filter text stay on the admin doctor read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Literal["not_empty", "quiet", "filter_mismatch", "bad_filter", "unknown"]
+    hint: str
+
+
+_QUIET_HINT = (
+    "No alert label matches anything in this window. The grid is quiet, not misconfigured."
+)
+
+
+@router.get("/alerts/empty-reason", response_model=AlertsEmptyReasonOut)
+async def alerts_empty_reason(
+    range_: str = Query("24h", alias="range"),
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> AlertsEmptyReasonOut:
+    """Tell a quiet grid apart from a filter that matched nothing.
+
+    A SEPARATE request on purpose. Folding these counts into ``list_alerts``
+    would put four extra searches on a screen that polls every ten seconds, for
+    the case that is normal on a calm grid; the console calls this only when
+    the list came back empty. It is still cheaper than the thing it explains:
+    four ``size=0`` counts in one round trip, against the list route's two
+    aggregations with ``top_hits``.
+
+    Always answers 200. This is advice about an empty screen, and an advisory
+    that can itself fail with an error card leaves the analyst worse off than
+    the silence it replaced; every failure lands in ``unknown`` with the hint
+    the list route's 503 would have carried. The one exception is a malformed
+    absolute window, which is the caller's bug and 400s exactly as the list
+    route 400s it.
+    """
+    # Tell the two OQL failures apart before they blur into one hint: parse the
+    # configured filter on its own first, so a rejection there is unambiguously
+    # the filter. Anything the counting call then rejects is the caller's
+    # window, and a bad window is a 400, not an explanation of an empty feed.
+    try:
+        aq.build_filter(
+            settings,
+            time_range=range_,
+            severity=None,
+            oql=None,
+            dataset_oqls=[settings.webui_alerts_query],
+        )
+    except OqlValidationError as exc:
+        return AlertsEmptyReasonOut(
+            reason="bad_filter",
+            hint=(
+                f"WEBUI_ALERTS_QUERY is not valid OQL ({exc}), so the alerts feed is "
+                f"empty whatever the grid holds. Set it to {DEFAULT_ALERTS_QUERY} in "
+                "Config → Queries, or run `soc-ai doctor` for the count under every "
+                "label on your grid."
+            ),
+        )
+
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            counts = await aq.count_alert_labels(
+                elastic,
+                settings,
+                time_range=range_,
+                abs_from=from_,
+                abs_to=to,
+                time_zone=settings.so_timezone,
+            )
+    except OqlValidationError as exc:
+        raise HTTPException(
+            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
+        ) from exc
+    except (TimeoutError, TransportError) as exc:
+        return AlertsEmptyReasonOut(reason="unknown", hint=_grid_unavailable(exc)["hint"])
+    except ApiError as exc:
+        # _es_api_error_http owns the 400-vs-503 split (429 and 408 are the grid
+        # struggling, not a bad query). Read the class off the status it chose
+        # rather than its body, whose declared type is a plain string.
+        query_side = _es_api_error_http(exc).status_code == 400
+        return AlertsEmptyReasonOut(
+            reason="unknown",
+            hint=(
+                "Elasticsearch rejected the count. Check EVENTS_INDEX_PATTERN and the time range."
+                if query_side
+                else _GRID_UNAVAILABLE["hint"]
+            ),
+        )
+
+    configured, configured_row = next(iter(counts.items()))
+    if configured_row.total > 0:
+        return AlertsEmptyReasonOut(reason="not_empty", hint="")
+    # Most matches wins; a tie goes to a label the shipped default already
+    # unions. Before that second key, ties went to whichever label
+    # ALERT_LABEL_CANDIDATES happened to list first, an order written for the
+    # doctor's output and not for a recommendation — and it named ``tags:alerts``
+    # over ``event.kind:alert``, a label this project has measured but cannot
+    # explain and which the product does not ship, over one it does.
+    #
+    # ``default`` covers the state where the configured filter IS every known
+    # label: nothing to compare against, so a zero best reads as quiet rather
+    # than 500ing the one route an empty screen has left to ask.
+    better, better_count = max(
+        ((label, c.total) for label, c in counts.items() if label != configured),
+        key=lambda pair: (pair[1], pair[0] in DEFAULT_ALERT_LABELS),
+        default=("", 0),
+    )
+    if better_count == 0:
+        return AlertsEmptyReasonOut(reason="quiet", hint=_QUIET_HINT)
+    return AlertsEmptyReasonOut(
+        reason="filter_mismatch",
+        hint=(
+            f"The alerts feed matched nothing in this window, but {better} matches "
+            f"{better_count} that the feed cannot see. The queue is empty because of "
+            "the filter, not because the grid is quiet. Set WEBUI_ALERTS_QUERY="
+            f"{aq.widen_alert_filter(configured, better)} in Config → Queries, or run "
+            "`soc-ai doctor` for the count under every label."
+        ),
+    )
 
 
 @router.get("/alerts/events", response_model=list[AlertEventOut])
@@ -507,17 +697,14 @@ async def list_group_events(
     async with request.app.state.db_sessionmaker() as db:
         direct = await inv_svc.latest_for_alerts(db, [e.es_id for e in events])
         # A missing endpoint DEGRADES to "" rather than dropping the event from the
-        # pair tier — the same coalescing the sweep planner's clustering uses, and
-        # the shape the store's pair helpers already key on. Filtering to
-        # both-endpoints-present meant a host/process detection could never match
-        # its own cluster's verdict and fell through to the rule-level standing
-        # verdict, which on a rule that ALSO fires on flows credited the host
-        # detection to an unrelated flow.
-        pairs: list[tuple[str, str, str]] = [
-            (rule_name, e.src_ip or "", e.dst_ip or "") for e in events
-        ]
+        # pair tier — the same key the sweep planner's clustering builds, through
+        # the same constructor. Filtering to both-endpoints-present meant a
+        # host/process detection could never match its own cluster's verdict and
+        # fell through to the rule-level standing verdict, which on a rule that
+        # ALSO fires on flows credited the host detection to an unrelated flow.
+        keys = [inv_svc.pair_key(rule_name, e.src_ip, e.dst_ip, e.subject_host) for e in events]
         pair_map = await inv_svc.latest_for_pairs(
-            db, pairs, window_days=settings.webui_inherit_window_days
+            db, keys, window_days=settings.webui_inherit_window_days
         )
         # Rule-level fallback uses the rule's STANDING verdict (latest complete,
         # verdict-bearing) — same source as the group badge — so every event in a
@@ -547,7 +734,7 @@ async def list_group_events(
             ago=_ago(e.timestamp),
         )
         direct_inv = direct.get(e.es_id)
-        pair_inv = pair_map.get((rule_name, e.src_ip or "", e.dst_ip or ""))
+        pair_inv = pair_map.get(inv_svc.pair_key(rule_name, e.src_ip, e.dst_ip, e.subject_host))
         # A DIRECT run of this exact alert only "owns" it (investigated, NOT
         # inherited) when it is complete (a landed verdict) or still running (an
         # in-flight re-run). An error/cancelled direct run produced no verdict, so

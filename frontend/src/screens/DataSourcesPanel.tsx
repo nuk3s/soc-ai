@@ -8,7 +8,7 @@ function freshness(iso: string | null): string {
   const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
   if (days <= 0) return 'today';
   if (days === 1) return 'yesterday';
-  return `${days}d ago`;
+  return `${days} d ago`;
 }
 
 function status(s: DataSource): { color: string; label: string } {
@@ -41,10 +41,9 @@ export function DataSourcesPanel({
       {!collapsed && (
       <>
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-        What the agent draws on for enrichment — local-mirror feeds (zero-egress, refreshed
-        out-of-band) and opt-in online lookups. Provider API keys are set live in the API keys
-        panel below (encrypted at rest, never shown again); the master switch for online lookups
-        is under "Online enrichment".
+        The agent draws on two types of source for enrichment. A local feed sends nothing out of
+        this network. An online lookup is opt-in. Set the provider API keys in the API keys panel
+        below. The master switch for online lookups is under "Online enrichment".
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         <div className="grid grid-cols-[1fr_120px_90px_80px_100px] gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
@@ -76,7 +75,7 @@ export function DataSourcesPanel({
                 <div className="text-[11.5px] text-dim">
                   {s.category}
                   <div className="text-[10px] text-faint">
-                    {s.egress === 'none' ? 'zero-egress' : 'reaches out'}
+                    {s.egress === 'none' ? 'zero-egress' : 'sends data out'}
                   </div>
                 </div>
                 <div className="font-mono text-[11.5px] text-dim">

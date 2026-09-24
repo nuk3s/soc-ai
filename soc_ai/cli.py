@@ -7,7 +7,8 @@ The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
   instance, rendering each SSE event to stdout with colorized output. Useful
   for terminal-first analysts and incident-response work where opening a
   browser is overhead.
-- ``healthz``: prints the health endpoint's JSON.
+- ``healthz``: prints the LIVENESS endpoint's JSON. It probes no dependency —
+  ``doctor`` below is the check that answers whether the install works.
 - ``doctor``: checks the whole dependency surface (config, local store +
   migration head, DNS/TCP/TLS-layered upstream reachability, Security Onion,
   Elasticsearch — including the audit write grant and index-pattern dataset
@@ -332,9 +333,10 @@ def _warn_insecure_auth(token: str | None, verify: bool | str) -> None:
     """
     if token and verify is False:
         print(
-            f"{_C['yellow']}WARNING{_C['reset']}: sending a Bearer token with TLS "
-            "certificate verification disabled (the default) — an on-path attacker "
-            "could capture it. Pass --verify or --cafile to verify the server's cert.",
+            f"{_C['yellow']}WARNING{_C['reset']}: soc-ai sends a Bearer token with "
+            "TLS certificate verification disabled. This is the default. An on-path "
+            "attacker could capture the token. Pass --verify or --cafile to verify "
+            "the server's certificate.",
             file=sys.stderr,
         )
 
@@ -355,8 +357,8 @@ def _print_401_hint_if_no_token(status_code: int, token: str | None) -> None:
     if status_code == 401 and not token:
         print(
             f"{_C['yellow']}hint{_C['reset']}: this deployment requires authentication. "
-            "Set SOC_AI_API_TOKEN or pass --token scai_...; mint one in the web UI "
-            "under Config → API tokens.",
+            "Set SOC_AI_API_TOKEN, or pass --token scai_... . Mint a token in the web "
+            "UI under Config → API tokens.",
             file=sys.stderr,
         )
 
@@ -405,12 +407,18 @@ def _doctor(args: argparse.Namespace) -> int:
 
     Exit codes:
       0   every required check passed (WARN/INFO lines don't fail the doctor)
-      1   at least one required check FAILed
+      1   at least one required check FAILed, or --strict and something WARNed
+
+    The default stays lenient on purpose. A monitor keyed on this exit status has
+    read 0-with-warnings as success for the life of the tool, and silently
+    starting to page it would be a worse defect than the one it fixes — but a
+    WARN nobody's automation can see is how the band becomes decorative, so
+    --strict makes the other answer available without changing anyone's.
     """
     from soc_ai.doctor import CheckResult, exit_code, run_doctor  # noqa: PLC0415 - lazy
 
     results = asyncio.run(run_doctor())
-    rc = exit_code(results)
+    rc = exit_code(results, strict=bool(getattr(args, "strict", False)))
 
     if args.json:
         print(
@@ -546,6 +554,25 @@ def _validate_batch(args: argparse.Namespace) -> int:
         try:
             catalogue = load_all_scenarios(scenarios_dir)
             picked = select_scenarios(catalogue, selector=args.synth_set)
+            # `select_scenarios` already excludes the declarative population
+            # from the tier and `all` selectors, but an EXPLICIT id still
+            # resolves either — deliberately, since an explicit request is
+            # explicit. This is the triage harness though, and a scenario with
+            # no alert has nothing for it to sample: it would plant its
+            # documents and then raise from the ingester, leaving litter behind
+            # and reporting nothing useful. Reject before any side effect.
+            not_triageable = [s.id for s in picked if s.spec_journey is not None]
+            if not_triageable:
+                print(
+                    f"{_C['red']}--synth-set names scenarios that cannot be "
+                    f"triaged{_C['reset']}: {', '.join(not_triageable)}\n"
+                    "  These declare a spec_journey and belong to the declarative "
+                    "population. They carry no alert by design.\n"
+                    "  Score them with `soc-ai spec-run` or the spec_journey "
+                    "coverage gate.",
+                    file=sys.stderr,
+                )
+                return 5
             synth_scenarios = tuple(picked)
         except Exception as e:
             print(
@@ -639,6 +666,7 @@ async def _fire_quality_alarm(
     mode: str,
     reasons: list[str],
     metrics: Any,
+    audit: Any = None,
 ) -> None:
     """Best-effort alarm side effects for a nightly quality regression.
 
@@ -648,13 +676,21 @@ async def _fire_quality_alarm(
     notifications are enabled + configured — the nightly must never grow an
     egress path the operator didn't turn on). The committed snapshot row is
     the durable record; neither channel failing can lose the alarm itself.
+
+    ``audit`` is the caller's logger. The in-app nightly passes the server's
+    own, because a second :class:`~soc_ai.audit.logger.AuditLogger` in one
+    process is a second chain head with its own lock, and the two heads then
+    hand the same position to two records. That is now caught by the grid
+    rather than written (see :mod:`soc_ai.audit.logger`), but caught means a
+    conflict and a retry inside the write budget — cheaper not to create the
+    collision. The CLI has no server logger to borrow and builds one.
     """
     from soc_ai import notify  # noqa: PLC0415 - lazy
     from soc_ai.audit.logger import AuditLogger  # noqa: PLC0415 - lazy
 
-    audit = None
     try:
-        audit = AuditLogger(settings, elastic)
+        if audit is None:
+            audit = AuditLogger(settings, elastic)
         await audit.log_kind(
             session_id="quality-nightly",
             kind="quality_regression",
@@ -778,7 +814,7 @@ def _eval_nightly(args: argparse.Namespace) -> int:
         # The nightly only trends if something schedules it — hand the operator
         # the exact host-cron line (docs/DOCKER.md carries the same one).
         print(
-            f"\n{_C['dim']}schedule it (host cron — see docs/DOCKER.md):{_C['reset']}\n"
+            f"\n{_C['dim']}schedule it with host cron. See docs/DOCKER.md.{_C['reset']}\n"
             "  17 2 * * *  root  docker compose -f /opt/soc-ai/docker-compose.yml "
             "exec -T soc-ai python -m soc_ai eval-nightly",
             file=sys.stderr,
@@ -822,8 +858,8 @@ def _auto_aggregate_after_batch(args: argparse.Namespace) -> None:
         _eval_report(forwarded)
     except Exception as e:
         print(
-            f"{_C['yellow']}eval-report failed (batch is intact, run "
-            f"`soc-ai eval-report {target}` manually): "
+            f"{_C['yellow']}eval-report failed. The batch is intact. Run "
+            f"`soc-ai eval-report {target}` by hand. "
             f"{type(e).__name__}: {e}{_C['reset']}",
             file=sys.stderr,
         )
@@ -884,8 +920,8 @@ def _eval_report(args: argparse.Namespace) -> int:
     meta_md = batch_dir / "meta_analysis.md"
     if meta_md.exists() and not args.rerun_meta:
         print(
-            f"{_C['dim']}meta-analysis already exists at {meta_md}; "
-            f"pass --rerun-meta to regenerate{_C['reset']}",
+            f"{_C['dim']}meta-analysis already exists at {meta_md}. "
+            f"Pass --rerun-meta to build it again.{_C['reset']}",
             file=sys.stderr,
         )
         return 0
@@ -919,7 +955,7 @@ def _eval_report(args: argparse.Namespace) -> int:
         return 0
     except Exception as e:
         print(
-            f"{_C['yellow']}meta-analysis failed (aggregates intact): "
+            f"{_C['yellow']}meta-analysis failed. The aggregates are intact. "
             f"{type(e).__name__}: {e}{_C['reset']}",
             file=sys.stderr,
         )
@@ -1023,8 +1059,8 @@ def _eval_journey(args: argparse.Namespace) -> int:
         return EXIT_NO_JOURNEY
     if scenario.hunt_journey is None:
         print(
-            f"{_C['red']}scenario {scenario.id!r} declares no hunt_journey{_C['reset']} — "
-            f"nothing to run. Scenarios with one: {with_journeys}",
+            f"{_C['red']}scenario {scenario.id!r} declares no hunt_journey{_C['reset']}. "
+            f"Nothing can run. Scenarios with one: {with_journeys}",
             file=sys.stderr,
         )
         return EXIT_NO_JOURNEY
@@ -1033,7 +1069,7 @@ def _eval_journey(args: argparse.Namespace) -> int:
         print(f"{_C['dim']}{line}{_C['reset']}", file=sys.stderr, flush=True)
 
     _emit(
-        "eval-journey never cleans the grid — bracket it with `soc-ai synth-clean` before and after"
+        "eval-journey never cleans the grid. Bracket it with `soc-ai synth-clean` before and after."
     )
 
     async def _go() -> Any:
@@ -1091,10 +1127,10 @@ def _register_eval_journey(sub: Any) -> None:
     """Register the ``eval-journey`` subparser (split out of :func:`main` for size)."""
     p_ej = sub.add_parser(
         "eval-journey",
-        help="Run ONE synth scenario's hunt journey (ingest → hunt → promote → "
-        "verdict) against the live grid and score it stage by stage; exit 0 only "
-        "when the journey reaches COMPLETE. Bracket it with `soc-ai synth-clean` "
-        "before and after — this command never wipes the grid itself",
+        help="Run ONE synth scenario's hunt journey against the live grid and "
+        "score it stage by stage. The journey is ingest, hunt, promote, verdict. "
+        "Exit 0 only when the journey reaches COMPLETE. Bracket it with "
+        "`soc-ai synth-clean` before and after. This command never wipes the grid",
     )
     p_ej.add_argument(
         "scenario_id",
@@ -1127,8 +1163,8 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
     settings = get_settings()
     if not settings.discovery_enabled:
         print(
-            f"{_C['dim']}internal-identifier discovery is disabled "
-            f"(set DISCOVERY_ENABLED=true to enable){_C['reset']}"
+            f"{_C['dim']}internal-identifier discovery is off. Set "
+            f"DISCOVERY_ENABLED=true to turn it on.{_C['reset']}"
         )
         return 0
 
@@ -1161,7 +1197,7 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
         print(
             f"  cidrs:    {summary.cidrs_found} found "
             f"({summary.cidrs_suggested} suggested, "
-            f"{_C['dim']}always muted — un-mute to apply{_C['reset']})"
+            f"{_C['dim']}always muted, un-mute to apply{_C['reset']})"
         )
         if summary.errors:
             n_err = len(summary.errors)
@@ -1216,7 +1252,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
     Exit codes:
       0   every epoch intact (including an empty index — nothing to tamper
           with), whether that is one epoch or many
-      1   TAMPER DETECTED — at least one epoch broke
+      1   the chain does not verify — at least one epoch broke. The headline
+          distinguishes the two reasons: TAMPER DETECTED when a record no
+          longer matches its own hash, CHAIN BROKEN when every copy still
+          hashes true and the damage is duplicated or absent positions (two
+          writers, not an intruder). Both exit 1.
       2   could not run (ES unreachable / settings didn't load)
     """
     from soc_ai.audit.verify import (  # noqa: PLC0415 - lazy
@@ -1261,9 +1301,9 @@ def _audit_verify(args: argparse.Namespace) -> int:
     scope = f" (last {days}d window)" if days is not None else ""
     if result.capped:
         print(
-            f"{_C['yellow']}warning: scan hit the record cap — only a prefix of the "
-            f"chain was verified; bound the scan with --days to check a smaller "
-            f"window{_C['reset']}",
+            f"{_C['yellow']}warning: the scan hit the record cap. It verified only "
+            f"a prefix of the chain. Bound the scan with --days to check a smaller "
+            f"window.{_C['reset']}",
             file=sys.stderr,
         )
 
@@ -1275,14 +1315,15 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # seq resets to 0 at every genesis.
         if result.epochs_broken == 1:
             tally = (
-                f"1 of {result.epochs} epochs broken — break at seq "
-                f"{result.first_broken_seq} (epoch {result.first_broken_epoch_start})"
+                f"1 of {result.epochs} epochs broken. The break is at seq "
+                f"{result.first_broken_seq} in epoch {result.first_broken_epoch_start}"
             )
         else:
             tally = (
-                f"{result.epochs_broken} of {result.epochs} epochs broken — oldest "
-                f"break seq {result.first_broken_seq} (epoch {result.first_broken_epoch_start}), "
-                f"newest broken epoch {result.newest_broken_epoch_start}"
+                f"{result.epochs_broken} of {result.epochs} epochs broken. The oldest "
+                f"break is at seq {result.first_broken_seq} in epoch "
+                f"{result.first_broken_epoch_start}. The newest broken epoch is "
+                f"{result.newest_broken_epoch_start}"
             )
         # A capped scan cannot vouch for anything beyond its own prefix — the
         # cap always truncates the NEWEST end of the chain (the fetch is
@@ -1296,20 +1337,57 @@ def _audit_verify(args: argparse.Namespace) -> int:
             trailing = " The latest epoch is broken."
         else:
             trailing = f" Every epoch after {result.newest_broken_epoch_start} verified intact."
+        # The headline has to match the evidence underneath it. This printed
+        # "TAMPER DETECTED" unconditionally, and the very next line said "the
+        # records were not altered; two writers continued the chain from the
+        # same point" — a headline contradicted by its own body, on a finding
+        # that is soc-ai's own concurrency and not an intruder.
+        #
+        # `altered_records` is the discriminator and it is exact: a record that
+        # no longer matches its own hash is someone changing the record of a
+        # decision. A position claimed twice, with every copy still hashing
+        # true, is two writers. Both mean the chain does not verify, so both
+        # still exit 1 and both still print red — what changes is which of the
+        # two an operator is being told to go and look for.
+        headline = "TAMPER DETECTED" if result.altered_records else "CHAIN BROKEN"
         print(
-            f"{_C['red']}{_C['bold']}TAMPER DETECTED{_C['reset']}{_C['red']} — "
+            f"{_C['red']}{_C['bold']}{headline}{_C['reset']}{_C['red']}: "
             f"{tally}.{trailing}{_C['reset']}{scope}",
             file=sys.stderr,
         )
+        # WHAT broke, not just that something did. A position claimed twice by
+        # two writers and a record whose content was edited after the fact are
+        # different events with different responses, and one sentence covering
+        # both ("a record was edited, reordered, inserted, or deleted") left an
+        # operator unable to tell a known concurrency defect from an intrusion.
+        detail = result.newest_break_detail or result.first_break_detail
         print(
-            f"{_C['dim']}{result.records_verified} record(s) scanned. A record was "
-            f"edited, reordered, inserted, or deleted.{_C['reset']}",
+            f"{_C['dim']}{result.records_verified} record(s) scanned. "
+            f"{detail or 'A record was edited, reordered, inserted, or deleted.'}"
+            f"{_C['reset']}",
             file=sys.stderr,
         )
+        # How widespread, in the same words the scheduled alarm and the webhook
+        # use. Naming one sequence number leaves a single collision and a
+        # forked afternoon reading identically.
+        from soc_ai.audit.verify import describe_blast_radius  # noqa: PLC0415
+
+        blast_radius = describe_blast_radius(result)
+        if blast_radius:
+            print(f"{_C['dim']}{blast_radius}{_C['reset']}", file=sys.stderr)
+        if result.newest_break_kind == "duplicate_seq":
+            print(
+                f"{_C['dim']}A duplicated position is the signature of two writers "
+                f"that append at once. An edit leaves a different signature. Compare "
+                f"the timestamps and sessions of the records at that sequence. "
+                f"Two different sessions minutes apart means concurrency. One record "
+                f"rewritten in place means an edit.{_C['reset']}",
+                file=sys.stderr,
+            )
         return 1
 
     if result.records_verified == 0:
-        print(f"{_C['green']}audit chain intact{_C['reset']} — 0 records{scope}")
+        print(f"{_C['green']}audit chain intact{_C['reset']}: 0 records{scope}")
         return 0
 
     # epochs > 1: every epoch checked out, but that is "no tamper found within
@@ -1319,16 +1397,16 @@ def _audit_verify(args: argparse.Namespace) -> int:
     # falls short of the full claim).
     if result.epochs > 1:
         print(
-            f"{_C['yellow']}chain intact within {result.epochs} epochs{_C['reset']} — "
-            f"{result.records_verified} records verified{scope}. Epoch boundaries "
-            f"are process restarts — a chain-head recovery bug fixed 2026-08-17 — "
-            f"and cross-epoch linkage is not provable."
+            f"{_C['yellow']}chain intact within {result.epochs} epochs{_C['reset']}: "
+            f"{result.records_verified} records verified{scope}. Epoch boundaries are "
+            f"process restarts. A chain-head recovery bug was fixed on 2026-08-17. "
+            f"Cross-epoch linkage is not provable."
         )
         return 0
 
     span = f"seq {result.first_seq}..{result.last_seq}"
     print(
-        f"{_C['green']}audit chain intact{_C['reset']} — "
+        f"{_C['green']}audit chain intact{_C['reset']}: "
         f"{result.records_verified} records verified ({span}){scope}"
     )
     return 0
@@ -1352,10 +1430,10 @@ def _register_audit(sub: Any) -> None:
         type=int,
         default=None,
         metavar="N",
-        help="Bound the scan to audit records from the last N days (by timestamp). "
-        "Default: the whole index. NOTE: a windowed scan verifies contiguity "
-        "WITHIN the window but cannot verify linkage across the window boundary "
-        "(the record before the window isn't fetched).",
+        help="Bound the scan to audit records from the last N days, by timestamp. "
+        "The default is the whole index. A windowed scan verifies contiguity "
+        "WITHIN the window. It cannot verify linkage across the window boundary, "
+        "because it does not fetch the record before the window.",
     )
     p_ver.set_defaults(func=_audit_verify)
     # `soc-ai audit` with no subcommand: print the group help instead of serving.
@@ -1416,9 +1494,10 @@ def _backup(args: argparse.Namespace) -> int:
     cache_dirs = _resolve_cache_dirs()
     if args.full and cache_dirs is None:
         print(
-            f"{_C['red']}--full needs the cache directories from settings{_C['reset']}, "
-            "which did not load. Run from a directory with a populated .env (or drop "
-            "--full — the caches are re-downloadable via `soc-ai blocklists refresh`).",
+            f"{_C['red']}--full needs the cache directories from settings{_C['reset']}. "
+            "The settings did not load. Run from a directory with a populated .env. "
+            "You can also drop --full. `soc-ai blocklists refresh` downloads the "
+            "caches again.",
             file=sys.stderr,
         )
         return 2
@@ -1431,7 +1510,7 @@ def _backup(args: argparse.Namespace) -> int:
         return 1
 
     m = result.manifest
-    head = m.alembic_head or "(fresh — no migrations applied)"
+    head = m.alembic_head or "(fresh, no migrations applied)"
     print(
         f"backed up {data_dir / 'soc-ai.db'} "
         f"({result.db_bytes / 1_048_576:.1f} MiB, migration head {head})"
@@ -1441,8 +1520,8 @@ def _backup(args: argparse.Namespace) -> int:
         print(f"  caches:   {', '.join(m.caches) or '(none found)'}")
     else:
         print(
-            f"  caches:   excluded {_C['dim']}(re-downloadable — `soc-ai blocklists "
-            f"refresh` re-seeds them; --full includes them){_C['reset']}"
+            f"  caches:   excluded {_C['dim']}(`soc-ai blocklists refresh` re-seeds "
+            f"them. --full includes them.){_C['reset']}"
         )
     print(f"{_C['bold']}archive: {result.archive}{_C['reset']}")
     return 0
@@ -1485,12 +1564,12 @@ def _restore(args: argparse.Namespace) -> int:
 
     for w in result.warnings:
         print(f"{_C['yellow']}warning: {w}{_C['reset']}", file=sys.stderr)
-    head = result.archive_head or "(fresh — no migrations applied)"
+    head = result.archive_head or "(fresh, no migrations applied)"
     print(f"restored store → {result.db_path} (migration head {head})")
     if result.archive_head and result.code_head and result.archive_head != result.code_head:
         print(
             f"  archive head {result.archive_head} is older than code head "
-            f"{result.code_head} — the app migrates it to head at next startup"
+            f"{result.code_head}. The app migrates it to head at the next startup."
         )
     print(f"  sidecars: {', '.join(result.sidecars) or '(none)'}")
     if result.caches:
@@ -1518,9 +1597,9 @@ def _register_backup(sub: Any) -> None:
     p_bak.add_argument(
         "--full",
         action="store_true",
-        help="Also include the enrichment caches (blocklists, MaxMind, cloud "
-        "prefixes). Excluded by default: they are re-downloadable via "
-        "`soc-ai blocklists refresh` and dwarf the DB",
+        help="Also include the enrichment caches: blocklists, MaxMind and cloud "
+        "prefixes. soc-ai excludes them by default. `soc-ai blocklists refresh` "
+        "downloads them again. They are much larger than the DB",
     )
     p_bak.add_argument(
         "--data-dir",
@@ -1532,17 +1611,17 @@ def _register_backup(sub: Any) -> None:
 
     p_res = sub.add_parser(
         "restore",
-        help="Restore a `soc-ai backup` archive into the data directory. Refuses "
-        "to overwrite an existing store (or restore under a live-looking app) "
-        "without --yes; refuses archives from a newer soc-ai (downgrade). "
-        "Stop the app first",
+        help="Restore a `soc-ai backup` archive into the data directory. Without "
+        "--yes it refuses to overwrite an existing store. Without --yes it also "
+        "refuses to restore under an app that looks live. It refuses an archive "
+        "from a newer soc-ai. Stop the app first",
     )
     p_res.add_argument("archive", help="Path to the soc-ai-backup-*.tar.gz to restore")
     p_res.add_argument(
         "--yes",
         action="store_true",
-        help="Overwrite existing state, and proceed even when the store looks "
-        "live (recent WAL activity) — the restore prints what it overwrites",
+        help="Overwrite existing state. Proceed even when the store looks live "
+        "with recent WAL activity. The restore prints what it overwrites",
     )
     p_res.add_argument(
         "--data-dir",
@@ -1553,12 +1632,438 @@ def _register_backup(sub: Any) -> None:
     p_res.set_defaults(func=_restore)
 
 
+def _spec_run(args: argparse.Namespace) -> int:
+    """Run one hunt spec, or the whole catalog, and print candidates as JSON.
+
+    Exit codes:
+      0   ran; nothing found, or candidates printed
+      2   no such spec id
+      3   at least one spec was BLIND (its precondition matched nothing)
+      5   at least one spec errored against the grid
+
+    Blind gets its own exit code on purpose. "The DCSync spec found nothing"
+    and "the DCSync spec cannot see, because Directory Service Access auditing
+    is off" are opposite facts, and a script that treats both as success is
+    exactly the false all-clear this tool exists to prevent.
+    """
+    import asyncio  # noqa: PLC0415 - lazy
+    import json  # noqa: PLC0415 - lazy
+    from dataclasses import asdict  # noqa: PLC0415 - lazy
+    from pathlib import Path  # noqa: PLC0415 - lazy
+
+    from soc_ai.hunting.execute import run_spec  # noqa: PLC0415 - lazy
+    from soc_ai.hunting.spec import load_catalog  # noqa: PLC0415 - lazy
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+
+    settings = get_settings()
+    catalog = load_catalog(Path(__file__).parent / "hunting" / "catalog")
+
+    if args.spec_id and args.spec_id not in catalog:
+        print(f"no such spec: {args.spec_id}", file=sys.stderr)
+        print(f"available: {', '.join(sorted(catalog))}", file=sys.stderr)
+        return 2
+    specs = [catalog[args.spec_id]] if args.spec_id else list(catalog.values())
+
+    async def _go() -> list[Any]:
+        elastic = ElasticClient(settings)
+        try:
+            return [
+                await run_spec(
+                    spec,
+                    elastic=elastic,
+                    settings=settings,
+                    since=args.since,
+                    until=args.until,
+                    include_synth=args.include_synth,
+                )
+                for spec in specs
+            ]
+        finally:
+            await elastic.aclose()
+
+    runs = asyncio.run(_go())
+
+    blind = any(r.blind for r in runs)
+    errored = any(r.error for r in runs)
+    for run in runs:
+        payload = {
+            **{k: v for k, v in asdict(run).items() if k != "candidates"},
+            "clean": run.clean,
+            "candidates": [asdict(c) for c in run.candidates],
+        }
+        print(json.dumps(payload, default=str))
+
+    if errored:
+        return 5
+    return 3 if blind else 0
+
+
+def _register_spec_run(sub: Any) -> None:
+    """Register the ``spec-run`` subparser."""
+    p_sr = sub.add_parser(
+        "spec-run",
+        help="Run a declarative hunt spec (or the whole catalog) against the grid "
+        "and print candidates as JSON. No model is called.",
+    )
+    p_sr.add_argument(
+        "spec_id",
+        nargs="?",
+        default=None,
+        help="Spec id to run; omit to run the whole catalog",
+    )
+    p_sr.add_argument(
+        "--since",
+        required=True,
+        help="Window start, ES date math or ISO-8601 (e.g. now-7d, 2026-09-03T00:00:00Z)",
+    )
+    p_sr.add_argument(
+        "--until",
+        default="now",
+        help="Window end, ES date math or ISO-8601 (default: now)",
+    )
+    p_sr.add_argument(
+        "--include-synth",
+        action="store_true",
+        help="Also read planted evaluation documents in logs-synth-*. A spec can "
+        "then run against a synthetic scenario planted on a live grid. Do not use "
+        "this for production hunting. It is off by default. Every other query "
+        "excludes those documents.",
+    )
+    p_sr.set_defaults(func=_spec_run)
+
+
+def _spec_sweep(args: argparse.Namespace) -> int:
+    """Sweep the hunt catalog, gate the results, and record triggered hunts.
+
+    Exit codes:
+      0   swept; hunts recorded or nothing to report
+      3   at least one spec was BLIND
+      5   at least one spec errored against the grid
+
+    Two modes worth knowing:
+
+    ``--shadow`` runs everything and records NO hunt, while still reporting what
+    each spec would have surfaced. It seeds the fire-once state rather than
+    spending it, so a week of shadow does not leave the spec silent on the day
+    it goes live.
+
+    ``--backfill`` sweeps history to seed state and produce one digest, rather
+    than firing a finding per historical occurrence at somebody who was not
+    watching when they happened.
+    """
+    import asyncio  # noqa: PLC0415 - lazy
+    import json  # noqa: PLC0415 - lazy
+    from datetime import UTC, datetime  # noqa: PLC0415 - lazy
+
+    from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415 - lazy
+    from soc_ai.hunting.sweep import sweep_catalog  # noqa: PLC0415 - lazy
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+
+    settings = get_settings()
+    # An operator following the console's hint types `spec-sweep --shadow` with
+    # no window and got an argparse error. The scheduler already knows the
+    # answer, so the CLI uses the same one rather than making the operator
+    # supply it: the same helper the loop calls, floor and clamp included, so
+    # a hand-run sweep covers exactly what the loop's would. The widening is
+    # said the way the loop says it; with no logging configured this lands on
+    # stderr, and the JSON on stdout stays parseable.
+    since = args.since
+    if since is None:
+        import logging  # noqa: PLC0415 - lazy
+
+        from soc_ai.hunting.window import sweep_window  # noqa: PLC0415 - lazy
+
+        window = sweep_window(settings)
+        window.say_if_widened(logging.getLogger(__name__))
+        since = window.since
+
+    async def _go() -> Any:
+        engine = make_engine(settings)
+        # The sweep WRITES, so the schema has to exist. `serve` migrates at
+        # startup; a CLI invocation against a fresh database would otherwise
+        # fail on a missing table halfway through the catalog, after some
+        # specs had already queried the grid.
+        await run_migrations(engine)
+        elastic = ElasticClient(settings)
+        try:
+            async with make_sessionmaker(engine)() as session:
+                # The effective catalog, not the files alone: a retired
+                # analytic must stop running and a local one in shadow must
+                # start, and both facts live in the database.
+                tiers = await effective_catalog(session)
+                result = await sweep_catalog(
+                    tiers.specs,
+                    session=session,
+                    elastic=elastic,
+                    settings=settings,
+                    since=since,
+                    until=args.until,
+                    now=datetime.now(UTC).replace(tzinfo=None),
+                    backfill=args.backfill,
+                    include_synth=args.include_synth,
+                    record=not args.shadow,
+                    shadow_ids=tiers.shadow_ids,
+                )
+                await session.commit()
+                return result
+        finally:
+            await elastic.aclose()
+            await engine.dispose()
+
+    result = asyncio.run(_go())
+    print(json.dumps(result.to_dict(), indent=2))
+    if result.errored:
+        return 5
+    return 3 if result.blind else 0
+
+
+def _priors(args: argparse.Namespace) -> int:
+    """Run every role prior against every profiled entity and print what fired.
+
+    Exit codes:
+      0   swept; findings printed (or none, with the coverage breakdown)
+      5   the sweep could not complete against the grid
+
+    A zero-finding sweep prints its coverage counts either way. "Nothing
+    departed" and "nothing could be measured" are the same empty list, and an
+    analyst who cannot tell them apart has been handed an all-clear that was
+    never earned.
+    """
+    import asyncio  # noqa: PLC0415 - lazy
+
+    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
+    from soc_ai.hunting.prior_sweep import (  # noqa: PLC0415 - lazy
+        format_sweep,
+        run_prior_sweep,
+    )
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+
+    settings = get_settings()
+
+    async def _go() -> int:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        elastic = ElasticClient(settings)
+        try:
+            async with make_sessionmaker(engine)() as session:
+                # The estate's own address space, so the sweep does not record
+                # observations about the internet and form leads out of them.
+                from soc_ai.oracle.identifiers import (  # noqa: PLC0415 - lazy
+                    effective_internal_identifiers,
+                )
+
+                cidrs = (await effective_internal_identifiers(session, settings)).cidrs
+                # The effective catalog, for the same reason the spec sweep
+                # reads it: a retired prior must stop running and a local one
+                # in shadow must start.
+                from soc_ai.hunting.catalog_tiers import (  # noqa: PLC0415 - lazy
+                    effective_catalog,
+                )
+
+                tiers = await effective_catalog(session)
+                sweep = await run_prior_sweep(
+                    elastic=elastic,
+                    settings=settings,
+                    db=session,
+                    recent_hours=int(args.recent_hours),
+                    record=bool(args.record),
+                    cidrs=cidrs,
+                    catalog=tiers.specs,
+                    shadow_ids=tiers.shadow_ids,
+                )
+            print(format_sweep(sweep))
+            return 5 if sweep.errors else 0
+        finally:
+            # aclose, named directly. `getattr(elastic, "close", None)` was the
+            # first cut and it silently did nothing -- the method is aclose --
+            # leaking an aiohttp session on every run. Same shape as the
+            # operator_value bug in prior_sweep: a getattr default turns a
+            # wrong name into a no-op instead of an error.
+            await elastic.aclose()
+            await engine.dispose()
+
+    return asyncio.run(_go())
+
+
+def _register_priors(sub: Any) -> None:
+    """Register the ``priors`` subparser."""
+    p_pr = sub.add_parser(
+        "priors",
+        help="Run the role priors against every entity that has a behavioural "
+        "profile, and print what departed. No model is called.",
+    )
+    p_pr.add_argument(
+        "--recent-hours",
+        type=int,
+        default=24,
+        help="How far back 'lately' reaches. The default is 24. This window is "
+        "much shorter than the 30-day baseline. Over one window, every "
+        "observation is already in the baseline built from it. The sweep is then "
+        "clean whatever happened.",
+    )
+    p_pr.add_argument(
+        "--record",
+        action="store_true",
+        help="Write each departure as an observation, and form leads from what "
+        "accumulates. This is OFF by default, because a read of the coverage must "
+        "have no side effect. An operator who reads the sweep must not change what "
+        "the next run concludes. soc-ai records leads in shadow either way.",
+    )
+    p_pr.set_defaults(func=_priors)
+
+
+def format_lead_quality(report: Any) -> str:
+    """The lead quality block as a table.
+
+    The same numbers the Analytics tab shows, so an operator on a terminal and
+    an analyst on the page read one report. The rule and the noise-floor note
+    sit under the table, because a number with no rule beside it invites a
+    change to the rule.
+    """
+    lines: list[str] = ["week      formed  hunted  threat  promoted  dismissed"]
+    for week in report.weeks:
+        dismissed = ", ".join(f"{k}={v}" for k, v in week.dismissed.items()) or "-"
+        lines.append(
+            f"{week.week:<9} {week.formed:>6}  {week.hunted:>6}  {week.threat:>6}  "
+            f"{week.promoted:>8}  {dismissed}"
+        )
+    if report.by_types:
+        width = max(len(t.types) for t in report.by_types)
+        width = max(width, len("types"))
+        lines.append("")
+        lines.append(f"{'types':<{width}}  formed  dismissed  threat")
+        for row in report.by_types:
+            lines.append(
+                f"{row.types:<{width}}  {row.formed:>6}  {row.dismissed:>9}  {row.threat:>6}"
+            )
+    else:
+        lines.append("")
+        lines.append("No lead formed in this window.")
+    lines.append("")
+    lines.append(f"rule: {report.rule}")
+    lines.append(f"note: {report.note}")
+    return "\n".join(lines)
+
+
+def _leads(args: argparse.Namespace) -> int:
+    """Print what the lead rule produced over the last few weeks.
+
+    Exit codes:
+      0   the report printed
+      2   no mode was asked for
+
+    Reads the local store only. No model and no grid.
+    """
+    import asyncio  # noqa: PLC0415 - lazy
+
+    if not getattr(args, "report", False):
+        print("soc-ai leads needs a mode. Use --report.")
+        return 2
+
+    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+
+    settings = get_settings()
+
+    async def _go() -> int:
+        # The route owns the counting, so the table and the Analytics tab can
+        # never report different numbers for one week.
+        from soc_ai.api.webui.routes_hunts import lead_quality  # noqa: PLC0415 - lazy
+
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        try:
+            async with make_sessionmaker(engine)() as session:
+                report = await lead_quality(session, weeks=int(args.weeks))
+            print(format_lead_quality(report))
+            return 0
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_go())
+
+
+def _register_leads(sub: Any) -> None:
+    """Register the ``leads`` subparser."""
+    p_le = sub.add_parser(
+        "leads",
+        help="Print what the lead rule produced: leads formed, hunted, with a "
+        "threat finding, dismissed by reason and promoted, per week and per "
+        "observation-type pair. No model is called.",
+    )
+    p_le.add_argument(
+        "--report",
+        action="store_true",
+        help="Print the lead quality table. This is the only mode today.",
+    )
+    p_le.add_argument(
+        "--weeks",
+        type=int,
+        default=4,
+        help="How many ISO weeks to report, newest first. The default is 4. A "
+        "threshold moves on a week of data, never on a day.",
+    )
+    p_le.set_defaults(func=_leads)
+
+
+def _register_spec_sweep(sub: Any) -> None:
+    """Register the ``spec-sweep`` subparser."""
+    p_ss = sub.add_parser(
+        "spec-sweep",
+        help="Sweep the declarative hunt catalog and record triggered hunts for "
+        "anything not already handled. No model is called.",
+    )
+    p_ss.add_argument(
+        "--since",
+        default=None,
+        help="Window start (ES date math or ISO-8601). Defaults to the configured "
+        "look-back window, so the command the console prints runs as printed.",
+    )
+    p_ss.add_argument("--until", default="now", help="Window end (default: now)")
+    p_ss.add_argument(
+        "--shadow",
+        action="store_true",
+        help="Report what each spec WOULD find. Record no hunt. This seeds the "
+        "fire-once state and does not spend it. The spec is then not silent when "
+        "it goes live.",
+    )
+    p_ss.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Seed state from history without firing a finding per historical "
+        "occurrence. Use once when adding a spec.",
+    )
+    p_ss.add_argument(
+        "--include-synth",
+        action="store_true",
+        help="Also read planted evaluation documents in logs-synth-*. The sweep can "
+        "then run against a synthetic scenario planted on a live grid. Do not use "
+        "this for production hunting. It is off by default. soc-ai marks a hunt "
+        "recorded under it as a synthetic-evaluation run.",
+    )
+    p_ss.set_defaults(func=_spec_sweep)
+
+
 def _register_synth_clean(sub: Any) -> None:
     """Register the ``synth-clean`` subparser (split out of :func:`main` for size)."""
     p_sc = sub.add_parser(
         "synth-clean",
-        help="Delete synthetic-eval docs (synth.scenario_id) from logs-synth-* "
-        "so fixtures don't accumulate forever",
+        help="Delete synthetic-eval docs (synth.scenario_id) from logs-synth-*. "
+        "The fixtures then do not accumulate",
     )
     p_sc.add_argument(
         "--older-than-days",
@@ -1578,10 +2083,10 @@ def _register_eval_nightly(sub: Any) -> None:
     """Register the ``eval-nightly`` subparser (split out of :func:`main` for size)."""
     p_en = sub.add_parser(
         "eval-nightly",
-        help="Nightly quality micro-eval: investigate a few real alerts, land one "
-        "row in the local quality trend, and alarm on regression. Schedule it "
-        "from host cron (see docs/DOCKER.md); the mode defaults to oracle-graded "
-        "iff oracle_enabled, else zero-egress local",
+        help="Nightly quality micro-eval. It investigates a few real alerts, lands "
+        "one row in the local quality trend, and alarms on a regression. Schedule "
+        "it from host cron. See docs/DOCKER.md. The mode defaults to oracle-graded "
+        "if oracle_enabled is on. Otherwise the mode is zero-egress local",
     )
     p_en.add_argument(
         "--oql",
@@ -1625,15 +2130,21 @@ def _register_doctor(sub: Any) -> None:
     """Register the ``doctor`` subparser (split out of :func:`main` for size)."""
     p_doc = sub.add_parser(
         "doctor",
-        help="Check the whole dependency surface (config, store, DNS/TCP/TLS "
-        "reachability, SO/ES — including the audit write grant and index-pattern "
-        "coverage — gateway, model fitness) and print a pass/fail table; exit 0 "
-        "iff all required checks pass",
+        help="Check the whole dependency surface and print a pass/fail table. The "
+        "checks cover config, store, DNS, TCP and TLS reachability, SO and ES, the "
+        "audit write grant, index-pattern coverage, the gateway and model fitness. "
+        "Exit 0 only if every required check passes",
     )
     p_doc.add_argument(
         "--json",
         action="store_true",
         help="Emit the check results as JSON instead of the table (for automation)",
+    )
+    p_doc.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero on WARN and on FAIL. This is opt-in. An existing "
+        "monitor keyed on this exit status keeps seeing what it always saw",
     )
     p_doc.set_defaults(func=_doctor)
     # Registered here rather than in main(): model-probe is doctor's sibling
@@ -1716,16 +2227,16 @@ def _add_api_client_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--token",
         default=None,
-        help="API bearer token (scai_...) for a secured deployment "
-        "(api_auth_required=true, the shipped default). Falls back to the "
-        "SOC_AI_API_TOKEN environment variable; omit both only if the "
-        "server allows unauthenticated access.",
+        help="API bearer token (scai_...) for a secured deployment. "
+        "api_auth_required=true is the shipped default. The CLI falls back to the "
+        "SOC_AI_API_TOKEN environment variable. Omit both only if the server "
+        "allows unauthenticated access.",
     )
     p.add_argument(
         "--verify",
         action="store_true",
-        help="Verify the server's TLS certificate against the system CA store "
-        "(default: no verification, matching the lab self-signed posture)",
+        help="Verify the server's TLS certificate against the system CA store. "
+        "The default is no verification. That matches the lab self-signed posture",
     )
     p.add_argument(
         "--cafile",
@@ -1754,7 +2265,10 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
     _add_api_client_args(p_triage)
     p_triage.set_defaults(func=_triage)
 
-    p_health = sub.add_parser("healthz", help="Print the soc-ai /healthz JSON")
+    p_health = sub.add_parser(
+        "healthz",
+        help="Print the soc-ai /healthz liveness JSON (probes nothing — see `doctor`)",
+    )
     p_health.add_argument(
         "--url",
         default=None,
@@ -1872,6 +2386,10 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
     p_vb.set_defaults(func=_validate_batch)
 
     _register_eval_nightly(sub)
+    _register_spec_run(sub)
+    _register_spec_sweep(sub)
+    _register_priors(sub)
+    _register_leads(sub)
 
     p_er = sub.add_parser(
         "eval-report",

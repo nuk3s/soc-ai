@@ -1,25 +1,30 @@
 # soc-ai
 
 <p align="center">
-  <img src="img/banner.png" alt="soc-ai — self-hosted LLM triage for Security Onion" width="820">
+  <img src="img/banner.png" alt="soc-ai: self-hosted LLM triage for Security Onion" width="820">
 </p>
 
 **Onion AI without the Pro license.** soc-ai reads the alerts on your
-[Security Onion](https://securityonionsolutions.com/) grid and triages them with an
-LLM you host yourself. For each alert it pulls the related events, checks what else the
-host has been doing, runs the indicators against local threat intel, and decodes the
-packets off the sensor when that's what it takes. Then it hands you a **verdict, a
-confidence number, and the reasoning that got it there.**
+[Security Onion](https://securityonionsolutions.com/) grid. It triages them with
+a large language model that you host yourself. For each alert it pulls the
+related events, and it checks what else the host has done. It runs the
+indicators against local threat intel. It decodes the packets from the sensor if
+the payload matters. Then it gives you a verdict, a confidence number, and the
+reasoning behind them.
 
 The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway.
-Nothing about your network leaves it, and write-backs stay yours: the agent recommends,
-you execute. The one exception is an audited auto-acknowledge for high-confidence,
-low-stakes false positives, on by default and one toggle to turn off. There's an optional cloud "Oracle" for a second opinion
-on the hard ones; it's off until you turn it on, and its input is sanitized first.
+No data about your network leaves it. The write-backs stay yours, because the
+agent recommends and you execute. One exception exists. soc-ai can
+auto-acknowledge a high-confidence, low-stakes, investigated false positive, and
+it audits that write. The exception is off until you turn it on.
+
+An optional cloud Oracle gives a second opinion on a hard alert. The Oracle is
+off until you turn it on, and soc-ai sanitizes its input first.
 
 !!! note
-    Not affiliated with or endorsed by Security Onion Solutions, LLC. soc-ai is a
-    separate service that talks to a grid you already run.
+    Security Onion Solutions, LLC has no affiliation with soc-ai and does not
+    endorse it. soc-ai is a separate service. It reads a grid that you already
+    run.
 
 <p align="center">
   <img src="img/screenshot-investigation.png" alt="An investigation: verdict, confidence, reasoning, recommended actions, and the agent's timeline" width="900">
@@ -35,68 +40,84 @@ on the hard ones; it's off until you turn it on, and its input is sanitized firs
 
     ---
 
-    A console at `/app` shows your alert queue grouped by rule, with the AI verdict and
-    confidence inline next to each one. Open an alert to investigate it, or sweep the whole
-    untriaged queue with auto-triage. Every investigation gets a shareable permalink.
+    A console at `/app` shows your alert queue grouped by rule. Each row carries
+    the verdict and the confidence. Open an alert to investigate it. Use
+    auto-triage to sweep the whole untriaged queue. Every investigation has a
+    permalink that you can share.
 
-    The dashboard has an assistant that answers questions about your grid in one turn,
-    using the same read-only tools. Ask it what datasets you have or which rule was
-    noisiest overnight; when a question needs a sweep it writes the hunt objective and
-    waits for you to confirm.
+    The dashboard carries an assistant that answers questions about your grid in
+    one turn. It uses the same read-only tools. Ask it which datasets you have,
+    or which rule was noisiest overnight. If a question needs a sweep, the
+    assistant writes the hunt objective and waits for you to confirm it.
 
     [:octicons-arrow-right-24: Web console guide](WEBUI_GUIDE.md)
 
 </div>
 
-Under the hood it runs a read-only agent. For one alert it will:
+soc-ai runs a read-only agent. For one alert it does this:
 
-- read the alert context, the related events (via [OQL](OQL_PRIMER.md)), and the host's
-  recent alert history;
-- enrich the indicators against on-disk threat intel: blocklists, GeoIP/ASN,
-  cloud-prefix tagging;
-- pull and decode raw PCAP from the sensor when the payload matters;
-- weigh the evidence and write a verdict with its confidence and rationale;
-- recommend the write actions (acknowledge, escalate to a case, comment) for you to run
-  with one click.
+1. It reads the alert context, the related events and the recent alert history
+   of the host. It queries the events with [OQL](OQL_PRIMER.md).
+2. It enriches the indicators against on-disk threat intel: blocklists, GeoIP
+   and ASN data, and cloud-prefix tagging.
+3. It pulls and decodes raw PCAP from the sensor if the payload matters.
+4. It weighs the evidence and writes a verdict with a confidence and a
+   rationale.
+5. It recommends the write actions for you to run with one click: acknowledge,
+   escalate to a case, and comment.
 
 See [what the agent can do](AGENT_TOOLS.md) for the full tool surface and its guardrails.
 
 ---
 
-## Hunt across the network, not just one alert
+## Hunting across the network
 
-Some questions are bigger than a single detection: *"is anything beaconing to a rare
-external IP?"*, *"are the DCs seeing credential-abuse lockouts?"*, *"APT-X uses technique
-Y; is it showing up here?"* The **Hunt Console** takes an objective in plain English and turns
-the same read-only agent loose across many hosts and a time window, then hands back
-**findings + a narrative** mapped to MITRE ATT&CK, rather than a single-alert verdict.
+Some questions cover more than one detection. *"Is anything beaconing to a rare
+external IP?"* *"Are the domain controllers seeing credential-abuse lockouts?"*
+*"APT-X uses technique Y. Does it appear here?"* The **Hunt Console** takes an
+objective in plain English. It runs the same read-only agent across many hosts
+and a time window. It returns findings and a narrative mapped to MITRE ATT&CK.
 
 <p align="center">
   <img src="img/hunt-console.svg" alt="The Hunt Console: a plain-English objective drives a read-only agent loop across hosts and time, producing findings, a narrative, MITRE ATT&CK techniques, and advisory recommended actions" width="900">
 </p>
 
-Hunts follow the **same safety model** as investigation: strictly read-only. The agent
-queries and correlates; it never acks, escalates, or edits a case. It runs on a bounded
-budget and concludes with what it found, and if it's cut short it still writes up a
-grounded partial report rather than erroring out.
+A hunt follows the same safety model as an investigation. A hunt is read-only.
+The agent queries and correlates. It never acknowledges an alert, escalates one,
+or edits a case. It runs on a bounded budget and reports what it found. If the
+budget stops it early, it still writes a grounded partial report instead of an
+error.
+
+soc-ai also hunts when nobody asks. An analytic runs over the grid and writes a
+hit. Hits on one entity form a lead. The lead starts its own hunt, and you
+promote the hunt to an investigation that ends in a verdict.
+
+<p align="center">
+  <img src="img/hunting-flow.svg" alt="The hunting pipeline: an analytic finds a hit, hits on one entity form a lead, the lead starts a hunt, and a promoted hunt becomes an investigation with a verdict" width="900">
+</p>
+
+[:octicons-arrow-right-24: The hunting guide](HUNTING.md)
 
 ---
 
-## What it won't do on its own
+## What soc-ai does not do on its own
 
-The whole point is that you stay in control of anything that changes state.
+You stay in control of every action that changes state.
 
-- **Reads run freely:** pulling events, context, enrichment, and packets is safe, so the
-  agent does it without asking.
-- **Writes wait for a human:** acknowledging an alert, opening a case, leaving a comment.
-  The agent recommends them and you execute them with a click. One pragmatic carve-out
-  ships on by default: **confident false positives are auto-acknowledged** (confidence-
-  gated, never on critical/high-severity or malware/exploit-class alerts, every
-  unattended write audited). `auto_ack_fp_enabled=false` turns it off.
-- **Nothing leaves your network without your consent.** The reasoning runs on your own
-  model, on your own hardware. The Oracle (an optional cloud second opinion) is **off by
-  default**, and even when on, internal hostnames, usernames, and IPs are redacted before
-  anything is sent. Leave it off and the whole pipeline stays on your network.
+- **Reads run freely.** The agent pulls events, context, enrichment and packets
+  without asking. A read changes nothing.
+- **Writes wait for a human.** A write acknowledges an alert, opens a case or
+  adds a comment. The agent recommends the write and you execute it with a
+  click. One exception is off until you turn it on with
+  `auto_ack_fp_enabled=true`. It auto-acknowledges a confident false positive.
+  The investigation must have retrieved something first. It never fires on a
+  critical or high-severity alert, or on a malware-class or exploit-class alert,
+  and soc-ai audits every unattended write.
+- **No data leaves your network without your consent.** The reasoning runs on
+  your own model and your own hardware. The Oracle is an optional cloud second
+  opinion, and it is off by default. If you turn it on, soc-ai redacts
+  internal hostnames, usernames and IP addresses before it sends anything. Leave
+  it off and the whole pipeline stays on your network.
 
 [:octicons-arrow-right-24: The full safety model](SAFETY_MODEL.md)
 
@@ -104,18 +125,21 @@ The whole point is that you stay in control of anything that changes state.
 
 ## Why run your own
 
-Alert triage is the one place a SOC most wants to point an LLM, and the one place you
-least want to ship your network's hostnames, usernames, and IPs to someone else's cloud.
-soc-ai exists so you don't have to make that trade:
+Alert triage is the task a security operations centre most wants to give to an
+LLM. It is also the task where you least want to send your hostnames, usernames
+and IP addresses to another company's cloud. soc-ai removes that trade:
 
-- **Free and yours:** no per-seat, per-alert, or per-investigation meter, and no license
-  unlocked by phoning home. You run it, you own it.
-- **Fully local, or air-gapped:** the reasoning runs on a model you host. With the Oracle
-  off (the default), the whole pipeline works with no internet at all.
-- **Readable reasoning:** every verdict cites the events it rests on, and no
-  true/false-positive call stands without evidence from a tool call.
-- **You own every change:** the agent recommends writes and you execute them; the one
-  unattended write (the FP auto-ack) is bounded, audited, and yours to switch off.
+- **Free and yours:** soc-ai has no per-seat meter, no per-alert meter and no
+  per-investigation meter. No license needs a call home. You run it and you own
+  it.
+- **Local or air-gapped:** the reasoning runs on a model that you host. The
+  Oracle is off by default, so the whole pipeline works with no internet
+  connection.
+- **Readable reasoning:** every verdict cites the events that it rests on. A
+  true-positive or false-positive verdict needs evidence from a tool call.
+- **You own every change.** The agent recommends a write and you execute it. The
+  false-positive auto-acknowledge is the one unattended write. It is off by
+  default, bounded and audited. It never fires if the run retrieved nothing.
 
 ---
 
@@ -125,9 +149,10 @@ soc-ai exists so you don't have to make that trade:
   <img src="img/architecture.png" alt="Architecture: the analyst drives soc-ai, which reads Security Onion and local intel, reasons with a local model, and writes only what you allow" width="900">
 </p>
 
-`ANALYST_MODEL` is the one model the agent triages with: whatever your gateway serves.
-The reasoning happens locally. The Oracle path is the only way anything reaches a cloud
-API, it's opt-in, and it only ever sees sanitized input.
+`ANALYST_MODEL` names the one model that the agent triages with. It is whatever
+model your gateway serves. The reasoning runs on your host. The Oracle path is
+the only path that reaches a cloud API. You opt in to the Oracle, and it reads
+sanitized input only.
 
 [:octicons-arrow-right-24: Architecture in depth](ARCHITECTURE.md)
 
@@ -141,7 +166,7 @@ API, it's opt-in, and it only ever sees sanitized input.
 
     ---
 
-    Clone, run `./setup.sh`, and work your first alert in the browser.
+    Clone the repo, run `./setup.sh`, and work your first alert in the browser.
 
     [:octicons-arrow-right-24: Quickstart](quickstart.md)
 
@@ -149,7 +174,7 @@ API, it's opt-in, and it only ever sees sanitized input.
 
     ---
 
-    The SO account, role, and firewall prerequisites: the setup steps that reliably bite.
+    The Security Onion account, role and firewall prerequisites. These setup steps reliably cause trouble.
 
     [:octicons-arrow-right-24: SO setup](SECURITY-ONION-SETUP.md)
 
@@ -157,7 +182,7 @@ API, it's opt-in, and it only ever sees sanitized input.
 
     ---
 
-    Required mounts, SELinux relabeling, upstream TLS trust, and the port-8443 conflict.
+    The required mounts, SELinux relabeling, upstream TLS trust, and the port 8443 conflict.
 
     [:octicons-arrow-right-24: Docker](DOCKER.md)
 
@@ -166,6 +191,6 @@ API, it's opt-in, and it only ever sees sanitized input.
 ---
 
 soc-ai is open source under the [Apache-2.0 license](https://github.com/nuk3s/soc-ai/blob/main/LICENSE).
-If you already run Security Onion, it's the self-hosted way to put a local model to work on
-your queue. Curious where the project is going? The [roadmap](ROADMAP.md) keeps the
-story honest, including everything already shipped behind a switch.
+If you already run Security Onion, soc-ai puts a local model to work on your
+alert queue. The [roadmap](ROADMAP.md) keeps the story honest, and it includes
+everything that already shipped behind a switch.

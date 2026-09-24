@@ -12,19 +12,32 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
 from soc_ai.config import Settings
+from soc_ai.demo.catalog_trail import (
+    BLIND_SPEC,
+    CATALOG_HUNT_ID,
+    ERRORED_SPEC,
+    FIRED_SPEC,
+    ROWS_PER_SPEC,
+    seed_catalog_trail,
+)
 from soc_ai.demo.fixtures import load_fixtures, seed_fixtures
+from soc_ai.hunting.spec import CATALOG_DIR, load_catalog
+from soc_ai.hunting.sweep import SWEEP_ACTOR
 from soc_ai.store.auth import utcnow
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+from soc_ai.store.hunt_spec_sweeps import catalog_status
 from soc_ai.store.models import (
     Backtest,
     Hunt,
     HuntEvent,
     HuntSchedule,
+    HuntSpecSweep,
     Investigation,
     InvestigationEvent,
     QualitySnapshot,
@@ -447,3 +460,222 @@ def test_startup_does_not_seed_outside_demo(
     monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", path)
     with _app_client(Settings(**_base_settings_kwargs())) as client:
         assert client.get("/api/v1/investigations").json()["rows"] == []
+
+
+# ---------------------------------------------------------------------------
+# Hunt catalog trail: a generated week of sweeps, seeded beside the fixtures
+# so the Operate hub's catalog panel and the Hunts "Catalog" preset show the
+# declarative catalog working on a demo grid that never ran a sweep.
+# ---------------------------------------------------------------------------
+
+CATALOG_IDS = list(load_catalog(CATALOG_DIR))
+
+
+async def _trail(
+    settings: Settings,
+) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession], datetime]:
+    """A migrated store with the trail seeded once, anchored at one 'now'."""
+    engine, maker = await _db(settings)
+    now = utcnow()
+    assert await seed_catalog_trail(maker, now=now) == 1
+    return engine, maker, now
+
+
+def test_catalog_trail_names_shipped_specs() -> None:
+    """The trail's spec ids are the catalog's own. A renamed spec must fail
+    here rather than reappear on the demo as "not yet swept"."""
+    assert {FIRED_SPEC, BLIND_SPEC, ERRORED_SPEC} <= set(CATALOG_IDS)
+
+
+async def test_catalog_trail_seeds_one_row_per_spec_per_six_hours(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker, now = await _trail(settings_kratos)
+    async with maker() as db:
+        rows = (await db.scalars(select(HuntSpecSweep).order_by(HuntSpecSweep.id))).all()
+    await engine.dispose()
+    by_spec: dict[str, list[HuntSpecSweep]] = {}
+    for r in rows:
+        by_spec.setdefault(r.spec_id, []).append(r)
+    assert set(by_spec) == set(CATALOG_IDS)
+    for spec_id, spec_rows in by_spec.items():
+        assert len(spec_rows) == ROWS_PER_SPEC == 28, spec_id
+        ages = [now - r.created_at for r in spec_rows]
+        assert timedelta(0) < min(ages) < timedelta(hours=1), spec_id
+        assert timedelta(days=6, hours=18) < max(ages) < timedelta(days=7, hours=1), spec_id
+        # Rows come back by id, so equal gaps here also prove insertion order is
+        # time order: catalog_status reads each spec's newest row by max(id).
+        gaps = {b.created_at - a.created_at for a, b in pairwise(spec_rows)}
+        assert gaps == {timedelta(hours=6)}, spec_id
+        assert all(r.window_since == "now-1440m" and r.window_until == "now" for r in spec_rows)
+        assert not any(r.shadow for r in spec_rows), spec_id
+
+
+async def test_catalog_trail_decoy_spec_is_permanently_blind(settings_kratos: Settings) -> None:
+    """A demo grid has no canary, so the decoy spec is blind on every sweep and
+    never records a hunt: the panel's amber marker, not a firing."""
+    engine, maker, _ = await _trail(settings_kratos)
+    async with maker() as db:
+        rows = (
+            await db.scalars(select(HuntSpecSweep).where(HuntSpecSweep.spec_id == BLIND_SPEC))
+        ).all()
+    await engine.dispose()
+    assert len(rows) == ROWS_PER_SPEC
+    assert all(r.blind and r.precondition_docs == 0 and r.matched_docs == 0 for r in rows)
+    assert all(r.hunt_id is None and r.error is None for r in rows)
+
+
+async def test_catalog_trail_fired_row_links_a_triggered_hunt(settings_kratos: Settings) -> None:
+    engine, maker, now = await _trail(settings_kratos)
+    async with maker() as db:
+        linked = (
+            await db.scalars(select(HuntSpecSweep).where(HuntSpecSweep.hunt_id.is_not(None)))
+        ).all()
+        hunt = await db.get(Hunt, CATALOG_HUNT_ID)
+        n_events = await db.scalar(
+            select(func.count()).select_from(HuntEvent).where(HuntEvent.hunt_id == CATALOG_HUNT_ID)
+        )
+    await engine.dispose()
+    assert len(linked) == 1
+    (fired,) = linked
+    assert fired.spec_id == FIRED_SPEC
+    assert fired.hunt_id == CATALOG_HUNT_ID
+    assert not fired.blind and fired.error is None and not fired.shadow
+    assert fired.fresh_candidates == 1 and fired.matched_docs >= 1
+    assert timedelta(hours=40) < now - fired.created_at < timedelta(hours=56)
+
+    assert hunt is not None
+    assert hunt.kind == "triggered"
+    assert hunt.started_by == SWEEP_ACTOR
+    assert hunt.status == "complete"
+    assert hunt.objective.startswith(f"[catalog] {FIRED_SPEC}: ")
+    assert hunt.objective.endswith("(now-1440m → now)")
+    assert hunt.objective_hash
+    assert hunt.created_at == fired.created_at
+    assert hunt.finished_at is not None and hunt.finished_at >= hunt.created_at
+    assert hunt.findings_count == 1
+    assert hunt.report is not None
+    (finding,) = hunt.report["findings"]
+    assert finding["category"] == "threat"
+    assert finding["citations"]
+    assert hunt.narrative and hunt.narrative == hunt.report["narrative"]
+    assert "1 finding(s)" in hunt.narrative
+    # A sweep-recorded hunt has no event stream; the seeded one must not invent one.
+    assert n_events == 0
+
+
+async def test_catalog_trail_handled_rows_follow_the_firing(settings_kratos: Settings) -> None:
+    """After the firing the gate holds the same condition back: rows carry
+    already_handled (one of them inside the last 24h, so the panel's handled
+    count is non-zero) and nothing fires a second time."""
+    engine, maker, now = await _trail(settings_kratos)
+    async with maker() as db:
+        rows = (
+            await db.scalars(
+                select(HuntSpecSweep)
+                .where(HuntSpecSweep.spec_id == FIRED_SPEC)
+                .order_by(HuntSpecSweep.id)
+            )
+        ).all()
+    await engine.dispose()
+    fired_idx = next(i for i, r in enumerate(rows) if r.hunt_id is not None)
+    assert all(r.already_handled == 0 and r.matched_docs == 0 for r in rows[:fired_idx])
+    after = rows[fired_idx + 1 :]
+    assert any(r.already_handled >= 1 for r in after)
+    assert any(r.already_handled >= 1 for r in after if now - r.created_at < timedelta(hours=24))
+    assert all(r.fresh_candidates == 0 and r.hunt_id is None for r in after)
+    # A held-back candidate is a matched one: handled never exceeds matched.
+    assert all(r.matched_docs >= r.already_handled for r in rows)
+
+
+async def test_catalog_trail_one_transient_error_days_back(settings_kratos: Settings) -> None:
+    """One errored row about four days back exercises the red marker in the
+    history without putting it on any spec's newest row."""
+    engine, maker, now = await _trail(settings_kratos)
+    async with maker() as db:
+        errored = (
+            await db.scalars(select(HuntSpecSweep).where(HuntSpecSweep.error.is_not(None)))
+        ).all()
+    await engine.dispose()
+    assert len(errored) == 1
+    (row,) = errored
+    assert row.spec_id == ERRORED_SPEC
+    assert timedelta(days=3, hours=12) < now - row.created_at < timedelta(days=4, hours=12)
+    assert row.hunt_id is None and not row.blind
+    assert row.error is not None and len(row.error) < 80
+
+
+async def test_catalog_trail_status_reads_as_the_panel_expects(settings_kratos: Settings) -> None:
+    engine, maker, now = await _trail(settings_kratos)
+    async with maker() as db:
+        status = await catalog_status(db, now=now)
+    await engine.dispose()
+    assert set(status) == set(CATALOG_IDS)
+    assert all(s.last_error is None for s in status.values())
+    assert [sid for sid, s in status.items() if s.blind] == [BLIND_SPEC]
+    assert all(s.sweeps_24h == 4 for s in status.values())
+    assert all(s.fired_24h == 0 for s in status.values())
+    assert all(s.fresh_24h == 0 for s in status.values())
+    assert all(s.shadow_24h == 0 for s in status.values()), "the demo trail is live sweeps only"
+    assert [sid for sid, s in status.items() if s.last_fired_at is not None] == [FIRED_SPEC]
+    fired = status[FIRED_SPEC]
+    assert fired.last_fired_at is not None
+    assert timedelta(hours=40) < now - fired.last_fired_at < timedelta(hours=56)
+    assert fired.already_handled_24h >= 1
+    assert all(s.already_handled_24h == 0 for sid, s in status.items() if sid != FIRED_SPEC)
+
+
+async def test_catalog_trail_seed_twice_is_idempotent(settings_kratos: Settings) -> None:
+    """A restart skips the trail the same way it skips a fixture row: by the
+    hunt's primary key, with the sweep rows riding along like events."""
+    engine, maker, now = await _trail(settings_kratos)
+    assert await seed_catalog_trail(maker, now=now + timedelta(hours=1)) == 0
+    async with maker() as db:
+        n_rows = await db.scalar(select(func.count()).select_from(HuntSpecSweep))
+        n_hunts = await db.scalar(
+            select(func.count()).select_from(Hunt).where(Hunt.kind == "triggered")
+        )
+    await engine.dispose()
+    assert n_rows == ROWS_PER_SPEC * len(CATALOG_IDS)
+    assert n_hunts == 1
+
+
+def test_startup_seeds_catalog_trail_in_demo_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Demo startup lands the trail beside the fixtures: the catalog route
+    reads the week of sweeps and the Hunts "Catalog" preset lists the hunt."""
+    from tests.test_demo_mode import _app_client, _demo_app_settings
+
+    path = tmp_path / "fixtures.json"
+    path.write_text(json.dumps(FIXTURE))
+    monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", path)
+    with _app_client(_demo_app_settings()) as client:
+        catalog = client.get("/api/v1/hunt-catalog").json()
+        triggered = client.get("/api/v1/hunts", params={"kind": "triggered"}).json()
+    specs = {s["id"]: s for s in catalog["specs"]}
+    assert set(specs) == set(CATALOG_IDS)
+    assert catalog["last_sweep_at"] is not None
+    assert all(s["last_swept_at"] is not None for s in specs.values())
+    assert all(s["last_error"] is None for s in specs.values())
+    assert [sid for sid, s in specs.items() if s["blind"]] == [BLIND_SPEC]
+    assert all(s["fired_24h"] == 0 for s in specs.values())
+    fired = specs[FIRED_SPEC]
+    assert fired["last_fired_at"] is not None
+    assert fired["already_handled_24h"] >= 1
+    assert [h["id"] for h in triggered] == [CATALOG_HUNT_ID]
+    assert triggered[0]["kind"] == "triggered"
+    assert triggered[0]["startedBy"] == SWEEP_ACTOR
+    assert triggered[0]["objective"].startswith(f"[catalog] {FIRED_SPEC}: ")
+    assert triggered[0]["findingCount"] == 1
+
+
+def test_startup_does_not_seed_catalog_trail_outside_demo() -> None:
+    """The trail is demo content: a normal boot leaves every spec unswept."""
+    from tests.test_demo_mode import _app_client
+
+    with _app_client(Settings(**_base_settings_kwargs())) as client:
+        catalog = client.get("/api/v1/hunt-catalog").json()
+        triggered = client.get("/api/v1/hunts", params={"kind": "triggered"}).json()
+    assert all(s["last_swept_at"] is None for s in catalog["specs"])
+    assert triggered == []

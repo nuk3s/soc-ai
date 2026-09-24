@@ -18,10 +18,17 @@ implementation, so there is nothing for OQL to gate. Every query threads a
 eval docs so fixtures never leak into a hunt's findings, ``True`` (the
 hunt-journey eval) sees every plant, and a scenario id (the batch eval) sees
 only THAT scenario's plants — the same contract as every other events reader
-(:func:`soc_ai.tools.query_events.query_events_oql`). Every tool self-bounds
-its output (top-N) and returns a structured ``{"error": True, ...}`` dict
-rather than raising, matching the rest of the read-tool surface (see
-:mod:`soc_ai.tools.prevalence`, :mod:`soc_ai.tools.discover`).
+(:func:`soc_ai.tools.query_events.query_events_oql`). It threads a
+:data:`~soc_ai.tools._provenance.Provenance` beside it, defaulting to ``live``,
+because every statistic here is a statistic ABOUT a network and an imported
+capture is a different network: a replayed C2 PCAP is a flawless beacon, an
+imported EVTX corpus decides which DCE-RPC operations count as rare, and both
+land in the same index a sensor writes to. Each tool reports the population it
+counted (``provenance``, and a clause in its ``summary``) so a narrowed
+denominator is never a silent one. Every tool self-bounds its output (top-N)
+and returns a structured ``{"error": True, ...}`` dict rather than raising,
+matching the rest of the read-tool surface (see :mod:`soc_ai.tools.prevalence`,
+:mod:`soc_ai.tools.discover`).
 
 This module also holds the family's shared statistics helpers, starting with
 :func:`_shannon_entropy_chars` (char-level Shannon entropy).
@@ -48,7 +55,8 @@ from typing import Any
 from soc_ai.config import Settings
 from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.so_client.fields import resolve_agg_field
+from soc_ai.so_client.fields import dataset_name_filter, resolve_agg_field
+from soc_ai.tools._provenance import LIVE, Provenance, denominator_note, provenance_must_not
 from soc_ai.tools._registry import tool
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.online import is_internal_ip
@@ -193,7 +201,11 @@ def _internal_dest_exclusion(settings: Settings) -> dict[str, Any]:
 
 
 def _hunt_must_not(
-    settings: Settings, *, exclude_internal_dest: bool, include_synth: SynthScope = False
+    settings: Settings,
+    *,
+    exclude_internal_dest: bool,
+    include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> list[dict[str, Any]]:
     """The shared ``must_not`` clause set for this module's queries.
 
@@ -206,8 +218,19 @@ def _hunt_must_not(
     scoped sweep sees its own plants and never a sibling's. With
     ``exclude_internal_dest`` it also carries the server-side
     internal-destination CIDR exclusion (:func:`_internal_dest_exclusion`).
+
+    ``provenance`` is the third scope, and the one with the largest number
+    behind it (:mod:`soc_ai.tools._provenance`). Every tool in this module
+    measures a POPULATION — a cadence, an entropy distribution, an operation
+    histogram scored against a busy baseline, a novelty diff — and an imported
+    capture or a replayed corpus supplies all four in quantity. A PCAP of
+    somebody else's C2 replays as a textbook beacon with a cv of 0.02, and this
+    module's whole contract is that its candidates are MEASURED rather than
+    eyeballed, so a candidate measured off backfill is worse than a guess: it
+    arrives with sample ids that resolve.
     """
     must_not: list[dict[str, Any]] = list(synth_scope_must_not(include_synth))
+    must_not += provenance_must_not(provenance)
     if exclude_internal_dest:
         must_not.append(_internal_dest_exclusion(settings))
     return must_not
@@ -244,18 +267,24 @@ def _beacon_summary(
     *,
     pairs_scanned: int,
     internal_excluded: int,
+    provenance: Provenance,
 ) -> str:
+    # "No cadence found" and "N of M pairs beacon" are both claims about a
+    # population, and the sentence has to say which one. Both branches carry it:
+    # the empty branch is where a narrowed denominator most easily reads as a
+    # clean grid rather than as a grid this sweep did not look at all of.
+    scope = denominator_note(provenance)
     external_pairs = pairs_scanned - internal_excluded
     if not items:
         return (
             f"No periodic or semi-regular cadence found across {external_pairs} "
             f"external pair(s) scanned ({pairs_scanned} pair(s) total, "
-            f"{internal_excluded} internal excluded)."
+            f"{internal_excluded} internal excluded, {scope})."
         )
     strongest = items[0]
     return (
         f"{len(candidates)} of {external_pairs} external pairs show periodic or "
-        f"semi-regular cadence; strongest {strongest['src']}→{strongest['dst']} "
+        f"semi-regular cadence ({scope}); strongest {strongest['src']}→{strongest['dst']} "
         f"every ~{strongest['mean_interval_s']:.0f}s (cv {strongest['cv']:.2f})."
     )
 
@@ -274,6 +303,7 @@ async def beacon_profile(
     min_events: int = _MIN_EVENTS_DEFAULT,
     include_internal: bool = False,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Measure connection cadence per src→dst pair and flag periodic ones.
 
@@ -311,11 +341,19 @@ async def beacon_profile(
             scenario id (the batch eval): only THAT scenario's plants
             visible — a scoped sweep can never read a sibling scenario's
             plants as network-wide truth.
+        provenance: which population the cadence is measured over
+            (:mod:`soc_ai.tools._provenance`). ``"live"`` (the default) sees
+            only this grid's own sensor telemetry. A replayed C2 capture is a
+            textbook beacon — regular by construction, since it was recorded
+            that way — and scoring it produces a perfect, citable finding about
+            a network nobody here runs. ``"any"`` includes backfill, for a
+            caller deliberately profiling what an import contains.
 
     Returns:
         On success::
 
             {window_minutes, pairs_scanned, internal_excluded, truncated,
+             provenance,
              items: [{src, dst, events, mean_interval_s, stdev_s, cv,
                       bytes_out_avg, sample_ids, verdict_hint}, ...],
              thresholds: {min_events, cv_max}, summary}
@@ -349,7 +387,9 @@ async def beacon_profile(
         return err
 
     filters: list[dict[str, Any]] = [
-        _build_time_filter(window_minutes, None),
+        # Anchor-free by construction: an analytics sweep asks how often, so it
+        # counts the whole span back from now and takes no window mode.
+        _build_time_filter(window_minutes, None)[0],
         {"term": {"event.dataset": "zeek.conn"}},
     ]
     if src:
@@ -370,6 +410,7 @@ async def beacon_profile(
                 settings,
                 exclude_internal_dest=not include_internal,
                 include_synth=include_synth,
+                provenance=provenance,
             ),
         }
     }
@@ -463,10 +504,15 @@ async def beacon_profile(
             # cv fallback of 0.0 would otherwise rank the burst as the
             # STRONGEST periodic beacon on the grid. Zero cadence is not a
             # cadence — require a positive measured mean.
-            if inter_arrival is None or inter_arrival.mean_s <= 0 or inter_arrival.cv > _CV_MAX:
+            if (
+                inter_arrival is None
+                or (cv := inter_arrival.cv) is None
+                or inter_arrival.mean_s <= 0
+                or cv > _CV_MAX
+            ):
                 continue
 
-            verdict_hint = "periodic" if inter_arrival.cv <= _CV_PERIODIC else "semi-regular"
+            verdict_hint = "periodic" if cv <= _CV_PERIODIC else "semi-regular"
             candidates.append(
                 {
                     "src": src_ip,
@@ -474,7 +520,7 @@ async def beacon_profile(
                     "events": len(timestamps),
                     "mean_interval_s": inter_arrival.mean_s,
                     "stdev_s": inter_arrival.stdev_s,
-                    "cv": inter_arrival.cv,
+                    "cv": cv,
                     "bytes_out_avg": (dst_bucket.get("bytes_out_avg") or {}).get("value"),
                     "sample_ids": _sample_ids(valid_hits, _MAX_SAMPLE_IDS),
                     "verdict_hint": verdict_hint,
@@ -489,10 +535,15 @@ async def beacon_profile(
         "pairs_scanned": pairs_scanned,
         "internal_excluded": internal_excluded,
         "truncated": truncated,
+        "provenance": provenance,
         "items": items,
         "thresholds": {"min_events": min_events, "cv_max": _CV_MAX},
         "summary": _beacon_summary(
-            candidates, items, pairs_scanned=pairs_scanned, internal_excluded=internal_excluded
+            candidates,
+            items,
+            pairs_scanned=pairs_scanned,
+            internal_excluded=internal_excluded,
+            provenance=provenance,
         ),
     }
 
@@ -558,15 +609,19 @@ def _split_registrable(qname: str) -> tuple[str, str]:
     return ".".join(labels[-2:]), ".".join(labels[:-2])
 
 
-def _dns_summary(items: list[dict[str, Any]], *, parents_scanned: int) -> str:
+def _dns_summary(
+    items: list[dict[str, Any]], *, parents_scanned: int, provenance: Provenance
+) -> str:
+    scope = denominator_note(provenance)
     if not items:
         return (
-            f"No DGA/tunnel-shaped parent domain found across {parents_scanned} parent(s) scanned."
+            f"No DGA/tunnel-shaped parent domain found across {parents_scanned} "
+            f"parent(s) scanned ({scope})."
         )
     strongest = items[0]
     return (
         f"{len(items)} of {parents_scanned} parent(s) scanned show DGA/tunnel-shaped "
-        f"qname entropy; strongest {strongest['parent']} (entropy "
+        f"qname entropy ({scope}); strongest {strongest['parent']} (entropy "
         f"{strongest['entropy_mean']:.2f}, {strongest['queries']} queries, "
         f"{strongest['unique_subdomains']} unique subdomains)."
     )
@@ -703,6 +758,7 @@ async def dns_entropy_scan(
     parent_domain: str | None = None,
     min_queries: int = 50,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Measure per-parent-domain qname entropy/volume and flag DGA/tunnel candidates.
 
@@ -748,11 +804,17 @@ async def dns_entropy_scan(
             excludes all planted eval docs, True (hunt-journey eval) sees
             every plant, a scenario id (batch eval) sees only that
             scenario's plants — see :func:`beacon_profile`.
+        provenance: which population the entropy distribution is measured over
+            (:mod:`soc_ai.tools._provenance`). ``"live"`` (the default) is this
+            grid's own DNS. An imported capture of a DNS-tunnelling incident
+            contains, by definition, a textbook tunnel, and reporting it as a
+            candidate found on this network is a finding about the capture.
+            ``"any"`` includes backfill.
 
     Returns:
         On success::
 
-            {window_minutes, parents_scanned, truncated,
+            {window_minutes, parents_scanned, truncated, provenance,
              items: [{parent, queries, subdomain_queries, unique_subdomains,
                       entropy_mean, longest_label, example_qnames,
                       sample_ids}, ...],
@@ -774,7 +836,9 @@ async def dns_entropy_scan(
         return err
 
     filters: list[dict[str, Any]] = [
-        _build_time_filter(window_minutes, None),
+        # Anchor-free by construction: an analytics sweep asks how often, so it
+        # counts the whole span back from now and takes no window mode.
+        _build_time_filter(window_minutes, None)[0],
         {"terms": {"event.dataset": ["zeek.dns"]}},
     ]
     query: dict[str, Any] = {
@@ -786,7 +850,10 @@ async def dns_entropy_scan(
             # resolvers are internal, so excluding internal destination.ip
             # would drop the very traffic this sweep measures.
             "must_not": _hunt_must_not(
-                settings, exclude_internal_dest=False, include_synth=include_synth
+                settings,
+                exclude_internal_dest=False,
+                include_synth=include_synth,
+                provenance=provenance,
             ),
         }
     }
@@ -838,6 +905,7 @@ async def dns_entropy_scan(
         "window_minutes": window_minutes,
         "parents_scanned": parents_scanned,
         "truncated": truncated,
+        "provenance": provenance,
         "items": items,
         "thresholds": {
             "entropy_mean_min": _ENTROPY_MIN,
@@ -846,7 +914,7 @@ async def dns_entropy_scan(
             "entropy_extreme_min": _ENTROPY_EXTREME_MIN,
             "min_queries_floor": min_queries,
         },
-        "summary": _dns_summary(items, parents_scanned=parents_scanned),
+        "summary": _dns_summary(items, parents_scanned=parents_scanned, provenance=provenance),
     }
 
 
@@ -942,11 +1010,16 @@ def _dcerpc_summary(
     distinct_ops: int,
     flagged_total: int,
     rare_total: int,
+    provenance: Provenance,
 ) -> str:
+    # "rare against a busy baseline" is a comparison between two counts taken
+    # over one population, so naming the population is not decoration here — it
+    # is the only thing that makes the word "rare" mean anything.
+    scope = denominator_note(provenance)
     if not flagged_total and not rare_total:
         return (
             f"No dangerous or rare DCE-RPC operations found across "
-            f"{distinct_ops} distinct operation(s)."
+            f"{distinct_ops} distinct operation(s) ({scope})."
         )
     parts = []
     if flagged_total:
@@ -954,7 +1027,7 @@ def _dcerpc_summary(
         parts.append(f"{flagged_total} dangerous operation(s) seen ({names})")
     if rare_total:
         parts.append(f"{rare_total} rare-against-busy-baseline operation(s)")
-    return "; ".join(parts) + f" — {distinct_ops} distinct operation(s) total."
+    return "; ".join(parts) + f" — {distinct_ops} distinct operation(s) total, {scope}."
 
 
 _DCERPC_HISTOGRAM_DESCRIPTION = (
@@ -971,6 +1044,7 @@ async def dcerpc_histogram(
     window_minutes: int = 1440,
     rare_max: int = 5,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Histogram DCE-RPC operations and flag dangerous / rare-against-busy ones.
 
@@ -1005,11 +1079,18 @@ async def dcerpc_histogram(
             excludes all planted eval docs, True (hunt-journey eval) sees
             every plant, a scenario id (batch eval) sees only that
             scenario's plants — see :func:`beacon_profile`.
+        provenance: which population the histogram is built over
+            (:mod:`soc_ai.tools._provenance`). ``"live"`` (the default) is this
+            grid's own DCE-RPC. It matters most to the ``rare`` list, which is
+            a comparison against the busiest operation seen: an imported EVTX
+            or PCAP corpus moves that baseline, so what counts as rare here was
+            being decided by whatever file was loaded last. ``"any"`` includes
+            backfill.
 
     Returns:
         On success::
 
-            {window_minutes, total_ops, distinct_ops, truncated,
+            {window_minutes, total_ops, distinct_ops, truncated, provenance,
              items: [{operation, count, sources, sample_ids}, ...],
              flagged: [{operation, count, sources, sample_ids}, ...],
              flagged_total, flagged_truncated,
@@ -1047,7 +1128,9 @@ async def dcerpc_histogram(
         return err
 
     filters: list[dict[str, Any]] = [
-        _build_time_filter(window_minutes, None),
+        # Anchor-free by construction: an analytics sweep asks how often, so it
+        # counts the whole span back from now and takes no window mode.
+        _build_time_filter(window_minutes, None)[0],
         {"term": {"event.dataset": "zeek.dce_rpc"}},
     ]
     query: dict[str, Any] = {
@@ -1059,7 +1142,10 @@ async def dcerpc_histogram(
             # DCE-RPC traffic is lateral movement between INTERNAL hosts, so
             # excluding internal destination.ip would blind the histogram.
             "must_not": _hunt_must_not(
-                settings, exclude_internal_dest=False, include_synth=include_synth
+                settings,
+                exclude_internal_dest=False,
+                include_synth=include_synth,
+                provenance=provenance,
             ),
         }
     }
@@ -1126,6 +1212,7 @@ async def dcerpc_histogram(
         "total_ops": total_ops,
         "distinct_ops": distinct_ops,
         "truncated": truncated,
+        "provenance": provenance,
         "items": items,
         "flagged": flagged,
         "flagged_total": flagged_total,
@@ -1140,6 +1227,7 @@ async def dcerpc_histogram(
             distinct_ops=distinct_ops,
             flagged_total=flagged_total,
             rare_total=rare_total,
+            provenance=provenance,
         ),
     }
 
@@ -1229,20 +1317,25 @@ def _first_seen_summary(
     baseline_destinations: int,
     internal_excluded: int,
     baseline_truncated: bool,
+    provenance: Provenance,
 ) -> str:
+    # A novelty claim is only as good as the baseline it was not in, and both
+    # windows are drawn from the same population — so the population is named
+    # once, for the pair of them.
+    scope = denominator_note(provenance)
     if not items:
         summary = (
             f"No novel external destinations among {recent_destinations} recent "
             f"destination(s) ({baseline_destinations} baseline destination(s) scanned, "
-            f"{internal_excluded} internal excluded)."
+            f"{internal_excluded} internal excluded, {scope})."
         )
     else:
         strongest = items[0]
         summary = (
             f"{len(items)} novel external destination(s) among {recent_destinations} "
             f"recent destination(s), absent from the {baseline_destinations}-destination "
-            f"baseline ({internal_excluded} internal excluded); busiest new destination "
-            f"{strongest['dst']} ({strongest['recent_events']} event(s))."
+            f"baseline ({internal_excluded} internal excluded, {scope}); busiest new "
+            f"destination {strongest['dst']} ({strongest['recent_events']} event(s))."
         )
     if baseline_truncated:
         summary += (
@@ -1268,6 +1361,7 @@ async def first_seen(
     baseline_days: int = 30,
     dataset: str = "zeek.conn",
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Diff recent external destinations against a trailing baseline.
 
@@ -1294,18 +1388,29 @@ async def first_seen(
             exactly where the recent window begins. Default 30, capped at
             ``_MAX_BASELINE_DAYS`` (365 — mirrors
             :mod:`soc_ai.tools.prevalence`'s lookback ceiling).
-        dataset: ``event.dataset`` value both queries are scoped to. Default
+        dataset: dataset name both queries are scoped to, matched under
+            ``event.dataset`` or ``data_stream.dataset``. Default
             ``"zeek.conn"``.
         include_synth: synth-doc visibility (``SynthScope``), applied to
             BOTH queries: False (prod) excludes all planted eval docs, True
             (hunt-journey eval) sees every plant, a scenario id (batch
             eval) sees only that scenario's plants — see
             :func:`beacon_profile`.
+        provenance: which population BOTH windows are drawn from
+            (:mod:`soc_ai.tools._provenance`), applied to the recent side and
+            the baseline side together — a novelty diff whose two halves count
+            different populations measures the difference between the
+            populations, not the passage of time. ``"live"`` (the default) is
+            this grid's own telemetry, which is what "we have never seen this
+            destination" has to mean: an import landing inside the baseline
+            window suppresses genuinely new destinations, and one landing
+            inside the recent window reports a flood of first-seens the day the
+            corpus arrived. ``"any"`` includes backfill.
 
     Returns:
         On success::
 
-            {recent_minutes, baseline_days, dataset,
+            {recent_minutes, baseline_days, dataset, provenance,
              recent_destinations, baseline_destinations, internal_excluded,
              baseline_empty, baseline_truncated, recent_truncated,
              items: [{dst, recent_events, first_seen_ts, sources,
@@ -1352,7 +1457,7 @@ async def first_seen(
         return err
 
     recent_range, baseline_range = _first_seen_windows(recent_minutes, baseline_days)
-    dataset_term = {"term": {"event.dataset": dataset}}
+    dataset_term = dataset_name_filter(dataset)
     # Synth-scope exclusion (prod hides all plants; a scenario scope hides
     # every sibling's) plus the
     # SERVER-SIDE internal-destination exclusion (this tool only ever reports
@@ -1360,7 +1465,19 @@ async def first_seen(
     # on the baseline side that means the 1000-slot membership set holds only
     # external destinations, instead of internal chatter eating slots and
     # forcing spurious baseline_truncated caveats.
-    must_not = _hunt_must_not(settings, exclude_internal_dest=True, include_synth=include_synth)
+    #
+    # ONE clause list, spliced into both queries. That is what keeps the two
+    # halves of the diff comparable: a baseline counting backfill and a recent
+    # window that does not would report the arrival of an import as the
+    # disappearance of half the network, and the reverse pairing would report it
+    # as a flood of new destinations. Building the lists separately is the only
+    # way to get that wrong, so there is only one.
+    must_not = _hunt_must_not(
+        settings,
+        exclude_internal_dest=True,
+        include_synth=include_synth,
+        provenance=provenance,
+    )
 
     recent_query: dict[str, Any] = {
         "bool": {"filter": [recent_range, dataset_term], "must_not": must_not}
@@ -1429,6 +1546,7 @@ async def first_seen(
             "baseline_empty": True,
             "baseline_truncated": baseline_truncated,
             "recent_truncated": recent_truncated,
+            "provenance": provenance,
             "items": [],
             "summary": (
                 "Baseline window contained no data (retention/coverage gap) — "
@@ -1436,7 +1554,9 @@ async def first_seen(
                 f"every one of the {recent_destinations} recent destination(s) "
                 "would falsely read as first-seen. Shorten baseline_days to fit "
                 "the data actually retained, or verify the dataset's coverage, "
-                "before drawing first-seen conclusions."
+                f"before drawing first-seen conclusions. The baseline counted "
+                f"{denominator_note(provenance)}, so a grid whose history is all "
+                "backfill reaches this branch by design rather than by failure."
             ),
         }
 
@@ -1484,6 +1604,7 @@ async def first_seen(
         "baseline_empty": False,
         "baseline_truncated": baseline_truncated,
         "recent_truncated": recent_truncated,
+        "provenance": provenance,
         "items": items,
         "summary": _first_seen_summary(
             items,
@@ -1491,6 +1612,7 @@ async def first_seen(
             baseline_destinations=baseline_destinations,
             internal_excluded=internal_excluded,
             baseline_truncated=baseline_truncated,
+            provenance=provenance,
         ),
     }
 

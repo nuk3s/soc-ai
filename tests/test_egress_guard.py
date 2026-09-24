@@ -166,7 +166,15 @@ def test_registered_tool_schema_exposes_real_params(settings_kratos: Settings) -
 
     tool = agent._function_toolset.tools["t_query_events_oql"]
     schema = tool.tool_def.parameters_json_schema
-    assert set(schema["properties"]) == {"query", "time_range_minutes", "max_results"}
+    # ``window_mode`` is here deliberately: the centred window's own note tells
+    # the model to ask again with ``window_mode='before'`` for a how-often
+    # question, which it can only do if the wrapper leaves the parameter visible.
+    assert set(schema["properties"]) == {
+        "query",
+        "time_range_minutes",
+        "max_results",
+        "window_mode",
+    }
     # The docstring (the LLM-visible description) survived the wrap too.
     assert "OQL" in (tool.tool_def.description or "")
     # And the registered closure really is the guard wrapper.

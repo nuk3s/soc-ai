@@ -1,0 +1,40 @@
+id: profile-activity-outside-measured-hours
+title: A host is active in an hour it has never used before
+description: >
+  Every machine keeps a schedule. A workstation runs while someone uses it. A
+  server runs in its maintenance window. A backup job runs in its slot.
+
+  Activity in an hour a host has never used is not a finding on its own, because
+  people work late. It is a second signal. It turns a lone novel destination
+  into a result worth reading.
+
+  This is the weakest clause in the design. Daylight saving, shift changes and
+  travel all move a host's schedule without an incident. This clause contributes
+  to a lead. It never forms a lead alone.
+
+  A host with no measured active hours does not fire. An empty set means the
+  sweep never saw the host active. That is a coverage gap.
+
+level: low
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+profile:
+  dimension: active_hours
+  test: outside_active_hours
+
+attack:
+  - T1029
+
+false_positives:
+  - A person works late, travels, or works in another timezone. This analytic
+    expects all 3 cases. They are the reason this clause carries the lowest
+    weight.
+  - A daylight saving transition moves every hour on the host by 1. The shift
+    lasts about 2 weeks. The baseline then absorbs it.
+  - An operator schedules a new job. The job establishes its hour within the
+    support window.
+
+references:
+  - https://attack.mitre.org/techniques/T1029/

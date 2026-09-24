@@ -6,62 +6,62 @@ rules: []
 
 # Noisy rule tuning methodology
 
-Not a triage runbook — a procedure for deciding what to do about a rule
-that keeps firing on benign activity. Alert fatigue is a security risk in
-itself: analysts who dismiss a rule 200 times stop reading it, and the
-201st might be real. Tune deliberately, with data, and leave a trail.
+This document is a procedure for a rule that fires repeatedly on benign activity. It is
+not a triage runbook. Alert fatigue is itself a security risk. An analyst who dismisses a
+rule 200 times stops reading it. The 201st alert can be real. Tune the rule deliberately, use
+data, and leave a record.
 
 ## Qualify the noise first
 
-Before touching the rule, characterize the last 30 days of its alerts:
+Characterize the alerts of the last 30 days before you change the rule:
 
-- **Volume and trend**: total fires, fires/day, growing or steady?
-- **Concentration**: what fraction comes from the top 3 source hosts, top 3
-  destinations, or one subnet? Noise is usually concentrated; real threat
-  activity is distributed. A rule that's 95% one appliance is a *scoping*
-  problem, not a bad rule.
-- **Verdict history**: how many were investigated and what fraction ended
-  false positive? If any recent fire was a true positive, the rule stays —
-  scope around the noise instead of suppressing broadly.
+- **Volume and trend**. Count the total fires and the fires per day. Record whether the
+  count grows or stays steady.
+- **Concentration**. Measure the fraction that comes from the top 3 source hosts, the top
+  3 destinations or one subnet. Noise is usually concentrated. Real threat activity is
+  distributed. A rule with 95 % of its fires from one appliance has a *scoping* problem.
+- **Verdict history**. Count the alerts that reached an investigation. Measure the
+  fraction that ended as a false positive. Keep the rule if any recent fire was a true
+  positive. Scope the rule around the noise. Do not suppress the rule broadly.
 
 ## Choose the narrowest effective action
 
-In order of preference:
+Use this order of preference:
 
-1. **Fix the source**: when the noise is a misconfiguration (a service with
-   stale credentials, a broken health check), fixing the system beats every
-   suppression option — the alert was doing its job.
-2. **Scoped suppression**: suppress the rule for the *specific* source/
-   destination pairs that account for the noise (e.g. the vulnerability
-   scanner's IP, the backup server's nightly job). Keep the rule live for
-   everything else.
-3. **Threshold/rate adjustment**: for burst-prone rules, alert on N fires
-   in M minutes rather than every packet.
-4. **Severity demotion**: keep the record for hunting/correlation but drop
-   it out of the triage queue.
-5. **Full disable** — last resort, only for rules that are wrong by design
-   for your environment (a protocol you don't run, a geography that doesn't
-   apply), and only with an expiry/review date.
+1. **Fix the source.** Repair the system if a misconfiguration causes the noise. A service
+   with stale credentials or a broken health check is a misconfiguration. A repair beats
+   every suppression option. The alert did its job.
+2. **Apply a scoped suppression.** Suppress the rule for the *specific* source and
+   destination pairs that produce the noise. Two examples are the IP of the vulnerability
+   scanner and the nightly job of the backup server. Keep the rule live for everything
+   else.
+3. **Adjust the threshold or the rate.** For a burst-prone rule, alert on N fires in M
+   minutes. Do not alert on every packet.
+4. **Demote the severity.** Keep the record for hunts and correlation. Remove the alert
+   from the triage queue.
+5. **Disable the rule in full.** Use this action last. Use it only for a rule that is
+   wrong by design for your environment. A protocol that you do not run or a geography
+   that does not apply makes a rule wrong by design. Set an expiry date or a review date
+   for the disable.
 
 ## Guardrails
 
-- Every tuning action needs: the evidence summary that justified it, the
-  scope (why this narrow), an owner, and a **review date**. Untracked
-  suppressions become permanent blind spots.
-- Never tune away a rule family that maps to a technique you have no other
-  coverage for — check what else would catch the behavior (MITRE ATT&CK
-  mapping helps here) before removing the only tripwire.
-- Prefer tuning in your detection layer over deleting upstream rules, so
-  vendor updates don't silently resurrect or orphan your changes.
-- Re-run the 30-day analysis after tuning: if the rule still tops the noise
-  chart, the scoping was wrong; if it went silent entirely, verify the rule
-  still fires on a known-good test (a suppression wider than intended looks
-  identical to success).
+- Record 4 items for every tuning action: the evidence summary that justified it, the
+  scope, an owner and a **review date**. Record why the scope is narrow. An untracked
+  suppression becomes a permanent gap in coverage.
+- Never tune away a rule family that maps to a technique with no other coverage. Check
+  what else catches the behavior before you remove the only detection. A MITRE ATT&CK
+  mapping helps here.
+- Tune in your detection layer. Do not delete the upstream rules. A vendor update then
+  cannot resurrect or orphan your changes silently.
+- Re-run the 30-day analysis after the tuning. The scoping was wrong if the rule is still
+  the top source of noise. Verify that the rule still fires on a known-good test if the
+  rule went silent. A suppression wider than intended looks the same as success.
 
-## When triaging an alert from a known-noisy rule
+## When you triage an alert from a known-noisy rule
 
-Don't auto-dismiss on the rule's reputation. Check whether *this* fire
-matches the documented benign pattern (same source, same schedule, same
-shape). A noisy rule firing *off-pattern* — new source, odd hour, different
-target — deserves a full look precisely because everyone else has stopped
-looking.
+Do not dismiss the alert because of the reputation of the rule. Check whether *this* fire
+matches the documented benign pattern. That pattern has the same source, the same
+schedule and the same shape. Give a full look to a noisy rule that fires off its pattern.
+A new source, an odd hour or a different target is off-pattern. Everyone else has stopped
+looking at this rule.

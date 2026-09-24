@@ -1,0 +1,43 @@
+id: identity-4768-preauth-disabled
+title: 'A Kerberos ticket request names an account without pre-authentication: AS-REP roasting'
+description: >
+  A 4768 authentication-ticket request carries PreAuthType 0. That value means
+  the account does not require Kerberos pre-authentication. Any principal can
+  then request a ticket for the account and crack the reply offline. The attempt
+  writes no failed logon and no account lockout.
+
+  An administrator disables pre-authentication deliberately. This analytic
+  therefore records a weakness and the moment somebody used it. The range held 1
+  matching document of 3,913.
+
+level: high
+# No benign population. Disabling pre-authentication is a standing account
+# setting; the one exception below is an identity, and its appearing at every
+# logon is the exposure, not a baseline that clears it. A triage may not close
+# this false_positive on how often it fires.
+no_benign_baseline: true
+scope_field: winlog.event_data.TargetUserName
+scope_kind: user
+
+precondition:
+  all:
+    - field: event.code
+      value: "4768"
+
+detection:
+  all:
+    - field: event.code
+      value: "4768"
+    - field: winlog.event_data.PreAuthType
+      value: "0"
+
+attack:
+  - T1558.004
+
+false_positives:
+  - An administrator configures some accounts without pre-authentication for a
+    legacy application. These accounts appear every time they authenticate.
+    This analytic therefore fires once per account.
+
+references:
+  - https://attack.mitre.org/techniques/T1558/004/

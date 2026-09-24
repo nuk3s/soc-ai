@@ -1,32 +1,34 @@
-# soc-ai web UI: operator guide
+# The soc-ai web console: operator guide
 
-The soc-ai web UI is a self-hosted triage console for Security Onion alerts. It
-runs on the soc-ai host at **`https://<host>:8443/app`** behind session auth.
-This guide is a practical reference for the analyst/operator surfaces.
+The soc-ai web console is a self-hosted triage console for Security Onion
+alerts. It runs on the soc-ai host at `https://<host>:8443/app` behind
+session authentication. This guide is a reference for the analyst screens and
+the operator screens.
 
 ![An investigation in the console](img/screenshot-investigation.png)
 
-> **Front door is `/app`**, the React console. It is the only web surface;
-> bare `/` redirects into it and signing in lands you on the Dashboard. (The
-> legacy server-rendered `/ui` console has been removed.)
+> The front door is `/app`, the React console. It is the only web surface.
+> Bare `/` redirects to it, and a sign-in lands you on the Dashboard. The old
+> server-rendered `/ui` console is gone.
 
-> **First run / self-signed cert:** the UI serves over HTTPS with a self-signed
-> cert. Visit the base URL once and accept the cert warning before signing in;
-> otherwise the browser refuses the connection with an opaque `TypeError: Failed
-> to fetch`.
+> **First run with a self-signed certificate:** the console serves HTTPS with a
+> self-signed certificate. Visit the base URL once and accept the certificate
+> warning before you sign in. If you do not, the browser refuses the connection
+> with an opaque `TypeError: Failed to fetch`.
 
 ## Sign in
 
-`/app/login`: username + password. Two roles:
+`/app/login` takes a username and a password. There are two roles:
 
-- **analyst**: full triage console (alerts, hunts, investigations).
-- **admin**: everything an analyst can do **plus** the config console (`/app/config`).
+- **analyst**: the full triage console, with alerts, hunts and investigations.
+- **admin**: everything an analyst can do, and the config console at `/app/config`.
 
-The first admin (`admin`) is bootstrapped on first start; its generated password
-is written **once** to a locked-down sidecar file,
-`<soc_ai_data_dir>/bootstrap-admin-password.txt` (mode `0600`) — not to the
-service log, which is often readable by the same audience the credential must
-stay secret from. Read it for your deploy path:
+soc-ai creates the first admin, `admin`, at the first start. It writes the
+generated password once to a locked-down sidecar file,
+`<soc_ai_data_dir>/bootstrap-admin-password.txt`, with mode `0600`. It does not
+write the password to the service log, because the service log is often readable
+by the same people the credential must stay secret from. Read the file for your
+deploy path:
 
 ```bash
 # Docker deploy (default data dir /var/lib/soc-ai/data)
@@ -35,382 +37,490 @@ docker exec soc-ai cat /var/lib/soc-ai/data/bootstrap-admin-password.txt
 cat "$SOC_AI_DATA_DIR/bootstrap-admin-password.txt"
 ```
 
-Only if the data dir was not writable at startup does soc-ai fall back to
-logging the plaintext (`journalctl -u soc-ai | grep -i password` /
-`docker compose logs soc-ai | grep -i password`); on the normal path the log
-holds only a pointer line, not the password.
+soc-ai logs the plaintext password only if the data directory was not writable
+at startup. Read it then with `journalctl -u soc-ai | grep -i password` or with
+`docker compose logs soc-ai | grep -i password`. On the normal path the log holds
+a pointer line and no password.
 
-Change it after first login (Config → Users → reset password), then **delete the
-sidecar file** — it is no longer needed and should not linger on the volume.
+Change the password after the first login. Use Config → Users → reset password.
+Then delete the sidecar file, because nothing needs it and the volume must not
+keep it.
 
 ## Navigation
 
-The sidebar groups into two. **Investigate** (Dashboard, Alerts,
-Investigations, Hosts, Notifications, Hunts) stays open; it's the loop most of
-a shift runs in. **Operate** (the Operate hub, Runbooks, Backtest, Config)
-starts collapsed, since those are once-a-shift or once-a-week stops rather
-than per-alert ones. Click its heading to expand it, or navigate straight to
-one of its screens: Operate expands itself whenever the current page lives
-inside it, so your screen is never hidden behind a closed group.
+The sidebar has two groups. Investigate holds Dashboard, Alerts,
+Investigations, Hosts, Notifications and Hunts. It stays open, because most of a
+shift runs in that loop. Operate holds the Operate hub, Runbooks, Backtest and
+Config. It starts collapsed, because you reach those screens once a shift or
+once a week.
+
+Click the Operate heading to expand the group, or go straight to one of its
+screens. Operate expands itself if the current page lives inside it, so no closed
+group hides your screen.
 
 ## Dashboard (`/app/dashboard`)
 
-Where signing in lands you. What the grid is doing right now and what soc-ai
-has made of it, with a box to ask about either.
+A sign-in lands you here. The Dashboard shows what the grid does now and what
+soc-ai made of it. A box on the screen answers questions about either one.
 
 ### Setup health
 
-A persistent card at the top of the Dashboard's side column. Persistent means
-it never hides itself the way the panels below it do when there's nothing to
-review. Clean, it's one compact line: "All checks passing," with how long ago
-that was confirmed. Degraded, admins see each failing or warned check by
-name, with its detail and a hint where there is one, plus a **Re-check**
-button that forces a fresh check past the ten-minute cache, for when the
-problem is already fixed. A re-check that itself fails says so ("Re-check
-failed — try again") and leaves the last known-good rows on screen instead of
-blanking them. Analysts get a count and a pointer to Config → Diagnostics,
-never the row names.
+A persistent card sits at the top of the side column on the Dashboard.
+Persistent means the card never hides itself. The panels below it do hide if
+they have nothing to review.
 
-It's fed by the same doctor checks Wave 1 added, minus the model fitness
-probe. That one can take a couple of minutes, too slow for a dashboard poll,
-so fitness stays on the model battery in Config.
+A clean card is one compact line, "All checks passing," with the time since that
+check. On a degraded card an admin sees each failing or warned check by name,
+with its detail and a hint if one exists. The card also carries a Re-check
+button. Re-check forces a fresh check past the 10 minute cache, for the case
+where the problem is already fixed. A re-check that itself fails says so
+("The re-check failed. Try again.") and leaves the last known-good rows on screen. An
+analyst sees a count and a pointer to Config → Diagnostics, and never the row
+names.
+
+The card reads the same doctor checks that Wave 1 added, without the model
+fitness probe. That probe can take a few minutes and is too slow for a dashboard
+poll. Fitness stays on the model battery in Config.
 
 ### Ask soc-ai
 
-A chat that answers on the spot, using the same read tools as the investigation
-chat and taking about as long. Ask it what datasets you have, which rule was
-noisiest overnight, or what a host has been up to.
+A chat answers on the spot. It uses the same read tools as the investigation chat
+and takes about as long. Ask it which datasets you have, which rule was noisiest
+overnight, or what a host did.
 
-- **One rolling thread per analyst**, kept across navigation and restarts. Two
-  analysts don't see each other's questions. **Clear** discards yours.
-- **It proposes hunts, it never starts one.** When answering would take a sweep
-  across many hosts or a long window, the turn comes back with a **Start hunt**
-  card holding an objective the agent wrote from what it just looked at, and a
-  line on what the sweep would settle. Both are on the card before you decide;
-  pressing **Start hunt** launches that objective and opens the running hunt.
-- **What it can't do:** no write actions, no verdict changes, no ack or
-  escalate. Read tools only.
-- **Turning it off:** Config → Models & Reasoning → Agent → *Dashboard chat*.
-  Hot, so it takes effect without a restart; the box disappears from the
-  Dashboard rather than failing when someone types. Do that if a shared analyst
-  model is already saturated by the triage backlog — the assistant sits on the
-  screen everyone lands on, which makes it the easiest place in the product to
-  spend inference capacity without meaning to. Nothing runs while nobody types,
-  and switching it off keeps stored threads.
+- **One rolling thread per analyst:** the thread survives navigation and
+  restarts. Two analysts do not see each other's questions. Clear discards
+  your thread.
+- **It proposes a hunt and never starts one.** If an answer needs a sweep across
+  many hosts or a long window, the turn returns a Start hunt card. The card
+  holds an objective that the agent wrote from what it read, and a line on what
+  the sweep would settle. You see both before you decide. Press Start hunt to
+  run that objective and to open the running hunt.
+- **What it cannot do:** it runs no write action, it changes no verdict, and it
+  never acknowledges or escalates an alert. It has read tools only.
+- **How to turn it off:** open Config → Models & Reasoning → Agent →
+  *Dashboard chat*. The setting is hot, so it takes effect with no restart. The
+  box then disappears from the Dashboard instead of failing under a question.
+
+    Turn it off if the triage backlog already saturates a shared analyst model.
+    The assistant sits on the screen that everyone lands on, so it is the easiest
+    place in the product to spend inference capacity by accident. Nothing runs
+    while nobody types, and the stored threads survive the change.
 
 ### Outcome and severity tiles
 
-The verdict tiles count alert **groups** over the range you picked. The four
+The verdict tiles count alert groups over the range that you picked. The four
 settled verdicts open the Investigations list filtered to that verdict.
-**Untriaged** goes to `/app/alerts` instead, because a group nobody has
-investigated has no investigation row to show; the link carries your range and
-un-hides acked groups, so the destination holds exactly what the tile counted.
+Untriaged opens `/app/alerts` instead, because a group that nobody
+investigated has no investigation row to show. That link carries your range and
+un-hides acknowledged groups, so the destination holds what the tile counted.
 
-The severity bars go to the same list, filtered to that severity.
+The severity bars open the same list, filtered to that severity.
 
 ### Verdict quality
 
-The trend from the nightly micro-eval (see
+This card holds the trend from the nightly micro-eval. See
 [DOCKER.md](DOCKER.md#the-nightly-quality-micro-eval-schedule-it-in-app-or-from-host-cron)
-for scheduling it). The badge says which instrument measured each point:
-**oracle graded** points carry an agreement rate, **locally measured** points
-carry fallback and error rates instead. The two are never blended on one line.
+for how to schedule it. The badge names the instrument that measured each point.
+An oracle-graded point carries an agreement rate. A locally measured point
+carries fallback and error rates. soc-ai never blends the two on one line.
+
+Under the run count, one line dates the newest point and the last attempt. If a
+run wrote nothing, the line carries the reason from that run. The usual reason is
+a grid with no eligible alerts. With the in-app nightly on, a point older than 2
+scheduled runs gets an amber "no point in Nd" marker, so last month's point
+cannot pass as last night's. The attempt half lives in the memory of the server
+process and clears on a restart.
 
 Under the headline rate sits the grade composition, "3 agree · 2 partial". A
-partial critique ("right verdict, thin reasoning") costs the rate exactly as
-much as a flat disagreement, and a bare 60% can't tell you which you got — one
-is a prompt to tighten, the other a regression to chase.
+partial critique reads "right verdict, thin reasoning". It costs the rate as much
+as a flat disagreement. A bare 60% cannot tell you which one you got. A partial
+critique asks you to tighten a prompt. A disagreement asks you to chase a
+regression.
 
-When a point alarms, the card prints the path to that run's eval bundle. That
-directory holds the oracle critiques, which are the only evidence for or against
-the alarm. It is a path on the soc-ai host, not a link: read it with
-`docker exec soc-ai cat <path>/report.md`.
+If a point alarms, the card prints the path to the eval bundle of that run. That
+directory holds the oracle critiques. The critiques are the only evidence for or
+against the alarm. The card prints a path on the soc-ai host and not a link. Read
+it with `docker exec soc-ai cat <path>/report.md`.
 
 ## Triage console (`/app/alerts`)
 
 ![The alert queue with AI verdicts inline](img/screenshot-alerts.png)
 
-The main pane: Security-Onion-style alert groups (by rule), newest first.
+The main pane holds alert groups in the Security Onion style. soc-ai groups them
+by rule and shows the newest first.
 
-- **Filter / sort:** time range, severity, sort order, and a free-text OQL box.
+- **Filter and sort:** the controls are the time range, the severity, the sort
+  order, and a free-text OQL box.
 - **Expand a group:** click a group row to load its recent events.
-- **Hunt:** start an AI investigation for an alert/group. Hunts run as
-  **background tasks**: they survive closing the drawer, run concurrently, and
-  every run is recorded. Live progress (phase / elapsed / tools called /
-  enrichments) streams into the drawer.
-- **Verdict badges:** each group/alert shows its latest investigation verdict
-  (true_positive / false_positive / needs_more_info / running / error). A dashed
-  badge with an "inherited" tooltip means the verdict was inherited from a
-  **similar** alert (same rule, same src/dst pair, within the inherit window),
-  visible at both the individual and **group** level.
-- **Permalinks:** every investigation has a shareable URL
-  (`/app/investigation/{id}`), created even while a hunt is still running.
-- **⚡ Auto-triage:** sweep the current view and hunt everything not already
-  covered. Use the **severity checkboxes** (default critical + high) to choose
-  which severities it acts on. A single run is capped (`auto_triage_max_targets`,
-  default 25) so one click can't spawn dozens of hunts; uncovered overflow is
-  picked up by the next run. The status chip shows hunted/total/skipped + the
-  chosen severities.
+- **Hunt:** start an AI investigation for an alert or a group. A hunt runs as a
+  background task. It survives a closed drawer, it runs beside other hunts, and
+  soc-ai records every run. Live progress streams into the drawer: the phase, the
+  elapsed time, the tools called and the enrichments.
+- **Verdict badges:** each group and each alert shows its latest investigation
+  verdict: true_positive, false_positive, needs_more_info, running or error. A
+  dashed badge with an "inherited" tooltip means the verdict came from a similar
+  alert. A similar alert has the same rule and the same src/dst pair, inside the
+  inherit window. The badge appears at the individual level and at the group
+  level.
+- **Permalinks:** every investigation has a URL that you can share,
+  `/app/investigation/{id}`. soc-ai creates the URL while the hunt still runs.
+- **⚡ Auto-triage:** sweep the current view and hunt every alert that nothing
+  covers yet. Use the severity checkboxes to choose the severities it acts on.
+  The default is critical and high. `auto_triage_max_targets` caps a single
+  run at 25 targets, so one click cannot start dozens of hunts. The next run
+  picks up the uncovered overflow. The status chip shows the hunted, total and
+  skipped counts with the chosen severities.
 
 ## Investigations (`/app/investigations`)
 
 ![The investigations list with verdicts and confidence](img/screenshot-investigations.png)
 
-A list of all past + in-flight investigations (verdict, rule, when, who started
-it) with permalinks. Use it to review history and find a prior verdict.
+The screen lists every past investigation and every in-flight one, with a
+permalink on each. A row carries the verdict, the rule, the time and the person
+who started it. Use the list to review history and to find an earlier verdict.
 
-**Stale-run reaping:** investigations left `running` by a crash/restart/network
-drop are cleaned up automatically. On startup every orphaned `running` row is
-marked `error` (its worker died with the previous process), and a periodic sweep
-marks any run still `running` past `investigation_reaper_minutes` (default 30).
-No manual SQL needed to clear orphans.
+**Stale-run reaping:** soc-ai cleans up an investigation that a crash, a restart
+or a network drop left in `running`. At startup it marks every orphaned `running`
+row as `error`, because the worker for that row died with the previous process. A
+periodic sweep then marks any run that stays `running` past
+`investigation_reaper_minutes`. That setting defaults to 30. You never have to
+clear an orphan by hand.
+
+## Hunts (`/app/hunts`)
+
+This screen holds the hunting pipeline in order, top to bottom: the Needs you
+strip, Analytic hits, Leads, Hunts and the New hunt drawer. A second tab,
+Analytics, holds the analytic catalog and the Lead quality block.
+
+The Needs-you strip counts the two things that wait on you: the unread shadow
+hits, and the leads that need a decision. Each link jumps to the block that holds
+them, with the filter set. The sidebar badge on the Hunts item shows the same
+count.
+
+[docs/HUNTING.md](HUNTING.md) is the full guide. It covers the five nouns, how a
+hit becomes a lead and a lead becomes a hunt, the shadow week, the settings, the
+command line and the API routes.
 
 ## Hosts (`/app/hosts`)
 
-What soc-ai has concluded about each machine on your network, and what you have
-declared instead. Two screens.
+This screen holds what soc-ai concluded about each machine on your network, and
+what you declared instead. It has two screens.
 
-**The list** (`/app/hosts`) is one row per host: address, role, hostname,
-criticality, how many fields each lane holds, event count, last seen. Search
-matches an address or a hostname; the **Role** and **Lane** selects narrow to a
-role, or to hosts a human has touched ("declared") versus hosts nobody has
-("inferred only"). Sort by last seen, first seen, stalest, busiest or address.
-Click a row to open the host.
+**The list** at `/app/hosts` gives one row per host. A row holds the address, the
+role, the hostname, the criticality, the number of fields in each lane, the event
+count and the last-seen time.
 
-Above the table sit four counts of the whole network. The panel header below
-counts what your filters match; these four never do. **All hosts** carries how
-many have no clean build, meaning never swept or errored on the last attempt.
-**Named** is hosts whose name the resolver will assert, so it agrees with the
-Hostname column rather than with whatever is stored. **Reporting** is hosts
-where an agent on the machine reports about itself, and it is the only place
-the console shows how far host-log shipping has got. **Needs review** is the
-open disagreements, the same number the queue carries. Under the four sits the
-age of the numbers — "Last swept 4h ago", and a note while automatic sweeps are
-off, since nothing else refreshes them. A count that could not be read shows a
-dash, never a zero.
+Search matches an address or a hostname. The Role select narrows to one role. The
+Lane select narrows to the hosts a human has touched, "declared", or to the hosts
+nobody has touched, "inferred only". Sort by last seen, first seen, stalest,
+busiest or address. Click a row to open the host.
 
-**The host page** (`/app/hosts/<ip>`), top to bottom:
+Four counts of the whole network sit above the table. The panel header below them
+counts what your filters match. The four counts never follow the filters.
 
-- **The banner** names the machine — hostname if anything knows one, otherwise
-  the address — with its role, where that role came from, OS, criticality, and
-  whether the machine reports on itself. "no agent data" means every field below
-  was observed from the network rather than told to us by the host.
-- **Four counters**: services it answers on, accounts seen authenticating,
-  connection volume, and alerts over seven days. Under the alert count sits an
-  **all alerts · 7d** link, and it means what it says: the alerts console
-  filters by time, severity and verdict, never by host, so it opens on the whole
-  network's detections over those days with this host's among them.
-- **Peers, volume and users** over the window you pick — 24h or 7d.
-- **Twelve field cards**, one per dossier field.
+- **All hosts** carries how many hosts have no clean build. A host has no clean
+  build if no sweep reached it, or if the last attempt errored.
+- **Named** counts the hosts whose name the resolver asserts, so it agrees with
+  the Hostname column and not with the stored value.
+- **Reporting** counts the hosts where an agent on the machine reports about
+  itself. It is the only place the console shows the progress of host-log
+  shipping.
+- **Needs review** counts the open disagreements. It is the same number the queue
+  carries.
 
-An internal address opened from anywhere in the console lands here: alert rows,
-the peer graph, and old `/entity/<ip>` links all redirect. External addresses
-still open the Entity screen, because the sweep only builds hosts inside your
-`internal_cidrs`.
+Under the four counts sits the age of the numbers, for example "Last swept 4h
+ago". A note appears while automatic sweeps are off, because nothing else
+refreshes the numbers. A count that soc-ai could not read shows a dash and never
+a zero.
+
+**The host page** at `/app/hosts/<ip>` holds these parts, top to bottom:
+
+- **The banner** names the machine. It uses the hostname if any source knows one,
+  and the address if none does. It also carries the role, the source of that
+  role, the OS, the criticality, and whether the machine reports on itself. "no
+  agent data" means the network supplied every field below, and the host told
+  soc-ai nothing.
+- **Four counters** cover the services the host answers on, the accounts that
+  authenticated, the connection volume, and the alerts over 7 days. An
+  `all alerts · 7d` link sits under the alert count. The alerts console filters
+  by time, severity and verdict, and never by host. The link therefore opens on
+  the detections of the whole network over those days, with this host's
+  detections among them.
+- **Peers, volume and users** over the window that you pick, 24h or 7d.
+- **12 field cards**, one for each dossier field.
+
+An internal address opens here from anywhere in the console. Alert rows, the peer
+graph and old `/entity/<ip>` links all redirect to it. An external address still
+opens the Entity screen, because the sweep builds hosts inside your
+`internal_cidrs` only.
 
 ### The two lanes
 
-Every field holds up to two answers and they never overwrite each other:
+Every field holds up to 2 answers, and one answer never overwrites the other:
 
-- **inferred** — what the sweep concluded, with a provenance rung (what kind of
-  signal it came from), a confidence, and the evidence behind it under **Why?**.
-- **operator** — what you declared. Stored in its own columns, so no rebuild can
-  clobber it.
+- **inferred** is what the sweep concluded. It carries a provenance rung that
+  names the type of signal, a confidence, and the evidence under **Why?**.
+- **operator** is what you declared. soc-ai stores it in its own columns, so no
+  rebuild can overwrite it.
 
-Nothing is a stored "current value". The page resolves each field on read,
-operator lane first, then the inferred value if it clears the confidence floor
-(`dossier_min_confidence`) and has been re-confirmed inside the freshness window
-(`dossier_staleness_hours`). A field that resolves to nothing says which of
-those it failed, because "no signal yet" and "observed but too weak to assert"
-are different answers.
+soc-ai stores no "current value". The page resolves each field as it reads it. It
+takes the operator lane first. It then takes the inferred value if that value
+clears the confidence floor `dossier_min_confidence` and a re-confirmation falls
+inside the freshness window `dossier_staleness_hours`. A field that resolves to
+nothing names the test it failed, because "no signal yet" and "observed but too
+weak to assert" are different answers.
 
-### Declaring, accepting, keeping yours (admin)
+### Declare a value, accept one, or keep yours
 
 On any field card:
 
-- **Declare a value** (**Edit declaration** once one exists) writes your value
-  and an optional note, recorded with your name and shown back on the card.
-  Three fields — services offered, activity profile, management plane — hold
-  structured values and take JSON.
-- **Hand back to the builder** deletes your override and lets the sweep's answer
-  stand again.
-- When the sweep disagrees with something you declared, the card says so and
-  names the kind: the evidence points elsewhere, the evidence it rested on is
-  gone, or the address appears to have rebound to a different machine. Then:
-  - **Accept inference** (confirm with **Discard my value**) drops your override
-    and takes the sweep's answer.
-  - **Keep mine** keeps yours and stops the question for a while. The interval
-    doubles each time you press it, capped at 90 days.
+- **Declare a value** writes your value and an optional note. The card records
+  your name and shows the value back. The button reads Edit declaration once a
+  declaration exists. Three fields hold structured values and take JSON:
+  services offered, activity profile and management plane.
+- **Hand back to the builder** deletes your override, so the answer from the
+  sweep stands again.
+- If the sweep disagrees with a value that you declared, the card says so and
+  names the type of disagreement. The evidence points elsewhere. The evidence it
+  rested on is gone. The address appears to have rebound to a different machine.
+  Then you have two choices:
+  - **Accept inference** drops your override and takes the answer from the sweep.
+    Confirm it with Discard my value.
+  - **Keep mine** keeps your value and stops the question for a period. The
+    period doubles each time you press it, up to 90 days.
 
-Analysts see all of this read-only. Declaring, accepting, keeping and running a
-sweep are admin-only.
+An analyst sees all of this as read-only. Only an admin can declare a value,
+accept one, keep one, or run a sweep.
 
-A disagreement has to earn its way onto the screen: three consecutive builds
-that disagree (`dossier_conflict_min_observations`) before you are prompted, and
-at most one prompt per field per 14 days
-(`dossier_conflict_prompt_interval_hours`). One build agreeing resets the count.
+A disagreement must earn its place on the screen. soc-ai prompts you after 3
+consecutive builds disagree. `dossier_conflict_min_observations` sets that count.
+It prompts at most once per field per 14 days.
+`dossier_conflict_prompt_interval_hours` sets that interval. One build that
+agrees resets the count.
 
 ### Running the sweep
 
-**The scheduled sweep is off by default** (`dossier_schedule_enabled`). A sweep
-is hundreds of hosts across several Elasticsearch queries each, so you decide
-when it runs. Until it has run at least once the Hosts screen is empty — that is
-a sweep that has not happened, not a network with no hosts on it.
+The scheduled sweep is off by default. `dossier_schedule_enabled` controls it. A
+sweep covers hundreds of hosts and runs several Elasticsearch queries for
+each one, so you decide when it runs. The Hosts screen stays empty until the
+sweep runs once. An empty screen means the sweep has not run. It does not mean
+the network has no hosts on it.
 
-- **Rebuild now** on the Hosts screen (admin) runs one in the background and
-  reports what it built.
+- **Rebuild now** on the Hosts screen runs a sweep in the background and reports
+  what it built. Only an admin sees the button.
 - Config → Host dossier turns on the schedule and sets its interval. Every
-  setting there is hot: no restart, and the next sweep picks it up.
+  setting there is hot, so it needs no restart and the next sweep reads it.
 
 ## Operate hub (`/app/operate`)
 
-![The Operate hub: six cards for model fitness, verdict quality, audit chain, backtest, diagnostics, and runbooks](img/screenshot-operate.png)
+![The Operate hub: the Analytics panel, with its sweep status line and one row per analytic, above the trust-instrument cards](img/screenshot-operate.png)
 
-A map of the console's trust instruments: six cards, each naming one thing
-soc-ai can prove and linking to where you prove it. It carries no live status
-of its own. That's the Dashboard's setup-health card's job.
+The hub maps the trust instruments of the console. It holds 6 cards. Each card
+names one thing that soc-ai can prove and links to the screen where you prove it.
+The cards carry no live status of their own. The setup-health card on the
+Dashboard carries that status.
 
-- **Model fitness**: prove the analyst model is fit before triage depends on
-  it. Links to Config → Agent.
-- **Verdict quality**: prove the verdicts held up, the nightly micro-eval
-  trend. Links to Config → Quality.
-- **Audit chain**: prove the tamper-evident record is intact. Links to
-  Config → Diagnostics, which carries a **Verify audit chain** button.
-  Pressing it reports one of five outcomes: intact (green check, records
-  verified), partial verification (amber; capped to the start of the chain,
-  not the whole thing), intact within N epochs (amber; every restart's own
-  trail checked out, but restart boundaries can't be linked to each other, so
-  this stops short of "one unbroken chain" — see below), tampered (red; names
-  the sequence number and the restart it broke in), or couldn't verify (amber;
-  the console couldn't read the chain at all). Only a full, single-epoch,
-  uncapped scan gets the green check.
+The one live panel on the page sits above the cards. It is the Hunt catalog.
+The declarative hunt catalog runs unattended, as a scheduler sweep with no model
+call. If nothing fires, it leaves no trace anywhere else in the console. Check
+here that it runs.
 
-  A chain that spans more than one epoch isn't itself a red flag: a process
-  restart legitimately can't link back to what came before it (a fixed bug
-  once turned restarts into 134 of them — see the Diagnostics panel's own
-  copy for specifics), and the console names that plainly rather than crying
-  tamper on every one of them.
-- **Backtest**: replay history against today's pipeline. Links to Backtest.
-- **Diagnostics**: the doctor's view from inside the app. Links to Config →
-  Diagnostics.
-- **Runbooks**: the procedures grounding every verdict. Links to Runbooks.
+The status line says whether the sweeps are on, how often they run, how far back
+they look, and when the last one ran. With the sweeps off the line still shows
+the other three, because a `soc-ai spec-sweep` run by hand leaves the same trail with
+the same look-back. The interval then reads "once enabled", because that is the
+schedule the flag would start. The line also says how to turn the sweeps on.
+
+A legend above the rows says that the counts cover the last 24 hours. Each spec
+then gets a row. The row holds the level of the spec, the number of times it
+fired in that window, and how many of those hits were fresh or already handled.
+It also holds the last sweep time, the last firing time, and 3 markers.
+
+**shadow** is amber and carries a count. It means some sweeps in the window were
+`spec-sweep --shadow` runs. A shadow sweep counts what it would have reported as
+fresh, and never as fired. On a marked row, "fired 0, fresh 2" is the shadow
+reporting. The spec is not withholding a hit. A condition that a shadow sweep saw
+is fresh again to the live sweep that follows, so the fresh count is per sweep and
+not per condition.
+
+**blind** is amber. It means the precondition of the spec matched nothing on the
+last sweep. The telemetry that the spec reads is absent. An absent telemetry
+plane is not a clean grid.
+
+**error** is red. It means the sweep itself broke on that spec. Hover over the
+marker for the reason.
+
+A spec that the loop never reached reads "not yet swept" and not a row of zeros.
+A row of zeros would say "swept, saw nothing". The panel refreshes itself every 5
+minutes.
+
+- **Model fitness** proves the analyst model is fit before triage depends on it.
+  It links to Config → Agent.
+- **Verdict quality** proves the verdicts held up. It carries the nightly
+  micro-eval trend and links to Config → Quality.
+- **Audit chain** proves the tamper-evident record is intact. It links to
+  Config → Diagnostics, and that screen carries a Verify audit chain button.
+  Press it and it reports one of 5 outcomes:
+  - intact. A green check. soc-ai verified the records.
+  - partial verification. Amber. The scan stopped at the start of the chain and
+    did not cover the whole chain.
+  - intact within N epochs. Amber. Every restart has its own verified trail, but
+    soc-ai cannot link one restart boundary to another. This outcome stops short
+    of "one unbroken chain". Read the paragraph below.
+  - tampered. Red. The message names the sequence number and the restart it broke
+    in.
+  - couldn't verify. Amber. The console could not read the chain at all.
+
+  Only a full, single-epoch, uncapped scan gets the green check.
+
+  A chain that spans more than one epoch is not proof of a problem. A process
+  restart legitimately cannot link back to what came before it. A fixed bug once
+  turned restarts into 134 epochs, and the Diagnostics panel holds the specifics.
+  The console names that state plainly. It reports no tamper at a boundary.
+- **Backtest** replays history against the current pipeline. It links to
+  Backtest.
+- **Diagnostics** is the doctor's view from inside the app. It links to
+  Config → Diagnostics.
+- **Runbooks** holds the procedures that ground every verdict. It links to
+  Runbooks.
 
 ## Runbooks (`/app/runbooks`)
 
-The authoring space for your team's own triage guidance, the corpus the
-investigation agent searches (its `lookup_runbook` tool) and cites in verdicts.
-Reading is open to analysts; creating/editing/deleting is admin-gated.
+This screen is the authoring space for your team's own triage guidance. The
+investigation agent searches this corpus with its `lookup_runbook` tool and cites
+it in a verdict. An analyst can read a runbook. Only an admin can create, edit or
+delete one.
 
-- **Editor**: title, markdown content (with a write/preview toggle), tags, and
-  **linked rules**: detection rule names/UUIDs this runbook applies to. A
-  rule-link is the strongest retrieval signal: when that rule fires, this
-  runbook wins.
-- **Import files…**: bulk-import existing `.md` procedures from your wiki or
-  repo. Optional YAML front-matter (`title:`, `tags:`, `rules:`) is parsed
-  leniently: malformed metadata is ignored and the body still imports; the
-  title falls back to the first `#` heading, then the filename.
-- **Load starter pack**: seeds ten generic, vendor-neutral SOC runbooks shipped
-  with the repo (`runbooks/starter-pack/`). Idempotent by title, so it never
-  duplicates or overwrites a runbook you already have, so it's safe to re-run
-  after upgrades. Edit the seeded copies freely; your edits stick.
-- When the optional **Retrieval (RAG)** embeddings tier is configured, each row
-  shows its embed status (`embedded` / `not embedded` / `stale embedding`);
-  the catch-up pass lives at Config → Retrieval → "Re-embed runbooks".
+- **Editor**: the title, the markdown content, the tags, and the linked rules. A
+  write and preview toggle sits on the content field. A linked rule is a
+  detection rule name or UUID that this runbook applies to. A rule link is the
+  strongest retrieval signal, so this runbook wins if that rule fires.
+- **Import files…**: import your existing `.md` procedures from your wiki or repo
+  in bulk. The optional YAML front-matter fields are `title:`, `tags:` and
+  `rules:`. The parser is lenient. It ignores malformed metadata and still
+  imports the body. A missing title falls back to the first `#` heading, then to
+  the filename.
+- **Load starter pack**: seed 10 generic, vendor-neutral SOC runbooks from
+  `runbooks/starter-pack/` in the repo. The action is idempotent by title, so it
+  never duplicates or overwrites a runbook that you already have. Run it again
+  after an upgrade. Edit the seeded copies as you want, because your edits stay.
+- If you configure the optional Retrieval (RAG) embeddings tier, each row shows
+  its embed status: `embedded`, `not embedded` or `stale embedding`. The
+  catch-up pass lives at Config → Retrieval → "Re-embed runbooks".
 
-The Config page keeps a compact summary (count + manage link) next to the
-Retrieval settings.
+The Config page keeps a compact summary next to the Retrieval settings. The
+summary holds a count and a manage link.
 
 ## Config console (`/app/config`, admin only)
 
-In-UI configuration. A non-admin who reaches it gets a clean 403 (no login loop).
+This screen configures soc-ai from the console. A non-admin who reaches it gets a
+clean 403 and no login loop.
 
 ### The day-1 view
 
 ![The Config day-1 view: a section's day-1 settings up front, the rest collapsed behind an Advanced fold](img/screenshot-config-day1.png)
 
-Config opens on eight decisions, not the full list: the analyst model, the
-events index pattern, the alerts query, the four auto-triage knobs (schedule
-on/off, interval, per-run target cap, minimum severity), and the
-notifications master toggle. Most of those are the ones setup.sh already asks
-about at install time, or ones that decide whether the console shows anything
-at all; the notifications toggle is the one opt-in outbound-egress decision
-worth a day-one look rather than a trip behind Advanced. Everything else in a
-section folds behind an **Advanced (N)** reveal, collapsed by default. A
-section with no day-1 settings in it starts with its Advanced fold open
-instead, so it doesn't read as empty.
+Config opens on 8 decisions and not on the full list. The decisions are the
+analyst model, the events index pattern, the alerts query, the 4 auto-triage
+settings, and the notifications master toggle. The 4 auto-triage settings are the
+schedule switch, the interval, the per-run target cap and the minimum severity.
+setup.sh already asks about most of them at install time, or they decide whether
+the console shows anything at all. The notifications toggle is the one opt-in
+outbound-egress decision that deserves a day-one look.
 
-Settings search is unaffected: it still finds every setting, day-1 or tucked
-behind Advanced, and clicking a result opens both its section and its
-Advanced fold if that's where the setting lives.
+Everything else in a section folds behind an Advanced (N) reveal, collapsed by
+default. A section with no day-1 setting in it starts with its Advanced fold
+open, so it does not read as empty.
 
-### Settings sections (Oracle / Agent / PCAP)
+Settings search still finds every setting, day-1 or behind Advanced. A click on a
+result opens the section of the setting. It also opens the Advanced fold if the
+setting lives there.
 
-Editable, **non-secret** runtime settings. Each row shows a **source badge**:
+### Settings sections: Oracle, Agent and PCAP
 
-- `env`: the value comes from `.env` (the default).
-- `db`: an admin override is set (stored in the `config_overrides` table).
+These sections hold editable, non-secret runtime settings. Each row shows a source
+badge:
 
-Changes are **hot-applied**: saving persists the override *and* mutates the live
-settings, so it takes effect on the **next investigation with no restart**. The
-overrides are re-applied at startup, so they survive restarts. Editable keys:
+- `env` means the value comes from `.env`. This is the default.
+- `db` means an admin override is set. soc-ai stores it in the `config_overrides`
+  table.
 
-- **Oracle**: `oracle_enabled` (the cloud frontier-model second opinion;
-  everything sent to it is sanitized first), `oracle_model`, and the escalation
-  thresholds (`oracle_escalate_*`). This is the home for the Oracle toggle.
-- **Agent**: `investigate_when_unsure` (run the bounded investigation loop when
-  the fast round-1 verdict isn't evidence-backed) and `general_chat_enabled`
-  (the Dashboard's Ask soc-ai box; on by default).
-- **PCAP**: `pcap_enabled` (fetch + decode raw packets on demand via the SO
-  sensor's Suricata pcap ring).
+soc-ai hot-applies a change. A save writes the override and changes the live
+settings, so the change takes effect on the next investigation with no restart.
+soc-ai re-applies the overrides at startup, so they survive a restart.
+These keys are editable:
+
+- **Oracle**: `oracle_enabled`, `oracle_model`, and the escalation thresholds
+  `oracle_escalate_*`. `oracle_enabled` turns on the cloud frontier-model second
+  opinion, and soc-ai sanitizes everything that it sends there. This section is
+  the home of the Oracle toggle.
+- **Agent**: `investigate_when_unsure` and `general_chat_enabled`.
+  `investigate_when_unsure` runs the bounded investigation loop if evidence does
+  not back the fast round-1 verdict. `general_chat_enabled` controls the Ask
+  soc-ai box on the Dashboard, and it is on by default.
+- **PCAP**: `pcap_enabled` fetches and decodes raw packets on demand from the
+  Suricata pcap ring on the Security Onion sensor.
 
 ### Connection (Danger Zone)
 
-LLM gateway, Security Onion, and Elasticsearch connection details default to the
-values in `.env` on the host, with **secrets masked** (`••••••`) and never
-echoed back. They are **not** read-only, though: the **Danger Zone** panel lets
-an admin override the connection identity and credentials — `so_host`,
+The connection details for the LLM gateway, Security Onion and Elasticsearch
+default to the values in `.env` on the host. soc-ai masks a secret as `••••••`
+and never echoes it back. These fields are not read-only. The Danger Zone panel
+lets an admin override the connection identity and the credentials: `so_host`,
 `so_username`, `so_password`, `so_verify_ssl`, the SSH-pivot fields
-(`so_ssh_host` / `so_ssh_user` / `so_ssh_key`), `es_hosts`, `es_username`,
+`so_ssh_host`, `so_ssh_user` and `so_ssh_key`, `es_hosts`, `es_username`,
 `es_password`, `es_verify_ssl`, `litellm_base_url`, `litellm_api_key`, and
-`internal_cidrs`. Each write requires a **typed confirmation** (retype the key
-name) and is **Fernet-encrypted at rest** (needs `CONFIG_SECRET_KEY`). Because
-these repoint startup-built clients they are **not** hot: an override takes
-effect on the **next restart**. Since an admin session can repoint the gateway
-or grid from here — sending every alert's enriched context to a different
-endpoint — treat the admin role and `/app/config` as trust-sensitive, not just
-"agent knobs".
+`internal_cidrs`.
 
-- **Test connection** buttons probe the **LiteLLM gateway** (`GET /v1/models`,
-  reports model count) and **Elasticsearch** (`ping`, reports cluster + version).
-  Results are inline ✓/✗ and never contain a secret.
+Each write needs a typed confirmation. Retype the key name to confirm it. soc-ai
+encrypts the value at rest with Fernet, so this panel needs `CONFIG_SECRET_KEY`.
+These settings repoint clients that soc-ai builds at startup, so they are not
+hot. An override takes effect at the next restart.
+
+An admin session can repoint the gateway or the grid from here. That sends the
+enriched context of every alert to a different endpoint. Treat the admin role and
+`/app/config` as trust-sensitive.
+
+- **Test connection** buttons probe the LiteLLM gateway with `GET /v1/models` and
+  report the model count. A second button probes Elasticsearch with `ping` and
+  reports the cluster and the version. Each result is an inline ✓ or ✗ and holds
+  no secret.
 
 ### API keys
 
-A separate **API keys** panel (rendered next to Data sources, not in the normal
-settings groups) holds the enrichment-provider secrets: `shodan_api_key`,
-`greynoise_api_key`, `misp_api_key`, `maxmind_license_key`, `abuse_ch_auth_key`,
-and `crawl4ai_token`. These are **write-only** (Fernet-encrypted at rest, never
-rendered back), **hot-applied** (read fresh on each enrichment call — no restart
-and no typed confirm), and also need `CONFIG_SECRET_KEY` to persist.
+A separate API keys panel holds the enrichment-provider secrets:
+`shodan_api_key`, `greynoise_api_key`, `misp_api_key`, `maxmind_license_key`,
+`abuse_ch_auth_key`, and `crawl4ai_token`. The panel renders next to Data sources
+and not in the normal settings groups. These keys are write-only. soc-ai
+encrypts each one at rest with Fernet and never renders it back. soc-ai
+hot-applies them and reads each one fresh on every enrichment call, so they need
+no restart and no typed confirmation. They also need `CONFIG_SECRET_KEY` to
+persist.
 
 ### Users
 
-Add users (username / password ≥ 8 / role), enable/disable, reset password
-(shown **once**), and change role. Guards: you can't disable your own account,
-and you can't disable or demote the **last enabled admin**.
+Add a user with a username, a password of 8 characters or more, and a role. You
+can enable a user, disable one, reset a password, and change a role. soc-ai shows
+a reset password once. Two guards apply. You cannot disable your own account. You
+cannot disable or demote the last enabled admin.
 
 ### API tokens
 
-Mint API tokens (the `scai_…` value is shown **once** at creation, so copy it then;
-only its hash is stored) and revoke them. Tokens are for programmatic API
-access (automation / integrations) once `API_AUTH_REQUIRED` is enabled.
+Mint an API token here, and revoke one here. soc-ai shows the `scai_…` value once
+at creation, so copy it then. soc-ai stores only the hash of the token. A token
+gives programmatic API access for automation and integrations after you
+enable `API_AUTH_REQUIRED`.
 
 ## Safety model (recap)
 
-Every **read** tool the agent uses is read-only. Every **write** tool (anything
-that changes Security Onion state: ack, escalate-to-case, comment) is something
-the agent can only *recommend*; you execute it with a click from the report,
-and every execution is audited. The one bounded exception is the
-confidence-gated auto-acknowledge for low-stakes false positives
-(`auto_ack_fp_enabled`), which never touches critical or malware-class alerts. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the
-agent capability surface in [AGENT_TOOLS.md](AGENT_TOOLS.md).
+Every read tool that the agent uses is read-only. A write tool changes Security
+Onion state. The write tools acknowledge an alert, escalate it to a
+case, and add a comment. The agent can only *recommend* a write tool. You execute
+it with a click from the report, and soc-ai audits every execution.
+
+The one bounded exception is the confidence-gated auto-acknowledge for a
+low-stakes false positive. `auto_ack_fp_enabled` controls it. It never touches a
+critical alert or a malware-class alert. It never fires on a verdict that the run
+retrieved nothing for. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the agent
+capability surface in [AGENT_TOOLS.md](AGENT_TOOLS.md).

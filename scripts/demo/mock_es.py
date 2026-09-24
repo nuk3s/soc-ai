@@ -714,12 +714,24 @@ def _search_response_from_docs(body: dict, docs: list[dict]) -> dict:
     # --- generic aggregation (behavioral-analytics tools + resolve_agg_field) --
     # Any terms agg OTHER than the two console shapes above: match the query
     # against the docs, then run the (possibly nested) aggs over what matched.
+    #
+    # Real ES returns hits AND aggregations when both are asked for, and it has
+    # to here too: every OQL read now carries a reserved composition agg (so a
+    # count can say what it counted), so "has aggs" no longer implies "wants no
+    # hits". Returning an empty hit list on a size>0 read would empty the demo's
+    # event listings while looking like a query that simply matched nothing.
     if aggs:
         matched = [d for d in visible if _doc_matches(query, _doc_source(d))]
+        size = body.get("size")
+        hits = (
+            sorted(matched, key=_doc_ts, reverse=True)[:size]
+            if isinstance(size, int) and size > 0
+            else []
+        )
         return {
             "took": 3,
             "timed_out": False,
-            "hits": {"total": {"value": len(matched), "relation": "eq"}, "hits": []},
+            "hits": {"total": {"value": len(matched), "relation": "eq"}, "hits": hits},
             "aggregations": _run_aggs(aggs, matched),
         }
 

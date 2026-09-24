@@ -150,7 +150,7 @@ const toolbarBtnCls =
 function DraftChip() {
   return (
     <span
-      title="Drafted from investigation history — the agent will NOT cite this runbook until you approve it."
+      title="The draft comes from investigation history. The agent does not cite this runbook until you approve it."
       className="rounded px-1.5 py-0.5 text-[10px] font-bold"
       style={{ background: '#f5a62322', color: '#f5a623' }}
     >
@@ -167,15 +167,15 @@ function EmbedChip({ rb }: { rb: Runbook }) {
       ? [
           'not embedded',
           '#f5a623',
-          'No embedding vector yet (the gateway was down during the save) — run “Re-embed runbooks” in Config → Retrieval.',
+          'This runbook has no embedding vector. The gateway was down during the save. Run “Re-embed runbooks” in Config → Retrieval.',
         ]
       : rb.stale
         ? [
             'stale embedding',
             '#f5a623',
-            'Embedded by a different model than currently configured — run “Re-embed runbooks” in Config → Retrieval.',
+            'The embedding model is not the configured model. Run “Re-embed runbooks” in Config → Retrieval.',
           ]
-        : ['embedded', '#12b76a', 'Semantic-search vector is current.'];
+        : ['embedded', '#12b76a', 'The semantic-search vector is current.'];
   return (
     <span
       title={title}
@@ -284,7 +284,7 @@ export function Runbooks() {
       cancel();
       setNonce((n) => n + 1);
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Save failed');
+      setActionError(e instanceof Error ? e.message : 'The save failed.');
     } finally {
       setBusy(false);
     }
@@ -298,7 +298,7 @@ export function Runbooks() {
       if (editing === id) cancel();
       setNonce((n) => n + 1);
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Delete failed');
+      setActionError(e instanceof Error ? e.message : 'The delete failed.');
     } finally {
       setBusy(false);
       setPendingDelete(null);
@@ -340,7 +340,7 @@ export function Runbooks() {
       setBulkSummary(`Starter pack: ${r.created} added, ${r.skipped} already present`);
       setNonce((n) => n + 1);
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Starter pack failed');
+      setActionError(e instanceof Error ? e.message : 'The starter pack install failed.');
     } finally {
       setBusy(false);
     }
@@ -360,7 +360,7 @@ export function Runbooks() {
       setPromotable(await getPromotableRules());
     } catch (e) {
       setPromotable([]);
-      setPromoError(e instanceof Error ? e.message : 'Failed to load promotable rules');
+      setPromoError(e instanceof Error ? e.message : 'The list of promotable rules did not load.');
     }
   };
 
@@ -376,7 +376,7 @@ export function Runbooks() {
       setNonce((n) => n + 1);
       openEdit(rb);
     } catch (e) {
-      setPromoError(e instanceof Error ? e.message : `Drafting failed for ${ruleName}`);
+      setPromoError(e instanceof Error ? e.message : `The draft failed for ${ruleName}.`);
     } finally {
       setDraftingRule(null);
     }
@@ -395,7 +395,7 @@ export function Runbooks() {
       setEditingDraft(false);
       setNonce((n) => n + 1);
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Approve failed');
+      setActionError(e instanceof Error ? e.message : 'The approval failed.');
     } finally {
       setBusy(false);
     }
@@ -416,8 +416,8 @@ export function Runbooks() {
         >
           <DraftChip />
           <span className="min-w-[200px] flex-1 text-[12px] leading-[1.45] text-dim">
-            Drafted from this rule's investigation history. Review and edit — the agent will
-            not cite it until you approve.
+            The draft comes from this rule's investigation history. Review the draft and edit
+            it. The agent does not cite the draft until you approve it.
           </span>
           <button
             onClick={() => void approve()}
@@ -441,7 +441,7 @@ export function Runbooks() {
       <div className="mb-3 flex min-h-0 flex-1 flex-col">
         <div className="mb-1 flex flex-none items-center justify-between">
           <label className="block text-[11px] font-semibold uppercase tracking-[.06em] text-faint">
-            Content (markdown)
+            Markdown content
           </label>
           <button
             type="button"
@@ -457,14 +457,14 @@ export function Runbooks() {
             {draft.content.trim() ? (
               <Markdown>{draft.content}</Markdown>
             ) : (
-              <span className="italic text-faint">Nothing to preview yet.</span>
+              <span className="italic text-faint">The content is empty. Select Write to add markdown.</span>
             )}
           </div>
         ) : (
           <textarea
             value={draft.content}
             onChange={(e) => setDraft({ ...draft, content: e.target.value })}
-            placeholder="The procedure the agent should cite. What normal looks like on this network, the confirm/dismiss steps, known-benign hosts, pivot queries…"
+            placeholder="The procedure the agent cites. Describe what is normal on this network. Give the confirm steps and the dismiss steps. Name the known-benign hosts and the pivot queries."
             rows={12}
             className={`${inputCls} min-h-[55vh] flex-1 resize-y font-mono leading-[1.55] lg:min-h-[240px] lg:resize-none`}
           />
@@ -476,7 +476,7 @@ export function Runbooks() {
           <input
             value={draft.tags}
             onChange={(e) => setDraft({ ...draft, tags: e.target.value })}
-            placeholder="comma-separated — e.g. scan, recon"
+            placeholder="Separate tags with a comma. Example: scan, recon"
             className={inputCls}
           />
         </div>
@@ -485,7 +485,7 @@ export function Runbooks() {
           <input
             value={draft.linked_rules}
             onChange={(e) => setDraft({ ...draft, linked_rules: e.target.value })}
-            placeholder="rule names / UUIDs — strongest match signal"
+            placeholder="Rule names or UUIDs. This is the strongest match signal."
             className={inputCls}
           />
         </div>
@@ -523,11 +523,12 @@ export function Runbooks() {
         <div className="text-[20px] font-semibold tracking-[-.015em]">Runbooks</div>
       </div>
       <div className="mb-4 mt-0.5 max-w-[880px] flex-none text-[13px] leading-[1.55] text-dim">
-        Your team's own triage guidance — the investigation agent searches these (via the{' '}
-        <code className="text-[12px] text-text">lookup_runbook</code> tool) and cites the best
-        match, so verdicts ground in <strong>your</strong> procedures instead of guessing from thin
-        data. A runbook that names a detection rule under <em>Linked rules</em> is preferred
-        whenever that rule fires. Purely local — nothing here is ever written to Security Onion.
+        A runbook holds your team's own triage guidance. The investigation agent searches the
+        runbooks with the{' '}
+        <code className="text-[12px] text-text">lookup_runbook</code> tool and cites the best
+        match. The verdict then cites <strong>your</strong> procedure. A runbook that names a
+        detection rule under <em>Linked rules</em> ranks first if that rule fires. Every runbook
+        stays local. soc-ai never writes a runbook to Security Onion.
       </div>
 
       {/* toolbar: bulk actions + new (search lives in the list pane) */}
@@ -548,7 +549,7 @@ export function Runbooks() {
         <button
           onClick={() => fileInputRef.current?.click()}
           disabled={busy}
-          title="Import one or more markdown files. Optional front-matter: title, tags, rules."
+          title="Import one or more markdown files. Each file can carry optional front-matter with title, tags and rules."
           className={toolbarBtnCls}
         >
           <FileUp size={13} />
@@ -557,7 +558,7 @@ export function Runbooks() {
         <button
           onClick={() => void loadPack()}
           disabled={busy}
-          title="Add the shipped starter pack: 10 generic SOC runbooks (beaconing, scans, brute force, DNS, phishing, lateral movement, exfil, mining, TLS, tuning). Skips any title you already have."
+          title="Add the shipped starter pack of 10 generic SOC runbooks. The pack covers beaconing, scans, brute force, DNS, phishing, lateral movement, data exfiltration, cryptomining, TLS and tuning. The pack skips any title you already have."
           className={toolbarBtnCls}
         >
           {busy ? <Spinner size={12} /> : <PackagePlus size={13} />}
@@ -566,7 +567,7 @@ export function Runbooks() {
         <button
           onClick={() => void togglePromo()}
           disabled={busy}
-          title="Turn what this deployment already learned into runbooks: rules with enough completed investigations get an AI-drafted, org-specific runbook you review and approve."
+          title="Draft a runbook from the investigations this deployment already ran. The model writes an org-specific draft for you to review and approve."
           className={toolbarBtnCls}
         >
           <History size={13} />
@@ -588,16 +589,17 @@ export function Runbooks() {
             Draft a runbook from investigation history
           </div>
           <div className="mb-2 max-w-[720px] text-[11.5px] leading-[1.5] text-faint">
-            Rules with 3+ completed investigations and no runbook yet. Drafting distills the
-            observed verdicts, rationales and analyst chat into an org-specific draft — nothing
-            is used by the agent until you approve it.
+            The list holds each rule with 3 or more completed investigations and no runbook. The
+            model distills the observed verdicts, the rationales and the analyst chat into an
+            org-specific draft. The agent uses no draft until you approve it.
           </div>
           {promoError && <div className="mb-2 text-[12px] text-danger">{promoError}</div>}
           {promotable === null && <LoadingState />}
           {promotable !== null && promotable.length === 0 && !promoError && (
             <div className="py-1 text-[12.5px] text-faint">
-              Nothing to draft right now — every rule with enough history already has a runbook
-              (drafts count), or no rule has 3+ completed investigations yet.
+              No rule is ready to draft. Either every rule with enough history already has a
+              runbook, or no rule has 3 or more completed investigations. A draft counts as a
+              runbook.
             </div>
           )}
           {(promotable ?? []).map((r) => (
@@ -623,8 +625,8 @@ export function Runbooks() {
                 disabled={busy || draftingRule !== null || editing !== null}
                 title={
                   editing !== null
-                    ? 'Close the open editor first — the new draft opens there.'
-                    : 'Run one analyst-model call to distill this rule’s history into a draft (may take up to a minute).'
+                    ? 'Close the open editor first. The new draft opens there.'
+                    : 'Run one analyst-model call to distill this rule’s history into a draft. The call can take up to a minute.'
                 }
                 className={toolbarBtnCls}
               >
@@ -656,7 +658,7 @@ export function Runbooks() {
               <BookOpen size={22} className="text-faint" />
               <div className="text-[13px] font-medium text-dim">No runbook open</div>
               <div className="max-w-[380px] text-[12px] text-faint">
-                Pick a runbook from the list to edit it here, or start a new one.
+                Select a runbook from the list to edit it here. Select New runbook to start one.
               </div>
               <button onClick={openNew} disabled={busy} className={`${toolbarBtnCls} mt-1`}>
                 <Plus size={13} />
@@ -683,8 +685,8 @@ export function Runbooks() {
             )}
             {!loading && !error && runbooks.length === 0 && editing !== 'new' && (
               <div className="px-3.5 py-5 text-[12.5px] text-faint">
-                No runbooks yet. Write one, import your existing .md procedures, or load the starter
-                pack to give the agent something to cite.
+                No runbooks yet. Write one, import your .md procedures, or load the starter pack.
+                The agent then has a runbook to cite.
               </div>
             )}
             {!loading && !error && runbooks.length > 0 && visible.length === 0 && (

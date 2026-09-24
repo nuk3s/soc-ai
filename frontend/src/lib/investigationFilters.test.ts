@@ -4,7 +4,9 @@
 // deep-link filter parsing (unknown values dropped, never wedging the filter).
 import { describe, expect, it } from 'vitest';
 import {
+  PIPELINE_ERRORS_URL,
   VERDICT_FILTER_VALUES,
+  errorStateFromSearch,
   livePipelineErrors,
   verdictFilterFromSearch,
 } from './investigationFilters';
@@ -82,5 +84,70 @@ describe('verdictFilterFromSearch', () => {
   it('returns no filter without the param', () => {
     expect(verdictFilterFromSearch('')).toEqual([]);
     expect(verdictFilterFromSearch('?other=1')).toEqual([]);
+  });
+});
+
+describe('livePipelineErrors, runs that died without a verdict', () => {
+  // The deployed instance held 188 rows in this state: status 'error', no
+  // verdict, no report, so `fallback` was never stamped and the KPI that counts
+  // `fallback` saw none of them.
+  it('counts a failed run with no verdict', () => {
+    const rows = [
+      row({ id: 'died', status: 'error', verdict: 'untriaged', noVerdict: true }),
+      row({ id: 'fallback', fallback: true }),
+    ];
+    expect(livePipelineErrors(rows).map((r) => r.id)).toEqual(['died', 'fallback']);
+  });
+
+  it('drops a dismissed failure, because a dismissed one stays dismissed', () => {
+    const rows = [
+      row({ id: 'acked', status: 'error', noVerdict: true, errorDismissed: true }),
+      row({ id: 'live', status: 'error', noVerdict: true }),
+    ];
+    expect(livePipelineErrors(rows).map((r) => r.id)).toEqual(['live']);
+  });
+
+  it('drops a superseded failure, because a later run reached a verdict', () => {
+    const rows = [
+      row({ id: 'superseded', status: 'error', noVerdict: true, isPrimary: false }),
+      row({ id: 'live', status: 'error', noVerdict: true, isPrimary: true }),
+    ];
+    expect(livePipelineErrors(rows).map((r) => r.id)).toEqual(['live']);
+  });
+
+  // Negative control: a healthy list grows no count. Cancelled and interrupted
+  // runs are not failures: one was asked for, the other is re-huntable. An
+  // errored run that DID reach a verdict has an answer to read.
+  it('counts nothing on a healthy list', () => {
+    const rows = [
+      row({ id: 'fp', status: 'complete', verdict: 'false_positive' }),
+      row({ id: 'tp', status: 'complete', verdict: 'true_positive' }),
+      row({ id: 'stopped', status: 'cancelled', verdict: 'untriaged' }),
+      row({ id: 'orphan', status: 'interrupted', verdict: 'untriaged' }),
+      row({ id: 'late', status: 'error', verdict: 'false_positive' }),
+    ];
+    expect(livePipelineErrors(rows)).toEqual([]);
+  });
+});
+
+// The tile promised a number its own list could not reproduce: the count
+// excluded dismissed and superseded runs and the list excluded neither, so the
+// tile went nine, eight, seven while the list sat at twenty (dogfood
+// 2026-09-07, D2). The deep link now names the partition, and the server
+// applies it to the rows AND the header count.
+describe('the pipeline-error deep link names what the tile counted', () => {
+  it('asks for the runs that still need a retry', () => {
+    expect(errorStateFromSearch(PIPELINE_ERRORS_URL)).toBe('live');
+    expect(verdictFilterFromSearch(PIPELINE_ERRORS_URL)).toEqual(['pipeline_error']);
+  });
+
+  it('reads handled as well, so the excluded rows stay reachable', () => {
+    expect(errorStateFromSearch('?verdict=pipeline_error&errors=handled')).toBe('handled');
+  });
+
+  it('drops an unknown value rather than wedging the list', () => {
+    expect(errorStateFromSearch('?verdict=pipeline_error&errors=bogus')).toBeNull();
+    expect(errorStateFromSearch('?verdict=pipeline_error')).toBeNull();
+    expect(errorStateFromSearch('')).toBeNull();
   });
 });

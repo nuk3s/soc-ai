@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from soc_ai.config import Settings
-from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.get_playbooks import get_playbooks
 from soc_ai.tools.lookup_runbook import lookup_runbook
@@ -469,3 +469,125 @@ async def test_lookup_runbook_no_db_returns_empty() -> None:
 async def test_lookup_runbook_invalid_k_rejected() -> None:
     with pytest.raises(ValueError, match="k must be positive"):
         await lookup_runbook("anything", k=0)
+
+
+# ---------------------------------------------------------------------------
+# t_field_values honours the same field policy as the query language
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_field_values_refuses_a_field_the_query_language_forbids(
+    settings_kratos: Settings,
+) -> None:
+    """One field policy, not two that disagree.
+
+    This tool exists to "learn what actually populates a field BEFORE querying
+    on it", so enumerating the values of a field that can never be queried is a
+    disclosure with no legitimate follow-up. It also made the two surfaces
+    contradict each other: OQL refused `winlog.event_data.Foo` while this
+    returned its top values.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from soc_ai.so_client.elastic import ElasticClient
+    from soc_ai.tools.discover import field_values
+
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=AsyncMock()):
+        client = ElasticClient(settings_kratos)
+    client.search = AsyncMock()  # type: ignore[method-assign]
+
+    out = await field_values(
+        "winlog.event_data.NobodyClassifiedThis",
+        elastic=client,
+        settings=settings_kratos,
+    )
+
+    assert out["error"] is True
+    assert "not queryable" in out["reason"]
+    client.search.assert_not_awaited(), "a refused field must cost no ES round-trip"
+
+
+@pytest.mark.asyncio
+async def test_field_values_still_serves_a_whitelisted_field(
+    settings_kratos: Settings,
+) -> None:
+    """The guard must not cost the case the tool exists for."""
+    from unittest.mock import AsyncMock, patch
+
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+    from soc_ai.tools.discover import field_values
+
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=AsyncMock()):
+        client = ElasticClient(settings_kratos)
+    client.search = AsyncMock(  # type: ignore[method-assign]
+        return_value=EsSearchResult(
+            total=2,
+            took_ms=1,
+            aggregations={"vals": {"buckets": [{"key": "zeek.conn", "doc_count": 2}]}},
+        )
+    )
+
+    out = await field_values("event.dataset", elastic=client, settings=settings_kratos)
+
+    assert "error" not in out
+    assert out["values"][0]["value"] == "zeek.conn"
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_names_a_nearby_field_so_the_agent_can_self_correct(
+    settings_kratos: Settings,
+) -> None:
+    """Reuses OQL's did-you-mean tail; a reject is the agent's only correction channel."""
+    from unittest.mock import AsyncMock, patch
+
+    from soc_ai.so_client.elastic import ElasticClient
+    from soc_ai.tools.discover import field_values
+
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=AsyncMock()):
+        client = ElasticClient(settings_kratos)
+    client.search = AsyncMock()  # type: ignore[method-assign]
+
+    # NOT `source.iip`: `source` is a whitelisted PREFIX, so a typo inside it
+    # is allowed and never reaches the refusal. Only a field outside every
+    # prefix gets here, which is itself worth knowing about the policy.
+    out = await field_values("winlog.channell", elastic=client, settings=settings_kratos)
+    assert "did you mean: winlog.channel" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_the_marker_namespace_guard_still_answers_silently(
+    settings_kratos: Settings,
+) -> None:
+    """That one must NOT become a named refusal: the refusal itself would be a tell.
+
+    Enumerating `synth.scenario_id` would list every planted scenario, so it
+    answers exactly as a nonexistent field does. The whitelist refusal above is
+    different — the whitelist is static and public, so there is no oracle to
+    protect.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from soc_ai.so_client.elastic import ElasticClient
+    from soc_ai.tools.discover import field_values
+
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=AsyncMock()):
+        client = ElasticClient(settings_kratos)
+    client.search = AsyncMock()  # type: ignore[method-assign]
+
+    out = await field_values("synth.scenario_id", elastic=client, settings=settings_kratos)
+    # Compared against a REAL answer rather than a literal dict. "Answers
+    # exactly as a nonexistent field does" is a claim about two shapes matching,
+    # and a hardcoded expectation only tests one of them: the day the answered
+    # path gained a key, the literal would have gone on passing while the two
+    # diverged, and the divergence is the tell this test exists to prevent.
+    client.search = AsyncMock(  # type: ignore[method-assign]
+        return_value=EsSearchResult(total=0, took_ms=1, hits=[], aggregations={"vals": {}})
+    )
+    nonexistent = await field_values("host.name", elastic=client, settings=settings_kratos)
+
+    assert out.keys() == nonexistent.keys()
+    assert out["field"] == "synth.scenario_id"
+    assert out["dataset"] is None
+    assert out["values"] == nonexistent["values"] == []
+    assert "error" not in out

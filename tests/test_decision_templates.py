@@ -981,3 +981,226 @@ def test_analytic_guard_does_not_weaken_existing_guards() -> None:
         classtype="misc-activity",
     )
     assert match_decision_template(_ctx(malware, enrichments=_INTERNAL_PAIR)) is None
+
+
+# ---------------------------------------------------------------------------
+# Template authority: a template that classifies vs a template that disposes
+# ---------------------------------------------------------------------------
+#
+# A template that reads the ENDPOINTS classifies the traffic. A template that
+# reads what the RULE DETECTED disposes of the detection. Only the second may
+# settle an alert with nothing retrieved.
+
+
+def _ognl_exploit_alert() -> SoAlert:
+    """The production alert that exposed the hole.
+
+    An exploitation-attempt signature between two internal hosts, carrying none
+    of the existing guard tokens: no attack classtype, no malware word in the
+    rule name, no analytic word either.
+    """
+    return SoAlert(
+        id="ognl-1",
+        rule_name="ET HUNTING Potential Forced OGNL Evaluation - HTTP Body",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="bad-unknown",
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+
+
+def test_clean_internal_traffic_is_provisional() -> None:
+    """Locality is not a disposition. The template may still propose a benign
+    verdict, but it may not settle one, so its candidate is provisional."""
+    cv = match_decision_template(_ctx(_ognl_exploit_alert(), enrichments=_INTERNAL_PAIR))
+    assert cv is not None
+    assert cv.template_id == "clean_internal_traffic"
+    assert cv.authority == "provisional"
+
+
+def test_routine_internal_info_alert_is_also_provisional() -> None:
+    """Same template, genuinely routine rule: still provisional. Authority is a
+    property of the template's grounds, not of the alert that happened to
+    match it."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET INFO Windows Update Delivery Optimization",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="misc-activity",
+        rule_metadata=RuleMetadata(signature_severity="Informational"),
+        alert_action="allowed",
+    )
+    cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
+    assert cv is not None
+    assert cv.template_id == "clean_internal_traffic"
+    assert cv.authority == "provisional"
+
+
+def test_protocol_housekeeping_templates_are_dispositive() -> None:
+    """NEGATIVE CONTROL. These read the rule, not the endpoints: a STUN keepalive
+    with a clean Zeek conn is routine because of what fired, so it keeps the
+    zero-tool fast path and routine triage stays cheap."""
+    stun = SoAlert(
+        id="s1",
+        rule_name="ET INFO Session Traversal Utilities for NAT (STUN Binding Request)",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="93.184.216.34",
+    )
+    cv = match_decision_template(_ctx(stun, typed_zeek=TypedZeekFields(conn_states=["SF"])))
+    assert cv is not None
+    assert cv.template_id == "stun_quic_keepalive"
+    assert cv.authority == "dispositive"
+
+    ntp = SoAlert(
+        id="n1",
+        rule_name="ET INFO External NTP Server Query",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="93.184.216.34",
+    )
+    cv = match_decision_template(_ctx(ntp, typed_zeek=TypedZeekFields(conn_states=["SF"])))
+    assert cv is not None
+    assert cv.template_id == "ntp_protocol_housekeeping"
+    assert cv.authority == "dispositive"
+
+    dnssec = SoAlert(
+        id="d1",
+        rule_name="ET INFO DNS Query for DNSKEY Record",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+    )
+    cv = match_decision_template(_ctx(dnssec, enrichments=_INTERNAL_PAIR))
+    assert cv is not None
+    assert cv.template_id == "dns_dnssec_housekeeping"
+    assert cv.authority == "dispositive"
+
+
+def test_external_reputation_templates_are_provisional() -> None:
+    """Absence of a blocklist hit on an external host is absence of proof, so
+    neither external-reputation template may settle a verdict on its own."""
+    for template_id, asn in (
+        ("informational_external_unknown_asn", AsnInfo(number=64500, org="Example Telecom")),
+        ("informational_external_clean_benign_cloud", AsnInfo(number=15169, org="GOOGLE")),
+    ):
+        alert = SoAlert(
+            id="e1",
+            rule_name="ET INFO Observed DNS Query to .cloud TLD",
+            severity_label="low",
+            source_ip="10.0.0.1",
+            destination_ip="93.184.216.34",
+            alert_action="allowed",
+            rule_metadata=RuleMetadata(signature_severity="Informational"),
+        )
+        enrich = {
+            "10.0.0.1": IndicatorEnrichment(
+                indicator="10.0.0.1", indicator_type="ip", internal=True
+            ),
+            "93.184.216.34": IndicatorEnrichment(
+                indicator="93.184.216.34", indicator_type="ip", internal=False, asn=asn
+            ),
+        }
+        cv = match_decision_template(
+            _ctx(alert, enrichments=enrich, typed_zeek=TypedZeekFields(conn_states=["SF"]))
+        )
+        assert cv is not None, template_id
+        assert cv.template_id == template_id
+        assert cv.authority == "provisional"
+
+
+def test_a_candidate_defaults_to_provisional() -> None:
+    """A template added later must not inherit the fast path by forgetting to
+    declare itself. The permissive value is the one you have to type."""
+    from soc_ai.agent.decision_templates import CandidateVerdict
+
+    cv = CandidateVerdict(
+        verdict="false_positive",
+        confidence=0.9,
+        cited_evidence=[],
+        template_id="hypothetical_new_template",
+        rationale="x",
+    )
+    assert cv.authority == "provisional"
+
+
+# ---------------------------------------------------------------------------
+# The attack-classtype guard against the classtype Security Onion really sends
+# ---------------------------------------------------------------------------
+
+
+def test_attack_classtype_guard_reads_the_eve_description() -> None:
+    """Suricata EVE writes the classification DESCRIPTION in alert.category,
+    which is where SoAlert.classtype comes from, so the shortname table this
+    guard is keyed on never matched a live alert. An internal lateral-movement
+    attempt was getting the locality anchor as a result."""
+    for description in (
+        "Attempted Administrator Privilege Gain",
+        "Attempted Information Leak",
+        "Attempted Denial of Service",
+        "Web Application Attack",
+        "Successful Credential Theft Detected",
+    ):
+        alert = SoAlert(
+            id="a1",
+            rule_name="ET INFO Something Unremarkable",
+            severity_label="low",
+            source_ip="10.0.0.1",
+            destination_ip="10.0.0.2",
+            classtype=description,
+        )
+        assert match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR)) is None, description
+
+
+def test_benign_eve_descriptions_still_match_a_template() -> None:
+    """NEGATIVE CONTROL. Widening the guard to descriptions must not swallow the
+    benign categories, which are the bulk of the queue."""
+    for description in ("Misc activity", "Not Suspicious Traffic"):
+        alert = SoAlert(
+            id="a1",
+            rule_name="ET INFO Windows Update Delivery Optimization",
+            severity_label="low",
+            source_ip="10.0.0.1",
+            destination_ip="10.0.0.2",
+            classtype=description,
+        )
+        cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
+        assert cv is not None, description
+        assert cv.template_id == "clean_internal_traffic"
+
+
+def test_policy_violation_template_reads_the_eve_description() -> None:
+    """The same table drove t_policy_violation_internal, which therefore never
+    fired in production either."""
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET POLICY Cleartext Credentials Observed",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="10.0.0.2",
+        classtype="Potential Corporate Privacy Violation",
+    )
+    cv = match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR))
+    assert cv is not None
+    assert cv.template_id == "policy_violation_internal"
+    # Its second leg is locality, so it proposes rather than disposes.
+    assert cv.authority == "provisional"
+
+
+def test_c2_classtype_template_reads_the_eve_description() -> None:
+    alert = SoAlert(
+        id="a1",
+        rule_name="ET INFO Something Unremarkable",
+        severity_label="low",
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.9",
+        classtype="Malware Command and Control Activity Detected",
+    )
+    cv = match_decision_template(_ctx(alert))
+    assert cv is not None
+    assert cv.template_id == "command_and_control_classtype"
+    assert cv.verdict == "true_positive"

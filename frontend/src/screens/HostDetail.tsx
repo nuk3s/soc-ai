@@ -1,6 +1,7 @@
 import { AlertTriangle, ChevronLeft, RotateCw, Server } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
 import { HostActivityRow } from '../components/HostActivityRow';
 import { HostBriefing } from '../components/HostBriefing';
 import { HostChatDock } from '../components/HostChatDock';
@@ -33,6 +34,9 @@ import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { absTime } from '../lib/timeRange';
 import type { Dossier, DossierRefreshStatus, HostActivityRange } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
+import { BehaviouralProfile } from '../components/BehaviouralProfile';
+import { HostObservations } from '../components/HostObservations';
+import { LeadsStrip } from '../components/LeadsStrip';
 
 // request() collapses an HTTPException detail to its `hint`, so this IS the
 // 404's own wording from routes_dossier._require_ip. Matching it lets the screen
@@ -116,6 +120,31 @@ function servicePorts(dossier: Dossier): string[] | null {
   // cannot disagree about a payload shape. Payload order is kept, not sorted:
   // the collector ranks by connection count, so the head is the busiest.
   return portsView(f.value_json)?.ports ?? null;
+}
+
+/**
+ * The ports the BEHAVIOURAL PROFILE has this host serving, or null when no
+ * plane on the grid can answer the dimension.
+ *
+ * The profile is the longer read: the panel further down the page builds it
+ * from up to 30 days of history, while the services fact above is one sweep's
+ * conclusion. On the range they disagreed by a port, and the page printed 7 in
+ * the card and 8 in the panel (dogfood 2026-09-17).
+ *
+ * `measured` over an empty set is an ANSWER — this host serves nothing — so it
+ * returns an empty list rather than falling through to the sweep. Only
+ * coverage the profile cannot speak for returns null.
+ *
+ * The members are bare port numbers. The aggregation keys on
+ * `destination.port` alone, so nothing here knows the protocol, and the "tcp/"
+ * the sweep's own payload carries would be invented.
+ */
+function profileServedPorts(dossier: Dossier): string[] | null {
+  const d = dossier.profile?.find((row) => row.dimension === 'served_ports');
+  if (!d) return null;
+  if (d.coverage !== 'measured' && d.top.length === 0) return null;
+  // Busiest first, the order the wire already holds them in.
+  return d.top.map(([port]) => port);
 }
 
 /**
@@ -324,13 +353,13 @@ export function HostDetail() {
       const status = await startDossierRefresh();
       if (status.note === 'dossier disabled') {
         // Nothing was started, so there is no run to follow.
-        setSweepNote('The host dossier is switched off in Config, so nothing was swept.');
+        setSweepNote('No sweep started. The host dossier is off in Config.');
       } else if (status.note === 'already running') {
         startedSweep.current = sweepHealth.data?.last_run ?? null;
-        setSweepNote('A sweep is already running — this page updates when it finishes.');
+        setSweepNote('A sweep is already running. This page updates after the sweep finishes.');
       } else {
         startedSweep.current = sweepHealth.data?.last_run ?? null;
-        setSweepNote('Sweeping in the background — this page updates when it finishes.');
+        setSweepNote('The sweep runs in the background. This page updates after the sweep finishes.');
       }
       // Arm the poll now rather than waiting out an interval: the POST claims
       // the running slot before it schedules anything, so the next status read
@@ -364,7 +393,9 @@ export function HostDetail() {
   }, [focusField, dossier, ip]);
 
   return (
-    <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
+    // The dock at the bottom right is fixed to the viewport. Without the
+    // reservation it draws over the last Edit control on the facts panel.
+    <div className={cn('px-[22px] pt-[18px] font-sans text-text', DOCK_SAFE_AREA_CLASS)}>
       <div className="mb-3.5 flex flex-wrap items-center gap-3">
         <Link to="/hosts" className="flex items-center gap-1.5 text-[12.5px] text-dim hover:text-text">
           <ChevronLeft size={13} /> Hosts
@@ -420,8 +451,8 @@ export function HostDetail() {
           <Panel>
             <PanelHeader icon={<Server size={15} />} title="Not a host address" />
             <EmptyState>
-              <span className="font-mono text-dim">{ip}</span> is not an IP address, and hosts are
-              keyed on addresses. Pick a host from the{' '}
+              <span className="font-mono text-dim">{ip}</span> is not an IP address. A host is
+              keyed on an IP address. Pick a host from the{' '}
               <Link to="/hosts" className="text-accent hover:underline">
                 Hosts screen
               </Link>
@@ -460,22 +491,21 @@ export function HostDetail() {
                       data-testid="host-never-seen-lead"
                       className="mb-2 text-[13px] leading-[1.6] text-dim"
                     >
-                      The network sweep has no record of this address — but the last sweep came
-                      back blind, so that is not the same as this address being absent from your
-                      network.
+                      The network sweep has no record of this address. The last sweep could not
+                      read the network. The address may still be on your network.
                     </div>
                     <div
                       data-testid="host-sweep-blind"
                       className="rounded-card border border-warn/30 bg-warn/[0.06] px-3.5 py-2.5"
                     >
                       <div className="text-[12.5px] leading-[1.6] text-text-2">
-                        The last sweep hit {plural(sweepErrorCount, 'error')} and could not read
-                        the whole network, so <span className="font-mono">{ip}</span> may be a host
-                        it never got to look at. Until a sweep gets through, this page cannot tell
-                        you whether the address is on your network or not.{' '}
+                        The last sweep hit {plural(sweepErrorCount, 'error')}. The sweep could not
+                        read the whole network. The sweep may never have looked at{' '}
+                        <span className="font-mono">{ip}</span>. This page cannot say if the address
+                        is on your network until a sweep reads the whole network.{' '}
                         {sweepErrors.length > 0
-                          ? 'Sweeping again runs the same queries, so start with what failed:'
-                          : 'An admin can read what failed and start another sweep from the Hosts screen.'}
+                          ? 'Another sweep runs the same queries. Read what failed first:'
+                          : 'An admin can read what failed. An admin can start another sweep from the Hosts screen.'}
                       </div>
                       {/* The strings, not just how many — the same reason the
                           Hosts list prints them. This channel carries local
@@ -512,16 +542,16 @@ export function HostDetail() {
                       data-testid="host-never-seen-lead"
                       className="mb-2 text-[13px] leading-[1.6] text-dim"
                     >
-                      The network sweep has no record of this address, so there is nothing to
-                      report about it — which is different from "nothing notable".
+                      The network sweep has no record of this address. This page has nothing to
+                      report about the address. That is different from "nothing notable".
                     </div>
                     <div
                       data-testid="host-sweep-unreadable"
                       className="text-[12.5px] leading-[1.6] text-faint"
                     >
-                      This page could not check how the last sweep went, so it cannot tell you
-                      whether <span className="font-mono">{ip}</span> is outside the ranges
-                      Security Onion monitors or a host the last sweep never got to.
+                      This page could not check the last sweep. The address{' '}
+                      <span className="font-mono">{ip}</span> may be outside the ranges Security
+                      Onion monitors. The last sweep may also have missed the address.
                       <span className="mt-0.5 block font-mono text-[11.5px] text-dim">
                         {sweepHealth.error?.message}
                       </span>
@@ -533,13 +563,13 @@ export function HostDetail() {
                       data-testid="host-never-seen-lead"
                       className="mb-2 text-[13px] leading-[1.6] text-dim"
                     >
-                      The network sweep has never seen this address, so there is nothing to report
-                      about it — which is different from "nothing notable".
+                      The network sweep has never seen this address. This page has nothing to
+                      report about the address. That is different from "nothing notable".
                     </div>
                     <div className="text-[12.5px] leading-[1.6] text-faint">
-                      If <span className="font-mono">{ip}</span> is inside the ranges Security Onion
-                      monitors, the next sweep will pick it up once it shows enough traffic. If it
-                      is outside them, it will never appear here.
+                      The next sweep records <span className="font-mono">{ip}</span> if the address
+                      is inside the ranges Security Onion monitors. The address must also show
+                      enough traffic. The address never appears here if it is outside those ranges.
                     </div>
                   </>
                 )}
@@ -565,9 +595,9 @@ export function HostDetail() {
                   >
                     <div className="min-w-0 flex-1">
                       <div className="text-[12.5px] leading-[1.6] text-text-2">
-                        This page could not read <span className="font-mono">{ip}</span>'s live
-                        activity either, so it cannot say whether the address is carrying traffic
-                        right now.
+                        This page could not read the live activity for{' '}
+                        <span className="font-mono">{ip}</span>. This page cannot say if the address
+                        carries traffic now.
                       </div>
                       <div className="mt-0.5 text-[11.5px] leading-[1.5] text-dim">
                         {activity.error?.message}
@@ -594,7 +624,7 @@ export function HostDetail() {
                     data-testid="host-sweep-running"
                     className="mt-3 flex items-center gap-1.5 text-[12.5px] text-text-2"
                   >
-                    <Spinner size={12} />A sweep is running now — this page updates when it
+                    <Spinner size={12} />A sweep is running now. This page updates after the sweep
                     finishes.
                   </div>
                 ) : sweepNote ? (
@@ -628,9 +658,9 @@ export function HostDetail() {
               >
                 <AlertTriangle size={14} className="mt-0.5 flex-none" />
                 <span>
-                  A different machine may hold this address now (rebound{' '}
-                  {absTime(dossier.identity_rebound_at)}) — the declarations below may describe a
-                  host that has moved on.
+                  A different machine may hold this address now. The rebound time is{' '}
+                  {absTime(dossier.identity_rebound_at)}. The declarations below may describe a host
+                  that no longer holds this address.
                 </span>
               </div>
             )}
@@ -646,7 +676,7 @@ export function HostDetail() {
                 <AlertTriangle size={14} className="mt-0.5 flex-none text-danger" />
                 <div className="min-w-0 flex-1">
                   <div className="font-semibold text-danger">
-                    The last sweep failed on this host — what follows may be out of date.
+                    The last sweep failed on this host. The facts below may be out of date.
                   </div>
                   <div className="mt-0.5 break-words font-mono text-[12px] text-text-2">
                     {dossier.build_error}
@@ -690,9 +720,12 @@ export function HostDetail() {
                 and the why-care strip sits directly under them — still above
                 the fold, because "why should I care" cannot rank below a peer
                 graph. */}
+            {/* The profile's own served-ports set where it has one, so the
+                card and the profile panel below it count the same ports. */}
             <HostKpis
               ip={dossier.ip}
-              services={servicePorts(dossier)}
+              services={profileServedPorts(dossier) ?? servicePorts(dossier)}
+              servicesSource={profileServedPorts(dossier) != null ? 'profile' : 'dossier'}
               activity={shown}
               state={state}
               range={shownRange}
@@ -722,6 +755,19 @@ export function HostDetail() {
               focusField={focusField}
               roleVocabulary={roleVocab}
             />
+
+            {/* Directly beneath the facts and their traffic pattern, because
+                it is the same shape of claim with better provenance -- and
+                because the two are currently computed separately and an
+                analyst needs to see both to notice when they disagree. */}
+            <BehaviouralProfile profile={dossier.profile ?? []} />
+            {/* Every observation on this host, from every source. A repeated
+                single signal is visible here before it forms a lead, so the
+                panel sits between the profile and the leads it may feed. */}
+            <HostObservations entityKey={ip} />
+            {/* All, not New. A lead under a hunt and a lead already closed
+                both belong to this host, and the host page listed neither. */}
+            <LeadsStrip entityKey={ip} status="all" className="mt-4" />
 
             <HostUnknowns
               dossier={dossier}

@@ -210,7 +210,14 @@ async def test_rule_prevalence_accepts_max_lookback(settings_kratos: Settings) -
     )
 
     assert out["observed"] is False
-    search.assert_called_once()
+    # The point of this test is the ceiling: 365d is IN bounds, so unlike the
+    # over-cap case above the query is actually issued. It is no longer the only
+    # one — a rule with no live fires also gets the import-volume probe, so that
+    # "first-seen" cannot be a first-seen earned by hiding a corpus — so the
+    # assertion names the tool's own query rather than counting calls.
+    assert search.call_count >= 1
+    window = search.call_args_list[0].args[1]["bool"]["filter"][0]["range"]["@timestamp"]
+    assert window["gte"] == "now-365d"
 
 
 # ---------------------------------------------------------------------------

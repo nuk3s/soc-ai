@@ -244,7 +244,7 @@ export function CommandPalette() {
     setQ('');
     setIdx(0);
     getInvestigations().then(setInvs).catch(() => {});
-    getAlerts({ range: '7d' }).then(setGroups).catch(() => {});
+    getAlerts({ range: '7d' }).then((q) => setGroups(q.groups)).catch(() => {});
     if (!configRequested.current) {
       configRequested.current = true;
       getConfig()

@@ -185,7 +185,7 @@ describe('a later 404 never takes away a report already on screen', () => {
 // non-destructive by construction: a strip above the content, and the content
 // untouched.
 describe('a failed foreground refresh is marked, not swallowed', () => {
-  const REFRESH_FAILED = /Refresh failed — still showing data from/i;
+  const REFRESH_FAILED = /Refresh failed\. This data is from/i;
 
   it('investigation: the report stays and says it is not current', async () => {
     vi.mocked(getInvestigation).mockResolvedValueOnce({
@@ -235,7 +235,7 @@ describe('a failed foreground refresh is marked, not swallowed', () => {
     // Two failed background polls: the stale marker, which promises a retry.
     vi.mocked(getHunt).mockImplementation(serverError);
     await act(async () => { await vi.advanceTimersByTimeAsync(POLL_MS * 2 + 1); });
-    expect(screen.getByText(/Showing data from .* — retrying/i)).toBeTruthy();
+    expect(screen.getByText(/This data is from .* retries automatically/i)).toBeTruthy();
 
     // The analyst takes the retry themselves, and THAT fails. The click is what
     // failed, so the strip says so — but this hunt is still RUNNING and its 3s
@@ -245,7 +245,7 @@ describe('a failed foreground refresh is marked, not swallowed', () => {
     fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByText(REFRESH_FAILED)).toBeTruthy();
-    expect(screen.getByText(/— retrying/i)).toBeTruthy();
+    expect(screen.getByText(/retries automatically/i)).toBeTruthy();
     expect(screen.getAllByText(RUNNING_OBJECTIVE).length).toBeGreaterThan(0);
 
     // And it does heal itself: the next poll lands, nobody having clicked.

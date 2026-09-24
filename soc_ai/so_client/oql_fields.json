@@ -112,7 +112,28 @@
     "user_agent.original",
     "file.mime_type",
     "file.hash.md5",
-    "file.hash.sha256"
+    "file.hash.sha256",
+    "winlog.channel",
+    "winlog.event_id",
+    "winlog.event_data.Properties",
+    "winlog.event_data.ObjectType",
+    "winlog.event_data.ObjectName",
+    "winlog.event_data.AccessMask",
+    "winlog.event_data.SubjectUserName",
+    "winlog.event_data.SubjectDomainName",
+    "winlog.event_data.PreAuthType",
+    "winlog.event_data.TicketEncryptionType",
+    "winlog.event_data.ServiceName",
+    "winlog.event_data.TargetUserName",
+    "winlog.event_data.TargetDomainName",
+    "winlog.event_data.Status",
+    "winlog.event_data.LogonType",
+    "winlog.event_data.AuthenticationPackageName",
+    "winlog.event_data.LogonProcessName",
+    "winlog.event_data.LmPackageName",
+    "winlog.logon.type",
+    "winlog.event_data.WorkstationName",
+    "winlog.event_data.IpAddress"
   ],
   "forbidden_fields": [
     "_index",
@@ -121,5 +142,7 @@
     "fields",
     "script",
     "script_fields"
-  ]
+  ],
+  "_comment_winlog": "Windows Security channel leaves are enumerated INDIVIDUALLY in exact_fields, never as a `winlog` prefix. A prefix would admit several hundred leaves in one line, including many carrying identifiers no Oracle redaction route classifies \u2014 the same open-set problem the allow-known-safe backstop was built to close, reintroduced on the query side. Each field here is one an identity detection turns on and was verified present on real 4662/4768/4769 documents. Adding another means classifying it for egress in soc_ai/oracle/redact.py too.",
+  "_comment_winlog_auth_package": "AuthenticationPackageName / LogonProcessName / LmPackageName and the readable `winlog.logon.type` alias are the fields that separate Kerberos from NTLM, which is the first question Windows triage asks and the one the range's operating documentation names for telling management traffic from real users. Counted on the range over fourteen days, all on system.security: AuthenticationPackageName Negotiate 20614 / Kerberos 19984 / NTLM 526; LmPackageName NTLM V2 501 / NTLM V1 24; winlog.logon.type Network 37452 / Service 2271 / Interactive 1320. Their values are public Windows constants, so they are allowlisted BY PATH in oracle/backstop.py rather than tokenised \u2014 word-shaped constants would otherwise reach the Oracle masked. One data-shape trap on LogonProcessName: Windows right-pads it to eight characters, so an exact term for `NtLmSsp` matched 2 documents on the range where `NtLmSsp ` matched 555. Query it with the anchored wildcard `NtLmSsp*`; the other three fields are unpadded."
 }

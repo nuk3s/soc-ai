@@ -23,9 +23,9 @@ import { FactRow } from './HostFacts';
 /** What kind-specific words an open disagreement opens with. */
 function conflictLead(kind: string | null, label: string): string {
   if (kind === 'retracted')
-    return `The evidence behind your ${label} declaration has gone away — the sweep no longer sees anything here.`;
+    return `The evidence behind your ${label} declaration has gone. The sweep sees nothing here now.`;
   if (kind === 'rebound')
-    return `A different machine may hold this address now — your ${label} declaration may describe a host that has moved on.`;
+    return `A different machine may hold this address now. Your ${label} declaration may describe a different host.`;
   return `The sweep keeps disagreeing with your ${label}.`;
 }
 
@@ -83,7 +83,7 @@ function ConflictCard({
         )}
         <span className="text-faint">
           {' '}
-          — seen {conflict.observations} time{conflict.observations === 1 ? '' : 's'}
+          · seen {conflict.observations} time{conflict.observations === 1 ? '' : 's'}
           {conflict.first_seen_at ? ` since ${relativeAge(conflict.first_seen_at)}` : ''}
         </span>
       </div>
@@ -92,7 +92,7 @@ function ConflictCard({
       )}
       {conflict.snoozed_until && (
         <div className="mt-1 text-[11.5px] text-faint">
-          Kept yours — asking again after {absTime(conflict.snoozed_until)}
+          Kept yours. The sweep asks again after {absTime(conflict.snoozed_until)}.
         </div>
       )}
       {canDeclare && (
@@ -125,7 +125,7 @@ function ConflictCard({
               <button
                 disabled={busy}
                 onClick={() => run(() => snoozeDossierConflict(ip, f.field))}
-                title="Keep your declaration; the sweep asks again later (the interval doubles, capped at 90 days)"
+                title="Keep your declaration. The sweep asks again later, at an interval that doubles up to 90 days."
                 className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-text-2 hover:border-accent hover:text-text disabled:opacity-60"
               >
                 {busy ? <Spinner size={12} /> : <Check size={12} />}
@@ -203,8 +203,8 @@ export function HostBriefing({ dossier, canDeclare, onApplied, focusField }: Hos
         <div className="flex items-start gap-2 rounded-card border border-border bg-surface-1 px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-dim">
           <EyeOff size={13} className="mt-0.5 flex-none text-faint" />
           <span>
-            No agent reports from this machine — its processes, users and local logs are invisible
-            here. Everything on this page was learned from network traffic.
+            No agent reports from this machine. This page cannot show its processes, its users or
+            its local logs. Everything on this page comes from network traffic.
           </span>
         </div>
       )}

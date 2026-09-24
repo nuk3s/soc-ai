@@ -21,6 +21,7 @@ import {
   activityProfileView,
   fieldLabel,
   isJsonField,
+  isWithheldGuess,
   partitionFields,
   portString,
   portsView,
@@ -28,6 +29,7 @@ import {
   relativeAge,
   ROLE_VOCABULARY,
   unresolvedPhrase,
+  roleLabel,
 } from '../lib/hostDossier';
 import { absTime } from '../lib/timeRange';
 import type { Dossier, DossierField, DossierFieldName } from '../lib/types';
@@ -111,7 +113,7 @@ export function DeclareEditor({
       try {
         parsed = JSON.parse(raw);
       } catch {
-        return onInvalid(`That is not valid JSON — ${label} is stored as a structured value.`);
+        return onInvalid(`That is not valid JSON. soc-ai stores ${label} as a structured value.`);
       }
       // `null` parses fine and would post a declaration that resolves to
       // nothing — the same thing the server's empty_override rule refuses.
@@ -160,14 +162,14 @@ export function DeclareEditor({
         </>
       )}
       <label className="text-[11.5px] font-semibold text-dim" htmlFor={`declare-note-${f.field}`}>
-        Note <span className="font-normal text-faint">(optional — recorded with your name)</span>
+        Note <span className="font-normal text-faint">· optional · recorded with your name</span>
       </label>
       <input
         id={`declare-note-${f.field}`}
         aria-label={`Note for ${label}`}
         value={note}
         onChange={(e) => setNote(e.target.value)}
-        placeholder="Optional — how you know this"
+        placeholder="Optional. How you know this."
         className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
       />
       <div className="flex items-center gap-2">
@@ -247,7 +249,7 @@ function PortChips({ payload }: { payload: unknown[] }) {
  *  investigation prompt prints) for anything unrecognised. */
 function FactValue({ f }: { f: DossierField }) {
   if (f.field === 'activity_profile') {
-    const view = activityProfileView(f.value_json);
+    const view = activityProfileView(f.value_json, f.value);
     return (
       <div className="min-w-0">
         {f.value && <div className="text-[13px] text-text">{f.value}</div>}
@@ -277,7 +279,7 @@ function FactValue({ f }: { f: DossierField }) {
     if (view) {
       const denied = view.answers === false || (f.value ?? '').trim().toLowerCase() === 'no';
       if (denied || view.ports.length === 0) {
-        return <span className="text-[12.5px] text-dim">no admin interface answering</span>;
+        return <span className="text-[12.5px] text-dim">no admin interface answers</span>;
       }
       return (
         <span className="flex flex-wrap items-center gap-1.5">
@@ -377,7 +379,7 @@ function WhyDrawer({
                   </span>
                 </>
               ) : (
-                <span className="text-faint">nothing — it does not work this field out</span>
+                <span className="text-faint">nothing. The sweep does not work this field out</span>
               )}
             </div>
           </div>
@@ -448,8 +450,8 @@ function WhyDrawer({
               className="rounded-control border border-border-strong bg-surface-3 px-2.5 py-1 text-[11.5px] text-dim hover:text-text disabled:opacity-60"
             >
               {sweeps != null
-                ? `Remove my declaration — the sweep's answer (${sweeps}) will stand`
-                : 'Remove my declaration — this goes back to unknown'}
+                ? `Remove my declaration. The sweep's answer ${sweeps} then stands.`
+                : 'Remove my declaration. This field then goes back to unknown.'}
             </button>
           </div>
         )}
@@ -574,6 +576,113 @@ export function FactRow({
   );
 }
 
+// ---- a role the resolver withheld -------------------------------------------
+
+/**
+ * The role a host is left with, when the sweep has a guess and the resolver
+ * will not assert it.
+ *
+ * The guess is the whole content of the ROLES bar's "low confidence" bucket
+ * and the reason a role-scoped analytic skips the host, and it used to live in
+ * the collapsed unknown line where no reader met it.
+ */
+export function withheldRole(fields: DossierField[]): DossierField | null {
+  const f = fields.find((row) => row.field === 'role');
+  if (!f || !isWithheldGuess(f) || !f.inferred_value) return null;
+  return f;
+}
+
+/** The withheld guess as a fact row: the role, the number that withheld it,
+ *  and the same declare control every other row carries. */
+function WithheldRoleRow({
+  ip,
+  f,
+  canDeclare,
+  highlight,
+  onApplied,
+  roleVocabulary,
+}: {
+  ip: string;
+  f: DossierField;
+  canDeclare: boolean;
+  highlight: boolean;
+  onApplied: (next: Dossier) => void;
+  roleVocabulary?: readonly string[];
+}) {
+  const { busy, err, setErr, run } = useDossierWrite(onApplied);
+  const [editing, setEditing] = useState(false);
+  const label = fieldLabel(f.field);
+  return (
+    <div
+      data-testid={`field-${f.field}`}
+      data-field={f.field}
+      data-highlight={highlight ? 'true' : 'false'}
+      id={`field-${f.field}`}
+      className={cn(
+        'border-b border-border-faint px-4 py-2.5 last:border-0',
+        highlight && 'border-l-2 border-l-accent bg-accent/[0.04]',
+      )}
+    >
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <span className="w-[130px] flex-none text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
+          {label}
+        </span>
+        <div className="min-w-0 flex-1">
+          <span
+            className="inline-flex items-baseline gap-1.5"
+            title="The sweep inferred this role below the confidence gate. Declare the role to settle it."
+          >
+            <span className="relative top-[-2px] h-2 w-2 flex-none rounded-full bg-warn" />
+            <span className="break-words text-[13px] text-dim">
+              possibly {roleLabel(f.inferred_value ?? '')}
+            </span>
+          </span>
+        </div>
+        {f.inferred_confidence != null && (
+          <span className="flex-none font-mono text-[11.5px] text-faint">
+            confidence {f.inferred_confidence.toFixed(2)}
+          </span>
+        )}
+        {canDeclare && !editing && (
+          <button
+            onClick={() => {
+              setErr(null);
+              setEditing(true);
+            }}
+            aria-label={`Edit ${label}`}
+            className="flex flex-none items-center gap-1 rounded-control border border-border-strong bg-surface-3 px-2 py-0.5 text-[11px] font-semibold text-dim hover:border-accent hover:text-text"
+          >
+            <Pencil size={10} />
+            Edit
+          </button>
+        )}
+      </div>
+
+      <WhyDrawer f={f} canDeclare={canDeclare} busy={busy} onRemove={() => {}} />
+
+      {editing && (
+        <DeclareEditor
+          f={f}
+          busy={busy}
+          roleVocabulary={roleVocabulary}
+          onInvalid={setErr}
+          onCancel={() => {
+            setEditing(false);
+            setErr(null);
+          }}
+          onSave={(body) => run(() => setDossierOverride(ip, body), () => setEditing(false))}
+        />
+      )}
+
+      {err && (
+        <div className="mt-2 rounded-control border border-danger/35 bg-danger/[0.07] px-3 py-2 text-[12px] text-danger">
+          {err}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- the known panel --------------------------------------------------------
 
 export interface HostFactsProps {
@@ -596,6 +705,10 @@ export function HostFacts({
 }: HostFactsProps) {
   const { known } = partitionFields(dossier.fields);
   const rows = known.filter((f) => !BRIEFING_FIELDS.has(f.field));
+  // The withheld role guess rides with the facts rather than in the collapsed
+  // unknown line. It is not counted as a fact: the header counts what the
+  // resolver will assert, and this row is the one the resolver refused.
+  const guess = withheldRole(dossier.fields);
   return (
     <div data-testid="host-facts" className="mb-3">
       <Panel>
@@ -608,22 +721,34 @@ export function HostFacts({
             </span>
           }
         />
-        {rows.length === 0 ? (
+        {rows.length === 0 && guess == null ? (
           <div className="px-4 py-4 text-[12.5px] text-faint">
             Nothing confirmed about this machine yet.
           </div>
         ) : (
-          rows.map((f) => (
-            <FactRow
-              key={f.field}
-              ip={dossier.ip}
-              f={f}
-              canDeclare={canDeclare}
-              highlight={focusField === f.field}
-              onApplied={onApplied}
-              roleVocabulary={roleVocabulary}
-            />
-          ))
+          <>
+            {guess && (
+              <WithheldRoleRow
+                ip={dossier.ip}
+                f={guess}
+                canDeclare={canDeclare}
+                highlight={focusField === guess.field}
+                onApplied={onApplied}
+                roleVocabulary={roleVocabulary}
+              />
+            )}
+            {rows.map((f) => (
+              <FactRow
+                key={f.field}
+                ip={dossier.ip}
+                f={f}
+                canDeclare={canDeclare}
+                highlight={focusField === f.field}
+                onApplied={onApplied}
+                roleVocabulary={roleVocabulary}
+              />
+            ))}
+          </>
         )}
       </Panel>
     </div>
@@ -709,7 +834,10 @@ export function HostUnknowns({
   focusField,
   roleVocabulary,
 }: HostFactsProps) {
-  const { unknown } = partitionFields(dossier.fields);
+  // A withheld role guess is stated in the facts panel above, so it does not
+  // also appear here. One answer, one place on the page.
+  const guess = withheldRole(dossier.fields);
+  const unknown = partitionFields(dossier.fields).unknown.filter((f) => f !== guess);
   const names = unknown.map((f) => f.field).join(',');
 
   // Collapsed by default: these are the gaps, not the content. A deep link

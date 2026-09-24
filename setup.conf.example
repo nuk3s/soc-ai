@@ -23,7 +23,11 @@ LITELLM_API_KEY=                       # gateway API key, if it requires one
 LITELLM_VERIFY_SSL=true                # false if the gateway uses a self-signed cert
 
 # ── Grid-specific tuning (defaults fit most single-node grids) ────────────────
-WEBUI_ALERTS_QUERY=tags:alert          # Elastic-Agent grids often: event.dataset:suricata.alert
+# What the triage queue counts as an alert. SO's own pipelines tag Suricata,
+# Sigma, Wazuh and Strelka `tags:alert`; Elastic Defend endpoint alerts carry
+# ECS `event.kind:alert` instead, so the default unions both. Narrow it (e.g.
+# to event.dataset:suricata.alert) only after checking `soc-ai doctor`.
+WEBUI_ALERTS_QUERY=tags:alert OR event.kind:alert
 # Events live in SO 3.x `logs-*` data streams. setup.sh auto-detects the cluster
 # prefix during its ES check and writes the concrete value; leave blank to accept
 # that. Single-node = logs-* ; multi-node / distributed = *:logs-* .

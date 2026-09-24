@@ -34,7 +34,7 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.tuning_heuristic import (
     MIN_ALERTS,
     MIN_FP,
-    MIN_INVESTIGATIONS,
+    MIN_TRIAGED,
     MUTE_MIN_ALERTS,
     OVERRIDE_FP_SIGNAL,
     assess,
@@ -44,7 +44,7 @@ from soc_ai.webui import alerts_query as aq
 __all__ = [
     "MIN_ALERTS",
     "MIN_FP",
-    "MIN_INVESTIGATIONS",
+    "MIN_TRIAGED",
     "MUTE_MIN_ALERTS",
     "OVERRIDE_FP_SIGNAL",
     "assess",
@@ -73,12 +73,14 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
     settings = state.settings
     elastic = state.elastic
 
-    groups, _total = await aq.fetch_groups(
-        elastic,
-        settings,
-        time_range="7d",
-        sort="count",
-    )
+    groups = (
+        await aq.fetch_groups(
+            elastic,
+            settings,
+            time_range="7d",
+            sort="count",
+        )
+    ).groups
     if not groups:
         return []
 

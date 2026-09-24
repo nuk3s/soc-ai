@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from typing import Any
 
 from soc_ai.tools.get_alert_context import (
@@ -42,6 +43,26 @@ _PLAIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,}$")
 _PLAIN_TOOL_RE = re.compile(r"^(t_[a-z0-9_]+)(?:\s*:.*)?$")
 # Plain path with the observed value appended (`alert.dns_query=example.com`).
 _PLAIN_PATH_EQ_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)\s*=")
+
+
+def _alert_context_fields() -> frozenset[str]:
+    """Top-level field names of the alert-context bundle.
+
+    Bare, underscored, and long enough that ``_PLAIN_ID_RE`` claims them —
+    ``host_alert_profile`` classified as an Elasticsearch document id, and an id
+    resolves ONLY by membership in the retrieved-id set, where a field name can
+    never appear. So it failed to resolve on every investigation that cited it,
+    which is every investigation that followed the triage prompt: the prompt
+    says "Check `host_alert_profile`" in as many words. Measured on the range,
+    that capped otherwise-clean runs at 87.5-90% citation coverage.
+
+    Derived from the model rather than listed here so it cannot drift the day a
+    field is added. Read lazily: this module is imported by the orchestrator and
+    the tool package imports back through it at module scope.
+    """
+    from soc_ai.tools.get_alert_context import EnrichedAlertContext  # noqa: PLC0415
+
+    return frozenset(EnrichedAlertContext.model_fields)
 
 
 def _classify_citation(citation: str) -> tuple[str, str | None]:
@@ -82,6 +103,13 @@ def _classify_citation(citation: str) -> tuple[str, str | None]:
         return "path", s
     if m := _PLAIN_PATH_EQ_RE.match(s):
         return "path", m.group(1)
+    # Before the id fallback, and for the same reason tool names are: a name the
+    # alert-context bundle actually has is not a document id, and calling it one
+    # sends it to a resolver where it can never match. See _alert_context_fields.
+    # Classified as a `path` so it resolves the way every other bundle field
+    # does — structurally, against the enriched alert — rather than by substring.
+    if s in _alert_context_fields():
+        return "path", s
     if _PLAIN_ID_RE.match(s):
         return "id", s
     return "unknown", None
@@ -456,6 +484,89 @@ def _targeted_result_has_data(result: Any) -> bool:
     return any(v for k, v in result.items() if k not in _NON_EVIDENCE_RESULT_KEYS)
 
 
+def tool_return_is_evidence(tool_name: Any, content: Any) -> bool:
+    """Whether one tool RETURN counts as gathered evidence.
+
+    The single definition behind both readings of a run:
+    :func:`count_successful_tool_calls` walks a live PydanticAI history, and
+    :func:`recorded_run_retrieved_evidence` walks the same run after it has been
+    written to the investigation store. They used to be one implementation and
+    no implementation: the recorded side did not exist, so the auto-triage
+    inheritance path had no way to ask whether the verdict it was about to
+    acknowledge on the analyst's grid rested on anything, and it never asked.
+
+    An error result, a dedup or prefetch short-circuit, an empty list, an
+    empty-but-non-error dict, and a return from a :data:`NON_EVIDENTIAL_TOOLS`
+    tool (soc-ai's own inference rather than an observation) are all NOT
+    evidence.
+    """
+    if tool_name in NON_EVIDENTIAL_TOOLS:
+        return False
+    if content is None:
+        return False  # a tool that returned nothing is not evidence
+    if isinstance(content, dict):
+        if (
+            content.get("error")
+            or content.get("duplicate_call")
+            or content.get("prefetch_already_has_this")
+        ):
+            return False
+        # A NON-error dict is only evidence when it carries DISCRIMINATING
+        # data. A zero-hit OQL loop message or a clean-internal enrich made
+        # a call but discovered nothing; counting it would let one throwaway
+        # call satisfy the hard evidence gate (the QVOD zero-tool defect,
+        # one call away). Same standard as the Phase-D dispatch.
+        return _targeted_result_has_data(content)
+    # An empty list (zero hits / no matches) from a list-returning tool —
+    # t_query_zeek_logs, t_query_cases, t_query_detections, t_get_playbooks,
+    # t_lookup_runbook — gathered nothing. Held to the same standard as an empty
+    # dict so one throwaway call cannot exempt the hard evidence gate (the QVOD
+    # zero-tool defect).
+    return not (isinstance(content, list) and not content)
+
+
+# Recorded event kinds that can carry a retrieval. Anything else in the store is
+# bookkeeping, prompt assembly or a verdict, and says nothing about whether the
+# run looked at the world.
+RETRIEVAL_EVENT_KINDS: tuple[str, ...] = (
+    "tool_result",
+    "targeted_tool_result",
+    "oracle_adjudication",
+)
+
+
+def recorded_run_retrieved_evidence(events: Iterable[tuple[str, Any]]) -> bool:
+    """Whether a run that is already ON DISK retrieved anything.
+
+    Reads the persisted ``(kind, payload)`` pairs a completed investigation left
+    behind and answers the same question ``run_retrieved_evidence`` answers live
+    in the orchestrator: did a successful tool call, a Phase-D targeted dispatch
+    that returned discriminating data, or the Oracle's own tool loop stand
+    behind this verdict?
+
+    Needed because a verdict outlives the run that produced it. Auto-triage
+    inheritance hands one investigation's false positive to every sibling alert
+    on the same rule and address pair, and acknowledges them in Security Onion —
+    on production that is roughly 200 grid writes per investigation. Only the
+    recorded events can say whether the verdict at the top of that fan-out was
+    ever grounded.
+    """
+    for kind, payload in events:
+        p = payload if isinstance(payload, dict) else {}
+        if kind == "oracle_adjudication":
+            try:
+                if int(p.get("oracle_tool_calls") or 0) >= 1:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        elif kind == "targeted_tool_result":
+            if _targeted_result_has_data(p.get("result")):
+                return True
+        elif kind == "tool_result" and tool_return_is_evidence(p.get("tool_name"), p.get("result")):
+            return True
+    return False
+
+
 def count_successful_tool_calls(messages: list[Any] | None) -> int:
     """Count tool calls that returned NON-error DISCRIMINATING DATA in a PydanticAI history.
 
@@ -488,32 +599,10 @@ def count_successful_tool_calls(messages: list[Any] | None) -> int:
             # RESULT is evidence.
             if getattr(part, "part_kind", None) not in ("tool-return", "builtin-tool-return"):
                 continue
-            # A result that is soc-ai's own inference is context, not evidence —
-            # see NON_EVIDENTIAL_TOOLS. Dropped before the content tests because
-            # a found dossier passes them all: it is data, just not OBSERVED data.
-            if getattr(part, "tool_name", None) in NON_EVIDENTIAL_TOOLS:
-                continue
-            c = part.content
-            if c is None:
-                continue  # a tool that returned nothing is not evidence
-            if isinstance(c, dict):
-                if c.get("error") or c.get("duplicate_call") or c.get("prefetch_already_has_this"):
-                    continue
-                # A NON-error dict is only evidence when it carries DISCRIMINATING
-                # data. A zero-hit OQL loop message or a clean-internal enrich made
-                # a call but discovered nothing; counting it would let one throwaway
-                # call satisfy the hard evidence gate (the QVOD zero-tool defect,
-                # one call away). Same standard as the Phase-D dispatch.
-                if not _targeted_result_has_data(c):
-                    continue
-            elif isinstance(c, list) and not c:
-                # An empty list (zero hits / no matches) from a list-returning
-                # tool — t_query_zeek_logs, t_query_cases, t_query_detections,
-                # t_get_playbooks, t_lookup_runbook — gathered nothing. Hold it to
-                # the same standard as an empty dict so one throwaway call cannot
-                # exempt the hard evidence gate (the QVOD zero-tool defect).
-                continue
-            n += 1
+            # Content tests live in tool_return_is_evidence so the recorded
+            # reading of the same run cannot drift from this one.
+            if tool_return_is_evidence(getattr(part, "tool_name", None), part.content):
+                n += 1
     return n
 
 
@@ -790,6 +879,25 @@ def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
             evidence.append(
                 f"MISP hit on {indicator}: {desc[:120]} (path enrichments.{indicator}.misp_hits)"
             )
+
+    # Blocklist coverage. Same shape and the same reasoning as the endpoint
+    # coverage gap below: when the feeds loaded nothing, every lookup missed and
+    # the miss says nothing. Handed over as a citable fact so the synthesizer
+    # can name it, instead of a silence it reads as a clean reputation check.
+    # ONE bullet for the run, not one per indicator, and only on an explicit
+    # False — an unrecorded enrichment makes no claim. Constant wording apart
+    # from the citation path.
+    unchecked = next(
+        (i for i, e in enrichments.items() if getattr(e, "blocklist_checked", None) is False),
+        None,
+    )
+    if unchecked is not None:
+        evidence.append(
+            "blocklist coverage gap: no local threat-intel feed was loaded, so no indicator "
+            "was checked against one — every empty blocklist_hits in this bundle is an "
+            "absence of data, not a clean reputation result; not exoneration and not guilt "
+            f"(path enrichments.{unchecked}.blocklist_sources)"
+        )
 
     # Endpoint coverage. When the prefetch established that the alert's hosts
     # ship no endpoint telemetry (or the grid holds none at all), hand the

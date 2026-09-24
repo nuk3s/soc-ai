@@ -12,3 +12,18 @@ export function middleEllipsis(s: string, max = 72): string {
   const tail = max - 1 - head;
   return `${chars.slice(0, head).join('').trimEnd()}…${chars.slice(chars.length - tail).join('').trimStart()}`;
 }
+
+/**
+ * The first sentence of a paragraph.
+ *
+ * A hunt objective runs to several sentences: what to sweep, then what to
+ * answer. A header line holds one of them, and the whole objective there
+ * pushed every other word off the row.
+ *
+ * A line with no full stop is one sentence already, so it comes back whole.
+ */
+export function firstSentence(s: string): string {
+  const text = s.trim();
+  const end = text.match(/[.!?](?=\s|$)/);
+  return end?.index === undefined ? text : text.slice(0, end.index + 1);
+}

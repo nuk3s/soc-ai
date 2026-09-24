@@ -1,11 +1,37 @@
 {
   "id": "flow-abc-123",
-  "type": "api",
+  "type": "browser",
   "expires_at": "2026-05-07T11:00:00Z",
   "issued_at": "2026-05-07T10:30:00Z",
   "ui": {
     "action": "https://so.example.com/auth/self-service/login?flow=flow-abc-123",
     "method": "POST",
-    "nodes": []
+    "nodes": [
+      {
+        "type": "input",
+        "group": "default",
+        "attributes": {
+          "name": "csrf_token",
+          "type": "hidden",
+          "value": "csrf-value-abc",
+          "required": true
+        }
+      },
+      {
+        "type": "input",
+        "group": "password",
+        "attributes": { "name": "identifier", "type": "text", "value": "" }
+      },
+      {
+        "type": "input",
+        "group": "password",
+        "attributes": { "name": "password", "type": "password", "required": true }
+      },
+      {
+        "type": "input",
+        "group": "password",
+        "attributes": { "name": "method", "type": "submit", "value": "password" }
+      }
+    ]
   }
 }

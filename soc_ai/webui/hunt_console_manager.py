@@ -67,6 +67,8 @@ class HuntConsoleManager:
         started_by: str,
         prior: str | None = None,
         kind: str = "chat",
+        starter: str = "analyst",
+        lead_id: int | None = None,
     ) -> str | None:
         """Create the hunt row and spawn a background drainer task.
 
@@ -79,6 +81,9 @@ class HuntConsoleManager:
         ``kind`` tags the hunt row (``"chat"`` for an operator-typed hunt,
         ``"scheduled"`` for a recurring hunt fired by the schedule loop) — it is
         threaded straight into ``hunt_recorded_run`` → ``hunt_svc.create``.
+
+        ``starter`` names the class that started the hunt: analyst, schedule or
+        lead. ``lead_id`` links a lead-started hunt to its lead.
         """
         # Concurrency guard: this manager is fire-and-forget (one unbounded
         # background asyncio.Task per call), so without a cap a scripted/rapid-fire
@@ -104,6 +109,8 @@ class HuntConsoleManager:
                 started_by=started_by,
                 prior=prior,
                 kind=kind,
+                starter=starter,
+                lead_id=lead_id,
                 cancel_token=token,
             )
 
@@ -394,7 +401,7 @@ async def _hunt_chat_resolve_if_pending(state: Any, assistant_event_id: int) -> 
             await hunt_svc.finish_chat_assistant(
                 db,
                 assistant_event_id,
-                content="The assistant was interrupted — please ask again.",
+                content="The assistant was interrupted. Ask again.",
                 status="error",
                 meta=None,
             )

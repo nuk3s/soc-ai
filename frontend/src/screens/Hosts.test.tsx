@@ -196,7 +196,7 @@ import {
   startDossierRefresh,
 } from '../lib/api';
 import { roleAccent } from '../lib/hostColors';
-import { Hosts } from './Hosts';
+import { Hosts, LOW_CONFIDENCE_ROLE } from './Hosts';
 
 beforeEach(() => {
   vi.mocked(listDossiers).mockReset().mockResolvedValue(page([BLUE, QUIET]));
@@ -288,7 +288,7 @@ describe('Hosts table', () => {
     const row = rowFor('192.168.10.8');
     // Criticality is a word an operator declared — it renders as itself.
     expect(within(row).getByText('high')).toBeTruthy();
-    expect(within(row).getByTitle(/2 fields declared/i)).toBeTruthy();
+    expect(within(row).getByTitle(/declared 2 fields/i)).toBeTruthy();
     expect(within(row).getByTitle(/disagrees/i).textContent).toContain('1');
     // The old CRITICALITY and LANES column headers are gone.
     expect(screen.queryByText('Lanes')).toBeNull();
@@ -342,7 +342,7 @@ describe('Hosts table', () => {
     expect(text).not.toMatch(/resolved on read/i);
     expect(text).not.toMatch(/\binference\b/i);
     // The subtitle is the user's version of the doctrine sentence.
-    expect(text).toMatch(/your answers win/i);
+    expect(text).toMatch(/your declaration replaces the sweep's answer/i);
   });
 });
 
@@ -518,12 +518,12 @@ describe('Hosts controls reach the server', () => {
     expect(lastQuery()).toMatchObject({ activity: 'active' });
     expect(lastQuery()?.source).toBeUndefined();
     // The escape hatch names what it hides and offers the way out.
-    expect(screen.getByText(/quiet hosts.*are hidden/i)).toBeTruthy();
+    expect(screen.getByText(/this table hides quiet hosts/i)).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
     await waitFor(() => expect(lastQuery()?.activity).toBeUndefined());
     expect(lastQuery()?.source).toBeUndefined();
-    expect(screen.queryByText(/quiet hosts.*are hidden/i)).toBeNull();
+    expect(screen.queryByText(/this table hides quiet hosts/i)).toBeNull();
   });
 
   it('sends the search to the server, debounced, from the first page', async () => {
@@ -587,7 +587,7 @@ describe('Hosts — quiet-but-real census', () => {
     // The escape hatch is exactly where it matters most here: a zero-row page
     // has no pager to carry it, so the note has to reach off the EmptyState
     // too, not only off a table that this page never renders.
-    expect(screen.getByText(/quiet hosts.*are hidden/i)).toBeTruthy();
+    expect(screen.getByText(/this table hides quiet hosts/i)).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
     await waitFor(() => expect(lastQuery()?.activity).toBeUndefined());
@@ -608,8 +608,8 @@ describe('Hosts — quiet-but-real census', () => {
     expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
     expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
     // Retry over an outage, not a verdict about a page that never arrived —
-    // "quiet hosts are hidden" claims a result the failed fetch never returned.
-    expect(screen.queryByText(/quiet hosts.*are hidden/i)).toBeNull();
+    // "this table hides quiet hosts" claims a result the failed fetch never got.
+    expect(screen.queryByText(/this table hides quiet hosts/i)).toBeNull();
   });
 });
 
@@ -651,7 +651,7 @@ describe('Hosts broken-builds filter', () => {
     await screen.findByText('192.168.10.140');
     expect(lastQuery()).toMatchObject({ health: 'broken' });
     expect(lastQuery()?.activity).toBeUndefined();
-    expect(screen.queryByText(/quiet hosts.*are hidden/i)).toBeNull();
+    expect(screen.queryByText(/this table hides quiet hosts/i)).toBeNull();
     expect(screen.getAllByRole('button', { name: /show all hosts/i })).toHaveLength(1);
     // The Show control must not keep claiming "with traffic" over a request
     // that, per the assertions above, does not actually filter on it.
@@ -866,7 +866,7 @@ describe('Hosts bulk declare', () => {
     fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
     expect(await screen.findByText(/1 of 2 hosts/)).toBeTruthy();
-    expect(screen.getByText(/1 not swept yet \(192\.168\.10\.9\)/)).toBeTruthy();
+    expect(screen.getByText(/1 not swept yet: 192\.168\.10\.9/)).toBeTruthy();
     // The host that did not take it stays selected, so "try again" is one click.
     expect(screen.getByRole('button', { name: /declare \(1\)/i })).toBeTruthy();
   });
@@ -991,7 +991,7 @@ describe('Hosts bulk declare reports a partial batch', () => {
     fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
 
     expect(await screen.findByText(/1 of 2 hosts/)).toBeTruthy();
-    expect(screen.getByText(/1 failed \(192\.168\.10\.9\) — try those again/)).toBeTruthy();
+    expect(screen.getByText(/1 failed: 192\.168\.10\.9\. Try those again/)).toBeTruthy();
     expect(screen.getByRole('button', { name: /declare \(1\)/i })).toBeTruthy();
   });
 
@@ -1007,5 +1007,74 @@ describe('Hosts bulk declare reports a partial batch', () => {
     fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
     await waitFor(() => expect(screen.queryByTestId('list-toolbar-selection')).toBeNull());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The roles the resolver withholds
+// ---------------------------------------------------------------------------
+
+// The ROLES bar counts these hosts in their own amber bucket, and until now no
+// filter on the screen could list them: the ROLE facet offered only values the
+// resolver had asserted (dogfood 2026-09-17).
+describe('Hosts — a role the sweep guessed and the resolver withheld', () => {
+  const GUESSED = host('192.168.10.31', {}, { role: { reason: 'low_confidence' } });
+  const STALE_GUESS = host('192.168.10.32', {}, { role: { reason: 'stale' } });
+
+  const withBucket = (count: number) =>
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, roles_low_confidence: count });
+
+  it('offers the bucket in the ROLE filter only when the network has one', async () => {
+    withBucket(0);
+    mount();
+    await screen.findByText('192.168.10.8');
+    expect(
+      within(screen.getByLabelText('Role') as HTMLSelectElement).queryByText('low confidence'),
+    ).toBeNull();
+  });
+
+  it('lists exactly the rows the bucket counts', async () => {
+    withBucket(2);
+    vi.mocked(listDossiers).mockResolvedValue(page([BLUE, QUIET, GUESSED, STALE_GUESS], 4));
+    mount();
+    await screen.findByText('192.168.10.8');
+
+    fireEvent.change(screen.getByLabelText('Role'), { target: { value: LOW_CONFIDENCE_ROLE } });
+
+    // The server has no such role, so the request drops the facet and widens
+    // the page instead — the narrowing happens over the rows it returns.
+    await waitFor(() => expect(lastQuery()?.role).toBeUndefined());
+    expect(lastQuery()?.limit).toBe(200);
+
+    await waitFor(() => expect(screen.queryByText('192.168.10.8')).toBeNull());
+    expect(screen.getByText('192.168.10.31')).toBeTruthy();
+    expect(screen.getByText('192.168.10.32')).toBeTruthy();
+    // A declared role and a field nothing was ever found for are not guesses.
+    expect(screen.queryByText('192.168.10.9')).toBeNull();
+  });
+
+  // A count taken off the page must say which page, or it reads as the
+  // network's — the defect the summary strip exists to prevent.
+  it('says how much of the network it read to reach that answer', async () => {
+    withBucket(9);
+    vi.mocked(listDossiers).mockResolvedValue({
+      rows: [BLUE, QUIET, GUESSED],
+      total: 500,
+      limit: 200,
+      offset: 0,
+    });
+    mount();
+    await screen.findByText('192.168.10.8');
+    fireEvent.change(screen.getByLabelText('Role'), { target: { value: LOW_CONFIDENCE_ROLE } });
+    expect(await screen.findByText(/1 low confidence · read 1–200 of 500/)).toBeTruthy();
+  });
+
+  it('marks the withheld guess in the Role column', async () => {
+    withBucket(1);
+    vi.mocked(listDossiers).mockResolvedValue(page([GUESSED], 1));
+    mount();
+    await screen.findByText('192.168.10.31');
+    const cell = within(rowFor('192.168.10.31')).getByTestId('role-possibly');
+    expect(cell.textContent).toContain('possibly');
   });
 });

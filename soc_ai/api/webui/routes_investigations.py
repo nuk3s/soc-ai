@@ -17,6 +17,7 @@ from sqlalchemy import select
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui import _timeline, routes_hunts
+from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
     _iso_utc,
@@ -71,6 +72,16 @@ _STATUS = frozenset(inv_svc.DISPLAY_STATUSES)
 _SEARCH_MAX = 200
 
 
+def _note_or_none(value: object) -> str | None:
+    """A validator note worth showing, or None.
+
+    Models write the STRING "null" when they have nothing to say, and the page
+    rendered "Post-validator override — null" as if that were a note.
+    """
+    text = str(value or "").strip()
+    return text if text and text.lower() not in {"null", "none", "n/a", "nothing"} else None
+
+
 def _row_status(inv: Investigation) -> str:
     """Effective display status for an investigation row.
 
@@ -90,10 +101,54 @@ def _row_status(inv: Investigation) -> str:
     return status
 
 
+def _reached_no_verdict(inv: Investigation) -> bool:
+    """This run ended in a failure state and produced no verdict.
+
+    The Python twin of :func:`~soc_ai.store.investigations.failed_triage_sql`,
+    kept beside :func:`_row_status` because it is that function's result plus
+    the same blank-verdict test. One predicate behind the row flag, the dismiss
+    guard and the SQL filter, so a run the Dashboard counts is a run the
+    operator can clear.
+    """
+    return _row_status(inv) == "error" and not (inv.verdict or "").strip()
+
+
+def _subject_type(inv: Investigation) -> str:
+    """What this run investigated: ``"hunt"`` or ``"alert"``.
+
+    Read off the stored subject (migration 0050), so a legacy row and an alert
+    row both read ``"alert"``. Distinct from ``kind``, which says where the run
+    came from and is unchanged: a run can be kind ``lead`` and subject type
+    ``hunt``.
+    """
+    subject = getattr(inv, "subject_json", None)
+    return "hunt" if isinstance(subject, dict) and subject.get("type") == "hunt" else "alert"
+
+
+def _subject_out(inv: Investigation, hunt: Hunt | None) -> dict[str, Any] | None:
+    """The subject the drawer reads, or None for an alert subject.
+
+    Served from the row, not rebuilt: the hunt row carries no foreign key and
+    may be deleted, and the subject is a record of what THIS run read. The
+    hunt's objective is topped up from the hunt when the row is still there and
+    the stored record has none (a legacy hunt-subject row).
+    """
+    stored = getattr(inv, "subject_json", None)
+    if not isinstance(stored, dict) or stored.get("type") != "hunt":
+        return None
+    out = dict(stored)
+    if hunt is not None and not out.get("objective"):
+        out["objective"] = hunt.objective
+    return out
+
+
 class InvestigationRowOut(BaseModel):
     id: str
     name: str
     kind: str
+    # What the run investigated (migration 0050): "alert" or "hunt". `kind`
+    # says where the run came from and does not change.
+    subjectType: str = "alert"
     verdict: str
     conf: float | None = None
     host: str
@@ -116,10 +171,17 @@ class InvestigationRowOut(BaseModel):
     # chip (not the amber Needs-info pill), makes it filterable, and the Dashboard
     # excludes it from the Needs-info KPI.
     fallback: bool = False
-    # Operator ack of a fallback run (POST /investigations/{id}/dismiss-error).
-    # The Dashboard's "N pipeline errors" KPI counts rows where `fallback` is
-    # True AND this is False — the row stays a pipeline error historically; the
-    # ack only silences the dashboard nag.
+    # This run ended in a failure state having reached NO verdict: the other half
+    # of "the pipeline produced nothing usable". A fallback at least wrote a
+    # report to be marked; these wrote nothing at all, which is why they were
+    # invisible to every count keyed on `fallback` alone. The Dashboard's
+    # pipeline-error tile counts `(fallback or noVerdict) and not errorDismissed`
+    # on a primary row.
+    noVerdict: bool = False
+    # Operator ack of a failed run (POST /investigations/{id}/dismiss-error).
+    # The Dashboard's "N pipeline errors" KPI counts rows where `fallback` or
+    # `noVerdict` is True AND this is False. The row stays a pipeline error
+    # historically; the ack only silences the dashboard nag.
     errorDismissed: bool = False
     # What happened LAST to this row's alert, decided over the alert's WHOLE run
     # group exactly as `isPrimary` is. When it names a different run than this
@@ -191,6 +253,7 @@ def _row(
         # kind='suricata' regardless of their feed doc's real kind — accepted;
         # no ES-derived fallback.
         kind=inv.kind,
+        subjectType=_subject_type(inv),
         verdict=_verdict(inv.verdict),
         conf=inv.confidence,
         host=inv.src_ip or "—",
@@ -200,9 +263,12 @@ def _row(
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(inv.created_at),
         chatCount=chat_count,
-        alertId=inv.alert_es_id or inv.id,
+        # The group the row belongs to. A hunt-subject run groups under
+        # itself: the document it anchors on is a time anchor, not its subject.
+        alertId=inv_svc.alert_group_id(inv) or inv.id,
         isPrimary=is_primary,
         fallback=is_pipeline_fallback(inv.report),
+        noVerdict=_reached_no_verdict(inv),
         errorDismissed=inv.error_dismissed_at is not None,
         latestRunId=inv.id if latest_run is None else latest_run.id,
         latestRunStatus=latest_status,
@@ -242,6 +308,10 @@ def _primary_run_ids(rows: Sequence[_RunLike]) -> set[str]:
     "re-investigate" must surface the in-flight run as the alert's current
     state, not tuck it under the stale verdict as an "earlier run". Errored/
     cancelled/interrupted re-runs still nest under the run that worked.
+
+    ``alert_es_id`` here is the GROUP key, which the caller fills through
+    :func:`~soc_ai.store.investigations.alert_group_id`. A run that stands
+    alone arrives with None and is its own group.
     """
     best_live: dict[str, str] = {}
     best_any: dict[str, str] = {}
@@ -299,6 +369,26 @@ def _csv_filter(raw: str | None, allowed: tuple[str, ...]) -> list[str]:
     return [v for v in (p.strip() for p in raw.split(",")) if v in allowed]
 
 
+# The two halves of a pipeline-error set. A run "needs a retry" when it produced
+# nothing usable AND nobody has dealt with it: not dismissed by an operator, and
+# not superseded by a later run of the same alert that did land a verdict.
+# Re-running IS the fix, so a superseded error is resolved without an explicit
+# ack. This is the Dashboard tile's predicate, and it lives here so the tile and
+# the list it deep-links to cannot drift apart (dogfood 2026-09-07, D2).
+_ERROR_STATES = ("live", "handled")
+
+
+def _needs_retry(row: InvestigationRowOut) -> bool:
+    """Whether this run still wants an operator's attention.
+
+    The two shapes of "the pipeline produced nothing usable" are an E1.2
+    fallback (a placeholder verdict the pipeline never reasoned to) and a run
+    that died outright with no verdict at all. Either one still counts unless it
+    has been dismissed or superseded.
+    """
+    return (row.fallback or row.noVerdict) and not row.errorDismissed and row.isPrimary
+
+
 class InvestigationListOut(BaseModel):
     """One SQL page of the list, with figures counted over the right sets.
 
@@ -308,6 +398,9 @@ class InvestigationListOut(BaseModel):
     phantom-untriaged defect, twice shipped). ``totalAll`` / ``active`` describe
     the WHOLE table: "empty store vs. filter matched nothing" and "poll while
     anything is running anywhere" cannot be answered from a filtered page.
+
+    Under ``error_state`` the figures are counted over the PARTITION instead,
+    still over the whole partition rather than the page, for the same reason.
     """
 
     rows: list[InvestigationRowOut]
@@ -319,6 +412,12 @@ class InvestigationListOut(BaseModel):
     # The clamped values the server actually used — the client pages by these.
     limit: int
     offset: int
+    # True when the answer was decided over a capped read that the filter set
+    # outgrew, which makes ``total`` a FLOOR. Only ``error_state`` can set it:
+    # its partition is decided in Python, over one page, because "superseded"
+    # is a fact about an alert's whole run group rather than a column. A count
+    # that silently stops being a count is the failure this flag exists for.
+    partial: bool = False
 
 
 @router.get("/investigations", response_model=InvestigationListOut)
@@ -329,6 +428,7 @@ async def list_investigations(
     q: str | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
+    error_state: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> InvestigationListOut:
@@ -348,9 +448,18 @@ async def list_investigations(
     contain non-primary rows whose primary sibling is absent; the client tucks a
     retry under its primary only when that primary is present, and shows it
     top-level otherwise.
+
+    ``error_state`` splits a pipeline-error set into the runs that still need a
+    retry (``live``) and the ones somebody has already dealt with (``handled``:
+    dismissed, or superseded by a later run that landed a verdict). It is the
+    one filter that cannot be SQL, because "superseded" is a fact about an
+    alert's whole run group rather than a column, so it is decided in Python
+    over one capped read and the response says when the set outgrew that cap.
+    An unknown value is dropped, like an unknown ``verdict`` member.
     """
     statuses = _csv_filter(status, inv_svc.DISPLAY_STATUSES)
     verdicts = _csv_filter(verdict, _VERDICT_FILTERS)
+    wanted_state = error_state if error_state in _ERROR_STATES else None
     needle = (q or "").strip()
     if len(needle) > _SEARCH_MAX:
         raise HTTPException(
@@ -362,6 +471,10 @@ async def list_investigations(
         )
     limit = min(max(limit, 1), inv_svc.MAX_PAGE_LIMIT)
     offset = max(0, offset)
+    # Partitioning needs the WHOLE filter set in hand, not the caller's page:
+    # the split is decided per row and the count has to describe the partition.
+    read_limit = inv_svc.MAX_PAGE_LIMIT if wanted_state else limit
+    read_offset = 0 if wanted_state else offset
     async with request.app.state.db_sessionmaker() as db:
         page = await inv_svc.query_page(
             db,
@@ -370,20 +483,21 @@ async def list_investigations(
             verdicts=verdicts,
             statuses=statuses,
             q=needle or None,
-            limit=limit,
-            offset=offset,
+            limit=read_limit,
+            offset=read_offset,
         )
         chat_counts = await chat_svc.counts_for(db, [inv.id for inv in page.rows])
-        alert_ids = sorted({inv.alert_es_id for inv in page.rows if inv.alert_es_id})
+        alert_ids = sorted({g for inv in page.rows if (g := inv_svc.alert_group_id(inv))})
         group_rows = await inv_svc.runs_for_alerts(db, alert_ids)
-    # Primacy over the FULL groups. A page row with a blank alert_es_id
-    # contributes no group to fan out on, so it is merged in as its own
-    # one-run group — otherwise it would carry the default isPrimary and the
-    # decision would be made for it rather than about it. Newest-first order is
-    # what _primary_run_ids assumes.
+    # Primacy over the FULL groups. A page row that names no group — a blank
+    # alert_es_id, or a hunt-subject run, whose anchor document is a time
+    # anchor and not its subject — contributes no group to fan out on, so it
+    # is merged in as its own one-run group; otherwise it would carry the
+    # default isPrimary and the decision would be made for it rather than
+    # about it. Newest-first order is what _primary_run_ids assumes.
     seen = {r.id for r in group_rows}
     combined = group_rows + [
-        inv_svc.RunRef(inv.id, inv.alert_es_id, inv.status, inv.created_at)
+        inv_svc.RunRef(inv.id, inv_svc.alert_group_id(inv), inv.status, inv.created_at)
         for inv in page.rows
         if inv.id not in seen
     ]
@@ -391,23 +505,40 @@ async def list_investigations(
     primary = _primary_run_ids(combined)
     # Same groups, same pass, second question: what happened to each alert LAST.
     latest = _latest_runs(combined)
+    rows = [
+        _row(
+            inv,
+            chat_counts.get(inv.id, 0),
+            is_primary=inv.id in primary,
+            latest_run=latest.get(inv_svc.alert_group_id(inv) or inv.id),
+        )
+        for inv in page.rows
+    ]
+    if wanted_state is None:
+        return InvestigationListOut(
+            rows=rows,
+            total=page.total,
+            running=page.running,
+            truePositives=page.true_positives,
+            totalAll=page.total_all,
+            active=page.active,
+            limit=limit,
+            offset=offset,
+        )
+    kept = [r for r in rows if _needs_retry(r) == (wanted_state == "live")]
     return InvestigationListOut(
-        rows=[
-            _row(
-                inv,
-                chat_counts.get(inv.id, 0),
-                is_primary=inv.id in primary,
-                latest_run=latest.get(inv.alert_es_id or inv.id),
-            )
-            for inv in page.rows
-        ],
-        total=page.total,
-        running=page.running,
-        truePositives=page.true_positives,
+        rows=kept[offset : offset + limit],
+        total=len(kept),
+        # Counted over the partition, for the same reason the SQL figures are
+        # counted over the filter set: a figure tallied from the visible page
+        # describes the page while reading as the query's.
+        running=sum(1 for r in kept if r.status == inv_svc.VERDICTS_RUNNING),
+        truePositives=sum(1 for r in kept if r.verdict == "true_positive" and not r.fallback),
         totalAll=page.total_all,
         active=page.active,
         limit=limit,
         offset=offset,
+        partial=page.total > len(page.rows),
     )
 
 
@@ -433,7 +564,10 @@ async def get_investigation(
         # Promotion provenance: hunt_id has no FK (the referenced hunt may be
         # deleted — see the Investigation model note), so this must degrade
         # gracefully rather than 404/500 when the row is gone.
-        hunt = await db.get(Hunt, inv.hunt_id) if inv.kind == "hunt" and inv.hunt_id else None
+        # A hunt-subject run reads its hunt too, whatever its kind: a lead
+        # promotion is kind 'lead' and its subject is still a hunt.
+        wants_hunt = inv.kind == "hunt" or _subject_type(inv) == "hunt"
+        hunt = await db.get(Hunt, inv.hunt_id) if wants_hunt and inv.hunt_id else None
 
     report = inv.report or {}
     # Live acked state so an ack performed OUTSIDE this run (group-ack, another
@@ -461,7 +595,7 @@ async def get_investigation(
     summary_text = report.get("summary") or inv.summary or ""
     meta = InvMetaOut(
         model=settings.analyst_model,
-        oracle="escalated to Oracle" if has_oracle else "not escalated — local verdict",
+        oracle="escalated to Oracle" if has_oracle else "not escalated, local verdict",
         ranBy=inv.started_by or "—",
         # tz-AWARE ISO (with +00:00) so the value is unambiguous UTC — the raw
         # naive string had no offset, so it couldn't be localized/interpreted.
@@ -512,12 +646,13 @@ async def get_investigation(
         graphNote=graph_note,
         openQuestions=report.get("open_questions") or [],
         resolution=report.get("resolution") or None,
-        validatorNote=report.get("validator_note") or None,
+        validatorNote=_note_or_none(report.get("validator_note")),
         # Pipeline-failure provenance (E1.2) — non-None ONLY for a synth-failure
         # fallback run; drives the drawer's "failed before reaching a verdict"
         # panel instead of the amber Needs-info block.
         fallback=_timeline._fallback_out(report),
         errorDismissed=inv.error_dismissed_at is not None,
+        subject=_subject_out(inv, hunt),
         huntId=inv.hunt_id,
         huntObjective=(hunt.objective[:160] if hunt else None),
         alertAcked=alert_acked,
@@ -539,7 +674,7 @@ async def cancel_hunt(inv_id: str, request: Request) -> dict[str, bool]:
             status_code=404,
             detail={
                 "reason": "not_running",
-                "hint": "no in-flight hunt to cancel — it already finished",
+                "hint": "No hunt is running. This one already finished.",
             },
         )
     return {"cancelled": True}
@@ -547,25 +682,33 @@ async def cancel_hunt(inv_id: str, request: Request) -> dict[str, bool]:
 
 @router.post("/investigations/{inv_id}/dismiss-error")
 async def dismiss_pipeline_error(inv_id: str, request: Request) -> dict[str, bool]:
-    """Acknowledge a pipeline-error run so the Dashboard KPI stops counting it.
+    """Acknowledge a run that produced no verdict so the Dashboard stops counting it.
 
-    The run's fallback marker is untouched — it stays visible under the
-    Investigations "Pipeline error" filter as a historical fact; only the
-    dashboard nag is silenced. Idempotent (a repeat ack is a no-op 200).
-    404 for an unknown id; 409 when the run is not a pipeline fallback (there
-    is no error to dismiss — the button is only shown on fallback runs, but we
-    guard server-side too).
+    Both shapes the pipeline-error count holds are dismissible: an E1.2 fallback
+    (the run wrote a placeholder verdict and marked the report) and a run that
+    died outright, leaving no verdict at all. The second could not be cleared at
+    all until now, which meant a count including it could never be worked down.
+    188 such runs stood on the deployed instance, none of them acknowledged.
+
+    Nothing about the run changes but the ack stamp: it stays visible under the
+    Investigations "Pipeline error" filter as a historical fact, and stays
+    re-runnable. Idempotent (a repeat ack is a no-op 200). 404 for an unknown id;
+    409 when the run reached a verdict and did not fail (there is no error to
+    dismiss; the button is only shown where there is one, but we guard
+    server-side too).
     """
     async with request.app.state.db_sessionmaker() as db:
         inv = await db.get(Investigation, inv_id)
         if inv is None:
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        if not is_pipeline_fallback(inv.report):
+        if not is_pipeline_fallback(inv.report) and not _reached_no_verdict(inv):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "reason": "not_pipeline_error",
-                    "hint": "this run is not a pipeline-failure fallback — nothing to dismiss",
+                    "hint": (
+                        "This run reached a verdict and did not fail. There is nothing to dismiss."
+                    ),
                 },
             )
         await inv_svc.dismiss_error(db, inv_id)
@@ -591,7 +734,7 @@ async def delete_investigation(inv_id: str, request: Request) -> dict[str, bool]
                 status_code=409,
                 detail={
                     "reason": "still_running",
-                    "hint": "cancel the running hunt before deleting it",
+                    "hint": "Cancel the running hunt before you delete it.",
                 },
             )
         await inv_svc.delete(db, inv_id)
@@ -822,7 +965,9 @@ async def request_more_info(
             status_code=409,
             detail={
                 "reason": "no_alert",
-                "hint": "this investigation has no alert reference to re-investigate",
+                "hint": (
+                    "This investigation has no alert reference. soc-ai cannot re-investigate it."
+                ),
             },
         )
     # `inconclusive` (a self-consistency vote split) is grouped with
@@ -834,9 +979,9 @@ async def request_more_info(
             detail={
                 "reason": "not_needs_more_info",
                 "hint": (
-                    "request-more-info only applies to a needs_more_info or "
-                    f"inconclusive verdict; this investigation is "
-                    f"'{inv.verdict or 'untriaged'}'"
+                    "Request-more-info applies only to a needs_more_info or "
+                    "inconclusive verdict. This investigation is "
+                    f"'{inv.verdict or 'untriaged'}'."
                 ),
             },
         )
@@ -865,5 +1010,9 @@ async def request_more_info(
         focus_hint=focus_hint,
     )
     if new_inv_id is None:
-        raise HTTPException(status_code=503, detail={"reason": "could_not_start"})
+        raise api_error(
+            503,
+            "could_not_start",
+            "The console did not start the run. Check the model gateway on the Config screen.",
+        )
     return {"investigation_id": new_inv_id}

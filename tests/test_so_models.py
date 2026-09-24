@@ -836,3 +836,442 @@ def test_parse_iso_datetime_passthrough_naive_gets_utc() -> None:
     result = _parse_iso(naive)
     assert result is not None
     assert result.tzinfo == UTC
+
+
+# ---- ECS array-vs-scalar (Elastic Defend endpoint telemetry) -----------
+#
+# Elasticsearch has no array type: every field may hold zero, one or many
+# values, and ECS says so explicitly. A model annotation admitting only a
+# scalar is therefore stricter than the data it parses, and on the measured
+# grids the strictness bites hardest on endpoint telemetry: every
+# `endpoint.events.*` document Elastic Defend writes carries `event.action` as
+# a list.
+
+
+def _endpoint_process_hit() -> dict[str, Any]:
+    """One Elastic Defend process document, in the shape the grid stores it.
+
+    `event.action`, `event.type` and `event.category` are lists because Defend
+    writes them that way, not because anything unusual happened here.
+    """
+    return {
+        "_id": "endpoint-process-1",
+        "_source": {
+            "@timestamp": "2026-09-05T03:56:37.665117Z",
+            "agent": {"type": "endpoint"},
+            "message": "Endpoint process event",
+            "tags": ["elastic-agent", "events.process"],
+            "data_stream": {
+                "type": "logs",
+                "namespace": "default",
+                "dataset": "endpoint.events.process",
+            },
+            "host": {"name": "ws-01", "ip": ["198.51.100.20"]},
+            "user": {"name": "svc-build"},
+            "process": {"entity_id": "yG4ttygujemL", "name": "powershell.exe"},
+            "event": {
+                "kind": "event",
+                "module": "endpoint",
+                "dataset": "endpoint.events.process",
+                "action": ["start", "end"],
+                "category": ["process"],
+                "type": ["start", "end"],
+            },
+        },
+    }
+
+
+def test_alert_reads_event_action_when_endpoint_telemetry_writes_a_list() -> None:
+    """The reported defect. `SoAlert.event_action` was `str | None`, so every
+    Elastic Defend document failed validation outright and the whole alert was
+    unreadable: a promotion anchored on endpoint telemetry died in prefetch
+    before it fetched a single pivot.
+
+    First element, matching how the neighbouring `event.category` has always
+    been read.
+    """
+    alert = SoAlert.from_es_hit(_endpoint_process_hit())
+    assert alert.event_action == "start"
+    assert alert.event_category == "process"
+    assert alert.id == "endpoint-process-1"
+    # The full list stays reachable: nothing is lost, only narrowed.
+    assert get_dotted(alert.raw, "event.action") == ["start", "end"]
+
+
+def test_alert_event_action_scalar_is_still_read_as_itself() -> None:
+    """Negative control for the unwrap: a document writing the scalar (every
+    Suricata alert on both measured grids) must be unaffected."""
+    hit = {"_id": "x", "_source": {"event": {"action": "blocked", "dataset": "suricata.alert"}}}
+    alert = SoAlert.from_es_hit(hit)
+    assert alert.event_action == "blocked"
+
+
+def _wrap_every_leaf(node: Any) -> Any:
+    """Rewrite a document so every scalar leaf is a single-element list.
+
+    A field that is already a list is left alone: Elasticsearch flattens
+    nested arrays, so `[["a"]]` is not a shape any grid can produce.
+    """
+    if isinstance(node, dict):
+        return {k: _wrap_every_leaf(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_wrap_every_leaf(v) if isinstance(v, dict) else v for v in node]
+    return [node]
+
+
+def test_alert_parses_a_document_whose_every_leaf_is_a_list() -> None:
+    """The structural guard, rather than a list of fields.
+
+    Enumerating the fields that "can" be arrays is a losing game: Elasticsearch
+    permits an array anywhere, so the next scalar attribute someone adds is the
+    next outage. This wraps every leaf of a realistic Suricata document and
+    asserts the model still parses it, which fails the moment a new scalar
+    field is read without unwrapping.
+    """
+    source = {
+        "@timestamp": "2026-09-05T12:00:00Z",
+        "event": {
+            "action": "allowed",
+            "module": "suricata",
+            "dataset": "suricata.alert",
+            "category": "intrusion_detection",
+            "severity": 1,
+            "severity_label": "high",
+        },
+        "rule": {"name": "ET EXPLOIT something", "uuid": "abc-123"},
+        "source": {"ip": "198.51.100.9", "port": 44_301},
+        "destination": {"ip": "198.51.100.20", "port": 8080},
+        "host": {"name": "sensor-a", "ip": ["198.51.100.3"]},
+        "user": {"name": "svc-build"},
+        "process": {"entity_id": "pid-1"},
+        "file": {"hash": {"sha256": "a" * 64}},
+        "network": {"community_id": "1:abcdef"},
+        "payload_printable": "GET / HTTP/1.1",
+        "tags": ["alert"],
+    }
+    alert = SoAlert.from_es_hit({"_id": "wrapped", "_source": _wrap_every_leaf(source)})
+    assert alert.event_action == "allowed"
+    assert alert.rule_name == "ET EXPLOIT something"
+    assert alert.source_ip == "198.51.100.9"
+    assert alert.destination_port == 8080
+    assert alert.severity_score == 1
+    assert alert.host_ip == ["198.51.100.3"]
+    assert alert.file_hash_sha256 == "a" * 64
+
+
+def test_alert_parses_a_zeek_document_whose_every_leaf_is_a_list() -> None:
+    """Same guard over the Zeek branch, which reads through the candidate
+    tables in `fields.py` rather than through `get_dotted` directly."""
+    source = {
+        "@timestamp": "2026-09-05T12:00:00Z",
+        "event": {"dataset": "zeek.conn", "duration": 12.5},
+        "connection": {"state": "SF", "history": "ShADad"},
+        "client": {"bytes": 4_200},
+        "server": {"bytes": 91},
+        "network": {"protocol": "ssl"},
+        "ssl": {"server_name": "example.test", "established": True},
+        "hash": {"ja3": "b" * 32, "ja3s": "c" * 32},
+        "file": {"mime_type": "application/x-dosexec", "size": 1024},
+        "http": {
+            "method": "GET",
+            "virtual_host": "example.test",
+            "uri": "/x",
+            "status_code": 200,
+        },
+        "user_agent": {"original": "curl/8.5.0"},
+        "ssh": {"auth_success": False, "auth_attempts": 3, "client": "SSH-2.0-OpenSSH"},
+    }
+    alert = SoAlert.from_es_hit({"_id": "zeek-wrapped", "_source": _wrap_every_leaf(source)})
+    assert alert.zeek_conn_state == "SF"
+    assert alert.zeek_conn_orig_bytes == 4_200
+    assert alert.zeek_conn_duration == 12.5
+    assert alert.zeek_ssl_server_name == "example.test"
+    assert alert.zeek_files_mime_type == "application/x-dosexec"
+    assert alert.zeek_http_status == 200
+    assert alert.zeek_ssh_auth_attempts == 3
+    # A list-wrapped False is False. `bool([False])` is True, so an unwrap that
+    # skipped the booleans would report a FAILED SSH login as a successful one.
+    assert alert.zeek_ssh_auth_success is False
+    assert alert.zeek_ssl_established is True
+    assert alert.prefetch_parse_errors == []
+
+
+def test_alert_tags_written_as_a_scalar_do_not_explode_into_characters() -> None:
+    """The same asymmetry inverted. `tags` is annotated `list[str]` and built
+    with `list(...)`, so a grid writing the scalar produced one tag per
+    character. Both measured grids hold documents in each shape."""
+    hit = {"_id": "x", "_source": {"tags": "alert"}}
+    assert SoAlert.from_es_hit(hit).tags == ["alert"]
+
+
+def test_case_and_detection_read_scalars_out_of_list_wrapped_documents() -> None:
+    """`SoCase` and `SoDetection` are read from `so-case*` / `so-detection*`
+    index documents, so they carry the same Elasticsearch guarantee as the
+    events index: none."""
+    case = SoCase.from_so_doc(
+        {"id": ["c-1"], "title": ["Suspicious login"], "status": ["open"], "tags": "triage"}
+    )
+    assert case.id == "c-1"
+    assert case.title == "Suspicious login"
+    assert case.status == "open"
+    assert case.tags == ["triage"]
+
+    det = SoDetection.from_so_doc(
+        {"id": ["d-1"], "title": ["Rule"], "author": ["ann", "bob"], "tags": "sigma"}
+    )
+    assert det.id == "d-1"
+    assert det.author == "ann"
+    assert det.tags == ["sigma"]
+
+
+# ---- The `event_data` envelope (Sigma and host detections) --------------
+#
+# Security Onion's Sigma pipeline does not merge the endpoint document it
+# matched into the alert. It writes the detection's own identity at the top
+# level (rule.*, event.module/dataset/severity, @timestamp) and nests the WHOLE
+# originating document under `event_data`. Reading only the top level returned
+# null for every pivot the investigator needs, on exactly the detection class
+# that has no flow to fall back on.
+
+
+def _sigma_envelope_hit() -> dict[str, Any]:
+    """A Sigma detection in the shape Security Onion writes it.
+
+    Modelled on a live grid document: the detection identity is top-level, the
+    matched event is nested whole under `event_data`.
+    """
+    return {
+        "_id": "sigma-1",
+        "_source": {
+            "@timestamp": "2026-09-07T13:02:04.000Z",
+            "rule": {
+                "name": "Grid Node Login Failure (SSH)",
+                "uuid": "923421c7-9b1e-45d4-80cc-e21d060c8723",
+                "product": "linux",
+            },
+            "event": {
+                "module": "sigma",
+                "dataset": "sigma.alert",
+                "severity": 4,
+                "severity_label": "high",
+            },
+            "sigma_level": "high",
+            "tags": "alert",
+            "event_data": {
+                "@timestamp": "2026-09-07T13:00:14Z",
+                "source": {"ip": "192.0.2.77", "port": 47108},
+                "destination": {"ip": "198.51.100.10", "port": 22},
+                "host": {"name": "grid-node-01", "ip": ["198.51.100.10", "fe80::1"]},
+                "user": {"name": "svc-backup"},
+                "process": {"name": "sshd-session", "entity_id": "proc-9"},
+                "network": {"community_id": "1:envelope=="},
+                "file": {"hash": {"sha256": "deadbeef" * 8}},
+                "event": {
+                    "module": "system",
+                    "dataset": "system.auth",
+                    "action": "ssh_login",
+                    "category": ["authentication"],
+                    "outcome": "failure",
+                },
+                "message": "Invalid user svc-backup from 192.0.2.77 port 47108",
+                "tags": ["elastic-agent", "input-syslog"],
+            },
+        },
+    }
+
+
+def test_alert_reads_every_pivot_out_of_the_event_data_envelope() -> None:
+    """The reported defect: all six named pivots, plus the four found beside
+    them, came back null on a nested detection while severity was populated."""
+    alert = SoAlert.from_es_hit(_sigma_envelope_hit())
+    assert alert.source_ip == "192.0.2.77"
+    assert alert.source_port == 47108
+    assert alert.destination_ip == "198.51.100.10"
+    assert alert.destination_port == 22
+    assert alert.host_name == "grid-node-01"
+    assert alert.host_ip == ["198.51.100.10", "fe80::1"]
+    assert alert.user_name == "svc-backup"
+    assert alert.process_entity_id == "proc-9"
+    assert alert.file_hash_sha256 == "deadbeef" * 8
+    assert alert.network_community_id == "1:envelope=="
+    assert alert.event_action == "ssh_login"
+    assert alert.event_category == "authentication"
+    assert alert.message == "Invalid user svc-backup from 192.0.2.77 port 47108"
+
+
+def test_alert_keeps_the_detections_own_identity_when_the_envelope_disagrees() -> None:
+    """Precedence. The two levels genuinely disagree about `event.module` and
+    `event.dataset`: the top level names the SIGMA detection, the envelope names
+    the log the rule fired on. Letting the envelope win would relabel every
+    Sigma alert as `system.auth` and break every reader that routes on it."""
+    alert = SoAlert.from_es_hit(_sigma_envelope_hit())
+    assert alert.event_module == "sigma"
+    assert alert.event_dataset == "sigma.alert"
+    assert alert.rule_name == "Grid Node Login Failure (SSH)"
+    assert alert.severity_label == "high"
+    assert alert.severity_score == 4
+    assert alert.tags == ["alert"]
+    assert alert.timestamp == datetime(2026, 9, 7, 13, 2, 4, tzinfo=UTC)
+
+
+def test_alert_reads_the_envelope_in_the_flat_dotted_layout_too() -> None:
+    """The envelope is subject to the same flat-vs-nested drift as everything
+    else on an ES document."""
+    hit = {
+        "_id": "sigma-flat",
+        "_source": {
+            "rule.name": "Weak Encryption Enabled and Kerberoast",
+            "event.dataset": "sigma.alert",
+            "event_data.source.ip": "192.0.2.9",
+            "event_data.host.name": "dc-01",
+            "event_data.user.name": "svc-sql",
+        },
+    }
+    alert = SoAlert.from_es_hit(hit)
+    assert alert.source_ip == "192.0.2.9"
+    assert alert.host_name == "dc-01"
+    assert alert.user_name == "svc-sql"
+    assert alert.event_dataset == "sigma.alert"
+
+
+def test_alert_with_top_level_fields_ignores_a_contradicting_envelope() -> None:
+    """NEGATIVE CONTROL. An alert that genuinely carries top-level fields must
+    be read exactly as before, envelope or no envelope. Every pivot below is
+    present at BOTH levels with different values; the top level wins on all."""
+    hit = {
+        "_id": "both-levels",
+        "_source": {
+            "source": {"ip": "192.0.2.1", "port": 1111},
+            "destination": {"ip": "192.0.2.2", "port": 2222},
+            "host": {"name": "top-host", "ip": ["192.0.2.1"]},
+            "user": {"name": "top-user"},
+            "process": {"entity_id": "top-proc"},
+            "file": {"hash": {"sha256": "aa" * 32}},
+            "network": {"community_id": "1:top=="},
+            "event": {"action": "blocked", "category": "network", "dataset": "suricata.alert"},
+            "message": "top-level message",
+            "event_data": {
+                "source": {"ip": "198.51.100.1", "port": 3333},
+                "destination": {"ip": "198.51.100.2", "port": 4444},
+                "host": {"name": "nested-host", "ip": ["198.51.100.1"]},
+                "user": {"name": "nested-user"},
+                "process": {"entity_id": "nested-proc"},
+                "file": {"hash": {"sha256": "bb" * 32}},
+                "network": {"community_id": "1:nested=="},
+                "event": {"action": "allowed", "category": "authentication"},
+                "message": "nested message",
+            },
+        },
+    }
+    alert = SoAlert.from_es_hit(hit)
+    assert alert.source_ip == "192.0.2.1"
+    assert alert.source_port == 1111
+    assert alert.destination_ip == "192.0.2.2"
+    assert alert.destination_port == 2222
+    assert alert.host_name == "top-host"
+    assert alert.host_ip == ["192.0.2.1"]
+    assert alert.user_name == "top-user"
+    assert alert.process_entity_id == "top-proc"
+    assert alert.file_hash_sha256 == "aa" * 32
+    assert alert.network_community_id == "1:top=="
+    assert alert.event_action == "blocked"
+    assert alert.event_category == "network"
+    assert alert.message == "top-level message"
+
+
+def test_an_envelope_changes_nothing_on_an_alert_that_carries_its_own_fields(
+    sample_alert: dict[str, Any],
+) -> None:
+    """NEGATIVE CONTROL, the ~99% path, stated over the whole model.
+
+    A real Suricata alert is parsed twice: once as the grid stores it, and once
+    with a contradicting envelope bolted on. Every field the document answers
+    for itself must read the same in both. The envelope may only fill a field
+    the top level left empty, and never move one it had already answered.
+    """
+    plain = SoAlert.from_es_hit(sample_alert)
+    with_envelope = {
+        "_id": sample_alert["_id"],
+        "_source": {
+            **sample_alert["_source"],
+            "event_data": {
+                "source": {"ip": "198.51.100.1", "port": 3333},
+                "destination": {"ip": "198.51.100.2", "port": 4444},
+                "host": {"name": "nested-host", "ip": ["198.51.100.1"]},
+                "user": {"name": "nested-user"},
+                "process": {"entity_id": "nested-proc"},
+                "file": {"hash": {"sha256": "bb" * 32}},
+                "network": {"community_id": "1:nested=="},
+                "event": {"action": "allowed", "category": "authentication"},
+                "message": "nested message",
+                "tags": ["nested"],
+            },
+        },
+    }
+    wrapped = SoAlert.from_es_hit(with_envelope)
+    before, after = plain.model_dump(), wrapped.model_dump()
+    moved = {k: (before[k], after[k]) for k in before if before[k] != after[k]}
+    # `event.action` / `event.category` are absent from this document, so the
+    # envelope is allowed to answer them. Nothing else may differ, and nothing
+    # the document DID answer may have moved.
+    assert set(moved) == {"event_action", "event_category"}
+    assert all(old in (None, [], "") for old, _ in moved.values())
+    # And the values really are the top-level ones, not a coincidence of nulls.
+    assert plain.source_ip == "192.168.1.50"
+    assert plain.destination_ip == "203.0.113.10"
+    assert plain.host_name == "workstation-01"
+    assert plain.user_name == "alice"
+    assert plain.process_entity_id == "proc-abc-123"
+    assert plain.tags == ["alert", "suricata", "malware"]
+
+
+def test_alert_unwraps_a_zeek_document_carried_inside_an_envelope() -> None:
+    """A Sigma rule that fires on Zeek telemetry nests a Zeek document. The
+    typed-Zeek extraction is gated on the dataset, so it has to consult the
+    envelope's dataset as well as the top-level one, or the whole typed block
+    stays None on exactly the documents it was written for."""
+    hit = {
+        "_id": "sigma-zeek",
+        "_source": {
+            "rule": {"name": "Long Connection to Rare Destination"},
+            "event": {"module": "sigma", "dataset": "sigma.alert", "severity_label": "high"},
+            "event_data": {
+                "source": {"ip": "192.0.2.30"},
+                "destination": {"ip": "203.0.113.9"},
+                "event": {"dataset": "zeek.conn", "duration": 3600.5},
+                "connection": {"state": "SF", "history": "ShAdDaf"},
+                "client": {"bytes": 4200000000},
+                "server": {"bytes": 4100000},
+            },
+        },
+    }
+    alert = SoAlert.from_es_hit(hit)
+    # The model still reports the DETECTION's dataset.
+    assert alert.event_dataset == "sigma.alert"
+    assert alert.zeek_conn_state == "SF"
+    assert alert.zeek_conn_history == "ShAdDaf"
+    assert alert.zeek_conn_duration == 3600.5
+    assert alert.zeek_conn_orig_bytes == 4200000000
+    assert alert.zeek_conn_resp_bytes == 4100000
+
+
+def test_alert_reads_the_suricata_message_json_out_of_an_envelope() -> None:
+    """`classtype` and `payload_printable` are parsed out of the `message` JSON
+    string, so a nested `message` took them down with it."""
+    hit = {
+        "_id": "sigma-suri",
+        "_source": {
+            "rule": {"name": "Sigma over a Suricata alert"},
+            "event": {"module": "sigma", "dataset": "sigma.alert"},
+            "event_data": {
+                "message": (
+                    '{"alert": {"category": "trojan-activity", "action": "allowed"},'
+                    ' "payload_printable": "GET /gate.php HTTP/1.1"}'
+                ),
+            },
+        },
+    }
+    alert = SoAlert.from_es_hit(hit)
+    assert alert.classtype == "trojan-activity"
+    assert alert.alert_action == "allowed"
+    assert alert.payload_printable == "GET /gate.php HTTP/1.1"

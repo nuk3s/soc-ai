@@ -32,6 +32,17 @@ question resolves on a modern Elastic-Agent 9.x grid and on the legacy ``zeek.*`
 synth fixtures. The tool NEVER raises: empty data returns a clean
 ``{observed: False, ...}`` dict; an ES / query error returns
 ``{error: True, message: ...}``.
+
+**The baseline is this network's, not an import's** (see
+:mod:`soc_ai.tools._provenance`). Every number here is a population statistic —
+``first_seen`` is a novelty test, ``rarity`` is a rarity test, ``distinct_days``
+is the denominator both rest on — so the query counts live telemetry only and
+``provenance`` says so in the result. On a grid holding a replayed corpus the
+unfiltered version answered about the corpus: an ``is_novel: False, rarity:
+"common"`` verdict earned entirely on days a capture file happened to span is a
+baseline of somebody else's network, and it reads identically to a real one.
+A caller retro-hunting a freshly published indicator across full retention
+passes ``provenance="any"`` and gets the old behaviour, deliberately.
 """
 
 from __future__ import annotations
@@ -43,6 +54,14 @@ from typing import Any
 from soc_ai.config import Settings
 from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.tools._provenance import (
+    LIVE,
+    Provenance,
+    count_imports,
+    denominator_note,
+    imports_note,
+    provenance_must_not,
+)
 from soc_ai.tools._registry import tool
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
@@ -185,7 +204,7 @@ def _classify_rarity(distinct_days: int, total_events: int, is_novel: bool) -> s
     return "common"
 
 
-def _empty_result(summary: str, evidence: dict[str, Any]) -> dict[str, Any]:
+def _empty_result(summary: str, evidence: dict[str, Any], provenance: Provenance) -> dict[str, Any]:
     """Clean not-observed result (never an error)."""
     return {
         "observed": False,
@@ -195,6 +214,7 @@ def _empty_result(summary: str, evidence: dict[str, Any]) -> dict[str, Any]:
         "distinct_days": 0,
         "is_novel": False,
         "rarity": "first-seen",
+        "provenance": provenance,
         "summary": summary,
         "evidence": evidence,
     }
@@ -205,7 +225,8 @@ def _empty_result(summary: str, evidence: dict[str, Any]) -> dict[str, Any]:
     description=(
         "Local first-seen / prevalence oracle: has this host talked to this "
         "dest/domain before, and how rare is it? Learned from the events index "
-        "only (no external calls)."
+        "only (no external calls), over this grid's own live telemetry — "
+        "imported captures and replayed corpora are not part of the baseline."
     ),
 )
 async def prevalence(
@@ -218,6 +239,7 @@ async def prevalence(
     lookback_days: int = 90,
     time_anchor: datetime | None = None,
     include_synth: SynthScope = False,
+    provenance: Provenance = LIVE,
 ) -> dict[str, Any]:
     """Answer "has THIS host seen THIS dest/domain before, and how rare is it?".
 
@@ -246,6 +268,13 @@ async def prevalence(
         include_synth: synth-doc visibility (``SynthScope``). False (prod):
             planted docs never enter the baseline. A scenario id (batch eval):
             that scenario's plants do, siblings' do not.
+        provenance: which population the baseline is drawn from
+            (:mod:`soc_ai.tools._provenance`). ``"live"`` (the default) counts
+            only what this grid's own sensors observed — the right denominator
+            for a novelty or rarity question, since an imported capture's days
+            and flows are not this network's history. ``"any"`` counts backfill
+            too, for a caller retro-hunting a newly published indicator across
+            everything on disk.
 
     Returns:
         On success::
@@ -260,6 +289,9 @@ async def prevalence(
           first match falls inside the lookback window with no earlier sighting
           available — treat the pairing/domain/host as new.
         - ``rarity`` — ``"first-seen"`` | ``"rare"`` | ``"common"``.
+        - ``provenance`` — the population every count above was drawn from, so a
+          reader can tell a live baseline from a full-retention one without
+          having to know which caller asked.
         - ``evidence`` — the resolved mode, the indicators, and the raw counts,
           so the agent can cite what was actually queried.
 
@@ -299,11 +331,20 @@ async def prevalence(
         "domain": domain,
         "lookback_days": lookback_days,
         "index_pattern": settings.events_index_pattern,
+        # Named in the evidence block as well as the summary because this is the
+        # block a citation is built from: the agent quotes these keys back, and a
+        # count quoted without the population it came from is the defect this
+        # tool's own history is made of.
+        "provenance": provenance,
     }
     if mode == "domain":
         evidence["domain_fields"] = list(_DOMAIN_FIELDS)
 
-    wrapped: dict[str, Any] = {
+    # Kept separate from the wrapped form below so the import-volume probe on the
+    # empty branch has something to ask the un-narrowed question with. Handing it
+    # the filtered query would ask "which imports are not imports", which answers
+    # zero on every grid and would report every absence as genuine.
+    base: dict[str, Any] = {
         "bool": {
             "must": [query],
             "filter": [_lookback_filter(lookback_days, time_anchor)],
@@ -311,6 +352,20 @@ async def prevalence(
             # baseline; a batch eval scopes to its own scenario so a run can build
             # a baseline over the plants it is graded on (not a blanket exclude).
             "must_not": synth_scope_must_not(include_synth),
+        }
+    }
+    wrapped: dict[str, Any] = {
+        "bool": {
+            **base["bool"],
+            # Provenance scope, threaded the same way and for a stronger reason:
+            # every field this tool returns is a population statistic, and an
+            # imported capture contributes days and flows that this host never
+            # had. Without it a pairing seen only inside a replayed corpus came
+            # back "common — an established baseline".
+            "must_not": [
+                *base["bool"]["must_not"],
+                *provenance_must_not(provenance),
+            ],
         }
     }
 
@@ -342,11 +397,17 @@ async def prevalence(
 
     total = result.total
     if total <= 0:
+        # The one branch where the narrowed denominator can invent a finding.
+        # "No prior events, treat as novel" is the sentence a filtered-away
+        # import turns into a lie, so measure the backfill before saying it.
+        imported = await count_imports(elastic, settings.events_index_pattern, base)
+        evidence["imported_matches"] = imported
         summary = (
-            f"No prior events for {subject} in the last {lookback_days}d — "
-            f"first-seen (no baseline). This pairing/host appears novel."
+            f"No prior events for {subject} in the last {lookback_days}d "
+            f"({denominator_note(provenance)}) — first-seen (no baseline). "
+            f"This pairing/host appears novel." + imports_note(imported)
         )
-        return _empty_result(summary, evidence)
+        return _empty_result(summary, evidence, provenance)
 
     aggregations = result.aggregations or {}
     first_seen = _agg_value_as_string(aggregations.get("first_seen"))
@@ -369,23 +430,28 @@ async def prevalence(
     evidence["total_is_lower_bound"] = result.total_is_lower_bound
 
     count_str = result.total_display  # "≥N" when ES capped the count
+    # Every sentence below quotes a count and a day-spread, and both are only
+    # meaningful next to the population they were measured over. Carried in the
+    # prose rather than left to the field, because the summary is what gets
+    # quoted into a rationale.
+    scope = denominator_note(provenance)
     if is_novel:
         summary = (
             f"{subject}: seen on a single day only "
-            f"({count_str} event(s), first/last {first_seen}) — novel, no baseline."
+            f"({count_str} event(s), first/last {first_seen}, {scope}) — novel, no baseline."
         )
     elif rarity == "concentrated":
         summary = (
             f"{subject}: concentrated — {count_str} event(s) packed into just "
             f"{distinct_days} distinct day(s) (first {first_seen}, last {last_seen}) "
-            f"in the last {lookback_days}d. Heavy short-span activity, not a "
+            f"in the last {lookback_days}d, {scope}. Heavy short-span activity, not a "
             f"long-running baseline."
         )
     else:
         summary = (
             f"{subject}: {rarity} — {count_str} event(s) across {distinct_days} "
             f"distinct day(s) (first {first_seen}, last {last_seen}) in the last "
-            f"{lookback_days}d."
+            f"{lookback_days}d, {scope}."
         )
 
     return {
@@ -396,6 +462,7 @@ async def prevalence(
         "distinct_days": distinct_days,
         "is_novel": is_novel,
         "rarity": rarity,
+        "provenance": provenance,
         "summary": summary,
         "evidence": evidence,
     }

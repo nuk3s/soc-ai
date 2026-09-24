@@ -606,6 +606,177 @@ async def test_verify_two_epochs_broken_tallies_both_oldest_and_newest_kept() ->
     assert result.latest_epoch_broken is False
 
 
+async def test_verify_reports_how_widespread_the_forking_is() -> None:
+    """One break out of many is not an answer an operator can act on.
+
+    The daily verification named a single sequence number while the window it
+    scanned held 41 duplicated sequence numbers across 51 extra records, some
+    positions claimed by four writers. A single collision and a forked stretch
+    of a whole afternoon produced the same sentence.
+    """
+    from soc_ai.audit.chain import compute_hash
+
+    def _fork(rec: dict[str, Any], writer: str) -> dict[str, Any]:
+        copy = dict(rec)
+        copy["session_id"] = writer
+        copy.pop("hash")
+        copy["hash"] = compute_hash(copy, copy["prev_hash"])
+        return copy
+
+    epoch = _build_chain(10, start_time=_BASE_TS)
+    forks = [
+        _fork(epoch[3], "writer-b"),
+        _fork(epoch[7], "writer-b"),
+        _fork(epoch[7], "writer-c"),
+    ]
+    elastic = _elastic_with(epoch + forks)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert result.ok is False
+    assert result.duplicate_seqs == 2
+    assert result.extra_records == 3
+    assert result.max_claimants == 3
+    assert result.altered_records == 0
+    assert result.break_kinds == ("duplicate_seq",)
+    # Bounded in time: the newest record involved in any break. Nothing has
+    # forked since, and that is the whole difference between a historical
+    # artifact and something happening now.
+    assert result.oldest_break_at == epoch[3]["timestamp"]
+    assert result.newest_break_at == epoch[7]["timestamp"]
+
+
+async def test_verify_sums_the_census_across_epochs() -> None:
+    """Positions repeat across epochs legitimately, so the census is per epoch.
+
+    ``seq`` restarts at zero on every process incarnation. Two epochs each with
+    their own fork is two duplicated positions, not one.
+    """
+    from soc_ai.audit.chain import compute_hash
+
+    def _fork(rec: dict[str, Any]) -> dict[str, Any]:
+        copy = dict(rec)
+        copy["session_id"] = "writer-b"
+        copy.pop("hash")
+        copy["hash"] = compute_hash(copy, copy["prev_hash"])
+        return copy
+
+    e0 = _build_chain(4, start_time=_BASE_TS)
+    e1 = _build_chain(4, start_time=_BASE_TS + timedelta(hours=1))
+    elastic = _elastic_with([*e0, _fork(e0[2]), *e1, _fork(e1[2])])
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert result.epochs == 2
+    assert result.epochs_broken == 2
+    assert result.duplicate_seqs == 2
+    assert result.extra_records == 2
+    assert result.newest_break_at == e1[2]["timestamp"]
+
+
+async def test_verify_counts_an_alteration_apart_from_a_fork() -> None:
+    """The distinction the verifier already draws, carried up to the result.
+
+    A duplicated position is what a second writer leaves behind. A record whose
+    content no longer matches its own hash is what an edit leaves behind, and
+    the two must reach the operator as separate facts.
+    """
+    epoch = _build_chain(6, start_time=_BASE_TS)
+    epoch[3]["payload"] = {"i": "changed after the fact"}
+    elastic = _elastic_with(epoch)
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert result.ok is False
+    assert result.altered_records == 1
+    assert result.duplicate_seqs == 0
+    assert "content_altered" in result.break_kinds
+
+
+async def test_verify_of_an_intact_chain_reports_no_blast_radius() -> None:
+    """NEGATIVE CONTROL. A sound chain censuses to nothing."""
+    elastic = _elastic_with(_build_chain(30))
+    result = await verify_audit_chain(elastic, "soc-ai-audit")
+
+    assert result.ok is True
+    assert result.duplicate_seqs == 0
+    assert result.extra_records == 0
+    assert result.max_claimants == 0
+    assert result.altered_records == 0
+    assert result.missing_seqs == 0
+    assert result.break_kinds == ()
+    assert result.newest_break_at is None
+    assert result.oldest_break_at is None
+
+
+def test_the_blast_radius_sentence_names_the_scale_and_the_kind() -> None:
+    """One sentence, shared by the bell, the webhook and the CLI."""
+    from soc_ai.audit.verify import describe_blast_radius
+
+    forked = ChainVerifyResult(
+        ok=False,
+        records_verified=9000,
+        first_broken_seq=109667,
+        first_seq=100000,
+        last_seq=109999,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start="2026-09-01T00:00:00+00:00",
+        epochs_broken=1,
+        newest_broken_epoch_start="2026-09-01T00:00:00+00:00",
+        latest_epoch_broken=True,
+        first_break_kind="duplicate_seq",
+        first_break_detail="2 records claim sequence 109667",
+        newest_break_kind="duplicate_seq",
+        newest_break_detail="2 records claim sequence 109667",
+        duplicate_seqs=41,
+        extra_records=51,
+        max_claimants=4,
+        altered_records=0,
+        missing_seqs=0,
+        oldest_break_at="2026-09-01T02:00:00+00:00",
+        newest_break_at="2026-09-01T06:00:00+00:00",
+        break_kinds=("duplicate_seq",),
+    )
+    sentence = describe_blast_radius(forked)
+    assert "41 sequence numbers" in sentence
+    assert "51 extra records" in sentence
+    assert "4 writers" in sentence
+    # The reading that matters: widespread, but nothing was edited.
+    assert "no record was altered" in sentence.lower()
+    assert "2026-09-01T06:00:00+00:00" in sentence
+
+    altered = ChainVerifyResult(
+        ok=False,
+        records_verified=10,
+        first_broken_seq=3,
+        first_seq=0,
+        last_seq=9,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start=None,
+        epochs_broken=1,
+        newest_broken_epoch_start=None,
+        latest_epoch_broken=True,
+        altered_records=2,
+        break_kinds=("content_altered",),
+        newest_break_at="2026-09-02T06:00:00+00:00",
+    )
+    assert "2 records no longer match their own hash" in describe_blast_radius(altered)
+
+    intact = ChainVerifyResult(
+        ok=True,
+        records_verified=10,
+        first_broken_seq=None,
+        first_seq=0,
+        last_seq=9,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start=None,
+        epochs_broken=0,
+        newest_broken_epoch_start=None,
+        latest_epoch_broken=False,
+    )
+    assert describe_blast_radius(intact) == ""
+
+
 async def test_verify_latest_epoch_broken_is_flagged() -> None:
     """When the MOST RECENT epoch itself is the broken one, say so distinctly.
 
@@ -1151,3 +1322,86 @@ def test_endpoint_admin_gated() -> None:
             ok = c.get("/api/v1/config/audit/verify-chain")
         assert ok.status_code == 200
         assert ok.json()["ok"] is True
+
+
+def test_endpoint_reports_the_same_blast_radius_the_cli_and_bell_do(
+    client: TestClient,
+) -> None:
+    """The census travels to the Config screen, not just to the CLI.
+
+    Found on the range: ``soc-ai audit verify`` and the notification bell both
+    said six sequences and six extra records, while this endpoint — the Config
+    screen's only source — carried nothing but ``first_break_detail``, so the
+    screen read "2 records claim sequence 503". One break described at two
+    sizes by two surfaces is worse than either number on its own.
+    """
+    from soc_ai.audit.verify import describe_blast_radius
+
+    result = ChainVerifyResult(
+        ok=False,
+        records_verified=7247,
+        first_broken_seq=503,
+        first_seq=0,
+        last_seq=7246,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start="2026-09-01T22:57:40.978484+00:00",
+        epochs_broken=1,
+        newest_broken_epoch_start="2026-09-01T22:57:40.978484+00:00",
+        latest_epoch_broken=True,
+        first_break_kind="duplicate_seq",
+        first_break_detail="2 records claim sequence 503",
+        newest_break_kind="duplicate_seq",
+        newest_break_detail="2 records claim sequence 503",
+        duplicate_seqs=6,
+        extra_records=6,
+        max_claimants=2,
+        altered_records=0,
+        missing_seqs=0,
+        oldest_break_at="2026-09-02T00:29:51.171220+00:00",
+        newest_break_at="2026-09-07T02:36:46.347817+00:00",
+        break_kinds=("duplicate_seq",),
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=result)):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["duplicate_seqs"] == 6
+    assert body["extra_records"] == 6
+    assert body["max_claimants"] == 2
+    assert body["altered_records"] == 0
+    assert body["missing_seqs"] == 0
+    assert body["oldest_break_at"] == "2026-09-02T00:29:51.171220+00:00"
+    assert body["newest_break_at"] == "2026-09-07T02:36:46.347817+00:00"
+    assert body["break_kinds"] == ["duplicate_seq"]
+
+    # Byte-identical to what the CLI prints and the bell carries.
+    assert body["blast_radius"] == describe_blast_radius(result)
+    # And it says the larger, true thing rather than the first instance.
+    assert "6 sequence numbers" in body["blast_radius"]
+    assert "6 extra records" in body["blast_radius"]
+    assert "No record was altered" in body["blast_radius"]
+
+
+def test_endpoint_blast_radius_is_empty_on_an_intact_chain(client: TestClient) -> None:
+    """No break, no sentence — the screen must not render an empty verdict."""
+    result = ChainVerifyResult(
+        ok=True,
+        records_verified=7,
+        first_broken_seq=None,
+        first_seq=0,
+        last_seq=6,
+        capped=False,
+        epochs=1,
+        first_broken_epoch_start=None,
+        epochs_broken=0,
+        newest_broken_epoch_start=None,
+        latest_epoch_broken=False,
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=result)):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    body = resp.json()
+    assert body["blast_radius"] == ""
+    assert body["duplicate_seqs"] == 0
+    assert body["break_kinds"] == []

@@ -1,0 +1,36 @@
+id: prior-audit-policy-changed-on-dc
+title: An account changes the audit policy on a domain controller
+description: >
+  A change to what a domain controller records changes the evidence every other
+  analytic depends on. An administrator makes this change rarely and
+  deliberately. An intruder who intends to stay makes the same change early.
+
+  This analytic is single-shot. It never accumulates toward a lead. It reports
+  the change even if nothing else happens.
+
+level: critical
+evaluator: profile
+scope_field: host.name
+scope_kind: host
+
+# The benign population here is "planned change", which is not a property of
+# the event and cannot be measured from the grid. Frequency says nothing about
+# whether a given change was authorised.
+no_benign_baseline: true
+
+profile:
+  dimension: logon_users
+  test: novel_for
+  roles:
+    - domain_controller
+
+attack:
+  - T1562.002
+
+false_positives:
+  - An administrator runs planned hardening work or a group-policy rollout. The
+    telemetry does not show authorisation. This analytic reports the change,
+    and the analyst confirms it against the change record.
+
+references:
+  - https://attack.mitre.org/techniques/T1562/002/

@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from soc_ai.audit.chain import GENESIS_SEQ, verify_chain
+from soc_ai.audit.chain import GENESIS_SEQ, ChainCensus, census_chain, verify_chain_detail
 from soc_ai.so_client.elastic import (
     ElasticClient,
     GridPartialResultsError,
@@ -152,6 +152,14 @@ class ChainVerifyResult:
       trail is sound right now: a break with nothing broken after it (or with
       an old ``newest_broken_epoch_start`` and other epochs that verified
       clean since) is a historical scar, not an active problem.
+    - ``first_break_kind`` / ``first_break_detail`` and ``newest_break_kind`` /
+      ``newest_break_detail`` — WHAT broke, for the oldest and the newest
+      broken epoch respectively (None iff ``ok`` is True). See
+      :data:`~soc_ai.audit.chain.BreakKind`: "the chain is broken" covers a
+      position claimed twice by two writers and a record whose content was
+      edited after the fact, and an operator has to be able to tell those
+      apart. ``*_detail`` is one printable sentence and names no record
+      content.
     - ``latest_epoch_broken`` — True iff the temporally LAST epoch actually
       fetched failed its own check. False (including vacuously, for an empty
       scan) otherwise. This is what lets a consumer tell "every epoch after
@@ -161,6 +169,22 @@ class ChainVerifyResult:
       whether or not the scan was ``capped``; it is the RENDERING layer's job
       to decide this field is only trustworthy for that reassurance when
       ``capped`` is False (see ``capped`` above).
+
+    ``verify_chain_detail`` stops at the first thing in an epoch that does not
+    fit, which answers "is this sound" and not "how much of it is affected".
+    The census fields below answer the second question, summed over the broken
+    epochs (see :func:`~soc_ai.audit.chain.census_chain`): ``duplicate_seqs``,
+    ``extra_records``, ``max_claimants``, ``altered_records``, ``missing_seqs``,
+    and the ``oldest_break_at`` / ``newest_break_at`` bounds over the records
+    actually involved. ``break_kinds`` is every kind found across the scan, not
+    just the first and newest epoch's. All of them are zero/empty when ``ok``.
+
+    Naming one sequence number out of the whole population is what the daily
+    verification did on the deployed instance, and it left an operator unable to
+    tell a single collision from a forked afternoon, or to see whether every one
+    of them fell before the fix that stopped the forking. The count is
+    deliberately not written down here: the last one that was went stale, and a
+    scan reports the live figure anyway.
     """
 
     ok: bool
@@ -174,6 +198,18 @@ class ChainVerifyResult:
     epochs_broken: int
     newest_broken_epoch_start: str | None
     latest_epoch_broken: bool
+    first_break_kind: str | None = None
+    first_break_detail: str | None = None
+    newest_break_kind: str | None = None
+    newest_break_detail: str | None = None
+    duplicate_seqs: int = 0
+    extra_records: int = 0
+    max_claimants: int = 0
+    altered_records: int = 0
+    missing_seqs: int = 0
+    oldest_break_at: str | None = None
+    newest_break_at: str | None = None
+    break_kinds: tuple[str, ...] = ()
 
 
 def _raise_if_partial(
@@ -414,6 +450,50 @@ def _epoch_start(epoch: list[dict[str, Any]]) -> str | None:
     return ts if isinstance(ts, str) else None
 
 
+def _aggregate_census(broken_epochs: list[list[dict[str, Any]]], kinds: set[str]) -> ChainCensus:
+    """Sum the per-epoch censuses of the epochs that broke.
+
+    Per epoch, because ``seq`` restarts at zero on every process incarnation:
+    one position claimed once in each of two epochs is not a duplicate. Mutates
+    *kinds* to add whatever the census found beyond the first break each epoch
+    reported, so "the chain has a fork AND something was edited" is expressible
+    rather than collapsing to whichever came first.
+    """
+    duplicate_seqs = extra_records = max_claimants = altered_records = missing_seqs = 0
+    oldest: str | None = None
+    newest: str | None = None
+    for epoch in broken_epochs:
+        census = census_chain(epoch)
+        duplicate_seqs += census.duplicate_seqs
+        extra_records += census.extra_records
+        max_claimants = max(max_claimants, census.max_claimants)
+        altered_records += census.altered_records
+        missing_seqs += census.missing_seqs
+        if census.duplicate_seqs:
+            kinds.add("duplicate_seq")
+        if census.altered_records:
+            kinds.add("content_altered")
+        if census.missing_seqs:
+            kinds.add("missing_seq")
+        if census.oldest_break_at is not None and (
+            oldest is None or census.oldest_break_at < oldest
+        ):
+            oldest = census.oldest_break_at
+        if census.newest_break_at is not None and (
+            newest is None or census.newest_break_at > newest
+        ):
+            newest = census.newest_break_at
+    return ChainCensus(
+        duplicate_seqs=duplicate_seqs,
+        extra_records=extra_records,
+        max_claimants=max_claimants,
+        altered_records=altered_records,
+        missing_seqs=missing_seqs,
+        oldest_break_at=oldest,
+        newest_break_at=newest,
+    )
+
+
 async def verify_audit_chain(
     elastic: ElasticClient,
     audit_index_alias: str,
@@ -451,10 +531,20 @@ async def verify_audit_chain(
     first_broken_seq: int | None = None
     first_broken_epoch_start: str | None = None
     newest_broken_epoch_start: str | None = None
+    first_break_kind: str | None = None
+    first_break_detail: str | None = None
+    newest_break_kind: str | None = None
+    newest_break_detail: str | None = None
     # Tracks whichever epoch was checked most recently; after the loop it
     # holds the LAST (temporally newest) epoch's own result. Vacuously True
     # for zero epochs — nothing exists to be "the broken latest epoch".
     last_epoch_ok = True
+    # The epochs that actually broke, censused after the loop. An intact epoch
+    # censuses to all zeros by construction (verify_chain_detail checks every
+    # record's hash and the contiguity of every position), so skipping it costs
+    # nothing but a hash recompute it would have redone.
+    broken_epochs: list[list[dict[str, Any]]] = []
+    kinds: set[str] = set()
     for i, epoch in enumerate(epochs):
         # Only epoch 0 can be a legitimately-unfetched boundary — a windowed
         # (days=N) scan may start mid-epoch, with its first record's predecessor
@@ -469,23 +559,31 @@ async def verify_audit_chain(
         # group under cover of a real genesis marker — expect_genesis=True
         # never lets that boundary go unverified the way False would.
         expect_genesis = True if i > 0 else days is None
-        epoch_ok, epoch_broken = verify_chain(epoch, expect_genesis=expect_genesis)
-        last_epoch_ok = epoch_ok
-        if not epoch_ok:
+        brk = verify_chain_detail(epoch, expect_genesis=expect_genesis)
+        last_epoch_ok = brk is None
+        if brk is not None:
             ok = False
             epochs_broken += 1
             epoch_start = _epoch_start(epoch)
             if first_broken_seq is None:
                 # First (oldest, since epochs are in time order) break — set
                 # once, kept for the single-break-era fields' compatibility.
-                first_broken_seq = epoch_broken
+                first_broken_seq = brk.seq
                 first_broken_epoch_start = epoch_start
+                first_break_kind = brk.kind
+                first_break_detail = brk.detail
             # Keeps being overwritten by every later break found, so after the
             # loop it holds the MOST RECENT (temporally newest) broken epoch —
             # never break out of this loop early; a later epoch's status is
             # exactly the thing "am I sound now" needs.
             newest_broken_epoch_start = epoch_start
+            newest_break_kind = brk.kind
+            newest_break_detail = brk.detail
 
+            kinds.add(brk.kind)
+            broken_epochs.append(epoch)
+
+    radius = _aggregate_census(broken_epochs, kinds)
     latest_epoch_broken = bool(epochs) and not last_epoch_ok
 
     # Seq span actually covered (over ALL fetched chained records, regardless of
@@ -509,4 +607,119 @@ async def verify_audit_chain(
         epochs_broken=epochs_broken,
         newest_broken_epoch_start=newest_broken_epoch_start,
         latest_epoch_broken=latest_epoch_broken,
+        first_break_kind=first_break_kind,
+        first_break_detail=first_break_detail,
+        newest_break_kind=newest_break_kind,
+        newest_break_detail=newest_break_detail,
+        duplicate_seqs=radius.duplicate_seqs,
+        extra_records=radius.extra_records,
+        max_claimants=radius.max_claimants,
+        altered_records=radius.altered_records,
+        missing_seqs=radius.missing_seqs,
+        oldest_break_at=radius.oldest_break_at,
+        newest_break_at=radius.newest_break_at,
+        break_kinds=tuple(sorted(kinds)),
     )
+
+
+def finding_key(result: ChainVerifyResult) -> str:
+    """A stable identity for a chain-break finding, for a dismissal to hang on.
+
+    The alarm this backs is a standing one, and the bell dismisses a standing
+    alarm the same way everywhere in this product: a stable id the client
+    remembers, minted fresh when the condition genuinely changes (the dependency
+    outage keys on the flip time, the dossier prod on its cycle counter, the
+    quality alarm on its code plus the transition that raised it). The audit
+    alarm keyed on the moment of DETECTION instead, so every run minted a new
+    id and the entry could not be cleared at all: an undismissable danger
+    notification every day until the damage aged out of the window.
+
+    A tamper alarm cannot simply become dismissible, though, so what goes into
+    this key is the safety argument:
+
+    - the break kinds present, so dismissing a known historical fork can never
+      suppress a record being edited, because that is a different key;
+    - the newest record involved in any break, so anything that breaks after a
+      dismissal moves the key forward and re-raises;
+    - how many records no longer match their own hash, so a further alteration
+      re-raises even when the kind is already showing.
+
+    Deliberately NOT in the key: the duplicate and extra-record counts. A
+    rolling window sheds old records every day, so those counts fall on their
+    own as a historical scar ages out, and keying on them would re-raise the
+    same finding every morning, the defect this replaces. They are reported,
+    they are just not part of the identity.
+    """
+    kinds = "+".join(result.break_kinds) or (result.newest_break_kind or "unknown")
+    newest = result.newest_break_at or result.newest_broken_epoch_start or "unknown"
+    return f"{kinds}|{newest}|{result.altered_records}"
+
+
+def finding_is_dismissible(result: ChainVerifyResult) -> bool:
+    """Whether a human may silence this finding from the bell.
+
+    A duplicated position is what a second writer leaves behind. The verifier
+    says so in as many words, the concurrency defect behind them is known and
+    fixed, and an operator acknowledging a bounded historical scar is a
+    reasonable thing to let them do. (An earlier version of this docstring put
+    a count on the deployed instance's scar; it had moved by the time anyone
+    read it, so the number is gone rather than wrong — `soc-ai audit verify`
+    reports the live figure.)
+
+    A record whose content no longer matches its own hash is someone changing
+    the record of a decision. There is no version of that which should be
+    silenceable from a browser's local storage, and the bell's "Clear all"
+    would otherwise do it in one click, so a finding that includes one is not
+    offered as dismissible.
+    """
+    return result.altered_records == 0 and "content_altered" not in result.break_kinds
+
+
+def describe_blast_radius(result: ChainVerifyResult) -> str:
+    """One sentence saying how widespread a finding is, or "" when there is none.
+
+    Shared by the scheduled verification's alarm, the notification webhook and
+    the ``soc-ai audit verify`` CLI, so all three say the same thing about the
+    same scan. Names counts and timestamps only, never any record's content.
+
+    An alteration is stated first when there is one. "41 positions were claimed
+    twice and nothing was edited" and "one record no longer matches its own
+    hash" are different emergencies, and the second must not be read past on the
+    way to the first.
+    """
+    if result.ok:
+        return ""
+    parts: list[str] = []
+    if result.altered_records:
+        n = result.altered_records
+        parts.append(
+            f"{n} record{'' if n == 1 else 's'} no longer "
+            f"{'matches its' if n == 1 else 'match their'} own hash, so content was "
+            "changed after it was written"
+        )
+    if result.duplicate_seqs:
+        n = result.duplicate_seqs
+        extra = result.extra_records
+        clause = (
+            f"{n} sequence number{'' if n == 1 else 's'} claimed by more than one "
+            f"record, across {extra} extra record{'' if extra == 1 else 's'}"
+        )
+        if result.max_claimants > 2:
+            clause += f", up to {result.max_claimants} writers at one position"
+        parts.append(clause)
+        if not result.altered_records:
+            parts.append("No record was altered: every copy still matches its own hash")
+    if result.missing_seqs:
+        n = result.missing_seqs
+        parts.append(f"{n} position{'' if n == 1 else 's'} absent from the run")
+    if not parts:
+        # A relinked or orphan-head break has no population to count.
+        parts.append(
+            (result.newest_break_detail or "The audit hash chain does not verify").rstrip(".")
+        )
+    if result.newest_break_at:
+        span = f"Newest affected record {result.newest_break_at}"
+        if result.oldest_break_at and result.oldest_break_at != result.newest_break_at:
+            span += f", oldest {result.oldest_break_at}"
+        parts.append(span)
+    return ". ".join(parts) + "."

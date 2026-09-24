@@ -36,6 +36,8 @@ _TL_GROUP = {
     "triage_report": "Decision",
     "approval_request": "Decision",
     "approval_required": "Decision",
+    "template_grounds_adopted": "Validators",
+    "investigator_evidence_carried": "Validators",
     "citation_validation": "Validators",
     "citation_cap": "Validators",
     "confidence_floor_raise": "Validators",
@@ -45,6 +47,10 @@ _TL_GROUP = {
     # consequence, not an investigative tool call — a "no tools" heuristic run
     # must not grow a "Tool calls" timeline section from its own auto-ack.
     "auto_ack": "Decision",
+    # Sibling alerts acknowledged off this verdict by auto-triage inheritance,
+    # appended after the run finished. A consequence of the verdict, like the
+    # auto-ack above — never an investigative tool call.
+    "inherited_ack": "Decision",
     # Proactive context budgeting happens during prefetch assembly.
     "context_trimmed": "Prefetch & pivots",
     # E4.2 memory recall happens while assembling the round-1 prompt (before
@@ -52,6 +58,11 @@ _TL_GROUP = {
     "prior_outcomes": "Prefetch & pivots",
     # Chat-transcript memory recall — same prompt-assembly moment as priors.
     "chat_memory": "Prefetch & pivots",
+    # The same-session lookup runs during prompt assembly too, before any
+    # synthesis, so it belongs with the rest of the prefetch story.
+    "session_prior": "Prefetch & pivots",
+    # Holding a verdict is a decision, not a lookup.
+    "session_verdict_conflict": "Decision",
 }
 # Write-action tools (ack/escalate/comment): their tool_call rows belong under
 # "Decision" too — they act on the verdict rather than investigate.
@@ -183,6 +194,24 @@ def _peer_sub(enr: dict[str, Any]) -> str | None:
     return None
 
 
+def _blocklist_unchecked(enrichments: Any) -> bool:
+    """True when an enrichment AFFIRMS that no blocklist feed answered it.
+
+    Tri-state on purpose: ``None`` is a record written before the field existed
+    and makes no claim, so it renders as it always did. Only an explicit
+    ``False`` turns a quiet "nothing flagged" into "nothing was checked".
+
+    Shape-tolerant, like everything else reading a stored payload here: a
+    partial enrichment can leave a list or a string where the map belongs, and
+    a timeline row must not 500 over it.
+    """
+    if not isinstance(enrichments, dict):
+        return False
+    return any(
+        isinstance(e, dict) and e.get("blocklist_checked") is False for e in enrichments.values()
+    )
+
+
 def _flag_sources(enr: dict[str, Any]) -> list[str]:
     """Names of the intel sources that flagged the indicator (bounded for a badge)."""
     srcs: list[str] = []
@@ -261,12 +290,16 @@ def _entity_graph(
         else:
             edge["label"] = "observed"
         edges.append(edge)
-    note = f"{label or src} contacted {n} peer(s)" + (
-        f"; {len(flagged_names)} flagged malicious by enrichment"
-        f" ({_compact(', '.join(flagged_names), 60)})"
+    note = f"{label or src} contacted {n} peer(s)." + (
+        f" Enrichment flagged {len(flagged_names)} of them as malicious: "
+        f"{_compact(', '.join(flagged_names), 60)}."
         if flagged_names
         else ""
     )
+    # An unflagged node is not a cleared node when no feed was loaded. The node
+    # shapes carry no third state, so the graph says it in words.
+    if _blocklist_unchecked(enrichments):
+        note += " soc-ai loaded no blocklist feed. It checked none of them against intel."
     return nodes, edges, note
 
 
@@ -369,9 +402,19 @@ def _tool_outcome(result: Any) -> str:
         misp = result.get("misp_hits") or []
         if bl or misp:
             srcs = [str(h["source"]) for h in bl if isinstance(h, dict) and h.get("source")]
-            return "flagged malicious" + (f" ({', '.join(srcs)})" if srcs else "")
-        # A miss is a COVERAGE statement, not a verdict — say so precisely.
-        return "internal address" if result.get("internal") else "no blocklist/MISP match"
+            return "flagged malicious" + (f" by {', '.join(srcs)}" if srcs else "")
+        # A miss is a COVERAGE statement, not a verdict — say so precisely, and
+        # only when there was coverage. `blocklist_checked is False` means a
+        # lookup ran against feeds that had never been refreshed, so the miss
+        # is an absence of data; `None` means the record predates the field and
+        # makes no claim either way, which is the old wording. "Internal" does
+        # not excuse it: the curated internal-seed feed is the one that names
+        # known-bad internal hosts.
+        where = "internal address" if result.get("internal") else ""
+        if result.get("blocklist_checked") is False:
+            unloaded = "no blocklist loaded. soc-ai checked nothing"
+            return f"{where} — {unloaded}" if where else unloaded
+        return where or "no blocklist/MISP match"
     # ES query / zeek result
     if result.get("prefetch_already_has_this"):
         return "already in alert context"
@@ -437,28 +480,57 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
     if kind in ("enriched_alert_context", "alert_context"):
         enr = p.get("enrichments") or {}
         prof = p.get("host_alert_profile") or {}
+        if p.get("subject") == "hunt":
+            # D2. The step loaded the hunt and the documents its findings
+            # cite. The alert profile of the one anchor document says nothing
+            # about a hunt that spans several.
+            docs = p.get("subject_documents")
+            return (
+                "soc-ai loaded the hunt's findings and the "
+                f"{len(docs) if isinstance(docs, list) else 0} documents they cite. "
+                f"It enriched {len(enr)} indicator(s)."
+            )
+        # "Enriched N indicators" reads as N reputation checks. Say when it was not.
+        gap = (
+            " soc-ai loaded no blocklist feed. It checked no indicator against threat intel."
+            if _blocklist_unchecked(enr)
+            else ""
+        )
         return (
-            f"Loaded the alert and enriched {len(enr)} indicator(s); the host shows "
-            f"{len(prof)} distinct alert type(s) in the window."
+            f"soc-ai loaded the alert and enriched {len(enr)} indicator(s). The host shows "
+            f"{len(prof)} distinct alert type(s) in the window.{gap}"
         )
     if kind == "decision_template_match":
+        if p.get("skipped") == "hunt_subject":
+            return "A decision template matches an alert rule class. A hunt has none."
         if p.get("matched"):
             return (
                 f"Matched the '{_template_label(p.get('template_id'))}' pattern → "
                 f"{p.get('verdict')} ({p.get('confidence')}). {p.get('rationale', '')}".strip()
             )
-        return "No pattern matched — ran a full tool-using investigation."
+        return "No pattern matched. soc-ai ran a full tool-using investigation."
     if kind == "investigation_loop_entered":
+        # The first pass is skipped on most alerts, so there is often no
+        # round-1 verdict. Say nothing rather than "Round 1 was None at None".
+        if p.get("round1_verdict") is None:
+            return f"{p.get('reason', '')} The first pass did not run.".strip()
         return (
-            f"{p.get('reason', '')} (round-1 was {p.get('round1_verdict')} @ "
-            f"{p.get('round1_confidence')})".strip()
-        )
+            f"{p.get('reason', '')} Round 1 was {p.get('round1_verdict')} at "
+            f"{p.get('round1_confidence')}."
+        ).strip()
     if kind == "triage_report":
         return f"{p.get('verdict')} ({p.get('confidence')})\n{_compact(p.get('summary', ''), 300)}"
+    if kind == "template_grounds_adopted":
+        cites = p.get("citations") or []
+        return f"{p.get('template_id')} grounds recorded as the citations: {', '.join(cites)}"
     if kind == "citation_validation":
         c = p.get("counts") or {}
         valid, total, cov = c.get("valid", "?"), p.get("total", "?"), p.get("coverage_ratio")
-        return f"{valid}/{total} citations valid (coverage {cov})"
+        if p.get("vacuous") or total == 0:
+            # Coverage over nothing is not a number. Saying "0/0 (coverage 0.0)"
+            # implies the report tried to cite and failed; it did not try.
+            return "the report offered no citations"
+        return f"{valid}/{total} citations valid. Coverage is {cov}."
     if kind == "citation_cap":
         return (
             f"confidence {p.get('original_confidence')} → {p.get('capped_confidence')} "
@@ -481,8 +553,26 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             f"{it.get('verdict')} ({it.get('matched_on')})" for it in items if isinstance(it, dict)
         )
         return (
-            f"Context only — never evidence. {p.get('count')} prior verdict(s) "
-            f"within {p.get('window_days')}d shown to the synthesizer: {chips}"
+            f"Context only. This is never evidence. The synthesizer saw "
+            f"{p.get('count')} prior verdict(s) within {p.get('window_days')} days: {chips}"
+        )
+    if kind == "session_prior":
+        # The same conversation, already read. Named rather than tallied: the
+        # analyst needs the id to open the other investigation, which is the
+        # whole point of telling them the two are related.
+        items = p.get("items") or []
+        chips = ", ".join(
+            f"{it.get('verdict')} ({it.get('id')})" for it in items if isinstance(it, dict)
+        )
+        return (
+            f"Same network session, already investigated: {chips}. "
+            f"The window is {p.get('window_minutes')} min."
+        )
+    if kind == "session_verdict_conflict":
+        return (
+            f"Held at needs_more_info. Investigation {p.get('prior_investigation_id')} "
+            "already reached true positive on this same session. A false positive "
+            "cannot stand on it."
         )
     if kind == "chat_memory":
         # Chat-transcript recall: source/role chips only — the payload carries
@@ -493,8 +583,8 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             f"{it.get('source')} ({it.get('role')})" for it in items if isinstance(it, dict)
         )
         return (
-            f"Context only — never evidence. {p.get('count')} past chat excerpt(s) "
-            f"within {p.get('window_days')}d shown to the synthesizer: {chips}"
+            f"Context only. This is never evidence. The synthesizer saw "
+            f"{p.get('count')} past chat excerpt(s) within {p.get('window_days')} days: {chips}"
         )
     return _compact(p, 220)
 
@@ -517,8 +607,9 @@ class RecommendedActionOut(BaseModel):
     # "Executed · analyst"). None keeps the UI's default auto-ack wording.
     appliedNote: str | None = None
     # Why a PENDING ack is waiting for a human when auto-ack is otherwise armed
-    # (severity/exploit-class guard, or confidence below the threshold) — from
-    # the persisted auto_ack_skipped event. None when auto-ack simply doesn't
+    # (severity/exploit-class guard, confidence below the threshold, nothing
+    # retrieved, or a report that cites nothing that resolves) — from the
+    # persisted auto_ack_skipped event. None when auto-ack simply doesn't
     # apply. Two identical-looking ack cards behaving differently with no
     # explanation was a dogfood trust finding (2026-07-15).
     pendingNote: str | None = None
@@ -659,6 +750,12 @@ class InvestigationOut(BaseModel):
     # web UI) so the UI never offers "Acknowledge" for an already-acked alert.
     # False on any ES error (resilient: the page must never break on this).
     alertAcked: bool = False
+    # What the run investigated (migration 0050). None for an alert subject:
+    # the alert is named by the fields above. For a hunt subject it carries
+    # the hunt id, the objective, the finding ordinals and titles, the lead id,
+    # the cited document ids and the observation ids, so the page can read
+    # "Subject: hunt <objective>" with the findings and the lead.
+    subject: dict[str, Any] | None = None
     # Promotion provenance (migration 0031) — set only when kind == "hunt".
     huntId: str | None = None
     # First 160 chars of the source hunt's objective. None when the hunt was
@@ -826,9 +923,22 @@ def _build_actions(
             conf, thr = p.get("confidence"), p.get("threshold")
             if isinstance(conf, int | float) and isinstance(thr, int | float):
                 ack_pending_note = (
-                    f"Auto-ack is on, but confidence {conf:.2f} is below "
-                    f"the {thr:.2f} auto-ack threshold."
+                    f"Auto-ack is on. Confidence {conf:.2f} is below the "
+                    f"{thr:.2f} auto-ack threshold."
                 )
+        elif p.get("reason") == "no_investigation":
+            ack_pending_note = (
+                "Auto-ack is on. This run reached its verdict and retrieved "
+                "nothing. A person must acknowledge it."
+            )
+        elif p.get("reason") == "uncited":
+            # Both shapes read the same way to an analyst — the verdict names
+            # nothing that can be checked — so they get one sentence, with the
+            # count telling them which one it was.
+            ack_pending_note = (
+                "Auto-ack is on. The report cites no evidence that resolves to "
+                "anything this run retrieved. A person must acknowledge it."
+            )
         break
 
     def _ack_note(tn: str) -> str | None:
@@ -1041,11 +1151,13 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
                 group = "Decision"
             result = result_by_call.get(p.get("tool_call_id"))
             title, detail = _tool_step(tn, p.get("args") or {}, result)
-        elif e.kind == "decision_template_match":
+        elif e.kind == "decision_template_match" and not p.get("skipped"):
+            # A skipped step falls through to the shared labeler, which says
+            # which skip it was. This branch is for a template that RAN.
             title = (
                 f"Matched pattern: {_template_label(p.get('template_id'))}"
                 if p.get("matched")
-                else "No pattern matched — ran a full investigation"
+                else "No pattern matched: a full investigation ran"
             )
             detail = _detail_for(e.kind, p)
         else:

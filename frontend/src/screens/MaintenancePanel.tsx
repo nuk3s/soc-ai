@@ -44,9 +44,10 @@ export function MaintenancePanel({
       {!collapsed && (
         <>
           <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-            What the host cron jobs actually did — nightly database backups (kept 14 days,
-            plus a copy outside the container) and the daily blocklist-feed refresh. Stale
-            rows here mean a cron is not running.
+            This panel shows what the host cron jobs did. A nightly cron job backs up the
+            database. The backup cron job keeps 14 days of archives. It also writes a copy
+            outside the container. A daily cron job refreshes the blocklist feeds. A stale row
+            means a cron job does not run.
           </div>
 
           {loading && !data && <LoadingState />}
@@ -65,12 +66,12 @@ export function MaintenancePanel({
                 {data.blocklists_refreshed ? (
                   <>
                     <span className="font-semibold">{data.blocklist_files}</span> feed file
-                    {data.blocklist_files === 1 ? '' : 's'} · last refreshed{' '}
-                    <span className="font-semibold">{absTime(data.blocklists_refreshed)}</span>
+                    {data.blocklist_files === 1 ? '' : 's'}. The last refresh was{' '}
+                    <span className="font-semibold">{absTime(data.blocklists_refreshed)}</span>.
                   </>
                 ) : (
                   <span className="text-faint">
-                    No blocklist files yet — the refresh cron has not run.
+                    No blocklist file is present. The refresh cron job did not run.
                   </span>
                 )}
               </div>
@@ -81,7 +82,7 @@ export function MaintenancePanel({
               <div className="overflow-hidden rounded-card border border-border bg-surface-1">
                 {backups.length === 0 && (
                   <div className="px-3.5 py-4 text-[12.5px] text-faint">
-                    No backup archives yet — the backup cron has not run.
+                    No backup archive is present. The backup cron job did not run.
                   </div>
                 )}
                 {backups.map((b) => (
@@ -96,7 +97,7 @@ export function MaintenancePanel({
                 ))}
               </div>
               <div className="mt-1.5 font-mono text-[10.5px] text-faint">
-                archives in {data.backups_dir}
+                the archives are in {data.backups_dir}
               </div>
             </>
           )}

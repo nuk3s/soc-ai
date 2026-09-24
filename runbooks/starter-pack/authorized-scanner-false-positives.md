@@ -9,51 +9,53 @@ rules:
 
 # Authorized scanner false positives
 
-Scan-class alerts (MITRE ATT&CK **T1046** Network Service Discovery,
-**T1595** Active Scanning) are the highest-volume false-positive family in
-most SOCs, because legitimate vulnerability scanners, asset-inventory tools,
-and monitoring systems behave exactly like reconnaissance. The job here is
-to separate *sanctioned* scanning from *unsanctioned* scanning quickly and
-repeatably — not to suppress the rule family.
+Scan-class alerts are the largest false-positive family in most security operations
+centers. The MITRE ATT&CK techniques are **T1046** Network Service Discovery and
+**T1595** Active Scanning. Vulnerability scanners, asset-inventory tools and monitoring
+systems behave like reconnaissance. Separate sanctioned scanning from unsanctioned
+scanning. Use a method that is quick and repeatable. Keep the rule family active.
 
 ## Establish the source's identity
 
-1. Is the source IP on the org's documented scanner list (vulnerability
-   management appliances, monitoring pollers, asset discovery)? If your team
-   keeps that list in a runbook or asset DB, cite it in the verdict.
-2. Does the source's behavior match its role? An authorized scanner probes
-   **many hosts across many ports on a schedule** (often nightly or weekly,
-   from a fixed IP). Verify the schedule matches: an "authorized scanner"
-   suddenly scanning at an unusual hour, or from a new IP, is not covered by
-   the authorization.
-3. Reverse DNS / asset ownership: scanner appliances are normally servers in
-   a management subnet, not user workstations. **A workstation exhibiting
-   scanner behavior is never a false positive on identity grounds alone** —
-   that pattern is post-compromise discovery.
+**Warning: a workstation with scanner behavior is never a false positive on identity
+grounds alone. That pattern is post-compromise discovery.**
+
+1. Look for the source IP on the documented scanner list of your organization. The list
+   covers vulnerability management appliances, monitoring pollers and asset discovery
+   tools.
+2. Cite the list in the verdict if your team keeps it in a runbook or an asset database.
+3. Check that the behavior of the source matches its role. An authorized scanner probes
+   **many hosts across many ports on a schedule**. The schedule is often nightly or
+   weekly, from a fixed IP.
+4. Verify that the scan matches the schedule. The authorization does not cover a scan at
+   an unusual hour. The authorization does not cover a scan from a new IP.
+5. Check the reverse DNS record and the asset ownership. Scanner appliances are normally
+   servers in a management subnet. User workstations are not scanner appliances.
 
 ## Confirm the scan shape
 
-Pivot on the source over the alert window and characterize:
+Pivot on the source over the alert window. Describe the scan with these measures:
 
-- **Breadth**: distinct destination hosts and ports touched. Authorized
-  scans are broad and indiscriminate; targeted attacker discovery is often
-  narrow (a handful of high-value ports: 445, 3389, 22, 1433).
-- **Follow-through**: an authorized scanner connects, grabs a banner, and
-  moves on. Sessions that continue past service identification — logins
-  attempted, shares enumerated, payloads delivered — are exploitation, not
-  scanning, regardless of the source.
-- **Credentialed scan artifacts**: authenticated vulnerability scans produce
-  bursts of admin-looking activity (WMI, SSH logins, registry reads) from the
-  scanner account. Verify the account used is the designated scan account.
+- **Breadth**: count the distinct destination hosts and ports. An authorized scan is
+  broad and indiscriminate. Attacker discovery is often narrow. A narrow scan touches a
+  few high-value ports: 445, 3389, 22, 1433.
+- **Follow-through**: an authorized scanner connects, reads a banner and moves to the
+  next host. A session that continues past service identification is exploitation.
+  Attempted logins, enumerated shares and delivered payloads are exploitation from any
+  source.
+- **Credentialed scan artifacts**: an authenticated vulnerability scan produces bursts of
+  administrative activity from the scanner account. The activity includes Windows
+  Management Instrumentation (WMI) calls, SSH logins and registry reads. Verify that the
+  scan used the designated scan account.
 
 ## Verdict guidance
 
-- **Dismiss** when source identity, schedule, and shape all match the
-  sanctioned profile. Say *which* scanner and *which* schedule in the
-  rationale so the dismissal is auditable.
-- **Escalate** when the source is not a known scanner, when a known scanner
-  runs outside its window or from a new address, or when there is any
-  follow-through beyond banner grabbing.
-- If the same sanctioned scanner keeps firing the same rule, recommend a
-  tuning action (suppress that rule for that source) rather than another
-  hundred manual dismissals — see the noisy-rule tuning runbook.
+- **Dismiss** the alert if the source identity, the schedule and the shape all match the
+  sanctioned profile. Name the scanner and the schedule in the rationale. The dismissal
+  is then auditable.
+- **Escalate** the alert if the source is not a known scanner. Escalate if a known
+  scanner runs outside its window or from a new address. Escalate if the session
+  continues past banner collection.
+- Recommend a tuning action if the same sanctioned scanner fires the same rule
+  repeatedly. Suppress that rule for that source. A hundred manual dismissals are then
+  unnecessary. Read the noisy rule tuning runbook.

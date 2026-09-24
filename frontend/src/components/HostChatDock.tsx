@@ -43,7 +43,7 @@ export function HostChatDock({ ip, hostname }: { ip: string; hostname: string | 
       // The DELETE already returns the emptied thread, but the hook owns the
       // thread state and exposes only a re-read (same trade as the Dashboard).
       .then(() => chat.refresh())
-      .catch(() => setClearError('Could not clear the conversation — please try again.'));
+      .catch(() => setClearError('Could not clear the conversation. Try again.'));
   };
 
   const msgCount = chat.messages.length;
@@ -57,7 +57,7 @@ export function HostChatDock({ ip, hostname }: { ip: string; hostname: string | 
               // The name a human uses when the sweep (or an operator) has one;
               // the address is the honest fallback.
               scopeLabel={hostname ?? ip}
-              placeholder="Ask about this host… e.g. who has it talked to today?"
+              placeholder="Ask about this host. For example: who has it talked to today?"
               listSizeClass="min-h-0 flex-1"
               fill
               onClose={close}
@@ -65,8 +65,8 @@ export function HostChatDock({ ip, hostname }: { ip: string; hostname: string | 
                 <div className="flex flex-col gap-2.5 py-1 text-[12.5px]">
                   <div className="flex items-center gap-1.5 text-faint">
                     <MessageSquare size={13} />
-                    Ask about this host — answered here from its dossier and live telemetry.
-                    Questions that need a sweep come back as a hunt to confirm.
+                    Ask about this host. soc-ai answers from its dossier and its live telemetry.
+                    A question that needs a sweep comes back as a hunt for you to confirm.
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {STARTERS.map((q) => (

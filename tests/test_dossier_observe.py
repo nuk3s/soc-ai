@@ -45,6 +45,7 @@ from soc_ai.dossier.types import (
 )
 from soc_ai.so_client import fields, inventory
 from soc_ai.so_client.elastic import EsSearchResult
+from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.host_summary import _base_host_query
 
 _IP = "192.168.10.202"
@@ -192,7 +193,12 @@ def _call_kind(query: dict[str, Any], aggs: dict[str, Any] | None) -> str:
         return "probe"
     if aggs and "responder" in aggs:
         return "main"
-    if aggs and set(aggs) == {"datasets"}:
+    # "datasets" plus the optional second census over documents that carry no
+    # ``event.dataset``. Matched by PRESENCE rather than by an exact key set,
+    # because an exact set made this router a de-facto schema lock: adding the
+    # fallback census to the real query broke eight tests that have nothing to
+    # do with dataset identity.
+    if aggs and "datasets" in aggs:
         return "inventory"
     if aggs and "hosts" in aggs:
         return "agent"
@@ -228,6 +234,7 @@ class _FakeES:
         *,
         populated: frozenset[str] = _ECS_POPULATED,
         grid_datasets: tuple[str, ...] = _ALL_DATASETS,
+        imported_datasets: tuple[str, ...] = (),
         main_aggs: dict[str, Any] | None = None,
         main_total: int = 0,
         main_errors: tuple[str, ...] = (),
@@ -242,6 +249,7 @@ class _FakeES:
     ) -> None:
         self.populated = populated
         self.grid_datasets = grid_datasets
+        self.imported_datasets = imported_datasets
         self.main_aggs = main_aggs
         self.main_total = main_total
         self.main_errors = list(main_errors)
@@ -295,10 +303,22 @@ class _FakeES:
                 aggregations={
                     "datasets": {
                         "buckets": [
-                            {"key": d, "doc_count": 10, "categories": {"buckets": []}}
-                            for d in self.grid_datasets
+                            {
+                                "key": d,
+                                "doc_count": 10,
+                                "categories": {"buckets": []},
+                                # `imported_datasets` are on disk and have no
+                                # live document behind them: an so-import-evtx
+                                # load, or a replayed corpus.
+                                "live": {
+                                    "doc_count": 0 if d in self.imported_datasets else 10,
+                                    "last_seen": {"value": None},
+                                },
+                            }
+                            for d in (*self.grid_datasets, *self.imported_datasets)
                         ]
-                    }
+                    },
+                    "live_events": {"doc_count": 10 * len(self.grid_datasets)},
                 },
             )
         if kind == "main":
@@ -439,11 +459,19 @@ async def test_every_search_carries_the_synth_kill_switch() -> None:
 
     await _collect(es)
 
-    kill_switch = [{"exists": {"field": "synth.scenario_id"}}]
+    kill_switch = synth_scope_must_not(False)
     for call in es.calls:
         if call["kind"] in ("probe", "inventory"):
             continue
-        assert call["query"]["bool"]["must_not"] == kill_switch, (
+        must_not = call["query"]["bool"]["must_not"]
+        # Containment, not equality. Every dossier read is built on
+        # ``host_summary._base_host_query``, which now also excludes imported
+        # and replayed documents — desirable here above anywhere else, since a
+        # dossier is a DURABLE asset record and an imported capture reusing this
+        # RFC1918 address would give the machine a foreign identity permanently.
+        # Spelled as equality this assertion failed on that, which is a
+        # different claim than the one it makes.
+        assert all(clause in must_not for clause in kill_switch), (
             f"{call['key']} search would let synth fixtures into a real dossier"
         )
 
@@ -557,6 +585,31 @@ async def test_multi_dataset_search_narrows_to_what_the_grid_has() -> None:
     windows = _one(es, "zeek.ntlm|zeek.dce_rpc")
     assert _datasets_in(windows["query"]) == ("zeek.ntlm", "zeek.dce_rpc")
     assert _datasets_in(_one(es, "zeek.http")["query"]) == ("zeek.http",)
+
+
+async def test_an_import_only_dataset_is_not_grid_coverage() -> None:
+    """The dossier widens the census to its own window, up to fourteen days, and
+    that is exactly the window where the measured grid was 89% backfill.
+
+    A plane that exists only as an import is not telemetry this network
+    produced. Searching it for a host's identity resolves that host against
+    whatever the import contains, which is somebody else's network.
+    """
+    es = _FakeES(
+        grid_datasets=("zeek.conn", "zeek.dns", "zeek.http"),
+        imported_datasets=("zeek.dhcp",),
+        main_aggs=_MAIN_AGGS,
+        main_total=3412,
+    )
+
+    obs = await _collect(es)
+
+    searched = {ds for c in es.calls if c["kind"] == "targeted" for ds in _datasets_in(c["query"])}
+    assert "zeek.dhcp" not in searched
+    # The live planes are still searched, so this is a provenance gate and not
+    # a gate that switched everything off.
+    assert "zeek.http" in searched
+    assert obs.available_datasets == frozenset({"zeek.conn", "zeek.dns", "zeek.http"})
 
 
 async def test_empty_inventory_does_not_gate_the_targeted_searches() -> None:
@@ -1132,7 +1185,13 @@ _NETWORK_BUCKETS: list[dict[str, Any]] = [
     _agent_bucket("edge-proxy", ["192.168.10.119", _PROXY_SECOND_IP], docs=216274),
 ]
 
-_HOSTLOG_DATASETS = ("system.auth", "system.syslog")
+_HOSTLOG_DATASETS = (
+    "system.auth",
+    "system.syslog",
+    "system.security",
+    "elastic_agent",
+    "windows.sysmon_operational",
+)
 _GRID_WITH_HOST_LOGS = (*_ALL_DATASETS, *_HOSTLOG_DATASETS)
 
 
@@ -1176,7 +1235,7 @@ async def test_the_agent_inventory_is_one_aggregation_for_the_whole_network() ->
     assert hosts["aggs"]["latest"]["top_hits"]["sort"] == [{"@timestamp": {"order": "desc"}}]
     datasets = [c for c in call["query"]["bool"]["filter"] if "terms" in c]
     assert datasets[0]["terms"]["event.dataset"] == list(_HOSTLOG_DATASETS)
-    assert call["query"]["bool"]["must_not"] == [{"exists": {"field": "synth.scenario_id"}}]
+    assert call["query"]["bool"]["must_not"] == synth_scope_must_not(False)
 
 
 async def test_a_uniquely_claimed_address_carries_the_agents_self_report() -> None:
@@ -1727,7 +1786,7 @@ async def test_the_dns_pass_is_one_size_zero_aggregation_over_the_dns_dataset() 
     assert names["aggs"]["ips"]["terms"]["field"] == "dns.resolved_ip"
     datasets = [c for c in call["query"]["bool"]["filter"] if "terms" in c]
     assert {"event.dataset": ["zeek.dns"]} in [c["terms"] for c in datasets]
-    assert call["query"]["bool"]["must_not"] == [{"exists": {"field": "synth.scenario_id"}}]
+    assert call["query"]["bool"]["must_not"] == synth_scope_must_not(False)
 
 
 async def test_the_dns_pass_narrows_to_internal_answers_when_the_field_allows_it() -> None:
@@ -1835,7 +1894,7 @@ async def test_the_wide_pass_does_not_claim_an_internal_impact_it_cannot_see() -
     assert inv.errors == ()
     detail = next(d for d in inv.notes if "truncated" in d)
     assert "ran wide" in detail
-    assert "impact unknown" in detail
+    assert "The internal impact is unknown" in detail
     assert "41000" in detail
     # It is a caveat on a working pass, not a failure: the names that DID fit are
     # still claimed.
@@ -1947,3 +2006,53 @@ async def test_without_an_inventory_the_observations_carry_no_dns_name() -> None
     assert obs.dns_name_evidence == ""
     assert obs.dns_name_withheld == ""
     assert obs.dns_name_observed_at is None
+
+
+def test_served_ports_are_read_from_every_flow_sensor_not_only_zeek() -> None:
+    """Role inference is driven entirely by served ports.
+
+    Scoped to ``event.dataset: zeek.conn``, a Security Onion running Elastic
+    Agent without Zeek can never classify a single host, and every role-scoped
+    prior on that grid is permanently blind. On the measured range it was worse:
+    Zeek was present and shipping 885,000 documents that carried no
+    ``destination.port`` at all, so the aggregation was pinned to the one plane
+    that could not answer while three others could.
+
+    The clause must also match under ``data_stream.dataset``: a stock Security
+    Onion ships ``network_traffic.*`` with no ``event.dataset`` whatsoever, so a
+    single-field term silently excludes the largest flow plane on the grid.
+    """
+    from soc_ai.so_client.fields import FLOW_DATASETS, flow_dataset_filter
+
+    clause = flow_dataset_filter()
+    terms = clause["bool"]["should"]
+    pairs = {(next(iter(t["term"])), next(iter(t["term"].values()))) for t in terms}
+
+    for dataset in FLOW_DATASETS:
+        assert ("event.dataset", dataset) in pairs
+        assert ("data_stream.dataset", dataset) in pairs, (
+            f"{dataset} is unreachable under data_stream.dataset, which is the "
+            "only name field network_traffic.* carries"
+        )
+    assert clause["bool"]["minimum_should_match"] == 1
+
+
+def test_no_flow_aggregation_pins_itself_to_one_dataset() -> None:
+    """A regression guard on the two call sites that had the hardcode.
+
+    Both the dossier's responder aggregation and host_summary's resp_ports
+    scoped themselves to zeek.conn with a bare term. Either one reverting
+    silently re-blinds role inference on a Zeek-less grid, and the symptom --
+    every host unclassified -- looks like a quiet network rather than a bug.
+    """
+    from pathlib import Path
+
+    import soc_ai.dossier.observe as observe_mod
+    import soc_ai.tools.host_summary as summary_mod
+
+    for module in (observe_mod, summary_mod):
+        path = Path(module.__file__)
+        text = path.read_text()
+        assert '{"term": {"event.dataset": "zeek.conn"}}' not in text, (
+            f"{path.name} pins a flow aggregation to zeek.conn again"
+        )

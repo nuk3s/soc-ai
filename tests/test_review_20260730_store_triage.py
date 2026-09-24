@@ -173,8 +173,8 @@ def test_plan_targets_passes_group_kind_to_fetch_group_events(
 
     async def fake_fetch_groups(
         elastic: Any, settings: Any, *, time_range: str, severity: str, oql: str | None
-    ) -> tuple[list[aq.AlertGroup], Any]:
-        return [suricata, notice], None
+    ) -> aq.GroupPage:
+        return aq.GroupPage([suricata, notice], 0)
 
     async def fake_fetch_group_events(
         elastic: Any,

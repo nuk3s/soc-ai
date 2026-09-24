@@ -35,6 +35,19 @@ AuditKind = Literal[
     # proactive context budgeting: oldest pivot events dropped to fit the
     # analyst model's input window (soc_ai.agent.context_budget)
     "context_trimmed",
+    # a dispositive decision template lent its own cited_evidence to a report
+    # that cited nothing, so the grounds the verdict rests on are on the record
+    # rather than implied. Must be a valid audit kind or _audit silently drops
+    # it (the recurring trap the downgrade kinds below document).
+    "template_grounds_adopted",
+    # the investigation loop's own evidence bullets were carried into a report
+    # that cited nothing (soc_ai/agent/gates.py::_carry_investigator_evidence).
+    # The transcript held the grounds and the handoff to the synthesizer lost
+    # them, so a third of runs shipped a verdict that read as unsupported and
+    # 713 of those were acknowledged in Security Onion. Must be a valid audit
+    # kind or _audit silently drops it (the recurring trap the downgrade kinds
+    # document below).
+    "investigator_evidence_carried",
     # citation validators (orchestrator synth-first path)
     "citation_validation",
     "citation_cap",
@@ -134,6 +147,20 @@ AuditKind = Literal[
     # prune. Must be a valid audit kind or the write is silently dropped (the
     # same trap the downgrade kinds document above).
     "quality_regression",
+    # Scheduled tamper-evident-chain verification (soc_ai/main.py
+    # _audit_verify_loop). Written on a NON-ok outcome only: the payload carries
+    # the epoch tally, the break's kind and seq, and whether the current epoch
+    # is the broken one. The record goes into the very chain it is reporting on,
+    # which is the point — the finding is then as durable and as tamper-evident
+    # as everything else, and the next verification covers it too. Must be a
+    # valid audit kind or the write is silently dropped (the same trap the
+    # downgrade kinds document above).
+    "audit_chain_verification",
+    # Model-fitness battery result. Absent until 2026-09-05, so every
+    # `log_kind(kind="model_battery")` at routes_config.py raised a
+    # ValidationError that the surrounding try/except swallowed — the battery
+    # completed and its audit trail silently did not.
+    "model_battery",
     # alert ownership / triage-state changes (soc_ai/api/webui/routes_alert_actions.py
     # POST /alerts/assign). Emitted best-effort on assign / state-change / unassign so a
     # multi-analyst team has a trail of who took (or released) a rule and moved it through
@@ -152,12 +179,35 @@ AuditKind = Literal[
     # MUST be a valid audit kind or every auto-ack fails to record and the badge
     # never shows.
     "auto_ack",
+    # unattended acknowledge written by auto-triage's verdict-INHERITANCE path
+    # (soc_ai/webui/autotriage.py::_ack_inherited_fps), which acks a sibling
+    # alert off another investigation's verdict and creates no investigation row
+    # of its own. The ack_alert tool_call/tool_result records execute_write_tool
+    # already writes name the alert but not where the verdict came from, so on
+    # the deployed instance 110,635 grid writes were attributable to a user
+    # string and nothing else. This record carries ``inherited_from`` — the
+    # investigation whose false positive authorized the write — so the trail can
+    # be walked back from the ack to the reasoning. Must be a valid audit kind
+    # or _audit silently drops it (the recurring trap the downgrade kinds
+    # document above).
+    "auto_ack_inherited",
     # auto-ack ARMED for a confident FP but held back by a guard
     # (maybe_auto_ack_fp: high_stakes severity/exploit-class cap, or confidence
     # below the threshold). Recorded so the drawer can explain WHY the pending
     # ack needs a human (_build_actions ``e.kind == "auto_ack_skipped"`` →
     # pendingNote). No write happened; the payload carries reason + numbers.
     "auto_ack_skipped",
+    # another completed investigation covered the same network session (same
+    # community id, inside the session window). Emitted whenever one exists,
+    # agreeing or not, so the analyst is told the two alerts are one session and
+    # gets the other investigation's id. The payload carries that id and its
+    # verdict, never the session's contents.
+    "session_prior",
+    # this run reached a benign verdict on a session another investigation had
+    # already called a true positive, and the close was refused. Recorded
+    # separately from session_prior because a contradiction is a different fact
+    # from a resemblance: this one changed the verdict.
+    "session_verdict_conflict",
     # analyst-egress fail-closed residue sweep (soc_ai/agent/orchestrator.py::
     # _guard_egress). Emitted best-effort when analyst_redaction_fail_closed is on
     # and the INDEPENDENT unsafe_residue detector finds an internal identifier that

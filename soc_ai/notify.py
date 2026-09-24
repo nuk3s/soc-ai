@@ -54,6 +54,7 @@ NOTIFY_KINDS: tuple[str, ...] = (
     "hunt_threat",
     "model_fitness_fail",
     "quality_regression",
+    "audit_chain_break",
     "test",
 )
 
@@ -171,6 +172,7 @@ def _trigger_enabled(settings: Any, kind: str) -> bool:
         "hunt_threat": "notify_on_hunt_threat",
         "model_fitness_fail": "notify_on_model_fitness_fail",
         "quality_regression": "notify_on_quality_regression",
+        "audit_chain_break": "notify_on_audit_chain_break",
     }.get(kind)
     if flag is None:
         return False
@@ -306,7 +308,7 @@ def event_for_investigation(
     body = f"Confidence {confidence:.2f}. {summary}".strip()
     return NotifyEvent(
         kind="tp",
-        title="High-confidence true positive",
+        title="True positive found",
         body=body[:500],
         url=f"/app/investigation/{investigation_id}",
         severity="critical",
@@ -359,7 +361,7 @@ def event_for_model_fitness(*, result: dict[str, Any], settings: Any) -> NotifyE
     return NotifyEvent(
         kind="model_fitness_fail",
         title=f"Analyst model unfit: {model}",
-        body=(detail or "Model-fitness probe graded FAIL.")[:500],
+        body=(detail or "The model fitness probe graded this model FAIL.")[:500],
         url="",
         severity="warning",
     )
@@ -381,14 +383,63 @@ def event_for_quality_regression(
         return None
     if not reasons:
         return None
-    mode_label = "oracle graded" if mode == "graded" else "locally measured"
-    body = f"Nightly micro-eval ({mode_label}): " + "; ".join(reasons)
+    mode_label = (
+        "The oracle graded this run." if mode == "graded" else "soc-ai measured this run locally."
+    )
+    body = f"The nightly micro-eval found a regression. {mode_label} " + ". ".join(reasons)
     return NotifyEvent(
         kind="quality_regression",
         title="Verdict quality regression",
         body=body[:500],
         url="/app/",
         severity="warning",
+    )
+
+
+def event_for_audit_chain_break(
+    *,
+    epochs_broken: int,
+    seq: int | None,
+    kind: str | None,
+    detail: str | None,
+    latest_epoch_broken: bool,
+    settings: Any,
+    blast_radius: str | None = None,
+) -> NotifyEvent | None:
+    """Build an audit-chain-break NotifyEvent, or None when the trigger is off.
+
+    Critical severity, and no apology for it: the audit trail is the record
+    every other claim this product makes rests on, and a break in it means
+    either a concurrency defect or someone editing decisions after the fact.
+    The body carries WHICH of those the verifier could tell (see
+    :data:`~soc_ai.audit.chain.BreakKind`) so on-call is not left to guess
+    between a known bug and an intrusion. The permalink is the config page,
+    where the verify-chain diagnostic lives; it doubles as the dedup entity,
+    so a standing break pings once an hour at worst.
+
+    ``blast_radius`` says how widespread the damage is (see
+    :func:`~soc_ai.audit.verify.describe_blast_radius`). One sequence number
+    out of 41 is not something on-call can size, and the difference between one
+    collision and a forked afternoon changes what they do next.
+    """
+    if not bool(getattr(settings, "notify_on_audit_chain_break", False)):
+        return None
+    where = f" at sequence {seq}" if seq is not None else ""
+    if latest_epoch_broken:
+        scope = "the current epoch"
+    elif epochs_broken == 1:
+        scope = "1 epoch of history"
+    else:
+        scope = f"{epochs_broken} epochs of history"
+    body = detail or f"The audit hash chain does not verify{where}."
+    if blast_radius:
+        body = f"{body} {blast_radius}"
+    return NotifyEvent(
+        kind="audit_chain_break",
+        title=f"Audit chain broken: {kind or 'unknown'} in {scope}",
+        body=body[:500],
+        url="/app/config",
+        severity="critical",
     )
 
 
@@ -402,10 +453,7 @@ def canned_test_event() -> NotifyEvent:
     return NotifyEvent(
         kind="test",
         title="soc-ai notification test",
-        body=(
-            "This is a test notification from soc-ai. If you received it, the "
-            "webhook is configured correctly."
-        ),
+        body=("This is a test notification from soc-ai. If you read it, the webhook works."),
         url="",
         severity="info",
     )
@@ -430,7 +478,7 @@ async def send_test(settings: Any, audit: Any = None) -> tuple[bool, str]:
     """
     url = _webhook_url(settings)
     if not url:
-        return False, "No webhook URL configured."
+        return False, "No webhook URL is configured."
 
     fmt = str(getattr(settings, "notify_format", "json") or "json").lower()
     if fmt not in NOTIFY_FORMATS:
@@ -468,7 +516,7 @@ async def send_test(settings: Any, audit: Any = None) -> tuple[bool, str]:
             _LOGGER.warning("notification test audit write failed (continuing)", exc_info=True)
 
     if ok:
-        return True, f"Test sent — webhook returned HTTP {status}."
+        return True, f"soc-ai sent the test. The webhook returned HTTP {status}."
     if error is not None:
-        return False, f"Test send failed: {error}."
-    return False, f"Webhook returned HTTP {status}."
+        return False, f"The test send failed: {error}."
+    return False, f"The webhook returned HTTP {status}."

@@ -43,6 +43,21 @@ from soc_ai.store.models import Hunt, Investigation
 class JourneyStage(StrEnum):
     """The furthest stage a scenario's hunt journey reached."""
 
+    # The declarative spec that should have surfaced this scenario did not
+    # fire, or fired on the wrong entity. Ordered BEFORE the hunt stage because
+    # it happens before it, and kept separate because the two failures need
+    # different fixes: a spec that did not fire is a detection bug, while a
+    # hunt that found nothing after the spec fired is an agent bug. Collapsing
+    # them into HUNT_FOUND_NOTHING would send every investigation to the wrong
+    # place, which is the exact confusion this enum exists to prevent.
+    #
+    # Only reachable for a scenario carrying a ``spec_journey``.
+    TRIGGER_DID_NOT_FIRE = "trigger_did_not_fire"
+    # The spec fired but could not see: its precondition matched nothing, so
+    # the scenario's telemetry plane is absent rather than clean. Distinct from
+    # TRIGGER_DID_NOT_FIRE because the detection is not at fault — the fixture
+    # or the grid is.
+    TRIGGER_BLIND = "trigger_blind"
     # The hunt surfaced no findings at all (including an errored hunt whose
     # report never landed) — the journey died at the hunt stage.
     HUNT_FOUND_NOTHING = "hunt_found_nothing"

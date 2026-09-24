@@ -12,12 +12,14 @@ import type { SavedView } from './types';
 const listSavedViews = vi.hoisted(() => vi.fn());
 const saveView = vi.hoisted(() => vi.fn());
 const deleteSavedView = vi.hoisted(() => vi.fn());
+const getMe = vi.hoisted(() => vi.fn());
 
 vi.mock('./api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./api')>()),
   listSavedViews,
   saveView,
   deleteSavedView,
+  getMe,
 }));
 
 import { useSavedViews } from './useSavedViews';
@@ -35,6 +37,9 @@ beforeEach(() => {
   listSavedViews.mockReset().mockResolvedValue([]);
   saveView.mockReset();
   deleteSavedView.mockReset().mockResolvedValue({ ok: true });
+  // Default: /me is unreachable, which the hook treats as "unknown" and falls
+  // through to the views read, so every pre-existing test keeps its shape.
+  getMe.mockReset().mockRejectedValue(new Error('no /me'));
 });
 
 describe('useSavedViews', () => {
@@ -152,6 +157,25 @@ describe('useSavedViews', () => {
     expect(result.current.error).toMatch(/signed-in session/i);
   });
 
+  // Removing the control was half an answer: on a deployment with the auth gate
+  // down, four list screens rendered no chips and no save control at all, with
+  // no error, so an analyst concluded the feature did not exist rather than
+  // that it was unavailable (dogfood 2026-09-07, D3).
+  it('says WHY there is no save control instead of just removing it', async () => {
+    listSavedViews.mockRejectedValue(
+      new ApiError('Saved views belong to a signed-in user.', 401, 'no_session'),
+    );
+    const { result } = renderHook(() => useSavedViews('alerts', {}, vi.fn()));
+    await waitFor(() => expect(result.current.unavailable).toBeTruthy());
+    expect(result.current.unavailable).toMatch(/signed-in/i);
+  });
+
+  it('reports nothing unavailable on a deployment where views work', async () => {
+    const { result } = renderHook(() => useSavedViews('alerts', {}, vi.fn()));
+    await waitFor(() => expect(listSavedViews).toHaveBeenCalled());
+    expect(result.current.unavailable).toBeNull();
+  });
+
   it('KEEPS the save control through a transient server failure', async () => {
     // The latch used to fire on any rejection, so one 500 deleted a working
     // feature for the rest of the mount. Only "you have no user row" means the
@@ -204,5 +228,46 @@ describe('useSavedViews', () => {
     });
     await waitFor(() => expect(result.current.views).toHaveLength(1));
     expect(result.current.views[0].query).toEqual({ a: 2 });
+  });
+});
+
+describe('useSavedViews — the session probe', () => {
+  it('never issues the views read when no user row is behind the session', async () => {
+    // The 401 that read produced was handled correctly, but the browser still
+    // logged it as a console error on Alerts, Investigations, Hunts and Hosts
+    // -- four red lines on a healthy box with auth off, which is the noise
+    // that makes a real error invisible later.
+    getMe.mockResolvedValue({ username: 'anonymous', role: 'admin', status: '', signed_in: false });
+    const { result } = renderHook(() => useSavedViews('alerts', {}, () => {}));
+    await waitFor(() => expect(result.current.onSaveView).toBeUndefined());
+    expect(listSavedViews).not.toHaveBeenCalled();
+  });
+
+  // The notice tells the reader to sign in. With authentication off there is
+  // nothing to sign in to, so the line was standing advice nobody could take
+  // on four list screens (dogfood 2026-09-17). A refused READ keeps it: there
+  // the advice works.
+  it('says nothing about signing in when there is nobody to sign in as', async () => {
+    getMe.mockResolvedValue({ username: 'anonymous', role: 'admin', status: '', signed_in: false });
+    const { result } = renderHook(() => useSavedViews('alerts', {}, () => {}));
+    await waitFor(() => expect(result.current.onSaveView).toBeUndefined());
+    expect(result.current.unavailable).toBeNull();
+  });
+
+  it('still reads views for a signed-in session', async () => {
+    getMe.mockResolvedValue({ username: 'analyst', role: 'admin', status: '', signed_in: true });
+    listSavedViews.mockResolvedValue([view()]);
+    const { result } = renderHook(() => useSavedViews('investigations', {}, () => {}));
+    await waitFor(() => expect(result.current.views).toHaveLength(1));
+    expect(listSavedViews).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a backend that omits signed_in as unknown and reads anyway', async () => {
+    // An older backend has no flag. Unknown must not read as "no", or a
+    // rolling deploy silently drops saved views on every screen.
+    getMe.mockResolvedValue({ username: 'analyst', role: 'admin', status: '' });
+    listSavedViews.mockResolvedValue([view()]);
+    const { result } = renderHook(() => useSavedViews('investigations', {}, () => {}));
+    await waitFor(() => expect(result.current.views).toHaveLength(1));
   });
 });

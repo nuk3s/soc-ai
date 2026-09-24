@@ -33,6 +33,8 @@ export interface ToolbarPreset {
   label: string;
   count?: number;
   active: boolean;
+  /** One sentence that states what the chip filters to. */
+  title?: string;
 }
 
 /** A saved view as the chip row needs it — the full row lives in lib/types. */
@@ -69,6 +71,9 @@ export interface ListToolbarSelection {
 
 export interface ListToolbarProps {
   presets?: ToolbarPreset[];
+  /** The word before the preset chips. "Views" by default; Hunts filters on
+   *  the type of run, so it says "Type". */
+  presetsLabel?: string;
   onPreset?: (id: string) => void;
   views?: ToolbarView[];
   /** The saved view currently applied, if the screen tracks one. */
@@ -81,6 +86,11 @@ export interface ListToolbarProps {
   onSaveView?: (name: string) => void | Promise<void>;
   /** The last saved-view write's error, shown beside the composer. */
   viewError?: string | null;
+  /** Why this screen cannot save a view. Renders a DISABLED save control and
+   *  the reason instead of the working one. Omitting the control silently is
+   *  how four list screens taught an analyst the feature did not exist
+   *  (dogfood 2026-09-07, D3). */
+  saveViewUnavailable?: string | null;
   search?: ListToolbarSearch;
   /** The screen's own facet controls. */
   children?: ReactNode;
@@ -198,6 +208,7 @@ function DeleteConfirm({
 
 export function ListToolbar({
   presets,
+  presetsLabel = 'Views',
   onPreset,
   views,
   activeViewId,
@@ -210,6 +221,7 @@ export function ListToolbar({
   selection,
   note,
   viewError,
+  saveViewUnavailable,
 }: ListToolbarProps) {
   const [naming, setNaming] = useState(false);
   const [draft, setDraft] = useState('');
@@ -218,7 +230,9 @@ export function ListToolbar({
    *  the first, so there is never more than one live destructive control. */
   const [pendingDelete, setPendingDelete] = useState<number | null>(null);
 
-  const hasChips = !!presets?.length || !!views?.length || !!onSaveView;
+  // A screen that CANNOT save a view still gets the row, because that is the
+  // only place the reason can be said.
+  const hasChips = !!presets?.length || !!views?.length || !!onSaveView || !!saveViewUnavailable;
   const selecting = (selection?.count ?? 0) > 0;
 
   const commitName = () => {
@@ -253,7 +267,7 @@ export function ListToolbar({
           className="mb-2.5 flex flex-wrap items-center gap-1.5"
         >
           <span className="mr-0.5 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
-            Views
+            {presetsLabel}
           </span>
           {presets?.map((p) => (
             <Chip
@@ -261,6 +275,7 @@ export function ListToolbar({
               label={p.label}
               count={p.count}
               active={p.active}
+              title={p.title}
               onClick={() => onPreset?.(p.id)}
             />
           ))}
@@ -347,6 +362,26 @@ export function ListToolbar({
                 Save view
               </button>
             ))}
+          {/* Unavailable, and saying so. The control stays visible and inert so
+              the analyst learns the feature exists and what it needs, instead
+              of finding a blank strip and drawing the other conclusion. */}
+          {!onSaveView && saveViewUnavailable && (
+            <>
+              <button
+                type="button"
+                disabled
+                title={saveViewUnavailable}
+                className={cn(
+                  CHIP_BASE,
+                  'cursor-not-allowed border-dashed border-border-2 bg-transparent text-faint opacity-70',
+                )}
+              >
+                <Plus size={11} className="flex-none" />
+                Save view
+              </button>
+              <span className="text-[11.5px] text-faint">{saveViewUnavailable}</span>
+            </>
+          )}
           {viewError && (
             <span role="alert" className="text-[11.5px] text-danger">
               {viewError}

@@ -8,56 +8,61 @@ rules:
 
 # DNS tunneling and anomaly triage
 
-DNS tunneling (MITRE ATT&CK **T1071.004** Application Layer Protocol: DNS,
-**T1048** Exfiltration Over Alternative Protocol) abuses the one protocol
-almost every environment lets out. Data is encoded into query names and
-answers, so the tunnel lives in your resolver logs. The confounder: several
-legitimate products (EDR/antivirus telemetry, some CDN health checks,
-anti-spam lookups) also encode data in DNS and look tunnel-like.
+DNS tunneling abuses the one protocol that almost every environment lets out. The MITRE
+ATT&CK techniques are **T1071.004** Application Layer Protocol: DNS and **T1048**
+Exfiltration Over Alternative Protocol. A tunnel encodes data into query names and
+answers. The tunnel therefore lives in your resolver logs. Several legitimate products
+also encode data in DNS and look like a tunnel. These products include endpoint detection
+and response telemetry, antivirus telemetry, some content delivery network health checks
+and anti-spam lookups.
 
 ## Confirm the tunnel shape
 
-Pivot on the suspected client's DNS activity for the last 24 hours, grouped
-by registered domain (the zone one level below the TLD):
+Pivot on the DNS activity of the suspected client for the last 24 h. Group the queries by
+registered domain. The registered domain is the zone one level below the top-level
+domain.
 
-- **Volume to one zone**: a tunnel produces hundreds-to-thousands of queries
-  to a single registered domain, each with a **unique** subdomain label.
-  Normal domains repeat (caching works); tunnels never repeat.
-- **Label entropy and length**: encoded labels are long (often 30–63 chars
-  per label, names near the 253-char ceiling) and high-entropy
-  (base32/base64-ish character mixes). Human-named subdomains are short
-  dictionary words.
-- **Record-type mix**: heavy TXT, NULL, or CNAME traffic from an endpoint
-  is anomalous — workstations overwhelmingly ask for A/AAAA. TXT-dominant
-  flows to one zone are a strong tunnel indicator.
-- **Response entropy**: tunnels carry payloads downstream in answers;
-  NXDOMAIN floods with unique names suggest DGA rather than tunneling
-  (different playbook — malware trying to *find* C2, not talk through DNS).
+- **Volume to one zone**. A tunnel produces hundreds to thousands of queries to a single
+  registered domain. Each query carries a **unique** subdomain label. A normal domain
+  repeats its labels because caching works. A tunnel never repeats a label.
+- **Label entropy and length**. An encoded label is long. Labels are often 30 to 63
+  characters, and full names approach the ceiling of 253 characters. An encoded label has
+  high entropy and mixes characters like base32 or base64. A human-named subdomain is a
+  short dictionary word.
+- **Record-type mix**. Heavy TXT, NULL or CNAME traffic from an endpoint is anomalous. A
+  workstation asks for A and AAAA records most of the time. A flow to one zone that TXT
+  records dominate is a strong tunnel indicator.
+- **Response entropy**. A tunnel carries payloads downstream in the answers. A flood of
+  NXDOMAIN responses with unique names indicates a domain generation algorithm. That
+  algorithm needs a different runbook. The malware tries to find its command and control
+  server. The malware does not talk through DNS.
 
 ## Assess the zone
 
-- Age and reputation of the registered domain: tunnels typically use young,
-  cheaply registered domains with wildcard resolution. Query a name you
-  invent under the zone — if the authoritative server resolves *anything*,
-  that wildcard behavior fits tunneling infrastructure.
-- Fleet prevalence: security agents tunnel-like telemetry goes to vendor
-  zones queried by **every** protected host. One host alone talking to the
-  zone is the attacker pattern; verify against a known-vendor-domain list
-  before dismissing on prevalence alone.
+- Check the age and the reputation of the registered domain. A tunnel typically uses a
+  young, cheaply registered domain with wildcard resolution. Query a name that you invent
+  under the zone. Wildcard behavior fits tunnel infrastructure if the authoritative server
+  resolves the invented name.
+- Check the fleet prevalence. Tunnel-like telemetry from a security agent goes to a
+  vendor zone. **Every** protected host queries that vendor zone. One host alone that
+  talks to the zone is the attacker pattern. Verify the zone against a list of known
+  vendor domains before you dismiss the alert on prevalence alone.
 
-## Check the escape hatch
+## Check the resolver
 
-Also confirm the client is using the *sanctioned* resolver. Queries sent
-directly to external resolvers (or DoH endpoints, **T1572** Protocol
-Tunneling) bypass your logging and controls — a host that switched resolvers
-recently deserves scrutiny regardless of query content.
+Confirm that the client uses the *sanctioned* resolver. Queries sent directly to an
+external resolver bypass your logging and your controls. Queries sent to a DNS over HTTPS
+endpoint bypass them too. The MITRE ATT&CK technique is **T1572** Protocol Tunneling.
+Examine a host that changed its resolver recently. Examine it whatever the query content
+is.
 
 ## Verdict guidance
 
-- **Escalate** unique-label high-volume flows to a young or single-host zone,
-  and anything TXT/NULL-dominant that isn't attributable to a known product.
-  Estimate exfil volume (sum of encoded label bytes) for the case notes.
-- **Dismiss** vendor telemetry zones (name the vendor), and record them so
-  future alerts auto-contextualize.
-- For DGA-shaped NXDOMAIN storms, pivot to malware triage on the client —
-  the DNS is a symptom, not the channel.
+- **Escalate** a high-volume flow of unique labels to a young zone or a single-host zone.
+  Escalate any flow that TXT or NULL records dominate and that no known product explains.
+  Estimate the exfiltration volume for the notes of the investigation. Sum the bytes of
+  the encoded labels.
+- **Dismiss** a vendor telemetry zone. Name the vendor. Record the zone so that a future
+  alert carries the context.
+- Pivot to malware triage on the client for a storm of NXDOMAIN responses that fits a
+  domain generation algorithm. The DNS traffic is a symptom. DNS is not the channel.

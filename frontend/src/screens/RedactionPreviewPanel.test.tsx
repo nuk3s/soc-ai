@@ -31,7 +31,7 @@ describe('HighlightedText', () => {
     expect(marks).toHaveLength(1);
     expect(marks[0]).toHaveTextContent('ws-07.corp.example');
     expect(marks[0].className).toContain('#f5a623'); // MARK_VALUE amber
-    expect(marks[0]).toHaveAttribute('title', 'redacted as HOST_1');
+    expect(marks[0]).toHaveAttribute('title', 'soc-ai replaces this value with HOST_1.');
   });
 
   it('marks opaque labels green on the sanitized side, naming the value they replace', () => {
@@ -45,7 +45,7 @@ describe('HighlightedText', () => {
     expect(marks).toHaveLength(1);
     expect(marks[0]).toHaveTextContent('HOST_1');
     expect(marks[0].className).toContain('text-success'); // MARK_LABEL green
-    expect(marks[0]).toHaveAttribute('title', 'replaces ws-07.corp.example');
+    expect(marks[0]).toHaveAttribute('title', 'This label replaces ws-07.corp.example.');
   });
 
   it('matches longest-first so a substring value never splits the longer match', () => {
@@ -59,7 +59,7 @@ describe('HighlightedText', () => {
     );
     expect(marks).toHaveLength(1); // one whole-hostname mark, not ws-07 + remainder
     expect(marks[0]).toHaveTextContent('ws-07.corp.example');
-    expect(marks[0]).toHaveAttribute('title', 'redacted as HOST_2');
+    expect(marks[0]).toHaveAttribute('title', 'soc-ai replaces this value with HOST_2.');
   });
 
   it('matches values case-insensitively (the sanitizer lowercases host/email/MAC)', () => {

@@ -1,7 +1,8 @@
 import { Disc, FlaskConical, Wrench } from 'lucide-react';
 
-import { KIND, SEVERITY, VERDICT } from '../lib/tokens';
-import type { DetectionKind, Severity, Verdict } from '../lib/types';
+import { HUNT_KIND, KIND, SEVERITY, VERDICT } from '../lib/tokens';
+import { detectionKindTitle } from '../lib/tooltips';
+import type { DetectionKind, HuntKind, Severity, Verdict } from '../lib/types';
 
 // ---- "In development" badge — marks features that aren't wired up yet -------
 export function DevBadge({ label = 'In development' }: { label?: string }) {
@@ -36,9 +37,12 @@ export function RoleChip({ role }: { role: string }) {
 
 // ---- Detection kind badge (mono uppercase pill) ----------------------------
 export function KindBadge({ kind }: { kind: DetectionKind }) {
-  const k = KIND[kind];
+  // Guarded for the same reason SeverityTag is: an off-union kind from the API
+  // should cost one odd badge, not the row it sits in.
+  const k = KIND[kind] ?? KIND.alert;
   return (
     <span
+      title={detectionKindTitle(kind)}
       className="flex-none rounded-chip border px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em]"
       style={{ color: k.color, background: k.bg, borderColor: k.border }}
     >
@@ -49,12 +53,22 @@ export function KindBadge({ kind }: { kind: DetectionKind }) {
 
 // ---- Severity dot + label --------------------------------------------------
 export function SeverityTag({ sev }: { sev: Severity }) {
-  const s = SEVERITY[sev];
+  // A value off the union renders as "unknown" rather than crashing the row it
+  // sits in. `SEVERITY[sev]` was an unguarded index, so one unrecognized
+  // severity from the API took out every alert row on the screen with it.
+  const s = SEVERITY[sev] ?? SEVERITY.unknown;
+  // Hollow dot for "no severity on the document": a filled dot on the same
+  // ramp as the four rungs reads as a level, and this is the absence of one.
+  const hollow = s === SEVERITY.unknown;
   return (
     <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold" style={{ color: s.color }}>
       <span
         className="h-[7px] w-[7px] rounded-[2px]"
-        style={{ background: s.color, boxShadow: `0 0 7px ${s.glow}` }}
+        style={
+          hollow
+            ? { border: `1.5px solid ${s.color}` }
+            : { background: s.color, boxShadow: `0 0 7px ${s.glow}` }
+        }
       />
       {s.label}
     </span>
@@ -117,7 +131,7 @@ export function PipelineErrorChip({ hint, large }: { hint?: string | null; large
         (large ? 'px-3 py-[5px] text-[12.5px] uppercase tracking-[.01em]' : 'px-[9px] py-[2.5px] text-[11.5px]')
       }
       style={{ color: '#fca5a5', background: 'rgba(240,68,56,.09)', borderColor: 'rgba(240,68,56,.35)' }}
-      title={hint ?? 'This run failed before reaching a verdict — re-run it'}
+      title={hint ?? 'This run failed before it reached a verdict. Run it again.'}
     >
       <Wrench size={large ? 12 : 10} strokeWidth={2.5} />
       Pipeline error
@@ -138,10 +152,36 @@ export function SyntheticEvalBadge() {
     <span
       className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
       style={{ color: '#f5a623', borderColor: 'rgba(245,166,35,.4)', background: 'rgba(245,166,35,.09)' }}
-      title="This run executed against planted synthetic attack scenarios used to evaluate verdict quality — nothing in it describes real activity on your network."
+      title="This run used planted synthetic attack scenarios that measure verdict quality. Nothing in it describes real activity on your network."
     >
       <FlaskConical size={9} strokeWidth={2.5} />
-      Synthetic — evaluation data
+      Synthetic evaluation data
+    </span>
+  );
+}
+
+// ---- hunt kind badge --------------------------------------------------------
+// Marks how a hunt came to exist: a recurring schedule, or (since 1.5.0) the
+// declarative hunt catalog, which records a hunt with no model call. Without
+// it a spec-authored row is indistinguishable from one an analyst typed except
+// by its objective string. A manual hunt is the default and gets NO badge — a
+// chip on every row is noise, and the two automated kinds are the ones worth a
+// glance. HUNT_KIND still spells 'manual' because the hunt list's header line
+// and the detail page's kind field name the unbadged rows with it; the badge
+// is not the only place a kind is said. Same pill as KindBadge so the eye
+// reads it as the same sort of fact.
+// A kind this build does not know (a newer backend, an older fixture) renders
+// nothing rather than throwing — one unknown row must not blank the list.
+export function HuntKindBadge({ kind }: { kind: HuntKind }) {
+  const k = HUNT_KIND[kind];
+  if (!k || kind === 'chat') return null;
+  return (
+    <span
+      className="flex-none rounded-chip border px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em]"
+      style={{ color: k.color, background: k.bg, borderColor: k.border }}
+      title={k.title}
+    >
+      {k.label}
     </span>
   );
 }
@@ -154,7 +194,7 @@ export function RecordedRunChip() {
     <span
       className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-pill border px-[9px] py-[2.5px] text-[11.5px] font-semibold"
       style={{ color: '#8fb5f9', background: 'rgba(75,139,245,.09)', borderColor: 'rgba(75,139,245,.35)' }}
-      title="soc-ai ran this investigation for real earlier and recorded it — you are replaying the recording, not running live."
+      title="soc-ai ran this investigation earlier and recorded it. You are replaying the recording."
     >
       <Disc size={10} strokeWidth={2.5} />
       recorded run

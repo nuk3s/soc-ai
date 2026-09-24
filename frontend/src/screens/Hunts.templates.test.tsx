@@ -19,8 +19,19 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHuntSchedules: vi.fn().mockResolvedValue({ schedules: [], masterSwitchEnabled: true }),
   getHuntTemplates: getHuntTemplatesMock,
   startHuntConsole: startHuntConsoleMock,
+  getAnalytics: vi.fn().mockResolvedValue({ analytics: [], counts: {} }),
+  // The three surfaces above the list, in their quiet state.
+  getAnalyticHits: vi.fn().mockResolvedValue({
+    hits: [],
+    counts: { all: 0, unread: 0, live: 0, shadow: 0 },
+  }),
+  getNeedsYou: vi
+    .fn()
+    .mockResolvedValue({ unread_shadow_hits: 0, leads_needing_decision: 0, total: 0 }),
+  getLeads: vi.fn().mockResolvedValue([]),
 }));
 
+import { ShellProvider } from '../shell/ShellContext';
 import { Hunts } from './Hunts';
 
 // `availabilityKnown` is optional on the shared type, so a payload from a
@@ -47,14 +58,18 @@ function tpl(over: Partial<Template>): Template {
   };
 }
 
+// The starters live in the New hunt drawer now. `?new=1` opens it, so these
+// tests drive the picker where an analyst meets it.
 function renderHunts() {
   return render(
-    <MemoryRouter initialEntries={['/hunts']}>
+    <MemoryRouter initialEntries={['/hunts?new=1']}>
       <DemoProvider demo={false}>
-        <Routes>
-          <Route path="/hunts" element={<Hunts />} />
-          <Route path="/hunts/:id" element={<div>HUNT DETAIL</div>} />
-        </Routes>
+        <ShellProvider>
+          <Routes>
+            <Route path="/hunts" element={<Hunts />} />
+            <Route path="/hunts/:id" element={<div>HUNT DETAIL</div>} />
+          </Routes>
+        </ShellProvider>
       </DemoProvider>
     </MemoryRouter>,
   );
@@ -134,9 +149,9 @@ describe('TemplatePicker three-state catalogue', () => {
 
     const demoted = screen.getByText('Lateral movement');
     const title = demoted.closest('button')!.getAttribute('title')!;
-    expect(title).toContain('Needs a Windows host — none observed on this network.');
-    expect(title).toContain('Re-checked after every dossier sweep.');
-    expect(title).toContain('Still runnable.');
+    expect(title).toContain('This hunt needs a Windows host. The network shows none of it.');
+    expect(title).toContain('Each dossier sweep checks this again.');
+    expect(title).toContain('You can still run this hunt.');
 
     // collapsing hides it again
     fireEvent.click(expander);
@@ -155,8 +170,106 @@ describe('TemplatePicker three-state catalogue', () => {
     expect((box as HTMLTextAreaElement).value).toBe('Hunt for lateral movement.');
 
     fireEvent.click(screen.getByText('Start hunt'));
-    expect(startHuntConsoleMock).toHaveBeenCalledWith('Hunt for lateral movement.');
+    expect(startHuntConsoleMock).toHaveBeenCalledWith(
+      'Hunt for lateral movement.',
+      undefined,
+      THREE[2].id,
+    );
     expect(await screen.findByText('HUNT DETAIL')).toBeTruthy();
+  });
+
+  // A requirement that names alternatives ("zeek.rdp|system.security") is
+  // missing as a whole. The chip must read it back as a choice, not paste the
+  // separator at the operator.
+  it('reads an unmet alternative requirement back as "either … or …"', async () => {
+    getHuntTemplatesMock.mockResolvedValue([
+      tpl({
+        name: 'Lateral movement',
+        objectiveTemplate: 'Hunt for lateral movement.',
+        available: false,
+        missingDatasets: ['zeek.rdp|system.security'],
+      }),
+    ]);
+    renderHunts();
+
+    // Wait for the TEMPLATE-fed render: the legend only exists once a real,
+    // flagged template is in (the fallback pills share the builtin names).
+    await screen.findByText(/highlighted starters match the telemetry/);
+
+    const chip = screen.getByText('Lateral movement').closest('button')!;
+    expect(chip.getAttribute('data-availability')).toBe('missing');
+    expect(chip.getAttribute('title')).toContain(
+      'missing telemetry: zeek.rdp or system.security',
+    );
+  });
+
+  // Present only as imported history: the chip stays available (hunting
+  // history is legitimate) and says so, because "available" alone reads as
+  // "this grid is seeing it".
+  it('says when a template is available only through imported history', async () => {
+    getHuntTemplatesMock.mockResolvedValue([
+      tpl({
+        name: 'DNS / C2 exfiltration',
+        objectiveTemplate: 'Hunt for DNS tunneling.',
+        backfillOnlyDatasets: ['zeek.dns'],
+      }),
+      // A flagged sibling so the legend renders, which is what marks the
+      // template-fed pass (the fallback pills share the builtin names).
+      tpl({ name: 'Lateral movement', available: false, missingDatasets: ['zeek.rdp'] }),
+    ]);
+    renderHunts();
+    await screen.findByText(/highlighted starters match the telemetry/);
+
+    const chip = screen.getByText('DNS / C2 exfiltration').closest('button')!;
+    expect(chip.getAttribute('data-availability')).toBe('available');
+    expect(chip.getAttribute('data-backfill')).toBe('true');
+    expect(chip.getAttribute('title')).toContain('Backfill only: zeek.dns');
+    // NEGATIVE CONTROL: a live plane carries no such note.
+    const other = screen.getByText('Lateral movement').closest('button')!;
+    expect(other.getAttribute('data-backfill')).toBeNull();
+  });
+});
+
+// A starter can name analytics to run before the hunt itself
+// (t.analytics). The chip must hand the starter's id to `startHuntConsole`
+// so the server renders those analytics into the objective, and the
+// tooltip must tell the analyst what "Start hunt" is about to run first.
+describe('TemplatePicker starter analytics', () => {
+  it('passes the template id as the third argument to startHuntConsole', async () => {
+    const withAnalytics = tpl({
+      name: 'Credential abuse',
+      objectiveTemplate: 'Hunt for credential abuse.',
+      analytics: ['lockout_burst', 'rare_admin_logon'],
+    });
+    getHuntTemplatesMock.mockResolvedValue([withAnalytics]);
+    startHuntConsoleMock.mockResolvedValue({ hunt_id: 'h-100' });
+    renderHunts();
+
+    fireEvent.click(await screen.findByText('Credential abuse'));
+    fireEvent.click(screen.getByText('Start hunt'));
+
+    expect(startHuntConsoleMock).toHaveBeenCalledWith(
+      'Hunt for credential abuse.',
+      undefined,
+      withAnalytics.id,
+    );
+    expect(await screen.findByText('HUNT DETAIL')).toBeTruthy();
+  });
+
+  it('names the analytics in the chip tooltip', async () => {
+    getHuntTemplatesMock.mockResolvedValue([
+      tpl({
+        name: 'Credential abuse',
+        objectiveTemplate: 'Hunt for credential abuse.',
+        analytics: ['lockout_burst', 'rare_admin_logon'],
+      }),
+    ]);
+    renderHunts();
+
+    const chip = await screen.findByText('Credential abuse');
+    const title = chip.closest('button')!.getAttribute('title')!;
+    expect(title).toContain('Hunt for credential abuse.');
+    expect(title).toContain('Runs first: lockout_burst, rare_admin_logon.');
   });
 });
 
@@ -177,7 +290,7 @@ describe('TemplatePicker fallback presets (template service unreachable)', () =>
     // element with the text: /availability unknown…/" while passing on every
     // idle box and on five local reruns.
     expect(
-      await screen.findByText(/availability unknown while the template service is unreachable/i),
+      await screen.findByText(/The availability is unknown\. The list of starters could not be read/i),
     ).toBeTruthy();
   });
 
@@ -187,7 +300,7 @@ describe('TemplatePicker fallback presets (template service unreachable)', () =>
 
     await screen.findByText('Beaconing to rare IPs');
     expect(
-      screen.queryByText(/availability unknown while the template service is unreachable/i),
+      screen.queryByText(/The availability is unknown\. The list of starters could not be read/i),
     ).toBeNull();
   });
 });
@@ -205,7 +318,7 @@ describe('TemplatePicker fallback presets (template service unreachable)', () =>
 // list is real and only the annotation is missing.
 // ---------------------------------------------------------------------------
 
-const UNKNOWN_CAPTION = /availability unknown — the grid inventory could not be read/i;
+const UNKNOWN_CAPTION = /The availability is unknown\. The grid inventory could not be read/i;
 
 describe('TemplatePicker availability unknown (inventory unreadable)', () => {
   const UNCHECKED: Template[] = [
@@ -231,7 +344,7 @@ describe('TemplatePicker availability unknown (inventory unreadable)', () => {
     expect(chips.length).toBe(UNCHECKED.length); // the selector matches something
     for (const chip of chips) {
       expect(chip.getAttribute('data-availability')).toBe('unknown');
-      expect(chip.getAttribute('title')).toContain('Availability unknown');
+      expect(chip.getAttribute('title')).toContain('The availability is unknown');
     }
   });
 
@@ -240,7 +353,7 @@ describe('TemplatePicker availability unknown (inventory unreadable)', () => {
     renderHunts();
     await screen.findByText(UNKNOWN_CAPTION);
 
-    expect(screen.queryByText(/highlighted templates match telemetry/i)).toBeNull();
+    expect(screen.queryByText(/highlighted starters match the telemetry/i)).toBeNull();
   });
 
   it('keeps the amber flag and the legend on a HEALTHY grid', async () => {
@@ -254,7 +367,7 @@ describe('TemplatePicker availability unknown (inventory unreadable)', () => {
     ]);
     const { container } = renderHunts();
 
-    expect(await screen.findByText(/highlighted templates match telemetry/i)).toBeTruthy();
+    expect(await screen.findByText(/highlighted starters match the telemetry/i)).toBeTruthy();
     expect(screen.queryByText(UNKNOWN_CAPTION)).toBeNull();
 
     const states = [...container.querySelectorAll('[data-availability]')].map((c) =>
@@ -262,4 +375,5 @@ describe('TemplatePicker availability unknown (inventory unreadable)', () => {
     );
     expect(states).toEqual(['available', 'missing']);
   });
+
 });
