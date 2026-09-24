@@ -96,20 +96,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Create or update the Release from CHANGELOG.md
+      - name: Create or update the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"   # e.g. v1.2.3
           ver="${tag#v}"             # 1.2.3
-          # Body = everything under the '## [ver]' heading up to the next version
-          # heading (literal substring match, so dots aren't treated as regex).
-          notes="$(awk -v ver="$ver" 'index($0,"## [" ver "]")==1{grab=1;next} grab&&/^## \[/{exit} grab{print}' CHANGELOG.md)"
-          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
-            notes="Release ${tag}. See CHANGELOG.md."
-          fi
-          printf '%s\n' "$notes" > "${RUNNER_TEMP}/notes.md"
+          # The body is the release note under docs/releases/ when one exists,
+          # else the CHANGELOG section, cut to GitHub's 125,000-character
+          # limit. One script, so a hand-made Release reads the same.
+          bash scripts/release-notes.sh "$ver" "$tag" > "${RUNNER_TEMP}/notes.md"
           # Pre-release tags (v1.2.3-rc1) are flagged and never marked latest,
           # mirroring the image job's latest=auto behavior.
           case "$tag" in
