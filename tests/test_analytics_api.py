@@ -132,7 +132,7 @@ def _seed_shadow_hit(client: TestClient, *, complete: bool) -> None:
                 evidence={"sample_ids": ["d1"], "receipts": receipts},
                 source="catalog",
                 shadow=True,
-                now=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+                now=datetime.now(UTC) - timedelta(hours=1),
             )
 
     asyncio.run(seed())
@@ -179,7 +179,7 @@ def test_a_shadow_hit_with_no_receipts_at_all_could_not_run(client: TestClient) 
                 evidence={"sample_ids": ["d1"]},
                 source="catalog",
                 shadow=True,
-                now=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+                now=datetime.now(UTC) - timedelta(hours=1),
             )
 
     asyncio.run(seed())
@@ -202,7 +202,7 @@ def test_a_live_observation_is_not_a_shadow_hit(client: TestClient) -> None:
                 spec_id=_SHIPPED,
                 fingerprint=content_fingerprint(_SHIPPED, "10.1.2.5"),
                 source="catalog",
-                now=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+                now=datetime.now(UTC) - timedelta(hours=1),
             )
 
     asyncio.run(seed())
@@ -350,7 +350,7 @@ def _insert_observation(client: TestClient, **fields: Any) -> int:
     """
     from soc_ai.store.models import EntityObservation
 
-    born = fields.pop("born_at", datetime(2026, 9, 18, 12, 0))
+    born = fields.pop("born_at", datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1))
 
     async def go() -> int:
         async with client.app.state.db_sessionmaker() as db:

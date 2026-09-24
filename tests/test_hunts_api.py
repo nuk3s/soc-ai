@@ -3808,7 +3808,9 @@ def _seed_lead(client: TestClient) -> int:
     from soc_ai.hunting.weight import Kind
 
     async def go() -> int:
-        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        # Born one hour ago, not at a fixed date: the weight floors to zero a
+        # few days after any fixed date, and the test then fails by the calendar.
+        now = datetime.now(UTC) - timedelta(hours=1)
         async with client.app.state.db_sessionmaker() as db:
             await record_observation(
                 db,
@@ -3955,7 +3957,9 @@ def _seed_profile_lead(client: TestClient) -> int:
     from soc_ai.hunting.weight import Kind
 
     async def go() -> int:
-        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        # Born one hour ago, not at a fixed date: the weight floors to zero a
+        # few days after any fixed date, and the test then fails by the calendar.
+        now = datetime.now(UTC) - timedelta(hours=1)
         async with client.app.state.db_sessionmaker() as db:
             await record_observation(
                 db,
@@ -4568,7 +4572,9 @@ def test_observations_for_an_entity_leave_out_another_host(client: TestClient) -
     _seed_lead(client)
 
     async def other() -> None:
-        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        # Born one hour ago, not at a fixed date: the weight floors to zero a
+        # few days after any fixed date, and the test then fails by the calendar.
+        now = datetime.now(UTC) - timedelta(hours=1)
         async with client.app.state.db_sessionmaker() as db:
             await record_observation(
                 db,
@@ -4729,8 +4735,8 @@ def test_a_lead_observation_says_whether_its_analytic_can_be_opened(
                         spec_id=spec_id,
                         fingerprint=fingerprint,
                         birth_weight=0.7,
-                        born_at=datetime(2026, 9, 18, 12, 0),
-                        first_seen_at=datetime(2026, 9, 18, 12, 0),
+                        born_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
+                        first_seen_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
                         occurrences=1,
                         source=source,
                         lead_id=lead_id,
