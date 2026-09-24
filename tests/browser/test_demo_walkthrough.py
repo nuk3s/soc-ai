@@ -33,9 +33,10 @@ from playwright.sync_api import Page, expect
 _WAIT_MS = 15000
 
 # The one honesty-banner copy (soc_ai frontend src/lib/demo.tsx). A distinctive
-# substring: avoids coupling to the surrounding em-dashes while still proving the
-# real banner rendered.
-_BANNER = "these investigations were run by soc-ai and recorded"
+# substring of the current sentence, so the test proves the real banner rendered
+# without pinning its punctuation. Keep it in step with the copy: this assertion
+# runs only in the browser-smoke CI job, not in the local pytest gate.
+_BANNER = "soc-ai ran these investigations and recorded them"
 
 # A recorded replay alert (committed fixtures.json). Its recorded verdict is read
 # from the fixture rather than hardcoded, so a data refresh can't silently pass.
