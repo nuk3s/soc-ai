@@ -460,3 +460,39 @@ async def test_purging_never_touches_user_entities(settings_kratos: Settings) ->
         kept = await ep.load_profiles(db, entity_kind="user", entity_key="alice")
     assert removed == 0
     assert set(kept) == {"logon_users"}
+
+
+async def test_purging_keeps_host_rows_keyed_on_a_hostname(settings_kratos: Settings) -> None:
+    """A hostname is not an address, and failing the address test is not proof
+    of being foreign.
+
+    The process and logon dimensions key their host rows on ``host.name``.
+    Purging those as out of scope would delete every agent-plane baseline on
+    any estate that had configured its CIDRs, on every sweep.
+    """
+    import ipaddress
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for key, dim in (
+            ("dc01", "logon_users"),
+            ("WS01.corp.example", "process_names"),
+            ("52.123.129.14", "peers_out"),
+        ):
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                dimension=dim,
+                shape="categorical",
+                vector={},
+            )
+        removed = await ep.purge_out_of_scope(db, cidrs=[ipaddress.ip_network("10.1.0.0/16")])
+        dc = await ep.load_profiles(db, entity_kind="host", entity_key="dc01")
+        ws = await ep.load_profiles(db, entity_kind="host", entity_key="WS01.corp.example")
+        gone = await ep.load_profiles(db, entity_kind="host", entity_key="52.123.129.14")
+
+    assert removed == 1
+    assert set(dc) == {"logon_users"}
+    assert set(ws) == {"process_names"}
+    assert gone == {}

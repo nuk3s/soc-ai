@@ -38,7 +38,7 @@ from datetime import datetime
 from typing import Any
 
 from soc_ai.dossier.profile_math import summarise_cells
-from soc_ai.enrichment.discovery import _is_internal_ip
+from soc_ai.enrichment.discovery import _is_internal_ip, _is_ip_literal
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import DATASET_NAME_FIELDS, EPHEMERAL_PORT_FLOOR, is_peer_address
 from soc_ai.tools._provenance import LIVE, provenance_must_not
@@ -351,8 +351,14 @@ def _ours(key: str, *, entity_kind: str, cidrs: Sequence[Any]) -> bool:
 
     Only HOST entities are address-scoped. A user principal has no address, and
     running it through an address test would drop every user on the grid.
+
+    A host keyed on its name rather than an address passes for the same
+    reason. The process and logon dimensions key their rows on ``host.name``,
+    which only an agent on the machine can ship, and a hostname fails the
+    address test however local the machine is: with CIDRs configured every one
+    of those rows was dropped as foreign.
     """
-    if entity_kind != "host" or not cidrs:
+    if entity_kind != "host" or not cidrs or not _is_ip_literal(key):
         return True
     return _is_internal_ip(key, list(cidrs))
 
@@ -693,12 +699,16 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
             continue
 
         buckets = ((result.aggregations or {}).get(dimension) or {}).get("buckets") or []
-        entity_kind = "user" if dimension == "logon_users" else "host"
+        # Every categorical dimension is a HOST profile, the logon one
+        # included: its entity is the machine logged on to and the users are
+        # its members. It was once labelled ``user``, and since every reader
+        # loads a host's profile under ``host`` the stored logon set was
+        # unreachable.
         profiles.extend(
             _profiles_from_buckets(
                 buckets,
                 dimension=dimension,
-                entity_kind=entity_kind,
+                entity_kind="host",
                 window_days=window_days,
                 cidrs=cidrs,
             )

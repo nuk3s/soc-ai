@@ -256,19 +256,30 @@ async def purge_out_of_scope(db: AsyncSession, *, cidrs: Sequence[Any]) -> int:
     that basis would delete every baseline on an unconfigured estate.
 
     User entities are never touched. A principal has no address, and running
-    one through an address test deletes every user profile on the grid.
+    one through an address test deletes every user profile on the grid. Nor is
+    a host row keyed on a hostname: the process and logon dimensions key their
+    rows on ``host.name``, which fails an address test whatever machine it
+    names, and purging those would delete every agent-plane baseline on any
+    estate that had configured its CIDRs.
     """
     if not cidrs:
         return 0
 
-    from soc_ai.enrichment.discovery import _is_internal_ip  # noqa: PLC0415 - lazy, avoids a cycle
+    from soc_ai.enrichment.discovery import (  # noqa: PLC0415 - lazy, avoids a cycle
+        _is_internal_ip,
+        _is_ip_literal,
+    )
 
     rows = (
         (await db.execute(select(EntityProfile).where(EntityProfile.entity_kind == "host")))
         .scalars()
         .all()
     )
-    doomed = [r.id for r in rows if not _is_internal_ip(r.entity_key, list(cidrs))]
+    doomed = [
+        r.id
+        for r in rows
+        if _is_ip_literal(r.entity_key) and not _is_internal_ip(r.entity_key, list(cidrs))
+    ]
     if not doomed:
         return 0
 

@@ -320,6 +320,41 @@ async def test_out_of_scope_observations_are_purged(settings_kratos: Settings) -
     assert {r.entity_key for r in rows} == {"10.1.10.21"}
 
 
+async def test_purging_observations_keeps_host_rows_keyed_on_a_hostname(
+    settings_kratos: Settings,
+) -> None:
+    """A host keyed on its agent name is neither inside nor outside a CIDR.
+
+    The process and logon planes key their observations on ``host.name``.
+    The purge must keep those rows, as the profile purge does, or every
+    agent-plane departure is deleted at the start of the next sweep on any
+    estate with CIDRs configured.
+    """
+    import ipaddress
+
+    from soc_ai.hunting.leads import purge_out_of_scope_observations
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for key in ("dc01", "WS01.corp.example", "52.123.129.14"):
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                kind=Kind.OFF_HOURS,
+                spec_id="s",
+                fingerprint=content_fingerprint("hour", "3"),
+                now=_NOW,
+            )
+        removed = await purge_out_of_scope_observations(
+            db, cidrs=[ipaddress.ip_network("10.1.0.0/16")]
+        )
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+
+    assert removed == 1
+    assert {r.entity_key for r in rows} == {"dc01", "WS01.corp.example"}
+
+
 async def test_purging_observations_with_no_cidrs_removes_nothing(
     settings_kratos: Settings,
 ) -> None:

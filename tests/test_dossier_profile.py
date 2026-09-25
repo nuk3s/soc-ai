@@ -860,3 +860,84 @@ async def test_multicast_and_link_local_are_not_peers() -> None:
     )
     peers = next(p for p in sweep.profiles if p.dimension == "peers_out")
     assert set(peers.vector) == {"8.8.8.8", "10.1.10.255"}
+
+
+_LOGON_OK = {"system.security": {"user.name": 100, "host.name": 100}}
+_PROCESS_OK = {"windows.sysmon_operational": {"process.name": 100, "host.name": 100}}
+
+
+async def test_the_logon_dimension_is_keyed_on_the_host_and_labelled_so() -> None:
+    """The entity of ``logon_users`` is the host; the users are its members.
+
+    The rows were labelled ``user`` while being keyed on ``host.name``. Every
+    reader loads the host's profile under the ``host`` kind, so the stored
+    logon set could never be found: the DC's baseline was written and no
+    surface could read it.
+    """
+    es = _FakeES(
+        field_presence=_LOGON_OK,
+        agg_payloads={
+            "logon_users": {
+                "buckets": [
+                    _entity_bucket(
+                        "dc01.corp.example",
+                        [
+                            ("alice", 40, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z"),
+                            ("bob", 12, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z"),
+                        ],
+                    )
+                ]
+            }
+        },
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    logons = [p for p in sweep.profiles if p.dimension == "logon_users" and p.entity_key != "*"]
+    assert [p.entity_key for p in logons] == ["dc01.corp.example"]
+    assert {p.entity_kind for p in logons} == {"host"}
+    assert set(logons[0].vector) == {"alice", "bob"}
+
+
+async def test_a_hostname_keyed_host_row_survives_a_configured_estate() -> None:
+    """A host named by its agent is one of ours whatever the CIDR list says.
+
+    The process and logon dimensions key their entities on ``host.name``. The
+    estate test is an address test, and a hostname is not an address, so on
+    any deployment that had configured its CIDRs every one of those rows was
+    dropped as foreign -- the better configured the estate, the blinder the
+    agent dimensions.
+    """
+    import ipaddress
+
+    es = _FakeES(
+        field_presence={**_PROCESS_OK, **_LOGON_OK},
+        agg_payloads={
+            "process_names": {
+                "buckets": [
+                    _entity_bucket(
+                        "WS01.corp.example",
+                        [("explorer.exe", 40, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z")],
+                    )
+                ]
+            },
+            "logon_users": {
+                "buckets": [
+                    _entity_bucket(
+                        "dc01",
+                        [("alice", 40, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z")],
+                    )
+                ]
+            },
+        },
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es,
+        settings=_settings(),
+        window_hours=24 * 30,
+        time_anchor=_ANCHOR,
+        cidrs=[ipaddress.ip_network("10.1.0.0/16")],
+    )
+    keys = {(p.entity_kind, p.entity_key, p.dimension) for p in sweep.profiles if p.vector}
+    assert ("host", "WS01.corp.example", "process_names") in keys
+    assert ("host", "dc01", "logon_users") in keys

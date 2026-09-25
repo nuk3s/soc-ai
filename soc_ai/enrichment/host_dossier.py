@@ -1086,17 +1086,13 @@ def _coverage_fill(sweep: Any) -> list[tuple[str, str, str, int]]:
 
     A row exists for a host only when the aggregation returned a bucket for it,
     so the presence of any row from a plane is the proof that the plane
-    answered. The row is read whatever entity kind it carries: the logon
-    dimension keys its rows on the host and labels them ``user``.
+    answered. Only a dimension the host has NO row for is filled: the lane's
+    own row, whatever it holds, is the measurement and is never overwritten.
     """
     have: dict[str, set[str]] = {}
-    answered: dict[str, set[str]] = {}
     support: dict[str, int] = {}
     for b in sweep.profiles:
-        if b.entity_key == "*":
-            continue
-        answered.setdefault(b.entity_key, set()).add(b.dimension)
-        if b.entity_kind != "host":
+        if b.entity_key == "*" or b.entity_kind != "host":
             continue
         have.setdefault(b.entity_key, set()).add(b.dimension)
         support[b.entity_key] = max(support.get(b.entity_key, 0), int(b.support_days or 0))
@@ -1104,9 +1100,8 @@ def _coverage_fill(sweep: Any) -> list[tuple[str, str, str, int]]:
     fill: list[tuple[str, str, str, int]] = []
     for key, dims in have.items():
         days = support.get(key, 0)
-        seen = answered.get(key, set())
         for plane in _AGENT_PLANES:
-            measured = bool(seen & set(plane))
+            measured = bool(dims & set(plane))
             for dim in plane:
                 if dim in dims:
                     continue

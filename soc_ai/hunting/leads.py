@@ -171,19 +171,29 @@ async def purge_out_of_scope_observations(db: AsyncSession, *, cidrs: Sequence[A
 
     Fails OPEN on an empty CIDR list and never touches user entities, matching
     :func:`soc_ai.store.entity_profiles.purge_out_of_scope` — two functions
-    answering the same question differently is how they come to disagree.
+    answering the same question differently is how they come to disagree. A
+    host keyed on its agent name rather than an address (the process and logon
+    planes key on ``host.name``) is kept, as the profile purge keeps it: a
+    CIDR list cannot place a name.
     """
     if not cidrs:
         return 0
 
-    from soc_ai.enrichment.discovery import _is_internal_ip  # noqa: PLC0415 - lazy, avoids a cycle
+    from soc_ai.enrichment.discovery import (  # noqa: PLC0415 - lazy, avoids a cycle
+        _is_internal_ip,
+        _is_ip_literal,
+    )
 
     rows = (
         (await db.execute(select(EntityObservation).where(EntityObservation.entity_kind == "host")))
         .scalars()
         .all()
     )
-    doomed = [r.id for r in rows if not _is_internal_ip(r.entity_key, list(cidrs))]
+    doomed = [
+        r.id
+        for r in rows
+        if _is_ip_literal(r.entity_key) and not _is_internal_ip(r.entity_key, list(cidrs))
+    ]
     if not doomed:
         return 0
 

@@ -972,3 +972,147 @@ async def test_a_silent_plane_does_not_make_every_profiled_host_a_collapse(
     assert sweep.fired == ()
     assert sweep.results == ()
     await engine.dispose()
+
+
+class _LaneES(_FakeES):
+    """Answers the baseline lane: canned members per dimension, 30 days deep.
+
+    ``payloads`` maps a dimension to ``{entity: {member: count}}``. Every
+    other aggregation gets no buckets, and each entity carries a month of
+    active days so the profile clears the support floor and is scorable.
+    """
+
+    def __init__(self, payloads: dict[str, dict[str, dict[str, int]]]) -> None:
+        super().__init__()
+        self.payloads = payloads
+
+    async def search(self, index: str, query: Any, **kwargs: Any) -> Any:
+        aggs = kwargs.get("aggs") or {}
+        if "plane_probe" in aggs:
+            return await super().search(index, query, **kwargs)
+        key = next(iter(aggs), None)
+        buckets = [
+            {
+                "key": entity,
+                "doc_count": sum(members.values()),
+                "active_days": {
+                    "buckets": [
+                        {"key_as_string": f"2026-08-{d:02d}", "doc_count": 1} for d in range(1, 31)
+                    ]
+                },
+                "members": {
+                    "buckets": [
+                        {
+                            "key": m,
+                            "doc_count": c,
+                            "first": {"value_as_string": "2026-08-01T00:00:00Z"},
+                            "last": {"value_as_string": "2026-08-30T00:00:00Z"},
+                        }
+                        for m, c in members.items()
+                    ]
+                },
+            }
+            for entity, members in self.payloads.get(key or "", {}).items()
+        ]
+        return EsSearchResult(
+            total=0,
+            took_ms=1,
+            hits=[],
+            aggregations={key: {"buckets": buckets}} if key else {},
+            total_is_lower_bound=False,
+        )
+
+
+async def test_an_account_in_the_dc_logon_baseline_is_not_a_first_logon(
+    settings_kratos: Settings,
+) -> None:
+    """The logon baseline the lane builds is the one the sweep reads.
+
+    The lane keyed its logon rows on ``host.name`` and labelled them ``user``;
+    the sweep loads the host's profile under the ``host`` kind. On a DC that
+    also ships process telemetry the coverage fill then wrote an EMPTY
+    measured logon row under the kind the sweep reads, so every account that
+    logged on to the DC twice in a day was a first logon, on every sweep.
+    """
+    from soc_ai.dossier.profile import collect_entity_profiles
+    from soc_ai.enrichment.host_dossier import _coverage_fill
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        host = HostDossier(host_key=_SWITCH, ip=_SWITCH)
+        db.add(host)
+        await db.flush()
+        stamp = datetime.now(UTC).replace(tzinfo=None)
+        db.add(
+            HostDossierField(
+                dossier_id=host.id,
+                field="role",
+                operator_value="domain_controller",
+                operator_set_at=stamp,
+            )
+        )
+        db.add(
+            HostDossierField(
+                dossier_id=host.id,
+                field="hostname",
+                operator_value="dc01",
+                operator_set_at=stamp,
+            )
+        )
+        await db.commit()
+
+    agent_name = "DC01.corp.example"
+    lane = _LaneES(
+        {
+            "logon_users": {agent_name: {"alice": 40, "bob": 12}},
+            "process_names": {agent_name: {"lsass.exe": 400}},
+        }
+    )
+    built = await collect_entity_profiles(
+        elastic=lane,
+        settings=_settings_like(settings_kratos),
+        window_hours=24 * 30,
+        time_anchor=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    # Persist exactly as the dossier job does: the lane's rows, then the
+    # per-host coverage fill for the dimensions the lane left silent.
+    async with maker() as db:
+        for row in built.profiles:
+            await ep.upsert_profile(
+                db,
+                entity_kind=row.entity_kind,
+                entity_key=row.entity_key,
+                dimension=row.dimension,
+                shape=row.shape,
+                vector=row.vector,
+                coverage=row.coverage,
+                support_days=row.support_days,
+                window_days=30,
+            )
+        for key, dim, coverage, days in _coverage_fill(built):
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                dimension=dim,
+                shape="categorical",
+                vector=None if coverage == "blind" else {},
+                coverage=coverage,
+                support_days=days if coverage != "blind" else 0,
+                window_days=30,
+            )
+
+    es = _FakeES(recent={agent_name: {"alice": 2, "bob": 3, "mallory": 2}})
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(dimension="logon_users", roles=["domain_controller"]),
+        )
+
+    assert sweep.errors == ()
+    assert len(sweep.results) == 1
+    assert sweep.results[0].coverage == COVERAGE_MEASURED, sweep.results[0].note
+    assert [d.member for d in sweep.results[0].departures] == ["mallory"]
+    await engine.dispose()

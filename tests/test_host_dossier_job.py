@@ -2037,7 +2037,7 @@ async def test_an_agent_dimension_is_blind_unless_its_plane_answered(
             profiles=(
                 # The DC: flow and security logs, no process telemetry.
                 _row("10.0.0.7", "peers_out"),
-                _row("10.0.0.7", "logon_users", kind="user"),
+                _row("10.0.0.7", "logon_users"),
                 # A workstation with Sysmon and no logon documents.
                 _row("10.0.0.8", "peers_out"),
                 _row("10.0.0.8", "process_names"),
@@ -2059,8 +2059,10 @@ async def test_an_agent_dimension_is_blind_unless_its_plane_answered(
     # dimensions are blind, whatever the inventory says.
     assert dc["process_names"].coverage == "blind"
     assert dc["process_parents"].coverage == "blind"
-    # The logon plane answered for this host, so an empty logon set is a fact.
+    # The logon row is the lane's own, keyed on the host like every other
+    # dimension; the fill must not overwrite it with an empty placeholder.
     assert dc["logon_users"].coverage == "measured"
+    assert dc["logon_users"].vector == {"x": {"count": 2}}
 
     # The process plane answered, so the pair dimension is measured and empty.
     assert ws["process_parents"].coverage == "measured"
