@@ -6,14 +6,18 @@ reads the document the same way the agent's ``get_event_raw`` tool does.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from fastapi import Depends, Request
+from elastic_transport import TransportError
+from elasticsearch import ApiError
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import router
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools.get_event_raw import get_event_raw
@@ -43,7 +47,16 @@ async def get_event(
     elastic: ElasticClient = Depends(get_elastic),
 ) -> EventDocumentOut:
     """The full source of one document. 404 if the grid does not hold it."""
-    source = await get_event_raw(event_id, elastic=elastic, settings=settings)
+    # The same bound and the same error mapping as every other console grid
+    # read: fail fast with the retryable 503 card instead of holding the chip
+    # request for the ES client's whole retry budget and then answering 500.
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            source = await get_event_raw(event_id, elastic=elastic, settings=settings)
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
     if not isinstance(source, dict) or source.get("error") == "event not found":
         raise api_error(
             404,
