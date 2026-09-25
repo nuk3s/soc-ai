@@ -972,6 +972,79 @@ def test_hunt_console_manager_caps_concurrent_hunts() -> None:
     asyncio.run(_go())
 
 
+def test_stream_hunt_chat_refuses_at_concurrency_ceiling(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /hunts/chat/stream counts against the SAME ceiling as every other
+    start path. It used to drive hunt_recorded_run directly, so N concurrent
+    streams put N hunts on the model route no matter how full the manager was —
+    the incident the ceiling exists for, reachable from the API/CLI surface."""
+
+    async def _no_events(*_a: Any, **_kw: Any) -> Any:
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(hcm, "_MAX_CONCURRENT_HUNTS", 0)
+    with patch("soc_ai.api.hunt_runner.run_hunt", _no_events):
+        resp = client.post("/api/v1/hunts/chat/stream", json={"objective": "hunt for beaconing"})
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["reason"] == "could_not_start"
+
+
+def test_stream_hunt_chat_is_cancellable_from_the_console() -> None:
+    """A streamed hunt is registered with the HuntConsoleManager like a polled
+    one, so POST /hunts/{id}/cancel finds it (instead of 404 no_live_hunt), the
+    run is told it was an operator cancel, and the live stream ends."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui import routes_hunts
+
+    async def _go() -> None:
+        block = asyncio.Event()
+        seen: dict[str, Any] = {}
+
+        def _fake_run(_state: Any, **kw: Any) -> Any:
+            seen.update(kw)
+
+            async def _gen() -> Any:
+                yield "hunt_created", {"hunt_id": "h1"}
+                yield "hunt_started", {"sequence": 1}
+                await block.wait()  # hold the run open until cancelled
+
+            return _gen()
+
+        state = SimpleNamespace()
+        request = SimpleNamespace(app=SimpleNamespace(state=state), headers={})
+        with (
+            patch.object(hcm, "hunt_recorded_run", _fake_run),
+            patch.object(hcm, "ctx_from_state", lambda _s: MagicMock()),
+            patch.object(routes_hunts, "identify_caller", AsyncMock(return_value="tester")),
+        ):
+            resp = await routes_hunts.stream_hunt_chat(
+                request, routes_hunts.HuntChatIn(objective="hunt for beaconing")
+            )
+            events = resp.body_iterator
+            first = await anext(events)
+            assert first["event"] == "hunt_created"
+            assert '"h1"' in first["data"]
+            second = await anext(events)
+            assert second["event"] == "hunt_started"
+
+            mgr = hcm.get_manager(state)
+            assert mgr.cancel("h1") is True
+            # The run learns it was an EXPLICIT cancel (recorded as 'cancelled',
+            # not 'error'), and the live stream closes instead of hanging.
+            assert seen["cancel_token"].requested is True
+            with pytest.raises(StopAsyncIteration):
+                await anext(events)
+            for _ in range(5):
+                await asyncio.sleep(0)  # flush done-callbacks (slot cleanup)
+            assert "h1" not in mgr._tasks
+            assert mgr.cancel("h1") is False
+
+    asyncio.run(_go())
+
+
 def test_run_hunt_chat_turn_error_content_is_scrubbed_before_persisting() -> None:
     """F75: identical to the investigation-chat catch-all (chat_manager.py) —
     the raised exception's message is stringified straight into the persisted
