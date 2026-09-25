@@ -16,11 +16,18 @@ Archive layout (``soc-ai-backup-<UTC-stamp>.tar.gz``)::
 
 Sidecars are every regular file directly under ``soc_ai_data_dir`` except the
 DB itself and its ``-wal``/``-shm`` journals (the snapshot already contains
-their committed state) and ``*.tar.gz`` (a previous backup parked in the data
-dir is not app state). Today that means the Ed25519 decision-record signing
-key (``decision_signing_ed25519.key`` — losing it breaks signature
-verification for previously exported records) and the pinned sensor
-``known_hosts`` (the SSH trust anchor for PCAP fetch).
+their committed state), ``*.tar.gz`` (a previous backup parked in the data
+dir is not app state) and the one-shot ``bootstrap-admin-password.txt``
+(a plaintext credential the operator is meant to consume and retire, not
+state worth carrying into a restore). Today that means the Ed25519
+decision-record signing key (``decision_signing_ed25519.key`` — losing it
+breaks signature verification for previously exported records) and the
+pinned sensor ``known_hosts`` (the SSH trust anchor for PCAP fetch).
+
+The archive holds the signing key and the full store (password hashes,
+encrypted secrets, login-token hashes), so it is created mode 0600
+regardless of the process umask — the default ``--out`` is the CWD, which is
+often more widely readable than the data dir.
 
 The enrichment caches (blocklists, MaxMind, cloud prefixes) live in separate
 directories and are EXCLUDED by default: they are re-downloadable with
@@ -58,11 +65,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from alembic.script import ScriptDirectory
 
 from soc_ai import __version__
+from soc_ai.bootstrap_credential import bootstrap_credential_path
 from soc_ai.store.db import _migration_config
 
 MANIFEST_VERSION = 1
@@ -193,6 +202,9 @@ def _db_migration_head(db_path: Path) -> str | None:
 def _sidecar_files(data_dir: Path) -> list[Path]:
     """App-owned flat files next to the DB (see the module docstring)."""
     picked: list[Path] = []
+    # Resolved through the helper that owns the filename so this stays in
+    # step the day the sidecar moves.
+    credential = bootstrap_credential_path(SimpleNamespace(soc_ai_data_dir=data_dir))
     for p in sorted(data_dir.iterdir()):
         if not p.is_file():
             continue
@@ -200,6 +212,8 @@ def _sidecar_files(data_dir: Path) -> list[Path]:
             continue  # snapshot covers the DB; -wal/-shm are journal state
         if p.name.endswith(".tar.gz"):
             continue  # a parked backup archive is not app state
+        if p == credential:
+            continue  # a one-shot plaintext credential is not app state
         picked.append(p)
     return picked
 
@@ -254,7 +268,11 @@ def create_backup(
 
         tmp_archive = out_path.parent / f".{out_path.name}.tmp-{os.getpid()}"
         try:
-            with tarfile.open(tmp_archive, "w:gz") as tar:
+            # Create the temp file private (0600) rather than under the umask:
+            # the rename below carries that mode onto *out_path*, so the
+            # archive never spends a moment world-readable.
+            fd = os.open(tmp_archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh, tarfile.open(fileobj=fh, mode="w:gz") as tar:
                 manifest_bytes = json.dumps(manifest.as_dict(), indent=2).encode()
                 info = tarfile.TarInfo(_MANIFEST_ARCNAME)
                 info.size = len(manifest_bytes)

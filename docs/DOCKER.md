@@ -340,9 +340,12 @@ find "$DEST" -name 'soc-ai-backup-*.tar.gz' -type f -mtime "+$RETAIN_DAYS" -dele
 47 2 * * *  root  /usr/local/bin/soc-ai-backup.sh >/var/log/soc-ai-backup.log 2>&1
 ```
 
-Store the backups off the box, because they hold the decision-record signing key
-and the pinned sensor `known_hosts`. Test a restore at regular intervals. An
-untested backup is not a recovery plan.
+Store the backups off the box, because they hold the decision-record signing key,
+the pinned sensor `known_hosts` and the full store (password hashes, encrypted
+secrets). The archive is written mode `0600` regardless of the umask; keep it that
+way wherever you copy it. The one-shot `bootstrap-admin-password.txt` is never
+packed. Test a restore at regular intervals. An untested backup is not a recovery
+plan.
 
 Restore refuses every dangerous step without `--yes`. It does not overwrite an
 existing store, and it prints exactly what it would replace. It does not restore
