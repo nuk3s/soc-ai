@@ -8,6 +8,7 @@ allowlist coverage.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from soc_ai.oracle.sanitize import (
@@ -1118,3 +1119,146 @@ class TestSuffixFqdnDetectorReplacerInvariant:
             outbound = json.dumps(f"seen {fqdn} in traffic")
             issues = [i for i in unsafe_residue(outbound) if "internal host" in i]
             assert issues, f"detector missed {fqdn!r}"
+
+
+# ---------------------------------------------------------------------------
+# 21. Defanged identifiers — both gates must see through IOC defanging
+# ---------------------------------------------------------------------------
+
+
+class TestDefangedIdentifiers:
+    """Analyst prose (runbooks, case comments) routinely writes identifiers in
+    defanged notation (``10[.]0[.]0[.]5``, ``dc01(dot)corp(dot)local``,
+    ``hxxp://``).  That notation is still the identifier: both the replacer
+    and the independent residue detector must re-fang before matching, or a
+    private address leaves the box wrapped in brackets.
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "DC is 10[.]0[.]0[.]5 per runbook",
+            "DC is 10(.)0(.)0(.)5 per runbook",
+            "DC is 10{.}0{.}0{.}5 per runbook",
+            "DC is 10(dot)0(dot)0(dot)5 per runbook",
+            "DC is 10[ . ]0[ . ]0[ . ]5 per runbook",
+            "see hxxp://192[.]168[.]1[.]10/admin",
+            "see hXXps://172[.]16[.]0[.]1/admin",
+        ],
+    )
+    def test_defanged_private_ipv4_redacted(self, raw: str) -> None:
+        m = _clean_mapping()
+        out = sanitize(raw, m)
+        assert isinstance(out, str)
+        assert "IP_01" in out
+        # No octet survives in any spelling: dotted, bracketed, or spaced.
+        assert not re.search(r"\d\s*[\[({.]", out), out
+        assert "hxxp" not in out.lower()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "runbook host dc01[.]corp[.]local",
+            "runbook host dc01(dot)corp(dot)local",
+            "runbook host dc01{.}corp{.}local",
+            "runbook host hxxp://dc01[.]corp[.]local/x",
+        ],
+    )
+    def test_defanged_internal_fqdn_redacted(self, raw: str) -> None:
+        m = _clean_mapping()
+        out = sanitize(raw, m, extra_suffixes=(".corp.local",))
+        assert isinstance(out, str)
+        assert "HOST_01" in out
+        assert "dc01" not in out.lower()
+        assert "corp" not in out.lower()
+
+    def test_defanged_mixed_prose(self) -> None:
+        m = _clean_mapping()
+        raw = "the DC is 10[.]0[.]0[.]5 (dc01[.]corp[.]local); see hxxp://10[.]0[.]0[.]5/admin"
+        out = sanitize(raw, m, extra_suffixes=(".corp.local",))
+        assert out == "the DC is IP_01 (HOST_01); see http://IP_01/admin"
+
+    def test_desanitize_returns_fanged_form(self) -> None:
+        """Re-fanging is not reversed: the label maps back to the dotted
+        identifier the Oracle actually reasoned about, not the bracketed
+        spelling the analyst typed."""
+        m = _clean_mapping()
+        out = sanitize("DC is 10[.]0[.]0[.]5", m)
+        assert desanitize(out, m) == "DC is 10.0.0.5"
+        assert m.reverse["IP_01"] == "10.0.0.5"
+
+    def test_same_label_for_defanged_and_plain_spelling(self) -> None:
+        m = _clean_mapping()
+        out = sanitize("10.0.0.5 aka 10[.]0[.]0[.]5 aka 10(dot)0(dot)0(dot)5", m)
+        assert out == "IP_01 aka IP_01 aka IP_01"
+
+    def test_public_defanged_indicator_passes_through_refanged(self) -> None:
+        """A public IOC is only re-fanged, never redacted — the Oracle still
+        needs it to reason about the threat."""
+        m = _clean_mapping()
+        out = sanitize("c2 at 8[.]8[.]8[.]8 and evil[.]com via hxxps://evil[.]com/x", m)
+        assert out == "c2 at 8.8.8.8 and evil.com via https://evil.com/x"
+        assert m.reverse == {}
+
+    def test_allowlisted_defanged_public_ip_untouched(self) -> None:
+        m = _clean_mapping()
+        out = sanitize("watch 10[.]0[.]0[.]5 closely", m, allowlist=["10.0.0.5"])
+        assert out == "watch 10.0.0.5 closely"
+        assert m.reverse == {}
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "10[.]0[.]0[.]5",
+            "10(.)0(.)0(.)5",
+            "10{.}0{.}0{.}5",
+            "10(dot)0(dot)0(dot)5",
+            "hxxp://192[.]168[.]1[.]10/",
+        ],
+    )
+    def test_residue_flags_defanged_private_ipv4(self, raw: str) -> None:
+        issues = unsafe_residue(json.dumps(raw), wire_escaped=True)
+        assert any("private IPv4" in i for i in issues), issues
+
+    def test_residue_flags_defanged_internal_fqdn(self) -> None:
+        issues = unsafe_residue(
+            json.dumps("host dc01[.]corp[.]local seen"),
+            extra_suffixes=(".corp.local",),
+            wire_escaped=True,
+        )
+        assert any("internal host" in i for i in issues), issues
+
+    def test_residue_reports_refanged_form(self) -> None:
+        issues = unsafe_residue("DC is 10[.]0[.]0[.]5")
+        assert issues == ["residual private IPv4: 10.0.0.5"]
+
+    def test_residue_public_defanged_is_clean(self) -> None:
+        outbound = json.dumps("c2 8[.]8[.]8[.]8 evil[.]com hxxp://x")
+        assert unsafe_residue(outbound, wire_escaped=True) == []
+
+    def test_residue_allowlist_applies_to_refanged_form(self) -> None:
+        issues = unsafe_residue("watch 10[.]0[.]0[.]5", allowlist=["10.0.0.5"])
+        assert issues == []
+
+    def test_sanitize_case_loop_evidence(self) -> None:
+        from soc_ai.oracle.redact import sanitize_case
+
+        m = _clean_mapping()
+        out = sanitize_case(
+            {"loop_evidence": "runbook: the DC is 10[.]0[.]0[.]5; see hxxp://10[.]0[.]0[.]5/admin"},
+            m,
+        )
+        assert "10[.]" not in out["loop_evidence"]
+        assert "10.0.0.5" not in out["loop_evidence"]
+        assert "IP_01" in out["loop_evidence"]
+        assert unsafe_residue(json.dumps(out), wire_escaped=True) == []
+
+    def test_end_to_end_fail_closed(self) -> None:
+        """Whatever the replacer misses, the detector must still flag: a
+        defanged private address can never be clean at both gates."""
+        raw = "DC is 10[.]0[.]0[.]5 (dc01[.]corp[.]local)"
+        suffixes = (".corp.local",)
+        m = _clean_mapping()
+        out = sanitize(raw, m, extra_suffixes=suffixes)
+        assert unsafe_residue(json.dumps(out), extra_suffixes=suffixes, wire_escaped=True) == []
+        assert unsafe_residue(json.dumps(raw), extra_suffixes=suffixes, wire_escaped=True)

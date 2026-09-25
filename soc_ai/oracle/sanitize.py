@@ -27,6 +27,10 @@ WHAT IS REDACTED
 - UNC share paths (``\\<host>\\<share>``) — only the ``<host>`` component.
 - MAC addresses (always — they identify physical hardware).
 
+Defanged spellings of any of the above (``10[.]0[.]0[.]5``, ``dc01(dot)corp``,
+``hxxp://``) are re-fanged before the rules run, so the notation analysts use
+in runbooks and case comments cannot carry an identifier past the gate.
+
 WHAT PASSES THROUGH (load-bearing — do NOT touch)
 -------------------------------------------------
 Public IPs, public domains, URLs, file hashes (MD5/SHA-*), CVE IDs, ATT&CK
@@ -55,6 +59,20 @@ from soc_ai.oracle._cred_data import (
 # ---------------------------------------------------------------------------
 # Compiled patterns  (module-level — compiled once, reused everywhere)
 # ---------------------------------------------------------------------------
+
+# IOC "defanging" notation analysts use in runbooks and case comments so an
+# identifier is not clickable: a bracket/paren/brace-wrapped dot or ``dot``
+# word (``10[.]0[.]0[.]5``, ``dc01(dot)corp(dot)local``) and the ``hxxp``
+# scheme.  Every dotted pattern below requires a literal ``.`` between labels,
+# so a defanged internal address would otherwise pass every rule untouched and
+# leave the box wrapped in brackets.  The text is RE-fanged first (the same
+# treatment the web-search guard applies) so the rules see the real
+# identifier.  Re-fanging is not reversed by :func:`desanitize` — the label
+# maps back to the dotted form — and a regex-literal spelling such as
+# ``re(.)x`` is rewritten to ``re.x`` as a side effect, which is harmless for
+# a payload that is leaving the box anyway.
+_DEFANG_DOT_RE = re.compile(r"[\[({]\s*(?:\.|dot)\s*[\])}]", re.IGNORECASE)
+_DEFANG_HXXP_RE = re.compile(r"hxxp(s?)", re.IGNORECASE)
 
 # IPv4 — broad capture; each match is validated via ipaddress before redacting.
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -274,6 +292,11 @@ def _sanitize_str(
     placeholder.  Parking replaces originals with placeholders before any
     redaction rule runs; the restoration step swaps them back after all rules.
     """
+
+    # --- Re-fang defanged notation so every rule below (and the allowlist
+    # parking, which matches the dotted spelling) sees the real identifier.
+    text = _DEFANG_DOT_RE.sub(".", text)
+    text = _DEFANG_HXXP_RE.sub(r"http\1", text)
 
     # --- Park allowlisted tokens (replace original with placeholder) -----
     for original, ph in orig_to_ph.items():
@@ -612,7 +635,7 @@ def find_unknown_oracle_labels(obj: Any, mapping: Mapping) -> list[str]:
     return sorted(found)
 
 
-def unsafe_residue(
+def unsafe_residue(  # noqa: PLR0915 - one linear sweep, one step per identifier class
     text: str,
     *,
     allowlist: Iterable[str] = (),
@@ -657,6 +680,10 @@ def unsafe_residue(
     """
     issues: list[str] = []
     allow: set[str] = set(allowlist)
+
+    # --- 0. Re-fang defanged notation so every dotted pattern below sees the
+    # real identifier (flagged residue is reported in its re-fanged form).
+    text = _residue_refang(text)
 
     # --- 1. Private IPv4 (independent from sanitize._is_private_ipv4) -----
     # Re-implement the check without calling the sanitize helper so a change
@@ -786,6 +813,22 @@ def unsafe_residue(
 
 
 _OPAQUE_LABEL_RE = re.compile(r"(?:USER|HOST|IP|MAC|EMAIL)_\d+")
+
+# Independent re-fang for the residue sweep.  Deliberately re-declared (NOT
+# shared with the replacer's _DEFANG_*_RE) so the two paths cannot fail
+# together; keep the accepted notation aligned with the replacer when editing
+# either — a defanged form only the replacer understands would be flagged
+# here as residue, one only the detector understands would leak.
+_RESIDUE_DEFANG_DOT_RE = re.compile(r"[\[({]\s*(?:\.|dot)\s*[\])}]", re.IGNORECASE)
+_RESIDUE_DEFANG_HXXP_RE = re.compile(r"hxxp(s?)", re.IGNORECASE)
+
+
+def _residue_refang(text: str) -> str:
+    """Undo IOC defanging (``10[.]0[.]0[.]5``, ``a(dot)b``, ``hxxp://``) so the
+    residue patterns, which all require a literal ``.``, see the real value."""
+    text = _RESIDUE_DEFANG_DOT_RE.sub(".", text)
+    return _RESIDUE_DEFANG_HXXP_RE.sub(r"http\1", text)
+
 
 # Independent (do-not-share-with-redact) NetBIOS/Windows bare-hostname patterns.
 # Mirrors the conservative shape used by the redacter but is re-declared here so
