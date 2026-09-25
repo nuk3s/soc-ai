@@ -15,7 +15,7 @@ import pytest
 from pydantic import SecretStr
 from soc_ai.agent.triage import TriageReport
 from soc_ai.config import Settings
-from soc_ai.oracle.client import OracleResult, adjudicate
+from soc_ai.oracle.client import OracleResult, _parse_oracle_verdict, adjudicate
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -383,6 +383,62 @@ async def test_adjudicate_returns_none_on_unparseable_response() -> None:
         )
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Test: NaN / out-of-range confidence → rejected as unparseable, never clamped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw_confidence",
+    ["NaN", "Infinity", "-Infinity", "85", "1.5", "-0.1"],
+)
+def test_parse_oracle_verdict_rejects_nan_and_out_of_range_confidence(
+    raw_confidence: str,
+) -> None:
+    """A confidence outside 0.0-1.0 (or NaN/inf, which json.loads accepts) must
+    fail OracleVerdict validation rather than survive to the report mapper,
+    where a clamp would turn it into a fabricated 1.0."""
+    raw = (
+        '{"verdict": "false_positive", "confidence": '
+        + raw_confidence
+        + ', "summary": "Benign scanner.", "reasoning": "Known vuln scanner."}'
+    )
+    assert _parse_oracle_verdict(raw) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_confidence", ["NaN", "85"])
+async def test_adjudicate_rejects_nan_and_out_of_range_confidence(
+    raw_confidence: str,
+) -> None:
+    """A verdict whose confidence is NaN or percent-style must not become a
+    1.0-confidence report (which would clear the auto-ack threshold); it is
+    treated like any other unparseable answer and the local verdict is kept."""
+    settings = _make_settings()
+    ctx = _make_ctx(settings)
+    raw = (
+        '{"verdict": "false_positive", "confidence": '
+        + raw_confidence
+        + ', "summary": "Benign scanner.", "reasoning": "Known vuln scanner."}'
+    )
+    failure: dict[str, str] = {}
+
+    with (
+        patch("soc_ai.oracle.client._call_oracle_raw", AsyncMock(return_value=raw)),
+        patch("soc_ai.oracle.client.asyncio.sleep", AsyncMock()),
+    ):
+        result = await adjudicate(
+            ctx,
+            enriched=_stub_enriched(),
+            local_report=_stub_report(),
+            transcript_text="",
+            failure_out=failure,
+        )
+
+    assert result is None
+    assert failure.get("reason") == "no_parseable_verdict"
 
 
 # ---------------------------------------------------------------------------
