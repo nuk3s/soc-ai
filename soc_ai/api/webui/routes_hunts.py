@@ -2613,7 +2613,10 @@ async def dismiss_lead(request: Request, lead_id: int, body: LeadDismissIn) -> L
 async def hunt_lead(
     request: Request, lead_id: int, settings: Settings = Depends(get_settings_dep)
 ) -> dict[str, str]:
-    """Start a hunt from the lead. A second call returns the same hunt.
+    """Start a hunt from the lead.
+
+    A second call while that hunt runs returns the same hunt. A call after it
+    has finished starts another one, which is Hunt again on the lead page.
 
     The body of the start lives in :mod:`soc_ai.hunting.lead_hunt`, because the
     auto-hunt loop starts the same hunt. This route turns the refusals into
@@ -2659,7 +2662,11 @@ async def promote_lead(
         lead = await leads_store.get(db, lead_id)
         if lead is None:
             raise _lead_not_found(lead_id)
-        if lead.investigation_id:
+        # The second click on a promoted lead lands on its investigation. A
+        # reopened lead keeps the id as history and is open to decide again,
+        # so the id alone is not the answer: read it only while the
+        # promotion stands. Promoting again writes the new id over it.
+        if lead.investigation_id and lead.status == "promoted":
             return {"investigation_id": lead.investigation_id, "existing": "true"}
         if lead.status in leads_store.CLOSED_STATUSES:
             raise _lead_is_closed(lead, "promote")

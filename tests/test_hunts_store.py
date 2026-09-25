@@ -14,8 +14,9 @@ from datetime import datetime, timedelta
 
 from soc_ai.config import Settings
 from soc_ai.store import hunts as hunt_svc
+from soc_ai.store import leads as leads_store
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from soc_ai.store.models import Hunt
+from soc_ai.store.models import Hunt, HuntSpecState, Lead
 from sqlalchemy import inspect, text
 
 REPORT = {
@@ -293,6 +294,91 @@ async def test_delete_removes_hunt_and_events(settings_kratos: Settings) -> None
         assert await hunt_svc.get_with_events(db, hunt.id) is None
         # deleting a missing id returns False
         assert await hunt_svc.delete(db, hunt.id) is False
+    await engine.dispose()
+
+
+async def test_delete_releases_the_lead_and_the_fired_condition(settings_kratos: Settings) -> None:
+    """Nothing points at a deleted hunt afterwards.
+
+    Neither ``Lead.hunt_id`` nor ``HuntSpecState.hunt_id`` carries a foreign
+    key, so the delete has to clear them itself. A lead left ``hunting`` on a
+    hunt that is gone can never be hunted again: the button answers with the
+    dead id and the loop only takes leads with no id. A fired condition left
+    pointing at the deleted hunt reads as handled although nothing is left
+    for an operator to read.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        hunt = await hunt_svc.create(db, objective="x", started_by="a", kind="lead")
+        await hunt_svc.finalize(db, hunt.id, status="complete", report=REPORT)
+        hunted = Lead(status="open", entities_json=[["host", "10.0.0.5"]], shadow=False)
+        reopened = Lead(
+            status="open",
+            entities_json=[["host", "10.0.0.6"]],
+            shadow=False,
+            hunt_id=hunt.id,
+            dismissed_reason="benign_repeat",
+            dismissed_at=datetime(2026, 9, 20, 9, 0),
+        )
+        db.add_all([hunted, reopened])
+        await db.commit()
+        await leads_store.mark_hunting(db, hunted.id, hunt_id=hunt.id)
+        fired = HuntSpecState(
+            spec_id="spec",
+            scope_key="host-a",
+            fingerprint="fp",
+            disposition="fired",
+            hunt_id=hunt.id,
+        )
+        db.add(fired)
+        await db.commit()
+        hunted_id, reopened_id, fired_id = hunted.id, reopened.id, fired.id
+
+        assert await hunt_svc.delete(db, hunt.id) is True
+
+    async with maker() as db:
+        hunted_after = await db.get(Lead, hunted_id)
+        assert hunted_after is not None
+        # Back to where it was before the hunt, so it can take another one.
+        assert hunted_after.hunt_id is None and hunted_after.status == "open"
+        reopened_after = await db.get(Lead, reopened_id)
+        assert reopened_after is not None
+        # A reopened lead loses the id and keeps the dismissal as history.
+        assert reopened_after.hunt_id is None and reopened_after.status == "open"
+        assert reopened_after.dismissed_reason == "benign_repeat"
+        assert reopened_after.dismissed_at is not None
+        fired_after = await db.get(HuntSpecState, fired_id)
+        assert fired_after is not None
+        assert fired_after.hunt_id is None and fired_after.disposition == "fired"
+    await engine.dispose()
+
+
+async def test_reap_stale_pending_chat_resolves_orphaned_turns(settings_kratos: Settings) -> None:
+    """A pending hunt-chat turn whose task is gone is resolved to an error.
+
+    The hunt follow-up chat stores its assistant turn as a hunt event, not in
+    ``chat_messages``, so the chat reaper never sees it. Left pending, the
+    hunt's chat spins and every later question is refused as busy.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        hunt = await hunt_svc.create(db, objective="beaconing", started_by="a")
+        await hunt_svc.finalize(db, hunt.id, status="complete", report=REPORT)
+        await hunt_svc.add_chat_user_message(db, hunt.id, "which host?")
+        done = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+        await hunt_svc.finish_chat_assistant(db, done.id, content="10.0.0.5")
+        await hunt_svc.add_chat_user_message(db, hunt.id, "and the peer?")
+        pending = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+
+        assert await hunt_svc.reap_stale_pending_chat(db) == 1
+
+        by_id = {ev.id: ev for ev in await hunt_svc.list_chat_messages(db, hunt.id)}
+        assert by_id[pending.id].payload["status"] == "error"
+        assert "interrupted" in by_id[pending.id].payload["content"]
+        assert by_id[done.id].payload == {"content": "10.0.0.5", "status": "done"}
+        assert not any(ev.payload.get("status") == "pending" for ev in by_id.values())
+        # Nothing left to reap.
+        assert await hunt_svc.reap_stale_pending_chat(db) == 0
     await engine.dispose()
 
 

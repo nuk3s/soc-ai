@@ -1290,6 +1290,18 @@ async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
             "reaped %d orphaned 'pending' dashboard chat turn(s) at startup", orphaned_general
         )
 
+    # …and the hunt follow-up chat, whose turns live in hunt_events rather than
+    # in either chat table. Neither reaper above reaches them, and a pending
+    # turn left there keeps the hunt's chat spinning and refuses every later
+    # question on that hunt as busy. Startup only: the rows carry no timestamp
+    # for the periodic sweep to age them by.
+    async with db_sessionmaker() as db:
+        orphaned_hunt_chat = await hunt_svc.reap_stale_pending_chat(db)
+    if orphaned_hunt_chat:
+        _LOGGER.info(
+            "reaped %d orphaned 'pending' hunt chat turn(s) at startup", orphaned_hunt_chat
+        )
+
     # Expired sessions: get_session_user rejects them but leaves the row, so an
     # abandoned cookie's row lingers forever. Sweep them here (storage hygiene) —
     # the lookup is indexed so this is not a hot-path cost, just unbounded growth.

@@ -41,9 +41,10 @@ from soc_ai.main import (
 from soc_ai.store import auth as auth_svc
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import general_chat as gc_svc
+from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from soc_ai.store.models import ChatMessage, GeneralChatMessage
+from soc_ai.store.models import ChatMessage, GeneralChatMessage, HuntEvent
 
 
 def _make_app(status: _DiscoveryStatus) -> SimpleNamespace:
@@ -403,6 +404,38 @@ async def test_init_store_reaps_pending_chat_turns(settings_kratos: Settings) ->
         # the completed turn is untouched
         kept = await db.get(ChatMessage, done.id)
         assert kept is not None and kept.status == "done" and kept.content == "kept"
+
+
+@pytest.mark.asyncio
+async def test_init_store_reaps_pending_hunt_chat_turns(settings_kratos: Settings) -> None:
+    """A hunt follow-up chat turn still 'pending' after a restart is resolved to
+    'error' by _init_store, while a done turn is kept. The hunt chat lives in
+    hunt_events rather than chat_messages, so the chat reaper above never
+    reaches it; without its own sweep the row stayed pending forever and every
+    later question on that hunt was refused as busy."""
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    async with maker() as db:
+        hunt = await hunt_svc.create(db, objective="beaconing", started_by="t")
+        await hunt_svc.finalize(db, hunt.id, status="complete", report={"findings": []})
+        done = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+        await hunt_svc.finish_chat_assistant(db, done.id, content="kept", status="done")
+        pend = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+    await engine.dispose()
+
+    # Restart on the same on-disk DB → startup reap runs.
+    engine2 = make_engine(settings_kratos)
+    maker2 = await _init_store(engine2, settings_kratos)
+    async with maker2() as db:
+        reaped = await db.get(HuntEvent, pend.id)
+        assert reaped is not None
+        assert reaped.payload["status"] == "error"
+        assert "interrupted" in reaped.payload["content"]
+        kept = await db.get(HuntEvent, done.id)
+        assert kept is not None
+        assert kept.payload["status"] == "done" and kept.payload["content"] == "kept"
+    await engine2.dispose()
 
 
 @pytest.mark.asyncio

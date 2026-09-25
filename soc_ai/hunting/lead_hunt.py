@@ -43,8 +43,10 @@ AUTO_HUNT_ACTOR = "auto-hunt"
 class LeadHuntStart:
     """The hunt the lead now has.
 
-    ``existing`` is true when the lead already had one. A second click and a
-    loop wake that races it both land here rather than running a second agent.
+    ``existing`` is true when the lead already had one that has not finished.
+    A second click and a loop wake that races it both land here rather than
+    running a second agent. A finished hunt is not in the way: the start after
+    it is a second hunt, which the lead page offers as Hunt again.
     """
 
     hunt_id: str
@@ -78,6 +80,14 @@ async def start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadH
     The lead is marked hunting only after the console reports a hunt id. A
     lead marked hunting on a hunt that never began sits in In progress for
     ever and appears on no tab the analyst reads.
+
+    A lead that names a hunt is read against the hunt row. While that hunt
+    runs, the start lands on it: a second click and a loop wake that races it
+    must not run a second agent. Once it has finished the start is a second
+    hunt, the one the page offers after a visibility gap or a failed run; the
+    finished hunt stays as history and the lead moves to the new one. A hunt
+    id with no row is treated as running: the console writes the row before
+    it reports the id, so the id is the record that a start is under way.
     """
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
     from soc_ai.webui import hunt_console_manager as hcm  # noqa: PLC0415 - lazy
@@ -88,7 +98,9 @@ async def start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadH
         if lead is None:
             raise LeadHuntRefused("lead_not_found", lead_id)
         if lead.hunt_id:
-            return LeadHuntStart(hunt_id=str(lead.hunt_id), existing=True)
+            hunt = await db.get(Hunt, str(lead.hunt_id))
+            if hunt is None or hunt.status in HUNT_RUNNING_STATUSES:
+                return LeadHuntStart(hunt_id=str(lead.hunt_id), existing=True)
         if lead.status in leads_store.CLOSED_STATUSES:
             raise LeadHuntRefused("lead_is_closed", lead_id, lead=lead)
         rows = await leads_store.timeline(db, lead_id)
