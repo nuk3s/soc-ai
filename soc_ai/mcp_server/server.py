@@ -12,16 +12,24 @@ Run as a stdio MCP server::
 Or programmatically::
 
     from soc_ai.mcp_server.server import build_mcp
-    mcp = build_mcp(settings, elastic, misp=misp, enrichment=enrichment)
+    mcp = build_mcp(settings, elastic, misp=misp, enrichment=enrichment, audit=audit)
     await mcp.run_stdio_async()
+
+Pass an ``AuditLogger`` as ``audit`` (``__main__`` does) so each tool call an
+MCP client makes lands in the tamper-evident audit index like every other
+tool invocation; leaving it ``None`` runs the server unaudited.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 
+from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools.enrichment import (
@@ -39,6 +47,67 @@ from soc_ai.tools.query_detections import query_detections
 from soc_ai.tools.query_events import query_events_oql
 from soc_ai.tools.query_zeek import query_zeek_logs
 
+_LOGGER = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+def _result_summary(result: Any) -> dict[str, Any]:
+    """A bounded description of a tool's return value for the audit record.
+
+    The full body can be hundreds of events; the trail only needs to show
+    that the call happened and roughly how much came back.
+    """
+    if isinstance(result, list):
+        return {"count": len(result)}
+    return {"type": type(result).__name__}
+
+
+class _ToolAudit:
+    """Writes a ``tool_call`` / ``tool_result`` pair around each MCP tool call.
+
+    One instance per server process: stdio MCP has no per-client identity to
+    attribute to, so the trail groups everything a given launch did under a
+    single ``mcp-*`` session id and ``user="mcp"``. With ``audit=None`` every
+    call is a no-op, so a bare embedding keeps working unaudited.
+    """
+
+    def __init__(self, audit: AuditLogger | None) -> None:
+        self._audit = audit
+        self._session_id = f"mcp-{uuid.uuid4().hex[:12]}"
+
+    async def _record(self, kind: str, payload: dict[str, Any]) -> None:
+        # Audit must never block a read tool: these are fail-open writes,
+        # the same way the orchestrator's _audit swallows logger errors.
+        if self._audit is None:
+            return
+        try:
+            await self._audit.log_kind(self._session_id, kind, payload, user="mcp")
+        except Exception as e:
+            _LOGGER.warning("audit log_kind failed (kind=%s): %s", kind, e)
+
+    async def __call__(
+        self, name: str, args: dict[str, Any], call: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Run ``call`` with a ``tool_call`` before and a ``tool_result`` after.
+
+        ``args`` are the clamped values that actually reach the tool, not the
+        raw caller input, so the record matches what hit Elasticsearch. A
+        failing tool is still recorded (with the error) and then re-raised so
+        the MCP client sees it.
+        """
+        await self._record("tool_call", {"tool": name, "args": args})
+        try:
+            result = await call()
+        except Exception as e:
+            await self._record(
+                "tool_result",
+                {"tool": name, "ok": False, "error": f"{type(e).__name__}: {e}"},
+            )
+            raise
+        await self._record("tool_result", {"tool": name, "ok": True, **_result_summary(result)})
+        return result
+
 
 def build_mcp(
     settings: Settings,
@@ -46,6 +115,7 @@ def build_mcp(
     misp: MispClient | None = None,
     enrichment: EnrichmentContext | None = None,
     db_sessionmaker: Any = None,
+    audit: AuditLogger | None = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` server with the read-only tool surface.
 
@@ -55,11 +125,20 @@ def build_mcp(
     ``None`` the enrich tools degrade to internal-CIDR + MISP only (the caller
     — see ``__main__`` — normally builds and passes it so MCP clients get the
     same enrichment depth as the FastAPI path).
+
+    ``audit`` is the tamper-evident ES audit logger. Every tool invocation an
+    MCP client makes is written to it as a ``tool_call`` / ``tool_result``
+    pair under a per-server ``mcp-*`` session id and ``user="mcp"``, so grid
+    queries and IOC lookups made through this surface show up in
+    ``soc-ai audit verify`` and the per-kind egress counters exactly like
+    the agent's own tool calls do. ``__main__`` always passes one; a bare
+    embedding may leave it ``None`` and runs unaudited.
     """
     mcp: FastMCP = FastMCP("soc-ai")
     _blocklist = enrichment.blocklist if enrichment else None
     _maxmind = enrichment.maxmind if enrichment else None
     _cloud = enrichment.cloud if enrichment else None
+    _audited = _ToolAudit(audit)
 
     @mcp.tool()
     async def query_events(
@@ -75,12 +154,16 @@ def build_mcp(
         # request body with no ceiling (oql.py's _HARD_MAX_RESULTS only guards
         # an explicit `head` stage).
         max_results = min(max_results, 25)
-        result = await query_events_oql(
-            query,
-            elastic=elastic,
-            settings=settings,
-            time_range_minutes=time_range_minutes,
-            max_results=max_results,
+        result = await _audited(
+            "query_events",
+            {"query": query, "time_range_minutes": time_range_minutes, "max_results": max_results},
+            lambda: query_events_oql(
+                query,
+                elastic=elastic,
+                settings=settings,
+                time_range_minutes=time_range_minutes,
+                max_results=max_results,
+            ),
         )
         return result.model_dump(mode="json")
 
@@ -97,12 +180,20 @@ def build_mcp(
         # existing default.
         window_seconds = min(window_seconds, 14_400)
         max_per_pivot = min(max_per_pivot, 50)
-        result = await get_alert_context(
-            alert_id,
-            elastic=elastic,
-            settings=settings,
-            window_seconds=window_seconds,
-            max_per_pivot=max_per_pivot,
+        result = await _audited(
+            "alert_context",
+            {
+                "alert_id": alert_id,
+                "window_seconds": window_seconds,
+                "max_per_pivot": max_per_pivot,
+            },
+            lambda: get_alert_context(
+                alert_id,
+                elastic=elastic,
+                settings=settings,
+                window_seconds=window_seconds,
+                max_per_pivot=max_per_pivot,
+            ),
         )
         return result.model_dump(mode="json")
 
@@ -116,12 +207,16 @@ def build_mcp(
         # Same clamp as the agent's t_query_cases wrapper (toolset.py):
         # query_cases only rejects non-positive max_results, not unbounded ones.
         max_results = min(max_results, 10)
-        out = await query_cases(
-            query,
-            elastic=elastic,
-            settings=settings,
-            status=status,
-            max_results=max_results,
+        out = await _audited(
+            "cases",
+            {"query": query, "status": status, "max_results": max_results},
+            lambda: query_cases(
+                query,
+                elastic=elastic,
+                settings=settings,
+                status=status,
+                max_results=max_results,
+            ),
         )
         return [c.model_dump(mode="json") for c in out]
 
@@ -130,11 +225,15 @@ def build_mcp(
         """Search SOC detection rules by free-text."""
         # Same clamp as the agent's t_query_detections wrapper (toolset.py).
         max_results = min(max_results, 10)
-        out = await query_detections(
-            query,
-            elastic=elastic,
-            settings=settings,
-            max_results=max_results,
+        out = await _audited(
+            "detections",
+            {"query": query, "max_results": max_results},
+            lambda: query_detections(
+                query,
+                elastic=elastic,
+                settings=settings,
+                max_results=max_results,
+            ),
         )
         return [d.model_dump(mode="json") for d in out]
 
@@ -148,13 +247,22 @@ def build_mcp(
         """Pivot into Zeek logs by network.community_id."""
         # Same clamp as the agent's t_query_zeek_logs wrapper (toolset.py).
         max_results = min(max_results, 25)
-        return await query_zeek_logs(
-            community_id,
-            elastic=elastic,
-            settings=settings,
-            log_types=log_types,
-            time_range_minutes=time_range_minutes,
-            max_results=max_results,
+        return await _audited(
+            "zeek_logs",
+            {
+                "community_id": community_id,
+                "log_types": log_types,
+                "time_range_minutes": time_range_minutes,
+                "max_results": max_results,
+            },
+            lambda: query_zeek_logs(
+                community_id,
+                elastic=elastic,
+                settings=settings,
+                log_types=log_types,
+                time_range_minutes=time_range_minutes,
+                max_results=max_results,
+            ),
         )
 
     @mcp.tool()
@@ -162,11 +270,15 @@ def build_mcp(
         """Pull playbooks; optionally scoped to a given alert's linked rule."""
         # Same clamp as the agent's t_get_playbooks wrapper (toolset.py).
         max_results = min(max_results, 10)
-        out = await get_playbooks(
-            elastic=elastic,
-            settings=settings,
-            alert_id=alert_id,
-            max_results=max_results,
+        out = await _audited(
+            "playbooks",
+            {"alert_id": alert_id, "max_results": max_results},
+            lambda: get_playbooks(
+                elastic=elastic,
+                settings=settings,
+                alert_id=alert_id,
+                max_results=max_results,
+            ),
         )
         return [p.model_dump(mode="json") for p in out]
 
@@ -174,13 +286,17 @@ def build_mcp(
     async def enrich_indicator_ip(ip: str) -> dict[str, Any]:
         """Enrich an IP via internal-CIDR + local blocklists/GeoIP/cloud + optional MISP."""
         return (
-            await enrich_ip(
-                ip,
-                settings=settings,
-                misp=misp,
-                blocklist=_blocklist,
-                maxmind=_maxmind,
-                cloud=_cloud,
+            await _audited(
+                "enrich_indicator_ip",
+                {"ip": ip},
+                lambda: enrich_ip(
+                    ip,
+                    settings=settings,
+                    misp=misp,
+                    blocklist=_blocklist,
+                    maxmind=_maxmind,
+                    cloud=_cloud,
+                ),
             )
         ).model_dump(mode="json")
 
@@ -188,14 +304,24 @@ def build_mcp(
     async def enrich_indicator_domain(domain: str) -> dict[str, Any]:
         """Enrich a domain via local blocklists + optional MISP lookup."""
         return (
-            await enrich_domain(domain, settings=settings, misp=misp, blocklist=_blocklist)
+            await _audited(
+                "enrich_indicator_domain",
+                {"domain": domain},
+                lambda: enrich_domain(domain, settings=settings, misp=misp, blocklist=_blocklist),
+            )
         ).model_dump(mode="json")
 
     @mcp.tool()
     async def enrich_indicator_hash(hash_value: str, algo: str) -> dict[str, Any]:
         """Enrich a file hash via local blocklists + optional MISP lookup."""
         return (
-            await enrich_hash(hash_value, algo, settings=settings, misp=misp, blocklist=_blocklist)
+            await _audited(
+                "enrich_indicator_hash",
+                {"hash_value": hash_value, "algo": algo},
+                lambda: enrich_hash(
+                    hash_value, algo, settings=settings, misp=misp, blocklist=_blocklist
+                ),
+            )
         ).model_dump(mode="json")
 
     @mcp.tool()
@@ -209,6 +335,10 @@ def build_mcp(
         """
         # Same clamp as the agent's t_lookup_runbook wrapper (toolset.py).
         k = min(k, 5)
-        return await lookup_runbook(query, k=k, db_sessionmaker=db_sessionmaker)
+        return await _audited(
+            "runbook",
+            {"query": query, "k": k},
+            lambda: lookup_runbook(query, k=k, db_sessionmaker=db_sessionmaker),
+        )
 
     return mcp
