@@ -253,3 +253,30 @@ def test_investigator_doctrine_requires_the_pivot_before_attribution() -> None:
     assert "before" in p.lower() and "waypoint" in p.lower()
     # And the empty case must be framed as a finding, not a dead end.
     assert "autonomously" in p.lower()
+
+
+@pytest.mark.parametrize("lookback", [0, -30, 10**7])
+async def test_an_impossible_window_is_an_error_not_a_self_originated_verdict(
+    lookback: int,
+) -> None:
+    """A zero or negative lookback makes ``gte > lte``: the query is empty by
+    construction, and the empty branch reads as "nothing was observed driving
+    this host, so its behavior appears self-originated" — a claim that has to
+    be true, and here could not have been tested. A window past the cap the
+    sibling tools enforce is refused the same way, before touching ES.
+    """
+    import json
+
+    es = _es([])
+    result = await origin_chain(
+        "192.168.10.202",
+        elastic=es,
+        settings=_Settings(),
+        lookback_minutes=lookback,
+        time_anchor=ANCHOR,
+    )
+
+    assert result["error"] is True
+    assert "lookback_minutes" in result["message"]
+    assert "self-originated" not in json.dumps(result)
+    es.search.assert_not_called()
