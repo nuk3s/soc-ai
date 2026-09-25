@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -44,7 +44,7 @@ from soc_ai.dossier.profile import (
     _window_filter,
     resolve_plane,
 )
-from soc_ai.dossier.profile_math import cell_for, median
+from soc_ai.dossier.profile_math import TimeCell, cell_for, median
 from soc_ai.hunting.leads import (
     LeadOutcome,
     content_fingerprint,
@@ -58,6 +58,7 @@ from soc_ai.hunting.priors import (
     COVERAGE_MEASURED,
     COVERAGE_NOT_APPLICABLE,
     PriorResult,
+    _blank,
     evaluate_prior,
 )
 from soc_ai.hunting.receipts import build_receipts
@@ -70,7 +71,7 @@ from soc_ai.hunting.wording import (
     when,
 )
 from soc_ai.store import entity_profiles as ep
-from soc_ai.store.models import HostDossier, HostDossierField
+from soc_ai.store.models import EntityProfile, HostDossier, HostDossierField
 
 __all__ = ["PriorSweep", "run_prior_sweep"]
 
@@ -187,6 +188,13 @@ def _dimension_spec(dimension: str) -> tuple[tuple[str, ...], str, str, str] | N
     return None
 
 
+# How many entities one shaped recent read returns. The read is a terms bucket
+# over the busiest entities in the window; past this many, an entity that is
+# missing from the answer may simply have ranked below the cut, so absence
+# cannot be read as silence.
+RECENT_MAX_ENTITIES = 500
+
+
 async def _recent_shaped(
     elastic: Any,
     settings: Any,
@@ -198,13 +206,16 @@ async def _recent_shaped(
     probe_field: str,
     hours: int,
     tz: str,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, dict[str, Any]] | None:
     """Recent activity for a non-categorical dimension.
 
     For ``active_hours`` this is which local hours the entity was seen in. For
     a rate it is the MEDIAN per-hour count inside each of the three cells,
     which is what the baseline holds — comparing a total against a median would
     make every entity look like a spike in proportion to the window length.
+
+    ``None`` when no plane on this grid carries the field, as distinct from an
+    empty mapping for a plane that was quiet. See :func:`_recent_members`.
     """
     minutes = max(1, hours) * 60
     usable = await resolve_plane(
@@ -216,7 +227,7 @@ async def _recent_shaped(
             "network from an unreachable one"
         )
     if not usable:
-        return {}
+        return None
 
     query = {
         "bool": {
@@ -235,7 +246,7 @@ async def _recent_shaped(
     }
     aggs = {
         dimension: {
-            "terms": {"field": entity_field, "size": 500},
+            "terms": {"field": entity_field, "size": RECENT_MAX_ENTITIES},
             "aggs": {
                 "per_hour": {
                     "date_histogram": {
@@ -321,13 +332,19 @@ async def _recent_members(
     dimension: str,
     hours: int,
     cidrs: Sequence[Any] = (),
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, dict[str, Any]] | None:
     """What each entity did on this dimension lately, keyed entity -> members.
 
-    RAISES when the plane probe could not run. A probe failure is a broken
-    sweep, and returning an empty mapping for it would make a dead grid
-    indistinguishable from a quiet network — the sweep would report "no recent
-    activity on any entity" while Elasticsearch was down.
+    Three answers, the same three :func:`resolve_plane` gives, because each
+    reads differently to the operator:
+
+    a mapping   the plane answered; empty means nothing happened lately
+    ``None``    no plane on this grid carries the field — the dimension is
+                blind, and reporting it as "no recent activity" is the
+                false all-clear the coverage report exists to prevent
+    RAISES      the plane probe could not run. A probe failure is a broken
+                sweep, and returning an empty mapping for it would make a
+                dead grid indistinguishable from a quiet network
     """
     spec = _dimension_spec(dimension)
     if spec is None:
@@ -344,7 +361,7 @@ async def _recent_members(
             "network from an unreachable one"
         )
     if not usable:
-        return {}
+        return None
 
     query = {
         "bool": {
@@ -397,6 +414,33 @@ async def _recent_members(
     return out
 
 
+def _name_keys(name: str) -> tuple[str, ...]:
+    """The keys a hostname is looked up under: folded, and its short label.
+
+    Sysmon and winlogbeat write ``host.name`` the way Windows says it, which is
+    often upper-case and sometimes fully qualified, while the dossier holds
+    whatever DHCP or NTLM handed it. ``WS01.corp.example`` and ``ws01`` are one
+    machine and must find one role.
+    """
+    folded = name.strip().lower()
+    if not folded:
+        return ()
+    label = folded.split(".", 1)[0]
+    return (folded, label) if label != folded else (folded,)
+
+
+def _role_for(
+    roles: dict[str, tuple[str | None, float]], entity_key: str
+) -> tuple[str | None, float]:
+    """The role held for an entity keyed either by IP or by ``host.name``."""
+    if entity_key in roles:
+        return roles[entity_key]
+    for key in _name_keys(entity_key):
+        if key in roles:
+            return roles[key]
+    return (None, 0.0)
+
+
 async def _roles(db: AsyncSession) -> dict[str, tuple[str | None, float]]:
     """Every host's effective role and the confidence behind it.
 
@@ -404,17 +448,32 @@ async def _roles(db: AsyncSession) -> dict[str, tuple[str | None, float]]:
     confidence: a human who has declared a machine's role is not a 0.5 guess,
     and leaving it below the gate would make every declared host blind — the
     exact opposite of what declaring one is for.
+
+    Keyed on the dossier's IP AND on the hostname the dossier believes. The
+    process and logon dimensions key their entities on ``host.name``, and a
+    map keyed on the IP alone answered "role unknown" for every one of them:
+    five of the shipped role priors could never evaluate, and declaring the
+    role in the console changed nothing.
     """
     rows = (
         await db.execute(
             select(HostDossier.host_key, HostDossierField.field, HostDossierField)
             .join(HostDossierField, HostDossierField.dossier_id == HostDossier.id)
-            .where(HostDossierField.field == "role")
+            .where(HostDossierField.field.in_(("role", "hostname")))
         )
     ).all()
 
     out: dict[str, tuple[str | None, float]] = {}
-    for host_key, _field, row in rows:
+    names: dict[str, str] = {}
+    for host_key, field, row in rows:
+        if field == "hostname":
+            # The same precedence as the role: what the operator declared,
+            # else what the sweep still believes.
+            if row.operator_value:
+                names[host_key] = str(row.operator_value)
+            elif row.inferred_value and row.inferred_retracted_at is None:
+                names[host_key] = str(row.inferred_value)
+            continue
         # Attributes read directly, never through getattr with a default. The
         # first cut guessed the column was ``override_value`` (it is
         # ``operator_value``) and the default turned that typo into "no
@@ -434,7 +493,168 @@ async def _roles(db: AsyncSession) -> dict[str, tuple[str | None, float]]:
             str(row.inferred_value) if row.inferred_value else None,
             float(row.inferred_confidence) if row.inferred_confidence is not None else 0.0,
         )
+
+    for host_key, name in names.items():
+        if host_key not in out:
+            continue
+        for key in _name_keys(name):
+            out.setdefault(key, out[host_key])
     return out
+
+
+def _covered_cells(*, hours: int, tz: str, now: datetime | None = None) -> set[str]:
+    """Which of the three cells the last ``hours`` actually fell in.
+
+    A host that sent nothing over a Sunday has a zero weekend cell and nothing
+    to say about its work cell. Zero-filling every cell would make a Monday
+    morning sweep report a collapse in hours the window never covered.
+    """
+    end = now or datetime.now(UTC)
+    return {cell_for(end - timedelta(hours=back), tz=tz).value for back in range(max(1, hours) + 1)}
+
+
+async def _silent_profiled(db: AsyncSession, *, dimension: str, present: set[str]) -> list[str]:
+    """Hosts with a scorable baseline on ``dimension`` that were not seen lately.
+
+    The recent read only returns entities that had at least one document, so
+    the host the collapse prior was written for — the one whose agent was
+    killed — is exactly the one it never handed to the evaluator.
+    """
+    rows = (
+        await db.execute(
+            select(EntityProfile.entity_key).where(
+                EntityProfile.entity_kind == "host",
+                EntityProfile.dimension == dimension,
+                EntityProfile.coverage == COVERAGE_MEASURED,
+            )
+        )
+    ).all()
+    return sorted({str(key) for (key,) in rows if str(key) not in present})
+
+
+def _zero_cells(cells: set[str]) -> dict[str, Any]:
+    """What a silent host observed: nothing, in every covered cell.
+
+    No sample ids, because there are no documents behind an absence; the
+    departure cites the baseline it fell from instead.
+    """
+    return {
+        cell.value: {"value": 0.0, "sample_ids": []} for cell in TimeCell if cell.value in cells
+    }
+
+
+def _plane_of(
+    dimension: str, shaped: tuple[str, str, tuple[str, ...], str, str] | None
+) -> tuple[str, tuple[str, ...]]:
+    """The (probe field, candidate datasets) a dimension is read from."""
+    if shaped is not None:
+        return shaped[3], shaped[2]
+    spec = _dimension_spec(dimension)
+    if spec is None:
+        return dimension, ()
+    return spec[1], spec[0]
+
+
+async def _recent(
+    elastic: Any,
+    settings: Any,
+    *,
+    dimension: str,
+    shaped: tuple[str, str, tuple[str, ...], str, str] | None,
+    hours: int,
+    tz: str,
+    cidrs: Sequence[Any],
+) -> dict[str, dict[str, Any]] | None:
+    """The recent read for one dimension, through whichever reader it needs."""
+    if shaped is None:
+        return await _recent_members(
+            elastic, settings, dimension=dimension, hours=hours, cidrs=cidrs
+        )
+    _dim, shape, candidates, probe_field, entity_field = shaped
+    return await _recent_shaped(
+        elastic,
+        settings,
+        dimension=dimension,
+        shape=shape,
+        entity_field=entity_field,
+        candidates=candidates,
+        probe_field=probe_field,
+        hours=hours,
+        tz=tz,
+    )
+
+
+def _no_plane(
+    spec: HuntSpec, *, dimension: str, shaped: tuple[str, str, tuple[str, ...], str, str] | None
+) -> tuple[PriorResult, str]:
+    """The blind result and the note for a dimension no plane on this grid carries."""
+    probe_field, candidates = _plane_of(dimension, shaped)
+    reason = f"no plane on this grid carries {probe_field}"
+    return (
+        _blank(spec, None, COVERAGE_BLIND, reason),
+        f"{spec.id}: {reason}. Tried {', '.join(candidates)}.",
+    )
+
+
+async def _silent_hosts(
+    db: AsyncSession,
+    *,
+    spec_id: str,
+    dimension: str,
+    present: set[str],
+    hours: int,
+    tz: str,
+    notes: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Zero observations for every profiled host the recent read did not see.
+
+    Only called when the plane answered for somebody. With nothing seen on any
+    entity the shipper is down, and one collapse finding per profiled host
+    would say otherwise. A read that returned as many entities as it can hold
+    is the other case where absence is not silence: a profiled host outside
+    the answer may only have ranked below the cut, so nothing is scored and
+    the sweep says so in a note.
+    """
+    if len(present) >= RECENT_MAX_ENTITIES:
+        notes.append(
+            f"{spec_id}: recent read returned {RECENT_MAX_ENTITIES} entities, "
+            "so absence is not silence; silent hosts were not scored"
+        )
+        return {}
+    zero = _zero_cells(_covered_cells(hours=hours, tz=tz))
+    silent = await _silent_profiled(db, dimension=dimension, present=present)
+    return {entity_key: dict(zero) for entity_key in silent}
+
+
+async def _evaluate_entities(
+    db: AsyncSession,
+    spec: HuntSpec,
+    *,
+    observations: dict[str, dict[str, Any]],
+    roles: dict[str, tuple[str | None, float]],
+    results: list[PriorResult],
+    errors: list[str],
+) -> None:
+    """Score one spec against every entity that has something observed."""
+    assert spec.profile is not None
+    dimension = spec.profile.dimension
+    for entity_key, observed in observations.items():
+        role, confidence = _role_for(roles, entity_key)
+        try:
+            profiles = await ep.load_profiles(db, entity_kind="host", entity_key=entity_key)
+        except Exception as exc:
+            errors.append(f"{spec.id}/{entity_key}: profile read failed: {exc}")
+            continue
+
+        results.append(
+            evaluate_prior(
+                spec,
+                profile=profiles.get(dimension),
+                observed=observed,
+                role=role,
+                role_confidence=confidence,
+            )
+        )
 
 
 async def run_prior_sweep(
@@ -480,7 +700,10 @@ async def run_prior_sweep(
     # One recent read per DIMENSION, not per spec: several priors share a
     # dimension, and re-reading the plane for each is the difference between
     # four aggregations and nine.
-    recent_cache: dict[str, dict[str, dict[str, Any]]] = {}
+    #
+    # ``None`` in the cache means no plane on this grid carries the dimension.
+    recent_cache: dict[str, dict[str, dict[str, Any]] | None] = {}
+    tz = str(getattr(settings, "so_timezone", "UTC") or "UTC")
 
     for spec in priors:
         assert spec.profile is not None
@@ -488,31 +711,28 @@ async def run_prior_sweep(
         shaped = next((row for row in _SHAPED if row[0] == dimension), None)
         if dimension not in recent_cache:
             try:
-                if shaped is not None:
-                    _dim, shape, candidates, probe_field, entity_field = shaped
-                    recent_cache[dimension] = await _recent_shaped(
-                        elastic,
-                        settings,
-                        dimension=dimension,
-                        shape=shape,
-                        entity_field=entity_field,
-                        candidates=candidates,
-                        probe_field=probe_field,
-                        hours=recent_hours,
-                        tz=str(getattr(settings, "so_timezone", "UTC") or "UTC"),
-                    )
-                else:
-                    recent_cache[dimension] = await _recent_members(
-                        elastic,
-                        settings,
-                        dimension=dimension,
-                        hours=recent_hours,
-                        cidrs=cidrs,
-                    )
+                recent_cache[dimension] = await _recent(
+                    elastic,
+                    settings,
+                    dimension=dimension,
+                    shaped=shaped,
+                    hours=recent_hours,
+                    tz=tz,
+                    cidrs=cidrs,
+                )
             except Exception as exc:
                 errors.append(f"{spec.id}: recent read for {dimension} failed: {exc}")
                 recent_cache[dimension] = {}
         recent = recent_cache[dimension]
+
+        if recent is None:
+            # Blind, not quiet. The profile lane records the same grid state
+            # as a blind row; a zero row here read as an all-clear on a
+            # dimension nothing could measure.
+            result, note = _no_plane(spec, dimension=dimension, shaped=shaped)
+            results.append(result)
+            notes.append(note)
+            continue
 
         if not recent:
             notes.append(
@@ -520,23 +740,31 @@ async def run_prior_sweep(
                 f"{recent_hours} h"
             )
 
-        for entity_key, observed in recent.items():
-            role, confidence = roles.get(entity_key, (None, 0.0))
+        observations = dict(recent)
+        if (
+            recent
+            and shaped is not None
+            and shaped[1] == "numeric"
+            and spec.profile.test == "below"
+        ):
             try:
-                profiles = await ep.load_profiles(db, entity_kind="host", entity_key=entity_key)
-            except Exception as exc:
-                errors.append(f"{spec.id}/{entity_key}: profile read failed: {exc}")
-                continue
-
-            results.append(
-                evaluate_prior(
-                    spec,
-                    profile=profiles.get(dimension),
-                    observed=observed,
-                    role=role,
-                    role_confidence=confidence,
+                observations.update(
+                    await _silent_hosts(
+                        db,
+                        spec_id=spec.id,
+                        dimension=dimension,
+                        present=set(recent),
+                        hours=recent_hours,
+                        tz=tz,
+                        notes=notes,
+                    )
                 )
-            )
+            except Exception as exc:
+                errors.append(f"{spec.id}: profile read failed: {exc}")
+
+        await _evaluate_entities(
+            db, spec, observations=observations, roles=roles, results=results, errors=errors
+        )
 
     lead_outcome: LeadOutcome | None = None
     sweep = PriorSweep(

@@ -14,12 +14,12 @@ from it, and the sweep returns clean no matter what happened.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from soc_ai.config import Settings
-from soc_ai.hunting.prior_sweep import DEFAULT_RECENT_HOURS, run_prior_sweep
+from soc_ai.hunting.prior_sweep import DEFAULT_RECENT_HOURS, RECENT_MAX_ENTITIES, run_prior_sweep
 from soc_ai.hunting.priors import COVERAGE_BLIND, COVERAGE_MEASURED
 from soc_ai.hunting.spec import HuntSpec
 from soc_ai.so_client.elastic import EsSearchResult
@@ -191,14 +191,16 @@ async def _seed_profile(
     vector: Any,
     coverage: str = "measured",
     dimension: str = "served_ports",
+    shape: str = "categorical",
+    entity_key: str = _SWITCH,
 ) -> None:
     async with maker() as db:
         await ep.upsert_profile(
             db,
             entity_kind="host",
-            entity_key=_SWITCH,
+            entity_key=entity_key,
             dimension=dimension,
-            shape="categorical",
+            shape=shape,
             vector=vector,
             coverage=coverage,
             support_days=30,
@@ -745,4 +747,228 @@ async def test_the_plane_probe_names_every_candidate_dataset(
 
     assert es.probe_keys, "the sweep sent no plane probe"
     assert set(es.probe_keys) == {f"{d}|destination.port" for d in FLOW_CANDIDATES}
+    await engine.dispose()
+
+
+async def test_a_role_is_found_for_a_hostname_keyed_dimension(
+    settings_kratos: Settings,
+) -> None:
+    """The process and logon dimensions key their entities on ``host.name``.
+
+    The dossier keys its roles on the IP. A role lookup by the entity key
+    alone therefore missed on every one of those dimensions, and every
+    role-scoped prior on them was blind on every host, however clearly the
+    operator had declared the role.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        host = HostDossier(host_key=_SWITCH, ip=_SWITCH)
+        db.add(host)
+        await db.flush()
+        stamp = datetime.now(UTC).replace(tzinfo=None)
+        db.add(
+            HostDossierField(
+                dossier_id=host.id,
+                field="role",
+                operator_value="workstation",
+                operator_set_at=stamp,
+            )
+        )
+        db.add(
+            HostDossierField(
+                dossier_id=host.id,
+                field="hostname",
+                operator_value="ws01",
+                operator_set_at=stamp,
+            )
+        )
+        await db.commit()
+    # The agent names the host the way Windows does: upper-case and qualified.
+    # The dossier holds the short lower-case label. They are the same machine.
+    agent_name = "WS01.corp.example"
+    await _seed_profile(
+        maker,
+        vector={"explorer.exe": {"count": 40}},
+        dimension="process_names",
+        entity_key=agent_name,
+    )
+
+    es = _FakeES(recent={agent_name: {"psexec.exe": 3}})
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(dimension="process_names", roles=["workstation"]),
+        )
+
+    assert sweep.errors == ()
+    assert len(sweep.results) == 1
+    assert sweep.results[0].coverage == COVERAGE_MEASURED, sweep.results[0].note
+    assert [d.member for d in sweep.results[0].departures] == ["psexec.exe"]
+    await engine.dispose()
+
+
+class _NoPlaneES(_FakeES):
+    """A grid where no candidate dataset carries the probed field."""
+
+    async def search(self, index: str, query: Any, **kwargs: Any) -> Any:
+        aggs = kwargs.get("aggs") or {}
+        if "plane_probe" in aggs:
+            probe = aggs["plane_probe"]["filters"]["filters"]
+            return EsSearchResult(
+                total=0,
+                took_ms=1,
+                hits=[],
+                aggregations={"plane_probe": {"buckets": {k: {"doc_count": 0} for k in probe}}},
+                total_is_lower_bound=False,
+            )
+        return await super().search(index, query, **kwargs)
+
+
+async def test_a_grid_with_no_plane_for_a_dimension_is_blind_not_quiet(
+    settings_kratos: Settings,
+) -> None:
+    """No plane carries the field. That is blind, and it is not "no activity".
+
+    Reported as a quiet dimension, the trail row is all zeros and reads as an
+    all-clear on a grid that could not measure the dimension at all.
+    """
+    from soc_ai.store import prior_spec_runs
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40}})
+
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=_NoPlaneES(),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            record=True,
+        )
+        trail = await prior_spec_runs.newest(db)
+
+    assert sweep.errors == ()
+    assert sweep.fired == ()
+    assert sweep.coverage_counts()[COVERAGE_BLIND] >= 1
+    assert not any("no recent" in note for note in sweep.notes), sweep.notes
+    assert any("destination.port" in note for note in sweep.notes), sweep.notes
+    assert trail["prior-under-test"].blind >= 1
+    await engine.dispose()
+
+
+_EVERY_CELL = {
+    "work": {"median": 500.0, "dispersion": 20.0, "support_days": 20, "samples": 200},
+    "off": {"median": 500.0, "dispersion": 20.0, "support_days": 20, "samples": 200},
+    "weekend": {"median": 500.0, "dispersion": 20.0, "support_days": 8, "samples": 80},
+}
+
+
+async def test_a_host_that_went_silent_is_a_collapsed_rate_departure(
+    settings_kratos: Settings,
+) -> None:
+    """A host with a rate baseline that sent nothing lately has collapsed to zero.
+
+    The recent read only returns entities that had at least one document, so
+    the host the collapse analytic was written for -- the one whose agent was
+    killed -- never reached the evaluator. Only a partial drop could fire.
+    """
+    engine, maker = await _db(settings_kratos)
+    await _seed_profile(maker, vector=_EVERY_CELL, dimension="connection_rate", shape="numeric")
+
+    # Another host is still talking, so the plane itself is alive.
+    recent = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:00:00.000Z")
+    es = _ShapedES("10.1.10.7", [(recent, 300)])
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(dimension="connection_rate", test="below", roles=[]),
+        )
+
+    assert sweep.errors == ()
+    silent = [r for r in sweep.results if r.entity_key == _SWITCH]
+    assert len(silent) == 1, sweep.results
+    assert silent[0].coverage == COVERAGE_MEASURED
+    assert silent[0].departures, silent[0].note
+    assert all(d.observed_value == 0.0 for d in silent[0].departures)
+    assert all(d.sample_ids == () for d in silent[0].departures)
+    await engine.dispose()
+
+
+class _SaturatedES(_ShapedES):
+    """A shaped read that fills the terms bucket: many entities, one hour each."""
+
+    def _buckets(self) -> list[dict[str, Any]]:
+        stamp = self.hourly[0][0]
+        return [
+            {
+                "key": f"10.2.{i // 250}.{i % 250 + 1}",
+                "doc_count": 1,
+                "per_hour": {
+                    "buckets": [
+                        {
+                            "key_as_string": stamp,
+                            "doc_count": 1,
+                            "samples": _sample_hits(_doc_ids(stamp)),
+                        }
+                    ]
+                },
+            }
+            for i in range(RECENT_MAX_ENTITIES)
+        ]
+
+
+async def test_a_saturated_recent_read_does_not_score_absent_hosts_as_silent(
+    settings_kratos: Settings,
+) -> None:
+    """When the recent read is full, a host missing from it may just rank below the cut.
+
+    The read holds the busiest RECENT_MAX_ENTITIES entities. On an estate
+    larger than that, a profiled host outside the top set is still talking,
+    so it must not be scored as zero and formed into a collapse lead.
+    """
+    engine, maker = await _db(settings_kratos)
+    await _seed_profile(maker, vector=_EVERY_CELL, dimension="connection_rate", shape="numeric")
+
+    recent = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:00:00.000Z")
+    es = _SaturatedES("unused", [(recent, 1)])
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(dimension="connection_rate", test="below", roles=[]),
+        )
+
+    assert sweep.fired == ()
+    assert not [r for r in sweep.results if r.entity_key == _SWITCH], sweep.results
+    assert any("absence is not silence" in note for note in sweep.notes), sweep.notes
+    await engine.dispose()
+
+
+async def test_a_silent_plane_does_not_make_every_profiled_host_a_collapse(
+    settings_kratos: Settings,
+) -> None:
+    """When NOTHING was seen lately the plane is down, not every host.
+
+    A shipper outage across the grid must not become one collapse finding per
+    profiled host.
+    """
+    engine, maker = await _db(settings_kratos)
+    await _seed_profile(maker, vector=_EVERY_CELL, dimension="connection_rate", shape="numeric")
+
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=_FakeES(recent={}),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(dimension="connection_rate", test="below", roles=[]),
+        )
+
+    assert sweep.fired == ()
+    assert sweep.results == ()
     await engine.dispose()
