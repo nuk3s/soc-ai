@@ -381,12 +381,25 @@ def _resolve_suffixes(extra_suffixes: Iterable[str]) -> tuple[str, ...]:
 
     Tries to read from settings; falls back to ``_DEFAULT_SUFFIXES`` if
     the settings singleton is not loadable (required fields missing).
+
+    Every suffix is canonicalised to lowercase with a leading dot (the form
+    ``store.internal_identifiers.normalize("suffix", ...)`` produces) and
+    repeats are dropped.  The suffix-FQDN regexes below embed the suffix
+    verbatim after a label that cannot end in ``.``, and the email/domain
+    rules lowercase the value but not the suffix, so a caller passing
+    ``"acme.example"`` or ``".ACME.EXAMPLE"`` would otherwise defeat both the
+    replacer and the residue detector at once — nothing would refuse.
     """
     try:
         base = _settings_suffixes()
     except Exception:
         base = _DEFAULT_SUFFIXES
-    return base + tuple(extra_suffixes)
+    out: list[str] = []
+    for raw in (*base, *extra_suffixes):
+        lowered = raw.strip().lower().lstrip(".")
+        if lowered and "." + lowered not in out:
+            out.append("." + lowered)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

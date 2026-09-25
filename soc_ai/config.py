@@ -1631,11 +1631,23 @@ class Settings(BaseSettings):
     @field_validator("oracle_internal_suffixes", mode="before")
     @classmethod
     def _parse_suffixes(cls, v: Any) -> Any:
+        # Canonicalise each entry to lowercase with a leading dot, the same form
+        # the DB identifier path produces.  Every consumer assumes that form: the
+        # sanitizer's suffix-FQDN regex embeds the suffix verbatim after a label
+        # that cannot end in ".", and its email/domain rules lowercase the value
+        # but not the suffix, so "acme.example" or ".ACME.EXAMPLE" would match
+        # nothing and internal names would egress on the paths that read this
+        # tuple directly (CLI, eval, DB-less fallbacks).
         if isinstance(v, str):
             v = v.strip()
             if not v:
                 return ()
-            return tuple(s.strip() for s in v.split(",") if s.strip())
+            out: list[str] = []
+            for raw in v.split(","):
+                lowered = raw.strip().lower().lstrip(".")
+                if lowered and "." + lowered not in out:
+                    out.append("." + lowered)
+            return tuple(out)
         return v
 
     @field_validator("oracle_extra_hosts", mode="before")

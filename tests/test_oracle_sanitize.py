@@ -886,6 +886,31 @@ class TestSettingsSuffixes:
         out = sanitize(hostname, m)
         assert hostname not in out
 
+    @pytest.mark.parametrize("suffix", ["acme.example", ".ACME.EXAMPLE", "ACME.Example"])
+    def test_suffix_without_leading_dot_or_uppercase_still_redacts(self, suffix: str) -> None:
+        """A suffix supplied without its leading dot or in mixed case must
+        still drive both the replacer and the residue detector: the DB path
+        canonicalises suffixes, and callers handing us a raw tuple must get the
+        same treatment or an internal FQDN/email egresses with no refusal."""
+        raw = "beacon from dc01.acme.example seen, mail jdoe@acme.example"
+        m = _clean_mapping()
+        out = sanitize(raw, m, extra_suffixes=(suffix,))
+        assert "acme.example" not in out, out
+        assert "HOST_" in out and "EMAIL_" in out
+        assert unsafe_residue(raw, extra_suffixes=(suffix,)), suffix
+        assert unsafe_residue(out, extra_suffixes=(suffix,)) == []
+
+    def test_resolved_suffixes_are_canonical_and_deduplicated(self) -> None:
+        """The resolved tuple hands every downstream regex the same canonical
+        form and drops repeats so a suffix given twice does not build two
+        identical alternations."""
+        from soc_ai.oracle.sanitize import _resolve_suffixes
+
+        resolved = _resolve_suffixes(("acme.example", ".ACME.EXAMPLE", ".lan", " . ", ""))
+        assert resolved.count(".acme.example") == 1
+        assert resolved.count(".lan") == 1
+        assert all(s.startswith(".") and s == s.lower() and s != "." for s in resolved)
+
 
 # ---------------------------------------------------------------------------
 # Fix 3: oracle_extra_hosts wired identically into sanitize + unsafe_residue

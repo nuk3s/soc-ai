@@ -682,6 +682,21 @@ def test_csv_env_forms_for_oracle_and_proxy_lists(monkeypatch: pytest.MonkeyPatc
     assert Settings().proxy_trusted_ips == ["192.0.2.1"]
 
 
+def test_oracle_internal_suffixes_env_is_canonicalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A suffix typed without its leading dot or in mixed case must load in the
+    same canonical form the DB identifier path produces (lowercase, leading dot).
+
+    The sanitizer's suffix-FQDN regex embeds the suffix verbatim after a label
+    that cannot end in ``.``, and its email/domain rules lowercase the value but
+    not the suffix, so ``acme.example`` or ``.ACME.EXAMPLE`` silently matched
+    nothing on every consumer that reads the raw settings tuple.
+    """
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("ORACLE_INTERNAL_SUFFIXES", "acme.example, .ACME.Corp ,.lan,LAN, . ,")
+    s = Settings()
+    assert s.oracle_internal_suffixes == (".acme.example", ".acme.corp", ".lan")
+
+
 def test_apply_to_settings_returns_only_applied_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """apply_to_settings reports which overrides actually took.
 
