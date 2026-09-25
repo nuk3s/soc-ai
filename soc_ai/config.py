@@ -7,6 +7,7 @@ surface and inline documentation of each knob.
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address
 from pathlib import Path
@@ -622,6 +623,24 @@ class Settings(BaseSettings):
     soc_ai_tls_cert: Path | None = None
     soc_ai_tls_key: Path | None = None
     log_level: str = "INFO"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _validate_log_level(cls, v: Any) -> Any:
+        """Uppercase + validate log_level against the stdlib level names.
+
+        ``logging.basicConfig`` only knows the upper-case spellings while uvicorn
+        takes lowercase ones, so an operator who writes ``LOG_LEVEL=debug`` the
+        uvicorn way would boot the server and then lose it in lifespan with a
+        logging traceback. Normalise here and reject typos at load time instead.
+        """
+        if not isinstance(v, str):
+            raise ValueError(f"LOG_LEVEL must be a string, got {type(v).__name__}")
+        names = logging.getLevelNamesMapping()
+        upper = v.strip().upper()
+        if upper not in names:
+            raise ValueError(f"LOG_LEVEL must be one of: {', '.join(sorted(names))}; got {v!r}")
+        return upper
 
     # --- Web UI / local store -------------------------------------------
     soc_ai_data_dir: Path = Path("data")
@@ -1820,6 +1839,20 @@ class Settings(BaseSettings):
         # A blank SO_SSH_KNOWN_HOSTS must mean "unset" (derive the default path),
         # not Path("") == Path(".") which would point SSH at the CWD.
         "so_ssh_known_hosts",
+        # Same Path("") == Path(".") trap: .env.example ships both bare for the
+        # plain-HTTP-behind-a-proxy case, and a truthy "." would make `serve` hand
+        # uvicorn ssl_certfile="." and the CLI pick https:// for healthz/triage.
+        "soc_ai_tls_cert",
+        "soc_ai_tls_key",
+        # Optional provider keys / webhook URL, also shipped bare. SecretStr("")
+        # is not None, so a blank would read as "configured" on the data-sources
+        # page and in the doctor while every consumer refuses to use it.
+        "greynoise_api_key",
+        "shodan_api_key",
+        "maxmind_license_key",
+        "abuse_ch_auth_key",
+        "notify_webhook_url",
+        "crawl4ai_token",
         mode="before",
     )
     @classmethod

@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from soc_ai.config import Settings
 
@@ -53,6 +53,17 @@ def _iso_mtime(paths: list[Path]) -> str | None:
     return datetime.fromtimestamp(max(times), tz=UTC).isoformat()
 
 
+def _secret_set(val: SecretStr | None) -> bool:
+    """A key counts as configured only when it holds a non-blank value.
+
+    A bare ``KEY=`` line reads as ``None`` from the env, but a caller can still
+    hand us ``SecretStr("")``; the lookup tools treat that as not configured, and
+    the catalog has to say the same or the page shows a lookup as enabled that
+    every request refuses.
+    """
+    return val is not None and bool(val.get_secret_value().strip())
+
+
 def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
     """Introspect every enrichment data source against the live config + filesystem."""
     out: list[DataSourceOut] = []
@@ -84,7 +95,7 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             present=bool(maxmind),
             last_refreshed=_iso_mtime(maxmind),
             needs_key=True,
-            key_configured=settings.maxmind_license_key is not None,
+            key_configured=_secret_set(settings.maxmind_license_key),
             note="Needs MAXMIND_LICENSE_KEY to refresh.",
         )
     )
@@ -116,7 +127,7 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             present=misp_on,
             last_refreshed=None,
             needs_key=True,
-            key_configured=settings.misp_api_key is not None,
+            key_configured=_secret_set(settings.misp_api_key),
             note="Optional. Set MISP_URL + MISP_API_KEY to enable.",
         )
     )
@@ -137,7 +148,7 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             note="Free, no key. Enabled by the Online enrichment master switch.",
         )
     )
-    gn_key = settings.greynoise_api_key is not None
+    gn_key = _secret_set(settings.greynoise_api_key)
     out.append(
         DataSourceOut(
             id="greynoise",
@@ -152,7 +163,7 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             note="Needs the Online enrichment switch + GREYNOISE_API_KEY in .env.",
         )
     )
-    shodan_key = settings.shodan_api_key is not None
+    shodan_key = _secret_set(settings.shodan_api_key)
     out.append(
         DataSourceOut(
             id="shodan_host",

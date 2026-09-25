@@ -203,6 +203,57 @@ def test_so_ca_bundle_accepts_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.so_ca_bundle == Path("/etc/pki/ca.pem")
 
 
+def test_blank_tls_cert_and_key_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verbatim ``.env.example`` ships ``SOC_AI_TLS_CERT=`` / ``SOC_AI_TLS_KEY=``
+    bare; both must read as unset (plain HTTP), not ``Path(".")``."""
+    from soc_ai import cli
+
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("SOC_AI_TLS_CERT", "")
+    monkeypatch.setenv("SOC_AI_TLS_KEY", "")
+    s = Settings()
+    assert s.soc_ai_tls_cert is None
+    assert s.soc_ai_tls_key is None
+    monkeypatch.setattr(cli, "get_settings", lambda: s)
+    assert cli._resolve_base_url(None).startswith("http://")
+
+
+def test_log_level_is_normalised_to_uppercase(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``logging.basicConfig`` only accepts upper-case level names, so the
+    uvicorn-style lowercase spelling must be normalised rather than crash serve."""
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    assert Settings().log_level == "DEBUG"
+    monkeypatch.setenv("LOG_LEVEL", " warning ")
+    assert Settings().log_level == "WARNING"
+
+
+def test_log_level_rejects_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("LOG_LEVEL", "verbose")
+    with pytest.raises(ValidationError, match="LOG_LEVEL"):
+        Settings()
+
+
+def test_blank_provider_keys_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional API keys / webhook URL ship bare in ``.env.example``; a blank
+    value must be ``None`` so every ``is not None`` feature gate stays off."""
+    _setenv_required(monkeypatch)
+    fields = {
+        "GREYNOISE_API_KEY": "greynoise_api_key",
+        "SHODAN_API_KEY": "shodan_api_key",
+        "MAXMIND_LICENSE_KEY": "maxmind_license_key",
+        "ABUSE_CH_AUTH_KEY": "abuse_ch_auth_key",
+        "NOTIFY_WEBHOOK_URL": "notify_webhook_url",
+        "CRAWL4AI_TOKEN": "crawl4ai_token",
+    }
+    for env_name in fields:
+        monkeypatch.setenv(env_name, "")
+    s = Settings()
+    for env_name, attr in fields.items():
+        assert getattr(s, attr) is None, env_name
+
+
 def test_blocklist_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """New blocklist + maxmind settings have sane defaults."""
     _setenv_required(monkeypatch)

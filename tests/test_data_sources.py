@@ -52,6 +52,25 @@ def test_online_tools_default_off_and_need_config(tmp_path: Path) -> None:
     assert srcs["shodan_host"].needs_key is True  # paid, key-gated
     assert srcs["shodan_host"].enabled is False
 
+    # A blank key (the bare `KEY=` line in .env.example) is not a configured key:
+    # the lookup tools refuse with not_configured, so the catalog must agree.
+    blank = {
+        s.id: s
+        for s in collect_data_sources(
+            _settings(
+                tmp_path,
+                allow_online_enrichment=True,
+                greynoise_api_key=SecretStr(""),
+                shodan_api_key=SecretStr(""),
+                maxmind_license_key=SecretStr(""),
+            )
+        )
+    }
+    for sid in ("greynoise", "shodan_host"):
+        assert blank[sid].key_configured is False, sid
+        assert blank[sid].enabled is False, sid
+    assert blank["maxmind"].key_configured is False
+
 
 def test_freshness_reads_local_file_mtime(tmp_path: Path) -> None:
     (tmp_path / "tor_exits.txt").write_text("1.2.3.4\n")
