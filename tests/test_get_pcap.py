@@ -591,3 +591,44 @@ async def test_dispatch_table_includes_t_get_pcap() -> None:
     # Should return a dict with ok=False (disabled), not raise
     assert isinstance(result, dict)
     assert result.get("ok") is False
+
+
+# ---------------------------------------------------------------------------
+# window_minutes ceiling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_window_minutes_is_capped_before_the_sensor_is_touched() -> None:
+    """The window selects every so-pcap.* ring file it overlaps and runs one
+    ssh+tcpdump per file, so a model-supplied window of a year would sweep the
+    whole ring. The span handed to the fetch must stay within the ceiling."""
+    from datetime import timedelta
+
+    from soc_ai.tools import get_pcap as mod
+
+    settings = _make_settings(pcap_enabled=True)
+    anchor = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+    seen: list[tuple[datetime, datetime]] = []
+
+    def _fake_fetch(*args: Any) -> bytes:
+        start, end = args[-2], args[-1]
+        seen.append((start, end))
+        return b""
+
+    with patch.object(mod, "fetch_pcap_bytes", side_effect=_fake_fetch):
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            window_minutes=100_000,
+            alert_ts=anchor,
+        )
+
+    assert isinstance(result, PcapFacts)
+    assert len(seen) == 1
+    start, end = seen[0]
+    # The window is centred on the anchor: half-width each side, capped.
+    assert end - start <= timedelta(minutes=2 * mod.MAX_WINDOW_MINUTES)
+    assert start >= anchor - timedelta(minutes=mod.MAX_WINDOW_MINUTES)
+    assert end <= anchor + timedelta(minutes=mod.MAX_WINDOW_MINUTES)

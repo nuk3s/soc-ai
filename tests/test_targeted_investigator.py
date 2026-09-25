@@ -415,3 +415,64 @@ async def test_dispatch_es_query_tools_bind_without_auth_typeerror(
     # A successful bind returns a dict (model_dump of EsSearchResult); a binding
     # failure would have raised TypeError inside the dispatcher.
     assert isinstance(out, dict)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "module_path", "tool_args"),
+    [
+        ("t_web_search", "soc_ai.tools.web_search.web_search", {"query": "fs01.corp.example"}),
+        ("t_crawl_page", "soc_ai.tools.crawl_page.crawl_page", {"url": "http://fs01/x"}),
+    ],
+)
+async def test_dispatch_egress_tools_receive_effective_internal_identifiers(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    module_path: str,
+    tool_args: dict[str, Any],
+) -> None:
+    """Phase-D dispatch must hand web_search / crawl_page the SAME effective
+    internal-identifier sets the interactive wrappers pass (env config unioned
+    with the DB-discovered hosts/suffixes). Without them the tool guard falls
+    back to the raw settings tuples, so a discovered internal name that is not
+    in .env is not recognised and goes out to the search engine / crawler.
+    """
+    from soc_ai.agent.targeted_investigator import _dispatch_named_tool
+
+    seen: dict[str, Any] = {}
+
+    async def fake(
+        query: str = "",
+        url: str = "",
+        *,
+        settings: Any,
+        suffixes: tuple[str, ...] | None = None,
+        extra_hosts: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        seen.update(settings=settings, suffixes=suffixes, extra_hosts=extra_hosts)
+        return {"ok": True}
+
+    monkeypatch.setattr(module_path, fake)
+
+    class _StubCtx:
+        settings = object()
+        db_sessionmaker = None
+        effective_internal_suffixes = ("corp.example",)
+        effective_internal_hosts = ("fs01",)
+        _egress_idents_resolved = True
+
+    out = await _dispatch_named_tool(tool_name, tool_args, _StubCtx())
+    assert out == {"ok": True}
+    assert seen["settings"] is _StubCtx.settings
+    assert seen["suffixes"] == ("corp.example",)
+    assert seen["extra_hosts"] == ("fs01",)
+
+
+def test_clamp_arg_ceilings_caps_pcap_window() -> None:
+    """t_get_pcap's window drives SSH + tcpdump over the sensor's whole pcap
+    ring, so the synth-supplied window must be capped like max_results is."""
+    from soc_ai.agent.targeted_investigator import _clamp_arg_ceilings
+
+    assert _clamp_arg_ceilings("t_get_pcap", {"window_minutes": 999})["window_minutes"] == 60
+    small = {"src_ip": "10.0.0.1", "dst_ip": "10.0.0.2", "window_minutes": 5}
+    assert _clamp_arg_ceilings("t_get_pcap", small) is small

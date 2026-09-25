@@ -64,7 +64,7 @@ from soc_ai.tools.decode_payload import decode_payload
 from soc_ai.tools.discover import describe_dataset, field_values
 from soc_ai.tools.enrichment import enrich_domain, enrich_hash, enrich_ip
 from soc_ai.tools.get_event_raw import get_event_raw
-from soc_ai.tools.get_pcap import get_pcap_facts
+from soc_ai.tools.get_pcap import MAX_WINDOW_MINUTES, get_pcap_facts
 from soc_ai.tools.get_playbooks import get_playbooks
 from soc_ai.tools.get_rule_content import get_rule_content
 from soc_ai.tools.greynoise import greynoise
@@ -446,8 +446,8 @@ def _clamp_tool_result[T](value: T) -> T:
     budget while preserving the wrapper fields (``total``, ``took_ms``,
     ``aggregations``), and tag the dict with ``__truncated__`` /
     ``__total_items__`` / ``__shown_items__``.
-    For other dicts: tag with ``__truncated__`` only — we don't slice
-    nested fields (that's domain-specific).
+    For other dicts: clip the oversized string leaves (see
+    ``_clip_plain_dict``) and list the cut paths under ``__clipped_fields__``.
     For primitive / string returns: clip to budget chars and signal.
     """
     # The synthetic-eval marker never crosses the model boundary. Applied here
@@ -565,11 +565,65 @@ def _clamp_tool_result[T](value: T) -> T:
                         else:
                             hi = mid - 1
                     return cast("T", _agg_candidate(lo))
-        # No recognized list field — fall back to flag-only.
-        return cast("T", {**value, "__truncated__": True, "__total_bytes__": len(encoded)})
+        # No recognized list field — nothing structural to drop, so shorten
+        # the oversized string leaves instead.
+        return cast("T", _clip_plain_dict(value, len(encoded)))
     # Strings / numbers — stringify + clip.
     text = str(value)
     return cast("T", text[: _TOOL_RESULT_BUDGET_BYTES - 100] + " …[truncated]")
+
+
+# Per-leaf cap for a plain dict with no list to slice. t_get_event_raw's raw
+# _source is the case that matters: a Suricata alert carries payload,
+# payload_printable and the whole EVE record in message, 100KB+ that used to
+# pass through with only a flag. The cap is halved down to the floor while the
+# result stays over budget. Both are multiples of 4 so a clipped base64 prefix
+# still decodes.
+_CLIP_LEAF_CHARS = 2048
+_CLIP_LEAF_FLOOR = 256
+
+
+def _clip_plain_dict(value: dict[str, Any], total_bytes: int) -> dict[str, Any]:
+    """Shrink an over-budget dict by cutting its longest string leaves.
+
+    Every key survives; the paths that were cut are listed under
+    ``__clipped_fields__`` so the model knows a decode of ``payload`` works on
+    a prefix only. The cap is tightened while the result stays over budget.
+    """
+    cap = _CLIP_LEAF_CHARS
+    while True:
+        clipped: list[str] = []
+        candidate: dict[str, Any] = {
+            **_clip_string_leaves(value, cap, "", clipped),
+            "__truncated__": True,
+            "__total_bytes__": total_bytes,
+        }
+        if clipped:
+            candidate["__clipped_fields__"] = clipped
+        if len(json.dumps(candidate)) <= _TOOL_RESULT_BUDGET_BYTES or cap <= _CLIP_LEAF_FLOOR:
+            return candidate
+        cap //= 2
+
+
+def _clip_string_leaves(value: Any, cap: int, path: str, clipped: list[str]) -> Any:
+    """Copy ``value`` with every string leaf longer than ``cap`` cut to it.
+
+    A marker naming the removed length is appended to each cut leaf and the
+    leaf's dotted path is recorded in ``clipped``. The input is never mutated.
+    """
+    if isinstance(value, str):
+        if len(value) <= cap:
+            return value
+        clipped.append(path)
+        return f"{value[:cap]}…[clipped {len(value) - cap} chars]"
+    if isinstance(value, dict):
+        return {
+            k: _clip_string_leaves(v, cap, f"{path}.{k}" if path else str(k), clipped)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_clip_string_leaves(v, cap, f"{path}[{i}]", clipped) for i, v in enumerate(value)]
+    return value
 
 
 # Framing carried on every t_host_dossier result. The dossier is inferred from
@@ -1899,10 +1953,15 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
             - ET MALWARE / TROJAN / EXPLOIT / HUNTING rules (validate the payload)
             - Kerberoast / psexec lateral movement (confirm the wire protocol)
 
+            window_minutes is the half-width around the alert timestamp (default
+            2, capped at 60 — every ring file the window overlaps costs a tcpdump
+            pass on the sensor).
+
             DO NOT call for clean-internal informational alerts
             (signature_severity=Informational, internal-internal, alert_action=allowed)
             where the prefetch is already sufficient.
             """
+            window_minutes = min(window_minutes, MAX_WINDOW_MINUTES)
             if dup := _dedup_result(
                 ctx,
                 "t_get_pcap",

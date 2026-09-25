@@ -19,7 +19,12 @@ import logging
 from collections.abc import Callable
 from typing import Any, NoReturn, cast
 
-from soc_ai.agent.toolset import PHASE_D_TOOLS, _clamp_tool_result, strip_synth_markers
+from soc_ai.agent.toolset import (
+    PHASE_D_TOOLS,
+    _clamp_tool_result,
+    _egress_tool_idents,
+    strip_synth_markers,
+)
 from soc_ai.agent.triage import TargetedGap
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +43,10 @@ _PHASE_D_ARG_CEILINGS: dict[str, dict[str, int]] = {
     "t_query_detections": {"max_results": 10},
     "t_get_playbooks": {"max_results": 10},
     "t_lookup_runbook": {"k": 5},
+    # The pcap window drives one ssh + tcpdump pass per ring file it overlaps on
+    # the production sensor, so an oversized window is sensor load, not just
+    # prompt bytes.
+    "t_get_pcap": {"window_minutes": 60},
 }
 
 
@@ -219,6 +228,13 @@ async def _dispatch_named_tool(
         # get_pcap_facts needs only settings (already in base_kwargs) +
         # alert_ts from the context time anchor.
         base_kwargs["alert_ts"] = getattr(ctx, "default_time_anchor", None)
+    elif tool_name in {"t_web_search", "t_crawl_page"}:
+        # The online egress guards recognise internal identifiers by the
+        # EFFECTIVE sets (env config unioned with the DB-discovered hosts and
+        # suffixes), exactly as the interactive wrappers pass them. Left to
+        # the raw settings tuples, a discovered internal name in the synth's
+        # args would go out to the search engine or be crawled server-side.
+        base_kwargs["suffixes"], base_kwargs["extra_hosts"] = await _egress_tool_idents(ctx)
 
     # Drop any injected base kwarg the target signature does not accept. The
     # injection tables above are keyed by tool NAME, not by inspecting each

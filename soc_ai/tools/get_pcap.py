@@ -48,6 +48,13 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Ceiling on ``window_minutes``. The window is the half-width around the alert,
+# and every so-pcap.* ring file it overlaps gets its own ssh + tcpdump pass with
+# the filtered bytes buffered in memory, so the window is what bounds the load
+# a single call puts on the sensor. An hour each side covers any flow an alert
+# can be about; the model-facing wrappers advertise the same ceiling.
+MAX_WINDOW_MINUTES = 60
+
 # libpcap global header is exactly 24 bytes.
 _PCAP_HEADER_LEN = 24
 
@@ -372,9 +379,9 @@ async def get_pcap_facts(
     src_port, dst_port:
         Optional; coerced to ``int`` (``None`` skips port filtering).
     window_minutes:
-        Search window half-width.  The window is centred on ``alert_ts``
-        (or ``datetime.now(UTC)`` if omitted): ``[ts - window_minutes,
-        ts + window_minutes]``.
+        Search window half-width, clamped to ``[1, MAX_WINDOW_MINUTES]``.
+        The window is centred on ``alert_ts`` (or ``datetime.now(UTC)`` if
+        omitted): ``[ts - window_minutes, ts + window_minutes]``.
     alert_ts:
         UTC timestamp of the alert.  Defaults to ``datetime.now(UTC)``.
     """
@@ -427,7 +434,7 @@ async def get_pcap_facts(
     # the command embeds only ``strftime``/``int(timestamp())`` output).
     anchor = alert_ts if alert_ts is not None else datetime.now(UTC)
     try:
-        delta = timedelta(minutes=max(1, int(window_minutes)))
+        delta = timedelta(minutes=min(MAX_WINDOW_MINUTES, max(1, int(window_minutes))))
         start_ts = anchor - delta
         end_ts = anchor + delta
     except (TypeError, ValueError) as exc:
