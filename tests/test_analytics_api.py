@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 from soc_ai.config import Settings
+from soc_ai.hunting.catalog_tiers import effective_catalog
 from soc_ai.main import create_app
 
 from tests.test_analytics_store import SPEC_TEXT
@@ -82,6 +83,23 @@ def test_retire_a_shipped_analytic_needs_a_reason_and_is_reversible(client: Test
         f"/api/v1/analytics/{_RETIRABLE}/status", json={"to": "shadow", "why": "reinstate"}
     )
     assert back.status_code == 200 and back.json()["status"] == "shadow"
+
+    # Reinstated means running again. The row said 'shadow' while the sweep
+    # skipped the analytic, so the dry-run week brought no receipts.
+    async def catalog() -> Any:
+        async with client.app.state.db_sessionmaker() as db:
+            return await effective_catalog(db)
+
+    cat = asyncio.run(catalog())
+    assert _RETIRABLE in cat.specs and _RETIRABLE in cat.shadow_ids
+
+    # The file on disk is the spec, so a shipped analytic has no candidate,
+    # and the hint must not offer one.
+    edit = client.post(f"/api/v1/analytics/{_RETIRABLE}/status", json={"to": "candidate"})
+    assert edit.status_code == 422
+    assert edit.json()["detail"]["reason"] == "transition_not_allowed"
+    assert "candidate" not in edit.json()["detail"]["hint"]
+    assert "live" in edit.json()["detail"]["hint"]
 
 
 def test_a_shipped_analytic_can_only_be_retired(client: TestClient) -> None:

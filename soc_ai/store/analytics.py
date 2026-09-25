@@ -2,9 +2,10 @@
 
 A local analytic is a spec that an analyst or the drafter wrote. It starts as a
 candidate. An analyst moves it to shadow, approves it to live, or retires it. A
-shipped analytic can only be retired, because the file on disk is the analytic
-and an in-place local edit would make the repository and the database disagree
-about what ran.
+shipped analytic can only be retired, and reinstated through shadow, because
+the file on disk is the analytic and an in-place local edit would make the
+repository and the database disagree about what ran. It never becomes a
+candidate: there is no text to edit.
 
 Every transition writes a version row with the spec text before and after, so
 the history of an analytic is readable and diffable in the app.
@@ -25,6 +26,7 @@ from soc_ai.store.models import AnalyticState, AnalyticVersion
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "STATUSES",
+    "allowed_transitions",
     "create_local",
     "retire_shipped",
     "states",
@@ -42,6 +44,19 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "live": frozenset({"retired"}),
     "retired": frozenset({"shadow"}),
 }
+
+
+def allowed_transitions(tier: str, status: str) -> frozenset[str]:
+    """The statuses one analytic may move to, given its tier.
+
+    A shipped analytic has no candidate. Candidate is the status of a spec text
+    an analyst is still writing, and the spec of a shipped analytic is the file
+    on disk. A shipped row parked there read as editable and never ran.
+    """
+    targets = ALLOWED_TRANSITIONS.get(status, frozenset())
+    if tier == "shipped":
+        return targets - {"candidate"}
+    return targets
 
 
 def _now(now: datetime | None) -> datetime:
@@ -134,8 +149,10 @@ async def transition(
     state = await db.get(AnalyticState, analytic_id)
     if state is None:
         raise LookupError(analytic_id)
-    if to_status not in ALLOWED_TRANSITIONS.get(state.status, frozenset()):
-        raise ValueError(f"{state.status} -> {to_status} is not allowed")
+    if to_status not in allowed_transitions(state.tier, state.status):
+        raise ValueError(
+            f"{state.status} -> {to_status} is not allowed for a {state.tier} analytic"
+        )
     at = _now(now)
     db.add(
         AnalyticVersion(

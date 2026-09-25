@@ -2,7 +2,8 @@
 
 Shipped analytics are YAML files on disk, versioned in the repository. Local
 analytics are rows with spec text. A shipped analytic is live unless a state
-row retires it. A local analytic runs only in shadow or live.
+row retires it, or holds it in shadow on its way back from retirement. A local
+analytic runs only in shadow or live.
 
 The sweeps read ``specs`` and ``shadow_ids``. The routes read ``listed`` and
 ``status_of``. The two sets differ on purpose: an analytic the analyst must see
@@ -33,7 +34,7 @@ _REFUSED: set[str] = set()
 class Catalog:
     """The catalog as the sweeps and the routes each need to read it."""
 
-    # The runnable analytics: shipped live, local shadow, and local live.
+    # The runnable analytics: shipped and local, in shadow or live.
     specs: dict[str, HuntSpec]
     # Every analytic the app lists, runnable or not, with its parsed spec.
     listed: dict[str, HuntSpec]
@@ -72,8 +73,13 @@ async def effective_catalog(db: AsyncSession | None) -> Catalog:
         status = state.status if state is not None and state.tier == "shipped" else "live"
         tiers[spec_id] = ("shipped", status)
         listed[spec_id] = spec
-        if status == "live":
+        # A reinstated shipped analytic dry-runs in shadow like a local one.
+        # Left out of the shadow set, it read 'shadow' in the app while the
+        # sweep never ran it, so its approval to live had no receipts to read.
+        if status in ("shadow", "live"):
             specs[spec_id] = spec
+        if status == "shadow":
+            shadow.add(spec_id)
 
     for spec_id, state in states.items():
         if state.tier != "local":
