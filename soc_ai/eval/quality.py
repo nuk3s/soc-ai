@@ -585,7 +585,7 @@ def detect_regression(
     ]
     if new.fallback_rate is not None and hist_fallback:
         med_fb = _median(hist_fallback)
-        if new.fallback_rate - med_fb > FALLBACK_JUMP:
+        if new.fallback_rate - med_fb > FALLBACK_JUMP + _FLOAT_SLOP:
             reasons.append(
                 AlarmReason(
                     CODE_FALLBACK_JUMP,
