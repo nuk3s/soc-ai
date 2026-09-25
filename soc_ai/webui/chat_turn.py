@@ -439,11 +439,17 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
                 # the treatment is now identical: the old "scoped" (tools ran) vs
                 # "blanket" (zero-tool) caveat split (dogfood 2026-07-15) existed only
                 # to word a banner that no longer ships.
-                answer = redact_ungrounded(answer, grounding.ungrounded) + UNVERIFIED_QUIET_LINE
+                # The quiet line claims a removal, so it is earned only by an
+                # actual change to the text — a flagged answer that redaction
+                # left untouched must not tell the analyst otherwise.
+                redacted = redact_ungrounded(answer, grounding.ungrounded)
+                stripped = list(grounding.ungrounded) if redacted != answer else []
+                if stripped:
+                    answer = redacted + UNVERIFIED_QUIET_LINE
                 meta["narrative_grounding"] = {
                     "grounded": False,
                     "ungrounded": grounding.ungrounded,
-                    "stripped": list(grounding.ungrounded),
+                    "stripped": stripped,
                     "reason": grounding.reason,
                 }
             else:
