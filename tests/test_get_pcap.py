@@ -42,7 +42,7 @@ import dpkt
 import pytest
 from soc_ai.tools.get_pcap import (
     _MAX_PCAP_FILES,
-    _MAX_WINDOW_MINUTES,
+    MAX_WINDOW_MINUTES,
     _build_bpf,
     _build_find_command,
     _ssh_base_args,
@@ -437,21 +437,24 @@ async def test_port_out_of_range_rejected_without_subprocess(port_arg: str, valu
 
 
 @pytest.mark.asyncio
-async def test_window_minutes_over_cap_returns_error_without_subprocess() -> None:
-    """A window above the cap is refused before find runs, and the error names the bound."""
+async def test_window_minutes_over_cap_is_clamped_before_find() -> None:
+    """A window above the cap runs, but the find window is the cap, not the ask."""
     settings = _make_settings(pcap_enabled=True)
-    with patch("soc_ai.tools.get_pcap.subprocess.run") as mock_run:
+    anchor = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    empty = MagicMock(returncode=0, stdout=b"", stderr=b"")
+    with patch("soc_ai.tools.get_pcap.subprocess.run", return_value=empty) as mock_run:
         result = await get_pcap_facts(
             settings=settings,
             src_ip="10.0.0.1",
             dst_ip="10.0.0.2",
             window_minutes=10**6,
+            alert_ts=anchor,
         )
-    assert isinstance(result, dict)
-    assert result["ok"] is False
-    assert "window_minutes" in result["error"]
-    assert str(_MAX_WINDOW_MINUTES) in result["error"]
-    mock_run.assert_not_called()
+    assert isinstance(result, PcapFacts)
+    assert mock_run.call_count == 1  # find only: nothing matched
+    remote = " ".join(mock_run.call_args_list[0].args[0])
+    start = anchor - timedelta(minutes=MAX_WINDOW_MINUTES)
+    assert f"@{int(start.timestamp())}" in remote
 
 
 @pytest.mark.asyncio
@@ -464,7 +467,7 @@ async def test_window_minutes_at_cap_is_accepted() -> None:
             settings=settings,
             src_ip="10.0.0.1",
             dst_ip="10.0.0.2",
-            window_minutes=_MAX_WINDOW_MINUTES,
+            window_minutes=MAX_WINDOW_MINUTES,
         )
     assert isinstance(result, PcapFacts)
     mock_run.assert_called()
@@ -494,9 +497,26 @@ async def test_too_many_candidate_files_is_an_error_not_a_sweep() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", [10**12, 10**16, float("inf"), float("nan")])
-async def test_window_minutes_overflow_never_raises(value: Any) -> None:
-    """Absurd window values return an error dict; nothing raises and nothing spawns."""
+@pytest.mark.parametrize("value", [10**12, 10**16])
+async def test_window_minutes_huge_int_is_clamped_not_raised(value: int) -> None:
+    """An integer past the datetime range never raises; it is clamped like any over-ask."""
+    settings = _make_settings(pcap_enabled=True)
+    empty = MagicMock(returncode=0, stdout=b"", stderr=b"")
+    with patch("soc_ai.tools.get_pcap.subprocess.run", return_value=empty) as mock_run:
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            window_minutes=value,
+        )
+    assert isinstance(result, PcapFacts)
+    assert mock_run.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+async def test_window_minutes_non_finite_returns_error_without_subprocess(value: float) -> None:
+    """A non-finite window returns an error dict; nothing raises and nothing spawns."""
     settings = _make_settings(pcap_enabled=True)
     with patch("soc_ai.tools.get_pcap.subprocess.run") as mock_run:
         result = await get_pcap_facts(
@@ -726,6 +746,39 @@ async def test_tcpdump_partial_failure_keeps_the_files_that_worked() -> None:
     ok = MagicMock(returncode=0, stdout=canned_pcap, stderr=b"")
 
     with patch("soc_ai.tools.get_pcap.subprocess.run", side_effect=[find_result, rotated_away, ok]):
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            alert_ts=alert_ts,
+        )
+
+    assert isinstance(result, PcapFacts), f"Expected PcapFacts, got {type(result)}: {result}"
+    assert result.packets == 1
+
+
+@pytest.mark.asyncio
+async def test_tcpdump_torn_live_file_keeps_the_packets_already_read() -> None:
+    """Exit 1 after packet data is a torn tail of the file Suricata is writing.
+
+    The newest ring file is the live one; tcpdump reads every matched packet
+    and then exits 1 on the torn last record.  Those packets are evidence and
+    are kept; only an error exit with no packet data is a failure.
+    """
+    frame = _make_tcp_frame("10.0.0.1", 54321, "10.0.0.2", 443, b"x")
+    canned_pcap = _build_pcap([(1000.0, frame)])
+    settings = _make_settings(pcap_enabled=True)
+    alert_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    find_result = MagicMock(returncode=0, stdout=b"/nsm/suripcap/t1/so-pcap.1000\n", stderr=b"")
+    torn = MagicMock(
+        returncode=1,
+        stdout=canned_pcap,
+        stderr=b"tcpdump: pcap_loop: truncated dump file; tried to read 1514 captured bytes, "
+        b"only got 800\n",
+    )
+
+    with patch("soc_ai.tools.get_pcap.subprocess.run", side_effect=[find_result, torn]):
         result = await get_pcap_facts(
             settings=settings,
             src_ip="10.0.0.1",

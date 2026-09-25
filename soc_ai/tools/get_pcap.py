@@ -224,14 +224,21 @@ def _stream_filtered(settings: Settings, remote_path: str, bpf: str) -> bytes:
     Returns raw filtered pcap bytes (may be just the 24-byte global header
     if nothing matched — that is not an error).
 
-    tcpdump exits 0 after reading a savefile whose BPF matched nothing.  Any
-    non-zero exit is a real error — the file could not be opened, the BPF
-    did not compile, or sudo refused without a tty — and raises
-    ``RuntimeError`` carrying the exit status and a stderr excerpt.  Callers
-    skip the file and continue; a file that has just rotated out of the ring
-    is not fatal, only every file failing is.  Reporting an error exit as an
-    empty capture would hand the model "no traffic" as evidence when the
-    fetch never ran.
+    tcpdump exits 0 after reading a savefile whose BPF matched nothing.  A
+    non-zero exit with no packet data is a real error — the file could not be
+    opened, the BPF did not compile, or sudo refused without a tty — and
+    raises ``RuntimeError`` carrying the exit status and a stderr excerpt.
+    Callers skip the file and continue; a file that has just rotated out of
+    the ring is not fatal, only every file failing is.  Reporting an error
+    exit as an empty capture would hand the model "no traffic" as evidence
+    when the fetch never ran.
+
+    A non-zero exit *after* packet data is different: the newest ring file is
+    the one Suricata is still writing, so its last record is often torn and
+    tcpdump exits 1 with "truncated dump file" having already written every
+    packet that matched.  That is a partial read of a live file, kept with a
+    warning; for an alert inside the default window it is often the only
+    candidate file.
 
     stderr is not redirected on the sensor: it is the only signal that says
     why tcpdump failed.  ssh runs without a tty, so sudo cannot prompt and
@@ -263,13 +270,22 @@ def _stream_filtered(settings: Settings, remote_path: str, bpf: str) -> bytes:
         check=False,
         timeout=settings.so_ssh_timeout_s,
     )
+    out = proc.stdout or b""
     if proc.returncode != 0:
         # The excerpt ends up in the tool result the model reads, so keep it
         # short.  tcpdump writes "reading from file ..." to stderr on success
         # too, which is why stderr is only surfaced on a non-zero exit.
         stderr = (proc.stderr or b"").decode(errors="replace").strip()[:200]
+        if len(out) > _PCAP_HEADER_LEN:
+            _LOGGER.warning(
+                "tcpdump on %s exit=%d after partial read (torn tail of the live file): %s",
+                remote_path,
+                proc.returncode,
+                stderr,
+            )
+            return out
         raise RuntimeError(f"tcpdump on {remote_path} exit={proc.returncode}: {stderr}")
-    return proc.stdout or b""
+    return out
 
 
 # ---------------------------------------------------------------------------
