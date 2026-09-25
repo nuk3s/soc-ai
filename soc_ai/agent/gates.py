@@ -131,7 +131,8 @@ def _retrieved_evidence_tokens(alert_ctx: Any, messages: list[Any] | None) -> fr
       JA3/hash/cipher subset of the decisive pivot values; the wire-string
       leaves — SMB file name, requested SPN, DCE-RPC endpoint/operation — are
       attacker-chosen free-form strings on the attacker's own prefetched flow,
-      so they ground a verdict (``_pivot_evidence_tokens``) but never resolve
+      so they ground a verdict (``_pivot_wire_string_cited``, only when cited as a
+    distinctive value) but never resolve
       an id-shaped citation),
     * evidence-key leaves (:data:`soc_ai.agent.evidence._EVIDENCE_KEYS` —
       ``_id``/``uid``/``sid``/``uuid``, hash/JA3 leaves, detector rule
@@ -1361,22 +1362,65 @@ _PIVOT_ATTRS: tuple[str, ...] = (
 )
 
 
+# The decisive pivot leaves that are attacker-composed free-form wire strings
+# (SMB file name, requested Kerberos SPN, DCE-RPC endpoint/operation) rather than
+# sensor-computed digests/fingerprints or a fixed-vocabulary enum.
+_PIVOT_WIRE_STRING_ATTRS: frozenset[str] = frozenset(_PIVOT_DECISIVE_ATTRS) - frozenset(
+    _PIVOT_ID_SAFE_ATTRS
+)
+
+
 def _pivot_evidence_tokens(enriched_ctx: Any) -> set[str]:
-    """Distinctive lowercased tokens from prefetched PIVOT documents — their ES ids
-    plus decisive typed values (JA3/JA3S, file hashes, Kerberos SPN, SMB file name,
-    DCE-RPC endpoint). A verdict that cites one of these is grounded in correlated
-    evidence the orchestrator gathered, not in the alert's own label."""
+    """Lowercased tokens from prefetched PIVOT documents that a plain substring
+    match may credit: their ES ids plus the id-safe decisive values (JA3/JA3S,
+    file hashes, Kerberos cipher). A verdict that cites one of these is grounded in
+    correlated evidence the orchestrator gathered, not in the alert's own label.
+
+    The wire-string leaves (SMB file name, SPN, DCE-RPC endpoint/operation) are
+    deliberately NOT here — see :func:`_pivot_wire_string_cited`."""
     tokens: set[str] = set()
     for attr in _PIVOT_ATTRS:
         for ev in getattr(enriched_ctx, attr, None) or []:
             eid = getattr(ev, "id", None)
             if eid:
                 tokens.add(str(eid).lower())
-            for f in _PIVOT_DECISIVE_ATTRS:
+            for f in _PIVOT_ID_SAFE_ATTRS:
                 v = getattr(ev, f, None)
                 if isinstance(v, str) and len(v) >= 4:
                     tokens.add(v.lower())
     return tokens
+
+
+def _pivot_wire_string_cited(enriched_ctx: Any, cited: str) -> bool:
+    """True iff a DISTINCTIVE wire-string pivot value appears in ``cited``
+    (lowercased citation text).
+
+    The four wire-string leaves are composed by whoever sent the flow, and the
+    alert's own flow is what the community-id prefetch normalizes into the pivot
+    bundle — so a plain ``len >= 4`` substring match would let a file named
+    ``name`` or ``alert`` turn a bare ``alert.rule_name`` citation into
+    "grounded in a pivot" and switch the zero-tool-verdict defense off. These
+    values therefore take the GATE C distinctiveness bands of
+    :func:`_semantic_token_resolves`: never a stop-word, a substring match only
+    from 8 chars (a service binary path, an SPN), and a whole-word match from 5
+    chars (an RPC endpoint like ``svcctl`` / ``lsarpc``). A planted value that
+    equals a whole citation phrase (an SMB file literally named
+    ``alert.rule_name``) still matches; that residual is a long, specific string
+    the model had to echo verbatim, not a generic fragment."""
+    for attr in _PIVOT_ATTRS:
+        for ev in getattr(enriched_ctx, attr, None) or []:
+            for f in _PIVOT_WIRE_STRING_ATTRS:
+                v = getattr(ev, f, None)
+                if not isinstance(v, str):
+                    continue
+                low = v.lower()
+                if low in _CITATION_STOP_WORDS:
+                    continue
+                if len(low) >= 8 and low in cited:
+                    return True
+                if len(low) >= 5 and re.search(rf"\b{re.escape(low)}\b", cited):
+                    return True
+    return False
 
 
 def _verdict_grounded_in_pivot(report: Any, enriched_ctx: Any) -> bool:
@@ -1388,15 +1432,18 @@ def _verdict_grounded_in_pivot(report: Any, enriched_ctx: Any) -> bool:
     host fan-out as a tool call on the agent's behalf, so a verdict grounded in a
     pivot record is not a zero-investigation rationalization. A verdict that cites
     only the alert's own fields matches nothing here and stays gated — the QVOD
-    zero-tool-verdict defense is preserved. The value match is unforgeable: a cited
-    JA3/hash/SPN can only match a pivot the model was actually shown."""
-    tokens = _pivot_evidence_tokens(enriched_ctx)
-    if not tokens:
-        return False
+    zero-tool-verdict defense is preserved. A cited doc id / JA3 / hash can only
+    match a pivot the model was actually shown; the attacker-composed wire-string
+    leaves count only when cited as a distinctive value
+    (:func:`_pivot_wire_string_cited`), so a short generic file name planted on the
+    alert's own flow cannot ground an alert-only citation."""
     cited = " ".join(str(c) for c in (getattr(report, "citations", None) or [])).lower()
     if not cited:
         return False
-    return any(tok in cited for tok in tokens)
+    tokens = _pivot_evidence_tokens(enriched_ctx)
+    if any(tok in cited for tok in tokens):
+        return True
+    return _pivot_wire_string_cited(enriched_ctx, cited)
 
 
 def _verdict_cites_decisive_pivot_value(report: Any, enriched_ctx: Any) -> bool:
@@ -1408,18 +1455,22 @@ def _verdict_cites_decisive_pivot_value(report: Any, enriched_ctx: Any) -> bool:
     agent use gathered evidence?"), but for RAISING confidence a bare doc id is not
     enough — every alert has correlated pivots, so citing one proves nothing about
     maliciousness. Flooring confidence to the escalation level requires a concrete
-    malicious-leaning signal the model actually cited."""
+    malicious-leaning signal the model actually cited. The wire-string leaves are
+    banded exactly as in :func:`_verdict_grounded_in_pivot`, so the two cannot
+    drift apart."""
+    cited = " ".join(str(c) for c in (getattr(report, "citations", None) or [])).lower()
+    if not cited:
+        return False
     values: set[str] = set()
     for attr in _PIVOT_ATTRS:
         for ev in getattr(enriched_ctx, attr, None) or []:
-            for f in _PIVOT_DECISIVE_ATTRS:
+            for f in _PIVOT_ID_SAFE_ATTRS:
                 v = getattr(ev, f, None)
                 if isinstance(v, str) and len(v) >= 4:
                     values.add(v.lower())
-    if not values:
-        return False
-    cited = " ".join(str(c) for c in (getattr(report, "citations", None) or [])).lower()
-    return bool(cited) and any(v in cited for v in values)
+    if any(v in cited for v in values):
+        return True
+    return _pivot_wire_string_cited(enriched_ctx, cited)
 
 
 def _retrieved_decisive_value_tokens(

@@ -300,6 +300,102 @@ def test_hard_gate_exempts_pivot_grounded_escalation() -> None:
     assert "evidence_gate_pivot_exemption" in audit
 
 
+def _smb_pivot_ctx(name: str) -> EnrichedAlertContext:
+    # The SMB file name is a free-form wire string the sender of the flow chose;
+    # community-id prefetch normalizes that same flow into the pivot bundle.
+    return EnrichedAlertContext(
+        alert=_alert(),
+        file_events=[_zeek("piv-smb-1", "zeek.smb_files", {"zeek.smb_files.name": name})],
+    )
+
+
+def test_short_generic_wire_string_does_not_ground_alert_only_citation() -> None:
+    # An SMB file literally named "name" or "alert" is a substring of the
+    # citation path "alert.rule_name". That must not turn a rule-label-only
+    # citation into "grounded in a pivot": the value is attacker-composed, so
+    # the zero-tool-verdict defense has to keep gating the verdict.
+    for smb_name in ("name", "alert", "rule"):
+        ctx = _smb_pivot_ctx(smb_name)
+        report = TriageReport(
+            verdict="false_positive",
+            confidence=0.9,
+            summary="rule name looks benign",
+            citations=["alert.rule_name"],
+        )
+        assert _verdict_grounded_in_pivot(report, ctx) is False, smb_name
+        assert _verdict_cites_decisive_pivot_value(report, ctx) is False, smb_name
+        audit: dict[str, Any] = {}
+        out = _downgrade_unevidenced_verdict(
+            report, ctx, None, audit, targeted_messages=None, targeted_tool_called=None
+        )
+        assert out.verdict == "needs_more_info", smb_name
+        assert "evidence_gate_downgrade" in audit, smb_name
+        assert "evidence_gate_pivot_exemption" not in audit, smb_name
+
+
+def test_short_wire_string_fragment_does_not_ground_citation() -> None:
+    # A medium-length wire string only counts when cited as a whole word, never
+    # as a fragment buried inside a longer citation token.
+    ctx = EnrichedAlertContext(
+        alert=_alert(),
+        file_events=[
+            _zeek("piv-smb-1", "zeek.smb_files", {"zeek.smb_files.name": "ule_na"}),
+        ],
+    )
+    report = TriageReport(
+        verdict="false_positive",
+        confidence=0.9,
+        summary="benign",
+        citations=["alert.rule_name"],
+    )
+    assert _verdict_grounded_in_pivot(report, ctx) is False
+    assert _verdict_cites_decisive_pivot_value(report, ctx) is False
+
+
+def test_distinctive_wire_string_cited_verbatim_still_grounds() -> None:
+    # Legitimate grounding survives: a service binary written over SMB and cited
+    # verbatim, an SPN, and a short DCE-RPC endpoint cited as a whole word.
+    ctx = _smb_pivot_ctx("Windows\\Temp\\PSEXESVC.exe")
+    report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="PsExec-style lateral movement",
+        citations=["SMB write of Windows\\Temp\\PSEXESVC.exe on pivot flow"],
+    )
+    assert _verdict_grounded_in_pivot(report, ctx) is True
+    assert _verdict_cites_decisive_pivot_value(report, ctx) is True
+
+    rpc_ctx = EnrichedAlertContext(
+        alert=_alert(),
+        community_id_events=[
+            _zeek("piv-rpc-1", "zeek.dce_rpc", {"zeek.dce_rpc.endpoint": "svcctl"}),
+            _zeek("piv-krb-1", "zeek.kerberos", {"zeek.kerberos.service": "MSSQLSvc/db01"}),
+        ],
+    )
+    rpc_report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="remote service creation",
+        citations=["DCE-RPC svcctl CreateServiceW on pivot flow"],
+    )
+    assert _verdict_grounded_in_pivot(rpc_report, rpc_ctx) is True
+    assert _verdict_cites_decisive_pivot_value(rpc_report, rpc_ctx) is True
+    spn_report = TriageReport(
+        verdict="true_positive",
+        confidence=0.85,
+        summary="Kerberoasting",
+        citations=["RC4 TGS request for MSSQLSvc/db01"],
+    )
+    assert _verdict_grounded_in_pivot(spn_report, rpc_ctx) is True
+    # The hard gate honours the same grounding.
+    audit: dict[str, Any] = {}
+    out = _downgrade_unevidenced_verdict(
+        report, ctx, None, audit, targeted_messages=None, targeted_tool_called=None
+    )
+    assert out.verdict == "true_positive"
+    assert "evidence_gate_pivot_exemption" in audit
+
+
 def test_hard_gate_still_downgrades_alert_only_rationalization() -> None:
     # QVOD defense preserved: a verdict citing only the alert's own fields, with no
     # tool call and no pivot citation, is still coerced to needs_more_info.
