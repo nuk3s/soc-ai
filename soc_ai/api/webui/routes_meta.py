@@ -1082,13 +1082,26 @@ class HealthOut(BaseModel):
 
 
 async def _cached_pcap_probe(state: Any, settings: Settings) -> dict[str, Any]:
-    now = time.monotonic()
-    cached = getattr(state, "_pcap_probe_cache", None)
-    if cached is not None and now - cached[0] < _PCAP_PROBE_TTL_S:
-        return cached[1]  # type: ignore[no-any-return]
-    result = await probes.probe_pcap(settings)
-    state._pcap_probe_cache = (now, result)
-    return result
+    """The pcap sensor probe result, TTL-cached (single-flight).
+
+    Each probe is an ssh login to the sensor, bounded only by the ssh timeout,
+    so concurrent polls against a cold cache must share ONE in-flight probe:
+    result-only caching would fork one ssh child per dashboard tab, all pinned
+    to a sensor that may already be the slow thing. The lock is separate from
+    ``_health_probe_lock`` so a wedged sensor never holds up the ES/LLM/SO legs.
+    """
+    lock = getattr(state, "_pcap_probe_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        state._pcap_probe_lock = lock
+    async with lock:
+        now = time.monotonic()
+        cached = getattr(state, "_pcap_probe_cache", None)
+        if cached is not None and now - cached[0] < _PCAP_PROBE_TTL_S:
+            return cached[1]  # type: ignore[no-any-return]
+        result = await probes.probe_pcap(settings)
+        state._pcap_probe_cache = (now, result)
+        return result
 
 
 # Hard bound on ONE health probe leg. Without it, probe_es rides the ES
