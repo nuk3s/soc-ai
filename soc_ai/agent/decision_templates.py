@@ -839,6 +839,15 @@ def match_decision_template(ctx: EnrichedAlertContext) -> CandidateVerdict | Non
     protocol housekeeping or reputation, and none of those separate anything on
     a sensor with no benign population to separate from.
 
+    A benign candidate is likewise withheld on an attack-class alert. The
+    protocol-housekeeping templates key on a token in the rule name, and the
+    name of an ET DOS NTP amplification rule or an ET SCAN STUN probe carries
+    that token too; with the routine SF conn beside it, the alert was settled
+    false_positive with dispositive authority before a single tool ran. The
+    classtype is the detection, and a protocol named in the rule is not a
+    defence against it. ``clean_internal_traffic`` carries the same guard on
+    its own, for the lateral-movement case it was written against.
+
     Withheld at the choke point rather than guarded per template so a template
     added later cannot reintroduce the anchor by forgetting the check. Positive
     candidates pass through untouched: the concern is closure, not escalation.
@@ -848,7 +857,7 @@ def match_decision_template(ctx: EnrichedAlertContext) -> CandidateVerdict | Non
     settle the alert, provisional ones only propose. See
     :data:`TemplateAuthority`.
     """
-    withhold_benign = _rule_signals_decoy(ctx)
+    withhold_benign = _rule_signals_decoy(ctx) or _rule_signals_attack(ctx)
     for tmpl in TEMPLATES:
         result = tmpl(ctx)
         if result is None:
