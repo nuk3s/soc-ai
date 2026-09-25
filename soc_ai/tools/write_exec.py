@@ -94,6 +94,18 @@ async def execute_write_tool(
         return None, (f"{e}; dropped_args={sorted(dropped)}" if dropped else str(e))
     except (TypeError, ValueError) as e:
         return None, f"tool invocation failed: {e}; dropped_args={sorted(dropped)}"
+    except Exception as e:
+        # Everything else the tool can throw is still a tool failure the caller
+        # must see as ``error``: an SO that is unreachable (httpx transport
+        # errors are not SoApiError — the client never got a response to wrap)
+        # and model-authored arguments of the wrong type (``case_title: null``
+        # reaches ``.strip()`` as AttributeError). The endpoint renders the
+        # string; a raise here would turn the analyst's Execute into a bare 500
+        # and abort an unattended ack batch on its first failure.
+        return (
+            None,
+            f"tool invocation failed: {type(e).__name__}: {e}; dropped_args={sorted(dropped)}",
+        )
 
     if audit is not None:
         # Result record is best-effort (fail-open): the SO state change already

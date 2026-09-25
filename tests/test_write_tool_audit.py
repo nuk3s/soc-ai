@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import Settings
@@ -195,3 +196,41 @@ async def test_audit_records_anonymous_when_unauthenticated(
         )
     assert error is None
     assert all(d["approved_by"] == "anonymous" for d in es.indexed)
+
+
+@pytest.mark.asyncio
+async def test_transport_error_is_returned_not_raised(settings_kratos: Settings) -> None:
+    """An unreachable SO surfaces as the ``error`` string, not as a raise.
+
+    The tool's own SO call fails at the transport layer (httpx never gets a
+    response), which is exactly the case the ``(result, error)`` contract
+    exists for: the endpoint renders ``error`` rather than answering a 500.
+    """
+    auth = AsyncMock()
+    auth.request = AsyncMock(side_effect=httpx.ConnectError("boom"))
+    result, error = await execute_write_tool(
+        "ack_alert",
+        {"alert_id": "abcdefgh"},
+        auth=auth,
+        settings=settings_kratos,
+    )
+    assert result is None
+    assert error is not None
+    assert "ConnectError" in error
+    assert "boom" in error
+
+
+@pytest.mark.asyncio
+async def test_non_string_arg_is_returned_not_raised(settings_kratos: Settings) -> None:
+    """A model-authored ``null`` for a string argument is a tool failure, not a raise."""
+    auth = AsyncMock()
+    result, error = await execute_write_tool(
+        "escalate_to_case",
+        {"alert_id": "abcdefgh", "case_title": None, "case_description": "why"},
+        auth=auth,
+        settings=settings_kratos,
+    )
+    assert result is None
+    assert error is not None
+    assert "AttributeError" in error
+    auth.request.assert_not_called()  # the SO write never started
