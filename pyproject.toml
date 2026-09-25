@@ -78,6 +78,7 @@ dev = [
     "playwright>=1.59.0",
     "pytest-playwright>=0.7.2",
     "pre-commit>=3.8.0",
+    "pytest-xdist>=3.6",
 ]
 docs = [
     # Documentation site (Material for MkDocs). Build/serve with:

@@ -94,7 +94,7 @@ def _rate_dep(dimension: str, member: str, *, value: float, median: float) -> Si
 
 def test_novelty_names_the_noun_and_counts_in_words() -> None:
     text = _phrase(Kind.NOVEL_DESTINATION, _dep("peers_out", "10.0.0.5", 3))
-    assert text == "new outbound peer for this host: 10.0.0.5. The sweep saw it 3 times"
+    assert text == "new outbound peer for this host: 10.0.0.5. 3 documents in the last 24 h"
     assert "x3" not in text and "peers_out" not in text
 
 

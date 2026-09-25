@@ -16,7 +16,7 @@ import { getObservations, type EntityObservation } from '../lib/api';
 import {
   CHIP_IN_LEAD,
   CHIP_NO_LEAD,
-  CHIP_SEEN,
+  CHIP_SWEEPS,
   CHIP_TYPE,
   UNREAD_DOT,
 } from '../lib/tooltips';
@@ -49,6 +49,7 @@ const ROWS: EntityObservation[] = [
     weight_now: 0.21,
     lead_id: 12,
     born_at: iso(9 * HOUR),
+    first_seen_at: iso(3 * 24 * HOUR),
     occurrences: 3,
     read: false,
   },
@@ -93,7 +94,7 @@ describe('HostObservations', () => {
 
     const profile = screen.getByTestId('observation-2');
     expect(within(profile).getByText('profile')).toBeTruthy();
-    expect(within(profile).getByText('seen 3 times')).toBeTruthy();
+    expect(within(profile).getByText('seen on 3 sweeps, first seen 3d ago')).toBeTruthy();
   });
 
   it('marks an unread shadow hit and says it is in no lead', async () => {
@@ -114,7 +115,9 @@ describe('HostObservations', () => {
     );
     expect(within(catalog).getByText('in lead 12').getAttribute('title')).toBe(CHIP_IN_LEAD);
     const profile = screen.getByTestId('observation-2');
-    expect(within(profile).getByText('seen 3 times').getAttribute('title')).toBe(CHIP_SEEN);
+    expect(
+      within(profile).getByText('seen on 3 sweeps, first seen 3d ago').getAttribute('title'),
+    ).toBe(CHIP_SWEEPS);
     const shadow = screen.getByTestId('observation-3');
     expect(within(shadow).getByText('shadow hit · unread').getAttribute('title')).toBe(UNREAD_DOT);
     expect(within(shadow).getByText('not yet in a lead').getAttribute('title')).toBe(CHIP_NO_LEAD);

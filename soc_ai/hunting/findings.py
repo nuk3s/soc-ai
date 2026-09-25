@@ -422,4 +422,39 @@ def threat_finding_count(findings: Any) -> int:
     return sum(1 for f in findings if isinstance(f, Mapping) and finding_category(f) == "threat")
 
 
-__all__ = ["candidate_findings", "finding_category", "spec_report", "threat_finding_count"]
+def hunt_outcome(status: str, findings: Any) -> tuple[int, str]:
+    """(threat findings, outcome) for a hunt row.
+
+    ``outcome`` is empty unless the hunt completed; then ``threats``, ``clean``,
+    ``gap`` (the hunt saw nothing but blindness) or ``failed`` (a query raised).
+    The Hunts page paints from this, and the lead store settles a lead from
+    it, so the two can never disagree about what a hunt found.
+
+    A gap finding beside observation findings is a caveat, not the outcome.
+    A hunt that looked at the host, explained what it saw and found no
+    threat is clean even when it notes what it could not inspect. Only a hunt
+    whose every finding is a gap reads as ``gap``.
+    """
+    if not isinstance(findings, list):
+        return 0, ""
+    rows = [f for f in findings if isinstance(f, dict)]
+    threats = threat_finding_count(rows)
+    if status != "complete":
+        return threats, ""
+    if threats:
+        return threats, "threats"
+    gaps = [f for f in rows if finding_category(f) == "visibility_gap"]
+    if not gaps:
+        return 0, "clean"
+    if any(str(f.get("title") or "").endswith(": could not run") for f in gaps):
+        return 0, "failed"
+    return 0, "gap" if len(gaps) == len(rows) else "clean"
+
+
+__all__ = [
+    "candidate_findings",
+    "finding_category",
+    "hunt_outcome",
+    "spec_report",
+    "threat_finding_count",
+]

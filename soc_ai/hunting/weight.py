@@ -28,6 +28,8 @@ happening.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 
@@ -38,13 +40,18 @@ __all__ = [
     "DEFAULT_LEAD_THRESHOLD",
     "DEFAULT_MIN_KINDS",
     "KIND_FOR_DIMENSION",
+    "KIND_WEIGHT_CAP",
     "Kind",
+    "KindWeight",
     "alert_weight",
     "birth_weight",
+    "decay_horizon_hours",
     "is_finding_grade",
     "kind_for_dimension",
+    "lead_total",
     "live_weight",
     "stacked",
+    "weight_by_kind",
 ]
 
 # Chosen to be MOVED. The design is explicit that the half-life, floor and
@@ -280,3 +287,62 @@ def live_weight(
 
     # A cliff. Below the floor this is history, and history is never summed.
     return value if value >= floor else 0.0
+
+
+def decay_horizon_hours(
+    half_life_hours: float = DEFAULT_HALF_LIFE_HOURS, floor: float = DEFAULT_FLOOR
+) -> float:
+    """The age at which a full-weight observation drops below the floor.
+
+    Derived from the two constants :func:`live_weight` floors on, not a third
+    number: ``half_life * log2(1 / floor)``. With the defaults that is 207.4
+    hours. The lead layer reads it as the span in which a closed lead still
+    answers for a repeat of the types it held.
+    """
+    if half_life_hours <= 0 or floor <= 0 or floor >= 1:
+        return 0.0
+    return half_life_hours * math.log2(1.0 / floor)
+
+
+# What one kind can contribute to a lead's total. Two thresholds: one kind at
+# the cap is a lead-and-a-half worth of one story, and a second kind at any
+# weight is what turns it into a chain. Production summed 45 novel served
+# ports to 25 against a threshold of 0.85, and 25 ranked nothing, because
+# the one thing it measured was how many rows the sweep had written.
+KIND_WEIGHT_CAP = 2.0 * DEFAULT_LEAD_THRESHOLD
+
+
+@dataclass(frozen=True)
+class KindWeight:
+    """The live weight of one kind on a lead, against the cap one kind can reach."""
+
+    kind: str
+    weight: float
+    cap: float
+    saturated: bool
+
+
+def weight_by_kind(
+    pairs: Iterable[tuple[Kind | str, float]], *, cap: float = KIND_WEIGHT_CAP
+) -> list[KindWeight]:
+    """Sum live weights per kind, each kind capped, kinds in name order.
+
+    A negative weight counts as zero. Nothing here subtracts from a lead.
+    """
+    sums: dict[str, float] = {}
+    for kind, weight in pairs:
+        key = kind.value if isinstance(kind, Kind) else str(kind)
+        sums[key] = sums.get(key, 0.0) + max(0.0, float(weight))
+    return [
+        KindWeight(kind=key, weight=min(cap, total), cap=cap, saturated=total >= cap)
+        for key, total in sorted(sums.items())
+    ]
+
+
+def lead_total(pairs: Iterable[tuple[Kind | str, float]], *, cap: float = KIND_WEIGHT_CAP) -> float:
+    """A lead's total: the capped sum of each kind.
+
+    Formation writes this as ``weight_at_formation`` and the lead page reads
+    it as ``weight_now``, so the two agree.
+    """
+    return sum(row.weight for row in weight_by_kind(pairs, cap=cap))

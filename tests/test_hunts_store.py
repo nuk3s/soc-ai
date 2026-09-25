@@ -75,7 +75,7 @@ async def test_migration_at_head_is_current(settings_kratos: Settings) -> None:
     engine, _maker = await _db(settings_kratos)
     async with engine.connect() as conn:
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0050"
+        assert row.scalar_one() == "0051"
     await engine.dispose()
 
 

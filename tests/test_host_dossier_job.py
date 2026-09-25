@@ -34,15 +34,16 @@ from typing import Any
 
 import pytest
 from soc_ai.config import Settings
+from soc_ai.dossier import profile_job
 from soc_ai.enrichment import host_dossier as job
 from soc_ai.so_client import fields, inventory
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.store import host_dossier as store
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.internal_identifiers import list_identifiers, set_state
-from soc_ai.store.models import DossierRun, HostDossier, HostDossierField
+from soc_ai.store.models import DossierRun, EntityProfile, HostDossier, HostDossierField
 from soc_ai.tools._synth_scope import synth_scope_must_not
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 _HYPERVISOR = "192.168.10.202"
@@ -1917,7 +1918,7 @@ async def test_profiles_are_not_built_unless_the_deployment_opts_in(
         called.append(1)
         raise AssertionError("the profile lane ran with the gate off")
 
-    monkeypatch.setattr(job, "collect_entity_profiles", _spy)
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _spy)
     await job.run_dossier_refresh(_FakeES(), maker, settings)
     assert called == []
     await engine.dispose()
@@ -1934,7 +1935,7 @@ async def test_a_profile_failure_does_not_abort_the_sweep(
     async def _explode(**kwargs: Any) -> Any:
         raise RuntimeError("the grid is gone")
 
-    monkeypatch.setattr(job, "collect_entity_profiles", _explode)
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _explode)
     summary = await job.run_dossier_refresh(_FakeES(src={"192.168.10.5": 40}), maker, settings)
 
     assert any("entity profiles" in e for e in summary.errors)
@@ -1983,7 +1984,7 @@ async def test_built_profiles_are_persisted_and_the_grid_placeholder_is_not(
             notes=("process_names: no plane carries process.name",),
         )
 
-    monkeypatch.setattr(job, "collect_entity_profiles", _fake)
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake)
     summary = await job.run_dossier_refresh(_FakeES(), maker, settings)
 
     async with maker() as db:
@@ -2047,7 +2048,7 @@ async def test_an_agent_dimension_is_blind_unless_its_plane_answered(
     async def _fake_agents(**kwargs: Any) -> AgentInventory:
         return AgentInventory(claims={"10.0.0.7": ("dc01",), "10.0.0.8": ("ws08",)})
 
-    monkeypatch.setattr(job, "collect_entity_profiles", _fake_profiles)
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake_profiles)
     monkeypatch.setattr(job, "collect_agent_inventory", _fake_agents)
     await job.run_dossier_refresh(_FakeES(), maker, settings)
 
@@ -2106,7 +2107,7 @@ async def test_a_host_without_an_agent_gets_blind_rows_not_missing_ones(
     async def _fake_agents(**kwargs: Any) -> AgentInventory:
         return AgentInventory(claims={"10.0.0.6": ("ws06",)})
 
-    monkeypatch.setattr(job, "collect_entity_profiles", _fake_profiles)
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake_profiles)
     monkeypatch.setattr(job, "collect_agent_inventory", _fake_agents)
     await job.run_dossier_refresh(_FakeES(), maker, settings)
 
@@ -2130,4 +2131,184 @@ async def test_a_host_without_an_agent_gets_blind_rows_not_missing_ones(
     assert with_agent["process_parents"].vector == {}
     # The logon plane answered for neither host, so it is blind on both.
     assert with_agent["logon_users"].coverage == "blind"
+    await engine.dispose()
+
+
+def _flow_row(key: str, dim: str = "peers_out") -> Any:
+    from soc_ai.dossier.profile import BuiltProfile
+
+    return BuiltProfile(
+        entity_kind="host",
+        entity_key=key,
+        dimension=dim,
+        shape="categorical",
+        vector={"203.0.113.9": {"count": 3}},
+        coverage="measured",
+        support_days=12,
+    )
+
+
+async def _seed_old_row(maker: async_sessionmaker[Any], key: str) -> None:
+    """A row from a build two days ago, for a host the next build will not see."""
+    from soc_ai.store import entity_profiles as ep
+
+    async with maker() as db:
+        await ep.upsert_profile(
+            db,
+            entity_kind="host",
+            entity_key=key,
+            dimension="served_ports",
+            shape="categorical",
+            vector={},
+            support_days=9,
+        )
+        await db.execute(
+            update(EntityProfile)
+            .where(EntityProfile.entity_key == key)
+            .values(built_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2))
+        )
+        await db.commit()
+
+
+async def test_a_flow_dimension_no_plane_carries_is_blind_on_every_host(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production logged "dns_names: no plane on this grid carries
+    dns.question.name" and wrote 178 dns_names rows that read measured over an
+    empty set. The fill decided measured from the host's flow rows and never
+    asked whether the plane had answered."""
+    from soc_ai.dossier.profile import BuiltProfile, ProfileSweep
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+
+    async def _fake_profiles(**kwargs: Any) -> ProfileSweep:
+        return ProfileSweep(
+            profiles=(
+                _flow_row("10.0.0.5"),
+                BuiltProfile(
+                    entity_kind="host",
+                    entity_key="*",
+                    dimension="dns_names",
+                    shape="categorical",
+                    vector=None,
+                    coverage="blind",
+                ),
+            ),
+            planes={"flow": ("network_traffic.flow",)},
+            notes=(
+                "dns_names: no plane on this grid carries dns.question.name. "
+                "Tried zeek.dns, network_traffic.dns.",
+            ),
+            unanswered=("dns_names",),
+        )
+
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake_profiles)
+    await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        host = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.5")
+    assert host["dns_names"].coverage == "blind"
+    assert host["dns_names"].vector is None
+    assert not host["dns_names"].is_scorable
+    # The sibling flow dimensions the plane DID answer stay measured and empty.
+    assert host["served_ports"].coverage == "measured"
+    assert host["served_ports"].vector == {}
+    await engine.dispose()
+
+
+async def test_an_unmeasurable_dimension_writes_its_reason_on_every_host(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The grid refused the shaped query after every retry. Nothing written
+    meant blind on 215 hosts with no way to say why; a row with the reason is
+    what lets the host page and the Analytics panel say it."""
+    from soc_ai.dossier.profile import ProfileSweep
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+    reason = "Trying to create too many buckets. Must be less than or equal to: [65536]"
+
+    async def _fake_profiles(**kwargs: Any) -> ProfileSweep:
+        return ProfileSweep(
+            profiles=(_flow_row("10.0.0.5"), _flow_row("10.0.0.6")),
+            planes={"flow": ("network_traffic.flow",)},
+            unmeasurable={"active_hours": reason, "connection_rate": reason},
+        )
+
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake_profiles)
+    summary = await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        five = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.5")
+        six = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.6")
+    for host in (five, six):
+        assert host["active_hours"].coverage == "unmeasurable"
+        assert host["active_hours"].coverage_reason == reason
+        assert host["active_hours"].vector is None
+        assert host["active_hours"].shape == "active_hours"
+        assert not host["active_hours"].is_scorable
+        assert host["connection_rate"].coverage == "unmeasurable"
+        assert host["connection_rate"].shape == "numeric"
+    assert any(n.startswith("active_hours: unmeasurable: Trying") for n in summary.notes)
+    assert not any("active_hours" in e for e in summary.errors)
+    await engine.dispose()
+
+
+async def test_rows_the_build_did_not_refresh_are_expired_after_a_clean_build(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """upsert never deletes. A host that left the window kept its rows, and a
+    dimension a later build could not write kept its old coverage forever."""
+    from soc_ai.dossier.profile import ProfileSweep
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+    await _seed_old_row(maker, "10.0.0.9")
+
+    async def _fake_profiles(**kwargs: Any) -> ProfileSweep:
+        return ProfileSweep(
+            profiles=(_flow_row("10.0.0.5"),), planes={"flow": ("network_traffic.flow",)}
+        )
+
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake_profiles)
+    summary = await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        gone = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.9")
+        kept = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.5")
+    assert gone == {}
+    assert kept["peers_out"].coverage == "measured"
+    assert any("expired 1 stale row(s)" in n for n in summary.notes)
+    await engine.dispose()
+
+
+async def test_nothing_is_expired_when_the_build_reports_an_error(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dimension whose query failed wrote no row this run. Expiring its old
+    rows on that basis would delete a baseline because the grid hiccupped."""
+    from soc_ai.dossier.profile import ProfileSweep
+    from soc_ai.store import entity_profiles as ep
+
+    settings = _settings(settings_kratos, entity_profiles_enabled=True)
+    engine, maker = await _db(settings)
+    await _seed_old_row(maker, "10.0.0.9")
+
+    async def _fake_profiles(**kwargs: Any) -> ProfileSweep:
+        return ProfileSweep(
+            profiles=(_flow_row("10.0.0.5"),),
+            planes={"flow": ("network_traffic.flow",)},
+            errors=("served_ports: elasticsearch said no",),
+        )
+
+    monkeypatch.setattr(profile_job, "collect_entity_profiles", _fake_profiles)
+    await job.run_dossier_refresh(_FakeES(), maker, settings)
+
+    async with maker() as db:
+        old = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.9")
+    assert set(old) == {"served_ports"}
     await engine.dispose()

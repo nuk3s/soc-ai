@@ -22,14 +22,25 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import bcrypt
 import pytest
 from pydantic import SecretStr
-from soc_ai.config import Settings, get_settings
+
+# Cheap bcrypt for the whole suite. Every app startup hashes a bootstrap-admin
+# password and the security harness hashes two more per test; at the library
+# default (cost 12, ~0.16 s each on the CI runner) that was minutes of the run.
+# Cost 4 is the bcrypt minimum; the hashes still round-trip through the real
+# checkpw path. Patched before any soc_ai import so auth.py's import-time
+# dummy hash picks it up too.
+_real_gensalt = bcrypt.gensalt
+bcrypt.gensalt = lambda rounds=4, prefix=b"2b": _real_gensalt(rounds, prefix)  # type: ignore[assignment]
+
+from soc_ai.config import Settings, get_settings  # noqa: E402
 
 # Security-audit harness fixtures (auth ON, two real roles, hostile-doc
 # factory). Imported by name so pytest registers them here: pytest 9 rejects
 # `pytest_plugins` in a non-rootdir conftest, and the repo has no root conftest.
-from tests.conftest_security import (  # noqa: F401
+from tests.conftest_security import (  # noqa: E402, F401
     admin_session,
     analyst_session,
     audit_client,
@@ -99,6 +110,12 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]
     # pydantic-settings reads `.env` from cwd; chdir to a clean tmp dir so the
     # repo's runtime .env doesn't bleed into tests.
     monkeypatch.chdir(tmp_path)
+    # The enrichment data dirs default to absolute /var/lib/soc-ai paths, so on
+    # a host with a real install every app startup parsed ~7 MB of AWS/Azure
+    # prefix JSON (~1.8 s per test) and tests saw live data CI never has.
+    # Point them at empty dirs; tests that need data pass the kwarg.
+    for name in ("blocklist", "maxmind", "cloud_prefix"):
+        monkeypatch.setenv(f"{name.upper()}_DATA_DIR", str(tmp_path / "no-host-data" / name))
     get_settings.cache_clear()
     # Reset the in-process credential throttles so failed-attempt tests don't
     # leak lockout state into later tests (the per-IP spray throttle aggregates

@@ -21,6 +21,7 @@ import {
   ACTION_HUNT_NOW,
   ACTION_REOPEN,
   CHIP_ANALYTIC_MATCH,
+  CHIP_CLOSED_BY_HUNT,
   CHIP_DISMISS_REASON,
   CHIP_LEFT_TO_YOU,
   CHIP_NO_BENIGN_BASELINE,
@@ -29,6 +30,7 @@ import {
   INVESTIGATION_GONE,
   LEADS_NOTE_AUTO_HUNT,
   LEGEND_AUTO_HUNT,
+  PILL_CLOSED_BY_HUNT,
   PILL_DISMISSED,
   PILL_HUNTED,
   PILL_HUNT_QUEUED,
@@ -78,6 +80,18 @@ export const REASON_LABEL: Record<string, string> = {
  *  from, so it carries the list the route validates against. */
 export const DISMISS_REASONS = Object.keys(REASON_LABEL);
 
+/** The reason the server writes when the settle rule closes a lead after a
+ *  clean hunt. It is not in REASON_LABEL: the form never offers it, and the
+ *  pill reads the sentence below instead of a reason. */
+export const HUNT_CLEAN_REASON = 'hunt_clean';
+export const HUNT_CLOSED_LABEL = 'Closed. The hunt found no threat.';
+/** The hand the server signs that closure with reads as the product on screen. */
+export const HUNT_CLOSED_ACTOR = 'soc-ai';
+
+export function closedByHunt(lead: { status: string; dismissed_reason?: string | null }): boolean {
+  return lead.status === 'dismissed' && lead.dismissed_reason === HUNT_CLEAN_REASON;
+}
+
 /** The word each lead status wears on screen. The API values do not change:
  *  they stay open, hunting, dismissed and promoted. */
 export const LEAD_STATUS_LABEL: Record<string, string> = {
@@ -94,7 +108,7 @@ export function leadStatusLabel(status: string): string {
 
 /** A hunt that has stopped. The lead is no longer waiting on it. This is the
  *  server's rule for `needs_decision` too, so the pill and the tab agree. */
-const HUNT_DONE = new Set(['complete', 'error']);
+const HUNT_DONE = new Set(['complete', 'error', 'cancelled', 'interrupted']);
 
 /** The outcome label that makes a benign repeat the right reason to dismiss. */
 const NO_THREAT = 'No threat observed';
@@ -186,25 +200,29 @@ export function LeadStatePill({
     hunt_id?: string | null;
     hunt_outcome_label?: string | null;
     hunt_queued?: boolean;
+    dismissed_reason?: string | null;
   };
 }) {
   const state = leadState(lead);
   const style = LEAD_STATE_STYLE[state];
   const queued = huntQueued(lead);
+  const byHunt = closedByHunt(lead);
   // The tail of the pill names who holds the lead next. A finished hunt names
-  // its outcome. A queued hunt names the loop.
+  // its outcome. A queued hunt names the loop. A closure by the rule is one
+  // sentence, with no tail.
   const outcome = state === 'hunted' && lead.hunt_outcome_label ? ` · ${lead.hunt_outcome_label}` : '';
-  const tail = queued ? ' · hunt queued' : outcome;
+  const tail = byHunt ? '' : queued ? ' · hunt queued' : outcome;
+  const title = byHunt ? PILL_CLOSED_BY_HUNT : queued ? PILL_HUNT_QUEUED : LEAD_STATE_TITLE[state];
   return (
     <span
       data-testid="lead-status"
       data-lead-state={state}
-      title={queued ? PILL_HUNT_QUEUED : LEAD_STATE_TITLE[state]}
+      title={title}
       className="inline-flex flex-none items-center gap-1.5 rounded-chip border px-1.5 py-px text-[10.5px] font-medium"
       style={{ color: style.color, borderColor: style.border, background: style.background }}
     >
       <span className="h-[5px] w-[5px] rounded-full" style={{ background: style.color }} />
-      {LEAD_STATE_LABEL[state]}
+      {byHunt ? HUNT_CLOSED_LABEL : LEAD_STATE_LABEL[state]}
       {tail}
     </span>
   );
@@ -499,13 +517,23 @@ function LeadRow({
           {LEFT_TO_YOU_LABEL}
         </span>
       )}
-      {lead.status === 'dismissed' && lead.dismissed_reason && (
+      {closedByHunt(lead) ? (
         <span
           className="rounded-chip border border-border-faint px-1.5 py-px text-[10.5px] text-faint"
-          title={CHIP_DISMISS_REASON}
+          title={CHIP_CLOSED_BY_HUNT}
         >
-          reason: {REASON_LABEL[lead.dismissed_reason] ?? lead.dismissed_reason}
+          closed by {HUNT_CLOSED_ACTOR}
         </span>
+      ) : (
+        lead.status === 'dismissed' &&
+        lead.dismissed_reason && (
+          <span
+            className="rounded-chip border border-border-faint px-1.5 py-px text-[10.5px] text-faint"
+            title={CHIP_DISMISS_REASON}
+          >
+            reason: {REASON_LABEL[lead.dismissed_reason] ?? lead.dismissed_reason}
+          </span>
+        )
       )}
       {lead.entities.length > 1 && (
         <span className="text-[11.5px] text-dim">
@@ -739,7 +767,10 @@ function LeadRow({
                 {sourceLabel(o.source, o.shadow)}
               </span>
               {o.summary ?? kindLabel(o.kind, o.kind_label)}
-              {o.occurrences > 1 && `, seen ${plural(o.occurrences, 'time')}`}
+              {o.occurrences > 1 &&
+                `, seen on ${plural(o.occurrences, 'sweep')}${
+                  o.first_seen_at ? `, first seen ${ago(o.first_seen_at)}` : ''
+                }`}
             </li>
           ))}
           {lead.observations.length > 4 && (

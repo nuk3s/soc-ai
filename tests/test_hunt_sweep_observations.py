@@ -291,7 +291,7 @@ async def test_the_next_sweep_after_an_approval_writes_a_live_observation(
 
     assert len(rows) == 1, "the sweep refreshes the row it wrote, it does not add one"
     assert rows[0].shadow is False
-    assert rows[0].occurrences == 2
+    assert rows[0].occurrences == 1, "the same documents on both sweeps are one sighting"
     assert shadow_now is False, "the lead reads its mark back from its observations"
 
 

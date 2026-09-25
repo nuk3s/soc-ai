@@ -52,6 +52,11 @@ const COVERAGE: Record<string, { label: string; color: string; title: string }> 
     color: '#8b949e',
     title: 'The external destinations of this host all resolve to a proxy. The proxy carries this dimension.',
   },
+  unmeasurable: {
+    label: 'unmeasurable',
+    color: '#f85149',
+    title: 'The grid refused the query that measures this dimension. soc-ai can score no departure here. The row shows the reason the grid gave.',
+  },
 };
 
 function CoverageChip({ coverage, days }: { coverage: string; days: number }) {
@@ -72,13 +77,22 @@ function CoverageChip({ coverage, days }: { coverage: string; days: number }) {
 const PREVIEW = 8;
 const MORE = /\s\+\d+ more$/;
 
+// What a row with no members says. Three different absences, three sentences.
+function fallbackFor(d: ProfileDimension): string {
+  if (d.coverage === 'blind') return 'cannot be measured for this host';
+  if (d.coverage === 'unmeasurable') {
+    return `not measured: ${d.coverage_reason ?? 'the grid refused the query'}`;
+  }
+  return 'nothing observed';
+}
+
 // A set row says "197 peers · a, b, c, +189 more". The 189 exist and the
 // backend sends them, so "+189 more" opens rather than naming what the page
 // cannot show. Shaped rows (hours, rates) have no members and print as-is.
 function ProfileSummary({ d }: { d: ProfileDimension }) {
   const [open, setOpen] = useState(false);
   const members = d.shape === 'categorical' ? d.top : [];
-  const fallback = d.coverage === 'blind' ? 'cannot be measured for this host' : 'nothing observed';
+  const fallback = fallbackFor(d);
   if (members.length <= PREVIEW) {
     return (
       <span className="min-w-0 flex-1 break-words text-text-2" title={d.summary}>

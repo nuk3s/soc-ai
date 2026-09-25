@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 
 import { DocumentChip } from './DocumentDrawer';
-import { REASON_LABEL } from './LeadsStrip';
+import { HUNT_CLOSED_ACTOR, REASON_LABEL, closedByHunt } from './LeadsStrip';
 import { Panel, PanelHeader } from './Panel';
 import type { LeadDetail } from '../lib/api';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
@@ -9,7 +9,7 @@ import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import {
   CHIP_DISMISSED_EVENT,
-  CHIP_SEEN,
+  CHIP_SWEEPS,
   CHIP_TYPE,
   COUNT_OBSERVATIONS,
   OBSERVATION_NO_ANALYTIC,
@@ -94,13 +94,15 @@ export function LeadTimeline({
                 className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[10.5px] text-text-2"
                 title={CHIP_DISMISSED_EVENT}
               >
-                dismissed
+                {closedByHunt(lead) ? 'closed' : 'dismissed'}
               </span>
             </div>
             <div className="mt-0.5 font-medium">
-              Dismissed {ago(lead.dismissed_at)} by {lead.dismissed_by}:{' '}
-              {REASON_LABEL[lead.dismissed_reason ?? ''] ?? lead.dismissed_reason}
-              {lead.dismissed_note ? `. ${lead.dismissed_note}` : ''}
+              {closedByHunt(lead)
+                ? `Closed ${ago(lead.dismissed_at)} by ${HUNT_CLOSED_ACTOR}. The hunt found no threat.`
+                : `Dismissed ${ago(lead.dismissed_at)} by ${lead.dismissed_by}: ${
+                    REASON_LABEL[lead.dismissed_reason ?? ''] ?? lead.dismissed_reason
+                  }${lead.dismissed_note ? `. ${lead.dismissed_note}` : ''}`}
               {reopened ? '. Reopened.' : ''}
             </div>
           </li>
@@ -131,8 +133,9 @@ export function LeadTimeline({
                 {o.birth_weight.toFixed(2)} → {o.weight_now.toFixed(2)} now
               </span>
               {o.occurrences > 1 && (
-                <span className="text-[11px] text-dim" title={CHIP_SEEN}>
-                  seen {plural(o.occurrences, 'time')}
+                <span className="text-[11px] text-dim" title={CHIP_SWEEPS}>
+                  seen on {plural(o.occurrences, 'sweep')}
+                  {o.first_seen_at ? `, first seen ${ago(o.first_seen_at)}` : ''}
                 </span>
               )}
             </div>

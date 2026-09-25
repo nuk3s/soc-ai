@@ -38,7 +38,7 @@ async def test_migration_creates_the_ledger(settings_kratos: Settings) -> None:
         # A SECOND head canary, despite the note in tests/test_hunts_store.py
         # claiming the repo keeps exactly one. Bump both when a migration lands.
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0050"
+        assert row.scalar_one() == "0051"
     await engine.dispose()
 
 

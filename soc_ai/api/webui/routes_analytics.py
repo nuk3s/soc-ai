@@ -940,6 +940,9 @@ class EntityObservationOut(BaseModel):
     weight_now: float
     lead_id: int | None
     born_at: str | None
+    # When the row was first written. The panel says "first seen 3d ago"
+    # beside the sweep count, so a repeat reads as a duration and not a tally.
+    first_seen_at: str | None = None
     occurrences: int
     read: bool
     # Whether ``spec_id`` is an analytic the catalog lists. An alert verdict
@@ -1020,6 +1023,7 @@ async def list_observations(
                 ),
                 lead_id=observation.lead_id,
                 born_at=_iso(observation.born_at),
+                first_seen_at=_iso(observation.first_seen_at),
                 occurrences=int(observation.occurrences or 1),
                 read=observation.read_at is not None,
                 analytic_exists=observation.spec_id in cat.listed,

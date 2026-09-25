@@ -15,7 +15,9 @@ from soc_ai.hunting.priors import (
     COVERAGE_BLIND,
     COVERAGE_MEASURED,
     COVERAGE_NOT_APPLICABLE,
+    LINUX_EPHEMERAL_START,
     evaluate_prior,
+    served_port_counts,
 )
 from soc_ai.hunting.spec import CATALOG_DIR, HuntSpec, load_catalog
 from soc_ai.store.entity_profiles import ProfileRow
@@ -49,6 +51,7 @@ def _profile(
         shape="categorical",
         vector={"22": {"count": 40}} if vector is None else vector,
         coverage=coverage,
+        coverage_reason=None,
         support_days=support_days,
         role="network_device",
         role_confidence=0.9,
@@ -60,6 +63,15 @@ def _profile(
     )
 
 
+def _seen(count: int, *, peers: int = 2, days: int = 2, **extra: Any) -> dict[str, Any]:
+    """One observed member with what the recent read now carries.
+
+    Two peers and two days by default, so a member counts as a served port
+    unless the test says otherwise.
+    """
+    return {"count": count, "peers": peers, "days": days, **extra}
+
+
 # ---------------------------------------------------------------------------
 # The inverted confidence gate
 # ---------------------------------------------------------------------------
@@ -69,7 +81,7 @@ def test_a_low_confidence_role_is_blind_not_weakly_firing() -> None:
     result = evaluate_prior(
         _spec(roles=["network_device"]),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.5,
     )
@@ -82,7 +94,7 @@ def test_an_unknown_role_is_blind_not_a_free_pass() -> None:
     result = evaluate_prior(
         _spec(roles=["network_device"]),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role=None,
         role_confidence=None,
     )
@@ -94,7 +106,7 @@ def test_a_high_confidence_role_evaluates_normally() -> None:
     result = evaluate_prior(
         _spec(roles=["network_device"]),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -109,7 +121,7 @@ def test_a_prior_scoped_to_other_roles_does_not_apply() -> None:
     result = evaluate_prior(
         _spec(roles=["domain_controller"]),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="workstation",
         role_confidence=0.9,
     )
@@ -121,7 +133,7 @@ def test_a_prior_with_no_roles_applies_to_every_role() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="workstation",
         role_confidence=0.9,
     )
@@ -138,7 +150,7 @@ def test_a_blind_profile_produces_no_departures() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector=None, coverage="blind"),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -152,7 +164,7 @@ def test_a_learning_profile_produces_no_departures() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(coverage="learning", support_days=3),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -167,7 +179,7 @@ def test_a_missing_profile_is_blind_not_clean() -> None:
     result = evaluate_prior(
         _spec(),
         profile=None,
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -182,7 +194,7 @@ def test_a_measured_but_empty_baseline_still_scores() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector={}),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -199,7 +211,7 @@ def test_a_member_already_in_the_baseline_is_not_a_departure() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector={"22": {"count": 40}, "445": {"count": 5}}),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -210,7 +222,7 @@ def test_several_novel_members_each_produce_a_departure() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector={"22": {"count": 40}}),
-        observed={"445": {"count": 4}, "3389": {"count": 2}, "22": {"count": 9}},
+        observed={"445": _seen(4), "3389": _seen(2), "22": _seen(9)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -223,7 +235,7 @@ def test_a_departure_carries_what_the_baseline_held_for_context() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector={"22": {"count": 40}}),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -320,7 +332,7 @@ def test_a_member_that_recurs_is_a_departure_however_high_the_port() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector={"22": {"count": 40}}),
-        observed={"47908": {"count": 12}},
+        observed={"47908": _seen(12)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -333,7 +345,7 @@ def test_the_recurrence_floor_is_declarable_per_prior() -> None:
     result = evaluate_prior(
         _spec(min_observations=1),
         profile=_profile(vector={"22": {"count": 40}}),
-        observed={"47908": {"count": 1}},
+        observed={"47908": _seen(1)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -359,7 +371,7 @@ def test_the_departure_carries_the_observed_count() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(vector={"22": {"count": 40}}),
-        observed={"3389": {"count": 57}},
+        observed={"3389": _seen(57)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -597,7 +609,7 @@ def test_a_role_scoped_prior_is_still_blind_on_an_unclassified_host() -> None:
     result = evaluate_prior(
         _spec(roles=["network_device"]),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role=None,
         role_confidence=None,
     )
@@ -633,7 +645,7 @@ def test_a_novel_member_carries_the_documents_it_was_seen_in() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(),
-        observed={"445": {"count": 4, "sample_ids": ("d1", "d2", "d3")}},
+        observed={"445": _seen(4, sample_ids=("d1", "d2", "d3"))},
         role="network_device",
         role_confidence=0.9,
     )
@@ -646,7 +658,7 @@ def test_a_departure_with_no_sample_carries_an_empty_list_not_a_crash() -> None:
     result = evaluate_prior(
         _spec(),
         profile=_profile(),
-        observed={"445": {"count": 4}},
+        observed={"445": _seen(4)},
         role="network_device",
         role_confidence=0.9,
     )
@@ -675,3 +687,123 @@ def test_a_rate_departure_carries_the_documents_of_its_cell() -> None:
         role_confidence=0.9,
     )
     assert result.departures[0].sample_ids == ("r1", "r2", "r3")
+
+
+# ---------------------------------------------------------------------------
+# The peers-or-days guard on served ports
+# ---------------------------------------------------------------------------
+
+
+def test_a_port_reached_from_one_peer_on_one_day_does_not_count() -> None:
+    # The production case. Postfix on a hypervisor looked up a name. The
+    # endpoint sensor wrote the reply with the hypervisor as the destination
+    # and the ephemeral source port of the lookup as the destination port.
+    # One peer, one day, nineteen documents across nineteen sweeps.
+    assert served_port_counts("33897", count=19, peers=1, days=1) is False
+
+
+def test_a_port_two_peers_reach_counts() -> None:
+    assert served_port_counts("445", count=2, peers=2, days=1) is True
+
+
+def test_a_port_reached_on_two_days_counts() -> None:
+    assert served_port_counts("445", count=2, peers=1, days=2) is True
+
+
+def test_a_high_port_needs_two_peers_and_two_days() -> None:
+    # Linux hands out 32768 and up per connection. A listener parked up there
+    # is real when several machines reach it across several days.
+    assert served_port_counts("33897", count=6, peers=2, days=1) is False
+    assert served_port_counts("33897", count=6, peers=1, days=2) is False
+    assert served_port_counts("33897", count=6, peers=2, days=2) is True
+    assert served_port_counts(str(LINUX_EPHEMERAL_START), count=6, peers=2, days=1) is False
+    assert served_port_counts(str(LINUX_EPHEMERAL_START - 1), count=6, peers=2, days=1) is True
+
+
+def test_a_port_with_no_documents_never_counts() -> None:
+    assert served_port_counts("445", count=0, peers=5, days=5) is False
+
+
+def test_a_member_that_is_not_a_port_number_does_not_count() -> None:
+    assert served_port_counts("http", count=4, peers=3, days=3) is False
+    assert served_port_counts(None, count=4, peers=3, days=3) is False
+
+
+def test_a_novel_port_from_one_peer_on_one_day_is_not_a_departure() -> None:
+    # Nineteen documents cleared the recurrence floor nineteen times on
+    # production. The floor counts documents. The guard counts peers and days.
+    result = evaluate_prior(
+        _spec(),
+        profile=_profile(vector={"22": _seen(40)}),
+        observed={"33897": _seen(19, peers=1, days=1)},
+        role="network_device",
+        role_confidence=0.9,
+    )
+    assert result.departures == ()
+    assert result.coverage == COVERAGE_MEASURED
+
+
+def test_a_novel_port_two_peers_reach_is_a_departure() -> None:
+    result = evaluate_prior(
+        _spec(),
+        profile=_profile(vector={"22": _seen(40)}),
+        observed={"8443": _seen(2, peers=2, days=1)},
+        role="network_device",
+        role_confidence=0.9,
+    )
+    assert [d.member for d in result.departures] == ["8443"]
+
+
+def test_a_recent_read_without_peers_or_days_does_not_fire_on_a_served_port() -> None:
+    # An older shape, or a plane that carries no source address. Zero is
+    # what the reader hands back, and zero does not count. A permissive
+    # default here is how the ephemeral-port stream got in the first time.
+    result = evaluate_prior(
+        _spec(),
+        profile=_profile(vector={"22": _seen(40)}),
+        observed={"8443": {"count": 12}},
+        role="network_device",
+        role_confidence=0.9,
+    )
+    assert result.departures == ()
+
+
+def test_the_guard_applies_to_served_ports_and_not_to_outbound_ports() -> None:
+    # consumed_ports is keyed on the source. A peer count there would count
+    # the entity itself, so the dimension keeps the recurrence floor alone.
+    result = evaluate_prior(
+        _spec(dimension="consumed_ports"),
+        profile=_profile(vector={"443": {"count": 90}}, dimension="consumed_ports"),
+        observed={"8220": {"count": 3}},
+        role="network_device",
+        role_confidence=0.9,
+    )
+    assert [d.member for d in result.departures] == ["8220"]
+
+
+def test_the_note_states_documents_in_the_window_not_sweeps() -> None:
+    # "The sweep saw it 2 times" sat beside "seen 19 times" on one row, and
+    # the two numbers measured different things. The note says what the
+    # count is: documents, in the window the sweep read.
+    result = evaluate_prior(
+        _spec(),
+        profile=_profile(vector={"22": _seen(40)}),
+        observed={"8443": _seen(4)},
+        role="network_device",
+        role_confidence=0.9,
+        window_hours=12,
+    )
+    assert "4 documents in the last 12 h" in result.note
+    assert "saw it" not in result.note
+
+
+def test_one_document_reads_in_the_singular() -> None:
+    result = evaluate_prior(
+        _spec(min_observations=1),
+        profile=_profile(vector={"22": _seen(40)}),
+        observed={"8443": _seen(1)},
+        role="network_device",
+        role_confidence=0.9,
+        window_hours=24,
+    )
+    assert "1 document in the last 24 h" in result.note

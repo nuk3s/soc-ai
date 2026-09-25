@@ -11,7 +11,7 @@ import {
 } from '../components/LeadsStrip';
 import { Definition } from '../components/Definition';
 import { LeadTimeline } from '../components/LeadTimeline';
-import { DismissLeadForm, REASON_LABEL } from '../components/LeadsStrip';
+import { DismissLeadForm, HUNT_CLOSED_ACTOR, REASON_LABEL, closedByHunt } from '../components/LeadsStrip';
 import { Panel, PanelHeader } from '../components/Panel';
 import { EmptyState, LoadingState } from '../components/States';
 import {
@@ -32,6 +32,7 @@ import { ago } from '../lib/timeRange';
 import {
   ACTION_HUNT_NOW,
   ACTION_REOPEN,
+  CHIP_CLOSED_BY_HUNT,
   CHIP_DISMISS_REASON,
   CHIP_LEFT_TO_YOU,
   CHIP_ONE_SIGNAL,
@@ -44,6 +45,7 @@ import {
   PROMOTE_NEEDS_HUNT,
   RELATED_REASON,
   WEIGHT_AT_FORMATION,
+  WEIGHT_BY_TYPE,
   WEIGHT_NOW,
   huntStatusTitle,
 } from '../lib/tooltips';
@@ -199,14 +201,25 @@ export function LeadDetail() {
             reason sat on the timeline alone, below every observation. The word
             is the strip's word: one dismissal read "reason:" there and
             "Closed:" here, which is two names for one fact. */}
-        {closed && d.dismissed_reason && (
+        {closedByHunt(d) ? (
           <span
             data-testid="lead-closed-reason"
             className="text-[11.5px] text-dim"
-            title={CHIP_DISMISS_REASON}
+            title={CHIP_CLOSED_BY_HUNT}
           >
-            reason: {REASON_LABEL[d.dismissed_reason] ?? d.dismissed_reason}
+            closed by {HUNT_CLOSED_ACTOR}
           </span>
+        ) : (
+          closed &&
+          d.dismissed_reason && (
+            <span
+              data-testid="lead-closed-reason"
+              className="text-[11.5px] text-dim"
+              title={CHIP_DISMISS_REASON}
+            >
+              reason: {REASON_LABEL[d.dismissed_reason] ?? d.dismissed_reason}
+            </span>
+          )
         )}
         {d.kinds.map((k, i) => (
           <span
@@ -382,6 +395,21 @@ export function LeadDetail() {
         <span title={WEIGHT_AT_FORMATION}>
           at formation {d.weight_at_formation.toFixed(2)}
         </span>{' '}
+        {/* One line per type, each against the cap one type can reach. A
+            lead read "weight now 25.00" over one type repeated, and 25 ranked
+            nothing. "1.70 of 1.70, saturated" says what the number is. */}
+        {liveWeight &&
+          (d.weight_by_kind ?? []).map((k) => (
+            <span
+              key={k.kind}
+              className="ml-1 font-mono text-[11px]"
+              title={WEIGHT_BY_TYPE}
+              data-testid={`weight-kind-${k.kind}`}
+            >
+              {kindLabel(k.kind, k.kind_label)} {k.weight.toFixed(2)} of {k.cap.toFixed(2)}
+              {k.saturated ? ', saturated' : ''}
+            </span>
+          ))}{' '}
         · {plural(d.kinds.length, 'type')} ·{' '}
         {plural(d.entities.length, 'entity', 'entities')} named · {d.scope_count} with observations
       </div>

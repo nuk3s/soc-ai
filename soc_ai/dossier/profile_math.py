@@ -20,15 +20,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 __all__ = [
+    "GUARDED_PORT_DIMENSIONS",
+    "LINUX_EPHEMERAL_START",
     "Cell",
     "TimeCell",
     "cell_for",
     "mad",
     "median",
     "robust_z",
+    "served_port_counts",
     "summarise_cells",
 ]
 
@@ -148,3 +152,40 @@ def summarise_cells(samples: list[tuple[datetime, float]], *, tz: str) -> dict[T
         )
         for cell, values in grouped.items()
     }
+
+
+# The port range Linux hands out per connection. The IANA dynamic floor
+# (49152, so_client.fields.EPHEMERAL_PORT_FLOOR) stays where it is. The range
+# read a listener at 47908 once, and a numeric floor high enough to catch it
+# would hide a real listener parked on a high port. A port in this range has
+# to earn its place with peers AND days.
+LINUX_EPHEMERAL_START = 32768
+
+# The dimensions the peers-or-days guard applies to: sets of ports the ENTITY
+# answers on, keyed by destination.ip.
+GUARDED_PORT_DIMENSIONS = frozenset({"served_ports"})
+
+
+def served_port_counts(member: Any, *, count: int, peers: int, days: int) -> bool:
+    """Whether a port earned a place in a served-port set.
+
+    Telemetry-independent. A served port is one several machines reach, or
+    one reached again on another day. One peer on one day is what an
+    ephemeral source port looks like when a sensor writes the reply as a
+    flow. The production sweep read 73 of them as new services on two
+    hypervisors. Every one was a Postfix DNS lookup seen by the endpoint
+    sensor.
+
+    ``count`` below one never counts. A member that is not a port number
+    never counts. The dimension is a set of ports, and a word in it is a
+    mapping defect, not a service.
+    """
+    if count < 1:
+        return False
+    try:
+        port = int(str(member))
+    except (TypeError, ValueError):
+        return False
+    if port >= LINUX_EPHEMERAL_START:
+        return peers >= 2 and days >= 2
+    return peers >= 2 or days >= 2

@@ -36,15 +36,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from soc_ai.dossier.profile import (
     _CATEGORICAL,
     _SHAPED,
+    _SHAPED_CANDIDATES,
+    _SHAPED_ENTITY_FIELD,
+    _SHAPED_PROBE_FIELD,
     _dataset_clause,
+    _direction_for,
+    _member_days,
+    _member_peers,
     _nested_terms,
     _outside_the_estate,
+    _peer_field,
     _port_bound,
     _scope_must_not,
     _window_filter,
     resolve_plane,
 )
-from soc_ai.dossier.profile_math import cell_for, median
+from soc_ai.dossier.profile_math import GUARDED_PORT_DIMENSIONS, cell_for, median
 from soc_ai.hunting.leads import (
     LeadOutcome,
     content_fingerprint,
@@ -72,13 +79,13 @@ from soc_ai.hunting.wording import (
 from soc_ai.store import entity_profiles as ep
 from soc_ai.store.models import HostDossier, HostDossierField
 
-__all__ = ["PriorSweep", "run_prior_sweep"]
+__all__ = ["PriorSweep", "ProfileState", "run_prior_sweep"]
 
 _LOGGER = logging.getLogger(__name__)
 
-# How far back "lately" reaches. A day, because the baseline is thirty and the
-# two must not be the same window.
-DEFAULT_RECENT_HOURS = 24
+# Re-exported. The number lives in soc_ai.hunting.window; the CLI and the
+# tests import it from here.
+from soc_ai.hunting.window import DEFAULT_RECENT_HOURS  # noqa: E402 - re-export beside its use
 
 # How many documents the recent read keeps per member. Three is enough for an
 # analyst to read the condition and cheap enough to ask for on every bucket.
@@ -86,13 +93,24 @@ SAMPLE_IDS_PER_MEMBER = 3
 
 
 def _samples_agg() -> dict[str, Any]:
-    """Up to three document ids per bucket, with no document bodies.
+    """Up to three document ids per bucket, with no document bodies, newest first.
 
     ``_source: false`` because the id is the whole point. The observation cites
     the document and the hunt reads it with ``get_event_raw``; carrying the
     bodies back would multiply the response for a field no caller here reads.
+
+    Newest first, because the sample is what tells a new sighting from a
+    re-read. Unsorted, Elasticsearch returns the same three oldest documents
+    on every sweep while they sit in the window, and a port a hundred new
+    machines reached today would cite the same three ids it cited yesterday.
     """
-    return {"top_hits": {"size": SAMPLE_IDS_PER_MEMBER, "_source": False}}
+    return {
+        "top_hits": {
+            "size": SAMPLE_IDS_PER_MEMBER,
+            "_source": False,
+            "sort": [{"@timestamp": {"order": "desc"}}],
+        }
+    }
 
 
 def _hit_ids(bucket: Any) -> list[str]:
@@ -120,7 +138,9 @@ def _keep_ids(into: list[str], ids: Sequence[str]) -> None:
             into.append(one)
 
 
-def _recent_terms(*, entity_field: str, member_field: str) -> dict[str, Any]:
+def _recent_terms(
+    *, entity_field: str, member_field: str, peer_field: str | None = None
+) -> dict[str, Any]:
     """The baseline's member aggregation, plus the documents behind each member.
 
     The sample rides on the RECENT read only. Both reads carry the same bucket
@@ -129,8 +149,13 @@ def _recent_terms(*, entity_field: str, member_field: str) -> dict[str, Any]:
     thousand documents fetched to describe what is ordinary. What is ordinary
     needs no citation. A departure from it does, and a day fills far fewer
     buckets than a month.
+
+    ``peer_field`` is the one the baseline used. The guard reads peers and
+    days from both sides of the comparison.
     """
-    body = _nested_terms(entity_field=entity_field, member_field=member_field)
+    body = _nested_terms(
+        entity_field=entity_field, member_field=member_field, peer_field=peer_field
+    )
     body["aggs"]["members"]["aggs"] = {
         **body["aggs"]["members"]["aggs"],
         "samples": _samples_agg(),
@@ -150,6 +175,8 @@ class PriorSweep:
     # score. The trail needs it: a spec absent from results is otherwise
     # indistinguishable from one that was never run.
     evaluated_specs: tuple[str, ...] = ()
+    # The window the recent read covered, so the rendering can state it.
+    recent_hours: int = DEFAULT_RECENT_HOURS
 
     @property
     def fired(self) -> tuple[PriorResult, ...]:
@@ -171,6 +198,21 @@ class PriorSweep:
         for result in self.results:
             counts[result.coverage] = counts.get(result.coverage, 0) + 1
         return counts
+
+
+@dataclass(frozen=True)
+class ProfileState:
+    """What the caller knew about the baselines when the sweep ran.
+
+    ``built_at`` is the newest ``entity_profiles.built_at``; ``stale`` is the
+    caller's verdict on it; ``reason`` is why a dimension could not be
+    measured, when one could not. Recorded on the trail so the panel can say
+    "baseline 26 h old" next to a coverage count instead of implying now.
+    """
+
+    built_at: datetime | None = None
+    stale: bool = False
+    reason: str | None = None
 
 
 def _dimension_spec(dimension: str) -> tuple[tuple[str, ...], str, str, str] | None:
@@ -346,6 +388,7 @@ async def _recent_members(
     if not usable:
         return {}
 
+    direction = _direction_for(dimension, planes=usable)
     query = {
         "bool": {
             "filter": [
@@ -363,12 +406,15 @@ async def _recent_members(
                 # surface dynamic ports the baseline was never allowed to hold,
                 # and every one of them would score as novel.
                 *_port_bound(member_field),
+                # The SAME direction clauses, for the same reason.
+                *direction["filter"],
             ],
             # The same estate scope, for the same reason. The outbound-port
             # baseline holds destinations outside the estate only.
             "must_not": [
                 *_scope_must_not(),
                 *_outside_the_estate(dimension, cidrs=cidrs),
+                *direction["must_not"],
             ],
         }
     }
@@ -376,7 +422,13 @@ async def _recent_members(
         settings.events_index_pattern,
         query,
         size=0,
-        aggs={dimension: _recent_terms(entity_field=entity_field, member_field=member_field)},
+        aggs={
+            dimension: _recent_terms(
+                entity_field=entity_field,
+                member_field=member_field,
+                peer_field=_peer_field(dimension),
+            )
+        },
     )
     buckets = ((result.aggregations or {}).get(dimension) or {}).get("buckets") or []
 
@@ -386,14 +438,19 @@ async def _recent_members(
         if not isinstance(key, str) or not key:
             continue
         members = ((bucket.get("members") or {}).get("buckets")) or []
-        out[key] = {
-            str(m.get("key")): {
+        seen: dict[str, Any] = {}
+        for m in members:
+            if m.get("key") is None:
+                continue
+            entry: dict[str, Any] = {
                 "count": int(m.get("doc_count") or 0),
                 "sample_ids": _hit_ids(m),
             }
-            for m in members
-            if m.get("key") is not None
-        }
+            if dimension in GUARDED_PORT_DIMENSIONS:
+                entry["peers"] = _member_peers(m)
+                entry["days"] = _member_days(m)
+            seen[str(m.get("key"))] = entry
+        out[key] = seen
     return out
 
 
@@ -447,6 +504,7 @@ async def run_prior_sweep(
     record: bool = False,
     cidrs: Sequence[Any] = (),
     shadow_ids: frozenset[str] = frozenset(),
+    profiles: ProfileState | None = None,
 ) -> PriorSweep:
     """Evaluate every ``profile`` spec against every entity that has a baseline.
 
@@ -489,15 +547,17 @@ async def run_prior_sweep(
         if dimension not in recent_cache:
             try:
                 if shaped is not None:
-                    _dim, shape, candidates, probe_field, entity_field = shaped
+                    # Both shaped dimensions read the same flow plane, keyed
+                    # by the same entity; the lane holds those three once.
+                    _dim, shape = shaped
                     recent_cache[dimension] = await _recent_shaped(
                         elastic,
                         settings,
                         dimension=dimension,
                         shape=shape,
-                        entity_field=entity_field,
-                        candidates=candidates,
-                        probe_field=probe_field,
+                        entity_field=_SHAPED_ENTITY_FIELD,
+                        candidates=_SHAPED_CANDIDATES,
+                        probe_field=_SHAPED_PROBE_FIELD,
                         hours=recent_hours,
                         tz=str(getattr(settings, "so_timezone", "UTC") or "UTC"),
                     )
@@ -523,7 +583,9 @@ async def run_prior_sweep(
         for entity_key, observed in recent.items():
             role, confidence = roles.get(entity_key, (None, 0.0))
             try:
-                profiles = await ep.load_profiles(db, entity_kind="host", entity_key=entity_key)
+                # ``baselines``, not ``profiles``: that name is the caller's
+                # ProfileState, recorded on the trail after this loop.
+                baselines = await ep.load_profiles(db, entity_kind="host", entity_key=entity_key)
             except Exception as exc:
                 errors.append(f"{spec.id}/{entity_key}: profile read failed: {exc}")
                 continue
@@ -531,10 +593,11 @@ async def run_prior_sweep(
             results.append(
                 evaluate_prior(
                     spec,
-                    profile=profiles.get(dimension),
+                    profile=baselines.get(dimension),
                     observed=observed,
                     role=role,
                     role_confidence=confidence,
+                    window_hours=recent_hours,
                 )
             )
 
@@ -544,16 +607,19 @@ async def run_prior_sweep(
         errors=tuple(errors),
         notes=tuple(notes),
         evaluated_specs=tuple(s.id for s in priors),
+        recent_hours=recent_hours,
     )
     if record:
         try:
-            lead_outcome = await _record_and_form(db, results, cidrs=cidrs, shadow_ids=shadow_ids)
+            lead_outcome = await _record_and_form(
+                db, results, cidrs=cidrs, shadow_ids=shadow_ids, recent_hours=recent_hours
+            )
         except Exception as exc:
             errors.append(f"could not record the observations: {exc}")
         try:
             from soc_ai.store import prior_spec_runs  # noqa: PLC0415 - lazy, avoids a cycle
 
-            await prior_spec_runs.record_sweep(db, sweep)
+            await prior_spec_runs.record_sweep(db, sweep, profiles=profiles)
         except Exception as exc:
             errors.append(f"could not record the sweep trail: {exc}")
 
@@ -563,6 +629,7 @@ async def run_prior_sweep(
         notes=tuple(notes),
         leads=lead_outcome,
         evaluated_specs=sweep.evaluated_specs,
+        recent_hours=recent_hours,
     )
 
 
@@ -572,6 +639,7 @@ async def _record_and_form(
     *,
     cidrs: Sequence[Any] = (),
     shadow_ids: frozenset[str] = frozenset(),
+    recent_hours: int = DEFAULT_RECENT_HOURS,
 ) -> LeadOutcome:
     """Turn departures into observations, then form leads from what accumulates.
 
@@ -604,7 +672,7 @@ async def _record_and_form(
                 # that had collapsed -- a new thing appearing, where the truth
                 # was an existing one stopping.
                 summary=(
-                    f"{phrase(result.kind, departure)}. "
+                    f"{phrase(result.kind, departure, window_hours=recent_hours)}. "
                     f"{baseline_sentence(departure.baseline_size, departure.support_days)}"
                 ),
                 # The documents the recent read saw this member in, named the
@@ -711,7 +779,7 @@ def format_sweep(sweep: PriorSweep) -> str:
         lines.append(f"  [{result.spec_id}] {result.entity_kind}:{result.entity_key}")
         for departure in result.departures:
             lines.append(
-                f"      {phrase(result.kind, departure)}. "
+                f"      {phrase(result.kind, departure, window_hours=sweep.recent_hours)}. "
                 f"{baseline_sentence(departure.baseline_size, departure.support_days)}"
             )
     if sweep.leads is not None:

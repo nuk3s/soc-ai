@@ -477,3 +477,199 @@ async def test_the_loop_is_registered_and_cancelled_in_the_lifespan() -> None:
     source = _read(main.__file__)
     assert "lead_auto_hunt_task = asyncio.create_task(_lead_auto_hunt_loop(app))" in source
     assert "lead_auto_hunt_task.cancel()" in source
+
+
+async def _hunt_row(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    hunt_id: str,
+    lead_id: int,
+    status: str,
+    started_by: str = "auto-hunt",
+    findings: list[dict[str, Any]] | None = None,
+) -> None:
+    """One hunt row on one lead, in the loop's hand unless told otherwise."""
+    async with maker() as db:
+        db.add(
+            Hunt(
+                id=hunt_id,
+                objective="o",
+                objective_hash="x",
+                started_by=started_by,
+                kind="lead",
+                starter="lead",
+                status=status,
+                lead_id=lead_id,
+                report=None if findings is None else {"findings": findings, "narrative": "n"},
+            )
+        )
+        await db.commit()
+
+
+async def _lead_state(
+    maker: async_sessionmaker[AsyncSession], lead_id: int
+) -> tuple[str, str | None]:
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        return str(lead.status), lead.hunt_id
+
+
+async def test_a_failed_auto_hunt_is_retried_once(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """A gateway that dropped one hunt gets one more try. The lead is open again."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="open", hunt_id="01ERR1")
+    await _hunt_row(maker, hunt_id="01ERR1", lead_id=lead_id, status="error")
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker))
+    assert [c["lead_id"] for c in started] == [lead_id]
+    assert await _lead_state(maker, lead_id) == ("hunting", "01HUNT1")
+    await engine.dispose()
+
+
+async def test_two_failed_auto_hunts_leave_the_lead_to_the_analyst(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """The second failure is the last the loop pays for. The lead stays visible and open."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="open", hunt_id="01ERR2")
+    await _hunt_row(maker, hunt_id="01ERR1", lead_id=lead_id, status="error")
+    await _hunt_row(maker, hunt_id="01ERR2", lead_id=lead_id, status="interrupted")
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker), wakes=2)
+    assert started == []
+    assert await _lead_state(maker, lead_id) == ("open", "01ERR2")
+    await engine.dispose()
+
+
+async def test_a_hunt_that_could_not_run_counts_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """A complete hunt whose query raised is a failure too, or the loop re-hunts it every wake."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="open", hunt_id="01COULDNOT2")
+    could_not = [{"title": "net-rare-served-port: could not run", "category": "visibility_gap"}]
+    await _hunt_row(
+        maker, hunt_id="01COULDNOT1", lead_id=lead_id, status="complete", findings=could_not
+    )
+    await _hunt_row(
+        maker, hunt_id="01COULDNOT2", lead_id=lead_id, status="complete", findings=could_not
+    )
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker))
+    assert started == []
+    await engine.dispose()
+
+
+async def test_hunts_an_analyst_lost_do_not_count_against_the_loop(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """NEGATIVE CONTROL for the retry limit. Only the loop's own failures count."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="open", hunt_id="01BYHAND2")
+    await _hunt_row(maker, hunt_id="01BYHAND1", lead_id=lead_id, status="error", started_by="ana")
+    await _hunt_row(maker, hunt_id="01BYHAND2", lead_id=lead_id, status="error", started_by="ana")
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker))
+    assert [c["lead_id"] for c in started] == [lead_id]
+    await engine.dispose()
+
+
+async def test_a_wake_settles_a_lead_whose_hunt_finished_clean(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """The install that upgraded with two leads stuck in hunting. One wake, both closed."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="hunting", hunt_id="01CLEAN")
+    await _hunt_row(maker, hunt_id="01CLEAN", lead_id=lead_id, status="complete", findings=[])
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker))
+    assert started == []
+    assert await _lead_state(maker, lead_id) == ("dismissed", "01CLEAN")
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        assert lead.dismissed_reason == "hunt_clean" and lead.dismissed_by == "auto-hunt"
+    await engine.dispose()
+
+
+async def test_a_wake_leaves_a_lead_with_threat_findings_to_the_analyst(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Idempotent across wakes. A threat is the analyst's decision, and nothing re-hunts it."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="hunting", hunt_id="01THREAT")
+    await _hunt_row(
+        maker,
+        hunt_id="01THREAT",
+        lead_id=lead_id,
+        status="complete",
+        findings=[{"title": "Beaconing to a rare external address"}],
+    )
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker), wakes=3)
+    assert started == []
+    assert await _lead_state(maker, lead_id) == ("hunting", "01THREAT")
+    await engine.dispose()
+
+
+async def test_a_wake_settles_then_retries_a_lead_whose_hunt_errored(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Settle first, then select: the errored hunt is back to open and hunted in the same wake."""
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _lead(maker, status="hunting", hunt_id="01ERR")
+    await _hunt_row(maker, hunt_id="01ERR", lead_id=lead_id, status="error")
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    await _run(monkeypatch, _app(maker))
+    assert [c["lead_id"] for c in started] == [lead_id]
+    assert await _lead_state(maker, lead_id) == ("hunting", "01HUNT1")
+    await engine.dispose()
+
+
+async def test_startup_settles_the_leads_the_old_process_left_hunting(
+    settings_kratos: Settings,
+) -> None:
+    """The reaper makes the orphaned hunt terminal first, then the lead settles from it."""
+    engine, maker = await _db(settings_kratos)
+    clean = await _lead(maker, status="hunting", hunt_id="01CLEAN")
+    await _hunt_row(maker, hunt_id="01CLEAN", lead_id=clean, status="complete", findings=[])
+    orphan = await _lead(maker, status="hunting", hunt_id="01ORPHAN")
+    await _hunt_row(maker, hunt_id="01ORPHAN", lead_id=orphan, status="running")
+
+    await main_mod._reap_orphans_at_startup(maker)
+
+    assert await _lead_state(maker, clean) == ("dismissed", "01CLEAN")
+    assert await _lead_state(maker, orphan) == ("open", "01ORPHAN")
+    async with maker() as db:
+        hunt = await db.get(Hunt, "01ORPHAN")
+        assert hunt.status == "interrupted"
+    await engine.dispose()

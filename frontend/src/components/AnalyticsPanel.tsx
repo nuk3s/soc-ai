@@ -132,9 +132,21 @@ const TIER_TITLE =
 const WEEK_TITLE =
   'What this analytic did over the last 7 days. obs is observations written. leads is the leads it fed.';
 
+/** How fresh the baseline the sweep scored against was, or why a dimension
+ *  could not be measured. Empty for a backend that does not say. */
+export function baselineNote(coverage: PriorCoverage): string {
+  if (coverage.profiles_reason) return ` · baseline unmeasurable: ${coverage.profiles_reason}`;
+  if (!coverage.profiles_built_at) return '';
+  const hours = Math.max(
+    0,
+    Math.floor((Date.now() - Date.parse(coverage.profiles_built_at)) / 3_600_000),
+  );
+  return ` · baseline ${hours} h old${coverage.profiles_stale ? ', stale' : ''}`;
+}
+
 function coverageCell(coverage: PriorCoverage | null | undefined): string {
   if (!coverage) return '—';
-  return `${coverage.measured} measured · ${coverage.blind} blind`;
+  return `${coverage.measured} measured · ${coverage.blind} blind${baselineNote(coverage)}`;
 }
 
 /** The sweep the coverage figures came from. A coverage column with no date

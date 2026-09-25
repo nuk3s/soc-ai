@@ -7,7 +7,7 @@ import { absTime, ago } from '../lib/timeRange';
 import {
   CHIP_IN_LEAD,
   CHIP_NO_LEAD,
-  CHIP_SEEN,
+  CHIP_SWEEPS,
   CHIP_TYPE,
   COUNT_OBSERVATIONS,
   UNREAD_DOT,
@@ -67,8 +67,9 @@ function Row({ observation }: { observation: EntityObservation }) {
       </span>
       <span className="min-w-0 flex-1 text-text-2">{observation.summary ?? ''}</span>
       {observation.occurrences > 1 && (
-        <span className="text-[11px] text-dim" title={CHIP_SEEN}>
-          seen {plural(observation.occurrences, 'time')}
+        <span className="text-[11px] text-dim" title={CHIP_SWEEPS}>
+          seen on {plural(observation.occurrences, 'sweep')}
+          {observation.first_seen_at ? `, first seen ${ago(observation.first_seen_at)}` : ''}
         </span>
       )}
       <span className="font-mono text-[11px] text-dim" title={WEIGHT_TITLE}>

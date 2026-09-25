@@ -10,13 +10,18 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from soc_ai.hunting.weight import (
     DEFAULT_FLOOR,
     DEFAULT_HALF_LIFE_HOURS,
+    DEFAULT_LEAD_THRESHOLD,
+    KIND_WEIGHT_CAP,
     Kind,
     birth_weight,
+    lead_total,
     live_weight,
     stacked,
+    weight_by_kind,
 )
 
 _NOW = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
@@ -120,3 +125,46 @@ def test_every_kind_has_a_birth_weight() -> None:
     # indistinguishable from a kind that never fired.
     for kind in Kind:
         assert 0.0 < birth_weight(kind) <= 1.0, kind
+
+
+# ---------------------------------------------------------------------------
+# The per-type cap on a lead's total
+# ---------------------------------------------------------------------------
+
+
+def test_one_kind_saturates_at_twice_the_lead_threshold() -> None:
+    # Production formed a lead at 25 from 45 novel served ports. Forty-five
+    # rows of one kind are one story told forty-five times.
+    assert pytest.approx(2 * DEFAULT_LEAD_THRESHOLD) == KIND_WEIGHT_CAP
+    assert lead_total([(Kind.NOVEL_SERVED_PORT, 0.5)] * 45) == pytest.approx(KIND_WEIGHT_CAP)
+
+
+def test_two_kinds_saturate_at_twice_the_cap() -> None:
+    pairs = [(Kind.NOVEL_SERVED_PORT, 1.0)] * 30 + [(Kind.OFF_HOURS, 0.3)] * 30
+    assert lead_total(pairs) == pytest.approx(2 * KIND_WEIGHT_CAP)
+
+
+def test_below_the_cap_the_total_is_the_plain_sum() -> None:
+    assert lead_total([(Kind.NOVEL_DESTINATION, 0.5), (Kind.OFF_HOURS, 0.3)]) == pytest.approx(0.8)
+
+
+def test_the_breakdown_names_each_kind_once_with_its_cap() -> None:
+    rows = weight_by_kind(
+        [(Kind.OFF_HOURS, 0.3), ("novel_served_port", 1.0), (Kind.NOVEL_SERVED_PORT, 1.0)]
+    )
+    assert [r.kind for r in rows] == ["novel_served_port", "off_hours"]
+    served, off = rows
+    assert served.weight == pytest.approx(KIND_WEIGHT_CAP)
+    assert served.saturated is True
+    assert off.weight == pytest.approx(0.3)
+    assert off.saturated is False
+    assert off.cap == pytest.approx(KIND_WEIGHT_CAP)
+
+
+def test_a_negative_weight_never_subtracts_from_a_kind() -> None:
+    assert lead_total([(Kind.OFF_HOURS, -0.3), (Kind.OFF_HOURS, 0.3)]) == pytest.approx(0.3)
+
+
+def test_an_empty_lead_weighs_nothing() -> None:
+    assert lead_total([]) == 0.0
+    assert weight_by_kind([]) == []

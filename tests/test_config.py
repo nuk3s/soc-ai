@@ -206,6 +206,10 @@ def test_so_ca_bundle_accepts_path(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_blocklist_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """New blocklist + maxmind settings have sane defaults."""
     _setenv_required(monkeypatch)
+    # conftest's clean_env points these at empty tmp dirs; this test is about the
+    # shipped defaults, so drop the override.
+    for name in ("BLOCKLIST_DATA_DIR", "MAXMIND_DATA_DIR", "CLOUD_PREFIX_DATA_DIR"):
+        monkeypatch.delenv(name)
     s = Settings()
     assert s.blocklist_data_dir.name == "blocklists"
     assert s.maxmind_data_dir.name == "maxmind"

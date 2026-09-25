@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -128,6 +128,46 @@ def _lead_outcome(**over):  # type: ignore[no-untyped-def]
     from soc_ai.hunting.leads import LeadOutcome
 
     return LeadOutcome(**over)
+
+
+def _profile_settings(settings: Settings, *, schedule_enabled: bool = False) -> Settings:
+    """Profiles on, the dossier schedule as the range had it: off."""
+    settings.entity_profiles_enabled = True
+    settings.dossier_schedule_enabled = schedule_enabled
+    settings.dossier_schedule_interval_hours = 24
+    settings.hunting_prior_sweep_interval_minutes = 60
+    return settings
+
+
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _freshness(newest: datetime | None, unmeasurable: dict[str, str] | None = None):  # type: ignore[no-untyped-def]
+    from soc_ai.store.entity_profiles import ProfileFreshness
+
+    return ProfileFreshness(newest_built_at=newest, unmeasurable=dict(unmeasurable or {}))
+
+
+def _build(written: int = 640):  # type: ignore[no-untyped-def]
+    from soc_ai.dossier.profile_job import ProfileBuild
+
+    return ProfileBuild(written=written)
+
+
+async def _tick_with_profiles(app: Any, sweeper: Any, *, freshness: Any, builder: Any) -> None:
+    """One wake with the profile job's two entry points replaced."""
+    with (
+        patch("soc_ai.dossier.profile_job.freshness", new=freshness),
+        patch("soc_ai.dossier.profile_job.build_profiles", new=builder),
+    ):
+        await _tick(app, sweeper, wakes=1)
+
+
+def _profile_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("prior sweep: profiles")
+    ]
 
 
 async def test_the_sweep_is_on_by_default(settings_kratos: Settings) -> None:
@@ -394,3 +434,194 @@ async def test_the_loop_is_registered_and_cancelled_in_the_lifespan() -> None:
     source = _read(main.__file__)
     assert "prior_sweep_task = asyncio.create_task(_prior_sweep_loop(app))" in source
     assert "prior_sweep_task.cancel()" in source
+
+
+# ---------------------------------------------------------------------------
+# Profile freshness: the sweep is the only consumer, so the sweep owns it
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_profiles_are_rebuilt_before_the_sweep_whatever_the_dossier_schedule_says(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The range: the dossier schedule was off, the host timer that built the
+    baselines was retired, and the sweep evaluated three-day-old profiles
+    every hour and reported ~640 blind. Two schedules an operator has to wire
+    together is one schedule too many."""
+    settings = _profile_settings(settings_kratos, schedule_enabled=False)
+    order: list[str] = []
+    seen: dict[str, Any] = {}
+    stale_stamp = _now() - timedelta(hours=26)
+
+    async def _read(_maker: Any) -> Any:
+        # Stale before the rebuild, current after it.
+        return _freshness(stale_stamp if "build" not in order else _now())
+
+    async def _builder(*args: Any, **kwargs: Any) -> Any:
+        order.append("build")
+        return _build(640)
+
+    async def _sweeper(**kwargs: Any) -> Any:
+        order.append("sweep")
+        seen.update(kwargs)
+        return _sweep(results=(_result(),))
+
+    with caplog.at_level(logging.INFO):
+        await _tick_with_profiles(_app(settings), _sweeper, freshness=_read, builder=_builder)
+    assert order == ["build", "sweep"]
+    state = seen["profiles"]
+    assert state.stale is False
+    assert state.built_at is not None
+    assert _profile_lines(caplog) == ["prior sweep: profiles 26 h old, rebuilt 640 row(s)"]
+
+
+async def test_fresh_profiles_are_read_not_rebuilt(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _profile_settings(settings_kratos)
+    fresh_stamp = _now() - timedelta(hours=1)
+    builder = AsyncMock(return_value=_build())
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    with caplog.at_level(logging.INFO):
+        await _tick_with_profiles(
+            _app(settings),
+            sweeper,
+            freshness=AsyncMock(return_value=_freshness(fresh_stamp)),
+            builder=builder,
+        )
+    builder.assert_not_awaited()
+    sweeper.assert_awaited_once()
+    state = sweeper.await_args.kwargs["profiles"]
+    assert state.built_at == fresh_stamp
+    assert state.stale is False
+    assert _profile_lines(caplog) == ["prior sweep: profiles 1 h old"]
+
+
+async def test_profiles_never_built_are_built(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _profile_settings(settings_kratos)
+    reads = iter([_freshness(None), _freshness(_now())])
+
+    async def _read(_maker: Any) -> Any:
+        return next(reads)
+
+    builder = AsyncMock(return_value=_build(12))
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    with caplog.at_level(logging.INFO):
+        await _tick_with_profiles(_app(settings), sweeper, freshness=_read, builder=builder)
+    builder.assert_awaited_once()
+    assert _profile_lines(caplog) == ["prior sweep: profiles never built, rebuilt 12 row(s)"]
+
+
+async def test_a_stamp_in_the_future_reads_as_stale(settings_kratos: Settings) -> None:
+    """A row stamped in local time east of UTC reads as built in the future.
+    Rebuilding it is what writes the UTC stamp that ends the skew."""
+    settings = _profile_settings(settings_kratos)
+    reads = iter([_freshness(_now() + timedelta(hours=3)), _freshness(_now())])
+
+    async def _read(_maker: Any) -> Any:
+        return next(reads)
+
+    builder = AsyncMock(return_value=_build())
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    await _tick_with_profiles(_app(settings), sweeper, freshness=_read, builder=builder)
+    builder.assert_awaited_once()
+
+
+async def test_the_staleness_threshold_is_the_dossier_interval_floored_at_two_sweep_intervals(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.main import _profile_stale_after, _profiles_are_stale
+
+    s = settings_kratos
+    s.dossier_schedule_interval_hours = 24
+    s.hunting_prior_sweep_interval_minutes = 60
+    assert _profile_stale_after(s) == timedelta(hours=24)
+    s.dossier_schedule_interval_hours = 1
+    s.hunting_prior_sweep_interval_minutes = 60
+    assert _profile_stale_after(s) == timedelta(minutes=120)
+    s.dossier_schedule_interval_hours = 1
+    s.hunting_prior_sweep_interval_minutes = 15
+    assert _profile_stale_after(s) == timedelta(minutes=60)
+
+    now = _now()
+    day = timedelta(hours=24)
+    assert _profiles_are_stale(None, now, day) is True
+    assert _profiles_are_stale(now - timedelta(hours=1), now, day) is False
+    assert _profiles_are_stale(now - timedelta(hours=25), now, day) is True
+    assert _profiles_are_stale(now + timedelta(hours=3), now, day) is True
+
+
+async def test_a_rebuild_failure_is_logged_and_the_sweep_still_runs(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    from soc_ai.api.webui import _get_dossier_status
+
+    settings = _profile_settings(settings_kratos)
+    app = _app(settings)
+    builder = AsyncMock(side_effect=RuntimeError("the grid is gone"))
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(coverage="blind"),)))
+    with caplog.at_level(logging.INFO):
+        await _tick_with_profiles(
+            app,
+            sweeper,
+            freshness=AsyncMock(return_value=_freshness(_now() - timedelta(days=3))),
+            builder=builder,
+        )
+    sweeper.assert_awaited_once()
+    assert sweeper.await_args.kwargs["profiles"].stale is True
+    warned = [r.getMessage() for r in caplog.records if "profile rebuild failed" in r.getMessage()]
+    assert warned and "the grid is gone" in warned[0]
+    # The slot is released whatever happened inside it.
+    assert _get_dossier_status(app.state).running is False
+
+
+async def test_no_rebuild_while_a_dossier_sweep_holds_the_slot(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two network sweeps at once is the connection-pool pressure that has
+    frozen this app before. The rebuild shares the dossier's slot and yields."""
+    from soc_ai.api.webui import _DossierStatus
+
+    settings = _profile_settings(settings_kratos)
+    app = _app(settings)
+    held = _DossierStatus()
+    held.running = True
+    app.state._dossier_status = held
+    builder = AsyncMock(return_value=_build())
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    with caplog.at_level(logging.INFO):
+        await _tick_with_profiles(
+            app,
+            sweeper,
+            freshness=AsyncMock(return_value=_freshness(_now() - timedelta(days=3))),
+            builder=builder,
+        )
+    builder.assert_not_awaited()
+    sweeper.assert_awaited_once()
+    assert sweeper.await_args.kwargs["profiles"].stale is True
+    assert any("rebuild skipped this wake" in line for line in _profile_lines(caplog))
+    assert held.running is True
+
+
+async def test_the_unmeasurable_reason_rides_with_the_sweep(settings_kratos: Settings) -> None:
+    settings = _profile_settings(settings_kratos)
+    state = _freshness(_now() - timedelta(hours=1), {"active_hours": "too many buckets"})
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    await _tick_with_profiles(
+        _app(settings),
+        sweeper,
+        freshness=AsyncMock(return_value=state),
+        builder=AsyncMock(return_value=_build()),
+    )
+    assert sweeper.await_args.kwargs["profiles"].reason == "active_hours: too many buckets"
+
+
+async def test_profiles_off_means_no_freshness_read(settings_kratos: Settings) -> None:
+    assert settings_kratos.entity_profiles_enabled is False
+    reader = AsyncMock(return_value=_freshness(None))
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    await _tick_with_profiles(_app(settings_kratos), sweeper, freshness=reader, builder=AsyncMock())
+    reader.assert_not_awaited()
+    assert sweeper.await_args.kwargs["profiles"] is None

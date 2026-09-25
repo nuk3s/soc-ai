@@ -1186,7 +1186,10 @@ export interface DossierRow {
 export interface ProfileDimension {
   dimension: string;
   shape: 'categorical' | 'numeric' | 'active_hours' | string;
-  coverage: 'measured' | 'learning' | 'blind' | 'behind_proxy' | string;
+  coverage: 'measured' | 'learning' | 'blind' | 'behind_proxy' | 'unmeasurable' | string;
+  /** The Elasticsearch reason when coverage is `unmeasurable`. Absent from an
+   *  older backend. */
+  coverage_reason?: string | null;
   support_days: number;
   window_days: number;
   summary: string;

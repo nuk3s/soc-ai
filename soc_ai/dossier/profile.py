@@ -34,12 +34,16 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
-from soc_ai.dossier.profile_math import summarise_cells
+from soc_ai.dossier.profile_math import (
+    GUARDED_PORT_DIMENSIONS,
+    served_port_counts,
+    summarise_cells,
+)
 from soc_ai.enrichment.discovery import _is_internal_ip
-from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.so_client.elastic import DEFAULT_MAX_BUCKETS, ElasticClient
 from soc_ai.so_client.fields import DATASET_NAME_FIELDS, EPHEMERAL_PORT_FLOOR, is_peer_address
 from soc_ai.tools._provenance import LIVE, provenance_must_not
 from soc_ai.tools._synth_scope import synth_scope_must_not
@@ -54,6 +58,7 @@ __all__ = [
     "ProfileSweep",
     "collect_entity_profiles",
     "resolve_plane",
+    "served_direction_clauses",
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +89,11 @@ LOGON_CANDIDATES: tuple[str, ...] = ("system.security",)
 # terms agg on a 3.8M-document plane is how you take an Elasticsearch down.
 _MAX_ENTITIES = 500
 _MAX_MEMBERS = 200
+# The most slices the shaped entity terms will be cut into. At 32 slices of
+# 500 entities the ladder has tried 16,000 entity buckets per request down to
+# 500, and a grid that still refuses is telling us its limit, not ours.
+_MAX_PARTITIONS = 32
+_TOO_MANY_BUCKETS = "too_many_buckets_exception"
 
 
 @dataclass(frozen=True)
@@ -114,6 +124,14 @@ class ProfileSweep:
     planes: dict[str, tuple[str, ...]] = dc_field(default_factory=dict)
     errors: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    # Dimensions no plane on this grid can answer, by name. The ``*`` row says
+    # the same thing per profile; this says it per dimension, which is what
+    # the per-host coverage fill needs, since the fill skips ``*`` rows.
+    unanswered: tuple[str, ...] = ()
+    # Dimensions the grid refused to measure after every retry, with the
+    # Elasticsearch reason. Not an error: the sweep finished, and the answer
+    # is "this grid cannot answer this at this size".
+    unmeasurable: dict[str, str] = dc_field(default_factory=dict)
 
 
 def _dataset_clause(dataset: str) -> dict[str, Any]:
@@ -239,15 +257,72 @@ async def resolve_plane(
     return tuple(usable)
 
 
-def _member_aggs() -> dict[str, Any]:
-    """Per-member sub-aggregations: when it was first and last seen."""
-    return {
+def _member_aggs(peer_field: str | None = None) -> dict[str, Any]:
+    """Per-member sub-aggregations: when it was first and last seen.
+
+    ``peer_field`` adds how many distinct peers reached the member. Asked for
+    on the served-port dimension only. The outbound-port dimension is keyed
+    on the source, so a peer count there would count the entity itself, and
+    the address dimensions have no port to guard.
+
+    The days the guard reads come from ``first`` and ``last``. Two metric
+    aggregations cost no buckets. A day histogram under every member of
+    every entity is 500 x 200 x 30 buckets on a busy grid, which is over
+    ``search.max_buckets``.
+    """
+    aggs: dict[str, Any] = {
         "first": {"min": {"field": "@timestamp"}},
         "last": {"max": {"field": "@timestamp"}},
     }
+    if peer_field:
+        aggs["peers"] = {"cardinality": {"field": peer_field}}
+    return aggs
 
 
-def _nested_terms(*, entity_field: str, member_field: str) -> dict[str, Any]:
+def _peer_field(dimension: str) -> str | None:
+    """The field that names the far end of a guarded port dimension."""
+    return "source.ip" if dimension in GUARDED_PORT_DIMENSIONS else None
+
+
+def _member_peers(member: dict[str, Any]) -> int:
+    """Distinct peers behind one member bucket. Zero when the agg was not asked for."""
+    raw = (member.get("peers") or {}).get("value")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0
+    return int(raw)
+
+
+def _member_days(member: dict[str, Any]) -> int:
+    """Distinct UTC calendar dates from a member's first sighting to its last.
+
+    Zero when either stamp is missing, and zero is the reading that does NOT
+    count. One when both fall on the same date. Two when they fall on two
+    dates, however close the stamps are.
+    """
+    first = _stamp_date(member, "first")
+    last = _stamp_date(member, "last")
+    if first is None or last is None:
+        return 0
+    return abs((last - first).days) + 1
+
+
+def _stamp_date(bucket: dict[str, Any], key: str) -> date | None:
+    """The UTC calendar date of one min/max stamp. None when unreadable."""
+    raw = _stamp(bucket, key)
+    if raw is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).date()
+
+
+def _nested_terms(
+    *, entity_field: str, member_field: str, peer_field: str | None = None
+) -> dict[str, Any]:
     """One entity terms agg, each with its members and its own day count.
 
     ``active_days`` sits at the ENTITY level, not the member level, for two
@@ -262,6 +337,11 @@ def _nested_terms(*, entity_field: str, member_field: str) -> dict[str, Any]:
     counts distinct millisecond values, so the support floor was being cleared
     by volume rather than by persistence, and one busy afternoon read as a
     thousand days of history.
+
+    ``peer_field`` adds the per-member peer count the served-port guard
+    reads. The day count it also reads is derived from ``first`` and
+    ``last``, which every member carries, so the guard adds one cardinality
+    per member and no buckets.
     """
     return {
         "terms": {"field": entity_field, "size": _MAX_ENTITIES},
@@ -275,7 +355,7 @@ def _nested_terms(*, entity_field: str, member_field: str) -> dict[str, Any]:
             },
             "members": {
                 "terms": {"field": member_field, "size": _MAX_MEMBERS},
-                "aggs": _member_aggs(),
+                "aggs": _member_aggs(peer_field),
             },
         },
     }
@@ -326,6 +406,67 @@ def _outside_the_estate(dimension: str, *, cidrs: Sequence[Any]) -> list[dict[st
     if not nets:
         return []
     return [{"terms": {"destination.ip": nets}}]
+
+
+# The direction rule for served ports, keyed by plane.
+#
+# The generic clauses apply on every plane. DNS is never a served port: an
+# endpoint sensor writes a lookup twice, once mirrored with the asking host
+# as the destination and the lookup's ephemeral source port as the
+# destination port. A flow a sensor marked as leaving the host is not one the
+# host received. ``network.direction`` is optional in ECS and most planes
+# omit it; ``internal`` and ``unknown`` say nothing about direction, so the
+# clause drops the three outbound words and keeps everything else.
+#
+# The endpoint sensor names the inbound side. ``connection_accepted`` is the
+# host answering; ``connection_attempted`` is the host calling out. A plane
+# this table does not name gets the generic clauses only, so a grid with a
+# flow plane nobody here has seen still builds a served-port set.
+_ACCEPTED_ACTION_BY_PLANE: dict[str, str] = {"endpoint.events.network": "connection_accepted"}
+_DNS_ACTIONS: tuple[str, ...] = ("lookup_requested", "lookup_result")
+_OUTBOUND_DIRECTIONS: tuple[str, ...] = ("egress", "outbound", "external")
+
+
+def served_direction_clauses(planes: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+    """The bool clauses that keep a served-port read to connections the entity received.
+
+    Returns ``{"filter": [...], "must_not": [...]}``. The baseline builder and
+    the recent read both spread these into their query, so the two sides of
+    the comparison agree on what a served port is.
+
+    Each plane-specific filter is a choice: a document from any other plane,
+    or the action that names an accepted connection. Written as a plain term
+    it would drop every Zeek document from a read that spans both planes.
+    """
+    filters: list[dict[str, Any]] = []
+    for plane in planes:
+        action = _ACCEPTED_ACTION_BY_PLANE.get(plane)
+        if action is None:
+            continue
+        filters.append(
+            {
+                "bool": {
+                    "should": [
+                        {"bool": {"must_not": [_dataset_clause(plane)]}},
+                        {"term": {"event.action": action}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
+    must_not: list[dict[str, Any]] = [
+        {"term": {"network.protocol": "dns"}},
+        {"terms": {"event.action": list(_DNS_ACTIONS)}},
+        {"terms": {"network.direction": list(_OUTBOUND_DIRECTIONS)}},
+    ]
+    return {"filter": filters, "must_not": must_not}
+
+
+def _direction_for(dimension: str, *, planes: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+    """The direction clauses for this dimension. Empty for every dimension but a guarded one."""
+    if dimension not in GUARDED_PORT_DIMENSIONS:
+        return {"filter": [], "must_not": []}
+    return served_direction_clauses(planes)
 
 
 def _entity_support_days(bucket: dict[str, Any], *, window_days: int) -> int:
@@ -391,11 +532,23 @@ def _profiles_from_buckets(
                 continue
             m_first = _stamp(member, "first")
             m_last = _stamp(member, "last")
-            vector[name] = {
-                "count": int(member.get("doc_count") or 0),
+            count = int(member.get("doc_count") or 0)
+            entry: dict[str, Any] = {
+                "count": count,
                 "first_seen": m_first,
                 "last_seen": m_last,
             }
+            if dimension in GUARDED_PORT_DIMENSIONS:
+                peers = _member_peers(member)
+                days = _member_days(member)
+                # The same guard the evaluator applies. A baseline that holds
+                # ephemeral ports fills its 200 slots with noise, and every
+                # real port outside them reads as new for ever.
+                if not served_port_counts(name, count=count, peers=peers, days=days):
+                    continue
+                entry["peers"] = peers
+                entry["days"] = days
+            vector[name] = entry
             if m_first and (first is None or m_first < first):
                 first = m_first
             if m_last and (last is None or m_last > last):
@@ -458,60 +611,205 @@ _CATEGORICAL: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
     ("logon_users", LOGON_CANDIDATES, "user.name", "host.name", "user.name"),
 )
 
-# Dimensions that are not membership sets.
+# The two dimensions that are not membership sets. They share one query.
 #
-# ``active_hours`` is a 168-bin SET test — "was this host ever active in this
-# hour of the week" — and needs no dispersion, which is why it does not go
-# through the three-cell summary. ``connection_rate`` is the three-cell one.
+# ``active_hours`` is a 24-bin SET test ("was this host ever active in this
+# hour") and needs no dispersion. ``connection_rate`` is the three-cell
+# summary. Both read the same hourly histogram of the same flow documents
+# keyed by the same entity, so they are one aggregation read twice. Run as
+# two aggregations the 700M-document grid refused both with the bucket limit.
 #
 # Both exist because without them there is exactly ONE observation kind
-# available on a network-only grid, and a lead needs two. The chaining half of
-# the design was inert on the range for precisely that reason.
-_SHAPED: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
-    ("active_hours", "active_hours", FLOW_CANDIDATES, "destination.ip", "source.ip"),
-    ("connection_rate", "numeric", FLOW_CANDIDATES, "destination.ip", "source.ip"),
+# available on a network-only grid, and a lead needs two.
+_SHAPED: tuple[tuple[str, str], ...] = (
+    ("active_hours", "active_hours"),
+    ("connection_rate", "numeric"),
 )
+_SHAPED_DIMENSIONS: tuple[str, ...] = tuple(d for d, _ in _SHAPED)
+_SHAPED_CANDIDATES = FLOW_CANDIDATES
+_SHAPED_PROBE_FIELD = "destination.ip"
+_SHAPED_ENTITY_FIELD = "source.ip"
 
 
-def _shaped_aggs(dimension: str, shape: str, *, entity_field: str) -> dict[str, Any]:
-    """The aggregation for a non-categorical dimension."""
-    inner: dict[str, Any] = {
-        "active_days": {
-            "date_histogram": {
-                "field": "@timestamp",
-                "calendar_interval": "day",
-                "min_doc_count": 1,
-            }
-        }
-    }
-    if shape == "active_hours":
-        # Hour of DAY, not hour of week. The design says 168 bins, and 168 is
-        # right for a set test in principle — but on a 30-day window each bin
-        # holds four or five samples, and "this host has never been active in
-        # this hour" then rests on four observations. Hour of day gives thirty
-        # per bin. The weekday/weekend split that 168 bins were carrying is
-        # already held by the three-cell rate dimension.
-        inner["hours"] = {
-            "date_histogram": {
-                "field": "@timestamp",
-                "calendar_interval": "hour",
-                "min_doc_count": 1,
-            }
-        }
-    else:
-        inner["per_hour"] = {
-            "date_histogram": {
-                "field": "@timestamp",
-                "calendar_interval": "hour",
-                "min_doc_count": 1,
-            }
-        }
+def _shaped_aggs(*, entity_field: str, partition: int, num_partitions: int) -> dict[str, Any]:
+    """The one aggregation both shaped dimensions read, for one partition.
+
+    ``include.partition`` splits the entity terms into ``num_partitions``
+    disjoint slices, so each request builds one slice's hour buckets and the
+    total stays under ``search.max_buckets``. Every entity carries a day
+    histogram and an hour histogram: over thirty days that is 751 buckets, and
+    500 entities in one request is 375,000 against a limit of 65,536.
+
+    Hour of DAY, not hour of week. On a 30-day window a 168-bin set holds four
+    or five samples per bin; hour of day holds thirty. The weekday/weekend
+    split is already carried by the three-cell rate dimension.
+    """
     return {
-        dimension: {
-            "terms": {"field": entity_field, "size": _MAX_ENTITIES},
-            "aggs": inner,
+        "shaped": {
+            "terms": {
+                "field": entity_field,
+                "size": _MAX_ENTITIES,
+                "include": {"partition": partition, "num_partitions": num_partitions},
+            },
+            "aggs": {
+                "active_days": {
+                    "date_histogram": {
+                        "field": "@timestamp",
+                        "calendar_interval": "day",
+                        "min_doc_count": 1,
+                    }
+                },
+                "hours": {
+                    "date_histogram": {
+                        "field": "@timestamp",
+                        "calendar_interval": "hour",
+                        "min_doc_count": 1,
+                    }
+                },
+            },
         }
     }
+
+
+def _estate_filter(entity_field: str, *, cidrs: Sequence[Any]) -> list[dict[str, Any]]:
+    """Keep only entities inside the estate, in the query rather than after it.
+
+    The lane already drops external entities in Python. Dropping them in the
+    query is what keeps the bucket count honest: on the measured grid 774
+    addresses reached the aggregation and 215 were ours, so three quarters
+    of the bucket budget went to the internet. An ``ip`` field takes CIDR
+    notation in a terms query. Fails OPEN on an empty CIDR list, like every
+    scope test in this lane.
+    """
+    nets = [str(c).strip() for c in cidrs if str(c).strip()]
+    if not nets:
+        return []
+    return [{"terms": {entity_field: nets}}]
+
+
+def _partition_count(
+    entities: int, *, window_hours: int, window_days: int, max_buckets: int
+) -> int:
+    """How many slices the entity terms need to fit under half the bucket limit.
+
+    Half, because the estimate is a cardinality (approximate) times a ceiling
+    (every hour of every day active), and a slice that lands exactly on the
+    limit is a retry the ladder then has to pay for.
+    """
+    per_entity = max(1, window_hours) + max(1, window_days)
+    budget = max(1, max_buckets // 2)
+    needed = -(-(max(0, entities) * per_entity) // budget)
+    return max(1, min(_MAX_PARTITIONS, needed))
+
+
+def _too_many_buckets(exc: BaseException) -> bool:
+    """Whether an Elasticsearch error is the bucket limit, read from its body.
+
+    The top-level ``reason`` of a search_phase_execution_exception is an
+    empty string; the cause sits under ``caused_by`` or ``root_cause``.
+    """
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return False
+    if (error.get("caused_by") or {}).get("type") == _TOO_MANY_BUCKETS:
+        return True
+    return any((rc or {}).get("type") == _TOO_MANY_BUCKETS for rc in error.get("root_cause") or [])
+
+
+def _es_reason(exc: BaseException) -> str:
+    """The sentence Elasticsearch gave, or the exception text when it gave none."""
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        for node in (error.get("caused_by") or {}, error):
+            reason = node.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip()[:255]
+    return str(exc)[:255]
+
+
+async def _max_buckets(elastic: Any) -> int:
+    """The grid's bucket limit. A client that cannot say gets the ES default."""
+    reader = getattr(elastic, "max_buckets", None)
+    if reader is None:
+        return DEFAULT_MAX_BUCKETS
+    try:
+        return int(await reader())
+    except Exception:
+        return DEFAULT_MAX_BUCKETS
+
+
+async def _entity_count(
+    elastic: Any, settings: Any, query: dict[str, Any], *, entity_field: str
+) -> int:
+    """A cheap cardinality read, so the first partition count is an estimate."""
+    try:
+        result = await elastic.search(
+            settings.events_index_pattern,
+            query,
+            size=0,
+            aggs={"entities": {"cardinality": {"field": entity_field}}},
+        )
+    except Exception:
+        return 0
+    value = ((result.aggregations or {}).get("entities") or {}).get("value")
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+async def _collect_shaped(
+    elastic: Any,
+    settings: Any,
+    query: dict[str, Any],
+    *,
+    entity_field: str,
+    window_hours: int,
+    window_days: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Every entity bucket for the shaped dimensions, or the reason there are none.
+
+    The ladder: start from the estimate, double on the bucket limit, stop at
+    ``_MAX_PARTITIONS``. A refusal past the cap returns ``([], reason)`` so
+    the caller can write the reason down. Any other failure raises: that is a
+    broken query, not a fact about the grid's size.
+    """
+    max_buckets = await _max_buckets(elastic)
+    entities = await _entity_count(elastic, settings, query, entity_field=entity_field)
+    partitions = _partition_count(
+        entities, window_hours=window_hours, window_days=window_days, max_buckets=max_buckets
+    )
+    while True:
+        buckets: list[dict[str, Any]] = []
+        refused: BaseException | None = None
+        for partition in range(partitions):
+            try:
+                result = await elastic.search(
+                    settings.events_index_pattern,
+                    query,
+                    size=0,
+                    aggs=_shaped_aggs(
+                        entity_field=entity_field,
+                        partition=partition,
+                        num_partitions=partitions,
+                    ),
+                )
+            except Exception as exc:
+                refused = exc
+                break
+            buckets.extend(((result.aggregations or {}).get("shaped") or {}).get("buckets") or [])
+        if refused is None:
+            return buckets, None
+        if not _too_many_buckets(refused):
+            raise refused
+        if partitions >= _MAX_PARTITIONS:
+            return [], _es_reason(refused)
+        _LOGGER.info(
+            "profile: %d partition(s) exceeded search.max_buckets=%d; retrying with %d",
+            partitions,
+            max_buckets,
+            min(_MAX_PARTITIONS, partitions * 2),
+        )
+        partitions = min(_MAX_PARTITIONS, partitions * 2)
 
 
 def _active_hours_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
@@ -537,7 +835,7 @@ def _active_hours_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
 def _rate_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
     """The three local-time cells for a numeric dimension."""
     samples: list[tuple[datetime, float]] = []
-    for hour_bucket in ((bucket.get("per_hour") or {}).get("buckets")) or []:
+    for hour_bucket in ((bucket.get("hours") or {}).get("buckets")) or []:
         stamp = _parse_stamp(hour_bucket.get("key_as_string"))
         if stamp is None:
             continue
@@ -622,6 +920,8 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
     planes: dict[str, tuple[str, ...]] = {}
     errors: list[str] = []
     notes: list[str] = []
+    unanswered: list[str] = []
+    unmeasurable: dict[str, str] = {}
 
     # The cached probe answer, per (candidate list, field). ``None`` is one of
     # the three answers resolve_plane gives and it is the one that matters: the
@@ -658,6 +958,7 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
             continue
 
         if not usable:
+            unanswered.append(dimension)
             profiles.append(_blind(dimension))
             notes.append(
                 f"{dimension}: no plane on this grid carries {probe_field}. "
@@ -665,6 +966,7 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
             )
             continue
 
+        direction = _direction_for(dimension, planes=usable)
         query = {
             "bool": {
                 "filter": [
@@ -678,14 +980,22 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
                     {"exists": {"field": entity_field}},
                     {"exists": {"field": member_field}},
                     *_port_bound(member_field),
+                    *direction["filter"],
                 ],
                 "must_not": [
                     *_scope_must_not(),
                     *_outside_the_estate(dimension, cidrs=cidrs),
+                    *direction["must_not"],
                 ],
             }
         }
-        aggs = {dimension: _nested_terms(entity_field=entity_field, member_field=member_field)}
+        aggs = {
+            dimension: _nested_terms(
+                entity_field=entity_field,
+                member_field=member_field,
+                peer_field=_peer_field(dimension),
+            )
+        }
         try:
             result = await elastic.search(settings.events_index_pattern, query, size=0, aggs=aggs)
         except Exception as exc:
@@ -705,26 +1015,28 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
         )
 
     tz = str(getattr(settings, "so_timezone", "UTC") or "UTC")
-    for dimension, shape, candidates, probe_field, entity_field in _SHAPED:
-        cache = resolved.setdefault(candidates, {})
-        if probe_field not in cache:
-            cache[probe_field] = await resolve_plane(
-                elastic,
-                settings,
-                candidates=candidates,
-                field=probe_field,
-                minutes=minutes,
-                time_anchor=time_anchor,
-                lag_minutes=lag_minutes,
+    cache = resolved.setdefault(_SHAPED_CANDIDATES, {})
+    if _SHAPED_PROBE_FIELD not in cache:
+        cache[_SHAPED_PROBE_FIELD] = await resolve_plane(
+            elastic,
+            settings,
+            candidates=_SHAPED_CANDIDATES,
+            field=_SHAPED_PROBE_FIELD,
+            minutes=minutes,
+            time_anchor=time_anchor,
+            lag_minutes=lag_minutes,
+        )
+    usable = cache[_SHAPED_PROBE_FIELD]
+    if usable is None:
+        for dimension in _SHAPED_DIMENSIONS:
+            errors.append(
+                f"{dimension}: could not determine which plane carries {_SHAPED_PROBE_FIELD}"
             )
-        usable = cache[probe_field]
-        if usable is None:
-            errors.append(f"{dimension}: could not determine which plane carries {probe_field}")
-            continue
-        if not usable:
+    elif not usable:
+        for dimension in _SHAPED_DIMENSIONS:
             profiles.append(_blind(dimension))
-            continue
-
+            unanswered.append(dimension)
+    else:
         query = {
             "bool": {
                 "filter": [
@@ -735,50 +1047,59 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
                             "minimum_should_match": 1,
                         }
                     },
-                    {"exists": {"field": entity_field}},
+                    {"exists": {"field": _SHAPED_ENTITY_FIELD}},
+                    *_estate_filter(_SHAPED_ENTITY_FIELD, cidrs=cidrs),
                 ],
                 "must_not": _scope_must_not(),
             }
         }
+        entity_buckets: list[dict[str, Any]] = []
+        refusal: str | None = None
         try:
-            result = await elastic.search(
-                settings.events_index_pattern,
+            entity_buckets, refusal = await _collect_shaped(
+                elastic,
+                settings,
                 query,
-                size=0,
-                aggs=_shaped_aggs(dimension, shape, entity_field=entity_field),
+                entity_field=_SHAPED_ENTITY_FIELD,
+                window_hours=max(1, window_hours),
+                window_days=window_days,
             )
         except Exception as exc:
-            errors.append(f"{dimension}: {exc}")
-            continue
-
-        buckets = ((result.aggregations or {}).get(dimension) or {}).get("buckets") or []
-        for bucket in buckets:
+            for dimension in _SHAPED_DIMENSIONS:
+                errors.append(f"{dimension}: {exc}")
+        if refusal is not None:
+            for dimension in _SHAPED_DIMENSIONS:
+                unmeasurable[dimension] = refusal
+        for bucket in entity_buckets:
             key = bucket.get("key")
             if not isinstance(key, str) or not key:
                 continue
             if not _ours(key, entity_kind="host", cidrs=cidrs):
                 continue
             support = _entity_support_days(bucket, window_days=window_days)
-            vector = (
-                _active_hours_vector(bucket, tz=tz)
-                if shape == "active_hours"
-                else _rate_vector(bucket, tz=tz)
-            )
-            profiles.append(
-                BuiltProfile(
-                    entity_kind="host",
-                    entity_key=key,
-                    dimension=dimension,
-                    shape=shape,
-                    vector=vector,
-                    coverage="measured" if support >= MIN_SUPPORT_DAYS else "learning",
-                    support_days=support,
+            for dimension, shape in _SHAPED:
+                vector = (
+                    _active_hours_vector(bucket, tz=tz)
+                    if shape == "active_hours"
+                    else _rate_vector(bucket, tz=tz)
                 )
-            )
+                profiles.append(
+                    BuiltProfile(
+                        entity_kind="host",
+                        entity_key=key,
+                        dimension=dimension,
+                        shape=shape,
+                        vector=vector,
+                        coverage="measured" if support >= MIN_SUPPORT_DAYS else "learning",
+                        support_days=support,
+                    )
+                )
 
     return ProfileSweep(
         profiles=tuple(profiles),
         planes=planes,
         errors=tuple(errors),
         notes=tuple(notes),
+        unanswered=tuple(unanswered),
+        unmeasurable=unmeasurable,
     )

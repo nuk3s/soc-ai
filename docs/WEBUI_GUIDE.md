@@ -198,6 +198,12 @@ hits, and the leads that need a decision. Each link jumps to the block that hold
 them, with the filter set. The sidebar badge on the Hunts item shows the same
 count.
 
+A lead settles when its hunt finishes. A hunt that found no threat closes the
+lead, and the lead sits under Closed as "Closed. The hunt found no threat." with
+the chip "closed by soc-ai". A hunt that found a threat or a visibility gap leaves
+the lead under Needs decision. A hunt that could not run twice leaves it there as
+"Hunted · Could not run", with Hunt again.
+
 [docs/HUNTING.md](HUNTING.md) is the full guide. It covers the five nouns, how a
 hit becomes a lead and a lead becomes a hunt, the shadow week, the settings, the
 command line and the API routes.
@@ -249,6 +255,11 @@ a zero.
   detections among them.
 - **Peers, volume and users** over the window that you pick, 24h or 7d.
 - **12 field cards**, one for each dossier field.
+- **The behavioural profile**, one row for each dimension of the host's baseline.
+  Each row carries a coverage chip: measured, learning, blind, behind proxy or
+  unmeasurable. A blind row reads "cannot be measured for this host". An
+  unmeasurable row reads "not measured:" and the reason the grid gave when it
+  refused the query.
 
 An internal address opens here from anywhere in the console. Alert rows, the peer
 graph and old `/entity/<ip>` links all redirect to it. An external address still
@@ -305,7 +316,9 @@ The scheduled sweep is off by default. `dossier_schedule_enabled` controls it. A
 sweep covers hundreds of hosts and runs several Elasticsearch queries for
 each one, so you decide when it runs. The Hosts screen stays empty until the
 sweep runs once. An empty screen means the sweep has not run. It does not mean
-the network has no hosts on it.
+the network has no hosts on it. The behavioural baseline does not wait on this
+schedule. The profile sweep rebuilds it when it is older than the dossier refresh
+interval, and a scheduled dossier refresh rebuilds it too.
 
 - **Rebuild now** on the Hosts screen runs a sweep in the background and reports
   what it built. Only an admin sees the button.
@@ -350,6 +363,12 @@ plane is not a clean grid.
 
 **error** is red. It means the sweep itself broke on that spec. Hover over the
 marker for the reason.
+
+The row of a profile analytic also carries a coverage cell: how many entities the
+last sweep measured against a real baseline, how many it read blind, and then the
+age of the baseline, as in "baseline 3 h old". The cell adds "stale" when a
+rebuild was due and did not happen. It reads "baseline unmeasurable:" and the
+reason the grid gave when the grid refused the query that builds a dimension.
 
 A spec that the loop never reached reads "not yet swept" and not a row of zeros.
 A row of zeros would say "swept, saw nothing". The panel refreshes itself every 5

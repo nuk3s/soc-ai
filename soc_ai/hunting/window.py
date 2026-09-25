@@ -26,6 +26,12 @@ from typing import Protocol
 # control; this is for the value that arrives by environment instead.
 MIN_INTERVAL_MINUTES = 5
 
+# How far back the prior sweep reads for "what did this entity do lately".
+# Lives here, beside the other window numbers and away from the sweep, so the
+# wording module can state the window in a sentence without importing the
+# sweep that calls the evaluator that calls the wording.
+DEFAULT_RECENT_HOURS = 24
+
 
 class SweepSettings(Protocol):
     """The two settings the window is computed from."""

@@ -202,7 +202,7 @@ class HuntFindingOut(BaseModel):
 # The classifier lives in soc_ai.hunting.findings so the notifications bell and
 # this page cannot disagree about what a gap is.
 from soc_ai.hunting.findings import finding_category as _finding_category  # noqa: E402
-from soc_ai.hunting.findings import threat_finding_count  # noqa: E402
+from soc_ai.hunting.findings import hunt_outcome as _hunt_outcome  # noqa: E402
 from soc_ai.hunting.wording import reword_legacy_summary  # noqa: E402
 
 
@@ -394,28 +394,6 @@ def _report_confidence(report: dict[str, Any]) -> float | None:
     """
     value = report.get("confidence")
     return None if value is None else float(value)
-
-
-def _hunt_outcome(status: str, findings: Any) -> tuple[int, str]:
-    """(threat findings, outcome) for a hunt row.
-
-    ``outcome`` is empty unless the hunt completed; then ``threats``, ``clean``,
-    ``gap`` (the precondition saw no telemetry) or ``failed`` (a query raised).
-    The last two are the ones the list must not paint green.
-    """
-    if not isinstance(findings, list):
-        return 0, ""
-    rows = [f for f in findings if isinstance(f, dict)]
-    threats = threat_finding_count(rows)
-    if status != "complete":
-        return threats, ""
-    if threats:
-        return threats, "threats"
-    gaps = [f for f in rows if _finding_category(f) == "visibility_gap"]
-    if not gaps:
-        return 0, "clean"
-    failed = any(str(f.get("title") or "").endswith(": could not run") for f in gaps)
-    return 0, "failed" if failed else "gap"
 
 
 # One phrase per outcome, written once. Section 6 of the 1.5.1 design names
@@ -2254,10 +2232,28 @@ class LeadObservationDetailOut(LeadObservationOut):
     analytic_exists: bool = False
 
 
+class LeadKindWeightOut(BaseModel):
+    """The live weight of one type on a lead, against the cap one type can reach.
+
+    ``kind`` is the identifier the app filters on. ``kind_label`` is the
+    analyst's word for it. The page reads "new served port 1.70 of 1.70,
+    saturated" from this row, where it read a bare 25 before.
+    """
+
+    kind: str
+    kind_label: str = ""
+    weight: float
+    cap: float
+    saturated: bool
+
+
 class LeadDetailOut(LeadOut):
     """One lead with its timeline, its live weight and its dismissal."""
 
     weight_now: float
+    # The live weight per type, each against the cap one type can reach.
+    # The sum of these IS ``weight_now``.
+    weight_by_kind: list[LeadKindWeightOut] = []
     single_signal: bool = False
     dismissed_reason: str | None = None
     dismissed_note: str | None = None
@@ -2406,10 +2402,17 @@ def _lead_hunt_state(hunt: Hunt | None) -> tuple[str | None, str | None]:
     A lead reads Hunted once its hunt finished. The list and the detail page
     both need this. The detail page said "Hunting" after the hunt was done,
     because only the list computed it.
+
+    A hunt that ended in error, cancelled or interrupted reads "Could not
+    run": the lead behind it is open and waits, and the row has to say why.
     """
+    from soc_ai.store.leads import HUNT_FAILED_STATUSES  # noqa: PLC0415 - lazy
+
     if hunt is None:
         return None, None
     status = _HUNT_STATUS.get(hunt.status, "error")
+    if status in HUNT_FAILED_STATUSES:
+        return status, OUTCOME_LABEL["failed"]
     _threats, outcome = _hunt_outcome(status, (_hunt_report(hunt).get("findings") or []))
     return status, OUTCOME_LABEL.get(outcome) if outcome else None
 
@@ -2470,11 +2473,15 @@ def _lead_detail(
     the weight at formation, because a lead that has gone quiet reads the same
     as a fresh one without both numbers.
     """
-    from soc_ai.hunting.weight import live_weight  # noqa: PLC0415 - lazy
+    from soc_ai.hunting.weight import (  # noqa: PLC0415 - lazy
+        lead_total,
+        live_weight,
+        weight_by_kind,
+    )
     from soc_ai.store.leads import DISMISS_REASONS, hunt_is_queued  # noqa: PLC0415 - lazy
 
     obs = []
-    total = 0.0
+    pairs: list[tuple[str, float]] = []
     for o in rows:
         w = live_weight(
             float(o.birth_weight or 0.0),
@@ -2482,7 +2489,7 @@ def _lead_detail(
             count=int(o.occurrences or 1),
             now=now,
         )
-        total += w
+        pairs.append((str(o.kind), w))
         obs.append(
             LeadObservationDetailOut(
                 id=o.id,
@@ -2501,6 +2508,19 @@ def _lead_detail(
                 analytic_exists=o.spec_id in (analytics or set()),
             )
         )
+    # The same capped total formation wrote. Summed plainly, the page said 25
+    # over a lead that formed at 25, and both numbers measured row count.
+    total = lead_total(pairs)
+    by_kind = [
+        LeadKindWeightOut(
+            kind=row.kind,
+            kind_label=kind_label(row.kind),
+            weight=round(row.weight, 3),
+            cap=round(row.cap, 3),
+            saturated=row.saturated,
+        )
+        for row in weight_by_kind(pairs)
+    ]
     hunt_status, hunt_outcome_label = _lead_hunt_state(hunt)
     related_out: list[LeadRelatedOut] = []
     for r in related or []:
@@ -2530,6 +2550,7 @@ def _lead_detail(
         kind_labels=[kind_label(k) for k in (lead.kinds_json or [])],
         weight_at_formation=float(lead.weight_at_formation or 0.0),
         weight_now=round(total, 3),
+        weight_by_kind=by_kind,
         scope_count=int(lead.scope_count or 0),
         hunt_id=lead.hunt_id,
         shadow=bool(lead.shadow),
@@ -2788,6 +2809,10 @@ class LeadQualityWeekOut(BaseModel):
     hunted: int = 0
     threat: int = 0
     promoted: int = 0
+    # Leads the settle rule closed because their hunt found no threat. Counted
+    # apart from the dismissals: a closure in the rule's hand is not a lesson
+    # an analyst taught, and the sharpening loop reads only the lessons.
+    closed_by_hunt: int = 0
     # Reason to count, for the reasons that occurred. A reason nobody gave is
     # absent rather than zero.
     dismissed: dict[str, int] = {}
@@ -2799,6 +2824,7 @@ class LeadQualityTypesOut(BaseModel):
     types: str
     formed: int = 0
     dismissed: int = 0
+    closed_by_hunt: int = 0
     threat: int = 0
 
 
@@ -2839,7 +2865,7 @@ async def lead_quality(db: Any, *, weeks: int = 4, now: datetime | None = None) 
     week is a measurement, and dropping it would make a quiet week look like a
     week that was never swept.
     """
-    from soc_ai.store.leads import DISMISS_REASONS  # noqa: PLC0415 - lazy
+    from soc_ai.store.leads import AUTO_HUNT_ACTOR, DISMISS_REASONS  # noqa: PLC0415 - lazy
     from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
 
     weeks = max(1, min(int(weeks), 26))
@@ -2892,7 +2918,11 @@ async def lead_quality(db: Any, *, weeks: int = 4, now: datetime | None = None) 
                 week.threat += 1
         if lead.status == "promoted" and week is not None:
             week.promoted += 1
-        if lead.status == "dismissed":
+        if lead.status == "dismissed" and lead.dismissed_by == AUTO_HUNT_ACTOR:
+            types.closed_by_hunt += 1
+            if week is not None:
+                week.closed_by_hunt += 1
+        elif lead.status == "dismissed":
             types.dismissed += 1
             reason = str(lead.dismissed_reason or NO_REASON_RECORDED)
             if week is not None:

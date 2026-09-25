@@ -21,10 +21,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.models import EntityProfile
@@ -37,10 +37,14 @@ __all__ = [
     "COVERAGE_BLIND",
     "COVERAGE_LEARNING",
     "COVERAGE_MEASURED",
+    "COVERAGE_UNMEASURABLE",
+    "ProfileFreshness",
     "ProfileRow",
+    "freshness",
     "load_profiles",
     "profiles_for_role",
     "purge_entity",
+    "purge_older_than",
     "purge_out_of_scope",
     "upsert_profile",
 ]
@@ -49,12 +53,27 @@ COVERAGE_MEASURED = "measured"
 COVERAGE_BLIND = "blind"
 COVERAGE_LEARNING = "learning"
 COVERAGE_BEHIND_PROXY = "behind_proxy"
+# The grid refused the query that measures this dimension, after every retry.
+# Distinct from blind: a plane carries the field, and the grid could not
+# answer at this size. ``coverage_reason`` says what the grid said.
+COVERAGE_UNMEASURABLE = "unmeasurable"
 
 # The only coverage state a departure may be scored against. ``learning`` and
 # ``behind_proxy`` are excluded deliberately: the first has not earned the
 # right to call anything unusual, and for the second the dimension has moved
 # to the proxy, so absence here says nothing about the host.
 _SCORABLE = frozenset({COVERAGE_MEASURED})
+
+
+def _utcnow() -> datetime:
+    """Naive UTC, the shape every stamp in this schema stores.
+
+    The update path stamped ``datetime.now()`` for one release. On a host in
+    America/New_York that put a four-hour skew between rebuilt rows and every
+    other timestamp in the database, and any staleness check that compared
+    them was wrong by the host's offset.
+    """
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 @dataclass(frozen=True)
@@ -67,6 +86,7 @@ class ProfileRow:
     shape: str
     vector: Any | None
     coverage: str
+    coverage_reason: str | None
     support_days: int
     role: str | None
     role_confidence: float | None
@@ -95,6 +115,7 @@ def _row(model: EntityProfile) -> ProfileRow:
         shape=model.shape,
         vector=model.vector_json,
         coverage=model.coverage,
+        coverage_reason=model.coverage_reason,
         support_days=model.support_days,
         role=model.role,
         role_confidence=model.role_confidence,
@@ -115,6 +136,7 @@ async def upsert_profile(
     shape: str,
     vector: Any | None,
     coverage: str = COVERAGE_MEASURED,
+    coverage_reason: str | None = None,
     support_days: int = 0,
     role: str | None = None,
     role_confidence: float | None = None,
@@ -148,6 +170,7 @@ async def upsert_profile(
                 shape=shape,
                 vector_json=vector,
                 coverage=coverage,
+                coverage_reason=coverage_reason,
                 support_days=support_days,
                 role=role,
                 role_confidence=role_confidence,
@@ -155,12 +178,14 @@ async def upsert_profile(
                 window_days=window_days,
                 first_seen=first_seen,
                 last_seen=last_seen,
+                built_at=_utcnow(),
             )
         )
     else:
         existing.shape = shape
         existing.vector_json = vector
         existing.coverage = coverage
+        existing.coverage_reason = coverage_reason
         existing.support_days = support_days
         existing.role = role
         existing.role_confidence = role_confidence
@@ -168,7 +193,7 @@ async def upsert_profile(
         existing.window_days = window_days
         existing.first_seen = first_seen
         existing.last_seen = last_seen
-        existing.built_at = datetime.now()
+        existing.built_at = _utcnow()
 
     await db.commit()
 
@@ -290,6 +315,50 @@ async def purge_entity(db: AsyncSession, *, entity_kind: str, entity_key: str) -
             EntityProfile.entity_key == entity_key,
         )
     )
+    await db.commit()
+    # cast: same contract as purge_out_of_scope above.
+    return int(cast("CursorResult[Any]", result).rowcount or 0)
+
+
+@dataclass(frozen=True)
+class ProfileFreshness:
+    """What the table can say about itself without reading a row.
+
+    ``newest_built_at`` is the newest stamp in the table, so a reader can tell
+    "these baselines are three days old" from "these are current".
+    ``unmeasurable`` maps each dimension the grid refused to the reason it
+    gave, one entry per dimension however many hosts carry it.
+    """
+
+    newest_built_at: datetime | None
+    unmeasurable: dict[str, str]
+
+
+async def freshness(db: AsyncSession) -> ProfileFreshness:
+    """The newest ``built_at`` and every unmeasurable dimension's reason."""
+    newest = (await db.execute(select(func.max(EntityProfile.built_at)))).scalar_one_or_none()
+    rows = (
+        await db.execute(
+            select(EntityProfile.dimension, EntityProfile.coverage_reason)
+            .where(EntityProfile.coverage == COVERAGE_UNMEASURABLE)
+            .distinct()
+        )
+    ).all()
+    reasons: dict[str, str] = {}
+    for dimension, reason in rows:
+        reasons.setdefault(str(dimension), str(reason or ""))
+    return ProfileFreshness(newest_built_at=newest, unmeasurable=reasons)
+
+
+async def purge_older_than(db: AsyncSession, *, built_before: datetime) -> int:
+    """Delete every row stamped before ``built_before``. Returns how many.
+
+    The build's expiry: a row the current build did not refresh describes a
+    host the window no longer holds, or a dimension the build no longer
+    writes, and ``upsert_profile`` never deletes. The caller passes the run's
+    own start, so nothing the run wrote can be older than the mark.
+    """
+    result = await db.execute(delete(EntityProfile).where(EntityProfile.built_at < built_before))
     await db.commit()
     # cast: same contract as purge_out_of_scope above.
     return int(cast("CursorResult[Any]", result).rowcount or 0)

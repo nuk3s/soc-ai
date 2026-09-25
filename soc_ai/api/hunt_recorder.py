@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from soc_ai.hunting.findings import plain_error
 from soc_ai.store import hunts as hunt_svc
+from soc_ai.store import leads as leads_store
+from soc_ai.store.models import Hunt
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -169,3 +171,16 @@ class HuntRecorder:
                 )
         except Exception:
             _LOGGER.exception("hunt recorder finalize failed")
+        # The lead the hunt was started on settles now, in the same breath as
+        # the hunt row. Its own try block: the hunt is finalized whatever
+        # happens here, and a settle failure must read as a settle failure.
+        if self._lead_id is None:
+            return
+        try:
+            async with self._maker() as db:
+                hunt = await db.get(Hunt, self.hunt_id)
+                if hunt is not None:
+                    moved = await leads_store.settle_after_hunt(db, hunt)
+                    _LOGGER.info("lead %s after hunt %s: %s", self._lead_id, self.hunt_id, moved)
+        except Exception:
+            _LOGGER.exception("lead %s did not settle after hunt %s", self._lead_id, self.hunt_id)

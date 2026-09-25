@@ -43,6 +43,13 @@ class PriorCoverageOut(BaseModel):
     not_applicable: int
     fired: int
     shadow: bool
+    # What the sweep knew about its baselines. ``profiles_built_at`` is the
+    # newest baseline it read; ``profiles_stale`` is its verdict on that;
+    # ``profiles_reason`` is why a dimension could not be measured. All three
+    # are empty for a run recorded before the trail carried them.
+    profiles_built_at: str | None = None
+    profiles_stale: bool = False
+    profiles_reason: str | None = None
 
 
 class HuntCatalogSpecOut(BaseModel):
@@ -141,6 +148,7 @@ class HuntCatalogOut(BaseModel):
 def _coverage_out(run: Any) -> PriorCoverageOut | None:
     if run is None:
         return None
+    built = getattr(run, "profiles_built_at", None)
     return PriorCoverageOut(
         last_run_at=_iso_z(run.created_at),
         measured=int(run.measured or 0),
@@ -149,6 +157,9 @@ def _coverage_out(run: Any) -> PriorCoverageOut | None:
         not_applicable=int(run.not_applicable or 0),
         fired=int(run.fired or 0),
         shadow=bool(run.shadow),
+        profiles_built_at=_iso_z(built) if built is not None else None,
+        profiles_stale=bool(getattr(run, "profiles_stale", False)),
+        profiles_reason=getattr(run, "profiles_reason", None) or None,
     )
 
 

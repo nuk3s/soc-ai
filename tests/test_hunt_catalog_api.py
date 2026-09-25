@@ -510,3 +510,56 @@ def test_a_profile_spec_carries_the_prior_sweeps_coverage(client: TestClient) ->
 
     # A match spec has no prior coverage at all.
     assert by_id[DCSYNC]["coverage"] is None
+
+
+def test_the_coverage_says_how_fresh_the_baselines_were(client: TestClient) -> None:
+    """The prior sweep on the range evaluated three-day-old baselines every
+    hour and its coverage read as the state of the grid now. What the sweep
+    knew about its baselines travels with the coverage."""
+    import asyncio
+
+    from soc_ai.hunting.prior_sweep import PriorSweep, ProfileState
+    from soc_ai.hunting.priors import PriorResult
+    from soc_ai.store import prior_spec_runs
+
+    stale_spec = "prior-hypervisor-novel-served-port"
+    plain_spec = "prior-audit-policy-changed-on-dc"
+    built = datetime.now(UTC) - timedelta(hours=26)
+
+    def _sweep(spec_id: str) -> PriorSweep:
+        return PriorSweep(
+            results=(
+                PriorResult(
+                    spec_id=spec_id, entity_kind="host", entity_key="192.0.2.4", coverage="blind"
+                ),
+            ),
+            evaluated_specs=(spec_id,),
+        )
+
+    async def _seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await prior_spec_runs.record_sweep(
+                db,
+                _sweep(stale_spec),
+                profiles=ProfileState(
+                    built_at=built.replace(tzinfo=None),
+                    stale=True,
+                    reason="active_hours: Trying to create too many buckets",
+                ),
+            )
+            await prior_spec_runs.record_sweep(db, _sweep(plain_spec))
+
+    asyncio.run(_seed())
+    by_id = {s["id"]: s for s in client.get("/api/v1/hunt-catalog").json()["specs"]}
+
+    cov = by_id[stale_spec]["coverage"]
+    assert cov["profiles_built_at"].startswith(built.strftime("%Y-%m-%dT%H:%M"))
+    assert cov["profiles_built_at"].endswith("Z")
+    assert cov["profiles_stale"] is True
+    assert cov["profiles_reason"] == "active_hours: Trying to create too many buckets"
+
+    # A sweep recorded without a profile state says nothing about it.
+    plain = by_id[plain_spec]["coverage"]
+    assert plain["profiles_built_at"] is None
+    assert plain["profiles_stale"] is False
+    assert plain["profiles_reason"] is None

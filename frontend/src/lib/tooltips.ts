@@ -67,6 +67,8 @@ export const PILL_HUNTED =
 
 export const PILL_DISMISSED =
   'Dismissed: an analyst closed this lead with a reason. Reopen puts it back in the queue.';
+export const PILL_CLOSED_BY_HUNT =
+  'Closed: soc-ai closed this lead. Its hunt found no threat. Reopen puts it back in the queue.';
 
 export const PILL_PROMOTED =
   'Promoted: an analyst opened an investigation from this lead. The lead is closed.';
@@ -132,6 +134,7 @@ export const CHIP_NO_LEAD = 'This hit formed no lead and joined none.';
 export const CHIP_CATALOG_RUN = 'A row the catalog sweep wrote for an analytic hit. Not an agent run.';
 
 export const CHIP_DISMISS_REASON = 'The dismissal reason the analyst chose.';
+export const CHIP_CLOSED_BY_HUNT = 'soc-ai closed this lead after its hunt. No analyst chose a reason.';
 
 export const CHIP_WINDOW = 'The window the hunt searched.';
 
@@ -244,6 +247,11 @@ export const CHIP_TYPE = 'The type of observation. Two types on one entity form 
 
 export const CHIP_SEEN = 'The analytic matched this entity again. The repeat adds weight.';
 
+/** The sweep count. A sweep counts when it cites a document the row had not
+ *  cited. A re-read of the same documents is not a sighting. */
+export const CHIP_SWEEPS =
+  'The number of sweeps that saw a new document for this observation. Each one adds weight.';
+
 export const WEIGHT_NOW =
   'The live weight decays with a 48 h half-life. A new sighting adds weight.';
 
@@ -251,6 +259,11 @@ export const WEIGHT_NOW =
  *  it never moves, so it cannot wear the sentence of the decaying weight. */
 export const WEIGHT_AT_FORMATION =
   'The live weight the lead reached when it formed. This number does not change.';
+
+/** The weight per type. Stated against the cap, so one type repeated reads
+ *  as saturated and not as a large number. */
+export const WEIGHT_BY_TYPE =
+  'The live weight of this type. One type saturates at its cap. A second type adds a chain.';
 
 export const FILTER_HITS =
   'Hit filters. Unread: shadow hits nobody has opened or acted on. Live: hits from live ' +
@@ -476,6 +489,7 @@ export const QUALITY_HUNTED = 'Leads from the week that a hunt has run on.';
 export const QUALITY_THREAT = 'Leads from the week whose hunt reported a threat finding.';
 
 export const QUALITY_PROMOTED = 'Leads from the week an analyst promoted to an investigation.';
+export const QUALITY_CLOSED_BY_HUNT = 'Leads from the week that soc-ai closed because the hunt found no threat.';
 
 export const QUALITY_DISMISSED =
   'Leads from the week an analyst dismissed, under the reason the analyst chose.';
@@ -485,6 +499,8 @@ export const QUALITY_TYPES = 'The observation types that formed the lead, as one
 export const QUALITY_TYPES_FORMED = 'Leads these types formed over the window.';
 
 export const QUALITY_TYPES_DISMISSED = 'Leads these types formed that an analyst dismissed.';
+export const QUALITY_TYPES_CLOSED_BY_HUNT =
+  'Leads these types formed that soc-ai closed because the hunt found no threat.';
 
 export const QUALITY_TYPES_THREAT =
   'Leads these types formed whose hunt reported a threat finding.';

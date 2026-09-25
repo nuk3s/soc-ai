@@ -14,6 +14,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import { dismissLead, getLeads, huntLead, promoteLead, reopenLead, type Lead } from '../lib/api';
 import {
   ACTION_REOPEN,
+  PILL_CLOSED_BY_HUNT,
   PILL_DISMISSED,
   PILL_HUNTED,
   PILL_IN_PROGRESS,
@@ -26,7 +27,14 @@ import {
   TAB_NEEDS_DECISION,
   WEIGHT_AT_FORMATION,
 } from '../lib/tooltips';
-import { LEAD_ACTION, LeadsStrip, leadState } from './LeadsStrip';
+import {
+  DISMISS_REASONS,
+  HUNT_CLEAN_REASON,
+  LEAD_ACTION,
+  LeadsStrip,
+  REASON_LABEL,
+  leadState,
+} from './LeadsStrip';
 
 const HOUR = 3_600_000;
 const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
@@ -96,7 +104,8 @@ describe('LeadsStrip', () => {
     mount();
     const row = await screen.findByTestId('lead-7');
     expect(within(row).getByText(/tcp\/1234/)).toBeTruthy();
-    expect(within(row).getByText(/seen 3 times/)).toBeTruthy();
+    expect(within(row).getByText(/seen on 3 sweeps, first seen 5h ago/)).toBeTruthy();
+    expect(within(row).queryByText(/seen 3 times/)).toBeNull();
   });
 
   it('shows a shadow lead with its flag rather than hiding it', async () => {
@@ -611,5 +620,51 @@ describe('the fold', () => {
     mount();
     await screen.findByTestId('lead-7');
     expect(screen.queryByRole('button', { name: /^Collapse /})).toBeNull();
+  });
+});
+
+describe('a lead the hunt closed', () => {
+  const CLOSED_BY_HUNT: Lead = {
+    ...LEAD,
+    id: 21,
+    status: 'dismissed',
+    hunt_id: 'H-LEAD-21',
+    hunt_status: 'complete',
+    hunt_outcome_label: 'No threat observed',
+    dismissed_reason: 'hunt_clean',
+    dismissed_at: iso(2 * HOUR),
+  };
+
+  it('reads Closed with the sentence, names soc-ai, and offers Reopen only', async () => {
+    vi.mocked(getLeads).mockResolvedValue([CLOSED_BY_HUNT]);
+    mount();
+    const row = await screen.findByTestId('lead-21');
+    const pill = within(row).getByTestId('lead-status');
+    expect(pill.textContent).toBe('Closed. The hunt found no threat.');
+    expect(pill.getAttribute('title')).toBe(PILL_CLOSED_BY_HUNT);
+    expect(pill.getAttribute('data-lead-state')).toBe('dismissed');
+    expect(within(row).getByText('closed by soc-ai')).toBeTruthy();
+    expect(within(row).queryByText(/reason:/)).toBeNull();
+    expect(within(row).queryByText(/hunt_clean/)).toBeNull();
+    expect(within(row).getByRole('button', { name: LEAD_ACTION.reopen })).toBeTruthy();
+    expect(within(row).queryByRole('button', { name: LEAD_ACTION.dismiss })).toBeNull();
+    expect(within(row).queryByRole('button', { name: LEAD_ACTION.huntAgain })).toBeNull();
+  });
+
+  it('keeps the five analyst reasons and never offers the closure as one', () => {
+    expect(DISMISS_REASONS).toEqual([
+      'expected_for_role',
+      'known_change',
+      'benign_repeat',
+      'bad_baseline',
+      'other',
+    ]);
+    expect(HUNT_CLEAN_REASON in REASON_LABEL).toBe(false);
+  });
+
+  it('reads every terminal hunt status as Hunted', () => {
+    expect(leadState({ status: 'hunting', hunt_status: 'cancelled' })).toBe('hunted');
+    expect(leadState({ status: 'hunting', hunt_status: 'interrupted' })).toBe('hunted');
+    expect(leadState({ status: 'open', hunt_status: 'error', hunt_id: 'H-1' })).toBe('hunted');
   });
 });

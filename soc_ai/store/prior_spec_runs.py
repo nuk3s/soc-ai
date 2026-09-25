@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from soc_ai.store.models import PriorSpecRun
 
 if TYPE_CHECKING:  # pragma: no cover
-    from soc_ai.hunting.prior_sweep import PriorSweep
+    from soc_ai.hunting.prior_sweep import PriorSweep, ProfileState
 
 __all__ = ["KEEP_LAST_PER_SPEC", "newest", "record_sweep"]
 
@@ -30,6 +30,7 @@ async def record_sweep(
     shadow: bool = True,
     now: datetime | None = None,
     keep_last: int = KEEP_LAST_PER_SPEC,
+    profiles: ProfileState | None = None,
 ) -> int:
     """Write one row per spec that was evaluated. Returns how many.
 
@@ -63,6 +64,9 @@ async def record_sweep(
                 blind=c["blind"],
                 not_applicable=c["not_applicable"],
                 fired=c["fired"],
+                profiles_built_at=profiles.built_at if profiles else None,
+                profiles_stale=bool(profiles.stale) if profiles else False,
+                profiles_reason=(profiles.reason or None) if profiles else None,
             )
         )
         written += 1

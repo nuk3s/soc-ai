@@ -72,7 +72,6 @@ import hashlib
 import ipaddress
 import logging
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -82,6 +81,7 @@ from sqlalchemy import func, nulls_first, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from soc_ai.config import Settings
+from soc_ai.dossier import profile_job
 from soc_ai.dossier.infer import infer_host_facts
 
 # The three borrowed privates are deliberate: `_agg_datetime` is the collector's
@@ -95,12 +95,10 @@ from soc_ai.dossier.observe import (
     collect_dns_names,
     collect_host_observations,
 )
-from soc_ai.dossier.profile import collect_entity_profiles
 from soc_ai.dossier.types import AgentInventory, DnsNameInventory, Fact, HostObservations
 from soc_ai.enrichment.discovery import _is_internal_ip, _junk_host_reason
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.store import entity_profiles
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store.auth import utcnow
 from soc_ai.store.internal_identifiers import upsert_detected
@@ -1049,180 +1047,6 @@ def _record_error(summary: DossierSummary, detail: str) -> None:
         summary.errors.append(f"... further failures suppressed after {_MAX_RECORDED_ERRORS}")
 
 
-# Dimensions an agent on the machine supplies, grouped by the plane that feeds
-# them. A host that ships no document on a plane is BLIND for every dimension
-# that plane feeds -- not empty, blind.
-#
-# The agent inventory used to decide this. It cannot: an agent that ships
-# security logs and runs no Sysmon is listed, and the domain controller's
-# process, process-pair and logon-user dimensions all read "measured, none
-# observed" while nothing on that host could produce a process document. An
-# agent that ships one kind of log says nothing about the kinds it does not.
-_AGENT_PLANES: tuple[tuple[str, ...], ...] = (
-    ("process_names", "process_parents"),
-    ("logon_users",),
-)
-_AGENT_DIMENSIONS: tuple[str, ...] = tuple(d for plane in _AGENT_PLANES for d in plane)
-# Dimensions every host with flow can answer. A host that has flow and no row
-# here genuinely did none of this: measured, and empty.
-_FLOW_DIMENSIONS: tuple[str, ...] = ("served_ports", "consumed_ports", "peers_out", "dns_names")
-
-
-def _coverage_fill(sweep: Any) -> list[tuple[str, str, str, int]]:
-    """Rows to write for dimensions a host has NO row for: (key, dim, coverage, support).
-
-    The lane emits one grid-level placeholder when no plane can answer a
-    dimension at all, and nothing for a host that simply has no data in it.
-    On the page those two absences and "we never tried" looked identical -- the
-    DC, which has no agent, showed no processes row at all rather than a blind
-    one (dogfood, 2026-09-16). This is where per-host coverage is decided:
-
-    * an agent dimension whose plane returned no document for this host is
-      ``blind``;
-    * an agent dimension whose plane DID answer for this host, with no rows of
-      its own, is measured and empty -- the plane is there and carried nothing
-      of that kind;
-    * a flow dimension on a host that has flow rows is measured and empty.
-
-    A row exists for a host only when the aggregation returned a bucket for it,
-    so the presence of any row from a plane is the proof that the plane
-    answered. The row is read whatever entity kind it carries: the logon
-    dimension keys its rows on the host and labels them ``user``.
-    """
-    have: dict[str, set[str]] = {}
-    answered: dict[str, set[str]] = {}
-    support: dict[str, int] = {}
-    for b in sweep.profiles:
-        if b.entity_key == "*":
-            continue
-        answered.setdefault(b.entity_key, set()).add(b.dimension)
-        if b.entity_kind != "host":
-            continue
-        have.setdefault(b.entity_key, set()).add(b.dimension)
-        support[b.entity_key] = max(support.get(b.entity_key, 0), int(b.support_days or 0))
-
-    fill: list[tuple[str, str, str, int]] = []
-    for key, dims in have.items():
-        days = support.get(key, 0)
-        seen = answered.get(key, set())
-        for plane in _AGENT_PLANES:
-            measured = bool(seen & set(plane))
-            for dim in plane:
-                if dim in dims:
-                    continue
-                fill.append((key, dim, "measured" if measured else "blind", days))
-        if dims & set(_FLOW_DIMENSIONS):
-            for dim in _FLOW_DIMENSIONS:
-                if dim not in dims:
-                    fill.append((key, dim, "measured", days))
-    return fill
-
-
-async def _build_entity_profiles(
-    es_client: Any,
-    db_sessionmaker: Any,
-    settings: Any,
-    summary: DossierSummary,
-    cidrs: Sequence[Any] = (),
-) -> None:
-    """Build and persist behavioural profiles, if the deployment has opted in.
-
-    Runs once per sweep rather than once per host: the aggregations are keyed
-    by entity, so one pass produces every entity's row and a per-host call
-    would re-read the same 3.8M-document plane once per address.
-
-    Gated OFF by default. The design does not let this layer influence anything
-    before a shadow week has been read, and a profile nobody has looked at is a
-    confident claim about a network nobody has checked it against.
-
-    The sweep must survive this failing. A dossier run that aborts because a
-    baseline could not be built has traded a working feature for a new one.
-    """
-    if not getattr(settings, "entity_profiles_enabled", False):
-        return
-
-    window_days = max(1, int(getattr(settings, "entity_profile_window_days", 30)))
-    lag_hours = max(0, int(getattr(settings, "entity_profile_lag_hours", 24)))
-    try:
-        sweep = await collect_entity_profiles(
-            elastic=es_client,
-            settings=settings,
-            window_hours=window_days * 24,
-            # The baseline stops where the prior sweep's recent window starts.
-            # Without the gap it contains the very window it is compared
-            # against and nothing can ever be novel.
-            lag_hours=lag_hours,
-            # Host entities are scoped to the estate's own address space, or
-            # the lane profiles the internet.
-            cidrs=cidrs,
-        )
-    except Exception as exc:  # pragma: no cover - the lane swallows its own
-        _record_error(summary, f"entity profiles: {exc}")
-        return
-
-    for detail in sweep.errors:
-        _record_error(summary, f"entity profiles: {detail}")
-    for note in sweep.notes:
-        _record_note(summary, note)
-    if sweep.planes:
-        _record_note(
-            summary,
-            "profile planes: "
-            + "; ".join(f"{k}={','.join(v)}" for k, v in sorted(sweep.planes.items())),
-        )
-
-    written = 0
-    purged = 0
-    try:
-        async with db_sessionmaker() as db:
-            # Before writing: drop anything the current scope excludes. The
-            # builder was scoped to the estate's CIDRs, but upsert never
-            # deletes, so without this a scoping change leaves the profiles it
-            # now excludes sitting in the table being reported on.
-            purged = await entity_profiles.purge_out_of_scope(db, cidrs=cidrs)
-            for built in sweep.profiles:
-                # The blind placeholder the lane emits is keyed "*" — it says
-                # the GRID cannot answer this dimension, which is a note on the
-                # run, not a row about an entity that does not exist.
-                if built.entity_key == "*":
-                    continue
-                await entity_profiles.upsert_profile(
-                    db,
-                    entity_kind=built.entity_kind,
-                    entity_key=built.entity_key,
-                    dimension=built.dimension,
-                    shape=built.shape,
-                    vector=built.vector,
-                    coverage=built.coverage,
-                    support_days=built.support_days,
-                    window_days=window_days,
-                )
-                written += 1
-            # Per-host coverage for the dimensions the lane left silent.
-            for key, dim, coverage, days in _coverage_fill(sweep):
-                await entity_profiles.upsert_profile(
-                    db,
-                    entity_kind="host",
-                    entity_key=key,
-                    dimension=dim,
-                    shape="categorical",
-                    vector=None if coverage == "blind" else {},
-                    coverage=coverage,
-                    support_days=days if coverage != "blind" else 0,
-                    window_days=window_days,
-                )
-                written += 1
-    except Exception as exc:
-        _record_error(summary, f"entity profiles: persist failed: {exc}")
-        return
-
-    _record_note(
-        summary,
-        f"entity profiles: wrote {written} row(s)"
-        + (f", purged {purged} out of scope" if purged else ""),
-    )
-
-
 def _record_note(summary: DossierSummary, detail: str) -> None:
     """Append an advisory note, bounded — the twin of :func:`_record_error`.
 
@@ -1356,7 +1180,11 @@ async def _sweep(
     for note in (*agent_inventory.notes, *dns_names.notes):
         _record_note(summary, note)
 
-    await _build_entity_profiles(es_client, db_sessionmaker, settings, summary, cidrs)
+    build = await profile_job.build_profiles(es_client, db_sessionmaker, settings, cidrs)
+    for detail in build.errors:
+        _record_error(summary, detail)
+    for note in build.notes:
+        _record_note(summary, note)
 
     candidates = await _census(
         es_client, index, cidrs, lookback_days, summary, agg_size=_census_agg_size(settings)

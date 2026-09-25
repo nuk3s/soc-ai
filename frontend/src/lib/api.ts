@@ -1271,6 +1271,11 @@ export interface PriorCoverage {
   not_applicable: number;
   fired: number;
   shadow: boolean;
+  /** The newest baseline the sweep read, its verdict on that, and why a
+   *  dimension could not be measured. Absent from an older backend. */
+  profiles_built_at?: string | null;
+  profiles_stale?: boolean;
+  profiles_reason?: string | null;
 }
 
 export interface HuntCatalogSpec {
@@ -2545,9 +2550,23 @@ export interface LeadObservationDetail extends LeadObservation {
   evidence: Record<string, unknown> | null;
 }
 
+/** The live weight of one type on a lead. One type saturates at `cap`, so a
+ *  lead built from one type repeated reads "1.70 of 1.70, saturated" and never
+ *  a bare 25. `kind` is the identifier; `kind_label` is the analyst's word. */
+export interface LeadKindWeight {
+  kind: string;
+  kind_label?: string;
+  weight: number;
+  cap: number;
+  saturated: boolean;
+}
+
 /** One lead with its timeline, its live weight and its dismissal. */
 export interface LeadDetail extends Lead {
   weight_now: number;
+  /** The live weight per type. The sum of these is `weight_now`. Absent on a
+   *  route that sends none, and the page then shows the total alone. */
+  weight_by_kind?: LeadKindWeight[];
   single_signal: boolean;
   dismissed_reason: string | null;
   dismissed_note: string | null;
@@ -2638,6 +2657,7 @@ export interface LeadQualityWeek {
   hunted: number;
   threat: number;
   promoted: number;
+  closed_by_hunt: number;
   dismissed: Record<string, number>;
 }
 
@@ -2646,6 +2666,7 @@ export interface LeadQualityTypes {
   types: string;
   formed: number;
   dismissed: number;
+  closed_by_hunt: number;
   threat: number;
 }
 
@@ -2907,6 +2928,9 @@ export interface EntityObservation {
   weight_now: number;
   lead_id: number | null;
   born_at: string | null;
+  /** When the row was first written. Absent on a route that sends none, and
+   *  the row then states the sweep count alone. */
+  first_seen_at?: string | null;
   occurrences: number;
   read: boolean;
   /** The label the server wrote for this kind. Absent on a route that sends

@@ -20,11 +20,13 @@ import { ApiError, getEvent, getHunts, getLead, huntLead, reopenLead } from '../
 import {
   ACTION_REOPEN,
   CHIP_ONE_SIGNAL,
+  CHIP_SWEEPS,
   DEFINE_LEAD,
   LEAD_LEGEND,
   STATUS_COMPLETE,
   STATUS_COMPLETE_ROW,
   WEIGHT_AT_FORMATION,
+  WEIGHT_BY_TYPE,
   WEIGHT_NOW,
 } from '../lib/tooltips';
 import { ShellProvider } from '../shell/ShellContext';
@@ -130,6 +132,54 @@ describe('LeadDetail', () => {
     mount();
     expect((await screen.findByText(/weight now 1\.28/)).getAttribute('title')).toBe(WEIGHT_NOW);
     expect(screen.getByText(/at formation 1\.30/).getAttribute('title')).toBe(WEIGHT_AT_FORMATION);
+  });
+
+  it('shows the weight per type against its cap and says when a type is saturated', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      kinds: ['novel_served_port'],
+      weight_at_formation: 1.7,
+      weight_now: 1.7,
+      single_signal: true,
+      weight_by_kind: [
+        { kind: 'novel_served_port', kind_label: 'new served port', weight: 1.7, cap: 1.7, saturated: true },
+      ],
+    } as never);
+    mount();
+    const row = await screen.findByTestId('weight-kind-novel_served_port');
+    expect(row.textContent).toBe('new served port 1.70 of 1.70, saturated');
+    expect(row.getAttribute('title')).toBe(WEIGHT_BY_TYPE);
+  });
+
+  it('shows a type under its cap without the saturated word', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      weight_by_kind: [
+        { kind: 'prior_no_baseline', kind_label: 'finding with no benign baseline', weight: 1.0, cap: 1.7, saturated: false },
+        { kind: 'off_hours', kind_label: 'off hours', weight: 0.28, cap: 1.7, saturated: false },
+      ],
+    } as never);
+    mount();
+    const row = await screen.findByTestId('weight-kind-off_hours');
+    expect(row.textContent).toBe('off hours 0.28 of 1.70');
+  });
+
+  it('states the sweep count and the first sighting as their own string on the timeline', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      observations: [
+        {
+          ...LEAD.observations[1],
+          occurrences: 3,
+          first_seen_at: new Date(Date.now() - 3 * 24 * 3_600_000).toISOString(),
+        },
+      ],
+    } as never);
+    mount();
+    const row = await screen.findByTestId('observation-2');
+    const seen = within(row).getByText('seen on 3 sweeps, first seen 3d ago');
+    expect(seen.getAttribute('title')).toBe(CHIP_SWEEPS);
+    expect(within(row).queryByText(/seen 3 times/)).toBeNull();
   });
 
   // An alert verdict writes the observation, and an alert has no analytic. The
@@ -288,6 +338,33 @@ describe('LeadDetail dismissal and reopen', () => {
     expect(screen.queryByRole('button', { name: 'Hunt' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Promote' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+  });
+
+  it('reads a lead the hunt closed as Closed, names soc-ai, and offers Reopen', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'dismissed',
+      hunt_id: 'H-LEAD-1',
+      hunt_status: 'complete',
+      hunt_outcome_label: 'No threat observed',
+      dismissed_reason: 'hunt_clean',
+      dismissed_by: 'auto-hunt',
+      dismissed_at: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+    } as never);
+    mount();
+    const chip = await screen.findByTestId('lead-status');
+    expect(chip.textContent).toBe('Closed. The hunt found no threat.');
+    expect(screen.getByTestId('lead-closed-reason').textContent).toBe('closed by soc-ai');
+    const event = screen.getByTestId('lead-dismissal');
+    expect(event.textContent).toContain('by soc-ai. The hunt found no threat.');
+    expect(event.textContent).not.toContain('auto-hunt');
+    expect(event.textContent).not.toContain('hunt_clean');
+    expect(screen.getByRole('button', { name: 'Reopen' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    // The form the analyst opens after a reopen still offers five reasons.
+    expect(
+      (screen.getByTestId('lead-dismissal').textContent ?? '').includes('Reopened.'),
+    ).toBe(false);
   });
 
   // A promoted lead became an investigation. The page stated the work it

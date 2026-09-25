@@ -54,7 +54,7 @@ jobs:
         run: uv run mypy soc_ai/
 
       - name: pytest
-        run: uv run pytest -v
+        run: uv run pytest -n auto
 
   # The React SPA (frontend/) — typecheck + unit tests (vitest) + production
   # build so a broken UI can't land silently. No eslint config is committed

@@ -122,6 +122,12 @@ async def test_a_repeated_catalog_hit_refreshes_instead_of_duplicating(
                 db, spec=_spec(False), candidates=[_candidate("198.51.100.7")], now=_NOW
             )
         rows = await _rows(db)
+        assert len(rows) == 1
+        assert rows[0].occurrences == 1, "the same two documents, read twice, are one sighting"
+
+        later = replace(_candidate("198.51.100.7"), sample_ids=("d3",), anchor_id="d3")
+        await observe_catalog_hits(db, spec=_spec(False), candidates=[later], now=_NOW)
+        rows = await _rows(db)
     assert len(rows) == 1
     assert rows[0].occurrences == 2
 

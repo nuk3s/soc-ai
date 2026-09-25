@@ -13,8 +13,9 @@ from it, and the sweep returns clean no matter what happened.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -59,8 +60,23 @@ def _sample_hits(ids: Sequence[str]) -> dict[str, Any]:
 class _FakeES:
     """Answers the plane probe as healthy and returns canned recent members."""
 
-    def __init__(self, recent: dict[str, dict[str, int]] | None = None) -> None:
+    def __init__(
+        self,
+        recent: dict[str, dict[str, int]] | None = None,
+        *,
+        peers: int = 2,
+        days: int = 2,
+        salt: str = "",
+    ) -> None:
         self.recent = recent or {}
+        # Every member reports this many distinct peers and active days. Two
+        # each by default, so a member counts as a served port unless a test
+        # says otherwise.
+        self.peers = peers
+        self.days = days
+        # Appended to every sampled document id. A second fake with a
+        # different salt is a sweep that saw different documents.
+        self.salt = salt
         self.windows: list[Any] = []
         # (agg keys, query) of every read that is not the plane probe.
         self.reads: list[tuple[set[str], dict[str, Any]]] = []
@@ -69,6 +85,21 @@ class _FakeES:
         # for document ids at all.
         self.aggs: list[dict[str, Any]] = []
 
+    def _stamps(self) -> dict[str, Any]:
+        """``first`` and ``last`` that span ``self.days`` calendar dates.
+
+        The reader derives the day count from these two stamps. Fewer than
+        one day means no stamps at all, which the reader reads as zero.
+        """
+        if self.days < 1:
+            return {}
+        last = datetime.now(UTC)
+        first = last - timedelta(days=self.days - 1)
+        return {
+            "first": {"value_as_string": first.isoformat()},
+            "last": {"value_as_string": last.isoformat()},
+        }
+
     def _buckets(self) -> list[dict[str, Any]]:
         return [
             {
@@ -76,7 +107,13 @@ class _FakeES:
                 "doc_count": sum(members.values()),
                 "members": {
                     "buckets": [
-                        {"key": m, "doc_count": c, "samples": _sample_hits(_doc_ids(m))}
+                        {
+                            "key": m,
+                            "doc_count": c,
+                            "samples": _sample_hits([f"{i}{self.salt}" for i in _doc_ids(m)]),
+                            "peers": {"value": self.peers},
+                            **self._stamps(),
+                        }
                         for m, c in members.items()
                     ]
                 },
@@ -452,6 +489,42 @@ async def test_record_writes_observations_and_forms_leads(
     await engine.dispose()
 
 
+async def test_the_profile_state_reaches_the_trail_past_the_per_entity_read(
+    settings_kratos: Settings,
+) -> None:
+    """The sweep reads one entity's baselines into a local on every turn of
+    its loop. That local shared the name of the caller's ProfileState, so the
+    trail recorded a dict of rows where it meant the freshness verdict."""
+    from datetime import UTC, datetime, timedelta
+
+    from soc_ai.hunting.prior_sweep import ProfileState
+    from soc_ai.store.models import PriorSpecRun
+    from sqlalchemy import select
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40}})
+    built = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=26)
+
+    es = _FakeES(recent={_SWITCH: {"445": 6}})
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            record=True,
+            profiles=ProfileState(built_at=built, stale=True, reason="active_hours: refused"),
+        )
+        runs = (await db.execute(select(PriorSpecRun))).scalars().all()
+
+    assert runs, "the sweep left no trail"
+    assert all(r.profiles_stale is True for r in runs)
+    assert all(r.profiles_built_at == built for r in runs)
+    assert all(r.profiles_reason == "active_hours: refused" for r in runs)
+    await engine.dispose()
+
+
 async def test_a_no_baseline_prior_records_at_finding_weight(
     settings_kratos: Settings,
 ) -> None:
@@ -585,7 +658,9 @@ async def test_the_recent_read_asks_for_the_documents_behind_each_member(
     bodies = [a["served_ports"] for a in es.aggs if "served_ports" in a]
     assert bodies, "the sweep made no recent read"
     samples = bodies[0]["aggs"]["members"]["aggs"]["samples"]
-    assert samples == {"top_hits": {"size": 3, "_source": False}}
+    assert samples == {
+        "top_hits": {"size": 3, "_source": False, "sort": [{"@timestamp": {"order": "desc"}}]}
+    }
     await engine.dispose()
 
 
@@ -628,13 +703,17 @@ async def test_a_repeat_of_the_same_departure_keeps_one_row(
     Were the ids part of the fingerprint, every sweep would sample different
     documents for the same condition and write a new row for each, and one
     beacon would outrank the network by arithmetic alone.
+
+    And the count moves with the evidence. Two sweeps over the same documents
+    are one sighting read twice. A sweep that samples a document the row has
+    not cited is a second sighting.
     """
     from soc_ai.store.models import EntityObservation
     from sqlalchemy import select
 
     engine, maker = await _db(settings_kratos)
     await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
-    await _seed_profile(maker, vector={"22": {"count": 40}})
+    await _seed_profile(maker, vector={"22": {"count": 40, "peers": 3, "days": 12}})
 
     async with maker() as db:
         for _run in (1, 2):
@@ -645,6 +724,17 @@ async def test_a_repeat_of_the_same_departure_keeps_one_row(
                 catalog=_prior(),
                 record=True,
             )
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].occurrences == 1, "the same documents were read twice, not seen twice"
+
+        await run_prior_sweep(
+            elastic=_FakeES(recent={_SWITCH: {"445": 6}}, salt="-later"),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            record=True,
+        )
         rows = (await db.execute(select(EntityObservation))).scalars().all()
 
     assert len(rows) == 1
@@ -684,7 +774,9 @@ async def test_the_shaped_recent_read_asks_for_the_documents_behind_each_hour(
     bodies = [a["active_hours"] for a in es.aggs if "active_hours" in a]
     assert bodies, "the sweep made no shaped recent read"
     samples = bodies[0]["aggs"]["per_hour"]["aggs"]["samples"]
-    assert samples == {"top_hits": {"size": 3, "_source": False}}
+    assert samples == {
+        "top_hits": {"size": 3, "_source": False, "sort": [{"@timestamp": {"order": "desc"}}]}
+    }
 
     assert [d.member for d in sweep.fired[0].departures] == ["3"]
     assert list(sweep.fired[0].departures[0].sample_ids) == _doc_ids(stamp)
@@ -746,3 +838,121 @@ async def test_the_plane_probe_names_every_candidate_dataset(
     assert es.probe_keys, "the sweep sent no plane probe"
     assert set(es.probe_keys) == {f"{d}|destination.port" for d in FLOW_CANDIDATES}
     await engine.dispose()
+
+
+async def test_the_recent_read_asks_for_peers_and_days_behind_each_served_port(
+    settings_kratos: Settings,
+) -> None:
+    """The recent read carries the same two numbers the baseline does.
+
+    Without them the guard reads zero peers and zero days for every member
+    and nothing on a served port can ever fire.
+    """
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40}})
+
+    es = _FakeES(recent={_SWITCH: {"445": 6}})
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=es, settings=_settings_like(settings_kratos), db=db, catalog=_prior()
+        )
+
+    bodies = [a["served_ports"] for a in es.aggs if "served_ports" in a]
+    assert bodies, "the sweep made no recent read"
+    member_aggs = bodies[0]["aggs"]["members"]["aggs"]
+    assert member_aggs["peers"] == {"cardinality": {"field": "source.ip"}}
+    assert member_aggs["first"] == {"min": {"field": "@timestamp"}}
+    assert member_aggs["last"] == {"max": {"field": "@timestamp"}}
+    assert "days" not in member_aggs
+    await engine.dispose()
+
+
+async def test_a_served_port_reached_from_one_peer_on_one_day_does_not_fire(
+    settings_kratos: Settings,
+) -> None:
+    """The production case, end to end through the sweep."""
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40, "peers": 3, "days": 12}})
+
+    async with maker() as db:
+        quiet = await run_prior_sweep(
+            elastic=_FakeES(recent={_SWITCH: {"33897": 19}}, peers=1, days=1),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+        )
+        loud = await run_prior_sweep(
+            elastic=_FakeES(recent={_SWITCH: {"33897": 19}}, peers=2, days=2),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+        )
+    assert quiet.fired == ()
+    assert [d.member for r in loud.fired for d in r.departures] == ["33897"]
+    await engine.dispose()
+
+
+async def test_the_recent_read_applies_the_same_direction_clauses_as_the_baseline(
+    settings_kratos: Settings,
+) -> None:
+    """Asymmetry here is the port-bound defect again, with a new field.
+
+    A baseline that excludes DNS mirrors and a recent read that keeps them
+    makes every mirrored lookup a novel served port.
+    """
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40, "peers": 3, "days": 12}})
+
+    es = _FakeES(recent={_SWITCH: {"445": 3}})
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=es, settings=_settings_like(settings_kratos), db=db, catalog=_prior()
+        )
+
+    reads = [q for keys, q in es.reads if "served_ports" in keys]
+    assert reads, "the sweep made no recent read"
+    must_not = reads[0]["bool"]["must_not"]
+    assert {"term": {"network.protocol": "dns"}} in must_not
+    assert {"terms": {"event.action": ["lookup_requested", "lookup_result"]}} in must_not
+    assert {"terms": {"network.direction": ["egress", "outbound", "external"]}} in must_not
+    # The fake answers the plane probe as healthy for every candidate, so the
+    # endpoint plane is in the read and its accepted-connection clause is too.
+    assert '"connection_accepted"' in json.dumps(reads[0]["bool"]["filter"])
+    await engine.dispose()
+
+
+async def test_a_recorded_departure_states_documents_in_the_window_it_read(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.store.models import EntityObservation
+    from sqlalchemy import select
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40, "peers": 3, "days": 12}})
+
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=_FakeES(recent={_SWITCH: {"445": 6}}),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            recent_hours=6,
+            record=True,
+        )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+
+    assert row.summary == (
+        "new served port for this host: 445. 6 documents in the last 6 h. "
+        "The baseline holds 1 value over 30 days."
+    )
+    await engine.dispose()
+
+
+async def test_the_default_window_is_the_one_the_sweep_reads() -> None:
+    from soc_ai.hunting.window import DEFAULT_RECENT_HOURS as FROM_WINDOW
+
+    assert DEFAULT_RECENT_HOURS == FROM_WINDOW == 24

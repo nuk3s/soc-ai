@@ -48,6 +48,26 @@ describe('BehaviouralProfile', () => {
     expect(screen.getByTestId('profile-coverage-measured')).toBeTruthy();
   });
 
+  it('renders unmeasurable with the reason the grid gave, never as nothing observed', () => {
+    // The grid refused the query after every retry. That is a fact about the
+    // grid's size, and "nothing observed" would turn it into a fact about the host.
+    mount([
+      dim({
+        dimension: 'active_hours',
+        shape: 'active_hours',
+        coverage: 'unmeasurable',
+        coverage_reason: 'Trying to create too many buckets',
+        support_days: 0,
+        summary: '',
+        top: [],
+      }),
+    ]);
+    const row = screen.getByText('active hours').closest('li')!;
+    expect(within(row).getByTestId('profile-coverage-unmeasurable')).toBeTruthy();
+    expect(within(row).getByText(/not measured: Trying to create too many buckets/)).toBeTruthy();
+    expect(within(row).queryByText(/nothing observed/)).toBeNull();
+  });
+
   it('states absence rather than omitting the panel', () => {
     // A missing panel is indistinguishable from "this host has no unusual behaviour".
     mount([]);

@@ -3919,9 +3919,110 @@ def test_hunting_a_lead_starts_a_lead_hunt_and_marks_the_lead(
     row = next(h for h in client.get("/api/v1/hunts?kind=lead").json() if h["id"] == hunt_id)
     assert row["starter"] == "lead" and row["leadId"] == lead_id
     assert row["objective"].startswith(f"[lead {lead_id}] ")
-    # A second click does not start a second hunt.
-    again = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
-    assert again.status_code == 200 and again.json()["hunt_id"] == hunt_id
+
+
+def test_hunt_again_on_a_hunted_lead_starts_a_second_hunt(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """A finished hunt does not block the next. The lead names the newest one."""
+    import asyncio
+    import time
+
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    lead_id = _seed_lead(client)
+
+    async def attach_finished() -> None:
+        from soc_ai.store import leads as leads_store
+        from soc_ai.store.models import Hunt
+
+        async with client.app.state.db_sessionmaker() as db:
+            db.add(
+                Hunt(
+                    id="01HUNTDONE",
+                    objective="o",
+                    objective_hash="x",
+                    started_by="auto-hunt",
+                    kind="lead",
+                    starter="lead",
+                    status="complete",
+                    lead_id=lead_id,
+                    report={
+                        "findings": [{"title": "Beaconing to a rare external address"}],
+                        "narrative": "n",
+                    },
+                )
+            )
+            await db.commit()
+            await leads_store.mark_hunting(db, lead_id, hunt_id="01HUNTDONE")
+
+    asyncio.run(attach_finished())
+    with (
+        patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            return_value=TestModel(
+                call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+            ),
+        ),
+        patch(
+            "soc_ai.agent.toolset.query_events_oql",
+            AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["hunt_id"] != "01HUNTDONE" and "existing" not in body
+        out = None
+        for _ in range(50):
+            out = _read_hunt(settings_kratos, body["hunt_id"])
+            if out is not None and out["status"] in ("complete", "error"):
+                break
+            time.sleep(0.1)
+    assert out is not None and out["status"] == "complete"
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["hunt_id"] == body["hunt_id"] and detail["status"] == "hunting"
+    on_lead = {
+        h["id"] for h in client.get("/api/v1/hunts?kind=lead").json() if h["leadId"] == lead_id
+    }
+    assert on_lead == {"01HUNTDONE", body["hunt_id"]}
+
+
+def test_a_lead_hunt_that_finds_no_threat_closes_the_lead(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """The route path end to end: the hunt lands clean, the lead reads Closed."""
+    import time
+
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    lead_id = _seed_lead(client)
+    clean = HuntReport(narrative="Nothing notable on this host.")
+    with (
+        patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            return_value=TestModel(call_tools=["t_query_events_oql"], custom_output_args=clean),
+        ),
+        patch(
+            "soc_ai.agent.toolset.query_events_oql",
+            AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+        assert res.status_code == 200
+        hunt_id = res.json()["hunt_id"]
+        detail = None
+        for _ in range(50):
+            detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+            if detail["status"] == "dismissed":
+                break
+            time.sleep(0.1)
+    assert detail is not None and detail["status"] == "dismissed"
+    assert detail["dismissed_reason"] == "hunt_clean" and detail["dismissed_by"] == "auto-hunt"
+    assert detail["hunt_id"] == hunt_id and detail["hunt_status"] == "complete"
+    assert detail["hunt_outcome_label"] == "No threat observed"
+    assert lead_id in _lead_set(client, "closed")
+    assert lead_id not in _lead_set(client, "needs_decision")
 
 
 def test_every_kind_has_analyst_words() -> None:
@@ -4124,15 +4225,29 @@ def test_reopening_a_lead_keeps_the_dismissal_as_history(client: TestClient) -> 
 
 
 def test_hunting_a_lead_that_is_already_hunting_says_the_hunt_exists(client: TestClient) -> None:
-    """The second click must not start a second hunt, and must say so."""
+    """The second click while the hunt runs must not start a second hunt, and must say so."""
     import asyncio
 
     lead_id = _seed_lead(client)
 
     async def attach() -> None:
         from soc_ai.store import leads as leads_store
+        from soc_ai.store.models import Hunt
 
         async with client.app.state.db_sessionmaker() as db:
+            db.add(
+                Hunt(
+                    id="01HUNTEXISTING",
+                    objective="o",
+                    objective_hash="x",
+                    started_by="admin",
+                    kind="lead",
+                    starter="lead",
+                    status="running",
+                    lead_id=lead_id,
+                )
+            )
+            await db.commit()
             await leads_store.mark_hunting(db, lead_id, hunt_id="01HUNTEXISTING")
 
     asyncio.run(attach())
@@ -4902,6 +5017,56 @@ def test_a_lead_hunt_that_was_cancelled_still_waits_on_a_decision(client: TestCl
     assert _lead_set(client, "in_progress") == set()
 
 
+def test_a_lead_the_hunt_closed_is_on_the_closed_tab_with_its_reason(client: TestClient) -> None:
+    """The store closed it. Every tab, count and page reads that close."""
+    import asyncio
+
+    lead_id = _seed_lead(client)
+
+    async def close() -> None:
+        from soc_ai.store import leads as leads_store
+        from soc_ai.store.models import Hunt
+
+        async with client.app.state.db_sessionmaker() as db:
+            db.add(
+                Hunt(
+                    id="01HUNTCLEAN",
+                    objective="o",
+                    objective_hash="x",
+                    started_by="auto-hunt",
+                    kind="lead",
+                    starter="lead",
+                    status="complete",
+                    lead_id=lead_id,
+                    report={"findings": [], "narrative": "n"},
+                )
+            )
+            await db.commit()
+            await leads_store.mark_hunting(db, lead_id, hunt_id="01HUNTCLEAN")
+            hunt = await db.get(Hunt, "01HUNTCLEAN")
+            assert await leads_store.settle_after_hunt(db, hunt) == "closed"
+
+    asyncio.run(close())
+    assert lead_id in _lead_set(client, "closed")
+    assert lead_id not in _lead_set(client, "needs_decision")
+    assert lead_id not in _lead_set(client, "in_progress")
+    closed = client.get("/api/v1/leads?status=closed").json()
+    row = next(lead for lead in closed if lead["id"] == lead_id)
+    assert row["status"] == "dismissed" and row["dismissed_reason"] == "hunt_clean"
+    assert row["hunt_status"] == "complete" and row["hunt_outcome_label"] == "No threat observed"
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["dismissed_by"] == "auto-hunt"
+    # The analyst's list does not grow. The closure is the rule's word, not a choice.
+    assert detail["dismiss_reasons"] == [
+        "expected_for_role",
+        "known_change",
+        "benign_repeat",
+        "bad_baseline",
+        "other",
+    ]
+    assert client.get("/api/v1/hunts/needs-you").json()["leads_needing_decision"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Related leads on the API, and the lead quality block
 # ---------------------------------------------------------------------------
@@ -5077,6 +5242,7 @@ def _seed_quality_lead(
     kinds: list[str],
     status: str = "open",
     dismissed_reason: str | None = None,
+    dismissed_by: str | None = None,
     hunt_id: str | None = None,
     threat: bool = False,
 ) -> int:
@@ -5120,6 +5286,7 @@ def _seed_quality_lead(
                 updated_at=formed_at,
                 hunt_id=hunt_id,
                 dismissed_reason=dismissed_reason,
+                dismissed_by=dismissed_by,
                 dismissed_at=formed_at if status == "dismissed" else None,
                 shadow=False,
             )
@@ -5185,6 +5352,7 @@ def test_the_lead_quality_block_counts_two_weeks_and_two_type_pairs(
         "hunted": 2,
         "threat": 1,
         "promoted": 0,
+        "closed_by_hunt": 0,
         "dismissed": {"expected_for_role": 1},
     }
     assert weeks[label(last_week)] == {
@@ -5193,13 +5361,26 @@ def test_the_lead_quality_block_counts_two_weeks_and_two_type_pairs(
         "hunted": 0,
         "threat": 0,
         "promoted": 1,
+        "closed_by_hunt": 0,
         "dismissed": {"known_change": 1},
     }
     # The two leads written with the same two types in a different order are
     # one pair, because the label is sorted.
     assert body["by_types"] == [
-        {"types": "catalog_match+off_hours", "formed": 2, "dismissed": 1, "threat": 1},
-        {"types": "novel_destination", "formed": 2, "dismissed": 1, "threat": 0},
+        {
+            "types": "catalog_match+off_hours",
+            "formed": 2,
+            "dismissed": 1,
+            "closed_by_hunt": 0,
+            "threat": 1,
+        },
+        {
+            "types": "novel_destination",
+            "formed": 2,
+            "dismissed": 1,
+            "closed_by_hunt": 0,
+            "threat": 0,
+        },
     ]
     assert body["rule"] == (
         "A lead forms at 0.85 over two or more types, on a finding with no benign "
@@ -5218,3 +5399,65 @@ def test_the_lead_quality_block_reads_a_quiet_week_as_a_measurement(
     # Newest first, so the current week is the first row.
     year, week, _day = datetime.now(UTC).isocalendar()
     assert body["weeks"][0]["week"] == f"{year}-W{week:02d}"
+
+
+def test_the_lead_quality_block_splits_hunt_closures_from_dismissals(
+    client: TestClient,
+) -> None:
+    """A closure in the rule's hand is not an analyst's lesson. The two are counted apart."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    this_week = now - timedelta(hours=1)
+    year, week, _day = this_week.isocalendar()
+    _seed_quality_lead(
+        client,
+        formed_at=this_week,
+        kinds=["novel_served_port"],
+        status="dismissed",
+        dismissed_reason="hunt_clean",
+        dismissed_by="auto-hunt",
+        hunt_id="01HUNTAUTO",
+    )
+    _seed_quality_lead(
+        client,
+        formed_at=this_week,
+        kinds=["novel_served_port"],
+        status="dismissed",
+        dismissed_reason="benign_repeat",
+        dismissed_by="ann",
+        hunt_id="01HUNTANN",
+    )
+
+    body = client.get("/api/v1/leads/quality?weeks=1").json()
+    assert body["weeks"] == [
+        {
+            "week": f"{year}-W{week:02d}",
+            "formed": 2,
+            "hunted": 2,
+            "threat": 0,
+            "promoted": 0,
+            "closed_by_hunt": 1,
+            "dismissed": {"benign_repeat": 1},
+        }
+    ]
+    assert body["by_types"] == [
+        {
+            "types": "novel_served_port",
+            "formed": 2,
+            "dismissed": 1,
+            "closed_by_hunt": 1,
+            "threat": 0,
+        }
+    ]
+
+
+def test_a_lead_whose_hunt_did_not_run_reads_could_not_run(client: TestClient) -> None:
+    """The lead is open with the hunt it names. The row says why it waits."""
+    errored = _seed_lead_row(client, status="open", hunt_status="error")
+    interrupted = _seed_lead_row(client, status="open", hunt_status="interrupted")
+    rows = {int(lead["id"]): lead for lead in client.get("/api/v1/leads?status=all").json()}
+    assert rows[errored]["hunt_status"] == "error"
+    assert rows[errored]["hunt_outcome_label"] == "Could not run"
+    assert rows[interrupted]["hunt_outcome_label"] == "Could not run"
+    assert {errored, interrupted} <= _lead_set(client, "needs_decision")
+    detail = client.get(f"/api/v1/hunts/leads/{errored}").json()
+    assert detail["hunt_outcome_label"] == "Could not run"

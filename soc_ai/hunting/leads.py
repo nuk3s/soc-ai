@@ -32,7 +32,7 @@ import hashlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import select
@@ -45,7 +45,9 @@ from soc_ai.hunting.weight import (
     DEFAULT_MIN_KINDS,
     Kind,
     birth_weight,
+    decay_horizon_hours,
     is_finding_grade,
+    lead_total,
     live_weight,
 )
 from soc_ai.store.models import EntityObservation, Lead
@@ -229,11 +231,16 @@ async def record_observation(
 ) -> EntityObservation:
     """Write one observation, or refresh the existing one for the same content.
 
-    On a repeat, ``born_at`` moves forward and ``occurrences`` increments, so
-    the thing decays from when it was LAST seen and stacks on how often. The
-    original sighting is preserved in ``first_seen_at``, because "started three
-    weeks ago and is still going" is a different story from "started today" and
-    a refreshed ``born_at`` alone cannot tell them apart.
+    On a repeat that cites a document the row has not cited, ``born_at``
+    moves forward and ``occurrences`` increments, so the thing decays from
+    when it was LAST seen and stacks on how often. A repeat over the same
+    documents changes neither. The hourly sweep reads a 24 h window, and the
+    same two documents sat inside it for nineteen sweeps: the row said "seen
+    19 times" over a port one process used once, and the stack formed a lead
+    from a re-read. The original sighting is preserved in ``first_seen_at``,
+    because "started three weeks ago and is still going" is a different story
+    from "started today" and a refreshed ``born_at`` alone cannot tell them
+    apart.
 
     ``source`` names the adapter that wrote the row. ``shadow`` is true if the
     analytic is not live. ``weight`` overrides the birth weight of the kind.
@@ -248,8 +255,13 @@ async def record_observation(
     Written at birth only, the flag left an approved analytic's hit between the
     two halves of the hits surface for the life of the row.
 
-    A refresh clears ``read_at``. The analyst read one sighting. The thing has
-    fired again, and the second sighting asks for its own read.
+    A refresh clears ``read_at`` on the same condition. The analyst read one
+    sighting. The thing has fired again, and the second sighting asks for its
+    own read.
+
+    The summary and the evidence are rewritten on every repeat. The wording
+    changes between builds, and the row reads in today's words on the next
+    sweep whether or not that sweep saw a new document.
     """
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
     born = birth_weight(kind) if weight is None else float(weight)
@@ -266,8 +278,14 @@ async def record_observation(
     ).scalar_one_or_none()
 
     if existing is not None:
-        existing.born_at = at
-        existing.occurrences = int(existing.occurrences or 0) + 1
+        # One condition answers three questions: does the sighting count,
+        # does it decay from now, and does the analyst have to read it again.
+        # A new document is a new sighting. The same documents are not.
+        fresh = bool(_evidence_ids(evidence) - _evidence_ids(existing.evidence_json))
+        if fresh:
+            existing.born_at = at
+            existing.occurrences = int(existing.occurrences or 0) + 1
+            existing.read_at = None
         existing.birth_weight = born
         # The flag and the read mark answer two different questions. The flag
         # asks what the analytic is now. The read mark asks whether the analyst
@@ -278,11 +296,6 @@ async def record_observation(
         # recomputed on, and reading it after a commit is a load the caller
         # cannot see.
         lead_id = int(existing.lead_id) if existing.lead_id else 0
-        # A refresh clears the read mark only when the evidence changed. The
-        # same condition seen again in the same documents is the sighting the
-        # analyst already read. New documents are a new sighting.
-        if _evidence_ids(evidence) - _evidence_ids(existing.evidence_json):
-            existing.read_at = None
         if summary:
             existing.summary = summary
         if evidence is not None:
@@ -476,26 +489,97 @@ def _forms_a_lead(
     return total >= threshold and len(kinds) >= min_kinds, False
 
 
-async def _drop_closed(
-    db: AsyncSession, observations: Sequence[WeighedObservation]
+async def _recent_hunt_closed_lead(
+    db: AsyncSession, *, entity: tuple[str, str], at: datetime, horizon: timedelta
+) -> Lead | None:
+    """The newest lead the settle rule closed on this entity inside the horizon.
+
+    Looked up by the lead, not by its observations: the observations that
+    formed it may have decayed to nothing while the close is still recent,
+    and the close is what answers for the entity.
+    """
+    from soc_ai.store.leads import AUTO_HUNT_ACTOR  # noqa: PLC0415 - avoids an import cycle
+
+    rows = (
+        (
+            await db.execute(
+                select(Lead)
+                .where(
+                    Lead.status == "dismissed",
+                    Lead.dismissed_by == AUTO_HUNT_ACTOR,
+                    Lead.dismissed_at >= at - horizon,
+                )
+                .order_by(Lead.dismissed_at.desc(), Lead.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    wanted = [entity[0], entity[1]]
+    for lead in rows:
+        if any(list(e) == wanted for e in (lead.entities_json or []) if len(e) == 2):
+            return lead
+    return None
+
+
+async def _apply_closed_leads(
+    db: AsyncSession,
+    observations: Sequence[WeighedObservation],
+    *,
+    entity: tuple[str, str],
+    at: datetime,
+    half_life_hours: float,
+    floor: float,
 ) -> list[WeighedObservation]:
-    """Drop the observations that a closed lead already holds.
+    """What a closed lead does to the observations on its entity.
 
     A dismissed or promoted lead is an answer. Its observations are consumed.
     They do not count toward a new lead, and the closed lead does not change.
     A new lead can still form on the same entity from observations recorded
     after the close.
+
+    A lead the settle rule closed is a narrower answer: the hunt read the
+    types the lead held and found no threat. Inside the decay horizon of that
+    close, an observation of a type the lead held joins it as history and
+    forms nothing, because the same repeat would start the same hunt and
+    land the same answer. An observation of a type the lead did NOT hold
+    reopens it: the question changed. The automatic dismissal is cleared and
+    the hunt id with it, so the loop hunts the reopened lead; the old hunt
+    row keeps the lead id, as the record of the first hunt.
+
+    An analyst's dismissal is never rejoined or reopened here. It stands.
     """
-    attached = {o.lead_id for o in observations if o.lead_id}
-    if not attached:
-        return list(observations)
-    # The import is local. soc_ai.store.leads imports soc_ai.store.models only,
-    # and a module-level import here would cycle through soc_ai.hunting.
     from soc_ai.store.leads import CLOSED_STATUSES  # noqa: PLC0415 - avoids an import cycle
 
-    rows = await db.execute(select(Lead.id, Lead.status).where(Lead.id.in_(list(attached))))
-    closed = {int(i) for i, s in rows if s in CLOSED_STATUSES}
-    return [o for o in observations if o.lead_id not in closed]
+    naive_at = at.replace(tzinfo=None) if at.tzinfo is not None else at
+    attached = {o.lead_id for o in observations if o.lead_id}
+    closed: set[int] = set()
+    if attached:
+        rows = await db.execute(select(Lead.id, Lead.status).where(Lead.id.in_(list(attached))))
+        closed = {int(i) for i, s in rows if s in CLOSED_STATUSES}
+    kept = [o for o in observations if o.lead_id not in closed]
+    loose = [o for o in kept if o.lead_id is None]
+    if not loose:
+        return kept
+    horizon = timedelta(hours=decay_horizon_hours(half_life_hours, floor))
+    lead = await _recent_hunt_closed_lead(db, entity=entity, at=naive_at, horizon=horizon)
+    if lead is None:
+        return kept
+    held = {str(k) for k in (lead.kinds_json or [])}
+    if {o.kind.value for o in loose} <= held:
+        await _join_lead(db, lead.id, loose)
+        await db.commit()
+        return [o for o in kept if o.lead_id is not None]
+    lead.status = STATUS_OPEN
+    lead.hunt_id = None
+    lead.dismissed_reason = None
+    lead.dismissed_note = None
+    lead.dismissed_by = None
+    lead.dismissed_at = None
+    lead.updated_at = naive_at
+    await db.commit()
+    reopened = int(lead.id)
+    return [o for o in observations if o.lead_id is None or o.lead_id == reopened]
 
 
 async def _join_lead(
@@ -799,11 +883,20 @@ async def form_leads(
         if not observations:
             continue
 
-        observations = await _drop_closed(db, observations)
+        observations = await _apply_closed_leads(
+            db,
+            observations,
+            entity=entity,
+            at=at,
+            half_life_hours=half_life_hours,
+            floor=floor,
+        )
         if not observations:
             continue
 
-        total = sum(o.weight for o in observations)
+        # Capped per kind. Forty-five rows of one kind are one story told
+        # forty-five times, and the sum said 25 where the story said 1.7.
+        total = lead_total((o.kind, o.weight) for o in observations)
         kinds = {o.kind for o in observations}
         related = sorted({r for o in observations for r in o.related if tuple(r) != entity})
 

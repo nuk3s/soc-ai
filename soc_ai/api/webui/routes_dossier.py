@@ -183,6 +183,9 @@ class ProfileDimensionOut(BaseModel):
     dimension: str
     shape: str  # categorical | numeric | active_hours
     coverage: str
+    # The Elasticsearch reason when ``coverage`` is ``unmeasurable``. The page
+    # prints it in the row, so a refused query never reads as a quiet host.
+    coverage_reason: str | None = None
     support_days: int
     window_days: int
     # A short, per-shape sentence the row can print without a client-side
@@ -668,6 +671,7 @@ def _profile_out(rows: dict[str, Any]) -> list[ProfileDimensionOut]:
                 dimension=dim,
                 shape=row.shape,
                 coverage=row.coverage,
+                coverage_reason=getattr(row, "coverage_reason", None),
                 support_days=int(row.support_days or 0),
                 window_days=int(row.window_days or 0),
                 summary=summary,
@@ -788,20 +792,23 @@ def _refresh_out(status: _DossierStatus, note: str | None = None) -> DossierRefr
     )
 
 
-async def _run_dossier_task(state: Any) -> None:
+async def _run_dossier_task(state: Any, *, trigger: str = "manual") -> None:
     """Background worker: one network sweep, summary stashed, never raises.
 
-    The enrichment import sits INSIDE the guard along with the sweep: a task that
-    died — on an import, on a down grid, on anything — while holding the
-    single-flight slot would wedge the Rebuild button until the next restart, and
-    the slot is only released in ``finally``.
+    ``trigger`` is what the ``dossier_run`` row records. The button passes
+    nothing and the row says ``manual``; the scheduler passes ``schedule``.
+    Every scheduled run in production read ``manual`` while this was fixed.
+
+    The enrichment import sits INSIDE the guard along with the sweep: a task
+    that died while holding the single-flight slot would wedge the Rebuild
+    button until the next restart, and the slot is only released in ``finally``.
     """
     status = _get_dossier_status(state)
     try:
         from soc_ai.enrichment.host_dossier import run_dossier_refresh  # noqa: PLC0415 - lazy
 
         summary = await run_dossier_refresh(
-            state.elastic, state.db_sessionmaker, state.settings, trigger="manual"
+            state.elastic, state.db_sessionmaker, state.settings, trigger=trigger
         )
         status.last_summary = asdict(summary)
     except Exception:

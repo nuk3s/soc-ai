@@ -272,6 +272,51 @@ describe('AnalyticsPanel sweep', () => {
     expect(within(quiet).queryByText('blind on the last sweep')).toBeNull();
   });
 
+  // The coverage counts implied "now". On the range they were scored
+  // against baselines three days old, and on production against a table
+  // where two dimensions could not be measured at all.
+  const withBaseline = (extra: Record<string, unknown>) => ({
+    ...SWEPT,
+    specs: [{ ...SWEPT.specs[0], coverage: { ...SWEPT.specs[0].coverage, ...extra } }],
+  });
+
+  it('says how old the baseline the coverage was scored against is', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(
+      withBaseline({
+        profiles_built_at: new Date(Date.now() - 26 * 3_600_000).toISOString(),
+        profiles_stale: true,
+        profiles_reason: null,
+      }) as never,
+    );
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(row).getByText('6 measured · 38 blind · baseline 26 h old, stale')).toBeTruthy();
+  });
+
+  it('says why the baseline could not be measured', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(
+      withBaseline({
+        profiles_built_at: new Date(Date.now() - 3_600_000).toISOString(),
+        profiles_stale: false,
+        profiles_reason: 'active_hours: Trying to create too many buckets',
+      }) as never,
+    );
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(
+      within(row).getByText(
+        '6 measured · 38 blind · baseline unmeasurable: active_hours: Trying to create too many buckets',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('reads an older backend without baseline fields unchanged', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(SWEPT as never);
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(row).getByText('6 measured · 38 blind')).toBeTruthy();
+  });
+
   it('names a rejection in the legend', async () => {
     mount();
     const legend = await screen.findByTestId('analytics-legend');

@@ -22,7 +22,7 @@ from soc_ai.hunting.leads import (
     record_observation,
     weigh_entity,
 )
-from soc_ai.hunting.weight import Kind
+from soc_ai.hunting.weight import KIND_WEIGHT_CAP, Kind
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import EntityObservation, Lead
 from sqlalchemy import select
@@ -39,7 +39,16 @@ async def _db(settings: Settings):  # type: ignore[no-untyped-def]
     return engine, make_sessionmaker(engine)
 
 
-async def _observe(db, kind: Kind, member: str, *, spec: str = "s", now=_NOW) -> None:
+async def _observe(
+    db,
+    kind: Kind,
+    member: str,
+    *,
+    spec: str = "s",
+    now=_NOW,
+    ids: tuple[str, ...] = (),
+) -> None:
+    """One observation. ``ids`` are the documents it cites, if any."""
     await record_observation(
         db,
         entity_kind=_HOST[0],
@@ -48,6 +57,7 @@ async def _observe(db, kind: Kind, member: str, *, spec: str = "s", now=_NOW) ->
         spec_id=spec,
         fingerprint=content_fingerprint("dim", member),
         summary=f"{kind.value}: {member}",
+        evidence={"sample_ids": list(ids)} if ids else None,
         now=now,
     )
 
@@ -62,10 +72,17 @@ async def test_a_repeat_refreshes_rather_than_accumulating(
 ) -> None:
     # A beacon seen every five minutes would otherwise become three hundred
     # rows and outrank every other signal on the network by arithmetic alone.
+    # Each sighting cites a document the last one did not.
     _engine, maker = await _db(settings_kratos)
     async with maker() as db:
         for i in range(5):
-            await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", now=_NOW + timedelta(hours=i))
+            await _observe(
+                db,
+                Kind.NOVEL_DESTINATION,
+                "203.0.113.9",
+                now=_NOW + timedelta(hours=i),
+                ids=(f"d{i}",),
+            )
         rows = (await db.execute(select(EntityObservation))).scalars().all()
     assert len(rows) == 1
     assert rows[0].occurrences == 5
@@ -78,10 +95,86 @@ async def test_a_repeat_moves_born_at_but_keeps_first_seen(
     # "started today", and a refreshed born_at alone cannot tell them apart.
     _engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", now=_NOW)
-        await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", now=_NOW + timedelta(days=3))
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.9", now=_NOW, ids=("d1",))
+        await _observe(
+            db,
+            Kind.NOVEL_DESTINATION,
+            "203.0.113.9",
+            now=_NOW + timedelta(days=3),
+            ids=("d2",),
+        )
         row = (await db.execute(select(EntityObservation))).scalars().one()
     assert row.first_seen_at < row.born_at
+
+
+async def test_a_repeat_on_the_same_documents_does_not_stack(
+    settings_kratos: Settings,
+) -> None:
+    """A re-read is not a sighting.
+
+    The hourly sweep reads a 24 h window. The same two documents sat inside
+    it for nineteen sweeps, and the row said "seen 19 times" over a port one
+    process used once. The count moves when the evidence does.
+    """
+    now = datetime.now(UTC)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for i in range(19):
+            await _observe(
+                db,
+                Kind.NOVEL_SERVED_PORT,
+                "33897",
+                now=now + timedelta(hours=i),
+                ids=("d1", "d2"),
+            )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+    assert row.occurrences == 1
+    assert row.born_at == now.replace(tzinfo=None)
+
+
+async def test_a_repeat_with_one_new_document_stacks_once(
+    settings_kratos: Settings,
+) -> None:
+    now = datetime.now(UTC)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_SERVED_PORT, "445", now=now, ids=("d1", "d2"))
+        await _observe(
+            db,
+            Kind.NOVEL_SERVED_PORT,
+            "445",
+            now=now + timedelta(hours=1),
+            ids=("d2", "d3"),
+        )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+    assert row.occurrences == 2
+    assert row.born_at == (now + timedelta(hours=1)).replace(tzinfo=None)
+
+
+async def test_a_repeat_still_rewrites_the_summary_and_the_evidence(
+    settings_kratos: Settings,
+) -> None:
+    # The wording can change between builds. The row reads in today's words
+    # on the next sweep whether or not the sweep saw a new document.
+    now = datetime.now(UTC)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_SERVED_PORT, "445", now=now, ids=("d1",))
+        await record_observation(
+            db,
+            entity_kind=_HOST[0],
+            entity_key=_HOST[1],
+            kind=Kind.NOVEL_SERVED_PORT,
+            spec_id="s",
+            fingerprint=content_fingerprint("dim", "445"),
+            summary="today's words",
+            evidence={"sample_ids": ["d1"], "baseline": {"member": "445"}},
+            now=now + timedelta(hours=1),
+        )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+    assert row.occurrences == 1
+    assert row.summary == "today's words"
+    assert row.evidence_json["baseline"] == {"member": "445"}
 
 
 async def test_different_content_is_a_different_observation(
@@ -452,8 +545,8 @@ async def test_one_kind_stacked_past_the_single_signal_threshold_forms_a_lead(
     # two-kind rule refused it. It is now a lead that says so.
     _engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        for _ in range(8):
-            await _observe(db, Kind.NOVEL_PROCESS, "rundll32.exe")
+        for i in range(8):
+            await _observe(db, Kind.NOVEL_PROCESS, "rundll32.exe", ids=(f"d{i}",))
         outcome = await form_leads(db, entity_keys=[_HOST], now=_NOW)
         leads = (await db.execute(select(Lead))).scalars().all()
     assert len(outcome.formed) == 1
@@ -473,8 +566,8 @@ async def test_three_repeats_of_one_kind_form_nothing(
     """
     _engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        for _ in range(3):
-            await _observe(db, Kind.NOVEL_PROCESS, "rundll32.exe")
+        for i in range(3):
+            await _observe(db, Kind.NOVEL_PROCESS, "rundll32.exe", ids=(f"d{i}",))
         outcome = await form_leads(db, entity_keys=[_HOST], now=_NOW)
     assert outcome.formed == ()
 
@@ -485,11 +578,11 @@ async def test_a_catalog_hit_seen_twice_forms_nothing(settings_kratos: Settings)
     # lead on its own. Four repeats are needed now.
     _engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        for _ in range(2):
-            await _observe(db, Kind.CATALOG_MATCH, "identity-4769")
+        for i in range(2):
+            await _observe(db, Kind.CATALOG_MATCH, "identity-4769", ids=(f"d{i}",))
         twice = await form_leads(db, entity_keys=[_HOST], now=_NOW)
-        for _ in range(2):
-            await _observe(db, Kind.CATALOG_MATCH, "identity-4769")
+        for i in range(2, 4):
+            await _observe(db, Kind.CATALOG_MATCH, "identity-4769", ids=(f"d{i}",))
         four = await form_leads(db, entity_keys=[_HOST], now=_NOW)
     assert twice.formed == ()
     assert len(four.formed) == 1
@@ -1069,11 +1162,12 @@ async def test_the_lifted_start_tags_the_hunt_as_a_lead_hunt(
     await engine.dispose()
 
 
-async def test_a_second_start_returns_the_hunt_that_exists(
+async def test_a_second_start_returns_the_hunt_that_runs(
     settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One lead, one hunt. The analyst's click and the loop's wake can race."""
+    """One lead, one running hunt. The analyst's click and the loop's wake can race."""
     from soc_ai.hunting import lead_hunt
+    from soc_ai.store.models import Hunt
 
     engine, maker = await _db(settings_kratos)
     lead_id = await _one_lead(maker, evidence={"sample_ids": ["d1"]})
@@ -1081,10 +1175,66 @@ async def test_a_second_start_returns_the_hunt_that_exists(
     monkeypatch.setattr("soc_ai.webui.hunt_console_manager.get_manager", lambda _s: manager)
 
     await lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="tester")
+    async with maker() as db:
+        db.add(
+            Hunt(
+                id="01HUNTFROMLEAD",
+                objective="o",
+                objective_hash="x",
+                started_by="tester",
+                kind="lead",
+                starter="lead",
+                status="running",
+                lead_id=lead_id,
+            )
+        )
+        await db.commit()
     again = await lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="loop")
 
     assert again.hunt_id == "01HUNTFROMLEAD" and again.existing is True
     assert len(calls) == 1, "the second start ran a second agent"
+    await engine.dispose()
+
+
+async def test_a_start_after_the_hunt_finished_starts_another_and_repoints_the_lead(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hunt again is a real button. The lead names the newest hunt."""
+    from soc_ai.hunting import lead_hunt
+    from soc_ai.store import leads as leads_store
+    from soc_ai.store.models import Hunt, Lead
+
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _one_lead(maker, evidence={"sample_ids": ["d1"]})
+    async with maker() as db:
+        db.add(
+            Hunt(
+                id="01HUNTOLD",
+                objective="o",
+                objective_hash="x",
+                started_by="auto-hunt",
+                kind="lead",
+                starter="lead",
+                status="complete",
+                lead_id=lead_id,
+                report={
+                    "findings": [{"title": "Beaconing to a rare external address"}],
+                    "narrative": "n",
+                },
+            )
+        )
+        await db.commit()
+        await leads_store.mark_hunting(db, lead_id, hunt_id="01HUNTOLD")
+    calls, manager = _recorder()
+    monkeypatch.setattr("soc_ai.webui.hunt_console_manager.get_manager", lambda _s: manager)
+
+    out = await lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="tester")
+
+    assert out.hunt_id == "01HUNTFROMLEAD" and out.existing is False
+    assert len(calls) == 1
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        assert lead.status == "hunting" and lead.hunt_id == "01HUNTFROMLEAD"
     await engine.dispose()
 
 
@@ -1253,27 +1403,34 @@ async def test_the_loop_leaves_out_the_leads_that_are_not_its_work(
         dismissed_at=_NOW.replace(tzinfo=None),
     )
 
-    # A lead whose hunt row exists but whose hunt_id was never stamped: the
-    # console started the hunt and the mark failed. It has had its hunt.
+    # A lead whose hunt runs but whose hunt_id was never stamped: the console
+    # started the hunt and the mark failed. The running row is the record.
+    has_one = await _row(maker)
+    # The same failed mark, but the hunt has finished. The lead is open with
+    # no hunt of its own, so the loop takes it again.
     had_one = await _row(maker)
     async with maker() as db:
-        db.add(
-            Hunt(
-                id="01HUNTORPHAN",
-                objective="look at this lead",
-                objective_hash="x",
-                started_by="auto-hunt",
-                kind="lead",
-                starter="lead",
-                status="complete",
-                lead_id=had_one,
+        for hunt_id, status, lead_id in (
+            ("01HUNTORPHAN", "running", has_one),
+            ("01HUNTDONE", "complete", had_one),
+        ):
+            db.add(
+                Hunt(
+                    id=hunt_id,
+                    objective="look at this lead",
+                    objective_hash="x",
+                    started_by="auto-hunt",
+                    kind="lead",
+                    starter="lead",
+                    status=status,
+                    lead_id=lead_id,
+                )
             )
-        )
         await db.commit()
 
     async with maker() as db:
         waiting = {int(lead.id) for lead in await lead_hunt.leads_awaiting_a_hunt(db, limit=50)}
-    assert waiting == {fresh}
+    assert waiting == {fresh, had_one}
     await engine.dispose()
 
 
@@ -1306,3 +1463,221 @@ async def test_the_cap_counts_only_the_hunts_the_loop_started(
         await db.commit()
         assert await lead_hunt.running_auto_hunts(db) == 2
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# One type saturates
+# ---------------------------------------------------------------------------
+
+
+async def _forty_five_ports(db, now: datetime) -> None:
+    """Forty-five novel served ports on one host, one of them seen on eight sweeps.
+
+    The repeat carries a new document each time, so the single-signal rule
+    reads a stack of 0.5 x (1 + ln 8) = 1.54 and forms the lead by itself.
+    """
+    for port in range(33000, 33045):
+        await _observe(db, Kind.NOVEL_SERVED_PORT, str(port), now=now, ids=(f"d{port}",))
+    for i in range(1, 8):
+        await _observe(db, Kind.NOVEL_SERVED_PORT, "33000", now=now, ids=(f"d33000-{i}",))
+
+
+async def test_one_type_saturates_at_its_cap_however_many_rows_it_holds(
+    settings_kratos: Settings,
+) -> None:
+    now = datetime.now(UTC)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _forty_five_ports(db, now)
+        outcome = await form_leads(db, entity_keys=[_HOST], now=now)
+        lead = (await db.execute(select(Lead))).scalars().one()
+    assert len(outcome.formed) == 1
+    assert lead.single_signal is True
+    assert lead.weight_at_formation == pytest.approx(KIND_WEIGHT_CAP)
+    assert lead.weight_at_formation < 2.0
+
+
+async def test_the_lead_page_reads_the_same_capped_total_as_formation(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.api.webui.routes_hunts import _lead_detail
+
+    now = datetime.now(UTC)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _forty_five_ports(db, now)
+        await form_leads(db, entity_keys=[_HOST], now=now)
+        lead = (await db.execute(select(Lead))).scalars().one()
+        rows = (
+            (
+                await db.execute(
+                    select(EntityObservation).where(EntityObservation.lead_id == lead.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        detail = _lead_detail(lead, rows, now)
+    assert detail.weight_now == pytest.approx(lead.weight_at_formation, abs=1e-3)
+    assert [(k.kind, k.saturated) for k in detail.weight_by_kind] == [("novel_served_port", True)]
+    assert detail.weight_by_kind[0].cap == pytest.approx(KIND_WEIGHT_CAP)
+    assert detail.weight_by_kind[0].kind_label != ""
+
+
+async def _clean_hunt_closed(
+    db,  # type: ignore[no-untyped-def]
+    lead_id: int,
+    *,
+    at: datetime,
+    hunt_id: str = "01HUNTCLEAN",
+) -> None:
+    """Hunt the lead, land the hunt clean, and let the store close it."""
+    from soc_ai.store import leads as leads_store
+    from soc_ai.store.models import Hunt
+
+    hunt = Hunt(
+        id=hunt_id,
+        objective="o",
+        objective_hash="x",
+        started_by="auto-hunt",
+        kind="lead",
+        starter="lead",
+        status="complete",
+        lead_id=lead_id,
+        report={"findings": [], "narrative": "n"},
+    )
+    db.add(hunt)
+    await db.commit()
+    await leads_store.mark_hunting(db, lead_id, hunt_id=hunt_id)
+    assert await leads_store.settle_after_hunt(db, hunt, now=at) == "closed"
+
+
+async def test_the_decay_horizon_is_where_a_full_weight_observation_reaches_the_floor() -> None:
+    from soc_ai.hunting.weight import decay_horizon_hours, live_weight
+
+    now = datetime.now(UTC)
+    horizon = decay_horizon_hours()
+    assert 207.0 < horizon < 208.0
+    assert live_weight(1.0, born_at=now - timedelta(hours=horizon - 1), now=now) > 0.0
+    assert live_weight(1.0, born_at=now - timedelta(hours=horizon + 1), now=now) == 0.0
+
+
+async def test_a_same_type_after_a_hunt_closed_the_lead_joins_it_as_history(
+    settings_kratos: Settings,
+) -> None:
+    """The hunt read this type on this host and said no threat. A repeat is the same question."""
+    now = datetime.now(UTC)
+    formed_at = now - timedelta(hours=3)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.10", now=formed_at)
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", now=formed_at)
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=formed_at)
+        first = await form_leads(db, entity_keys=[_HOST], now=formed_at)
+        lead_id = first.formed[0]
+        await _clean_hunt_closed(db, lead_id, at=now - timedelta(hours=2))
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.11", now=now - timedelta(hours=1))
+        second = await form_leads(db, entity_keys=[_HOST], now=now - timedelta(hours=1))
+        lead = await db.get(Lead, lead_id)
+        rows = (
+            (await db.execute(select(EntityObservation).order_by(EntityObservation.id)))
+            .scalars()
+            .all()
+        )
+    assert second.formed == () and second.updated == ()
+    assert lead.status == "dismissed" and lead.dismissed_reason == "hunt_clean"
+    assert len(rows) == 4 and {r.lead_id for r in rows} == {lead_id}
+
+
+async def test_a_new_type_after_a_hunt_closed_the_lead_reopens_it(
+    settings_kratos: Settings,
+) -> None:
+    """The question changed. The lead is open again with no hunt, so the loop hunts it."""
+    now = datetime.now(UTC)
+    formed_at = now - timedelta(hours=3)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.10", now=formed_at)
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", now=formed_at)
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=formed_at)
+        first = await form_leads(db, entity_keys=[_HOST], now=formed_at)
+        lead_id = first.formed[0]
+        await _clean_hunt_closed(db, lead_id, at=now - timedelta(hours=2))
+        await _observe(db, Kind.NOVEL_PROCESS, "rundll32.exe", now=now - timedelta(hours=1))
+        second = await form_leads(db, entity_keys=[_HOST], now=now - timedelta(hours=1))
+        lead = await db.get(Lead, lead_id)
+        rows = (
+            (await db.execute(select(EntityObservation).order_by(EntityObservation.id)))
+            .scalars()
+            .all()
+        )
+    assert second.formed == () and second.updated == (lead_id,)
+    assert lead.status == "open" and lead.hunt_id is None
+    assert lead.dismissed_reason is None and lead.dismissed_by is None
+    assert lead.dismissed_at is None and lead.dismissed_note is None
+    assert "novel_process" in lead.kinds_json
+    assert {r.lead_id for r in rows} == {lead_id}
+
+
+async def test_a_same_type_past_the_horizon_forms_a_fresh_lead(
+    settings_kratos: Settings,
+) -> None:
+    """A close older than the decay horizon is history. The host starts a new story."""
+    from soc_ai.hunting.weight import decay_horizon_hours
+
+    # The horizon is measured from the time the repeat forms, so the close
+    # is placed one hour past it from there, not from the clock.
+    fresh = datetime.now(UTC) - timedelta(hours=1)
+    closed_at = fresh - timedelta(hours=decay_horizon_hours() + 1)
+    formed_at = closed_at - timedelta(hours=1)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.10", now=formed_at)
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", now=formed_at)
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=formed_at)
+        first = await form_leads(db, entity_keys=[_HOST], now=formed_at)
+        old_id = first.formed[0]
+        await _clean_hunt_closed(db, old_id, at=closed_at)
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.20", now=fresh)
+        await _observe(db, Kind.RARE_FOR_PEERS, "wmic.exe", now=fresh)
+        await _observe(db, Kind.OFF_HOURS, "04:10", now=fresh)
+        second = await form_leads(db, entity_keys=[_HOST], now=fresh)
+        old = await db.get(Lead, old_id)
+    assert len(second.formed) == 1 and second.formed[0] != old_id
+    assert second.updated == ()
+    assert old.status == "dismissed" and old.dismissed_reason == "hunt_clean"
+
+
+async def test_an_analyst_dismissal_is_never_rejoined_or_reopened_by_the_rule(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL. Only the rule's own closure absorbs a repeat. An analyst's stands."""
+    from soc_ai.store import leads as leads_store
+
+    now = datetime.now(UTC)
+    formed_at = now - timedelta(hours=3)
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.10", now=formed_at)
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", now=formed_at)
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=formed_at)
+        first = await form_leads(db, entity_keys=[_HOST], now=formed_at)
+        await leads_store.dismiss(
+            db,
+            first.formed[0],
+            reason="benign_repeat",
+            note=None,
+            by="ann",
+            now=now - timedelta(hours=2),
+        )
+        await _observe(db, Kind.NOVEL_DESTINATION, "203.0.113.11", now=now - timedelta(hours=1))
+        second = await form_leads(db, entity_keys=[_HOST], now=now - timedelta(hours=1))
+        lead = await db.get(Lead, first.formed[0])
+        loose = (
+            (await db.execute(select(EntityObservation).where(EntityObservation.lead_id.is_(None))))
+            .scalars()
+            .all()
+        )
+    assert second.formed == () and second.updated == ()
+    assert lead.status == "dismissed" and lead.dismissed_by == "ann"
+    assert len(loose) == 1

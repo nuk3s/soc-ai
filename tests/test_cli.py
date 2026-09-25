@@ -1278,3 +1278,33 @@ def test_format_lead_quality_says_so_when_no_lead_formed() -> None:
         )
     )
     assert "No lead formed in this window." in out
+
+
+def test_format_lead_quality_prints_the_hunt_closures_in_their_own_column() -> None:
+    from soc_ai.api.webui.routes_hunts import (
+        LeadQualityOut,
+        LeadQualityTypesOut,
+        LeadQualityWeekOut,
+    )
+
+    report = LeadQualityOut(
+        weeks=[
+            LeadQualityWeekOut(
+                week="2026-W39",
+                formed=3,
+                hunted=3,
+                closed_by_hunt=2,
+                dismissed={"benign_repeat": 1},
+            )
+        ],
+        by_types=[
+            LeadQualityTypesOut(types="novel_served_port", formed=3, dismissed=1, closed_by_hunt=2)
+        ],
+        rule="r",
+        note="n",
+    )
+    lines = _strip_ansi(cli.format_lead_quality(report)).splitlines()
+    assert "closed by hunt" in lines[0]
+    assert lines[1].split() == ["2026-W39", "3", "3", "0", "0", "2", "benign_repeat=1"]
+    types_row = next(line for line in lines if line.startswith("novel_served_port"))
+    assert types_row.split() == ["novel_served_port", "3", "1", "2", "0"]

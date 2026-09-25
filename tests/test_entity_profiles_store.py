@@ -8,13 +8,14 @@ machine with its predecessor's history.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from soc_ai.config import Settings
 from soc_ai.store import entity_profiles as ep
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from sqlalchemy import inspect, text
+from soc_ai.store.models import EntityProfile
+from sqlalchemy import inspect, text, update
 
 pytestmark = pytest.mark.asyncio
 
@@ -30,8 +31,19 @@ async def test_migration_creates_the_table(settings_kratos: Settings) -> None:
     async with engine.connect() as conn:
         tables = await conn.run_sync(lambda sc: inspect(sc).get_table_names())
         assert "entity_profiles" in tables
+        profile_cols = await conn.run_sync(
+            lambda sc: {c["name"] for c in inspect(sc).get_columns("entity_profiles")}
+        )
+        run_cols = await conn.run_sync(
+            lambda sc: {c["name"] for c in inspect(sc).get_columns("prior_spec_runs")}
+        )
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0050"
+        assert row.scalar_one() == "0051"
+    # Why a dimension could not be measured, and what the sweep knew about
+    # its baselines. Without the first, a refused query wrote no row and read
+    # as blind; without the second, coverage counts implied "now".
+    assert "coverage_reason" in profile_cols
+    assert {"profiles_built_at", "profiles_stale", "profiles_reason"} <= run_cols
     await engine.dispose()
 
 
@@ -419,3 +431,126 @@ async def test_purging_never_touches_user_entities(settings_kratos: Settings) ->
         kept = await ep.load_profiles(db, entity_kind="user", entity_key="alice")
     assert removed == 0
     assert set(kept) == {"logon_users"}
+
+
+async def test_built_at_is_utc_on_insert_and_on_update_whatever_the_host_zone(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The range host runs in America/New_York. The update path stamped local
+    time and the insert path stamped UTC, so one table held two clocks and a
+    rebuilt row read four hours older than it was."""
+    import time
+
+    monkeypatch.setenv("TZ", "Pacific/Kiritimati")  # UTC+14, the widest offset there is
+    time.tzset()
+    try:
+        _engine, maker = await _db(settings_kratos)
+        async with maker() as db:
+            for count in (1, 2):
+                await ep.upsert_profile(
+                    db,
+                    entity_kind="host",
+                    entity_key="198.51.100.21",
+                    dimension="served_ports",
+                    shape="categorical",
+                    vector={"445": {"count": count}},
+                    support_days=count,
+                )
+                loaded = await ep.load_profiles(db, entity_kind="host", entity_key="198.51.100.21")
+                stamp = loaded["served_ports"].built_at
+                assert stamp is not None and stamp.tzinfo is None
+                skew = abs(datetime.now(UTC).replace(tzinfo=None) - stamp)
+                assert skew < timedelta(minutes=5), f"write {count}: built_at is {skew} from UTC"
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()
+
+
+async def test_freshness_reports_the_newest_stamp_and_every_unmeasurable_reason(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        empty = await ep.freshness(db)
+        assert empty.newest_built_at is None
+        assert empty.unmeasurable == {}
+        await ep.upsert_profile(
+            db,
+            entity_kind="host",
+            entity_key="198.51.100.5",
+            dimension="peers_out",
+            shape="categorical",
+            vector={},
+            support_days=9,
+        )
+        for key in ("198.51.100.5", "198.51.100.6"):
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                dimension="active_hours",
+                shape="active_hours",
+                vector=None,
+                coverage=ep.COVERAGE_UNMEASURABLE,
+                coverage_reason="Trying to create too many buckets",
+            )
+        state = await ep.freshness(db)
+    assert state.newest_built_at is not None
+    assert abs(datetime.now(UTC).replace(tzinfo=None) - state.newest_built_at) < timedelta(
+        minutes=5
+    )
+    # One reason per dimension, however many hosts carry it.
+    assert state.unmeasurable == {"active_hours": "Trying to create too many buckets"}
+
+
+async def test_purge_older_than_removes_only_rows_built_before_the_mark(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for key in ("198.51.100.7", "198.51.100.8"):
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                dimension="served_ports",
+                shape="categorical",
+                vector={},
+                support_days=9,
+            )
+        two_days_ago = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2)
+        await db.execute(
+            update(EntityProfile)
+            .where(EntityProfile.entity_key == "198.51.100.7")
+            .values(built_at=two_days_ago)
+        )
+        await db.commit()
+        mark = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+        gone = await ep.purge_older_than(db, built_before=mark)
+        assert gone == 1
+        assert await ep.load_profiles(db, entity_kind="host", entity_key="198.51.100.7") == {}
+        kept = await ep.load_profiles(db, entity_kind="host", entity_key="198.51.100.8")
+    assert set(kept) == {"served_ports"}
+
+
+async def test_unmeasurable_keeps_its_reason_and_is_not_scorable(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await ep.upsert_profile(
+            db,
+            entity_kind="host",
+            entity_key="198.51.100.9",
+            dimension="connection_rate",
+            shape="numeric",
+            vector=None,
+            coverage=ep.COVERAGE_UNMEASURABLE,
+            coverage_reason="Trying to create too many buckets",
+        )
+        loaded = await ep.load_profiles(db, entity_kind="host", entity_key="198.51.100.9")
+    row = loaded["connection_rate"]
+    assert row.coverage == "unmeasurable"
+    assert row.coverage_reason == "Trying to create too many buckets"
+    assert row.vector is None
+    assert not row.is_scorable, "a refused measurement must not score a departure"

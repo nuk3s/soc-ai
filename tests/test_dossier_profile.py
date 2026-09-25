@@ -10,10 +10,13 @@ reports the result as measured.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from soc_ai.config import Settings
 from soc_ai.dossier.profile import (
     EPHEMERAL_PORT_FLOOR,
     FLOW_CANDIDATES,
@@ -106,12 +109,20 @@ class _FakeES:
 
 
 def _entity_bucket(
-    key: str, members: list[tuple[str, int, str, str]], *, days: int = 30
+    key: str,
+    members: list[tuple[str, int, str, str]],
+    *,
+    days: int = 30,
+    peers: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """One entity bucket: members with count and first/last, days at the top.
 
     ``active_days`` sits on the ENTITY, matching the aggregation: support is a
     property of the entity's own history, not of each member of it.
+
+    ``peers`` is per member, keyed by member name, and defaults to two so a
+    fixture written before the guard still counts. The member's days are
+    what the reader derives from its ``first`` and ``last`` stamps.
     """
     return {
         "key": key,
@@ -128,11 +139,121 @@ def _entity_bucket(
                     "doc_count": count,
                     "first": {"value_as_string": first},
                     "last": {"value_as_string": last},
+                    "peers": {"value": (peers or {}).get(name, 2)},
                 }
                 for name, count, first, last in members
             ]
         },
     }
+
+
+class _TooManyBuckets(Exception):
+    """What elasticsearch-py raises for a 400 whose cause is the bucket limit.
+
+    The reason sits under ``caused_by``; the top-level reason is an empty
+    string, which is exactly what the production grid returned.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("BadRequestError(400, 'search_phase_execution_exception')")
+        self.body = {
+            "error": {
+                "type": "search_phase_execution_exception",
+                "reason": "",
+                "caused_by": {
+                    "type": "too_many_buckets_exception",
+                    "reason": "Trying to create too many buckets. Must be less than or equal "
+                    "to: [65536] but this number of buckets was exceeded.",
+                },
+            }
+        }
+
+
+def _shaped_bucket(key: str, hours: list[tuple[str, int]], *, days: int = 30) -> dict[str, Any]:
+    """One entity of the shaped query: its days at the top, its hours below."""
+    return {
+        "key": key,
+        "doc_count": sum(c for _, c in hours),
+        "active_days": {
+            "buckets": [
+                {"key_as_string": f"2026-08-{d:02d}", "doc_count": 1} for d in range(1, days + 1)
+            ]
+        },
+        "hours": {"buckets": [{"key_as_string": stamp, "doc_count": c} for stamp, c in hours]},
+    }
+
+
+# Tuesday 2026-09-15 and Wednesday 2026-09-16: two working hours and one night hour.
+_THREE_HOURS = [
+    ("2026-09-15T10:00:00.000Z", 40),
+    ("2026-09-16T11:00:00.000Z", 44),
+    ("2026-09-16T23:00:00.000Z", 2),
+]
+
+
+class _ShapedES(_FakeES):
+    """A grid that answers the shaped query one partition at a time.
+
+    ``entities`` is every entity bucket the grid holds; partition ``p`` of
+    ``n`` answers ``entities[p::n]``, the way a hash partition does. Below
+    ``too_many_below`` partitions the grid refuses with the bucket limit, the
+    way a 700M-document grid refused 500 entities in one request.
+    ``max_buckets=None`` is a client whose cluster-settings read is refused.
+    """
+
+    def __init__(
+        self,
+        *,
+        entities: list[dict[str, Any]],
+        too_many_below: int = 1,
+        max_buckets: int | None = 65536,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.entities = entities
+        self.too_many_below = too_many_below
+        self._max_buckets = max_buckets
+        self.shaped_calls: list[tuple[int, int]] = []
+
+    async def max_buckets(self) -> int:
+        if self._max_buckets is None:
+            raise RuntimeError("cluster:monitor/settings refused")
+        return self._max_buckets
+
+    async def search(
+        self,
+        index: str,
+        query: dict[str, Any],
+        *,
+        size: int = 100,
+        from_: int = 0,
+        sort: list[dict[str, Any]] | None = None,
+        source: list[str] | bool | None = None,
+        aggs: dict[str, Any] | None = None,
+        track_total_hits: bool | None = None,
+    ) -> EsSearchResult:
+        keys = set(aggs or {})
+        if "entities" in keys:
+            self.calls.append({"index": index, "query": query, "aggs": aggs, "size": size})
+            return _result(aggregations={"entities": {"value": len(self.entities)}})
+        if "shaped" in keys:
+            self.calls.append({"index": index, "query": query, "aggs": aggs, "size": size})
+            include = (aggs or {})["shaped"]["terms"]["include"]
+            n, p = int(include["num_partitions"]), int(include["partition"])
+            self.shaped_calls.append((n, p))
+            if n < self.too_many_below:
+                raise _TooManyBuckets()
+            return _result(aggregations={"shaped": {"buckets": self.entities[p::n]}})
+        return await super().search(
+            index,
+            query,
+            size=size,
+            from_=from_,
+            sort=sort,
+            source=source,
+            aggs=aggs,
+            track_total_hits=track_total_hits,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -634,21 +755,18 @@ async def test_non_port_dimensions_carry_no_port_bound() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_active_hours_is_built_as_a_168_bin_set() -> None:
+async def test_active_hours_is_built_as_a_set_of_hours() -> None:
     """Without this dimension the off-hours clause cannot fire at all.
 
     On the range that left exactly one observation kind available, and a lead
     needs two -- so the whole chaining half of the design was inert while every
-    surface reported it healthy.
-
-    A set test, not a rate: "was this host ever active in this hour of the
-    week" needs no dispersion, which is why it is the one dimension that does
-    not go through the three-cell summary.
+    surface reported it healthy. A set test, not a rate: "was this host ever
+    active in this hour" needs no dispersion.
     """
     es = _FakeES(
         field_presence=_FLOW_OK,
         agg_payloads={
-            "active_hours": {
+            "shaped": {
                 "buckets": [
                     {
                         "key": "10.1.10.21",
@@ -682,39 +800,7 @@ async def test_a_numeric_dimension_is_summarised_into_three_cells() -> None:
     called by anything, so no rate dimension was ever built."""
     es = _FakeES(
         field_presence=_FLOW_OK,
-        agg_payloads={
-            "connection_rate": {
-                "buckets": [
-                    {
-                        "key": "10.1.10.21",
-                        "doc_count": 900,
-                        "active_days": {
-                            "buckets": [
-                                {"key_as_string": f"2026-08-{d:02d}", "doc_count": 1}
-                                for d in range(1, 31)
-                            ]
-                        },
-                        "per_hour": {
-                            "buckets": [
-                                # Tuesday 2026-09-15, working hours and night.
-                                {
-                                    "key_as_string": "2026-09-15T10:00:00.000Z",
-                                    "doc_count": 40,
-                                },
-                                {
-                                    "key_as_string": "2026-09-16T11:00:00.000Z",
-                                    "doc_count": 44,
-                                },
-                                {
-                                    "key_as_string": "2026-09-16T23:00:00.000Z",
-                                    "doc_count": 2,
-                                },
-                            ]
-                        },
-                    }
-                ]
-            }
-        },
+        agg_payloads={"shaped": {"buckets": [_shaped_bucket("10.1.10.21", _THREE_HOURS)]}},
     )
     sweep = await collect_entity_profiles(
         elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
@@ -733,13 +819,13 @@ async def test_an_empty_cell_is_recorded_rather_than_omitted() -> None:
     es = _FakeES(
         field_presence=_FLOW_OK,
         agg_payloads={
-            "connection_rate": {
+            "shaped": {
                 "buckets": [
                     {
                         "key": "10.1.10.21",
                         "doc_count": 1,
                         "active_days": {"buckets": []},
-                        "per_hour": {
+                        "hours": {
                             "buckets": [
                                 {"key_as_string": "2026-09-15T10:00:00.000Z", "doc_count": 7}
                             ]
@@ -860,3 +946,371 @@ async def test_multicast_and_link_local_are_not_peers() -> None:
     )
     peers = next(p for p in sweep.profiles if p.dimension == "peers_out")
     assert set(peers.vector) == {"8.8.8.8", "10.1.10.255"}
+
+
+# ---------------------------------------------------------------------------
+# Served ports: who reached the port, and on how many days
+# ---------------------------------------------------------------------------
+
+
+def _served_call(es: _FakeES) -> dict[str, Any]:
+    calls = [c for c in es.calls if "served_ports" in set(c["aggs"] or {})]
+    assert calls, "no served-port aggregation was issued"
+    return calls[0]
+
+
+def _consumed_call(es: _FakeES) -> dict[str, Any]:
+    calls = [c for c in es.calls if "consumed_ports" in set(c["aggs"] or {})]
+    assert calls, "no outbound-port aggregation was issued"
+    return calls[0]
+
+
+async def test_the_served_port_aggregation_asks_for_peers_and_days_per_member() -> None:
+    """A port's document count says nothing about who reached it.
+
+    Two documents from one peer on one day is an ephemeral port mirrored by a
+    sensor. Two documents from two peers is a service. The aggregation has to
+    carry both numbers or the guard has nothing to read.
+    """
+    es = _FakeES(field_presence=_FLOW_OK)
+    await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    member_aggs = _served_call(es)["aggs"]["served_ports"]["aggs"]["members"]["aggs"]
+    assert member_aggs["peers"] == {"cardinality": {"field": "source.ip"}}
+    # The days come from the two stamps every member carries. A histogram
+    # under every member of every entity is over search.max_buckets.
+    assert member_aggs["first"] == {"min": {"field": "@timestamp"}}
+    assert member_aggs["last"] == {"max": {"field": "@timestamp"}}
+    assert "days" not in member_aggs
+    # The outbound-port dimension is keyed on the source. Its members are the
+    # far end, and a peer count there would count the entity itself.
+    consumed_aggs = _consumed_call(es)["aggs"]["consumed_ports"]["aggs"]["members"]["aggs"]
+    assert "peers" not in consumed_aggs
+    assert "days" not in consumed_aggs
+
+
+async def test_a_served_port_membership_carries_its_peers_and_days() -> None:
+    es = _FakeES(
+        field_presence=_FLOW_OK,
+        agg_payloads={
+            "served_ports": {
+                "buckets": [
+                    _entity_bucket(
+                        "198.51.100.20",
+                        [("22", 40, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z")],
+                        peers={"22": 7},
+                    )
+                ]
+            }
+        },
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    served = next(p for p in sweep.profiles if p.dimension == "served_ports")
+    assert served.vector["22"]["count"] == 40
+    assert served.vector["22"]["peers"] == 7
+    # 20 August to 14 September, both ends counted.
+    assert served.vector["22"]["days"] == 26
+
+
+async def test_the_builder_drops_a_served_port_one_peer_reached_on_one_day() -> None:
+    """The 200 member slots hold real ports.
+
+    On production the served-port baseline of a hypervisor held 8006, 22 and
+    197 ephemeral ports at four documents each. Every port outside those 200
+    then read as new for ever. The builder applies the same guard the
+    evaluator applies, so the baseline and the comparison agree on what a
+    served port is.
+    """
+    es = _FakeES(
+        field_presence=_FLOW_OK,
+        agg_payloads={
+            "served_ports": {
+                "buckets": [
+                    _entity_bucket(
+                        "198.51.100.20",
+                        [
+                            ("22", 40, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z"),
+                            ("8006", 3000, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z"),
+                            ("33897", 2, "2026-09-13T12:33:00Z", "2026-09-13T12:33:00Z"),
+                            ("41604", 2, "2026-09-13T13:01:00Z", "2026-09-13T13:01:00Z"),
+                        ],
+                        peers={"22": 3, "8006": 9, "33897": 1, "41604": 1},
+                    )
+                ]
+            }
+        },
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    served = next(p for p in sweep.profiles if p.dimension == "served_ports")
+    assert set(served.vector) == {"22", "8006"}
+
+
+async def test_the_builder_keeps_an_outbound_port_whatever_its_peers_say() -> None:
+    # The guard is for the dimension keyed on the destination. The outbound
+    # set is keyed on the source, and its members carry no peer count.
+    es = _FakeES(
+        field_presence=_FLOW_OK,
+        agg_payloads={
+            "consumed_ports": {
+                "buckets": [
+                    _entity_bucket(
+                        "198.51.100.21",
+                        [("8220", 2, "2026-09-13T12:33:00Z", "2026-09-13T12:33:00Z")],
+                        peers={"8220": 0},
+                    )
+                ]
+            }
+        },
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    consumed = next(p for p in sweep.profiles if p.dimension == "consumed_ports")
+    assert set(consumed.vector) == {"8220"}
+
+
+# ---------------------------------------------------------------------------
+# Served ports: connections the entity RECEIVED
+# ---------------------------------------------------------------------------
+
+
+async def test_a_served_port_read_keeps_only_connections_the_entity_received() -> None:
+    """The endpoint sensor writes a DNS lookup twice.
+
+    Once as the host asking, and once mirrored with the host as the
+    destination and the lookup's ephemeral source port as the destination
+    port. A read keyed on destination.ip alone counts the mirror as a
+    service. The direction clauses drop DNS on every plane, drop flows a
+    sensor marked outbound, and on the endpoint plane keep the one action
+    that names an accepted connection.
+    """
+    es = _FakeES(
+        field_presence={
+            "network_traffic.flow": _FLOW_FIELDS,
+            "endpoint.events.network": _FLOW_FIELDS,
+        }
+    )
+    await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    query = _served_call(es)["query"]["bool"]
+    must_not = query["must_not"]
+    assert {"term": {"network.protocol": "dns"}} in must_not
+    assert {"terms": {"event.action": ["lookup_requested", "lookup_result"]}} in must_not
+    assert {"terms": {"network.direction": ["egress", "outbound", "external"]}} in must_not
+    accepted = [
+        f
+        for f in query["filter"]
+        if '"connection_accepted"' in json.dumps(f) and "endpoint.events.network" in json.dumps(f)
+    ]
+    assert len(accepted) == 1, "the endpoint plane carries no accepted-connection clause"
+    # The clause is a choice: a document from another plane, or an accepted
+    # connection. A document from Packetbeat carries no event.action and
+    # must not be dropped by a clause written for the endpoint sensor.
+    assert accepted[0]["bool"]["minimum_should_match"] == 1
+    assert len(accepted[0]["bool"]["should"]) == 2
+
+
+async def test_the_outbound_port_read_carries_no_direction_clause() -> None:
+    es = _FakeES(
+        field_presence={
+            "network_traffic.flow": _FLOW_FIELDS,
+            "endpoint.events.network": _FLOW_FIELDS,
+        }
+    )
+    await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    body = json.dumps(_consumed_call(es)["query"])
+    assert "connection_accepted" not in body
+    assert '"network.protocol": "dns"' not in body
+    assert '"network.direction"' not in body
+
+
+async def test_a_zeek_only_grid_gets_the_generic_clauses_and_no_endpoint_action() -> None:
+    # Zeek writes conn.log from the originator to the responder. The
+    # destination IS the responder. Nothing extra is needed there, and a
+    # clause that asks Zeek for an endpoint action would empty the dimension.
+    es = _FakeES(field_presence={"zeek.conn": _FLOW_FIELDS})
+    await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    query = _served_call(es)["query"]["bool"]
+    assert "connection_accepted" not in json.dumps(query)
+    assert {"term": {"network.protocol": "dns"}} in query["must_not"]
+
+
+async def test_a_plane_the_helper_has_never_seen_gets_the_generic_clauses() -> None:
+    from soc_ai.dossier.profile import served_direction_clauses
+
+    clauses = served_direction_clauses(["firewall.flow"])
+    assert clauses["filter"] == []
+    assert clauses["must_not"] == [
+        {"term": {"network.protocol": "dns"}},
+        {"terms": {"event.action": ["lookup_requested", "lookup_result"]}},
+        {"terms": {"network.direction": ["egress", "outbound", "external"]}},
+    ]
+
+
+# The shaped query on a big grid: one query, partitioned, ending in a reason
+# ---------------------------------------------------------------------------
+
+
+async def test_the_two_shaped_dimensions_come_from_one_query() -> None:
+    """One aggregation, read twice.
+
+    Both dimensions read the same hourly histogram of the same flow documents
+    keyed by the same entity. Run as two queries the production grid refused
+    both with the bucket limit, and one query is half the cost either way.
+    """
+    es = _ShapedES(field_presence=_FLOW_OK, entities=[_shaped_bucket("10.1.10.21", _THREE_HOURS)])
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert es.shaped_calls == [(1, 0)]
+    by_dim = {p.dimension: p for p in sweep.profiles if p.entity_key == "10.1.10.21"}
+    assert {"active_hours", "connection_rate"} <= set(by_dim)
+    assert set(by_dim["active_hours"].vector) == {"10", "11", "23"}
+    assert by_dim["connection_rate"].shape == "numeric"
+    assert by_dim["connection_rate"].vector["work"]["median"] == 42.0
+    assert sweep.errors == ()
+    assert sweep.unmeasurable == {}
+
+
+async def test_the_shaped_query_keeps_the_entity_inside_the_estate() -> None:
+    """The lane dropped external entities in Python, after the aggregation had
+    spent its bucket budget on them: 774 addresses reached the query on the
+    production grid and 215 were ours."""
+    import ipaddress
+
+    es = _ShapedES(field_presence=_FLOW_OK, entities=[])
+    await collect_entity_profiles(
+        elastic=es,
+        settings=_settings(),
+        window_hours=24 * 30,
+        time_anchor=_ANCHOR,
+        cidrs=[ipaddress.ip_network("10.1.0.0/16")],
+    )
+    shaped = [c for c in es.calls if "shaped" in set(c["aggs"] or {})]
+    assert shaped, "the shaped query never ran"
+    assert {"terms": {"source.ip": ["10.1.0.0/16"]}} in shaped[0]["query"]["bool"]["filter"]
+
+
+async def test_the_partition_estimate_fits_under_half_the_bucket_limit() -> None:
+    from soc_ai.dossier.profile import _partition_count
+
+    # 100 entities x (720 + 30) buckets = 75,000 against a budget of 32,768: three slices.
+    assert _partition_count(100, window_hours=720, window_days=30, max_buckets=65536) == 3
+    # Nothing seen yet is still one request, never zero.
+    assert _partition_count(0, window_hours=720, window_days=30, max_buckets=65536) == 1
+    # The cap holds however big the estate is.
+    assert _partition_count(100_000, window_hours=720, window_days=30, max_buckets=65536) == 32
+
+
+async def test_partitions_start_from_the_estimate_and_cover_every_entity() -> None:
+    entities = [_shaped_bucket(f"10.1.0.{n + 1}", _THREE_HOURS) for n in range(100)]
+    es = _ShapedES(field_presence=_FLOW_OK, entities=entities)
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert es.shaped_calls == [(3, 0), (3, 1), (3, 2)]
+    keys = {p.entity_key for p in sweep.profiles if p.dimension == "active_hours"}
+    assert len(keys) == 100
+
+
+async def test_the_bucket_limit_doubles_the_partitions_and_retries() -> None:
+    """The production failure. One request for 500 entities of hourly buckets
+    is 375,000 buckets against a limit of 65,536. The grid answered 400, the
+    lane wrote no row, and both dimensions read blind on every host."""
+    es = _ShapedES(
+        field_presence=_FLOW_OK,
+        entities=[_shaped_bucket("10.1.10.21", _THREE_HOURS)],
+        too_many_below=4,
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert es.shaped_calls == [(1, 0), (2, 0), (4, 0), (4, 1), (4, 2), (4, 3)]
+    dims = {p.dimension for p in sweep.profiles if p.entity_key == "10.1.10.21"}
+    assert {"active_hours", "connection_rate"} <= dims
+    assert sweep.errors == ()
+    assert sweep.unmeasurable == {}
+
+
+async def test_past_the_partition_cap_the_dimensions_are_unmeasurable_with_the_reason() -> None:
+    es = _ShapedES(
+        field_presence=_FLOW_OK,
+        entities=[_shaped_bucket("10.1.10.21", _THREE_HOURS)],
+        too_many_below=64,
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert [n for n, p in es.shaped_calls if p == 0] == [1, 2, 4, 8, 16, 32]
+    assert set(sweep.unmeasurable) == {"active_hours", "connection_rate"}
+    assert "too many buckets" in sweep.unmeasurable["active_hours"]
+    shaped = [p for p in sweep.profiles if p.dimension in ("active_hours", "connection_rate")]
+    assert shaped == []
+    # Unmeasurable is a finished answer, not a failed sweep.
+    assert not [e for e in sweep.errors if "active_hours" in e or "connection_rate" in e]
+
+
+async def test_a_refusal_that_is_not_the_bucket_limit_is_an_error_not_unmeasurable() -> None:
+    es = _FakeES(field_presence=_FLOW_OK, error_on="shaped")
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert any(e.startswith("active_hours:") for e in sweep.errors)
+    assert any(e.startswith("connection_rate:") for e in sweep.errors)
+    assert sweep.unmeasurable == {}
+
+
+async def test_a_client_that_cannot_read_the_bucket_limit_uses_the_default() -> None:
+    entities = [_shaped_bucket(f"10.1.0.{n + 1}", _THREE_HOURS) for n in range(100)]
+    es = _ShapedES(field_presence=_FLOW_OK, entities=entities, max_buckets=None)
+    await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert es.shaped_calls[0][0] == 3
+
+
+async def test_a_dimension_no_plane_carries_is_named_as_unanswered() -> None:
+    """The per-host coverage fill needs the dimension by name. The ``*`` row
+    says the same thing per profile, and the fill skips ``*`` rows."""
+    es = _FakeES(
+        field_presence={
+            "network_traffic.flow": _FLOW_FIELDS,
+            "zeek.dns": {"dns.question.name": 0},
+        }
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    assert "dns_names" in sweep.unanswered
+    assert "peers_out" not in sweep.unanswered
+
+
+async def test_the_elastic_client_reads_the_bucket_limit_and_falls_back_when_refused(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.so_client.elastic import DEFAULT_MAX_BUCKETS, ElasticClient
+
+    fake = AsyncMock()
+    fake.cluster.get_settings = AsyncMock(
+        return_value={
+            "persistent": {},
+            "transient": {},
+            "defaults": {"search.max_buckets": "10000"},
+        }
+    )
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake):
+        client = ElasticClient(settings_kratos)
+    assert await client.max_buckets() == 10000
+    # The grid's ES user may lack cluster:monitor/settings. That is not an error.
+    fake.cluster.get_settings = AsyncMock(side_effect=RuntimeError("403"))
+    assert await client.max_buckets() == DEFAULT_MAX_BUCKETS

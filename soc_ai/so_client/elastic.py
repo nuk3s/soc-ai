@@ -27,6 +27,10 @@ from soc_ai.demo.guard import assert_loopback_only
 
 _LOGGER = logging.getLogger(__name__)
 
+# Elasticsearch's default ``search.max_buckets``. Read from the cluster when
+# the ES user may; assumed otherwise.
+DEFAULT_MAX_BUCKETS = 65536
+
 
 class GridPartialResultsError(TransportError):
     """Elasticsearch answered 200, but the search did not read the whole grid.
@@ -310,6 +314,34 @@ class ElasticClient:
             "cluster": info.get("cluster_name", ""),
             "version": version.get("number", ""),
         }
+
+    async def max_buckets(self) -> int:
+        """The cluster's ``search.max_buckets``, or the ES default when refused.
+
+        A nested aggregation that creates more buckets than this answers 400
+        ``too_many_buckets_exception``, not a partial result. The profile lane
+        sizes its partitions from it. The grid's ES user may lack
+        ``cluster:monitor/settings``; that is a debug line, not a failure,
+        because the lane's retry ladder covers a wrong assumption.
+        """
+        try:
+            raw = await self._client.cluster.get_settings(include_defaults=True, flat_settings=True)
+        except Exception as exc:
+            _LOGGER.debug(
+                "cluster settings read refused (%s); assuming search.max_buckets=%d",
+                exc,
+                DEFAULT_MAX_BUCKETS,
+            )
+            return DEFAULT_MAX_BUCKETS
+        for section in ("transient", "persistent", "defaults"):
+            value = (raw.get(section) or {}).get("search.max_buckets")
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return DEFAULT_MAX_BUCKETS
+        return DEFAULT_MAX_BUCKETS
 
     async def get(self, index: str, doc_id: str) -> dict[str, Any] | None:
         """Fetch a single document by id. Returns ``None`` on 404."""

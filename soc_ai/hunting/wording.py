@@ -18,6 +18,7 @@ import re
 from typing import Any
 
 from soc_ai.hunting.weight import Kind
+from soc_ai.hunting.window import DEFAULT_RECENT_HOURS
 
 __all__ = [
     "baseline_sentence",
@@ -137,13 +138,18 @@ def rate_phrase(
     )
 
 
-def phrase(kind: Kind, departure: Any) -> str:
+def phrase(kind: Kind, departure: Any, *, window_hours: int = DEFAULT_RECENT_HOURS) -> str:
     """Say what actually departed, in words an analyst would use.
 
     Rendering every departure as "novel X" was wrong for the rate tests: a
     connection rate that collapsed was printed as "novel connection_rate: off",
     which reads as a new thing appearing rather than an existing one stopping.
     The hour-of-day tests name the hour, not the "cell" the baseline is kept in.
+
+    A novel member states its documents in the window the sweep read. It
+    said "The sweep saw it 2 times" beside a chip that said "seen 19 times",
+    and the two counted different things. ``window_hours`` is the window the
+    caller read; the default is the one the sweep defaults to.
 
     No trailing stop. The caller adds the baseline sentence after it.
     """
@@ -164,13 +170,26 @@ def phrase(kind: Kind, departure: Any) -> str:
             ratio=getattr(departure, "ratio", None),
             count=count,
         )
-    seen = times(count)
-    if seen:
-        return f"new {noun(dimension)} for this host: {member}. The sweep saw it {seen}"
+    try:
+        documents = int(count)
+    except (TypeError, ValueError):
+        documents = 0
+    if documents > 0:
+        return (
+            f"new {noun(dimension)} for this host: {member}. "
+            f"{plural(documents, 'document')} in the last {int(window_hours)} h"
+        )
     return f"new {noun(dimension)} for this host: {member}"
 
 
-def result_note(kind: Kind, departures: Any, *, baseline_size: Any, support_days: Any) -> str:
+def result_note(
+    kind: Kind,
+    departures: Any,
+    *,
+    baseline_size: Any,
+    support_days: Any,
+    window_hours: int = DEFAULT_RECENT_HOURS,
+) -> str:
     """The note on one evaluated prior, in the same words as the summary.
 
     The note said "9 novel consumed_ports against a baseline of 15 over 30
@@ -180,7 +199,7 @@ def result_note(kind: Kind, departures: Any, *, baseline_size: Any, support_days
     rows = list(departures or ())
     if not rows:
         return f"Nothing departed. {base}"
-    lead = f"{phrase(kind, rows[0])}. "
+    lead = f"{phrase(kind, rows[0], window_hours=window_hours)}. "
     if len(rows) > 1:
         lead += f"{len(rows) - 1} more of the same type followed. "
     return lead + base

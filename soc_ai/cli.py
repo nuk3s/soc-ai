@@ -1929,22 +1929,27 @@ def format_lead_quality(report: Any) -> str:
     an analyst on the page read one report. The rule and the noise-floor note
     sit under the table, because a number with no rule beside it invites a
     change to the rule.
+
+    Hunt closures have their own column. A lead the rule closed is not a
+    dismissal an analyst chose, and mixing the two would make every quiet
+    week read as a week of benign repeats.
     """
-    lines: list[str] = ["week      formed  hunted  threat  promoted  dismissed"]
+    lines: list[str] = ["week      formed  hunted  threat  promoted  closed by hunt  dismissed"]
     for week in report.weeks:
         dismissed = ", ".join(f"{k}={v}" for k, v in week.dismissed.items()) or "-"
         lines.append(
             f"{week.week:<9} {week.formed:>6}  {week.hunted:>6}  {week.threat:>6}  "
-            f"{week.promoted:>8}  {dismissed}"
+            f"{week.promoted:>8}  {week.closed_by_hunt:>14}  {dismissed}"
         )
     if report.by_types:
         width = max(len(t.types) for t in report.by_types)
         width = max(width, len("types"))
         lines.append("")
-        lines.append(f"{'types':<{width}}  formed  dismissed  threat")
+        lines.append(f"{'types':<{width}}  formed  dismissed  closed by hunt  threat")
         for row in report.by_types:
             lines.append(
-                f"{row.types:<{width}}  {row.formed:>6}  {row.dismissed:>9}  {row.threat:>6}"
+                f"{row.types:<{width}}  {row.formed:>6}  {row.dismissed:>9}  "
+                f"{row.closed_by_hunt:>14}  {row.threat:>6}"
             )
     else:
         lines.append("")

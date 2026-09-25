@@ -45,6 +45,7 @@ from soc_ai.store import general_chat as general_chat_svc
 from soc_ai.store import hunt_templates as hunt_templates_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store import leads as leads_store
 from soc_ai.store.auth import bootstrap_admin, purge_expired_sessions
 from soc_ai.store.config_overrides import apply_to_settings, load_overrides
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
@@ -398,6 +399,105 @@ def _grid_is_known_down(app: FastAPI) -> bool:
     return "es" in down
 
 
+def _profile_stale_after(settings: Any) -> timedelta:
+    """How old a baseline may be before the prior sweep rebuilds it.
+
+    The dossier interval, floored at two prior-sweep intervals. A rebuild on
+    every wake would double the query load for baselines that change on the
+    timescale of a provisioning ticket, not a shift.
+    """
+    try:
+        hours = int(getattr(settings, "dossier_schedule_interval_hours", 24) or 24)
+    except (TypeError, ValueError):
+        hours = 24
+    floor = 2 * _prior_sweep_interval_minutes(settings)
+    return timedelta(minutes=max(hours * 60, floor))
+
+
+def _profiles_are_stale(newest: datetime | None, now: datetime, threshold: timedelta) -> bool:
+    """Never built, older than the threshold, or stamped in the future.
+
+    The future case is a row written in local time east of UTC by the release
+    that stamped ``datetime.now()``. Rebuilding it is what ends the skew; no
+    migration can, because no migration knows the host's offset.
+    """
+    if newest is None:
+        return True
+    return newest > now or (now - newest) >= threshold
+
+
+def _profile_age(newest: datetime | None, now: datetime) -> str:
+    if newest is None:
+        return "never built"
+    hours = max(0, int((now - newest).total_seconds() // 3600))
+    return f"{hours} h old"
+
+
+def _unmeasurable_reason(unmeasurable: dict[str, str]) -> str | None:
+    joined = "; ".join(f"{d}: {r}" for d, r in sorted(unmeasurable.items()))
+    return joined[:255] or None
+
+
+async def _refresh_profiles_if_stale(app: FastAPI, settings: Any, now: datetime) -> Any:
+    """Rebuild the baselines the sweep is about to read, when they are stale.
+
+    Returns the ``ProfileState`` the sweep records, or ``None`` when profiles
+    are off. Runs whether or not the dossier schedule is on: the sweep is the
+    only consumer of the baselines, so it owns their freshness. The rebuild
+    takes the dossier's single-flight slot, because two network sweeps at once
+    is the connection-pool pressure that has frozen this app before; if the
+    slot is held the rebuild waits for the next wake.
+
+    Never raises. A rebuild that fails is logged and the sweep runs on what
+    exists, reporting it stale.
+    """
+    from soc_ai.api.webui import _get_dossier_status  # noqa: PLC0415
+    from soc_ai.dossier import profile_job  # noqa: PLC0415
+    from soc_ai.hunting.prior_sweep import ProfileState  # noqa: PLC0415
+    from soc_ai.oracle.identifiers import effective_internal_identifiers  # noqa: PLC0415
+
+    if not getattr(settings, "entity_profiles_enabled", False):
+        return None
+
+    before = await profile_job.freshness(app.state.db_sessionmaker)
+    age = _profile_age(before.newest_built_at, now)
+    reason = _unmeasurable_reason(before.unmeasurable)
+    if not _profiles_are_stale(before.newest_built_at, now, _profile_stale_after(settings)):
+        _LOGGER.info("prior sweep: profiles %s", age)
+        return ProfileState(built_at=before.newest_built_at, stale=False, reason=reason)
+
+    status = _get_dossier_status(app.state)
+    if status.running:
+        _LOGGER.info(
+            "prior sweep: profiles %s; a dossier sweep holds the slot, rebuild skipped this wake",
+            age,
+        )
+        return ProfileState(built_at=before.newest_built_at, stale=True, reason=reason)
+
+    status.running = True
+    try:
+        async with app.state.db_sessionmaker() as db:
+            cidrs = (await effective_internal_identifiers(db, settings)).cidrs
+        build = await profile_job.build_profiles(
+            app.state.elastic, app.state.db_sessionmaker, settings, cidrs
+        )
+    except Exception as exc:
+        _LOGGER.warning("prior sweep: profile rebuild failed: %s: %s", type(exc).__name__, exc)
+        return ProfileState(built_at=before.newest_built_at, stale=True, reason=reason)
+    finally:
+        status.running = False
+
+    for err in build.errors:
+        _LOGGER.warning("prior sweep: %s", err)
+    after = await profile_job.freshness(app.state.db_sessionmaker)
+    _LOGGER.info("prior sweep: profiles %s, rebuilt %d row(s)", age, build.written)
+    return ProfileState(
+        built_at=after.newest_built_at,
+        stale=False,
+        reason=_unmeasurable_reason(after.unmeasurable),
+    )
+
+
 async def _prior_sweep_loop(app: FastAPI) -> None:
     """Run the profile sweep on a loop: the hunting layer's supply of observations.
 
@@ -419,10 +519,11 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
     - it skips a demo and a grid the health probe already knows is down. Both
       write the same damage: a sweep that could not measure records that
       nothing departed, which is a baseline learning from an outage;
-    - it is not coupled to the dossier loop that builds the baselines it
-      reads. If the dossiers are not built yet the sweep runs anyway and
-      reports what it could not measure as blind, exactly as the CLI does.
-      Waiting for the other loop would let either one stop the other.
+    - it owns the freshness of the baselines it reads. If profiles are on and
+      the newest is missing, older than the dossier interval (floored at two
+      sweep intervals) or stamped in the future, it rebuilds them first, under
+      the dossier's single-flight slot, whatever the dossier schedule says. A
+      rebuild that fails is logged and the sweep runs on what exists.
 
     The sweep itself never raises: it returns its errors, and they are logged
     beside the counts. A sweep that fails another way is logged and the loop
@@ -458,6 +559,10 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
             ):
                 continue
 
+            # The baselines first. The sweep reads them, so their freshness
+            # is the sweep's job, not a second schedule's.
+            profiles = await _refresh_profiles_if_stale(app, settings, now)
+
             async with app.state.db_sessionmaker() as db:
                 # The estate's own address space, so the sweep does not record
                 # observations about the internet and form leads out of them.
@@ -474,6 +579,7 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
                     cidrs=cidrs,
                     catalog=tiers.specs,
                     shadow_ids=tiers.shadow_ids,
+                    profiles=profiles,
                 )
                 await db.commit()
             # Stamped only after a sweep that returned, so a failure retries on
@@ -877,7 +983,7 @@ async def _dossier_scheduler_loop(app: FastAPI, settings: Any) -> None:
             if not _dossier_due(status.last_run, settings.dossier_schedule_interval_hours):
                 continue
             status.running = True  # claim the single-flight slot before scheduling
-            status._task = asyncio.create_task(_run_dossier_task(app.state))
+            status._task = asyncio.create_task(_run_dossier_task(app.state, trigger="schedule"))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1100,6 +1206,11 @@ async def _lead_auto_hunt_loop(app: FastAPI) -> None:
     and the start in :func:`soc_ai.hunting.lead_hunt.start_lead_hunt`, which
     the Hunt button on the lead calls as well.
 
+    Before it selects, each wake settles every hunting lead whose hunt has
+    finished, through :func:`soc_ai.store.leads.settle_finished_hunts`. The
+    startup reaper runs the same call, so an install that upgrades with leads
+    stuck in ``hunting`` needs no migration of data by hand.
+
     A lead whose observations cite no documents is skipped, not started: its
     hunt would have no evidence to read first and would search the grid from
     scratch. The skip is re-read on every wake, because the sweep can record
@@ -1128,6 +1239,15 @@ async def _lead_auto_hunt_loop(app: FastAPI) -> None:
             cap = max(1, int(getattr(settings, "lead_auto_hunt_concurrency", 2) or 1))
 
             async with app.state.db_sessionmaker() as db:
+                # Bookkeeping before selection. A lead whose hunt finished
+                # while this process was down, or before the settle rule
+                # existed, moves now, and an errored one is back to open in
+                # time for the selection below to retry it.
+                settled = await leads_store.settle_finished_hunts(db)
+                if settled:
+                    _LOGGER.info(
+                        "lead auto-hunt: settled %d lead(s) whose hunt had finished", settled
+                    )
                 running = await lead_hunt.running_auto_hunts(db)
                 if running >= cap:
                     continue
@@ -1264,6 +1384,14 @@ async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
         )
     if orphaned_hunts:
         _LOGGER.info("reaped %d orphaned 'running' hunt(s) at startup", orphaned_hunts)
+
+    # Leads: a lead whose hunt finished with no process there to settle it,
+    # and every lead an older release left in 'hunting'. Runs after the hunt
+    # reaper, so an orphaned hunt is terminal by the time the rule reads it.
+    async with db_sessionmaker() as db:
+        settled = await leads_store.settle_finished_hunts(db)
+    if settled:
+        _LOGGER.info("settled %d lead(s) whose hunt had finished, at startup", settled)
 
     # Backtests: mark 'error' — a backtest is a one-shot measurement whose replay
     # task died, not a re-huntable target.

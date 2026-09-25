@@ -41,10 +41,18 @@ decays with a 48 h half-life.
 A false-positive verdict records nothing. A verdict changed to false positive removes the
 observation it wrote.
 
+A repeat sighting adds one occurrence to an observation only when the sweep cites a document the
+observation has not cited before. A sweep that reads the same documents again moves nothing. The
+observation row states the two counts apart: the documents in the window, as in "6 documents in
+the last 24 h", and the sweeps that saw a new document, as in "seen on 3 sweeps, first seen 3d
+ago".
+
 A lead forms in one of three ways.
 
 1. The live weight on one entity reaches 0.85 across two or more types. Two different things saw the
-   same machine.
+   same machine. Each type counts at most 1.7, twice the lead threshold, so one type that repeats
+   cannot carry the total alone. The lead page shows the weight of each type against that cap, as
+   in "new served port 1.70 of 1.70, saturated".
 2. One observation is **finding grade**: a catalog hit from an analytic that declares no benign
    baseline, or a true-positive alert. One such observation forms a lead alone.
 3. One type repeats until its uncapped weight reaches 1.5. A 0.7 type reaches that on the fourth
@@ -57,27 +65,92 @@ lead. It never pulls two leads together.
 A lead that holds one or more shadow observations is a shadow lead. A shadow lead starts nothing by
 itself.
 
+## The baseline behind a profile departure
+
+A profile departure compares a host with its own baseline. The baseline holds one vector for each
+dimension: the served ports, the consumed ports, the peers, the DNS names, the processes, the
+process pairs, the logon users, the active hours and the connection rate. Each is built from up to
+30 days of history.
+
+A **served port** is a port the host receives connections on. A DNS lookup does not count. An
+outbound flow does not count. On an endpoint network event, only an accepted connection counts. A
+served port also needs two different peers or two different days before it counts, in the baseline
+and at novelty alike. A port at 32768 or above needs both. One client that tries one high port once
+is not a service.
+
+Each dimension of each host carries a coverage state, and the host page shows it as a chip.
+**measured** is a real baseline, and an empty one means the host does none of this. **learning**
+has under 7 days of history, and nothing is scored against it yet. **blind** means no plane on this
+grid can answer the dimension for this host. A dimension whose telemetry plane the grid does not
+carry reads blind on every host, never measured. **behind proxy** means the external destinations
+of the host all resolve to a proxy, and the proxy carries the dimension. **unmeasurable** means a
+plane carries the field, but the grid refused the query that measures it. soc-ai scores a departure
+against a measured dimension only.
+
+The active hours and the connection rate are built through one query over the whole estate, split
+into partitions. When Elasticsearch refuses the query for too many buckets, the builder doubles the
+partitions and tries again, up to 32 partitions. When the grid still refuses, both dimensions are
+recorded as unmeasurable with the reason the grid gave. The host page shows the reason on the row,
+as "not measured: <reason>", and the Analytics coverage line reads "baseline unmeasurable:
+<reason>".
+
+The profile sweep owns the age of the baseline. At each wake it reads when the baseline was last
+built. A baseline older than the dossier refresh interval is rebuilt before the sweep scores
+anything, whatever the dossier schedule setting says. That age is floored at twice the sweep
+interval, so the defaults rebuild after 24 h. A dossier refresh also rebuilds the baseline on every
+run. The Analytics coverage line reads "baseline N h old". It adds "stale" when a rebuild was due
+and did not happen, and the sweep then scores against the baseline it has.
+
 ## How a lead becomes a hunt
 
 With `lead_auto_hunt` on, a loop wakes every 60 s. It starts the hunt for each open lead that has
 no hunt, oldest lead first, up to `lead_auto_hunt_concurrency` hunts at a time. The lead then reads
 "New · hunt queued".
 
-The loop leaves four leads alone:
+The loop leaves five leads alone:
 
 - a **dismissed** lead, because you answered it;
 - a **reopened** lead, because you reopened it to decide again;
 - a **shadow** lead, because nothing in shadow starts a hunt;
 - a lead whose observations **cite no documents**, because its hunt would have no evidence to read
-  first.
+  first;
+- a lead whose loop hunt **could not run twice**, because a third attempt would end the same way.
 
-Each of those carries the chip "left to you" and keeps its Hunt button. The skip is logged once an
-hour for each lead.
+The first four carry the chip "left to you" and keep their Hunt button. The fifth reads
+"Hunted · Could not run" and offers Hunt again. The skip is logged once an hour for each lead.
 
 A lead hunt reads the lead's own documents before it queries the grid. Its objective names the
 lead's observations and the related leads, and it asks the hunt to state whether the leads are one
 campaign, with the evidence. The objective is written once, at the start of the hunt, so it reads
 "Related leads at the start of this hunt".
+
+## When the hunt finishes
+
+A lead settles when its hunt finishes. What the hunt found decides where the lead goes.
+
+- The hunt found **no threat**. soc-ai closes the lead with the reason `hunt_clean`. The lead moves
+  to the Closed tab and reads "Closed. The hunt found no threat.", with the chip "closed by soc-ai".
+  No analyst chose a reason, so the lead quality report counts it apart from your dismissals.
+- The hunt found a **threat**, or it reported a **visibility gap**. The lead waits on you under
+  Needs decision as "Hunted · Threat findings" or "Hunted · No threat observed · visibility gap".
+  Read the hunt, then promote or dismiss.
+- The hunt **could not run**: an error, a cancel, an interrupted process, or a query that raised.
+  The lead returns to open and keeps the hunt. The loop starts one more hunt. When that one cannot
+  run either, the lead waits on you as "Hunted · Could not run" and offers Hunt again.
+
+**Hunt again** starts a real second hunt, and the lead then points at it. While the attached hunt
+still runs, the button opens that hunt instead. A lead the hunt closed offers Reopen only. Reopen
+it first, then hunt again.
+
+soc-ai signs a hunt closure as soc-ai even when you started the hunt by hand. A lead you dismissed
+yourself and then reopened is never closed by a hunt. A clean hunt on it waits on you.
+
+A closed lead keeps its history. When a type the hunt already cleared shows up again while the
+lead's observations are still live, the new observation joins the closed lead as history. Nothing
+forms and nothing re-hunts. A new type reopens the lead in place, and the loop hunts it again.
+
+A lead that an earlier release left in hunting settles at the next start. With `lead_auto_hunt` on,
+the loop also settles finished hunts at each wake, before it picks the next leads.
 
 ## How a hunt becomes an investigation
 
@@ -161,18 +234,20 @@ A shadow hit stays unread until you open its evidence or act on it. A live hit h
 ### 3. Leads
 
 Four tabs, named by what you must do: **Needs decision**, **In progress**, **Closed**, **All**. The
-block opens on Needs decision.
+block opens on Needs decision. Closed holds the leads you dismissed or promoted and the leads a
+hunt closed.
 
 Every row carries a state pill: `New`, `In progress`, `Hunted · <outcome>`, `Dismissed`,
-`Promoted`. A new lead whose hunt the loop has taken reads `New · hunt queued`. The pill is the
-state. The tab is a filter.
+`Closed. The hunt found no threat.`, `Promoted`. A new lead whose hunt the loop has taken reads
+`New · hunt queued`. A lead whose loop hunt could not run twice reads `Hunted · Could not run`. The
+pill is the state. The tab is a filter.
 
 | State | Actions |
 |---|---|
 | New | Hunt now, Dismiss |
 | In progress | View hunt |
 | Hunted | Read hunt, Promote, Dismiss, Hunt again |
-| Dismissed, Promoted | Reopen. A promoted lead also offers Open investigation. |
+| Dismissed, Closed by the hunt, Promoted | Reopen. A promoted lead also offers Open investigation. |
 
 A dismissal needs a reason: `expected_for_role`, `known_change`, `benign_repeat`, `bad_baseline` or
 `other`. Free text is optional. The lead quality report counts the reasons, so pick the honest one.
@@ -206,9 +281,13 @@ the entities it could not see. Retirement decisions read the ledger.
 A block under the analytics table. It states the lead rule in one sentence, and the noise floor
 rule beside it: a threshold moves on a week of data, never on a day. Then two tables.
 
-- **Per ISO week**: leads formed, hunted, with a threat finding, promoted, and dismissed under each
-  reason. A week with no leads is still a row, because a quiet week is a measurement.
-- **Per set of observation types**: formed, dismissed, and with a threat finding.
+- **Per ISO week**: leads formed, hunted, with a threat finding, promoted, closed by hunt, and
+  dismissed under each reason. A week with no leads is still a row, because a quiet week is a
+  measurement.
+- **Per set of observation types**: formed, dismissed, closed by hunt, and with a threat finding.
+
+Closed by hunt counts the leads soc-ai closed because the hunt found no threat. The dismissal
+columns count your reasons only.
 
 The reason columns come from the data, so a reason nobody used costs no column. A failed read
 states the failure. Over a dead endpoint, "no leads" is a false all-clear.
@@ -248,7 +327,7 @@ Retirement is the one status that hides a hit. A retired analytic keeps its ledg
 |---|---|---|---|
 | `lead_auto_hunt` | on | A lead that has never had a hunt starts one when it forms. | live |
 | `lead_auto_hunt_concurrency` | 2 | How many lead hunts the loop runs at once. The floor is 1. | live |
-| `entity_profiles_enabled` | off | The dossier refresh builds a behavioural baseline for each host. The profile sweep reads every host as blind until this is on. Turn it on for the shadow week. | live |
+| `entity_profiles_enabled` | off | Build a behavioural baseline for each host. The profile sweep rebuilds it when it is older than the dossier refresh interval, and a dossier refresh rebuilds it too. The profile sweep reads every host as blind until this is on. Turn it on for the shadow week. | live |
 | `hunt_spec_sweeps_enabled` | off | Run the analytic catalog on a loop. Turn this on last. | live |
 | `hunt_spec_sweep_interval_minutes` | 60 | Minutes between catalog sweeps. The floor is 5. | live |
 | `hunt_spec_sweep_window_minutes` | 1440 | How far back each sweep looks. | live |
@@ -284,9 +363,9 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 | `GET /hunts/hits` | Every analytic hit from the last `days` days, live first, then shadow with unread first. `filter` takes `all`, `unread`, `live` or `shadow`. |
 | `GET /hunts/needs-you` | The one number the sidebar badge and the Needs-you strip show: unread shadow hits plus leads that wait on a decision. |
 | `GET /leads` | The lead list. `status` takes a stored value, `all`, or one of the tab aliases `new`, `closed`, `needs_decision` and `in_progress`. |
-| `GET /leads/quality` | The lead rule, the noise floor rule, and what the rule produced per ISO week and per observation-type pair. `weeks` sets the window. |
+| `GET /leads/quality` | The lead rule, the noise floor rule, and what the rule produced per ISO week and per observation-type pair, with `closed_by_hunt` counted apart from `dismissed`. `weeks` sets the window. |
 | `GET /hunts/leads/{id}` | One lead: its observations, its entities, its related leads and whether its investigation still exists. |
-| `POST /hunts/leads/{id}/hunt` | Start the lead hunt by hand. |
+| `POST /hunts/leads/{id}/hunt` | Start the lead hunt by hand. While the attached hunt runs, it returns that hunt. After a hunt has finished, it starts a new one. |
 | `POST /hunts/leads/{id}/promote` | Promote the lead to an investigation of its hunt. Answers 409 `lead_not_hunted` when no hunt has finished. |
 | `POST /hunts/leads/{id}/dismiss` | Dismiss the lead with a reason from the fixed list. |
 | `POST /hunts/leads/{id}/reopen` | Reopen a closed lead. The loop does not hunt it again. |

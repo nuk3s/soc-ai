@@ -913,7 +913,7 @@ async def test_dossier_loop_runs_when_enabled_and_due(monkeypatch: pytest.Monkey
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
         # mirror the real worker's finally: release the slot + stamp last_run
         status.running = False
@@ -950,7 +950,7 @@ async def test_dossier_loop_skips_when_durable_stamp_is_fresh(
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
 
     monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
@@ -976,7 +976,7 @@ async def test_dossier_loop_runs_when_durable_stamp_is_stale(
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
         status.running = False
         status.last_run = datetime.now(UTC).isoformat()
@@ -1007,7 +1007,7 @@ async def test_dossier_loop_runs_when_durable_read_fails(
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
         status.running = False
         status.last_run = datetime.now(UTC).isoformat()
@@ -1033,7 +1033,7 @@ async def test_dossier_loop_skips_when_disabled(monkeypatch: pytest.MonkeyPatch)
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
 
     monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
@@ -1066,7 +1066,7 @@ async def test_dossier_loop_respects_single_flight(monkeypatch: pytest.MonkeyPat
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
 
     monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
@@ -1102,7 +1102,7 @@ async def test_dossier_loop_yields_the_slot_to_a_rebuild_that_lands_mid_read(
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
 
     monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
@@ -1159,7 +1159,7 @@ async def test_dossier_loop_survives_iteration_error(monkeypatch: pytest.MonkeyP
 
     invoked: list[bool] = []
 
-    async def _stub_worker(state: Any) -> None:
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
         invoked.append(True)
         status.running = False
         status.last_run = datetime.now(UTC).isoformat()
@@ -1275,3 +1275,23 @@ async def test_init_store_reaps_pending_general_chat_turns(settings_kratos: Sett
         kept = await db.get(GeneralChatMessage, done_id)
         assert kept is not None and kept.status == "done" and kept.content == "kept"
     await engine2.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dossier_loop_labels_its_run_as_scheduled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production's nightly runs were labelled manual: the loop reused the
+    button's worker, and the worker hardcoded the trigger."""
+    status = _DossierStatus()
+    app = _dossier_app(status)
+    _patch_durable_stamp(monkeypatch, None, [])
+    triggers: list[str] = []
+
+    async def _stub_worker(state: Any, *, trigger: str = "manual") -> None:
+        triggers.append(trigger)
+        status.running = False
+        status.last_run = datetime.now(UTC).isoformat()
+
+    monkeypatch.setattr("soc_ai.api.webui._run_dossier_task", _stub_worker)
+    await _run_dossier_iterations(monkeypatch, app, _dossier_settings())
+    await _drain_dossier_worker(status)
+    assert triggers == ["schedule"]

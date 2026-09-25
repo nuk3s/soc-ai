@@ -6,7 +6,7 @@ Timestamps are naive UTC throughout (SQLite has no timezone type);
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -25,6 +25,12 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def _utcnow() -> datetime:
+    """Naive UTC, the shape every stamp in this schema stores."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
 
 # The type every OPTIONAL JSON column must use, so that an absence is stored as
 # an absence.
@@ -1191,8 +1197,10 @@ class EntityProfile(Base):
 
     vector_json: Mapped[Any | None] = mapped_column(NULLABLE_JSON, default=None)
 
-    # measured | blind | behind_proxy | learning
+    # measured | blind | behind_proxy | learning | unmeasurable
     coverage: Mapped[str] = mapped_column(String(16), default="measured")
+    # The Elasticsearch reason when coverage is ``unmeasurable``. Null otherwise.
+    coverage_reason: Mapped[str | None] = mapped_column(String(255), default=None)
     support_days: Mapped[int] = mapped_column(Integer, default=0)
 
     role: Mapped[str | None] = mapped_column(String(32), default=None)
@@ -1203,7 +1211,11 @@ class EntityProfile(Base):
     window_days: Mapped[int] = mapped_column(Integer, default=30)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
-    built_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    # Naive UTC on the Python side, like every other stamp. The server default
+    # stays for rows written by SQL; SQLite's CURRENT_TIMESTAMP is UTC too.
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(), default=_utcnow, server_default=func.now()
+    )
 
 
 class EntityObservation(Base):
@@ -1353,6 +1365,11 @@ class PriorSpecRun(Base):
     blind: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     not_applicable: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     fired: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # What the sweep knew about its baselines: the newest built_at it read,
+    # whether it judged that stale, and why a dimension was unmeasurable.
+    profiles_built_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    profiles_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    profiles_reason: Mapped[str | None] = mapped_column(String(255), default=None)
 
 
 class AnalyticState(Base):

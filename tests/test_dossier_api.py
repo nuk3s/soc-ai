@@ -941,6 +941,24 @@ def test_refresh_worker_never_raises() -> None:
     assert status.last_summary == {"errors": ["the refresh failed. See the server logs."]}
 
 
+def test_refresh_worker_passes_its_trigger_through(monkeypatch) -> None:
+    from soc_ai.api.webui.routes_dossier import _run_dossier_task
+    from soc_ai.enrichment.host_dossier import DossierSummary
+
+    seen: dict[str, str] = {}
+
+    async def _refresh(es, maker, settings, *, trigger="schedule", audit=None):  # type: ignore[no-untyped-def]
+        seen["trigger"] = trigger
+        return DossierSummary()
+
+    monkeypatch.setattr("soc_ai.enrichment.host_dossier.run_dossier_refresh", _refresh)
+    state = SimpleNamespace(elastic=object(), db_sessionmaker=object(), settings=object())
+    asyncio.run(_run_dossier_task(state, trigger="schedule"))
+    assert seen["trigger"] == "schedule"
+    asyncio.run(_run_dossier_task(state))
+    assert seen["trigger"] == "manual"
+
+
 # ---------------------------------------------------------------------------
 # Audit + auth
 # ---------------------------------------------------------------------------
@@ -1795,3 +1813,36 @@ def test_the_dossier_carries_the_behavioural_profile_with_its_coverage(client) -
 def test_a_host_with_no_profile_has_an_empty_list_not_an_error(client) -> None:
     body = client.get("/api/v1/dossiers/10.1.10.250").json()
     assert body["profile"] == []
+
+
+def test_an_unmeasurable_dimension_carries_its_reason_to_the_host_page(client) -> None:
+    """A dimension the grid refused must not render as "nothing observed".
+    The reason travels with the row so the page can say what the grid said."""
+    import asyncio
+
+    from soc_ai.store import entity_profiles as ep
+
+    ip = "10.1.10.12"
+
+    async def _seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=ip,
+                dimension="active_hours",
+                shape="active_hours",
+                vector=None,
+                coverage="unmeasurable",
+                coverage_reason="Trying to create too many buckets",
+                support_days=0,
+                window_days=30,
+            )
+
+    asyncio.run(_seed())
+    body = client.get(f"/api/v1/dossiers/{ip}").json()
+    by_dim = {p["dimension"]: p for p in body["profile"]}
+    hours = by_dim["active_hours"]
+    assert hours["coverage"] == "unmeasurable"
+    assert hours["coverage_reason"] == "Trying to create too many buckets"
+    assert hours["summary"] == "" and hours["top"] == []

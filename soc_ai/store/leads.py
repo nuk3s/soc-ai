@@ -22,16 +22,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from soc_ai.store.models import EntityObservation, Hunt, Lead
 
 __all__ = [
+    "AUTO_HUNT_ACTOR",
+    "AUTO_HUNT_RETRY_LIMIT",
     "CLOSED_STATUSES",
     "DISMISS_REASONS",
+    "HUNT_CLEAN_REASON",
+    "HUNT_FAILED_STATUSES",
     "HUNT_RUNNING_STATUSES",
     "RELATED_WINDOW_DAYS",
     "RelatedLead",
+    "analyst_dismissed",
     "cites_documents",
     "dismiss",
     "evidence_block_for",
     "get",
+    "hunt_did_not_run",
     "hunt_is_queued",
+    "hunt_outcome_of",
     "in_progress_clause",
     "mark_hunting",
     "mark_promoted",
@@ -40,6 +47,8 @@ __all__ = [
     "related_counts",
     "related_leads",
     "reopen",
+    "settle_after_hunt",
+    "settle_finished_hunts",
     "timeline",
 ]
 
@@ -56,6 +65,21 @@ DISMISS_REASONS: tuple[str, ...] = (
 # A closed lead does not absorb new observations. A new lead can form on the
 # same entity from observations recorded after the close.
 CLOSED_STATUSES: frozenset[str] = frozenset({"dismissed", "promoted"})
+
+# The hand the loop signs its hunts with, and the hand the settle rule signs
+# a closure with. Defined here, because the store reads it to tell an
+# analyst's dismissal from the rule's, and soc_ai.hunting.lead_hunt imports
+# this module. The loop reads it through lead_hunt, as before.
+AUTO_HUNT_ACTOR = "auto-hunt"
+
+# The reason the settle rule writes. It is not in DISMISS_REASONS: the form
+# offers the analyst five reasons, and this one is the rule's own word.
+HUNT_CLEAN_REASON = "hunt_clean"
+
+# A hunt that ended without an answer. The lead behind one goes back to open,
+# and the loop tries once more, then leaves it to the analyst.
+HUNT_FAILED_STATUSES: tuple[str, ...] = ("error", "cancelled", "interrupted")
+AUTO_HUNT_RETRY_LIMIT = 2
 
 _KIND_WORDS: dict[str, str] = {
     "novel_destination": "a new destination",
@@ -263,6 +287,100 @@ async def reopen(db: AsyncSession, lead_id: int, by: str, *, now: datetime | Non
     await db.refresh(lead)
     _LOGGER.info("lead %s reopened by %s", lead.id, by[:80])
     return lead
+
+
+def hunt_outcome_of(hunt: Hunt) -> str:
+    """``threats``, ``clean``, ``gap``, ``failed``, or empty for a hunt that did not complete."""
+    from soc_ai.hunting.findings import hunt_outcome  # noqa: PLC0415 - avoids an import cycle
+
+    report = hunt.report if isinstance(hunt.report, dict) else {}
+    return hunt_outcome(hunt.status, report.get("findings") or [])[1]
+
+
+def hunt_did_not_run(hunt: Hunt) -> bool:
+    """Whether the hunt ended without an answer.
+
+    Two shapes. The hunt row is terminal and not complete: error, cancelled,
+    interrupted. Or it completed and a query raised, which the report records
+    as a visibility gap titled ": could not run". Both count toward the retry
+    limit, because both would otherwise be re-hunted every wake for ever.
+    """
+    if hunt.status in HUNT_RUNNING_STATUSES:
+        return False
+    return hunt.status in HUNT_FAILED_STATUSES or hunt_outcome_of(hunt) == "failed"
+
+
+def analyst_dismissed(lead: Lead) -> bool:
+    """Whether an analyst, not the settle rule, wrote the dismissal the lead carries."""
+    return lead.dismissed_at is not None and lead.dismissed_by != AUTO_HUNT_ACTOR
+
+
+async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | None = None) -> str:
+    """Move the lead the hunt was started on, once the hunt has finished.
+
+    Returns what happened: ``closed``, ``reopened``, ``waits`` or ``none``.
+
+    - ``clean``: the hunt answered no threat. The lead closes with the reason
+      ``hunt_clean`` in the rule's own hand. A lead an analyst dismissed and
+      reopened is theirs to decide; it waits instead.
+    - ``threats`` or ``gap``: the lead waits on the analyst. A threat is a
+      decision, and a gap cannot be hunted away.
+    - anything else (a query raised, or the hunt ended in error, cancelled
+      or interrupted): the lead returns to open and keeps the hunt it names,
+      so the row reads "Could not run" and the loop may try once more.
+
+    ``none`` when the hunt names no lead, the lead is not hunting, the lead
+    names a different hunt now, or the hunt still runs. So a second call, a
+    reconciliation pass and a stale hunt all change nothing.
+    """
+    if hunt.lead_id is None:
+        return "none"
+    lead = await db.get(Lead, int(hunt.lead_id))
+    if lead is None or lead.status != "hunting" or lead.hunt_id != hunt.id:
+        return "none"
+    if hunt.status in HUNT_RUNNING_STATUSES:
+        return "none"
+    at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    outcome = hunt_outcome_of(hunt)
+    if outcome in ("threats", "gap"):
+        return "waits"
+    if outcome == "clean":
+        if analyst_dismissed(lead):
+            return "waits"
+        lead.status = "dismissed"
+        lead.dismissed_reason = HUNT_CLEAN_REASON
+        lead.dismissed_note = None
+        lead.dismissed_by = AUTO_HUNT_ACTOR
+        lead.dismissed_at = at
+        lead.updated_at = at
+        await db.commit()
+        _LOGGER.info("lead %s closed: hunt %s found no threat", lead.id, hunt.id)
+        return "closed"
+    lead.status = "open"
+    lead.updated_at = at
+    await db.commit()
+    _LOGGER.info("lead %s back to open: hunt %s did not run (%s)", lead.id, hunt.id, hunt.status)
+    return "reopened"
+
+
+async def settle_finished_hunts(db: AsyncSession, *, now: datetime | None = None) -> int:
+    """Apply :func:`settle_after_hunt` to every hunting lead whose hunt is terminal.
+
+    Runs at startup and at each loop wake. Returns how many leads moved. A
+    lead whose hunt row is missing is left alone: it reads as waiting, which
+    is the truth. Idempotent, because a lead that moved is no longer hunting.
+    """
+    rows = await db.execute(
+        select(Lead, Hunt)
+        .join(Hunt, Hunt.id == Lead.hunt_id)
+        .where(Lead.status == "hunting", Hunt.status.not_in(HUNT_RUNNING_STATUSES))
+        .order_by(Lead.id)
+    )
+    moved = 0
+    for _lead, hunt in rows.all():
+        if await settle_after_hunt(db, hunt, now=now) in ("closed", "reopened"):
+            moved += 1
+    return moved
 
 
 def _entity_names(entities: Any) -> list[str]:

@@ -22,8 +22,10 @@ from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observa
 from soc_ai.hunting.weight import (
     DEFAULT_HALF_LIFE_HOURS,
     DEFAULT_LEAD_THRESHOLD,
+    KIND_WEIGHT_CAP,
     Kind,
     birth_weight,
+    lead_total,
     live_weight,
 )
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
@@ -47,11 +49,23 @@ async def _db(settings: Settings):  # type: ignore[no-untyped-def]
     return engine, make_sessionmaker(engine)
 
 
-def _sum(pairs: list[tuple[Kind, float]]) -> float:
-    return sum(
-        live_weight(birth_weight(kind), born_at=_NOW - timedelta(hours=age), count=1, now=_NOW)
+def _pairs(pairs: list[tuple[Kind, float]]) -> list[tuple[Kind, float]]:
+    return [
+        (
+            kind,
+            live_weight(birth_weight(kind), born_at=_NOW - timedelta(hours=age), count=1, now=_NOW),
+        )
         for kind, age in pairs
-    )
+    ]
+
+
+def _sum(pairs: list[tuple[Kind, float]]) -> float:
+    return sum(weight for _kind, weight in _pairs(pairs))
+
+
+def _total(pairs: list[tuple[Kind, float]]) -> float:
+    """The same weights through the per-type cap, which is what formation reads."""
+    return lead_total(_pairs(pairs))
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +124,27 @@ async def test_the_half_life_is_the_one_the_design_named() -> None:
     # Pinned so a change to the half-life has to come with a change to this
     # file, where the requirement it must satisfy is written down.
     assert DEFAULT_HALF_LIFE_HOURS == 48.0
+
+
+async def test_the_per_type_cap_leaves_both_required_cases_intact() -> None:
+    # The cap is 2 x the threshold. Both required cases sit under it, so the
+    # capped total and the plain sum are the same number.
+    two_strong = [(Kind.NOVEL_DESTINATION, 0.0), (Kind.NOVEL_DESTINATION, _WORKING_DAY_HOURS)]
+    three_weak = [
+        (Kind.OFF_HOURS, 0.0),
+        (Kind.OFF_HOURS, _WORKING_DAY_HOURS / 2),
+        (Kind.OFF_HOURS, _WORKING_DAY_HOURS),
+    ]
+    assert _total(two_strong) == pytest.approx(_sum(two_strong))
+    assert _total(three_weak) == pytest.approx(_sum(three_weak))
+    assert _total(two_strong) >= DEFAULT_LEAD_THRESHOLD
+    assert _total(three_weak) >= DEFAULT_LEAD_THRESHOLD
+
+
+async def test_ten_of_one_kind_reach_the_cap_and_no_further() -> None:
+    ten = [(Kind.NOVEL_DESTINATION, 0.0)] * 10
+    assert _sum(ten) == pytest.approx(5.0)
+    assert _total(ten) == pytest.approx(KIND_WEIGHT_CAP)
 
 
 # ---------------------------------------------------------------------------

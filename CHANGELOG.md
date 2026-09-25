@@ -6,6 +6,42 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A lead settles when its hunt finishes.** A lead stayed in hunting after its hunt had finished,
+  so a hunt that found no threat left the lead on Needs decision for you to dismiss by hand, and a
+  hunt that could not run left it there with no second try. A hunt that finds no threat now closes
+  the lead: it moves to Closed, reads "Closed. The hunt found no threat." with the chip "closed by
+  soc-ai", and the lead quality report counts it under "Closed by hunt", apart from your
+  dismissals. A hunt that finds a threat still waits on you, and so does a hunt that saw nothing but a
+  visibility gap. A gap the hunt notes beside what it observed does not hold the lead. A hunt that could
+  not run returns the lead to open and the loop tries once more. A second failure leaves the lead
+  on Needs decision as "Hunted · Could not run". Hunt again starts a real second hunt. A repeat of
+  a type the hunt cleared joins the closed lead as history while its observations are still live,
+  and a new type reopens it. A lead an earlier release left in hunting settles at the next start.
+- **A served port is a connection the host received.** The served-ports dimension of a host's
+  baseline counted a DNS lookup and an outbound flow as a port the host served, so a client read as a
+  server and a first outbound call read as a new service. A served port is now a port the host
+  receives connections on. On an endpoint network event only an accepted connection counts. A port
+  also needs two different peers or two different days before it counts, in the baseline and at
+  novelty alike, and a port at 32768 or above needs both. An observation's occurrence count now
+  moves only when the sweep cites a document it has not cited before, and the row states the two
+  counts apart: "6 documents in the last 24 h" and "seen on 3 sweeps". A lead's weight caps each
+  type at 1.7, twice the lead threshold, so one type that repeats cannot carry a lead alone, and the
+  lead page shows the weight of each type against that cap.
+- **The profile builder heals itself.** The active hours and the connection rate of a host's
+  baseline now build through one query over the estate, split into partitions. When Elasticsearch
+  refuses the query for too many buckets, the builder doubles the partitions and tries again, up
+  to 32. When the grid still refuses, both dimensions are recorded as unmeasurable with the reason
+  the grid gave: the host page row reads "not measured:" and the reason, and the Analytics
+  coverage line reads "baseline unmeasurable:" and the reason. A dimension whose telemetry plane
+  the grid does not carry reads blind on every host, never measured. The profile sweep now owns
+  the age of the baseline. It rebuilds the profiles when they are older than the dossier refresh
+  interval, floored at twice the sweep interval, whatever the dossier schedule setting says, and
+  the coverage line reads "baseline N h old". Before this, only the dossier sweep built profiles,
+  so a deployment with the dossier schedule off scored a days-old baseline and reported it as
+  current. Migration 0051 adds the columns.
+
 ## [1.5.0] - 2026-09-23
 
 1.5.0 is the hunting release. soc-ai now looks for the attacks that raise no alert. An analytic

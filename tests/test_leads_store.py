@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from soc_ai.config import Settings
@@ -599,3 +600,307 @@ async def test_the_objective_names_the_related_leads_and_asks_for_a_campaign(
     # before.
     assert "Related leads" not in plain
     assert "one campaign" not in plain
+
+
+# Three finding shapes, one per outcome the hunt rule reads. A title that
+# ends in ": could not run" is the shape spec_report writes for a query that
+# raised, and the category is what finding_category reads first.
+_THREAT: dict[str, Any] = {
+    "title": "Beaconing to a rare external address",
+    "severity": "high",
+    "hosts": ["198.51.100.7"],
+    "citations": ["es-1"],
+}
+_GAP: dict[str, Any] = {"title": "No telemetry in the window", "category": "visibility_gap"}
+_OBSERVATION: dict[str, Any] = {
+    "title": "New ports are mail DNS source ports",
+    "category": "observation",
+    "severity": "info",
+}
+_FAILED: dict[str, Any] = {
+    "title": "net-rare-served-port: could not run",
+    "category": "visibility_gap",
+}
+
+
+def test_hunt_outcome_names_the_four_outcomes() -> None:
+    """The rule the Hunts page paints from, now readable by the store."""
+    from soc_ai.hunting.findings import hunt_outcome
+
+    assert hunt_outcome("complete", []) == (0, "clean")
+    assert hunt_outcome("complete", [_THREAT]) == (1, "threats")
+    assert hunt_outcome("complete", [_GAP]) == (0, "gap")
+    assert hunt_outcome("complete", [_GAP, _FAILED]) == (0, "failed")
+    assert hunt_outcome("complete", [_OBSERVATION, _GAP, _FAILED]) == (0, "failed")
+
+
+def test_a_hunt_that_saw_the_host_and_noted_one_gap_is_clean() -> None:
+    """A gap is the whole outcome only when the hunt saw nothing else.
+
+    The first two lead hunts on a production grid each explained the lead as a
+    benign pattern in four observation findings and added one honest caveat
+    ("mail payload content not inspected") as a visibility gap. The old rule
+    read any gap as the outcome, so both leads waited on the analyst for
+    ever. A hunt that saw the host and found no threat is clean; a hunt that
+    saw only blindness is a gap.
+    """
+    from soc_ai.hunting.findings import hunt_outcome
+
+    assert hunt_outcome("complete", [_OBSERVATION, _GAP]) == (0, "clean")
+    assert hunt_outcome("complete", [_OBSERVATION]) == (0, "clean")
+    assert hunt_outcome("complete", [_GAP, _GAP]) == (0, "gap")
+    assert hunt_outcome("error", [_THREAT]) == (1, "")
+    assert hunt_outcome("complete", None) == (0, "")
+
+
+async def _lead_row(
+    db,  # type: ignore[no-untyped-def]
+    *,
+    hunt_id: str | None = None,
+    dismissed_reason: str | None = None,
+    dismissed_by: str | None = None,
+    dismissed_at: datetime | None = None,
+) -> Lead:
+    """One lead row on its own host, so several can exist side by side.
+
+    ``_lead`` forms through the rule and merges a second lead into the first.
+    The settle tests need three leads with three hunts, written at the row
+    level, because they pin the transition and not the formation.
+    """
+    lead = Lead(
+        status="hunting" if hunt_id else "open",
+        entities_json=[["host", "198.51.100.7"]],
+        kinds_json=["novel_served_port"],
+        weight_at_formation=1.5,
+        shadow=False,
+        hunt_id=hunt_id,
+        dismissed_reason=dismissed_reason,
+        dismissed_by=dismissed_by,
+        dismissed_at=dismissed_at,
+    )
+    db.add(lead)
+    await db.commit()
+    await db.refresh(lead)
+    return lead
+
+
+async def _hunt_row(
+    db,  # type: ignore[no-untyped-def]
+    *,
+    hunt_id: str,
+    lead_id: int,
+    status: str = "complete",
+    findings: list[dict[str, Any]] | None = None,
+    started_by: str = "auto-hunt",
+) -> Hunt:
+    hunt = Hunt(
+        id=hunt_id,
+        objective="o",
+        objective_hash="x",
+        started_by=started_by,
+        kind="lead",
+        starter="lead",
+        status=status,
+        lead_id=lead_id,
+        report=None if findings is None else {"findings": findings, "narrative": "n"},
+    )
+    db.add(hunt)
+    await db.commit()
+    await db.refresh(hunt)
+    return hunt
+
+
+async def test_a_clean_hunt_closes_its_lead(settings_kratos: Settings) -> None:
+    """The hunt answered the question the lead asked. Nobody has to click."""
+    _engine, maker = await _db(settings_kratos)
+    now = datetime.now(UTC)
+    async with maker() as db:
+        lead = await _lead_row(db, hunt_id="01CLEAN")
+        hunt = await _hunt_row(db, hunt_id="01CLEAN", lead_id=lead.id, findings=[])
+        assert await leads_store.settle_after_hunt(db, hunt, now=now) == "closed"
+        lead = await leads_store.get(db, lead.id)
+    assert lead.status == "dismissed"
+    assert lead.dismissed_reason == leads_store.HUNT_CLEAN_REASON == "hunt_clean"
+    assert lead.dismissed_by == leads_store.AUTO_HUNT_ACTOR == "auto-hunt"
+    assert lead.dismissed_at == now.replace(tzinfo=None)
+    assert lead.hunt_id == "01CLEAN"
+
+
+async def test_threat_findings_and_a_visibility_gap_leave_the_lead_on_the_analyst(
+    settings_kratos: Settings,
+) -> None:
+    """A threat is the analyst's decision. A gap cannot be hunted away."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        threats = await _lead_row(db, hunt_id="01THREAT")
+        hunt = await _hunt_row(db, hunt_id="01THREAT", lead_id=threats.id, findings=[_THREAT])
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        gap = await _lead_row(db, hunt_id="01GAP")
+        hunt = await _hunt_row(db, hunt_id="01GAP", lead_id=gap.id, findings=[_GAP])
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        threats = await leads_store.get(db, threats.id)
+        gap = await leads_store.get(db, gap.id)
+    assert threats.status == "hunting" and threats.dismissed_reason is None
+    assert gap.status == "hunting" and gap.dismissed_reason is None
+
+
+async def test_a_hunt_that_did_not_run_returns_the_lead_to_open(
+    settings_kratos: Settings,
+) -> None:
+    """The lead keeps the hunt it names, so the row can say "Could not run"."""
+    _engine, maker = await _db(settings_kratos)
+    cases = [
+        ("01ERR", "error", None),
+        ("01CANCEL", "cancelled", None),
+        ("01INTERRUPT", "interrupted", None),
+        ("01FAILED", "complete", [_GAP, _FAILED]),
+    ]
+    async with maker() as db:
+        for hunt_id, status, findings in cases:
+            lead = await _lead_row(db, hunt_id=hunt_id)
+            hunt = await _hunt_row(
+                db, hunt_id=hunt_id, lead_id=lead.id, status=status, findings=findings
+            )
+            assert await leads_store.settle_after_hunt(db, hunt) == "reopened", hunt_id
+            lead = await leads_store.get(db, lead.id)
+            assert lead.status == "open" and lead.hunt_id == hunt_id, hunt_id
+            assert lead.dismissed_reason is None, hunt_id
+
+
+async def test_an_analyst_dismissal_in_the_history_blocks_the_automatic_close(
+    settings_kratos: Settings,
+) -> None:
+    """The analyst reopened this lead to decide again. The rule does not decide for them."""
+    _engine, maker = await _db(settings_kratos)
+    dismissed_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2)
+    async with maker() as db:
+        lead = await _lead_row(
+            db,
+            hunt_id="01AGAIN",
+            dismissed_reason="benign_repeat",
+            dismissed_by="ann",
+            dismissed_at=dismissed_at,
+        )
+        hunt = await _hunt_row(db, hunt_id="01AGAIN", lead_id=lead.id, findings=[])
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        lead = await leads_store.get(db, lead.id)
+    assert lead.status == "hunting"
+    assert lead.dismissed_reason == "benign_repeat" and lead.dismissed_by == "ann"
+    assert lead.dismissed_at == dismissed_at
+
+
+async def test_settle_is_idempotent_and_ignores_a_hunt_the_lead_no_longer_names(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead_row(db, hunt_id="01SECOND")
+        first = await _hunt_row(db, hunt_id="01FIRST", lead_id=lead.id, findings=[])
+        second = await _hunt_row(db, hunt_id="01SECOND", lead_id=lead.id, findings=[_THREAT])
+        # The first hunt is history. Its clean answer must not close a lead
+        # whose current hunt found a threat.
+        assert await leads_store.settle_after_hunt(db, first) == "none"
+        assert await leads_store.settle_after_hunt(db, second) == "waits"
+        assert await leads_store.settle_after_hunt(db, second) == "waits"
+        lead = await leads_store.get(db, lead.id)
+        assert lead.status == "hunting"
+        closed = await _lead_row(db, hunt_id="01ONCE")
+        hunt = await _hunt_row(db, hunt_id="01ONCE", lead_id=closed.id, findings=[])
+        assert await leads_store.settle_after_hunt(db, hunt) == "closed"
+        assert await leads_store.settle_after_hunt(db, hunt) == "none"
+        running = await _lead_row(db, hunt_id="01RUNS")
+        hunt = await _hunt_row(db, hunt_id="01RUNS", lead_id=running.id, status="running")
+        assert await leads_store.settle_after_hunt(db, hunt) == "none"
+
+
+async def test_hunt_did_not_run_reads_the_status_and_the_could_not_run_finding(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead_row(db)
+        error = await _hunt_row(db, hunt_id="01E", lead_id=lead.id, status="error")
+        failed = await _hunt_row(db, hunt_id="01F", lead_id=lead.id, findings=[_GAP, _FAILED])
+        clean = await _hunt_row(db, hunt_id="01C", lead_id=lead.id, findings=[])
+        gap = await _hunt_row(db, hunt_id="01G", lead_id=lead.id, findings=[_GAP])
+        running = await _hunt_row(db, hunt_id="01R", lead_id=lead.id, status="running")
+    assert leads_store.hunt_did_not_run(error) is True
+    assert leads_store.hunt_did_not_run(failed) is True
+    assert leads_store.hunt_did_not_run(clean) is False
+    assert leads_store.hunt_did_not_run(gap) is False
+    assert leads_store.hunt_did_not_run(running) is False
+
+
+async def test_settle_finished_hunts_settles_every_hunting_lead_with_a_terminal_hunt(
+    settings_kratos: Settings,
+) -> None:
+    """The reconciliation: one call, every stuck lead, and a second call does nothing."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        clean = await _lead_row(db, hunt_id="01CLEAN")
+        await _hunt_row(db, hunt_id="01CLEAN", lead_id=clean.id, findings=[])
+        threat = await _lead_row(db, hunt_id="01THREAT")
+        await _hunt_row(db, hunt_id="01THREAT", lead_id=threat.id, findings=[_THREAT])
+        lost = await _lead_row(db, hunt_id="01LOST")
+        await _hunt_row(db, hunt_id="01LOST", lead_id=lost.id, status="interrupted")
+        running = await _lead_row(db, hunt_id="01RUNS")
+        await _hunt_row(db, hunt_id="01RUNS", lead_id=running.id, status="running")
+        assert await leads_store.settle_finished_hunts(db) == 2
+        assert await leads_store.settle_finished_hunts(db) == 0
+        rows = {
+            lead.id: lead.status
+            for lead in (await db.scalars(select(Lead).order_by(Lead.id))).all()
+        }
+    assert rows == {
+        clean.id: "dismissed",
+        threat.id: "hunting",
+        lost.id: "open",
+        running.id: "hunting",
+    }
+
+
+async def test_the_recorder_settles_the_lead_when_its_hunt_lands(
+    settings_kratos: Settings,
+) -> None:
+    """The one call site. A hunt that lands clean closes its lead in the same breath."""
+    from soc_ai.api.hunt_recorder import HuntRecorder
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead(db)
+    recorder = HuntRecorder(
+        maker, objective="o", started_by="auto-hunt", kind="lead", starter="lead", lead_id=lead.id
+    )
+    hunt_id = await recorder.start()
+    assert hunt_id
+    async with maker() as db:
+        await leads_store.mark_hunting(db, lead.id, hunt_id=hunt_id)
+    await recorder.record("hunt_report", 1, {"findings": [], "narrative": "Nothing notable."})
+    await recorder.finish("complete")
+    async with maker() as db:
+        lead = await leads_store.get(db, lead.id)
+        hunt = await db.get(Hunt, hunt_id)
+    assert hunt.status == "complete"
+    assert lead.status == "dismissed" and lead.dismissed_reason == "hunt_clean"
+    assert lead.dismissed_by == "auto-hunt" and lead.hunt_id == hunt_id
+
+
+async def test_the_recorder_returns_the_lead_to_open_when_the_hunt_errors(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.api.hunt_recorder import HuntRecorder
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead(db)
+    recorder = HuntRecorder(
+        maker, objective="o", started_by="auto-hunt", kind="lead", starter="lead", lead_id=lead.id
+    )
+    hunt_id = await recorder.start()
+    async with maker() as db:
+        await leads_store.mark_hunting(db, lead.id, hunt_id=hunt_id)
+    recorder.note_failure(RuntimeError("gateway 502"))
+    await recorder.finish("error")
+    async with maker() as db:
+        lead = await leads_store.get(db, lead.id)
+    assert lead.status == "open" and lead.hunt_id == hunt_id

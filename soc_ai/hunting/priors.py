@@ -32,9 +32,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from soc_ai.dossier.profile_math import robust_z
+from soc_ai.dossier.profile_math import (
+    GUARDED_PORT_DIMENSIONS,
+    LINUX_EPHEMERAL_START,
+    robust_z,
+    served_port_counts,
+)
 from soc_ai.hunting.spec import HuntSpec
 from soc_ai.hunting.weight import Kind, kind_for_dimension
+from soc_ai.hunting.window import DEFAULT_RECENT_HOURS
 from soc_ai.hunting.wording import plural, result_note
 from soc_ai.store.entity_profiles import ProfileRow
 
@@ -43,9 +49,12 @@ __all__ = [
     "COVERAGE_LEARNING",
     "COVERAGE_MEASURED",
     "COVERAGE_NOT_APPLICABLE",
+    "GUARDED_PORT_DIMENSIONS",
+    "LINUX_EPHEMERAL_START",
     "Departure",
     "PriorResult",
     "evaluate_prior",
+    "served_port_counts",
 ]
 
 COVERAGE_MEASURED = "measured"
@@ -116,7 +125,20 @@ def _observed_count(value: Any) -> int:
     an odd shape must neither crash the sweep nor sail past the recurrence
     floor — both of which a permissive default would allow.
     """
-    raw = value.get("count") if isinstance(value, Mapping) else value
+    return (
+        _observed_int(value, "count")
+        if isinstance(value, Mapping)
+        else _observed_int({"count": value}, "count")
+    )
+
+
+def _observed_int(value: Any, key: str) -> int:
+    """One integer the caller measured for this member. Zero when unreadable.
+
+    Zero is the reading that does NOT count. A member the recent read could
+    not describe must not pass a guard that asks how many peers reached it.
+    """
+    raw = value.get(key) if isinstance(value, Mapping) else None
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 0
     return int(raw)
@@ -195,6 +217,7 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
     observed: Mapping[Any, Any],
     role: str | None,
     role_confidence: float | None,
+    window_hours: int = DEFAULT_RECENT_HOURS,
 ) -> PriorResult:
     """Compare what was just seen against what this entity's baseline holds.
 
@@ -349,6 +372,7 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
             )
 
     elif test.test == "novel_for":
+        guarded = test.dimension in GUARDED_PORT_DIMENSIONS
         for raw_member, value in observed.items():
             member = str(raw_member)
             if member in known:
@@ -357,6 +381,18 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
             # Recurrence floor. One sighting is not a pattern, and the whole
             # ephemeral-port false-positive class is exactly one sighting.
             if count < test.min_observations:
+                continue
+            # The peers-or-days guard, on served ports. The floor counts
+            # documents, and an endpoint sensor writes one DNS lookup as two
+            # documents with the entity on the receiving side. The guard asks
+            # who reached the port and on how many days, which no sensor
+            # mirrors.
+            if guarded and not served_port_counts(
+                member,
+                count=count,
+                peers=_observed_int(value, "peers"),
+                days=_observed_int(value, "days"),
+            ):
                 continue
             departures.append(
                 Departure(
@@ -378,6 +414,7 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
         departures,
         baseline_size=len(known),
         support_days=profile.support_days,
+        window_hours=window_hours,
     )
     return PriorResult(
         spec_id=spec.id,

@@ -7,9 +7,11 @@ import {
   QUALITY_FORMED,
   QUALITY_HUNTED,
   QUALITY_PROMOTED,
+  QUALITY_CLOSED_BY_HUNT,
   QUALITY_THREAT,
   QUALITY_TYPES,
   QUALITY_TYPES_DISMISSED,
+  QUALITY_TYPES_CLOSED_BY_HUNT,
   QUALITY_TYPES_FORMED,
   QUALITY_TYPES_THREAT,
   QUALITY_WEEK,
@@ -42,6 +44,8 @@ import { Freshness, LoadingState } from './States';
 // its constants, so the block cannot drift from the thresholds it measures.
 // The note is the noise floor rule: a threshold moves on a week of data, never
 // on a day.
+//
+// Hunt closures are their own column: a lead soc-ai closed is not a lesson an analyst taught.
 //
 // A failed read states the failure. "No lead formed" over a dead endpoint is
 // the false all-clear this whole surface exists to prevent.
@@ -126,6 +130,9 @@ export function LeadQualityPanel() {
                       <th className={HEAD_CLASS} title={QUALITY_PROMOTED}>
                         Promoted
                       </th>
+                      <th className={HEAD_CLASS} title={QUALITY_CLOSED_BY_HUNT}>
+                        Closed by hunt
+                      </th>
                       {/* One column per reason the data carries. The header is
                           the analyst's word for the reason, the same word the
                           dismiss form offered. */}
@@ -148,6 +155,7 @@ export function LeadQualityPanel() {
                         <td className={CELL_CLASS}>{w.hunted}</td>
                         <td className={CELL_CLASS}>{w.threat}</td>
                         <td className={CELL_CLASS}>{w.promoted}</td>
+                        <td className={CELL_CLASS}>{w.closed_by_hunt}</td>
                         {reasons.map((r) => (
                           <td key={r} className={CELL_CLASS}>
                             {w.dismissed[r] ?? 0}
@@ -174,6 +182,9 @@ export function LeadQualityPanel() {
                       <th className={HEAD_CLASS} title={QUALITY_TYPES_DISMISSED}>
                         Dismissed
                       </th>
+                      <th className={HEAD_CLASS} title={QUALITY_TYPES_CLOSED_BY_HUNT}>
+                        Closed by hunt
+                      </th>
                       <th className={HEAD_CLASS} title={QUALITY_TYPES_THREAT}>
                         Threat
                       </th>
@@ -189,6 +200,7 @@ export function LeadQualityPanel() {
                         <td className={`${CELL_CLASS} pl-[15px] text-text-2`}>{typesLabel(t.types)}</td>
                         <td className={CELL_CLASS}>{t.formed}</td>
                         <td className={CELL_CLASS}>{t.dismissed}</td>
+                        <td className={CELL_CLASS}>{t.closed_by_hunt}</td>
                         <td className={CELL_CLASS}>{t.threat}</td>
                       </tr>
                     ))}
