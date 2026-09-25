@@ -9,10 +9,13 @@ Coverage
 * pcap_enabled=False → disabled error dict, no subprocess spawned.
 * pcap_enabled=True + mocked fetch with a TLS SNI → PcapFacts with that SNI.
 * BPF construction: bidirectional host clause + VLAN-OR form.
-* find command: window bounding (newermt start, awk end epoch).
+* find command: window bounding (newermt @epoch start, awk end epoch).
 * Injection: non-IP src_ip → error dict, no subprocess.
+* Ports outside 0-65535 and windows over the cap → error dict, no subprocess.
 * SSH failure (non-zero exit) → graceful error dict, no exception.
-* tcpdump exit 1 (no BPF match) → empty PcapFacts (notes set), no error.
+* tcpdump exit 0 with no output (no BPF match) → empty PcapFacts (notes set).
+* tcpdump non-zero exit on every file → error dict carrying stderr.
+* decode_pcap runs off the event loop thread.
 * Wiring point A: t_get_pcap registered in build_investigator.
 * Wiring point B: TargetedGap.tool_name Literal includes t_get_pcap;
   dispatch_table in targeted_investigator includes it.
@@ -21,11 +24,15 @@ Coverage
 from __future__ import annotations
 
 import io
+import os
 import shlex
+import shutil
 import socket
 import struct
+import subprocess
 import tempfile
-from datetime import UTC, datetime
+import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,6 +41,8 @@ from unittest.mock import MagicMock, patch
 import dpkt
 import pytest
 from soc_ai.tools.get_pcap import (
+    _MAX_PCAP_FILES,
+    _MAX_WINDOW_MINUTES,
     _build_bpf,
     _build_find_command,
     _ssh_base_args,
@@ -236,16 +245,65 @@ def test_bpf_with_ports() -> None:
 
 
 def test_find_command_contains_window_bounds() -> None:
-    """find command must include -newermt <start> and awk end-epoch bound."""
+    """find command must include -newermt '@<start epoch>' and the awk end-epoch bound.
+
+    The start bound is an epoch, not a wall-clock string: a zone-less
+    ``YYYY-MM-DD HH:MM:SS`` is read by the sensor's ``find`` in the sensor's
+    own timezone, which shifts the window by the UTC offset on any sensor
+    whose OS clock is not UTC.
+    """
     settings = _make_settings()
     start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     end = datetime(2026, 1, 1, 12, 5, 0, tzinfo=UTC)
     cmd = _build_find_command(settings, start, end)
     assert "-newermt" in cmd, "find command missing -newermt"
-    assert "2026-01-01 12:00:00" in cmd, "start timestamp missing from find command"
+    assert f"-newermt '@{int(start.timestamp())}'" in cmd, (
+        f"start epoch missing from find command: {cmd!r}"
+    )
+    assert "2026-01-01 12:00:00" not in cmd, "start must not be a zone-less wall-clock string"
     end_epoch = str(int(end.timestamp()))
     assert end_epoch in cmd, f"end epoch {end_epoch!r} missing from find command: {cmd!r}"
     assert "awk" in cmd, "awk window-bound filter missing from find command"
+
+
+def _gnu_find_available() -> bool:
+    find = shutil.which("find")
+    if find is None:
+        return False
+    try:
+        out = subprocess.run([find, "--version"], capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return b"GNU findutils" in out.stdout
+
+
+@pytest.mark.skipif(not _gnu_find_available(), reason="needs GNU find (-newermt/-printf)")
+def test_find_command_window_is_timezone_independent(tmp_path: Path) -> None:
+    """The find window lists the same files whatever the sensor's TZ is.
+
+    A file written five minutes after the window start must be found when
+    the remote shell runs under a timezone west of UTC — the case where a
+    zone-less start string used to shift the window past the file's mtime.
+    """
+    pcap = tmp_path / "so-pcap.1767268800"
+    pcap.write_bytes(b"")
+    os.utime(pcap, (1767269100, 1767269100))  # 2026-01-01 12:05:00 UTC
+    settings = _make_settings(so_suripcap_dir=str(tmp_path))
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 1, 1, 12, 10, 0, tzinfo=UTC)
+    cmd = _build_find_command(settings, start, end)
+
+    for tz in ("UTC", "America/New_York", "Europe/Berlin"):
+        proc = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env={**os.environ, "TZ": tz},
+        )
+        assert str(pcap) in proc.stdout.decode(), (
+            f"file not listed under TZ={tz}: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
 
 
 def test_find_command_shlex_quotes_suripcap_dir() -> None:
@@ -356,6 +414,104 @@ async def test_injection_invalid_dst_ip_rejected() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("port_arg", ["src_port", "dst_port"])
+@pytest.mark.parametrize("value", [70000, -1, 65536])
+async def test_port_out_of_range_rejected_without_subprocess(port_arg: str, value: int) -> None:
+    """A port outside 0-65535 is an error dict, never a BPF compile error on the sensor.
+
+    ``port 70000`` does not compile in tcpdump, and a compile failure exits
+    1 — which must never be mistaken for "no packets matched".
+    """
+    settings = _make_settings(pcap_enabled=True)
+    with patch("soc_ai.tools.get_pcap.subprocess.run") as mock_run:
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            **{port_arg: value},
+        )
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert f"invalid {port_arg}" in result["error"]
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_window_minutes_over_cap_returns_error_without_subprocess() -> None:
+    """A window above the cap is refused before find runs, and the error names the bound."""
+    settings = _make_settings(pcap_enabled=True)
+    with patch("soc_ai.tools.get_pcap.subprocess.run") as mock_run:
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            window_minutes=10**6,
+        )
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert "window_minutes" in result["error"]
+    assert str(_MAX_WINDOW_MINUTES) in result["error"]
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_window_minutes_at_cap_is_accepted() -> None:
+    """The cap itself is inclusive."""
+    settings = _make_settings(pcap_enabled=True)
+    empty = MagicMock(returncode=0, stdout=b"", stderr=b"")
+    with patch("soc_ai.tools.get_pcap.subprocess.run", return_value=empty) as mock_run:
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            window_minutes=_MAX_WINDOW_MINUTES,
+        )
+    assert isinstance(result, PcapFacts)
+    mock_run.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_too_many_candidate_files_is_an_error_not_a_sweep() -> None:
+    """A dense ring inside the window is refused before any tcpdump runs.
+
+    Each candidate file is its own ssh + sudo tcpdump read, so the fetch
+    asks for a narrower window instead of serialising hundreds of them.
+    """
+    settings = _make_settings(pcap_enabled=True)
+    listing = "".join(f"/nsm/suripcap/t1/so-pcap.{1000 + i}\n" for i in range(_MAX_PCAP_FILES + 1))
+    find_result = MagicMock(returncode=0, stdout=listing.encode(), stderr=b"")
+    with patch("soc_ai.tools.get_pcap.subprocess.run", return_value=find_result) as mock_run:
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            alert_ts=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        )
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert "narrow window_minutes" in result["error"]
+    assert mock_run.call_count == 1  # find only, no tcpdump
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [10**12, 10**16, float("inf"), float("nan")])
+async def test_window_minutes_overflow_never_raises(value: Any) -> None:
+    """Absurd window values return an error dict; nothing raises and nothing spawns."""
+    settings = _make_settings(pcap_enabled=True)
+    with patch("soc_ai.tools.get_pcap.subprocess.run") as mock_run:
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            window_minutes=value,
+        )
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert "window_minutes" in result["error"]
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_injection_both_missing_rejected() -> None:
     """Missing src_ip + dst_ip returns an error dict immediately."""
     settings = _make_settings(pcap_enabled=True)
@@ -386,8 +542,8 @@ def test_commands_are_arg_lists_not_shell_strings() -> None:
             m.stdout = b"/nsm/suripcap/t1/so-pcap.1000\n"
             m.stderr = b""
         else:
-            # second call = tcpdump → empty bytes (returncode 1 = no match)
-            m.returncode = 1
+            # second call = tcpdump → empty bytes (returncode 0 = no match)
+            m.returncode = 0
             m.stdout = b""
             m.stderr = b""
         return m
@@ -446,8 +602,9 @@ async def test_alert_ts_never_interpolated_into_remote_command() -> None:
     assert captured, "expected the remote find command to be issued"
     find_cmd = captured[0]
     assert "rm -rf" not in find_cmd
-    # The window start is the strftime of (anchor - window): re-derived, safe.
-    assert "2026-06-15 11:58:00" in find_cmd
+    # The window start is the epoch of (anchor - window): re-derived, safe.
+    start_epoch = int((anchor - timedelta(minutes=2)).timestamp())
+    assert f"-newermt '@{start_epoch}'" in find_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -482,19 +639,24 @@ async def test_ssh_failure_returns_error_dict() -> None:
 
 
 # ---------------------------------------------------------------------------
-# tcpdump exit 1 (no BPF match) → empty PcapFacts, not an error
+# tcpdump no BPF match (exit 0, header only) → empty PcapFacts, not an error
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_tcpdump_no_match_returns_empty_pcap_facts() -> None:
-    """tcpdump exit 1 (no BPF match) → PcapFacts (empty), no error dict."""
+@pytest.mark.parametrize("stdout", [b"", _build_pcap([])])
+async def test_tcpdump_no_match_returns_empty_pcap_facts(stdout: bytes) -> None:
+    """tcpdump exit 0 with no packets (no BPF match) → PcapFacts (empty), no error dict.
+
+    tcpdump exits 0 after reading a savefile that matched nothing; with
+    ``-w -`` it still emits the 24-byte global header.  Both the bare header
+    and empty output are a clean no-match.
+    """
     settings = _make_settings(pcap_enabled=True)
     alert_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
     find_result = MagicMock(returncode=0, stdout=b"/nsm/suripcap/t1/so-pcap.1000\n", stderr=b"")
-    # exit code 1 = no BPF match; stdout is empty (not even a pcap header)
-    tcpdump_no_match = MagicMock(returncode=1, stdout=b"", stderr=b"")
+    tcpdump_no_match = MagicMock(returncode=0, stdout=stdout, stderr=b"reading from file ...\n")
 
     with patch("soc_ai.tools.get_pcap.subprocess.run", side_effect=[find_result, tcpdump_no_match]):
         result = await get_pcap_facts(
@@ -504,17 +666,119 @@ async def test_tcpdump_no_match_returns_empty_pcap_facts() -> None:
             alert_ts=alert_ts,
         )
 
-    # Should be a PcapFacts (possibly empty) or a clean "no packets" dict —
-    # either way, NOT {"ok": False, ...}.
-    if isinstance(result, dict):
-        # If it is a dict it must NOT be an error dict
-        assert result.get("ok") is not False, (
-            f"tcpdump exit 1 should not be treated as an error; got {result}"
+    assert isinstance(result, PcapFacts), f"Expected PcapFacts, got {type(result)}: {result}"
+    assert result.packets == 0
+    assert any("no packets matched" in n for n in result.notes)
+
+
+# ---------------------------------------------------------------------------
+# tcpdump non-zero exit → error dict, never "no packets matched"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tcpdump_exit_1_is_an_error() -> None:
+    """tcpdump exit 1 (sudo denied, unreadable file, bad BPF) → error dict with stderr.
+
+    Exit 1 is tcpdump's error status, not "no match".  Reporting it as an
+    empty capture would hand the model fabricated negative evidence.
+    """
+    settings = _make_settings(pcap_enabled=True)
+    alert_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    find_result = MagicMock(returncode=0, stdout=b"/nsm/suripcap/t1/so-pcap.1000\n", stderr=b"")
+    sudo_denied = MagicMock(returncode=1, stdout=b"", stderr=b"sudo: a password is required\n")
+
+    with patch("soc_ai.tools.get_pcap.subprocess.run", side_effect=[find_result, sudo_denied]):
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            alert_ts=alert_ts,
         )
-    else:
-        assert isinstance(result, PcapFacts), f"Expected PcapFacts, got {type(result)}"
-        # Empty pcap — 0 packets is fine
-        assert result.packets == 0
+
+    assert isinstance(result, dict), f"expected an error dict, got {result!r}"
+    assert result["ok"] is False
+    assert "tcpdump" in result["error"]
+    assert "a password is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_tcpdump_partial_failure_keeps_the_files_that_worked() -> None:
+    """One failing file out of two is skipped; the other file's packets are returned.
+
+    A rotating ring can legitimately lose a file mid-fetch, so a per-file
+    failure is not fatal — only every file failing is.
+    """
+    frame = _make_tcp_frame("10.0.0.1", 54321, "10.0.0.2", 443, b"x")
+    canned_pcap = _build_pcap([(1000.0, frame)])
+    settings = _make_settings(pcap_enabled=True)
+    alert_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    find_result = MagicMock(
+        returncode=0,
+        stdout=b"/nsm/suripcap/t1/so-pcap.1000\n/nsm/suripcap/t1/so-pcap.1060\n",
+        stderr=b"",
+    )
+    rotated_away = MagicMock(
+        returncode=1, stdout=b"", stderr=b"tcpdump: so-pcap.1000: No such file or directory\n"
+    )
+    ok = MagicMock(returncode=0, stdout=canned_pcap, stderr=b"")
+
+    with patch("soc_ai.tools.get_pcap.subprocess.run", side_effect=[find_result, rotated_away, ok]):
+        result = await get_pcap_facts(
+            settings=settings,
+            src_ip="10.0.0.1",
+            dst_ip="10.0.0.2",
+            alert_ts=alert_ts,
+        )
+
+    assert isinstance(result, PcapFacts), f"Expected PcapFacts, got {type(result)}: {result}"
+    assert result.packets == 1
+
+
+def test_stream_filtered_keeps_tcpdump_stderr() -> None:
+    """The remote tcpdump command must not discard stderr — it is the only error signal."""
+    from soc_ai.tools.get_pcap import _stream_filtered
+
+    settings = _make_settings()
+    captured: dict[str, Any] = {}
+
+    def _fake_run(args: list[str], **kw: Any) -> Any:
+        captured["remote_cmd"] = args[-1]
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    with patch("subprocess.run", _fake_run):
+        _stream_filtered(settings, "/nsm/suripcap/so-pcap.1700000000", "host 10.0.0.1")
+
+    assert "2>/dev/null" not in captured["remote_cmd"]
+
+
+# ---------------------------------------------------------------------------
+# decode runs off the event loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_decode_runs_off_the_event_loop_thread() -> None:
+    """decode_pcap is a per-packet Python loop; it must not run on the loop thread."""
+    frame = _make_tcp_frame("10.0.0.1", 54321, "10.0.0.2", 443, b"x")
+    canned_pcap = _build_pcap([(1000.0, frame)])
+    settings = _make_settings(pcap_enabled=True)
+    on_main: list[bool] = []
+
+    def _fake_decode(raw: bytes, *, max_packets: int) -> PcapFacts:
+        on_main.append(threading.current_thread() is threading.main_thread())
+        return PcapFacts()
+
+    with (
+        patch("soc_ai.tools.get_pcap.fetch_pcap_bytes", return_value=canned_pcap),
+        patch("soc_ai.tools.get_pcap.decode_pcap", _fake_decode),
+    ):
+        result = await get_pcap_facts(settings=settings, src_ip="10.0.0.1", dst_ip="10.0.0.2")
+
+    assert isinstance(result, PcapFacts)
+    assert on_main == [False], "decode_pcap ran on the event loop thread"
 
 
 # ---------------------------------------------------------------------------

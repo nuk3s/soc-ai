@@ -18,8 +18,11 @@ Security notes
   No f-string is ever interpolated into a shell command string that a
   subprocess will execute.
 * ``src_ip`` / ``dst_ip`` are validated with ``ipaddress.ip_address()``
-  before use.  Ports are coerced to ``int``.  Any value that fails
-  validation short-circuits to an error dict without spawning a process.
+  before use.  Ports are coerced to ``int`` and range-checked (0-65535);
+  ``window_minutes`` is clamped to ``MAX_WINDOW_MINUTES`` and a fetch that
+  would touch more than ``_MAX_PCAP_FILES`` ring files is refused.  Any value
+  that fails validation short-circuits to an error dict without spawning a
+  process.
 * ``-o UserKnownHostsFile=<data_dir>/known_hosts`` pins the sensor host key
   to a service-owned, persistent file (not the read-only homedir). First
   contact is accepted (``StrictHostKeyChecking=accept-new``) and *remembered*,
@@ -54,6 +57,13 @@ _LOGGER = logging.getLogger(__name__)
 # a single call puts on the sensor. An hour each side covers any flow an alert
 # can be about; the model-facing wrappers advertise the same ceiling.
 MAX_WINDOW_MINUTES = 60
+
+# Upper bound on how many so-pcap files one fetch will stream.  Each file is a
+# separate ssh + sudo tcpdump read of the whole file, so a dense ring inside an
+# in-range window is refused with an error that asks for a narrower window
+# rather than silently truncated (a truncated sweep would read as "no
+# packets" for the part it skipped).
+_MAX_PCAP_FILES = 100
 
 # libpcap global header is exactly 24 bytes.
 _PCAP_HEADER_LEN = 24
@@ -153,16 +163,23 @@ def _build_find_command(settings: Settings, start_ts: datetime, end_ts: datetime
     orchestrator's own computation.
 
     Returns a remote shell command string that:
-    1. Finds so-pcap.* files with mtime >= window_start (find -newermt).
+    1. Finds so-pcap.* files with mtime >= window_start (find -newermt
+       '@<epoch>').
     2. Filters to files whose embedded unix-ts <= window_end (awk on
        the last dot-separated field in the filename).
+
+    Both bounds are unix epochs.  A zone-less ``YYYY-MM-DD HH:MM:SS`` start
+    would be read by the sensor's ``find`` in the sensor's own timezone, so
+    on a sensor whose OS clock is not UTC the window would shift by the UTC
+    offset — west of UTC it moves past a live alert's files entirely and the
+    fetch finds nothing.  ``@<epoch>`` is timezone-independent.
     """
-    after = start_ts.strftime("%Y-%m-%d %H:%M:%S")
+    after = f"@{int(start_ts.timestamp())}"
     end_epoch = int(end_ts.timestamp())
     # ``so_suripcap_dir`` is operator config, not user input, and ``after`` is a
     # server-side timestamp — but we ``shlex.quote`` the dir as defense-in-depth
     # against operator-config self-injection into the remote shell string. The
-    # ``after`` value is a fixed-format strftime so it cannot contain a quote.
+    # ``after`` value is ``@`` plus an int so it cannot contain a quote.
     suripcap_dir = shlex.quote(settings.so_suripcap_dir)
     return (
         f"find {suripcap_dir} -name 'so-pcap.*' "
@@ -207,10 +224,18 @@ def _stream_filtered(settings: Settings, remote_path: str, bpf: str) -> bytes:
     Returns raw filtered pcap bytes (may be just the 24-byte global header
     if nothing matched — that is not an error).
 
-    tcpdump exits 1 when the BPF matches no packets.  We treat that the
-    same as exit 0 (empty but valid output).  Any other non-zero exit with
-    stderr is treated as an error and logged (but callers skip the file and
-    continue, not abort).
+    tcpdump exits 0 after reading a savefile whose BPF matched nothing.  Any
+    non-zero exit is a real error — the file could not be opened, the BPF
+    did not compile, or sudo refused without a tty — and raises
+    ``RuntimeError`` carrying the exit status and a stderr excerpt.  Callers
+    skip the file and continue; a file that has just rotated out of the ring
+    is not fatal, only every file failing is.  Reporting an error exit as an
+    empty capture would hand the model "no traffic" as evidence when the
+    fetch never ran.
+
+    stderr is not redirected on the sensor: it is the only signal that says
+    why tcpdump failed.  ssh runs without a tty, so sudo cannot prompt and
+    the subprocess timeout still bounds the call.
 
     The ``sudo_prefix`` is the first element of the remote command if
     ``settings.so_ssh_sudo`` is non-empty.  The command is built as a
@@ -230,10 +255,7 @@ def _stream_filtered(settings: Settings, remote_path: str, bpf: str) -> bytes:
     # from validated ipaddress objects + int ports only.  Quote both with
     # shlex.quote in the remote shell command string for robustness against
     # spaces and as defense-in-depth.
-    remote_cmd = (
-        f"{sudo_prefix}tcpdump -nn -r {shlex.quote(remote_path)} "
-        f"-w - {shlex.quote(bpf)} 2>/dev/null"
-    )
+    remote_cmd = f"{sudo_prefix}tcpdump -nn -r {shlex.quote(remote_path)} -w - {shlex.quote(bpf)}"
     ssh_args = _ssh_base_args(settings)
     proc = subprocess.run(  # noqa: S603 - arg-list, no shell; path from server listing, BPF from validated IPs
         [*ssh_args, remote_cmd],
@@ -241,12 +263,12 @@ def _stream_filtered(settings: Settings, remote_path: str, bpf: str) -> bytes:
         check=False,
         timeout=settings.so_ssh_timeout_s,
     )
-    if proc.returncode not in (0, 1):
-        # exit 1 = no BPF match (treated as empty); anything else is a
-        # real error (file missing, sudo denied, read error, etc.).
-        stderr = (proc.stderr or b"").decode(errors="replace")[:200]
-        _LOGGER.warning("tcpdump on %s exit=%d: %s", remote_path, proc.returncode, stderr)
-        return b""
+    if proc.returncode != 0:
+        # The excerpt ends up in the tool result the model reads, so keep it
+        # short.  tcpdump writes "reading from file ..." to stderr on success
+        # too, which is why stderr is only surfaced on a non-zero exit.
+        stderr = (proc.stderr or b"").decode(errors="replace").strip()[:200]
+        raise RuntimeError(f"tcpdump on {remote_path} exit={proc.returncode}: {stderr}")
     return proc.stdout or b""
 
 
@@ -318,7 +340,10 @@ def fetch_pcap_bytes(
     PermissionError
         SSH authentication failure.
     RuntimeError
-        Remote find failure or any other subprocess error.
+        Remote find failure, more candidate files than ``_MAX_PCAP_FILES``,
+        or tcpdump failing on every candidate file.  A tcpdump failure on
+        some files is logged and skipped as long as at least one file was
+        read.
     """
     bpf = _build_bpf(src_ip, dst_ip, src_port, dst_port)
     files = _list_remote_files(settings, start_ts, end_ts)
@@ -330,6 +355,11 @@ def fetch_pcap_bytes(
             settings.so_ssh_host,
         )
         return b""
+    if len(files) > _MAX_PCAP_FILES:
+        raise RuntimeError(
+            f"window spans {len(files)} so-pcap files on {settings.so_ssh_host} "
+            f"(max {_MAX_PCAP_FILES}); narrow window_minutes"
+        )
     _LOGGER.info(
         "pcap fetch: %d candidate file(s) for BPF %r on %s",
         len(files),
@@ -337,10 +367,21 @@ def fetch_pcap_bytes(
         settings.so_ssh_host,
     )
     chunks: list[bytes] = []
+    failures: list[str] = []
     for f in files:
-        data = _stream_filtered(settings, f, bpf)
+        try:
+            data = _stream_filtered(settings, f, bpf)
+        except RuntimeError as exc:
+            _LOGGER.warning("pcap fetch: %s", exc)
+            failures.append(str(exc))
+            continue
         if data and len(data) > _PCAP_HEADER_LEN:
             chunks.append(data)
+    if failures and len(failures) == len(files):
+        raise RuntimeError(
+            f"tcpdump failed on {len(failures)}/{len(files)} pcap files on "
+            f"{settings.so_ssh_host}: {failures[0]}"
+        )
     return _merge_pcaps(chunks)
 
 
@@ -377,11 +418,14 @@ async def get_pcap_facts(
         ``ipaddress.ip_address()`` — any non-IP value returns an error
         dict immediately (injection-safe boundary).
     src_port, dst_port:
-        Optional; coerced to ``int`` (``None`` skips port filtering).
+        Optional; coerced to ``int`` and must be 0-65535 (``None`` skips
+        port filtering).  An out-of-range port would not compile as a BPF
+        on the sensor, so it is refused here instead.
     window_minutes:
         Search window half-width, clamped to ``[1, MAX_WINDOW_MINUTES]``.
         The window is centred on ``alert_ts`` (or ``datetime.now(UTC)`` if
-        omitted): ``[ts - window_minutes, ts + window_minutes]``.
+        omitted): ``[ts - window_minutes, ts + window_minutes]``.  A value
+        that is not a finite number returns an error dict.
     alert_ts:
         UTC timestamp of the alert.  Defaults to ``datetime.now(UTC)``.
     """
@@ -423,21 +467,37 @@ async def get_pcap_facts(
     except (TypeError, ValueError):
         return {"ok": False, "error": f"invalid dst_port {dst_port!r}"}
 
+    # tcpdump rejects ``port 70000`` at BPF compile time with exit 1, which
+    # must never be mistaken for "no packets matched" — refuse it here.
+    if coerced_src_port is not None and not 0 <= coerced_src_port <= 65535:
+        return {"ok": False, "error": f"invalid src_port {src_port!r} (must be 0-65535)"}
+    if coerced_dst_port is not None and not 0 <= coerced_dst_port <= 65535:
+        return {"ok": False, "error": f"invalid dst_port {dst_port!r} (must be 0-65535)"}
+
     # ------------------------------------------------------------------
     # Time window
     # ------------------------------------------------------------------
+    # ``window_minutes`` is model-supplied.  ``int()`` of a float can raise
+    # OverflowError (inf) as well as ValueError (nan); the clamp keeps one call
+    # from sweeping the whole ring buffer through sudo tcpdump, and the wrappers
+    # advertise the same ceiling so the model has no reason to ask for more.
+    try:
+        minutes = min(MAX_WINDOW_MINUTES, max(1, int(window_minutes)))
+    except (TypeError, ValueError, OverflowError):
+        return {"ok": False, "error": f"invalid window_minutes {window_minutes!r}"}
+
     # ``alert_ts`` is typed ``datetime | None`` (the orchestrator passes
     # ``alert.timestamp``).  Guard the arithmetic anyway so a non-datetime
     # value can never raise out of this "never raises" surface — and so a
     # hostile string anchor short-circuits to an error dict without spawning
     # a subprocess (it could never reach the remote shell regardless, since
-    # the command embeds only ``strftime``/``int(timestamp())`` output).
+    # the command embeds only ``int(timestamp())`` output).
     anchor = alert_ts if alert_ts is not None else datetime.now(UTC)
     try:
-        delta = timedelta(minutes=min(MAX_WINDOW_MINUTES, max(1, int(window_minutes))))
+        delta = timedelta(minutes=minutes)
         start_ts = anchor - delta
         end_ts = anchor + delta
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         return {"ok": False, "error": f"invalid alert_ts/window_minutes: {exc}"}
 
     # ------------------------------------------------------------------
@@ -470,7 +530,7 @@ async def get_pcap_facts(
         return {"ok": False, "error": f"pcap fetch error: {type(exc).__name__}: {exc}"}
 
     # ------------------------------------------------------------------
-    # tcpdump exit 1 (no match) → empty bytes → empty PcapFacts
+    # No files, or no BPF match → empty bytes → empty PcapFacts
     # ------------------------------------------------------------------
     if not raw_bytes:
         _LOGGER.info(
@@ -486,10 +546,14 @@ async def get_pcap_facts(
         return facts
 
     # ------------------------------------------------------------------
-    # Decode
+    # Decode — off the event loop: decode_pcap is a per-packet Python loop
+    # over up to ``pcap_max_packets`` packets, which stalls every SSE stream
+    # and health poll in the process if it runs on the loop thread.
     # ------------------------------------------------------------------
     try:
-        facts = decode_pcap(raw_bytes, max_packets=settings.pcap_max_packets)
+        facts = await asyncio.to_thread(
+            decode_pcap, raw_bytes, max_packets=settings.pcap_max_packets
+        )
     except Exception as exc:
         _LOGGER.warning("get_pcap_facts: decode error: %s", exc)
         return {"ok": False, "error": f"pcap decode error: {type(exc).__name__}: {exc}"}

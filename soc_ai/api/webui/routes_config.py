@@ -101,6 +101,19 @@ class ConnTestOut(BaseModel):
     detail: str
 
 
+# Danger-zone keys that Settings requires non-empty. A blank value for one of
+# these still passes coerce (str -> "", csv -> []) and, for the credentials and
+# es_hosts, even validate_assignment — so it would be stored as a real override
+# and applied on the next restart: an empty SO username/password silently
+# replaces the env credentials, and es_hosts=[] makes ElasticClient raise before
+# the app is up. The optional connection fields (ES credentials, LiteLLM key,
+# the PCAP SSH settings) are deliberately NOT listed: blank is a legitimate
+# value for them.
+_DANGER_REQUIRED_KEYS: frozenset[str] = frozenset(
+    {"so_host", "so_username", "so_password", "es_hosts", "litellm_base_url"}
+)
+
+
 def _setting_value(spec: cfg_svc.SettingSpec, settings: Settings) -> bool | float | str:
     val = getattr(settings, spec.attr, None)
     if spec.type == "csv":
@@ -1241,6 +1254,21 @@ async def api_save_danger_setting(
             status_code=400, detail={"reason": "invalid_value", "hint": str(exc)}
         ) from exc
 
+    # A blank value for a required connection setting is never a valid override
+    # (see _DANGER_REQUIRED_KEYS). Refuse it here, before the secret handling
+    # and the persist, so it is a 400 regardless of CONFIG_SECRET_KEY.
+    if body.key in _DANGER_REQUIRED_KEYS and (
+        (isinstance(typed, str) and not typed.strip()) or (isinstance(typed, list) and not typed)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "empty_value",
+                "hint": f"{body.key} cannot be blank. Send a value, or delete the override "
+                "to revert to the environment value.",
+            },
+        )
+
     # 4. Determine actor for audit trail (id is int | None)
     user = await current_user(request)
     updated_by: int | None = user.id if user else None
@@ -1251,24 +1279,28 @@ async def api_save_danger_setting(
     #    an uncaught 500. No plaintext is written on this path.
     secret_box = request.app.state.secret_box
 
-    # Validate the live assignment BEFORE persisting for hot specs: a value that
-    # fails live validation (a field or cross-field constraint, e.g. PCAP_ENABLED
-    # requiring a non-empty SO_SSH_HOST, or a malformed internal_cidrs entry) must
-    # be refused up front rather than committed over the operator's prior override
-    # and then "rolled back" by DELETING the row — which would discard that prior
-    # value and revert to the env value on the next restart. Dry-run against a
-    # COPY of the live settings (the hot danger specs are all non-secret plaintext).
-    if spec.hot:
-        try:
-            setattr(settings.model_copy(), spec.attr, typed)
-        except (ValueError, TypeError, ValidationError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "reason": "invalid_value",
-                    "hint": f"{body.key} failed validation on apply. soc-ai did not save it.",
-                },
-            ) from exc
+    # Validate the assignment BEFORE persisting: a value that fails validation (a
+    # field or cross-field constraint, e.g. PCAP_ENABLED requiring a non-empty
+    # SO_SSH_HOST, a malformed internal_cidrs entry, or a URL with no host that
+    # got past the scheme check in coerce) must be refused up front rather than
+    # committed over the operator's prior override and then "rolled back" by
+    # DELETING the row — which would discard that prior value and revert to the
+    # env value on the next restart. For a restart-required spec the same dry-run
+    # is what apply_to_settings will do at boot: a value it refuses now would
+    # otherwise be stored as an override that fails on every restart. Dry-run
+    # against a COPY of the live settings; secret specs are validated from the
+    # plaintext (validate_assignment coerces str -> SecretStr) and the copy is
+    # discarded, so nothing is written or applied here.
+    try:
+        setattr(settings.model_copy(), spec.attr, typed)
+    except (ValueError, TypeError, ValidationError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "invalid_value",
+                "hint": f"{body.key} failed validation on apply. soc-ai did not save it.",
+            },
+        ) from exc
 
     try:
         async with request.app.state.db_sessionmaker() as db:
@@ -1298,6 +1330,31 @@ async def api_save_danger_setting(
         restart_required = True
 
     return {"ok": True, "restart_required": restart_required}
+
+
+@router.delete(
+    "/config/danger/setting/{key}",
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_clear_danger_setting(key: str, request: Request) -> dict[str, object]:
+    """Drop the stored override for a danger-zone setting.
+
+    This is the recovery path when a saved connection setting turns out to be
+    wrong: the next restart falls back to the environment value. The live value
+    is deliberately left alone (the env value is not re-read here and the SO/ES/
+    LiteLLM clients are built at startup anyway), so a restart is always
+    required. No-op when no override exists.
+    """
+    spec = cfg_svc.WHITELIST_BY_KEY.get(key)
+    if spec is None or not spec.danger:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "unknown_danger_key", "hint": "key is not a known danger setting"},
+        )
+    async with request.app.state.db_sessionmaker() as db:
+        await cfg_svc.delete_override(db, key)
+    return {"ok": True, "restart_required": True}
 
 
 # ── API keys (hot, write-only enrichment provider secrets) ────────────────────

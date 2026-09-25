@@ -5122,6 +5122,129 @@ class TestDangerZoneSave:
 
             assert asyncio.run(_read()) is None
 
+    def test_blank_value_is_refused_for_restart_keys(self, settings: Settings) -> None:
+        """A blank value for a connection setting Settings requires non-empty must
+        be refused up front — not stored as a real override. Otherwise the next
+        restart applies it: es_hosts=[] makes ElasticClient raise before the app
+        is up, and an empty SO password/username silently replaces the env
+        credentials."""
+        import asyncio
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        cases = [
+            ("es_hosts", ""),
+            ("es_hosts", " , "),
+            ("so_password", ""),
+            ("so_username", "   "),
+            ("so_host", ""),
+            ("litellm_base_url", "  "),
+        ]
+        for c in _client(settings):
+            for key, value in cases:
+                r = c.post(
+                    "/api/v1/config/danger/setting",
+                    json={"key": key, "value": value, "confirm": key},
+                )
+                assert r.status_code == 400, (key, r.text)
+                assert r.json()["detail"]["reason"] == "empty_value", (key, r.text)
+
+                async def _read(app=c.app, key=key) -> str | None:
+                    async with app.state.db_sessionmaker() as db:
+                        return await db.scalar(
+                            select(ConfigOverride.value).where(ConfigOverride.key == key)
+                        )
+
+                assert asyncio.run(_read()) is None, key
+
+            # The live connection settings are untouched.
+            live = c.app.state.settings
+            assert [str(h) for h in live.es_hosts] == ["https://so.example.com:9200/"]
+            assert live.so_username == "analyst"
+            assert live.so_password.get_secret_value() == "password123"
+
+    def test_optional_blank_values_still_accepted(self, settings: Settings) -> None:
+        """Blank is a legitimate value for the optional connection fields (the ES
+        credentials, the LiteLLM key, the PCAP SSH settings when PCAP is off), so
+        the required-key guard must not reject them."""
+        for c in _client(settings):
+            for key in ("es_username", "es_password", "litellm_api_key", "so_ssh_user"):
+                r = c.post(
+                    "/api/v1/config/danger/setting",
+                    json={"key": key, "value": "", "confirm": key},
+                )
+                assert r.status_code == 200, (key, r.text)
+
+    def test_restart_key_dry_run_refuses_unapplyable_value(self, settings: Settings) -> None:
+        """A restart-required value that Settings would reject on apply (a URL
+        with no host passes the scheme check in coerce) must be refused now with
+        no row stored — not persisted as an override that fails on every boot."""
+        import asyncio
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "so_host", "value": "http://", "confirm": "so_host"},
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"]["reason"] == "invalid_value"
+
+            async def _read(app=c.app) -> str | None:
+                async with app.state.db_sessionmaker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "so_host")
+                    )
+
+            assert asyncio.run(_read()) is None
+
+    def test_delete_danger_override_reverts_to_env(self, settings: Settings) -> None:
+        """DELETE /config/danger/setting/{key} drops the stored override so the
+        next restart falls back to the env value; GET reports source=env again."""
+        import asyncio
+
+        from soc_ai.store.models import ConfigOverride
+        from sqlalchemy import select
+
+        for c in _client(settings):
+            r = c.post(
+                "/api/v1/config/danger/setting",
+                json={"key": "so_username", "value": "override", "confirm": "so_username"},
+            )
+            assert r.status_code == 200
+            rows = c.get("/api/v1/config/danger").json()
+            assert next(x for x in rows if x["key"] == "so_username")["source"] == "db"
+
+            r = c.delete("/api/v1/config/danger/setting/so_username")
+            assert r.status_code == 200
+            assert r.json() == {"ok": True, "restart_required": True}
+
+            async def _read(app=c.app) -> str | None:
+                async with app.state.db_sessionmaker() as db:
+                    return await db.scalar(
+                        select(ConfigOverride.value).where(ConfigOverride.key == "so_username")
+                    )
+
+            assert asyncio.run(_read()) is None
+            rows = c.get("/api/v1/config/danger").json()
+            row = next(x for x in rows if x["key"] == "so_username")
+            assert row["source"] == "env"
+            assert row["isSet"] is True
+
+            # Deleting a key that has no override is a no-op, not an error.
+            assert c.delete("/api/v1/config/danger/setting/so_username").status_code == 200
+
+    def test_delete_rejects_non_danger_key(self, settings: Settings) -> None:
+        """Only danger-zone keys may be cleared through this route."""
+        for c in _client(settings):
+            for key in ("not_a_real_key", "shodan_api_key", "analyst_model"):
+                r = c.delete(f"/api/v1/config/danger/setting/{key}")
+                assert r.status_code == 400, key
+                assert r.json()["detail"]["reason"] == "unknown_danger_key"
+
     def test_secret_save_without_config_secret_key_returns_400_not_500(self) -> None:
         """Saving a SECRET danger setting with no CONFIG_SECRET_KEY → 400 (not 500),
         and no plaintext value is written to the DB."""
