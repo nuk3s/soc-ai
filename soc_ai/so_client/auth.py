@@ -148,6 +148,10 @@ class KratosAuth:
         self._strategy: str | None = None
         self._client = _make_async_client(settings)
         self._logged_in = False
+        # Counts the sessions a login has adopted. A 401 names the session it
+        # refused by this number, so a 401 that lands after another caller has
+        # already replaced that session does not log in a second time.
+        self._session_gen = 0
         # The API flow answers with this token and sets no cookie. None on the
         # browser flow, where the cookie jar carries the session.
         self._session_token: str | None = None
@@ -416,6 +420,7 @@ class KratosAuth:
     def _adopt(self, strategy: str, info: dict[str, Any] | None, *, accepted: bool) -> None:
         """Keep the session the last flow made."""
         self._logged_in = True
+        self._session_gen += 1
         if not accepted:
             return
         if self._strategy != strategy:
@@ -432,49 +437,69 @@ class KratosAuth:
         async with self._lock:
             if self._logged_in:
                 return
-            held = self._refusal_until - time.monotonic()
-            if held > 0:
-                raise SoAuthError(
-                    "SOC refused the last session. soc-ai holds the login for "
-                    f"{held:.0f} more seconds. Check the SO version and the login flow.",
-                    status_code=int(httpx.codes.UNAUTHORIZED),
-                )
+            await self._login_locked()
 
-            order = self._strategy_order()
-            for strategy in order:
-                is_last = strategy == order[-1]
-                try:
-                    status, info = await self._establish(strategy)
-                except _BrowserFlowUnavailable as exc:
-                    if is_last:
-                        raise SoAuthError(
-                            f"The Kratos browser flow could not complete: {exc}"
-                        ) from exc
-                    _LOGGER.info(
-                        "the Kratos browser flow is not available (%s). soc-ai tries the API flow.",
-                        exc,
-                    )
-                    continue
+    async def _relogin_if_stale(self, gen: int) -> None:
+        """Replace the session numbered ``gen`` after SOC answered it with 401.
 
-                if status == httpx.codes.OK:
-                    self._adopt(strategy, info, accepted=True)
-                    return
-                if status == httpx.codes.UNAUTHORIZED and not is_last:
-                    _LOGGER.info(
-                        "SOC refused the %s session (GET /api/info answered HTTP 401). "
-                        "soc-ai tries the API flow.",
-                        strategy,
-                    )
-                    continue
-
-                # The last flow. Keep the session, so the caller reads the real
-                # answer from SOC rather than an exception from soc-ai.
-                self._adopt(strategy, info, accepted=False)
-                if status == httpx.codes.UNAUTHORIZED:
-                    self._session_refused(
-                        f"GET /api/info answered HTTP 401 with a new {strategy} session"
-                    )
+        Several reads can be in flight on one expired session, and their 401s
+        land a few milliseconds apart. The first one replaces the session. The
+        others find the generation moved on and keep the fresh session, rather
+        than wipe the cookie jar out from under the callers already retrying
+        with it and log in once more. The check and the reset happen under the
+        login lock, so a late 401 cannot clear the jar while a login is between
+        its CSRF init and its credential submit.
+        """
+        async with self._lock:
+            if self._session_gen != gen:
                 return
+            self._logged_in = False
+            self._reset_credentials()
+            await self._login_locked()
+
+    async def _login_locked(self) -> None:
+        """Run the login flows. The caller holds ``self._lock``."""
+        held = self._refusal_until - time.monotonic()
+        if held > 0:
+            raise SoAuthError(
+                "SOC refused the last session. soc-ai holds the login for "
+                f"{held:.0f} more seconds. Check the SO version and the login flow.",
+                status_code=int(httpx.codes.UNAUTHORIZED),
+            )
+
+        order = self._strategy_order()
+        for strategy in order:
+            is_last = strategy == order[-1]
+            try:
+                status, info = await self._establish(strategy)
+            except _BrowserFlowUnavailable as exc:
+                if is_last:
+                    raise SoAuthError(f"The Kratos browser flow could not complete: {exc}") from exc
+                _LOGGER.info(
+                    "the Kratos browser flow is not available (%s). soc-ai tries the API flow.",
+                    exc,
+                )
+                continue
+
+            if status == httpx.codes.OK:
+                self._adopt(strategy, info, accepted=True)
+                return
+            if status == httpx.codes.UNAUTHORIZED and not is_last:
+                _LOGGER.info(
+                    "SOC refused the %s session (GET /api/info answered HTTP 401). "
+                    "soc-ai tries the API flow.",
+                    strategy,
+                )
+                continue
+
+            # The last flow. Keep the session, so the caller reads the real
+            # answer from SOC rather than an exception from soc-ai.
+            self._adopt(strategy, info, accepted=False)
+            if status == httpx.codes.UNAUTHORIZED:
+                self._session_refused(
+                    f"GET /api/info answered HTTP 401 with a new {strategy} session"
+                )
+            return
 
     # ── the srv-token and the refusal ceiling ────────────────────────────
 
@@ -541,6 +566,9 @@ class KratosAuth:
             headers.setdefault("X-Session-Token", self._session_token)
         if self._srv_token:
             headers.setdefault("X-Srv-Token", self._srv_token)
+        # The session this request goes out on. A 401 refuses THIS session,
+        # not whichever session is current by the time the 401 lands.
+        gen = self._session_gen
         resp = await self._client.request(method, url, headers=headers, **kwargs)
         if resp.status_code != httpx.codes.UNAUTHORIZED:
             self._session_accepted()
@@ -550,11 +578,10 @@ class KratosAuth:
             # soc-ai returns the 401 rather than feeding a login storm.
             return resp
         _LOGGER.info("Kratos session rejected (401); re-authenticating")
-        # Reset via a method call (not inline `= None`) so mypy doesn't
-        # narrow the token attrs to None and dead-code-eliminate the
-        # post-login re-reads — the async `login()` repopulates them.
-        self._clear_session()
-        await self.login()
+        # The reset happens inside a method call (not inline `= None`) so mypy
+        # doesn't narrow the token attrs to None and dead-code-eliminate the
+        # post-login re-reads — the login repopulates them.
+        await self._relogin_if_stale(gen)
         if self._session_token:
             headers["X-Session-Token"] = self._session_token
         if self._srv_token:
