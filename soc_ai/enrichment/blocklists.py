@@ -81,13 +81,54 @@ class BlocklistDB:
                 _LOGGER.warning("unknown blocklist source: %s (skipping)", source)
                 db.missing_sources.append(source)
                 continue
+            filename = _FEED_FILES[source]
+            before = db._indicator_count()
             try:
                 loader(db, data_dir)
-                db.loaded_sources.append(source)
             except FileNotFoundError as e:
                 _LOGGER.warning("blocklist source %s: file missing (%s)", source, e)
                 db.missing_sources.append(source)
+                continue
+            except Exception as e:
+                # A refresh interrupted mid-download, an upstream row with a null
+                # value or a hand-edited seed file all surface here as parse
+                # errors. The process must come up regardless: the feed reads as
+                # not loaded, and the startup warning in
+                # build_local_enrichment_context tells the operator to refresh.
+                _LOGGER.warning(
+                    "blocklist source %s: cannot parse %s (%s: %s); treating as not loaded",
+                    source,
+                    data_dir / filename,
+                    type(e).__name__,
+                    e,
+                )
+                db.missing_sources.append(source)
+                continue
+            if db._indicator_count() == before:
+                # The file parsed but held nothing: an error page saved as
+                # urlhaus.csv, an empty body, a `{}` dump, or an operator seed
+                # list with no entries yet. A feed that indexed nothing did not
+                # answer, and blocklist_checked is derived from loaded_sources,
+                # so it must not read as "checked, clean".
+                _LOGGER.warning(
+                    "blocklist source %s: %s holds no indicators; treating as not loaded",
+                    source,
+                    data_dir / filename,
+                )
+                db.missing_sources.append(source)
+                continue
+            db.loaded_sources.append(source)
         return db
+
+    def _indicator_count(self) -> int:
+        # Count entries, not keys: a feed whose indicators all overlap an earlier
+        # feed adds hits under existing keys, and it did index something.
+        return (
+            sum(len(hits) for hits in self.ips.values())
+            + sum(len(hits) for hits in self.domains.values())
+            + sum(len(hits) for hits in self.hashes.values())
+            + len(self.spamhaus_networks)
+        )
 
     def lookup_ip(self, ip: str) -> list[BlocklistHit]:
         key = _norm_ip(ip) or ip
@@ -227,8 +268,10 @@ def _load_threatfox(db: BlocklistDB, data_dir: Path) -> None:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            ioc_value = entry.get("ioc_value", "").strip()
-            ioc_type = entry.get("ioc_type", "").strip()
+            # ThreatFox has shipped rows with a null ioc_value; `or ""` keeps
+            # them from turning into a startup failure.
+            ioc_value = str(entry.get("ioc_value") or "").strip()
+            ioc_type = str(entry.get("ioc_type") or "").strip()
             tags_str = entry.get("tags", "") or ""
             tags = tuple(t.strip() for t in tags_str.split(",") if t.strip())
             try:
@@ -352,7 +395,14 @@ def _load_internal_seed(db: BlocklistDB, data_dir: Path) -> None:
         data = yaml.safe_load(f) or {}
     for attr, ind_type in (("ips", "ip"), ("domains", "domain"), ("hashes", "sha256")):
         for entry in data.get(attr) or []:
-            indicator = entry.get("indicator", "").strip()
+            if not isinstance(entry, dict):
+                # A bare `- 1.2.3.4` line is the common hand-editing slip; skip
+                # it rather than fail the whole seed list.
+                _LOGGER.warning(
+                    "internal_seed: skipping %s entry %r (expected a mapping)", attr, entry
+                )
+                continue
+            indicator = str(entry.get("indicator") or "").strip()
             raw_tags = entry.get("tags") or []
             tags = tuple(raw_tags) if isinstance(raw_tags, list) else (str(raw_tags),)
             if not indicator:
@@ -417,6 +467,15 @@ def _spamhaus_lookup(db: BlocklistDB, ip: str) -> list[BlocklistHit]:
             )
     return hits
 
+
+_FEED_FILES: dict[str, str] = {
+    "urlhaus": "urlhaus.csv",
+    "threatfox": "threatfox.json",
+    "feodo": "feodo.csv",
+    "tor": "tor_exits.txt",
+    "internal_seed": "internal_seed.yaml",
+    "spamhaus_drop": "spamhaus_drop.txt",
+}
 
 _LOADERS: dict[str, Callable[[BlocklistDB, Path], None]] = {
     "urlhaus": _load_urlhaus,

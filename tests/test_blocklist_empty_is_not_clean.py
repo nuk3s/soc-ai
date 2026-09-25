@@ -25,6 +25,7 @@ unchecked, which is its own false statement.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -411,3 +412,36 @@ def test_no_coverage_bullet_when_nothing_was_recorded() -> None:
         _enriched_ctx(_clean_internal_alert(), _internal_pair(sources=None))
     )
     assert not [b for b in bullets if "blocklist" in b]
+
+
+# ---------------------------------------------------------------------------
+# A feed file with nothing in it is the same absence of data
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_feed_that_indexed_nothing_is_not_a_clean_lookup(
+    settings_kratos: Settings, tmp_path: Path
+) -> None:
+    """The no-file case above is not the only way to end up with nothing
+    loaded. A refresh that wrote an error page or an empty body leaves a file
+    the loader accepts, and the result must still say it checked nothing."""
+    (tmp_path / "urlhaus.csv").write_text("<html><body>Unauthorized</body></html>\n")
+    (tmp_path / "tor_exits.txt").write_text("")
+    db = BlocklistDB.from_dir(tmp_path, sources=["urlhaus", "tor"])
+    e = await enrich_ip(EXTERNAL, settings=settings_kratos, blocklist=db)
+    assert e.blocklist_hits == []
+    assert e.blocklist_sources == []
+    assert e.blocklist_checked is False
+    assert any("no sources loaded" in err for err in e.errors), e.errors
+
+
+@pytest.mark.asyncio
+async def test_a_feed_that_did_not_parse_is_not_a_clean_lookup(
+    settings_kratos: Settings, tmp_path: Path
+) -> None:
+    (tmp_path / "threatfox.json").write_text('{"1": [{"ioc_value": "1.2.3')
+    db = BlocklistDB.from_dir(tmp_path, sources=["threatfox"])
+    e = await enrich_ip(EXTERNAL, settings=settings_kratos, blocklist=db)
+    assert e.blocklist_sources == []
+    assert e.blocklist_checked is False

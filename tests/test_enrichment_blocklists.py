@@ -370,3 +370,154 @@ def test_empty_blocklist_dir_warns_at_build(
         "local IOC reputation is DISABLED" in rec.message and "blocklists refresh" in rec.message
         for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# A feed file that exists but cannot be parsed must not stop the process.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "body", "source"),
+    [
+        pytest.param("threatfox.json", '{"1": [{"ioc_value": "1.2.3', "threatfox", id="truncated"),
+        pytest.param("threatfox.json", "", "threatfox", id="zero-byte"),
+        pytest.param(
+            "threatfox.json",
+            '{"1": [{"ioc_value": null, "ioc_type": "ip"}]}',
+            "threatfox",
+            id="null-ioc-value",
+        ),
+        pytest.param("internal_seed.yaml", "ips:\n  - 1.2.3.4\n", "internal_seed", id="bare-seed"),
+        pytest.param("internal_seed.yaml", "ips: [\n", "internal_seed", id="yaml-syntax"),
+    ],
+)
+def test_unreadable_feed_file_is_skipped_not_fatal(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    filename: str,
+    body: str,
+    source: str,
+) -> None:
+    """A refresh interrupted mid-download, an upstream row with a null value or
+    an operator's hand-edited seed file must degrade to "that feed did not
+    load", not take the FastAPI lifespan down with it."""
+    (tmp_path / filename).write_text(body, encoding="utf-8")
+    caplog.set_level("WARNING")
+    db = BlocklistDB.from_dir(tmp_path, sources=[source])
+    assert source in db.missing_sources
+    assert source not in db.loaded_sources
+    assert any(source in rec.message and filename in rec.message for rec in caplog.records)
+
+
+def test_non_utf8_feed_file_is_skipped_not_fatal(tmp_path: Path) -> None:
+    (tmp_path / "feodo.csv").write_bytes(b"\xff\xfe,not text\n")
+    db = BlocklistDB.from_dir(tmp_path, sources=["feodo"])
+    assert db.missing_sources == ["feodo"]
+    assert db.loaded_sources == []
+
+
+def test_one_corrupt_feed_does_not_take_the_others_down(tmp_path: Path) -> None:
+    (tmp_path / "threatfox.json").write_text("{", encoding="utf-8")
+    (tmp_path / "tor_exits.txt").write_text("198.51.100.99\n", encoding="utf-8")
+    db = BlocklistDB.from_dir(tmp_path, sources=["threatfox", "tor"])
+    assert db.loaded_sources == ["tor"]
+    assert db.missing_sources == ["threatfox"]
+    assert len(db.lookup_ip("198.51.100.99")) == 1
+
+
+def test_a_feed_that_only_overlaps_another_still_counts_as_loaded(tmp_path: Path) -> None:
+    """An operator seed list that repeats a public feed's indicators is not empty.
+
+    Hits land under keys the earlier feed already created, so a key count
+    would read the seed as holding nothing; the entry count sees both hits.
+    """
+    (tmp_path / "tor_exits.txt").write_text("198.51.100.99\n", encoding="utf-8")
+    (tmp_path / "internal_seed.yaml").write_text(
+        "ips:\n  - indicator: 198.51.100.99\n    tags: [known-bad]\n", encoding="utf-8"
+    )
+    db = BlocklistDB.from_dir(tmp_path, sources=["tor", "internal_seed"])
+    assert db.loaded_sources == ["tor", "internal_seed"]
+    assert db.missing_sources == []
+    assert len(db.lookup_ip("198.51.100.99")) == 2
+
+
+def test_corrupt_feed_does_not_raise_at_build(tmp_path: Path) -> None:
+    """build_local_enrichment_context promises to never raise; main.py's
+    lifespan holds it to that."""
+    from types import SimpleNamespace
+
+    from soc_ai.tools.enrichment import build_local_enrichment_context
+
+    (tmp_path / "threatfox.json").write_text('{"1": [{"ioc_value": "1.2.3', encoding="utf-8")
+    settings = SimpleNamespace(
+        blocklist_data_dir=tmp_path,
+        blocklist_sources=["threatfox"],
+        spamhaus_license_acknowledged=False,
+        maxmind_data_dir=tmp_path,
+        cloud_prefix_data_dir=tmp_path,
+    )
+    ctx = build_local_enrichment_context(settings)  # type: ignore[arg-type]
+    assert ctx.blocklist.loaded_sources == []
+    assert ctx.blocklist.missing_sources == ["threatfox"]
+
+
+# ---------------------------------------------------------------------------
+# A feed that parses but holds no indicators did not answer.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "body", "source"),
+    [
+        pytest.param(
+            "urlhaus.csv", "<html><body>Unauthorized</body></html>\n", "urlhaus", id="html-page"
+        ),
+        pytest.param("tor_exits.txt", "", "tor", id="empty-body"),
+        pytest.param("threatfox.json", "{}", "threatfox", id="empty-object"),
+        pytest.param("feodo.csv", "# first_seen_utc,dst_ip,dst_port\n", "feodo", id="header-only"),
+        pytest.param("internal_seed.yaml", "ips: []\ndomains: []\n", "internal_seed", id="seed"),
+    ],
+)
+def test_feed_with_no_indicators_is_not_reported_as_loaded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    filename: str,
+    body: str,
+    source: str,
+) -> None:
+    """``blocklist_checked`` is derived from ``loaded_sources``. A feed that
+    indexed nothing would otherwise turn every miss into "checked, clean"."""
+    (tmp_path / filename).write_text(body, encoding="utf-8")
+    caplog.set_level("WARNING")
+    db = BlocklistDB.from_dir(tmp_path, sources=[source])
+    assert db.loaded_sources == []
+    assert db.missing_sources == [source]
+    assert any(
+        source in rec.message and filename in rec.message and "no indicators" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_all_feeds_empty_fires_the_startup_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The "local IOC reputation is DISABLED" line must fire for a directory of
+    indicator-free files exactly as it does for an unseeded one."""
+    from types import SimpleNamespace
+
+    from soc_ai.tools.enrichment import build_local_enrichment_context
+
+    (tmp_path / "urlhaus.csv").write_text("<html><body>Unauthorized</body></html>\n")
+    (tmp_path / "tor_exits.txt").write_text("")
+    settings = SimpleNamespace(
+        blocklist_data_dir=tmp_path,
+        blocklist_sources=["urlhaus", "tor"],
+        spamhaus_license_acknowledged=False,
+        maxmind_data_dir=tmp_path,
+        cloud_prefix_data_dir=tmp_path,
+    )
+    caplog.set_level("WARNING")
+    ctx = build_local_enrichment_context(settings)  # type: ignore[arg-type]
+    assert ctx.blocklist.loaded_sources == []
+    assert any("local IOC reputation is DISABLED" in rec.message for rec in caplog.records)
