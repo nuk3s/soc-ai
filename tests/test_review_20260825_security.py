@@ -615,6 +615,120 @@ def test_typed_evidence_fix_does_not_resolve_planted_content_tokens() -> None:
     assert counts["findings_capped"] == 1
 
 
+# Short-circuit tool payloads are the model's OWN words echoed back: a
+# duplicate_call short-circuit carries the args it was called with, a tool error
+# carries the query fragment that failed. Neither is retrieved evidence, so a
+# value-shaped citation must not resolve (or corroborate) by matching them.
+_ECHOED_DOMAIN = "evil-c2-fake.example"
+_ECHOED_IP = "203.0.113.77"
+
+
+def _echo_finding() -> Any:
+    from soc_ai.agent.hunt import HuntFinding
+
+    return HuntFinding(
+        title="C2 beacon to known-bad domain",
+        detail="Host resolves and beacons to the domain.",
+        severity="critical",
+        category="threat",
+        hosts=["10.9.9.9"],
+        citations=[_ECHOED_DOMAIN, _ECHOED_IP],
+    )
+
+
+def test_hunt_duplicate_call_echo_does_not_ground_a_finding() -> None:
+    """A duplicate_call short-circuit from t_prevalence echoes the model's own
+    args; a critical threat finding citing the domain/IP from those args must
+    be stripped and capped exactly as if nothing had been gathered."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    tool_results = [
+        {
+            "tool_name": "t_prevalence",
+            "result": {
+                "duplicate_call": True,
+                "tool_name": "t_prevalence",
+                "args": {
+                    "ip": "10.9.9.9",
+                    "peer_ip": _ECHOED_IP,
+                    "domain": _ECHOED_DOMAIN,
+                    "lookback_days": 90,
+                },
+                "hint": "Same args were already called this investigation.",
+            },
+        }
+    ]
+    validated, counts = _validate_hunt_findings([_echo_finding()], tool_results)
+
+    f = validated[0]
+    assert f.citations == [], "citation resolved against the model's echoed args"
+    assert f.severity == "low", f"severity not capped: {f.severity} ({f.validator_note})"
+    assert f.validator_note is not None
+    assert counts["citations_stripped"] == 2
+    assert counts["findings_capped"] == 1
+
+
+def test_hunt_tool_error_fragment_echo_does_not_ground_a_finding() -> None:
+    """A tool error payload echoes the query fragment the model wrote (the
+    OQL validator's rejection); a citation matching that fragment must not
+    resolve, nor count as corroboration for a critical threat."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    tool_results = [
+        {
+            "tool_name": "t_enrich_domain",
+            "result": {
+                "error": True,
+                "type": "OqlValidationError",
+                "message": "unknown field in query",
+                "fragment": f"dns.query.name:{_ECHOED_DOMAIN} AND dst:{_ECHOED_IP}",
+            },
+        },
+        {
+            "tool_name": "t_query_events_oql",
+            "result": {"prefetch_already_has_this": True, "query": _ECHOED_DOMAIN},
+        },
+    ]
+    validated, counts = _validate_hunt_findings([_echo_finding()], tool_results)
+
+    f = validated[0]
+    assert f.citations == [], "citation resolved against an echoed error fragment"
+    assert f.severity == "low", f"severity not capped: {f.severity} ({f.validator_note})"
+    assert counts["citations_stripped"] == 2
+    assert counts["findings_capped"] == 1
+
+
+def test_hunt_genuine_prevalence_result_still_grounds_a_finding() -> None:
+    """Guard against over-correction: a real t_prevalence result naming the
+    same domain/IP (a retrieved novelty answer, not an echo) still resolves the
+    citations AND corroborates, so the critical threat keeps its severity."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    tool_results = [
+        {
+            "tool_name": "t_prevalence",
+            "result": {
+                "ip": "10.9.9.9",
+                "peer_ip": _ECHOED_IP,
+                "domain": _ECHOED_DOMAIN,
+                "first_seen": "2026-09-20T01:02:03Z",
+                "last_seen": "2026-09-24T01:02:03Z",
+                "distinct_days": 5,
+                "is_novel": True,
+                "rarity": "rare",
+            },
+        }
+    ]
+    validated, counts = _validate_hunt_findings([_echo_finding()], tool_results)
+
+    f = validated[0]
+    assert f.citations == [_ECHOED_DOMAIN, _ECHOED_IP]
+    assert f.severity == "critical", f"severity degraded: {f.severity} ({f.validator_note})"
+    assert f.validator_note is None
+    assert counts["citations_stripped"] == 0
+    assert counts["findings_capped"] == 0
+
+
 # Wire-string pivot leaves (M2 follow-up): four _PIVOT_DECISIVE_ATTRS values are
 # attacker-chosen free-form strings — an SMB file NAME the attacker picks, a
 # client-requested Kerberos SPN, a DCE-RPC endpoint/operation. Planting an
