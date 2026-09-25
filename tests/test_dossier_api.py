@@ -1551,6 +1551,56 @@ def test_bulk_override_refuses_a_json_shaped_role_or_criticality(client: TestCli
     assert resp.json()["updated"] == ["10.0.7.3"]
 
 
+def test_single_host_override_refuses_a_json_shaped_role_or_criticality(
+    client: TestClient,
+) -> None:
+    """The single-host declare is deliberately open on WHICH role a host has,
+    but not on WHERE the word lands. A role or grade sent as ``value_json``
+    resolves and renders like an override while the importance sort, the role
+    facet and the Hosts flags cell — all readers of the scalar — see an ungraded,
+    role-less host. The bulk route already refuses that shape; one host at a
+    time was the same silent burying, just slower."""
+    for field, junk in (("criticality", "super-important"), ("role", "srever")):
+        ip = "10.0.7.11"
+        _seed_host(client, ip)
+        resp = client.post(
+            f"/api/v1/dossiers/{ip}/override",
+            json={"field": field, "value_json": junk},
+        )
+        assert resp.status_code == 400, f"{field}: {resp.text}"
+        assert resp.json()["detail"]["reason"] == "not_a_json_field"
+        got = _field(client.get(f"/api/v1/dossiers/{ip}").json(), field)
+        assert got["source"] != "operator"
+        assert got["value"] is None
+
+    # A grade that is valid as a scalar is still refused as JSON: it would land
+    # in the column the order cannot read.
+    _seed_host(client, "10.0.7.12")
+    resp = client.post(
+        "/api/v1/dossiers/10.0.7.12/override",
+        json={"field": "criticality", "value_json": "critical"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["reason"] == "not_a_json_field"
+
+    # The open role vocabulary of the single-host declare is untouched: the same
+    # word sent as the scalar is accepted as it always was.
+    resp = client.post(
+        "/api/v1/dossiers/10.0.7.12/override", json={"field": "role", "value": "srever"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert _field(resp.json(), "role")["value"] == "srever"
+
+    # And the three fields a scalar cannot carry still take value_json.
+    _seed_host(client, "10.0.7.13")
+    resp = client.post(
+        "/api/v1/dossiers/10.0.7.13/override",
+        json={"field": "services_offered", "value_json": [{"port": 8006, "proto": "tcp"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _field(resp.json(), "services_offered")["source"] == "operator"
+
+
 def test_bulk_override_accepts_every_canonical_criticality_grade(client: TestClient) -> None:
     """The constraint is the importance sort's own rank map, so every grade the
     order can read is a grade an operator may declare in bulk."""

@@ -1320,6 +1320,47 @@ async def _current_dossier(request: Request, key: str, settings: Settings) -> Do
     return _dossier_out(resolved, profile)
 
 
+# The two fields a bulk declare constrains to a closed vocabulary — one word
+# each, both read by something other than the eye (the ROLES distribution and
+# facet; the importance order). Named once so the vocabulary checks and the
+# "not JSON-shaped" refusal cannot come to cover different fields.
+_SCALAR_VOCABULARY_FIELDS: tuple[str, ...] = ("role", dossier_store.CRITICALITY_FIELD)
+
+
+def _refuse_json_shaped_scalar(field: str, value_json: Any) -> None:
+    """Refuse a role or grade sent as ``value_json`` — on either declare route.
+
+    The bulk vocabulary gates read the SCALAR, so the same crafted request they
+    refuse walked straight past them with the word in `value_json` instead — and
+    landed worse than the hole they close. The resolver takes the operator lane
+    whichever half holds the value, so the page renders `super-important`; the
+    importance sort and the Hosts flags cell both read the scalar, so the order
+    ranks the host as ungraded and the table shows no grade at all. Declared,
+    unreadable, and invisible on the one screen the declaration was made from.
+
+    The single-host declare has no vocabulary gate to walk past — its role
+    vocabulary is open on purpose — but the burying is the same: the word an
+    operator declared for one host lands in the column nothing ranks on. So the
+    shape is refused on both routes, and the one writer keeps one contract.
+
+    Refused rather than vocabulary-checked, because a role and a grade are
+    single words: even `value_json: "critical"` is a valid grade written to the
+    column that nothing ranks on. `value_json` exists for the three fields a
+    scalar cannot carry, and these two are not among them.
+    """
+    if field in _SCALAR_VOCABULARY_FIELDS and value_json is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "not_a_json_field",
+                "hint": (
+                    f"{field} is a single word. Send it as `value`. `value_json` is for "
+                    "services_offered, activity_profile and management_plane."
+                ),
+            },
+        )
+
+
 @router.post(
     "/dossiers/{ip}/override",
     response_model=DossierOut,
@@ -1341,7 +1382,8 @@ async def set_dossier_override(
 
     An override with neither a value nor a structured value is refused: it would
     resolve to nothing while looking like a decision. To hand a field back to the
-    builder, DELETE the override.
+    builder, DELETE the override. ``role`` and ``criticality`` are refused as
+    ``value_json`` for the reason :func:`_refuse_json_shaped_scalar` gives.
 
     A BLANK value counts as no value. Whitespace is not a declaration, and stored
     as one it would still win in the resolver — pinning the field to empty and
@@ -1363,6 +1405,7 @@ async def set_dossier_override(
                 "hint": "An override needs a value. DELETE it to accept the inference.",
             },
         )
+    _refuse_json_shaped_scalar(field, body.value_json)
     actor = await identify_caller(request)
     async with request.app.state.db_sessionmaker() as db:
         row = await dossier_store.set_override(
@@ -1387,12 +1430,6 @@ async def set_dossier_override(
 # A selection is bounded by what an operator can meaningfully review before
 # clicking. It is also the ceiling on one request's write loop.
 MAX_BULK_HOSTS = 500
-
-# The two fields a bulk declare constrains to a closed vocabulary — one word
-# each, both read by something other than the eye (the ROLES distribution and
-# facet; the importance order). Named once so the vocabulary checks and the
-# "not JSON-shaped" refusal below cannot come to cover different fields.
-_SCALAR_VOCABULARY_FIELDS: tuple[str, ...] = ("role", dossier_store.CRITICALITY_FIELD)
 
 
 @router.post(
@@ -1440,30 +1477,7 @@ async def bulk_set_dossier_override(
                 "hint": ("An override needs a value. DELETE it per host to accept the inference."),
             },
         )
-    if field in _SCALAR_VOCABULARY_FIELDS and body.value_json is not None:
-        # The vocabulary gates below read the SCALAR, so the same crafted request
-        # they refuse walked straight past them with the word in `value_json`
-        # instead — and landed worse than the hole they close. The resolver takes
-        # the operator lane whichever half holds the value, so the page renders
-        # `super-important`; the importance sort and the Hosts flags cell both
-        # read the scalar, so the order ranks the host as ungraded and the table
-        # shows no grade at all. Declared, unreadable, and invisible on the one
-        # screen the declaration was made from.
-        #
-        # Refused rather than vocabulary-checked, because a role and a grade are
-        # single words: even `value_json: "critical"` is a valid grade written to
-        # the column that nothing ranks on. `value_json` exists for the three
-        # fields a scalar cannot carry, and these two are not among them.
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "not_a_json_field",
-                "hint": (
-                    f"{field} is a single word. Send it as `value`. `value_json` is for "
-                    "services_offered, activity_profile and management_plane."
-                ),
-            },
-        )
+    _refuse_json_shaped_scalar(field, body.value_json)
     if field == "role" and value is not None and value not in ROLE_VOCABULARY:
         # BULK role is closed vocabulary; the SINGLE-host declare is deliberately
         # not. That asymmetry is the whole point. One operator who knows a
