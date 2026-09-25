@@ -225,3 +225,32 @@ def test_login_per_ip_spray_lockout(auth_client: TestClient) -> None:
     r = auth_client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW})
     assert r.status_code == 429
     assert r.json()["detail"]["reason"] == "too_many_attempts"
+
+
+def test_login_lockout_survives_ipv6_address_rotation(auth_settings: Settings) -> None:
+    """Five failed logins for one username from five addresses inside the same
+    IPv6 /64 still trip the per-(ip, username) throttle: one host owns the whole
+    /64, so rotating the interface identifier is not a new source."""
+    settings = auth_settings.model_copy(update={"proxy_trusted_ips": ["testclient"]})
+    for client in _client(settings):
+        for i in range(1, 6):
+            r = client.post(
+                "/api/v1/login",
+                json={"username": "admin", "password": "wrong"},
+                headers={"X-Forwarded-For": f"2001:db8::{i}"},
+            )
+            assert r.status_code == 401
+        r = client.post(
+            "/api/v1/login",
+            json={"username": "admin", "password": ADMIN_PW},
+            headers={"X-Forwarded-For": "2001:db8::ffff"},
+        )
+        assert r.status_code == 429
+        assert r.json()["detail"]["reason"] == "too_many_attempts"
+        # A different /64 is a different source and is not locked.
+        r = client.post(
+            "/api/v1/login",
+            json={"username": "admin", "password": ADMIN_PW},
+            headers={"X-Forwarded-For": "2001:db9::1"},
+        )
+        assert r.status_code == 200
