@@ -15,15 +15,22 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.hunting.execute import Candidate
-from soc_ai.hunting.leads import LeadOutcome, content_fingerprint, form_leads, record_observation
+from soc_ai.hunting.leads import (
+    STATUS_OPEN,
+    LeadOutcome,
+    _lead_shape,
+    content_fingerprint,
+    form_leads,
+    record_observation,
+)
 from soc_ai.hunting.spec import HuntSpec
-from soc_ai.hunting.weight import Kind, alert_weight
+from soc_ai.hunting.weight import DEFAULT_FLOOR, DEFAULT_HALF_LIFE_HOURS, Kind, alert_weight
 from soc_ai.store.hunt_spec_state import GAP_SCOPE
-from soc_ai.store.models import EntityObservation
+from soc_ai.store.models import EntityObservation, Lead
 
 __all__ = [
     "ALERT_SPEC_ID",
@@ -173,13 +180,22 @@ async def observe_alert_verdict(
     weight = alert_weight(verdict)
     entities = internal_hosts(hosts)
     if weight is None:
-        await db.execute(
-            delete(EntityObservation).where(
-                EntityObservation.spec_id == ALERT_SPEC_ID,
-                EntityObservation.fingerprint == alert_id,
-            )
+        mine = (
+            EntityObservation.spec_id == ALERT_SPEC_ID,
+            EntityObservation.fingerprint == alert_id,
         )
+        attached = sorted(
+            {
+                int(i)
+                for i in (
+                    await db.execute(select(EntityObservation.lead_id).where(*mine))
+                ).scalars()
+                if i is not None
+            }
+        )
+        await db.execute(delete(EntityObservation).where(*mine))
         await db.commit()
+        await _drop_from_leads(db, attached, now=now)
         return LeadOutcome()
     if not entities:
         return LeadOutcome()
@@ -205,6 +221,54 @@ async def observe_alert_verdict(
             weight=weight,
         )
     return await form_leads(db, entity_keys=[("host", h) for h in entities], now=now)
+
+
+async def _drop_from_leads(db: AsyncSession, lead_ids: Sequence[int], *, now: datetime) -> None:
+    """Reshape or close the open leads whose alert observation was just deleted.
+
+    A true positive is finding-grade and forms a lead alone. Deleting the
+    observation used to leave that lead open with no evidence: nothing else
+    closes a lead, so it sat in the queue for good, and with the loop on it
+    read as "hunt queued" while every wake skipped it for citing nothing. A
+    lead that has nothing left is dismissed, which keeps the analyst's answer
+    in the ledger. A lead that still holds other observations is reshaped
+    from them, the way a sweep would reshape it.
+
+    A lead that carries a hunt, or that an analyst already closed, is left as
+    it is. The hunt ran on the evidence as it stood, and the decision on it
+    is the analyst's.
+    """
+    if not lead_ids:
+        return
+    # The import is local: soc_ai.store.leads reaches back into this module.
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - avoids an import cycle
+
+    for lead_id in lead_ids:
+        lead = await db.get(Lead, lead_id)
+        if lead is None or lead.status != STATUS_OPEN or lead.hunt_id:
+            continue
+        kinds, subjects, _shadow = await _lead_shape(
+            db, lead.id, at=now, half_life_hours=DEFAULT_HALF_LIFE_HOURS, floor=DEFAULT_FLOOR
+        )
+        if not subjects:
+            await leads_store.dismiss(
+                db,
+                lead.id,
+                reason="other",
+                note="The alert that formed this lead was re-triaged as a false positive.",
+                by="soc-ai",
+                now=now,
+            )
+            continue
+        # The entities the remaining observations are about lead the list;
+        # the ones the lead merely named follow, as on an extend.
+        named = {tuple(e) for e in (lead.entities_json or []) if len(e) == 2} | subjects
+        names = [*sorted(subjects), *sorted(named - subjects)]
+        lead.kinds_json = sorted(kinds)
+        lead.entities_json = [list(e) for e in names]
+        lead.scope_count = len(subjects)
+        lead.updated_at = now.replace(tzinfo=None)
+        await db.commit()
 
 
 async def observe_hunt_finding(

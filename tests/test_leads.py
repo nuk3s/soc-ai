@@ -22,6 +22,7 @@ from soc_ai.hunting.leads import (
     record_observation,
     weigh_entity,
 )
+from soc_ai.hunting.sources import observe_alert_verdict
 from soc_ai.hunting.weight import Kind
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import EntityObservation, Lead
@@ -425,6 +426,77 @@ async def test_a_true_positive_alert_forms_a_lead_alone(settings_kratos: Setting
         leads = (await db.execute(select(Lead))).scalars().all()
     assert len(outcome.formed) == 1
     assert leads[0].single_signal is False
+
+
+async def _alert(db, verdict: str, *, alert_id: str = "alert-1", now=_NOW):  # type: ignore[no-untyped-def]
+    return await observe_alert_verdict(
+        db,
+        alert_id=alert_id,
+        rule_name="ET MALWARE Test",
+        verdict=verdict,
+        confidence=0.9,
+        hosts=[_HOST[1]],
+        now=now,
+    )
+
+
+async def test_a_verdict_changed_to_false_positive_closes_the_lead_it_formed(
+    settings_kratos: Settings,
+) -> None:
+    # The alert formed the lead alone. Deleting the observation and leaving
+    # the lead open left a lead with no evidence in the queue for good.
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        lead = await db.get(Lead, first.formed[0])
+    assert rows == []
+    assert lead is not None
+    assert lead.status == "dismissed"
+    assert lead.dismissed_reason == "other"
+    assert lead.dismissed_at is not None
+    assert lead.hunt_id is None
+
+
+async def test_a_false_positive_reshapes_a_lead_that_still_holds_other_observations(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=_NOW + timedelta(minutes=5))
+        await form_leads(db, entity_keys=[_HOST], now=_NOW + timedelta(minutes=5))
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        lead = await db.get(Lead, first.formed[0])
+    assert [r.kind for r in rows] == ["off_hours"]
+    assert lead is not None
+    assert lead.status == STATUS_OPEN
+    assert lead.kinds_json == ["off_hours"]
+    assert lead.entities_json == [list(_HOST)]
+    assert lead.scope_count == 1
+    assert {r.lead_id for r in rows} == {lead.id}
+
+
+async def test_a_false_positive_leaves_a_hunted_lead_alone(settings_kratos: Settings) -> None:
+    # The hunt was run on the evidence as it stood. Its lead keeps the hunt
+    # and the analyst's decision on it; only the observation goes.
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        lead = await db.get(Lead, first.formed[0])
+        assert lead is not None
+        lead.status = "hunting"
+        lead.hunt_id = "hunt-1"
+        await db.commit()
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        await db.refresh(lead)
+    assert rows == []
+    assert lead.status == "hunting"
+    assert lead.hunt_id == "hunt-1"
+    assert lead.dismissed_at is None
 
 
 async def test_a_needs_more_info_alert_does_not_form_alone(settings_kratos: Settings) -> None:
