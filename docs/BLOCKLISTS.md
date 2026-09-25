@@ -21,8 +21,16 @@ timer, the cron alternative and the synth-eval snapshot pinning.
 The job writes each feed under the exact filename that the matching loader in
 `soc_ai/enrichment/blocklists.py` reads from `blocklist_data_dir`. It writes the format
 that the loader parses. The job writes the download atomically. It writes a temporary
-file in the same directory and then calls `os.replace`. A partial or failed download can
-never corrupt a live feed file that triage reads.
+file in the same directory and then calls `os.replace`, so an interrupted write can
+never leave a half-written live feed file that triage reads.
+
+An HTTP 200 alone does not replace a feed. Before the swap, the job runs the download
+through the same loader that triage uses. A body that parses to no indicator at all is
+discarded: an empty body, a sign-in or WAF challenge page served as HTML, a JSON error
+document, or a download that ended early. The previous file stays in place, the feed is
+reported as `FAIL`, and the job exits non-zero so the timer log shows it. The
+cloud-prefix half applies the same rule: the Cloudflare list must contain at least one
+CIDR line, and the AWS, GCP and Azure documents must carry their top-level prefix list.
 
 This job never fetches 2 configured sources over the network:
 
@@ -75,7 +83,8 @@ soc-ai blocklists refresh --source urlhaus
 ```
 
 The output reports `ok`, `FAIL` or `skip` for each feed. The exit code is non-zero only
-if a feed failed with an HTTP error or a write error. A skipped abuse.ch feed means
+if a feed failed with an HTTP error, a write error, or a body that the loader cannot
+turn into at least one indicator (see above). A skipped abuse.ch feed means
 that you set no Auth-Key. That state is expected, and it keeps the exit code 0.
 
 The job writes only to the configured `blocklist_data_dir` and `cloud_prefix_data_dir`.

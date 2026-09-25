@@ -6,6 +6,7 @@ tests/test_blocklist_refresh.py.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -160,6 +161,95 @@ async def test_refresh_cloud_prefixes_cloudflare_wraps_txt_in_json_envelope(tmp_
     assert "104.16.0.0/13" in written["prefixes"]
     # Comment lines are stripped from the JSON envelope.
     assert "# comment" not in written["prefixes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    ["<html>blocked</html>", ""],
+    ids=["html-challenge-page", "empty-body"],
+)
+async def test_refresh_cloud_cloudflare_rejects_body_without_cidrs(
+    tmp_path: Path, body: str
+) -> None:
+    """A 200 from www.cloudflare.com/ips-v4 that carries no CIDR line (a WAF
+    challenge page, an empty body) is a failed attempt: the good cloudflare.json
+    stays as it was and the status entry records the error, not a success."""
+    import json
+
+    good = b'{"prefixes": ["1.1.1.0/24"]}'
+    (tmp_path / "cloudflare.json").write_bytes(good)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(REFRESH_URLS["cloudflare_v4"]).mock(return_value=httpx.Response(200, text=body))
+        results = await refresh_cloud_prefixes(tmp_path, sources=["cloudflare"])
+
+    assert results[0].success is False
+    assert results[0].error
+    assert (tmp_path / "cloudflare.json").read_bytes() == good
+    status = json.loads((tmp_path / "cloud_refresh_status.json").read_text())
+    assert "last_error" in status["cloudflare"]
+    assert "last_success" not in status["cloudflare"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_cloud_cloudflare_keeps_only_cidr_lines(tmp_path: Path) -> None:
+    """Stray non-CIDR lines are dropped from the envelope, not fatal."""
+    import json
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(REFRESH_URLS["cloudflare_v4"]).mock(
+            return_value=httpx.Response(200, text="1.1.1.0/24\nnot-a-prefix\n104.16.0.0/13\n")
+        )
+        results = await refresh_cloud_prefixes(tmp_path, sources=["cloudflare"])
+    assert results[0].success is True
+    written = json.loads((tmp_path / "cloudflare.json").read_text())
+    assert written["prefixes"] == ["1.1.1.0/24", "104.16.0.0/13"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_cloud_json_feed_requires_expected_top_level_list(tmp_path: Path) -> None:
+    """Valid JSON that is not the provider's feed shape (a JSON error document,
+    the wrong provider's file) is rejected rather than written over aws.json."""
+    good = b'{"prefixes": [{"ip_prefix": "3.5.140.0/22"}]}'
+    (tmp_path / "aws.json").write_bytes(good)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(REFRESH_URLS["aws_prefixes"]).mock(
+            return_value=httpx.Response(200, text='{"values":[]}')
+        )
+        results = await refresh_cloud_prefixes(tmp_path, sources=["aws"])
+    assert results[0].success is False
+    assert "prefixes" in (results[0].error or "")
+    assert (tmp_path / "aws.json").read_bytes() == good
+
+
+@pytest.mark.asyncio
+async def test_refresh_cloud_torn_write_keeps_old_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prefix files go through the temp-file + os.replace path: a failure
+    at the final rename leaves the old aws.json intact, no temp file behind,
+    and the attempt recorded as a failure in the status file."""
+    import json
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise OSError("simulated replace failure")
+
+    good = b'{"prefixes": [{"ip_prefix": "3.5.140.0/22"}]}'
+    (tmp_path / "aws.json").write_bytes(good)
+    monkeypatch.setattr("soc_ai.enrichment.blocklist_refresh.os.replace", _boom)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(REFRESH_URLS["aws_prefixes"]).mock(
+            return_value=httpx.Response(200, text='{"prefixes":[]}')
+        )
+        results = await refresh_cloud_prefixes(tmp_path, sources=["aws"])
+
+    assert results[0].success is False
+    assert "simulated replace failure" in (results[0].error or "")
+    assert (tmp_path / "aws.json").read_bytes() == good
+    assert [name for name in os.listdir(tmp_path) if name.endswith(".tmp")] == []
+    status = json.loads((tmp_path / "cloud_refresh_status.json").read_text())
+    assert "last_error" in status["aws"]
+    assert "last_success" not in status["aws"]
 
 
 @pytest.mark.asyncio
