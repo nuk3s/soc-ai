@@ -279,6 +279,60 @@ async def test_planted_internal_identifiers_in_tool_results_do_not_egress() -> N
 
 
 @pytest.mark.asyncio
+async def test_whitelisted_identity_fields_in_tool_results_do_not_egress() -> None:
+    """The OQL whitelist exposes identity-bearing fields whose values have no
+    regex shape: winlogbeat's ``winlog.computer_name`` and Zeek's
+    ``ntlm.server_nb_computer_name`` (bare NetBIOS names) and
+    ``kerberos.client`` (a ``user/REALM`` principal). Only the field-aware
+    harvest can know they are internal; on the default single-shot path there
+    is no other backstop, so every one planted here must be tokenised before
+    egress — and adjudicate must still SUCCEED, not refuse."""
+    from soc_ai.oracle.client import adjudicate
+
+    settings = _make_settings()
+    ctx = _make_ctx(settings)
+
+    planted_result: dict[str, Any] = {
+        "total": 1,
+        "hits": [
+            {
+                "_id": "evt-planted-2",
+                "winlog": {"computer_name": "FILESRV"},
+                "ntlm": {"server_nb_computer_name": "PDC01"},
+                "kerberos": {"client": "jdoe/ACME.COM"},
+            }
+        ],
+    }
+    loop_messages = [_msg(_tool_return("t_query_events_oql", planted_result))]
+
+    captured: list[str] = []
+
+    async def _capture(payload: str, *, settings: Any) -> str:
+        captured.append(payload)
+        return _verdict_json()
+
+    with patch("soc_ai.oracle.client._call_oracle_raw", _capture):
+        result = await adjudicate(
+            ctx,
+            enriched=_stub_enriched(),
+            local_report=_stub_report(),
+            transcript_text="",
+            loop_messages=loop_messages,
+        )
+
+    assert result is not None, "sanitization (not refusal) is the expected path"
+    assert len(captured) == 1
+    payload = captured[0]
+    assert "FILESRV" not in payload, "winlog.computer_name egressed from a tool result"
+    assert "PDC01" not in payload, "ntlm.server_nb_computer_name egressed from a tool result"
+    assert "jdoe" not in payload, "kerberos.client account egressed from a tool result"
+    assert "ACME.COM" not in payload, "kerberos.client realm egressed from a tool result"
+    assert "HOST_" in payload
+    assert "USER_" in payload
+    assert "evt-planted-2" in payload
+
+
+@pytest.mark.asyncio
 async def test_residue_in_tool_results_fails_closed() -> None:
     """If sanitization misses residue inside a tool result, the independent
     residue sweep must refuse the whole adjudication — never send."""

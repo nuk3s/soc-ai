@@ -132,6 +132,16 @@ _USER_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+# USER fields that go through the credential-stopset gate instead of the
+# unconditional route above.  Zeek's ``kerberos.client`` carries a ``user/REALM``
+# principal — an account name and the AD realm in one string, sitting in no ECS
+# user field and with no regex shape the wire gate catches, so it egressed raw.
+# It cannot join ``_USER_FIELDS``: Zeek logs ``-`` for an absent client on a large
+# share of ``kerberos.log`` records, and an unconditional USER label for ``-``
+# would propagate into every hyphen of free text (``logon type 3 - see details``).
+# Matched as a dotted-path suffix, so ``zeek.kerberos.client`` is covered too.
+_GATED_USER_FIELDS: frozenset[str] = frozenset({"kerberos.client"})
+
 # Winlog/EVTX credential LEAF keys — matched case-insensitively against the last
 # path segment, wherever they nest (``winlog.event_data.TargetUserName``). These
 # carry the account name verbatim and are not in ``_USER_FIELDS``. The credential
@@ -181,6 +191,14 @@ _WINLOG_HOST_LEAF_KEYS: frozenset[str] = frozenset(
         "targethostname",
         "remotehost",
         "remotemachine",
+        # The ECS-flattened spellings the OQL whitelist exposes to the local loop:
+        # winlogbeat's own ``winlog.computer_name`` (top-level, not under
+        # ``event_data``) and Zeek NTLM's ``ntlm.server_nb_computer_name`` (the
+        # server's bare NetBIOS name).  Their FQDN-valued siblings
+        # (``server_dns_computer_name``, ``dhcp.client_fqdn``) stay with the
+        # suffix rule, per the domain/FQDN exclusion above.
+        "computer_name",
+        "server_nb_computer_name",
     }
 )
 
@@ -687,6 +705,13 @@ def _try_harvest_scalar(
     # USER fields — unconditional.
     if any(s in _USER_FIELDS for s in suffixes_of_path):
         mapping.label_for(value, "USER")
+        return
+
+    # Gated USER fields (``kerberos.client``) — honour the credential stopset so
+    # Zeek's ``-`` placeholder is left verbatim rather than learned as a label.
+    if any(s in _GATED_USER_FIELDS for s in suffixes_of_path):
+        if not _is_nonusername_token(value):
+            mapping.label_for(value, "USER")
         return
 
     # Winlog/EVTX credential leaf keys (TargetUserName / SubjectUserName /
