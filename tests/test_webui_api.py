@@ -1838,6 +1838,8 @@ def test_egress_policy_all_off_is_zero_egress(settings_kratos: Settings) -> None
             "analyst_cloud",
             "notifications",
             "rag_gateway",
+            "misp",
+            "update_check",
         }
         assert all(d["enabled"] is False for d in body["destinations"])
         # posture strings are populated + honest for the analyst destination
@@ -1859,6 +1861,37 @@ def test_egress_policy_flip_one_knob_breaks_zero_egress(settings_kratos: Setting
         # the others remain disabled
         assert by_id["oracle"]["enabled"] is False
         assert by_id["notifications"]["enabled"] is False
+
+
+def test_egress_policy_misp_url_breaks_zero_egress(settings_kratos: Settings) -> None:
+    """A configured MISP URL is a real outbound client (every non-internal
+    indicator plus the API key goes to that host, gated by nothing else), so the
+    page must list it as enabled and drop the zero-egress claim."""
+    settings = settings_kratos.model_copy(update={"misp_url": "https://misp.vendor.example"})
+    for client in _egress_client(settings):
+        body = client.get("/api/v1/config/egress-policy").json()
+        assert body["zero_egress"] is False
+        by_id = {d["id"]: d for d in body["destinations"]}
+        assert by_id["misp"]["enabled"] is True
+        assert "misp.vendor.example" in by_id["misp"]["detail"]
+        assert by_id["misp"]["count_7d"] is None  # no dedicated audit kind
+        assert by_id["oracle"]["enabled"] is False
+        assert by_id["online_enrichment"]["enabled"] is False
+
+
+def test_egress_policy_update_check_breaks_zero_egress(settings_kratos: Settings) -> None:
+    """The opt-in release check fetches api.github.com; with it on the page must
+    say so rather than report zero egress."""
+    settings = settings_kratos.model_copy(update={"update_check_enabled": True})
+    for client in _egress_client(settings):
+        body = client.get("/api/v1/config/egress-policy").json()
+        assert body["zero_egress"] is False
+        by_id = {d["id"]: d for d in body["destinations"]}
+        assert by_id["update_check"]["enabled"] is True
+        assert "api.github.com" in by_id["update_check"]["redaction"]
+        assert by_id["update_check"]["count_7d"] is None
+        assert by_id["misp"]["enabled"] is False
+        assert by_id["oracle"]["enabled"] is False
 
 
 def test_egress_policy_web_search_needs_url_not_just_toggle(settings_kratos: Settings) -> None:
@@ -1956,7 +1989,7 @@ def test_egress_policy_counts_null_when_audit_errors(settings_kratos: Settings) 
             assert resp.status_code == 200
             body = resp.json()
             # table still returned in full
-            assert len(body["destinations"]) == 7
+            assert len(body["destinations"]) == 9
             # every count is null (unknown), never a misleading 0
             assert all(d["count_7d"] is None for d in body["destinations"])
 
@@ -4681,9 +4714,86 @@ def test_investigation_no_oracle_yields_null(client: TestClient) -> None:
 # User management JSON API — /api/v1/config/users
 # ---------------------------------------------------------------------------
 
+ADMIN_PW_USERS = "test-users-admin-pw"
 
-def test_create_user_appears_in_list(client: TestClient) -> None:
+
+@pytest.fixture
+def admin_session_client(settings_kratos: Settings) -> Iterator[TestClient]:
+    """The default auth-off client, logged in as the bootstrap admin.
+
+    Creating a user and changing a role mint a credential that outlives a later
+    flip to auth-on, so — like reset-password and token minting — they demand a
+    real session user even when the admin gate no-ops. The cookie makes every
+    mutating call CSRF-checked, hence the default Origin header."""
+    settings = settings_kratos.model_copy(
+        update={"bootstrap_admin_password": SecretStr(ADMIN_PW_USERS)}
+    )
+    for client in _client(settings):
+        login = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_USERS})
+        assert login.status_code == 200, login.text
+        client.headers["Origin"] = "http://testserver"
+        yield client
+
+
+def test_create_user_requires_session_user_even_when_auth_off(
+    admin_session_client: TestClient,
+) -> None:
+    """With auth off the admin gate no-ops, so an anonymous LAN caller could
+    otherwise persist an admin login (with a password of its choosing) that
+    keeps working after the operator turns auth on. The floor is the same
+    ``no_session_user`` refusal reset-password and token minting apply."""
+    client = admin_session_client
+    client.cookies.clear()
+    resp = client.post(
+        "/api/v1/config/users",
+        json={"username": "backdoor", "password": "longpassword1", "role": "admin"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["reason"] == "no_session_user"
+    usernames = [u["username"] for u in client.get("/api/v1/config/users").json()["users"]]
+    assert "backdoor" not in usernames
+
+    # A real session user still creates users whether auth is on or off.
+    login = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_USERS})
+    assert login.status_code == 200, login.text
+    resp = client.post(
+        "/api/v1/config/users",
+        json={"username": "backdoor", "password": "longpassword1", "role": "admin"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_set_role_requires_session_user_even_when_auth_off(
+    admin_session_client: TestClient,
+) -> None:
+    """Promoting an existing account to admin is the same credential class as
+    creating one, through the other door — same floor."""
+    client = admin_session_client
+    client.post(
+        "/api/v1/config/users",
+        json={"username": "grace", "password": "longpassword1", "role": "analyst"},
+    )
+    users = client.get("/api/v1/config/users").json()["users"]
+    uid = next(u["id"] for u in users if u["username"] == "grace")
+
+    client.cookies.clear()
+    resp = client.post(f"/api/v1/config/users/{uid}/set-role", json={"role": "admin"})
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["reason"] == "no_session_user"
+    grace = next(
+        u for u in client.get("/api/v1/config/users").json()["users"] if u["username"] == "grace"
+    )
+    assert grace["role"] == "analyst"
+
+    login = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_USERS})
+    assert login.status_code == 200, login.text
+    resp = client.post(f"/api/v1/config/users/{uid}/set-role", json={"role": "admin"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_create_user_appears_in_list(admin_session_client: TestClient) -> None:
     """POST /config/users creates a user; GET /config/users surfaces it."""
+    client = admin_session_client
     resp = client.post(
         "/api/v1/config/users",
         json={"username": "alice", "password": "longpassword1", "role": "analyst"},
@@ -4697,8 +4807,9 @@ def test_create_user_appears_in_list(client: TestClient) -> None:
     assert "alice" in usernames
 
 
-def test_create_user_bad_role(client: TestClient) -> None:
+def test_create_user_bad_role(admin_session_client: TestClient) -> None:
     """POST /config/users with an unrecognised role returns 400 invalid_role."""
+    client = admin_session_client
     resp = client.post(
         "/api/v1/config/users",
         json={"username": "bob", "password": "longpassword1", "role": "superuser"},
@@ -4707,8 +4818,9 @@ def test_create_user_bad_role(client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "invalid_role"
 
 
-def test_create_user_short_password(client: TestClient) -> None:
+def test_create_user_short_password(admin_session_client: TestClient) -> None:
     """POST /config/users with a password shorter than 8 chars returns 400 password_too_short."""
+    client = admin_session_client
     resp = client.post(
         "/api/v1/config/users",
         json={"username": "bob", "password": "short", "role": "analyst"},
@@ -4717,9 +4829,10 @@ def test_create_user_short_password(client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "password_too_short"
 
 
-def test_create_user_password_over_bcrypt_limit(client: TestClient) -> None:
+def test_create_user_password_over_bcrypt_limit(admin_session_client: TestClient) -> None:
     """POST /config/users with a password over bcrypt's 72-byte limit returns a
     clean 400 (password_too_long), not an unhandled 500 from bcrypt.hashpw()."""
+    client = admin_session_client
     resp = client.post(
         "/api/v1/config/users",
         json={"username": "ivan", "password": "x" * 73, "role": "analyst"},
@@ -4728,8 +4841,9 @@ def test_create_user_password_over_bcrypt_limit(client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "password_too_long"
 
 
-def test_set_user_role(client: TestClient) -> None:
+def test_set_user_role(admin_session_client: TestClient) -> None:
     """POST /config/users/{id}/set-role promotes/demotes a user; GET reflects the change."""
+    client = admin_session_client
     client.post(
         "/api/v1/config/users",
         json={"username": "charlie", "password": "longpassword1", "role": "analyst"},
@@ -4746,8 +4860,9 @@ def test_set_user_role(client: TestClient) -> None:
     assert charlie["role"] == "admin"
 
 
-def test_toggle_user_disabled(client: TestClient) -> None:
+def test_toggle_user_disabled(admin_session_client: TestClient) -> None:
     """POST /config/users/{id}/toggle-disabled flips the disabled flag to True on first call."""
+    client = admin_session_client
     client.post(
         "/api/v1/config/users",
         json={"username": "dana", "password": "longpassword1", "role": "analyst"},
@@ -4762,8 +4877,9 @@ def test_toggle_user_disabled(client: TestClient) -> None:
     assert data["disabled"] is True  # was enabled, now disabled
 
 
-def test_last_admin_cannot_be_demoted(client: TestClient) -> None:
+def test_last_admin_cannot_be_demoted(admin_session_client: TestClient) -> None:
     """set-role to non-admin is blocked when the target is the only enabled admin."""
+    client = admin_session_client
     users = client.get("/api/v1/config/users").json()["users"]
     admin_users = [u for u in users if u["role"] == "admin" and not u["disabled"]]
     # The bootstrap admin is the only admin in a fresh test DB.
@@ -4818,7 +4934,7 @@ def test_toggle_disabled_bearer_token_caller_rejected_by_admin_gate(
         assert resp.json()["detail"]["reason"] == "admin_required"
 
 
-def test_reset_password_returns_password(client: TestClient) -> None:
+def test_reset_password_returns_password(admin_session_client: TestClient) -> None:
     """POST /config/users/{id}/reset-password returns ok=True and a non-empty new password.
 
     Since the 2026-08-25 audit (L7) the reset requires a real authenticated
@@ -4827,6 +4943,7 @@ def test_reset_password_returns_password(client: TestClient) -> None:
     plaintext credential that survives a later flip back to auth-on. The
     legitimate flow (a logged-in user's session) still returns the password.
     """
+    client = admin_session_client
     client.post(
         "/api/v1/config/users",
         json={"username": "eve", "password": "longpassword1", "role": "analyst"},
@@ -4835,6 +4952,7 @@ def test_reset_password_returns_password(client: TestClient) -> None:
     uid = next(u["id"] for u in users if u["username"] == "eve")
 
     # Anonymous (no session): refused, no plaintext in the response.
+    client.cookies.clear()
     resp = client.post(f"/api/v1/config/users/{uid}/reset-password")
     assert resp.status_code == 403
     assert resp.json()["detail"]["reason"] == "no_session_user"
@@ -4868,8 +4986,9 @@ def test_get_me_dev_fallback(client: TestClient) -> None:
     assert "status" in data
 
 
-def test_status_defaults_empty_on_create(client: TestClient) -> None:
+def test_status_defaults_empty_on_create(admin_session_client: TestClient) -> None:
     """Newly-created users have status == '' in the users list."""
+    client = admin_session_client
     client.post(
         "/api/v1/config/users",
         json={"username": "frank", "password": "longpassword1", "role": "analyst"},
@@ -6154,6 +6273,30 @@ def test_api_login_oversized_body_rejected(client: TestClient) -> None:
     resp = client.post("/api/v1/login", json={"username": "admin", "password": "x" * 9000})
     assert resp.status_code == 413
     assert resp.json()["detail"]["reason"] == "payload_too_large"
+
+
+def test_api_login_chunked_body_is_rejected(client: TestClient) -> None:
+    """A login request that omits Content-Length (chunked transfer) is refused
+    411 by the size guard itself — never buffered and never handed to LoginIn.
+    Without a declared length the server would have to read the whole body
+    before pydantic's max_length could run, which is exactly the pre-auth
+    memory pressure the 413 branch exists to prevent."""
+    resp = client.post(
+        "/api/v1/login",
+        content=iter([b"x" * 9000]),
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == 411, resp.text
+    assert resp.json()["detail"]["reason"] == "length_required"
+
+
+def test_api_login_chunked_guard_leaves_normal_login_alone(settings_kratos: Settings) -> None:
+    """A normal JSON login (the SPA, httpx, browsers all send Content-Length)
+    still reaches the handler and succeeds."""
+    for client in _auth_client(settings_kratos):
+        resp = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_API})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
 
 
 def test_api_login_overlong_password_field_rejected(client: TestClient) -> None:

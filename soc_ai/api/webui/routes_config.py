@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field, SecretStr, ValidationError
@@ -852,6 +853,8 @@ _EGRESS_AUDIT_KINDS: dict[str, list[str]] = {
     "analyst_cloud": [],
     "notifications": ["notification"],
     "rag_gateway": [],
+    "misp": [],
+    "update_check": [],
 }
 
 
@@ -859,8 +862,10 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
     """Build the egress destination rows from live Settings (no counts yet).
 
     "enabled" is derived TRUTHFULLY per destination: a toggle alone for Oracle /
-    online enrichment / analyst redaction; a toggle AND a reachable URL for web
-    search / page fetch; a toggle AND a configured webhook for notifications.
+    online enrichment / analyst redaction / the release check; a toggle AND a
+    reachable URL for web search / page fetch; a toggle AND a configured webhook
+    for notifications; a configured URL alone for MISP (that is the only thing
+    gating the client at startup).
 
     "redaction" is HONEST about posture. In particular, the analyst-model
     destination reads ``analyst_cloud_redaction``: with it OFF, the analyst model
@@ -878,6 +883,15 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
         analyst_redaction = "sanitized + fail-closed"
     else:
         analyst_redaction = "sanitized, best-effort"
+
+    # The MISP client exists iff misp_url is set — nothing else gates it, so the
+    # URL alone is the enable state. A runtime override stores the raw string
+    # rather than a validated URL, so derive the display host defensively.
+    misp_host = (
+        urlsplit(str(settings.misp_url)).hostname or "unset"
+        if settings.misp_url is not None
+        else "unset"
+    )
 
     return [
         {
@@ -956,6 +970,35 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
                 "go to your gateway's embeddings and rerank models: "
                 f"{settings.rag_embed_model or 'unset'} and "
                 f"{settings.rag_rerank_model or 'unset'}. Off means local FTS5 only."
+            ),
+        },
+        {
+            "id": "misp",
+            "label": "MISP (threat-intel lookup)",
+            # Not covered by allow_online_enrichment: the client is built at
+            # startup on the URL alone and queried for every non-internal
+            # indicator. Like rag_gateway, a REAL egress only if that URL
+            # points off-box — most MISP instances are operator-run.
+            "enabled": settings.misp_url is not None,
+            "redaction": (
+                "external indicators only (internal IPs skipped); sends the MISP API key"
+            ),
+            "detail": (
+                f"Indicator lookups against MISP at {misp_host}. This is a real "
+                "egress only if that host is outside your network."
+            ),
+        },
+        {
+            "id": "update_check",
+            "label": "Release check (GitHub)",
+            "enabled": bool(settings.update_check_enabled),
+            "redaction": (
+                "none. Sends nothing about the deployment; fetches the latest "
+                "release tag from api.github.com."
+            ),
+            "detail": (
+                "Opt-in version check behind the Update button. Fetches release "
+                "metadata from api.github.com; nothing about this deployment leaves."
             ),
         },
     ]
