@@ -422,13 +422,13 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         alert_es_id = inv.alert_es_id
         rule_name = inv.rule_name
         inv_real_id = inv.id
-        inv_kind = inv.kind
         next_seq = max((e.sequence for e in events), default=0) + 1
         # Anchor-keyed hunt check: a fresh non-hunt row over a promoted
-        # finding's anchor (a POST /investigate re-run) must not launder the
-        # document past the kind-keyed guard below — the anchor is still cited
-        # telemetry with no SO alert behind it, whatever THIS row's kind says.
-        anchors_a_hunt = inv_kind == "hunt" or (
+        # finding's or lead's anchor (a POST /investigate re-run) must not
+        # launder the document past the kind-keyed guard below — the anchor is
+        # still cited telemetry with no SO alert behind it, whatever THIS
+        # row's kind says.
+        anchors_a_hunt = inv_svc.is_promoted(inv) or (
             alert_es_id is not None and bool(await inv_svc.hunt_anchor_ids(db, [alert_es_id]))
         )
 

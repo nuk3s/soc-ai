@@ -31,6 +31,21 @@ VERDICTS_RUNNING = "running"
 # The subject type of a run whose subject is a hunt (migration 0050).
 HUNT_SUBJECT_TYPE = "hunt"
 
+# The kinds a promotion lands: a hunt finding ('hunt') or a lead ('lead').
+# Both anchor on a cited telemetry document with nothing in Security Onion
+# behind it, so every SO-write guard that asks "did a promotion anchor here?"
+# must ask about both kinds, never 'hunt' alone.
+PROMOTED_KINDS: tuple[str, ...] = ("hunt", "lead")
+
+
+def is_promoted(inv: Any) -> bool:
+    """Whether this row was landed by a promotion (finding or lead).
+
+    The row-level twin of the anchor test in :func:`hunt_anchor_ids`: a
+    promoted kind, or a hunt subject whatever the kind says.
+    """
+    return getattr(inv, "kind", None) in PROMOTED_KINDS or is_hunt_subject(inv)
+
 
 def is_hunt_subject(inv: Any) -> bool:
     """Whether this run investigated a hunt rather than the alert it anchors on.
@@ -700,21 +715,24 @@ async def latest_for_finding(
 
 
 async def hunt_anchor_ids(db: AsyncSession, alert_ids: Sequence[str]) -> set[str]:
-    """Subset of *alert_ids* that anchor at least one ``kind='hunt'`` investigation.
+    """Subset of *alert_ids* that anchor at least one promoted investigation.
 
     A promoted hunt finding's ``alert_es_id`` is a cited telemetry document,
     not a Security Onion alert — there is nothing in SO to ack/escalate, ever.
-    The SO-write guards key off THIS check (the anchor document itself) rather
-    than a row's own ``kind``, so a fresh non-hunt investigation opened over
-    the same anchor (a re-investigation via ``POST /investigate``) cannot
-    launder the document past the hunt-kind refusal.
+    A promoted lead anchors the same way and lands ``kind='lead'`` with the
+    hunt as its subject, so the test is :data:`PROMOTED_KINDS` or a hunt
+    subject, never ``'hunt'`` alone. The SO-write guards key off THIS check
+    (the anchor document itself) rather than a row's own ``kind``, so a fresh
+    non-hunt investigation opened over the same anchor (a re-investigation via
+    ``POST /investigate``) cannot launder the document past the hunt-kind
+    refusal.
     """
     ids = [i for i in alert_ids if i]
     if not ids:
         return set()
     rows = await db.scalars(
         select(Investigation.alert_es_id).where(
-            Investigation.kind == "hunt",
+            or_(Investigation.kind.in_(PROMOTED_KINDS), ~not_hunt_subject()),
             Investigation.alert_es_id.in_(ids),
         )
     )
@@ -1324,6 +1342,15 @@ async def latest_for_pairs(
     collide with a live rule's name by coincidence — without this filter such
     a row would become an inheritance source and ``_ack_inherited_fps`` would
     write unattended acks against real SO alerts it never investigated.
+
+    Column-scoped via ``load_only``, as :func:`latest_per_finding` is: this
+    runs on every alerts-page poll and every auto-triage sweep, over every
+    complete in-window row of every rule on the page, and its callers read
+    the id, the key columns, the verdict and confidence and when it ran.
+    Loading each row's ``report``/``summary``/``rationale`` blob to answer
+    that grew linearly with completed-investigation volume. ``raiseload=True``
+    makes an accidental read of an unloaded column a loud error instead of a
+    silent async lazy-load.
     """
     wanted = {key for key in pairs if names_a_subject(key)}
     if not wanted:
@@ -1333,6 +1360,19 @@ async def latest_for_pairs(
     rows = (
         await db.scalars(
             select(Investigation)
+            .options(
+                load_only(
+                    Investigation.id,
+                    Investigation.rule_name,
+                    Investigation.src_ip,
+                    Investigation.dest_ip,
+                    Investigation.host_name,
+                    Investigation.verdict,
+                    Investigation.confidence,
+                    Investigation.created_at,
+                    raiseload=True,
+                )
+            )
             .where(
                 Investigation.rule_name.in_(rules),
                 Investigation.status == "complete",

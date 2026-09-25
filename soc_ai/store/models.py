@@ -109,8 +109,9 @@ class Investigation(Base):
     alert_es_id: Mapped[str] = mapped_column(String(128), index=True)
     # Where this investigation came from. 'suricata' | 'sigma' | 'notice' are
     # detector-flag kinds (the alert feed's vocabulary); 'hunt' marks a
-    # promoted hunt finding — anchored on a cited evidence doc, with NOTHING in
-    # SO to ack (every SO-write surface must gate on this).
+    # promoted hunt finding and 'lead' a promoted lead — both anchored on a
+    # cited evidence doc, with NOTHING in SO to ack (every SO-write surface
+    # must gate on both; see investigations.PROMOTED_KINDS).
     kind: Mapped[str] = mapped_column(String(16), default="suricata", server_default="suricata")
     # Promotion provenance: the hunt and the zero-based index into its
     # report["findings"]. Set only when kind == 'hunt'. The ordinal is stable:
@@ -497,8 +498,13 @@ class ConfigOverride(Base):
     """Admin-set overrides for a whitelisted subset of Settings.
 
     ``value`` holds a JSON-encoded scalar (bool/str/float). The whitelist and
-    type coercion live in ``soc_ai.store.config_overrides`` — this table never
-    holds secrets (no password/api-key keys are whitelisted).
+    type coercion live in ``soc_ai.store.config_overrides``. The whitelist
+    includes the Danger Zone connection settings and write-only secret specs:
+    a secret's ``value`` is Fernet ciphertext keyed by ``CONFIG_SECRET_KEY``
+    (see ``soc_ai.store.secret_box``), while connection identity (hosts,
+    usernames) is stored in plaintext. Treat this table as sensitive in
+    dumps, backups and exports — a dump alone reveals no live secret without
+    the key, but it does reveal where soc-ai connects and as whom.
     """
 
     __tablename__ = "config_overrides"

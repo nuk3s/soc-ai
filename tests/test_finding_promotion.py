@@ -841,12 +841,15 @@ async def _seed_action_inv(
         return inv.id
 
 
-def test_execute_action_refuses_hunt_kind_write(kind_client: TestClient) -> None:
+@pytest.mark.parametrize("promoted_kind", ["hunt", "lead"])
+def test_execute_action_refuses_hunt_kind_write(
+    kind_client: TestClient, promoted_kind: str
+) -> None:
     """A hunt-kind investigation's anchor is cited telemetry, not an SO
     alert — the execute route must refuse the write outright, BEFORE target
     binding, so the rule-keyed group ack can never see a finding title
-    mistaken for a rule_name."""
-    inv_id = asyncio.run(_seed_action_inv(kind_client, kind="hunt"))
+    mistaken for a rule_name. A lead promotion anchors the same way."""
+    inv_id = asyncio.run(_seed_action_inv(kind_client, kind=promoted_kind))
     resp = kind_client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute")
     assert resp.status_code == 400
     assert resp.json()["detail"]["reason"] == "hunt_kind_no_so_target"
@@ -896,8 +899,19 @@ def test_run_recorded_and_investigate_default_focus_origin_to_rerun() -> None:
 _REHUNT_MGR_TARGET = "soc_ai.api.webui.routes_investigations.hunt_manager.get_manager"
 
 
+# A lead promotion lands kind='lead' with the hunt as its subject; it anchors
+# on a cited document exactly like a finding promotion, so every guard that
+# refuses a hunt-kind row must refuse a lead-kind row too.
+_PROMOTED_KINDS = ("hunt", "lead")
+
+
+def _lead_subject(hunt_id: str) -> dict[str, Any]:
+    return {"type": "hunt", "hunt_id": hunt_id, "lead_id": 10}
+
+
+@pytest.mark.parametrize("promoted_kind", _PROMOTED_KINDS)
 def test_bulk_rehunt_skips_hunt_kind_but_proceeds_for_suricata_kind(
-    kind_client: TestClient,
+    kind_client: TestClient, promoted_kind: str
 ) -> None:
     async def _seed() -> tuple[str, str]:
         maker = kind_client.app.state.db_sessionmaker
@@ -908,9 +922,10 @@ def test_bulk_rehunt_skips_hunt_kind_but_proceeds_for_suricata_kind(
                 alert_es_id="tel-doc-000001",
                 started_by="admin",
                 rule_name="Beaconing to rare external IP",
-                kind="hunt",
+                kind=promoted_kind,
                 hunt_id=hunt_row.id,
-                finding_ordinal=0,
+                finding_ordinal=0 if promoted_kind == "hunt" else None,
+                subject=_lead_subject(hunt_row.id) if promoted_kind == "lead" else None,
             )
             await inv_svc.finalize(db, promoted.id, status="complete", verdict="true_positive")
             plain = await inv_svc.create(
@@ -943,7 +958,10 @@ def test_bulk_rehunt_skips_hunt_kind_but_proceeds_for_suricata_kind(
     assert started[plain_id]["alertEsId"] == "ev-rh-plain"
 
 
-def test_request_more_info_refuses_hunt_kind_row(kind_client: TestClient) -> None:
+@pytest.mark.parametrize("promoted_kind", _PROMOTED_KINDS)
+def test_request_more_info_refuses_hunt_kind_row(
+    kind_client: TestClient, promoted_kind: str
+) -> None:
     async def _seed() -> str:
         maker = kind_client.app.state.db_sessionmaker
         async with maker() as db:
@@ -953,9 +971,10 @@ def test_request_more_info_refuses_hunt_kind_row(kind_client: TestClient) -> Non
                 alert_es_id="tel-doc-000001",
                 started_by="admin",
                 rule_name="Beaconing to rare external IP",
-                kind="hunt",
+                kind=promoted_kind,
                 hunt_id=hunt_row.id,
-                finding_ordinal=0,
+                finding_ordinal=0 if promoted_kind == "hunt" else None,
+                subject=_lead_subject(hunt_row.id) if promoted_kind == "lead" else None,
             )
             # needs_more_info is exactly the verdict this route exists to
             # relaunch — the kind guard must still block it before that check.
@@ -974,6 +993,112 @@ def test_request_more_info_refuses_hunt_kind_row(kind_client: TestClient) -> Non
     body = resp.json()["detail"]
     assert body["reason"] == "hunt_kind_no_rerun"
     assert body["hint"] == "Re-promote the finding from its hunt instead."
+    fake_mgr.start.assert_not_called()
+
+
+# ── The relaunch guards key off the ANCHOR document, not the row's own kind ──
+#
+# POST /investigate over a promoted finding's anchor is allowed (it runs with
+# SO writes off) and lands an ordinary kind="suricata" row over the same
+# alert_es_id. Bulk re-hunt and request-more-info relaunch through
+# HuntManager.start with the default kind, whose force-off only fires for a
+# promoted kind — so relaunching THAT row would run with allow_so_writes=True
+# over cited telemetry that has no SO alert behind it. Both routes must treat
+# a row over a promoted anchor exactly like the promoted row itself.
+
+
+def _seed_row_over_promoted_anchor(
+    client: TestClient, *, promoted_kind: str, verdict: str
+) -> tuple[str, str]:
+    """Seed a promoted row of *promoted_kind* over ``tel-doc-000001`` plus an
+    ordinary default-kind row over the same anchor (what a POST /investigate
+    re-run persists). Returns ``(promoted_id, laundered_id)``."""
+
+    async def _go() -> tuple[str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt_row = await hunt_svc.create(db, objective=_LONG_OBJECTIVE, started_by="admin")
+            promoted = await inv_svc.create(
+                db,
+                alert_es_id="tel-doc-000001",
+                started_by="admin",
+                rule_name="Beaconing to rare external IP",
+                kind=promoted_kind,
+                hunt_id=hunt_row.id,
+                finding_ordinal=0 if promoted_kind == "hunt" else None,
+                subject=_lead_subject(hunt_row.id) if promoted_kind == "lead" else None,
+            )
+            await inv_svc.finalize(db, promoted.id, status="complete", verdict="true_positive")
+            laundered = await inv_svc.create(
+                db,
+                alert_es_id="tel-doc-000001",
+                started_by="admin",
+                rule_name="Beaconing to rare external IP",
+            )
+            await inv_svc.finalize(db, laundered.id, status="complete", verdict=verdict)
+            return promoted.id, laundered.id
+
+    return asyncio.run(_go())
+
+
+@pytest.mark.parametrize("promoted_kind", _PROMOTED_KINDS)
+def test_bulk_rehunt_skips_a_non_hunt_row_over_a_promoted_anchor(
+    kind_client: TestClient, promoted_kind: str
+) -> None:
+    _, laundered_id = _seed_row_over_promoted_anchor(
+        kind_client, promoted_kind=promoted_kind, verdict="false_positive"
+    )
+
+    async def _seed_plain() -> str:
+        maker = kind_client.app.state.db_sessionmaker
+        async with maker() as db:
+            plain = await inv_svc.create(
+                db, alert_es_id="ev-rh-plain", started_by="admin", rule_name="ET SCAN Suspicious"
+            )
+            await inv_svc.finalize(db, plain.id, status="complete", verdict="false_positive")
+            return plain.id
+
+    plain_id = asyncio.run(_seed_plain())
+
+    starts: list[dict[str, Any]] = []
+
+    async def fake_start(_state: Any, **kwargs: Any) -> str:
+        starts.append(kwargs)
+        return "NEW-PLAIN"
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = fake_start
+
+    with patch(_REHUNT_MGR_TARGET, return_value=fake_mgr):
+        resp = kind_client.post(
+            "/api/v1/investigations/rehunt", json={"inv_ids": [laundered_id, plain_id]}
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    skipped = {s["invId"]: s["reason"] for s in body["skipped"]}
+    assert skipped.get(laundered_id) == "hunt_kind", body
+    started = {s["invId"]: s for s in body["started"]}
+    assert started[plain_id]["newInvId"] == "NEW-PLAIN"
+    assert [s["alert_id"] for s in starts] == ["ev-rh-plain"]
+
+
+@pytest.mark.parametrize("promoted_kind", _PROMOTED_KINDS)
+def test_request_more_info_refuses_a_non_hunt_row_over_a_promoted_anchor(
+    kind_client: TestClient, promoted_kind: str
+) -> None:
+    _, laundered_id = _seed_row_over_promoted_anchor(
+        kind_client, promoted_kind=promoted_kind, verdict="needs_more_info"
+    )
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = AsyncMock(return_value="SHOULD-NOT-START")
+
+    with patch(_REHUNT_MGR_TARGET, return_value=fake_mgr):
+        resp = kind_client.post(f"/api/v1/investigations/{laundered_id}/request-more-info")
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["reason"] == "hunt_kind_no_rerun"
     fake_mgr.start.assert_not_called()
 
 
@@ -1009,12 +1134,14 @@ def test_request_more_info_suricata_kind_control_gets_past_kind_check(
 # ── Quality review: manager forces allow_so_writes (single source of truth) ──
 
 
-def test_hunt_manager_forces_allow_so_writes_false_for_hunt_kind() -> None:
+@pytest.mark.parametrize("promoted_kind", _PROMOTED_KINDS)
+def test_hunt_manager_forces_allow_so_writes_false_for_hunt_kind(promoted_kind: str) -> None:
     """HuntManager.start(kind="hunt") must force allow_so_writes=False onto
     run_recorded EVEN WHEN the caller omits the kwarg entirely (its default is
     True) — the route's explicit allow_so_writes=False is documentation, not
     the only thing standing between a hunt-kind run and an unattended ack. A
-    future kind="hunt" caller that forgets the kwarg must not reopen the hole."""
+    future kind="hunt" caller that forgets the kwarg must not reopen the hole.
+    A lead promotion (kind="lead") anchors on cited telemetry the same way."""
     from unittest.mock import patch
 
     from soc_ai.webui import hunt_manager as hm
@@ -1035,9 +1162,9 @@ def test_hunt_manager_forces_allow_so_writes_false_for_hunt_kind() -> None:
                 object(),
                 alert_id="tel-doc-000001",
                 started_by="tester",
-                kind="hunt",
+                kind=promoted_kind,
                 hunt_id="01HUNTFORCED0000000000000000",
-                finding_ordinal=0,
+                finding_ordinal=0 if promoted_kind == "hunt" else None,
                 # allow_so_writes deliberately OMITTED — defaults to True.
             )
             await asyncio.sleep(0)  # let the drain task settle

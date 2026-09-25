@@ -824,6 +824,7 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
     eligible = unique_ids
 
     inv_by_id: dict[str, Investigation] = {}
+    promoted_anchors: set[str] = set()
     if eligible:
         async with request.app.state.db_sessionmaker() as db:
             rows = (
@@ -832,6 +833,14 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
                 .all()
             )
             inv_by_id = {inv.id: inv for inv in rows}
+            # Anchor-keyed, like POST /investigate and execute-action: a
+            # re-investigation of a promoted finding lands an ordinary
+            # kind="suricata" row over the same anchor, and relaunching THAT
+            # row through the manager's default kind would run with SO writes
+            # on over cited telemetry that has no SO alert behind it.
+            promoted_anchors = await inv_svc.hunt_anchor_ids(
+                db, [inv.alert_es_id for inv in rows if inv.alert_es_id]
+            )
 
     for inv_id in eligible:
         inv = inv_by_id.get(inv_id)
@@ -839,7 +848,7 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
             skipped.append({"invId": inv_id, "reason": "not_found"})
             continue
 
-        if inv.kind == "hunt":
+        if inv_svc.is_promoted(inv) or inv.alert_es_id in promoted_anchors:
             # A promoted finding's anchor is cited telemetry, not an SO alert —
             # relaunching it here would mint an unlabeled kind="suricata"
             # duplicate carrying the finding title as rule_name (the exact
@@ -946,10 +955,19 @@ async def request_more_info(
 
     async with request.app.state.db_sessionmaker() as db:
         inv = await db.get(Investigation, inv_id)
+        # Anchor-keyed, like bulk re-hunt: an ordinary row over a promoted
+        # anchor (a re-investigation) is as much off-limits as the promoted
+        # row itself — the manager's default kind would relaunch it with SO
+        # writes on over cited telemetry that has no SO alert behind it.
+        over_promoted_anchor = (
+            inv is not None
+            and bool(inv.alert_es_id)
+            and bool(await inv_svc.hunt_anchor_ids(db, [inv.alert_es_id]))
+        )
 
     if inv is None:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    if inv.kind == "hunt":
+    if inv_svc.is_promoted(inv) or over_promoted_anchor:
         # Re-promotion from the hunt page is the sanctioned re-run for a
         # promoted finding — relaunching here would mint an unlabeled
         # kind="suricata" duplicate against the same anchor telemetry doc.
