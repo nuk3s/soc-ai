@@ -8,7 +8,9 @@ machine with its predecessor's history.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import os
+import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from soc_ai.config import Settings
@@ -80,6 +82,45 @@ async def test_upserting_twice_updates_rather_than_duplicating(
         assert rows.scalar_one() == 1
     assert loaded["served_ports"].vector["445"]["count"] == 3
     assert loaded["served_ports"].support_days == 3
+
+
+async def test_rewriting_a_profile_stamps_built_at_in_utc_not_local_time(
+    settings_kratos: Settings,
+) -> None:
+    # The insert path leaves built_at to the database default, which is UTC,
+    # and every other timestamp in the store is naive UTC. A rewrite that
+    # stamps the local clock instead would put the second sweep's row hours
+    # away from the first on any host whose TZ is not UTC, and a "built N
+    # ago" reading over it would be off by the whole offset. Pin the process
+    # to a fixed-offset zone (no tzdata needed) so the bug is visible on a
+    # UTC build box too.
+    _engine, maker = await _db(settings_kratos)
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "XXX-7"
+    time.tzset()
+    try:
+        async with maker() as db:
+            for count in (1, 2):
+                await ep.upsert_profile(
+                    db,
+                    entity_kind="host",
+                    entity_key="10.1.10.21",
+                    dimension="served_ports",
+                    shape="categorical",
+                    vector={"445": {"count": count}},
+                    support_days=count,
+                )
+            loaded = await ep.load_profiles(db, entity_kind="host", entity_key="10.1.10.21")
+    finally:
+        if previous_tz is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+    built_at = loaded["served_ports"].built_at
+    assert built_at is not None
+    assert built_at.tzinfo is None
+    assert abs(built_at - datetime.now(UTC).replace(tzinfo=None)) < timedelta(seconds=5)
 
 
 async def test_a_stale_fingerprint_yields_nothing_not_a_stale_profile(

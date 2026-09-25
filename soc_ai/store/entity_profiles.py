@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import delete, select
@@ -168,7 +168,10 @@ async def upsert_profile(
         existing.window_days = window_days
         existing.first_seen = first_seen
         existing.last_seen = last_seen
-        existing.built_at = datetime.now()
+        # Naive UTC, like the insert path's server default and every other
+        # timestamp in the store; the local clock would drift the column by
+        # the host's UTC offset on every rewrite.
+        existing.built_at = datetime.now(UTC).replace(tzinfo=None)
 
     await db.commit()
 
