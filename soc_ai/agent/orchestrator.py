@@ -1765,6 +1765,25 @@ async def _resolve_oracle_identifiers(
     return effective.suffixes, effective.hosts
 
 
+def _strip_model_resolution(report: TriageReport) -> TriageReport:
+    """Drop a model-authored ``resolution`` from a *report*.
+
+    ``resolution`` is the pipeline-FAILURE marker. It suppresses Oracle
+    escalation, drops the run out of the Needs-info KPI, excludes the row from
+    the same-session consistency constraint and prior-outcome memory, and
+    renders it as an infrastructure error — and only the orchestrator's own
+    fallback builder (``_synth_failure_fallback_report``) may set it (see the
+    field's note in triage_models). The field is part of the model's output
+    schema, though, so any synthesizer or tool-using investigator reading
+    attacker-influenceable alert text can emit it next to a real verdict.
+    Every assignment from a model result goes through this, so a settled
+    verdict never stores as a pipeline failure on the model's say-so.
+    """
+    if report.resolution is None:
+        return report
+    return report.model_copy(update={"resolution": None})
+
+
 def _desanitize_report(report: TriageReport, guard: EgressGuard) -> TriageReport:
     """Restore real identifiers in every string field of a *report*.
 
@@ -2804,7 +2823,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             )
             await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
-            triage_round1 = synth_result_round1.output
+            triage_round1 = _strip_model_resolution(synth_result_round1.output)
             if guard is not None:
                 # Restore real identifiers AT THE ASSIGNMENT SOURCE (not at a
                 # later convergence point): the desanitized report drives
@@ -3055,6 +3074,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                         "summary": (partial_report.summary or "") + note,
                         # Never recurse into Phase D off a cut-short synthesis.
                         "gap_for_investigator": None,
+                        # Model output: the failure marker is not its to set.
+                        "resolution": None,
                     }
                 )
                 if guard is not None:
@@ -3240,16 +3261,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 await _audit(inv_usage_ev)
                 yield inv_usage_ev
 
-            loop_report = inv_result.output
-            # ``resolution`` is the pipeline-FAILURE marker. It suppresses Oracle
-            # escalation, drops the run out of the Needs-info KPI and renders the
-            # row as an infrastructure error, and only the orchestrator's own
-            # fallback builder may set it (see the field's note in
-            # triage_models). On the round-2 path the synthesizer could set it
-            # too, but this path hands the privileged field to a tool-using model
-            # reading attacker-influenceable text, so strip it here.
-            if loop_report.resolution is not None:
-                loop_report = loop_report.model_copy(update={"resolution": None})
+            # This path hands the privileged failure marker to a tool-using
+            # model reading attacker-influenceable text; the strip is the same
+            # one every model-authored report gets.
+            loop_report = _strip_model_resolution(inv_result.output)
             # The Oracle payload stays in the space the loop ran in (label space
             # under a guard), exactly like the transcript bullets it replaces.
             loop_evidence_bullets = [
@@ -3403,7 +3418,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     yield ev
             else:
                 report_path = "synth_round2"
-                triage_final = loop_synth_result.output
+                triage_final = _strip_model_resolution(loop_synth_result.output)
                 if guard is not None:
                     # Assignment-source restore — the gates below compare this
                     # report's text against RAW enriched/pivot values.
@@ -3574,7 +3589,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 break
             else:
                 phase_d_synth_ok = True
-                triage_final = synth_result_round2.output
+                triage_final = _strip_model_resolution(synth_result_round2.output)
                 if guard is not None:
                     # Assignment-source restore — a chained next-round gap's
                     # tool_args must dispatch with real values, and the gates
@@ -3617,6 +3632,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         sample_agent, sample_msg, sample_limits = final_synth_rerun
         sample_reports: list[TriageReport] = [triage_final]
         for _ in range(vote_samples - 1):
+            if report_path == "investigator":
+                # The sample re-runs the loop, tools and all, against the same
+                # ctx the primary run used. The dedup tracker is per-run state:
+                # inherited, every pivot the primary already made comes back as
+                # a ``duplicate_call`` stub and the sample votes blind. Nothing
+                # after the vote reads the tracker, so a fresh one per sample
+                # is safe (time anchor / prefetched ids stay as set).
+                ctx.dedup = _DedupTracker()
             try:
                 async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
                     if sample_limits is not None:
@@ -3630,12 +3653,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             except BaseException as e:
                 _LOGGER.warning("self-consistency sample failed (dropped): %s", e)
                 continue
-            extra_report = extra_result.output
-            # Same privileged-field strip as the W3 primary report above: on the
-            # investigator path a sample comes from a tool-using model, and a
-            # winning sample's ``resolution`` would be the one the run stores.
-            if report_path == "investigator" and extra_report.resolution is not None:
-                extra_report = extra_report.model_copy(update={"resolution": None})
+            # Same privileged-field strip as every primary report: a winning
+            # sample's ``resolution`` would be the one the run stores.
+            extra_report = _strip_model_resolution(extra_result.output)
             if guard is not None:
                 # Samples re-ran the SAME already-sanitized message, so their
                 # outputs are labeled too; restore before the vote so a winning
@@ -4029,8 +4049,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # W3 A/B provenance on the report itself, so a stored run answers "which
     # call wrote this verdict" without a join back across the event stream. The
     # report dict only ever carries a ``resolution`` here on the pipeline-
-    # fallback path, where ``report_path`` is None, so the stamp below is a
-    # no-op today; it is here so the marker travels with the dict if a future
+    # fallback path (every model-authored report had its own stripped at the
+    # assignment source), where ``report_path`` is None, so the stamp below is
+    # a no-op today; it is here so the marker travels with the dict if a future
     # path sets both.
     if report_path is not None and isinstance(triage_final.resolution, dict):
         triage_final = triage_final.model_copy(

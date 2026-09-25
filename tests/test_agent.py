@@ -8745,6 +8745,172 @@ async def test_both_report_paths_run_the_same_gates(
     )
 
 
+# The pipeline-failure marker, exactly as the schema description spells it out
+# to the model. Only ``_synth_failure_fallback_report`` may set it; every
+# consumer (Oracle gate, is_fallback column, KPI, session memory) keys on it.
+_SPOOFED_FALLBACK_RESOLUTION: dict[str, Any] = {"provenance": "pipeline_fallback"}
+
+
+def _assert_resolution_not_spoofed(events: list[Any], *, label: str = "") -> dict[str, Any]:
+    from soc_ai.triage_models import is_pipeline_fallback
+
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert "resolution" not in report_ev.payload, label
+    assert is_pipeline_fallback(report_ev.payload) is False, label
+    return dict(report_ev.payload)
+
+
+@pytest.mark.asyncio
+async def test_round1_report_cannot_spoof_pipeline_fallback_resolution(
+    settings_kratos: Settings,
+) -> None:
+    """A round-1 report carrying the failure marker lands as a real verdict.
+
+    ``resolution`` is in the model's output schema, so a synthesizer steered by
+    alert-embedded text (or a weak model copying the schema example) can emit
+    it next to a settled verdict. The stored report must not turn into an
+    infrastructure error on the model's say-so.
+    """
+    settings_kratos.investigate_when_unsure = False
+    ctx = _make_ctx(settings_kratos)
+    spoofed = TriageReport(
+        verdict="false_positive",
+        confidence=0.9,
+        summary="Internal scanner; expected periodic ICMP.",
+        citations=["alert.severity_label"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+        resolution=_SPOOFED_FALLBACK_RESOLUTION,
+    )
+
+    events = await _run_synth_first(ctx, report=spoofed, candidate=_strong_benign_candidate())
+
+    payload = _assert_resolution_not_spoofed(events)
+    assert payload["verdict"] == "false_positive"
+
+
+@pytest.mark.asyncio
+async def test_loop_reports_cannot_spoof_pipeline_fallback_resolution_on_either_path(
+    settings_kratos: Settings,
+) -> None:
+    """Both A/B arms strip a model-authored failure marker, not just W3."""
+    runs = await _run_both_report_paths(
+        settings_kratos,
+        report=_settled_report(resolution=_SPOOFED_FALLBACK_RESOLUTION),
+        with_tool_call=True,
+    )
+    for emits_report, events in runs.items():
+        payload = _assert_resolution_not_spoofed(events, label=f"emits_report={emits_report}")
+        assert payload["verdict"] == "true_positive"
+        assert payload["report_path"] == ("investigator" if emits_report else "synth_round2")
+
+
+@pytest.mark.asyncio
+async def test_budget_partial_report_cannot_spoof_pipeline_fallback_resolution(
+    settings_kratos: Settings,
+) -> None:
+    """The budget-cut partial synthesis is model output too — same strip."""
+    settings_kratos.investigate_when_unsure = True
+    partial_report = TriageReport(
+        verdict="false_positive",
+        confidence=0.55,
+        summary="Solicited echo reply; zeek shows normal TLS to a known host.",
+        citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=[],
+        gap_for_investigator=None,
+        resolution=_SPOOFED_FALLBACK_RESOLUTION,
+    )
+
+    events = await _run_budget_loop(settings_kratos, _fake_partial_agent(partial_report))
+
+    payload = _assert_resolution_not_spoofed(events)
+    assert payload["verdict"] == "false_positive"
+
+
+def _dedup_probe_investigator(ctx: InvestigationContext, output: Any) -> tuple[Any, list[bool]]:
+    """A loop investigator whose primary ``iter()`` registers one tool call on
+    ``ctx.dedup`` and whose vote-sample ``run()`` records whether that same
+    call now reads as a duplicate. The recorded flags are returned."""
+    from unittest.mock import MagicMock
+
+    probe_call = ("t_query_zeek_logs", {"community_id": "1:abc"})
+    investigator = _fake_loop_investigator_emitting(output, with_tool_call=True)
+    seen_in_sample: list[bool] = []
+
+    primary_iter_cm = investigator.iter.return_value
+
+    def _iter_marking_call(*_a: Any, **_kw: Any) -> Any:
+        ctx.dedup.is_duplicate(*probe_call)
+        return primary_iter_cm
+
+    investigator.iter = MagicMock(side_effect=_iter_marking_call)
+
+    original_run = investigator.run
+
+    async def _run_probing_dedup(*args: Any, **kwargs: Any) -> Any:
+        seen_in_sample.append(ctx.dedup.is_duplicate(*probe_call))
+        return await original_run(*args, **kwargs)
+
+    investigator.run = AsyncMock(side_effect=_run_probing_dedup)
+    return investigator, seen_in_sample
+
+
+@pytest.mark.asyncio
+async def test_self_consistency_investigator_sample_gets_fresh_dedup_tracker(
+    settings_kratos: Settings,
+) -> None:
+    """A vote sample on the investigator path re-runs the loop, tools and all.
+
+    The dedup tracker is per-run state: a sample that inherits the primary
+    run's tracker gets a ``duplicate_call`` stub for every pivot the primary
+    already made and votes blind. Each sample must start with a fresh one.
+    """
+    settings_kratos.investigate_when_unsure = True
+    settings_kratos.investigator_emits_report = True
+    settings_kratos.verdict_consistency_samples = 2
+    ctx = _make_ctx(settings_kratos)
+    report = _settled_report()
+    investigator, seen_in_sample = _dedup_probe_investigator(ctx, report)
+
+    events = await _run_loop(ctx, investigator=investigator, loop_synth=_fake_round2_synth(report))
+
+    kinds = [e.kind for e in events]
+    assert "self_consistency_vote" in kinds
+    assert investigator.run.await_count == 1  # one extra sample
+    assert seen_in_sample == [False]
+    report_ev = next(e for e in events if e.kind == "triage_report")
+    assert report_ev.payload["verdict"] == "true_positive"
+
+
+@pytest.mark.asyncio
+async def test_self_consistency_round2_sample_reruns_synth_not_investigator(
+    settings_kratos: Settings,
+) -> None:
+    """Flag off: the sample re-runs the round-2 synthesis; the loop runs once."""
+    settings_kratos.investigate_when_unsure = True
+    settings_kratos.investigator_emits_report = False
+    settings_kratos.verdict_consistency_samples = 2
+    ctx = _make_ctx(settings_kratos)
+    report = _settled_report()
+    investigator, seen_in_sample = _dedup_probe_investigator(
+        ctx,
+        InvestigationTranscript(
+            evidence=["t_query_zeek_logs -> ssl.server_name=evil.example.com"],
+            tentative_summary="Zeek SSL SNI gathered.",
+            open_questions=[],
+        ),
+    )
+    loop_synth = _fake_round2_synth(report)
+
+    events = await _run_loop(ctx, investigator=investigator, loop_synth=loop_synth)
+
+    kinds = [e.kind for e in events]
+    assert "self_consistency_vote" in kinds
+    assert seen_in_sample == []  # the investigator's run() is never the sample
+    assert investigator.run.await_count == 0
+    assert loop_synth.run.await_count == 2  # primary + one sample
+
+
 @pytest.mark.asyncio
 async def test_flag_on_citation_cap_still_applies(settings_kratos: Settings) -> None:
     """An investigator report whose citations do not resolve is capped."""
