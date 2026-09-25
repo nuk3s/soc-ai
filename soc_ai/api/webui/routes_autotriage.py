@@ -172,6 +172,16 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
     selection (already-verdicted ids skipped); otherwise it sweeps the
     critical+high detections in range."""
     state = request.app.state
+    # Resolve the caller BEFORE the single-flight check. identify_caller does a
+    # DB read, and it used to be awaited after the claim, outside the try that
+    # releases it: a busy SQLite ("database is locked") or a navigate-away at
+    # that one await left the claim outliving the request with no worker task
+    # behind it — the same wedge the CancelledError arm below describes, until
+    # a restart. It has to sit above the check, not between the check and the
+    # claim: that await is a scheduling point where the scheduler's own sweep
+    # (or a second POST) can take the slot, and a claim made without re-checking
+    # would launch a second worker over it. Same ordering as start_backtest.
+    started_by = f"auto-triage:{await identify_caller(request)}"
     status = at.get_status(state)
     if status.active:
         return _at_status(status, note="already running")
@@ -278,7 +288,6 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
     # 0 targets + N inherited acks still runs the worker: the ack pass is how a
     # standing inherited-FP backlog drains (no LLM calls involved).
     status.reset(active=True, total=len(targets), skipped=skipped, severities=chosen)
-    started_by = f"auto-triage:{await identify_caller(request)}"
     status._task = asyncio.create_task(
         at.run_auto_triage(
             state, targets=targets, started_by=started_by, inherited_acks=inherited_acks
